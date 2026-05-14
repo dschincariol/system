@@ -80,6 +80,12 @@ def _normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
+def _uses_postgres_storage(db: Any) -> bool:
+    raw = getattr(db, "raw", None)
+    module = f"{type(db).__module__}.{type(db).__name__} {type(raw).__module__}.{type(raw).__name__}".lower()
+    return "storage_pg" in module or "psycopg" in module
+
+
 _ROUTER_LOCK = threading.RLock()
 
 _LAST_EVENT_KEY_BY_STREAM: Dict[str, str] = {}
@@ -744,9 +750,20 @@ def publish_price_events(
 
         if db is not None and update_symbols and merged:
             update_ts_ms = int(received_ts_ms)
-            for r in merged:
-                db.execute(
+            if _uses_postgres_storage(db):
+                update_symbol_sql = """
+                    UPDATE symbols SET
+                      updated_ts_ms=?,
+                      meta_json=jsonb_set(
+                        COALESCE(meta_json, '{}'::jsonb),
+                        '{price_status,last_seen_ts_ms}',
+                        to_jsonb(CAST(? AS BIGINT)),
+                        true
+                      )
+                    WHERE symbol=?
                     """
+            else:
+                update_symbol_sql = """
                     UPDATE symbols SET
                       updated_ts_ms=?,
                       meta_json=json_set(
@@ -754,7 +771,10 @@ def publish_price_events(
                         '$.price_status.last_seen_ts_ms', ?
                       )
                     WHERE symbol=?
-                    """,
+                    """
+            for r in merged:
+                db.execute(
+                    update_symbol_sql,
                     (update_ts_ms, int(r["timestamp"]), str(r["symbol"])),
                 )
 

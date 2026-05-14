@@ -42,6 +42,7 @@ _JOBS_CACHE = {
     "payload": None,
 }
 _JOBS_CACHE_TTL_MS = int(float(os.environ.get("API_JOBS_CACHE_TTL_S", "2.5")) * 1000.0)
+_API_JOB_LIST_TIMEOUT_S = float(os.environ.get("API_JOB_LIST_TIMEOUT_S", "0.5"))
 
 
 def _warn(scope: str, err: Exception, **extra) -> None:
@@ -191,7 +192,13 @@ def api_get_jobs(parsed, _body=None, ctx=None):
     stale_after_s = int(float(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180")))
 
     try:
-        running = JOBS.list_jobs() or []
+        try:
+            running = JOBS.list_jobs(timeout_s=max(0.05, float(_API_JOB_LIST_TIMEOUT_S)), include_persisted=False) or []
+        except TypeError:
+            running = JOBS.list_jobs() or []
+    except TimeoutError as e:
+        _warn("jobs_list_timeout", e)
+        running = []
     except Exception as e:
         _warn("jobs_list", e)
         running = []

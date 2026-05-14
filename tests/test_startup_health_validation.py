@@ -177,6 +177,37 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertEqual(failures[0]["module"], "jobs.slow_job")
         self.assertIn("full job import failed", str(failures[0].get("stderr") or ""))
 
+    def test_startup_validation_log_redacts_connection_and_token_material(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+        dsn = "postgresql://unit:super-secret@127.0.0.1/trading"
+        snapshot = {
+            "ok": False,
+            "mode": "safe",
+            "gates": {
+                "database_reachable": {
+                    "ok": False,
+                    "detail": "password=super-secret token=clear-token",
+                    "dsn": dsn,
+                }
+            },
+            "db_validation": {
+                "dsn": dsn,
+                "password": "super-secret",
+                "api_key": "clear-key",
+            },
+            "reasons": ["token=clear-token"],
+        }
+
+        with self.assertLogs(start_system.LOG.name, level="WARNING") as records:
+            start_system._log_startup_validation("unit", snapshot, level="warning", attempt=1, timeout_s=1.0)
+
+        text = "\n".join(records.output)
+        self.assertIn("<redacted>", text)
+        self.assertNotIn("super-secret", text)
+        self.assertNotIn("clear-token", text)
+        self.assertNotIn("clear-key", text)
+        self.assertNotIn(dsn, text)
+
     def tearDown(self) -> None:
         try:
             (storage,) = _reload_modules("engine.runtime.storage")

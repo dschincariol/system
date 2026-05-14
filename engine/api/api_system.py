@@ -51,6 +51,7 @@ _SYSTEM_SNAPSHOT_CACHE = {
     "payload": None,
 }
 _SYSTEM_SNAPSHOT_CACHE_TTL_MS = int(float(os.environ.get("API_SYSTEM_SNAPSHOT_CACHE_TTL_S", "1.5")) * 1000.0)
+_API_JOB_LIST_TIMEOUT_S = float(os.environ.get("API_JOB_LIST_TIMEOUT_S", "0.5"))
 
 
 def _warn(scope: str, err: Exception, **extra) -> None:
@@ -1197,10 +1198,16 @@ def _get_jobs_payload(ctx=None):
         return [], ["jobs_manager_missing"]
 
     try:
-        rows = jobs_ref.list_jobs() or []
+        try:
+            rows = jobs_ref.list_jobs(timeout_s=max(0.05, float(_API_JOB_LIST_TIMEOUT_S)), include_persisted=False) or []
+        except TypeError:
+            rows = jobs_ref.list_jobs() or []
         if not isinstance(rows, list):
             return [], ["jobs_list_invalid"]
         return rows, []
+    except TimeoutError as e:
+        _warn("api_system.get_jobs_payload.timeout", e)
+        return [], ["jobs_list_timeout"]
     except Exception as e:
         _warn("api_system.get_jobs_payload.list_jobs", e)
         errors = [f"jobs_list_error:{e}"]
@@ -2390,7 +2397,19 @@ def _build_runtime_health(_parsed, ctx):
     }
 
     try:
-        jobs_payload = ctx["JOBS"].list_jobs() if ctx and ctx.get("JOBS") else []
+        if ctx and ctx.get("JOBS"):
+            try:
+                jobs_payload = ctx["JOBS"].list_jobs(
+                    timeout_s=max(0.05, float(_API_JOB_LIST_TIMEOUT_S)),
+                    include_persisted=False,
+                )
+            except TypeError:
+                jobs_payload = ctx["JOBS"].list_jobs()
+        else:
+            jobs_payload = []
+    except TimeoutError as e:
+        _warn("api_system.runtime_health.jobs_payload_timeout", e)
+        jobs_payload = []
     except Exception as e:
         _warn("api_system.runtime_health.jobs_payload", e)
         jobs_payload = []
@@ -3950,6 +3969,44 @@ def api_post_self_repair(_parsed=None, body=None, ctx=None):
             sup = ctx.get("SUPERVISOR") if ctx else None
             started = []
             results = {}
+            isolated_ingestion = str(os.environ.get("START_INGESTION_WITH_SERVER", "1")).strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+            def _env_enabled(key: str, default: bool = False) -> bool:
+                raw = os.environ.get(key)
+                if raw is None:
+                    return bool(default)
+                return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+            def _repair_job_allowed(name: str) -> bool:
+                if isolated_ingestion and name in {
+                    "ingestion_runtime",
+                    "stream_prices_polygon_ws",
+                    "stream_prices_ibkr",
+                    "poll_prices",
+                }:
+                    return False
+                if name == "stream_prices_polygon_ws":
+                    return _env_enabled("POLYGON_WS_ENABLED", False) and bool(
+                        str(os.environ.get("POLYGON_API_KEY", "") or "").strip()
+                    )
+                if name == "stream_prices_ibkr":
+                    return _env_enabled("IBKR_ENABLED", False)
+                if name == "poll_prices":
+                    return any(
+                        _env_enabled(key, False)
+                        for key in (
+                            "YFINANCE_ENABLED",
+                            "POLYGON_REST_ENABLED",
+                            "CCXT_ENABLED",
+                            "TRADIER_ENABLED",
+                        )
+                    )
+                return True
 
             for name in [
                 "ingestion_runtime",
@@ -3958,6 +4015,9 @@ def api_post_self_repair(_parsed=None, body=None, ctx=None):
                 "provider_monitor",
                 "metrics_collector",
             ]:
+                if not _repair_job_allowed(name):
+                    results[name] = {"ok": True, "skipped": True, "reason": "disabled_or_isolated_ingestion"}
+                    continue
                 try:
                     if sup:
                         result = sup.deterministic_start([name], include_deps=True, strict=False)

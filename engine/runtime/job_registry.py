@@ -769,6 +769,30 @@ ALLOWED_JOBS = {
     },
 ),
 
+"backtest_walk_forward": (
+    "engine/strategy/jobs/backtest_walk_forward.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "resource_class": "replay",
+        "resource_priority": 30,
+        "slot_cost": 1,
+    },
+),
+
+"portfolio_backtest": (
+    "engine/strategy/jobs/portfolio_backtest.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "resource_class": "replay",
+        "resource_priority": 30,
+        "slot_cost": 1,
+    },
+),
+
 # ---------------------------
 # Additional oneshot jobs
 # Registered, but not auto-booted in JOB_ORDER
@@ -811,6 +835,13 @@ ALLOWED_JOBS = {
 
 "backfill_labels_price": (
     "engine/data/jobs/backfill_labels_price_from_prices.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
+"calibrate_price_confidence": (
+    "engine/data/jobs/calibrate_price_confidence.py",
     "oneshot",
     None,
     {"execution": False},
@@ -987,6 +1018,13 @@ ALLOWED_JOBS = {
     {"execution": False},
 ),
 
+"strategy_kill_drift_monitor": (
+    "engine/strategy/jobs/kill_drift_monitor.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
 "kill_health_monitor": (
     "engine/runtime/jobs/kill_health_monitor.py",
     "oneshot",
@@ -994,8 +1032,22 @@ ALLOWED_JOBS = {
     {"execution": False},
 ),
 
+"strategy_kill_health_monitor": (
+    "engine/strategy/jobs/kill_health_monitor.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
 "kill_slippage_monitor": (
     "engine/runtime/jobs/kill_slippage_monitor.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
+"strategy_kill_slippage_monitor": (
+    "engine/strategy/jobs/kill_slippage_monitor.py",
     "oneshot",
     None,
     {"execution": False},
@@ -1017,6 +1069,13 @@ ALLOWED_JOBS = {
 
 "train_size_policy": (
     "engine/strategy/jobs/train_size_policy.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
+"train_drawdown_policy": (
+    "engine/strategy/jobs/train_drawdown_policy.py",
     "oneshot",
     None,
     {"execution": False},
@@ -1056,6 +1115,32 @@ ALLOWED_JOBS = {
 
 "calibrate_confidence_from_prices": (
     "engine/strategy/jobs/calibrate_confidence_from_prices.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
+"recalibrate_confidence": (
+    "engine/strategy/jobs/recalibrate_confidence.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
+"shadow_train": (
+    "engine/strategy/jobs/shadow_train_job.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "resource_class": "training",
+        "resource_priority": 35,
+        "slot_cost": 1,
+    },
+),
+
+"strategy_governance": (
+    "engine/strategy/jobs/strategy_governance_job.py",
     "oneshot",
     None,
     {"execution": False},
@@ -1149,6 +1234,18 @@ ALLOWED_JOBS = {
     },
 ),
 
+"trade_pipeline": (
+    "engine/strategy/jobs/trade_pipeline_job.py",
+    "oneshot",
+    None,
+    {
+        "execution": True,
+        "resource_class": "execution",
+        "resource_priority": 100,
+        "slot_cost": 1,
+    },
+),
+
 "execution_poll_and_attrib": (
     "engine/execution/jobs/execution_poll_and_attrib.py",
     "oneshot",
@@ -1159,6 +1256,27 @@ ALLOWED_JOBS = {
         "resource_priority": 100,
         "slot_cost": 1,
     },
+),
+
+"compute_exec_labels": (
+    "engine/execution/jobs/compute_exec_labels.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
+"compute_exec_labels_from_fills": (
+    "engine/execution/jobs/compute_exec_labels_from_fills.py",
+    "oneshot",
+    None,
+    {"execution": False},
+),
+
+"compute_exec_z": (
+    "engine/execution/jobs/compute_exec_z.py",
+    "oneshot",
+    None,
+    {"execution": False},
 ),
 
 "model_competition": (

@@ -246,10 +246,34 @@ class RuntimeSupervisor:
     def status(self) -> Dict[str, Any]:
         if self._delegate is not None:
             try:
-                jobs = self._delegate.list_jobs()
+                try:
+                    jobs = self._delegate.list_jobs(
+                        timeout_s=max(0.05, float(os.environ.get("API_JOB_LIST_TIMEOUT_S", "0.5"))),
+                        include_persisted=False,
+                    )
+                except TypeError:
+                    jobs = self._delegate.list_jobs()
                 analysis = _build_supervisor_analysis_from_jobs(jobs if isinstance(jobs, list) else [])
                 _write_supervisor_analysis(analysis)
                 return {"ok": True, "delegated": True, "jobs": jobs, "supervisor_analysis": analysis}
+            except TimeoutError as e:
+                analysis = {
+                    "ok": False,
+                    "restart_loops_detected": False,
+                    "restart_loops": [],
+                    "failed_jobs": [],
+                    "restarting_jobs": [],
+                    "crash_cause": str(e),
+                    "exit_patterns": [],
+                    "ts_ms": int(time.time() * 1000),
+                }
+                return {
+                    "ok": False,
+                    "delegated": True,
+                    "error": "jobs_list_timeout",
+                    "jobs": [],
+                    "supervisor_analysis": analysis,
+                }
             except Exception as e:
                 _warn_nonfatal(
                     "supervisor_delegate_status_failed",

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import py_compile
+import re
 import signal
 import socket
 import subprocess
@@ -445,6 +446,42 @@ def _startup_validation_summary(snapshot: Optional[Dict[str, Any]]) -> Dict[str,
     }
 
 
+_SENSITIVE_LOG_KEYS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "dsn",
+    "password",
+    "secret",
+    "token",
+)
+
+
+def _redact_log_string(value: str) -> str:
+    text = str(value)
+    text = re.sub(r"(?i)(password\s*=\s*)[^\s,;}\"]+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)(://[^:/@\s]+:)[^@/\s]+@", r"\1<redacted>@", text)
+    text = re.sub(r"(?i)((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^&\s,;}\"]+", r"\1<redacted>", text)
+    return text
+
+
+def _redact_for_log(value: Any, *, key: str = "") -> Any:
+    key_l = str(key or "").strip().lower()
+    sensitive_key = any(marker in key_l for marker in _SENSITIVE_LOG_KEYS)
+    if isinstance(value, dict):
+        return {str(k): _redact_for_log(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_for_log(v, key=key) for v in value]
+    if isinstance(value, tuple):
+        return [_redact_for_log(v, key=key) for v in value]
+    if sensitive_key and value not in (None, "", False, True) and not isinstance(value, (int, float)):
+        return "<redacted>"
+    if isinstance(value, str):
+        return _redact_log_string(value)
+    return value
+
+
 def _persist_startup_validation(snapshot: Optional[Dict[str, Any]], *, stage: str, attempt: int, timeout_s: float) -> None:
     payload = _startup_validation_summary(snapshot)
     payload["stage"] = str(stage)
@@ -460,7 +497,8 @@ def _log_startup_validation(stage: str, snapshot: Optional[Dict[str, Any]], *, l
     payload["stage"] = str(stage)
     payload["attempt"] = int(attempt)
     payload["timeout_s"] = float(timeout_s)
-    message = "STARTUP_HEALTH_VALIDATION " + json.dumps(payload, default=_json_default, separators=(",", ":"), sort_keys=True)
+    safe_payload = _redact_for_log(payload)
+    message = "STARTUP_HEALTH_VALIDATION " + json.dumps(safe_payload, default=_json_default, separators=(",", ":"), sort_keys=True)
     log_fn = getattr(LOG, str(level).lower(), LOG.warning)
     log_fn(message)
     try:

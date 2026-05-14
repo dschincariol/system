@@ -232,7 +232,7 @@ class JobState:
         # For oneshot jobs, we hold a cross-process lock "job:<name>"
         self._oneshot_lock_name: Optional[str] = None
 
-    def to_dict(self) -> Dict:
+    def to_dict(self, *, include_persisted: bool = True) -> Dict:
         with self._lock:
             # This is the canonical in-memory job snapshot exposed to APIs and
             # dashboards, so it merges process state with persisted heartbeat
@@ -250,29 +250,30 @@ class JobState:
             hb_age_s = None
             stale = False
 
-            try:
-                lock_heartbeat = _read_runtime_lock(self.name) or {}
-                persisted_heartbeat = _read_job_heartbeat(self.name) or {}
-                hb = dict(lock_heartbeat)
-                if persisted_heartbeat:
-                    # Persisted job_heartbeats are the daemon liveness source of
-                    # truth. A fresher lock row can exist even when the last
-                    # supervised heartbeat is stale, so do not let lock
-                    # freshness mask a stale daemon.
-                    hb["owner"] = persisted_heartbeat.get("owner") or hb.get("owner")
-                    hb["pid"] = persisted_heartbeat.get("pid") or hb.get("pid")
-                    hb["heartbeat_ts_ms"] = int(persisted_heartbeat.get("heartbeat_ts_ms") or 0)
-                    if persisted_heartbeat.get("_heartbeat_source"):
-                        hb["_heartbeat_source"] = persisted_heartbeat.get("_heartbeat_source")
-                hb_ts_ms = int(hb.get("heartbeat_ts_ms") or 0)
-                if hb_ts_ms > 0:
-                    hb_age_s = round((int(time.time() * 1000) - hb_ts_ms) / 1000.0, 1)
-                    stale = bool(hb_age_s > (float(_DAEMON_STALL_AFTER_MS) / 1000.0))
-            except Exception:
-                hb = {}
-                hb_ts_ms = 0
-                hb_age_s = None
-                stale = False
+            if include_persisted:
+                try:
+                    lock_heartbeat = _read_runtime_lock(self.name) or {}
+                    persisted_heartbeat = _read_job_heartbeat(self.name) or {}
+                    hb = dict(lock_heartbeat)
+                    if persisted_heartbeat:
+                        # Persisted job_heartbeats are the daemon liveness source of
+                        # truth. A fresher lock row can exist even when the last
+                        # supervised heartbeat is stale, so do not let lock
+                        # freshness mask a stale daemon.
+                        hb["owner"] = persisted_heartbeat.get("owner") or hb.get("owner")
+                        hb["pid"] = persisted_heartbeat.get("pid") or hb.get("pid")
+                        hb["heartbeat_ts_ms"] = int(persisted_heartbeat.get("heartbeat_ts_ms") or 0)
+                        if persisted_heartbeat.get("_heartbeat_source"):
+                            hb["_heartbeat_source"] = persisted_heartbeat.get("_heartbeat_source")
+                    hb_ts_ms = int(hb.get("heartbeat_ts_ms") or 0)
+                    if hb_ts_ms > 0:
+                        hb_age_s = round((int(time.time() * 1000) - hb_ts_ms) / 1000.0, 1)
+                        stale = bool(hb_age_s > (float(_DAEMON_STALL_AFTER_MS) / 1000.0))
+                except Exception:
+                    hb = {}
+                    hb_ts_ms = 0
+                    hb_age_s = None
+                    stale = False
 
             if (not running) and pid is None:
                 persisted_pid = int(hb.get("pid") or 0) if hb.get("pid") is not None else 0
@@ -592,22 +593,36 @@ class JobManager:
                 )
                 raise
 
-    def list_jobs(self):
-        with self._lock:
-            out = []
-            seen = set()
+    def list_jobs(self, *, timeout_s: float | None = None, include_persisted: bool = True):
+        acquired = False
+        if timeout_s is None:
+            self._lock.acquire()
+            acquired = True
+        else:
+            acquired = self._lock.acquire(timeout=max(0.0, float(timeout_s)))
+            if not acquired:
+                raise TimeoutError("jobs_manager_lock_timeout")
 
+        try:
+            ordered_jobs = []
+            seen = set()
             for name in JOB_ORDER:
                 if name in self._jobs:
-                    out.append(self._serialize_job_state(self._jobs[name]))
+                    ordered_jobs.append(self._jobs[name])
                     seen.add(name)
 
             for name in sorted(self._jobs):
                 if name in seen:
                     continue
-                out.append(self._serialize_job_state(self._jobs[name]))
+                ordered_jobs.append(self._jobs[name])
+        finally:
+            if acquired:
+                self._lock.release()
 
-            return out
+        return [
+            self._serialize_job_state(job, include_persisted=bool(include_persisted))
+            for job in ordered_jobs
+        ]
 
     def get(self, name: str) -> Optional[JobState]:
         with self._lock:
@@ -662,8 +677,8 @@ class JobManager:
             "slot_cost": max(0, int(slot_cost)),
         }
 
-    def _serialize_job_state(self, job: JobState) -> Dict:
-        out = dict(job.to_dict() or {})
+    def _serialize_job_state(self, job: JobState, *, include_persisted: bool = True) -> Dict:
+        out = dict(job.to_dict(include_persisted=bool(include_persisted)) or {})
         out.update(self._resource_profile(job))
         out["resource_managed"] = bool(int(out.get("slot_cost") or 0) > 0)
         return out

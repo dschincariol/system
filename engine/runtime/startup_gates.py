@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, Optional
 from engine.runtime.config_schema import ConfigError, load_runtime_config
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.platform import default_data_root, default_pg_dsn
+from engine.runtime.platform import default_data_root
 from engine.runtime.runtime_meta import meta_get
 
 
@@ -23,6 +23,11 @@ _DIR_PROBE_CACHE: Dict[str, Dict[str, Any]] = {}
 _DIR_PROBE_CACHE_TTL_MS = 30_000
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off"}
+
+
+def _redacted_pg_dsn() -> str:
+    return "<redacted>"
+
 
 _STARTUP_CONFIG_CONTRACT = {
     "required": [
@@ -458,12 +463,12 @@ def _db_reachable(db_path: Path) -> Dict[str, Any]:
             con.execute("SELECT 1").fetchone()
         finally:
             con.close()
-        return {"ok": True, "detail": "ok", "dsn": str(os.environ.get("TS_PG_DSN") or default_pg_dsn())}
+        return {"ok": True, "detail": "ok", "dsn": _redacted_pg_dsn()}
     except Exception as e:
         return {
             "ok": False,
             "detail": f"database_unreachable:{type(e).__name__}:{e}",
-            "dsn": str(os.environ.get("TS_PG_DSN") or default_pg_dsn()),
+            "dsn": _redacted_pg_dsn(),
         }
 
 
@@ -778,7 +783,7 @@ def evaluate_runtime_startup_gates(
             ),
             config_keys=["DB_PATH"],
             dependency="postgres",
-            extra={"dsn": str(os.environ.get("TS_PG_DSN") or default_pg_dsn())},
+            extra={"dsn": _redacted_pg_dsn()},
         ),
         "schema_valid": _gate(
             "schema_valid",
