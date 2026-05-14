@@ -1291,6 +1291,28 @@ def execution_allowed(
         if lifecycle_state == "SHUTTING_DOWN":
             lifecycle_state = "SHUTDOWN"
 
+        if lifecycle_state == "KILL_SWITCH":
+            try:
+                st = _read_state_hot(con, "global", "global")
+                st = _maybe_auto_expire(con, "global", "global", st)
+                if st and int(st[0]) == 1:
+                    return False, "kill_switch_db_global", {
+                        "scope": "global",
+                        "key": "global",
+                        "reason": st[1],
+                        "actor": st[2],
+                    }
+            except Exception as e:
+                _warn_nonfatal(
+                    "KILL_SWITCH_LIFECYCLE_DB_REASON_LOOKUP_FAILED",
+                    e,
+                    once_key="lifecycle_db_reason_lookup",
+                )
+            return False, "kill_switch_lifecycle", {
+                "scope": "global",
+                "key": lifecycle_state or "UNKNOWN"
+            }
+
         if lifecycle_state != "LIVE":
             return False, "runtime_state_block", {
                 "scope": "global",

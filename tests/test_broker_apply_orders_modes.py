@@ -38,6 +38,16 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "ENGINE_MODE",
         "EXEC_ADAPTIVE_SLICING",
         "BROKER_LATENCY_SLEEP",
+        "KILL_SWITCH_GLOBAL",
+        "TRADING_KILL_SWITCH",
+        "KILL_SWITCH",
+        "KILL_SWITCH_SYMBOLS",
+        "KILL_SWITCH_REGIMES",
+        "KILL_SWITCH_MODELS",
+        "DISABLE_LIVE_EXECUTION",
+        "TS_PG_SCHEMA",
+        "TS_PG_SCHEMA_PER_DB_PATH",
+        "TS_REDIS_KEY_PREFIX",
     )
 
     def setUp(self) -> None:
@@ -53,6 +63,16 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["BROKER_START_CASH"] = "100000"
         os.environ["EXEC_ADAPTIVE_SLICING"] = "0"
         os.environ["BROKER_LATENCY_SLEEP"] = "0"
+        os.environ["KILL_SWITCH_GLOBAL"] = "0"
+        os.environ["TRADING_KILL_SWITCH"] = "0"
+        os.environ["KILL_SWITCH"] = "0"
+        os.environ["KILL_SWITCH_SYMBOLS"] = ""
+        os.environ["KILL_SWITCH_REGIMES"] = ""
+        os.environ["KILL_SWITCH_MODELS"] = ""
+        os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+        os.environ.pop("TS_PG_SCHEMA", None)
+        os.environ["TS_PG_SCHEMA_PER_DB_PATH"] = "1"
+        os.environ["TS_REDIS_KEY_PREFIX"] = f"broker_apply_orders_modes_{Path(self.tmp.name).name}"
         os.environ["EXECUTION_MODE"] = "paper"
         os.environ["ENGINE_MODE"] = "paper"
 
@@ -357,6 +377,45 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertEqual(self._db_fetchone("SELECT mode FROM order_commands ORDER BY ts_ms DESC LIMIT 1"), "paper")
         self.assertEqual(self._db_fetchone("SELECT status FROM order_commands ORDER BY ts_ms DESC LIMIT 1"), "executed")
         self.assertEqual(self._db_fetchone("SELECT status FROM order_events ORDER BY id DESC LIMIT 1"), "executed")
+
+    def test_safe_mode_blocks_execution(self) -> None:
+        now_ms = self._seed_runtime_live()
+        self._set_mode("safe")
+        self._seed_portfolio_order(ts_ms=now_ms)
+
+        rc, out, _ = self._run_main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "execution_gate")
+        self.assertEqual(out["mode"], "safe")
+        self.assertEqual(out["broker"], "sim")
+        self.assertFalse(bool(out["gate"]["allowed"]))
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_commands") or 0), 0)
+        self.assertEqual(self._db_fetchone("SELECT status FROM order_events ORDER BY id DESC LIMIT 1"), "blocked")
+
+    def test_paper_mode_blocks_missing_broker_result(self) -> None:
+        now_ms = self._seed_runtime_live()
+        self._set_mode("paper")
+        self._seed_portfolio_order(ts_ms=now_ms)
+
+        with patch.object(
+            self.broker_apply_orders,
+            "apply_shadow_portfolio_orders",
+            return_value={"ok": True, "status": "applied"},
+        ):
+            rc, out, _ = self._run_main(competition_policy={})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "paper_broker_result")
+        self.assertEqual(out["mode"], "paper")
+        self.assertEqual(out["broker"], "sim")
+        self.assertEqual(out["reason"], "paper_broker_missing_broker")
+        self.assertEqual(out["result_status"], "applied")
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+        self.assertEqual(self._db_fetchone("SELECT status FROM order_events ORDER BY id DESC LIMIT 1"), "blocked")
 
     def test_live_mode_blocked_when_not_allowed(self) -> None:
         now_ms = self._seed_runtime_live()

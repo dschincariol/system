@@ -326,9 +326,16 @@ def _build_readiness_snapshot(_parsed, ctx=None) -> dict:
         snapshot = dict(cached)
     else:
         snapshot = _build_system_state_snapshot(_parsed, ctx)
-        snapshot["graph"] = dict(_get_supervisor_graph(ctx) or {})
-
         health = dict(snapshot.get("health") or {})
+        snapshot["graph"] = dict(
+            health.get("graph")
+            or {
+                "ok": False,
+                "status": "not_checked",
+                "reason": "fast_readiness_uses_cached_health",
+                "source": "cached_health",
+            }
+        )
         startup_validation = (
             dict(health.get("startup_validation") or {})
             if isinstance(health.get("startup_validation"), dict)
@@ -452,6 +459,26 @@ def _snapshot_response(snapshot, ok=None, **extra):
     payload.setdefault("readiness", dict(snapshot.get("readiness") or {}))
     payload.setdefault("timestamps", dict(snapshot.get("timestamps") or {}))
     return payload
+
+
+def _storage_readiness_from_health(health) -> dict:
+    health = dict(health or {})
+    startup_validation = dict(health.get("startup_validation") or {})
+    candidates = [
+        startup_validation.get("storage"),
+        ((startup_validation.get("checks") or {}).get("core_services_initialized") or {}).get("storage"),
+        (((startup_validation.get("checks") or {}).get("core_services_initialized") or {}).get("boot_diagnostics") or {}).get("storage"),
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        storage = dict(candidate)
+        if "ok" not in storage and str(storage.get("status") or "").strip().lower() in {"ready", "ok", "healthy"}:
+            storage["ok"] = True
+        if "checked" not in storage:
+            storage["checked"] = "ok" in storage or bool(storage.get("status"))
+        return storage
+    return {}
 
 
 def _safe_json_dict(raw):
@@ -1506,6 +1533,137 @@ def _build_ingestion_snapshot(jobs, health):
     }
 
 
+def _build_lightweight_services_snapshot(health):
+    health = dict(health or {})
+    job_summary = dict(health.get("job_summary") or {})
+    health_jobs = health.get("jobs") if isinstance(health.get("jobs"), dict) else {}
+    services = {}
+
+    running_count = 0
+    stale_count = int(job_summary.get("stale") or 0)
+    failed_count = 0
+    for name, row in (health_jobs or {}).items():
+        if not isinstance(row, dict):
+            continue
+        running = bool(row.get("running"))
+        ok = bool(row.get("ok", True))
+        services[str(name)] = {
+            "running": running,
+            "mode": row.get("mode"),
+            "stale": bool(row.get("stale")),
+            "ok": ok,
+        }
+        if running:
+            running_count += 1
+        if bool(row.get("stale")):
+            stale_count += 1
+        if not ok:
+            failed_count += 1
+
+    ingestion_runtime = health.get("ingestion_runtime")
+    if isinstance(ingestion_runtime, dict) and "ingestion_runtime" not in services:
+        running = bool(ingestion_runtime.get("running"))
+        services["ingestion_runtime"] = {
+            "running": running,
+            "mode": "safe",
+            "stale": bool(ingestion_runtime.get("stale")),
+            "ok": running,
+        }
+        if running:
+            running_count += 1
+        if bool(ingestion_runtime.get("stale")):
+            stale_count += 1
+
+    if running_count <= 0:
+        try:
+            running_count = int(job_summary.get("running") or job_summary.get("running_count") or 0)
+        except Exception:
+            running_count = 0
+    total_count = len(services)
+    try:
+        total_count = max(total_count, int(job_summary.get("total") or 0))
+    except Exception:
+        pass
+
+    engine_running = running_count > 0
+    summary_ok = job_summary.get("ok")
+    ok = bool(summary_ok) if summary_ok is not None else bool(engine_running and stale_count == 0 and failed_count == 0)
+    if engine_running and ok:
+        engine_state = "RUNNING"
+    elif engine_running:
+        engine_state = "DEGRADED"
+    else:
+        engine_state = "STOPPED"
+
+    reasons = []
+    if not engine_running:
+        reasons.append("services_not_running")
+    if stale_count > 0:
+        reasons.append("services_stale")
+    if failed_count > 0:
+        reasons.append("services_failed")
+
+    return {
+        "ok": ok,
+        "engine": {
+            "running": engine_running,
+            "job_count": total_count,
+            "running_count": running_count,
+            "stale_count": stale_count,
+            "failed_count": failed_count,
+            "zombie_count": 0,
+            "locked_count": 0,
+            "dead_count": 0,
+            "state": engine_state,
+        },
+        "services": services,
+        "reasons": reasons,
+        "source": "cached_health",
+    }
+
+
+def _build_lightweight_ingestion_snapshot(health):
+    health = dict(health or {})
+    ingestion_runtime = dict(health.get("ingestion_runtime") or {})
+    prices = dict(health.get("prices") or {})
+    providers = dict(health.get("providers") or {})
+    freshness = dict(health.get("ingestion_freshness") or {})
+    sources = dict(health.get("ingestion_sources") or freshness.get("sources") or {})
+    price_source = dict(sources.get("prices") or {})
+
+    running = bool(ingestion_runtime.get("running"))
+    prices_ok = bool(prices.get("ok")) or bool(price_source.get("ok"))
+    providers_ok = bool(providers.get("ok")) if providers else True
+    ok = bool(running and prices_ok and providers_ok)
+    if ok:
+        status = "RUNNING"
+    elif running:
+        status = "DEGRADED"
+    else:
+        status = "STOPPED"
+
+    reasons = []
+    if not running:
+        reasons.append("ingestion_not_running")
+    if not prices_ok:
+        reasons.append("prices_not_ok")
+    if providers and not providers_ok:
+        reasons.append("providers_not_ok")
+
+    return {
+        "ok": ok,
+        "status": status,
+        "running": running,
+        "sources": sources,
+        "prices": prices,
+        "providers": providers,
+        "freshness": freshness,
+        "last_price_ts_ms": int(prices.get("last_ts_ms") or price_source.get("last_ts_ms") or 0),
+        "reasons": reasons,
+        "source": "cached_health",
+    }
+
+
 def _normalize_health_payload(health, schema, preflight, graph, execution_barrier):
     out = dict(health or {})
     out["schema"] = dict(schema or {})
@@ -1879,7 +2037,8 @@ def _build_system_state_snapshot(_parsed, ctx=None):
     ts_ms = _ts_ms()
     timestamps = {"ts_ms": ts_ms, "snapshot_ts_ms": ts_ms}
 
-    jobs, job_errors = _get_jobs_payload(ctx)
+    jobs = []
+    job_errors = []
 
     try:
         health_raw = _cached_health_snapshot(allow_sync_on_miss=False)
@@ -1890,7 +2049,8 @@ def _build_system_state_snapshot(_parsed, ctx=None):
     if not isinstance(health_raw, dict):
         health_raw = {"ok": False, "reasons": ["health_snapshot_invalid"]}
 
-    kill_switches, kill_switch_errors = _get_kill_switch_data(_parsed, ctx)
+    kill_switches = dict((health_raw or {}).get("kill_switches") or {})
+    kill_switch_errors = []
 
     try:
         readiness = get_readiness_snapshot(health=dict(health_raw or {}))
@@ -1901,46 +2061,55 @@ def _build_system_state_snapshot(_parsed, ctx=None):
             "issues": [{"code": "readiness_error", "message": str(e), "detail": str(e)}],
         }
 
-    try:
-        system_state_detail = compute_system_state(
-            health=dict(health_raw or {}),
-            jobs=list(jobs or []),
-            kill_switches=dict(kill_switches or {}),
-            readiness=dict(readiness or {}),
+    lifecycle = dict((health_raw or {}).get("lifecycle") or {})
+    startup = dict((health_raw or {}).get("startup") or {})
+    state_name = str(lifecycle.get("state") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    if state_name == "UNKNOWN":
+        startup_mode = str(startup.get("mode") or os.environ.get("ENGINE_MODE") or "").strip().lower()
+        has_runtime_signal = bool(
+            ((health_raw or {}).get("db") or {}).get("ok")
+            or ((health_raw or {}).get("ingestion_runtime") or {}).get("running")
+            or ((health_raw or {}).get("prices") or {}).get("ok")
         )
-    except Exception as e:
-        system_state_detail = {
-            "ok": False,
-            "ts_ms": ts_ms,
-            "state": "UNKNOWN",
-            "reasons": [f"system_state_error:{e}"],
-        }
+        if startup_mode in {"safe", "sim", "paper", "shadow"} and has_runtime_signal:
+            state_name = "WARMING_UP"
+    system_state_detail = {
+        "ok": bool((health_raw or {}).get("ok")) or state_name in {"LIVE", "WARMING_UP", "DEGRADED", "KILL_SWITCH"},
+        "ts_ms": ts_ms,
+        "state": state_name,
+        "detail": str(lifecycle.get("detail") or ""),
+        "reasons": list((health_raw or {}).get("reasons") or []),
+    }
 
-    try:
-        get_execution_mode_fn = None
-        try:
-            from engine.api.internal_access import get_execution_mode as _get_execution_mode
-            get_execution_mode_fn = _get_execution_mode
-        except Exception:
-            get_execution_mode_fn = None
-
-        execution_barrier = execution_gate_snapshot(
-            get_execution_mode_fn=get_execution_mode_fn,
-            system_state=system_state_detail,
-            kill_switches=kill_switches,
-            execution_degraded=dict((health_raw or {}).get("execution_degraded") or {}),
-            portfolio_risk_gate=None,
-        )
-    except Exception as e:
+    execution_barrier = dict((health_raw or {}).get("execution_barrier") or {})
+    if not execution_barrier:
+        mode = str(os.environ.get("ENGINE_MODE") or os.environ.get("EXECUTION_MODE") or "unknown").strip().lower() or "unknown"
+        reason = {
+            "safe": "mode_safe",
+            "paper": "mode_paper",
+            "shadow": "mode_shadow_degraded_runtime",
+            "live": "mode_live_unarmed_unknown",
+        }.get(mode, f"mode_unknown:{mode}")
         execution_barrier = {
-            "ok": False,
+            "ok": True,
             "allowed": False,
-            "mode": "unknown",
-            "reason": f"execution_barrier_error:{e}",
+            "real_trading_allowed": False,
+            "mode": mode,
+            "reason": reason,
+            "runtime_state": state_name,
+            "fast_path": True,
         }
+    else:
+        mode = str((execution_barrier or {}).get("mode") or os.environ.get("ENGINE_MODE") or os.environ.get("EXECUTION_MODE") or "unknown").strip().lower() or "unknown"
+        execution_barrier.setdefault("ok", True)
+        execution_barrier["allowed"] = bool(execution_barrier.get("allowed"))
+        execution_barrier.setdefault("real_trading_allowed", False)
+        execution_barrier.setdefault("mode", mode)
+        execution_barrier.setdefault("runtime_state", state_name)
+        execution_barrier.setdefault("fast_path", True)
 
-    services = _build_services_snapshot(jobs)
-    ingestion = _build_ingestion_snapshot(jobs=jobs, health=health_raw)
+    services = _build_lightweight_services_snapshot(health_raw)
+    ingestion = _build_lightweight_ingestion_snapshot(health_raw)
 
     mode = str((execution_barrier or {}).get("mode") or "unknown").strip().lower() or "unknown"
     kill_switch_active = _kill_switch_active(kill_switches)
@@ -2026,75 +2195,7 @@ def api_get_runtime_config(_parsed, ctx=None):
 
 
 def api_get_system_state(_parsed, ctx=None):
-    ts_ms = _ts_ms()
-    timestamps = {"ts_ms": ts_ms, "snapshot_ts_ms": ts_ms}
-
-    health = _cached_health_snapshot()
-    if not isinstance(health, dict):
-        health = {"ok": False, "reasons": ["health_snapshot_invalid"]}
-
-    services = {
-        "ok": True,
-        "engine": {"running": True, "job_count": 0, "running_count": 0, "stale_count": 0, "failed_count": 0, "zombie_count": 0, "locked_count": 0, "dead_count": 0, "state": "RUNNING"},
-        "services": {},
-        "reasons": [],
-    }
-    ingestion = dict((health or {}).get("ingestion_runtime") or {})
-    if ingestion:
-        ingestion.setdefault("ok", bool(not ingestion.get("stale", False)))
-        ingestion.setdefault("status", "RUNNING" if ingestion.get("running") else "DEGRADED")
-    else:
-        ingestion = {"ok": False, "status": "UNKNOWN", "running": False, "reasons": ["ingestion_snapshot_missing"]}
-
-    execution_barrier = dict((health or {}).get("execution_barrier") or {})
-    mode = str((execution_barrier or {}).get("mode") or os.environ.get("ENGINE_MODE") or "unknown").strip().lower() or "unknown"
-    execution_allowed = bool((execution_barrier or {}).get("allowed"))
-
-    lifecycle = dict((health or {}).get("execution_barrier") or {})
-    state_name = str((lifecycle or {}).get("runtime_state") or "UNKNOWN").strip().upper() or "UNKNOWN"
-    status = _compute_status_name(
-        state_name=state_name,
-        health_ok=bool((health or {}).get("ok")),
-        services_ok=bool((services or {}).get("ok")),
-        ingestion_ok=bool((ingestion or {}).get("ok")),
-        execution_allowed=execution_allowed,
-        kill_switches={},
-    )
-
-    snapshot = {
-        "ok": bool((health or {}).get("ok")),
-        "status": status,
-        "state": state_name,
-        "mode": mode,
-        "execution_mode": mode,
-        "execution_allowed": execution_allowed,
-        "reasons": list((health or {}).get("reasons") or []),
-        "timestamps": timestamps,
-        "ts_ms": ts_ms,
-        "health": dict(health or {}),
-        "model_serving": dict((health or {}).get("model_serving") or {}),
-        "alert_lifecycle": dict((health or {}).get("alert_lifecycle") or {}),
-        "event_bus": dict((health or {}).get("event_bus") or {}),
-        "attribution_quality": dict((health or {}).get("attribution") or {}),
-        "ingestion": dict(ingestion or {}),
-        "services": dict(services or {}),
-        "readiness": {
-            "ok": bool((health or {}).get("ok")),
-            "ready": bool((health or {}).get("ok")),
-        },
-        "jobs": [],
-        "execution_barrier": execution_barrier,
-        "system_state_detail": {
-            "ok": bool((health or {}).get("ok")),
-            "state": state_name,
-            "reasons": list((health or {}).get("reasons") or []),
-            "ts_ms": ts_ms,
-            "model_serving": dict((health or {}).get("model_serving") or {}),
-            "alert_lifecycle": dict((health or {}).get("alert_lifecycle") or {}),
-            "event_bus": dict((health or {}).get("event_bus") or {}),
-            "attribution_quality": dict((health or {}).get("attribution") or {}),
-        },
-    }
+    snapshot = _build_system_state_snapshot(_parsed, ctx)
     return _snapshot_response(snapshot)
 
 # ----------------------------------------------------------------------
@@ -2489,7 +2590,11 @@ def api_get_health(_parsed, ctx=None):
     """
     snapshot = _cached_health_snapshot(allow_sync_on_miss=False)
     if isinstance(snapshot, dict):
-        return snapshot
+        payload = dict(snapshot)
+        meta = dict(payload.get("meta") or {})
+        meta["status"] = 200
+        payload["meta"] = meta
+        return payload
     return {
         "ok": False,
         "status": "DEGRADED",
@@ -2734,6 +2839,14 @@ def api_get_readiness(_parsed, ctx=None):
     ``ok`` is driven by the nested ``readiness`` payload rather than the
     broader status snapshot.
     """
+    try:
+        health_hint = _cached_health_snapshot(allow_sync_on_miss=False)
+    except Exception as e:
+        _warn("api_system.readiness.health_hint", e)
+        health_hint = {}
+    if not isinstance(health_hint, dict):
+        health_hint = {}
+
     boot_diagnostics = {}
     if isinstance(ctx, dict):
         boot_fn = ctx.get("_boot_diagnostics")
@@ -2745,13 +2858,7 @@ def api_get_readiness(_parsed, ctx=None):
                 boot_diagnostics = {}
     storage = dict(boot_diagnostics.get("storage") or {})
     if not storage:
-        try:
-            from engine.runtime.storage_pool import storage_readiness_snapshot
-
-            storage = dict(storage_readiness_snapshot() or {})
-        except Exception as e:
-            _warn("api_system.readiness.storage_snapshot", e)
-            storage = {}
+        storage = _storage_readiness_from_health(health_hint)
 
     storage_checked = bool(storage.get("checked"))
     storage_ok = storage.get("ok")
@@ -2894,11 +3001,17 @@ def api_get_runtime_watchdogs(_parsed, ctx=None):
     """
     ts_ms = int(time.time() * 1000)
     try:
-        health = _cached_health_snapshot()
+        health = _cached_health_snapshot(allow_sync_on_miss=False)
     except Exception as e:
         _warn("api_system.runtime_watchdogs.health", e)
         health = {"ok": False, "error": str(e), "reasons": [f"health_exception:{e}"]}
-    jobs_payload, _ = _get_jobs_payload(ctx)
+
+    health_jobs = health.get("jobs") if isinstance(health.get("jobs"), dict) else {}
+    jobs_payload = [
+        {"name": str(name), **dict(row or {})}
+        for name, row in dict(health_jobs or {}).items()
+        if isinstance(row, dict) and str(name or "").strip()
+    ]
 
     jobs_by_name = {str(j.get("name") or ""): j for j in jobs_payload if str(j.get("name") or "")}
 
@@ -3747,7 +3860,7 @@ def api_get_execution_barrier(_parsed, ctx=None):
         ``allowed``, and the selected block ``reason``. ``ok`` mirrors
         ``allowed`` to keep the endpoint fail-closed.
     """
-    snapshot = _build_system_snapshot(_parsed, ctx)
+    snapshot = _build_system_state_snapshot(_parsed, ctx)
     barrier = dict(snapshot.get("execution_barrier") or {})
     return {
         **snapshot,

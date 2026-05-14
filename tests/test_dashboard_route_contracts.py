@@ -1058,6 +1058,7 @@ def test_api_get_readiness_uses_lightweight_snapshot_path(route_runtime, monkeyp
             "execution": {"ok": True, "last_fill_ts_ms": None, "fills_table": "fills"},
             "lifecycle": {"state": "WARMING_UP", "detail": "awaiting_first_price_tick", "ts_ms": 333},
             "job_summary": {"ok": True, "total": 1, "stale": 0, "stale_jobs": []},
+            "graph": {"ok": True},
         },
         "ingestion": {"ok": False, "last_price_ts_ms": 190},
         "services": {"ok": True, "engine": {"running": True}},
@@ -1069,6 +1070,7 @@ def test_api_get_readiness_uses_lightweight_snapshot_path(route_runtime, monkeyp
     }
 
     monkeypatch.setattr(api_system, "_get_cached_system_snapshot", lambda: None)
+    monkeypatch.setattr(api_system, "_cached_health_snapshot", lambda *, allow_sync_on_miss=True: dict(light_snapshot["health"]))
     monkeypatch.setattr(api_system, "_build_system_snapshot", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full snapshot path should not run")))
     monkeypatch.setattr(api_system, "_build_system_state_snapshot", lambda *_args, **_kwargs: dict(light_snapshot))
     monkeypatch.setattr(api_system, "_get_supervisor_graph", lambda *_args, **_kwargs: {"ok": True})
@@ -1081,6 +1083,242 @@ def test_api_get_readiness_uses_lightweight_snapshot_path(route_runtime, monkeyp
     assert isinstance(response.get("production_validation"), dict)
     assert response["status"] == "FAILED"
     assert response["graph_valid"] is True
+
+
+def test_system_state_uses_lightweight_snapshot_path(route_runtime, monkeypatch):
+    (api_system,) = _reload_modules("engine.api.api_system")
+
+    light_snapshot = {
+        "ok": False,
+        "status": "DEGRADED",
+        "state": "LIVE",
+        "mode": "safe",
+        "execution_mode": "safe",
+        "execution_allowed": False,
+        "reasons": ["mode_safe"],
+        "timestamps": {"ts_ms": 123456, "snapshot_ts_ms": 123456},
+        "ts_ms": 123456,
+        "health": {"ok": False},
+        "ingestion": {"ok": True},
+        "services": {"ok": True},
+        "readiness": {"ok": False},
+        "execution_barrier": {"ok": True, "allowed": False, "mode": "safe", "reason": "mode_safe"},
+        "system_state_detail": {"ok": True, "state": "LIVE"},
+    }
+
+    monkeypatch.setattr(api_system, "_build_system_snapshot", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full snapshot path should not run")))
+    monkeypatch.setattr(api_system, "_build_system_state_snapshot", lambda *_args, **_kwargs: dict(light_snapshot))
+
+    response = api_system.api_get_system_state({}, route_runtime["ctx"])
+
+    assert response["state"] == "LIVE"
+    assert response["mode"] == "safe"
+    assert response["execution_allowed"] is False
+
+
+def test_execution_barrier_uses_lightweight_snapshot_path(route_runtime, monkeypatch):
+    (api_system,) = _reload_modules("engine.api.api_system")
+
+    light_snapshot = {
+        "ok": False,
+        "status": "DEGRADED",
+        "state": "LIVE",
+        "mode": "safe",
+        "execution_mode": "safe",
+        "execution_allowed": False,
+        "reasons": ["mode_safe"],
+        "timestamps": {"ts_ms": 123456, "snapshot_ts_ms": 123456},
+        "ts_ms": 123456,
+        "health": {"ok": False},
+        "ingestion": {"ok": True},
+        "services": {"ok": True},
+        "readiness": {"ok": False},
+        "execution_barrier": {"ok": True, "allowed": False, "mode": "safe", "reason": "mode_safe"},
+        "system_state_detail": {"ok": True, "state": "LIVE"},
+    }
+
+    monkeypatch.setattr(api_system, "_build_system_snapshot", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full snapshot path should not run")))
+    monkeypatch.setattr(api_system, "_build_system_state_snapshot", lambda *_args, **_kwargs: dict(light_snapshot))
+
+    response = api_system.api_get_execution_barrier({}, route_runtime["ctx"])
+
+    assert response["allowed"] is False
+    assert response["reason"] == "mode_safe"
+    assert response["execution_barrier"]["mode"] == "safe"
+
+
+def test_lightweight_system_snapshot_avoids_heavy_state_reads(route_runtime, monkeypatch):
+    (api_system,) = _reload_modules("engine.api.api_system")
+
+    monkeypatch.setattr(
+        api_system,
+        "_cached_health_snapshot",
+        lambda *, allow_sync_on_miss=True: {
+            "ok": False,
+            "reasons": ["health_fast_path"],
+            "lifecycle": {"state": "WARMING_UP", "detail": "awaiting_first_price_tick"},
+            "ingestion_runtime": {"running": True},
+            "prices": {"ok": True, "last_ts_ms": 123},
+            "providers": {"ok": True},
+            "job_summary": {"ok": True, "total": 1, "running_count": 1, "stale": 0},
+        },
+    )
+    monkeypatch.setattr(api_system, "_get_jobs_payload", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("jobs manager path should not run")))
+    monkeypatch.setattr(api_system, "market_data_status", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("market data IPC path should not run")))
+    monkeypatch.setattr(api_system, "_get_kill_switch_data", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("kill switch DB path should not run")))
+    monkeypatch.setattr(api_system, "compute_system_state", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("heavy system state should not run")))
+
+    snapshot = api_system._build_system_state_snapshot({}, route_runtime["ctx"])
+
+    assert snapshot["state"] == "WARMING_UP"
+    assert snapshot["mode"] == "safe"
+    assert snapshot["execution_allowed"] is False
+    assert snapshot["execution_barrier"]["fast_path"] is True
+    assert snapshot["services"]["source"] == "cached_health"
+    assert snapshot["ingestion"]["source"] == "cached_health"
+
+
+def test_lightweight_system_snapshot_uses_safe_runtime_signal_when_lifecycle_missing(
+    route_runtime,
+    monkeypatch,
+):
+    (api_system,) = _reload_modules("engine.api.api_system")
+
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setattr(
+        api_system,
+        "_cached_health_snapshot",
+        lambda *, allow_sync_on_miss=True: {
+            "ok": False,
+            "startup": {"mode": "safe"},
+            "db": {"ok": True},
+            "ingestion_runtime": {"running": True},
+            "prices": {"ok": True, "last_ts_ms": 123},
+            "providers": {"ok": True},
+            "job_summary": {"ok": True, "total": 1, "running_count": 1, "stale": 0},
+            "execution_barrier": {"ok": True, "allowed": False, "mode": "safe", "reason": "health_fast_path"},
+        },
+    )
+    monkeypatch.setattr(api_system, "_get_jobs_payload", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("jobs manager path should not run")))
+    monkeypatch.setattr(api_system, "market_data_status", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("market data IPC path should not run")))
+
+    snapshot = api_system._build_system_state_snapshot({}, route_runtime["ctx"])
+
+    assert snapshot["state"] == "WARMING_UP"
+    assert snapshot["status"] == "STARTING"
+    assert snapshot["execution_allowed"] is False
+    assert snapshot["execution_barrier"]["real_trading_allowed"] is False
+
+
+def test_api_get_readiness_uses_cached_storage_readiness(route_runtime, monkeypatch):
+    (api_system,) = _reload_modules("engine.api.api_system")
+    import engine.runtime.storage_pool as storage_pool
+
+    monkeypatch.setattr(
+        storage_pool,
+        "storage_readiness_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("live storage readiness should not run")),
+    )
+    monkeypatch.setattr(
+        api_system,
+        "_cached_health_snapshot",
+        lambda *, allow_sync_on_miss=True: {
+            "ok": False,
+            "startup_validation": {
+                "checks": {
+                    "core_services_initialized": {
+                        "boot_diagnostics": {
+                            "storage": {"status": "ready", "degraded": False}
+                        }
+                    }
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        api_system,
+        "_build_readiness_snapshot",
+        lambda *_args, **_kwargs: {
+            "ts_ms": 123456,
+            "state": "WARMING_UP",
+            "mode": "safe",
+            "execution_mode": "safe",
+            "execution_allowed": False,
+            "reasons": ["health_fast_path"],
+            "readiness": {"ok": False, "ready": False, "issues": []},
+            "production_validation": {
+                "status": "failed",
+                "safe_to_operate": False,
+                "unsafe_to_operate": True,
+                "current_degraded_reasons": ["health_fast_path"],
+            },
+            "health": {"ok": False},
+            "graph": {"ok": False, "source": "cached_health"},
+        },
+    )
+
+    response = api_system.api_get_readiness({}, route_runtime["ctx"])
+
+    assert response["ok"] is False
+    assert response["execution_allowed"] is False
+    assert response["storage"]["status"] == "ready"
+    assert response["storage"]["checked"] is True
+
+
+def test_runtime_watchdogs_health_cache_miss_does_not_sync_refresh(route_runtime, monkeypatch):
+    (api_system,) = _reload_modules("engine.api.api_system")
+    calls = []
+
+    def fake_cached_health_snapshot(*, allow_sync_on_miss=True):
+        calls.append(bool(allow_sync_on_miss))
+        return {
+            "ok": False,
+            "prices": {"ok": False},
+            "ingestion_freshness": {},
+            "events": {},
+            "labels": {},
+            "model": {},
+            "job_summary": {},
+            "jobs": {
+                "ingestion_runtime": {
+                    "running": True,
+                    "heartbeat_ts_ms": 123456,
+                    "heartbeat_age_s": 1.0,
+                    "restart_count": 0,
+                    "stale": False,
+                }
+            },
+        }
+
+    monkeypatch.setattr(api_system, "_cached_health_snapshot", fake_cached_health_snapshot)
+    monkeypatch.setattr(api_system, "_get_jobs_payload", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("jobs manager path should not run")))
+
+    response = api_system.api_get_runtime_watchdogs({}, route_runtime["ctx"])
+
+    assert calls == [False]
+    assert response["ok"] is False
+    assert response["pipeline_watchdog_state"]["ingestion_runtime"]["running"] is True
+
+
+def test_api_get_health_degraded_cache_keeps_http_ok(route_runtime, monkeypatch):
+    (api_system,) = _reload_modules("engine.api.api_system")
+
+    monkeypatch.setattr(
+        api_system,
+        "_cached_health_snapshot",
+        lambda *, allow_sync_on_miss=True: {
+            "ok": False,
+            "error": "storage_pool_timeout",
+            "reasons": ["health_snapshot_error:storage_pool_timeout"],
+            "meta": {"status": 500},
+        },
+    )
+
+    response = api_system.api_get_health({}, route_runtime["ctx"])
+
+    assert response["ok"] is False
+    assert response["error"] == "storage_pool_timeout"
+    assert response["meta"]["status"] == 200
 
 
 def test_api_get_health_cache_miss_returns_placeholder_without_sync_refresh(route_runtime, monkeypatch):

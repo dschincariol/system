@@ -1547,7 +1547,7 @@ def apply_new_portfolio_orders(
 
             if not orders:
                 acct = _mark_to_market(con, now_ms, book_key=book_key, best_effort=True)
-                return {"ok": True, "status": "no_orders", "account": acct}
+                return {"ok": True, "status": "no_orders", "broker": "sim", "account": acct}
 
         # -----------------------------
         # ALE/EPE integration note:
@@ -1563,6 +1563,7 @@ def apply_new_portfolio_orders(
             return {
                 "ok": True,
                 "status": "dry_run_preview",
+                "broker": "sim",
                 "order_id": (int(order_id) if order_id is not None else None),
                 "orders": orders,
                 "ale": ale_meta,
@@ -1580,7 +1581,7 @@ def apply_new_portfolio_orders(
                 try:
                     if int(last_applied) >= int(order_id):
                         acct = _mark_to_market(con, now_ms, book_key=book_key, best_effort=True)
-                        return {"ok": True, "status": "already_applied", "order_id": int(order_id), "account": acct}
+                        return {"ok": True, "status": "already_applied", "broker": "sim", "order_id": int(order_id), "account": acct}
                 except Exception as e:
                     _warn_nonfatal(
                         "broker_sim_last_applied_order_guard_failed",

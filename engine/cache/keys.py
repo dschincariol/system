@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-PREFIX = "trading"
+import os
+
+DEFAULT_PREFIX = "trading"
 
 HOT_PATH_TABLES = frozenset(
     {
@@ -26,6 +28,17 @@ def _part(value: object) -> str:
     return text
 
 
+def prefix() -> str:
+    """Return the Redis key prefix for the current process.
+
+    Production keeps the historical ``trading`` keyspace. Tests and isolated
+    local runs can set ``TS_REDIS_KEY_PREFIX`` to avoid sharing sticky runtime
+    gates, such as the kill switch, across independent databases.
+    """
+
+    return _part(os.environ.get("TS_REDIS_KEY_PREFIX") or DEFAULT_PREFIX)
+
+
 def table_key(table: str, *parts: object) -> str:
     table_name = _part(table)
     if table_name not in HOT_PATH_TABLES:
@@ -33,7 +46,7 @@ def table_key(table: str, *parts: object) -> str:
     key_parts = [_part(part) for part in parts]
     if not key_parts:
         raise ValueError("cache_key_id_required")
-    return ":".join([PREFIX, table_name, *key_parts])
+    return ":".join([prefix(), table_name, *key_parts])
 
 
 def kill_switch(scope: object = "snapshot", key: object | None = None) -> str:

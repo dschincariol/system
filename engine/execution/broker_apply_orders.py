@@ -421,6 +421,30 @@ def _record_execution_event_boundary(
         )
 
 
+def _paper_sim_result_issue(result: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(result, dict):
+        return {
+            "reason": "paper_broker_invalid_result",
+            "result_status": "invalid",
+            "result_broker": "",
+        }
+    broker = str(result.get("broker") or "").strip().lower()
+    status = str(result.get("status") or "")
+    if not broker:
+        return {
+            "reason": "paper_broker_missing_broker",
+            "result_status": status,
+            "result_broker": "",
+        }
+    if broker != "sim":
+        return {
+            "reason": "paper_broker_unexpected_broker",
+            "result_status": status,
+            "result_broker": broker,
+        }
+    return None
+
+
 def _blocked(
     *,
     started_ms: int,
@@ -1383,13 +1407,14 @@ def main() -> int:
             return 0
 
         if mode == "paper":
+            paper_broker = "sim"
             command_id = _record_execution_command_boundary(
                 ts_ms=int(_now_ms()),
                 batch_id=batch_or_oid,
                 payload_ts_ms=payload_ts_ms,
                 payload_source=str(payload_source),
                 mode="paper",
-                broker=str(BROKER_NAME),
+                broker=paper_broker,
                 raw_payload=list(raw_payload or []),
                 shaped_payload=list(shaped_payload or []),
                 real_payload=list(real_payload or []),
@@ -1400,25 +1425,41 @@ def main() -> int:
                 list(real_payload or []),
                 mode="paper",
                 payload_source=str(payload_source),
-                broker=str(BROKER_NAME),
+                broker=paper_broker,
             )
-            res = apply_new_portfolio_orders(
+            res = apply_shadow_portfolio_orders(
                 dry_run=False,
                 override_orders=real_payload,
                 override_order_id=(int(batch_or_oid) if batch_or_oid is not None else None),
                 override_ts_ms=(int(payload_ts_ms) if payload_ts_ms is not None else None),
             ) if real_payload else {"ok": True, "status": "no_real_orders", "broker": "sim"}
+            paper_result_issue = _paper_sim_result_issue(res)
+            if paper_result_issue is not None:
+                return _blocked(
+                    started_ms=int(started_ms),
+                    layer="paper_broker_result",
+                    mode="paper",
+                    broker=paper_broker,
+                    reason=str(paper_result_issue.get("reason") or "paper_broker_result_invalid"),
+                    payload={
+                        "result_ok": bool((res or {}).get("ok")) if isinstance(res, dict) else False,
+                        "result_status": str(paper_result_issue.get("result_status") or ""),
+                        "result_broker": str(paper_result_issue.get("result_broker") or ""),
+                    },
+                    command_id=command_id,
+                    correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
+                )
             shadow_res = _execute_shadow_groups(
                 shadow_groups=shadow_payload_by_model,
                 batch_or_oid=batch_or_oid,
                 payload_ts_ms=payload_ts_ms,
             ) if shadow_payload_by_model else {"ok": True, "groups": [], "submitted_models": 0, "fills_written": 0}
-            _write_execution_meta_last(BROKER_NAME, "paper_broker_sim")
+            _write_execution_meta_last(paper_broker, "paper_broker_sim")
             _record_execution_event_boundary(
                 event_type="command_result",
                 status=("executed" if bool((res or {}).get("ok", True)) else "failed"),
                 mode="paper",
-                broker=str(BROKER_NAME),
+                broker=paper_broker,
                 payload={
                     "payload_source": str(payload_source),
                     "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
@@ -1438,7 +1479,7 @@ def main() -> int:
                 {
                     "status": "ok",
                     "mode": "paper",
-                    "broker": BROKER_NAME,
+                    "broker": paper_broker,
                     "payload_source": payload_source,
                     "batch_id": batch_or_oid,
                     "result": res,

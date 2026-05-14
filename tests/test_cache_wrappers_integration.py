@@ -24,6 +24,13 @@ from engine.cache.wrappers import (
 )
 
 
+def test_cache_keys_honor_test_namespace(monkeypatch):
+    monkeypatch.setenv("TS_REDIS_KEY_PREFIX", "unit_cache_namespace")
+
+    assert keys.kill_switch("snapshot").startswith("unit_cache_namespace:")
+    assert keys.execution_mode().startswith("unit_cache_namespace:")
+
+
 def test_all_wrapper_reads_decode_loader_payloads(monkeypatch):
     def fake_read(key, loader=None, *, ttl_s=None):
         if key == keys.kill_switch("snapshot"):
