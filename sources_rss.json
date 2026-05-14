@@ -1,0 +1,8 @@
+{
+  "sources": [
+    { "name": "reuters_top", "url": "https://www.reuters.com/world/rss" },
+    { "name": "ft_markets", "url": "https://www.ft.com/markets?format=rss" },
+    { "name": "coindesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/" },
+    { "name": "cointelegraph", "url": "https://cointelegraph.com/rss" }
+  ]
+}

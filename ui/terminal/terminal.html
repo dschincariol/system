@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!--
+    FILE: ui/terminal/terminal.html
+
+    Structural shell for the browser terminal view. This page defines the DOM
+    contract consumed by terminal.js and keeps the terminal surface separate
+    from the main dashboard.
+  -->
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Trading Terminal</title>
+  <link rel="icon" href="/ui/favicon.ico">
+<link rel="stylesheet" href="/ui/terminal/terminal_theme.css">
+<script type="module" src="/ui/terminal/terminal.js"></script>
+</head>
+
+<body class="term">
+  <header class="termTop">
+    <div class="termBrand">
+      <div class="termTitle">⚡ Trading Terminal</div>
+      <div class="termSub">watchlist • chart • executions • orders • positions</div>
+    </div>
+
+    <div class="termControls">
+      <label class="ctl">
+        <span>Symbol</span>
+        <input id="symInput" class="inp" placeholder="SPY" autocomplete="off" spellcheck="false">
+      </label>
+
+      <label class="ctl">
+        <span>TF</span>
+        <select id="tfSel" class="sel">
+          <option value="1m">1m</option>
+          <option value="5m">5m</option>
+          <option value="15m">15m</option>
+          <option value="30m">30m</option>
+          <option value="1h">1h</option>
+          <option value="4h">4h</option>
+          <option value="1d">1d</option>
+        </select>
+      </label>
+
+      <label class="ctl">
+        <span>Chart</span>
+        <select id="typeSel" class="sel">
+          <option value="candle">Candle</option>
+          <option value="bar">Bar</option>
+          <option value="line">Line</option>
+          <option value="area">Area</option>
+        </select>
+      </label>
+
+      <label class="chk">
+        <input id="ovVwap" type="checkbox" checked>
+        <span>VWAP</span>
+      </label>
+
+      <label class="chk">
+        <input id="ovEma" type="checkbox" checked>
+        <span>EMA</span>
+      </label>
+
+      <label class="chk">
+        <input id="ovMarkers" type="checkbox" checked>
+        <span>Fills</span>
+      </label>
+
+      <label class="chk">
+        <input id="ovEquity" type="checkbox" checked>
+        <span>Equity</span>
+      </label>
+
+      <a class="btnLink" id="dashboardReturnLink" href="/ui/dashboard.html">Dashboard</a>
+    </div>
+  </header>
+
+  <div id="terminalStatusBanner" class="termBanner termBanner-warn" role="status" aria-live="polite">
+    Loading terminal snapshot…
+  </div>
+
+  <main class="termGrid">
+    <aside class="panel watch">
+      <div class="panelHd">
+        <div>Watchlist</div>
+        <div class="muted mono" id="watchMeta">—</div>
+      </div>
+      <div class="panelBody">
+        <input id="watchFilter" class="inp full" placeholder="filter…" autocomplete="off" spellcheck="false">
+        <div id="watchList" class="list"></div>
+      </div>
+    </aside>
+
+    <section class="panel chart">
+      <div class="panelHd">
+        <div id="chartTitle">Chart</div>
+        <div class="muted mono" id="chartHealth">—</div>
+      </div>
+      <div class="panelBody chartBody">
+        <div id="terminalChart" class="chartCanvas"></div>
+        <div id="xhairBox" class="xhair"></div>
+      </div>
+    </section>
+
+    <aside class="panel right">
+      <div class="panelHd">
+        <div>Account</div>
+        <div class="muted mono" id="acctMeta">—</div>
+      </div>
+      <div class="panelBody">
+        <div class="kv">
+          <div class="k">Cash</div><div class="v mono" id="acctCash">—</div>
+          <div class="k">Equity</div><div class="v mono" id="acctEquity">—</div>
+          <div class="k">Updated</div><div class="v mono" id="acctUpdated">—</div>
+        </div>
+
+       <div class="subHd">Order Entry</div>
+
+<div class="kv">
+  <div class="k">Safety</div>
+  <div>
+    <div id="tradingSafetyStatus" class="safetyStatus safetyStatus-warn" role="status" aria-live="polite">
+      Loading gate
+    </div>
+  </div>
+
+  <div></div>
+  <label class="chk armCtl">
+    <input id="terminalArmChk" type="checkbox">
+    <span>Arm shortcuts</span>
+  </label>
+
+  <div class="k">Qty</div>
+  <div><input id="ordQty" class="inp" value="100"></div>
+
+  <div></div>
+  <div class="orderActions">
+    <button id="btnBuy" class="btnLink">BUY</button>
+    <button id="btnSell" class="btnLink">SELL</button>
+    <button id="btnFlat" class="btnLink">FLATTEN</button>
+  </div>
+</div>
+
+<div class="sep"></div>
+
+        <div class="subHd tableSubHd">
+          <span>Positions</span>
+          <label class="srOnly" for="posFilter">Filter positions</label>
+          <input id="posFilter" class="inp tableFilter" placeholder="Search positions" autocomplete="off" spellcheck="false">
+        </div>
+        <div id="posTbl" class="tbl"></div>
+
+        <div class="sep"></div>
+
+        <div class="subHd tableSubHd">
+          <span>Orders</span>
+          <label class="srOnly" for="ordFilter">Filter orders</label>
+          <input id="ordFilter" class="inp tableFilter" placeholder="Search orders" autocomplete="off" spellcheck="false">
+        </div>
+        <div id="ordTbl" class="tbl"></div>
+      </div>
+    </aside>
+
+    <section class="panel blotter">
+      <div class="panelHd">
+        <div>Fills</div>
+        <div class="muted mono" id="fillsMeta">—</div>
+      </div>
+      <div class="panelBody">
+        <label class="srOnly" for="fillsFilter">Filter fills</label>
+        <input id="fillsFilter" class="inp full tableFilter" placeholder="Search fills" autocomplete="off" spellcheck="false">
+        <div id="fillsTbl" class="tbl"></div>
+      </div>
+    </section>
+  </main>
+
+
+</body>
+</html>

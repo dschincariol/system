@@ -1,0 +1,26 @@
+[Unit]
+Description=Trading config, Redis AOF, and state snapshot
+Documentation=file:/opt/trading/app/ops/server/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=-/etc/trading/trading.env
+EnvironmentFile=-/etc/trading/provider.env
+ExecStart=/bin/bash /opt/trading/ops/backup/state_snapshot.sh
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-state-snapshot
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/trading /tmp /var/tmp
+
+[Install]
+WantedBy=multi-user.target

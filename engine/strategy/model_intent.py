@@ -1,0 +1,180 @@
+"""
+FILE: model_intent.py
+
+Canonical model-intent payload helpers shared by event-processing jobs.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, Iterable, List, Optional
+
+from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.logging import get_logger
+
+LOG = get_logger("strategy.model_intent")
+_WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
+    if once_key and once_key in _WARNED_NONFATAL_KEYS:
+        return
+    log_failure(
+        LOG,
+        event="strategy_model_intent_nonfatal",
+        code=code,
+        message=code,
+        error=error,
+        level=logging.WARNING,
+        component="engine.strategy.model_intent",
+        extra=dict(extra or {}) or None,
+        persist=False,
+    )
+    if once_key:
+        _WARNED_NONFATAL_KEYS.add(once_key)
+
+
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "MODEL_INTENT_SAFE_FLOAT_FAILED",
+            e,
+            once_key="safe_float",
+            value=repr(value)[:120],
+        )
+        return default
+    if out != out:
+        return default
+    return out
+
+
+def _safe_list(values: Any) -> List[str]:
+    if not isinstance(values, Iterable) or isinstance(values, (str, bytes, dict)):
+        return []
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def infer_selected_features(explain: Dict[str, Any]) -> List[str]:
+    if not isinstance(explain, dict):
+        return []
+
+    for key in ("selected_features", "features_used", "feature_names", "feature_ids", "feature_set"):
+        vals = _safe_list(explain.get(key))
+        if vals:
+            return vals
+
+    model_block = explain.get("model")
+    if isinstance(model_block, dict):
+        for key in ("selected_features", "features_used", "feature_names", "feature_ids", "feature_set"):
+            vals = _safe_list(model_block.get(key))
+            if vals:
+                return vals
+
+    return []
+
+
+def build_model_intent(
+    *,
+    symbol: str,
+    horizon_s: int,
+    expected_z: float,
+    confidence: float,
+    explain: Optional[Dict[str, Any]] = None,
+    regime: Optional[str] = None,
+    universe_score: Optional[float] = None,
+    should_trade: bool = True,
+    timing: str = "enter_now",
+    target_weight: Optional[float] = None,
+    size_mult: Optional[float] = None,
+    prediction_strength: Optional[float] = None,
+) -> Dict[str, Any]:
+    ex = dict(explain or {})
+    z = float(expected_z)
+    conf = float(confidence)
+    strength = _safe_float(prediction_strength)
+    if strength is None:
+        strength = _safe_float(ex.get("prediction_strength"))
+    if strength is None:
+        strength = abs(z) * max(0.0, conf)
+    score = max(0.0, float(strength))
+    u_score = _safe_float(universe_score, score)
+    prob = _safe_float(ex.get("probability"), conf)
+    uncertainty = _safe_float(ex.get("uncertainty"), max(0.0, 1.0 - conf))
+    conf_raw = _safe_float(ex.get("raw_confidence"), conf)
+    side = "FLAT"
+    if z > 0:
+        side = "LONG"
+    elif z < 0:
+        side = "SHORT"
+
+    intent: Dict[str, Any] = {
+        "schema_version": 1,
+        "symbol": str(symbol or "").upper().strip(),
+        "horizon_s": int(horizon_s),
+        "should_trade": bool(should_trade),
+        "timing": str(timing or "enter_now"),
+        "side": side,
+        "expected_z": float(z),
+        "confidence": float(conf),
+        "probability": float(prob if prob is not None else conf),
+        "uncertainty": float(uncertainty if uncertainty is not None else max(0.0, 1.0 - conf)),
+        "confidence_raw": float(conf_raw if conf_raw is not None else conf),
+        "prediction_strength": float(score),
+        "score": float(score),
+        "selection_score": float(score),
+        "trade_score": float(score),
+        "include_in_universe": bool(should_trade),
+        "universe_score": float(u_score if u_score is not None else score),
+        "selected_features": infer_selected_features(ex),
+    }
+
+    if regime is not None:
+        intent["regime"] = str(regime)
+
+    if target_weight is not None:
+        tw = _safe_float(target_weight)
+        if tw is not None:
+            intent["target_weight"] = float(tw)
+
+    if size_mult is not None:
+        sm = _safe_float(size_mult)
+        if sm is not None:
+            intent["size_mult"] = float(sm)
+    else:
+        sm = _safe_float(ex.get("size_mult"))
+        if sm is not None:
+            intent["size_mult"] = float(sm)
+
+    tradability = ex.get("tradability")
+    if isinstance(tradability, dict):
+        for key in ("expected_ret_net", "p_win", "expected_dd"):
+            val = _safe_float(tradability.get(key))
+            if val is not None:
+                intent[key] = float(val)
+
+    return intent
+
+
+def is_canonical_model_intent(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    try:
+        return int(value.get("schema_version") or 0) >= 1
+    except Exception as e:
+        _warn_nonfatal(
+            "MODEL_INTENT_SCHEMA_VERSION_CHECK_FAILED",
+            e,
+            once_key="schema_version_check",
+            value=repr(value)[:240],
+        )
+        return False

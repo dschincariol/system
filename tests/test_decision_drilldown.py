@@ -1,0 +1,288 @@
+import json
+import sqlite3
+import subprocess
+from pathlib import Path
+
+from engine.api import api_dashboard_reads, api_read_advanced
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _init_decision_drilldown_db(db_path: Path) -> None:
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.executescript(
+            """
+            CREATE TABLE alerts (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                symbol TEXT,
+                horizon_s INTEGER,
+                ts_ms INTEGER,
+                event_title TEXT,
+                title TEXT,
+                message TEXT
+            );
+
+            CREATE TABLE decision_log (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                symbol TEXT,
+                horizon_s INTEGER,
+                ts_ms INTEGER,
+                action TEXT,
+                model_name TEXT,
+                model_version TEXT,
+                confidence REAL,
+                why TEXT,
+                risk_impact TEXT,
+                feature_set_tag TEXT,
+                explain_json TEXT,
+                extra_json TEXT
+            );
+
+            CREATE TABLE portfolio_orders (
+                id INTEGER PRIMARY KEY,
+                source_alert_id INTEGER,
+                ts_ms INTEGER,
+                symbol TEXT,
+                action TEXT,
+                delta_weight REAL,
+                client_order_id TEXT
+            );
+
+            CREATE TABLE execution_policy_audit (
+                id INTEGER PRIMARY KEY,
+                source_alert_id INTEGER,
+                portfolio_orders_batch_id INTEGER,
+                ts_ms INTEGER,
+                decision TEXT,
+                suppression_state TEXT,
+                decision_json TEXT
+            );
+
+            CREATE TABLE execution_orders (
+                id INTEGER PRIMARY KEY,
+                source_alert_id INTEGER,
+                portfolio_orders_id INTEGER,
+                client_order_id TEXT,
+                submit_ts_ms INTEGER,
+                updated_ts_ms INTEGER,
+                symbol TEXT,
+                broker TEXT,
+                status TEXT,
+                side TEXT,
+                qty REAL
+            );
+
+            CREATE TABLE execution_fills (
+                id INTEGER PRIMARY KEY,
+                source_alert_id INTEGER,
+                client_order_id TEXT,
+                fill_ts_ms INTEGER,
+                fill_px REAL,
+                fill_qty REAL,
+                symbol TEXT
+            );
+
+            CREATE TABLE trade_attribution_ledger (
+                id INTEGER PRIMARY KEY,
+                source_alert_id INTEGER,
+                portfolio_orders_id INTEGER,
+                client_order_id TEXT,
+                ts_ms INTEGER,
+                symbol TEXT,
+                suppression_reason TEXT,
+                decision_json TEXT,
+                pnl REAL
+            );
+
+            INSERT INTO alerts (
+                id, event_id, symbol, horizon_s, ts_ms, event_title, title, message
+            ) VALUES (
+                10, 9001, 'AAPL', 3600, 1700000000000,
+                'AAPL source signal', 'AAPL alert', 'source alert body'
+            );
+
+            INSERT INTO decision_log (
+                id, event_id, symbol, horizon_s, ts_ms, action, model_name,
+                model_version, confidence, why, risk_impact, feature_set_tag,
+                explain_json, extra_json
+            ) VALUES (
+                1, 9001, 'AAPL', 3600, 1700000000100, 'buy',
+                'temporal_predictor', '2026.05.10', 0.72,
+                'stored decision explanation', 'medium', 'features:v1',
+                '{"top_feature":"news_score"}', '{"model_version":"2026.05.10"}'
+            );
+
+            INSERT INTO portfolio_orders (
+                id, source_alert_id, ts_ms, symbol, action, delta_weight, client_order_id
+            ) VALUES (
+                301, 10, 1700000000200, 'AAPL', 'buy', 0.015, 'po-301'
+            );
+
+            INSERT INTO execution_policy_audit (
+                id, source_alert_id, portfolio_orders_batch_id, ts_ms,
+                decision, suppression_state, decision_json
+            ) VALUES (
+                201, 10, 301, 1700000000300,
+                'blocked', 'suppressed', '{"blocked_by":"max_position"}'
+            );
+
+            INSERT INTO trade_attribution_ledger (
+                id, source_alert_id, portfolio_orders_id, client_order_id, ts_ms,
+                symbol, suppression_reason, decision_json, pnl
+            ) VALUES (
+                401, 10, 301, 'po-301', 1700000000400,
+                'AAPL', 'max_position', '{"reason":"max_position"}', NULL
+            );
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_decision_detail_aggregates_existing_records(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "decision_drilldown.sqlite"
+    _init_decision_drilldown_db(db_path)
+
+    def connect():
+        return sqlite3.connect(str(db_path))
+
+    def fetch_decision_detail(decision_id: int):
+        if int(decision_id) != 1:
+            return None
+        con = sqlite3.connect(str(db_path))
+        try:
+            cur = con.execute("SELECT * FROM decision_log WHERE id=?", (int(decision_id),))
+            row = cur.fetchone()
+            columns = [item[0] for item in cur.description]
+            return dict(zip(columns, row)) if row else None
+        finally:
+            con.close()
+
+    monkeypatch.setattr(api_read_advanced, "db_connect", connect)
+    monkeypatch.setattr(api_read_advanced, "fetch_decision_detail", fetch_decision_detail)
+
+    payload = api_read_advanced.get_decision_detail(1)
+
+    assert payload["ok"] is True
+    assert payload["decision"]["decision_id"] == 1
+    assert payload["meta"]["detail_version"] == 1
+    assert payload["meta"]["source_alert_id"] == 10
+    assert payload["related"]["alert"]["id"] == 10
+    assert payload["related"]["trade_attribution_ledger"][0]["suppression_reason"] == "max_position"
+
+    stages = {stage["key"]: stage for stage in payload["stages"]}
+    assert {"source", "model", "portfolio", "policy", "route", "outcome"} <= set(stages)
+    assert stages["source"]["status"] == "available"
+    assert stages["model"]["status"] == "available"
+    assert "2026.05.10" in stages["model"]["summary"]
+    assert "72%" in stages["model"]["summary"]
+    assert stages["portfolio"]["status"] == "available"
+    assert stages["policy"]["summary"] == "max_position"
+    assert stages["route"]["status"] == "suppressed"
+    assert stages["outcome"]["status"] == "suppressed"
+
+
+def test_decision_detail_handles_missing_and_lineage_lookup(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "decision_drilldown.sqlite"
+    _init_decision_drilldown_db(db_path)
+
+    monkeypatch.setattr(api_read_advanced, "db_connect", lambda: sqlite3.connect(str(db_path)))
+    monkeypatch.setattr(api_read_advanced, "fetch_decision_detail", lambda _decision_id: None)
+
+    missing = api_read_advanced.get_decision_detail(404)
+    assert missing == {"ok": False, "error": "decision_not_found", "decision": None}
+
+    by_alert = api_read_advanced.get_decision_detail(0, source_alert_id=10)
+    assert by_alert["ok"] is True
+    assert by_alert["decision"]["decision_id"] == 1
+    assert by_alert["meta"]["source_alert_id"] == 10
+
+
+def test_dashboard_decision_handler_accepts_lineage_identifiers(monkeypatch) -> None:
+    captured = {}
+
+    def fake_get_decision_detail(decision_id: int, **kwargs):
+        captured["decision_id"] = decision_id
+        captured["kwargs"] = kwargs
+        return {"ok": True, "decision": {"decision_id": decision_id or None}, "stages": []}
+
+    monkeypatch.setattr(api_dashboard_reads, "get_decision_detail", fake_get_decision_detail)
+
+    assert api_dashboard_reads.api_get_decision_detail({}) == {"ok": False, "error": "missing_id"}
+
+    payload = api_dashboard_reads.api_get_decision_detail({
+        "source_alert_id": "10",
+        "portfolio_order_id": "301",
+        "ledger_id": "401",
+        "client_order_id": "po-301",
+    })
+
+    assert payload["ok"] is True
+    assert captured == {
+        "decision_id": 0,
+        "kwargs": {
+            "source_alert_id": 10,
+            "portfolio_order_id": 301,
+            "ledger_id": 401,
+            "client_order_id": "po-301",
+        },
+    }
+
+
+def test_frontend_decision_helper_renders_available_and_unavailable_stages() -> None:
+    script = """
+        import {
+          buildDecisionDetailUrl,
+          buildDecisionStageRows,
+          hasDecisionLookup
+        } from './ui/decision_drilldown.mjs';
+
+        const rows = buildDecisionStageRows({
+          stages: [
+            { key: 'model', label: 'Model decision', status: 'available', summary: 'model ok' },
+            {
+              key: 'route',
+              label: 'Route',
+              status: 'unavailable',
+              unavailable_reason: 'execution_route_unavailable'
+            }
+          ]
+        });
+        const fallback = buildDecisionStageRows({});
+        process.stdout.write(JSON.stringify({
+          rows,
+          fallback,
+          lookup: hasDecisionLookup({ sourceAlertId: 10 }),
+          url: buildDecisionDetailUrl({
+            sourceAlertId: 10,
+            portfolioOrderId: 301,
+            ledgerId: 401,
+            clientOrderId: 'po-301'
+          })
+        }));
+    """
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["rows"][0]["value"] == "available"
+    assert payload["rows"][1]["value"] == "unavailable"
+    assert payload["rows"][1]["meta"] == "execution_route_unavailable"
+    assert payload["fallback"][0]["value"] == "unavailable"
+    assert payload["lookup"] is True
+    assert payload["url"] == (
+        "/api/ui/decision?source_alert_id=10&portfolio_order_id=301"
+        "&ledger_id=401&client_order_id=po-301"
+    )

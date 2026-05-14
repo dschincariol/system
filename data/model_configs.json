@@ -1,0 +1,93 @@
+[
+  {
+    "family": "embed_regressor",
+    "instance_name": "short_intraday_core",
+    "horizon": "short",
+    "feature_groups": ["base", "tech"],
+    "symbol_universe": ["*"],
+    "risk_profile": "aggressive",
+    "training_window_days": 90,
+    "model_kind": "ridge",
+    "prediction_enabled": true,
+    "experimental": false,
+    "enabled": true
+  },
+  {
+    "family": "embed_regressor",
+    "instance_name": "medium_macro_crossasset",
+    "horizon": "medium",
+    "feature_groups": ["base", "macro", "options"],
+    "symbol_universe": ["*"],
+    "risk_profile": "balanced",
+    "training_window_days": 240,
+    "model_kind": "ridge",
+    "prediction_enabled": true,
+    "experimental": false,
+    "enabled": true
+  },
+  {
+    "family": "embed_regressor",
+    "instance_name": "long_regime_defensive",
+    "horizon": "long",
+    "feature_groups": ["base", "macro", "stress", "social_regime"],
+    "symbol_universe": ["*"],
+    "risk_profile": "conservative",
+    "training_window_days": 540,
+    "model_kind": "ridge",
+    "prediction_enabled": true,
+    "experimental": false,
+    "enabled": true
+  },
+  {
+    "family": "temporal_predictor",
+    "instance_name": "short_intraday_shadow",
+    "horizon": "short",
+    "feature_groups": ["base", "tech", "options"],
+    "symbol_universe": ["*"],
+    "risk_profile": "aggressive",
+    "training_window_days": 90,
+    "model_kind": "temporal",
+    "prediction_enabled": true,
+    "experimental": true,
+    "enabled": true
+  },
+  {
+    "family": "temporal_predictor",
+    "instance_name": "medium_crossasset_shadow",
+    "horizon": "medium",
+    "feature_groups": ["base", "macro", "options", "stress"],
+    "symbol_universe": ["*"],
+    "risk_profile": "balanced",
+    "training_window_days": 240,
+    "model_kind": "temporal",
+    "prediction_enabled": true,
+    "experimental": true,
+    "enabled": true
+  },
+  {
+    "family": "temporal_predictor",
+    "instance_name": "long_regime_shadow",
+    "horizon": "long",
+    "feature_groups": ["base", "macro", "stress", "social_regime", "weather"],
+    "symbol_universe": ["*"],
+    "risk_profile": "conservative",
+    "training_window_days": 540,
+    "model_kind": "temporal",
+    "prediction_enabled": true,
+    "experimental": true,
+    "enabled": true
+  },
+  {
+    "family": "gbm_regressor",
+    "instance_name": "medium_optin_shadow",
+    "horizon": "medium",
+    "feature_groups": ["base", "macro", "options", "stress"],
+    "symbol_universe": ["*"],
+    "risk_profile": "balanced",
+    "training_window_days": 240,
+    "model_kind": "lightgbm",
+    "prediction_enabled": false,
+    "experimental": true,
+    "enabled": false
+  }
+]

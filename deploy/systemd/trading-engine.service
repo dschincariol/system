@@ -1,0 +1,26 @@
+[Unit]
+Description=Trading System Engine Runtime
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading-system/repo
+EnvironmentFile=/etc/trading-system/trading.env
+ExecStart=/opt/trading-system/venv/bin/python /opt/trading-system/repo/start_system.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/opt/trading-system/logs/engine.log
+StandardError=append:/opt/trading-system/logs/engine.log
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/trading-system /etc/trading-system
+
+[Install]
+WantedBy=multi-user.target

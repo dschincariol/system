@@ -1,0 +1,626 @@
+/* ui/dashboard_theme.css
+   TECH THEME HARD OVERRIDES
+   Goal: force dashboard.html to visually match styles.tech.css even with inline <style>.
+*/
+
+/* ---------------------------
+   TOKENS (override inline vars)
+   --------------------------- */
+body.theme-tech {
+  --bg0:#070b10 !important;
+  --bg1:#0b1220 !important;
+  --panel:#0f1a2b !important;
+  --card:#0f1a2b !important;
+
+  --border:rgba(255,255,255,0.08) !important;
+  --border2:rgba(255,255,255,0.12) !important;
+
+  --text:#eaf2ff !important;
+  --muted:#9bb0d9 !important;
+
+  --green:#2bb673 !important;
+  --green2:#19a965 !important;
+  --amber:#f5a524 !important;
+  --red:#e25555 !important;
+  --blue:#3a86ff !important;
+
+  --shadow: 0 14px 35px rgba(0,0,0,0.45) !important;
+  --shadow2: 0 8px 18px rgba(0,0,0,0.28) !important;
+
+  --radius: 16px !important;
+  --radius2: 12px !important;
+  --focus: 0 0 0 4px rgba(58,134,255,0.18) !important;
+
+  background:
+    radial-gradient(1100px 650px at 10% -10%, rgba(58,134,255,.14), transparent 60%),
+    radial-gradient(900px 520px at 90% 0%, rgba(43,182,115,.10), transparent 60%),
+    linear-gradient(180deg, var(--bg1), var(--bg0)) !important;
+
+  color: var(--text) !important;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important;
+}
+
+/* kill the old dev-ish body styling in inline <style> */
+body.theme-tech {
+  margin: 0 !important;
+  padding: 16px !important;
+  padding-bottom: max(16px, env(safe-area-inset-bottom)) !important;
+}
+
+/* ---------------------------
+   SYSTEM STATUS HEADER
+   --------------------------- */
+
+#system-status-header{
+  margin-bottom:10px;
+}
+
+.systemStatusBar{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  padding:8px 14px;
+  background: rgba(15,26,43,.92);
+  border:1px solid var(--border2);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size:12px;
+}
+
+.statusItem{
+  padding:4px 8px;
+  border-radius:8px;
+  border:1px solid var(--border);
+  background: rgba(0,0,0,0.25);
+}
+
+.status_ok{
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.status_warning{
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.status_error{
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* ---------------------------
+   SYSTEM STATUS HEADER
+   --------------------------- */
+body.theme-tech #system-status-header {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 1001 !important;
+  margin: 0 0 12px 0 !important;
+}
+
+body.theme-tech .systemStatusBar {
+  display: grid !important;
+  grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+  gap: 8px !important;
+  padding: 10px !important;
+  background: rgba(15,26,43,.96) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow2) !important;
+  backdrop-filter: blur(10px) !important;
+}
+
+body.theme-tech .systemStatusItem {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 4px !important;
+  padding: 8px 10px !important;
+  min-width: 0 !important;
+  border: 1px solid rgba(255,255,255,.08) !important;
+  border-radius: 12px !important;
+  background: rgba(11,18,32,.92) !important;
+}
+
+body.theme-tech .systemStatusLabel {
+  font-size: 11px !important;
+  font-weight: 800 !important;
+  letter-spacing: .08em !important;
+  color: var(--muted) !important;
+}
+
+body.theme-tech .systemStatusValue {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+  font-size: 13px !important;
+  font-weight: 800 !important;
+  color: var(--text) !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+body.theme-tech .status_ok {
+  border-color: rgba(43,182,115,.70) !important;
+  box-shadow: inset 0 0 0 1px rgba(43,182,115,.12) !important;
+}
+
+body.theme-tech .status_ok .systemStatusValue {
+  color: var(--green) !important;
+}
+
+body.theme-tech .status_warning {
+  border-color: rgba(245,165,36,.75) !important;
+  box-shadow: inset 0 0 0 1px rgba(245,165,36,.12) !important;
+}
+
+body.theme-tech .status_warning .systemStatusValue {
+  color: var(--amber) !important;
+}
+
+body.theme-tech .status_error {
+  border-color: rgba(226,85,85,.78) !important;
+  box-shadow: inset 0 0 0 1px rgba(226,85,85,.12) !important;
+}
+
+body.theme-tech .status_error .systemStatusValue {
+  color: var(--red) !important;
+}
+
+@media (max-width: 1280px) {
+  body.theme-tech .systemStatusBar {
+    grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+  }
+}
+
+@media (max-width: 768px) {
+  body.theme-tech .systemStatusBar {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+/* ---------------------------
+   HEADERS / TOP STRIPS
+   --------------------------- */
+body.theme-tech .appHeader,
+body.theme-tech header,
+body.theme-tech #decisionBar {
+  border-radius: var(--radius) !important;
+}
+
+body.theme-tech #telemetryStrip {
+  background: rgba(15,26,43,.92) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow2) !important;
+}
+
+/* ---------------------------
+   CARDS (force tech surfaces)
+   --------------------------- */
+body.theme-tech .card {
+  background: rgba(15,26,43,.92) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow) !important;
+  padding: 14px !important;
+}
+
+body.theme-tech .screenTabs{
+  position: sticky !important;
+  top: 74px !important;
+  z-index: 1000 !important;
+  backdrop-filter: blur(12px) !important;
+}
+
+body.theme-tech .screenTab{
+  background: rgba(11,18,32,.95) !important;
+  border-color: rgba(255,255,255,.10) !important;
+  color: var(--text) !important;
+  box-shadow: var(--shadow2) !important;
+}
+
+body.theme-tech .screenTab.is-active{
+  background: linear-gradient(180deg, rgba(58,134,255,.26), rgba(58,134,255,.10)) !important;
+  border-color: rgba(58,134,255,.62) !important;
+  color: #ffffff !important;
+}
+
+body.theme-tech .screenMeta{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+}
+
+body.theme-tech[data-dashboard-screen="overview"] .dashboard-grid{
+  grid-template-columns: 320px minmax(0, 1.35fr) 320px !important;
+}
+
+body.theme-tech[data-dashboard-screen="overview"] #operatorSummaryCard,
+body.theme-tech[data-dashboard-screen="overview"] #recentDecisionsCard,
+body.theme-tech[data-dashboard-screen="overview"] #alertsCard{
+  border-color: rgba(58,134,255,.26) !important;
+  box-shadow:
+    0 20px 52px rgba(0,0,0,.56),
+    inset 0 0 0 1px rgba(58,134,255,.10) !important;
+}
+
+body.theme-tech[data-dashboard-screen="overview"] #executionAdvisoryCard,
+body.theme-tech[data-dashboard-screen="overview"] #systemHealthCard,
+body.theme-tech[data-dashboard-screen="overview"] #livePnlCard,
+body.theme-tech[data-dashboard-screen="overview"] #marketStressPanel{
+  background: linear-gradient(180deg, rgba(15,26,43,.98), rgba(11,18,32,.96)) !important;
+}
+
+body.theme-tech[data-dashboard-screen="overview"] #newsPanelsCard,
+body.theme-tech[data-dashboard-screen="overview"] #telemetryCard,
+body.theme-tech[data-dashboard-screen="overview"] #competitionOpsCard{
+  opacity: .88;
+}
+
+body.theme-tech[data-dashboard-screen="operate"] .dashboard-grid{
+  grid-template-columns: 330px minmax(0, 1.25fr) 330px !important;
+}
+
+body.theme-tech[data-dashboard-screen="operate"] #jobConsoleCard{
+  border-color: rgba(43,182,115,.28) !important;
+  box-shadow:
+    0 20px 52px rgba(0,0,0,.56),
+    inset 0 0 0 1px rgba(43,182,115,.10) !important;
+}
+
+body.theme-tech[data-dashboard-screen="explain"] .dashboard-grid{
+  grid-template-columns: 330px minmax(0, 1.2fr) 330px !important;
+}
+
+body.theme-tech[data-dashboard-screen="explain"] #recentDecisionsCard,
+body.theme-tech[data-dashboard-screen="explain"] #governanceSummaryCard,
+body.theme-tech[data-dashboard-screen="explain"] #portfolioCard{
+  border-color: rgba(245,165,36,.24) !important;
+}
+
+body.theme-tech[data-dashboard-screen="analyze"] .dashboard-grid{
+  grid-template-columns: 300px minmax(0, 1.45fr) 320px !important;
+}
+
+body.theme-tech[data-dashboard-screen="analyze"] #portfolioBacktestCard,
+body.theme-tech[data-dashboard-screen="analyze"] #modelMetricsCard,
+body.theme-tech[data-dashboard-screen="analyze"] #strategyMetricsCard{
+  border-color: rgba(255,255,255,.14) !important;
+}
+
+@media (max-width: 1200px){
+  body.theme-tech .screenTabs{
+    top: 64px !important;
+  }
+
+  body.theme-tech[data-dashboard-screen="overview"] .dashboard-grid,
+  body.theme-tech[data-dashboard-screen="operate"] .dashboard-grid,
+  body.theme-tech[data-dashboard-screen="explain"] .dashboard-grid,
+  body.theme-tech[data-dashboard-screen="analyze"] .dashboard-grid{
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* card header style */
+body.theme-tech .card h2 {
+  font-weight: 800 !important;
+  letter-spacing: .2px !important;
+  color: var(--text) !important;
+  border-bottom: 1px solid rgba(255,255,255,.06) !important;
+  padding-bottom: 10px !important;
+  margin-bottom: 12px !important;
+}
+
+/* ---------------------------
+   PILLS (tech pills)
+   --------------------------- */
+body.theme-tech .pill {
+  background: rgba(255,255,255,0.04) !important;
+  border: 1px solid var(--border2) !important;
+  color: var(--text) !important;
+  border-radius: 999px !important;
+  font-weight: 700 !important;
+}
+
+body.theme-tech .pill.ok { border-color: rgba(43,182,115,.65) !important; }
+body.theme-tech .pill.bad { border-color: rgba(226,85,85,.75) !important; }
+body.theme-tech .pill.warn { border-color: rgba(245,165,36,.75) !important; }
+
+body.theme-tech .pill.dim {
+  color: rgba(155,176,217,.95) !important;
+  background: rgba(255,255,255,0.03) !important;
+}
+
+/* ---------------------------
+   BUTTONS (tech)
+   --------------------------- */
+body.theme-tech .btn {
+  background: rgba(15,26,43,.92) !important;
+  border: 1px solid var(--border2) !important;
+  color: var(--text) !important;
+  border-radius: 14px !important;
+  box-shadow: var(--shadow2) !important;
+  font-weight: 800 !important;
+}
+
+body.theme-tech .btn:hover {
+  border-color: rgba(58,134,255,.55) !important;
+  filter: brightness(1.06) !important;
+}
+
+body.theme-tech .btn:focus {
+  outline: none !important;
+  box-shadow: var(--shadow2), var(--focus) !important;
+}
+
+/* ---------------------------
+   INPUTS / SELECTS
+   --------------------------- */
+body.theme-tech select,
+body.theme-tech input.input,
+body.theme-tech input[type="text"],
+body.theme-tech input[type="number"] {
+  background: rgba(11,18,32,.95) !important;
+  border: 1px solid var(--border2) !important;
+  color: var(--text) !important;
+  border-radius: 14px !important;
+}
+
+/* ---------------------------
+   TABLES (tech)
+   --------------------------- */
+body.theme-tech table {
+  border-collapse: collapse !important;
+}
+
+body.theme-tech th {
+  background: rgba(11,18,32,.95) !important;
+  color: rgba(155,176,217,.95) !important;
+  border-bottom: 1px solid rgba(255,255,255,.08) !important;
+}
+
+body.theme-tech td {
+  border-bottom: 1px solid rgba(255,255,255,.06) !important;
+}
+
+body.theme-tech tbody tr:hover td {
+  background: rgba(58,134,255,.08) !important;
+}
+
+/* ---------------------------
+   CONSOLES / PRE AREAS
+   --------------------------- */
+body.theme-tech .console,
+body.theme-tech pre.console,
+body.theme-tech pre.mono,
+body.theme-tech pre.small {
+  background: rgba(11,18,32,.92) !important;
+  border: 1px solid rgba(255,255,255,.08) !important;
+  border-radius: 14px !important;
+  box-shadow: var(--shadow2) !important;
+  color: rgba(234,242,255,.92) !important;
+}
+
+/* ---------------------------
+   HEATMAP / INCIDENTS / DRAWER
+   (these exist in your HTML)
+   --------------------------- */
+body.theme-tech .heatmapWrap {
+  background: rgba(11,18,32,.70) !important;
+  border: 1px solid rgba(255,255,255,.08) !important;
+  border-radius: var(--radius) !important;
+}
+
+body.theme-tech .incidentItem {
+  border: 1px solid rgba(255,255,255,.10) !important;
+  background: linear-gradient(180deg, rgba(15,26,43,.92), rgba(11,18,32,.92)) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow) !important;
+}
+
+body.theme-tech .drawer {
+  background: rgba(11,18,32,.98) !important;
+  border-left: 1px solid rgba(255,255,255,.10) !important;
+}
+
+/* ---------------------------
+   DEGRADE PULSE (kept)
+   --------------------------- */
+body.system-degraded {
+  animation: subtlePulse 2.5s infinite;
+}
+
+@keyframes subtlePulse {
+  0% { background-color: #0b0f15; }
+  50% { background-color: #11161d; }
+  100% { background-color: #0b0f15; }
+}
+
+/* Execution blocked accent override (set by JS via dataset) */
+:root[data-exec-blocked="1"] {
+  --accent: #ff6b6b;
+}
+
+/* ---------------------------
+   OPERATOR STARTUP PANEL
+   --------------------------- */
+
+body.theme-tech #operatorStartupCard {
+  background: rgba(15,26,43,.94) !important;
+  border: 1px solid var(--border2) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow) !important;
+}
+
+body.theme-tech .operatorStartupSummary {
+  display: flex !important;
+  gap: 8px !important;
+  flex-wrap: wrap !important;
+  margin: 8px 0 10px 0 !important;
+}
+
+body.theme-tech .operatorStartupProgressWrap {
+  width: 100% !important;
+  height: 10px !important;
+  border-radius: 999px !important;
+  overflow: hidden !important;
+  border: 1px solid rgba(255,255,255,.10) !important;
+  background: rgba(255,255,255,.05) !important;
+}
+
+body.theme-tech .operatorStartupProgressBar {
+  height: 100% !important;
+  width: 0% !important;
+  transition: width .25s ease !important;
+  background: linear-gradient(90deg, rgba(245,165,36,.95), rgba(226,85,85,.95)) !important;
+}
+
+body.theme-tech .operatorStartupProgressBarOk {
+  background: linear-gradient(90deg, rgba(43,182,115,.95), rgba(25,169,101,.95)) !important;
+}
+
+body.theme-tech .operatorStartupProgressBarWarn {
+  background: linear-gradient(90deg, rgba(245,165,36,.95), rgba(226,85,85,.95)) !important;
+}
+
+body.theme-tech .operatorStartupChecklist {
+  display: grid !important;
+  grid-template-columns: 1fr !important;
+  gap: 10px !important;
+  margin-top: 12px !important;
+}
+
+body.theme-tech .startupStep {
+  display: grid !important;
+  grid-template-columns: 96px minmax(0, 1fr) 90px !important;
+  gap: 12px !important;
+  align-items: center !important;
+  padding: 10px 12px !important;
+  border-radius: 14px !important;
+  border: 1px solid rgba(255,255,255,.08) !important;
+  background: rgba(11,18,32,.88) !important;
+}
+
+body.theme-tech .startupStepOk {
+  border-color: rgba(43,182,115,.70) !important;
+  box-shadow: inset 0 0 0 1px rgba(43,182,115,.12) !important;
+}
+
+body.theme-tech .startupStepPending,
+body.theme-tech .startupStepBlocked {
+  border-color: rgba(245,165,36,.65) !important;
+  box-shadow: inset 0 0 0 1px rgba(245,165,36,.10) !important;
+}
+
+body.theme-tech .startupStepIndex {
+  font-size: 11px !important;
+  font-weight: 800 !important;
+  letter-spacing: .08em !important;
+  color: var(--muted) !important;
+}
+
+body.theme-tech .startupStepTitle {
+  font-size: 14px !important;
+  font-weight: 800 !important;
+  color: var(--text) !important;
+}
+
+body.theme-tech .startupStepDetail {
+  margin-top: 4px !important;
+  font-size: 12px !important;
+  line-height: 1.35 !important;
+  color: var(--muted) !important;
+  word-break: break-word !important;
+}
+
+body.theme-tech .startupStepStatus {
+  text-align: right !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+  font-size: 12px !important;
+  font-weight: 900 !important;
+  letter-spacing: .06em !important;
+  color: var(--text) !important;
+}
+
+body.theme-tech .startupStepOk .startupStepStatus {
+  color: var(--green) !important;
+}
+
+body.theme-tech .startupStepPending .startupStepStatus,
+body.theme-tech .startupStepBlocked .startupStepStatus {
+  color: var(--amber) !important;
+}
+
+@media (max-width: 768px) {
+  body.theme-tech .startupStep {
+    grid-template-columns: 1fr !important;
+  }
+
+  body.theme-tech .startupStepStatus {
+    text-align: left !important;
+  }
+}
+
+/* ============================================================
+   OPERATOR CONSOLE GRID LAYOUT
+   ============================================================ */
+
+body.theme-tech .dashboard-grid{
+  display:grid;
+  grid-template-columns: minmax(280px,320px) minmax(0,1fr) minmax(300px,360px);
+  gap:14px;
+  align-items:start;
+  margin-top:10px;
+}
+
+body.theme-tech .dashboard-left{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-width:0;
+}
+
+body.theme-tech .dashboard-center{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-width:0;
+}
+
+body.theme-tech .dashboard-right{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-width:0;
+}
+
+body.theme-tech .dashboard-footer{
+  margin-top:16px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:12px;
+  align-items:stretch;
+}
+
+body.theme-tech .dashboard-footer > .card{
+  flex:1 1 420px;
+  margin-bottom:0 !important;
+}
+
+body.theme-tech #telemetryMount .telemetryStrip{
+  margin-bottom:0 !important;
+  width:100%;
+}
+
+/* responsive collapse */
+
+@media (max-width:1400px){
+  body.theme-tech .dashboard-grid{
+    grid-template-columns: 280px 1fr 280px;
+  }
+}
+
+@media (max-width:1100px){
+  body.theme-tech .dashboard-grid{
+    grid-template-columns: 1fr;
+  }
+}

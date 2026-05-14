@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#101113" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>Trading Ops Mobile</title>
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" href="../favicon.ico" />
+  <link rel="stylesheet" href="./mobile.css?v=1" />
+</head>
+<body>
+  <main class="mobileShell">
+    <header class="topBar">
+      <div>
+        <h1>Trading Ops</h1>
+        <p>Critical monitor</p>
+      </div>
+      <span id="overallBadge" class="badge badge-muted" role="status" aria-live="polite">loading</span>
+    </header>
+
+    <section id="endpointBanner" class="surfaceBanner" role="status" aria-live="polite">
+      Connecting to control-plane endpoints.
+    </section>
+
+    <section class="metricGrid" aria-label="Critical summary">
+      <div class="metricTile">
+        <span class="metricLabel">System</span>
+        <strong id="systemState">-</strong>
+        <span id="systemMeta" class="metricSub">waiting</span>
+      </div>
+      <div class="metricTile">
+        <span class="metricLabel">Trading</span>
+        <strong id="tradingState">-</strong>
+        <span id="tradingMeta" class="metricSub">waiting</span>
+      </div>
+      <div class="metricTile">
+        <span class="metricLabel">Today PnL</span>
+        <strong id="pnlTotal">-</strong>
+        <span id="pnlMeta" class="metricSub">waiting</span>
+      </div>
+      <div class="metricTile">
+        <span class="metricLabel">Alerts</span>
+        <strong id="alertCount">-</strong>
+        <span id="alertMeta" class="metricSub">waiting</span>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="systemTitle">
+      <div class="panelHeader">
+        <h2 id="systemTitle">Heartbeat</h2>
+        <span id="heartbeatBadge" class="badge badge-muted">waiting</span>
+      </div>
+      <dl class="kvList">
+        <div><dt>Readiness</dt><dd id="readinessValue">-</dd></div>
+        <div><dt>Health</dt><dd id="healthValue">-</dd></div>
+        <div><dt>Provider monitor</dt><dd id="providerHeartbeatValue">-</dd></div>
+        <div><dt>Ingestion</dt><dd id="ingestionValue">-</dd></div>
+      </dl>
+      <div id="systemReasons" class="noteBlock">No status reasons loaded yet.</div>
+    </section>
+
+    <section class="panel" aria-labelledby="pnlTitle">
+      <div class="panelHeader">
+        <h2 id="pnlTitle">Live PnL</h2>
+        <span id="pnlBadge" class="badge badge-muted">waiting</span>
+      </div>
+      <dl class="kvList">
+        <div><dt>Total</dt><dd id="pnlTotalDetail">-</dd></div>
+        <div><dt>Unrealized</dt><dd id="pnlUnrealized">-</dd></div>
+        <div><dt>Realized</dt><dd id="pnlRealized">-</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel" aria-labelledby="positionsTitle">
+      <div class="panelHeader">
+        <h2 id="positionsTitle">Open Positions</h2>
+        <span id="positionsBadge" class="badge badge-muted">waiting</span>
+      </div>
+      <div id="positionsList" class="rowList">No positions loaded yet.</div>
+    </section>
+
+    <section class="panel" aria-labelledby="alertsTitle">
+      <div class="panelHeader">
+        <h2 id="alertsTitle">Current Alerts</h2>
+        <span id="alertsBadge" class="badge badge-muted">waiting</span>
+      </div>
+      <div id="alertsList" class="rowList">No alerts loaded yet.</div>
+    </section>
+
+    <section class="panel" aria-labelledby="brokerTitle">
+      <div class="panelHeader">
+        <h2 id="brokerTitle">Broker and Feeds</h2>
+        <span id="feedsBadge" class="badge badge-muted">waiting</span>
+      </div>
+      <dl class="kvList">
+        <div><dt>Broker equity</dt><dd id="brokerEquity">-</dd></div>
+        <div><dt>Broker positions</dt><dd id="brokerPositions">-</dd></div>
+        <div><dt>Feed status</dt><dd id="feedStatus">-</dd></div>
+        <div><dt>Notifications</dt><dd id="notificationStatus">-</dd></div>
+      </dl>
+      <div id="feedDetails" class="noteBlock">No feed details loaded yet.</div>
+    </section>
+
+    <section class="panel emergencyPanel" aria-labelledby="emergencyTitle">
+      <div class="panelHeader">
+        <h2 id="emergencyTitle">Emergency Stop</h2>
+        <span id="killSwitchBadge" class="badge badge-danger">armed by confirmation</span>
+      </div>
+      <div id="consequencePreview" class="consequencePreview">
+        Loading current status before showing consequences.
+      </div>
+      <label class="fieldLabel" for="apiTokenInput">API token for protected actions</label>
+      <input id="apiTokenInput" class="textInput" type="password" inputmode="text" autocomplete="off" />
+      <label class="fieldLabel" for="killPhraseInput">Confirmation phrase</label>
+      <input id="killPhraseInput" class="textInput" type="text" inputmode="latin" autocomplete="off" placeholder="KILL" />
+      <button id="holdKillButton" class="holdButton" type="button" disabled>
+        <span id="holdButtonLabel">Type KILL to enable hold</span>
+        <span id="holdProgress" class="holdProgress" aria-hidden="true"></span>
+      </button>
+      <div id="emergencyResult" class="noteBlock resultBlock">No emergency action has been sent from this surface.</div>
+    </section>
+
+    <footer class="footerBar">
+      <span id="lastUpdated">Never refreshed.</span>
+      <button id="refreshButton" class="secondaryButton" type="button">Refresh</button>
+    </footer>
+  </main>
+
+  <script type="module" src="./mobile.js?v=1"></script>
+</body>
+</html>

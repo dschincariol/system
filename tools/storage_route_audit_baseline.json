@@ -1,0 +1,4 @@
+{
+  "comment": "Grandfathered storage route findings for migration-scoped hot tables. Prefer removing entries by routing the write through an approved owner module or annotating intentional cases with 'storage-route-audit: allow'.",
+  "allowed_fingerprints": []
+}

@@ -1,0 +1,669 @@
+"""Production table classification for Postgres + TimescaleDB.
+
+This module is intentionally import-only metadata. Migrations, verifier tests,
+and future schema reviews should use this as the single source of truth before
+shipping a table.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Union
+
+
+@dataclass(frozen=True)
+class Hypertable:
+    chunk: str
+    compress_after: str | None
+    retain: str | None
+    segmentby: tuple[str, ...] = ()
+    time_column: str = "ts_ms"
+    rationale: str = "append-mostly rows primarily read by time range"
+    write_rate: str = "medium"
+    read_pattern: str = "time-range scans"
+    audit: bool = False
+
+
+@dataclass(frozen=True)
+class Regular:
+    rationale: str = "mutable state, registry, bounded catalog, or non-time primary lookup"
+    write_rate: str = "low"
+    read_pattern: str = "primary-key or latest-state lookup"
+    cleanup: str | None = None
+    audit: bool = False
+
+
+TableClass = Union[Hypertable, Regular]
+
+
+def _h(
+    *,
+    chunk: str,
+    compress_after: str | None,
+    retain: str | None,
+    segmentby: tuple[str, ...] = (),
+    time_column: str = "ts_ms",
+    rationale: str,
+    write_rate: str,
+    read_pattern: str,
+    audit: bool = False,
+) -> Hypertable:
+    return Hypertable(
+        chunk=chunk,
+        compress_after=compress_after,
+        retain=retain,
+        segmentby=tuple(segmentby),
+        time_column=str(time_column),
+        rationale=str(rationale),
+        write_rate=str(write_rate),
+        read_pattern=str(read_pattern),
+        audit=bool(audit),
+    )
+
+
+def _r(
+    rationale: str,
+    *,
+    write_rate: str = "low",
+    read_pattern: str = "primary-key or latest-state lookup",
+    cleanup: str | None = None,
+    audit: bool = False,
+) -> Regular:
+    return Regular(
+        rationale=str(rationale),
+        write_rate=str(write_rate),
+        read_pattern=str(read_pattern),
+        cleanup=(None if cleanup is None else str(cleanup)),
+        audit=bool(audit),
+    )
+
+
+TICK_QUOTE = _h(
+    chunk="1 day",
+    compress_after="7 days",
+    retain="30 days",
+    segmentby=("symbol",),
+    rationale="high-rate market data stream; append-mostly and queried by symbol/time windows",
+    write_rate="very high",
+    read_pattern="latest and intraday ranges by (symbol, time)",
+)
+BAR_SERIES = _h(
+    chunk="1 day",
+    compress_after="7 days",
+    retain="1 year",
+    segmentby=("symbol",),
+    rationale="derived bar/price series; append-mostly and read by symbol/time ranges",
+    write_rate="high",
+    read_pattern="dashboard and model windows by (symbol, time)",
+)
+FEATURE_SERIES = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    rationale="point-in-time feature series; append-mostly and replayed by symbol/time",
+    write_rate="medium",
+    read_pattern="latest feature snapshot and historical replay by (symbol, time)",
+)
+GLOBAL_FEATURE_SERIES = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    rationale="append-mostly feature/evaluation series keyed primarily by time",
+    write_rate="medium",
+    read_pattern="time-range replay and dashboard scans",
+)
+HEALTH_SERIES = _h(
+    chunk="1 day",
+    compress_after="14 days",
+    retain="180 days",
+    rationale="operational health metric stream; append-mostly and dashboarded by time",
+    write_rate="medium",
+    read_pattern="recent operational time windows",
+)
+AUDIT_SERIES = _h(
+    chunk="1 week",
+    compress_after="90 days",
+    retain=None,
+    rationale="forensic audit ledger; append-only and retained indefinitely",
+    write_rate="low",
+    read_pattern="time-range audit review and actor/entity lookup",
+)
+EXECUTION_SERIES = _h(
+    chunk="1 week",
+    compress_after="90 days",
+    retain=None,
+    segmentby=("symbol",),
+    rationale="execution ledger; append-mostly financial evidence retained indefinitely",
+    write_rate="medium",
+    read_pattern="order, symbol, and time-range execution analysis",
+)
+DECISION_SERIES = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    rationale="model decision/prediction stream; append-mostly and replayed by symbol/time",
+    write_rate="high",
+    read_pattern="decision replay by (symbol, time) and JSON predicates",
+)
+
+
+TABLE_CLASS: dict[str, TableClass] = {}
+
+
+def _add(names: tuple[str, ...], cls: TableClass) -> None:
+    for name in names:
+        TABLE_CLASS[str(name)] = cls
+
+
+_add(
+    (
+        "price_quotes_raw",
+        "price_quotes",
+        "prices",
+        "price_ticks",
+    ),
+    TICK_QUOTE,
+)
+TABLE_CLASS["price_ticks"] = _h(**{**TICK_QUOTE.__dict__, "time_column": "time"})
+_add(("price_bars",), BAR_SERIES)
+TABLE_CLASS["price_data"] = _h(**{**BAR_SERIES.__dict__, "time_column": "timestamp"})
+
+TABLE_CLASS["market_microstructure_signals"] = FEATURE_SERIES
+TABLE_CLASS["price_anomalies"] = FEATURE_SERIES
+TABLE_CLASS["market_features"] = FEATURE_SERIES
+TABLE_CLASS["model_feature_snapshots"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    rationale="canonical point-in-time feature snapshots; latest lookup is by symbol, feature_set_tag, and time",
+    write_rate="high",
+    read_pattern="latest snapshot by (symbol, feature_set_tag, ts_ms) and replay windows",
+)
+_add(("news_event_features", "options_event_features"), FEATURE_SERIES)
+TABLE_CLASS["news_symbol_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
+TABLE_CLASS["options_symbol_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
+TABLE_CLASS["social_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
+TABLE_CLASS["social_regimes"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
+TABLE_CLASS["social_posts"] = FEATURE_SERIES
+TABLE_CLASS["gdelt_macro_features"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    time_column="bucket_ts_ms",
+    rationale="macro feature buckets; append-mostly and read by historical time windows",
+    write_rate="medium",
+    read_pattern="macro replay windows by bucket time",
+)
+TABLE_CLASS["feature_data"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="timestamp",
+    rationale="Timescale sidecar feature vectors; append-mostly and read by symbol/time",
+    write_rate="high",
+    read_pattern="feature-store replay by (symbol, timestamp)",
+)
+TABLE_CLASS["feature_store"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="time",
+    rationale="versioned Timescale feature store; append/update-current bucket by symbol/time/version",
+    write_rate="high",
+    read_pattern="latest feature vector at or before time",
+)
+TABLE_CLASS["factor_features"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "asof_ts"})
+TABLE_CLASS["factor_observations"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "asof_ts"})
+TABLE_CLASS["factor_group_scores"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "ts"})
+TABLE_CLASS["model_weather_effect"] = GLOBAL_FEATURE_SERIES
+TABLE_CLASS["nlp_text_blobs"] = _r(
+    "content-addressed NLP source text cache keyed by hash",
+    write_rate="medium",
+    read_pattern="primary-key lookup and symbol/time backfill scans",
+)
+TABLE_CLASS["nlp_embeddings"] = _r(
+    "content-addressed embedding cache keyed by text hash and local model name",
+    write_rate="medium",
+    read_pattern="primary-key lookup by hash/model",
+)
+TABLE_CLASS["nlp_sentiments"] = _r(
+    "content-addressed sentiment cache keyed by text hash and local model name",
+    write_rate="medium",
+    read_pattern="primary-key lookup by hash/model",
+)
+TABLE_CLASS["sec_filings"] = FEATURE_SERIES
+TABLE_CLASS["insider_transactions"] = _r(
+    "low-rate alternative data table upserted by source transaction id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/time feature snapshot reads",
+)
+TABLE_CLASS["congressional_trades"] = _r(
+    "low-rate alternative data table upserted by source trade id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/time feature snapshot reads",
+)
+TABLE_CLASS["weather_alerts"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "issued_ts"})
+TABLE_CLASS["weather_forecast_region_daily"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "run_ts"})
+
+_add(
+    (
+        "options_chain_v2",
+        "options_chain",
+        "options_surface",
+    ),
+    _h(
+        chunk="1 day",
+        compress_after="7 days",
+        retain="3 years",
+        segmentby=("underlying",),
+        rationale="options market data stream; append-mostly and queried by underlying/time",
+        write_rate="high",
+        read_pattern="underlying/time option surface and chain scans",
+    ),
+)
+TABLE_CLASS["options_surface_agg"] = _h(
+    chunk="1 day",
+    compress_after="7 days",
+    retain="3 years",
+    rationale="global options surface aggregate stream; append-mostly and read by time",
+    write_rate="medium",
+    read_pattern="dashboard scans by time",
+)
+
+_add(
+    (
+        "runtime_metrics",
+        "ingest_slippage",
+        "ingestion_pipeline_health",
+        "price_provider_health",
+        "weather_provider_health",
+        "broker_connection_health",
+        "execution_divergence",
+        "data_source_logs",
+    ),
+    HEALTH_SERIES,
+)
+TABLE_CLASS["broker_connection_health"] = _h(
+    chunk="1 day",
+    compress_after="14 days",
+    retain="180 days",
+    segmentby=("broker",),
+    rationale="broker liveness samples; append-mostly and dashboarded by time/broker",
+    write_rate="medium",
+    read_pattern="recent broker health by broker/time",
+)
+TABLE_CLASS["runtime_metrics"] = _h(
+    chunk="1 day",
+    compress_after="14 days",
+    retain="180 days",
+    segmentby=("metric",),
+    rationale="runtime metric stream; append-mostly and rolled up for dashboards",
+    write_rate="high",
+    read_pattern="metric/time dashboard windows",
+)
+
+_add(
+    (
+        "decision_log",
+        "decision_views",
+        "prediction_history",
+        "predictions",
+        "shadow_predictions",
+        "ensemble_predictions",
+        "model_predictions",
+        "model_oos_predictions",
+        "temporal_predictions",
+        "rl_strategy_policy_decisions",
+    ),
+    DECISION_SERIES,
+)
+TABLE_CLASS["model_predictions"] = _h(**{**DECISION_SERIES.__dict__, "time_column": "timestamp"})
+
+_add(
+    (
+        "broker_fills",
+        "execution_fills",
+        "execution_metrics",
+        "pnl_attribution",
+        "capital_efficiency",
+        "execution_capital_efficiency",
+        "execution_fill_quality",
+        "execution_policy_feedback",
+        "execution_strategy_attribution",
+        "execution_slippage_feedback",
+        "alpha_preservation_kpis",
+        "execution_analytics",
+        "trades",
+        "suppression_opportunity",
+        "order_events",
+        "trade_outcomes",
+    ),
+    EXECUTION_SERIES,
+)
+TABLE_CLASS["trade_outcomes"] = _h(**{**EXECUTION_SERIES.__dict__, "time_column": "timestamp"})
+TABLE_CLASS["trade_attribution_ledger"] = _h(
+    chunk="1 week",
+    compress_after=None,
+    retain=None,
+    segmentby=("symbol",),
+    rationale="compliance attribution ledger; append-only, never compressed, never deleted",
+    write_rate="medium",
+    read_pattern="order/source_alert/model/symbol lookup and time-range forensic review",
+)
+
+_add(
+    (
+        "kill_switch_audit",
+        "execution_mode_audit",
+        "execution_policy_audit",
+        "position_reconcile_audit",
+        "trade_suppression_audit",
+        "model_promotion_audit",
+        "crash_recovery_audit",
+        "rules_audit",
+        "pipeline_stage_audit",
+        "universe_audit",
+        "capital_preservation_audit",
+        "risk_events",
+        "model_governance_log",
+        "alert_interactions",
+        "alert_acks",
+        "alert_resolutions",
+        "promotion_statistical_evidence",
+        "portfolio_kill_snapshots",
+        "portfolio_risk_snapshots",
+    ),
+    AUDIT_SERIES,
+)
+TABLE_CLASS["alert_acks"] = _h(**{**AUDIT_SERIES.__dict__, "time_column": "acked_ts_ms"})
+TABLE_CLASS["alert_resolutions"] = _h(**{**AUDIT_SERIES.__dict__, "time_column": "resolved_ts_ms"})
+TABLE_CLASS["promotion_statistical_evidence"] = _h(**{**AUDIT_SERIES.__dict__, "time_column": "ts"})
+
+_add(
+    (
+        "event_log",
+        "events",
+        "equity_history",
+        "portfolio_bt_points",
+        "portfolio_equity_state",
+        "trade_decision_snapshot",
+        "strategy_allocator_history",
+        "shadow_metrics",
+        "shadow_training_runs",
+        "self_critic_alerts",
+        "exec_conf_calib",
+        "execution_ai_advisory",
+        "execution_ai_advisory_actions",
+        "execution_alerts",
+        "labels_exec",
+        "model_metrics",
+        "model_version_performance",
+        "portfolio_orders",
+        "portfolio_position_corr_snapshots",
+        "portfolio_model_corr_snapshots",
+        "pnl_decomposition",
+        "rl_shadow_eval",
+        "rl_shadow_actions",
+        "strategy_promotion_log",
+        "strategy_shadow_runs",
+        "temporal_shadow_eval",
+        "alpha_lifecycle",
+        "nlp_embeddings",
+        "nlp_sentiments",
+        "nlp_text_blobs",
+        "causal_scores",
+        "alerts_archive",
+    ),
+    GLOBAL_FEATURE_SERIES,
+)
+TABLE_CLASS["model_version_performance"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "recorded_ts_ms"})
+TABLE_CLASS["shadow_metrics"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "window_end_ms"})
+
+TABLE_CLASS["audit_chain_findings"] = _r(
+    rationale="tamper-evidence verifier findings; append-only diagnostics retained indefinitely",
+    write_rate="low",
+    read_pattern="time-range audit review and table/row investigation",
+)
+TABLE_CLASS["credential_access_log"] = _h(
+    chunk="1 week",
+    compress_after=None,
+    retain="1 year",
+    time_column="ts",
+    rationale="credential read audit trail; append-only and reviewed by time and credential name",
+    write_rate="low",
+    read_pattern="time-range credential access review",
+    audit=True,
+)
+
+
+_REGISTRY_RATIONALE = "registry/catalog table; primary access is by natural key, not by time range"
+_STATE_RATIONALE = "mutable state table; current value is the contract and rows are updated in place"
+_BOUNDED_RATIONALE = "bounded or low-rate operational table; primary lookup is not a time-range scan"
+_TRAINING_RATIONALE = "training/model artifact metadata; looked up by model/run identifiers"
+
+_add(
+    (
+        "model_registry",
+        "feature_registry",
+        "strategy_registry",
+        "sleeve_registry",
+        "data_sources",
+        "factor_registry",
+        "models",
+        "model_versions",
+        "gbm_models",
+        "hmm_regime_models",
+        "temporal_models",
+        "embed_models2",
+        "rl_policies",
+        "rl_strategy_policy_models",
+        "causal_dags",
+        "timescale_schema_version",
+        "artifacts",
+        "artifact_aliases",
+        "artifact_fsck_findings",
+    ),
+    _r(_REGISTRY_RATIONALE),
+)
+_add(
+    (
+        "kill_switch_state",
+        "execution_mode",
+        "execution_health_state",
+        "broker_order_state",
+        "broker_shadow_order_state",
+        "position_reconcile_baseline",
+        "trade_suppression_state",
+        "runtime_meta",
+        "execution_meta",
+        "runtime_metrics_state",
+        "risk_state",
+        "event_log_state",
+        "job_locks",
+        "job_heartbeats",
+        "job_checkpoints",
+        "ipc_channels",
+        "price_feed_lock",
+        "options_symbol_ingestion_state",
+        "portfolio_state",
+        "model_position_state",
+        "broker_meta",
+        "broker_shadow_meta",
+        "broker_account",
+        "broker_positions",
+        "broker_shadow_account",
+        "broker_shadow_positions",
+    ),
+    _r(_STATE_RATIONALE),
+)
+_add(
+    (
+        "schema_version",
+        "schema_migrations",
+        "active_feature_policy",
+        "alerts",
+        "job_history",
+        "domain_blacklist",
+        "domain_perf",
+        "earnings_calendar",
+        "confidence_calibration",
+        "champion_assignments",
+        "strategy_allocations",
+        "strategy_allocator_scores",
+        "strategy_cooldowns",
+        "sleeve_allocations",
+        "sleeve_metrics",
+        "model_promotion_cooldown",
+        "model_post_promo_watch",
+        "model_post_promo_results",
+        "alpha_decay_strategy_metrics",
+        "alpha_decay_runtime_history",
+        "feature_distribution_drift",
+        "model_competition_rankings",
+        "model_marketplace_scores",
+        "model_promotion_guard",
+        "symbol_universe",
+        "symbols",
+        "symbol_blacklist",
+        "universe_pit",
+        "notification_channel_tests",
+        "ipc_messages",
+        "execution_order_idempotency",
+        "exec_open_orders",
+        "exec_order_events",
+        "execution_orders",
+        "order_commands",
+    ),
+    _r(_BOUNDED_RATIONALE, cleanup="job_history and alerts use app-managed rotation where configured"),
+)
+_add(
+    (
+        "alpha_decay_metrics",
+        "backtest_scores",
+        "challenger_shadow_orders",
+        "embed_conf_calib",
+        "embed_model_eval",
+        "event_embeddings",
+        "event_embeddings_seq",
+        "factor_groups",
+        "labels",
+        "model_drift",
+        "model_lifecycle_runs",
+        "model_post_promo_results",
+        "model_runs",
+        "model_stats",
+        "model_stats_regime",
+        "model_stats_regime_versions",
+        "model_stats_versions",
+        "model_version_performance",
+        "model_versions",
+        "portfolio_bt_runs",
+        "portfolio_meta",
+        "regime_compat_scores",
+        "residual_distribution_drift",
+        "shadow_capital_scores",
+        "shadow_order_intents",
+        "size_policy",
+        "size_policy_points",
+        "sleeve_registry",
+        "spillover_beta",
+        "spillover_beta_versions",
+        "strategy_metrics",
+        "strategy_registry",
+        "symbolic_alpha_candidates",
+        "temporal_model_eval",
+        "validation_scores",
+        "walk_forward_runs",
+        "walk_forward_scores",
+        "embed_model_feature_schema",
+        "temporal_model_feature_schema",
+        "feature_candidates",
+        "feature_evaluation",
+        "ensemble_blend_weights",
+        "ensemble_family_performance",
+        "narrative_clusters",
+        "narrative_members",
+        "competition_post_commit_actions",
+    ),
+    _r(_TRAINING_RATIONALE, write_rate="low to medium", read_pattern="model/run keyed lookup and latest status reads"),
+)
+
+
+SOURCE_DECLARED_TABLES = frozenset(
+    {
+        "competition_post_commit_actions",
+        "feature_store",
+        "price_ticks",
+        "timescale_schema_version",
+        "price_data",
+        "feature_data",
+        "model_predictions",
+        "trade_outcomes",
+    }
+)
+
+FUTURE_CLASSIFIED_TABLES = frozenset(
+    {
+        "alerts_archive",
+        "model_oos_predictions",
+        "nlp_embeddings",
+        "nlp_sentiments",
+        "nlp_text_blobs",
+        "causal_scores",
+        "promotion_statistical_evidence",
+        "runtime_metrics_state",
+    }
+)
+
+AUDIT_CHAIN_TABLES = frozenset(
+    {
+        "decision_log",
+        "execution_mode_audit",
+        "execution_policy_audit",
+        "kill_switch_audit",
+        "model_promotion_audit",
+        "position_reconcile_audit",
+        "promotion_statistical_evidence",
+        "trade_attribution_ledger",
+    }
+)
+
+for _audit_table in AUDIT_CHAIN_TABLES:
+    if _audit_table in TABLE_CLASS:
+        TABLE_CLASS[_audit_table] = replace(TABLE_CLASS[_audit_table], audit=True)
+
+
+def hypertables() -> dict[str, Hypertable]:
+    return {name: cls for name, cls in TABLE_CLASS.items() if isinstance(cls, Hypertable)}
+
+
+def regular_tables() -> dict[str, Regular]:
+    return {name: cls for name, cls in TABLE_CLASS.items() if isinstance(cls, Regular)}
+
+
+def is_hypertable(table_name: str) -> bool:
+    return isinstance(TABLE_CLASS.get(str(table_name)), Hypertable)
+
+
+def audit_tables() -> tuple[str, ...]:
+    return tuple(sorted(name for name, cls in TABLE_CLASS.items() if getattr(cls, "audit", False)))
+
+
+__all__ = [
+    "FUTURE_CLASSIFIED_TABLES",
+    "AUDIT_CHAIN_TABLES",
+    "Hypertable",
+    "Regular",
+    "SOURCE_DECLARED_TABLES",
+    "TABLE_CLASS",
+    "TableClass",
+    "audit_tables",
+    "hypertables",
+    "is_hypertable",
+    "regular_tables",
+]

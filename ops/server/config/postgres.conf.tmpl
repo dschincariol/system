@@ -1,0 +1,49 @@
+# Managed by ops/server/bootstrap.sh.
+# Host-derived values are rendered at bootstrap time.
+
+listen_addresses = 'localhost'
+port = 5432
+unix_socket_directories = '{{ postgres_socket_dir }}'
+
+max_connections = {{ max_connections }}
+shared_buffers = '{{ shared_buffers }}'
+effective_cache_size = '{{ effective_cache_size }}'
+work_mem = '{{ work_mem }}'
+maintenance_work_mem = '{{ maintenance_work_mem }}'
+
+wal_buffers = '16MB'
+wal_level = replica
+wal_compression = on
+archive_mode = on
+archive_command = '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"'
+archive_timeout = '60s'
+checkpoint_completion_target = 0.9
+random_page_cost = 1.1
+effective_io_concurrency = 200
+
+max_worker_processes = {{ max_worker_processes }}
+max_parallel_workers = {{ max_parallel_workers }}
+max_parallel_workers_per_gather = {{ max_parallel_workers_per_gather }}
+max_parallel_maintenance_workers = {{ max_parallel_maintenance_workers }}
+
+shared_preload_libraries = 'timescaledb,pg_stat_statements'
+password_encryption = scram-sha-256
+track_io_timing = on
+track_activity_query_size = 4096
+pg_stat_statements.track = all
+
+log_destination = 'stderr'
+logging_collector = on
+log_directory = '/var/log/postgresql'
+log_filename = 'postgresql-16-main.log'
+log_min_duration_statement = 250
+log_checkpoints = on
+log_connections = off
+log_disconnections = off
+log_lock_waits = on
+deadlock_timeout = '1s'
+
+autovacuum = on
+autovacuum_max_workers = {{ autovacuum_max_workers }}
+autovacuum_naptime = '10s'
+default_statistics_target = 100

@@ -1,0 +1,26 @@
+[Unit]
+Description=Trading System Operator Server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading-system/repo
+EnvironmentFile=/etc/trading-system/trading.env
+ExecStart=/usr/bin/node /opt/trading-system/repo/boot/operator_server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/opt/trading-system/logs/operator.log
+StandardError=append:/opt/trading-system/logs/operator.log
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/trading-system /etc/trading-system
+
+[Install]
+WantedBy=multi-user.target

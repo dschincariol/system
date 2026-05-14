@@ -1,0 +1,2353 @@
+<!-- FILE: boot/operator_ui.html -->
+<!--
+  Browser operator console for local users. This page is a guided control and
+  diagnostics surface over operator_server.js and dashboard APIs; it should
+  present runtime state clearly, but backend/operator endpoints remain the
+  source of truth.
+-->
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Trading Engine Operator</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    /* This page is a thin local operator console. Authoritative runtime state
+       still comes from the operator/dashboard APIs, not from UI-only client state. */
+    :root{
+      --bg:#eef1f6;
+      --card:#ffffff;
+      --text:#0f172a;
+      --muted:#64748b;
+      --primary:#2563eb;
+      --primary2:#1d4ed8;
+      --danger:#dc2626;
+      --warn:#f59e0b;
+      --ok:#16a34a;
+      --line:rgba(2,6,23,.10);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      --shadow: 0 10px 24px rgba(2,6,23,.10);
+      --radius: 14px;
+    }
+
+    body{
+      margin:0;
+      padding:24px;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .topbar{
+      display:flex;
+      align-items:flex-end;
+      justify-content:space-between;
+      gap:16px;
+      flex-wrap:wrap;
+    }
+
+    h1{
+      margin:0;
+      font-size:22px;
+      letter-spacing:.2px;
+    }
+
+    .sub{
+      color:var(--muted);
+      font-size:13px;
+      margin-top:4px;
+    }
+
+    .grid{
+      display:grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+      gap:18px;
+      margin-top:18px;
+      align-items:start;
+    }
+
+    @media(max-width:1200px){
+      .grid{ grid-template-columns:1fr; }
+    }
+
+    .stack{
+      display:flex;
+      flex-direction:column;
+      gap:18px;
+      min-width:0;
+    }
+
+    .card{
+      background:var(--card);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      padding:18px;
+      min-width:0;
+    }
+
+    .row{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+
+    .row.tight{ gap:8px; }
+
+    .titleRow{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+
+    .sectionTitle{
+      font-weight:900;
+      font-size:15px;
+    }
+
+    .sectionSub{
+      color:var(--muted);
+      font-size:12px;
+      margin-top:2px;
+    }
+
+    button{
+      border:0;
+      border-radius:10px;
+      padding:10px 14px;
+      font-weight:700;
+      cursor:pointer;
+      background:var(--primary);
+      color:white;
+    }
+
+    button:hover{ background:var(--primary2); }
+
+    button.secondary{ background:#64748b; }
+    button.secondary:hover{ background:#475569; }
+
+    button.danger{ background:var(--danger); }
+    button.danger:hover{ filter:brightness(.95); }
+
+    button.ghost{
+      background:transparent;
+      color:var(--primary);
+      border:1px solid rgba(37,99,235,.25);
+    }
+    button.ghost:hover{ background:rgba(37,99,235,.08); }
+
+    button.mode{
+      background:#f1f5f9;
+      color:#0f172a;
+      border:1px solid rgba(2,6,23,.10);
+      font-weight:800;
+    }
+    button.mode.active{
+      border-color: rgba(37,99,235,.55);
+      box-shadow: 0 0 0 3px rgba(37,99,235,.14);
+      background: rgba(37,99,235,.08);
+      color:#0f172a;
+    }
+
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:7px 10px;
+      border-radius:999px;
+      background:#f1f5f9;
+      color:var(--muted);
+      font-size:12px;
+      font-weight:800;
+    }
+
+    .dot{
+      width:10px;
+      height:10px;
+      border-radius:999px;
+      background:#94a3b8;
+      flex:0 0 auto;
+    }
+    .dot.ok{ background:var(--ok); }
+    .dot.warn{ background:var(--warn); }
+    .dot.fail{ background:var(--danger); }
+
+    .hr{
+      height:1px;
+      background:var(--line);
+      margin:14px 0;
+    }
+
+    .muted{
+      color:var(--muted);
+      font-size:12px;
+    }
+
+    a.link{
+      color:var(--primary);
+      font-weight:900;
+      text-decoration:none;
+    }
+    a.link:hover{ text-decoration:underline; }
+
+    textarea{
+      width:100%;
+      height:220px;
+      border-radius:12px;
+      border:1px solid rgba(2,6,23,.12);
+      padding:12px;
+      font-family:var(--mono);
+      font-size:12px;
+      box-sizing:border-box;
+      background:#fbfdff;
+      resize:vertical;
+    }
+
+    input{
+      width:100%;
+      border-radius:12px;
+      border:1px solid rgba(2,6,23,.12);
+      padding:10px 12px;
+      box-sizing:border-box;
+      font-size:13px;
+      background:#fbfdff;
+    }
+
+    pre{
+      background:#0b1220;
+      color:#e5e7eb;
+      padding:12px;
+      border-radius:12px;
+      overflow-y:auto;
+      overflow-x:hidden;
+      font-family:var(--mono);
+      font-size:12px;
+      line-height:1.35;
+      height:340px;
+      max-height:340px;
+      white-space:pre-wrap;
+      word-break:break-word;
+      margin:0;
+    }
+
+    .issues{ margin-top:10px; }
+
+    .issue{
+      border-radius:12px;
+      padding:10px 12px;
+      margin-top:8px;
+      border:1px solid rgba(2,6,23,.12);
+      background:#ffffff;
+      display:flex;
+      gap:10px;
+      align-items:flex-start;
+    }
+
+    .badge{
+      font-size:11px;
+      font-weight:900;
+      padding:4px 8px;
+      border-radius:999px;
+      color:white;
+      line-height:1;
+      margin-top:1px;
+      min-width:48px;
+      text-align:center;
+    }
+    .badge.err{ background:var(--danger); }
+    .badge.warn{ background:var(--warn); }
+    .badge.info{ background:#64748b; }
+
+    .issueText{ font-size:13px; }
+
+    .bar{
+      width:100%;
+      height:10px;
+      background:#e2e8f0;
+      border-radius:999px;
+      overflow:hidden;
+    }
+
+    .bar > div{
+      height:100%;
+      width:0%;
+      background:var(--primary);
+      transition: width .25s ease;
+    }
+
+    .stepLine{
+      display:flex;
+      gap:10px;
+      align-items:flex-start;
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid rgba(2,6,23,.12);
+      background:#ffffff;
+      margin-top:8px;
+    }
+
+    .stepLine b{ font-size:13px; }
+
+    .stepDetail{
+      color:var(--muted);
+      font-size:12px;
+      margin-top:3px;
+      white-space:pre-wrap;
+    }
+
+    .metricsGrid{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:10px;
+      margin-top:12px;
+    }
+
+    .metricCard{
+      border:1px solid rgba(2,6,23,.08);
+      border-radius:12px;
+      padding:12px;
+      background:#f8fafc;
+      min-width:0;
+    }
+
+    .metricLabel{
+      font-size:12px;
+      color:var(--muted);
+      margin-bottom:4px;
+    }
+
+    .metricValue{
+      font-size:18px;
+      font-weight:900;
+      color:var(--text);
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .statusBanner{
+      border-left:6px solid var(--primary);
+    }
+
+    .miniGrid{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:10px;
+      margin-top:12px;
+    }
+
+    .miniCard{
+      border:1px solid rgba(2,6,23,.08);
+      border-radius:12px;
+      padding:12px;
+      background:#ffffff;
+      min-width:0;
+    }
+
+    .miniCardTitle{
+      font-size:12px;
+      color:var(--muted);
+      margin-bottom:4px;
+    }
+
+    .miniCardValue{
+      font-size:16px;
+      font-weight:900;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .panelList{
+      margin-top:12px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+
+    .panelItem{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      padding:10px 12px;
+      border:1px solid rgba(2,6,23,.08);
+      border-radius:12px;
+      background:#ffffff;
+      font-weight:700;
+    }
+
+    .configGrid{
+      display:grid;
+      grid-template-columns:minmax(0,1fr) minmax(280px, 0.9fr);
+      gap:18px;
+    }
+
+    @media(max-width:1200px){
+      .configGrid{ grid-template-columns:1fr; }
+    }
+
+    .hidden{
+      display:none !important;
+    }
+  </style>
+</head>
+<body>
+
+  <!--
+    OPERATOR CONSOLE
+    - All IDs are unique.
+    - All original user-facing functions are preserved.
+    - Added panels:
+      * Connection Status
+      * Data Ingestion Watchdog
+      * Training Pipeline Progress
+      * Trading Monitor
+      * Live PnL Summary
+    - This file intentionally keeps original API calls where possible.
+  -->
+
+  <div class="topbar">
+    <div>
+      <h1>Trading Engine Operator Panel</h1>
+      <div class="sub">Start/stop, validation, guided startup, diagnostics, risk, data, training, and trading operations.</div>
+    </div>
+
+    <div class="row">
+      <button class="ghost" onclick="copySnapshot('quick')">Support Snapshot</button>
+      <a class="pill link hidden" href="/api/operator/snapshot?mode=quick" id="snapshotDownloadLink">Download Snapshot</a>
+
+      <span class="pill" id="pillStatus">
+        <span class="dot" id="dotStatus"></span>
+        <span id="txtStatus">Checking system…</span>
+      </span>
+
+      <span class="pill" id="pillState">
+        <span class="dot" id="dotState"></span>
+        <span id="txtState">State: unknown</span>
+      </span>
+
+      <span class="pill">
+        <span class="dot" id="dotHealth"></span>
+        <span id="txtHealth">Health: unknown</span>
+      </span>
+
+      <span class="pill">
+        <span class="dot" id="dotData"></span>
+        <span id="txtData">Market data: checking</span>
+      </span>
+
+      <span class="pill" id="launchContextPill" style="display:none;"></span>
+    </div>
+  </div>
+
+  <div class="card statusBanner" id="summaryCard" style="margin-top:18px;">
+    <div id="summaryStateLine" class="muted" style="margin-top:6px;"></div>
+    <div style="font-weight:900;font-size:16px;">System Summary</div>
+    <div id="summaryHeadline" style="font-size:18px;margin-top:6px;font-weight:900;">Loading...</div>
+    <div class="muted" id="summaryMeaning" style="margin-top:6px;"></div>
+    <div style="margin-top:10px;font-weight:700;">Recommended Action</div>
+    <div id="summaryAction" class="muted"></div>
+  </div>
+
+  <div class="grid">
+
+    <!-- LEFT COLUMN -->
+    <div class="stack">
+
+      <div class="card" id="statusPanel">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">System Status</div>
+            <div class="sectionSub">High-level operational state and primary controls.</div>
+          </div>
+
+          <div class="row tight">
+            <button class="mode active" id="modeSafe" onclick="setMode('safe')">REVIEW</button>
+            <button class="mode" id="modeShadow" onclick="setMode('shadow')">DATA</button>
+            <button class="mode" id="modeLive" onclick="setMode('live')">TRADING</button>
+          </div>
+        </div>
+
+        <div class="hr"></div>
+
+        <div id="systemStateBig" style="font-size:24px;font-weight:900;">INITIALIZING</div>
+        <div id="systemStateDetail" class="muted" style="margin-top:6px;">Waiting for startup diagnostics.</div>
+        <div id="metaLine" class="muted" style="margin-top:10px;">—</div>
+
+        <div class="row" style="margin-top:14px;">
+          <button onclick="guidedBootstrap()">Start System Setup</button>
+          <button class="ghost" onclick="start()">Start Engine</button>
+          <button class="secondary" onclick="restart()">Restart</button>
+          <button class="secondary" onclick="stop()">Stop</button>
+          <button class="danger" onclick="emergencyStopHard()">Emergency Stop</button>
+          <a class="link" href="/ui/data_sources.html" target="_blank" rel="noopener">Open Source Control</a>
+          <a class="link" id="dashLink" href="#" target="_blank" rel="noopener">Open Dashboard</a>
+        </div>
+
+        <div class="miniGrid">
+          <div class="miniCard">
+            <div class="miniCardTitle">Operator Action Center</div>
+            <div id="actionContainer" style="margin-top:8px;"></div>
+          </div>
+
+          <div class="miniCard">
+            <div class="miniCardTitle">Live PnL Summary</div>
+            <div class="miniCardValue" id="pnlSummaryValue">Loading…</div>
+            <div class="muted" id="pnlSummarySub" style="margin-top:4px;">Awaiting trading monitor.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Startup Pipeline</div>
+            <div class="sectionSub">Universe, prices, events, labels, training, model readiness.</div>
+          </div>
+          <button class="ghost" onclick="renderPipeline()">Refresh</button>
+        </div>
+        <div id="startupPipeline" class="panelList"></div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Runtime Metrics</div>
+            <div class="sectionSub">Live database counts and model support.</div>
+          </div>
+          <button class="ghost" onclick="renderMetrics()">Refresh</button>
+        </div>
+        <div id="runtimeMetrics" class="metricsGrid"></div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Operator Health Panels</div>
+            <div class="sectionSub">System health, database, ingestion, model, readiness, and services.</div>
+          </div>
+          <button class="ghost" onclick="renderOperatorHealthPanels()">Refresh</button>
+        </div>
+        <div id="operatorHealthPanels" class="panelList"></div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Connection Status</div>
+            <div class="sectionSub">Broker, execution barrier, provider health and telemetry.</div>
+          </div>
+          <button class="ghost" onclick="renderConnectionStatus()">Refresh</button>
+        </div>
+        <div id="connectionStatus" class="panelList"></div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Data Ingestion Watchdog</div>
+            <div class="sectionSub">Monitors quotes, prices, providers and pipeline freshness.</div>
+          </div>
+          <button class="ghost" onclick="renderIngestionWatchdog()">Refresh</button>
+        </div>
+        <div id="ingestionWatchdog" class="panelList"></div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Training Pipeline Progress</div>
+            <div class="sectionSub">Labels, models, metrics and training readiness.</div>
+          </div>
+          <button class="ghost" onclick="renderTrainingProgress()">Refresh</button>
+        </div>
+        <div id="trainingProgress" class="panelList"></div>
+      </div>
+
+      <div class="card">
+  <div class="titleRow">
+    <div>
+      <div class="sectionTitle">Strategy Heatmap</div>
+      <div class="sectionSub">Live strategy performance.</div>
+    </div>
+    <button class="ghost" onclick="renderStrategyHeatmap()">Refresh</button>
+  </div>
+
+  <div id="strategyHeatmap" class="panelList"></div>
+</div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Appliance Service Control</div>
+            <div class="sectionSub">Linux service status, backups, upgrades, and operator restart.</div>
+          </div>
+          <button class="ghost" onclick="loadServiceStatus()">Refresh</button>
+        </div>
+
+        <div id="serviceStatusPanel" class="panelList" style="margin-top:12px;"></div>
+
+        <div class="row" style="margin-top:12px;">
+          <button onclick="runBackup()">Run Backup</button>
+          <button class="secondary" onclick="runSystemUpdate()">System Update</button>
+          <button class="ghost" onclick="restartOperatorService()">Restart Operator UI</button>
+        </div>
+
+        <div class="muted" id="serviceActionMsg" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Operator Actions</div>
+            <div class="sectionSub">Manual controls preserved from the original operator UI.</div>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px;">
+          <button onclick="preflight()">Preflight</button>
+          <button onclick="repairSystem()">Repair</button>
+          <button onclick="runInstitutional()">Institutional Check</button>
+          <button class="secondary" onclick="restartFeeds()">Restart Feeds</button>
+          <button class="ghost" onclick="clearLastError()">Clear Error</button>
+        </div>
+
+        <div class="hr"></div>
+
+        <div style="font-weight:900;font-size:14px;">Startup Wizard</div>
+        <div class="muted" id="wizardMsg">Click Start to begin. This shows progress in operator language.</div>
+        <div class="bar" style="margin-top:10px;"><div id="wizardBar"></div></div>
+        <div id="wizardSteps" style="margin-top:10px;"></div>
+
+        <div class="hr"></div>
+
+        <div style="font-weight:900;font-size:14px;">Readiness</div>
+        <div class="muted">Consolidated preflight. Fix ERR items before running TRADING.</div>
+        <div class="issues" id="readinessIssues"></div>
+
+        <div class="hr"></div>
+
+        <div style="font-weight:900;font-size:14px;">Institutional Validation</div>
+        <div class="muted">Requires: backend healthy + telemetry changing (data flowing).</div>
+        <div class="issues" id="institutionalIssues"></div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Configuration + Secrets</div>
+            <div class="sectionSub">Environment settings and encrypted secrets.</div>
+          </div>
+        </div>
+
+        <div class="configGrid" style="margin-top:12px;">
+          <div>
+            <div class="titleRow">
+              <div>
+                <div style="font-weight:900;font-size:14px;">Configuration (.env)</div>
+                <div class="muted">Edits are validated and normalized (typed ports/booleans).</div>
+              </div>
+              <div class="row tight">
+                <button class="ghost" onclick="validateConfig()">Validate</button>
+                <button onclick="saveConfig()">Save</button>
+                <button class="danger" onclick="factoryReset()">Factory Reset</button>
+              </div>
+            </div>
+            <textarea id="configArea" spellcheck="false"></textarea>
+            <div class="muted" id="configMsg" style="margin-top:10px;"></div>
+          </div>
+
+          <div>
+            <div class="titleRow">
+              <div>
+                <div style="font-weight:900;font-size:14px;">Secrets (encrypted at rest)</div>
+                <div class="muted">Keys are stored AES-256-GCM (host-derived key). Values are never shown.</div>
+              </div>
+              <button class="ghost" onclick="loadSecrets()">Refresh</button>
+            </div>
+
+            <div class="miniCard" style="margin-top:12px;">
+              <div class="miniCardTitle">Existing Keys</div>
+              <div class="miniCardValue" id="secretKeys">—</div>
+            </div>
+
+            <div class="miniCard" style="margin-top:12px;">
+              <div class="miniCardTitle">Add / Update Secret</div>
+              <input id="secretKey" placeholder="Key (e.g. IBKR_PASSWORD)"/>
+              <input id="secretValue" placeholder="Value" style="margin-top:8px;"/>
+              <div style="margin-top:14px;">
+                <button onclick="saveSecret()">Save Secret</button>
+              </div>
+              <div class="muted" id="secretsMsg" style="margin-top:10px;"></div>
+            </div>
+
+            <div class="miniCard" style="margin-top:12px;">
+              <div class="titleRow">
+                <div>
+                  <div class="miniCardTitle">Data Source Setup Lives On One Page</div>
+                  <div class="muted">Use the DB-backed Data Sources Control Center for provider credentials, provider settings, testing, enable/disable, and credential recovery.</div>
+                </div>
+              </div>
+              <div class="muted" style="margin-top:12px;">This operator page no longer acts as a second configuration system for feed setup.</div>
+              <div class="row tight" style="margin-top:12px;">
+                <a class="ghost" id="sourceControlLink" href="http://127.0.0.1:8000/ui/data_sources.html" target="_blank" rel="noopener">Open Data Sources Control Center</a>
+              </div>
+              <div class="muted" id="feedConfigMsg" style="margin-top:10px;">Use that page as the single source of truth for this functional area.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div class="stack">
+
+      <div class="card" id="healthCard">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">System Health</div>
+            <div class="sectionSub">Backend health API snapshot.</div>
+          </div>
+          <button class="ghost" onclick="viewHealth()">Refresh</button>
+        </div>
+        <pre id="healthView">(loading…)</pre>
+      </div>
+
+      <div class="card" id="marketCard" style="display:none;">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Market Data</div>
+            <div class="sectionSub">Live feed verification and candle snapshot.</div>
+          </div>
+          <button class="ghost" onclick="viewMarket()">Refresh</button>
+        </div>
+        <pre id="marketView">(loading…)</pre>
+      </div>
+
+      <div class="card" id="strategyCard" style="display:none;">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Strategy Decisions</div>
+            <div class="sectionSub">Strategy validation output.</div>
+          </div>
+          <button class="ghost" onclick="viewStrategy()">Refresh</button>
+        </div>
+        <pre id="strategyView">(loading…)</pre>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Trading Monitor</div>
+            <div class="sectionSub">Live positions, orders, fills, risk and PnL.</div>
+          </div>
+          <button class="ghost" onclick="renderTradingMonitor()">Refresh</button>
+        </div>
+        <pre id="tradingMonitor">(loading…)</pre>
+      </div>
+
+      <div class="card">
+  <div class="titleRow">
+    <div>
+      <div class="sectionTitle">Trade Blotter</div>
+      <div class="sectionSub">Recent executed trades.</div>
+    </div>
+    <button class="ghost" onclick="renderTradeBlotter()">Refresh</button>
+  </div>
+
+  <pre id="tradeBlotter">(loading…)</pre>
+</div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Operator Workflow</div>
+            <div class="sectionSub">Non-technical control actions for start, health, data, strategy, stop, and restart.</div>
+          </div>
+          <div class="row">
+            <button onclick="guidedBootstrap()">Start System Setup</button>
+            <button class="ghost" onclick="viewHealth()">View Health</button>
+            <button class="ghost" onclick="viewMarket()">View Market Data</button>
+            <button class="ghost" onclick="viewStrategy()">View Strategy Decisions</button>
+            <button class="secondary" onclick="restartFeeds()">Restart Feeds</button>
+            <button class="secondary" onclick="restartEngine()">Restart Engine</button>
+            <button class="danger" onclick="emergencyStopHard()">Emergency Stop</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Bootstrap Snapshot</div>
+            <div class="sectionSub">Operator + engine bootstrap diagnostic.</div>
+          </div>
+          <div class="row">
+            <button class="ghost" onclick="loadBootstrap()">Refresh</button>
+            <button class="ghost" onclick="copySnapshot('quick')">Copy Snapshot</button>
+          </div>
+        </div>
+        <details>
+          <summary>Advanced Bootstrap Diagnostics</summary>
+          <pre id="bootstrap">(loading…)</pre>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="titleRow">
+          <div>
+            <div class="sectionTitle">Runtime Logs</div>
+            <div class="sectionSub">Engine, operator, backup, or upgrade log tail.</div>
+          </div>
+          <div class="row">
+            <select id="logService" onchange="loadLogs()">
+              <option value="">runtime.log</option>
+              <option value="engine">engine.service</option>
+              <option value="operator">operator.service</option>
+              <option value="backup">backup.service</option>
+              <option value="upgrade">upgrade.service</option>
+            </select>
+            <button class="ghost" onclick="loadLogs()">Refresh</button>
+            <button class="ghost" onclick="copyLogs()">Copy</button>
+          </div>
+        </div>
+        <pre id="logs">(loading…)</pre>
+      </div>
+
+    </div>
+
+  </div>
+
+<script type="module">
+/**
+ * Trading Engine Operator Panel
+ *
+ * Maintenance notes:
+ * - Keep all DOM ids unique. Many helper functions depend on exact ids.
+ * - Original functions preserved:
+ *   updateSummary, esc, jget, jpost, setPill, renderIssues, renderModePanels,
+ *   setMode, updateDashboardLink, renderWizard, updateStatusAndReadiness,
+ *   runInstitutional, loadBootstrap, loadConfig, validateConfig, saveConfig,
+ *   loadLogs, loadSecrets, saveSecret, preflight, start, guidedBootstrap,
+ *   renderPipeline, renderMetrics, viewHealth, viewMarket, viewStrategy,
+ *   restartFeeds, restartEngine, emergencyStopHard, stop, restart,
+ *   repairSystem, clearLastError, factoryReset, refreshAll, copyLogs,
+ *   buildSnapshotBundle, copySnapshot, renderOperatorAction,
+ *   autoRemediationCheck, _runRefreshAll, _scheduleRefreshAll.
+ * - Added functions:
+ *   renderTradingMonitor, renderConnectionStatus, renderIngestionWatchdog,
+ *   renderTrainingProgress, updatePnlSummary.
+ */
+
+import {
+  summarizeRuntimeStatus,
+  unwrapHealthResponse
+} from "/ui/runtime_status_summary.js";
+import {
+  buildOperatorHealthPanelItems,
+  buildStartupDiagnostics,
+  asNumber,
+  formatAgeSeconds,
+  safeArray
+} from "/ui/runtime_diagnostics.js";
+
+const OPERATOR_BRIDGE_PREFIX = (() => {
+  const path = String(location.pathname || "");
+  if (path === "/operator" || path === "/operator/" || path === "/operator_ui.html") return "/operator";
+  if (path.startsWith("/operator/")) return "/operator";
+  return "";
+})();
+
+const OPERATOR_DIRECT_ORIGIN = (() => {
+  try {
+    const explicit = String(window.OPERATOR_DIRECT_ORIGIN || "").trim();
+    if (explicit) return new URL(explicit).origin;
+  } catch {}
+  return "http://127.0.0.1:4001";
+})();
+
+function operatorBridgeUrl(url){
+  const raw = String(url || "");
+  if(!OPERATOR_BRIDGE_PREFIX) return raw;
+  if(raw.startsWith("/api/")) return `${OPERATOR_BRIDGE_PREFIX}${raw}`;
+  if(raw.startsWith("api/")) return `${OPERATOR_BRIDGE_PREFIX}/${raw}`;
+  return raw;
+}
+
+function operatorTelemetryWsUrl(){
+  if(OPERATOR_BRIDGE_PREFIX){
+    const direct = new URL(OPERATOR_DIRECT_ORIGIN);
+    direct.protocol = direct.protocol === "https:" ? "wss:" : "ws:";
+    direct.pathname = "/ws/operator";
+    direct.search = "";
+    direct.hash = "";
+    return direct.toString();
+  }
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${location.host}/ws/operator`;
+}
+
+let selectedMode = "safe"; // safe | shadow | live
+
+// --------------------------------------------------
+// LIVE TELEMETRY STREAM
+// --------------------------------------------------
+let _telemetrySocket = null;
+
+function startTelemetryStream(){
+
+  if(_telemetrySocket) return;
+
+  try{
+
+    const url = operatorTelemetryWsUrl();
+
+    _telemetrySocket = new WebSocket(url);
+setPill(document.getElementById("dotHealth"), "ok");
+
+    _telemetrySocket.onmessage = (ev)=>{
+      try{
+        const msg = JSON.parse(ev.data);
+
+        if(msg.type === "health_update"){
+          document.getElementById("healthView").innerText =
+            JSON.stringify(msg.payload, null, 2);
+        }
+
+        if(msg.type === "trading_update"){
+          document.getElementById("tradingMonitor").innerText =
+            JSON.stringify(msg.payload, null, 2);
+        }
+
+        if(msg.type === "pnl_update"){
+          updatePnlSummary(msg.payload);
+        }
+
+      }catch(e){
+        console.warn("telemetry parse error", e);
+      }
+    };
+
+_telemetrySocket.onclose = ()=>{
+
+  console.warn("[WATCHDOG] telemetry websocket disconnected");
+
+  setPill(document.getElementById("dotHealth"), "warn");
+  document.getElementById("txtHealth").innerText = "Health: telemetry reconnecting";
+
+  _telemetrySocket = null;
+
+  setTimeout(startTelemetryStream, 3000);
+
+};
+
+  }catch(e){
+    console.warn("telemetry stream failed", e);
+  }
+}
+
+function renderMetricCard(label, value){
+  return `
+    <div class="metricCard">
+      <div class="metricLabel">${esc(label)}</div>
+      <div class="metricValue">${esc(String(value))}</div>
+    </div>
+  `;
+}
+
+function renderPanelItem(label, value, state){
+  const cls = state === "ok" ? "ok" : (state === "fail" ? "fail" : "warn");
+  return `
+    <div class="panelItem">
+      <span class="dot ${cls}"></span>
+      <span>${esc(label)}</span>
+      <span class="muted">${esc(String(value))}</span>
+    </div>
+  `;
+}
+
+async function updateSummary(){
+  let r = null;
+
+  try{
+    r = await jget("/api/operator_summary");
+
+    if(!r || !r.ok){
+      renderOperatorAction(r);
+      return;
+    }
+
+    document.getElementById("systemStateBig").innerText = r.state || "UNKNOWN";
+    document.getElementById("systemStateDetail").innerText = r.meaning || "";
+    document.getElementById("summaryHeadline").innerText = r.headline || "";
+    document.getElementById("summaryMeaning").innerText = r.meaning || "";
+    document.getElementById("summaryAction").innerText = r.recommended_action || "";
+    document.getElementById("summaryStateLine").innerText = `System state: ${r.state}`;
+
+    const card = document.getElementById("summaryCard");
+    const dot = document.getElementById("dotState");
+    const txt = document.getElementById("txtState");
+
+    dot.className = "dot";
+
+    if(r.severity === "ok"){
+      card.style.borderLeft = "6px solid #16a34a";
+      dot.classList.add("ok");
+      txt.innerText = "State: Ready";
+    }
+    else if(r.severity === "warn"){
+      card.style.borderLeft = "6px solid #f59e0b";
+      dot.classList.add("warn");
+      txt.innerText = "State: Attention required";
+    }
+    else if(r.severity === "error"){
+      card.style.borderLeft = "6px solid #dc2626";
+      dot.classList.add("fail");
+      txt.innerText = "State: System error";
+    }
+    else{
+      card.style.borderLeft = "6px solid #2563eb";
+      txt.innerText = "State: Starting";
+    }
+
+  }catch(e){
+    console.warn("summary error", e);
+  }
+
+  renderOperatorAction(r);
+}
+
+function esc(s){
+  return String(s ?? "")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;");
+}
+
+async function jget(url, timeoutMs = DEFAULT_GET_TIMEOUT_MS){
+  return await fetchJson(url, { timeoutMs });
+}
+
+async function jgetWithTimeout(url, timeoutMs = 8000){
+  return await fetchJson(url, { timeoutMs });
+}
+
+async function jpost(url, body, timeoutMs = DEFAULT_POST_TIMEOUT_MS){
+  return await fetchJson(url, {
+    method:"POST",
+    body,
+    timeoutMs
+  });
+}
+
+const DEFAULT_GET_TIMEOUT_MS = 8000;
+const DEFAULT_POST_TIMEOUT_MS = 15000;
+const CORE_REFRESH_MS = 5000;
+const PANEL_REFRESH_MS = 15000;
+const DETAIL_REFRESH_MS = 30000;
+const OPERATOR_AUTO_ACTIONS_ENABLED = false;
+
+async function fetchJson(url, options = {}){
+  const method = String(options.method || "GET").toUpperCase();
+  const timeoutMs = Number(options.timeoutMs || (method === "POST" ? DEFAULT_POST_TIMEOUT_MS : DEFAULT_GET_TIMEOUT_MS));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try{
+    const init = {
+      method,
+      cache:"no-store",
+      signal: controller.signal
+    };
+    if(method !== "GET"){
+      init.headers = { "Content-Type":"application/json" };
+      init.body = JSON.stringify(options.body || {});
+    }
+
+    const r = await fetch(operatorBridgeUrl(url), init);
+    const text = await r.text();
+    let payload = {};
+
+    if(text){
+      try{
+        payload = JSON.parse(text);
+      }catch(e){
+        return {
+          ok:false,
+          error:"invalid_json_response",
+          detail:String(e),
+          response_text: text.slice(0, 1000),
+          meta:{ status:r.status }
+        };
+      }
+    }
+
+    if(!payload || typeof payload !== "object"){
+      payload = { value: payload };
+    }
+
+    const meta = (payload.meta && typeof payload.meta === "object") ? { ...payload.meta } : {};
+    meta.status = Number(meta.status || r.status || 0);
+    payload.meta = meta;
+
+    if(!Object.prototype.hasOwnProperty.call(payload, "ok")){
+      payload.ok = r.ok;
+    }
+    if(!r.ok && !payload.error){
+      payload.error = `http_${r.status}`;
+    }
+
+    return payload;
+  }catch(e){
+    return {
+      ok:false,
+      error: e && e.name === "AbortError" ? "request_timeout" : "request_failed",
+      detail:String(e),
+      meta:{ status: e && e.name === "AbortError" ? 504 : 0 }
+    };
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+function setPill(dotEl, state){
+  dotEl.className = "dot";
+  if(state === "ok") dotEl.classList.add("ok");
+  if(state === "warn") dotEl.classList.add("warn");
+  if(state === "fail") dotEl.classList.add("fail");
+}
+
+function renderIssues(container, issues){
+  container.innerHTML = "";
+
+  if(!issues || issues.length === 0){
+    const el = document.createElement("div");
+    el.className = "issue";
+    el.innerHTML = `<span class="badge info">OK</span><div class="issueText">No issues detected.</div>`;
+    container.appendChild(el);
+    return;
+  }
+
+  for(const it of issues){
+    const el = document.createElement("div");
+    el.className = "issue";
+    const cls = it.level === "error" ? "err" : (it.level === "warn" ? "warn" : "info");
+    const code = it.code ? String(it.code) : "issue";
+    const msg = it.message ? String(it.message) : "";
+    el.innerHTML = `<span class="badge ${cls}">${esc(String(it.level || "info")).toUpperCase()}</span><div class="issueText"><b>${esc(code)}</b>: ${esc(msg)}</div>`;
+    container.appendChild(el);
+  }
+}
+
+function renderModePanels(mode){
+  const healthCard = document.getElementById("healthCard");
+  const marketCard = document.getElementById("marketCard");
+  const strategyCard = document.getElementById("strategyCard");
+
+  if(healthCard) healthCard.style.display = (mode === "safe") ? "block" : "none";
+  if(marketCard) marketCard.style.display = (mode === "shadow") ? "block" : "none";
+  if(strategyCard) strategyCard.style.display = (mode === "live") ? "block" : "none";
+}
+
+function setMode(mode){
+  selectedMode = mode;
+  document.getElementById("modeSafe").classList.toggle("active", mode === "safe");
+  document.getElementById("modeShadow").classList.toggle("active", mode === "shadow");
+  document.getElementById("modeLive").classList.toggle("active", mode === "live");
+  renderModePanels(mode);
+
+  if(mode === "safe") viewHealth();
+  if(mode === "shadow") viewMarket();
+  if(mode === "live") viewStrategy();
+}
+
+async function updateDashboardLink(){
+  try{
+    const cfg = await jget("/api/operator/config");
+    let host = cfg.DASHBOARD_HOST || "127.0.0.1";
+    const port = cfg.DASHBOARD_PORT || 8000;
+
+    host = String(host || "").trim() || "127.0.0.1";
+    if(host === "0.0.0.0") host = "127.0.0.1";
+    if(host.toLowerCase() === "localhost") host = "127.0.0.1";
+    const url = new URL(`http://${host}:${port}/ui/dashboard.html`);
+    const params = new URLSearchParams(window.location.search || "");
+    const symbol = String(params.get("symbol") || "").trim().toUpperCase();
+    const screen = String(params.get("screen") || "").trim().toLowerCase();
+    const decisionId = String(params.get("decision_id") || "").trim();
+    const advisoryId = String(params.get("advisory_id") || "").trim();
+    if(symbol) url.searchParams.set("symbol", symbol);
+    if(screen) url.searchParams.set("screen", screen);
+    if(decisionId) url.searchParams.set("decision_id", decisionId);
+    if(advisoryId) url.searchParams.set("advisory_id", advisoryId);
+    document.getElementById("dashLink").href = url.toString();
+    const sourceControl = new URL(`http://${host}:${port}/ui/data_sources.html`);
+    document.getElementById("sourceControlLink").href = sourceControl.toString();
+  }catch{
+    document.getElementById("dashLink").href = "#";
+    const sourceLink = document.getElementById("sourceControlLink");
+    if(sourceLink) sourceLink.href = "http://127.0.0.1:8000/ui/data_sources.html";
+  }
+}
+
+function renderLaunchContext(){
+  const pill = document.getElementById("launchContextPill");
+  if(!pill) return;
+  try{
+    const params = new URLSearchParams(window.location.search || "");
+    const symbol = String(params.get("symbol") || "").trim().toUpperCase();
+    const screen = String(params.get("screen") || "").trim().toLowerCase();
+    const focus = String(params.get("focus") || "").trim().toLowerCase();
+    const decisionId = String(params.get("decision_id") || "").trim();
+    const advisoryId = String(params.get("advisory_id") || "").trim();
+    const parts = [];
+    if(symbol) parts.push(`symbol ${symbol}`);
+    if(screen) parts.push(`screen ${screen}`);
+    if(focus) parts.push(`focus ${focus}`);
+    if(decisionId) parts.push(`decision ${decisionId}`);
+    if(advisoryId) parts.push(`advisory ${advisoryId}`);
+    if(!parts.length){
+      pill.style.display = "none";
+      return;
+    }
+    pill.style.display = "inline-flex";
+    pill.textContent = `Context: ${parts.join(" • ")}`;
+  }catch{
+    pill.style.display = "none";
+  }
+}
+
+function renderWizard(steps, ok){
+  const box = document.getElementById("wizardSteps");
+  box.innerHTML = "";
+
+  if(!steps || steps.length === 0){
+    document.getElementById("wizardBar").style.width = "0%";
+    document.getElementById("wizardMsg").innerText = "Click Start to begin.";
+    return;
+  }
+
+  let done = 0;
+  for(const s of steps){
+    if(s && s.ok) done += 1;
+  }
+
+  const pct = Math.round((done / steps.length) * 100);
+  document.getElementById("wizardBar").style.width = `${pct}%`;
+
+  if(ok){
+    document.getElementById("wizardMsg").innerText = "Startup complete.";
+  }else{
+    document.getElementById("wizardMsg").innerText =
+      "Some startup checks failed. The engine may still be running — inspect steps below.";
+  }
+
+  const map = {
+    entry: "Checking system files",
+    python: "Checking Python runtime",
+    port: "Checking dashboard port",
+    db: "Checking database access",
+    config: "Checking configuration",
+    spawn: "Starting trading engine",
+    bind_wait: "Waiting for engine startup",
+    health: "Verifying system health",
+    telemetry: "Waiting for market data"
+  };
+
+  for(const s of steps){
+    const el = document.createElement("div");
+    el.className = "stepLine";
+    const dot = s.ok ? "ok" : "fail";
+    let title = s.label || s.id || "step";
+    if(map[s.id]) title = map[s.id];
+
+    let detail = s.detail;
+    if(typeof detail === "object") detail = JSON.stringify(detail, null, 2);
+
+    el.innerHTML = `
+      <span class="dot ${dot}"></span>
+      <div>
+        <b>${esc(title)}</b>
+        <div class="stepDetail">${esc(detail || "")}</div>
+      </div>
+    `;
+    box.appendChild(el);
+  }
+}
+
+async function updateStatusAndReadiness(){
+  const st = await jget("/api/operator/status");
+  const rd = await jget("/api/operator/readiness");
+  const summary = summarizeRuntimeStatus({
+    healthPayload: rd && rd.health ? rd.health : null,
+    readinessPayload: rd,
+    engineStatus: st
+  });
+
+  document.getElementById("metaLine").innerText =
+    `Mode: ${st.lastMode || selectedMode} | Exit: ${st.lastExitCode ?? "N/A"} | Restarts: ${st.restartAttempts ?? 0} | Last Healthy: ${st.lastHealthyAt ?? "N/A"}${rd && rd.currentBlocker && rd.currentBlocker.message ? ` | Blocker: ${rd.currentBlocker.message}` : ""}`;
+
+  document.getElementById("txtStatus").innerText = `Engine: ${st.status}`;
+  setPill(document.getElementById("dotStatus"), st.status === "RUNNING" ? "ok" : (st.status === "INSTALLING" ? "warn" : "fail"));
+
+  document.getElementById("txtHealth").innerText = summary.indicators.health.text;
+  setPill(document.getElementById("dotHealth"), summary.indicators.health.state);
+
+  renderIssues(document.getElementById("readinessIssues"), rd.issues || []);
+
+  document.getElementById("txtData").innerText = summary.indicators.data.text;
+  setPill(document.getElementById("dotData"), summary.indicators.data.state);
+}
+
+async function runInstitutional(){
+  const j = await jget("/api/operator/institutionalCheck");
+
+  const issues = [];
+  if(!j.configValid) issues.push({ level:"error", code:"CONFIG_INVALID", message:"Invalid .env (typed validation failed)" });
+  if(!j.entryExists) issues.push({ level:"error", code:"ENTRY_MISSING", message:"Missing start_system.py" });
+  if(!j.dbPathWritable) issues.push({ level:"warn", code:"DB_NOT_WRITABLE", message:"DB directory not writable" });
+  if(!j.healthOk) issues.push({ level:"error", code:"HEALTH_FAIL", message:"Backend not healthy (/api/health)" });
+  if(!j.dataFlowing) issues.push({ level:"error", code:"DATA_NOT_FLOWING", message:"Telemetry did not change (data not flowing)" });
+  for(const e of (j.errors || [])){
+    issues.push({ level:"info", code:"DETAIL", message:String(e) });
+  }
+
+  renderIssues(document.getElementById("institutionalIssues"), issues);
+
+  if(j.ok){
+    document.getElementById("txtData").innerText = "Data: FLOWING";
+    setPill(document.getElementById("dotData"), "ok");
+  }else{
+    document.getElementById("txtData").innerText = "Data: NOT READY";
+    setPill(document.getElementById("dotData"), "fail");
+  }
+}
+
+async function loadBootstrap(){
+  const b = await jget("/api/operator/bootstrapStatus");
+  const s = await jget("/api/operator/status");
+  document.getElementById("bootstrap").innerText = JSON.stringify({ bootstrap:b, state:s }, null, 2);
+}
+
+async function loadConfig(){
+  const obj = await jget("/api/operator/config");
+  const text = Object.entries(obj).map(([k,v]) => `${k}=${v}`).join("\n");
+  document.getElementById("configArea").value = text;
+  document.getElementById("configMsg").innerText = "—";
+  await updateDashboardLink();
+}
+
+async function validateConfig(){
+  const r = await jget("/api/operator/config/validate");
+  if(r.ok){
+    document.getElementById("configMsg").innerText = "Config OK (typed normalization applied on Save).";
+  }else{
+    document.getElementById("configMsg").innerText = "Config has errors. Fix and Save again.";
+  }
+}
+
+async function saveConfig(){
+  const lines = document.getElementById("configArea").value.split("\n");
+  const obj = {};
+
+  for(const line of lines){
+    const trimmed = line.trim();
+    if(!trimmed || trimmed.startsWith("#")) continue;
+    const idx = trimmed.indexOf("=");
+    if(idx === -1) continue;
+    const k = trimmed.slice(0, idx).trim();
+    const v = trimmed.slice(idx + 1).trim();
+    if(k) obj[k] = v;
+  }
+
+  const r = await jpost("/api/operator/config", obj);
+
+  if(r.ok){
+    document.getElementById("configMsg").innerText = "Saved OK.";
+    await loadConfig();
+  }else{
+    document.getElementById("configMsg").innerText = "Save failed (validation errors). Check readiness list.";
+  }
+
+  await refreshAll();
+}
+
+async function loadLogs(){
+  const sel = document.getElementById("logService");
+  const service = sel ? String(sel.value || "").trim() : "";
+  const url = service
+    ? `/api/operator/logs?service=${encodeURIComponent(service)}`
+    : "/api/operator/logs";
+
+  const r = await jget(url, 15000);
+  const text = (r && typeof r.logs === "string")
+    ? r.logs
+    : JSON.stringify(r || { ok:false, error:"logs_unavailable" }, null, 2);
+  document.getElementById("logs").innerText = text || "(no logs yet)";
+}
+
+async function loadSecrets(){
+  const r = await jget("/api/operator/secrets");
+  document.getElementById("secretKeys").innerText = (r.keys || []).join(", ") || "—";
+}
+
+async function saveSecret(){
+  const key = document.getElementById("secretKey").value.trim();
+  const val = document.getElementById("secretValue").value;
+
+  if(!key || !val){
+    document.getElementById("secretsMsg").innerText = "Provide key + value.";
+    return;
+  }
+
+  const r = await jpost("/api/operator/secrets", { [key]: val });
+  document.getElementById("secretKey").value = "";
+  document.getElementById("secretValue").value = "";
+  document.getElementById("secretsMsg").innerText = (r && r.ok) ? "Saved." : "Failed.";
+  await loadSecrets();
+}
+
+async function preflight(){
+  try{
+    renderWizard([{ ok:false, label:"Preflight…", detail:"checking entry, python, port, db, config" }], false);
+
+    const r = await jget(`/api/operator/preflight?mode=${encodeURIComponent(selectedMode)}`);
+    const steps = [];
+
+    if(r && Array.isArray(r.checks)){
+      for(const c of r.checks){
+        steps.push({
+          ok: !!c.ok,
+          label: c.label || c.id || "check",
+          detail: (typeof c.details === "string") ? c.details : JSON.stringify(c.details || "", null, 2)
+        });
+      }
+    }else{
+      steps.push({ ok:false, label:"Preflight failed", detail: JSON.stringify(r || {}, null, 2) });
+    }
+
+    renderWizard(steps, !!(r && r.ok));
+    await refreshAll();
+  }catch(e){
+    renderWizard([{ ok:false, label:"Preflight exception", detail:String(e) }], false);
+  }
+}
+
+async function start(){
+  const request = { mode:selectedMode };
+  if(selectedMode === "live"){
+    const c = prompt("TRADING mode enables real execution.\nType TRADE to confirm:");
+    if(c !== "TRADE") return;
+    request.confirm = "TRADE";
+  }
+
+  renderWizard([{ ok:false, label:"Starting…", detail:"sending start request" }], false);
+
+  const r = await jpost("/api/operator/start", request);
+
+  if(r && r.steps){
+    renderWizard(r.steps, !!r.ok);
+  }else{
+    renderWizard([{ ok:false, label:"Start failed", detail: JSON.stringify(r || {}, null, 2) }], false);
+  }
+
+  await refreshAll();
+}
+
+async function guidedBootstrap(){
+  const request = { mode:selectedMode };
+  if(selectedMode === "live"){
+    const c = prompt("TRADING mode enables real execution.\nType TRADE to confirm:");
+    if(c !== "TRADE") return;
+    request.confirm = "TRADE";
+  }
+
+  renderWizard([{ ok:false, label:"System setup…", detail:"starting automated operator workflow" }], false);
+
+  const r = await jpost("/api/operator/guided_bootstrap", request, 180000);
+
+  if(r && Array.isArray(r.steps)){
+    renderWizard(r.steps, !!r.ok);
+  }else{
+    renderWizard([{ ok:false, label:"System setup failed", detail: JSON.stringify(r || {}, null, 2) }], false);
+  }
+
+  await refreshAll();
+}
+
+async function renderPipeline(){
+  try{
+    const countsRes = await jget("/api/operator/bootstrap_counts");
+    const counts = (countsRes && countsRes.counts) ? countsRes.counts : {};
+
+    const healthRes = await jget("/api/operator/health");
+    const body = unwrapHealthResponse(healthRes);
+
+    const steps = [
+      { label:"Universe", ok: asNumber(counts.symbols) > 0, detail:`symbols=${asNumber(counts.symbols)}` },
+      { label:"Prices", ok: asNumber(counts.prices) > 0 || !!(body.prices && body.prices.ok), detail:`prices=${asNumber(counts.prices)} age=${formatAgeSeconds(body.prices?.age_s)}` },
+      { label:"Providers", ok: asNumber(counts.price_provider_health) > 0 || !!(body.providers && body.providers.ok), detail:`providers=${asNumber(body.providers?.healthy)} / ${asNumber(body.providers?.total)}` },
+      { label:"Events", ok: asNumber(counts.events) > 0 || !!(body.events && body.events.ok), detail:`events=${asNumber(counts.events)} age=${formatAgeSeconds(body.events?.age_s)}` },
+      { label:"Labels", ok: asNumber(counts.labels) > 0 || !!(body.labels && body.labels.ok), detail:`labels=${asNumber(counts.labels)}` },
+      { label:"Model", ok: asNumber(counts.model_registry) > 0 || !!(body.model && body.model.ok), detail:`models=${asNumber(counts.model_registry)} support=${asNumber(body.model?.support_n)}` },
+      { label:"Execution", ok: !!(body.execution_barrier && body.execution_barrier.allowed), detail:`reason=${body.execution_barrier?.reason || "not_ready"}` }
+    ];
+
+    const html = steps.map((p) => {
+      const cls = p.ok ? "ok" : "warn";
+      return `
+        <div class="panelItem">
+          <span class="dot ${cls}"></span>
+          <span>${esc(p.label)}</span>
+          <span class="muted">${esc(p.detail)}</span>
+        </div>
+      `;
+    }).join("");
+
+    document.getElementById("startupPipeline").innerHTML = html;
+  }catch(e){
+    document.getElementById("startupPipeline").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+  }
+}
+
+async function renderMetrics(){
+  try{
+    const r = await jget("/api/operator/bootstrap_counts");
+    const c = (r && r.counts) ? r.counts : {};
+
+    document.getElementById("runtimeMetrics").innerHTML = [
+      renderMetricCard("Symbols", asNumber(c.symbols)),
+      renderMetricCard("Prices", asNumber(c.prices)),
+      renderMetricCard("Quotes", asNumber(c.price_quotes)),
+      renderMetricCard("Providers", asNumber(c.price_provider_health)),
+      renderMetricCard("Events", asNumber(c.events)),
+      renderMetricCard("Labels", asNumber(c.labels)),
+      renderMetricCard("Model Metrics", asNumber(c.model_metrics)),
+      renderMetricCard("Models", asNumber(c.model_registry))
+    ].join("");
+  }catch(e){
+    document.getElementById("runtimeMetrics").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+  }
+}
+
+async function renderOperatorHealthPanels(){
+  try{
+    const [health, readiness, services, watchdogs, providers, supervisor] = await Promise.all([
+      jgetWithTimeout("/api/operator/system_health", 8000),
+      jgetWithTimeout("/api/operator/trading_readiness", 8000),
+      jgetWithTimeout("/api/operator/service_status", 8000),
+      jgetWithTimeout("/api/operator/runtime_watchdogs", 8000),
+      jgetWithTimeout("/api/operator/provider_telemetry", 8000),
+      jgetWithTimeout("/api/operator/supervisor_diagnostics", 8000)
+    ]);
+
+    const html = buildOperatorHealthPanelItems({
+      health,
+      readiness,
+      services,
+      watchdogs,
+      providers,
+      supervisor
+    }).map((item) => renderPanelItem(item.label, item.value, item.state)).join("");
+
+    document.getElementById("operatorHealthPanels").innerHTML = html;
+  }catch(e){
+    document.getElementById("operatorHealthPanels").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+  }
+}
+
+async function renderConnectionStatus(){
+  try{
+    const r = await jget("/api/operator/health");
+    const h = unwrapHealthResponse(r);
+
+    if(h.broker_connection && !h.broker_connection.ok){
+
+  console.warn("Broker connection lost");
+
+  document.getElementById("txtState").innerText =
+    "State: Broker disconnected";
+
+  setPill(document.getElementById("dotState"), "warn");
+
+}
+
+    const html = [
+      renderPanelItem("Broker Connection", h.broker_connection?.state || "unknown", h.broker_connection?.ok ? "ok" : "warn"),
+      renderPanelItem("Execution Barrier", h.execution_barrier?.allowed ? "allowed" : (h.execution_barrier?.reason || "blocked"), h.execution_barrier?.allowed ? "ok" : "warn"),
+      renderPanelItem("Execution Supervisor", h.execution_supervisor?.state || "unknown", h.execution_supervisor?.ok ? "ok" : "warn"),
+      renderPanelItem("Providers", `${asNumber(h.providers?.healthy)} / ${asNumber(h.providers?.total)}`, h.providers?.ok ? "ok" : "warn"),
+      renderPanelItem("Portfolio", `positions=${asNumber(h.portfolio?.positions)}`, h.portfolio?.ok ? "ok" : "warn")
+    ].join("");
+
+    document.getElementById("connectionStatus").innerHTML = html;
+  }catch(e){
+    document.getElementById("connectionStatus").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+  }
+}
+
+async function renderIngestionWatchdog(){
+  try{
+    const r = await jget("/api/operator/health");
+    const h = unwrapHealthResponse(r);
+const priceAge = Number(h.prices?.age_s || 9999);
+const priceStale = priceAge > 60;
+    const html = [
+      renderPanelItem(
+  "Prices",
+  `age=${formatAgeSeconds(h.prices?.age_s)}`,
+  (h.prices?.ok && Number(h.prices?.age_s || 0) < 60) ? "ok" : "fail"
+),
+      renderPanelItem("Events", `age=${formatAgeSeconds(h.events?.age_s)}`, h.events?.ok ? "ok" : "fail"),
+      renderPanelItem("Event Log", `age=${formatAgeSeconds(h.event_log?.age_s)} count=${asNumber(h.event_log?.count)}`, h.event_log?.ok ? "ok" : "warn"),
+      renderPanelItem("Jobs", `active=${Object.keys(h.jobs || {}).length}`, h.job_summary?.ok ? "ok" : "warn"),
+      renderPanelItem("Reasons", safeArray(h.reasons).join(", ") || "none", safeArray(h.reasons).length === 0 ? "ok" : "warn"),
+      renderPanelItem("Operator Action", priceStale ? "restart feeds suggested" : "none", priceStale ? "warn" : "ok")
+    ].join("");
+
+    document.getElementById("ingestionWatchdog").innerHTML = html;
+  }catch(e){
+    document.getElementById("ingestionWatchdog").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+  }
+}
+
+// --------------------------------------------------
+// STRATEGY HEATMAP
+// --------------------------------------------------
+async function renderStrategyHeatmap(){
+
+  try{
+
+    const r = await jget("/api/operator/strategy_heatmap");
+
+    if(!r || !r.ok){
+      document.getElementById("strategyHeatmap").innerText =
+        JSON.stringify(r || {error:"no response"}, null, 2);
+      return;
+    }
+
+    const cells = safeArray(r.strategies).map(s => {
+
+      const pnl = Number(s.pnl || 0);
+
+      let state = "warn";
+      if(pnl > 0) state = "ok";
+      if(pnl < 0) state = "fail";
+
+      return renderPanelItem(
+        `${s.name}`,
+        `PnL=${pnl.toFixed(2)}`,
+        state
+      );
+
+    }).join("");
+
+    document.getElementById("strategyHeatmap").innerHTML = cells;
+
+  }catch(e){
+
+    document.getElementById("strategyHeatmap").innerText =
+      JSON.stringify({error:String(e)}, null, 2);
+
+  }
+
+}
+
+async function renderTrainingProgress(){
+  try{
+    const healthRes = await jget("/api/operator/health");
+    const h = unwrapHealthResponse(healthRes);
+    const countRes = await jget("/api/operator/bootstrap_counts");
+    const c = (countRes && countRes.counts) ? countRes.counts : {};
+    const promotionReady = !!h.model?.promotion_ready;
+
+const html = [
+  renderPanelItem("Training Mode", h.training?.mode || "unknown", h.training?.allowed ? "ok" : "warn"),
+  renderPanelItem("Labels", `${asNumber(c.labels)} rows`, h.labels?.ok ? "ok" : "warn"),
+  renderPanelItem("Model Registry", `${asNumber(c.model_registry)} rows`, asNumber(c.model_registry) > 0 ? "ok" : "warn"),
+  renderPanelItem("Model Metrics", `${asNumber(c.model_metrics)} rows`, asNumber(c.model_metrics) > 0 ? "ok" : "warn"),
+  renderPanelItem("Support N", `${asNumber(h.model?.support_n)}`, h.model?.ok ? "ok" : "warn"),
+  renderPanelItem("Promotion Status", h.model?.promotion_state || "idle", promotionReady ? "ok" : "warn"),
+  renderPanelItem("Operator Action", promotionReady ? "promote model available" : "none", promotionReady ? "warn" : "ok")
+];
+
+    document.getElementById("trainingProgress").innerHTML = html;
+  }catch(e){
+    document.getElementById("trainingProgress").innerHTML = `<div class="muted">${esc(String(e))}</div>`;
+  }
+}
+
+async function updatePnlSummary(summary){
+  const pnl = summary?.pnl || {};
+  const day = pnl.day_pnl ?? pnl.daily_pnl ?? pnl.realized_unrealized ?? pnl.total_pnl ?? "n/a";
+  const exposure = summary?.risk?.gross_exposure ?? summary?.risk?.net_exposure ?? "n/a";
+  document.getElementById("pnlSummaryValue").innerText = `PnL: ${day}`;
+  document.getElementById("pnlSummarySub").innerText = `Exposure: ${exposure}`;
+}
+
+// --------------------------------------------------
+// LIVE TRADE BLOTTER
+// --------------------------------------------------
+async function renderTradeBlotter(){
+
+  try{
+
+    const r = await jget("/api/operator/trade_blotter");
+
+    if(!r || !r.ok){
+      document.getElementById("tradeBlotter").innerText =
+        JSON.stringify(r || {error:"no response"}, null, 2);
+      return;
+    }
+
+    const rows = safeArray(r.trades).slice(-50).reverse();
+
+    const html = rows.map(t => `
+      ${esc(t.ts)}  ${esc(t.symbol)}  ${esc(t.side)}  
+      qty=${esc(t.qty)}  price=${esc(t.price)}
+    `).join("\n");
+
+    document.getElementById("tradeBlotter").innerText = html || "(no trades yet)";
+
+  }catch(e){
+
+    document.getElementById("tradeBlotter").innerText =
+      JSON.stringify({error:String(e)}, null, 2);
+
+  }
+
+}
+
+async function renderTradingMonitor(){
+  try{
+    const r = await jget("/api/operator/trading_monitor");
+
+    if(!r || !r.ok){
+      document.getElementById("tradingMonitor").innerText = JSON.stringify(r || { error:"no response" }, null, 2);
+      await updatePnlSummary({});
+      return;
+    }
+
+const summary = {
+  positions: safeArray(r.positions).length,
+  open_orders: safeArray(r.open_orders).length,
+  recent_fills: safeArray(r.recent_fills).length,
+  pnl: r.pnl || {},
+  risk: r.risk || {}
+};
+
+if(summary.risk){
+
+  const dd = Number(summary.risk.max_drawdown_pct || 0);
+  const exposure = Number(summary.risk.gross_exposure || 0);
+  let riskState = null;
+
+  if(dd > 5){
+
+    console.warn("RISK WARNING drawdown", dd);
+
+    document.getElementById("txtState").innerText =
+      `State: Risk warning (${dd.toFixed(2)}%)`;
+
+    setPill(document.getElementById("dotState"), "warn");
+    riskState = `drawdown_warning_${dd.toFixed(2)}pct`;
+  }
+
+  if(dd > 10){
+    console.error("CRITICAL RISK drawdown", dd);
+    riskState = `critical_drawdown_${dd.toFixed(2)}pct`;
+    document.getElementById("txtState").innerText =
+      `State: Critical drawdown (${dd.toFixed(2)}%)`;
+    setPill(document.getElementById("dotState"), "fail");
+  }
+
+  if(exposure > 5_000_000){
+    console.error("EXPOSURE LIMIT EXCEEDED", exposure);
+    riskState = `exposure_limit_${exposure}`;
+    document.getElementById("txtState").innerText =
+      `State: Exposure warning (${exposure.toFixed(0)})`;
+    setPill(document.getElementById("dotState"), "fail");
+  }
+
+  summary.risk_alert = riskState;
+
+}
+    document.getElementById("tradingMonitor").innerText = JSON.stringify(summary, null, 2);
+    await updatePnlSummary(summary);
+  }catch(e){
+    document.getElementById("tradingMonitor").innerText = JSON.stringify({ error:String(e) }, null, 2);
+    await updatePnlSummary({});
+  }
+}
+
+async function viewHealth(){
+  try{
+    const r = await jget("/api/operator/system_health");
+    document.getElementById("healthView").innerText = JSON.stringify(r, null, 2);
+  }catch(e){
+    document.getElementById("healthView").innerText = JSON.stringify({ ok:false, error:String(e) }, null, 2);
+  }
+}
+
+async function viewMarket(){
+  try{
+    const r = await jget("/api/operator/market_data?symbol=SPY&tf=1m&limit=30");
+    document.getElementById("marketView").innerText = JSON.stringify(r, null, 2);
+
+    if(r && r.telemetry){
+      setPill(document.getElementById("dotData"), "ok");
+      document.getElementById("txtData").innerText = "Market data: active";
+    }else{
+      setPill(document.getElementById("dotData"), "warn");
+      document.getElementById("txtData").innerText = "Market data: missing";
+    }
+  }catch(e){
+    document.getElementById("marketView").innerText = JSON.stringify({ ok:false, error:String(e) }, null, 2);
+    setPill(document.getElementById("dotData"), "fail");
+    document.getElementById("txtData").innerText = "Market data: error";
+  }
+}
+
+async function viewStrategy(){
+  try{
+    const r = await jget("/api/operator/strategy_decisions");
+    document.getElementById("strategyView").innerText = JSON.stringify(r, null, 2);
+  }catch(e){
+    document.getElementById("strategyView").innerText = JSON.stringify({ ok:false, error:String(e) }, null, 2);
+  }
+}
+
+async function restartFeeds(){
+  const r = await jpost("/api/operator/restart_feeds");
+  document.getElementById("marketView").innerText = JSON.stringify(r, null, 2);
+  await refreshAll();
+}
+
+async function restartEngine(){
+  const r = await jpost("/api/operator/restart_engine", { mode:selectedMode });
+  if(r && r.ok){
+    renderWizard([{ ok:true, label:"Restart Engine", detail:JSON.stringify(r, null, 2) }], true);
+  }else{
+    renderWizard([{ ok:false, label:"Restart Engine", detail:JSON.stringify(r || {}, null, 2) }], false);
+  }
+  await refreshAll();
+}
+
+async function emergencyStopHard(){
+  if(!confirm("Emergency stop will force SAFE mode and stop the engine. Continue?")) return;
+  const r = await jpost("/api/operator/emergency_stop");
+  if(r && r.ok){
+    renderWizard([{ ok:true, label:"Emergency Stop", detail:JSON.stringify(r, null, 2) }], true);
+  }else{
+    renderWizard([{ ok:false, label:"Emergency Stop", detail:JSON.stringify(r || {}, null, 2) }], false);
+  }
+  await refreshAll();
+}
+
+async function stop(){
+  await jpost("/api/operator/stop");
+  renderWizard([], false);
+  await refreshAll();
+}
+
+async function restart(){
+  await jpost("/api/operator/restart", { mode:selectedMode });
+  renderWizard([{ ok:false, label:"Restarting…", detail:"backend restarting" }], false);
+  await refreshAll();
+}
+
+async function repairSystem(){
+  const r = await jpost("/api/operator/self_repair");
+
+  if(r && Array.isArray(r.steps)){
+    const steps = (r.steps || []).map((s) => ({
+      ok: !!s.ok,
+      label: s.step || s.label || "step",
+      detail: (typeof s.detail === "string") ? s.detail : JSON.stringify(s.detail || s.error || "", null, 2)
+    }));
+    renderWizard(steps, !!r.ok);
+    alert(r.ok ? "Repair: OK" : "Repair: PARTIAL/FAILED (see wizard steps)");
+  }else{
+    alert("Repair: FAILED");
+  }
+
+  await refreshAll();
+}
+
+async function clearLastError(){
+  await jpost("/api/operator/clearLastError");
+  await refreshAll();
+}
+
+async function factoryReset(){
+  if(!confirm("Factory reset deletes .env and secrets and clears operator state. Continue?")) return;
+  await jpost("/api/operator/factoryReset", { confirm:"FACTORY_RESET" });
+  await refreshAll();
+  await loadConfig();
+  await loadSecrets();
+}
+
+let _lastPanelRefreshAt = 0;
+let _lastDetailRefreshAt = 0;
+
+async function refreshAll(force = true){
+  renderLaunchContext();
+
+  await Promise.allSettled([
+    updateSummary(),
+    updateStatusAndReadiness(),
+    loadServiceStatus(),
+    updateDashboardLink()
+  ]);
+
+  const now = Date.now();
+
+  if(force || (now - _lastPanelRefreshAt) >= PANEL_REFRESH_MS){
+    _lastPanelRefreshAt = now;
+    await Promise.allSettled([
+      renderPipeline(),
+      renderMetrics(),
+      renderOperatorHealthPanels(),
+      renderConnectionStatus(),
+      renderIngestionWatchdog(),
+      renderTrainingProgress()
+    ]);
+  }
+
+  if(force || (now - _lastDetailRefreshAt) >= DETAIL_REFRESH_MS){
+    _lastDetailRefreshAt = now;
+    await Promise.allSettled([
+      loadBootstrap(),
+      renderStrategyHeatmap(),
+      renderTradingMonitor(),
+      renderTradeBlotter(),
+      viewHealth(),
+      viewMarket(),
+      viewStrategy()
+    ]);
+  }
+
+  if(force){
+    await loadLogs();
+  }
+}
+
+async function loadServiceStatus(){
+  const panel = document.getElementById("serviceStatusPanel");
+  const msg = document.getElementById("serviceActionMsg");
+
+  if(panel) panel.innerHTML = `<div class="panelItem"><span class="dot warn"></span><span>Loading service status…</span></div>`;
+  if(msg) msg.innerText = "";
+
+  try{
+    const r = await jget("/api/operator/service_status");
+
+    if(!r || r.ok === false){
+      if(panel){
+        panel.innerHTML = `<div class="panelItem"><span class="dot fail"></span><span>Service status unavailable</span><span class="muted">${esc(JSON.stringify(r || {}, null, 2))}</span></div>`;
+      }
+      if(msg) msg.innerText = r && r.error ? `Service status error: ${r.error}` : "Service status unavailable.";
+      return;
+    }
+
+    if(msg){
+      if(r.currentBlocker && r.currentBlocker.message){
+        msg.innerText = `Current blocker: ${r.currentBlocker.message}`;
+      }else if(Array.isArray(r.degradedComponents) && r.degradedComponents.length){
+        msg.innerText = `Degraded: ${r.degradedComponents.join(", ")}`;
+      }else{
+        msg.innerText = "";
+      }
+    }
+
+    if(!r.managed){
+      if(panel){
+        panel.innerHTML = `
+          <div class="panelItem">
+            <span class="dot warn"></span>
+            <span>Development mode</span>
+            <span class="muted">systemd service control is only available on Linux appliance deployments</span>
+          </div>
+        `;
+      }
+      return;
+    }
+
+    const rows = [
+      { label:"Engine Service", data:r.engine },
+      { label:"Operator Service", data:r.operator },
+      { label:"Backup Service", data:r.backup },
+      { label:"Upgrade Service", data:r.upgrade }
+    ];
+
+    panel.innerHTML = rows.map((row) => {
+      const active = String(row.data?.active || "unknown");
+      const state = active === "active" ? "ok" : (active === "inactive" ? "warn" : "warn");
+      return `
+        <div class="panelItem">
+          <span class="dot ${state}"></span>
+          <span>${esc(row.label)}</span>
+          <span class="muted">active=${esc(active)} enabled=${esc(String(row.data?.enabled || "unknown"))} sub=${esc(String(row.data?.substate || "unknown"))}</span>
+        </div>
+      `;
+    }).join("");
+  }catch(e){
+    if(panel){
+      panel.innerHTML = `<div class="panelItem"><span class="dot fail"></span><span>Service status exception</span><span class="muted">${esc(String(e))}</span></div>`;
+    }
+  }
+}
+
+async function runBackup(){
+  const msg = document.getElementById("serviceActionMsg");
+  if(msg) msg.innerText = "Running backup…";
+
+  const r = await jpost("/api/operator/backup", {});
+  if(msg) msg.innerText = (r && r.ok) ? "Backup started." : `Backup failed: ${JSON.stringify(r || {}, null, 2)}`;
+
+  await loadServiceStatus();
+  await loadLogs();
+}
+
+async function runSystemUpdate(){
+  const msg = document.getElementById("serviceActionMsg");
+  if(msg) msg.innerText = "Starting system update…";
+
+  const r = await jpost("/api/operator/update", {});
+  if(msg) msg.innerText = (r && r.ok) ? "System update started." : `System update failed: ${JSON.stringify(r || {}, null, 2)}`;
+
+  await loadServiceStatus();
+  await loadLogs();
+}
+
+async function restartOperatorService(){
+  const msg = document.getElementById("serviceActionMsg");
+  if(msg) msg.innerText = "Restarting operator UI service…";
+
+  const r = await jpost("/api/operator/restart_operator", {});
+  if(msg) msg.innerText = (r && r.ok) ? "Operator UI restart requested." : `Operator restart failed: ${JSON.stringify(r || {}, null, 2)}`;
+}
+
+async function copyLogs(){
+  const text = document.getElementById("logs").innerText || "";
+
+  try{
+    await navigator.clipboard.writeText(text);
+    alert("Logs copied to clipboard.");
+    return;
+  }catch(e){
+    console.warn("Clipboard API failed, fallback copy.", e);
+  }
+
+  try{
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+
+    ta.focus();
+    ta.select();
+    const copied = document.execCommand("copy");
+
+    document.body.removeChild(ta);
+    if(!copied) throw new Error("execCommand_copy_failed");
+    alert("Logs copied to clipboard.");
+  }catch(e){
+    console.error(e);
+    alert("Copy failed.");
+  }
+}
+
+async function buildSnapshotBundle(mode = "quick"){
+  const normalizedMode = String(mode || "quick").trim().toLowerCase() || "quick";
+  const url = operatorBridgeUrl(`/api/operator/snapshot?mode=${encodeURIComponent(normalizedMode)}`);
+
+  let out;
+  try{
+    out = await jget(url);
+  }catch(e){
+    out = {
+      ok: false,
+      error: String(e),
+      snapshot_schema: {
+        name: "operator_repair_snapshot",
+        version: 2,
+        producer: "boot/operator_ui.html",
+        mode: normalizedMode
+      }
+    };
+  }
+
+  const rawLogs = document.getElementById("logs").innerText || "";
+  const browserCapture = {
+    captured_at: new Date().toISOString(),
+    href: String(window.location.href || ""),
+    userAgent: String(navigator.userAgent || ""),
+    language: String(navigator.language || ""),
+    online: navigator.onLine !== false,
+    clipboard_available: !!(navigator.clipboard && navigator.clipboard.writeText)
+  };
+
+  out.snapshot_mode = out.snapshot_mode || normalizedMode;
+  out.snapshot_meta = {
+    ...(out.snapshot_meta || {}),
+    captured_at: new Date().toISOString(),
+    ui_log_chars: rawLogs.length
+  };
+  out.browser_capture = browserCapture;
+  out.ui_capture = {
+    logs_tail: rawLogs.slice(-40000)
+  };
+
+  const dl = document.getElementById("snapshotDownloadLink");
+  if(dl){
+    dl.href = url;
+    dl.classList.remove("hidden");
+  }
+
+  return out;
+}
+
+async function copySnapshot(mode = "quick"){
+  const bundle = await buildSnapshotBundle(mode);
+  const text = JSON.stringify(bundle, null, 2);
+
+  try{
+    await navigator.clipboard.writeText(text);
+    alert("Snapshot copied to clipboard.");
+    return;
+  }catch(e){
+    console.warn("Clipboard API failed, using fallback.", e);
+  }
+
+  try{
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+
+    ta.focus();
+    ta.select();
+    const copied = document.execCommand("copy");
+
+    document.body.removeChild(ta);
+    if(!copied) throw new Error("execCommand_copy_failed");
+    alert("Snapshot copied to clipboard.");
+  }catch(e){
+    console.error(e);
+    const bootstrap = document.getElementById("bootstrap");
+    if(bootstrap) bootstrap.innerText = text;
+    alert("Copy failed. Snapshot text is shown in Bootstrap Snapshot.");
+  }
+}
+
+function renderOperatorAction(summary){
+  const box = document.getElementById("actionContainer");
+  box.innerHTML = "";
+
+  if(!summary || !summary.ok) return;
+
+  let btn = null;
+
+  if(summary.state === "ERROR"){
+    btn = `<button class="danger" onclick="repairSystem()">Repair System</button>`;
+  }
+  else if(summary.state === "DATA_MISSING"){
+    btn = `<button onclick="guidedBootstrap()">Restore Data + Pipeline</button>`;
+  }
+  else if(summary.state === "STARTING"){
+    btn = `<button class="secondary" disabled>System Starting…</button>`;
+  }
+  else if(summary.state === "RUNNING"){
+    btn = `<button onclick="guidedBootstrap()">Start System Setup</button>`;
+  }
+
+  box.innerHTML = btn || "";
+}
+
+let _autoRemediationBusy = false;
+let _autoFailCount = 0;
+let _autoBackoffMs = 0;
+let _autoLastActionAt = 0;
+
+async function autoRemediationCheck(){
+  if(!OPERATOR_AUTO_ACTIONS_ENABLED) return;
+  if(_autoRemediationBusy) return;
+
+  const now = Date.now();
+  if(_autoBackoffMs > 0 && (now - _autoLastActionAt) < _autoBackoffMs) return;
+
+  _autoRemediationBusy = true;
+
+  try{
+    const [status, readiness, health] = await Promise.all([
+      jget("/api/operator/status"),
+      jget("/api/operator/readiness"),
+      jget("/api/operator/health")
+    ]);
+    const healthBody = unwrapHealthResponse(health);
+    const observations = [];
+    if(status && status.status && status.status !== "RUNNING"){
+      observations.push(`engine_status=${status.status}`);
+    }
+    if(readiness && readiness.currentBlocker && (readiness.currentBlocker.message || readiness.currentBlocker.code)){
+      observations.push(`blocker=${readiness.currentBlocker.message || readiness.currentBlocker.code}`);
+    }
+    if(healthBody && Object.keys(healthBody).length){
+      const age = Number(healthBody.prices?.age_s || 0);
+      if(age > 90){
+        observations.push(`prices_stale_${age}s`);
+      }
+    }
+    if(observations.length){
+      console.warn("[AUTO] observations only", observations.join(" | "));
+    }
+    _autoFailCount = 0;
+    _autoBackoffMs = 0;
+
+  }catch(e){
+    _autoFailCount += 1;
+    _autoLastActionAt = Date.now();
+    _autoBackoffMs = Math.min(60000, 2000 * _autoFailCount);
+    console.warn("[AUTO] remediation error:", e);
+  }
+
+  _autoRemediationBusy = false;
+}
+
+let _refreshAllBusy = false;
+let _refreshTimer = null;
+let _autoRemediationTimer = null;
+
+async function _runRefreshAll(force = false){
+  if(document.hidden) return;
+  if(_refreshAllBusy) return;
+
+  _refreshAllBusy = true;
+  try{
+    await refreshAll(force);
+  }finally{
+    _refreshAllBusy = false;
+  }
+}
+
+function _scheduleRefreshAll(){
+  if(_refreshTimer){
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
+  }
+
+  _refreshTimer = setTimeout(async () => {
+    _refreshTimer = null;
+    await _runRefreshAll(false);
+    _scheduleRefreshAll();
+  }, CORE_REFRESH_MS);
+}
+
+document.addEventListener("visibilitychange", async () => {
+  if(document.hidden){
+    if(_refreshTimer){
+      clearTimeout(_refreshTimer);
+      _refreshTimer = null;
+    }
+    if(_autoRemediationTimer){
+      clearInterval(_autoRemediationTimer);
+      _autoRemediationTimer = null;
+    }
+    return;
+  }
+
+  await _runRefreshAll(true);
+  _scheduleRefreshAll();
+  if(OPERATOR_AUTO_ACTIONS_ENABLED && !_autoRemediationTimer){
+    _autoRemediationTimer = setInterval(autoRemediationCheck, DETAIL_REFRESH_MS);
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  if(_refreshTimer){
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
+  }
+  if(_autoRemediationTimer){
+    clearInterval(_autoRemediationTimer);
+    _autoRemediationTimer = null;
+  }
+  _refreshAllBusy = false;
+  _autoRemediationBusy = false;
+});
+
+window.preflight = preflight;
+window.guidedBootstrap = guidedBootstrap;
+window.start = start;
+window.stop = stop;
+window.restart = restart;
+window.repairSystem = repairSystem;
+window.runInstitutional = runInstitutional;
+window.clearLastError = clearLastError;
+window.factoryReset = factoryReset;
+
+window.saveSecret = saveSecret;
+window.loadSecrets = loadSecrets;
+
+window.validateConfig = validateConfig;
+window.saveConfig = saveConfig;
+
+window.loadLogs = loadLogs;
+window.copyLogs = copyLogs;
+window.loadServiceStatus = loadServiceStatus;
+window.runBackup = runBackup;
+window.runSystemUpdate = runSystemUpdate;
+window.restartOperatorService = restartOperatorService;
+
+window.loadBootstrap = loadBootstrap;
+window.copySnapshot = copySnapshot;
+
+window.setMode = setMode;
+
+window.renderPipeline = renderPipeline;
+window.renderMetrics = renderMetrics;
+window.renderConnectionStatus = renderConnectionStatus;
+window.renderIngestionWatchdog = renderIngestionWatchdog;
+window.renderTrainingProgress = renderTrainingProgress;
+window.renderTradingMonitor = renderTradingMonitor;
+window.renderWizard = renderWizard;
+
+window.viewHealth = viewHealth;
+window.viewMarket = viewMarket;
+window.viewStrategy = viewStrategy;
+
+window.restartFeeds = restartFeeds;
+window.restartEngine = restartEngine;
+window.emergencyStopHard = emergencyStopHard;
+window.loadServiceStatus = loadServiceStatus;
+window.runBackup = runBackup;
+window.runSystemUpdate = runSystemUpdate;
+window.restartOperatorService = restartOperatorService;
+
+(async function boot(){
+  startTelemetryStream();
+
+  await _runRefreshAll(true);
+  _scheduleRefreshAll();
+  if(OPERATOR_AUTO_ACTIONS_ENABLED){
+    _autoRemediationTimer = setInterval(autoRemediationCheck, DETAIL_REFRESH_MS);
+  }
+
+  await loadConfig();
+  await loadSecrets();
+  setMode(selectedMode);
+  renderWizard([], false);
+})();
+</script>
+
+</body>
+</html>

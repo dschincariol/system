@@ -1,0 +1,10 @@
+[Unit]
+Description=Run trading artifact snapshot daily
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=trading-artifact-snapshot.service
+
+[Install]
+WantedBy=timers.target

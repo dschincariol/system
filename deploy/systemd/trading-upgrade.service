@@ -1,0 +1,22 @@
+[Unit]
+Description=Trading System Upgrade
+
+[Service]
+Type=oneshot
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading-system/repo
+EnvironmentFile=/etc/trading-system/trading.env
+Environment=TRADING_UPGRADE_SERVICE_CONTROL=0
+ExecStartPre=+/bin/systemctl stop trading-operator.service
+ExecStartPre=+/bin/systemctl stop trading-engine.service
+ExecStart=/opt/trading-system/repo/deploy/bin/upgrade_trading_system.sh
+ExecStartPost=+/bin/systemctl start trading-engine.service
+ExecStartPost=+/bin/systemctl restart trading-operator.service
+StandardOutput=append:/opt/trading-system/logs/upgrade.log
+StandardError=append:/opt/trading-system/logs/upgrade.log
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/trading-system /etc/trading-system

@@ -1,0 +1,101 @@
+services:
+  timescaledb:
+    image: ${TIMESCALE_IMAGE:?set TIMESCALE_IMAGE}
+    container_name: trading-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${TIMESCALE_DB:-trading}
+      POSTGRES_USER: ${TIMESCALE_USER:-trading}
+      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}
+    ports:
+      - "${TIMESCALE_PORT:-5432}:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - trading-external
+
+  redis:
+    image: ${REDIS_IMAGE:?set REDIS_IMAGE}
+    container_name: trading-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli -a $$REDIS_PASSWORD ping
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - trading-external
+
+  minio:
+    image: ${MINIO_IMAGE:?set MINIO_IMAGE}
+    container_name: trading-minio
+    restart: unless-stopped
+    command:
+      - server
+      - /data
+      - --console-address
+      - :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - trading-external
+
+  minio-init:
+    image: ${MINIO_CLIENT_IMAGE:?set MINIO_CLIENT_IMAGE}
+    container_name: trading-minio-init
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:?set OBJECT_STORE_BUCKET}
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do
+          echo "waiting for minio"
+          sleep 2
+        done
+        mc mb --ignore-existing "local/$${OBJECT_STORE_BUCKET}"
+    networks:
+      - trading-external
+
+networks:
+  trading-external:
+    name: trading-external
+
+volumes:
+  timescaledb-data:
+  redis-data:
+  minio-data:

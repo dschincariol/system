@@ -1,0 +1,10 @@
+[Unit]
+Description=Run trading backup pruning daily
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+Unit=trading-backup-prune.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,42 @@
+[Unit]
+Description=Trading runtime, dashboard API, and jobs manager
+Documentation=file:/opt/trading/app/ops/server/README.md
+Wants=network-online.target postgresql.service redis-server.service pgbouncer.service
+After=network-online.target postgresql.service redis-server.service pgbouncer.service
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading/app
+EnvironmentFile=-/etc/trading/trading.env
+EnvironmentFile=-/etc/trading/provider.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TS_SERVICE_NAME=trading-jobs
+Environment=TS_SECRETS_PROVIDER=systemd-creds
+Environment=TS_PG_ROLE=app
+Environment=ENGINE_SUPERVISED=1
+Environment=ENGINE_MODE=safe
+Environment=AUTO_BOOT_DAEMONS=0
+Environment=START_INGESTION_WITH_SERVER=0
+Environment=OPEN_DASHBOARD_BROWSER_ON_START=0
+LoadCredentialEncrypted=master_key:/etc/credstore.encrypted/master_key.cred
+LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred
+ExecStart=/opt/trading/venv/bin/python start_system.py safe
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-jobs
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/trading /var/backups/trading /opt/trading/app/data /opt/trading/app/logs
+LimitNOFILE=65536
+LimitNPROC=4096
+TasksMax=4096
+
+[Install]
+WantedBy=trading.target

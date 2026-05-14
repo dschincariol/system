@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data Sources Control Plane</title>
+  <link rel="icon" href="/ui/favicon.ico">
+  <link rel="stylesheet" href="/ui/data_sources.css">
+  <link rel="stylesheet" href="/ui/base.css">
+</head>
+<body class="data-sources-screen">
+  <div class="shell">
+    <div class="hero">
+      <div>
+        <div class="eyebrow">Single Source Of Truth</div>
+        <h1>Data Sources Control Center</h1>
+        <p>Use this page to set up, test, enable, disable, recover, and monitor every data source. This is the only page non-technical operators should need for source configuration.</p>
+        <p class="hero-note">Source credentials and source-specific settings are stored in the database. The page will tell you what needs attention and what to do next.</p>
+      </div>
+      <div class="hero-actions">
+        <button class="btn" id="addSourceBtn">Add RSS Feed</button>
+        <button class="btn-secondary" id="refreshBtn">Refresh</button>
+        <a class="btn-secondary" href="/ui/dashboard.html">Dashboard</a>
+      </div>
+    </div>
+
+    <section class="card guide-shell">
+      <div class="card-head">
+        <h2>What Should I Do Now?</h2>
+        <span class="pill ok">Canonical Page</span>
+      </div>
+      <div class="card-body guide-grid">
+        <div class="guide-panel">
+          <div class="guide-title">Recommended Next Step</div>
+          <div id="actionCenter"></div>
+        </div>
+        <div class="guide-panel">
+          <div class="guide-title">How To Use This Page</div>
+          <div id="quickGuide"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card session-card">
+      <div class="card-head">
+        <h2>Session Controls</h2>
+        <span class="pill dim mono">operator-only mutations</span>
+      </div>
+      <div class="card-body session-grid">
+        <div class="field">
+          <label for="actorInput">Actor</label>
+          <input id="actorInput" placeholder="operator@desk">
+        </div>
+        <div class="field">
+          <label for="tokenInput">API Token</label>
+          <input id="tokenInput" type="password" placeholder="Optional unless DASHBOARD_API_TOKEN is set">
+        </div>
+        <div class="session-actions">
+          <button class="btn-secondary" id="saveSessionBtn" type="button">Save Session</button>
+          <button class="btn-secondary" id="clearTokenBtn" type="button">Clear Token</button>
+        </div>
+        <div class="session-note" id="sessionNote"></div>
+      </div>
+    </section>
+
+    <div class="status-strip">
+      <div class="metric"><div class="metric-label">Configured Sources</div><div class="metric-value" id="metricTotal">0</div></div>
+      <div class="metric"><div class="metric-label">Enabled</div><div class="metric-value" id="metricEnabled">0</div></div>
+      <div class="metric"><div class="metric-label">Healthy</div><div class="metric-value" id="metricHealthy">0</div></div>
+      <div class="metric"><div class="metric-label">Accumulated Errors</div><div class="metric-value" id="metricErrors">0</div></div>
+    </div>
+
+    <div id="flash" class="empty flash"></div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Connections</h2>
+        <span class="pill dim">Click a source card to see setup and recovery instructions</span>
+      </div>
+      <div class="card-body">
+        <div class="source-cards" id="sourceCards"></div>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="card">
+        <div class="card-head">
+          <h2>Detailed Inventory</h2>
+          <span class="pill dim">Live DB-backed config</span>
+        </div>
+        <div class="card-body table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Type</th>
+                <th>Job</th>
+                <th>Enabled</th>
+                <th>Status</th>
+                <th>Errors</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody id="sourcesBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="card detail-pane">
+        <div class="card-head">
+          <h2>Selected Source</h2>
+          <span class="pill dim">Setup, testing, status, and recovery</span>
+        </div>
+        <div class="card-body" id="detailPane"></div>
+      </aside>
+    </div>
+  </div>
+
+  <div class="modal-shell" id="modalShell">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="modalTitle">Edit Data Source</h2>
+        <button class="btn-secondary" id="modalCloseBtn" type="button">Close</button>
+      </div>
+      <form class="modal-form" id="modalForm">
+        <div class="field">
+          <label for="templateKey">Template</label>
+          <select id="templateKey"></select>
+        </div>
+        <div class="field">
+          <label for="sourceKey">Source Key</label>
+          <input id="sourceKey" placeholder="rss:reuters_top">
+        </div>
+        <div class="field">
+          <label for="displayName">Display Name</label>
+          <input id="displayName" placeholder="Human readable label">
+        </div>
+        <div class="field">
+          <label for="sourceType">Source Type</label>
+          <input id="sourceType" readonly>
+        </div>
+        <div class="field">
+          <label for="providerName">Provider Name</label>
+          <input id="providerName" readonly>
+        </div>
+        <div class="field">
+          <label for="jobName">Job Name</label>
+          <input id="jobName" readonly>
+        </div>
+        <div class="field checkbox-field">
+          <label for="enabled">Enabled</label>
+          <input id="enabled" type="checkbox" checked>
+        </div>
+
+        <div class="field full">
+          <label>Template Rules</label>
+          <div class="schema-note" id="schemaSummary"></div>
+        </div>
+
+        <div class="field full">
+          <label>Credentials</label>
+          <div class="editor-grid" id="credentialsFields"></div>
+          <div class="checkbox-stack">
+            <label class="checkbox-row" for="replaceCredentials">
+              <input id="replaceCredentials" type="checkbox">
+              <span>Replace stored credentials with only the values entered below</span>
+            </label>
+          </div>
+          <div class="clear-grid" id="clearCredentials"></div>
+        </div>
+
+        <div class="field full">
+          <label>Settings</label>
+          <div class="editor-grid" id="settingsFields"></div>
+        </div>
+
+        <div class="modal-actions">
+          <button class="btn-secondary" id="modalCancelBtn" type="button">Cancel</button>
+          <button class="btn" type="submit">Save Source</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script type="module" src="/ui/data_sources.js"></script>
+</body>
+</html>

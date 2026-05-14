@@ -1,0 +1,1210 @@
+/* ============================================================
+   COMMAND CENTER — PREMIUM CONTROL ROOM SYSTEM
+   Single Theme: TECH (Night Only)
+   Institutional, clean, no neon, no gamer glow
+============================================================ */
+
+/* ============================================================
+   DESIGN TOKENS
+============================================================ */
+.theme-tech,
+:root.theme-tech{
+
+  /* Core surfaces */
+  --bg-main: #1c2431;
+  --bg-secondary: #16202b;
+  --bg-tertiary: #121a24;
+
+  /* Panels */
+  --panel-main: #1f2a38;
+  --panel-elevated: #243142;
+  --panel-deep: #18222e;
+
+  /* Dashboard unified surface system */
+  --dash-surface-bg: linear-gradient(180deg, var(--panel-elevated), var(--panel-deep));
+  --dash-surface-border: rgba(255,255,255,0.14);
+  --dash-surface-shadow:
+    0 22px 65px rgba(0,0,0,0.70),
+    inset 0 1px 0 rgba(255,255,255,0.05);
+
+  --dash-surface-shadow-hover:
+    0 28px 80px rgba(0,0,0,0.75),
+    inset 0 1px 0 rgba(255,255,255,0.06);
+
+  /* Dashboard gauges (reduce neon glow) */
+  --metric-gauge-bg: radial-gradient(circle at top, rgba(0, 200, 150, 0.10), transparent 62%);
+  --metric-gauge-border: rgba(255,255,255,0.12);
+
+  /* Text */
+  --text-primary: #e8f0fa;
+  --text-secondary: rgba(232,240,250,0.72);
+
+  /* Structure */
+  --border-soft: rgba(255,255,255,0.08);
+  --border-strong: rgba(255,255,255,0.16);
+
+  --shadow-deep: 0 18px 50px rgba(0,0,0,0.55);
+  --shadow-panel: 0 18px 50px rgba(0,0,0,0.65);
+
+  /* Accent (controlled use only) */
+  --accent: #3ff6d2;
+
+  /* Status */
+  --ok: #22c55e;
+  --warn: #ffb020;
+  --bad: #ff4d6d;
+
+  --radius: 14px;
+
+  /* ============================================================
+     DASHBOARD TOKEN BRIDGE (CRITICAL)
+     styles.css dashboard tiles use these vars.
+     Map TECH theme surfaces into that contract.
+     ============================================================ */
+  --dash-tile-bg: var(--dash-surface-bg);
+  --dash-tile-border: var(--dash-surface-border);
+  --dash-tile-border-soft: rgba(255,255,255,0.08);
+  --dash-tile-hover: rgba(56,189,248,.06);
+  --dash-row-stripe: rgba(255,255,255,.02);
+  --dash-head-text: rgba(232,240,250,0.75);
+  --dash-tile-radius: 16px;
+}
+
+/* ============================================================
+   BODY
+============================================================ */
+.theme-tech body,
+body.theme-tech{
+
+  background:
+    radial-gradient(900px 700px at 20% 12%, rgba(63,246,210,0.025), transparent 60%),
+    var(--bg-main);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* ============================================================
+   SYSTEM STATUS HEADER
+============================================================ */
+.theme-tech #system-status-header,
+body.theme-tech #system-status-header{
+  position: sticky;
+  top: 0;
+  z-index: 1001;
+  margin: 0 0 12px 0;
+}
+
+.theme-tech .systemStatusBar,
+body.theme-tech .systemStatusBar{
+  display:grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap:8px;
+  padding:10px;
+  background: linear-gradient(180deg, rgba(36,49,66,.96), rgba(24,34,46,.96));
+  border: 1px solid var(--dash-surface-border);
+  border-radius: 16px;
+  box-shadow: var(--dash-surface-shadow);
+  backdrop-filter: blur(10px);
+}
+
+.theme-tech .systemStatusItem,
+body.theme-tech .systemStatusItem{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  padding:8px 10px;
+  min-width:0;
+  background: rgba(18,26,36,.92);
+  border:1px solid rgba(255,255,255,0.10);
+  border-radius:12px;
+}
+
+.theme-tech .systemStatusLabel,
+body.theme-tech .systemStatusLabel{
+  font-size:11px;
+  font-weight:800;
+  letter-spacing:.08em;
+  color: var(--text-secondary);
+}
+
+.theme-tech .systemStatusValue,
+body.theme-tech .systemStatusValue{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size:13px;
+  font-weight:800;
+  color: var(--text-primary);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+.theme-tech .status_ok,
+body.theme-tech .status_ok{
+  border-color: rgba(34,197,94,0.45);
+  box-shadow: inset 0 0 0 1px rgba(34,197,94,0.10);
+}
+
+.theme-tech .status_ok .systemStatusValue,
+body.theme-tech .status_ok .systemStatusValue{
+  color: var(--ok);
+}
+
+.theme-tech .status_warning,
+body.theme-tech .status_warning{
+  border-color: rgba(255,176,32,0.45);
+  box-shadow: inset 0 0 0 1px rgba(255,176,32,0.10);
+}
+
+.theme-tech .status_warning .systemStatusValue,
+body.theme-tech .status_warning .systemStatusValue{
+  color: var(--warn);
+}
+
+.theme-tech .status_error,
+body.theme-tech .status_error{
+  border-color: rgba(255,77,109,0.45);
+  box-shadow: inset 0 0 0 1px rgba(255,77,109,0.10);
+}
+
+.theme-tech .status_error .systemStatusValue,
+body.theme-tech .status_error .systemStatusValue{
+  color: var(--bad);
+}
+
+@media (max-width: 1280px){
+  .theme-tech .systemStatusBar,
+  body.theme-tech .systemStatusBar{
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 768px){
+  .theme-tech .systemStatusBar,
+  body.theme-tech .systemStatusBar{
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ============================================================
+   TOP NAV (CONTROL HUD)
+============================================================ */
+.theme-tech .top-nav{
+  background: linear-gradient(180deg, #1a2430, #141c26);
+  border-bottom: 1px solid var(--border-soft);
+  box-shadow: 0 18px 50px rgba(0,0,0,0.55);
+  backdrop-filter: blur(10px);
+}
+
+.theme-tech .brand-title-main{
+  font-weight: 900;
+  letter-spacing: 0.16em;
+  font-size: 15px;
+}
+
+.theme-tech .brand-title-sub{
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+/* ============================================================
+   SIDEBAR
+============================================================ */
+.theme-tech .sidebar{
+  background: linear-gradient(180deg, #1a2430, #151d27);
+  border-right: 1px solid var(--border-soft);
+  box-shadow: 4px 0 40px rgba(0,0,0,0.55);
+}
+
+.theme-tech .sidebar::before{
+  content:"";
+  position:absolute;
+  top:0;
+  left:0;
+  bottom:0;
+  width:2px;
+  background: rgba(63,246,210,0.45);
+  opacity:.45;
+}
+
+.theme-tech .sidebar-tab{
+  font-weight:600;
+  transition: background .15s ease;
+}
+
+.theme-tech .sidebar-tab:hover{
+  background: rgba(255,255,255,0.04);
+}
+
+.theme-tech .sidebar-tab.active{
+  background: rgba(255,255,255,0.05);
+  border-left: 2px solid rgba(63,246,210,0.55);
+}
+
+/* ============================================================
+   GLOBAL — SUBTLE LEFT ACCENT RAIL
+============================================================ */
+
+.theme-tech .card,
+.theme-tech .card-like,
+.theme-tech .room-tile{
+  position: relative;
+}
+
+/* Prevent table background clipping inside dashboard cards */
+.theme-tech #page-dashboard .card,
+.theme-tech #page-dashboard .card-like{
+  overflow: visible;
+}
+
+.theme-tech .card::before,
+.theme-tech .card-like::before,
+.theme-tech .room-tile::before{
+  content:"";
+  position:absolute;
+  top:0;
+  left:0;
+  bottom:0;
+  width:3px;
+  background: linear-gradient(
+    to bottom,
+    rgba(63,246,210,0.55),
+    rgba(63,246,210,0.15)
+  );
+  opacity:.65;
+}
+
+/* ============================================================
+   ROOM TILES — PHYSICAL CONTROL PANELS
+============================================================ */
+.theme-tech .room-tile{
+  padding: 18px;
+  position: relative;
+}
+
+/* Non-dashboard room tile hover */
+.theme-tech :not(#page-dashboard) .room-tile:hover{
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-panel);
+}
+
+/* Header */
+.theme-tech .room-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:12px;
+}
+
+.theme-tech .room-name{
+  font-weight:800;
+  letter-spacing:.03em;
+  font-size:15px;
+}
+
+.theme-tech .room-status-pill{
+  font-size:12px;
+  font-weight:700;
+}
+
+/* Metrics */
+.theme-tech .metric-gauge,
+.theme-tech .metric-pill{
+  background: var(--panel-deep);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+}
+
+/* Camera */
+.theme-tech .room-cam-img{
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  filter: brightness(1.05) contrast(1.05);
+}
+
+/* ============================================================
+   BUTTONS
+============================================================ */
+.theme-tech .btn-primary{
+  background: linear-gradient(180deg, rgba(63,246,210,0.18), rgba(63,246,210,0.08));
+  border: 1px solid rgba(63,246,210,0.45);
+  color: var(--text-primary);
+}
+
+/* ============================================================
+   STATUS HUD (top-right compact)
+============================================================ */
+.theme-tech .hud-status{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:6px 14px;
+  border-radius:10px;
+  background: var(--panel-deep);
+  border:1px solid var(--border-soft);
+  font-weight:700;
+  font-size:13px;
+}
+
+.theme-tech .hud-status.ok{
+  border-color: rgba(34,197,94,0.35);
+  color: var(--ok);
+}
+
+.theme-tech .hud-status.warn{
+  border-color: rgba(255,176,32,0.4);
+  color: var(--warn);
+}
+
+.theme-tech .hud-status.err{
+  border-color: rgba(255,77,109,0.4);
+  color: var(--bad);
+}
+
+/* ============================================================
+   POLISH RESTORE — PREMIUM DEPTH + BORDERS
+============================================================ */
+
+/* Stronger border system */
+.theme-tech {
+  --border-soft: rgba(255,255,255,0.12);
+  --border-strong: rgba(255,255,255,0.18);
+  --shadow-panel:
+    0 22px 65px rgba(0,0,0,0.70),
+    inset 0 1px 0 rgba(255,255,255,0.05);
+}
+
+/* ============================================================
+   DASHBOARD SURFACES (Room tiles + Cards unified)
+============================================================ */
+
+.theme-tech #page-dashboard .room-tile,
+.theme-tech #page-dashboard .card,
+.theme-tech #page-dashboard .card-like{
+  background: linear-gradient(180deg, rgba(15,26,43,.92), rgba(11,18,32,.92));
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 6px;
+  box-shadow:
+    0 10px 24px rgba(0,0,0,.45),
+    0 0 0 1px rgba(255,255,255,.03) inset;
+  transition:
+    transform var(--m-fast) var(--ease-out),
+    box-shadow var(--m-fast) var(--ease-out),
+    border-color var(--m-fast) var(--ease-out);
+}
+
+.theme-tech #page-dashboard .room-tile:hover,
+.theme-tech #page-dashboard .card:hover,
+.theme-tech #page-dashboard .card-like:hover{
+  transform: translateY(-1px);
+  border-color: rgba(88,166,255,.35);
+  box-shadow:
+    0 18px 36px rgba(0,0,0,.55),
+    0 0 0 1px rgba(88,166,255,.08) inset;
+}
+
+/* Global cards — all pages */
+.theme-tech .card,
+.theme-tech .card-like{
+  background: linear-gradient(
+    180deg,
+    var(--panel-elevated),
+    var(--panel-deep)
+  );
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  box-shadow: var(--shadow-panel);
+}
+
+/* Section labels */
+.theme-tech .section-title,
+.theme-tech .room-section-title{
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 0.78rem;
+  opacity: 0.85;
+}
+
+/* Dashboard main titles */
+.theme-tech #page-dashboard h2,
+.theme-tech #page-dashboard .room-title{
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+/* ============================================================
+   TABLES — UNIFIED SYSTEM (ALL CARDS / ALL PAGES)
+============================================================ */
+
+.theme-tech .card table,
+.theme-tech .card-like table,
+.theme-tech .room-tile table {
+
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--dash-tile-border-soft);
+  border-radius: var(--dash-tile-radius);
+  overflow: hidden;
+  background: transparent;
+}
+
+.theme-tech .card table thead,
+.theme-tech .card-like table thead,
+.theme-tech .room-tile table thead {
+
+  background: rgba(56,189,248,.10);
+  border-bottom: 1px solid rgba(56,189,248,.35);
+}
+
+.theme-tech .card table th,
+.theme-tech .card-like table th,
+.theme-tech .room-tile table th {
+
+  text-align: left;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--dash-head-text);
+  padding: 10px 12px;
+}
+
+.theme-tech .card table td,
+.theme-tech .card-like table td,
+.theme-tech .room-tile table td {
+
+  padding: 10px 12px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--dash-tile-border-soft);
+  color: var(--text-primary);
+  background: rgba(15,23,42,.35);
+}
+
+.theme-tech .card table tbody tr:nth-child(even) td,
+.theme-tech .card-like table tbody tr:nth-child(even) td,
+.theme-tech .room-tile table tbody tr:nth-child(even) td {
+
+  background: rgba(15,23,42,.45);
+}
+
+.theme-tech .card table tbody tr:hover td,
+.theme-tech .card-like table tbody tr:hover td,
+.theme-tech .room-tile table tbody tr:hover td {
+
+  background: rgba(56,189,248,.08);
+}
+
+/* ============================================================
+   DASHBOARD EVENTS — SEVERITY
+============================================================ */
+
+.theme-tech #page-dashboard tr.event-critical td {
+  background: rgba(239,68,68,.12) !important;
+  border-left: 3px solid #ef4444;
+}
+
+.theme-tech #page-dashboard tr.event-warn td {
+  background: rgba(255,176,32,.12) !important;
+  border-left: 3px solid #ffb020;
+}
+
+.theme-tech #page-dashboard tr.event-info td {
+  background: rgba(56,189,248,.10) !important;
+  border-left: 3px solid #38bdf8;
+}
+
+.theme-tech #page-dashboard tr.event-critical:hover td {
+  background: rgba(239,68,68,.18) !important;
+}
+
+.theme-tech #page-dashboard tr.event-warn:hover td {
+  background: rgba(255,176,32,.18) !important;
+}
+
+.theme-tech #page-dashboard tr.event-info:hover td {
+  background: rgba(56,189,248,.16) !important;
+}
+
+/* ==============================
+   SOP LIBRARY DESIGN UPGRADE
+================================= */
+
+.sop-editor {
+  width: 100%;
+  min-height: 420px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 16px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  resize: vertical;
+  box-shadow: 0 0 0 1px rgba(59,130,246,0.2),
+              0 10px 30px rgba(0,0,0,0.4);
+}
+
+.sop-card {
+  margin-bottom: 20px;
+  padding: 18px;
+  border-radius: 16px;
+  background: linear-gradient(145deg,#111827,#0b1220);
+  border: 1px solid rgba(59,130,246,0.25);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+}
+
+.sop-body {
+  max-height: 260px;
+  overflow-y: auto;
+  background: #0b1220;
+  padding: 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  border: 1px solid #1e293b;
+}
+
+.page-header h1 {
+  font-size: 28px;
+  letter-spacing: 1px;
+}
+
+/* ===============================
+   SOP SLIDE PANEL
+================================= */
+
+.sop-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 760px;
+  height: 100%;
+  background: #0f172a;
+  z-index: 1000;
+  overflow-y: auto;
+  box-shadow: -10px 0 40px rgba(0,0,0,0.6);
+  transition: transform 0.3s ease;
+  padding: 24px;
+}
+
+.sop-panel.hidden {
+  transform: translateX(100%);
+}
+
+.sop-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+/* ============================================================
+   DASHBOARD — CRITICAL ATTENTION STATE
+============================================================ */
+
+.theme-tech #page-dashboard .alert-panel.alert-critical{
+  border: 2px solid rgba(239,68,68,.55);
+  box-shadow:
+    0 0 0 1px rgba(239,68,68,.25),
+    0 24px 70px rgba(0,0,0,.75),
+    0 0 40px rgba(239,68,68,.18);
+}
+
+.theme-tech #page-dashboard .alert-panel.alert-critical::before{
+  background: linear-gradient(
+    to bottom,
+    rgba(239,68,68,.85),
+    rgba(239,68,68,.25)
+  );
+}
+
+/* ============================================================
+   DASHBOARD LIST HEIGHT FIX
+   Override legacy height caps from styles.css
+============================================================ */
+
+.theme-tech #page-dashboard .alert-list {
+  max-height: 360px !important;   /* 4 rows comfortably */
+  overflow-y: auto;
+}
+
+.theme-tech #page-dashboard .timeline-body {
+  max-height: 460px !important;   /* 6 irrigation rows */
+  overflow-y: auto;
+}
+
+.theme-tech .safe-mode-banner{
+  display:none;
+  position:fixed;
+  top:64px;
+  left:0;
+  right:0;
+  z-index:9999;
+  background:linear-gradient(90deg,#b00020,#7f0015);
+  color:white;
+  font-weight:800;
+  text-align:center;
+  padding:12px 16px;
+  font-size:15px;
+  letter-spacing:0.08em;
+  box-shadow:0 8px 30px rgba(0,0,0,0.6);
+  backdrop-filter:blur(6px);
+}
+
+/* ============================================================
+   DASHBOARD PLC CONTROL GRID (4 COLUMN OPTIMIZED)
+============================================================ */
+
+.plc-control-section{
+  margin-top: 18px;
+}
+
+.plc-control-grid{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+/* Individual PLC tile */
+.plc-tile{
+  background: linear-gradient(
+    180deg,
+    rgba(20,35,55,0.92),
+    rgba(14,24,40,0.88)
+  );
+  border: 1px solid rgba(148,163,184,.18);
+  border-radius: 16px;
+  padding: 14px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  position:relative;
+}
+
+/* Left accent rail */
+.plc-tile::before{
+  content:"";
+  position:absolute;
+  left:0;
+  top:0;
+  bottom:0;
+  width:4px;
+  border-radius:16px 0 0 16px;
+  background:linear-gradient(
+    180deg,
+    rgba(63,246,210,.5),
+    rgba(138,92,255,.5)
+  );
+  opacity:.7;
+}
+
+/* PLC Title */
+.plc-tile-title{
+  font-size:14px;
+  font-weight:900;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  opacity:.85;
+}
+
+/* Status badge */
+.plc-status-badge{
+  font-size:11px;
+  font-weight:900;
+  padding:4px 10px;
+  border-radius:999px;
+  border:1px solid rgba(148,163,184,.25);
+  background:rgba(148,163,184,.15);
+}
+
+.plc-status-badge.online{
+  border-color:rgba(34,197,94,.5);
+  background:rgba(34,197,94,.18);
+}
+
+.plc-status-badge.offline{
+  border-color:rgba(239,68,68,.5);
+  background:rgba(239,68,68,.18);
+}
+
+/* Section label (Inputs / Sensors / Relays) */
+.plc-section-label{
+  font-size:11px;
+  font-weight:800;
+  letter-spacing:.1em;
+  text-transform:uppercase;
+  opacity:.6;
+  margin-top:6px;
+}
+
+/* Section headers inside tile */
+.plc-tile h3{
+  margin:0;
+  font-size:14px;
+  font-weight:800;
+  letter-spacing:.05em;
+  opacity:.85;
+}
+
+/* Compact stat rows */
+.plc-stat-row{
+  display:flex;
+  justify-content:space-between;
+  font-size:13px;
+  opacity:.9;
+}
+
+/* Relay grid */
+.plc-relay-grid{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap:6px;
+  margin-top:6px;
+}
+
+.plc-relay-chip{
+  padding:4px 8px;
+  border-radius:999px;
+  font-size:11px;
+  font-weight:800;
+  text-align:center;
+  background:rgba(148,163,184,.15);
+  border:1px solid rgba(148,163,184,.25);
+}
+
+.plc-relay-chip.on{
+  background:rgba(34,197,94,.18);
+  border-color:rgba(34,197,94,.5);
+}
+
+.plc-relay-chip.off{
+  opacity:.6;
+}
+
+/* ============================================================
+   PLC CONTROL OVERVIEW — CARD + ROW STYLING (DASHBOARD)
+   Works even if JS outputs mostly plain text
+============================================================ */
+
+.plc-control-section.plc-control-left {
+  margin-top: 14px;
+}
+
+/* 2x2 grid like the old dashboard screenshot */
+#plcOperationalGrid.plc-control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+/* Treat each direct child as a "PLC card" */
+#plcOperationalGrid.plc-control-grid > * {
+  background: var(--panel);
+  border: 1px solid rgba(148,163,184,.20);
+  border-radius: 14px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.35);
+  padding: 14px;
+  min-height: 170px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Header-ish first line / titles */
+#plcOperationalGrid.plc-control-grid > * h3,
+#plcOperationalGrid.plc-control-grid > * h4,
+#plcOperationalGrid.plc-control-grid > * .title,
+#plcOperationalGrid.plc-control-grid > * .name {
+  margin: 0 0 8px 0;
+  font-weight: 800;
+  letter-spacing: .2px;
+}
+
+/* Make “label + value” lines look like the old rows */
+#plcOperationalGrid.plc-control-grid > * .row,
+#plcOperationalGrid.plc-control-grid > * .line,
+#plcOperationalGrid.plc-control-grid > * p,
+#plcOperationalGrid.plc-control-grid > * div {
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+/* Muted helpers */
+#plcOperationalGrid.plc-control-grid .muted,
+#plcOperationalGrid.plc-control-grid small,
+#plcOperationalGrid.plc-control-grid .small {
+  opacity: .78;
+}
+
+/* Status words pop (ONLINE / OFFLINE / IDLE etc) */
+#plcOperationalGrid.plc-control-grid .ok,
+#plcOperationalGrid.plc-control-grid .online {
+  color: #34d399;
+  font-weight: 800;
+}
+
+#plcOperationalGrid.plc-control-grid .warn {
+  color: #fbbf24;
+  font-weight: 800;
+}
+
+#plcOperationalGrid.plc-control-grid .bad,
+#plcOperationalGrid.plc-control-grid .offline {
+  color: #fb7185;
+  font-weight: 800;
+}
+
+/* If your JS uses a relay grid inside each PLC card */
+#plcOperationalGrid.plc-control-grid .relay-grid,
+#plcOperationalGrid.plc-control-grid .relayGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+#plcOperationalGrid.plc-control-grid .relay,
+#plcOperationalGrid.plc-control-grid .relay-tile,
+#plcOperationalGrid.plc-control-grid .relayCell {
+  border: 1px solid rgba(148,163,184,.18);
+  border-radius: 10px;
+  padding: 8px;
+  text-align: center;
+  background: rgba(255,255,255,0.02);
+}
+
+/* ============================================================
+   DASHBOARD EVENTS — COMPACT SINGLE-LINE MODE
+   Save vertical space (icon + message + time inline)
+============================================================ */
+
+.theme-tech #page-dashboard #dashEventsBody {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.theme-tech #page-dashboard #dashEventsBody .event-row,
+.theme-tech #page-dashboard #dashEventsBody .alert-item,
+.theme-tech #page-dashboard #dashEventsBody .event-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  padding: 8px 12px;
+  border-radius: 10px;
+
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  font-size: 13px;
+}
+
+/* Left side (icon + message inline) */
+.theme-tech #page-dashboard #dashEventsBody .event-row .event-main,
+.theme-tech #page-dashboard #dashEventsBody .alert-item .event-main,
+.theme-tech #page-dashboard #dashEventsBody .event-item .event-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Time inline on right */
+.theme-tech #page-dashboard #dashEventsBody .event-time {
+  opacity: 0.6;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+/* Remove forced line breaks */
+.theme-tech #page-dashboard #dashEventsBody br {
+  display: none;
+}
+
+/* ============================================================
+   PLC CONTROL — INTERNAL CARD LAYOUT FIX
+   Applies structure to existing markup (no JS changes required)
+============================================================ */
+
+/* Card internal layout */
+#plcOperationalGrid .plc-tile,
+#plcOperationalGrid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* First line (PLC name like VEG / F1 / F2 / TRIM) */
+#plcOperationalGrid > div > div:first-child {
+  font-weight: 900;
+  font-size: 14px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  opacity: .85;
+}
+
+/* RS485 sensor line */
+#plcOperationalGrid .rs485,
+#plcOperationalGrid div:has(> span:contains("RS485")) {
+  font-size: 12px;
+  opacity: .7;
+}
+
+/* ONLINE badge styling */
+#plcOperationalGrid .online,
+#plcOperationalGrid .ONLINE {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  border: 1px solid rgba(34,197,94,.5);
+  background: rgba(34,197,94,.18);
+  color: #34d399;
+  width: fit-content;
+}
+
+/* Temperature / RH / CO2 rows */
+#plcOperationalGrid div:has(> span),
+#plcOperationalGrid > div > div {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Idle line */
+#plcOperationalGrid div:contains("Idle") {
+  opacity: .75;
+  font-weight: 600;
+}
+
+/* Relay numbers container — force grid layout */
+#plcOperationalGrid > div {
+  position: relative;
+}
+
+/* Relay numbers (1–8) */
+#plcOperationalGrid > div {
+  --relay-gap: 8px;
+}
+
+#plcOperationalGrid > div {
+  font-size: 13px;
+}
+
+/* Find the 1–8 number block and grid it */
+#plcOperationalGrid > div {
+  display: flex;
+  flex-direction: column;
+}
+
+#plcOperationalGrid > div > div:last-of-type {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* Individual relay numbers */
+#plcOperationalGrid > div > div:last-of-type > span,
+#plcOperationalGrid > div > div:last-of-type > div {
+  text-align: center;
+  padding: 4px 0;
+  border-radius: 8px;
+  border: 1px solid rgba(148,163,184,.2);
+  background: rgba(255,255,255,.03);
+  font-weight: 700;
+}
+
+/* Footer line (RS485 mapped) */
+#plcOperationalGrid > div > div:last-child {
+  margin-top: 8px;
+  font-size: 12px;
+  opacity: .6;
+}
+
+/* ============================================================
+   PLC OPERATIONAL CARDS (matches dashboard_ui.js markup)
+============================================================ */
+
+.plc-operational-card {
+  background: linear-gradient(180deg,#1f2a38,#18222e);
+  border: 1px solid rgba(148,163,184,.18);
+  border-radius: 16px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  position: relative;
+}
+
+/* Header */
+.plc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.plc-title {
+  font-weight: 900;
+  letter-spacing: .08em;
+  font-size: 14px;
+  text-transform: uppercase;
+}
+
+/* Metrics row */
+.plc-metrics {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.plc-metric-chip {
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(148,163,184,.25);
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* Automation line */
+.plc-automation {
+  font-size: 13px;
+  font-weight: 700;
+  opacity: .85;
+}
+
+/* Relay grid */
+.plc-relay-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.plc-relay-box {
+  text-align: center;
+  padding: 6px 0;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 800;
+  border: 1px solid rgba(148,163,184,.25);
+  background: rgba(255,255,255,.04);
+  transition: background .15s ease, border-color .15s ease;
+}
+
+.plc-relay-on {
+  background: rgba(34,197,94,.18);
+  border-color: rgba(34,197,94,.55);
+  color: #22c55e;
+}
+
+.plc-relay-off {
+  opacity: .55;
+}
+
+/* RS485 footer */
+.plc-rs485-summary {
+  font-size: 12px;
+  opacity: .65;
+}
+
+/* =========================================================
+   SIDEBAR LAYOUT FIX — prevent footer overflow
+========================================================= */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: calc(100vh - 64px); /* match .page */
+}
+
+.sidebar-nav {
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 12px;
+}
+
+@media (max-width: 768px) {
+  .top-nav {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .top-nav a,
+  .top-nav button {
+    width: 100%;
+  }
+}
+
+.fixed-bottom-bar {
+  padding-bottom: calc(12px + env(safe-area-inset-bottom));
+}
+
+/* ============================================================
+   MOBILE (iPHONE) DASHBOARD — OPERATOR FIRST FIX
+============================================================ */
+
+@media (max-width: 900px) {
+
+  /* Force true single column grid */
+  .dashboard-grid {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 14px;
+  }
+
+  .rooms-column,
+  .right-column {
+    width: 100% !important;
+  }
+
+  /* Larger operator tiles */
+  .room-tile {
+    margin-bottom: 14px;
+    padding: 20px;
+  }
+
+  /* Remove hover lift on mobile */
+  #page-dashboard .room-tile:hover,
+  #page-dashboard .card:hover,
+  #page-dashboard .card-like:hover {
+    transform: none !important;
+  }
+
+  /* PLC grid → single column */
+  #plcOperationalGrid.plc-control-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Relay grid tighter */
+  .plc-relay-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  /* Compact events list */
+  #page-dashboard #dashEventsBody .event-row,
+  #page-dashboard #dashEventsBody .alert-item,
+  #page-dashboard #dashEventsBody .event-item {
+    font-size: 12px;
+    padding: 6px 10px;
+  }
+
+  /* Safe area */
+  .top-nav {
+    padding-top: env(safe-area-inset-top);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+
+}

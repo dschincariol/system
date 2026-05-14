@@ -1,0 +1,37 @@
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.css text eol=lf
+*.html text eol=lf
+*.ini text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.mjs text eol=lf
+*.py text eol=lf
+*.service text eol=lf
+*.sh text eol=lf
+*.sql text eol=lf
+*.target text eol=lf
+*.timer text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+*.db binary
+*.docx binary
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.onnx binary
+*.parquet binary
+*.pkl binary
+*.png binary
+*.sqlite binary
+*.sqlite3 binary
+*.zip binary

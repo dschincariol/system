@@ -1,0 +1,35 @@
+# Managed by ops/server/bootstrap.sh.
+
+bind 127.0.0.1 -::1
+protected-mode yes
+port {{ redis_tcp_port }}
+tcp-backlog 4096
+timeout 0
+tcp-keepalive 300
+
+supervised {{ redis_supervised }}
+daemonize no
+pidfile /run/redis/redis-server.pid
+
+dir {{ redis_dir }}
+dbfilename dump.rdb
+
+unixsocket {{ redis_socket }}
+unixsocketperm 770
+
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+maxmemory {{ redis_maxmemory }}
+maxmemory-policy noeviction
+
+save 900 1
+save 300 10
+save 60 10000
+
+loglevel notice
+logfile ""

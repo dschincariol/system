@@ -1,0 +1,9 @@
+[Unit]
+Description=Trading system application stack
+Documentation=file:/opt/trading/app/ops/server/README.md
+Requires=postgresql.service redis-server.service pgbouncer.service
+Wants=trading-api.service trading-jobs.service trading-stream-prices.service trading-ingest.service
+After=network-online.target postgresql.service redis-server.service pgbouncer.service
+
+[Install]
+WantedBy=multi-user.target

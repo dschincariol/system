@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading System Database Backup
+
+[Service]
+Type=oneshot
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading-system/repo
+EnvironmentFile=/etc/trading-system/trading.env
+ExecStart=/opt/trading-system/repo/deploy/bin/backup_trading_db.sh
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/trading-system /etc/trading-system

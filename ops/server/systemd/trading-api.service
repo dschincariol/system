@@ -1,0 +1,38 @@
+[Unit]
+Description=Trading operator UI and API
+Documentation=file:/opt/trading/app/ops/server/README.md
+Wants=network-online.target
+After=network-online.target trading-jobs.service
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading/app
+EnvironmentFile=-/etc/trading/trading.env
+EnvironmentFile=-/etc/trading/provider.env
+Environment=NODE_ENV=production
+Environment=TS_SERVICE_NAME=trading-api
+Environment=TS_SECRETS_PROVIDER=systemd-creds
+Environment=TS_PG_ROLE=app
+Environment=OPERATOR_AUTO_START=0
+Environment=OPERATOR_DISABLE_INTERNAL_ENGINE_START=1
+LoadCredentialEncrypted=master_key:/etc/credstore.encrypted/master_key.cred
+LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred
+ExecStart=/usr/bin/node boot/operator_server.js
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-api
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/trading /var/backups/trading /opt/trading/app/data /opt/trading/app/logs
+LimitNOFILE=65536
+LimitNPROC=4096
+TasksMax=4096
+
+[Install]
+WantedBy=trading.target

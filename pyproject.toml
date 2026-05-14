@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-system"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+  "scikit-learn>=1.5.2",
+]
+
+[project.optional-dependencies]
+windows-dev = [
+  "pywin32>=306; sys_platform == 'win32'",
+]
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+include = ["engine*", "routes*", "services*"]

@@ -1,0 +1,10 @@
+[Unit]
+Description=Trading System Daily Database Backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=trading-backup.service
+
+[Install]
+WantedBy=timers.target

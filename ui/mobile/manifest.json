@@ -1,0 +1,24 @@
+{
+  "name": "Trading Ops Mobile",
+  "short_name": "Ops Mobile",
+  "description": "Critical trading-system monitoring and emergency stop surface.",
+  "start_url": "/ui/mobile/",
+  "scope": "/ui/mobile/",
+  "display": "standalone",
+  "background_color": "#101113",
+  "theme_color": "#101113",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/ui/mobile/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/ui/favicon.ico",
+      "sizes": "any",
+      "type": "image/x-icon"
+    }
+  ]
+}

@@ -1,0 +1,3640 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <!--
+    FILE: ui/dashboard.html
+
+    This document is the structural shell for the main dashboard UI. Its IDs
+    and layout regions are consumed by dashboard.js and the extracted feature
+    modules, so markup changes here should be treated as API changes for the
+    browser layer.
+  -->
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Market Impact Dashboard</title>
+<link rel="icon" href="/ui/favicon.ico">
+  <style>
+
+
+    :root{
+  /* Motion system (ops-safe) */
+  --m-fast: 120ms;
+  --m-med: 180ms;
+  --m-slow: 260ms;
+  --ease-out: cubic-bezier(.22,.61,.36,1);
+      --bg: #0e1117;
+      --panel: #0b0f15;
+      --panel2:#0a0d12;
+      --text:#e6edf3;
+      --muted:#9da7b3;
+      --border:#30363d;
+      --chip:#0e1117;
+      --btn:#161b22;
+
+      --ok:#2ea043;
+      --warn:#d29922;
+      --crit:#ff6b6b;
+      --info:#58a6ff;
+
+      --r: 14px;
+      --r2: 10px;
+      --shadow: 0 10px 24px rgba(0,0,0,.30);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 16px;
+      padding-bottom: max(16px, env(safe-area-inset-bottom));
+    }
+
+    /* Top-level Health Summary */
+.healthScoreBar{
+  display:flex;
+  gap:12px;
+  align-items:flex-start;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  background: var(--panel2);
+  border:1px solid var(--border);
+  border-radius: var(--r);
+  padding:10px 12px;
+  margin-bottom:12px;
+  box-shadow: var(--shadow);
+}
+.healthScoreLead{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  min-width:220px;
+  flex:1 1 240px;
+}
+.healthScoreKicker{
+  font-size:11px;
+  color: var(--muted);
+  text-transform:uppercase;
+  letter-spacing:.05em;
+}
+.healthScoreMain{
+  display:flex;
+  gap:10px;
+  align-items:baseline;
+  flex-wrap:wrap;
+}
+.healthScoreValue{
+  font-size:28px;
+  font-weight:900;
+  line-height:1;
+  letter-spacing:.02em;
+}
+.healthScoreCoverage{
+  color: var(--muted);
+  font-size:12px;
+}
+.healthScoreSummary{
+  font-size:12px;
+  color: var(--muted);
+  line-height:1.35;
+  max-width:640px;
+}
+.healthScoreFactors{
+  display:flex;
+  gap:8px;
+  align-items:stretch;
+  flex-wrap:wrap;
+  flex:2 1 420px;
+}
+.healthScoreFactor{
+  min-width:146px;
+  padding:8px 10px;
+  border:1px solid rgba(48,54,61,.65);
+  border-radius: 12px;
+  background: rgba(255,255,255,.025);
+}
+.healthScoreFactor.ok{ border-color: rgba(46,160,67,.55); }
+.healthScoreFactor.warn{ border-color: rgba(210,153,34,.65); }
+.healthScoreFactor.bad{ border-color: rgba(255,107,107,.65); }
+.healthScoreFactor.dim{ opacity:.92; }
+.healthScoreFactorName{
+  font-size:11px;
+  color: var(--muted);
+  text-transform:uppercase;
+  letter-spacing:.05em;
+}
+.healthScoreFactorState{
+  margin-top:4px;
+  font-size:13px;
+  font-weight:800;
+}
+.healthScoreFactorDetail{
+  margin-top:3px;
+  font-size:11px;
+  color: var(--muted);
+  line-height:1.35;
+}
+
+    /* Telemetry Strip */
+.telemetryStrip{
+  display:flex;
+  gap:18px;
+  align-items:center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size:12px;
+  background: var(--panel2);
+  border:1px solid var(--border);
+  border-radius: var(--r);
+  padding:8px 14px;
+  margin-bottom:12px;
+  box-shadow: var(--shadow);
+}
+
+    /* App header */
+    .appHeader{
+      display:flex;
+      align-items:center;
+      gap:12px;
+      flex-wrap:wrap;
+      margin-bottom: 14px;
+    }
+    .appTitle{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      font-weight: 900;
+      letter-spacing: .2px;
+      font-size: 20px;
+      margin: 0;
+    }
+    .appSubtitle{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+    }
+    .appRight{
+      margin-left:auto;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+      
+    }
+
+    .screenShell{
+      display:flex;
+      flex-direction:column;
+      gap:14px;
+    }
+
+    .screenTabs{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+      padding:12px 14px;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius: var(--r);
+      background: linear-gradient(180deg, rgba(15,26,43,.92), rgba(11,18,32,.92));
+      box-shadow: var(--shadow);
+    }
+
+    .screenTabGroup{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+
+    .screenTab{
+      appearance:none;
+      border:1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.03);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 12px;
+      font-weight: 800;
+      cursor:pointer;
+      transition:
+        background var(--m-fast) var(--ease-out),
+        border-color var(--m-fast) var(--ease-out),
+        transform var(--m-fast) var(--ease-out);
+    }
+
+    .screenTab:hover{
+      border-color: rgba(88,166,255,.35);
+      background: rgba(88,166,255,.08);
+    }
+
+    .screenTab.is-active{
+      background: linear-gradient(180deg, rgba(88,166,255,.24), rgba(88,166,255,.12));
+      border-color: rgba(88,166,255,.55);
+      box-shadow: 0 0 0 1px rgba(88,166,255,.14) inset;
+    }
+
+    .screenMeta{
+      margin-left:auto;
+      color: var(--muted);
+      font-size: 12px;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+
+    .dashboard-screen-hidden{
+      display:none !important;
+    }
+
+    .dashboard-persona-hidden{
+      display:none !important;
+    }
+
+    .personaControl{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+    }
+
+    .personaSelect{
+      min-width:144px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background: rgba(22,27,34,.92);
+      color: var(--fg);
+      padding:4px 10px;
+      font: inherit;
+    }
+
+    /* Cards grid (outer layout only) */
+.dashboard-grid{
+  display:grid;
+  grid-template-columns: 320px 1fr 320px;
+  grid-template-rows: auto;
+  gap:14px;
+  align-items:start;
+}
+
+.dashboard-left{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+.dashboard-center{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+.dashboard-right{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+.dashboard-footer{
+  margin-top:16px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:12px;
+}
+
+.copilotPanel{
+  position: fixed;
+  top: 84px;
+  right: 16px;
+  bottom: 16px;
+  width: min(420px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(48,54,61,.8);
+  border-radius: 16px;
+  background: rgba(11,15,21,.98);
+  box-shadow: -18px 0 40px rgba(0,0,0,.34);
+  z-index: 1500;
+  transform: translateX(calc(100% + 24px));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--m-med) var(--ease-out),
+    opacity var(--m-fast) var(--ease-out);
+}
+
+.copilotPanel.is-open{
+  transform: none;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.copilotHeader{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px;
+}
+
+.copilotTitle{
+  font-weight: 900;
+  letter-spacing:.2px;
+}
+
+.copilotSubtitle{
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.copilotHeaderActions{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+
+.copilotStarters{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+
+.copilotThread{
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  padding-right: 2px;
+}
+
+.copilotEmpty{
+  border:1px dashed rgba(48,54,61,.75);
+  border-radius: 12px;
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  background: rgba(255,255,255,.02);
+}
+
+.copilotMessage{
+  border:1px solid rgba(48,54,61,.7);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,.02);
+}
+
+.copilotMessage.is-user{
+  background: rgba(88,166,255,.08);
+}
+
+.copilotRole{
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  margin-bottom: 6px;
+}
+
+.copilotText{
+  white-space: pre-wrap;
+  line-height: 1.45;
+  font-size: 13px;
+}
+
+.copilotSuggestedLabel{
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+
+.copilotSuggestedList{
+  margin: 6px 0 0 16px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.copilotComposer{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  border-top: 1px solid rgba(48,54,61,.5);
+  padding-top: 10px;
+}
+
+.copilotComposer.is-busy{
+  opacity: .92;
+}
+
+.copilotLabel{
+  font-size: 12px;
+  color: var(--muted);
+}
+
+#copilotQuestion{
+  width:100%;
+  resize: vertical;
+  min-height: 78px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(48,54,61,.75);
+  background: rgba(10,13,18,.9);
+  color: var(--text);
+  font: inherit;
+}
+
+.copilotComposerActions{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+
+@media (max-width:1200px){
+  .dashboard-grid{
+    grid-template-columns:1fr;
+  }
+  .copilotPanel{
+    top: 12px;
+    right: 12px;
+    left: 12px;
+    bottom: 12px;
+    width: auto;
+  }
+}
+    @media (max-width: 1100px){
+      .cards{ grid-template-columns: 1fr; }
+    }
+
+    /* Original .row is used elsewhere (keep as flex) */
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+
+.card {
+  background:
+    linear-gradient(180deg, rgba(15,26,43,.92), rgba(11,18,32,.92));
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: var(--r);
+  padding: 14px;
+  margin-bottom: 14px;
+  box-shadow:
+    0 10px 24px rgba(0,0,0,.45),
+    0 0 0 1px rgba(255,255,255,.03) inset;
+  transition:
+    transform var(--m-fast) var(--ease-out),
+    box-shadow var(--m-fast) var(--ease-out),
+    border-color var(--m-fast) var(--ease-out);
+}
+
+.card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(88,166,255,.35);
+  box-shadow:
+    0 18px 36px rgba(0,0,0,.55),
+    0 0 0 1px rgba(88,166,255,.08) inset;
+}
+
+    /* Card header polish */
+    .card h2{
+      margin: 0 0 10px;
+      display:flex;
+      align-items:center;
+      gap:10px;
+      font-size: 16px;
+      letter-spacing: .2px;
+    }
+
+    /* Collapsible */
+    .collapsible h2 { cursor: pointer; user-select: none; }
+    .collapsible.collapsed pre,
+    .collapsible.collapsed table,
+    .collapsible.collapsed canvas,
+    .collapsible.collapsed .table-wrap,
+    .collapsible.collapsed .console { display: none; }
+    .collapsible h2::after { content: " ▾"; opacity: 0.6; margin-left:auto; }
+    .collapsible.collapsed h2::after { content: " ▸"; }
+
+    /* Sticky card headers (so you can scroll inside a tall card) */
+    .card h2 {
+      position: sticky;
+      top: 0;
+      background: linear-gradient(to bottom, var(--panel) 85%, rgba(11,15,21,0));
+      padding: 10px 0 8px;
+      z-index: 2;
+      border-bottom: 1px solid rgba(48,54,61,.35);
+    }
+
+    /* Pills */
+.pill {
+  display: inline-flex;
+  align-items:center;
+  gap:6px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,.08);
+  background: rgba(255,255,255,.03);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  backdrop-filter: blur(6px);
+
+  transition:
+    background var(--m-fast) var(--ease-out),
+    border-color var(--m-fast) var(--ease-out),
+    transform var(--m-fast) var(--ease-out),
+    box-shadow var(--m-fast) var(--ease-out);
+}
+
+.pill:hover {
+  border-color: rgba(88,166,255,.35);
+  background: rgba(88,166,255,.06);
+}
+
+    .pill.ok   { border-color: var(--ok); }
+    .pill.bad  { border-color: var(--crit); }
+    .pill.dim  { opacity: .9; color: var(--muted); }
+.pill.warn {
+  background: linear-gradient(180deg, #f0b429, #d29922);
+  color:#000;
+  border-color: rgba(0,0,0,.35);
+  font-weight: 700;
+}
+
+.pill.crit {
+  background: linear-gradient(180deg, #ff7b7b, #ff4d4d);
+  color:#fff;
+  border-color: rgba(0,0,0,.35);
+  font-weight: 900;
+  box-shadow: 0 0 0 1px rgba(255,107,107,.35),
+              0 0 18px rgba(255,107,107,.25);
+}
+    .pill.acked{ background:#6e7681; color:#fff; border-color: rgba(0,0,0,.25); }
+    .pill.resolved { background:#444; color:#ddd; border-color: rgba(0,0,0,.25); }
+
+    @keyframes critPulse {
+  0%   { box-shadow: 0 0 0 rgba(255,107,107,0); }
+  50%  { box-shadow: 0 0 18px rgba(255,107,107,.35); }
+  100% { box-shadow: 0 0 0 rgba(255,107,107,0); }
+}
+
+.pill.crit {
+  animation: critPulse var(--m-slow) var(--ease-out) 1;
+}
+
+    /* -----------------------------
+       Operator vs Expert visibility
+       ----------------------------- */
+body.mode-operator .expertOnly { 
+  display:none !important; 
+}
+
+/* Expert panels visually de-emphasized in Operator Mode */
+body.mode-operator .card.expertOnly,
+body.mode-operator .expertAction {
+  opacity: .55;
+  filter: grayscale(.15);
+  pointer-events: none;
+}
+
+body.mode-operator.expert-unlocked .card.expertOnly,
+body.mode-operator.expert-unlocked .expertAction {
+  opacity: 1;
+  filter: none;
+  pointer-events: auto;
+}
+
+body.mode-expert .operatorOnly { display:none !important; }
+
+    /* Expert unlock gates risky actions while staying in Operator Mode */
+    body.mode-operator .expertAction { display:none !important; }
+    body.mode-operator.expert-unlocked .expertAction { display:inline-flex !important; }
+
+    /* -----------------------------
+       Decision Header (sticky)
+       ----------------------------- */
+.decisionBar{
+  position: sticky;
+  top: 0;
+  z-index: 999;
+  border: 1px solid rgba(88,166,255,.35);
+  background: rgba(11,15,21,.94);
+  backdrop-filter: blur(12px);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  box-shadow: 0 12px 26px rgba(0,0,0,.45);
+  margin: 0 0 12px;
+}
+
+    .decisionRow{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .decisionLeft{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .decisionRight{
+      margin-left:auto;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .pill.clickable{ cursor:pointer; user-select:none; }
+    .pill.clickable:hover{ filter: brightness(1.05); }
+
+    .filtersRow{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(48,54,61,.45);
+    }
+    .input, select{
+      background: var(--btn);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 7px 10px;
+      font-size: 13px;
+      outline: none;
+    }
+    .input::placeholder{ color: rgba(157,167,179,.75); }
+
+    /* -----------------------------
+       Heatmap
+       ----------------------------- */
+    .heatmapWrap{
+      border: 1px solid rgba(48,54,61,.45);
+      border-radius: 12px;
+      overflow:hidden;
+      background: var(--panel2);
+    }
+    .heatmapGrid{
+      display:grid;
+      grid-template-columns: 160px repeat(4, 1fr);
+      gap: 1px;
+      background: rgba(48,54,61,.45);
+    }
+.hmCell{
+  background: var(--panel);
+  padding: 8px 10px;
+  font-size: 12px;
+  min-height: 34px;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  cursor:pointer;
+  user-select:none;
+  transition: filter var(--m-fast) var(--ease-out),
+            background var(--m-fast) var(--ease-out),
+            transform var(--m-fast) var(--ease-out);
+
+}
+
+.hmCell:hover{
+  filter: brightness(1.12);
+  transform: scale(1.015);
+}
+
+    .hmHead{
+      font-weight: 800;
+      background: #0b0f15;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .hmSym{
+      font-weight: 800;
+      gap:10px;
+    }
+    .hmSwatch{
+      width: 10px;
+      height: 10px;
+      border-radius: 3px;
+      border: 1px solid rgba(0,0,0,.25);
+      flex: 0 0 auto;
+    }
+    .hmMeta{
+      margin-left:auto;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    /* -----------------------------
+       Incident list
+       ----------------------------- */
+    .incidentList{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      margin-top: 12px;
+    }
+
+.incidentItem{
+  position: relative;
+  border: 1px solid rgba(48,54,61,.55);
+  background: linear-gradient(to bottom, rgba(10,13,18,.75), rgba(11,15,21,.97));
+  border-radius: 14px;
+  padding: 10px 12px 10px 16px;
+  box-shadow: 0 10px 22px rgba(0,0,0,.25);
+  cursor:pointer;
+
+  animation: incidentIn var(--m-med) var(--ease-out) both;
+  transition:
+    transform var(--m-fast) var(--ease-out),
+    box-shadow var(--m-fast) var(--ease-out),
+    filter var(--m-fast) var(--ease-out);
+}
+
+.incidentItem:hover{
+  transform: translateY(-1px);
+  box-shadow: 0 14px 28px rgba(0,0,0,.35);
+  filter: brightness(1.05);
+}
+
+/* Severity rail */
+.incidentItem::before{
+  content:"";
+  position:absolute;
+  left:0;
+  top:8px;
+  bottom:8px;
+  width:4px;
+  border-radius: 4px;
+  background: var(--border);
+}
+
+.incidentItem[data-sev="CRIT"]::before{
+  background: var(--crit);
+  box-shadow: 0 0 12px rgba(255,107,107,.6);
+}
+
+.incidentItem[data-sev="WARN"]::before{
+  background: var(--warn);
+}
+
+    .incidentTop{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .incidentTitle{
+      font-weight: 900;
+      letter-spacing:.2px;
+    }
+    .incidentSub{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 6px;
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+    .incidentActions{
+      margin-left:auto;
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    canvas.spark{
+      width: 86px;
+      height: 18px;
+      border: 1px solid rgba(48,54,61,.55);
+      border-radius: 8px;
+      background: #0b0f15;
+    }
+
+    @keyframes incidentIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+    /* -----------------------------
+       Incident drawer (right side)
+       ----------------------------- */
+    .drawerOverlay{
+      display:none;
+      position:fixed;
+      inset:0;
+      background: rgba(0,0,0,.55);
+      z-index: 2000;
+    }
+.drawer{
+  position:fixed;
+  top:0;
+  right:0;
+  height:100%;
+  width:min(520px, 92vw);
+  background: #0b0f15;
+  border-left: 1px solid var(--border);
+  box-shadow: -18px 0 40px rgba(0,0,0,.55);
+  padding: 14px;
+  overflow:auto;
+
+  animation: drawerIn var(--m-med) var(--ease-out) both;
+}
+
+    .drawerHeader{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: linear-gradient(to bottom, #0b0f15 85%, rgba(11,15,21,0));
+      padding: 8px 0 10px;
+      border-bottom: 1px solid rgba(48,54,61,.45);
+    }
+    .drawerTitle{
+      font-weight: 950;
+      letter-spacing:.2px;
+      font-size: 16px;
+    }
+    .drawerSection{
+      margin-top: 12px;
+      border: 1px solid rgba(48,54,61,.45);
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: rgba(10,13,18,.55);
+    }
+    .drawerSection h3{
+      margin: 0 0 8px;
+      font-size: 13px;
+      letter-spacing:.2px;
+    }
+    .drawerKvs{
+      display:grid;
+      grid-template-columns: 120px 1fr;
+      gap: 6px 10px;
+      font-size: 12px;
+    }
+    .kvK{ color: var(--muted); }
+    .kvV{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+
+    .status {
+  font-weight: 800;
+  margin: 6px 0 6px;
+  transition: color var(--m-fast) var(--ease-out);
+}
+
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.bad { color: var(--crit); }
+
+    .opsBanner{
+      display:none;
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(48,54,61,.65);
+      background: rgba(255,255,255,.03);
+      box-shadow: var(--shadow);
+    }
+    .opsBanner.is-visible{ display:block; }
+    .opsBanner.warn{
+      border-color: rgba(210,153,34,.55);
+      background: rgba(210,153,34,.10);
+    }
+    .opsBanner.crit{
+      border-color: rgba(255,107,107,.55);
+      background: rgba(255,107,107,.10);
+    }
+    .opsBannerTitle{
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: .02em;
+    }
+    .opsBannerMeta{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    @keyframes drawerIn {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+    /* Text helpers */
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      opacity: 0.95;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    .opsStatGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .opsStat {
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,.025);
+    }
+    .opsStatLabel {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .opsStatValue {
+      margin-top: 6px;
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: .2px;
+    }
+    .opsNotes {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .opsNote {
+      border-left: 2px solid rgba(88,166,255,.35);
+      padding-left: 10px;
+    }
+    .operatorConsoleBridge {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border: 1px solid rgba(48,54,61,.65);
+      border-radius: 12px;
+      background: rgba(255,255,255,.025);
+    }
+    .operatorConsoleBridgeTop {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .operatorConsoleBridgeTitle {
+      font-weight: 900;
+      font-size: 13px;
+    }
+    .operatorConsoleBridgeActions {
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin-top: 10px;
+    }
+    .health-ok { color: var(--ok); }
+    .health-bad { color: var(--crit); font-weight: 800; }
+
+    /* Buttons */
+.btn {
+  appearance: none;
+  border: 1px solid rgba(255,255,255,.08);
+  background: linear-gradient(180deg, rgba(22,27,34,.95), rgba(15,20,28,.95));
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: 14px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  box-shadow: 0 8px 18px rgba(0,0,0,.35);
+
+  transition:
+    transform var(--m-fast) var(--ease-out),
+    box-shadow var(--m-fast) var(--ease-out),
+    border-color var(--m-fast) var(--ease-out);
+}
+
+.btn:hover {
+  border-color: rgba(88,166,255,.45);
+  box-shadow:
+    0 14px 28px rgba(0,0,0,.45),
+    0 0 0 1px rgba(88,166,255,.15) inset;
+}
+
+.btn:active {
+  transform: scale(.97);
+}
+    .btn[disabled] { opacity: .5; cursor: not-allowed; }
+    .btnSmall { padding: 6px 8px; font-size: 12px; border-radius: 10px; }
+
+    /* Button groups: nicer wrapping + spacing */
+    .btnRow{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin: 10px 0;
+    }
+
+    /* Icons (SVG sprite) */
+    .i{
+      width:16px;
+      height:16px;
+      display:inline-block;
+      flex:0 0 auto;
+      fill: currentColor;
+      opacity: .95;
+    }
+    .btn .i{ opacity:.95; }
+
+    /* Console */
+.console {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: var(--r2);
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+    /* Tables */
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--r2); }
+    table { width: 100%; border-collapse: collapse; min-width: 520px; }
+    th, td { 
+  padding: 8px 9px; 
+  border-bottom: 1px solid rgba(48,54,61,.65); 
+  font-size: 13px; 
+  vertical-align: top; 
+}
+
+tbody tr:hover td{
+  background: rgba(88,166,255,.08);
+}
+    th {
+      background: rgba(22,27,34,.95);
+      text-align: left;
+      position: sticky;
+      top: 38px; /* leaves space for sticky card header */
+      z-index: 1;
+      border-bottom: 1px solid rgba(48,54,61,.85);
+      backdrop-filter: blur(6px);
+    }
+tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
+    tbody tr:hover td{ background: rgba(88,166,255,.06); }
+    .decisionDrilldownRow{ cursor:pointer; }
+    .decisionDrilldownRow:focus-visible td{
+      outline: 2px solid rgba(88,166,255,.75);
+      outline-offset: -2px;
+      background: rgba(88,166,255,.10);
+    }
+    .sr-only{
+      position:absolute;
+      width:1px;
+      height:1px;
+      padding:0;
+      margin:-1px;
+      overflow:hidden;
+      clip:rect(0,0,0,0);
+      white-space:nowrap;
+      border:0;
+    }
+    .tableControls{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+      margin:10px 0 8px;
+    }
+    .tableSearchInput,
+    .tableSortSelect{
+      height:32px;
+      border:1px solid rgba(48,54,61,.85);
+      border-radius:6px;
+      background:rgba(13,17,23,.95);
+      color:var(--text);
+      padding:0 9px;
+      font:inherit;
+      font-size:12px;
+    }
+    .tableSearchInput{ min-width:190px; flex:1 1 220px; }
+    .tableSortSelect{ flex:0 0 auto; }
+    .tableCount{
+      margin-left:auto;
+      color:var(--muted);
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .tableSortButton{
+      width:100%;
+      border:0;
+      background:transparent;
+      color:inherit;
+      font:inherit;
+      font-weight:700;
+      cursor:pointer;
+      display:inline-flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:6px;
+      padding:0;
+      text-align:left;
+    }
+    .tableSortButton:focus-visible{
+      outline:2px solid rgba(88,166,255,.75);
+      outline-offset:2px;
+      border-radius:4px;
+    }
+    .tableSortButton.is-active{ color:var(--info); }
+    .tableSortIndicator{
+      display:inline-block;
+      width:1ch;
+      text-align:center;
+      color:var(--muted);
+    }
+
+    /* Canvas polish */
+    canvas{
+      border: 1px solid var(--border);
+      border-radius: var(--r2);
+      background: var(--panel2);
+    }
+
+    .replayControls{
+      display:grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap:8px;
+      align-items:end;
+      margin:10px 0;
+    }
+    .replayControls label{
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      color:var(--muted);
+      font-size:12px;
+    }
+    .replayControls button{
+      min-height:38px;
+    }
+    .replayScrubber{
+      width:100%;
+      margin:10px 0;
+    }
+    .replayStatGrid{
+      display:grid;
+      grid-template-columns: repeat(6, minmax(110px, 1fr));
+      gap:8px;
+      margin-top:8px;
+    }
+    .replayStat{
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      min-width:0;
+      padding:8px 10px;
+      border:1px solid rgba(48,54,61,.65);
+      border-radius:8px;
+      background:rgba(11,15,21,.72);
+    }
+    .replayStat span{
+      color:var(--muted);
+      font-size:11px;
+    }
+    .replayStat b{
+      font-size:13px;
+      overflow-wrap:anywhere;
+    }
+    .replayGap{
+      display:flex;
+      gap:8px;
+      align-items:flex-start;
+      padding:6px 0;
+      border-bottom:1px solid rgba(48,54,61,.35);
+      color:var(--muted);
+      font-size:12px;
+    }
+    .replayGap.warn{ color:var(--warn); }
+    .replayGap.bad{ color:var(--crit); }
+    #replayChart{
+      width:100%;
+      height:280px;
+      border:1px solid #30363d;
+      border-radius:10px;
+      background:#0a0d12;
+    }
+    @media (max-width: 920px){
+      .replayControls{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .replayStatGrid{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    /* Modal polish */
+    #whyModal{
+      backdrop-filter: blur(4px);
+    }
+
+    @media (prefers-reduced-motion: reduce){
+  *{
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+    /* Mobile */
+    @media (max-width: 768px) {
+      body { padding: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+      .cards { grid-template-columns: 1fr; gap: 10px; }
+      .card { padding: 12px; min-width: 0; }
+      .appTitle { font-size: 18px; }
+      .healthScoreValue { font-size: 24px; }
+      .healthScoreFactor { min-width: 0; flex: 1 1 140px; }
+      h2 { font-size: 16px; }
+      pre.mono { font-size: 11px; }
+      button, select, input { min-height: 44px; font-size: 16px; }
+      th { top: 36px; }
+    }
+
+    /* Small helper blocks already present in your HTML */
+    .pb { line-height: 1.25; }
+    .pb-steps { margin-top: 4px; font-size: 12px; opacity: 0.85; }
+
+    /* =============================
+       Decision framing UI
+       ============================= */
+    .decisionFrame { border-color: rgba(88,166,255,.25); background: rgba(10,13,18,.62); }
+    .dfTop{ display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; }
+    .dfPosture{ display:flex; flex-direction:column; gap:6px; min-width: 180px; }
+    .dfRight{ margin-left:auto; display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+    .dfRow{ display:flex; flex-direction:column; gap:6px; }
+    .dfBlock{ margin-top:10px; padding-top:10px; border-top: 1px solid rgba(48,54,61,.35); }
+
+    .postureBadge{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(48,54,61,.55);
+      background: rgba(11,15,21,.90);
+      font-weight: 950;
+      letter-spacing: .4px;
+      min-height: 42px;
+      gap:10px;
+      user-select:none;
+    }
+    .postureBadge.monitor{ border-color: rgba(46,160,67,.75); }
+    .postureBadge.prepare{ border-color: rgba(210,153,34,.85); }
+.postureBadge.act{
+  border-color: rgba(255,107,107,.85);
+  animation: softPulse 1.1s ease-in-out infinite;
+}
+
+    .postureDot{
+      width: 10px; height: 10px; border-radius: 999px;
+      background: #6e7681;
+      box-shadow: 0 0 0 3px rgba(110,118,129,.15);
+    }
+    .postureBadge.monitor .postureDot{ background: var(--ok); box-shadow: 0 0 0 3px rgba(46,160,67,.16); }
+    .postureBadge.prepare .postureDot{ background: var(--warn); box-shadow: 0 0 0 3px rgba(210,153,34,.16); }
+    .postureBadge.act .postureDot{ background: var(--crit); box-shadow: 0 0 0 3px rgba(255,107,107,.16); }
+
+    @keyframes softPulse {
+      0% { transform: scale(1); filter: brightness(1); }
+      50% { transform: scale(1.02); filter: brightness(1.06); }
+      100% { transform: scale(1); filter: brightness(1); }
+    }
+    .pulse { animation: softPulse 1.1s ease-in-out 1; }
+
+    /* =============================
+       Voice UI (iPhone friendly)
+       ============================= */
+    .voicePanel{
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(48,54,61,.45);
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .voiceTop{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .voiceTitle{ font-weight: 900; letter-spacing:.2px; }
+    .voiceMeta{ margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
+    .voiceTranscript{
+      padding: 10px 12px;
+      border: 1px solid rgba(48,54,61,.55);
+      border-radius: 12px;
+      background: rgba(10,13,18,.55);
+      min-height: 44px;
+      white-space: pre-wrap;
+    }
+
+    /* Make the mic button feel “held” */
+    #btnVoice.isListening{
+      border-color: rgba(88,166,255,.65);
+      box-shadow: 0 0 0 4px rgba(88,166,255,.14);
+    }
+#btnVoice.isListening::after{
+  content: " ●";
+  color: #58a6ff;
+  font-weight: 900;
+}
+
+    /* iPhone: ensure comfortable tap targets in decision bar */
+    @media (max-width: 768px){
+      #btnVoice { min-height: 44px; }
+      .postureBadge{ width: 100%; justify-content:flex-start; }
+      .dfRight{ width: 100%; }
+    }
+
+    .modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  z-index: 9999;
+  padding: 18px;
+}
+.modalInner {
+  max-width: 980px;
+  margin: 0 auto;
+  background:#0b0f15;
+  border:1px solid #30363d;
+  border-radius:12px;
+  padding:12px;
+}
+.modalHeader{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:10px;
+}
+.modalTitle{
+  font-weight:800;
+}
+.decisionCards{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(240px, 1fr));
+  gap:10px;
+  margin-top:10px;
+}
+.decisionCard{
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;
+  background:rgba(255,255,255,.03);
+  padding:12px;
+  cursor:pointer;
+  transition:transform var(--m-fast) var(--ease-out), border-color var(--m-fast) var(--ease-out), background var(--m-fast) var(--ease-out);
+}
+.decisionCard:hover{
+  transform:translateY(-1px);
+  border-color:rgba(88,166,255,.35);
+  background:rgba(88,166,255,.06);
+}
+.decisionCard.symbolContextMatch{
+  border-color:rgba(88,166,255,.72);
+  background:rgba(88,166,255,.10);
+}
+tr.symbolContextMatch td{
+  background:rgba(88,166,255,.11) !important;
+  box-shadow:inset 3px 0 0 rgba(88,166,255,.75);
+}
+.symbolContextMatch .pill:first-child{
+  border-color:rgba(88,166,255,.72);
+}
+.decisionCardTop{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin-bottom:8px;
+}
+.decisionCardWhy{
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.45;
+  margin-top:8px;
+}
+.decisionMetaRow{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.decisionDetailGrid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+  gap:12px;
+}
+.decisionDetailBlock{
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:10px;
+  padding:10px;
+  background:rgba(255,255,255,.02);
+}
+.decisionDetailBlock h3{
+  margin:0 0 8px;
+  font-size:13px;
+}
+.decisionDetailKvs{
+  display:grid;
+  grid-template-columns:auto 1fr;
+  gap:6px 10px;
+  font-size:12px;
+}
+.decisionEmpty{
+  color:var(--muted);
+  font-size:12px;
+  margin-top:10px;
+}
+.recommendedActionGrid{
+  display:grid;
+  grid-template-columns:minmax(280px, 1.15fr) minmax(220px, 1fr);
+  gap:12px;
+  align-items:stretch;
+}
+.recommendedActionHero{
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;
+  padding:14px;
+  background:linear-gradient(180deg, rgba(88,166,255,.10), rgba(255,255,255,.02));
+}
+.recommendedActionKicker{
+  font-size:11px;
+  letter-spacing:.12em;
+  text-transform:uppercase;
+  color:var(--muted);
+}
+.recommendedActionTitle{
+  margin-top:8px;
+  font-size:28px;
+  font-weight:900;
+  letter-spacing:.04em;
+}
+.recommendedActionSub{
+  margin-top:6px;
+  color:#e6edf3;
+  font-size:13px;
+}
+.recommendedActionReason{
+  margin-top:10px;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.45;
+}
+.panelStateRow{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  flex-wrap:wrap;
+  margin:8px 0 10px;
+  padding:8px 10px;
+  border:1px solid rgba(48,54,61,.55);
+  border-radius:10px;
+  background:rgba(255,255,255,.025);
+}
+.panelStateBadge{
+  display:inline-flex;
+  align-items:center;
+  border-radius:999px;
+  padding:2px 8px;
+  font-size:11px;
+  font-weight:800;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  border:1px solid rgba(255,255,255,.12);
+}
+.panelStateBadge.is-fresh{
+  color:#2ea043;
+  border-color:rgba(46,160,67,.45);
+  background:rgba(46,160,67,.12);
+}
+.panelStateBadge.is-stale{
+  color:#d29922;
+  border-color:rgba(210,153,34,.45);
+  background:rgba(210,153,34,.12);
+}
+.panelStateBadge.is-empty{
+  color:#9da7b3;
+  border-color:rgba(157,167,179,.28);
+  background:rgba(157,167,179,.08);
+}
+.panelStateBadge.is-error{
+  color:#ff6b6b;
+  border-color:rgba(255,107,107,.45);
+  background:rgba(255,107,107,.12);
+}
+.panelStateText{
+  flex:1 1 220px;
+  min-width:0;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.45;
+}
+.structuredSummary{
+  display:grid;
+  gap:8px;
+}
+.structuredSummaryGrid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(170px, 1fr));
+  gap:8px;
+  margin-top:10px;
+}
+.structuredSummaryRow{
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:10px;
+  padding:10px;
+  background:rgba(255,255,255,.02);
+}
+.structuredSummaryLabel{
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  color:var(--muted);
+}
+.structuredSummaryValue{
+  margin-top:6px;
+  font-size:14px;
+  font-weight:800;
+  color:#e6edf3;
+}
+.structuredSummaryMeta{
+  margin-top:4px;
+  font-size:11px;
+  color:var(--muted);
+  line-height:1.4;
+}
+.rawToggle{
+  margin-top:10px;
+}
+.rawToggle summary{
+  cursor:pointer;
+  color:var(--muted);
+  user-select:none;
+}
+.surfaceWrap{
+  position:relative;
+}
+.surfaceOverlayState{
+  position:absolute;
+  inset:12px 12px auto 12px;
+  z-index:5;
+  display:none;
+  padding:9px 12px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,.12);
+  background:rgba(11,15,21,.92);
+  color:#e6edf3;
+  font-size:12px;
+  line-height:1.45;
+  box-shadow:0 10px 30px rgba(0,0,0,.28);
+}
+.surfaceOverlayState.is-visible{
+  display:block;
+}
+@media (max-width: 980px){
+  .recommendedActionGrid{
+    grid-template-columns:1fr;
+  }
+}
+  </style>
+
+  <!-- Small theme overrides (degraded pulse, exec-blocked accent, etc.) -->
+  <link rel="stylesheet" href="/ui/dashboard_theme.css">
+<link rel="stylesheet" href="/ui/styles.tech.css">
+<link rel="stylesheet" href="/ui/base.css">
+
+</head>
+
+<body class="theme-tech">
+  <!-- SVG Icon Sprite (no external deps) -->
+  <svg aria-hidden="true" style="position:absolute; width:0; height:0; overflow:hidden;">
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M17.65 6.35A7.95 7.95 0 0012 4V1L7 6l5 5V7a5 5 0 11-5 5H5a7 7 0 107.75-6.92 7.9 7.9 0 014.9 1.27z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2H8l1-2z"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><path d="M12 12a4 4 0 10-4-4 4 4 0 004 4zm0 2c-4.42 0-8 2-8 4v2h16v-2c0-2-3.58-4-8-4z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.4 9.7-8 10-4.6-.3-8-5-8-10V6l8-4z"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M12 5V1L7 6l5 5V7c3.3 0 6 2.7 6 6a6 6 0 01-6 6H6v2h6a8 8 0 000-16z"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></symbol>
+    <symbol id="i-wand" viewBox="0 0 24 24"><path d="M2 22l14-14 2 2L4 24H2v-2zM16 2l6 6-2 2-6-6 2-2z"/></symbol>
+  </svg>
+
+  <div id="system-status-header"></div>
+  <div id="dashboardDegradedBanner" class="opsBanner" role="status" aria-live="polite">
+    <div id="dashboardDegradedBannerTitle" class="opsBannerTitle">Checking runtime state…</div>
+    <div id="dashboardDegradedBannerDetail" class="opsBannerMeta">Validating health, readiness, and execution safety.</div>
+  </div>
+
+<div class="appHeader">
+    <div>
+      <h1 class="appTitle">📊 Market Impact Dashboard</h1>
+      <div class="appSubtitle">Multi-screen ops surface • overview • operate • explain • analyze • data health • positions</div>
+    </div>
+    <div class="appRight">
+      <a class="btn" id="appDataSourcesLink" href="/ui/data_sources.html" title="Open Data Source Control Plane">🧭 Sources</a>
+      <a class="btn" id="appTerminalLink" href="/ui/terminal/terminal.html" title="Open Trading Terminal">⚡ Terminal</a>
+      <a class="btn" id="appOperatorLink" href="/operator/" title="Open Operator Console">🛠 Operator</a>
+      <button class="btn" id="btnCopilotToggle" type="button" aria-expanded="false" aria-controls="copilotPanel">🤖 Copilot</button>
+      <span class="pill dim">UI: <span class="mono">/ui/dashboard.html</span></span>
+      <span class="pill dim">API: <span class="mono">/api/*</span></span>
+    </div>
+</div>
+
+<div id="page-dashboard" class="screenShell">
+  <div class="screenTabs" id="dashboardScreenTabs" aria-label="Dashboard screens">
+    <div class="screenTabGroup">
+      <button class="screenTab is-active" type="button" data-screen-target="overview">Overview</button>
+      <button class="screenTab" type="button" data-screen-target="operate">Operate</button>
+      <button class="screenTab" type="button" data-screen-target="explain">Explain</button>
+      <button class="screenTab" type="button" data-screen-target="analyze">Analyze</button>
+      <button class="screenTab" type="button" data-screen-target="data">Data Health</button>
+      <button class="screenTab" type="button" data-screen-target="positions">Positions</button>
+      <button class="screenTab" type="button" data-screen-target="execution">Execution</button>
+    </div>
+    <div class="screenMeta">
+      Screen: <span id="dashboardScreenLabel" class="mono">overview</span>
+      <label class="personaControl" for="dashboardPersonaSelect">
+        Persona:
+        <select id="dashboardPersonaSelect" class="personaSelect" aria-label="Dashboard persona filter">
+          <option value="operations">Operations</option>
+          <option value="fund_manager">Fund Manager</option>
+          <option value="expert">Expert / All</option>
+        </select>
+      </label>
+      <span class="pill dim">View: <span id="dashboardPersonaLabel" class="mono">Operations</span></span>
+      <span id="operatorWsStatus" class="pill dim meta-pill-offset" title="Operator WebSocket status">
+        <span id="operatorWsDot" aria-hidden="true" style="display:inline-block; width:8px; height:8px; border-radius:999px; background:#6e7681; margin-right:6px; vertical-align:middle;"></span>
+        <span id="operatorWsLabel" class="mono">polling</span>
+      </span>
+    </div>
+  </div>
+
+  <div id="healthScoreBar" class="healthScoreBar" role="status" aria-live="polite">
+    <div class="healthScoreLead">
+      <div class="healthScoreKicker">Top-level health</div>
+      <div class="healthScoreMain">
+        <span id="healthScoreValue" class="healthScoreValue">—</span>
+        <span id="healthScoreBadge" class="pill dim">waiting</span>
+        <span id="healthScoreCoverage" class="healthScoreCoverage mono">0/4 factors</span>
+      </div>
+      <div id="healthScoreSummary" class="healthScoreSummary">
+        Waiting for enough live health inputs to compute the summary.
+      </div>
+    </div>
+    <div id="healthScoreFactors" class="healthScoreFactors" aria-label="Health score factor breakdown"></div>
+  </div>
+
+  <div class="card" id="recommendedActionCard">
+    <h2 class="card-header">🎯 Recommended Action <span id="recommendedActionStatePill" class="pill dim meta-pill-offset">loading</span></h2>
+    <div class="recommendedActionGrid">
+      <div class="recommendedActionHero">
+        <div class="recommendedActionKicker">Primary action</div>
+        <div id="recommendedActionPrimary" class="recommendedActionTitle">WAIT</div>
+        <div id="recommendedActionTarget" class="recommendedActionSub">Waiting for decisions, advisories, and runtime health.</div>
+        <div id="recommendedActionReason" class="recommendedActionReason">Decision support is loading.</div>
+      </div>
+      <div>
+        <div class="pill-row-compact">
+          <span id="recommendedActionConfidence" class="pill dim">confidence —</span>
+          <span id="recommendedActionBlocking" class="pill dim">status —</span>
+          <span id="recommendedActionUpdated" class="pill dim mono">updated —</span>
+        </div>
+        <div class="small section-note-title">Why this action</div>
+        <div id="recommendedActionNotes" class="opsNotes small">
+          <div class="opsNote">(loading...)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<div class="dashboard-grid">
+  <div class="dashboard-left">
+
+  <!-- Bloomberg-style Telemetry Strip -->
+  <div id="telemetryStrip" class="telemetryStrip" data-screens="overview">
+    <span id="tNav" data-metric="net_asset_value" tabindex="0">Net Asset Value —</span>
+    <span id="tReturn" data-flash-on-change="true" data-metric="total_return" tabindex="0">Total Return —</span>
+    <span id="tDD" data-flash-on-change="true" data-metric="max_drawdown" tabindex="0" title="Maximum Drawdown is the largest peak-to-trough decline in portfolio value. It represents the worst historical loss period. Lower is safer.">
+Maximum Drawdown —
+</span>
+    <span id="tSharpe" data-flash-on-change="true" data-metric="sharpe_ratio" tabindex="0" title="Sharpe Ratio measures return per unit of volatility. Higher means better risk-adjusted performance. A value above 1 is generally strong.">
+Sharpe Ratio —
+</span>
+    <span id="tCalmar" data-metric="calmar_ratio" tabindex="0" title="Calmar Ratio compares total return to maximum drawdown. It measures performance relative to worst historical loss. Higher is safer.">
+Calmar Ratio —
+</span>
+    <span id="tStress" data-metric="market_stress_score" tabindex="0">Market Stress Level —</span>
+    <span id="tPromotion" data-flash-on-change="true" data-metric="promotion_status" tabindex="0">Model Promotion Status —</span>
+    <span id="tCpu" data-metric="cpu_percent" tabindex="0">CPU Usage —</span>
+    <span id="tDb" data-metric="db_size_mb" tabindex="0">Database Status —</span>
+    <span id="tRam" data-metric="process_rss_mb" tabindex="0">Memory Usage —</span>
+
+  </div>
+
+<!-- ========================================================= -->
+<!-- OPERATOR SUMMARY (Human First View)                      -->
+<!-- ========================================================= -->
+<div class="card" id="operatorSummaryCard" data-screens="overview">
+
+  <h2>🧭 What’s going on?</h2>
+
+  <div style="display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 10px;">
+    <span id="opSystemPill" class="pill dim" data-metric="system_status" tabindex="0">System: —</span>
+    <span id="opExecPill" class="pill dim" data-metric="execution_status" tabindex="0">Trading: —</span>
+    <span id="opTrainPill" class="pill dim" data-metric="training_status" tabindex="0">Training: —</span>
+    <span id="opStressPill" class="pill dim" data-metric="market_condition" tabindex="0">Market: —</span>
+    <span id="opMoodPill" class="pill dim" data-metric="operating_mood" tabindex="0">Mood: —</span>
+    <span id="opUpdatedPill" class="pill dim mono">Updated: —</span>
+  </div>
+
+  <div class="small" style="margin-top:4px;">
+    <div><b id="opHeadline">—</b></div>
+    <div id="opMeaning" style="margin-top:6px;">—</div>
+  </div>
+
+  <div style="margin-top:10px; border-top:1px solid rgba(48,54,61,.45); padding-top:10px;">
+    <div class="small" style="font-weight:800;">What is blocking or degraded?</div>
+    <ul id="opBlockersList" class="small" style="margin:8px 0 0 18px;">
+      <li>(loading…)</li>
+    </ul>
+  </div>
+
+  <div style="margin-top:10px; border-top:1px solid rgba(48,54,61,.45); padding-top:10px;">
+    <div class="small" style="font-weight:800;">What should I do?</div>
+    <ul id="opNextList" class="small" style="margin:8px 0 0 18px;">
+      <li>(loading…)</li>
+    </ul>
+  </div>
+
+  <div style="margin-top:12px;">
+    <div style="display:flex; gap:8px; align-items:center;">
+  <button id="btnRefresh" class="btn">Refresh</button>
+  <button id="btnCopySnapshot" class="btn btnSmall">
+  <svg class="i"><use href="#i-undo"></use></svg>
+  Copy Snapshot
+</button>
+</div> 
+    <button class="btn btnWarn" id="btnOpFixIssues">🛠 Fix issues</button>
+    <button class="btn" id="btnOpJumpAlerts">🚨 View Alerts</button>
+    <button class="btn" id="btnOpJumpJobs">🧰 Job Console</button>
+  </div>
+
+</div>
+
+<div class="card" id="operatorStartupCard" data-screens="operate">
+  <h2>🟢 Operator Startup Panel</h2>
+
+  <div id="operatorStartupSummary" class="operatorStartupSummary">
+    <span class="pill dim">DATA FEED: —</span>
+    <span class="pill dim">MODELS: —</span>
+    <span class="pill dim">RISK: —</span>
+    <span class="pill dim">BROKER: —</span>
+  </div>
+
+  <div class="operatorStartupProgressWrap">
+    <div id="operatorStartupProgressBar" class="operatorStartupProgressBar" style="width:0%;"></div>
+  </div>
+
+  <div id="operatorStartupHeadline" class="small" style="margin:10px 0 8px;">Checking startup readiness…</div>
+
+  <div id="operatorStartupChecklist" class="operatorStartupChecklist"></div>
+
+  <div class="operatorConsoleBridge">
+    <div class="operatorConsoleBridgeTop">
+      <span class="operatorConsoleBridgeTitle">Node Operator Console</span>
+      <span id="operatorSidecarPill" class="pill dim">Sidecar: checking</span>
+      <span id="operatorSidecarWsPill" class="pill dim">Realtime: direct WS</span>
+    </div>
+    <div id="operatorSidecarDetail" class="small" style="margin-top:8px;">Checking sidecar reachability.</div>
+    <div class="operatorConsoleBridgeActions">
+      <a class="btn btnSmall" id="operatorConsoleLink" href="/operator/" target="_blank" rel="noopener">Open Console</a>
+      <a class="btn btnSmall" id="operatorConsoleDirectLink" href="http://127.0.0.1:4001/" target="_blank" rel="noopener">Open Port 4001</a>
+    </div>
+  </div>
+
+  <details class="rawToggle">
+    <summary>View Raw Startup Snapshot</summary>
+    <pre id="operatorStartupRaw" class="mono" style="margin-top:10px; max-height:260px; overflow:auto;">(loading...)</pre>
+  </details>
+</div>
+
+  <!-- Decision Header (sticky): guided ops clarity + speed -->
+  <div id="decisionBar" class="decisionBar" data-screens="overview,operate,explain">
+    <div class="decisionRow">
+      <div class="decisionLeft">
+        <span id="pillSystem" class="pill clickable dim" role="button" tabindex="0" data-metric="system_status">
+Overall System Condition —
+</span>
+        <span id="pillCrit" class="pill clickable dim" data-metric="crit_count" tabindex="0">
+Immediate Attention Required —
+</span>
+        <span id="pillWarn" class="pill clickable dim" data-metric="warn_count" tabindex="0">
+Issues To Monitor —
+</span>
+        <span id="pillData" class="pill clickable dim" data-metric="data_status" tabindex="0">
+Market Data Reliability —
+</span>
+        <span id="pillModel" class="pill clickable dim" data-metric="promotion_status" tabindex="0">
+Prediction Model Stability —
+</span>
+        <span id="pillExec" class="pill clickable dim" data-metric="execution_status" tabindex="0">
+Trade Execution Integrity —
+</span>
+      </div>
+
+      <div class="decisionRight">
+        <span id="pillUpdated" class="pill dim">Updated: —</span>
+
+        <!-- Operator default ON; Expert unlock is separate -->
+        <button class="btn" id="btnExpertUnlock">
+          <svg class="i"><use href="#i-shield"></use></svg>
+          Unlock Advanced: OFF
+        </button>
+
+        <!-- Push-to-talk voice (safe by design) -->
+        <button class="btn" id="btnVoice" aria-pressed="false" title="Hold to talk">
+          <svg class="i"><use href="#i-wand"></use></svg>
+          Hold to Talk
+        </button>
+
+        <span id="pillVoice" class="pill dim">Voice: OFF</span>
+
+      </div>
+    </div>
+
+    <div class="filtersRow">
+      <select id="globalRange" title="Time range">
+        <option value="15m">Last 15m</option>
+        <option value="1h">Last 1h</option>
+        <option value="6h" selected>Last 6h</option>
+        <option value="24h">Last 24h</option>
+        <option value="7d">Last 7d</option>
+      </select>
+
+      <select id="globalSev" title="Min severity">
+        <option value="ALL">Severity: All</option>
+        <option value="INFO">Severity: INFO+</option>
+        <option value="WARN" selected>Severity: WARN+</option>
+        <option value="CRIT">Severity: CRIT only</option>
+      </select>
+
+<input id="globalSymbol" class="input" placeholder="Symbol filter (e.g. BTC)" style="min-width:220px;" />
+
+<label class="pill dim" style="gap:8px;">
+  <input id="proChartsEnable" type="checkbox" />
+  pro charts
+</label>
+
+<select id="proChartsTf" title="Candle timeframe" style="min-width:90px;">
+  <option value="1m">1m</option>
+  <option value="5m">5m</option>
+  <option value="15m">15m</option>
+  <option value="1h">1h</option>
+</select>
+
+<select id="proChartsType" title="Chart type" style="min-width:110px;">
+  <option value="candle" selected>Candles</option>
+  <option value="line">Line</option>
+  <option value="bar">OHLC Bar</option>
+  <option value="area">Area</option>
+</select>
+
+<label class="pill dim" style="gap:8px;">
+  <input id="globalChangedOnly" type="checkbox" />
+  changed only
+</label>
+
+<!-- Pro Charting (toggle: "pro charts") -->
+<div class="card collapsible" id="proChartsCard" style="display:none;" data-screens="overview,analyze">
+      <h2 class="card-header">📊 Live Market Chart <span id="proChartsMeta" class="pill dim meta-pill-offset">disabled</span></h2>
+  <div class="small" style="margin:6px 0 10px;">
+    Uses /api/market/candles + /api/market/stream for price, /api/terminal/markers for trade markers, and /api/terminal/equity with /api/portfolio/backtest/latest fallback for portfolio overlay.
+  </div>
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:0 0 10px;">
+    <span id="proChartsHealth" class="pill dim">boot</span>
+    <label class="pill dim" style="gap:8px;">
+      <input id="proChartsOvVWAP" type="checkbox" checked />
+      VWAP
+    </label>
+    <label class="pill dim" style="gap:8px;">
+      <input id="proChartsOvEMA" type="checkbox" checked />
+      EMA 20/50
+    </label>
+    <label class="pill dim" style="gap:8px;">
+      <input id="proChartsOvTrades" type="checkbox" checked />
+      trade markers
+    </label>
+    <label class="pill dim" style="gap:8px;">
+      <input id="proChartsOvPnL" type="checkbox" checked />
+      portfolio PnL
+    </label>
+  </div>
+  <div class="surfaceWrap">
+    <div id="liveMarketChart" style="width:100%; height:420px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+    <div id="proChartsSurfaceState" class="surfaceOverlayState" aria-live="polite"></div>
+  </div>
+  <div id="proChartsCrosshair" style="margin-top:8px; min-height:52px; border:1px solid #30363d; border-radius:10px; background:#0b0f15; padding:8px 10px; color:#e6edf3;" class="small mono">hover chart</div>
+</div>
+
+<div class="card collapsible" id="replayCard" data-screens="overview,analyze" style="width:100%;">
+  <h2 class="card-header">Historical Replay <span id="replayMeta" class="pill dim meta-pill-offset">read-only</span></h2>
+  <div class="replayControls">
+    <label>
+      Date
+      <input id="replayDate" type="date" />
+    </label>
+    <label>
+      Symbol
+      <input id="replaySymbol" class="input" placeholder="SPY" />
+    </label>
+    <label>
+      Model
+      <input id="replayModel" class="input" placeholder="all models" />
+    </label>
+    <label>
+      Timeframe
+      <select id="replayTf">
+        <option value="1m" selected>1m</option>
+        <option value="5m">5m</option>
+        <option value="15m">15m</option>
+        <option value="1h">1h</option>
+      </select>
+    </label>
+    <button class="btn" id="replayLoad" type="button">
+      <svg class="i"><use href="#i-refresh"></use></svg>
+      Load
+    </button>
+  </div>
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+    <span id="replayStatus" class="pill dim">boot</span>
+    <span class="pill dim">read-only</span>
+    <span id="replayStats" style="display:flex; gap:8px; flex-wrap:wrap;"></span>
+  </div>
+  <canvas id="replayChart" width="1000" height="280"></canvas>
+  <input id="replayTimeline" class="replayScrubber" type="range" min="0" max="0" value="0" disabled />
+  <div id="replaySelected" class="replayStatGrid"></div>
+  <div class="table-wrap" id="replayEvents" style="margin-top:10px;"></div>
+  <div id="replayGaps" style="margin-top:8px;"></div>
+</div>
+    </div>
+
+    <!-- Voice panel (hidden unless active / last transcript shown) -->
+    <div id="voicePanel" class="voicePanel" style="display:none;">
+      <div class="voiceTop">
+        <div class="voiceTitle">Voice</div>
+        <div class="voiceMeta">
+          <span id="voiceState" class="pill dim">idle</span>
+          <span id="voiceLang" class="pill dim">en</span>
+        </div>
+      </div>
+
+      <div id="voiceTranscript" class="voiceTranscript mono">(press and hold “Hold to Talk”)</div>
+
+      <div class="voiceHints small">
+        Try: “what’s wrong”, “safe to ignore?”, “what happens next?”, “show similar”, “open the latest critical”, “acknowledge this”, “refresh”.
+      </div>
+    </div>
+  </div>
+
+  </div>
+
+<div class="dashboard-center">
+
+        <!-- Live PnL -->
+    <div class="card collapsible" id="livePnlCard" data-screens="overview">
+      <h2>💰 Live PnL</h2>
+      <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:8px;">
+        <span id="pnlTotal" class="pill dim" data-flash-on-change="true">Today PnL —</span>
+        <span id="pnlUnrealized" class="pill dim" data-flash-on-change="true">Unrealized Profit / Loss (Open Positions) —</span>
+        <span id="pnlRealized" class="pill dim" data-flash-on-change="true">Realized Profit / Loss (Closed Trades) —</span>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="recentDecisionsCard" data-screens="overview,explain">
+      <h2>🧠 Recent Decisions</h2>
+      <div class="small">Latest portfolio decision traces with confidence, risk impact, and plain-English reasoning.</div>
+      <div class="tableControls" data-table-controls="recentDecisions">
+        <label class="sr-only" for="decisionsFilter">Filter recent decisions</label>
+        <input id="decisionsFilter" class="tableSearchInput" data-dashboard-table-filter="recentDecisions" placeholder="Search decisions" autocomplete="off" spellcheck="false">
+        <label class="sr-only" for="decisionsSort">Sort recent decisions</label>
+        <select id="decisionsSort" class="tableSortSelect" data-dashboard-table-sort-select="recentDecisions" aria-label="Sort recent decisions">
+          <option value="ts_ms:desc">Newest</option>
+          <option value="symbol:asc">Symbol A-Z</option>
+          <option value="action:asc">Action A-Z</option>
+          <option value="confidence:desc">Confidence high</option>
+          <option value="risk:desc">Risk high</option>
+        </select>
+        <span class="tableCount" data-dashboard-table-count="recentDecisions">0 rows</span>
+      </div>
+      <div id="decisionsGrid" class="decisionCards"></div>
+      <div id="decisionsEmpty" class="decisionEmpty">(loading...)</div>
+    </div>
+
+    <div class="card collapsible" id="humanAlignmentCard" data-screens="explain">
+      <h2 class="card-header">🧭 Human Alignment <span id="humanAlignmentMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Passive operator analytics from recent alert interactions. Recommendations are advisory only.</div>
+
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th>Rule</th>
+              <th>Severity</th>
+              <th>Alerts</th>
+              <th>Opens</th>
+              <th>Ack Rate</th>
+              <th>Ignore Rate</th>
+            </tr>
+          </thead>
+          <tbody id="humanAlignmentBody">
+            <tr class="table-row">
+              <td colspan="6" class="metric-meta">(loading...)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="small" style="margin-top:10px;">Suggested reviews</div>
+      <div id="humanAlignmentRecommendations" class="decisionCards">
+        <div class="small">(loading...)</div>
+      </div>
+    </div>
+
+    <!-- Job Console -->
+    <div class="card collapsible" id="jobConsoleCard" data-screens="operate">
+      <h2>🧰 Job Console</h2>
+
+      <div class="small">Run your pipeline from here (no extra command prompts).</div>
+
+      <div class="btnRow">
+
+        <button class="btn expertAction" id="btnRunPipeline">
+          <svg class="i"><use href="#i-play"></use></svg>
+          Run Full Pipeline
+        </button>
+
+        <button id="btnFixIssues" class="btn btnWarn">🛠 Fix issues automatically</button>
+        
+        <button class="btn" id="btnRefreshJobs">
+          <svg class="i"><use href="#i-refresh"></use></svg>
+          Refresh
+        </button>
+
+        <button class="btn" id="btnClear">
+          <svg class="i"><use href="#i-trash"></use></svg>
+          Clear Log
+        </button>
+        <button class="btn" id="btnOperatorMode">
+          <svg class="i"><use href="#i-user"></use></svg>
+          Operator Mode: ON
+        </button>
+
+        <span class="pill dim">selected: <span id="selectedJob" class="mono">poll_prices</span></span>
+        <span class="pill dim" id="jobStatus">idle</span>
+      </div>
+
+      <div class="btnRow">
+        <button class="btn" data-job="poll_prices" data-action="start">Start poll_prices</button>
+        <button class="btn" data-job="ingest_now" data-action="start">Run ingest_now</button>
+        <button class="btn" data-job="process_events" data-action="start">Run process_events</button>
+        <button class="btn" data-job="label_due_events" data-action="start">Run label_due_events</button>
+        <button class="btn expertAction" data-job="train_model_v2" data-action="start">Run train_model_v2</button>
+        <button class="btn" data-job="validate_now" data-action="start">Run validate_now</button>
+        <button class="btn" data-job="portfolio_rebalance" data-action="start">Run portfolio_rebalance</button>
+        <button class="btn" data-job="portfolio_backtest" data-action="start">Run portfolio_backtest</button>
+        <button class="btn" data-job="broker_apply_orders" data-action="start">Run broker_apply_orders</button>
+      </div>
+
+      <div id="console" class="console"></div>
+    </div>
+
+    <div class="card collapsible" id="logViewerCard" data-screens="operate">
+      <h2>📜 Log Viewer</h2>
+      <div class="small">Filter Python-served job and operator logs without losing the existing raw tail console above.</div>
+
+      <div class="btnRow">
+        <select id="logViewerSource" title="Log source">
+          <option value="selected_job">Selected Job (poll_prices)</option>
+          <option value="operator_runtime">Operator Runtime</option>
+          <option value="operator_stderr">Operator Stderr</option>
+        </select>
+        <select id="logViewerLevel" title="Log level">
+          <option value="ALL" selected>All Levels</option>
+          <option value="CRIT">CRIT</option>
+          <option value="ERROR">ERROR</option>
+          <option value="WARN">WARN</option>
+          <option value="INFO">INFO</option>
+          <option value="DEBUG">DEBUG</option>
+          <option value="TRACE">TRACE</option>
+        </select>
+        <input id="logViewerSearch" class="input" placeholder="Search text" style="min-width:240px;" />
+        <select id="logViewerLimit" title="Line limit">
+          <option value="100">100 lines</option>
+          <option value="200" selected>200 lines</option>
+          <option value="400">400 lines</option>
+          <option value="800">800 lines</option>
+        </select>
+        <button class="btn" id="btnRefreshLogViewer">
+          <svg class="i"><use href="#i-refresh"></use></svg>
+          Refresh
+        </button>
+      </div>
+
+      <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+        <span id="logViewerSourcePill" class="pill dim">source —</span>
+        <span id="logViewerLevelPill" class="pill dim">level all</span>
+        <span id="logViewerMatchPill" class="pill dim">matches —</span>
+        <span id="logViewerUpdatedPill" class="pill dim">updated —</span>
+      </div>
+
+      <div id="logViewerMeta" class="small" style="margin-top:10px;">Choose a source to inspect recent logs.</div>
+      <div id="logViewerEmpty" class="small" style="margin-top:10px;">No log lines loaded yet.</div>
+      <div id="logViewerOutput" class="console" style="min-height:320px; margin-top:10px;"></div>
+    </div>
+
+    <!-- Drift Status (your patch expects these IDs) -->
+    <div class="card collapsible" id="driftStatusCard" data-screens="operate,analyze">
+      <h2>🧭 Drift Status</h2>
+      <div id="driftStatus" class="status"></div>
+      <pre id="driftDetails" class="mono"></pre>
+    </div>
+
+    <!-- System Health + pills that dashboard.js sets -->
+    <div class="card collapsible" id="systemHealthCard" data-screens="overview,operate">
+      <h2>🩺 System Health</h2>
+      <div class="pill-row-compact">
+        <span class="pill dim" data-flash-on-change="true" id="healthPrices">Price Data Freshness —</span>
+        <span class="pill dim" data-flash-on-change="true" id="healthLabels">Label Generation Status —</span>
+        <span class="pill dim" data-flash-on-change="true" id="healthModel">Active Model Health —</span>
+      </div>
+      <div id="healthStatus" class="status"></div>
+      <pre id="healthDetails" class="mono"></pre>
+    </div>
+
+    <div class="card collapsible" id="dataHealthSummaryCard" data-screens="data">
+      <h2>🛰 Data &amp; Ingestion Health</h2>
+      <div class="small">Python-served ingestion, telemetry, provider freshness, and execution-gate status for the main dashboard.</div>
+      <div class="pill-row">
+        <span class="pill dim" id="dataPipelinePill">pipeline —</span>
+        <span class="pill dim" id="dataProvidersPill">providers —</span>
+        <span class="pill dim" data-flash-on-change="true" id="dataFreshnessPill">freshness —</span>
+        <span class="pill dim" id="dataBarrierPill">barrier —</span>
+        <span class="pill dim" id="dataTelemetryPill">telemetry —</span>
+        <span class="pill dim mono" data-flash-on-change="true" id="dataUpdatedPill">updated —</span>
+      </div>
+      <div id="dataHealthSummaryGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">Pipeline</div><div class="opsStatValue">—</div></div>
+      </div>
+      <div class="small section-note-title">Current blockers</div>
+      <div id="dataHealthNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="dataProviderTelemetryCard" data-screens="data">
+      <h2 class="card-header">🧵 Provider Telemetry <span id="dataProvidersMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Reachability and freshness per provider from the same Python server that serves this dashboard.</div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Status</th>
+              <th>Freshness</th>
+              <th>Last Update</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody id="dataProvidersBody">
+            <tr class="table-row"><td colspan="5" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="dataProvidersFallback" class="small" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card collapsible" id="dataRuntimeSignalsCard" data-screens="data">
+      <h2>📡 Runtime Signals</h2>
+      <div class="small">Compact runtime telemetry and execution gate context refreshed on the dashboard poll cadence.</div>
+      <div id="dataRuntimeGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">Telemetry</div><div class="opsStatValue">—</div></div>
+      </div>
+      <div class="small section-note-title">Live notes</div>
+      <div id="dataRuntimeNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="competitionOpsCard" data-screens="explain,analyze">
+      <h2>🏁 Competition Control Plane</h2>
+      <div class="small">Competition state, replay freshness, and attribution quality used by autonomous promotion.</div>
+      <div class="pill-row">
+        <span class="pill dim" id="competitionCyclePill">cycle —</span>
+        <span class="pill dim" id="competitionReplayPill">replay —</span>
+        <span class="pill dim" id="competitionAttributionPill">attribution —</span>
+        <span class="pill dim" id="competitionChampionPill">champion —</span>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px;">
+        <div>
+          <div class="small" style="margin-bottom:6px;">Competition</div>
+          <pre id="competitionDetails" class="mono" style="max-height:280px; overflow:auto;">(loading...)</pre>
+        </div>
+        <div>
+          <div class="small" style="margin-bottom:6px;">Replay Freshness</div>
+          <pre id="replayFreshnessDetails" class="mono" style="max-height:280px; overflow:auto;">(loading...)</pre>
+        </div>
+        <div>
+          <div class="small" style="margin-bottom:6px;">Attribution Quality</div>
+          <pre id="attributionQualityDetails" class="mono" style="max-height:280px; overflow:auto;">(loading...)</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Training Status -->
+    <div class="card collapsible" id="trainingStatusCard" data-screens="operate,analyze">
+      <h2>🧪 Training Status</h2>
+      <div id="trainingStatus" class="status"></div>
+      <pre id="trainingDetails" class="mono"></pre>
+    </div>
+
+    <!-- Market Stress (read-only) -->
+    <div class="card collapsible" id="marketStressPanel" data-screens="overview">
+      <h2>🌩 Market Stress</h2>
+      <div class="small" style="margin-top:6px;">
+        Unified stress score + components (VIX family, VVIX, MOVE, credit/rates proxies).
+      </div>
+
+      <div class="pill-row">
+        <span class="pill dim">Score:</span>
+        <span id="marketStressBadge"
+      class="pill dim"
+      data-metric="market_stress_score"
+      tabindex="0"
+      title="Market Stress Level combines volatility, credit spreads, and rates signals into a unified risk score. Higher stress suggests elevated systemic risk.">
+loading
+</span>
+        <span class="pill dim">Updated:</span>
+        <span id="marketStressUpdated" class="pill dim mono" data-metric="market_stress_updated_ts_ms" tabindex="0">—</span>
+      </div>
+
+<div class="table-wrap table-wrap-spaced-sm">
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Value</th>
+              <th>Standardized Z-Score</th>
+            </tr>
+          </thead>
+          <tbody id="marketStressBody"></tbody>
+        </table>
+      </div>
+
+      <canvas id="marketStressSparkline" height="48" style="margin-top:10px;"></canvas>
+
+<div style="margin-top:8px;">
+  <span class="pill dim">Model confidence:</span>
+  <span id="confidenceBadge"
+      class="pill dim"
+      title="Model confidence reflects how certain the prediction system is about its current forecast. Higher confidence generally allows larger position sizing.">
+—
+</span>
+</div>
+
+      <details class="rawToggle">
+        <summary>View Raw Stress Snapshot</summary>
+        <pre id="marketStressRaw" class="mono" style="margin-top:10px; max-height:260px; overflow:auto;">(loading...)</pre>
+      </details>
+</div>
+
+    <div class="card collapsible" id="socialPressureCard" data-screens="analyze">
+      <h2>📣 Social Pressure</h2>
+      <div class="small">Symbol-scoped attention, shock, manipulation risk, and cross-platform confirmation.</div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Mention Z</th>
+              <th>Attention Shock</th>
+              <th>Manip Risk</th>
+              <th>Cross Confirm</th>
+            </tr>
+          </thead>
+          <tbody id="socialPressureBody">
+            <tr class="table-row">
+              <td colspan="5" class="metric-meta">(loading...)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="socialRegimesCard" data-screens="analyze">
+      <h2>🧠 Social Regimes</h2>
+      <div class="small">Classifier output for the current symbol’s social context regime and confidence.</div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Regime</th>
+              <th>Confidence</th>
+            </tr>
+          </thead>
+          <tbody id="socialRegimeBody">
+            <tr class="table-row">
+              <td colspan="3" class="metric-meta">(loading...)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="socialBlocksCard" data-screens="analyze">
+      <h2>⛔ Social Blocks</h2>
+      <div class="small">Recent social-manipulation blocks and the attached blocking rationale.</div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Symbol</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="socialBlocksBody">
+            <tr class="table-row">
+              <td colspan="3" class="metric-meta">(loading...)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="newsPanelsCard" data-screens="analyze">
+      <h2>📰 News</h2>
+      <div class="small">Latest news feed and sentiment trace.</div>
+
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Symbol</th>
+              <th>Title</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody id="newsBody">
+            <tr class="table-row">
+              <td colspan="4" class="metric-meta">(loading...)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="small" style="margin:10px 0 6px;">Sentiment</div>
+      <canvas id="newsSentimentCanvas" width="900" height="160" style="width:100%; height:160px;"></canvas>
+    </div>
+
+    <div class="card collapsible" id="weatherWidgetsCard" data-screens="analyze">
+      <h2>🌦 Weather Signals</h2>
+      <div class="small">Weather snapshot, alert feed, and weather-vs-base contribution for the active symbol context.</div>
+      <div id="weather-widgets" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; margin-top:10px;">
+        <div class="small">(loading...)</div>
+      </div>
+    </div>
+
+    <!-- Execution Overlays (read-only) -->
+    <div class="card collapsible" id="execOverlaysPanel" data-screens="operate,analyze,execution">
+      <h2>🧾 Execution Overlays</h2>
+      <div class="small" style="margin-top:6px;">
+        Read-only snapshot of execution knobs (cost model + portfolio exec realism).
+      </div>
+      <div id="execOverlaysSummary" class="structuredSummaryGrid">
+        <div class="structuredSummaryRow">
+          <div class="structuredSummaryLabel">Status</div>
+          <div class="structuredSummaryValue">Loading</div>
+          <div class="structuredSummaryMeta">Execution overlay snapshot is loading.</div>
+        </div>
+      </div>
+      <details class="rawToggle">
+        <summary>View Raw Overlay Snapshot</summary>
+        <pre id="execOverlaysRaw" class="mono" style="max-height:360px; overflow:auto;">(loading...)</pre>
+      </details>
+    </div>
+
+    
+
+    <!-- Promotions -->
+    <div class="card collapsible" id="promotionsSafetyCard" data-screens="operate,explain">
+      <h2>🧯 Promotions Safety</h2>
+      <div class="btnRow">
+        <button class="btn expertAction" id="btnTogglePromotions">Toggle Promotions</button>
+        <button class="btn expertAction" id="btnRollbackChampion">Rollback Champion</button>
+        <button class="btn" id="btnWhyNotPromoted">Why not promoted?</button>
+        <span class="pill dim" id="promotionPill">Model Promotion Eligibility —</span>
+      </div>
+      <pre class="mono small" id="promotionReason"></pre>
+    </div>
+
+    <div class="card collapsible" id="promotionGateCard" data-screens="explain,analyze">
+      <h2 class="card-header">Promotion Gate <span id="promotionGateMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Champion/challenger comparison, readiness gates, validation status, and audited action preview.</div>
+      <div id="promotionGateSummary" class="structuredSummaryGrid">
+        <div class="structuredSummaryRow">
+          <div class="structuredSummaryLabel">Status</div>
+          <div class="structuredSummaryValue">Loading</div>
+          <div class="structuredSummaryMeta">Promotion gate data is loading.</div>
+        </div>
+      </div>
+      <div class="small table-section-title">Champion vs challenger</div>
+      <div class="table-wrap">
+        <table id="promotionComparisonTable">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Champion</th>
+              <th>Challenger</th>
+              <th>Delta</th>
+              <th>Direction</th>
+            </tr>
+          </thead>
+          <tbody id="promotionGateComparisonBody">
+            <tr class="table-row"><td colspan="5" class="metric-meta">Loading comparison metrics...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="small table-section-title">Readiness checklist</div>
+      <div class="table-wrap">
+        <table id="promotionGateChecklist">
+          <thead>
+            <tr>
+              <th>Gate</th>
+              <th>State</th>
+              <th>Observed</th>
+              <th>Expected</th>
+            </tr>
+          </thead>
+          <tbody id="promotionGateChecklistBody">
+            <tr class="table-row"><td colspan="4" class="metric-meta">Loading gate checklist...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="promotionGateValidation" class="structuredSummaryGrid"></div>
+      <pre class="mono small" id="promotionRollbackPreview" style="white-space:pre-wrap;"></pre>
+      <details class="rawToggle">
+        <summary>View Raw Promotion Gate Payload</summary>
+        <pre id="promotionGateRaw" class="mono small" style="max-height:360px; overflow:auto;">(loading...)</pre>
+      </details>
+    </div>
+
+    <div class="card collapsible" id="governanceSummaryCard" data-screens="explain">
+<h2 class="card-header">🏛️ Governance <span id="governanceMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Champion state, replay freshness, self-critic blocks, and recent governance snapshots.</div>
+      <div id="governanceSummaryBody" class="structuredSummaryGrid">
+        <div class="structuredSummaryRow">
+          <div class="structuredSummaryLabel">Status</div>
+          <div class="structuredSummaryValue">Loading</div>
+          <div class="structuredSummaryMeta">Governance summary is loading.</div>
+        </div>
+      </div>
+      <details class="rawToggle">
+        <summary>View Raw Governance Snapshot</summary>
+        <pre id="governanceSummaryRaw" class="console" style="height:220px;">(loading...)</pre>
+      </details>
+    </div>
+
+    <!-- Confidence Calibration Curves -->
+    <div class="card collapsible" id="confidenceCalibrationCard" data-screens="analyze">
+      <h2>📈 Confidence Calibration</h2>
+      <div class="small">Latest isotonic curves (confidence → directional accuracy).</div>
+      <pre id="calibCurves" class="console" style="height:180px;">loading…</pre>
+    </div>
+
+    <div class="card collapsible" id="notificationStatusCard" data-screens="overview,operate">
+      <h2>📣 Notification Status</h2>
+      <div class="small">Configured notification channels and explicit safe test controls. Test sends occur only on operator click.</div>
+      <div class="small" style="margin-top:8px; font-weight:700;">Runtime health alert state</div>
+      <div id="runtimeHealthAlertBanner" class="status" style="margin-top:8px;">Loading runtime health alert state...</div>
+      <div id="runtimeHealthAlertMeta" class="metric-meta" style="margin-top:6px;">—</div>
+      <div id="notificationStatusBanner" class="status" style="margin-top:8px;">Loading notification status...</div>
+<div class="table-wrap table-wrap-spaced">
+        <table id="notificationStatusTable">
+          <thead>
+            <tr>
+              <th>Channel</th>
+              <th>Configured</th>
+              <th>Enabled</th>
+              <th>Validation</th>
+              <th>Last Test</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="notificationStatusTableBody">
+            <tr class="table-row">
+              <td colspan="6" class="metric-meta">Loading notification channels...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Alerts (operator: incident queue + heatmap; expert: raw table) -->
+    <div class="card collapsible" id="alertsCard" data-screens="overview,operate">
+      <h2>🚨 Alerts</h2>
+
+      <!-- Operator-first scanning -->
+      <div class="operatorOnly">
+        <div class="small">Scan → click to investigate → follow guided steps. Advanced actions require unlock.</div>
+
+        <div class="small" style="margin-top:6px;">Severity × Confidence by Symbol / Horizon</div>
+<div class="heatmapWrap" style="margin-top:6px;">
+          <div id="alertsHeatmap" class="heatmapGrid"></div>
+        </div>
+
+        <div id="incidentList" class="incidentList"></div>
+      </div>
+
+      <!-- Expert view (raw table preserved; hidden in operator mode) -->
+      <div class="expertOnly">
+        <div class="table-wrap">
+          <table id="alerts">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Prediction Horizon</th>
+                <th>Symbol</th>
+                <th>Prediction Horizon</th>
+                <th>Standardized Z-Score</th>
+                <th>Model Confidence</th>
+                <th>Event Description</th>
+                <th>Age</th>
+                <th>Why</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Relevance Stats -->
+    <div class="card collapsible" id="relevanceStatsCard" data-screens="analyze">
+      <h2>🧠 Relevance Stats</h2>
+      <div class="small">
+        Learned relevance weights used by predictor & alerts
+<span id="relevanceMeta" class="pill dim meta-pill-offset">loading</span>
+      </div>
+
+      <div style="margin-top:8px;">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Horizon</th>
+                <th>Relevance</th>
+                <th>Mean |z|</th>
+                <th>Number of Observations</th>
+              </tr>
+            </thead>
+            <tbody id="relevanceTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="small" style="margin-top:6px;">What changed since last refresh</div>
+        <pre id="relevanceDiff" class="console" style="height:120px;">(no previous snapshot)</pre>
+      </div>
+    </div>
+
+    <!-- Size Policy -->
+    <div class="card collapsible" id="sizePolicyCard" data-screens="analyze">
+      <h2>📏 Size Policy</h2>
+      <div class="small">Learned mapping: confidence → position size factor (0..1).</div>
+      <div style="margin:10px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button class="btn" id="btnTrainSizePolicy">Train Size Policy</button>
+        <span class="pill dim" id="sizePolicyPill">policy: ?</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Bucket</th>
+              <th>Conf Range</th>
+              <th>Number of Observations</th>
+              <th>Mean Net Ret</th>
+              <th>Std Net Ret</th>
+              <th>Factor</th>
+            </tr>
+          </thead>
+          <tbody id="sizePolicyBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Champion / Challenger -->
+    <div class="card collapsible" id="championChallengerCard" data-screens="analyze">
+      <h2>🏆 Champion / Challenger</h2>
+      <div class="small">Auto-learning status (promotions are gated by metrics).</div>
+      <div style="margin:10px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button class="btn" id="btnRunChallenger">🧪 Train & Eval Challenger</button>
+        <span class="pill dim" id="championPill">champion: ?</span>
+        <span class="pill dim" id="challengerPill">challenger: ?</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Kind</th>
+              <th>Root Mean Square Error (RMSE)</th>
+              <th>Dir Acc</th>
+              <th>n_eval</th>
+              <th>Eval Ts</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody id="modelRegistryBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Validation (dashboard.js expects tbody id="validation") -->
+    <div class="card collapsible" id="validationScoresCard" data-screens="analyze">
+      <h2>✅ Validation Scores</h2>
+      <div class="small">MAE/RMSE computed from predictions joined to realized labels.</div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Prediction Horizon</th>
+              <th>Mean Absolute Error (MAE)</th>
+              <th>Root Mean Square Error (RMSE)</th>
+              <th>Number of Observations</th>
+              <th>Last Updated</th>
+            </tr>
+          </thead>
+          <tbody id="validation"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Temporal Eval (dashboard.js uses "#temporalEval tbody") -->
+    <div class="card collapsible" id="temporalEvalCard" data-screens="analyze">
+      <h2 class="card-header">🕒 Temporal Predictor Eval <span class="pill dim">shadow only</span></h2>
+      <div class="table-wrap">
+        <table id="temporalEval">
+          <thead>
+            <tr>
+              <th>Horizon (s)</th>
+              <th>Number of Observations</th>
+              <th>Root Mean Square Error (RMSE)</th>
+              <th>Directional</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Temporal Shadow Eval (A.7) -->
+    <div class="card collapsible" id="temporalShadowCard" data-screens="analyze">
+      <h2 class="card-header">🧪 Temporal Shadow Promotion Gates <span class="pill dim">A.7</span></h2>
+      <div class="small">Shows why temporal is / isn’t eligible for promotion.</div>
+      <div class="table-wrap">
+        <table id="temporalShadowEval">
+<thead>
+<tr>
+<th>Symbol</th>
+<th>Key Type</th>
+<th>Key</th>
+<th>Prediction Horizon</th>
+<th>N</th>
+<th>RMSE</th>
+<th>Baseline RMSE</th>
+<th>RMSE Δ</th>
+<th>Directional Accuracy</th>
+<th>Baseline DirAcc</th>
+<th>DirAcc Δ</th>
+<th>Capital Efficiency</th>
+<th>Drawdown Contribution</th>
+<th>Slippage Impact</th>
+<th>Promotion Gate</th>
+<th>Detail</th>
+</tr>
+</thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+<!-- Confidence Calibration Curves -->
+<div class="card collapsible" id="calibrationCurvesCard" data-screens="analyze">
+  <h2>🎯 Confidence Calibration Curves</h2>
+
+  <div class="row">
+    <div>
+      <div class="small">Horizon (s)</div>
+      <input id="calibHorizon" type="number" value="3600" style="width:140px;">
+    </div>
+
+    <div>
+      <div class="small">Model kind</div>
+      <input id="calibKind" type="text" value="ridge" style="width:140px;">
+    </div>
+
+    <div style="display:flex; align-items:flex-end;">
+      <button id="btnReloadCalib" class="btn">Reload</button>
+    </div>
+  </div>
+
+  <canvas id="calibCanvas" width="900" height="180" style="margin-top:10px;"></canvas>
+  <pre id="calibRaw" class="small" style="white-space:pre-wrap; margin-top:8px;"></pre>
+</div>
+
+    <!-- Why Not Promoted (promotion audit feed) -->
+    <div class="card collapsible" id="promotionAuditCard" data-screens="explain,analyze">
+      <h2>🧾 Why Not Promoted</h2>
+      <div class="small">Recent promotion blocks/rejects/rollbacks from promotion_audit.</div>
+      <div class="table-wrap">
+        <table id="promotionAudit">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Model</th>
+              <th>Action</th>
+              <th>Regime/Key</th>
+              <th>Causal</th>
+              <th>Why</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="causalScoresCard" data-screens="explain,analyze">
+      <h2>Causal Diagnostics</h2>
+      <div class="table-wrap">
+        <table id="causalScores">
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>Target</th>
+              <th>Window</th>
+              <th>Score</th>
+              <th>Granger p</th>
+              <th>Lag</th>
+              <th>Decision</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Temporal Models (dashboard.js uses element id="temporalModels") -->
+    <div class="card collapsible" id="temporalModelsCard" data-screens="analyze">
+      <h2>Temporal Models</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Window</th>
+              <th>Input Dim</th>
+              <th>Weights</th>
+              <th>Metrics</th>
+              <th>Last Updated</th>
+            </tr>
+          </thead>
+          <tbody id="temporalModels"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Equity Drift (dashboard.js expects these IDs) -->
+    <div id="equityDriftPanel" class="card collapsible" data-screens="explain,analyze">
+      <h2 class="card-header">Equity Drift (Broker vs Backtest) <span id="equityDriftMeta" class="pill dim">—</span></h2>
+      <canvas id="equityDriftCanvas" width="900" height="180"></canvas>
+    </div>
+
+    <div id="driftExplainerPanel" class="card collapsible" data-screens="explain,analyze">
+      <h2 class="card-header">Drift Explainer <span id="driftExplainerMeta" class="pill dim">loading</span></h2>
+      <div class="pill-row">
+        <span id="driftExplainerStatus" class="pill dim">status -</span>
+        <span id="driftExplainerUpdated" class="pill dim mono">updated -</span>
+      </div>
+      <div id="driftExplainerSummary" class="small" style="margin-top:8px;">Loading drift attribution.</div>
+      <div id="driftExplainerLinks" class="btnRow" style="margin-top:10px;"></div>
+      <div class="table-wrap table-wrap-spaced-sm">
+        <table>
+          <thead>
+            <tr>
+              <th>Severity</th>
+              <th>Scope</th>
+              <th>Dimension</th>
+              <th>Current</th>
+              <th>Baseline</th>
+              <th>Delta</th>
+              <th>Signal</th>
+            </tr>
+          </thead>
+          <tbody id="driftExplainerRows">
+            <tr class="table-row"><td colspan="7" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="driftExplainerAffected" class="opsNotes small" style="margin-top:8px;">
+        <div class="opsNote">(loading affected dimensions...)</div>
+      </div>
+      <div id="driftExplainerUnavailable" class="opsNotes small" style="margin-top:8px;">
+        <div class="opsNote">(loading attribution availability...)</div>
+      </div>
+    </div>
+
+    <!-- Strategy Status (dashboard.js first version uses #strategyStatusPanel + #strategyStatusTable) -->
+    <div class="card collapsible" id="strategyStatusCard" data-screens="explain">
+      <h2 class="card-header">🧠 Active Strategy <span id="strategyStatusPanel" class="pill dim">—</span></h2>
+      <div class="table-wrap">
+        <table>
+          <tbody id="strategyStatusTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="performanceDivergenceCard" data-screens="overview,explain,analyze">
+      <h2 class="card-header">Model Performance Divergence <span id="performanceDivergenceMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Expected, backtest, shadow, and live realized behavior from existing dashboard read paths.</div>
+      <div class="pill-row">
+        <span class="pill dim" id="performanceDivergenceSelected">selected -</span>
+        <span class="pill dim mono" id="performanceDivergenceUpdated">updated -</span>
+      </div>
+      <canvas id="performanceDivergenceChart" width="900" height="120" style="width:100%; height:120px; margin-top:8px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
+      <div class="table-wrap table-wrap-spaced-sm">
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Expected/Backtest</th>
+              <th>Shadow</th>
+              <th>Live Realized</th>
+              <th>Delta</th>
+              <th>Status</th>
+              <th>Source Notes</th>
+            </tr>
+          </thead>
+          <tbody id="performanceDivergenceRows">
+            <tr class="table-row"><td colspan="7" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="performanceDivergenceStatus" class="small" style="margin-top:8px;">Loading performance divergence.</div>
+      <div id="performanceDivergenceMissing" class="opsNotes small" style="margin-top:8px;">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <!-- Strategy Metrics (dashboard.js uses "#strategyMetrics tbody") -->
+    <div class="card collapsible" id="strategyMetricsCard" data-screens="analyze">
+      <h2>📈 Strategy Metrics</h2>
+      <div class="table-wrap">
+        <table id="strategyMetrics">
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Window (d)</th>
+              <th>Net Calmar</th>
+              <th>Sharpe Ratio</th>
+              <th>Turnover</th>
+              <th>Last Updated</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Model Metrics (dashboard.js uses "#modelMetrics tbody") -->
+    <div class="card collapsible" id="modelMetricsCard" data-screens="analyze">
+      <h2>📏 Model Metrics</h2>
+      <div class="table-wrap">
+        <table id="modelMetrics">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Prediction Horizon</th>
+              <th>R² (Explained Variance)</th>
+              <th>Directional Accuracy</th>
+              <th>Expected Calibration Error</th>
+              <th>Average Confidence</th>
+              <th>Median Absolute Error</th>
+              <th>90th Percentile Absolute Error</th>
+              <th>Number of Observations</th>
+              <th>Last Updated</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Broker ↔ Backtest reconciliation badge -->
+    <div class="card collapsible" id="brokerPanel" data-screens="operate,analyze">
+      <h2>🧾 Broker (Paper Execution)</h2>
+      <div class="small" style="margin-top:6px;">
+        Reconciliation:
+        <span id="eqReconBadge" class="pill dim">loading</span>
+      </div>
+      <div id="eqReconDetail" class="small" style="margin-top:4px; opacity:.85;"></div>
+      <pre id="brokerSnapshot" class="console" style="height:240px;">(loading...)</pre>
+    </div>
+
+    <!-- Execution Cost vs Confidence -->
+<div class="card collapsible" id="executionCostCard" data-screens="operate,analyze,execution">
+  <h2>📉 Execution Cost vs Confidence</h2>
+  <div class="small">
+    Average execution cost grouped by prediction confidence.
+    Helps detect whether high-confidence trades are getting worse fills.
+  </div>
+
+  <div class="table-wrap table-wrap-spaced-sm">
+    <table>
+      <thead>
+        <tr>
+          <th>Prediction Confidence Level</th>
+          <th data-metric="execution_fill_count" tabindex="0">Total Trades</th>
+          <th data-metric="execution_mean_cost" tabindex="0">Average Execution Cost</th>
+          <th>Cost Severity</th>
+        </tr>
+      </thead>
+      <tbody id="execByConfBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card collapsible" id="executionAdvisoryCard" data-screens="overview,operate,explain">
+  <h2 class="card-header">🧠 Execution Advisories <span id="executionAdvisoryMeta" class="pill dim meta-pill-offset">loading</span></h2>
+  <div class="small">
+    Advisory-only execution guidance generated from the shaped order payload. Approvals are logged for audit and do not gate execution.
+  </div>
+
+  <div class="table-wrap table-wrap-spaced-sm">
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Urgency</th>
+          <th>Route</th>
+          <th>Expected Slip</th>
+          <th>Advice</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="executionAdvisoryBody">
+        <tr class="table-row">
+          <td colspan="6" class="metric-meta">(loading...)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+    <!-- Portfolio -->
+    <div class="card collapsible" id="portfolioCard" data-screens="explain">
+      <h2>💼 Portfolio</h2>
+      <div style="margin:10px 0;">
+        <span id="portfolioMeta" class="pill dim">loading</span>
+      </div>
+
+      <div class="small table-section-title">Current Target Positions</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Weight</th>
+              <th>Opened</th>
+              <th>Last Updated</th>
+            </tr>
+          </thead>
+          <tbody id="portfolioStateBody"></tbody>
+        </table>
+      </div>
+
+      <div class="small table-section-title">Recent Order Intents</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Symbol</th>
+              <th>Action</th>
+              <th>From</th>
+              <th>To</th>
+              <th>ΔW</th>
+            </tr>
+          </thead>
+          <tbody id="portfolioOrdersBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="positionsExposureSummaryCard" data-screens="positions">
+      <h2>📐 Positions &amp; Exposure</h2>
+      <div class="small">Current portfolio target book, live broker inventory, and risk-gate state from Python-served dashboard APIs.</div>
+      <div class="pill-row">
+        <span class="pill dim" id="positionsGrossPill">gross —</span>
+        <span class="pill dim" id="positionsNetPill">net —</span>
+        <span class="pill dim" id="positionsDrawdownPill">drawdown —</span>
+        <span class="pill dim" id="positionsBarrierPill">barrier —</span>
+        <span class="pill dim mono" data-flash-on-change="true" id="positionsFreshnessPill">freshness —</span>
+      </div>
+      <div id="positionsExposureGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">Exposure</div><div class="opsStatValue">—</div></div>
+      </div>
+      <div class="small section-note-title">Operator notes</div>
+      <div id="positionsExposureNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="positionsTargetsCard" data-screens="positions">
+      <h2 class="card-header">🎯 Target Positions <span id="positionsTargetsMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Size</th>
+              <th>Weight</th>
+              <th>Unrealized PnL ($)</th>
+              <th>Realized PnL ($)</th>
+              <th>Opened</th>
+              <th>Updated</th>
+            </tr>
+          </thead>
+          <tbody id="positionsTargetsBody">
+            <tr class="table-row"><td colspan="8" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="small" style="margin:10px 0 4px;">Recent Order Intents</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Symbol</th>
+              <th>Action</th>
+              <th>From</th>
+              <th>To</th>
+              <th>ΔW</th>
+            </tr>
+          </thead>
+          <tbody id="positionsOrdersBody">
+            <tr class="table-row"><td colspan="6" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="positionsLiveBookCard" data-screens="positions">
+      <h2 class="card-header">🧾 Live Broker Book <span id="positionsLiveMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Merged live positions from `/api/broker` and `/api/terminal/positions`.</div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Broker Qty</th>
+              <th>Terminal Qty</th>
+              <th>Avg Px</th>
+              <th>Updated</th>
+            </tr>
+          </thead>
+          <tbody id="positionsLiveBody">
+            <tr class="table-row"><td colspan="5" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="positionsDiagnosticsCard" data-screens="positions">
+      <h2 class="card-header">🧠 Exposure Diagnostics <span id="positionsDiagnosticsMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Correlation concentration and latest persisted portfolio-risk snapshot.</div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th>Pair</th>
+              <th>Corr</th>
+              <th>Overlap</th>
+              <th>Risk</th>
+            </tr>
+          </thead>
+          <tbody id="positionsPairsBody">
+            <tr class="table-row"><td colspan="4" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="small section-note-title">Risk notes</div>
+      <div id="positionsDiagnosticsNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionSnapshotCard" data-screens="execution">
+      <h2>🧮 Snapshot &amp; Positions</h2>
+      <div class="small">Account state and live position summary from the Python-served terminal snapshot route.</div>
+      <div class="pill-row">
+        <span class="pill dim" id="executionAccountPill">account —</span>
+        <span class="pill dim" id="executionPositionPill">positions —</span>
+        <span class="pill dim mono" data-flash-on-change="true" id="executionSnapshotPill">snapshot —</span>
+      </div>
+      <div id="executionSnapshotGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">Snapshot</div><div class="opsStatValue">—</div></div>
+      </div>
+      <div class="small" style="margin:10px 0 4px;">Position summary</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Qty</th>
+              <th>Avg Px</th>
+              <th>Updated</th>
+            </tr>
+          </thead>
+          <tbody id="executionSnapshotBody">
+            <tr class="table-row"><td colspan="4" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="small section-note-title">Snapshot notes</div>
+      <div id="executionSnapshotNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionOrdersCard" data-screens="execution">
+      <h2 class="card-header">📬 Open Orders <span id="executionOrdersMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Best-effort active broker orders plus live portfolio intents from <span class="mono">/api/terminal/orders</span>.</div>
+      <div class="tableControls" data-table-controls="executionOrders">
+        <label class="sr-only" for="executionOrdersFilter">Filter open orders</label>
+        <input id="executionOrdersFilter" class="tableSearchInput" data-dashboard-table-filter="executionOrders" placeholder="Search open orders" autocomplete="off" spellcheck="false">
+        <span class="tableCount" data-dashboard-table-count="executionOrders">0 rows</span>
+      </div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOrders" data-sort-key="symbol">Symbol <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOrders" data-sort-key="side">Side <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOrders" data-sort-key="size" data-sort-default="desc">Size <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOrders" data-sort-key="status">Status <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody id="executionOrdersBody">
+            <tr class="table-row"><td colspan="4" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="executionOrdersFallback" class="small" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card collapsible" id="suppressedTradesCard" data-screens="execution,explain">
+      <h2 class="card-header">⛔ Suppressed Trades <span id="suppressedTradesMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Suppression rows from the existing trade attribution ledger.</div>
+      <div class="tableControls" data-table-controls="suppressedTrades">
+        <label class="sr-only" for="suppressedTradesFilter">Filter suppressed trades</label>
+        <input id="suppressedTradesFilter" class="tableSearchInput" data-dashboard-table-filter="suppressedTrades" placeholder="Search suppressed trades" autocomplete="off" spellcheck="false">
+        <span class="tableCount" data-dashboard-table-count="suppressedTrades">0 rows</span>
+      </div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="suppressedTrades" data-sort-key="ts_ms" data-sort-default="desc">Time <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="suppressedTrades" data-sort-key="symbol">Symbol <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="suppressedTrades" data-sort-key="reason">Reason <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="suppressedTrades" data-sort-key="lineage">Lineage <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody id="suppressedTradesBody">
+            <tr class="table-row"><td colspan="4" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionFillsCard" data-screens="execution">
+      <h2 class="card-header">🧾 Recent Fills <span id="executionFillsMeta" class="pill dim meta-pill-offset" data-flash-on-change="true">loading</span></h2>
+      <div class="small">Recent fills from the same Python server that serves this dashboard.</div>
+      <div class="tableControls" data-table-controls="executionFills">
+        <label class="sr-only" for="executionFillsFilter">Filter recent fills</label>
+        <input id="executionFillsFilter" class="tableSearchInput" data-dashboard-table-filter="executionFills" placeholder="Search fills" autocomplete="off" spellcheck="false">
+        <span class="tableCount" data-dashboard-table-count="executionFills">0 rows</span>
+      </div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionFills" data-sort-key="symbol">Symbol <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionFills" data-sort-key="px" data-sort-default="desc">Fill Price <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionFills" data-sort-key="qty" data-sort-default="desc">Size <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionFills" data-sort-key="ts_ms" data-sort-default="desc">Timestamp <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody id="executionFillsBody">
+            <tr class="table-row"><td colspan="4" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionMetricsSummaryCard" data-screens="execution">
+      <h2>📊 Execution Metrics</h2>
+      <div class="small">Execution cost, latency, and overlay summary from existing Python-served execution routes.</div>
+      <div class="pill-row">
+        <span class="pill dim" id="executionMetricsPill">metrics —</span>
+        <span class="pill dim" id="executionCostPill">slippage —</span>
+        <span class="pill dim" id="executionOverlayPill">overlays —</span>
+        <span class="pill dim mono" data-flash-on-change="true" id="executionMetricsFreshnessPill">fills —</span>
+      </div>
+      <div id="executionMetricsGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">Metrics</div><div class="opsStatValue">—</div></div>
+      </div>
+      <div class="small section-note-title">Execution notes</div>
+      <div id="executionMetricsNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <!-- Portfolio Backtest Latest (dashboard.js expects span id="portfolioBtMeta") -->
+    <div class="card collapsible" id="portfolioBacktestCard" data-screens="analyze">
+      <h2 class="card-header">📈 Portfolio Backtest (Latest) <span id="portfolioBtMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="row" style="gap:12px; margin-top:10px;">
+        <div style="flex:1 1 360px; min-width:320px;">
+          <div class="small" style="margin:0 0 6px;">Equity Curve</div>
+          <canvas id="portfolioEquityCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
+          <div id="portfolioEquityPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+        </div>
+        <div style="flex:1 1 360px; min-width:320px;">
+          <div class="small" style="margin:0 0 6px;">Drawdown</div>
+          <canvas id="portfolioDdCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
+          <div id="portfolioDdPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+        </div>
+      </div>
+
+      <div class="small" style="margin:10px 0 6px;">Summary</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>Total Return</th>
+              <th>Maximum Drawdown</th>
+              <th>Sharpe Ratio</th>
+              <th>Total Trades</th>
+            </tr>
+          </thead>
+      <tbody id="portfolioBtSummaryBody"></tbody>
+    </table>
+  </div>
+</div>
+
+    <!-- Job History + Trends panels (dashboard.js expects these IDs) -->
+    <div class="card collapsible" id="jobHistoryCard" data-screens="analyze">
+      <h2>🧾 Job History</h2>
+      <div class="btnRow">
+        <button class="btn" id="btnShowJobHistory">Toggle History Panel</button>
+        <button class="btn" id="btnShowTrends">Toggle Confidence Trends</button>
+      </div>
+      <div id="jobHistoryPanel" style="display:none;">
+        <pre id="jobHistory" class="console" style="height:220px;"></pre>
+      </div>
+      <div id="confidenceTrendPanel" style="display:none; margin-top:10px;">
+        <pre id="confidenceTrends" class="console" style="height:220px;"></pre>
+      </div>
+    </div>
+
+<!-- System State -->
+<div class="card collapsible" id="systemStateCard" data-screens="operate,explain">
+  <h2>🧭 System State</h2>
+
+  <div class="small" style="margin-bottom:6px;">
+    Automation kill-switches (read-only)
+  </div>
+
+  <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+    <span id="ksAutoPipeline" class="pill dim">Automatic Pipeline Execution —</span>
+    <span id="ksAutoChallenger" class="pill dim">Automatic Challenger Training —</span>
+    <span id="ksAutoSizePolicy" class="pill dim">Automatic Position Size Learning —</span>
+  </div>
+
+  <pre id="systemStateText" class="mono small"></pre>
+</div>
+
+</div> <!-- end dashboard-center -->
+
+<div class="dashboard-right">
+
+  <div class="card collapsible" id="telemetryCard" data-screens="analyze">
+    <h2>📡 Telemetry</h2>
+    <div class="small" style="margin-bottom:8px;">
+      Live runtime telemetry remains pinned to the Overview screen. Use this area for deeper telemetry-oriented analysis as the screen expands.
+    </div>
+    <div id="telemetryMount"></div>
+  </div>
+
+  <!-- Why Modal (dashboard.js expects these IDs) -->
+  <div id="promoWhyModal" class="modal">
+  <div class="modalInner">
+    <div class="modalHeader">
+      <div class="modalTitle" id="promoWhyTitle">Why not promoted?</div>
+      <button class="btn btnSmall" id="btnClosePromoWhy">Close</button>
+    </div>
+    <div id="promoWhyBody" class="structuredSummary"></div>
+    <details class="rawToggle" style="margin-top:10px;">
+      <summary>View Raw Payload</summary>
+      <pre class="mono small" id="promoWhyRaw"></pre>
+    </details>
+  </div>
+</div>
+
+<div id="whyModal" style="
+    display:none;
+    position:fixed; inset:0;
+    background: rgba(0,0,0,0.55);
+    z-index:9999;
+    padding: 18px;
+  ">
+    <div style="
+      max-width: 980px;
+      margin: 0 auto;
+      background:#0b0f15;
+      border:1px solid #30363d;
+      border-radius:12px;
+      padding:12px;
+    ">
+      <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px;">
+        <div id="whyTitle" style="font-weight:800;"></div>
+        <div style="margin-left:auto;"></div>
+        <button class="btn" id="btnCloseWhy">Close</button>
+      </div>
+      <div id="whyBody" class="structuredSummary" style="max-height:420px; overflow:auto;"></div>
+      <details class="rawToggle" style="margin-top:10px;">
+        <summary>View Raw Explain Payload</summary>
+        <pre id="whyRaw" class="console" style="height:260px;"></pre>
+      </details>
+    </div>
+  </div>
+
+  <div id="decisionModal" class="modal">
+    <div class="modalInner" style="max-width:980px;">
+      <div class="modalHeader">
+        <div class="modalTitle" id="decisionModalTitle">Decision</div>
+        <div style="margin-left:auto; display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn btnSmall" id="btnDecisionOpenTerminal">Open In Terminal</button>
+          <button class="btn btnSmall" id="btnDecisionOpenOperator">Open In Operator</button>
+        </div>
+        <button class="btn btnSmall" id="btnCloseDecisionModal">Close</button>
+      </div>
+      <div id="decisionModalBody" class="decisionDetailGrid">
+        <div class="decisionDetailBlock">
+          <h3>Summary</h3>
+          <div id="decisionModalSummary" class="decisionDetailKvs"></div>
+        </div>
+        <div class="decisionDetailBlock">
+          <h3>Decision Path</h3>
+          <div id="decisionModalStagesSummary" class="structuredSummary"></div>
+          <details class="rawToggle">
+            <summary>View Related Records</summary>
+            <pre id="decisionModalRelated" class="mono small" style="margin:0; white-space:pre-wrap;"></pre>
+          </details>
+        </div>
+        <div class="decisionDetailBlock">
+          <h3>Allocation</h3>
+          <div id="decisionModalAllocation" class="decisionDetailKvs"></div>
+        </div>
+        <div class="decisionDetailBlock">
+          <h3>Inputs</h3>
+          <div id="decisionModalInputsSummary" class="structuredSummary"></div>
+          <details class="rawToggle">
+            <summary>View Raw Inputs</summary>
+            <pre id="decisionModalInputs" class="mono small" style="margin:0; white-space:pre-wrap;"></pre>
+          </details>
+        </div>
+        <div class="decisionDetailBlock">
+          <h3>Risk Gates</h3>
+          <div id="decisionModalRiskSummary" class="structuredSummary"></div>
+          <details class="rawToggle">
+            <summary>View Raw Risk Gates</summary>
+            <pre id="decisionModalRisk" class="mono small" style="margin:0; white-space:pre-wrap;"></pre>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="executionAdvisoryModal" class="modal">
+    <div class="modalInner" style="max-width:980px;">
+      <div class="modalHeader">
+        <div class="modalTitle" id="executionAdvisoryModalTitle">Execution Advisory</div>
+        <div style="margin-left:auto; display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn btnSmall" id="btnAdvisoryOpenTerminal">Open In Terminal</button>
+          <button class="btn btnSmall" id="btnAdvisoryOpenOperator">Open In Operator</button>
+        </div>
+        <button class="btn btnSmall" id="btnCloseExecutionAdvisoryModal">Close</button>
+      </div>
+      <div class="decisionDetailGrid">
+        <div class="decisionDetailBlock">
+          <h3>Summary</h3>
+          <div id="executionAdvisoryModalSummary" class="decisionDetailKvs"></div>
+        </div>
+        <div class="decisionDetailBlock">
+          <h3>History</h3>
+          <div id="executionAdvisoryModalHistory" class="decisionDetailKvs"></div>
+        </div>
+        <div class="decisionDetailBlock">
+          <h3>Features</h3>
+          <div id="executionAdvisoryModalFeaturesSummary" class="structuredSummary"></div>
+          <details class="rawToggle">
+            <summary>View Raw Features</summary>
+            <pre id="executionAdvisoryModalFeatures" class="mono small" style="margin:0; white-space:pre-wrap;"></pre>
+          </details>
+        </div>
+        <div class="decisionDetailBlock">
+          <h3>Rationale</h3>
+          <div id="executionAdvisoryModalRationaleSummary" class="structuredSummary"></div>
+          <details class="rawToggle">
+            <summary>View Raw Rationale</summary>
+            <pre id="executionAdvisoryModalRationale" class="mono small" style="margin:0; white-space:pre-wrap;"></pre>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Incident drawer (operator-first drilldown) -->
+  <div id="incidentOverlay" class="drawerOverlay" onclick="window.__ACTIVE_INCIDENT__=null; this.style.display='none'">
+    <div class="drawer"
+         role="dialog"
+         aria-modal="true"
+         aria-label="Incident details"
+         onclick="event.stopPropagation()">
+      <div class="drawerHeader">
+        <div>
+          <div id="drawerTitle" class="drawerTitle">Incident</div>
+          <div id="drawerSubtitle" class="metric-meta drawer-subtitle status-neutral"></div>
+        </div>
+        <div class="drawer-header-actions">
+          <span id="drawerAlertState" class="pill dim">ACTIVE</span>
+          <button class="btn btnSmall" id="btnIncidentAck">Acknowledge</button>
+          <button class="btn btnSmall" id="btnIncidentResolve">Resolve</button>
+        </div>
+        <button class="btn" id="btnCloseIncident">Close</button>
+      </div>
+      <div id="drawerActionStatus" class="metric-meta drawer-action-status status-neutral"></div>
+
+      <!-- Decision framing (operator-first) -->
+      <div class="drawerSection decisionFrame">
+        <div class="dfTop">
+          <div class="dfPosture">
+            <span class="dfLabel small">Recommended operating stance</span>
+            <div id="drawerPosture" class="postureBadge">—</div>
+          </div>
+
+          <div class="dfRight">
+            <div class="dfRow">
+              <span class="dfLabel small">System confidence in this recommendation</span>
+              <span id="drawerDecisionConfidence" class="pill dim">—</span>
+            </div>
+            <div class="dfRow">
+              <span class="dfLabel small">Can this safely be ignored for now?</span>
+              <span id="drawerSafeIgnore" class="pill dim">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="dfBlock">
+          <div class="dfLabel small">If no action is taken, what is the expected outcome?</div>
+          <div id="drawerNoChange" class="small"></div>
+        </div>
+
+        <div class="dfBlock">
+          <div class="dfLabel small">Why this operating stance is recommended</div>
+          <div id="drawerWhyPosture" class="small"></div>
+        </div>
+      </div>
+
+      <div class="drawerSection">
+        <h3>What this means</h3>
+        <div id="drawerMeaning" class="small"></div>
+      </div>
+
+      <div class="drawerSection">
+        <h3>Safe next steps</h3>
+        <div id="drawerSteps" class="small"></div>
+      </div>
+
+      <div class="drawerSection">
+        <h3>Similar past incidents</h3>
+        <div id="drawerSimilar" class="metric-meta">(loading…)</div>
+      </div>
+
+      <div class="drawerSection">
+        <h3>Key facts</h3>
+        <div id="drawerFacts" class="drawerKvs"></div>
+      </div>
+
+      <div class="drawerSection expertAction" style="margin-top:12px;">
+        <h3>Advanced details</h3>
+        <pre id="drawerRaw" class="console" style="height:260px;"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="copilotPanel" class="copilotPanel" aria-hidden="true" role="complementary" aria-label="AI copilot">
+    <div class="copilotHeader">
+      <div>
+        <div class="copilotTitle">AI Copilot</div>
+        <div class="copilotSubtitle">Read-only explanations and review guidance for the current dashboard context.</div>
+      </div>
+      <div class="copilotHeaderActions">
+        <span id="copilotStatus" class="pill dim">Read-only</span>
+        <button class="btn btnSmall" type="button" data-copilot-close>Close</button>
+      </div>
+    </div>
+
+    <div id="copilotStarters" class="copilotStarters" aria-label="Suggested questions"></div>
+    <div id="copilotThread" class="copilotThread" aria-live="polite"></div>
+
+    <form id="copilotForm" class="copilotComposer">
+      <label class="copilotLabel" for="copilotQuestion">Ask the copilot</label>
+      <textarea
+        id="copilotQuestion"
+        rows="3"
+        maxlength="600"
+        placeholder="What does this mean?"
+      ></textarea>
+      <div class="copilotComposerActions">
+        <span class="small">Explanation-only. No actions or system changes.</span>
+        <button class="btn" id="btnCopilotAsk" type="submit">Ask</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Load your real UI controller -->
+  <script type="module" src="/ui/dashboard.js?v=4"></script>
+  <script type="module" src="/ui/voice.js"></script>
+  <script type="module" src="/ui/copilot.js"></script>
+
+</div> <!-- end dashboard-right -->
+
+</div> <!-- end dashboard-grid -->
+
+</div> <!-- end screenShell -->
+
+<div class="dashboard-footer" id="operator-controls"></div>
+
+</body>
+</html>

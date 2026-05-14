@@ -1,0 +1,893 @@
+openapi: 3.1.0
+info:
+  title: Trading System HTTP API
+  version: 0.1.0
+  summary: Grounded OpenAPI baseline for the Python dashboard server surface.
+  description: |
+    This specification documents the current high-value HTTP paths assembled by
+    `dashboard_server.py` from `engine/api/`, `engine/terminal/api/`, and
+    `routes/data_sources_routes.py`.
+
+    It is intentionally incomplete. The broader `/api/*` surface, fallback
+    routes defined directly in `dashboard_server.py`, and the separate Node
+    operator server in `boot/operator_server.js` still need additional
+    incremental coverage.
+servers:
+  - url: http://127.0.0.1:8000
+    description: Local dashboard server. Actual bind host and port come from `DASHBOARD_HOST` and `DASHBOARD_PORT`.
+tags:
+  - name: system
+  - name: operator
+  - name: jobs
+  - name: data-sources
+  - name: terminal
+components:
+  securitySchemes:
+    DashboardApiToken:
+      type: apiKey
+      in: header
+      name: X-API-Token
+      description: |
+        When `DASHBOARD_API_TOKEN` is configured, mutating routes accept the
+        token in the `X-API-Token` header. The transport layer also accepts a
+        `token` query parameter.
+  schemas:
+    FreeformObject:
+      type: object
+      additionalProperties: true
+    ErrorEnvelope:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+      additionalProperties: true
+    HealthResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+        error:
+          type: string
+        reasons:
+          type: array
+          items:
+            type: string
+        ts_ms:
+          type: integer
+      additionalProperties: true
+    ExecutionBarrier:
+      type: object
+      required:
+        - ok
+        - mode
+        - allow_execution
+        - allow_execution_pipeline
+        - allow_simulation
+        - real_trading_allowed
+        - allowed
+        - reason
+        - runtime_state
+      properties:
+        ok:
+          type: boolean
+        ts_ms:
+          type: integer
+        mode:
+          type: string
+        armed:
+          type:
+            - integer
+            - "null"
+        allow_execution:
+          type: boolean
+        allow_execution_pipeline:
+          type: boolean
+        allow_simulation:
+          type: boolean
+        real_trading_allowed:
+          type: boolean
+        allowed:
+          type: boolean
+        reason:
+          type: string
+        runtime_state:
+          type: string
+        severity:
+          type: string
+      additionalProperties: true
+    SystemSnapshot:
+      type: object
+      required:
+        - ok
+        - status
+        - state
+        - mode
+        - execution_mode
+        - execution_barrier
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+        state:
+          type: string
+        mode:
+          type: string
+        execution_mode:
+          type: string
+        execution_allowed:
+          type: boolean
+        reasons:
+          type: array
+          items:
+            type: string
+        ts_ms:
+          type: integer
+        health:
+          $ref: '#/components/schemas/FreeformObject'
+        ingestion:
+          $ref: '#/components/schemas/FreeformObject'
+        services:
+          $ref: '#/components/schemas/FreeformObject'
+        readiness:
+          $ref: '#/components/schemas/FreeformObject'
+        execution_barrier:
+          $ref: '#/components/schemas/ExecutionBarrier'
+      additionalProperties: true
+paths:
+  /api/health:
+    get:
+      tags: [system]
+      summary: Return the cached system health snapshot.
+      operationId: getHealth
+      responses:
+        '200':
+          description: Health payload from `engine.api.api_system.api_get_health`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/operator/health:
+    get:
+      tags: [operator]
+      summary: Alias for `/api/health` used by operator-side clients.
+      operationId: getOperatorHealth
+      responses:
+        '200':
+          description: Same payload shape as `/api/health`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/system/state:
+    get:
+      tags: [system]
+      summary: Return the aggregated system state snapshot.
+      operationId: getSystemState
+      responses:
+        '200':
+          description: Runtime state assembled by `engine.api.api_system.api_get_system_state`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSnapshot'
+  /api/readiness:
+    get:
+      tags: [system]
+      summary: Return the condensed readiness view.
+      operationId: getReadiness
+      responses:
+        '200':
+          description: Readiness payload derived from health, graph validation, and execution state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSnapshot'
+  /api/execution/barrier:
+    get:
+      tags: [system]
+      summary: Return the current execution barrier and selected block reason.
+      operationId: getExecutionBarrier
+      responses:
+        '200':
+          description: Execution barrier snapshot extracted from the broader system snapshot.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SystemSnapshot'
+                  - type: object
+                    properties:
+                      execution_barrier:
+                        $ref: '#/components/schemas/ExecutionBarrier'
+                      allowed:
+                        type: boolean
+                      reason:
+                        type: string
+  /api/operator/service_status:
+    get:
+      tags: [operator]
+      summary: Return the aggregated engine and service status snapshot.
+      operationId: getOperatorServiceStatus
+      responses:
+        '200':
+          description: Service status payload with the nested `services` block from the system snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSnapshot'
+  /api/operator/provider_telemetry:
+    get:
+      tags: [operator]
+      summary: Return feed and provider telemetry for operator diagnostics.
+      operationId: getOperatorProviderTelemetry
+      responses:
+        '200':
+          description: Provider telemetry payload with feed freshness and active child ownership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSnapshot'
+  /api/operator/runtime_watchdogs:
+    get:
+      tags: [operator]
+      summary: Return heartbeat and freshness watchdog state for critical runtime jobs.
+      operationId: getOperatorRuntimeWatchdogs
+      responses:
+        '200':
+          description: Watchdog payload containing job heartbeat state, restart counters, and ingestion freshness.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSnapshot'
+  /api/operator/support_snapshot:
+    get:
+      tags: [operator]
+      summary: Return the repair-oriented support snapshot.
+      operationId: getOperatorSupportSnapshot
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          description: Snapshot mode forwarded to `api_get_support_snapshot`. Current code defaults to `repair`; `quick` is also used by operator tooling.
+          schema:
+            type: string
+            default: repair
+      responses:
+        '200':
+          description: Support snapshot with schema metadata, diagnostics, and evidence blocks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSnapshot'
+  /api/jobs:
+    get:
+      tags: [jobs]
+      summary: List allowed jobs with merged live and persisted state.
+      operationId: getJobs
+      responses:
+        '200':
+          description: Job inventory returned by `engine.api.api_jobs.api_get_jobs`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/jobs/start:
+    post:
+      tags: [jobs]
+      summary: Start a registered job.
+      operationId: postJobStart
+      description: |
+        The job name may be supplied in the request body or as a `name` query
+        parameter. When `DASHBOARD_API_TOKEN` is configured, the transport layer
+        requires `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+              additionalProperties: true
+      responses:
+        '200':
+          description: Start acknowledgement or failure envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/jobs/stop:
+    post:
+      tags: [jobs]
+      summary: Stop a registered job.
+      operationId: postJobStop
+      description: |
+        The job name may be supplied in the request body or as a `name` query
+        parameter. When `DASHBOARD_API_TOKEN` is configured, the transport layer
+        requires `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+              additionalProperties: true
+      responses:
+        '200':
+          description: Stop acknowledgement or failure envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/jobs/log:
+    get:
+      tags: [jobs]
+      summary: Return recent log lines for one job.
+      operationId: getJobLog
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 200
+            minimum: 1
+            maximum: 4000
+      responses:
+        '200':
+          description: Job log payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/jobs/history:
+    get:
+      tags: [jobs]
+      summary: Return recent history rows for one job.
+      operationId: getJobHistory
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 200
+            minimum: 1
+            maximum: 5000
+      responses:
+        '200':
+          description: Job history payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/pipeline/run:
+    post:
+      tags: [jobs]
+      summary: Run the pipeline order sequentially.
+      operationId: postPipelineRun
+      description: |
+        When `include_execution` is false or omitted, execution-tagged jobs are
+        skipped. When `DASHBOARD_API_TOKEN` is configured, the transport layer
+        requires `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: include_execution
+          in: query
+          required: false
+          schema:
+            type: boolean
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                include_execution:
+                  type: boolean
+                jobs:
+                  type: array
+                  items:
+                    type: string
+              additionalProperties: true
+      responses:
+        '200':
+          description: Pipeline execution result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources:
+    get:
+      tags: [data-sources]
+      summary: Return the data-source catalog, templates, and runtime snapshot.
+      operationId: getDataSources
+      responses:
+        '200':
+          description: Data-source control-plane inventory.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/data_sources/logs:
+    get:
+      tags: [data-sources]
+      summary: Return recent control-plane logs for one source.
+      operationId: getDataSourceLogs
+      parameters:
+        - name: source_key
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        '200':
+          description: Source log rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/data_sources/create:
+    post:
+      tags: [data-sources]
+      summary: Create a new configurable data source.
+      operationId: postDataSourceCreate
+      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Source creation result plus lifecycle reconciliation summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/update:
+    post:
+      tags: [data-sources]
+      summary: Update an existing configurable data source.
+      operationId: postDataSourceUpdate
+      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Source update result plus lifecycle reconciliation summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/delete:
+    post:
+      tags: [data-sources]
+      summary: Delete a configurable data source.
+      operationId: postDataSourceDelete
+      description: |
+        `source_key` may be supplied in the request body or query string. When
+        `DASHBOARD_API_TOKEN` is configured, the transport layer requires
+        `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: source_key
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Delete acknowledgement plus lifecycle reconciliation summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/enable:
+    post:
+      tags: [data-sources]
+      summary: Enable a configured data source.
+      operationId: postDataSourceEnable
+      description: |
+        `source_key` may be supplied in the request body or query string. When
+        `DASHBOARD_API_TOKEN` is configured, the transport layer requires
+        `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: source_key
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Enable result plus lifecycle reconciliation summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/disable:
+    post:
+      tags: [data-sources]
+      summary: Disable a configured data source.
+      operationId: postDataSourceDisable
+      description: |
+        `source_key` may be supplied in the request body or query string. When
+        `DASHBOARD_API_TOKEN` is configured, the transport layer requires
+        `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: source_key
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Disable result plus lifecycle reconciliation summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/test:
+    post:
+      tags: [data-sources]
+      summary: Run the provider-specific connectivity test for one source.
+      operationId: postDataSourceTest
+      description: |
+        `source_key` may be supplied in the request body or query string. The
+        response shape is provider-specific but always includes `ok` and
+        `source_key`. When `DASHBOARD_API_TOKEN` is configured, the transport
+        layer requires `X-API-Token` or `token` on this mutating route.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: source_key
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Provider-specific test result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/terminal/watchlist:
+    get:
+      tags: [terminal]
+      summary: Return the terminal watchlist.
+      operationId: getTerminalWatchlist
+      responses:
+        '200':
+          description: Terminal watchlist payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/terminal/snapshot:
+    get:
+      tags: [terminal]
+      summary: Return the one-call terminal bootstrap payload.
+      operationId: getTerminalSnapshot
+      responses:
+        '200':
+          description: Terminal snapshot containing watchlist, positions, orders, fills, and equity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/terminal/positions:
+    get:
+      tags: [terminal]
+      summary: Return current broker-position rows for the terminal.
+      operationId: getTerminalPositions
+      responses:
+        '200':
+          description: Terminal positions payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/terminal/orders:
+    get:
+      tags: [terminal]
+      summary: Return broker-order state and portfolio-order intents.
+      operationId: getTerminalOrders
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 500
+            minimum: 1
+            maximum: 5000
+      responses:
+        '200':
+          description: Terminal orders payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/terminal/fills:
+    get:
+      tags: [terminal]
+      summary: Return recent fill rows for the terminal.
+      operationId: getTerminalFills
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1000
+            minimum: 1
+            maximum: 20000
+      responses:
+        '200':
+          description: Terminal fills payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/terminal/equity:
+    get:
+      tags: [terminal]
+      summary: Return the current account snapshot plus equity history series.
+      operationId: getTerminalEquity
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 2000
+            minimum: 10
+            maximum: 50000
+      responses:
+        '200':
+          description: Terminal equity payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/terminal/markers:
+    get:
+      tags: [terminal]
+      summary: Return chart markers built from fills and terminal-originated intents.
+      operationId: getTerminalMarkers
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Terminal markers payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/terminal/order:
+    post:
+      tags: [terminal]
+      summary: Write a terminal order intent into `portfolio_orders`.
+      operationId: postTerminalOrder
+      description: |
+        This route does not bypass broker logic. It writes a portfolio-order
+        intent only when `execution_gate_snapshot()` reports that real trading
+        is currently allowed. When `DASHBOARD_API_TOKEN` is configured, the
+        transport layer requires `X-API-Token` or `token`.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, side, qty]
+              properties:
+                symbol:
+                  type: string
+                side:
+                  type: string
+                  enum: [BUY, SELL]
+                qty:
+                  type: number
+              additionalProperties: true
+      responses:
+        '200':
+          description: Terminal order acknowledgement or execution-blocked response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/terminal/flatten:
+    post:
+      tags: [terminal]
+      summary: Write a terminal flatten intent into `portfolio_orders`.
+      operationId: postTerminalFlatten
+      description: |
+        This route reads the current broker position, derives the flatten side
+        and quantity, and writes a portfolio-order intent instead of mutating
+        positions directly. When `DASHBOARD_API_TOKEN` is configured, the
+        transport layer requires `X-API-Token` or `token`.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol:
+                  type: string
+              additionalProperties: true
+      responses:
+        '200':
+          description: Terminal flatten acknowledgement, no-position message, or execution-blocked response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'

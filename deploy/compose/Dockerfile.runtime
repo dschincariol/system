@@ -1,0 +1,25 @@
+ARG PYTHON_RUNTIME_IMAGE=python:3.11-slim
+FROM ${PYTHON_RUNTIME_IMAGE}
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/app
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install -r /app/requirements.txt
+
+COPY . /app
+
+RUN mkdir -p /app/data /app/logs /app/artifact_mirror /app/training_datasets
+
+CMD ["python", "start_system.py"]
+

@@ -1,0 +1,1293 @@
+# FILE: dev_core/broker_router.py
+# REPLACE ENTIRE FILE WITH THIS (copy/paste)
+
+"""
+Unified Broker Router
+
+Supports:
+- sim
+- alpaca
+- ibkr
+
+Failover:
+  BROKER_FAILOVER="ibkr,alpaca"
+  Retries on exception OR ok=False
+  Returns structured failover_attempts
+
+Supports:
+- override_orders
+- override_order_id
+- override_ts_ms
+
+Adds:
+- Pre-Live Position Reconciliation Gate
+  (blocks LIVE execution if broker positions mismatch baseline)
+"""
+
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+from engine.execution.execution_slicing_engine import build_order_slices
+from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.logging import get_logger, log_event
+from engine.runtime.metrics import emit_counter, emit_timing
+from engine.runtime.observability import backoff_delay_s, record_component_health, record_rolling_rate
+from engine.runtime.tracing import trace_event
+
+# Execution gate providers are intentionally resolved by callers/tests or fail
+# closed. Eager imports can block router import if the runtime registry is
+# unavailable during execution-path safety checks.
+_execution_gate_snapshot = None  # type: ignore
+_ALLOWED_JOBS = {}  # type: ignore
+
+try:
+    from engine.cache.wrappers.kill_switch import read_kill_switch as _kill_switch_snapshot  # type: ignore
+except Exception:
+    _kill_switch_snapshot = None  # type: ignore
+
+try:
+    from engine.cache.wrappers.execution_mode import read_execution_mode as _get_execution_mode  # type: ignore
+except Exception:
+    _get_execution_mode = None  # type: ignore
+
+_read_execution_health = None  # type: ignore
+
+# Best-effort DB access for realized slippage distribution
+try:
+    from engine.runtime.storage import connect  # type: ignore
+except Exception:
+    connect = None  # type: ignore
+
+# Adaptive slicing (best-effort; router remains loadable)
+try:
+    from engine.strategy.adaptive_order_slicer import AdaptiveOrderSlicer  # type: ignore
+except Exception:
+    AdaptiveOrderSlicer = None  # type: ignore
+
+
+# ============================================================
+# Adapter imports (best-effort; router remains loadable)
+# ============================================================
+
+_sim_apply = None
+_alpaca_apply = None
+_ibkr_apply = None
+
+# Pre-live reconciliation gate (hard block on mismatch)
+try:
+    from engine.execution.position_reconcile import pre_live_position_reconcile as _prelive_reconcile
+except Exception:
+    _prelive_reconcile = None
+
+
+LOG = get_logger("execution.broker_router")
+_WARNED_NONFATAL_KEYS: set[str] = set()
+_SUCCESS_TRACE_MIN_MS = int(os.environ.get("BROKER_ROUTER_SUCCESS_TRACE_MIN_MS", "250"))
+BROKER_ROUTER_RETRY_ATTEMPTS = max(1, int(os.environ.get("BROKER_ROUTER_RETRY_ATTEMPTS", "2")))
+BROKER_ROUTER_RETRY_BASE_S = max(0.0, float(os.environ.get("BROKER_ROUTER_RETRY_BASE_S", "0.1")))
+BROKER_ROUTER_RETRY_MAX_S = max(0.0, float(os.environ.get("BROKER_ROUTER_RETRY_MAX_S", "1.0")))
+
+
+def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
+    if once_key and once_key in _WARNED_NONFATAL_KEYS:
+        return
+    log_failure(
+        LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error),
+        error=error,
+        level=30,
+        component="engine.execution.broker_router",
+        extra=extra or None,
+        persist=False,
+    )
+    if once_key:
+        _WARNED_NONFATAL_KEYS.add(once_key)
+
+
+def _resolve_sim_apply():
+    global _sim_apply
+    if _sim_apply is not None:
+        return _sim_apply
+    try:
+        from engine.execution.broker_sim import apply_new_portfolio_orders
+
+        _sim_apply = apply_new_portfolio_orders
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_SIM_IMPORT_FAILED", e, once_key="adapter_import:sim")
+        _sim_apply = None
+    return _sim_apply
+
+
+def _resolve_alpaca_apply():
+    global _alpaca_apply
+    if _alpaca_apply is not None:
+        return _alpaca_apply
+    try:
+        from engine.execution.broker_alpaca_rest import apply_latest_portfolio_orders_live
+
+        _alpaca_apply = apply_latest_portfolio_orders_live
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_ALPACA_IMPORT_FAILED", e, once_key="adapter_import:alpaca")
+        _alpaca_apply = None
+    return _alpaca_apply
+
+
+def _resolve_ibkr_apply():
+    global _ibkr_apply
+    if _ibkr_apply is not None:
+        return _ibkr_apply
+    try:
+        from engine.execution.broker_ibkr_gateway import apply_latest_portfolio_orders_live
+
+        _ibkr_apply = apply_latest_portfolio_orders_live
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_IBKR_IMPORT_FAILED", e, once_key="adapter_import:ibkr")
+        _ibkr_apply = None
+    return _ibkr_apply
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return int(default)
+    try:
+        return int(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_SAFE_INT_FAILED",
+            e,
+            once_key=f"safe_int:{type(value).__name__}:{str(value)[:64]}",
+            value_type=type(value).__name__,
+        )
+        return int(default)
+
+
+def _lineage_summary(orders: Optional[List[dict]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "order_count": 0,
+        "execution_targets": [],
+        "symbols": [],
+        "model_ids": [],
+        "model_names": [],
+        "source_alert_ids": [],
+    }
+    if not orders:
+        return out
+
+    targets = set()
+    symbols = set()
+    model_ids = set()
+    model_names = set()
+    source_alert_ids = set()
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        out["order_count"] += 1
+        targets.add(str(order.get("execution_target") or "real").strip().lower() or "real")
+        if order.get("symbol") not in (None, ""):
+            symbols.add(str(order.get("symbol")).strip().upper())
+        if order.get("model_id") not in (None, ""):
+            model_ids.add(str(order.get("model_id")).strip() or "baseline")
+        if order.get("model_name") not in (None, ""):
+            model_names.add(str(order.get("model_name")).strip())
+        elif order.get("strategy_name") not in (None, ""):
+            model_names.add(str(order.get("strategy_name")).strip())
+        if order.get("source_alert_id") is not None:
+            try:
+                source_alert_ids.add(_safe_int(order.get("source_alert_id")))
+            except Exception as e:
+                _warn_nonfatal(
+                    "BROKER_ROUTER_SOURCE_ALERT_ID_PARSE_FAILED",
+                    e,
+                    once_key="lineage_summary_source_alert_id_parse",
+                    raw_value=order.get("source_alert_id"),
+                )
+
+    out["execution_targets"] = sorted(x for x in targets if x)
+    out["symbols"] = sorted(x for x in symbols if x)
+    out["model_ids"] = sorted(x for x in model_ids if x)
+    out["model_names"] = sorted(x for x in model_names if x)
+    out["source_alert_ids"] = sorted(source_alert_ids)
+    return out
+
+
+def _normalized_order_source(order: Dict[str, Any]) -> str:
+    for key in ("source", "order_source"):
+        raw = order.get(key)
+        if raw is None:
+            continue
+        source = str(raw).strip().lower()
+        if source:
+            return source
+    return ""
+
+
+def _rl_source_block(orders: Optional[List[dict]]) -> Optional[Dict[str, Any]]:
+    """Reject shadow RL-originated orders before any broker adapter is reached."""
+    blocked: List[Dict[str, Any]] = []
+    for idx, order in enumerate(list(orders or [])):
+        if not isinstance(order, dict):
+            continue
+        source = _normalized_order_source(order)
+        if source.startswith(("rl.", "rl_")):
+            blocked.append(
+                {
+                    "index": int(idx),
+                    "symbol": str(order.get("symbol") or "").strip().upper(),
+                    "source": source,
+                }
+            )
+    if not blocked:
+        return None
+    return {
+        "ok": False,
+        "status": "rl_source_forbidden",
+        "reason": "RL portfolio policies are shadow-only and may not enter the live broker router.",
+        "blocked_orders": blocked,
+        "stop_failover": True,
+    }
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def _jobs_from_db_snapshot() -> List[Dict[str, Any]]:
+    """
+    Minimal job list for compute_system_state() when routing execution outside JobManager.
+    Uses job_locks.heartbeat_ts_ms to infer running-ness.
+    This keeps execution gating consistent even when the router is invoked
+    outside the normal supervised job loop.
+    """
+    connect_fn = connect
+    if connect_fn is None:
+        return []
+
+    try:
+        max_stale_s = float(os.environ.get("HEALTH_JOBS_MAX_STALE_S", "180"))
+    except Exception:
+        max_stale_s = 180.0
+
+    now_ms = int(time.time() * 1000)
+
+    def _load() -> List[Dict[str, Any]]:
+        try:
+            con = connect_fn(readonly=True)
+            try:
+                rows = con.execute(
+                        "SELECT job_name, heartbeat_ts_ms FROM job_locks"
+                    ).fetchall()
+            finally:
+                try:
+                    con.close()
+                except Exception as e:
+                    _warn_nonfatal(
+                        "BROKER_ROUTER_JOB_SNAPSHOT_CLOSE_FAILED",
+                        e,
+                        once_key="jobs_from_db_snapshot_close",
+                    )
+        except Exception:
+            rows = []
+
+        out: List[Dict[str, Any]] = []
+        for r in rows or []:
+            try:
+                name = str(r[0] or "")
+                hb = int(r[1] or 0)
+                running = (now_ms - hb) <= int(max_stale_s * 1000.0)
+
+                mode = ""
+                try:
+                    spec = _ALLOWED_JOBS.get(name)
+                    if isinstance(spec, (list, tuple)) and len(spec) >= 2:
+                        mode = str(spec[1] or "")
+                except Exception:
+                    mode = ""
+
+                out.append({"name": name, "running": bool(running), "mode": mode})
+            except Exception as e:
+                _warn_nonfatal(
+                    "BROKER_ROUTER_JOB_SNAPSHOT_ROW_FAILED",
+                    e,
+                    once_key=f"job_snapshot_row:{name}",
+                    job_name=str(name),
+                )
+                continue
+
+        return out
+
+    from engine.runtime.state_cache import cache_get_or_load
+    return cache_get_or_load("job_locks", "broker_router_snapshot", _load, ttl_s=1.0)
+
+
+def _execution_degraded_from_cache() -> Dict[str, Any]:
+    if _read_execution_health is None:
+        return {"active": False, "detail": {}}
+    try:
+        health = _read_execution_health() or {}
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_EXECUTION_HEALTH_CACHE_READ_FAILED",
+            e,
+            once_key="execution_health_cache_read",
+        )
+        return {"active": False, "detail": {}}
+    state = str(health.get("state") or health.get("status") or "").strip().lower()
+    if state not in {"critical", "degraded", "down", "unhealthy"}:
+        return {"active": False, "detail": dict(health or {})}
+    severity = "CRITICAL" if state in {"critical", "down", "unhealthy"} else "WARNING"
+    return {
+        "active": True,
+        "severity": severity,
+        "reason": f"execution_health_{state}",
+        "reason_codes": [f"execution_health_{state}"],
+        "detail": dict(health or {}),
+    }
+
+
+def _execution_gate_or_block(dry_run: bool) -> Optional[Dict[str, Any]]:
+    """
+    Returns None if allowed, else a structured block response.
+    Fail-closed if providers missing.
+    """
+    if bool(dry_run):
+        return None
+
+    if _execution_gate_snapshot is None:
+        return {"ok": False, "status": "execution_blocked_gate_unavailable"}
+
+    if _kill_switch_snapshot is None or _get_execution_mode is None:
+        return {"ok": False, "status": "execution_blocked_gate_providers_missing"}
+
+    gate = _execution_gate_snapshot(
+        get_execution_mode_fn=_get_execution_mode,
+        execution_degraded=_execution_degraded_from_cache(),
+        kill_switches=(_kill_switch_snapshot() or {}),
+    )
+
+    if (not bool(gate.get("ok"))) or (not bool(gate.get("allowed"))):
+        return {"ok": False, "status": "execution_blocked", "gate": gate}
+
+    return None
+
+
+def _real_trading_gate_or_block(broker_name: str, dry_run: bool) -> Optional[Dict[str, Any]]:
+    if bool(dry_run):
+        return None
+
+    if _execution_gate_snapshot is None or _kill_switch_snapshot is None or _get_execution_mode is None:
+        return {
+            "ok": False,
+            "status": "execution_blocked_gate_providers_missing",
+            "broker": str(broker_name),
+        }
+
+    gate = _execution_gate_snapshot(
+        get_execution_mode_fn=_get_execution_mode,
+        execution_degraded=_execution_degraded_from_cache(),
+        kill_switches=(_kill_switch_snapshot() or {}),
+    )
+    if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
+        return {
+            "ok": False,
+            "status": "real_trading_blocked",
+            "broker": str(broker_name),
+            "gate": gate,
+        }
+    return None
+
+
+def _load_recent_slippage_bps(symbol: str, broker: str, n: int = 80) -> List[float]:
+    """
+    Loads recent realized slippage_bps for (symbol, broker) from execution_analytics.
+    Falls back to empty on any error.
+    """
+    if connect is None:
+        return []
+
+    sym = str(symbol or "").upper().strip()
+    br = str(broker or "").lower().strip()
+    n = int(max(10, min(500, int(n))))
+
+    try:
+        con = connect()
+        try:
+            rows = con.execute(
+                """
+                SELECT slippage_bps
+                FROM execution_analytics
+                WHERE symbol = ?
+                  AND (broker = ? OR broker IS NULL)
+                  AND slippage_bps IS NOT NULL
+                ORDER BY ts_ms DESC
+                LIMIT ?
+                """,
+                (sym, br, n),
+            ).fetchall()
+            out = []
+            for (v,) in rows or []:
+                try:
+                    out.append(float(v))
+                except Exception as e:
+                    _warn_nonfatal(
+                        "BROKER_ROUTER_SLIPPAGE_PARSE_FAILED",
+                        e,
+                        once_key="load_recent_slippage_parse",
+                        symbol=sym,
+                        broker=br,
+                        raw_value=v,
+                    )
+            return out
+        finally:
+            con.close()
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_SLIPPAGE_HISTORY_FAILED",
+            e,
+            once_key=f"slippage_history:{sym}:{br}",
+            symbol=str(sym),
+            broker=str(br),
+        )
+        return []
+
+
+def _entry_delay_ms(order: Optional[Dict[str, Any]]) -> int:
+    src = dict(order or {})
+    for key in ("entry_delay_ms", "execution_entry_delay_ms", "entry_wait_ms"):
+        try:
+            val = src.get(key)
+            if val not in (None, ""):
+                return max(0, int(float(val)))
+        except Exception as e:
+            _warn_nonfatal(
+                "BROKER_ROUTER_ENTRY_DELAY_PARSE_FAILED",
+                e,
+                once_key=f"entry_delay:{key}",
+                key=str(key),
+            )
+            continue
+    return 0
+
+
+def _apply_entry_delay(
+    *,
+    order: Optional[Dict[str, Any]],
+    dry_run: bool,
+    slice_audit: Optional[List[Dict[str, Any]]] = None,
+    order_index: Optional[int] = None,
+) -> int:
+    delay_ms = _entry_delay_ms(order)
+    if delay_ms <= 0:
+        return 0
+
+    if isinstance(slice_audit, list):
+        slice_audit.append(
+            {
+                "symbol": str((order or {}).get("symbol") or "").upper().strip(),
+                "order_index": (int(order_index) if order_index is not None else None),
+                "stage": "entry_delay",
+                "delay_ms": int(delay_ms),
+                "applied": not bool(dry_run),
+            }
+        )
+
+    if (not bool(dry_run)) and delay_ms > 0:
+        time.sleep(float(delay_ms) / 1000.0)
+
+    return int(delay_ms)
+
+
+def _apply_batch_entry_delay(*, orders: Optional[List[dict]], dry_run: bool) -> int:
+    if not orders:
+        return 0
+    return _apply_entry_delay(order=dict((orders or [None])[0] or {}), dry_run=bool(dry_run))
+
+
+def _parse_failover_chain() -> List[str]:
+    raw = (os.environ.get("BROKER_FAILOVER", "") or "").strip()
+    if raw:
+        parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+        if parts:
+            return parts
+
+    name = str(os.environ.get("BROKER_NAME", os.environ.get("BROKER", "sim")) or "sim").lower().strip()
+    return [name] if name else ["sim"]
+
+
+def _adaptive_execute_orders(
+    *,
+    broker_name: str,
+    fn,
+    dry_run: bool,
+    override_orders: List[dict],
+    override_order_id: Optional[int],
+    override_ts_ms: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Executes override_orders using configurable slicing:
+    - TWAP
+    - VWAP
+    - POV
+    - adaptive
+    - preserves 1-order direct path when slicing disabled
+    """
+    if not override_orders:
+        return {"ok": True, "status": "no_orders", "broker": broker_name}
+
+    if os.environ.get("EXEC_ADAPTIVE_SLICING", "1") != "1":
+        return {"ok": False, "status": "adaptive_disabled"}
+
+    slice_audit: List[Dict[str, Any]] = []
+    all_ok = True
+    last_res: Dict[str, Any] = {}
+
+    for oidx, order in enumerate(list(override_orders or [])):
+        try:
+            symbol = str(order.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+
+            qty0 = float(order.get("qty") or 0.0)
+            if qty0 == 0.0:
+                continue
+
+            recent_slip = _load_recent_slippage_bps(symbol, broker_name, n=80)
+            sliced_orders = build_order_slices(order=dict(order), broker_name=str(broker_name))
+
+            if (
+                len(sliced_orders) == 1
+                and str((order or {}).get("slice_style") or (order or {}).get("execution_style") or "").strip() == ""
+                and AdaptiveOrderSlicer is not None
+            ):
+                spread_bps = float(order.get("spread_bps") or order.get("spread") or order.get("true_spread_bps") or 0.0)
+                vol_bps = float(order.get("vol_bps") or order.get("intraday_vol_bps") or order.get("volatility") or 0.0)
+                slicer = AdaptiveOrderSlicer(
+                    recent_slippage_bps=recent_slip,
+                    spread_bps=spread_bps,
+                    volatility_bps=vol_bps,
+                    symbol=symbol,
+                    broker=broker_name,
+                )
+                plan = slicer.compute_slice_plan(remaining_qty=abs(qty0))
+                if bool(plan.get("abort")):
+                    slice_audit.append(
+                        {
+                            "symbol": symbol,
+                            "order_index": int(oidx),
+                            "slice_index": 0,
+                            "abort": True,
+                            "abort_reason": plan.get("abort_reason"),
+                            "audit": plan.get("audit") or {},
+                        }
+                    )
+                    all_ok = False
+                    break
+
+                if float(plan.get("slice_qty") or 0.0) > 0.0 and float(plan.get("slice_qty") or 0.0) < abs(qty0):
+                    side_sign = 1.0 if qty0 > 0 else -1.0
+                    sliced_orders = []
+                    remaining = abs(qty0)
+                    slice_index = 0
+                    while remaining > 0.0:
+                        plan_i = slicer.compute_slice_plan(remaining_qty=remaining)
+                        slice_qty = float(plan_i.get("slice_qty") or 0.0)
+                        if slice_qty <= 0.0:
+                            break
+                        so = dict(order)
+                        so["qty"] = float(slice_qty) * float(side_sign)
+                        so["slice_style"] = "adaptive"
+                        so["slice_index"] = int(slice_index)
+                        so["slice_parent_qty"] = float(qty0)
+                        so["slice_interval_ms"] = int(plan_i.get("delay_ms") or 0)
+                        so["adaptive_slice_plan"] = plan_i.get("audit") or {}
+                        sliced_orders.append(so)
+                        remaining -= float(slice_qty)
+                        slice_index += 1
+
+            _apply_entry_delay(
+                order=order,
+                dry_run=bool(dry_run),
+                slice_audit=slice_audit,
+                order_index=int(oidx),
+            )
+
+            for sidx, so in enumerate(list(sliced_orders or [dict(order)])):
+                interval_ms = int(so.get("slice_interval_ms") or 0)
+                style = str(so.get("slice_style") or "single").strip().lower()
+
+                r = _call_adapter(
+                    fn,
+                    dry_run=bool(dry_run),
+                    override_orders=[so],
+                    override_order_id=override_order_id,
+                    override_ts_ms=override_ts_ms,
+                ) or {}
+
+                last_res = dict(r) if isinstance(r, dict) else {"raw": r}
+                ok = bool(last_res.get("ok", False))
+
+                slice_audit.append(
+                    {
+                        "symbol": symbol,
+                        "order_index": int(oidx),
+                        "slice_index": int(sidx),
+                        "slice_qty": float(so.get("qty") or 0.0),
+                        "delay_ms": int(interval_ms),
+                        "style": str(style),
+                        "ok": ok,
+                        "status": last_res.get("status"),
+                    }
+                )
+
+                if not ok:
+                    all_ok = False
+                    break
+
+                if interval_ms > 0 and sidx < (len(sliced_orders) - 1) and (not bool(dry_run)):
+                    time.sleep(float(interval_ms) / 1000.0)
+
+            if not all_ok:
+                break
+
+        except Exception as e:
+            all_ok = False
+            slice_audit.append({"order_index": int(oidx), "exception": str(e)})
+
+    out: Dict[str, Any] = {}
+    out.update(last_res if isinstance(last_res, dict) else {})
+    out["ok"] = bool(all_ok)
+    out.setdefault("status", "adaptive_sliced" if all_ok else "adaptive_failed")
+    out["adaptive_slices"] = slice_audit
+    return out
+
+
+def _is_retryable_result(res: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(res, dict):
+        return True
+    if bool(res.get("ok")) or bool(res.get("fatal_reconcile")) or bool(res.get("stop_failover")):
+        return False
+    status = str(res.get("status") or "").strip().lower()
+    return status not in {
+        "unknown_broker",
+        "sim_adapter_missing",
+        "alpaca_adapter_missing",
+        "ibkr_adapter_missing",
+        "execution_blocked",
+        "execution_blocked_gate_unavailable",
+        "execution_blocked_gate_providers_missing",
+        "real_trading_blocked",
+        "prelive_reconcile_block",
+        "submit_inflight_unknown",
+        "submission_unknown",
+    }
+
+
+def _call_adapter(
+
+    fn,
+    *,
+    dry_run: bool,
+    override_orders: Optional[List[dict]],
+    override_order_id: Optional[int],
+    override_ts_ms: Optional[int],
+):
+    """
+    Backward-compatible adapter wrapper.
+    Allows older backends that may not accept new kwargs.
+    """
+    try:
+        return fn(
+            dry_run=bool(dry_run),
+            override_orders=override_orders,
+            override_order_id=override_order_id,
+            override_ts_ms=override_ts_ms,
+        )
+    except TypeError as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_APPLY_SIGNATURE_RETRY_FAILED",
+            e,
+            once_key=f"apply_signature:{getattr(fn, '__name__', 'unknown')}:override_ts",
+            fn_name=getattr(fn, "__name__", "unknown"),
+        )
+        try:
+            return fn(
+                dry_run=bool(dry_run),
+                override_orders=override_orders,
+            )
+        except TypeError as inner:
+            _warn_nonfatal(
+                "BROKER_ROUTER_APPLY_SIGNATURE_MINIMAL_RETRY_FAILED",
+                inner,
+                once_key=f"apply_signature:{getattr(fn, '__name__', 'unknown')}:override_orders",
+                fn_name=getattr(fn, "__name__", "unknown"),
+            )
+            return fn(dry_run=bool(dry_run))
+
+
+def _apply_one(
+    name: str,
+    *,
+    dry_run: bool,
+    override_orders: Optional[List[dict]] = None,
+    override_order_id: Optional[int] = None,
+    override_ts_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+
+    name = (name or "").lower().strip()
+    trace_event(
+        "order_router",
+        component="engine.execution.broker_router",
+        entity_type="broker",
+        entity_id=str(name),
+        payload={
+            "dry_run": bool(dry_run),
+            "override_order_id": override_order_id,
+            "override_ts_ms": override_ts_ms,
+            "order_count": int(len(override_orders or [])),
+        },
+        broker=str(name),
+    )
+
+    # ---------------- SIM (never reconciled) ----------------
+    if name in ("sim", "paper", "sandbox"):
+        sim_apply = _resolve_sim_apply()
+        if sim_apply is None:
+            return {"ok": False, "status": "sim_adapter_missing", "broker": name}
+        if (not bool(dry_run)) and override_orders:
+            ad = _adaptive_execute_orders(
+                broker_name="sim",
+                fn=sim_apply,
+                dry_run=dry_run,
+                override_orders=list(override_orders or []),
+                override_order_id=override_order_id,
+                override_ts_ms=override_ts_ms,
+            )
+            if isinstance(ad, dict) and ad.get("status") != "adaptive_disabled":
+                res = ad or {}
+            else:
+                _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+                res = _call_adapter(
+                    sim_apply,
+                    dry_run=dry_run,
+                    override_orders=override_orders,
+                    override_order_id=override_order_id,
+                    override_ts_ms=override_ts_ms,
+                ) or {}
+        else:
+            _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+            res = _call_adapter(
+                sim_apply,
+                dry_run=dry_run,
+                override_orders=override_orders,
+                override_order_id=override_order_id,
+                override_ts_ms=override_ts_ms,
+            ) or {}
+
+        if isinstance(res, dict) and "broker" not in res:
+            res["broker"] = "sim"
+        return res
+
+    # ---------------- LIVE BROKERS ----------------
+    is_live = name in (
+        "alpaca", "alpaca_rest",
+        "ibkr", "interactivebrokers", "interactive_brokers",
+        "ib_gateway", "ibgateway", "tws",
+    )
+
+    if is_live:
+        gate_block = _real_trading_gate_or_block(broker_name=name, dry_run=bool(dry_run))
+        if gate_block is not None:
+            return gate_block
+
+    # Pre-live reconcile gate (never blocks dry_run)
+    prelive_reconcile = _prelive_reconcile
+    if is_live and (not bool(dry_run)) and callable(prelive_reconcile):
+        gate = prelive_reconcile(broker=name) or {}
+        if not bool(gate.get("ok", False)):
+            gate.setdefault("ok", False)
+            gate.setdefault("status", "prelive_reconcile_block")
+            gate["broker"] = name
+            gate["fatal_reconcile"] = True
+            return gate
+
+    # ---------------- ALPACA ----------------
+    if name in ("alpaca", "alpaca_rest"):
+        alpaca_apply = _resolve_alpaca_apply()
+        if alpaca_apply is None:
+            return {"ok": False, "status": "alpaca_adapter_missing", "broker": name}
+        if (not bool(dry_run)) and override_orders:
+            ad = _adaptive_execute_orders(
+                broker_name="alpaca",
+                fn=alpaca_apply,
+                dry_run=dry_run,
+                override_orders=list(override_orders or []),
+                override_order_id=override_order_id,
+                override_ts_ms=override_ts_ms,
+            )
+            if isinstance(ad, dict) and ad.get("status") != "adaptive_disabled":
+                res = ad or {}
+            else:
+                _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+                res = _call_adapter(
+                    alpaca_apply,
+                    dry_run=dry_run,
+                    override_orders=override_orders,
+                    override_order_id=override_order_id,
+                    override_ts_ms=override_ts_ms,
+                ) or {}
+        else:
+            _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+            res = _call_adapter(
+                alpaca_apply,
+                dry_run=dry_run,
+                override_orders=override_orders,
+                override_order_id=override_order_id,
+                override_ts_ms=override_ts_ms,
+            ) or {}
+
+        if isinstance(res, dict) and "broker" not in res:
+            res["broker"] = "alpaca"
+        return res
+
+    # ---------------- IBKR ----------------
+    if name in ("ibkr", "interactivebrokers", "interactive_brokers", "ib_gateway", "ibgateway", "tws"):
+        ibkr_apply = _resolve_ibkr_apply()
+        if ibkr_apply is None:
+            return {"ok": False, "status": "ibkr_adapter_missing", "broker": name}
+        if (not bool(dry_run)) and override_orders:
+            ad = _adaptive_execute_orders(
+                broker_name="ibkr",
+                fn=ibkr_apply,
+                dry_run=dry_run,
+                override_orders=list(override_orders or []),
+                override_order_id=override_order_id,
+                override_ts_ms=override_ts_ms,
+            )
+            if isinstance(ad, dict) and ad.get("status") != "adaptive_disabled":
+                res = ad or {}
+            else:
+                _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+                res = _call_adapter(
+                    ibkr_apply,
+                    dry_run=dry_run,
+                    override_orders=override_orders,
+                    override_order_id=override_order_id,
+                    override_ts_ms=override_ts_ms,
+                ) or {}
+        else:
+            _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+            res = _call_adapter(
+                ibkr_apply,
+                dry_run=dry_run,
+                override_orders=override_orders,
+                override_order_id=override_order_id,
+                override_ts_ms=override_ts_ms,
+            ) or {}
+
+        if isinstance(res, dict) and "broker" not in res:
+            res["broker"] = "ibkr"
+        return res
+
+    return {"ok": False, "status": "unknown_broker", "broker": name}
+
+
+# ============================================================
+# Public Router
+# ============================================================
+
+def apply_new_portfolio_orders_router(
+    dry_run: bool = False,
+    override_orders: Optional[List[dict]] = None,
+    override_order_id: Optional[int] = None,
+    override_ts_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Route portfolio orders through the configured broker failover chain.
+
+    Parameters
+    ----------
+    dry_run : bool, default=False
+        When ``True``, downstream adapters should avoid live order placement.
+    override_orders : list of dict, optional
+        Explicit order batch to route instead of loading the latest stored
+        portfolio-order batch.
+    override_order_id : int, optional
+        Persisted order or batch identifier used for lineage and tracing.
+    override_ts_ms : int, optional
+        Epoch milliseconds associated with the override batch.
+
+    Returns
+    -------
+    dict
+        Structured adapter result. Successful and failed outputs include a
+        ``failover_attempts`` list, and successful outputs also include the
+        selected ``broker``.
+
+    Notes
+    -----
+    Execution is gated before any broker call. Each broker is retried up to
+    ``BROKER_ROUTER_RETRY_ATTEMPTS`` times and only fails over on adapter
+    errors or ``ok=False`` results. ``fatal_reconcile`` responses stop the
+    failover chain immediately.
+
+    Side Effects
+    ------------
+    May place live orders unless ``dry_run`` is true and always emits metrics,
+    health signals, traces, and structured logs describing the routing attempt.
+    """
+    rl_block = _rl_source_block(override_orders)
+    if rl_block is not None:
+        return rl_block
+
+    lineage = _lineage_summary(override_orders)
+
+    blocked = _execution_gate_or_block(dry_run=bool(dry_run))
+    if blocked is not None:
+        return blocked
+
+    chain = _parse_failover_chain()
+    if not chain:
+        chain = ["sim"]
+
+    attempts: List[Dict[str, Any]] = []
+
+    for name in chain:
+        for attempt_num in range(1, int(BROKER_ROUTER_RETRY_ATTEMPTS) + 1):
+            t0 = time.time()
+            try:
+                res = _apply_one(
+                    name,
+                    dry_run=bool(dry_run),
+                    override_orders=override_orders,
+                    override_order_id=override_order_id,
+                    override_ts_ms=override_ts_ms,
+                ) or {}
+
+                dur_ms = int((time.time() - t0) * 1000)
+
+                # If reconciliation gate trips → DO NOT failover
+                if bool(res.get("fatal_reconcile", False)):
+                    attempts.append(
+                        {
+                            "broker": name,
+                            "attempt": int(attempt_num),
+                            "ok": False,
+                            "status": res.get("status"),
+                            "dur_ms": int(dur_ms),
+                        }
+                    )
+                    record_rolling_rate(
+                        "execution_success_rate",
+                        success=False,
+                        component="engine.execution.broker_router",
+                        extra_tags={"broker": str(name)},
+                    )
+                    record_component_health(
+                        "execution",
+                        ok=False,
+                        status=str(res.get("status") or "prelive_reconcile_block"),
+                        detail=str(res.get("status") or "fatal_reconcile"),
+                        latency_ms=float(dur_ms),
+                        extra={
+                            "broker": str(name),
+                            "attempts": int(len(attempts)),
+                            "order_count": int(lineage.get("order_count") or 0),
+                            "symbols": list(lineage.get("symbols") or []),
+                        },
+                    )
+                    res.setdefault("broker", name)
+                    res["failover_attempts"] = attempts
+                    return res
+
+                if bool(res.get("stop_failover", False)):
+                    status = str(res.get("status") or "submit_inflight_unknown")
+                    attempts.append(
+                        {
+                            "broker": name,
+                            "attempt": int(attempt_num),
+                            "ok": False,
+                            "status": status,
+                            "dur_ms": int(dur_ms),
+                        }
+                    )
+                    record_rolling_rate(
+                        "execution_success_rate",
+                        success=False,
+                        component="engine.execution.broker_router",
+                        extra_tags={"broker": str(name)},
+                    )
+                    record_component_health(
+                        "execution",
+                        ok=False,
+                        status=str(status),
+                        detail=str(res.get("detail") or status),
+                        latency_ms=float(dur_ms),
+                        extra={
+                            "broker": str(name),
+                            "attempts": int(len(attempts)),
+                            "order_count": int(lineage.get("order_count") or 0),
+                            "symbols": list(lineage.get("symbols") or []),
+                            "execution_targets": list(lineage.get("execution_targets") or []),
+                            "stop_failover": True,
+                        },
+                    )
+                    res.setdefault("broker", name)
+                    res["failover_attempts"] = attempts
+                    return res
+
+                ok = bool(res.get("ok", False))
+                status = str(res.get("status") or ("ok" if ok else "failed"))
+                attempts.append(
+                    {
+                        "broker": name,
+                        "attempt": int(attempt_num),
+                        "ok": ok,
+                        "status": status,
+                        "dur_ms": int(dur_ms),
+                    }
+                )
+
+                if ok:
+                    res.setdefault("broker", name)
+                    res["failover_attempts"] = attempts
+                    emit_counter(
+                        "order_throughput",
+                        int(len(override_orders or [])) if override_orders else 1,
+                        component="engine.execution.broker_router",
+                        broker=str(name),
+                        extra_tags={"throughput_type": "router_success"},
+                    )
+                    emit_timing(
+                        "execution_latency_ms",
+                        int(dur_ms),
+                        component="engine.execution.broker_router",
+                        broker=str(name),
+                    )
+                    record_rolling_rate(
+                        "execution_success_rate",
+                        success=True,
+                        component="engine.execution.broker_router",
+                        extra_tags={"broker": str(name)},
+                    )
+                    record_component_health(
+                        "execution",
+                        ok=True,
+                        status=str(status),
+                        detail="ok",
+                        latency_ms=float(dur_ms),
+                        extra={
+                            "broker": str(name),
+                            "attempts": int(len(attempts)),
+                            "order_count": int(lineage.get("order_count") or 0),
+                            "symbols": list(lineage.get("symbols") or []),
+                            "execution_targets": list(lineage.get("execution_targets") or []),
+                        },
+                    )
+                    if len(attempts) > 1 or int(dur_ms) >= int(_SUCCESS_TRACE_MIN_MS):
+                        trace_event(
+                            "order_router",
+                            component="engine.execution.broker_router",
+                            entity_type="broker",
+                            entity_id=str(name),
+                            payload={
+                                "ok": True,
+                                "status": res.get("status"),
+                                "attempts": attempts,
+                                "order_count": int(len(override_orders or [])),
+                                "lineage": lineage,
+                                "override_order_id": (int(override_order_id) if override_order_id is not None else None),
+                                "override_ts_ms": (int(override_ts_ms) if override_ts_ms is not None else None),
+                                "latency_ms": int(dur_ms),
+                            },
+                            broker=str(name),
+                        )
+                        log_event(
+                            LOG,
+                            20,
+                            "order_router_success",
+                            component="engine.execution.broker_router",
+                            extra={
+                                "broker": str(name),
+                                "status": res.get("status"),
+                                "attempts": attempts,
+                                "order_count": int(len(override_orders or [])),
+                                "lineage": lineage,
+                                "override_order_id": (int(override_order_id) if override_order_id is not None else None),
+                                "override_ts_ms": (int(override_ts_ms) if override_ts_ms is not None else None),
+                                "latency_ms": int(dur_ms),
+                            },
+                        )
+                    return res
+
+                retryable = bool(
+                    attempt_num < int(BROKER_ROUTER_RETRY_ATTEMPTS)
+                    and _is_retryable_result(res)
+                )
+                if retryable:
+                    emit_counter(
+                        "retry_attempt",
+                        1,
+                        component="engine.execution.broker_router",
+                        broker=str(name),
+                        extra_tags={
+                            "operation": "order_router",
+                            "attempt": int(attempt_num),
+                            "status": str(status),
+                        },
+                    )
+                    log_event(
+                        LOG,
+                        logging.WARNING,
+                        "order_router_retry_scheduled",
+                        component="engine.execution.broker_router",
+                        extra={
+                            "broker": str(name),
+                            "attempt": int(attempt_num),
+                            "status": str(status),
+                            "latency_ms": int(dur_ms),
+                            "lineage": lineage,
+                        },
+                    )
+                    time.sleep(
+                        backoff_delay_s(
+                            int(attempt_num),
+                            base_s=float(BROKER_ROUTER_RETRY_BASE_S),
+                            max_s=float(BROKER_ROUTER_RETRY_MAX_S),
+                        )
+                    )
+                    continue
+                break
+
+            except Exception as e:
+                _warn_nonfatal(
+                    "BROKER_ROUTER_BROKER_ATTEMPT_FAILED",
+                    e,
+                    once_key=f"broker_attempt:{name}",
+                    broker=str(name),
+                )
+                dur_ms = int((time.time() - t0) * 1000)
+                attempts.append(
+                    {
+                        "broker": name,
+                        "attempt": int(attempt_num),
+                        "ok": False,
+                        "status": "exception",
+                        "error": str(e),
+                        "dur_ms": int(dur_ms),
+                    }
+                )
+                retryable = attempt_num < int(BROKER_ROUTER_RETRY_ATTEMPTS)
+                if retryable:
+                    emit_counter(
+                        "retry_attempt",
+                        1,
+                        component="engine.execution.broker_router",
+                        broker=str(name),
+                        extra_tags={
+                            "operation": "order_router",
+                            "attempt": int(attempt_num),
+                            "status": "exception",
+                        },
+                    )
+                    log_event(
+                        LOG,
+                        logging.WARNING,
+                        "order_router_retry_scheduled",
+                        component="engine.execution.broker_router",
+                        extra={
+                            "broker": str(name),
+                            "attempt": int(attempt_num),
+                            "status": "exception",
+                            "error": str(e),
+                            "latency_ms": int(dur_ms),
+                            "lineage": lineage,
+                        },
+                    )
+                    time.sleep(
+                        backoff_delay_s(
+                            int(attempt_num),
+                            base_s=float(BROKER_ROUTER_RETRY_BASE_S),
+                            max_s=float(BROKER_ROUTER_RETRY_MAX_S),
+                        )
+                    )
+                    continue
+                break
+
+    emit_counter(
+        "job_failure",
+        1,
+        component="engine.execution.broker_router",
+        job="order_router",
+        extra_tags={"failure_type": "all_brokers_failed"},
+    )
+    record_rolling_rate(
+        "execution_success_rate",
+        success=False,
+        component="engine.execution.broker_router",
+        extra_tags={"broker": "failover_chain"},
+    )
+    record_component_health(
+        "execution",
+        ok=False,
+        status="all_brokers_failed",
+        detail="execution_failover_exhausted",
+        extra={
+            "broker": "failover_chain",
+            "attempts": int(len(attempts)),
+            "order_count": int(lineage.get("order_count") or 0),
+            "symbols": list(lineage.get("symbols") or []),
+            "execution_targets": list(lineage.get("execution_targets") or []),
+        },
+    )
+    trace_event(
+        "order_router",
+        component="engine.execution.broker_router",
+        entity_type="broker",
+        entity_id="failover_chain",
+        payload={
+            "ok": False,
+            "status": "all_brokers_failed",
+            "attempts": attempts,
+            "lineage": lineage,
+            "override_order_id": (int(override_order_id) if override_order_id is not None else None),
+            "override_ts_ms": (int(override_ts_ms) if override_ts_ms is not None else None),
+        },
+        job="order_router",
+    )
+    log_event(
+        LOG,
+        40,
+        "order_router_failed",
+        component="engine.execution.broker_router",
+        extra={
+            "status": "all_brokers_failed",
+            "attempts": attempts,
+            "lineage": lineage,
+            "override_order_id": (int(override_order_id) if override_order_id is not None else None),
+            "override_ts_ms": (int(override_ts_ms) if override_ts_ms is not None else None),
+        },
+    )
+    return {"ok": False, "status": "all_brokers_failed", "failover_attempts": attempts}
+
+
+def submit_order(order: dict, *, dry_run: bool = False, broker: Optional[str] = None) -> Dict[str, Any]:
+    """Compatibility wrapper for single-order submission through the router."""
+    previous = None
+    if broker:
+        previous = os.environ.get("BROKER_FAILOVER")
+        os.environ["BROKER_FAILOVER"] = str(broker)
+    try:
+        return apply_new_portfolio_orders_router(
+            dry_run=bool(dry_run),
+            override_orders=[dict(order or {})],
+            override_order_id=None,
+            override_ts_ms=int(time.time() * 1000),
+        )
+    finally:
+        if broker:
+            if previous is None:
+                os.environ.pop("BROKER_FAILOVER", None)
+            else:
+                os.environ["BROKER_FAILOVER"] = previous
+

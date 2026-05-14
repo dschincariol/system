@@ -1,0 +1,35 @@
+{
+  "name": "trading-engine-operator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Trading Engine Operator Control Panel",
+  "main": "boot/operator_server.js",
+  "scripts": {
+    "start": "node boot/operator_server.js",
+    "start:operator": "node boot/operator_server.js",
+    "start:engine": "python start_system.py",
+    "check:syntax": "python tools/syntax_check_workspace.py",
+    "lint:noops": "python tools/noop_guard.py",
+    "test:py": "python -m unittest discover -s tests -v",
+    "test:news": "python tools/news_ingestion_selftest.py",
+    "smoke:pipeline": "python tools/pipeline_smoke_test.py",
+    "validate": "python tools/validate_repo.py",
+    "check:ui": "python tools/check_local_asset_refs.py && python tools/check_dashboard_ui_contract.py && node --test tests/test_command_palette_helpers.mjs tests/test_symbol_context.mjs tests/test_mobile_ops_helpers.mjs tests/test_replay_ui_helpers.mjs",
+    "test:ui": "python tools/check_local_asset_refs.py && python -m pytest tests/test_dashboard_ui_contract.py tests/test_ui_asset_refs.py tests/test_mobile_ops_surface.py && node --test tests/test_command_palette_helpers.mjs tests/test_symbol_context.mjs tests/test_mobile_ops_helpers.mjs tests/test_replay_ui_helpers.mjs",
+    "validate:live": "python tools/validate_repo.py --live",
+    "validate:deps": "python tools/validate_dependency_lock.py",
+    "worktree:triage": "python tools/git_worktree_triage.py",
+    "deps:ci": "npm ci",
+    "deps:install": "npm install",
+    "backup": "bash deploy/bin/backup_trading_db.sh",
+    "upgrade": "bash deploy/bin/upgrade_trading_system.sh"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "4.22.1",
+    "sqlite3": "6.0.1",
+    "ws": "8.20.0"
+  }
+}

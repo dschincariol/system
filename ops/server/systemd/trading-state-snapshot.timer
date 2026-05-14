@@ -1,0 +1,10 @@
+[Unit]
+Description=Run trading state snapshot daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=trading-state-snapshot.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,169 @@
+# --------------------------------------------------
+# Python cache / build artifacts
+# --------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.nox/
+htmlcov/
+.claude/
+.repo-audit/
+
+# --------------------------------------------------
+# Virtualenv / local tooling
+# --------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+!deploy/env/
+deploy/env/*.env
+deploy/env/*.local
+!deploy/env/*.env.example
+.python-version
+
+# --------------------------------------------------
+# Runtime databases / WAL / SHM
+# --------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db.corrupt_*
+*.sqlite.corrupt_*
+*.sqlite3.corrupt_*
+
+# Keep empty data dirs if needed, but never local runtime DBs
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.sqlite-journal
+data/*.db.corrupt_*
+data/*.sqlite.corrupt_*
+data/*.sqlite3.corrupt_*
+!data/.gitkeep
+
+# --------------------------------------------------
+# Logs / runtime output
+# --------------------------------------------------
+logs/
+logs-*/
+logs-staging/
+logs-isolation/
+*.log
+*.log.*
+*.tmp
+*.dump
+*.prof
+*.pid
+*.seed
+*.out
+*.err
+*.lock
+*_hang.txt
+*_hang_dump.txt
+
+# --------------------------------------------------
+# Operator / machine-local state
+# --------------------------------------------------
+operator.state.json
+operator.secrets.json
+data/operator/
+data/runtime/
+data/retraining/
+data-staging/
+data-isolation/
+data/.data_source_master_key
+data/*.jsonl
+data/artifacts/
+data/cache/
+data/feature_cache/
+data/model_cache/
+data/models/
+data/processed/
+data/raw/
+tmp/
+.tmp/
+temp/
+*_trace.txt
+*_dump.txt
+
+# --------------------------------------------------
+# Environment / secrets
+# --------------------------------------------------
+.env
+.env.*
+*.env.local
+!.env.example
+
+# --------------------------------------------------
+# Editor / OS / backup leftovers
+# --------------------------------------------------
+*~
+*.orig
+*.rej
+*.bak
+.DS_Store
+Thumbs.db
+.import_fix_backup/
+.vscode/
+
+# --------------------------------------------------
+# VCS internals should never be bundled
+# --------------------------------------------------
+.git/
+.gitmodules
+
+# --------------------------------------------------
+# Node
+# --------------------------------------------------
+node_modules/
+
+# --------------------------------------------------
+# Build / dist
+# --------------------------------------------------
+build/
+dist/
+coverage/
+
+# --------------------------------------------------
+# Generated analysis reports
+# --------------------------------------------------
+pyright_*.json
+pyright-*.json
+pyright_report.json
+pyright-report.json
+pyright_workspace.txt
+*-pyright.json
+ruff_*.json
+ruff-*.json
+ruff_report.json
+ruff-report.json
+
+# --------------------------------------------------
+# Model / artifact outputs
+# --------------------------------------------------
+.cache/
+/artifacts/
+/artifacts-cache/
+/model-artifacts/
+/model_cache/
+/models/

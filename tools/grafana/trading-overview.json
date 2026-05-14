@@ -1,0 +1,321 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawSql": "SELECT to_timestamp(ts_ms / 1000.0) AS \"time\", metric, value_num\nFROM runtime_metrics\nWHERE metric IN ('pgbouncer.pool.cl_active','pgbouncer.pool.cl_waiting','pgbouncer.pool.sv_active','pgbouncer.pool.sv_idle')\n  AND $__timeFilter(to_timestamp(ts_ms / 1000.0))\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Connection State",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "displayMode": "gradient",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT COALESCE(tags_json::jsonb->>'query_id', 'unknown') AS query_id,\n       MAX(value_num) AS total_time_ms,\n       MAX(NULLIF(value_text, '')) AS normalized_query\nFROM runtime_metrics\nWHERE metric = 'pg_stat_statements.total_time_ms'\n  AND $__timeFilter(to_timestamp(ts_ms / 1000.0))\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 10",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Queries By Total Time",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT COALESCE(tags_json::jsonb->>'table', 'unknown') AS table_name,\n       MAX(value_num) AS write_rate_per_s\nFROM runtime_metrics\nWHERE metric = 'postgres.table.write_rate_per_s'\n  AND $__timeFilter(to_timestamp(ts_ms / 1000.0))\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 10",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Tables By Write Rate",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawSql": "SELECT to_timestamp(ts_ms / 1000.0) AS \"time\", value_num AS cache_hit_ratio\nFROM runtime_metrics\nWHERE metric = 'postgres.database.cache_hit_ratio'\n  AND $__timeFilter(to_timestamp(ts_ms / 1000.0))\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Cache Hit Ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT to_timestamp(ts_ms / 1000.0) AS \"time\",\n       value_num AS duration_ms,\n       tags_json::jsonb->>'query_hash' AS query_hash,\n       value_text AS normalized_query\nFROM runtime_metrics\nWHERE metric = 'postgres.slow_query.duration_ms'\n  AND ts_ms >= (EXTRACT(EPOCH FROM now() - interval '5 minutes') * 1000)::bigint\nORDER BY ts_ms DESC\nLIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "Slow Queries Last 5 Min",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "text": "closed"
+                },
+                "0.5": {
+                  "text": "half_open"
+                },
+                "1": {
+                  "text": "open"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawSql": "SELECT to_timestamp(ts_ms / 1000.0) AS \"time\", value_num AS redis_circuit_state\nFROM runtime_metrics\nWHERE metric = 'redis.circuit.state'\n  AND $__timeFilter(to_timestamp(ts_ms / 1000.0))\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Redis Circuit State",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 16
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawSql": "SELECT to_timestamp(ts_ms / 1000.0) AS \"time\",\n       COALESCE(tags_json::jsonb->>'source', 'unknown') AS metric,\n       value_num\nFROM runtime_metrics\nWHERE metric = 'ingestion.source_lag_s'\n  AND $__timeFilter(to_timestamp(ts_ms / 1000.0))\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Ingestion Lag Per Source",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "trading",
+    "postgres",
+    "pgbouncer"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Postgres datasource",
+        "multi": false,
+        "name": "DS_POSTGRES",
+        "options": [],
+        "query": "postgres",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Trading System Overview",
+  "uid": "trading-overview",
+  "version": 1,
+  "weekStart": ""
+}

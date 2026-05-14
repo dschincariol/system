@@ -1,0 +1,392 @@
+:root {
+  --bg: #101113;
+  --surface: #181a1d;
+  --surface-2: #202329;
+  --border: #343841;
+  --text: #f0f2f4;
+  --muted: #a9b0bb;
+  --dim: #78818f;
+  --ok: #39c071;
+  --warn: #e0aa36;
+  --danger: #ef5f5f;
+  --info: #5ab0ff;
+  --shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.mobileShell {
+  width: min(100%, 520px);
+  margin: 0 auto;
+  padding: max(14px, env(safe-area-inset-top)) 12px max(18px, env(safe-area-inset-bottom));
+}
+
+.topBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.topBar h1 {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.08;
+}
+
+.topBar p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.surfaceBanner,
+.panel,
+.metricTile {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.surfaceBanner {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.surfaceBanner.ok {
+  border-color: rgba(57, 192, 113, 0.55);
+  color: var(--ok);
+}
+
+.surfaceBanner.warn {
+  border-color: rgba(224, 170, 54, 0.6);
+  color: var(--warn);
+}
+
+.surfaceBanner.danger {
+  border-color: rgba(239, 95, 95, 0.7);
+  color: var(--danger);
+}
+
+.metricGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.metricTile {
+  min-height: 96px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.metricLabel,
+.fieldLabel {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.metricTile strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 23px;
+  line-height: 1.05;
+  overflow-wrap: anywhere;
+}
+
+.metricSub {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.panel {
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.panelHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.panel h2 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.badge-ok {
+  color: var(--ok);
+  border-color: rgba(57, 192, 113, 0.55);
+  background: rgba(57, 192, 113, 0.08);
+}
+
+.badge-warn {
+  color: var(--warn);
+  border-color: rgba(224, 170, 54, 0.6);
+  background: rgba(224, 170, 54, 0.08);
+}
+
+.badge-danger {
+  color: var(--danger);
+  border-color: rgba(239, 95, 95, 0.65);
+  background: rgba(239, 95, 95, 0.09);
+}
+
+.badge-muted {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.kvList {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.kvList div {
+  display: grid;
+  grid-template-columns: minmax(108px, 38%) minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+
+.kvList dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.kvList dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.noteBlock {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.rowList {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.dataRow {
+  display: grid;
+  grid-template-columns: minmax(72px, 1fr) minmax(0, 2fr);
+  gap: 8px;
+  min-height: 44px;
+  padding: 9px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.dataRow strong {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.dataRow span {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.dataRow.danger {
+  border-color: rgba(239, 95, 95, 0.55);
+}
+
+.dataRow.warn {
+  border-color: rgba(224, 170, 54, 0.55);
+}
+
+.emergencyPanel {
+  border-color: rgba(239, 95, 95, 0.75);
+  background: #1c1718;
+}
+
+.consequencePreview {
+  padding: 11px;
+  border: 1px solid rgba(239, 95, 95, 0.55);
+  border-radius: 6px;
+  color: #ffd4d4;
+  background: rgba(239, 95, 95, 0.08);
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.fieldLabel {
+  display: block;
+  margin: 12px 0 5px;
+}
+
+.textInput {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 11px;
+  color: var(--text);
+  background: #111315;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+
+.textInput:focus {
+  border-color: var(--info);
+  box-shadow: 0 0 0 3px rgba(90, 176, 255, 0.14);
+}
+
+.holdButton {
+  position: relative;
+  width: 100%;
+  min-height: 58px;
+  margin-top: 12px;
+  overflow: hidden;
+  color: #fff;
+  background: #8f2323;
+  border: 1px solid rgba(239, 95, 95, 0.9);
+  border-radius: 8px;
+  font-weight: 900;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.holdButton:disabled {
+  cursor: not-allowed;
+  color: var(--dim);
+  background: #24272d;
+  border-color: var(--border);
+}
+
+.holdButton span:first-child {
+  position: relative;
+  z-index: 2;
+}
+
+.holdProgress {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--hold-progress, 0%);
+  background: rgba(239, 95, 95, 0.45);
+  transition: width 80ms linear;
+  z-index: 1;
+}
+
+.resultBlock.ok {
+  color: var(--ok);
+  border-color: rgba(57, 192, 113, 0.55);
+}
+
+.resultBlock.danger {
+  color: var(--danger);
+  border-color: rgba(239, 95, 95, 0.6);
+}
+
+.footerBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 0 0;
+}
+
+.secondaryButton {
+  min-height: 38px;
+  padding: 7px 12px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-weight: 800;
+}
+
+.tone-ok {
+  color: var(--ok) !important;
+}
+
+.tone-warn {
+  color: var(--warn) !important;
+}
+
+.tone-danger {
+  color: var(--danger) !important;
+}
+
+@media (max-width: 360px) {
+  .metricGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .kvList div,
+  .dataRow {
+    grid-template-columns: 1fr;
+  }
+
+  .dataRow span {
+    text-align: left;
+  }
+}

@@ -1,0 +1,155 @@
+services:
+  runtime:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.runtime
+      args:
+        PYTHON_RUNTIME_IMAGE: ${PYTHON_RUNTIME_IMAGE:?set PYTHON_RUNTIME_IMAGE}
+    image: ${APP_RUNTIME_IMAGE:?set APP_RUNTIME_IMAGE}
+    container_name: trading-runtime
+    restart: unless-stopped
+    environment:
+      ENV: ${APP_ENV:-prod}
+      ENGINE_SUPERVISED: "1"
+      ENGINE_MODE: ${ENGINE_MODE:-safe}
+      EXECUTION_MODE: ${EXECUTION_MODE:-safe}
+      OPERATOR_MODE: ${OPERATOR_MODE:-safe}
+      PROD_LOCK: ${PROD_LOCK:-1}
+      ALLOW_TRAINING: ${ALLOW_TRAINING:-0}
+      TRADING_IMPORT_SMOKE_IMPORT_JOBS: ${TRADING_IMPORT_SMOKE_IMPORT_JOBS:-0}
+      TRADING_IMPORT_SMOKE_TIMEOUT_S: ${TRADING_IMPORT_SMOKE_TIMEOUT_S:-12.0}
+      TRADING_STARTUP_HEALTH_FAIL_OPEN: ${TRADING_STARTUP_HEALTH_FAIL_OPEN:-0}
+      TRADING_STARTUP_HEALTH_ASYNC_BIND: ${TRADING_STARTUP_HEALTH_ASYNC_BIND:-1}
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: 8000
+      DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:?set DASHBOARD_API_TOKEN}
+      TRADING_DATA: /app/data
+      TRADING_LOGS: /app/logs
+      DB_PATH: /app/data/trading.db
+      TIMESCALE_ENABLED: ${TIMESCALE_ENABLED:-1}
+      TIMESCALE_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}:${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}
+      TIMESCALE_PRICES_ENABLED: ${TIMESCALE_PRICES_ENABLED:-1}
+      TIMESCALE_PRICES_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}:${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}
+      PRICE_READ_BACKEND: ${PRICE_READ_BACKEND:-auto}
+      TELEMETRY_READ_BACKEND: ${TELEMETRY_READ_BACKEND:-auto}
+      LIVE_CACHE_BACKEND: ${LIVE_CACHE_BACKEND:-redis}
+      LIVE_CACHE_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      OBJECT_STORE_ENDPOINT: http://minio:9000
+      OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:?set OBJECT_STORE_BUCKET}
+      OBJECT_STORE_REGION: ${OBJECT_STORE_REGION:-}
+      OBJECT_STORE_ACCESS_KEY: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      OBJECT_STORE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      ARTIFACT_STORE_MIRROR_ROOT: /app/artifact_mirror
+      TRAINING_DATASET_STORE_ROOT: /app/training_datasets
+      TRAINING_DATASET_URI_PREFIX: minio://${OBJECT_STORE_BUCKET:?set OBJECT_STORE_BUCKET}/training-datasets
+      PREFLIGHT_REQUIRE_TIMESCALE: ${PREFLIGHT_REQUIRE_TIMESCALE:-1}
+      PREFLIGHT_REQUIRE_REDIS: ${PREFLIGHT_REQUIRE_REDIS:-1}
+      PREFLIGHT_REQUIRE_OBJECT_STORAGE: ${PREFLIGHT_REQUIRE_OBJECT_STORAGE:-1}
+      PREFLIGHT_EXTERNAL_TIMEOUT_S: ${PREFLIGHT_EXTERNAL_TIMEOUT_S:-2.0}
+      AUTO_BOOT_DAEMONS: ${AUTO_BOOT_DAEMONS:-0}
+      START_INGESTION_WITH_SERVER: ${START_INGESTION_WITH_SERVER:-1}
+      POLYGON_REST_ENABLED: ${POLYGON_REST_ENABLED:-0}
+      POLYGON_WS_ENABLED: ${POLYGON_WS_ENABLED:-0}
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      POLYGON_KEY: ${POLYGON_KEY:-}
+      TRADIER_ENABLED: ${TRADIER_ENABLED:-0}
+      TRADIER_API_TOKEN: ${TRADIER_API_TOKEN:-}
+      OPTIONS_PROVIDER_CHAIN: ${OPTIONS_PROVIDER_CHAIN:-}
+      OPTIONS_SYMBOL_LIMIT: ${OPTIONS_SYMBOL_LIMIT:-}
+      OPTIONS_CRITICAL_SYMBOLS: ${OPTIONS_CRITICAL_SYMBOLS:-DIA,SPY,QQQ,IWM}
+      BROKER_NAME: ${BROKER_NAME:-sim}
+      BROKER: ${BROKER:-sim}
+      ALPACA_BASE_URL: ${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
+      ALPACA_KEY_ID: ${ALPACA_KEY_ID:-}
+      ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
+    ports:
+      - "${DASHBOARD_PUBLIC_PORT:-8000}:8000"
+    volumes:
+      - trading-data:/app/data
+      - trading-logs:/app/logs
+      - artifact-mirror:/app/artifact_mirror
+      - training-datasets:/app/training_datasets
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os, sys, urllib.request
+          token = str(os.environ.get("DASHBOARD_API_TOKEN", "") or "").strip()
+          headers = {"X-API-Token": token} if token else {}
+          req = urllib.request.Request("http://127.0.0.1:8000/api/readiness", headers=headers)
+          with urllib.request.urlopen(req, timeout=5) as resp:
+              sys.exit(0 if int(getattr(resp, "status", 500)) < 500 else 1)
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    networks:
+      - trading-external
+
+  operator:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.operator
+      args:
+        NODE_RUNTIME_IMAGE: ${NODE_RUNTIME_IMAGE:?set NODE_RUNTIME_IMAGE}
+    image: ${APP_OPERATOR_IMAGE:?set APP_OPERATOR_IMAGE}
+    container_name: trading-operator
+    restart: unless-stopped
+    environment:
+      OPERATOR_BIND_HOST: 0.0.0.0
+      OPERATOR_PORT: 4001
+      OPERATOR_DISABLE_INTERNAL_ENGINE_START: "1"
+      DASHBOARD_BASE: http://runtime:8000
+      DASHBOARD_HOST: runtime
+      DASHBOARD_PORT: 8000
+      DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:?set DASHBOARD_API_TOKEN}
+      OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:?set OPERATOR_API_TOKEN}
+      OPERATOR_ALLOWED_ORIGIN: ${OPERATOR_ALLOWED_ORIGIN:-http://127.0.0.1:8000}
+      TRADING_LOGS: /app/logs
+      TRADING_DATA: /app/data
+      DB_PATH: /app/data/trading.db
+    ports:
+      - "${OPERATOR_PUBLIC_PORT:-4001}:4001"
+    volumes:
+      - trading-data:/app/data
+      - trading-logs:/app/logs
+    depends_on:
+      runtime:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - |
+          const http = require("http");
+          const req = http.get("http://127.0.0.1:4001/api/operator/status", (res) => {
+            process.exit(res.statusCode && res.statusCode < 500 ? 0 : 1);
+          });
+          req.on("error", () => process.exit(1));
+          req.setTimeout(5000, () => { req.destroy(); process.exit(1); });
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    networks:
+      - trading-external
+
+networks:
+  trading-external:
+    name: trading-external
+
+volumes:
+  trading-data:
+  trading-logs:
+  artifact-mirror:
+  training-datasets:

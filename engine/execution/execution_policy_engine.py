@@ -1,0 +1,984 @@
+"""Live-order policy shaping and suppression engine.
+
+The engine converts raw portfolio intents into execution-ready orders while
+enforcing TTL decay, regime compatibility, capital-preservation compression,
+and hard fail-closed barriers from kill switches and the trade-suppression
+engine.
+"""
+
+"""
+Execution Policy Engine (Unified + Regime Compatible + Trade Suppression Engine)
+
+Preserves:
+- TTL hard stop
+- Half-life alpha decay
+- Aggressiveness tiers
+- Volatility slicing
+- Broker-sim overrides
+- Kill switch enforcement
+- Structured audit trail
+- Strict signal timestamp enforcement
+
+Adds:
+- Regime compatibility sizing
+- Trade Suppression Engine (HARD_BLOCK / SOFT_THROTTLE / SIZE_COMPRESSION)
+- Unified compatibility for both qty-orders and to_weight intents
+"""
+
+import json
+import logging
+import math
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from engine.audit.chain import append_chain_row
+from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.storage import connect, init_db
+from engine.runtime.risk_state import get_state
+from engine.execution.kill_switch import execution_allowed
+from engine.cache.wrappers.execution_mode import read_execution_mode as get_execution_mode
+from engine.strategy.capital_guard import update_capital_preservation_mode
+from engine.execution.trade_suppression_engine import (
+    evaluate_trade_suppression,
+)
+from engine.execution.trade_attribution_ledger import log_suppression
+from engine.execution.execution_decision_engine import (
+    build_alpha_handoff,
+    decide_execution_strategy,
+    load_execution_feedback_snapshot,
+)
+from engine.strategy.regime_stack import (
+    compute_regime_vector,
+    regime_compatibility,
+    regime_model_version,
+)
+
+
+LOG = logging.getLogger("engine.execution.execution_policy_engine")
+_WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
+    key = str(once_key or "")
+    if key:
+        if key in _WARNED_NONFATAL_KEYS:
+            return
+        _WARNED_NONFATAL_KEYS.add(key)
+    log_failure(
+        LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error),
+        error=error,
+        level=logging.WARNING,
+        component="engine.execution.execution_policy_engine",
+        extra=extra or {},
+        include_health=False,
+        persist=False,
+    )
+
+
+# ============================================================
+# Defaults / knobs
+# ============================================================
+
+DEFAULT_TTL_MS = int(os.environ.get("EPE_DEFAULT_TTL_MS", str(5 * 60 * 1000)))
+DEFAULT_HALF_LIFE_MS = int(os.environ.get("EPE_DEFAULT_HALF_LIFE_MS", str(90 * 1000)))
+
+STRICT_SIGNAL_TS = os.environ.get("EPE_STRICT_SIGNAL_TS", "1") == "1"
+
+PASSIVE_MIN_ALPHA = float(os.environ.get("EPE_PASSIVE_MIN_ALPHA", "0.70"))
+NEUTRAL_MIN_ALPHA = float(os.environ.get("EPE_NEUTRAL_MIN_ALPHA", "0.40"))
+
+SIM_LAT_MS_PASSIVE = int(os.environ.get("EPE_SIM_LAT_MS_PASSIVE", "220"))
+SIM_LAT_MS_NEUTRAL = int(os.environ.get("EPE_SIM_LAT_MS_NEUTRAL", "140"))
+SIM_LAT_MS_AGGRESSIVE = int(os.environ.get("EPE_SIM_LAT_MS_AGGRESSIVE", "80"))
+
+SIM_CHUNK_PCT_PASSIVE = float(os.environ.get("EPE_SIM_CHUNK_PCT_PASSIVE", "0.22"))
+SIM_CHUNK_PCT_NEUTRAL = float(os.environ.get("EPE_SIM_CHUNK_PCT_NEUTRAL", "0.33"))
+SIM_CHUNK_PCT_AGGRESSIVE = float(os.environ.get("EPE_SIM_CHUNK_PCT_AGGRESSIVE", "0.45"))
+
+SIM_EXTRA_SLIP_BPS_PASSIVE = float(os.environ.get("EPE_SIM_EXTRA_SLIP_BPS_PASSIVE", "0.0"))
+SIM_EXTRA_SLIP_BPS_NEUTRAL = float(os.environ.get("EPE_SIM_EXTRA_SLIP_BPS_NEUTRAL", "0.5"))
+SIM_EXTRA_SLIP_BPS_AGGRESSIVE = float(os.environ.get("EPE_SIM_EXTRA_SLIP_BPS_AGGRESSIVE", "1.5"))
+
+# Capital Preservation Mode (CPM)
+EPE_CAPITAL_PRESERVE_KEEP_PCT = float(os.environ.get("EPE_CAPITAL_PRESERVE_KEEP_PCT", "0.50"))
+EPE_CAPITAL_PRESERVE_MIN_ORDERS = int(os.environ.get("EPE_CAPITAL_PRESERVE_MIN_ORDERS", "1"))
+EPE_CAPITAL_PRESERVE_QTY_MULT = float(os.environ.get("EPE_CAPITAL_PRESERVE_QTY_MULT", "0.50"))
+EPE_CAPITAL_PRESERVE_SIM_LAT_MS = int(os.environ.get("EPE_CAPITAL_PRESERVE_SIM_LAT_MS", "260"))
+EPE_CAPITAL_PRESERVE_CHUNK_PCT = float(os.environ.get("EPE_CAPITAL_PRESERVE_CHUNK_PCT", "0.18"))
+EPE_CAPITAL_PRESERVE_EXTRA_SLIP_BPS = float(os.environ.get("EPE_CAPITAL_PRESERVE_EXTRA_SLIP_BPS", "0.0"))
+
+TSE_SOFT_MIN_ALPHA = float(os.environ.get("TSE_SOFT_MIN_ALPHA", "0.30"))
+TSE_MIN_ABS_QTY = float(os.environ.get("TSE_MIN_ABS_QTY", "1e-9"))
+TSE_MAX_SLICES = int(os.environ.get("TSE_MAX_SLICES", "25"))
+EPE_MAX_FUTURE_SIGNAL_TS_MS = int(os.environ.get("EPE_MAX_FUTURE_SIGNAL_TS_MS", "30000"))
+EPE_MIN_REGIME_COMPAT_SCALE = float(os.environ.get("EPE_MIN_REGIME_COMPAT_SCALE", "0.35"))
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        if not math.isfinite(v):
+            return float(default)
+        return float(v)
+    except Exception as e:
+        _warn_nonfatal("EXECUTION_POLICY_ENGINE_SAFE_FLOAT_FAILED", e, once_key="safe_float", value=repr(x)[:120])
+        return float(default)
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception as e:
+        _warn_nonfatal("EXECUTION_POLICY_ENGINE_SAFE_INT_FAILED", e, once_key="safe_int", value=repr(x)[:120])
+        return int(default)
+
+
+def _ensure_tables(con) -> None:
+    # The audit table is additive and compatibility-tolerant because policy
+    # decisions are long-lived operational evidence across schema revisions.
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS execution_policy_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          signal_id TEXT,
+          model_id TEXT NOT NULL DEFAULT 'baseline',
+          symbol TEXT,
+          side TEXT,
+          qty REAL,
+          age_ms INTEGER,
+          ttl_ms INTEGER,
+          volatility REAL,
+          regime_compat REAL,
+          source_order_id INTEGER,
+          policy_json TEXT NOT NULL,
+          prev_hash BLOB,
+          row_hash BLOB NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_epe_audit_ts ON execution_policy_audit(ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_epe_audit_sym ON execution_policy_audit(symbol);
+        """
+    )
+
+    cols = {
+        str(r[1]).strip().lower()
+        for r in (con.execute("PRAGMA table_info(execution_policy_audit)").fetchall() or [])
+    }
+
+    if "source_alert_id" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN source_alert_id INTEGER;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:source_alert_id", column="source_alert_id")
+    if "model_id" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN model_id TEXT NOT NULL DEFAULT 'baseline';")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:model_id", column="model_id")
+    if "decision_json" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN decision_json TEXT;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:decision_json", column="decision_json")
+    if "prev_hash" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN prev_hash BLOB;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:prev_hash", column="prev_hash")
+    if "row_hash" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN row_hash BLOB;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:row_hash", column="row_hash")
+    if "actor" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN actor TEXT;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:actor", column="actor")
+    if "mode" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN mode TEXT;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:mode", column="mode")
+    if "broker" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN broker TEXT;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:broker", column="broker")
+    if "portfolio_orders_batch_id" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN portfolio_orders_batch_id INTEGER;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:portfolio_orders_batch_id", column="portfolio_orders_batch_id")
+    if "suppression_state" not in cols:
+        try:
+            con.execute("ALTER TABLE execution_policy_audit ADD COLUMN suppression_state TEXT;")
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_AUDIT_MIGRATION_FAILED", e, once_key="audit_column:suppression_state", column="suppression_state")
+
+
+def _alpha_remaining(age_ms: int, half_life_ms: int, ttl_ms: int) -> float:
+    # Alpha decay is hard-clamped by TTL: once expired, downstream shaping
+    # should treat the signal as having no remaining execution value.
+    if ttl_ms <= 0 or age_ms >= ttl_ms:
+        return 0.0
+    hl = max(1, half_life_ms)
+    rem = math.pow(0.5, float(age_ms) / float(hl))
+    return max(0.0, min(1.0, rem))
+
+
+def _decision_from_alpha(alpha_rem: float):
+    # Map continuous alpha decay into coarse execution tiers so broker logic
+    # receives stable, interpretable instructions rather than noisy floats.
+    if alpha_rem >= PASSIVE_MIN_ALPHA:
+        return "LIMIT", "PASSIVE", SIM_LAT_MS_PASSIVE, SIM_CHUNK_PCT_PASSIVE, SIM_EXTRA_SLIP_BPS_PASSIVE
+    if alpha_rem >= NEUTRAL_MIN_ALPHA:
+        return "LIMIT", "NEUTRAL", SIM_LAT_MS_NEUTRAL, SIM_CHUNK_PCT_NEUTRAL, SIM_EXTRA_SLIP_BPS_NEUTRAL
+    return "MARKET", "AGGRESSIVE", SIM_LAT_MS_AGGRESSIVE, SIM_CHUNK_PCT_AGGRESSIVE, SIM_EXTRA_SLIP_BPS_AGGRESSIVE
+
+
+def _normalize_side(o: Dict[str, Any]) -> str:
+    side = str(o.get("side") or o.get("to_side") or "").upper().strip()
+    if side in ("BUY", "LONG"):
+        return "LONG"
+    if side in ("SELL", "SHORT"):
+        return "SHORT"
+
+    qty = _safe_float(o.get("qty"), 0.0)
+    if qty > 0.0:
+        return "LONG"
+    if qty < 0.0:
+        return "SHORT"
+
+    to_weight = _safe_float(o.get("to_weight"), 0.0)
+    if to_weight > 0.0:
+        return "LONG"
+    if to_weight < 0.0:
+        return "SHORT"
+
+    return ""
+
+
+def _normalize_signal_ts(o: Dict[str, Any], default_signal_ts_ms: Optional[int]) -> int:
+    signal_ts = _safe_int(o.get("signal_ts_ms"), 0)
+    if signal_ts > 0:
+        return int(signal_ts)
+
+    ts_ms = _safe_int(o.get("ts_ms"), 0)
+    if ts_ms > 0:
+        return int(ts_ms)
+
+    source_ts_ms = _safe_int(o.get("source_ts_ms"), 0)
+    if source_ts_ms > 0:
+        return int(source_ts_ms)
+
+    if default_signal_ts_ms is not None:
+        return int(default_signal_ts_ms)
+    return 0
+
+
+def _regime_compatibility(con, symbol: str, signal_ts: int, o: Dict[str, Any]) -> Tuple[float, Optional[Dict[str, Any]]]:
+    try:
+        regime_vec = compute_regime_vector(symbol=symbol, ts_ms=int(signal_ts), con=con)
+    except Exception:
+        regime_vec = None
+
+    try:
+        prof = o.get("regime_profile")
+        if isinstance(prof, dict) and regime_vec:
+            regime_comp = float(regime_compatibility(prof, regime_vec))
+        else:
+            regime_comp = 1.0
+    except Exception:
+        regime_comp = 1.0
+
+    if not (regime_comp == regime_comp):
+        regime_comp = 1.0
+
+    # Compatibility is a sizing modifier, not a standalone veto. Hard blocks
+    # come from suppression and kill-switch layers.
+    regime_comp = max(0.0, min(1.0, float(regime_comp)))
+    return float(regime_comp), regime_vec
+
+
+def _scale_order_fields(o: Dict[str, Any], scale: float) -> Dict[str, Any]:
+    out = dict(o)
+    sc = max(0.0, float(scale))
+
+    if "qty" in out and out.get("qty") is not None:
+        try:
+            out["qty"] = float(out.get("qty") or 0.0) * float(sc)
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_QTY_SCALE_FAILED", e, once_key="qty_scale")
+
+    if "to_weight" in out and out.get("to_weight") is not None:
+        try:
+            out["to_weight"] = float(out.get("to_weight") or 0.0) * float(sc)
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_WEIGHT_SCALE_FAILED", e, once_key="to_weight_scale")
+
+    if "delta_weight" in out and out.get("delta_weight") is not None:
+        try:
+            out["delta_weight"] = float(out.get("delta_weight") or 0.0) * float(sc)
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_WEIGHT_SCALE_FAILED", e, once_key="delta_weight_scale")
+
+    if "from_weight" in out and out.get("from_weight") is not None and "to_weight" in out:
+        try:
+            out["delta_weight"] = float(out.get("to_weight") or 0.0) - float(out.get("from_weight") or 0.0)
+        except Exception as e:
+            _warn_nonfatal("EXECUTION_POLICY_ENGINE_DELTA_WEIGHT_COMPUTE_FAILED", e, once_key="delta_weight_compute")
+
+    return out
+
+
+def _effective_abs_qty(o: Dict[str, Any]) -> float:
+    qty = _safe_float(o.get("qty"), 0.0)
+    if abs(qty) > 0.0:
+        return abs(float(qty))
+    tw = _safe_float(o.get("to_weight"), 0.0)
+    if abs(tw) > 0.0:
+        return abs(float(tw))
+    return 0.0
+
+
+def _signed_qty_or_weight(o: Dict[str, Any], side: str) -> float:
+    qty = _safe_float(o.get("qty"), 0.0)
+    if abs(qty) > 0.0:
+        return float(qty)
+
+    tw = _safe_float(o.get("to_weight"), 0.0)
+    if abs(tw) > 0.0:
+        if side == "SHORT":
+            return -abs(float(tw))
+        return abs(float(tw))
+
+    return 0.0
+
+
+def _build_slice_qtys(total_qty: float, slice_pct: float, max_slices: int) -> List[float]:
+    signed_total = float(total_qty)
+    abs_total = abs(float(signed_total))
+    if abs_total <= 0.0:
+        return []
+
+    target_slice_abs = abs_total * max(0.0, float(slice_pct))
+    if target_slice_abs <= 0.0:
+        return [float(signed_total)]
+
+    slice_count = int(math.ceil(abs_total / max(target_slice_abs, 1e-12)))
+    slice_count = max(1, min(max(1, int(max_slices)), slice_count))
+    base_slice_abs = abs_total / float(slice_count)
+    sign = 1.0 if signed_total >= 0.0 else -1.0
+
+    emitted_abs = 0.0
+    slices: List[float] = []
+    for idx in range(slice_count):
+        if idx == (slice_count - 1):
+            cur_abs = max(0.0, abs_total - emitted_abs)
+        else:
+            cur_abs = float(base_slice_abs)
+        emitted_abs += float(cur_abs)
+        slices.append(sign * float(cur_abs))
+    return slices
+
+
+def _log_suppression_event(
+    *,
+    o: Dict[str, Any],
+    reason: str,
+    decision_json: Dict[str, Any],
+    execution_policy_json: Dict[str, Any],
+) -> None:
+    try:
+        log_suppression(
+            source_alert_id=(_safe_int(o.get("source_alert_id"), 0) if o.get("source_alert_id") is not None else None),
+            symbol=str(o.get("symbol") or "").strip().upper(),
+            suppression_reason=str(reason or "").strip(),
+            signal_json={
+                "signal_id": o.get("signal_id"),
+                "signal_ts_ms": o.get("signal_ts_ms"),
+                "side": o.get("side") or o.get("to_side"),
+                "qty": o.get("qty"),
+                "to_weight": o.get("to_weight"),
+            },
+            execution_policy_json=execution_policy_json,
+            decision_json=decision_json,
+        )
+    except Exception as e:
+        _warn_nonfatal("EXECUTION_POLICY_ENGINE_SUPPRESSION_LOG_FAILED", e, once_key="log_suppression")
+
+
+def apply_execution_policy(
+    orders: Optional[List[Dict[str, Any]]] = None,
+    *,
+    con=None,
+    intents: Optional[List[Dict[str, Any]]] = None,
+    actor: str = "system",
+    mode: str = "unknown",
+    broker: str = "unknown",
+    portfolio_orders_batch_id: Optional[int] = None,
+    portfolio_orders_id: Optional[int] = None,
+    default_signal_ts_ms: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Filter and transform candidate orders into execution-ready instructions.
+
+    Parameters
+    ----------
+    orders : list of dict, optional
+        Legacy alias for ``intents``. Each item may include fields such as
+        ``symbol``, side/quantity or target-weight data, ``confidence``,
+        ``expected_z``/``zscore``, ``signal_ts_ms``, ``alpha_ttl_ms``, and
+        ``alpha_half_life_ms``.
+    con : storage connection, optional
+        Existing database connection used for suppression lookups and audit
+        writes. A temporary connection is opened when omitted.
+    intents : list of dict, optional
+        Preferred input list. When provided, it takes precedence over
+        ``orders``.
+    actor : str, default="system"
+        Actor label forwarded into suppression and decision records.
+    mode : str, default="unknown"
+        Execution mode label recorded with suppression state.
+    broker : str, default="unknown"
+        Broker label recorded with suppression state.
+    portfolio_orders_batch_id : int, optional
+        Batch lineage identifier carried into shaped order metadata.
+    portfolio_orders_id : int, optional
+        Row lineage identifier carried into shaped order metadata.
+    default_signal_ts_ms : int, optional
+        Epoch milliseconds used when an order omits a signal timestamp.
+
+    Returns
+    -------
+    list of dict
+        Execution-ready order payloads. An empty list means the batch was fully
+        suppressed or a hard execution barrier blocked the request.
+
+    Raises
+    ------
+    Exception
+        Propagates database or policy-evaluation failures.
+
+    Notes
+    -----
+    Evaluation is fail-closed. Global kill-switch blocks and trade-suppression
+    hard blocks both return an empty list after recording suppression events.
+    Signal-age checks operate in milliseconds and reject timestamps that are
+    too far in the future, older than TTL, or fully decayed by alpha
+    half-life/TTL rules.
+
+    Side Effects
+    ------------
+    Initializes execution tables, reads runtime risk state, and writes
+    suppression or decision-audit records for blocked or transformed orders.
+    """
+    init_db()
+
+    payload = list(intents if intents is not None else (orders or []))
+    shaped: List[Dict[str, Any]] = []
+    feedback_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    owns = False
+    if con is None:
+        con = connect()
+        owns = True
+
+    try:
+        _ensure_tables(con)
+
+        allow, ks_reason, ks_meta = execution_allowed(con=con, symbol=None, regime=None)
+        if not allow:
+            for o in payload:
+                if isinstance(o, dict):
+                    _log_suppression_event(
+                        o=o,
+                        reason=str(ks_reason or "kill_switch_block"),
+                        decision_json={"blocked_by": "kill_switch", "meta": ks_meta or {}},
+                        execution_policy_json={"kill_switch_reason": ks_reason, "kill_switch_meta": ks_meta or {}},
+                    )
+            return []
+
+        tse = evaluate_trade_suppression(
+            con=con,
+            actor=str(actor or "system"),
+            mode=str(mode or "unknown"),
+            broker=str(broker or "unknown"),
+        ) or {"state": "NONE", "action": "NONE", "size_mult": 1.0, "throttle_mult": 1.0, "hard_block": False}
+
+        if bool(tse.get("hard_block")):
+            for o in payload:
+                if isinstance(o, dict):
+                    _log_suppression_event(
+                        o=o,
+                        reason=f"tse_hard_block:{str(tse.get('reason') or '')}",
+                        decision_json={"blocked_by": "tse", "tse": tse},
+                        execution_policy_json={"tse": tse, "execution_mode": get_execution_mode()},
+                    )
+            return []
+
+        now_ms = _now_ms()
+
+        try:
+            cpm_snapshot = update_capital_preservation_mode(con=con) or {}
+        except Exception:
+            cpm_snapshot = {}
+
+        capital_mode = str(get_state("capital_mode", "normal") or "normal").lower()
+        work_orders = list(payload)
+
+        if capital_mode == "preserve" and work_orders:
+            ranked = []
+            for idx, o in enumerate(work_orders):
+                try:
+                    qty_score = abs(_safe_float(o.get("qty"), 0.0))
+                except Exception:
+                    qty_score = 0.0
+
+                try:
+                    conf_score = max(0.01, float(o.get("confidence") or 1.0))
+                except Exception:
+                    conf_score = 1.0
+
+                try:
+                    z_score = max(1.0, abs(float(o.get("expected_z") or o.get("zscore") or 0.0)))
+                except Exception:
+                    z_score = 1.0
+
+                ranked.append((-(qty_score * conf_score * z_score), idx))
+
+            ranked.sort()
+
+            keep_n = max(
+                int(EPE_CAPITAL_PRESERVE_MIN_ORDERS),
+                int(math.ceil(len(ranked) * max(0.0, min(1.0, EPE_CAPITAL_PRESERVE_KEEP_PCT)))),
+            )
+
+            keep_idx = {idx for _, idx in ranked[:keep_n]}
+            work_orders = [o for idx, o in enumerate(work_orders) if idx in keep_idx]
+
+        for o in work_orders:
+            if not isinstance(o, dict):
+                continue
+
+            symbol = str(o.get("symbol") or "").strip().upper()
+            if not symbol:
+                _log_suppression_event(
+                    o=o,
+                    reason="missing_symbol",
+                    decision_json={"blocked_by": "epe", "reason": "missing_symbol"},
+                    execution_policy_json={"tse": tse},
+                )
+                continue
+
+            side = _normalize_side(o)
+            if not side:
+                _log_suppression_event(
+                    o=o,
+                    reason="missing_side",
+                    decision_json={"blocked_by": "epe", "reason": "missing_side"},
+                    execution_policy_json={"tse": tse},
+                )
+                continue
+
+            signal_ts = _normalize_signal_ts(o, default_signal_ts_ms)
+            ttl_ms = max(1, _safe_int(o.get("alpha_ttl_ms"), DEFAULT_TTL_MS))
+
+            if signal_ts <= 0 and STRICT_SIGNAL_TS:
+                signal_ts = int(now_ms)
+
+            if signal_ts > 0 and signal_ts > (now_ms + int(EPE_MAX_FUTURE_SIGNAL_TS_MS)):
+                _log_suppression_event(
+                    o=o,
+                    reason="future_signal_ts_ms",
+                    decision_json={
+                        "blocked_by": "epe",
+                        "reason": "future_signal_ts_ms",
+                        "signal_ts_ms": int(signal_ts),
+                        "now_ms": int(now_ms),
+                        "max_future_ms": int(EPE_MAX_FUTURE_SIGNAL_TS_MS),
+                    },
+                    execution_policy_json={"tse": tse},
+                )
+                continue
+
+            age_ms = max(0, now_ms - signal_ts) if signal_ts > 0 else 0
+            if ttl_ms > 0 and age_ms > ttl_ms:
+                _log_suppression_event(
+                    o=o,
+                    reason="ttl_expired",
+                    decision_json={"blocked_by": "epe", "reason": "ttl_expired", "age_ms": age_ms, "ttl_ms": ttl_ms},
+                    execution_policy_json={"tse": tse},
+                )
+                continue
+
+            half_life_ms = max(1, _safe_int(o.get("alpha_half_life_ms"), DEFAULT_HALF_LIFE_MS))
+            alpha_rem = _alpha_remaining(age_ms, half_life_ms, ttl_ms)
+
+            if alpha_rem <= 0.0:
+                _log_suppression_event(
+                    o=o,
+                    reason="alpha_decay_expired",
+                    decision_json={
+                        "blocked_by": "alpha_decay",
+                        "alpha_remaining": alpha_rem,
+                        "age_ms": age_ms,
+                        "half_life_ms": half_life_ms,
+                    },
+                    execution_policy_json={
+                        "alpha_remaining": alpha_rem,
+                        "alpha_half_life_ms": half_life_ms,
+                    },
+                )
+                continue
+
+            alpha_rem = max(0.10, float(alpha_rem))
+            order_type, aggressiveness, sim_lat_ms, sim_chunk_pct, sim_extra_slip = _decision_from_alpha(alpha_rem)
+
+            if capital_mode == "preserve":
+                order_type = "LIMIT"
+                aggressiveness = "PASSIVE"
+                sim_lat_ms = max(sim_lat_ms, int(EPE_CAPITAL_PRESERVE_SIM_LAT_MS))
+                sim_chunk_pct = min(sim_chunk_pct, float(EPE_CAPITAL_PRESERVE_CHUNK_PCT))
+                sim_extra_slip = min(sim_extra_slip, float(EPE_CAPITAL_PRESERVE_EXTRA_SLIP_BPS))
+
+            sim_lat_ms = int(float(sim_lat_ms) * (1.0 + (1.0 - alpha_rem)))
+            sim_chunk_pct = float(sim_chunk_pct) * max(0.15, alpha_rem)
+
+            volatility = _safe_float(o.get("volatility"), 0.0)
+            regime_comp, regime_vec = _regime_compatibility(con, symbol, signal_ts, o)
+
+            size_scale = max(float(EPE_MIN_REGIME_COMPAT_SCALE), float(regime_comp))
+            size_scale = max(0.0, min(1.0, float(size_scale)))
+
+            if capital_mode == "preserve":
+                size_scale *= float(EPE_CAPITAL_PRESERVE_QTY_MULT)
+
+            tse_action = str(tse.get("action") or "NONE").upper().strip()
+            if tse_action == "SIZE_COMPRESSION":
+                if float(alpha_rem) < float(TSE_SOFT_MIN_ALPHA):
+                    _log_suppression_event(
+                        o=o,
+                        reason="tse_size_compression_alpha_gate",
+                        decision_json={"blocked_by": "tse_size_compression", "alpha_remaining": alpha_rem, "tse": tse},
+                        execution_policy_json={"tse": tse, "alpha_remaining": alpha_rem},
+                    )
+                    continue
+                size_scale *= max(0.0, float(tse.get("size_mult") or 1.0))
+
+            if tse_action == "SOFT_THROTTLE":
+                if float(alpha_rem) < float(TSE_SOFT_MIN_ALPHA):
+                    _log_suppression_event(
+                        o=o,
+                        reason=f"tse_soft_throttle_alpha_gate:{str(tse.get('reason') or '')}",
+                        decision_json={"blocked_by": "tse_soft_throttle", "alpha_remaining": alpha_rem, "tse": tse},
+                        execution_policy_json={"tse": tse, "alpha_remaining": alpha_rem},
+                    )
+                    continue
+                size_scale *= max(0.0, float(tse.get("size_mult") or 1.0))
+                order_type = "LIMIT"
+                aggressiveness = "PASSIVE"
+                sim_lat_ms = max(sim_lat_ms, SIM_LAT_MS_PASSIVE)
+                sim_chunk_pct = min(sim_chunk_pct, SIM_CHUNK_PCT_PASSIVE)
+                sim_extra_slip = min(sim_extra_slip, SIM_EXTRA_SLIP_BPS_PASSIVE)
+
+            cache_key = (str(symbol), str(broker or "unknown").strip().lower())
+            feedback_snapshot = feedback_cache.get(cache_key)
+            if feedback_snapshot is None:
+                feedback_snapshot = load_execution_feedback_snapshot(
+                    con,
+                    symbol=str(symbol),
+                    broker=str(broker or "unknown"),
+                )
+                feedback_cache[cache_key] = dict(feedback_snapshot or {})
+
+            alpha_intent = build_alpha_handoff(
+                o,
+                side=str(side),
+                signal_ts_ms=int(signal_ts),
+                alpha_remaining=float(alpha_rem),
+                ttl_ms=int(ttl_ms),
+                half_life_ms=int(half_life_ms),
+            )
+            execution_decision = decide_execution_strategy(
+                alpha_intent=alpha_intent,
+                order=o,
+                broker=str(broker or "unknown"),
+                base_order_type=str(order_type),
+                base_aggressiveness=str(aggressiveness),
+                default_latency_ms=int(sim_lat_ms),
+                default_chunk_pct=float(sim_chunk_pct),
+                default_extra_slippage_bps=float(sim_extra_slip),
+                feedback=feedback_snapshot,
+            )
+
+            order_type = str(execution_decision.get("order_type") or order_type)
+            aggressiveness = str(execution_decision.get("aggressiveness") or aggressiveness)
+            sim_lat_ms = int(
+                max(
+                    25,
+                    round(
+                        float(sim_lat_ms)
+                        * float(execution_decision.get("latency_mult") or 1.0)
+                    ),
+                )
+            )
+            sim_chunk_pct = float(
+                max(
+                    0.05,
+                    min(
+                        1.0,
+                        float(execution_decision.get("chunk_pct") or sim_chunk_pct),
+                    ),
+                )
+            )
+            sim_extra_slip = float(
+                max(
+                    float(sim_extra_slip),
+                    float(execution_decision.get("sim_extra_slippage_bps") or 0.0),
+                )
+            )
+            size_scale *= max(
+                0.0,
+                float(execution_decision.get("size_mult") or 1.0),
+            )
+            size_scale = max(0.0, min(1.0, float(size_scale)))
+
+            shaped_order = _scale_order_fields(o, size_scale)
+            effective_abs_qty = _effective_abs_qty(shaped_order)
+            if effective_abs_qty <= float(TSE_MIN_ABS_QTY):
+                if tse_action == "SIZE_COMPRESSION":
+                    original_qty = (
+                        _safe_float(o.get("qty"), 0.0)
+                        if "qty" in o and o.get("qty") is not None
+                        else _safe_float(o.get("to_weight"), 0.0)
+                    )
+                    compressed_qty = (
+                        _safe_float(shaped_order.get("qty"), 0.0)
+                        if "qty" in shaped_order and shaped_order.get("qty") is not None
+                        else _safe_float(shaped_order.get("to_weight"), 0.0)
+                    )
+                    meta = {
+                        "original_qty": float(original_qty),
+                        "compressed_qty": float(compressed_qty),
+                    }
+                    _log_suppression_event(
+                        o=o,
+                        reason="tse_size_compression_scaled_to_zero",
+                        decision_json={
+                            "blocked_by": "tse_size_compression",
+                            "scale": size_scale,
+                            "tse": tse,
+                            "meta": meta,
+                        },
+                        execution_policy_json={"tse": tse, "scale": size_scale, "meta": meta},
+                    )
+                    continue
+                _log_suppression_event(
+                    o=o,
+                    reason=f"tse_scaled_to_zero:{str(tse.get('reason') or '')}",
+                    decision_json={"blocked_by": "tse_scale", "scale": size_scale, "tse": tse},
+                    execution_policy_json={"tse": tse, "scale": size_scale},
+                )
+                continue
+
+            signed_qty = _signed_qty_or_weight(shaped_order, side)
+            if abs(signed_qty) <= float(TSE_MIN_ABS_QTY):
+                _log_suppression_event(
+                    o=o,
+                    reason="no_effective_qty_after_scaling",
+                    decision_json={"blocked_by": "epe", "scale": size_scale},
+                    execution_policy_json={"tse": tse, "scale": size_scale},
+                )
+                continue
+
+            compat = float(regime_comp)
+            decision_blob = {
+                "model_id": str(o.get("model_id") or "baseline"),
+                "alpha_remaining": float(alpha_rem),
+                "order_type": str(order_type),
+                "aggressiveness": str(aggressiveness),
+                "execution_mode": get_execution_mode(),
+                "regime_model_version": str(regime_model_version()),
+                "regime_compat": float(regime_comp),
+                "tse": tse,
+                "size_scale": float(size_scale),
+                "actor": str(actor or "system"),
+                "mode": str(mode or "unknown"),
+                "broker": str(broker or "unknown"),
+                "portfolio_orders_batch_id": portfolio_orders_batch_id,
+                "portfolio_orders_id": portfolio_orders_id,
+                "alpha_intent": dict(alpha_intent),
+                "execution_decision": dict(execution_decision),
+                "execution_feedback": dict(feedback_snapshot or {}),
+            }
+
+            if "qty" in shaped_order and shaped_order.get("qty") is not None:
+                slice_pct = 0.15 if volatility > 0.03 else 0.25
+                if capital_mode == "preserve":
+                    slice_pct = min(slice_pct, float(EPE_CAPITAL_PRESERVE_CHUNK_PCT))
+
+                slice_qtys = _build_slice_qtys(
+                    float(shaped_order.get("qty") or 0.0),
+                    float(slice_pct),
+                    int(TSE_MAX_SLICES),
+                )
+                if not slice_qtys:
+                    slice_qtys = [float(shaped_order.get("qty") or 0.0)]
+                slices = len(slice_qtys)
+                slice_qty = abs(float(slice_qtys[0] or 0.0))
+
+                for slice_signed_qty in slice_qtys:
+                    row = dict(shaped_order)
+                    row["qty"] = float(slice_signed_qty)
+                    row["order_type"] = str(order_type)
+                    row["aggressiveness"] = str(aggressiveness)
+                    row["cancel_replace"] = True
+                    row["max_reprice_attempts"] = 3
+                    row["epe_alpha_remaining"] = float(alpha_rem)
+                    row["regime_compatibility"] = float(regime_comp)
+                    row["tse_state"] = str(tse.get("state") or "NONE")
+                    row["tse_action"] = str(tse.get("action") or "NONE")
+                    row["tse_size_mult"] = float(tse.get("size_mult") or 1.0)
+                    row["tse_reason"] = str(tse.get("reason") or "")
+                    row["capital_mode"] = str(capital_mode)
+                    row["capital_preservation_snapshot"] = dict(cpm_snapshot or {})
+                    row["alpha_intent"] = dict(alpha_intent)
+                    row["execution_policy"] = str(execution_decision.get("execution_policy") or "balanced")
+                    row["execution_policy_locked"] = 1
+                    row["entry_strategy"] = str(execution_decision.get("entry_strategy") or "working_limit")
+                    row["entry_delay_ms"] = int(execution_decision.get("entry_delay_ms") or 0)
+                    row["expected_slippage_bps"] = float(execution_decision.get("expected_slippage_bps") or 0.0)
+                    row["expected_fill_latency_ms"] = int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms)
+                    row["slippage_size_mult"] = float(execution_decision.get("size_mult") or 1.0)
+                    row["execution_feedback_snapshot"] = dict(feedback_snapshot or {})
+                    row["entry_limit_offset_bps"] = float(execution_decision.get("limit_offset_bps") or 0.0)
+                    row["epe_broker_sim_overrides"] = {
+                        "latency_ms": int(sim_lat_ms),
+                        "chunk_pct": float(sim_chunk_pct),
+                        "extra_slippage_bps": float(sim_extra_slip),
+                    }
+                    shaped.append(row)
+
+                policy_json = dict(decision_blob)
+                policy_json.update(
+                    {
+                        "slice_pct": float(slice_pct),
+                        "slice_qty": float(slice_qty),
+                        "slices": int(slices),
+                        "regime_vector": regime_vec,
+                    }
+                )
+
+                append_chain_row(
+                    "execution_policy_audit",
+                    {
+                        "ts_ms": int(now_ms),
+                        "signal_id": str(o.get("signal_id") or ""),
+                        "model_id": str(o.get("model_id") or "baseline"),
+                        "symbol": str(symbol),
+                        "side": str(side),
+                        "qty": float(shaped_order.get("qty") or 0.0),
+                        "age_ms": int(age_ms),
+                        "ttl_ms": int(ttl_ms),
+                        "volatility": float(volatility),
+                        "regime_compat": float(compat),
+                        "source_order_id": int(o.get("source_order_id") or 0),
+                        "policy_json": policy_json,
+                        "source_alert_id": (_safe_int(o.get("source_alert_id"), 0) if o.get("source_alert_id") is not None else None),
+                        "decision_json": decision_blob,
+                        "actor": str(actor or "system"),
+                        "mode": str(mode or "unknown"),
+                        "broker": str(broker or "unknown"),
+                        "portfolio_orders_batch_id": (int(portfolio_orders_batch_id) if portfolio_orders_batch_id is not None else (int(portfolio_orders_id) if portfolio_orders_id is not None else None)),
+                        "suppression_state": str(tse.get("state") or "NONE"),
+                    },
+                    con,
+                )
+                continue
+
+            row = dict(shaped_order)
+            row["to_side"] = str(side)
+            row["order_type"] = str(order_type)
+            row["aggressiveness"] = str(aggressiveness)
+            row["cancel_replace"] = True
+            row["max_reprice_attempts"] = 3
+            row["epe_alpha_remaining"] = float(alpha_rem)
+            row["regime_compatibility"] = float(regime_comp)
+            row["tse_state"] = str(tse.get("state") or "NONE")
+            row["tse_action"] = str(tse.get("action") or "NONE")
+            row["tse_size_mult"] = float(tse.get("size_mult") or 1.0)
+            row["tse_reason"] = str(tse.get("reason") or "")
+            row["capital_mode"] = str(capital_mode)
+            row["capital_preservation_snapshot"] = dict(cpm_snapshot or {})
+            row["alpha_intent"] = dict(alpha_intent)
+            row["execution_policy"] = str(execution_decision.get("execution_policy") or "balanced")
+            row["execution_policy_locked"] = 1
+            row["entry_strategy"] = str(execution_decision.get("entry_strategy") or "working_limit")
+            row["entry_delay_ms"] = int(execution_decision.get("entry_delay_ms") or 0)
+            row["expected_slippage_bps"] = float(execution_decision.get("expected_slippage_bps") or 0.0)
+            row["expected_fill_latency_ms"] = int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms)
+            row["slippage_size_mult"] = float(execution_decision.get("size_mult") or 1.0)
+            row["execution_feedback_snapshot"] = dict(feedback_snapshot or {})
+            row["entry_limit_offset_bps"] = float(execution_decision.get("limit_offset_bps") or 0.0)
+            row["epe_broker_sim_overrides"] = {
+                "latency_ms": int(sim_lat_ms),
+                "chunk_pct": float(sim_chunk_pct),
+                "extra_slippage_bps": float(sim_extra_slip),
+            }
+            shaped.append(row)
+
+            policy_json = dict(decision_blob)
+            policy_json.update(
+                {
+                    "slice_pct": 1.0,
+                    "slice_qty": float(_effective_abs_qty(row)),
+                    "slices": 1,
+                    "regime_vector": regime_vec,
+                }
+            )
+
+            append_chain_row(
+                "execution_policy_audit",
+                {
+                    "ts_ms": int(now_ms),
+                    "signal_id": str(o.get("signal_id") or ""),
+                    "model_id": str(o.get("model_id") or "baseline"),
+                    "symbol": str(symbol),
+                    "side": str(side),
+                    "qty": float(signed_qty),
+                    "age_ms": int(age_ms),
+                    "ttl_ms": int(ttl_ms),
+                    "volatility": float(volatility),
+                    "regime_compat": float(compat),
+                    "source_order_id": int(o.get("source_order_id") or 0),
+                    "policy_json": policy_json,
+                    "source_alert_id": (_safe_int(o.get("source_alert_id"), 0) if o.get("source_alert_id") is not None else None),
+                    "decision_json": decision_blob,
+                    "actor": str(actor or "system"),
+                    "mode": str(mode or "unknown"),
+                    "broker": str(broker or "unknown"),
+                    "portfolio_orders_batch_id": (int(portfolio_orders_batch_id) if portfolio_orders_batch_id is not None else (int(portfolio_orders_id) if portfolio_orders_id is not None else None)),
+                    "suppression_state": str(tse.get("state") or "NONE"),
+                },
+                con,
+            )
+
+        con.commit()
+        return shaped
+
+    finally:
+        if owns:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal("EXECUTION_POLICY_ENGINE_CONNECTION_CLOSE_FAILED", e, once_key="apply_execution_policy_close", scope="apply_execution_policy")

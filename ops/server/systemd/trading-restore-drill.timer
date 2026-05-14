@@ -1,0 +1,10 @@
+[Unit]
+Description=Run trading restore drill monthly
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+Unit=trading-restore-drill.service
+
+[Install]
+WantedBy=timers.target

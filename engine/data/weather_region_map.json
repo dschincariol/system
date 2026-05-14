@@ -1,0 +1,151 @@
+{
+  "regions": {
+    "us_gulf": {
+      "lat": 29.5,
+      "lon": -93.5,
+      "nws_area": "TX",
+      "normals": {
+        "temp_mean_c": 24.0,
+        "wind_mean_mps": 6.0,
+        "precip_sum_mm": 5.0,
+        "precip_7d_mm": 35.0
+      },
+      "thresholds": {
+        "anomaly_temp_c": 5.0,
+        "anomaly_wind_mps": 4.0,
+        "anomaly_precip_7d_mm": 20.0,
+        "extreme_temp_anomaly_c": 9.0,
+        "extreme_wind_mps": 14.0,
+        "extreme_precip_7d_mm": 45.0
+      },
+      "impact_groups": [
+        {
+          "group": "energy",
+          "weight": 0.65
+        },
+        {
+          "group": "transport",
+          "weight": 0.35
+        }
+      ]
+    },
+    "corn_belt": {
+      "lat": 41.9,
+      "lon": -93.6,
+      "nws_area": "IA",
+      "normals": {
+        "temp_mean_c": 14.0,
+        "wind_mean_mps": 5.0,
+        "precip_sum_mm": 3.0,
+        "precip_7d_mm": 22.0
+      },
+      "thresholds": {
+        "anomaly_temp_c": 6.0,
+        "anomaly_wind_mps": 3.5,
+        "anomaly_precip_7d_mm": 16.0,
+        "extreme_temp_anomaly_c": 10.0,
+        "extreme_wind_mps": 11.0,
+        "extreme_precip_7d_mm": 32.0
+      },
+      "impact_groups": [
+        {
+          "group": "agriculture",
+          "weight": 0.75
+        },
+        {
+          "group": "transport",
+          "weight": 0.25
+        }
+      ]
+    },
+    "northeast_corridor": {
+      "lat": 40.71,
+      "lon": -74.0,
+      "nws_area": "NY",
+      "normals": {
+        "temp_mean_c": 12.0,
+        "wind_mean_mps": 5.5,
+        "precip_sum_mm": 3.5,
+        "precip_7d_mm": 25.0
+      },
+      "thresholds": {
+        "anomaly_temp_c": 5.0,
+        "anomaly_wind_mps": 3.0,
+        "anomaly_precip_7d_mm": 14.0,
+        "extreme_temp_anomaly_c": 8.0,
+        "extreme_wind_mps": 10.0,
+        "extreme_precip_7d_mm": 28.0
+      },
+      "impact_groups": [
+        {
+          "group": "transport",
+          "weight": 1.0
+        }
+      ]
+    }
+  },
+  "symbol_groups": {
+    "energy": [
+      "XLE",
+      "XOP",
+      "OIH",
+      "UNG",
+      "USO"
+    ],
+    "agriculture": [
+      "DBA",
+      "WEAT",
+      "CORN",
+      "SOYB",
+      "MOO"
+    ],
+    "transport": [
+      "IYT",
+      "JETS",
+      "UPS",
+      "FDX",
+      "UNP"
+    ]
+  },
+  "symbols": {
+    "SPY": [
+      {
+        "region_id": "us_gulf",
+        "weight": 0.34,
+        "channels": [
+          "energy",
+          "transport"
+        ]
+      },
+      {
+        "region_id": "corn_belt",
+        "weight": 0.33,
+        "channels": [
+          "agriculture",
+          "transport"
+        ]
+      },
+      {
+        "region_id": "northeast_corridor",
+        "weight": 0.33,
+        "channels": [
+          "transport"
+        ]
+      }
+    ],
+    "DIA": [
+      "us_gulf",
+      "corn_belt",
+      "northeast_corridor"
+    ],
+    "IWM": [
+      "us_gulf",
+      "corn_belt",
+      "northeast_corridor"
+    ],
+    "QQQ": [
+      "us_gulf",
+      "northeast_corridor"
+    ]
+  }
+}
