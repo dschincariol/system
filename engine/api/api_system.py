@@ -267,7 +267,18 @@ def _cached_health_snapshot(*, allow_sync_on_miss: bool = True) -> dict:
 
 def _refresh_health_cache_sync() -> dict:
     try:
-        fresh = dict(get_health_snapshot() or {})
+        try:
+            from engine.runtime.storage_pool import storage_acquire_timeout_override
+
+            timeout_ctx = storage_acquire_timeout_override(
+                os.environ.get("DASHBOARD_STORAGE_REQUEST_TIMEOUT_S") or os.environ.get("TS_API_STORAGE_TIMEOUT_S") or 0.5
+            )
+        except Exception:
+            from contextlib import nullcontext
+
+            timeout_ctx = nullcontext()
+        with timeout_ctx:
+            fresh = dict(get_health_snapshot() or {})
     except Exception as e:
         _warn("api_system.health_cache.refresh", e)
         fresh = {"ok": False, "error": str(e), "reasons": [f"health_snapshot_error:{e}"]}

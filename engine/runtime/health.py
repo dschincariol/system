@@ -89,6 +89,7 @@ _HEALTH_SNAPSHOT_CACHE: Dict[str, Any] = {
     "ts_ms": 0,
     "payload": None,
 }
+_HEALTH_SNAPSHOT_REFRESH_LOCK = threading.Lock()
 _HEALTH_SNAPSHOT_CACHE_TTL_MS = int(float(os.environ.get("HEALTH_SNAPSHOT_CACHE_TTL_S", "2.5")) * 1000.0)
 _HEALTH_SNAPSHOT_TRACE = str(os.environ.get("HEALTH_SNAPSHOT_TRACE", "")).strip().lower() in (
     "1",
@@ -2011,11 +2012,78 @@ def get_schema_audit():
 # HEALTH SNAPSHOT
 # ---------------------------------------------------
 
+def _health_snapshot_pending_payload(
+    *,
+    now_ms: int,
+    reason: str,
+    cached_ts_ms: int = 0,
+) -> Dict[str, Any]:
+    cache_age_ms = max(0, int(now_ms) - int(cached_ts_ms or 0)) if cached_ts_ms else None
+    return {
+        "ok": False,
+        "ts_ms": int(now_ms),
+        "status": "DEGRADED",
+        "warming_up": True,
+        "error": str(reason or "health_snapshot_pending"),
+        "reasons": [str(reason or "health_snapshot_pending")],
+        "db": {
+            "ok": False,
+            "initialized": False,
+            "exists": False,
+            "status": "UNKNOWN",
+            "detail": str(reason or "health_snapshot_pending"),
+        },
+        "lifecycle": {
+            "state": "WARMING_UP",
+            "detail": str(reason or "health_snapshot_pending"),
+            "ts_ms": int(now_ms),
+        },
+        "execution_barrier": {
+            "ok": True,
+            "allowed": False,
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "allow_simulation": False,
+            "real_trading_allowed": False,
+            "mode": str(os.environ.get("EXECUTION_MODE") or os.environ.get("ENGINE_MODE") or "safe").strip().lower() or "safe",
+            "reason": str(reason or "health_snapshot_pending"),
+            "fast_path": True,
+        },
+        "cache": {
+            "source": "runtime_health_singleflight",
+            "stale": True,
+            "age_ms": cache_age_ms,
+            "populated": False,
+            "refresh_in_flight": True,
+        },
+    }
+
+
+def _stale_health_snapshot_payload(payload: Dict[str, Any], *, now_ms: int, cached_ts_ms: int) -> Dict[str, Any]:
+    out = copy.deepcopy(payload)
+    cache_age_ms = max(0, int(now_ms) - int(cached_ts_ms or 0))
+    cache = dict(out.get("cache") or {})
+    cache.update(
+        {
+            "source": "runtime_health_singleflight",
+            "stale": True,
+            "age_ms": int(cache_age_ms),
+            "populated": True,
+            "refresh_in_flight": True,
+        }
+    )
+    out["cache"] = cache
+    out.setdefault("ts_ms", int(now_ms))
+    return out
+
+
 def get_health_snapshot():
     # This is the canonical health snapshot consumed by lifecycle, APIs, and
     # startup checks, so it combines DB, schema, feed, and pipeline status.
     now_ms = int(time.time() * 1000)
     cache_ttl_ms = max(0, int(_HEALTH_SNAPSHOT_CACHE_TTL_MS))
+    cached_ts_ms = 0
+    cached_payload: Any = None
 
     if cache_ttl_ms > 0:
         try:
@@ -2031,9 +2099,23 @@ def get_health_snapshot():
         except Exception as e:
             _warn("health.snapshot_cache.read", e)
 
-    con = _db_connect()
+    refresh_lock_acquired = _HEALTH_SNAPSHOT_REFRESH_LOCK.acquire(blocking=False)
+    if not refresh_lock_acquired:
+        if isinstance(cached_payload, dict) and cached_ts_ms > 0:
+            return _stale_health_snapshot_payload(
+                cached_payload,
+                now_ms=now_ms,
+                cached_ts_ms=cached_ts_ms,
+            )
+        return _health_snapshot_pending_payload(
+            now_ms=now_ms,
+            reason="health_snapshot_refresh_in_flight",
+            cached_ts_ms=cached_ts_ms,
+        )
 
+    con = None
     try:
+        con = _db_connect()
         out = {
             "ok": False,
             "ts_ms": now_ms,
@@ -3690,7 +3772,11 @@ def get_health_snapshot():
         return out
 
     finally:
-        con.close()
+        try:
+            if con is not None:
+                con.close()
+        finally:
+            _HEALTH_SNAPSHOT_REFRESH_LOCK.release()
 
 
 def get_readiness_snapshot(

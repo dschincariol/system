@@ -104,12 +104,15 @@ class StorageCursor:
         columns: Sequence[str] = (),
         *,
         lastrowid: int = 0,
+        on_close: Callable[[], None] | None = None,
     ):
         self._cursor = cursor
         self._rows = [StorageRow(row, columns) for row in rows] if rows is not None else None
         self._offset = 0
         self._columns = tuple(columns)
         self.lastrowid = int(lastrowid or 0)
+        self._on_close = on_close
+        self._closed = False
 
     @property
     def rowcount(self) -> int:
@@ -153,8 +156,15 @@ class StorageCursor:
         return [StorageRow(_sqlite_compat_row(row, json_indexes), columns) for row in rows]
 
     def close(self) -> None:
-        if self._cursor is not None:
-            self._cursor.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._cursor is not None:
+                self._cursor.close()
+        finally:
+            if self._on_close is not None:
+                self._on_close()
 
     def __iter__(self):
         while True:
@@ -168,8 +178,10 @@ class StorageNativeCursor:
     def __init__(self, con: "StorageConnection"):
         self._con = con
         self._cursor = con.raw.cursor()
+        self._on_close = con._track_cursor(self._cursor)
         self._synthetic: StorageCursor | None = None
         self._lastrowid = 0
+        self._closed = False
 
     @property
     def rowcount(self) -> int:
@@ -233,7 +245,13 @@ class StorageNativeCursor:
         return [StorageRow(_sqlite_compat_row(row, json_indexes), columns) for row in rows]
 
     def close(self) -> None:
-        self._cursor.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._cursor.close()
+        finally:
+            self._on_close()
 
     def __enter__(self):
         return self
@@ -253,6 +271,7 @@ class StorageConnection:
         self._after_commit: list[Callable[[], None]] = []
         self._timeout_s = timeout_s
         self._lastrowid = 0
+        self._open_cursors: list[Any] = []
 
     @property
     def raw(self):
@@ -274,15 +293,31 @@ class StorageConnection:
         if synthetic is not None:
             return synthetic
         cur = self._raw.cursor()
-        normalized = _normalize_sql(sql, self._raw)
-        cur.execute(normalized, _normalize_params(params))
-        lastrowid = self._record_lastrowid(normalized, cur)
-        return StorageCursor(cur, lastrowid=lastrowid)
+        on_close = self._track_cursor(cur)
+        try:
+            normalized = _normalize_sql(sql, self._raw)
+            cur.execute(normalized, _normalize_params(params))
+            lastrowid = self._record_lastrowid(normalized, cur)
+            return StorageCursor(cur, lastrowid=lastrowid, on_close=on_close)
+        except Exception:
+            try:
+                cur.close()
+            finally:
+                on_close()
+            raise
 
     def executemany(self, sql: str, seq_of_params: Iterable[Any]):
         cur = self._raw.cursor()
-        cur.executemany(_normalize_sql(sql, self._raw), [_normalize_params(params) for params in seq_of_params])
-        return StorageCursor(cur)
+        on_close = self._track_cursor(cur)
+        try:
+            cur.executemany(_normalize_sql(sql, self._raw), [_normalize_params(params) for params in seq_of_params])
+            return StorageCursor(cur, on_close=on_close)
+        except Exception:
+            try:
+                cur.close()
+            finally:
+                on_close()
+            raise
 
     def executescript(self, sql_script: str):
         last = None
@@ -304,6 +339,26 @@ class StorageConnection:
     def register_after_commit(self, callback: Callable[[], None]) -> None:
         self._after_commit.append(callback)
 
+    def _track_cursor(self, cursor) -> Callable[[], None]:
+        self._open_cursors.append(cursor)
+
+        def _untrack() -> None:
+            try:
+                self._open_cursors.remove(cursor)
+            except ValueError:
+                pass
+
+        return _untrack
+
+    def _close_open_cursors(self) -> None:
+        cursors = list(self._open_cursors)
+        self._open_cursors.clear()
+        for cursor in cursors:
+            try:
+                cursor.close()
+            except Exception:
+                logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+
     def commit(self) -> None:
         self._raw.commit()
         callbacks = list(self._after_commit)
@@ -320,8 +375,11 @@ class StorageConnection:
             return
         self._closed = True
         try:
-            if self.in_transaction:
-                self._raw.rollback()
+            try:
+                self._close_open_cursors()
+            finally:
+                if self.in_transaction:
+                    self._raw.rollback()
         finally:
             release(self._raw)
 
