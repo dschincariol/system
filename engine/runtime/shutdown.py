@@ -8,11 +8,29 @@ raising cleanup-time exceptions back into the caller.
 from __future__ import annotations
 
 import time
+import os
+from contextlib import nullcontext
 from typing import Any, Optional
 
 from engine.runtime.logging import flush_logging_handlers, get_logger
 
 LOG = get_logger("runtime.shutdown")
+
+
+def _shutdown_storage_timeout_s() -> float:
+    try:
+        return max(0.05, float(os.environ.get("RUNTIME_SHUTDOWN_STORAGE_TIMEOUT_S", "0.5") or 0.5))
+    except Exception:
+        return 0.5
+
+
+def _storage_timeout_ctx():
+    try:
+        from engine.runtime.storage_pool import storage_acquire_timeout_override
+
+        return storage_acquire_timeout_override(_shutdown_storage_timeout_s())
+    except Exception:
+        return nullcontext()
 
 
 def runtime_shutdown(*, JOBS: Optional[Any] = None, SUPERVISOR: Optional[Any] = None) -> None:
@@ -21,29 +39,32 @@ def runtime_shutdown(*, JOBS: Optional[Any] = None, SUPERVISOR: Optional[Any] = 
     lifecycle = {}
     try:
         from engine.runtime.lifecycle_state import get_state
-        lifecycle = get_state() or {}
+        with _storage_timeout_ctx():
+            lifecycle = get_state() or {}
     except Exception:
         lifecycle = {}
 
     try:
         from engine.runtime.event_log import append_event
 
-        append_event(
-            event_type="runtime_shutdown_start",
-            event_source="runtime.shutdown",
-            entity_type="runtime",
-            entity_id="shutdown",
-            payload={
-                "jobs_present": bool(JOBS is not None),
-                "supervisor_present": bool(SUPERVISOR is not None),
-                "dashboard_bound_ts_ms": str((lifecycle or {}).get("dashboard_bound_ts_ms") or ""),
-                "dashboard_bound_detail": str((lifecycle or {}).get("dashboard_bound_detail") or ""),
-                "lifecycle_state": str((lifecycle or {}).get("state") or ""),
-                "lifecycle_detail": str((lifecycle or {}).get("detail") or ""),
-                "ts_ms": int(shutdown_ts_ms),
-            },
-            ts_ms=int(shutdown_ts_ms),
-        )
+        with _storage_timeout_ctx():
+            append_event(
+                event_type="runtime_shutdown_start",
+                event_source="runtime.shutdown",
+                entity_type="runtime",
+                entity_id="shutdown",
+                payload={
+                    "jobs_present": bool(JOBS is not None),
+                    "supervisor_present": bool(SUPERVISOR is not None),
+                    "dashboard_bound_ts_ms": str((lifecycle or {}).get("dashboard_bound_ts_ms") or ""),
+                    "dashboard_bound_detail": str((lifecycle or {}).get("dashboard_bound_detail") or ""),
+                    "lifecycle_state": str((lifecycle or {}).get("state") or ""),
+                    "lifecycle_detail": str((lifecycle or {}).get("detail") or ""),
+                    "ts_ms": int(shutdown_ts_ms),
+                },
+                ts_ms=int(shutdown_ts_ms),
+                best_effort=True,
+            )
     except Exception:
         LOG.exception("runtime_shutdown_start_event_failed")
 
@@ -137,8 +158,9 @@ def runtime_shutdown(*, JOBS: Optional[Any] = None, SUPERVISOR: Optional[Any] = 
     except Exception:
         LOG.exception("runtime_shutdown_telemetry_append_buffer_failed")
 
-    # Flush WAL + close pooled connections because runtime owns the SQLite
-    # lifecycle and should leave the DB in the cleanest state possible.
+    # Flush SQLite WAL + close pooled connections because runtime owns the
+    # storage lifecycle. Postgres-backed storage does not understand SQLite
+    # PRAGMAs, so skip that block for the Postgres facade.
     try:
         from engine.runtime.storage import connect, close_pooled_connections, shutdown_timeseries_storage  # type: ignore
     except Exception:
@@ -147,35 +169,37 @@ def runtime_shutdown(*, JOBS: Optional[Any] = None, SUPERVISOR: Optional[Any] = 
         close_pooled_connections = None  # type: ignore
         shutdown_timeseries_storage = None  # type: ignore
 
-    if connect is not None:
+    connect_module = str(getattr(connect, "__module__", "")) if connect is not None else ""
+    if connect is not None and "storage_pg" not in connect_module:
         try:
-            con = connect(readonly=False)
-            try:
-                con.execute("PRAGMA synchronous=FULL;")
-            except Exception:
-                LOG.exception("runtime_shutdown_pragma_synchronous_failed")
-            try:
-                con.execute("PRAGMA wal_checkpoint(RESTART);").fetchall()
-            except Exception:
+            with _storage_timeout_ctx():
+                con = connect(readonly=False)
                 try:
-                    con.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchall()
+                    con.execute("PRAGMA synchronous=FULL;")
+                except Exception:
+                    LOG.exception("runtime_shutdown_pragma_synchronous_failed")
+                try:
+                    con.execute("PRAGMA wal_checkpoint(RESTART);").fetchall()
                 except Exception:
                     try:
-                        con.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchall()
+                        con.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchall()
                     except Exception:
-                        LOG.exception("runtime_shutdown_wal_checkpoint_failed")
-            try:
-                con.commit()
-            except Exception:
+                        try:
+                            con.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchall()
+                        except Exception:
+                            LOG.exception("runtime_shutdown_wal_checkpoint_failed")
                 try:
-                    con.rollback()
+                    con.commit()
                 except Exception:
-                    LOG.exception("runtime_shutdown_db_rollback_failed")
-                LOG.exception("runtime_shutdown_db_commit_failed")
-            try:
-                con.close()
-            except Exception:
-                LOG.exception("runtime_shutdown_db_close_failed")
+                    try:
+                        con.rollback()
+                    except Exception:
+                        LOG.exception("runtime_shutdown_db_rollback_failed")
+                    LOG.exception("runtime_shutdown_db_commit_failed")
+                try:
+                    con.close()
+                except Exception:
+                    LOG.exception("runtime_shutdown_db_close_failed")
         except Exception:
             LOG.exception("runtime_shutdown_db_connect_failed")
 
@@ -194,17 +218,19 @@ def runtime_shutdown(*, JOBS: Optional[Any] = None, SUPERVISOR: Optional[Any] = 
     try:
         from engine.runtime.event_log import append_event, shutdown_event_log_buffer
 
-        append_event(
-            event_type="runtime_shutdown_complete",
-            event_source="runtime.shutdown",
-            entity_type="runtime",
-            entity_id="shutdown",
-            payload={
-                "ts_ms": int(time.time() * 1000),
-                "duration_ms": int(time.time() * 1000) - int(shutdown_ts_ms),
-            },
-            ts_ms=int(time.time() * 1000),
-        )
+        with _storage_timeout_ctx():
+            append_event(
+                event_type="runtime_shutdown_complete",
+                event_source="runtime.shutdown",
+                entity_type="runtime",
+                entity_id="shutdown",
+                payload={
+                    "ts_ms": int(time.time() * 1000),
+                    "duration_ms": int(time.time() * 1000) - int(shutdown_ts_ms),
+                },
+                ts_ms=int(time.time() * 1000),
+                best_effort=True,
+            )
         shutdown_event_log_buffer(timeout_s=2.0)
     except Exception:
         LOG.exception("runtime_shutdown_complete_event_failed")

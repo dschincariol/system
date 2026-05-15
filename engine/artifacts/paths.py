@@ -15,6 +15,10 @@ def artifacts_root() -> Path:
     configured = str(os.environ.get("TS_ARTIFACTS_ROOT") or "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
+    for env_name in ("TRADING_DATA", "DATA_DIR"):
+        runtime_data = str(os.environ.get(env_name) or "").strip()
+        if runtime_data:
+            return (Path(runtime_data).expanduser() / "artifacts").resolve()
     return (default_data_root() / "artifacts").resolve()
 
 

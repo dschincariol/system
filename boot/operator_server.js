@@ -496,7 +496,8 @@ const UPGRADE_SCRIPT = path.join(DEPLOY_BIN_DIR, "upgrade_trading_system.sh");
 function isLinuxManagedMode() {
   if (process.platform !== "linux") return false;
   try {
-    return fs.existsSync(SERVICE_CTL);
+    fs.accessSync(SERVICE_CTL, fs.constants.X_OK);
+    return true;
   } catch {
     return false;
   }

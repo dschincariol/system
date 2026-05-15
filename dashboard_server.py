@@ -1058,15 +1058,31 @@ def _shutdown_runtime_once(reason: str = "") -> None:
     _SERVER_STOP_EVENT.set()
 
     try:
-        mark_shutdown()
+        from engine.runtime.storage_pool import storage_acquire_timeout_override
+
+        timeout_ctx = storage_acquire_timeout_override(_dashboard_storage_request_timeout_s())
+    except Exception:
+        timeout_ctx = nullcontext()
+
+    try:
+        with timeout_ctx:
+            mark_shutdown()
     except Exception as e:
         log.exception("dashboard_server_mark_shutdown_failed: %s", e)
 
     try:
-        if mark_clean_shutdown:
-            mark_clean_shutdown()
-        elif set_state:
-            set_state(SHUTTING_DOWN, reason or "clean_shutdown")
+        from engine.runtime.storage_pool import storage_acquire_timeout_override
+
+        timeout_ctx = storage_acquire_timeout_override(_dashboard_storage_request_timeout_s())
+    except Exception:
+        timeout_ctx = nullcontext()
+
+    try:
+        with timeout_ctx:
+            if mark_clean_shutdown:
+                mark_clean_shutdown()
+            elif set_state:
+                set_state(SHUTTING_DOWN, reason or "clean_shutdown")
     except Exception as e:
         log.exception("dashboard_server_mark_clean_shutdown_failed: %s", e)
 
@@ -1074,6 +1090,22 @@ def _shutdown_runtime_once(reason: str = "") -> None:
         runtime_shutdown(JOBS=JOBS, SUPERVISOR=SUPERVISOR)
     except Exception as e:
         log.error("dashboard_server runtime_shutdown error: %s", e)
+
+
+def _request_httpd_shutdown(reason: str = "") -> None:
+    def _shutdown_httpd() -> None:
+        try:
+            if _HTTPD:
+                _HTTPD.shutdown()
+        except Exception as e:
+            log.exception("dashboard_server_httpd_shutdown_failed: %s", e)
+
+    _start_background_thread(
+        f"httpd_shutdown_{str(reason or 'signal')[:32]}",
+        _shutdown_httpd,
+        (),
+    )
+
 
 def _tail_text_file(path: str, limit_bytes: int = 65536) -> str:
     try:
@@ -5507,26 +5539,29 @@ def _run_dashboard_control_plane():
         def _shutdown(_sig=None, _frame=None):
             try:
                 if append_event:
-                    append_event(
-                        event_type="dashboard_server_shutdown_signal",
-                        event_source="dashboard_server",
-                        entity_type="runtime",
-                        entity_id="dashboard_server",
-                        payload={
-                            "signal": str(_sig) if _sig is not None else "",
-                            "ts_ms": int(time.time() * 1000),
-                        },
-                        ts_ms=int(time.time() * 1000),
-                        best_effort=True,
-                    )
+                    try:
+                        from engine.runtime.storage_pool import storage_acquire_timeout_override
+
+                        timeout_ctx = storage_acquire_timeout_override(_dashboard_storage_request_timeout_s())
+                    except Exception:
+                        timeout_ctx = nullcontext()
+                    with timeout_ctx:
+                        append_event(
+                            event_type="dashboard_server_shutdown_signal",
+                            event_source="dashboard_server",
+                            entity_type="runtime",
+                            entity_id="dashboard_server",
+                            payload={
+                                "signal": str(_sig) if _sig is not None else "",
+                                "ts_ms": int(time.time() * 1000),
+                            },
+                            ts_ms=int(time.time() * 1000),
+                            best_effort=True,
+                        )
             except Exception as e:
                 log.exception("dashboard_server_shutdown_append_event_failed: %s", e)
             _shutdown_runtime_once(f"signal={_sig}" if _sig is not None else "signal")
-            try:
-                if _HTTPD:
-                    _HTTPD.shutdown()
-            except Exception as e:
-                log.exception("dashboard_server_httpd_shutdown_failed: %s", e)
+            _request_httpd_shutdown(f"signal={_sig}" if _sig is not None else "signal")
 
         try:
             signal.signal(signal.SIGINT, _shutdown)

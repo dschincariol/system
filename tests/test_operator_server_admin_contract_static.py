@@ -81,6 +81,18 @@ def test_operator_server_caches_runtime_detection_and_uses_ingestion_owner_pid()
     assert "staleAttemptWithoutRuntime(ext)" in text
 
 
+def test_operator_managed_mode_requires_executable_service_helper():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    block = _extract_block(
+        text,
+        "function isLinuxManagedMode() {",
+        "let child = null;",
+    )
+
+    assert "fs.accessSync(SERVICE_CTL, fs.constants.X_OK);" in block
+    assert "fs.existsSync(SERVICE_CTL)" not in block
+
+
 def test_operator_server_uses_fast_preflight_for_refresh_snapshots():
     text = SERVER_PATH.read_text(encoding="utf-8")
 

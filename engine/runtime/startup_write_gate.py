@@ -84,15 +84,12 @@ def _read_runtime_meta_gate_state() -> Dict[str, Any]:
     if lifecycle_state in {"SHUTTING_DOWN", "SHUTDOWN", "KILL_SWITCH"}:
         state["reason"] = f"lifecycle_terminal:{lifecycle_state.lower()}"
         return state
-    if lifecycle_state in {"BOOTING", "WARMING", "WARMING_UP"}:
-        state["defer"] = True
-        if first_price_ts_ms:
-            state["reason"] = "lifecycle_warming_after_first_price"
-        else:
-            state["reason"] = "awaiting_first_price_tick"
-        return state
     if first_price_ts_ms:
         state["reason"] = "first_price_seen"
+        return state
+    if lifecycle_state in {"BOOTING", "WARMING", "WARMING_UP"}:
+        state["defer"] = True
+        state["reason"] = "awaiting_first_price_tick"
         return state
     if warmup_started_ts_ms:
         state["defer"] = True

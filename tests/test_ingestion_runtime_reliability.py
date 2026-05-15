@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,131 @@ def _path_stats(snapshot: dict[str, object], path_name: str) -> dict[str, object
         if str((row or {}).get("path") or "") == str(path_name):
             return dict(row or {})
     return {}
+
+
+def test_safe_no_credential_child_candidates_only_run_yfinance_polling() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "ENGINE_MODE": "safe",
+            "EXECUTION_MODE": "safe",
+            "INGESTION_CHILD_JOBS": "",
+            "POLYGON_WS_ENABLED": "0",
+            "POLYGON_REST_ENABLED": "0",
+            "IBKR_ENABLED": "0",
+            "CCXT_ENABLED": "0",
+            "TRADIER_ENABLED": "0",
+            "YFINANCE_ENABLED": "1",
+        },
+        clear=False,
+    ):
+        (ingestion_runtime,) = _reload_modules("engine.runtime.ingestion_runtime")
+        with patch.object(
+            ingestion_runtime,
+            "desired_ingestion_jobs",
+            return_value=[
+                "stream_prices_polygon_ws",
+                "options_poll",
+                "poll_prices",
+                "ingest_now",
+                "poll_macro",
+            ],
+        ):
+            candidates = ingestion_runtime._child_candidates()
+
+    assert candidates == ["poll_prices"]
+
+
+def test_safe_no_credential_child_spawn_sanitizes_provider_credentials() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "ENGINE_MODE": "safe",
+            "EXECUTION_MODE": "safe",
+            "BROKER": "sim",
+            "BROKER_NAME": "sim",
+            "DISABLE_LIVE_EXECUTION": "1",
+            "KILL_SWITCH_GLOBAL": "1",
+            "POLYGON_API_KEY": "dummy",
+            "TRADIER_API_TOKEN": "dummy",
+            "IBKR_HOST": "dummy",
+            "FMP_API_KEY": "dummy",
+            "ALPACA_KEY_ID": "dummy",
+            "ALPACA_SECRET_KEY": "dummy",
+            "OPENAI_API_KEY": "dummy",
+            "POLYGON_WS_ENABLED": "1",
+            "TRADIER_ENABLED": "1",
+            "YFINANCE_ENABLED": "1",
+        },
+        clear=False,
+    ):
+        (ingestion_runtime,) = _reload_modules("engine.runtime.ingestion_runtime")
+        captured: dict[str, dict[str, str]] = {}
+
+        def _fake_popen(*_args, **kwargs):
+            captured["env"] = dict(kwargs.get("env") or {})
+            return SimpleNamespace(pid=12345, poll=lambda: None)
+
+        with patch.object(ingestion_runtime.subprocess, "Popen", side_effect=_fake_popen):
+            ingestion_runtime._spawn_child_once("poll_prices")
+
+    env = captured["env"]
+    assert env["YFINANCE_ENABLED"] == "1"
+    assert env["POLYGON_WS_ENABLED"] == "0"
+    assert env["TRADIER_ENABLED"] == "0"
+    assert "POLYGON_API_KEY" not in env
+    assert "TRADIER_API_TOKEN" not in env
+    assert "IBKR_HOST" not in env
+    assert "FMP_API_KEY" not in env
+    assert "ALPACA_KEY_ID" not in env
+    assert "ALPACA_SECRET_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_safe_no_credential_child_spawn_sanitizes_control_plane_overlay() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "ENGINE_MODE": "safe",
+            "EXECUTION_MODE": "safe",
+            "BROKER": "sim",
+            "BROKER_NAME": "sim",
+            "DISABLE_LIVE_EXECUTION": "1",
+            "KILL_SWITCH_GLOBAL": "1",
+            "YFINANCE_ENABLED": "1",
+        },
+        clear=False,
+    ):
+        (ingestion_runtime,) = _reload_modules("engine.runtime.ingestion_runtime")
+        captured: dict[str, dict[str, str]] = {}
+
+        def _fake_popen(*_args, **kwargs):
+            captured["env"] = dict(kwargs.get("env") or {})
+            return SimpleNamespace(pid=12345, poll=lambda: None)
+
+        fake_manager = SimpleNamespace(
+            build_job_environment=lambda _job_name: {
+                "POLYGON_API_KEY": "dummy",
+                "ALPACA_KEY_ID": "dummy",
+                "ALPACA_SECRET_KEY": "dummy",
+                "OPENAI_API_KEY": "dummy",
+                "POLYGON_REST_ENABLED": "1",
+                "LIVE_PRICE_PROVIDER_CHAIN": "polygon,yfinance",
+            }
+        )
+
+        with patch.object(ingestion_runtime, "get_manager", return_value=fake_manager):
+            with patch.object(ingestion_runtime.subprocess, "Popen", side_effect=_fake_popen):
+                ingestion_runtime._spawn_child_once("poll_prices")
+
+    env = captured["env"]
+    assert env["YFINANCE_ENABLED"] == "1"
+    assert env["POLYGON_REST_ENABLED"] == "0"
+    assert env["LIVE_PRICE_PROVIDER_CHAIN"] == "yfinance"
+    assert "POLYGON_API_KEY" not in env
+    assert "ALPACA_KEY_ID" not in env
+    assert "ALPACA_SECRET_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
 
 
 class IngestionRuntimeReliabilityTests(unittest.TestCase):

@@ -231,22 +231,31 @@ class SQLiteContentionReliefTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(runtime_meta.meta_get("debounce_probe"), "same")
 
-    def test_startup_write_gate_stays_deferred_while_lifecycle_is_warming_after_first_price(self) -> None:
-        storage, runtime_meta, startup_write_gate = _reload_modules(
-            "engine.runtime.storage",
-            "engine.runtime.runtime_meta",
+    def test_startup_write_gate_releases_after_first_price_even_if_lifecycle_meta_lags(self) -> None:
+        (startup_write_gate,) = _reload_modules(
             "engine.runtime.startup_write_gate",
         )
-        storage.init_db()
 
-        runtime_meta.meta_set("warmup_started_ts_ms", "1700000000000")
-        runtime_meta.meta_set("first_price_ts_ms", "1700000001234")
-        runtime_meta.meta_set("lifecycle_state", "WARMING_UP")
+        class FakeConnection:
+            def execute(self, _sql, _params=()):
+                class Cursor:
+                    def fetchall(self):
+                        return [
+                            ("warmup_started_ts_ms", "1700000000000"),
+                            ("first_price_ts_ms", "1700000001234"),
+                            ("lifecycle_state", "WARMING_UP"),
+                        ]
 
-        state = startup_write_gate.startup_noncritical_write_gate_state(force_refresh=True)
+                return Cursor()
 
-        self.assertTrue(bool(state.get("defer")))
-        self.assertEqual(str(state.get("reason") or ""), "lifecycle_warming_after_first_price")
+            def close(self):
+                return None
+
+        with patch.object(startup_write_gate, "connect_ro", return_value=FakeConnection()):
+            state = startup_write_gate.startup_noncritical_write_gate_state(force_refresh=True)
+
+        self.assertFalse(bool(state.get("defer")))
+        self.assertEqual(str(state.get("reason") or ""), "first_price_seen")
 
     def test_startup_write_gate_releases_once_runtime_is_live_after_first_price(self) -> None:
         storage, runtime_meta, startup_write_gate = _reload_modules(

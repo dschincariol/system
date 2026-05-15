@@ -1145,6 +1145,9 @@ def test_execution_barrier_uses_lightweight_snapshot_path(route_runtime, monkeyp
     assert response["allowed"] is False
     assert response["reason"] == "mode_safe"
     assert response["execution_barrier"]["mode"] == "safe"
+    assert response["state"] == "LIVE"
+    assert "health" not in response
+    assert "jobs" not in response
 
 
 def test_lightweight_system_snapshot_avoids_heavy_state_reads(route_runtime, monkeypatch):
@@ -1208,6 +1211,40 @@ def test_lightweight_system_snapshot_uses_safe_runtime_signal_when_lifecycle_mis
     assert snapshot["status"] == "STARTING"
     assert snapshot["execution_allowed"] is False
     assert snapshot["execution_barrier"]["real_trading_allowed"] is False
+
+
+def test_lightweight_system_snapshot_uses_health_lifecycle_when_available(route_runtime, monkeypatch):
+    (api_system,) = _reload_modules("engine.api.api_system")
+
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setattr(
+        api_system,
+        "_cached_health_snapshot",
+        lambda *, allow_sync_on_miss=True: {
+            "ok": True,
+            "startup": {"mode": "safe"},
+            "db": {"ok": True},
+            "lifecycle": {
+                "state": "LIVE",
+                "detail": "market_data_healthy",
+                "first_price_ts_ms": "123",
+            },
+            "ingestion_runtime": {"running": True, "stale": False},
+            "prices": {"ok": True, "last_ts_ms": 123},
+            "providers": {"ok": True},
+            "job_summary": {"ok": True, "total": 1, "running_count": 1, "stale": 0},
+            "execution_barrier": {"ok": True, "allowed": False, "mode": "safe", "reason": "mode_safe"},
+        },
+    )
+    monkeypatch.setattr(api_system, "_get_jobs_payload", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("jobs manager path should not run")))
+    monkeypatch.setattr(api_system, "market_data_status", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("market data IPC path should not run")))
+
+    snapshot = api_system._build_system_state_snapshot({}, route_runtime["ctx"])
+
+    assert snapshot["state"] == "LIVE"
+    assert snapshot["status"] == "DEGRADED"
+    assert snapshot["system_state_detail"]["detail"] == "market_data_healthy"
+    assert snapshot["execution_allowed"] is False
 
 
 def test_api_get_readiness_uses_cached_storage_readiness(route_runtime, monkeypatch):

@@ -79,6 +79,18 @@ def test_repeated_readiness_probes_coalesce_health_refresh(monkeypatch):
         "api_get_runtime_watchdogs",
         lambda *_args, **_kwargs: {"ok": False, "status": "warming"},
     )
+    monkeypatch.setattr(
+        api_system,
+        "execution_gate_snapshot",
+        lambda: {
+            "ok": True,
+            "allowed": False,
+            "allow_execution": False,
+            "mode": "safe",
+            "reason": "health_fast_path",
+            "real_trading_allowed": False,
+        },
+    )
     ctx = {
         "_boot_diagnostics": lambda: {
             "storage": {
@@ -163,6 +175,18 @@ def test_operator_trading_readiness_is_prompt_during_warmup(monkeypatch):
         "api_get_runtime_watchdogs",
         lambda *_args, **_kwargs: {"ok": False, "status": "warming"},
     )
+    monkeypatch.setattr(
+        api_system,
+        "execution_gate_snapshot",
+        lambda: {
+            "ok": True,
+            "allowed": False,
+            "allow_execution": False,
+            "mode": "safe",
+            "reason": "health_fast_path",
+            "real_trading_allowed": False,
+        },
+    )
 
     started = time.perf_counter()
     response = api_system.api_get_trading_readiness(
@@ -184,6 +208,90 @@ def test_operator_trading_readiness_is_prompt_during_warmup(monkeypatch):
     assert response["ok"] is False
     assert response["ready"] is False
     assert response["execution_allowed"] is False
+
+
+def test_safe_no_credential_readiness_tolerates_skipped_trading_gates(monkeypatch):
+    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.setenv("BROKER", "sim")
+    monkeypatch.setenv("BROKER_NAME", "sim")
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "1")
+    monkeypatch.setenv("KILL_SWITCH_GLOBAL", "1")
+
+    startup_gates = {
+        "config_valid": {"ok": True, "detail": "ok"},
+        "database_reachable": {"ok": True, "detail": "ok"},
+        "schema_valid": {"ok": True, "detail": "ok"},
+        "core_services_initialized": {"ok": True, "detail": "ok"},
+        "required_api_dependencies_available": {"ok": True, "detail": "ok"},
+        "no_port_binding_conflict": {"ok": True, "detail": "ok"},
+        "ui_static_assets_present": {"ok": True, "detail": "ok"},
+    }
+    data_gates = {
+        "ingestion_active": {"ok": True, "detail": "ok"},
+        "ingestion_not_stale": {"ok": True, "detail": "ok"},
+        "critical_features_valid": {"ok": False, "detail": "feature_validation_missing"},
+        "model_inputs_valid": {"ok": False, "detail": "model_input_validation_missing"},
+        "scoring_pipeline_operational": {"ok": False, "detail": "scoring_pipeline_unreported"},
+    }
+    snapshot = {
+        "ts_ms": 123,
+        "status": "RUNNING",
+        "state": "LIVE",
+        "system_state_detail": {"state": "LIVE", "detail": "market_data_healthy"},
+        "health": {
+            "ok": True,
+            "prices": {"ok": True},
+            "providers": {"ok": True},
+            "startup_validation": {"ok": True, "gates": startup_gates},
+            "data_pipeline_gates": {"ok": False, "gates": data_gates},
+            "execution_supervisor": {"gates": {}},
+            "execution_barrier": {"allowed": False, "reason": "mode_safe"},
+        },
+        "graph": {"ok": True},
+    }
+
+    validation = api_system._build_production_validation(snapshot)
+
+    assert validation["status"] == "healthy"
+    assert validation["safe_to_operate"] is True
+    assert validation["gates"]["scoring_pipeline_operational"]["safe_mode_skipped"] is True
+    assert validation["gates"]["execution_engine_initialized"]["safe_mode_skipped"] is True
+
+
+def test_trading_readiness_stays_blocked_when_service_readiness_is_ok(monkeypatch):
+    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
+    monkeypatch.setattr(
+        api_system,
+        "api_get_readiness",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "ready": True,
+            "status": "HEALTHY",
+            "reasons": [],
+            "execution_allowed": False,
+        },
+    )
+    monkeypatch.setattr(
+        api_system,
+        "execution_gate_snapshot",
+        lambda: {
+            "ok": True,
+            "allowed": False,
+            "allow_execution": False,
+            "real_trading_allowed": False,
+            "reason": "mode_safe",
+        },
+    )
+
+    response = api_system.api_get_trading_readiness({}, {})
+
+    assert response["ok"] is False
+    assert response["ready"] is False
+    assert response["trading_ready"] is False
+    assert response["real_trading_allowed"] is False
+    assert response["reason"] == "mode_safe"
 
 
 def test_storage_connection_close_closes_tracked_cursors(monkeypatch):

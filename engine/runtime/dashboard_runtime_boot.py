@@ -11,10 +11,27 @@ def _mode() -> str:
     return str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name), "")
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_no_credential_runtime_mode() -> bool:
+    try:
+        from services.data_source_manager import safe_no_credential_market_data_mode
+
+        return bool(safe_no_credential_market_data_mode())
+    except Exception:
+        return False
+
+
 def run_post_bind_boot(dashboard_module, handler_ctx: Dict[str, Any]) -> None:
     jobs = dashboard_module._jobs_manager()
     supervisor = dashboard_module._runtime_supervisor()
     runtime_orchestrator = dashboard_module._runtime_orchestrator()
+    safe_no_credential = _safe_no_credential_runtime_mode()
 
     try:
         if dashboard_module._PRIMARY_BOOTSTRAP_DONE:
@@ -32,27 +49,37 @@ def run_post_bind_boot(dashboard_module, handler_ctx: Dict[str, Any]) -> None:
         dashboard_module.log.exception("failed to start lifecycle monitor")
         raise
 
-    try:
-        from engine.model_scoring import start_model_scoring_service
-
-        scoring_snapshot = start_model_scoring_service()
-        dashboard_module._BOOT_DIAGNOSTICS["model_scoring"] = dict(scoring_snapshot or {})
+    if safe_no_credential and not _env_flag("MODEL_SCORING_ENABLED", False):
+        dashboard_module._BOOT_DIAGNOSTICS["model_scoring"] = {
+            "enabled": False,
+            "ok": True,
+            "skipped": True,
+            "reason": "safe_no_credential_mode",
+        }
         dashboard_module._publish_boot_diagnostics()
-        if bool((scoring_snapshot or {}).get("enabled")) and not bool((scoring_snapshot or {}).get("ok")):
-            raise RuntimeError(f"model_scoring_start_failed:{scoring_snapshot}")
-    except Exception:
-        dashboard_module.log.exception("failed to start model_scoring service")
-        raise
+    else:
+        try:
+            from engine.model_scoring import start_model_scoring_service
 
-    try:
-        dashboard_module._start_background_thread(
-            "auto_rollback_loop",
-            dashboard_module.auto_rollback_loop,
-            (dashboard_module.api_post_rollback, dashboard_module.write_job_history),
-        )
-    except Exception:
-        dashboard_module.log.exception("failed to start auto_rollback_loop thread")
-        raise
+            scoring_snapshot = start_model_scoring_service()
+            dashboard_module._BOOT_DIAGNOSTICS["model_scoring"] = dict(scoring_snapshot or {})
+            dashboard_module._publish_boot_diagnostics()
+            if bool((scoring_snapshot or {}).get("enabled")) and not bool((scoring_snapshot or {}).get("ok")):
+                raise RuntimeError(f"model_scoring_start_failed:{scoring_snapshot}")
+        except Exception:
+            dashboard_module.log.exception("failed to start model_scoring service")
+            raise
+
+    if not (safe_no_credential and not _env_flag("AUTO_ROLLBACK_ENABLED", False)):
+        try:
+            dashboard_module._start_background_thread(
+                "auto_rollback_loop",
+                dashboard_module.auto_rollback_loop,
+                (dashboard_module.api_post_rollback, dashboard_module.write_job_history),
+            )
+        except Exception:
+            dashboard_module.log.exception("failed to start auto_rollback_loop thread")
+            raise
 
     try:
         preflight = dashboard_module._run_preflight_bounded()

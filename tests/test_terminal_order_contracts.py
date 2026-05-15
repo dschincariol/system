@@ -23,6 +23,27 @@ class _FakeReadConnection:
         pass
 
 
+class _FakeClosableReadConnection:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def execute(self, sql, params=()):
+        if "sqlite_master" in str(sql):
+            return _FakeRows([])
+        return _FakeRows([])
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeRows(list):
+    def fetchall(self):
+        return list(self)
+
+    def fetchone(self):
+        return self[0] if self else None
+
+
 class _FakeWriteConnection:
     def __init__(self) -> None:
         self.statements = []
@@ -153,6 +174,33 @@ def test_terminal_snapshot_includes_execution_barrier(monkeypatch):
     assert barrier["allow_simulation"] is True
     assert barrier["updated_ts_ms"] == 123456
     assert "mode_paper" in barrier["blocking_reasons"]
+
+
+def test_terminal_read_handlers_close_read_connections(monkeypatch):
+    connections = []
+
+    def fake_connect_ro():
+        conn = _FakeClosableReadConnection()
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(terminal_api, "connect_ro", fake_connect_ro)
+
+    calls = [
+        (terminal_api.api_get_terminal_watchlist, "/api/terminal/watchlist"),
+        (terminal_api.api_get_terminal_positions, "/api/terminal/positions"),
+        (terminal_api.api_get_terminal_orders, "/api/terminal/orders"),
+        (terminal_api.api_get_terminal_fills, "/api/terminal/fills"),
+        (terminal_api.api_get_terminal_equity, "/api/terminal/equity"),
+        (terminal_api.api_get_terminal_markers, "/api/terminal/markers"),
+        (terminal_api.api_get_terminal_markers, "/api/terminal/markers?symbol=SPY"),
+    ]
+
+    for handler, path in calls:
+        handler(urlparse(path), {})
+
+    assert len(connections) == len(calls)
+    assert all(conn.closed for conn in connections)
 
 
 def test_terminal_ui_gates_order_controls_from_execution_barrier():

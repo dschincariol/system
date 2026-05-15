@@ -235,13 +235,13 @@ def mark_dashboard_bound(detail: str = "") -> None:
 
 def mark_clean_shutdown() -> None:
     ts_ms = _now_ms()
-    meta_set("last_clean_shutdown_ts_ms", str(ts_ms))
+    meta_set("last_clean_shutdown_ts_ms", str(ts_ms), best_effort=True)
     set_state(SHUTTING_DOWN, "clean_shutdown")
 
 
 def mark_crash_shutdown(reason: str = "") -> None:
     ts_ms = _now_ms()
     msg = str(reason or "").strip()
-    meta_set("last_crash_shutdown_ts_ms", str(ts_ms))
-    meta_set("last_crash_reason", msg[:2000])
+    meta_set("last_crash_shutdown_ts_ms", str(ts_ms), best_effort=True)
+    meta_set("last_crash_reason", msg[:2000], best_effort=True)
     set_state(DEGRADED, msg or "crash_shutdown")

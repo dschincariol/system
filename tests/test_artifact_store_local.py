@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from engine.artifacts.paths import object_path
+from engine.artifacts.paths import artifacts_root, object_path
 from engine.artifacts.store import ArtifactCorruption, LocalArtifactStore
 
 
@@ -108,3 +108,17 @@ def test_postgres_runtime_schema_is_migration_owned(tmp_path: Path) -> None:
     LocalArtifactStore(root=tmp_path / "store", connect_factory=lambda: conn)
 
     assert conn.statements == []
+
+
+def test_artifacts_root_prefers_runtime_data_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("TS_ARTIFACTS_ROOT", raising=False)
+    monkeypatch.setenv("TRADING_DATA", str(tmp_path / "runtime_data"))
+
+    assert artifacts_root() == (tmp_path / "runtime_data" / "artifacts").resolve()
+
+
+def test_artifacts_root_explicit_override_wins(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TS_ARTIFACTS_ROOT", str(tmp_path / "explicit_artifacts"))
+    monkeypatch.setenv("TRADING_DATA", str(tmp_path / "runtime_data"))
+
+    assert artifacts_root() == (tmp_path / "explicit_artifacts").resolve()

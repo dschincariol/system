@@ -19,6 +19,7 @@ from engine.runtime.logging import get_logger
 
 LOG = get_logger("engine.data.provider_registry")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+_MARKET_DATA_JOB_NAMES = ("stream_prices_polygon_ws", "stream_prices_ibkr", "poll_prices", "options_poll")
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: object) -> None:
@@ -306,15 +307,77 @@ def get_market_data_job_names() -> List[str]:
     return out
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(str(name), "")
+    if raw_value is None or str(raw_value).strip() == "":
+        return bool(default)
+    return str(raw_value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _provider_chain() -> list[str]:
+    return [
+        x.strip().lower()
+        for x in str(os.environ.get("LIVE_PRICE_PROVIDER_CHAIN", "") or "").split(",")
+        if x.strip()
+    ]
+
+
+def _operational_market_data_job_names(candidates: list[str]) -> list[str]:
+    chain = _provider_chain()
+    polygon_key = bool(get_data_credential("POLYGON_API_KEY"))
+    tradier_key = bool(get_data_credential("TRADIER_API_TOKEN"))
+    polygon_ws_enabled = _env_enabled("POLYGON_WS_ENABLED", True)
+    polygon_rest_enabled = _env_enabled("POLYGON_REST_ENABLED", True)
+    ibkr_enabled = _env_enabled("IBKR_ENABLED", False)
+    yfinance_enabled = _env_enabled("YFINANCE_ENABLED", True)
+    ccxt_enabled = _env_enabled("CCXT_ENABLED", False)
+    tradier_enabled = _env_enabled("TRADIER_ENABLED", False)
+
+    out: list[str] = []
+    for raw_name in candidates:
+        name = str(raw_name or "").strip()
+        if name not in _MARKET_DATA_JOB_NAMES or name in out:
+            continue
+        if name == "stream_prices_polygon_ws":
+            if polygon_key and polygon_ws_enabled and ((not chain) or ("polygon_ws" in chain)):
+                out.append(name)
+            continue
+        if name == "stream_prices_ibkr":
+            if ibkr_enabled:
+                out.append(name)
+            continue
+        if name == "options_poll":
+            polygon_options = polygon_key and polygon_rest_enabled and ((not chain) or ("polygon" in chain))
+            tradier_options = tradier_key and tradier_enabled and ((not chain) or ("tradier" in chain))
+            if polygon_options or tradier_options:
+                out.append(name)
+            continue
+        if name == "poll_prices":
+            if (
+                yfinance_enabled
+                or ccxt_enabled
+                or (polygon_key and polygon_rest_enabled and ((not chain) or ("polygon" in chain)))
+            ):
+                out.append(name)
+    return out
+
+
 def get_enabled_market_data_job_names() -> List[str]:
+    raw = [x.strip() for x in os.environ.get("INGESTION_CHILD_JOBS", "").split(",") if x.strip()]
+    if raw:
+        # Explicit env override is the highest-priority operational control,
+        # but provider disable flags and missing credentials still fail closed.
+        filtered = _operational_market_data_job_names(raw)
+        return filtered or ["poll_prices"]
+
     try:
         from services.data_source_manager import desired_ingestion_jobs
 
-        desired = [
+        desired = _operational_market_data_job_names([
             str(name)
             for name in (desired_ingestion_jobs(read_only=True) or [])
-            if str(name).strip() in ("stream_prices_polygon_ws", "stream_prices_ibkr", "poll_prices", "options_poll")
-        ]
+            if str(name).strip() in _MARKET_DATA_JOB_NAMES
+        ])
         if desired:
             return list(dict.fromkeys(desired))
     except Exception as e:
@@ -324,22 +387,7 @@ def get_enabled_market_data_job_names() -> List[str]:
             once_key="provider_registry_desired_jobs_parse",
         )
 
-    raw = [x.strip() for x in os.environ.get("INGESTION_CHILD_JOBS", "").split(",") if x.strip()]
-    if raw:
-        # Explicit env override is the highest-priority operational control.
-        return raw
-
-    def _env_enabled(name: str, default: bool = False) -> bool:
-        raw_value = os.environ.get(str(name), "")
-        if raw_value is None or str(raw_value).strip() == "":
-            return bool(default)
-        return str(raw_value).strip().lower() in ("1", "true", "yes", "on")
-
-    chain = [
-        x.strip().lower()
-        for x in str(os.environ.get("LIVE_PRICE_PROVIDER_CHAIN", "") or "").split(",")
-        if x.strip()
-    ]
+    chain = _provider_chain()
     polygon_key = get_data_credential("POLYGON_API_KEY")
     polygon_ws_enabled = _env_enabled("POLYGON_WS_ENABLED", True)
     polygon_rest_enabled = _env_enabled("POLYGON_REST_ENABLED", True)

@@ -1011,8 +1011,7 @@ def _finalize_post_commit_price_cycle(
     if first_ts_ms > 0:
         try:
             did = meta_set_if_missing("first_price_ts_ms", str(int(first_ts_ms)))
-            if did:
-                set_state(LIVE, "first_market_data_tick")
+            set_state(LIVE, "first_market_data_tick" if did else "market_data_healthy")
         except Exception as e:
             _log_nonfatal("poll_prices_first_tick_state_update_failed", e)
 

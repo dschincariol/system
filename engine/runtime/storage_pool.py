@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import psycopg
+from psycopg.pq import TransactionStatus
 from psycopg_pool import ConnectionPool, PoolTimeout
 
 from engine.runtime.platform import default_pg_dsn, dsn_with_pg_password
@@ -368,9 +369,18 @@ def quote_ident(value: str) -> str:
     return '"' + text.replace('"', '""') + '"'
 
 
+def _rollback_if_in_transaction(conn: psycopg.Connection[Any]) -> None:
+    try:
+        if conn.info.transaction_status != TransactionStatus.IDLE:
+            conn.rollback()
+    except Exception:
+        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+
+
 def _configure_connection(conn: psycopg.Connection[Any]) -> None:
     if _POOL_TRANSACTION_MODE:
         return
+    _rollback_if_in_transaction(conn)
     previous_autocommit = bool(conn.autocommit)
     try:
         conn.autocommit = True
@@ -527,6 +537,7 @@ def release(conn) -> None:
             logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
         return
     try:
+        _rollback_if_in_transaction(conn)
         pool.putconn(conn)
     except ValueError:
         try:

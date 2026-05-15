@@ -173,9 +173,46 @@ from engine.runtime.locks import (
     read_lock as _read_lock,
     release_lock as _release_lock,
     ensure_job_history as _ensure_job_history,
-    write_job_history as _write_job_history,
+    write_job_history as _write_job_history_impl,
     read_job_history as _read_job_history,
 )
+
+
+def _job_history_write_timeout_s() -> float:
+    try:
+        return max(0.05, float(os.environ.get("JOBS_MANAGER_HISTORY_WRITE_TIMEOUT_S", "0.25") or 0.25))
+    except Exception:
+        return 0.25
+
+
+def _write_job_history(job_name: str, action: str, detail: str, exit_code) -> None:
+    try:
+        from engine.runtime.storage_pool import storage_acquire_timeout_override
+
+        timeout_ctx = storage_acquire_timeout_override(_job_history_write_timeout_s())
+    except Exception:
+        from contextlib import nullcontext
+
+        timeout_ctx = nullcontext()
+
+    try:
+        with timeout_ctx:
+            _write_job_history_impl(job_name, action, detail, exit_code)
+    except Exception as e:
+        try:
+            LOG.warning(
+                "job_history_write_failed",
+                extra={
+                    "event": "job_history_write_failed",
+                    "extra_json": {
+                        "job": str(job_name),
+                        "action": str(action),
+                        "error": f"{type(e).__name__}: {e}",
+                    },
+                },
+            )
+        except Exception:
+            pass
 
 
 # ------------------------------
@@ -1105,6 +1142,16 @@ class JobManager:
                 parts.insert(insert_at, _ENGINE_DIR)
 
             env["PYTHONPATH"] = os.pathsep.join(parts)
+            try:
+                from services.data_source_manager import (
+                    apply_safe_no_credential_runtime_environment,
+                    safe_no_credential_market_data_mode,
+                )
+
+                if safe_no_credential_market_data_mode():
+                    apply_safe_no_credential_runtime_environment(env)
+            except Exception as env_err:
+                _warn_nonfatal("JOBS_MANAGER_SAFE_ENV_SANITIZE_FAILED", env_err, job=str(job.name))
 
             try:
                 job.proc = subprocess.Popen(

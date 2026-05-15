@@ -9,6 +9,15 @@ from engine.runtime import job_registry
 from engine.runtime.job_registry import enforce_registered_job_path
 
 
+def test_job_history_write_is_best_effort(monkeypatch) -> None:
+    def fail_history(*args, **kwargs):
+        raise TimeoutError("history pool timeout")
+
+    monkeypatch.setattr(jobs_manager, "_write_job_history_impl", fail_history)
+
+    jobs_manager._write_job_history("poll_prices", "exit", "process exited", 1)
+
+
 def _manual_manager(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     script = root / "engine" / "runtime" / "jobs" / "rogue_unregistered.py"

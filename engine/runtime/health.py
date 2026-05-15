@@ -3752,6 +3752,11 @@ def get_health_snapshot():
         out["critical_blockers"] = _dedupe_strs(critical_blockers)
         out["system_stage"] = system_stage
         out["data_flow_ok"] = data_flow_ok
+        try:
+            out["lifecycle"] = dict(_lc_get_state() or {})
+        except Exception as e:
+            _warn("health.lifecycle_state", e)
+            out["lifecycle"] = {"state": "UNKNOWN", "detail": "", "first_price_ts_ms": ""}
 
         section_started = time.perf_counter()
         if cache_ttl_ms > 0:

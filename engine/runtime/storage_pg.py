@@ -1291,11 +1291,18 @@ def _upsert_dict(
     row: dict[str, Any],
     *,
     conflict_column: str,
+    conflict_columns: Sequence[str] | None = None,
     returning_id: bool = False,
     con: StorageConnection | None = None,
 ) -> int:
     table_name = _ident(table)
     conflict = _ident(conflict_column)
+    conflict_names = tuple(
+        str(col)
+        for col in (conflict_columns or (conflict_column,))
+        if str(col or "").strip()
+    ) or (str(conflict_column),)
+    conflict_idents = tuple(_ident(col) for col in conflict_names)
     clean = {str(k): v for k, v in dict(row or {}).items() if v is not None}
     if not clean:
         return 0
@@ -1304,15 +1311,16 @@ def _upsert_dict(
 
     columns = [_ident(col) for col in clean]
     placeholders = ", ".join(["?"] * len(columns))
-    update_columns = [col for col in columns if col != conflict]
+    update_columns = [col for col in columns if col not in set(conflict_idents)]
+    conflict_sql_columns = ", ".join(conflict_idents)
     if update_columns:
         updates = ", ".join(
             f"{col}=COALESCE(excluded.{col}, {table_name}.{col})"
             for col in update_columns
         )
-        conflict_sql = f"ON CONFLICT({conflict}) DO UPDATE SET {updates}"
+        conflict_sql = f"ON CONFLICT({conflict_sql_columns}) DO UPDATE SET {updates}"
     else:
-        conflict_sql = f"ON CONFLICT({conflict}) DO NOTHING"
+        conflict_sql = f"ON CONFLICT({conflict_sql_columns}) DO NOTHING"
     sql = (
         f"INSERT INTO {table_name} ({', '.join(columns)}) "
         f"VALUES ({placeholders}) {conflict_sql}"
@@ -1365,7 +1373,14 @@ def put_normalized_event(event: dict[str, Any], con: StorageConnection | None = 
         "meta_json": payload.get("meta_json") or payload,
     }
     if row.get("event_key"):
-        return _upsert_dict("events", row, conflict_column="event_key", returning_id=True, con=con)
+        return _upsert_dict(
+            "events",
+            row,
+            conflict_column="event_key",
+            conflict_columns=("event_key", "ts_ms"),
+            returning_id=True,
+            con=con,
+        )
     return _insert_dict("events", row, returning_id=True, con=con)
 
 

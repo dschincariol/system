@@ -1747,6 +1747,16 @@ def _spawn_ingestion_if_enabled() -> None:
     env["ENGINE_LAUNCHED_BY_SUPERVISOR"] = "1"
     env["ENGINE_JOB_NAME"] = "ingestion_runtime"
     env["PYTHONPATH"] = _BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    try:
+        from services.data_source_manager import (
+            apply_safe_no_credential_runtime_environment,
+            safe_no_credential_market_data_mode,
+        )
+
+        if safe_no_credential_market_data_mode():
+            apply_safe_no_credential_runtime_environment(env)
+    except Exception as e:
+        _log_swallowed("INGESTION_SAFE_ENV_SANITIZE_FAILED", error=str(e))
 
     creationflags = 0
     start_new_session = False

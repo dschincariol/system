@@ -28,6 +28,85 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+_SAFE_NO_CREDENTIAL_BOOTSTRAP_ENV = {
+    "POLYGON_REST_ENABLED": "0",
+    "POLYGON_WS_ENABLED": "0",
+    "IBKR_ENABLED": "0",
+    "CCXT_ENABLED": "0",
+    "TRADIER_ENABLED": "0",
+    "YFINANCE_ENABLED": "1",
+    "LIVE_PRICE_PROVIDER_CHAIN": "yfinance",
+    "OPTIONS_PROVIDER_CHAIN": "",
+}
+_BOOTSTRAP_CREDENTIAL_RUNTIME_ENV_KEYS = (
+    "ALPACA_API_KEY",
+    "ALPACA_KEY_ID",
+    "ALPACA_OAUTH_TOKEN",
+    "ALPACA_SECRET",
+    "ALPACA_SECRET_KEY",
+    "ANTHROPIC_API_KEY",
+    "BINANCE_API_KEY",
+    "BINANCE_SECRET",
+    "BINANCE_SECRET_KEY",
+    "CCXT_API_KEY",
+    "CCXT_PASSWORD",
+    "CCXT_SECRET",
+    "COINBASE_API_KEY",
+    "COINBASE_API_SECRET",
+    "COINBASE_SECRET",
+    "FINNHUB_API_KEY",
+    "FMP_API_KEY",
+    "GROQ_API_KEY",
+    "IBKR_CLIENT_ID",
+    "IBKR_HOST",
+    "IBKR_PASSWORD",
+    "IBKR_PORT",
+    "IBKR_USERNAME",
+    "KRAKEN_API_KEY",
+    "KRAKEN_PRIVATE_KEY",
+    "OANDA_ACCESS_TOKEN",
+    "OANDA_API_KEY",
+    "OPENAI_API_KEY",
+    "POLYGON_API_KEY",
+    "POLYGON_KEY",
+    "REDDIT_CLIENT_ID",
+    "REDDIT_CLIENT_SECRET",
+    "TRADIER_API_TOKEN",
+)
+
+
+def _bootstrap_env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name), "")
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_no_credential_bootstrap_mode() -> bool:
+    if _bootstrap_env_flag("ALLOW_CREDENTIAL_DATA_PROVIDERS_IN_SAFE", False):
+        return False
+    mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+    execution_mode = str(os.environ.get("EXECUTION_MODE") or "safe").strip().lower()
+    broker = str(os.environ.get("BROKER") or "sim").strip().lower()
+    broker_name = str(os.environ.get("BROKER_NAME") or broker or "sim").strip().lower()
+    if mode != "safe" or execution_mode not in {"safe", "paper", "sim-paper", "sim_paper"}:
+        return False
+    if broker != "sim" or broker_name != "sim":
+        return False
+    return bool(
+        _bootstrap_env_flag("DISABLE_LIVE_EXECUTION", True)
+        and _bootstrap_env_flag("KILL_SWITCH_GLOBAL", True)
+    )
+
+
+def _apply_safe_no_credential_bootstrap_environment() -> None:
+    if not _safe_no_credential_bootstrap_mode():
+        return
+    for key in _BOOTSTRAP_CREDENTIAL_RUNTIME_ENV_KEYS:
+        os.environ.pop(str(key), None)
+    for key, value in _SAFE_NO_CREDENTIAL_BOOTSTRAP_ENV.items():
+        os.environ[str(key)] = str(value)
+
 
 def _bootstrap_stderr_event(event: str, error: BaseException, **extra) -> None:
     payload = {
@@ -94,6 +173,8 @@ if not _db_path:
             default_db=default_db,
         )
     os.environ["DB_PATH"] = default_db
+
+_apply_safe_no_credential_bootstrap_environment()
 
 try:
     load_runtime_config()

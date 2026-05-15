@@ -59,6 +59,51 @@ _DATA_SOURCE_MANAGER_BEST_EFFORT_BUSY_TIMEOUT_MS = max(
     25,
     int(float(os.environ.get("DATA_SOURCE_MANAGER_BEST_EFFORT_BUSY_TIMEOUT_MS", "250") or 250.0)),
 )
+_BASE_CREDENTIAL_RUNTIME_ENV_KEYS = (
+    "ALPACA_API_KEY",
+    "ALPACA_KEY_ID",
+    "ALPACA_OAUTH_TOKEN",
+    "ALPACA_SECRET",
+    "ALPACA_SECRET_KEY",
+    "ANTHROPIC_API_KEY",
+    "BINANCE_API_KEY",
+    "BINANCE_SECRET",
+    "BINANCE_SECRET_KEY",
+    "CCXT_API_KEY",
+    "CCXT_PASSWORD",
+    "CCXT_SECRET",
+    "COINBASE_API_KEY",
+    "COINBASE_API_SECRET",
+    "COINBASE_SECRET",
+    "FINNHUB_API_KEY",
+    "FMP_API_KEY",
+    "GROQ_API_KEY",
+    "IBKR_CLIENT_ID",
+    "IBKR_HOST",
+    "IBKR_PASSWORD",
+    "IBKR_PORT",
+    "IBKR_USERNAME",
+    "KRAKEN_API_KEY",
+    "KRAKEN_PRIVATE_KEY",
+    "OANDA_ACCESS_TOKEN",
+    "OANDA_API_KEY",
+    "OPENAI_API_KEY",
+    "POLYGON_API_KEY",
+    "POLYGON_KEY",
+    "REDDIT_CLIENT_ID",
+    "REDDIT_CLIENT_SECRET",
+    "TRADIER_API_TOKEN",
+)
+_SAFE_NO_CREDENTIAL_ENV = {
+    "POLYGON_REST_ENABLED": "0",
+    "POLYGON_WS_ENABLED": "0",
+    "IBKR_ENABLED": "0",
+    "CCXT_ENABLED": "0",
+    "TRADIER_ENABLED": "0",
+    "YFINANCE_ENABLED": "1",
+    "LIVE_PRICE_PROVIDER_CHAIN": "yfinance",
+    "OPTIONS_PROVIDER_CHAIN": "",
+}
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -77,6 +122,48 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
     )
     if once_key:
         _WARNED_NONFATAL_KEYS.add(once_key)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name), "")
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def safe_no_credential_market_data_mode() -> bool:
+    if _env_flag("ALLOW_CREDENTIAL_DATA_PROVIDERS_IN_SAFE", False):
+        return False
+    mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+    execution_mode = str(os.environ.get("EXECUTION_MODE") or "safe").strip().lower()
+    broker = str(os.environ.get("BROKER") or "sim").strip().lower()
+    broker_name = str(os.environ.get("BROKER_NAME") or broker or "sim").strip().lower()
+    if mode != "safe" or execution_mode not in {"safe", "paper", "sim-paper", "sim_paper"}:
+        return False
+    if broker != "sim" or broker_name != "sim":
+        return False
+    return bool(_env_flag("DISABLE_LIVE_EXECUTION", True) and _env_flag("KILL_SWITCH_GLOBAL", True))
+
+
+def credential_runtime_env_keys() -> tuple[str, ...]:
+    keys = {str(key) for key in _BASE_CREDENTIAL_RUNTIME_ENV_KEYS}
+    try:
+        for definition in _default_catalog().values():
+            for env_name in (definition.credential_env or {}).values():
+                if str(env_name or "").strip():
+                    keys.add(str(env_name).strip())
+    except Exception:
+        pass
+    return tuple(sorted(keys))
+
+
+def apply_safe_no_credential_runtime_environment(env: Dict[str, str] | None = None) -> Dict[str, str]:
+    target = os.environ if env is None else env
+    for key in credential_runtime_env_keys():
+        target.pop(str(key), None)
+    for key, value in _SAFE_NO_CREDENTIAL_ENV.items():
+        target[str(key)] = str(value)
+    return dict(_SAFE_NO_CREDENTIAL_ENV)
 
 
 def _best_effort_source_status_payload(
@@ -1618,6 +1705,10 @@ class DataSourceManager:
 
     def build_job_environment(self, job_name: str) -> Dict[str, str]:
         self.initialize()
+        if safe_no_credential_market_data_mode():
+            if str(job_name or "").strip() == "poll_prices":
+                return dict(_SAFE_NO_CREDENTIAL_ENV)
+            return {}
         rows = [
             row
             for row in self.list_sources(include_credentials=True)
@@ -1684,6 +1775,9 @@ class DataSourceManager:
 
     def apply_runtime_environment(self) -> Dict[str, str]:
         self.initialize()
+        if safe_no_credential_market_data_mode():
+            return apply_safe_no_credential_runtime_environment()
+
         merged: Dict[str, str] = {}
         for row in self.list_sources():
             if not bool(row.get("enabled")):

@@ -82,8 +82,9 @@ def _normalize_symbol(value: Any) -> str:
 
 def _uses_postgres_storage(db: Any) -> bool:
     raw = getattr(db, "raw", None)
-    module = f"{type(db).__module__}.{type(db).__name__} {type(raw).__module__}.{type(raw).__name__}".lower()
-    return "storage_pg" in module or "psycopg" in module
+    db_module = str(type(db).__module__ or "").lower()
+    raw_module = str(type(raw).__module__ or "").lower()
+    return db_module == "engine.runtime.storage_pg" or raw_module.startswith("psycopg")
 
 
 _ROUTER_LOCK = threading.RLock()
@@ -536,15 +537,20 @@ def publish_price_events(
             _ensure_price_quotes_raw_schema(db)
 
         if sqlite_write_raw and raw_rows:
+            raw_conflict_target = (
+                "(symbol, provider, event_key, ts_ms)"
+                if _uses_postgres_storage(db)
+                else "(symbol, provider, event_key)"
+            )
             try:
                 db.executemany(
-                    """
+                    f"""
                     INSERT INTO price_quotes_raw(
                       ts_ms, symbol, provider, event_key, event_type, event_ts_ms,
                       last, bid, ask, spread, volume,
                       trade_ts_ms, quote_ts_ms, ingest_ts_ms, source
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(symbol, provider, event_key) DO UPDATE SET
+                    ON CONFLICT{raw_conflict_target} DO UPDATE SET
                       ts_ms=excluded.ts_ms,
                       event_type=excluded.event_type,
                       event_ts_ms=excluded.event_ts_ms,

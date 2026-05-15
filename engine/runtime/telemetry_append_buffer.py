@@ -118,6 +118,24 @@ _TABLE_SPECS: dict[str, dict[str, str]] = {
         "operation": "flush_ingest_slippage_buffer",
     },
 }
+
+
+def _uses_postgres_storage(con: Any) -> bool:
+    raw = getattr(con, "raw", None)
+    con_module = str(type(con).__module__ or "").lower()
+    raw_module = str(type(raw).__module__ or "").lower()
+    return con_module == "engine.runtime.storage_pg" or raw_module.startswith("psycopg")
+
+
+def _sql_for_table(table: str, con: Any) -> str:
+    spec = dict(_TABLE_SPECS.get(str(table)) or {})
+    sql = str(spec.get("sql") or "").strip()
+    if str(table) == "price_quotes_raw" and _uses_postgres_storage(con):
+        sql = sql.replace(
+            "ON CONFLICT(symbol, provider, event_key) DO UPDATE SET",
+            "ON CONFLICT(symbol, provider, event_key, ts_ms) DO UPDATE SET",
+        )
+    return sql
 _TABLE_ORDER: tuple[str, ...] = tuple(_TABLE_SPECS.keys())
 _BUFFER_LOCK = threading.Condition()
 _BUFFER_PENDING: dict[str, list[tuple[Any, ...]]] = {name: [] for name in _TABLE_ORDER}
@@ -244,11 +262,13 @@ def _write_rows(
     if not rows:
         return 0
     spec = dict(_TABLE_SPECS.get(str(table)) or {})
-    sql = str(spec.get("sql") or "").strip()
-    if not sql:
+    if not str(spec.get("sql") or "").strip():
         raise ValueError(f"unsupported_telemetry_table:{table}")
 
     def _write(con) -> None:
+        sql = _sql_for_table(str(table), con)
+        if not sql:
+            raise ValueError(f"unsupported_telemetry_table:{table}")
         if str(table) == "price_quotes_raw":
             from engine.runtime.storage import _ensure_price_quotes_raw_schema
 

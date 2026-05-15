@@ -7,6 +7,7 @@ import types
 from pathlib import Path
 
 import pytest
+from psycopg.pq import TransactionStatus
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,6 +132,64 @@ def test_get_pool_resolves_dsn_before_taking_pool_lock(monkeypatch):
     assert pool.kwargs["conninfo"].startswith("host=127.0.0.1")
 
 
+def test_configure_connection_rolls_back_dirty_connection(monkeypatch):
+    statements: list[str] = []
+
+    class FakeInfo:
+        transaction_status = TransactionStatus.INTRANS
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql: str) -> None:
+            statements.append(str(sql))
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.info = FakeInfo()
+            self.autocommit = False
+            self.rollbacks = 0
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+            self.info.transaction_status = TransactionStatus.IDLE
+
+        def cursor(self):
+            return FakeCursor()
+
+    conn = FakeConnection()
+    monkeypatch.setattr(storage_pool, "_POOL_TRANSACTION_MODE", False)
+
+    storage_pool._configure_connection(conn)  # type: ignore[arg-type]
+
+    assert conn.rollbacks == 1
+    assert conn.autocommit is False
+    assert statements == ['SET search_path = "trading", public']
+
+
+def test_risk_state_probe_closes_idle_connection(monkeypatch):
+    from engine.runtime import risk_state
+
+    class FakeConnection:
+        in_transaction = False
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    conn = FakeConnection()
+    monkeypatch.setattr(risk_state, "connect", lambda readonly=False: conn)
+
+    assert risk_state._active_write_txn_connection() is None
+    assert conn.closed is True
+
+
 def test_get_db_validation_snapshot_strict_raises(monkeypatch):
     class BrokenConnection:
         def __enter__(self):
@@ -147,3 +206,64 @@ def test_get_db_validation_snapshot_strict_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="db down"):
         storage_pg.get_db_validation_snapshot(strict=True)
+
+
+def test_put_normalized_event_uses_timescale_conflict_key(monkeypatch):
+    statements: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def fetchone(self):
+            return (42,)
+
+    class FakeConnection:
+        def execute(self, sql: str, params=()):
+            statements.append((str(sql), tuple(params or ())))
+            return FakeCursor()
+
+    event_id = storage_pg.put_normalized_event(
+        {
+            "ts_ms": 1234567890,
+            "source": "unit_test",
+            "title": "probe",
+            "event_key": "unit-test-event",
+        },
+        con=FakeConnection(),  # type: ignore[arg-type]
+    )
+
+    assert event_id == 42
+    sql = statements[-1][0]
+    assert "ON CONFLICT(event_key, ts_ms) DO UPDATE SET" in sql
+    assert "event_key=COALESCE" not in sql
+    assert "ts_ms=COALESCE" not in sql
+
+
+def test_price_quotes_raw_buffer_uses_timescale_conflict_key_for_postgres():
+    from engine.runtime import telemetry_append_buffer
+
+    class FakeRaw:
+        pass
+
+    FakeRaw.__module__ = "psycopg.connection"
+
+    class FakeConnection:
+        raw = FakeRaw()
+
+    sql = telemetry_append_buffer._sql_for_table("price_quotes_raw", FakeConnection())
+    compact_sql = " ".join(sql.split())
+
+    assert "ON CONFLICT(symbol, provider, event_key, ts_ms) DO UPDATE SET" in compact_sql
+
+
+def test_price_quotes_raw_buffer_keeps_sqlite_conflict_key_for_compatibility():
+    from engine.runtime import telemetry_append_buffer
+
+    class FakeConnection:
+        raw = object()
+
+    sql = telemetry_append_buffer._sql_for_table("price_quotes_raw", FakeConnection())
+    compact_sql = " ".join(sql.split())
+
+    assert "ON CONFLICT(symbol, provider, event_key) DO UPDATE SET" in compact_sql
+    assert "event_key, ts_ms" not in compact_sql

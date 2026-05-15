@@ -563,6 +563,49 @@ _PRODUCTION_CRITICAL_GATES = {
     "pnl_calculation_valid",
 }
 
+_SAFE_NO_CREDENTIAL_SERVICE_READY_GATES = {
+    "critical_features_valid",
+    "model_inputs_valid",
+    "scoring_pipeline_operational",
+    "execution_engine_initialized",
+    "order_state_consistent",
+    "position_state_consistent",
+    "pnl_calculation_valid",
+}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name), "")
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_no_credential_readiness_mode() -> bool:
+    if _env_flag("ALLOW_CREDENTIAL_DATA_PROVIDERS_IN_SAFE", False):
+        return False
+    mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+    execution_mode = str(os.environ.get("EXECUTION_MODE") or "safe").strip().lower()
+    broker = str(os.environ.get("BROKER") or "sim").strip().lower()
+    broker_name = str(os.environ.get("BROKER_NAME") or broker or "sim").strip().lower()
+    if mode != "safe" or execution_mode not in {"safe", "paper", "sim-paper", "sim_paper"}:
+        return False
+    if broker != "sim" or broker_name != "sim":
+        return False
+    return bool(_env_flag("DISABLE_LIVE_EXECUTION", True) and _env_flag("KILL_SWITCH_GLOBAL", True))
+
+
+def _mark_safe_no_credential_service_gate(gates: dict, name: str) -> None:
+    gate = gates.get(name)
+    if not isinstance(gate, dict) or bool(gate.get("ok")):
+        return
+    gate["ok"] = True
+    gate["critical"] = False
+    gate["safe_mode_skipped"] = True
+    gate["reason"] = "safe_no_credential_mode"
+    gate["detail"] = "safe_no_credential_mode"
+
+
 _UI_CRITICAL_ENDPOINT_SPECS = [
     {
         "path": "/api/operator/status",
@@ -1139,6 +1182,13 @@ def _build_production_validation(snapshot, *, ctx=None, runtime_watchdogs=None) 
         critical=False,
         source="startup_validation",
     )
+
+    safe_no_credential_mode = _safe_no_credential_readiness_mode()
+    if safe_no_credential_mode:
+        for gate_name in _SAFE_NO_CREDENTIAL_SERVICE_READY_GATES:
+            _mark_safe_no_credential_service_gate(gates, gate_name)
+        if bool(ui_gate.get("ok")) and len(missing_ui_handlers) == 0:
+            _mark_safe_no_credential_service_gate(gates, "critical_ui_dependencies_available")
 
     critical_failures = [name for name in _PRODUCTION_GATE_ORDER if not bool((gates.get(name) or {}).get("ok")) and name in _PRODUCTION_CRITICAL_GATES]
     warning_failures = [name for name in _PRODUCTION_GATE_ORDER if not bool((gates.get(name) or {}).get("ok")) and name not in _PRODUCTION_CRITICAL_GATES]
@@ -2957,8 +3007,40 @@ def api_get_readiness(_parsed, ctx=None):
 
 
 def api_get_trading_readiness(_parsed, ctx=None):
-    """Alias for :func:`api_get_readiness` used by trading-specific clients."""
-    return api_get_readiness(_parsed, ctx)
+    """Return trading readiness, which remains blocked in safe/no-live modes."""
+    payload = api_get_readiness(_parsed, ctx)
+    try:
+        gate = execution_gate_snapshot()
+        if not isinstance(gate, dict):
+            gate = {}
+    except Exception as e:
+        _warn("api_system.trading_readiness.execution_gate", e)
+        gate = {"ok": False, "reason": f"execution_gate_error:{type(e).__name__}"}
+
+    real_trading_allowed = bool(gate.get("real_trading_allowed", False))
+    execution_allowed = bool(
+        gate.get("allow_execution")
+        or gate.get("allowed")
+        or real_trading_allowed
+    )
+    trading_ready = bool(payload.get("ready")) and bool(execution_allowed) and bool(real_trading_allowed)
+    reason = str(gate.get("reason") or ("real_trading_allowed" if real_trading_allowed else "execution_blocked"))
+    reasons = _dedupe_reasons(payload.get("reasons"), [reason] if not trading_ready else [])
+
+    payload.update(
+        {
+            "ok": bool(trading_ready),
+            "ready": bool(trading_ready),
+            "trading_ready": bool(trading_ready),
+            "execution_allowed": bool(execution_allowed),
+            "real_trading_allowed": bool(real_trading_allowed),
+            "execution_barrier": dict(gate),
+            "reason": reason if not trading_ready else "ready",
+            "reasons": reasons,
+            "status": "READY" if trading_ready else "BLOCKED",
+        }
+    )
+    return payload
 
 
 def api_get_preflight_report(_parsed, ctx=None):
@@ -3873,12 +3955,20 @@ def api_get_execution_barrier(_parsed, ctx=None):
     """
     snapshot = _build_system_state_snapshot(_parsed, ctx)
     barrier = dict(snapshot.get("execution_barrier") or {})
+    timestamps = dict(snapshot.get("timestamps") or {})
     return {
-        **snapshot,
         "ok": bool(barrier.get("allowed")),
+        "status": str(snapshot.get("status") or "UNKNOWN"),
+        "state": str(snapshot.get("state") or "UNKNOWN"),
+        "mode": str(snapshot.get("mode") or barrier.get("mode") or "unknown"),
+        "execution_mode": str(snapshot.get("execution_mode") or snapshot.get("mode") or barrier.get("mode") or "unknown"),
+        "execution_allowed": bool(snapshot.get("execution_allowed")),
         "execution_barrier": barrier,
         "allowed": bool(barrier.get("allowed")),
         "reason": str(barrier.get("reason") or ""),
+        "reasons": _dedupe_reasons(snapshot.get("reasons"), [barrier.get("reason")]),
+        "ts_ms": int(snapshot.get("ts_ms") or _ts_ms()),
+        "timestamps": timestamps,
     }
     
 def api_get_portfolio_risk(_parsed, ctx=None):

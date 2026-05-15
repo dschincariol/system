@@ -57,6 +57,7 @@ OWNER = os.environ.get(
 PID = os.getpid()
 
 CHILD_JOBS_CSV = str(os.environ.get("INGESTION_CHILD_JOBS", "")).strip()
+_SAFE_NO_CREDENTIAL_CHILD_JOBS = {"poll_prices"}
 CHILD_MAX_RESTARTS = int(os.environ.get("INGESTION_RUNTIME_CHILD_MAX_RESTARTS", "10"))
 CHILD_RESTART_WINDOW_S = float(os.environ.get("INGESTION_RUNTIME_CHILD_RESTART_WINDOW_S", "300.0"))
 LOCK_STALE_AFTER_S = int(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180"))
@@ -621,6 +622,8 @@ def _child_candidates() -> List[str]:
             _warn_failure("INGESTION_RUNTIME_DESIRED_CHILDREN_LOOKUP_FAILED", e)
             requested = list(dict.fromkeys(list(INGESTION_DAEMON_JOBS or []) + list(get_enabled_market_data_job_names() or [])))
 
+    requested = _safe_no_credential_child_candidates(requested)
+
     out: List[str] = []
     seen = set()
     missing: List[str] = []
@@ -648,6 +651,63 @@ def _child_candidates() -> List[str]:
             _warn_failure("INGESTION_RUNTIME_LOG_MISSING_CHILDREN_FAILED", e, missing=list(missing))
 
     return out
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name), "")
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _safe_no_credential_ingestion_mode() -> bool:
+    try:
+        from services.data_source_manager import safe_no_credential_market_data_mode
+
+        if safe_no_credential_market_data_mode():
+            return bool(_env_flag("YFINANCE_ENABLED", True))
+    except Exception:
+        pass
+
+    mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+    execution_mode = str(os.environ.get("EXECUTION_MODE") or "safe").strip().lower()
+    if mode != "safe" or execution_mode not in ("safe", "paper", "sim-paper", "sim_paper"):
+        return False
+    paid_or_credentialed_enabled = any(
+        _env_flag(name, default)
+        for name, default in (
+            ("POLYGON_WS_ENABLED", True),
+            ("POLYGON_REST_ENABLED", True),
+            ("IBKR_ENABLED", False),
+            ("CCXT_ENABLED", False),
+            ("TRADIER_ENABLED", False),
+        )
+    )
+    return bool(_env_flag("YFINANCE_ENABLED", True) and not paid_or_credentialed_enabled)
+
+
+def _safe_no_credential_child_candidates(requested: List[str]) -> List[str]:
+    if not _safe_no_credential_ingestion_mode():
+        return list(requested or [])
+
+    filtered = [
+        str(name)
+        for name in (requested or [])
+        if str(name or "").strip() in _SAFE_NO_CREDENTIAL_CHILD_JOBS
+    ]
+    if _env_flag("YFINANCE_ENABLED", True) and "poll_prices" not in filtered:
+        filtered.append("poll_prices")
+    skipped = [
+        str(name)
+        for name in (requested or [])
+        if str(name or "").strip() and str(name or "").strip() not in _SAFE_NO_CREDENTIAL_CHILD_JOBS
+    ]
+    if skipped:
+        try:
+            log.info("safe no-credential ingestion filtered child jobs: %s", sorted(set(skipped)))
+        except Exception as e:
+            _warn_failure("INGESTION_RUNTIME_SAFE_CHILD_FILTER_LOG_FAILED", e)
+    return list(dict.fromkeys(filtered))
 
 
 def _resolve_child_script(job_name: str) -> Path:
@@ -715,6 +775,14 @@ def _spawn_child_once(job_name: str) -> subprocess.Popen:
         env.update(get_manager().build_job_environment(job_name))
     except Exception as e:
         _warn_failure("INGESTION_RUNTIME_BUILD_JOB_ENV_FAILED", e, job=str(job_name))
+
+    try:
+        if _safe_no_credential_ingestion_mode():
+            from services.data_source_manager import apply_safe_no_credential_runtime_environment
+
+            apply_safe_no_credential_runtime_environment(env)
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_SAFE_ENV_SANITIZE_FAILED", e, job=str(job_name))
 
     module_name = _script_module_name(script_path)
     if module_name:

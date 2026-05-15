@@ -95,6 +95,69 @@ def _json_meta_get(key: str) -> Dict[str, Any]:
         return {}
 
 
+def _compact_text(value: Any, *, limit: int = 240) -> str:
+    text = str(value or "")
+    if len(text) <= int(limit):
+        return text
+    return text[: max(0, int(limit) - 3)] + "..."
+
+
+def _compact_mapping(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keep = {
+        "ok",
+        "status",
+        "state",
+        "detail",
+        "reason",
+        "error",
+        "error_type",
+        "started",
+        "skipped",
+        "enabled",
+        "degraded",
+        "handler_count",
+        "pid",
+        "exit_code",
+        "ts_ms",
+        "started_ts_ms",
+        "finished_ts_ms",
+        "last_ok_ts_ms",
+    }
+    out: Dict[str, Any] = {}
+    for key, raw in value.items():
+        key_s = str(key)
+        if key_s not in keep:
+            continue
+        if isinstance(raw, dict):
+            out[key_s] = _compact_mapping(raw)
+        elif isinstance(raw, list):
+            out[key_s] = {"count": len(raw)}
+        elif isinstance(raw, str):
+            out[key_s] = _compact_text(raw)
+        else:
+            out[key_s] = raw
+    return out
+
+
+def _compact_boot_diagnostics(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key, raw in value.items():
+        key_s = str(key)
+        if isinstance(raw, dict):
+            out[key_s] = _compact_mapping(raw)
+        elif isinstance(raw, list):
+            out[key_s] = {"count": len(raw)}
+        elif isinstance(raw, str):
+            out[key_s] = _compact_text(raw)
+        else:
+            out[key_s] = raw
+    return out
+
+
 def _normalize_host(host: str) -> str:
     text = str(host or "").strip()
     if not text:
@@ -834,7 +897,7 @@ def evaluate_runtime_startup_gates(
             component="runtime",
             detail="ok" if not core_service_problems else "; ".join(core_service_problems[:5]),
             dependency="dashboard_bootstrap",
-            extra={"boot_diagnostics": boot_diagnostics},
+            extra={"boot_diagnostics": _compact_boot_diagnostics(boot_diagnostics)},
         ),
         "required_api_dependencies_available": _gate(
             "required_api_dependencies_available",
@@ -843,7 +906,7 @@ def evaluate_runtime_startup_gates(
             component="api",
             detail=api_gate_detail,
             dependency="dashboard_routes",
-            extra={"boot_diagnostics": api_dependencies},
+            extra={"boot_diagnostics": _compact_boot_diagnostics(api_dependencies)},
         ),
         "ui_static_assets_present": _gate(
             "ui_static_assets_present",

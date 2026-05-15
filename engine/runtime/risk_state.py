@@ -138,12 +138,19 @@ def _now_ms():
 
 
 def _active_write_txn_connection():
+    con = None
     try:
         con = connect(readonly=False)
     except Exception as e:
         _warn_nonfatal("RISK_STATE_ACTIVE_WRITE_TXN_CONNECTION_FAILED", e)
         return None
-    return con if bool(getattr(con, "in_transaction", False)) else None
+    if bool(getattr(con, "in_transaction", False)):
+        return con
+    try:
+        con.close()
+    except Exception as e:
+        _warn_nonfatal("RISK_STATE_ACTIVE_WRITE_TXN_CONNECTION_CLOSE_FAILED", e)
+    return None
 
 
 def set_state(key: str, value: str):

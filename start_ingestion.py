@@ -86,6 +86,17 @@ def _bootstrap_ingestion_env() -> None:
     os.environ.setdefault("TRADING_DATA", _DATA_DIR)
     os.environ.setdefault("DB_PATH", str((Path(_DATA_DIR) / "trading.db").resolve()))
 
+    try:
+        from services.data_source_manager import (
+            apply_safe_no_credential_runtime_environment,
+            safe_no_credential_market_data_mode,
+        )
+
+        if safe_no_credential_market_data_mode():
+            apply_safe_no_credential_runtime_environment()
+    except Exception as e:
+        _warn_nonfatal("START_INGESTION_SAFE_ENV_SANITIZE_FAILED", e)
+
 
 def _read_pid_file_record() -> dict:
     try:
