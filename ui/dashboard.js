@@ -177,7 +177,7 @@ import {
   isDashboardScreenAllowed,
   wireDashboardPersonaControls
 } from "./view_router.js";
-import { initCommandPalette } from "./command_palette.mjs";
+import { initCommandPalette, isSafePaletteJobAction } from "./command_palette.mjs";
 
 import {
   loadNewsPanels,
@@ -4211,8 +4211,49 @@ function setJobStatusPill(running, exitCode) {
   }
 }
 
+function jobActionSafetyReason(name, action) {
+  const normalizedName = String(name || "").trim();
+  const normalizedAction = String(action || "").trim().toLowerCase();
+  if (!normalizedName || normalizedAction !== "start") return "";
+  if (isSafePaletteJobAction(normalizedName, normalizedAction)) return "";
+  if (isReadOnlyMode()) {
+    return "Execution barrier/read-only mode blocks this job.";
+  }
+  return "";
+}
+
+function applyJobActionSafety(btn) {
+  if (!btn) return;
+  const name = String(btn.getAttribute("data-job") || "").trim();
+  const action = String(btn.getAttribute("data-action") || "").trim().toLowerCase();
+  const unsafeStart = !!name && action === "start" && !isSafePaletteJobAction(name, action);
+  const reason = jobActionSafetyReason(name, action);
+  btn.classList.toggle("dangerAction", unsafeStart);
+  if (reason) {
+    btn.dataset.safetyBlocked = "1";
+    btn.disabled = true;
+    btn.setAttribute("aria-disabled", "true");
+    btn.title = reason;
+    return;
+  }
+  if (btn.dataset.safetyBlocked === "1") {
+    delete btn.dataset.safetyBlocked;
+    btn.removeAttribute("aria-disabled");
+    btn.title = btn.dataset.previousTitle || "";
+    delete btn.dataset.previousTitle;
+    if (btn.dataset.jobState !== "running") {
+      btn.disabled = false;
+    }
+  }
+}
+
+function syncJobActionSafetyState() {
+  document.querySelectorAll("button[data-job][data-action]").forEach(applyJobActionSafety);
+}
+
 function setJobButtonState(name, state) {
   document.querySelectorAll(`button[data-job="${name}"]`).forEach(btn => {
+    btn.dataset.jobState = state || "";
     btn.disabled = (state === "running");
     btn.classList.toggle("job-running", state === "running");
     btn.classList.toggle("job-error", state === "error");
@@ -4223,6 +4264,7 @@ function setJobButtonState(name, state) {
     if (state === "running") btn.textContent = `⏳ ${label}`;
     else if (state === "error") btn.textContent = `❌ ${label}`;
     else btn.textContent = label;
+    applyJobActionSafety(btn);
   });
 }
 
@@ -4346,6 +4388,10 @@ function confirmJobAction(name, action) {
 
 function wireJobActionButtons() {
   document.querySelectorAll("button[data-job][data-action]").forEach((btn) => {
+    if (!btn.dataset.previousTitle && btn.title) {
+      btn.dataset.previousTitle = btn.title;
+    }
+    applyJobActionSafety(btn);
     if (btn._boundJobAction) return;
     btn._boundJobAction = true;
     btn.addEventListener("click", async () => {
@@ -7399,6 +7445,8 @@ async function loadSystemStatusHeader(preloaded = {}) {
   }
   if (executionBarrier) {
     window.__LAST_EXECUTION_BARRIER__ = executionBarrier;
+    syncJobActionSafetyState();
+    applyReadOnlyBanner();
   }
 
   const unresolvedAlerts = Array.isArray(_lastAlerts)
@@ -7518,6 +7566,8 @@ async function loadExecutionBarrier() {
     const j = await fetchJSON("/api/execution/barrier", { allowBusinessFalse: true });
     if (!j || typeof j !== "object") throw new Error("barrier unavailable");
     window.__LAST_EXECUTION_BARRIER__ = j;
+    syncJobActionSafetyState();
+    applyReadOnlyBanner();
     updateDashboardLiveState({ executionBarrier: j }, { sourceTs: extractRealtimeTs(j, Date.now()) });
 
     pill.className = buildPillClassName(pill, j.allowed ? "ok" : "crit");
@@ -7529,6 +7579,8 @@ async function loadExecutionBarrier() {
 
   } catch (e) {
     window.__LAST_EXECUTION_BARRIER__ = { ok: false, allowed: false, real_trading_allowed: false };
+    syncJobActionSafetyState();
+    applyReadOnlyBanner();
     updateDashboardLiveState({ executionBarrier: window.__LAST_EXECUTION_BARRIER__ }, { sourceTs: Date.now() });
     pill.className = buildPillClassName(pill, "crit");
     pill.textContent = "execution: error";

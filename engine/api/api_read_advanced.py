@@ -369,7 +369,12 @@ def get_latest_portfolio_backtest():
     con = db_connect()
     try:
         if (not _table_exists(con, "portfolio_bt_runs")) or (not _table_exists(con, "portfolio_bt_points")):
-            return {"ok": False, "error": "no portfolio backtest runs", "run": None, "meta": {"ready": False, "count": 0}}
+            return {
+                "ok": False,
+                "error": "no portfolio backtest runs",
+                "run": None,
+                "meta": {"ready": False, "count": 0, "status": 200},
+            }
 
         row = con.execute(
             """
@@ -381,7 +386,12 @@ def get_latest_portfolio_backtest():
         ).fetchone()
 
         if not row:
-            return {"ok": False, "error": "no portfolio backtest runs", "run": None, "meta": {"ready": False, "count": 0}}
+            return {
+                "ok": False,
+                "error": "no portfolio backtest runs",
+                "run": None,
+                "meta": {"ready": False, "count": 0, "status": 200},
+            }
 
         run_id, ts_ms, start_ts_ms, end_ts_ms, metrics_json = row
 

@@ -126,6 +126,12 @@
     }
 
     button:hover{ background:var(--primary2); }
+    button:disabled,
+    input:disabled,
+    textarea:disabled{
+      opacity:.55;
+      cursor:not-allowed;
+    }
 
     button.secondary{ background:#64748b; }
     button.secondary:hover{ background:#475569; }
@@ -468,7 +474,7 @@
           <div class="row tight">
             <button class="mode active" id="modeSafe" onclick="setMode('safe')">REVIEW</button>
             <button class="mode" id="modeShadow" onclick="setMode('shadow')">DATA</button>
-            <button class="mode" id="modeLive" onclick="setMode('live')">TRADING</button>
+            <button class="mode" id="modeLive" onclick="setMode('live')" disabled aria-disabled="true" title="TRADING mode is locked in monitoring mode.">TRADING</button>
           </div>
         </div>
 
@@ -653,8 +659,8 @@
               </div>
               <div class="row tight">
                 <button class="ghost" onclick="validateConfig()">Validate</button>
-                <button onclick="saveConfig()">Save</button>
-                <button class="danger" onclick="factoryReset()">Factory Reset</button>
+                <button id="saveConfigBtn" onclick="saveConfig()" disabled title="Configuration writes are disabled in monitoring mode.">Save</button>
+                <button class="danger" id="factoryResetBtn" onclick="factoryReset()" disabled title="Factory reset is disabled in monitoring mode.">Factory Reset</button>
               </div>
             </div>
             <textarea id="configArea" spellcheck="false"></textarea>
@@ -677,10 +683,10 @@
 
             <div class="miniCard" style="margin-top:12px;">
               <div class="miniCardTitle">Add / Update Secret</div>
-              <input id="secretKey" placeholder="Key (e.g. IBKR_PASSWORD)"/>
-              <input id="secretValue" placeholder="Value" style="margin-top:8px;"/>
+              <input id="secretKey" placeholder="Key (e.g. IBKR_PASSWORD)" disabled/>
+              <input id="secretValue" placeholder="Value" style="margin-top:8px;" disabled/>
               <div style="margin-top:14px;">
-                <button onclick="saveSecret()">Save Secret</button>
+                <button id="saveSecretBtn" onclick="saveSecret()" disabled title="Secret writes are disabled in monitoring mode.">Save Secret</button>
               </div>
               <div class="muted" id="secretsMsg" style="margin-top:10px;"></div>
             </div>
@@ -894,6 +900,40 @@ function operatorTelemetryWsUrl(){
 }
 
 let selectedMode = "safe"; // safe | shadow | live
+const OPERATOR_LIVE_MODE_UI_ENABLED = false;
+const OPERATOR_ADMIN_WRITES_ENABLED = false;
+
+function adminWritesEnabled(){
+  return OPERATOR_ADMIN_WRITES_ENABLED === true;
+}
+
+function liveModeUiEnabled(){
+  return OPERATOR_LIVE_MODE_UI_ENABLED === true;
+}
+
+function applyMonitoringSafetyLocks(){
+  const live = document.getElementById("modeLive");
+  if(live && !liveModeUiEnabled()){
+    live.disabled = true;
+    live.setAttribute("aria-disabled", "true");
+    live.title = "TRADING mode is locked in monitoring mode.";
+  }
+
+  const lockedWrites = [
+    ["saveConfigBtn", "Configuration writes are disabled in monitoring mode."],
+    ["factoryResetBtn", "Factory reset is disabled in monitoring mode."],
+    ["secretKey", "Secret writes are disabled in monitoring mode."],
+    ["secretValue", "Secret writes are disabled in monitoring mode."],
+    ["saveSecretBtn", "Secret writes are disabled in monitoring mode."]
+  ];
+  for(const [id, title] of lockedWrites){
+    const el = document.getElementById(id);
+    if(!el || adminWritesEnabled()) continue;
+    el.disabled = true;
+    el.setAttribute("aria-disabled", "true");
+    el.title = title;
+  }
+}
 
 // --------------------------------------------------
 // LIVE TELEMETRY STREAM
@@ -1156,6 +1196,12 @@ function renderModePanels(mode){
 }
 
 function setMode(mode){
+  if(mode === "live" && !liveModeUiEnabled()){
+    selectedMode = "safe";
+    const msg = document.getElementById("wizardMsg");
+    if(msg) msg.innerText = "TRADING mode is locked in monitoring mode.";
+    mode = "safe";
+  }
   selectedMode = mode;
   document.getElementById("modeSafe").classList.toggle("active", mode === "safe");
   document.getElementById("modeShadow").classList.toggle("active", mode === "shadow");
@@ -1339,8 +1385,11 @@ async function loadConfig(){
   const obj = await jget("/api/operator/config");
   const text = Object.entries(obj).map(([k,v]) => `${k}=${v}`).join("\n");
   document.getElementById("configArea").value = text;
-  document.getElementById("configMsg").innerText = "—";
+  document.getElementById("configMsg").innerText = adminWritesEnabled()
+    ? "—"
+    : "Monitoring mode: configuration writes are disabled.";
   await updateDashboardLink();
+  applyMonitoringSafetyLocks();
 }
 
 async function validateConfig(){
@@ -1353,6 +1402,10 @@ async function validateConfig(){
 }
 
 async function saveConfig(){
+  if(!adminWritesEnabled()){
+    document.getElementById("configMsg").innerText = "Monitoring mode: configuration writes are disabled.";
+    return;
+  }
   const lines = document.getElementById("configArea").value.split("\n");
   const obj = {};
 
@@ -1395,9 +1448,17 @@ async function loadLogs(){
 async function loadSecrets(){
   const r = await jget("/api/operator/secrets");
   document.getElementById("secretKeys").innerText = (r.keys || []).join(", ") || "—";
+  if(!adminWritesEnabled()){
+    document.getElementById("secretsMsg").innerText = "Monitoring mode: secret writes are disabled.";
+  }
+  applyMonitoringSafetyLocks();
 }
 
 async function saveSecret(){
+  if(!adminWritesEnabled()){
+    document.getElementById("secretsMsg").innerText = "Monitoring mode: secret writes are disabled.";
+    return;
+  }
   const key = document.getElementById("secretKey").value.trim();
   const val = document.getElementById("secretValue").value;
 
@@ -1568,9 +1629,6 @@ async function renderConnectionStatus(){
     const h = unwrapHealthResponse(r);
 
     if(h.broker_connection && !h.broker_connection.ok){
-
-  console.warn("Broker connection lost");
-
   document.getElementById("txtState").innerText =
     "State: Broker disconnected";
 
@@ -1886,6 +1944,10 @@ async function clearLastError(){
 }
 
 async function factoryReset(){
+  if(!adminWritesEnabled()){
+    document.getElementById("configMsg").innerText = "Monitoring mode: factory reset is disabled.";
+    return;
+  }
   if(!confirm("Factory reset deletes .env and secrets and clears operator state. Continue?")) return;
   await jpost("/api/operator/factoryReset", { confirm:"FACTORY_RESET" });
   await refreshAll();
@@ -2334,6 +2396,7 @@ window.runSystemUpdate = runSystemUpdate;
 window.restartOperatorService = restartOperatorService;
 
 (async function boot(){
+  applyMonitoringSafetyLocks();
   startTelemetryStream();
 
   await _runRefreshAll(true);

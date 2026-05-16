@@ -322,6 +322,8 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: "1mb" }));
+app.use("/ui", express.static(path.join(__dirname, "../ui")));
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
 app.use((err, _req, res, next) => {
   if (!err) return next();
   if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
@@ -3066,6 +3068,24 @@ function writeOperatorDbCache(key, payload) {
   } else if (key === "db_schema") {
     _dbSchemaCache = entry;
   }
+}
+
+function rowsFromOperatorPayload(payload, keys = []) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  for (const key of keys) {
+    const rows = payload[key];
+    if (Array.isArray(rows)) return rows;
+  }
+  if (Array.isArray(payload.rows)) return payload.rows;
+  if (payload.data && typeof payload.data === "object") {
+    for (const key of keys) {
+      const rows = payload.data[key];
+      if (Array.isArray(rows)) return rows;
+    }
+    if (Array.isArray(payload.data.rows)) return payload.data.rows;
+  }
+  return [];
 }
 
 async function verifyHealth(options = {}) {
@@ -6100,7 +6120,7 @@ app.get("/api/operator/proxy/:name", wrapOperatorRoute(async (req, res) => {
 // --------------------------------------------
 app.get("/api/operator/bootstrap_counts", wrapOperatorRoute(async (req, res) => {
   const payload = await loadBootstrapCountsPayload();
-  return sendOperatorPayload(res, payload, payload && payload.ok ? 200 : 503);
+  return jsonState(res, payload, 200);
 }));
 
 // --------------------------------------------
@@ -6545,9 +6565,9 @@ app.get("/api/operator/trading_monitor", wrapOperatorRoute(async (req, res) => {
     const ok = !!(positions.ok || openOrders.ok || fills.ok || pnl.ok || risk.ok);
     return sendOperatorPayload(res, {
       ok,
-      positions: positions.ok ? (positions.json.positions || positions.json || []) : [],
-      open_orders: openOrders.ok ? (openOrders.json.orders || openOrders.json || []) : [],
-      recent_fills: fills.ok ? (fills.json.fills || fills.json || []) : [],
+      positions: positions.ok ? rowsFromOperatorPayload(positions.json, ["positions"]) : [],
+      open_orders: openOrders.ok ? rowsFromOperatorPayload(openOrders.json, ["orders", "broker", "portfolio"]) : [],
+      recent_fills: fills.ok ? rowsFromOperatorPayload(fills.json, ["fills"]) : [],
       pnl: pnl.ok ? (pnl.json || {}) : {},
       risk: risk.ok ? (risk.json || {}) : {},
       degradedComponents: [
@@ -6587,7 +6607,7 @@ app.get("/api/operator/trade_blotter", wrapOperatorRoute(async (req, res) => {
     const base = dashBaseUrlFromEnv(envObj);
 
     const fills = await httpGetJson(`${base}/api/terminal/fills`);
-    const tradesRaw = fills.ok ? (fills.json.fills || fills.json || []) : [];
+    const tradesRaw = fills.ok ? rowsFromOperatorPayload(fills.json, ["fills"]) : [];
 
     const trades = tradesRaw.map((t) => ({
       ts: t.ts || t.timestamp || "",

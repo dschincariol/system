@@ -42,6 +42,24 @@ def _warn_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
     )
 
 
+def _table_columns(con, table_name: str) -> set[str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table_name})").fetchall() or []
+        return {str(row[1] or "").strip() for row in rows}
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_WEATHER_WIDGETS_TABLE_COLUMNS_FAILED", e, table=str(table_name))
+        return set()
+
+
+def _optional_metric(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 def get_weather_snapshot_for_symbol(symbol: str, ts_ms: Optional[int] = None) -> Dict[str, Any]:
     if ts_ms is None:
         ts_ms = _utc_ms()
@@ -61,11 +79,15 @@ def get_weather_effect_summary(ts_ms: Optional[int] = None) -> Dict[str, Any]:
 
     con = connect()
     try:
+        columns = _table_columns(con, "model_weather_effect")
+        base_spearman_expr = "base_spearman" if "base_spearman" in columns else "NULL AS base_spearman"
+        wx_spearman_expr = "wx_spearman" if "wx_spearman" in columns else "NULL AS wx_spearman"
+        spearman_delta_expr = "spearman_delta" if "spearman_delta" in columns else "NULL AS spearman_delta"
         rows = con.execute(
-            """
+            f"""
             SELECT horizon_s, ts_ms,
                    base_rmse, wx_rmse, rmse_delta,
-                   base_spearman, wx_spearman, spearman_delta,
+                   {base_spearman_expr}, {wx_spearman_expr}, {spearman_delta_expr},
                    n_eval
             FROM model_weather_effect
             WHERE key_type='global' AND key='global'
@@ -90,14 +112,26 @@ def get_weather_effect_summary(ts_ms: Optional[int] = None) -> Dict[str, Any]:
                 "base_rmse": float(r[2] or 0.0),
                 "wx_rmse": float(r[3] or 0.0),
                 "rmse_delta": float(r[4] or 0.0),
-                "base_spearman": float(r[5] or 0.0),
-                "wx_spearman": float(r[6] or 0.0),
-                "spearman_delta": float(r[7] or 0.0),
+                "base_spearman": _optional_metric(r[5]),
+                "wx_spearman": _optional_metric(r[6]),
+                "spearman_delta": _optional_metric(r[7]),
                 "n_eval": int(r[8] or 0),
             }
 
         out = [best[k] for k in sorted(best.keys())]
-        return {"ts_ms": int(ts_ms), "series": out}
+        return {
+            "ts_ms": int(ts_ms),
+            "series": out,
+            "meta": {
+                "ready": bool(out),
+                "status": 200,
+                "missing_columns": sorted(
+                    col
+                    for col in ("base_spearman", "wx_spearman", "spearman_delta")
+                    if col not in columns
+                ),
+            },
+        }
     finally:
         try:
             con.close()

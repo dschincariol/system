@@ -163,6 +163,18 @@ def test_dashboard_html_js_surface_static_smoke():
     assert assets, "dashboard asset graph should not be empty"
 
 
+def test_dashboard_unsafe_job_buttons_fail_closed_with_execution_barrier():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+
+    assert 'data-job="broker_apply_orders" data-action="start"' in html
+    assert "isSafePaletteJobAction" in js
+    assert "function syncJobActionSafetyState" in js
+    assert "Execution barrier/read-only mode blocks this job." in js
+    assert "window.__LAST_EXECUTION_BARRIER__ = j;" in js
+    assert "syncJobActionSafetyState();" in js
+
+
 def test_dashboard_ui_api_paths_are_registered_or_documented():
     route_snapshot = _dashboard_route_snapshot()
     refs = collect_dashboard_endpoint_references(root=REPO_ROOT)

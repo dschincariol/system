@@ -452,20 +452,21 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             try:
                 parsed = urlparse(self.path)
                 path = parsed.path or "/"
+                static_root_name = os.path.basename(os.path.normpath(_STATIC_DIR))
+                dashboard_path = "/dashboard.html" if static_root_name == "ui" else "/ui/dashboard.html"
+                terminal_path = "/terminal/terminal.html" if static_root_name == "ui" else "/ui/terminal/terminal.html"
 
                 if path in ("/", "/dashboard", "/dashboard.html"):
-                    self.path = "/ui/dashboard.html"
+                    self.path = dashboard_path
                     return
 
                 if path in ("/ui", "/ui/"):
-                    self.path = "/ui/dashboard.html"
+                    self.path = dashboard_path
                     return
 
                 if path in ("/terminal", "/terminal.html"):
-                    self.path = "/ui/terminal/terminal.html"
+                    self.path = terminal_path
                     return
-
-                static_root_name = os.path.basename(os.path.normpath(_STATIC_DIR))
 
                 # allow /ui/... when static root is project root
                 if path.startswith("/ui/"):

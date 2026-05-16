@@ -3523,7 +3523,13 @@ def api_get_supervisor_diagnostics(_parsed, ctx=None):
         "reasons": _dedupe_reasons(snapshot.get("reasons"), graph.get("reasons"), services.get("reasons"), ingestion.get("reasons")),
         "ts_ms": int(time.time() * 1000),
     }
-    return _snapshot_response(snapshot, ok=bool(diagnostics.get("ok")), supervisor_diagnostics=diagnostics, **diagnostics)
+    diagnostics_extra = {k: v for k, v in diagnostics.items() if k != "ok"}
+    return _snapshot_response(
+        snapshot,
+        ok=bool(diagnostics.get("ok")),
+        supervisor_diagnostics=diagnostics,
+        **diagnostics_extra,
+    )
 
 # ----------------------------------------------------------------------
 # TELEMETRY
