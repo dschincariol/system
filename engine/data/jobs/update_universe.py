@@ -28,8 +28,6 @@ from engine.data.default_symbols import load_default_symbols, parse_symbol_limit
 from engine.data.universe import extract_symbol_candidates, upsert_symbol
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import (
-    _ensure_sec_filings_schema,
-    _ensure_universe_audit_schema,
     acquire_job_lock,
     connect,
     init_db,
@@ -181,10 +179,19 @@ def _decay_scores(con) -> None:
         con.execute(
             """
             UPDATE symbols
-            SET score = MAX(?, score * (1.0 - ?)),
+            SET score = CASE
+                    WHEN score * (1.0 - ?) < ? THEN ?
+                    ELSE score * (1.0 - ?)
+                END,
                 updated_ts_ms = ?
             """,
-            (float(UNIVERSE_MIN_SCORE_FLOOR), float(UNIVERSE_SCORE_DECAY_PER_RUN), _now_ms()),
+            (
+                float(UNIVERSE_SCORE_DECAY_PER_RUN),
+                float(UNIVERSE_MIN_SCORE_FLOOR),
+                float(UNIVERSE_MIN_SCORE_FLOOR),
+                float(UNIVERSE_SCORE_DECAY_PER_RUN),
+                _now_ms(),
+            ),
         )
     except Exception as e:
         _warn_nonfatal("UPDATE_UNIVERSE_DECAY_SCORES_FAILED", e, once_key="decay_scores")
@@ -932,8 +939,6 @@ def main() -> None:
     started_ms = _now_ms()
     con = connect()
     try:
-        _ensure_sec_filings_schema(con)
-        _ensure_universe_audit_schema(con)
         now_ms = _now_ms()
         _seed_baseline(con)
         _decay_scores(con)

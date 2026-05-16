@@ -1638,6 +1638,55 @@ class StartupHealthValidationTests(unittest.TestCase):
 
         self.assertEqual(events, ["sync:safe", "run_server"])
 
+    def test_start_system_dashboard_return_requires_current_clean_shutdown(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+
+        self.assertFalse(
+            start_system._dashboard_returned_after_clean_shutdown(
+                {"state": "LIVE", "detail": "market_data_healthy", "last_clean_shutdown_ts_ms": "99"},
+                run_enter_ts_ms=100,
+            )
+        )
+        self.assertTrue(
+            start_system._dashboard_returned_after_clean_shutdown(
+                {"state": "LIVE", "detail": "market_data_healthy", "last_clean_shutdown_ts_ms": "101"},
+                run_enter_ts_ms=100,
+            )
+        )
+        self.assertTrue(
+            start_system._dashboard_returned_after_clean_shutdown(
+                {"state": "SHUTTING_DOWN", "detail": "clean_shutdown"},
+                run_enter_ts_ms=100,
+            )
+        )
+
+    def test_start_system_dashboard_return_accepts_server_stop_event(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+
+        stop_event = threading.Event()
+        stop_event.set()
+        previous_dashboard = sys.modules.get("dashboard_server")
+        sys.modules["dashboard_server"] = types.SimpleNamespace(_SERVER_STOP_EVENT=stop_event)
+        try:
+            self.assertTrue(
+                start_system._dashboard_returned_after_clean_shutdown(
+                    {"state": "LIVE", "detail": "market_data_healthy", "last_clean_shutdown_ts_ms": "0"},
+                    run_enter_ts_ms=100,
+                )
+            )
+            self.assertFalse(
+                start_system._dashboard_returned_after_clean_shutdown(
+                    {"state": "LIVE", "detail": "market_data_healthy", "last_clean_shutdown_ts_ms": "0"},
+                    run_enter_ts_ms=100,
+                    stop_requested_at_enter=True,
+                )
+            )
+        finally:
+            if previous_dashboard is None:
+                sys.modules.pop("dashboard_server", None)
+            else:
+                sys.modules["dashboard_server"] = previous_dashboard
+
     def test_start_system_post_bind_validation_waits_for_dashboard_bind(self) -> None:
         os.environ["TRADING_STARTUP_HEALTH_ASYNC_BIND"] = "1"
         (start_system,) = _reload_modules("start_system")

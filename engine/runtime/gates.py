@@ -253,11 +253,12 @@ def _explicit_execution_degraded_snapshot(execution_degraded: Any) -> Dict[str, 
     }
 
 
-def _portfolio_execution_degraded_snapshot() -> Dict[str, Any]:
-    if not callable(_get_risk_state):
+def _portfolio_execution_degraded_snapshot(risk_state_getter=None) -> Dict[str, Any]:
+    get_risk_state = risk_state_getter if callable(risk_state_getter) else _get_risk_state
+    if not callable(get_risk_state):
         return {"source": "portfolio_runtime", "active": False, "severity": "WARNING", "reason": "", "reason_codes": [], "detail": {}}
     try:
-        payload = _json_dict_or_empty(_get_risk_state("portfolio_runtime_health", ""))
+        payload = _json_dict_or_empty(get_risk_state("portfolio_runtime_health", ""))
         reasons = list(payload.get("degraded_reasons") or [])
         reason_codes = [
             str((row or {}).get("code") or "").strip()
@@ -361,10 +362,10 @@ def _event_bus_execution_degraded_snapshot() -> Dict[str, Any]:
         }
 
 
-def get_execution_degraded_snapshot(execution_degraded: Any = False) -> Dict[str, Any]:
+def get_execution_degraded_snapshot(execution_degraded: Any = False, *, risk_state_getter=None) -> Dict[str, Any]:
     sources = [
         _explicit_execution_degraded_snapshot(execution_degraded),
-        _portfolio_execution_degraded_snapshot(),
+        _portfolio_execution_degraded_snapshot(risk_state_getter=risk_state_getter),
         _event_bus_execution_degraded_snapshot(),
     ]
     active_sources = [dict(source) for source in sources if bool(source.get("active"))]
@@ -413,6 +414,7 @@ def execution_gate_snapshot(
     kill_switches: Optional[Dict[str, Any]] = None,
     execution_degraded: bool = False,
     portfolio_risk_gate: Optional[Dict[str, Any]] = None,
+    risk_state_getter=None,
 ) -> Dict[str, Any]:
     """Build the current execution barrier snapshot.
 
@@ -432,6 +434,9 @@ def execution_gate_snapshot(
         fields; a truthy scalar is treated as critical.
     portfolio_risk_gate : dict[str, Any] | None, optional
         Portfolio-risk gate snapshot that can independently block order flow.
+    risk_state_getter : callable | None, optional
+        Read-only risk-state accessor used by callers that already own a DB
+        handle and must avoid opening nested runtime connections.
 
     Returns
     -------
@@ -764,7 +769,10 @@ def execution_gate_snapshot(
             "severity_reasons": severity_reasons,
         }
 
-    execution_degraded_state = get_execution_degraded_snapshot(execution_degraded)
+    execution_degraded_state = get_execution_degraded_snapshot(
+        execution_degraded,
+        risk_state_getter=risk_state_getter,
+    )
     if execution_degraded_state.get("active") and execution_degraded_state.get("severity") == "CRITICAL":
         return {
             "ok": True,
@@ -791,13 +799,14 @@ def execution_gate_snapshot(
         }
 
     portfolio_risk_state = None
-    if callable(_get_risk_state):
+    get_risk_state = risk_state_getter if callable(risk_state_getter) else _get_risk_state
+    if callable(get_risk_state):
         try:
-            portfolio_risk_block = str(_get_risk_state("portfolio_risk_block", "0") or "0").strip()
-            portfolio_risk_info_raw = str(_get_risk_state("portfolio_risk_info", "") or "")
-            portfolio_risk_summary_raw = str(_get_risk_state("portfolio_risk_summary", "") or "")
-            portfolio_risk_status = str(_get_risk_state("portfolio_risk_status", "") or "").strip()
-            portfolio_risk_ts_ms = str(_get_risk_state("portfolio_risk_ts_ms", "0") or "0").strip()
+            portfolio_risk_block = str(get_risk_state("portfolio_risk_block", "0") or "0").strip()
+            portfolio_risk_info_raw = str(get_risk_state("portfolio_risk_info", "") or "")
+            portfolio_risk_summary_raw = str(get_risk_state("portfolio_risk_summary", "") or "")
+            portfolio_risk_status = str(get_risk_state("portfolio_risk_status", "") or "").strip()
+            portfolio_risk_ts_ms = str(get_risk_state("portfolio_risk_ts_ms", "0") or "0").strip()
 
             portfolio_risk_info = {}
             if portfolio_risk_info_raw:

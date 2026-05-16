@@ -123,12 +123,12 @@ def _trace_section(name: str, started: float, **extra: Any) -> None:
     if extra:
         payload.update(dict(extra))
     try:
-        trace_event(
+        log.info(
             "health_snapshot_section",
-            component="engine.runtime.health",
-            entity_type="health",
-            entity_id="runtime_snapshot",
-            payload=payload,
+            extra={
+                "event": "health_snapshot_section",
+                "extra_json": payload,
+            },
         )
     except Exception as e:
         _warn("health.trace_section", e, section=str(name))
@@ -221,11 +221,28 @@ def _json_list_or_empty(raw: Any) -> List[Any]:
     return list(payload) if isinstance(payload, list) else []
 
 
-def _portfolio_runtime_snapshot() -> Dict[str, Any]:
+def _risk_state_value_readonly(con, key: str, default: str = "") -> str:
+    owns_con = con is None
+    db = con or _db_connect()
     try:
-        from engine.runtime.risk_state import get_state  # type: ignore
+        if not _table_exists(db, "risk_state"):
+            return str(default)
+        row = db.execute(
+            "SELECT value FROM risk_state WHERE key=?",
+            (str(key),),
+        ).fetchone()
+        return str(row[0]) if row and row[0] is not None else str(default)
+    finally:
+        if owns_con:
+            try:
+                db.close()
+            except Exception:
+                pass
 
-        payload = _json_dict_or_empty(get_state("portfolio_runtime_health", ""))
+
+def _portfolio_runtime_snapshot(con=None) -> Dict[str, Any]:
+    try:
+        payload = _json_dict_or_empty(_risk_state_value_readonly(con, "portfolio_runtime_health", ""))
     except Exception as e:
         _warn("health.portfolio_runtime.load", e)
         return {
@@ -278,11 +295,16 @@ def _portfolio_runtime_snapshot() -> Dict[str, Any]:
     }
 
 
-def _execution_degraded_snapshot() -> Dict[str, Any]:
+def _execution_degraded_snapshot(con=None) -> Dict[str, Any]:
     try:
         from engine.runtime.gates import get_execution_degraded_snapshot  # type: ignore
 
-        payload = dict(get_execution_degraded_snapshot() or {})
+        payload = dict(
+            get_execution_degraded_snapshot(
+                risk_state_getter=lambda key, default="": _risk_state_value_readonly(con, str(key), str(default)),
+            )
+            or {}
+        )
         if not isinstance(payload, dict):
             payload = {}
         payload.setdefault("active", False)
@@ -398,6 +420,7 @@ def _refresh_execution_barrier_snapshot_with_con(
                 get_execution_mode_fn=get_execution_mode_fn,
                 kill_switches=kill_switches,
                 execution_degraded=dict(execution_degraded or {}),
+                risk_state_getter=lambda key, default="": _risk_state_value_readonly(con, str(key), str(default)),
             )
             or {}
         )
@@ -2742,6 +2765,7 @@ def get_health_snapshot():
                 snap = execution_gate_snapshot(
                     get_execution_mode_fn=_get_execution_mode,
                     kill_switches=_read_kill_switch_snapshot_readonly(con=con),
+                    risk_state_getter=lambda key, default="": _risk_state_value_readonly(con, str(key), str(default)),
                 )
                 if isinstance(snap, dict):
                     out["execution_barrier"] = snap
@@ -3141,7 +3165,7 @@ def get_health_snapshot():
         # ---------------------------
         section_started = time.perf_counter()
         try:
-            out["portfolio_runtime"] = _portfolio_runtime_snapshot()
+            out["portfolio_runtime"] = _portfolio_runtime_snapshot(con=con)
         except Exception as e:
             _warn("health.portfolio_runtime", e)
             out["portfolio_runtime"] = {
@@ -3160,7 +3184,7 @@ def get_health_snapshot():
         # ---------------------------
         section_started = time.perf_counter()
         try:
-            out["execution_degraded"] = _execution_degraded_snapshot()
+            out["execution_degraded"] = _execution_degraded_snapshot(con=con)
         except Exception as e:
             _warn("health.execution_degraded", e)
             out["execution_degraded"] = {

@@ -402,7 +402,7 @@ class StorageConnection:
 
 def _normalize_sql(sql: str, raw=None) -> str:
     text = to_pg_params(str(sql or ""))
-    text = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", text, flags=re.IGNORECASE)
+    text = _rewrite_insert_or_ignore(text)
     text = _rewrite_insert_or_replace(text, raw)
     text = _rewrite_json_extract(text)
     text = re.sub(
@@ -476,6 +476,15 @@ def _primary_key_columns(raw, table: str) -> tuple[str, ...]:
 
 def _identifier_csv(columns: Sequence[str]) -> str:
     return ", ".join(_ident(str(column)) for column in columns)
+
+
+def _rewrite_insert_or_ignore(sql: str) -> str:
+    if not re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", str(sql or ""), re.IGNORECASE):
+        return str(sql or "")
+    text = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", str(sql or ""), flags=re.IGNORECASE)
+    if "ON CONFLICT" in text.upper():
+        return text
+    return text.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
 
 
 def _rewrite_insert_or_replace(sql: str, raw=None) -> str:
@@ -730,16 +739,25 @@ def _pg_table_lookup(con: StorageConnection, params: Any, *, object_type: str) -
 def _pg_index_lookup(con: StorageConnection, params: Any) -> list[tuple[str]]:
     values = tuple(params or ())
     if not values:
-        return []
-    rows = con.raw.execute(
-        """
-        SELECT indexname
-        FROM pg_indexes
-        WHERE schemaname = ANY (current_schemas(false))
-          AND indexname = ANY (%s)
-        """,
-        (list(str(v) for v in values),),
-    ).fetchall()
+        rows = con.raw.execute(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = ANY (current_schemas(false))
+            ORDER BY indexname
+            """
+        ).fetchall()
+    else:
+        rows = con.raw.execute(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = ANY (current_schemas(false))
+              AND indexname = ANY (%s)
+            ORDER BY indexname
+            """,
+            (list(str(v) for v in values),),
+        ).fetchall()
     return [(str(row[0]),) for row in rows]
 
 
@@ -1035,6 +1053,7 @@ def init_db(schema: str | None = None):
                 from engine.execution.execution_ledger import init_execution_ledger
 
                 init_execution_ledger()
+                _ensure_alert_prediction_schema()
                 _ensure_sqlite_compat_bigints()
                 _PK_CACHE.clear()
                 _AUTO_INIT_SCHEMAS.add(schema_name())
@@ -1083,6 +1102,19 @@ def _ensure_walk_forward_registry_columns() -> None:
             con.execute("ALTER TABLE walk_forward_scores ADD COLUMN IF NOT EXISTS model_name TEXT")
             con.execute("ALTER TABLE walk_forward_scores ADD COLUMN IF NOT EXISTS model_version TEXT")
             con.execute("ALTER TABLE walk_forward_scores ADD COLUMN IF NOT EXISTS model_kind TEXT")
+        con.commit()
+
+
+def _ensure_alert_prediction_schema() -> None:
+    with connection(readonly=False) as con:
+        if _compat_table_exists(con, "alerts"):
+            con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS prediction_id BIGINT")
+            con.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_alerts_prediction_id
+                ON alerts(prediction_id, ts_ms DESC)
+                """
+            )
         con.commit()
 
 

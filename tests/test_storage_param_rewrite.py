@@ -49,6 +49,13 @@ def test_preserves_json_question_operator():
     assert to_pg_params(sql) == "SELECT * FROM events WHERE meta_json ? 'source' AND symbol=%s"
 
 
+def test_rewrites_case_then_placeholder_before_else():
+    sql = "UPDATE data_sources SET last_success_ts_ms = CASE WHEN ? = 1 THEN ? ELSE last_success_ts_ms END"
+    assert to_pg_params(sql) == (
+        "UPDATE data_sources SET last_success_ts_ms = CASE WHEN %s = 1 THEN %s ELSE last_success_ts_ms END"
+    )
+
+
 def test_preserves_json_question_array_operators():
     sql = "SELECT * FROM events WHERE meta_json ?| array['a', 'b'] AND tags ?& array['x'] AND symbol=?"
     assert to_pg_params(sql) == (

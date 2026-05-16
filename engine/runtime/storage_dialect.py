@@ -28,6 +28,16 @@ def _prev_significant_char(sql: str, idx: int) -> str:
     return sql[pos] if pos >= 0 else ""
 
 
+def _prev_word(sql: str, idx: int) -> str:
+    pos = idx - 1
+    while pos >= 0 and sql[pos].isspace():
+        pos -= 1
+    end = pos + 1
+    while pos >= 0 and (sql[pos].isalnum() or sql[pos] == "_"):
+        pos -= 1
+    return sql[pos + 1 : end].upper()
+
+
 def _next_starts_json_key(sql: str, idx: int) -> bool:
     idx = _skip_ws(sql, idx)
     if idx >= len(sql):
@@ -47,6 +57,22 @@ def _is_json_question_operator(sql: str, idx: int) -> bool:
 
     prev = _prev_significant_char(sql, idx)
     if not prev or (not _is_ident_char(prev) and prev not in _JSON_EXPR_END_CHARS):
+        return False
+    if _prev_word(sql, idx) in {
+        "AS",
+        "CASE",
+        "ELSE",
+        "IN",
+        "IS",
+        "ON",
+        "RETURNING",
+        "SELECT",
+        "SET",
+        "THEN",
+        "VALUES",
+        "WHEN",
+        "WHERE",
+    }:
         return False
     return _next_starts_json_key(sql, idx + 1)
 

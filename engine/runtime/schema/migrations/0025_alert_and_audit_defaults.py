@@ -27,6 +27,11 @@ def _column_exists(conn, table_name: str, column_name: str) -> bool:
 
 def up(conn) -> None:
     conn.execute("ALTER TABLE IF EXISTS alerts ADD COLUMN IF NOT EXISTS prediction_id BIGINT")
+    if _column_exists(conn, "alerts", "prediction_id"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_prediction_id "
+            "ON alerts(prediction_id, ts_ms DESC)"
+        )
     if _column_exists(conn, "alerts", "dedupe_key"):
         conn.execute(
             "ALTER TABLE alerts ALTER COLUMN dedupe_key "

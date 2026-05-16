@@ -1982,6 +1982,45 @@ def _run_dashboard_server(run_server, *, mode: str) -> None:
     _perform_startup_health_validation(mode=str(mode))
     run_server()
 
+
+def _coerce_ts_ms(value: Any) -> int:
+    try:
+        return int(str(value or "0").strip() or "0")
+    except Exception:
+        return 0
+
+
+def _dashboard_stop_requested() -> bool:
+    try:
+        module = sys.modules.get("dashboard_server")
+        event = getattr(module, "_SERVER_STOP_EVENT", None) if module is not None else None
+        return bool(callable(getattr(event, "is_set", None)) and event.is_set())
+    except Exception:
+        return False
+
+
+def _dashboard_returned_after_clean_shutdown(
+    lifecycle: Dict[str, Any],
+    *,
+    run_enter_ts_ms: int,
+    stop_requested_at_enter: bool = False,
+) -> bool:
+    try:
+        from engine.runtime.lifecycle_state import SHUTTING_DOWN
+
+        if str(lifecycle.get("state") or "").strip().upper() == str(SHUTTING_DOWN):
+            return True
+    except Exception:
+        if str(lifecycle.get("state") or "").strip().upper() in {"SHUTTING_DOWN", "SHUTDOWN", "SHUTTING"}:
+            return True
+
+    if _dashboard_stop_requested() and not bool(stop_requested_at_enter):
+        return True
+
+    clean_ts_ms = _coerce_ts_ms(lifecycle.get("last_clean_shutdown_ts_ms"))
+    return bool(clean_ts_ms > 0 and clean_ts_ms >= int(run_enter_ts_ms or 0))
+
+
 def _handle_signal(signum, _frame) -> None:
     _INGESTION_WATCHDOG_STOP.set()
     try:
@@ -2385,6 +2424,8 @@ def main():
                 minimum=1,
                 maximum=65535,
             )
+            dashboard_run_enter_ts_ms = int(time.time() * 1000)
+            dashboard_stop_requested_at_enter = _dashboard_stop_requested()
             if _STARTUP_HEALTH_ASYNC_BIND:
                 _run_dashboard_server_post_bind_validation(
                     run_server,
@@ -2397,10 +2438,14 @@ def main():
             _safe_print("[start_system] dashboard_server_run_server_returned")
 
             try:
-                from engine.runtime.lifecycle_state import get_state, SHUTTING_DOWN
+                from engine.runtime.lifecycle_state import get_state
                 _lc = get_state() or {}
-                _lc_state = str(_lc.get("state") or "").strip().upper()
-                if _lc_state != str(SHUTTING_DOWN):
+                if not _dashboard_returned_after_clean_shutdown(
+                    dict(_lc),
+                    run_enter_ts_ms=int(dashboard_run_enter_ts_ms),
+                    stop_requested_at_enter=bool(dashboard_stop_requested_at_enter),
+                ):
+                    _lc_state = str(_lc.get("state") or "").strip().upper()
                     raise RuntimeError(
                         "dashboard_server_returned_without_clean_shutdown:"
                         f"{_lc_state or 'UNKNOWN'}:"

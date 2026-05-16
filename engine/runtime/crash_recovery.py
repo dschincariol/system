@@ -108,6 +108,42 @@ def _table_exists(con, table_name: str) -> bool:
         return False
 
 
+def _is_timescale_hypertable(con, table_name: str) -> bool:
+    try:
+        if not hasattr(con, "raw"):
+            return False
+        row = con.execute(
+            """
+            SELECT 1
+            FROM timescaledb_information.hypertables
+            WHERE hypertable_schema = ANY (current_schemas(false))
+              AND hypertable_name = ?
+            LIMIT 1
+            """,
+            (str(table_name),),
+        ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _ensure_replay_key_index(con) -> None:
+    if _is_timescale_hypertable(con, "crash_recovery_audit"):
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_crash_recovery_audit_replay_key
+              ON crash_recovery_audit(replay_key)
+            """
+        )
+        return
+    con.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_crash_recovery_audit_replay_key
+          ON crash_recovery_audit(replay_key)
+        """
+    )
+
+
 def _ensure_tables(con) -> None:
     # Recovery audit is append-only and idempotence-keyed so boot-time replay
     # can be retried without duplicating the same restoration action.
@@ -130,11 +166,9 @@ def _ensure_tables(con) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_crash_recovery_audit_type
           ON crash_recovery_audit(event_type);
-
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_crash_recovery_audit_replay_key
-          ON crash_recovery_audit(replay_key);
         """
     )
+    _ensure_replay_key_index(con)
     con.commit()
 
 def _audit_event(
@@ -149,9 +183,15 @@ def _audit_event(
     detail: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
+        existing = con.execute(
+            "SELECT 1 FROM crash_recovery_audit WHERE replay_key=? LIMIT 1",
+            (str(replay_key),),
+        ).fetchone()
+        if existing:
+            return False
         cur = con.execute(
             """
-            INSERT OR IGNORE INTO crash_recovery_audit(
+            INSERT INTO crash_recovery_audit(
               ts_ms, event_type, client_order_id, broker_order_id, symbol, status, replay_key, detail_json
             )
             VALUES (?,?,?,?,?,?,?,?)
@@ -195,6 +235,12 @@ def _audit_event(
                 _warn("crash_recovery.audit_event.append_event", e, event_type=str(event_type), replay_key=str(replay_key))
         return inserted
     except Exception as e:
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            return False
         _warn("crash_recovery.audit_event", e, event_type=str(event_type), replay_key=str(replay_key))
         return False
 
