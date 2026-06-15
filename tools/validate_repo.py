@@ -106,6 +106,11 @@ def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
     run_env.setdefault("ENGINE_MODE", "safe")
     run_env.setdefault("EXECUTION_MODE", "safe")
     run_env.setdefault("OPERATOR_MODE", "safe")
+    run_env["APP_ENV"] = "test"
+    run_env["PROD_LOCK"] = "0"
+    run_env.pop("ENV", None)
+    run_env.pop("NODE_ENV", None)
+    run_env.pop("TS_ENV", None)
     run_env.setdefault("AUTO_BOOT_DAEMONS", "0")
     run_env.setdefault("AUTO_PIPELINE", "0")
     run_env["KILL_SWITCH_GLOBAL"] = "0"
@@ -155,15 +160,19 @@ def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
 def _telemetry_dual_write_burnin_required(env: dict[str, str]) -> bool:
     telemetry_validation_enabled = _env_truthy(env.get("TIMESCALE_TELEMETRY_VALIDATION_ENABLED"))
     telemetry_mirror_enabled = _env_truthy(env.get("TIMESCALE_TELEMETRY_MIRROR_ENABLED"))
+    if telemetry_validation_enabled or telemetry_mirror_enabled:
+        return True
+
+    storage_backend = str(env.get("TS_STORAGE_BACKEND") or "").strip().lower()
+    sqlite_storage = storage_backend in {"sqlite", "sqlite-test", "test"} or _env_truthy(env.get("TS_TESTING"))
+    if not sqlite_storage:
+        return False
+
     telemetry_read_backend = str(env.get("TELEMETRY_READ_BACKEND", "sqlite") or "sqlite").strip().lower()
     timescale_configured = _env_truthy(env.get("TIMESCALE_ENABLED")) or bool(
         str(env.get("TIMESCALE_DSN") or "").strip()
     )
-    return bool(
-        telemetry_validation_enabled
-        or telemetry_mirror_enabled
-        or (timescale_configured and telemetry_read_backend in {"auto", "timescale"})
-    )
+    return bool(timescale_configured and telemetry_read_backend in {"auto", "timescale"})
 
 
 def _telemetry_dual_write_burnin_command(python: str, env: dict[str, str]) -> list[str] | None:

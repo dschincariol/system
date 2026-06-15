@@ -135,6 +135,7 @@ class ValidateRepoContractTests(unittest.TestCase):
     def test_validate_repo_runs_telemetry_burnin_check_for_timescale_read_cutover(self) -> None:
         exit_code, calls, _, _ = self._run_main(
             env_overrides={
+                "TS_STORAGE_BACKEND": "sqlite",
                 "TIMESCALE_ENABLED": "1",
                 "TIMESCALE_DSN": "postgres://timescale",
                 "TELEMETRY_READ_BACKEND": "auto",
@@ -143,6 +144,19 @@ class ValidateRepoContractTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("telemetry-dual-write-burnin", [label for label, _, _ in calls])
+
+    def test_validate_repo_skips_legacy_telemetry_burnin_for_postgres_primary(self) -> None:
+        exit_code, calls, _, _ = self._run_main(
+            env_overrides={
+                "TIMESCALE_ENABLED": "1",
+                "TIMESCALE_DSN": "postgres://timescale",
+                "TELEMETRY_READ_BACKEND": "auto",
+                "TS_STORAGE_BACKEND": "postgres",
+            }
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn("telemetry-dual-write-burnin", [label for label, _, _ in calls])
 
     def test_validate_repo_runs_storage_route_audit(self) -> None:
         exit_code, calls, _, root = self._run_main()
@@ -165,6 +179,21 @@ class ValidateRepoContractTests(unittest.TestCase):
             ["python-bin", "-m", "unittest", "discover", "-s", "tests", "-v"],
         )
         self.assertEqual(unittest_call[2]["PYTHONPATH"], str(root))
+
+    def test_unit_test_env_forces_safe_test_auth_context(self) -> None:
+        run_env = validate_repo._unit_test_env(
+            {
+                "APP_ENV": "prod",
+                "PROD_LOCK": "1",
+                "DASHBOARD_API_TOKEN": "live-token-should-not-control-tests",
+            }
+        )
+
+        self.assertEqual(run_env["APP_ENV"], "test")
+        self.assertEqual(run_env["PROD_LOCK"], "0")
+        self.assertNotIn("ENV", run_env)
+        self.assertNotIn("NODE_ENV", run_env)
+        self.assertNotIn("TS_ENV", run_env)
 
 
 if __name__ == "__main__":
