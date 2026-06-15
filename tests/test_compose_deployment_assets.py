@@ -60,6 +60,7 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "POLYGON_REST_ENABLED",
             "POLYGON_WS_ENABLED",
             "POLYGON_API_KEY",
+            "YFINANCE_ENABLED",
             "TRADIER_ENABLED",
             "TRADIER_API_TOKEN",
             "OPTIONS_PROVIDER_CHAIN",
@@ -70,6 +71,16 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "ALPACA_KEY_ID",
             "ALPACA_SECRET_KEY",
             "OPERATOR_API_TOKEN",
+            "AUTO_PIPELINE",
+            "AUTO_PIPELINE_INCLUDE_EXECUTION",
+            "AUTO_PIPELINE_START_DELAY_S",
+            "MODEL_FEATURE_SNAPSHOT_SLEEP_S",
+            "MODEL_FEATURE_SNAPSHOT_BUCKET_SEC",
+            "INFERENCE_HEALTH_PROBE_ENABLED",
+            "INFERENCE_HEALTH_PROBE_SYMBOLS",
+            "INFERENCE_HEALTH_PROBE_INTERVAL_S",
+            "KILL_SWITCH_GLOBAL",
+            "DISABLE_LIVE_EXECUTION",
         ]
         for key in required_provider_contract:
             with self.subTest(key=key):
@@ -77,7 +88,14 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
                 self.assertIn(key, env_example_text)
 
         self.assertIn("POLYGON_REST_ENABLED: ${POLYGON_REST_ENABLED:-0}", stack_text)
+        self.assertIn("YFINANCE_ENABLED: ${YFINANCE_ENABLED:-1}", stack_text)
         self.assertIn("TRADIER_ENABLED: ${TRADIER_ENABLED:-0}", stack_text)
+        self.assertIn("AUTO_PIPELINE: ${AUTO_PIPELINE:-0}", stack_text)
+        self.assertIn("AUTO_PIPELINE_START_DELAY_S: ${AUTO_PIPELINE_START_DELAY_S:-90}", stack_text)
+        self.assertIn("MODEL_FEATURE_SNAPSHOT_SLEEP_S: ${MODEL_FEATURE_SNAPSHOT_SLEEP_S:-60}", stack_text)
+        self.assertIn("INFERENCE_HEALTH_PROBE_SYMBOLS: ${INFERENCE_HEALTH_PROBE_SYMBOLS:-AMD}", stack_text)
+        self.assertIn("INFERENCE_HEALTH_PROBE_INTERVAL_S: ${INFERENCE_HEALTH_PROBE_INTERVAL_S:-20}", stack_text)
+        self.assertIn("KILL_SWITCH_GLOBAL: ${KILL_SWITCH_GLOBAL:-1}", stack_text)
         self.assertIn("BROKER_NAME: ${BROKER_NAME:-sim}", stack_text)
 
     def test_operator_package_lock_matches_manifest_dependencies(self) -> None:

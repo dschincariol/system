@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -92,6 +93,44 @@ class ValidateRepoContractTests(unittest.TestCase):
             ["python-bin", "tools/runtime_graph_check.py", "--mode", "startup"],
         )
         self.assertEqual(runtime_graph_call[2]["PYTHONPATH"], str(root))
+
+    def test_validate_repo_live_loads_compose_env_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            compose_dir = root / "deploy" / "compose"
+            compose_dir.mkdir(parents=True)
+            (compose_dir / ".env").write_text(
+                "\n".join(
+                    [
+                        "DASHBOARD_PUBLIC_PORT=18000",
+                        "OPERATOR_PUBLIC_PORT=14001",
+                        "DASHBOARD_API_TOKEN=dashboard-secret",
+                        "OPERATOR_API_TOKEN=operator-secret",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            calls: list[tuple[str, list[str], dict[str, str]]] = []
+
+            def fake_run(label: str, args: list[str], env: dict[str, str]) -> None:
+                calls.append((label, list(args), dict(env)))
+
+            with (
+                patch.object(validate_repo, "ROOT", root),
+                patch.object(validate_repo, "_project_python", return_value="python-bin"),
+                patch.object(validate_repo, "_project_pytest", return_value=["pytest-bin"]),
+                patch.object(validate_repo, "_run", side_effect=fake_run),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                exit_code = validate_repo.main(["--live"])
+
+        self.assertEqual(exit_code, 0)
+        smoke_call = next(call for call in calls if call[0] == "pipeline-smoke")
+        self.assertEqual(smoke_call[2]["DASHBOARD_API_TOKEN"], "dashboard-secret")
+        self.assertEqual(smoke_call[2]["OPERATOR_API_TOKEN"], "operator-secret")
+        self.assertEqual(smoke_call[2]["PIPELINE_SMOKE_OPERATOR_TOKEN"], "operator-secret")
+        self.assertEqual(smoke_call[2]["PIPELINE_SMOKE_BASE"], "http://127.0.0.1:18000")
+        self.assertEqual(smoke_call[2]["PIPELINE_SMOKE_OPERATOR_BASE"], "http://127.0.0.1:14001")
 
     def test_validate_repo_skips_telemetry_burnin_check_by_default(self) -> None:
         exit_code, calls, _, _ = self._run_main()

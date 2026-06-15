@@ -104,6 +104,28 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 2)
         sleep.assert_called_once()
 
+    def test_ingestion_storage_ready_accepts_postgres_runtime_without_sqlite_file(self) -> None:
+        os.environ["DB_PATH"] = str(Path(self.tmp.name) / "missing_runtime.sqlite")
+        os.environ["TS_STORAGE_BACKEND"] = "postgres"
+        os.environ["TS_PG_DSN"] = "host=timescaledb dbname=trading user=trading password=test"
+        try:
+            (start_system,) = _reload_modules("start_system")
+
+            self.assertEqual(start_system._ingestion_storage_ready(), (True, "postgres"))
+        finally:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+            os.environ.pop("TS_PG_DSN", None)
+
+    def test_ingestion_storage_ready_requires_sqlite_file_for_sqlite_runtime(self) -> None:
+        missing_db = Path(self.tmp.name) / "missing_runtime.sqlite"
+        os.environ["DB_PATH"] = str(missing_db)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
+        os.environ.pop("TS_PG_DSN", None)
+
+        (start_system,) = _reload_modules("start_system")
+
+        self.assertEqual(start_system._ingestion_storage_ready(), (False, str(missing_db)))
+
     def test_startup_import_smoke_compiles_jobs_without_importing_them_by_default(self) -> None:
         (start_system,) = _reload_modules("start_system")
         tmp_root = Path(self.tmp.name) / "import_smoke_default"

@@ -173,3 +173,24 @@ def test_baseline_migration_covers_legacy_schema_surface():
         "execution_order_idempotency",
     ):
         assert required in table_names
+
+
+def test_realized_outcomes_migration_matches_model_scoring_contract():
+    import importlib
+
+    migration = importlib.import_module("engine.runtime.schema.migrations.0050_realized_outcomes")
+    statements = []
+
+    class FakeConnection:
+        def execute(self, sql, params=None):
+            assert params is None
+            statements.append(str(sql))
+
+    migration.up(FakeConnection())
+
+    sql = "\n".join(statements)
+    assert "CREATE TABLE IF NOT EXISTS realized_outcomes" in sql
+    for column in ("symbol", "ts_ms", "realized_return", "metadata_json", "created_ts_ms", "updated_ts_ms"):
+        assert column in sql
+    assert "UNIQUE(symbol, ts_ms)" in sql
+    assert "idx_realized_outcomes_symbol_ts" in sql

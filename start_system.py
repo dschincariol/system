@@ -1717,6 +1717,22 @@ def _ensure_ingestion_watchdog_started() -> None:
     _INGESTION_WATCHDOG_THREAD = thread
 
 
+def _postgres_runtime_storage_configured() -> bool:
+    backend = str(os.environ.get("TS_STORAGE_BACKEND") or "").strip().lower()
+    if backend in ("postgres", "postgresql", "pg"):
+        return True
+    if backend in ("sqlite", "sqlite-test", "test"):
+        return False
+    return bool(str(os.environ.get("TS_PG_DSN") or "").strip())
+
+
+def _ingestion_storage_ready() -> tuple[bool, str]:
+    if _postgres_runtime_storage_configured():
+        return True, "postgres"
+    db_path = str(os.environ.get("DB_PATH") or "").strip()
+    return bool(db_path and os.path.exists(db_path)), db_path
+
+
 def _spawn_ingestion_if_enabled() -> None:
     global _INGESTION_PROC, _INGESTION_RESTART_BLOCKED, _INGESTION_RESTART_TIMES
 
@@ -1740,9 +1756,9 @@ def _spawn_ingestion_if_enabled() -> None:
     if _existing_ingestion_runtime_active():
         return
 
-    db_path = str(os.environ.get("DB_PATH") or "").strip()
-    if not db_path or not os.path.exists(db_path):
-        raise RuntimeError(f"DB_NOT_INITIALIZED_BEFORE_INGESTION:{db_path}")
+    storage_ready, storage_detail = _ingestion_storage_ready()
+    if not storage_ready:
+        raise RuntimeError(f"DB_NOT_INITIALIZED_BEFORE_INGESTION:{storage_detail}")
 
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"

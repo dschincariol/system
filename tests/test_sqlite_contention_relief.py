@@ -231,6 +231,32 @@ class SQLiteContentionReliefTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(runtime_meta.meta_get("debounce_probe"), "same")
 
+    def test_data_quality_runtime_meta_keys_bypass_long_lived_cache_and_buffer(self) -> None:
+        self._set_env("RUNTIME_META_BEST_EFFORT_BUFFER_ENABLED", "1")
+        storage, runtime_meta = _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.runtime_meta",
+        )
+        storage.init_db()
+        real_run_write_txn = runtime_meta.run_write_txn
+        calls = []
+
+        def _capture_run_write_txn(fn, *args, **kwargs):
+            calls.append(dict(kwargs))
+            return real_run_write_txn(fn, *args, **kwargs)
+
+        key = "data_quality::feature_validation"
+        payload = '{"ok":true,"validated_ts_ms":1700000000000}'
+        with patch.object(runtime_meta, "_ensure_best_effort_writer_thread", side_effect=AssertionError("unexpected buffer")):
+            with patch.object(runtime_meta, "run_write_txn", side_effect=_capture_run_write_txn):
+                runtime_meta.meta_set(key, payload, best_effort=True)
+
+        self.assertTrue(runtime_meta._is_volatile_key(key))
+        self.assertFalse(runtime_meta._should_buffer_best_effort_key(key))
+        self.assertEqual(int(runtime_meta.runtime_meta_best_effort_buffer_snapshot().get("buffered_keys") or 0), 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(runtime_meta.meta_get(key), payload)
+
     def test_startup_write_gate_releases_after_first_price_even_if_lifecycle_meta_lags(self) -> None:
         (startup_write_gate,) = _reload_modules(
             "engine.runtime.startup_write_gate",

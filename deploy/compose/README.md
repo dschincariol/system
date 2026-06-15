@@ -92,9 +92,11 @@ The current production threshold for this repo remains:
 
 Chosen deployment mode: compose.
 
-Use compose for this production-functional server bring-up because the repository already defines the external dependency services, the Python runtime, and the Node operator sidecar in one deployment contract. The compose path keeps runtime lifecycle ownership with Docker, leaves the operator as a proxy/control sidecar, and starts in `ENGINE_MODE=safe`, `EXECUTION_MODE=safe`, `PROD_LOCK=1`, `ALLOW_TRAINING=0`, `MODEL_SCORING_ENABLED=0`, `BROKER_NAME=sim`, `BROKER=sim`, `AUTO_BOOT_DAEMONS=0`, and `START_INGESTION_WITH_SERVER=0`.
+Use compose for this production-functional server bring-up because the repository already defines the external dependency services, the Python runtime, and the Node operator sidecar in one deployment contract. The compose path keeps runtime lifecycle ownership with Docker, leaves the operator as a proxy/control sidecar, and starts the first dependency-only bring-up in `ENGINE_MODE=safe`, `EXECUTION_MODE=safe`, `PROD_LOCK=1`, `ALLOW_TRAINING=0`, `MODEL_SCORING_ENABLED=0`, `BROKER_NAME=sim`, `BROKER=sim`, `AUTO_BOOT_DAEMONS=0`, and `START_INGESTION_WITH_SERVER=0`.
 
 Ingestion is intentionally not auto-started in this safe bring-up. Provider credentials are disabled by default, and explicit ingestion startup should be validated separately before enabling provider polling.
+
+For the next production-function validation step, keep `BROKER_NAME=sim`, `BROKER=sim`, `EXECUTION_MODE=safe`, `DISABLE_LIVE_EXECUTION=1`, and `AUTO_PIPELINE_INCLUDE_EXECUTION=0`, then enable `AUTO_BOOT_DAEMONS=1`, `START_INGESTION_WITH_SERVER=1`, `MODEL_SCORING_ENABLED=1`, `AUTO_PIPELINE=1`, and `KILL_SWITCH_GLOBAL=0`. This proves the data/scoring/sim execution health path without enabling live broker order routing.
 
 The exact bring-up command is:
 

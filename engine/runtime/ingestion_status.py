@@ -34,6 +34,7 @@ DEFAULT_INGESTION_PIPELINE_JOBS = [
     "poll_macro",
     "ingest_now",
     "snapshot_model_features",
+    "inference_health_probe",
     "poll_gdelt",
     "poll_sec_filings",
     "ingest_form4",

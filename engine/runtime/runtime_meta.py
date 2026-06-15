@@ -205,16 +205,26 @@ _IMMEDIATE_BEST_EFFORT_KEYS = {
     # negative while the async writer is still pending.
     "ingestion_state",
 }
+_DATA_QUALITY_KEY_PREFIX = "data_quality::"
 
 
 def _is_volatile_key(key: str) -> bool:
     key_s = str(key or "").strip()
-    return key_s in _VOLATILE_KEYS or key_s.startswith("lifecycle_")
+    return (
+        key_s in _VOLATILE_KEYS
+        or key_s.startswith("lifecycle_")
+        or key_s.startswith(_DATA_QUALITY_KEY_PREFIX)
+    )
 
 
 def _should_buffer_best_effort_key(key: str) -> bool:
     key_s = str(key or "").strip()
     if key_s in _IMMEDIATE_BEST_EFFORT_KEYS:
+        return False
+    if key_s.startswith(_DATA_QUALITY_KEY_PREFIX):
+        # Health gates consume these keys across process boundaries. Buffering
+        # them can make /api/health report stale feature/model-input state even
+        # while the supervised inference probe is successfully refreshing it.
         return False
     return bool(
         _is_volatile_key(key_s)

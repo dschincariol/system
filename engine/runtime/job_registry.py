@@ -373,6 +373,13 @@ ALLOWED_JOBS = {
     {"execution": False},
 ),
 
+"inference_health_probe": (
+    "engine/runtime/jobs/inference_health_probe.py",
+    "daemon",
+    None,
+    {"execution": False, "resource_class": "inference"},
+),
+
 "provider_monitor": (
     "engine/runtime/jobs/provider_monitor_job.py",
     "daemon",
@@ -1581,6 +1588,7 @@ JOB_ORDER = [
     # Monitoring
     "provider_monitor",
     "metrics_collector",
+    "inference_health_probe",
     "observability_snapshot",
     "snapshot_equity",
 ]

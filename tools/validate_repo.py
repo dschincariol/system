@@ -79,17 +79,57 @@ def _env_truthy(value: str | None) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _load_dotenv_defaults(env: dict[str, str]) -> None:
-    env_path = ROOT / ".env"
+def _parse_simple_env_file(env_path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip().strip("'").strip('"')
+        values[key] = value
+    return values
+
+
+def _load_env_file_defaults(env: dict[str, str], env_path: Path) -> None:
     if not env_path.exists():
         return
+    values: dict[str, str] = {}
     try:
         from dotenv import dotenv_values
+
+        values = {
+            str(key): str(value)
+            for key, value in (dotenv_values(env_path) or {}).items()
+            if key and value is not None
+        }
     except Exception:
-        return
-    for key, value in (dotenv_values(env_path) or {}).items():
+        values = _parse_simple_env_file(env_path)
+    for key, value in values.items():
         if key and value is not None:
             env.setdefault(str(key), str(value))
+
+
+def _load_dotenv_defaults(env: dict[str, str]) -> None:
+    _load_env_file_defaults(env, ROOT / ".env")
+
+
+def _load_compose_live_defaults(env: dict[str, str]) -> None:
+    _load_env_file_defaults(env, ROOT / "deploy" / "compose" / ".env")
+
+    dashboard_port = str(env.get("DASHBOARD_PUBLIC_PORT") or "8000").strip() or "8000"
+    operator_port = str(env.get("OPERATOR_PUBLIC_PORT") or "4001").strip() or "4001"
+    env.setdefault("PIPELINE_SMOKE_BASE", f"http://127.0.0.1:{dashboard_port}")
+    env.setdefault("PIPELINE_SMOKE_OPERATOR_BASE", f"http://127.0.0.1:{operator_port}")
+    if str(env.get("OPERATOR_API_TOKEN") or "").strip():
+        env.setdefault("PIPELINE_SMOKE_OPERATOR_TOKEN", str(env.get("OPERATOR_API_TOKEN") or "").strip())
 
 
 def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
@@ -206,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(ROOT))
     _load_dotenv_defaults(env)
+    if args.live:
+        _load_compose_live_defaults(env)
     env.setdefault("TS_PG_SCHEMA_PER_DB_PATH", "1")
     env.setdefault("TS_PG_POOL_SIZE", "12")
     env.setdefault("TS_PG_POOL_MIN_SIZE", "2")
