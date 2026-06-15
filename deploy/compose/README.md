@@ -18,7 +18,7 @@ Use these compose assets when you want a containerized staging or production-lik
 ## Bring Up
 
 1. Copy `.env.example` to `.env` in this directory.
-2. Set approved image tags, dependency credentials, provider credentials, dashboard/operator API tokens, and public ports.
+2. Set approved image tags, dependency credentials, provider credentials, dashboard/operator API tokens, public ports, and `DATA_SOURCE_MASTER_KEY_FILE`. `DASHBOARD_API_TOKEN` and `OPERATOR_API_TOKEN` must be generated secrets, not placeholders.
 3. Build and start the stack:
 
 ```bash
@@ -67,6 +67,8 @@ The compose runtime passes provider and broker bootstrap settings from `deploy/c
 
 Do not commit populated `.env` files. If provider variables are blank or disabled, infrastructure and preflight dependency checks can still run, but live smoke should be expected to fail provider freshness checks.
 
+Dashboard mutation endpoints require `DASHBOARD_API_TOKEN` in production/live mode, including loopback binds. The runtime rejects missing, placeholder, or too-short dashboard tokens before serving mutations; the localhost no-token fallback is only for explicit safe local development and should not be enabled in compose production-like stacks.
+
 ## Operator Mode In Containers
 
 The operator container runs with `OPERATOR_DISABLE_INTERNAL_ENGINE_START=1`.
@@ -85,3 +87,48 @@ The current production threshold for this repo remains:
 - runtime preflight passes
 - `python tools/validate_repo.py --live` passes against the running stack
 - `docs/handoff/codex_migration/FULL_SCOPE_VALIDATION.md` no longer has blocking `Partial in repo` or `Not implemented in repo` rows for your intended deployment claim
+
+## 2026-06-15 Server Bring-Up Mode
+
+Chosen deployment mode: compose.
+
+Use compose for this production-functional server bring-up because the repository already defines the external dependency services, the Python runtime, and the Node operator sidecar in one deployment contract. The compose path keeps runtime lifecycle ownership with Docker, leaves the operator as a proxy/control sidecar, and starts in `ENGINE_MODE=safe`, `EXECUTION_MODE=safe`, `PROD_LOCK=1`, `ALLOW_TRAINING=0`, `MODEL_SCORING_ENABLED=0`, `BROKER_NAME=sim`, `BROKER=sim`, `AUTO_BOOT_DAEMONS=0`, and `START_INGESTION_WITH_SERVER=0`.
+
+Ingestion is intentionally not auto-started in this safe bring-up. Provider credentials are disabled by default, and explicit ingestion startup should be validated separately before enabling provider polling.
+
+The exact bring-up command is:
+
+```bash
+docker compose \
+  --env-file deploy/compose/.env \
+  -f deploy/compose/docker-compose.external-services.yml \
+  -f deploy/compose/docker-compose.stack.yml \
+  up -d --build
+```
+
+The exact preflight command is:
+
+```bash
+docker compose \
+  --env-file deploy/compose/.env \
+  -f deploy/compose/docker-compose.external-services.yml \
+  -f deploy/compose/docker-compose.stack.yml \
+  exec runtime python engine/runtime/prod_preflight.py --json
+```
+
+The exact endpoint checks are:
+
+```bash
+DASHBOARD_API_TOKEN="$(awk -F= '$1=="DASHBOARD_API_TOKEN"{print substr($0,index($0,"=")+1)}' deploy/compose/.env)"
+OPERATOR_API_TOKEN="$(awk -F= '$1=="OPERATOR_API_TOKEN"{print substr($0,index($0,"=")+1)}' deploy/compose/.env)"
+
+curl -fsS -H "X-API-Token: ${DASHBOARD_API_TOKEN}" http://127.0.0.1:8000/api/readiness
+curl -fsS -H "X-API-Token: ${DASHBOARD_API_TOKEN}" http://127.0.0.1:8000/api/operator/support_snapshot?mode=quick
+curl -fsS -H "X-API-Token: ${DASHBOARD_API_TOKEN}" http://127.0.0.1:8000/api/execution/barrier
+curl -fsS -H "X-API-Token: ${DASHBOARD_API_TOKEN}" http://127.0.0.1:8000/api/operator/provider_telemetry
+curl -fsS -H "X-API-Token: ${DASHBOARD_API_TOKEN}" http://127.0.0.1:8000/api/operator/service_status
+curl -fsS -H "X-Operator-Token: ${OPERATOR_API_TOKEN}" http://127.0.0.1:4001/api/operator/status
+curl -fsS -H "X-Operator-Token: ${OPERATOR_API_TOKEN}" http://127.0.0.1:4001/api/operator/readiness
+```
+
+Do not enable real trading during this bring-up.

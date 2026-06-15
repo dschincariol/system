@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import engine.api.http_transport as http_transport
+from engine.strategy import portfolio_execution_intents as execution_intents
 from engine.strategy.portfolio_execution_intents import _terminal_signed_qty
 from engine.terminal.api import api_terminal as terminal_api
 from engine.terminal.api import api_terminal_orders as terminal_orders
@@ -104,6 +107,10 @@ def test_terminal_order_accepts_dispatcher_body_and_records_quantity_contract(mo
 
 
 def test_terminal_order_post_through_http_dispatcher_uses_json_body(monkeypatch, tmp_path):
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.setenv("TS_API_ALLOW_LOCALHOST_MUTATIONS_WITHOUT_TOKEN", "1")
     writes = _patch_terminal_order_storage(monkeypatch)
     _patch_dispatcher_runtime_guards(monkeypatch)
     handler_cls = http_transport.build_handler(
@@ -228,3 +235,66 @@ def test_terminal_quantity_contract_survives_intent_weight_normalization():
     assert _terminal_signed_qty(
         {"terminal_order": {"sizing": "quantity", "side": "BUY", "qty": 2, "signed_qty": -5}}
     ) == -5.0
+
+
+def test_terminal_quantity_contract_loads_as_explicit_qty_with_neutral_weights(monkeypatch):
+    monkeypatch.setattr(execution_intents, "DEFAULT_DECISION_ENGINE", None)
+    monkeypatch.setattr(execution_intents, "get_competition_policy_for_intent", lambda **_kwargs: {})
+
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute(
+            """
+            CREATE TABLE portfolio_orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts_ms INTEGER NOT NULL,
+              model_id TEXT NOT NULL,
+              symbol TEXT NOT NULL,
+              action TEXT NOT NULL,
+              from_side TEXT,
+              to_side TEXT,
+              from_weight REAL NOT NULL,
+              to_weight REAL NOT NULL,
+              delta_weight REAL NOT NULL,
+              source_alert_id INTEGER,
+              explain_json TEXT
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO portfolio_orders (
+              ts_ms, model_id, symbol, action, from_side, to_side,
+              from_weight, to_weight, delta_weight, source_alert_id, explain_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(time.time() * 1000),
+                "baseline",
+                "SPY",
+                "SELL",
+                None,
+                "SELL",
+                0.0,
+                0.0,
+                0.0,
+                None,
+                terminal_orders._terminal_explain("SPY", "SELL", 3),
+            ),
+        )
+        con.commit()
+
+        result = execution_intents.load_latest_execution_intents(con)
+    finally:
+        con.close()
+
+    assert result["ok"] is True
+    assert len(result["intents"]) == 1
+    intent = result["intents"][0]
+    assert intent["terminal_order"] is True
+    assert intent["order_sizing"] == "quantity"
+    assert intent["qty"] == -3.0
+    assert intent["from_weight"] == 0.0
+    assert intent["to_weight"] == 0.0
+    assert intent["delta_weight"] == 0.0

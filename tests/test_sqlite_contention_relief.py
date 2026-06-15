@@ -722,6 +722,82 @@ class SQLiteContentionReliefTests(unittest.TestCase):
             liveness_con.close()
         self.assertEqual(int((row or [0])[0] or 0), 1)
 
+    def test_job_liveness_repairs_legacy_duplicate_heartbeats_before_upsert(self) -> None:
+        self._set_env("SQLITE_LIVENESS_DB_ENABLED", "1")
+        self._set_env("SQLITE_LIVENESS_QUEUE_ENABLED", "0")
+        legacy_liveness_path = Path(self.tmp.name) / "legacy_liveness.sqlite"
+        self._set_env("SQLITE_LIVENESS_DB_PATH", str(legacy_liveness_path))
+
+        legacy_con = sqlite3.connect(str(legacy_liveness_path))
+        try:
+            legacy_con.execute(
+                """
+                CREATE TABLE job_heartbeats (
+                  job_name TEXT,
+                  owner TEXT,
+                  pid INTEGER,
+                  ts_ms INTEGER,
+                  extra_json TEXT
+                )
+                """
+            )
+            legacy_con.executemany(
+                """
+                INSERT INTO job_heartbeats(job_name, owner, pid, ts_ms, extra_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    ("poll_prices", "old-owner", 111, 10, '{"phase":"old"}'),
+                    ("poll_prices", "newer-owner", 222, 20, '{"phase":"newer"}'),
+                ],
+            )
+            legacy_con.commit()
+        finally:
+            legacy_con.close()
+
+        (storage,) = _reload_modules("engine.runtime.storage")
+        storage.init_db()
+
+        con = storage.connect(readonly=True)
+        try:
+            row = con.execute(
+                "SELECT owner, pid, ts_ms, extra_json FROM job_heartbeats WHERE job_name=?",
+                ("poll_prices",),
+            ).fetchone()
+        finally:
+            con.close()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row[0]), "newer-owner")
+        self.assertEqual(int(row[1] or 0), 222)
+        self.assertEqual(int(row[2] or 0), 20)
+        self.assertEqual(str(row[3] or ""), '{"phase":"newer"}')
+
+        storage.put_job_heartbeat("poll_prices", "upsert-owner", 333, '{"phase":"upserted"}')
+
+        liveness_con = sqlite3.connect(str(legacy_liveness_path))
+        try:
+            rows = liveness_con.execute(
+                """
+                SELECT owner, pid, extra_json
+                FROM job_heartbeats
+                WHERE job_name=?
+                """,
+                ("poll_prices",),
+            ).fetchall()
+            pk_info = {
+                str(row[1]): int(row[5] or 0)
+                for row in liveness_con.execute("PRAGMA table_info(job_heartbeats)").fetchall()
+            }
+        finally:
+            liveness_con.close()
+
+        self.assertEqual(pk_info.get("job_name"), 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0][0]), "upsert-owner")
+        self.assertEqual(int(rows[0][1] or 0), 333)
+        self.assertEqual(str(rows[0][2] or ""), '{"phase":"upserted"}')
+
     def test_ipc_best_effort_channel_state_is_debounced(self) -> None:
         self._set_env("IPC_CHANNEL_STATE_BEST_EFFORT_MIN_INTERVAL_S", "60")
         storage, ipc = _reload_modules(

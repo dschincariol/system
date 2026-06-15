@@ -82,20 +82,19 @@ def parse_broker_timestamp_ms(value: Any, *, default_ms: Optional[int] = None) -
         except Exception as e:
             last_fmt_error = e
 
-    if last_fmt_error is not None:
-        _warn_nonfatal(
-            "BROKER_FILL_UTILS_TIMESTAMP_FORMAT_PARSE_FAILED",
-            last_fmt_error,
-            once_key="timestamp_format_parse",
-            value=text[:120],
-        )
-
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000.0)
     except Exception as e:
+        if last_fmt_error is not None:
+            _warn_nonfatal(
+                "BROKER_FILL_UTILS_TIMESTAMP_FORMAT_PARSE_FAILED",
+                last_fmt_error,
+                once_key="timestamp_format_parse",
+                value=text[:120],
+            )
         _warn_nonfatal(
             "BROKER_FILL_UTILS_TIMESTAMP_ISO_PARSE_FAILED",
             e,

@@ -849,6 +849,12 @@ def _family_training_job(model_name: str) -> Optional[Dict[str, Any]]:
             "module_name": "engine.strategy.models.lgbm_regressor",
             "base_lookback_days": int(os.environ.get("LGBM_LOOKBACK_DAYS", "365")),
         }
+    if name == "lgbm_ranker" or name.startswith("lgbm_ranker."):
+        return {
+            "job_name": "train_lgbm_ranker_models",
+            "module_name": "engine.strategy.models.lgbm_ranker",
+            "base_lookback_days": int(os.environ.get("LGBM_RANKER_LOOKBACK_DAYS", "365")),
+        }
     if name == "xgb_regressor" or name.startswith("xgb_regressor."):
         return {
             "job_name": "train_xgb_models",
@@ -1045,6 +1051,17 @@ def publish_lifecycle_status(payload: Dict[str, Any]) -> None:
         _warn_nonfatal("MODEL_LIFECYCLE_STATUS_META_SET_FAILED", e, payload_size=int(len(_json_dumps(payload or {}))))
 
 
+def _registry_has_champion(model_name: str) -> bool:
+    try:
+        from engine.model_registry import get_stage_latest
+
+        row = get_stage_latest(str(model_name), "champion", regime="global")
+    except Exception as e:
+        _warn_nonfatal("MODEL_LIFECYCLE_REGISTRY_CHAMPION_CHECK_FAILED", e, model_name=str(model_name))
+        return False
+    return bool(row)
+
+
 def mark_version_live(
     model_name: str,
     model_version: str,
@@ -1052,6 +1069,10 @@ def mark_version_live(
     stage: str = "champion",
     meta_patch: Optional[Dict[str, Any]] = None,
 ) -> None:
+    if str(stage or "").strip().lower() == "champion" and not _registry_has_champion(str(model_name)):
+        raise RuntimeError(
+            f"cannot mark model_version live as champion before registry promotion model={model_name}"
+        )
     update_model_version_status(
         str(model_name),
         str(model_version),

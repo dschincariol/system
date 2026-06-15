@@ -37,6 +37,7 @@ from engine.runtime.failure_diagnostics import log_failure
 from engine.data.asset_map import asset_class_for_symbol
 from engine.strategy.drawdown_state import get_current_drawdown
 from engine.strategy.risk import realized_vol_from_prices, corr_from_prices
+from engine.strategy.har_rv import resolve_vol_forecast
 from engine.runtime.risk_state import set_state, get_state_row
 from engine.runtime.event_log import record_risk_block
 from engine.runtime.storage import _table_exists
@@ -85,9 +86,11 @@ DD_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_DD_HARD_BLOCK", "0.15"))
 # Portfolio vol proxy + targeting
 VOL_LOOKBACK = int(os.environ.get("PORTFOLIO_RISK_VOL_LOOKBACK", os.environ.get("PORTFOLIO_VOL_LOOKBACK", "240")))
 VOL_TARGET = float(os.environ.get("PORTFOLIO_RISK_VOL_TARGET", os.environ.get("PORTFOLIO_TARGET_VOL", "0.020")))
+VOL_FORECAST_SOURCE = str(os.environ.get("VOL_FORECAST_SOURCE", "trailing") or "trailing").strip().lower()
 PORTFOLIO_VOL_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_VOL_HARD_BLOCK", "0.0"))  # 0 disables
 PORTFOLIO_VOL_FLOOR = float(os.environ.get("PORTFOLIO_RISK_VOL_FLOOR", "0.005"))
 PORTFOLIO_VOL_CEIL = float(os.environ.get("PORTFOLIO_RISK_VOL_CEIL", "0.080"))
+USE_GEX_VOL_MODIFIER = os.environ.get("PORTFOLIO_RISK_USE_GEX_VOL_MODIFIER", os.environ.get("USE_OPTIONS_FEATURES", "0")) == "1"
 PORTFOLIO_RISK_USE_MONTE_CARLO = os.environ.get("PORTFOLIO_RISK_USE_MONTE_CARLO", "1") == "1"
 PORTFOLIO_RISK_MC_MAX_AGE_S = int(os.environ.get("PORTFOLIO_RISK_MC_MAX_AGE_S", "900"))
 PORTFOLIO_RISK_MC_VAR_95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_VAR_95_BLOCK", "0.0"))
@@ -1106,21 +1109,58 @@ def _apply_asset_class_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[st
     return out
 
 
+def _symbol_vol_input(con, symbol: str, *, ts_ms: int) -> Dict[str, Any]:
+    try:
+        resolved = resolve_vol_forecast(
+            con,
+            str(symbol),
+            ts_ms=int(ts_ms),
+            source=str(VOL_FORECAST_SOURCE or "trailing"),
+            trailing_lookback=int(VOL_LOOKBACK),
+        )
+        vol = resolved.get("vol")
+        if vol is None:
+            return {"vol": None, "source": "missing"}
+        return {
+            "vol": float(vol),
+            "source": str(resolved.get("resolved_source") or resolved.get("source") or VOL_FORECAST_SOURCE),
+            "forecast_ratio": resolved.get("forecast_ratio"),
+            "forecast_ts_ms": resolved.get("ts_ms"),
+            "fallback": bool(resolved.get("fallback", False)),
+        }
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_VOL_FORECAST_RESOLVE_FAILED",
+            e,
+            once_key=f"vol_forecast:{symbol}",
+            symbol=str(symbol),
+            source=str(VOL_FORECAST_SOURCE),
+        )
+        try:
+            v = realized_vol_from_prices(con, str(symbol), lookback=int(VOL_LOOKBACK))
+        except Exception:
+            v = None
+        return {"vol": (None if v is None else float(v)), "source": "trailing_exception_fallback", "fallback": True}
+
+
 def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if not USE_VOL_CAPS:
         return dict(desired or {})
 
     out = dict(desired or {})
     vol_map: Dict[str, float] = {}
+    vol_meta: Dict[str, Dict[str, Any]] = {}
 
     for sym in list(out.keys()):
         try:
-            v = realized_vol_from_prices(con, str(sym), lookback=int(VOL_LOOKBACK))
+            resolved = _symbol_vol_input(con, str(sym), ts_ms=int(info.get("ts_ms") or 0))
+            v = resolved.get("vol")
             if v is None:
                 continue
             vv = float(v)
             vv = max(float(PORTFOLIO_VOL_FLOOR), min(float(PORTFOLIO_VOL_CEIL), vv))
             vol_map[str(sym)] = float(vv)
+            vol_meta[str(sym)] = dict(resolved)
         except Exception as e:
             _warn_nonfatal(
                 "PORTFOLIO_RISK_ENGINE_VOL_CAP_ROW_FAILED",
@@ -1131,6 +1171,9 @@ def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[s
 
     info["symbol_vol_n"] = int(len(vol_map))
     info["symbol_max_gross"] = float(MAX_SYMBOL_GROSS)
+    info["vol_forecast_source"] = str(VOL_FORECAST_SOURCE or "trailing")
+    if vol_meta:
+        info["symbol_vol_inputs"] = dict(vol_meta)
 
     hit: Dict[str, Any] = {}
     for sym, row in list(out.items()):
@@ -1140,6 +1183,7 @@ def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[s
             continue
 
         v = vol_map.get(str(sym))
+        meta = vol_meta.get(str(sym), {})
         mult = 1.0
         cap_source = "fallback_max_symbol_gross"
 
@@ -1151,7 +1195,7 @@ def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[s
             cap = min(float(SYMBOL_CAP_MAX_W), float(SYMBOL_CAP_MAX_W) * float(mult))
             if float(MAX_SYMBOL_GROSS) > 0.0:
                 cap = min(float(cap), float(MAX_SYMBOL_GROSS))
-            cap_source = "realized_vol"
+            cap_source = str(meta.get("source") or VOL_FORECAST_SOURCE or "realized_vol")
 
         if cap <= 0.0:
             continue
@@ -1169,6 +1213,7 @@ def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[s
                     "pre": float(aw),
                     "scale": float(scale),
                     "cap_source": str(cap_source),
+                    "forecast_ratio": meta.get("forecast_ratio"),
                 }
             hit[str(sym)] = {
                 "vol": (float(v) if v is not None else None),
@@ -1177,6 +1222,7 @@ def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[s
                 "scale": float(scale),
                 "mult": float(mult),
                 "cap_source": str(cap_source),
+                "forecast_ratio": meta.get("forecast_ratio"),
             }
 
     if hit:
@@ -1317,7 +1363,7 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
     return out
 
 
-def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]]) -> Optional[float]:
+def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]], info: Optional[Dict[str, Any]] = None) -> Optional[float]:
     syms = _top_symbols_by_abs(desired, int(MAX_SYMBOLS))
     if not syms:
         return None
@@ -1326,6 +1372,7 @@ def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]]) -> Optional[fl
     active_syms: List[str] = []
     w: List[float] = []
     vols: List[float] = []
+    vol_inputs: Dict[str, Dict[str, Any]] = {}
     for s in syms:
         row = (desired or {}).get(s) or {}
         sw = _signed_weight(row)
@@ -1333,11 +1380,13 @@ def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]]) -> Optional[fl
         if aw <= 0.0:
             continue
         try:
-            v = realized_vol_from_prices(con, s, lookback=int(VOL_LOOKBACK))
+            resolved = _symbol_vol_input(con, str(s), ts_ms=int((info or {}).get("ts_ms") or 0))
+            v = resolved.get("vol")
             if v is None:
                 return None
             vv = float(v)
             vv = max(float(PORTFOLIO_VOL_FLOOR), min(float(PORTFOLIO_VOL_CEIL), vv))
+            vol_inputs[str(s)] = dict(resolved)
         except Exception as e:
             _warn_nonfatal(
                 "PORTFOLIO_RISK_ENGINE_PORTFOLIO_VOL_SYMBOL_FAILED",
@@ -1352,6 +1401,9 @@ def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]]) -> Optional[fl
 
     if not w:
         return None
+    if info is not None:
+        info["portfolio_vol_inputs"] = dict(vol_inputs)
+        info["vol_forecast_source"] = str(VOL_FORECAST_SOURCE or "trailing")
 
     # normalize by gross to avoid pathological scaling
     gross = sum(abs(x) for x in w)
@@ -1388,14 +1440,88 @@ def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]]) -> Optional[fl
     return float(var ** 0.5)
 
 
+def _latest_options_gex_for_symbol(con, symbol: str, ts_ms: int) -> Optional[Dict[str, float]]:
+    try:
+        row = con.execute(
+            """
+            SELECT snapshot_ts_ms, gex_norm, gex_norm_z, gex_sign
+            FROM options_symbol_features
+            WHERE symbol=?
+              AND snapshot_ts_ms <= ?
+            ORDER BY snapshot_ts_ms DESC, bucket_ts_ms DESC
+            LIMIT 1
+            """,
+            (str(symbol), int(ts_ms)),
+        ).fetchone()
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GEX_LOOKUP_FAILED",
+            e,
+            once_key=f"gex_lookup:{symbol}",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return None
+    if not row:
+        return None
+    return {
+        "snapshot_ts_ms": float(_safe_float(row[0], 0.0)),
+        "gex_norm": float(_safe_float(row[1], 0.0)),
+        "gex_norm_z": float(max(-10.0, min(10.0, _safe_float(row[2], 0.0)))),
+        "gex_sign": float(max(-1.0, min(1.0, _safe_float(row[3], 0.0)))),
+    }
+
+
+def _gex_vol_target_modifier(con, desired: Dict[str, Dict[str, Any]], ts_ms: int) -> Dict[str, Any]:
+    """Return a volatility-regime modifier from GEX, never a direction signal."""
+
+    if not USE_GEX_VOL_MODIFIER:
+        return {"enabled": False, "modifier": 1.0}
+    weighted_norm = 0.0
+    weighted_z = 0.0
+    total_weight = 0.0
+    rows: Dict[str, Dict[str, float]] = {}
+    for sym, row in (desired or {}).items():
+        abs_w = abs(_signed_weight(row))
+        if abs_w <= 0.0:
+            continue
+        gex = _latest_options_gex_for_symbol(con, str(sym), int(ts_ms))
+        if not gex:
+            continue
+        weighted_norm += float(abs_w) * float(gex.get("gex_norm", 0.0))
+        weighted_z += float(abs_w) * float(gex.get("gex_norm_z", 0.0))
+        total_weight += float(abs_w)
+        rows[str(sym)] = dict(gex)
+    if total_weight <= 0.0:
+        return {"enabled": True, "modifier": 1.0, "symbols": rows, "coverage": 0.0}
+    avg_norm = float(weighted_norm / total_weight)
+    avg_z = float(weighted_z / total_weight)
+    negative_pressure = max(0.0, min(1.0, -avg_z / 2.0))
+    positive_damping = max(0.0, min(1.0, avg_z / 2.0))
+    modifier = float(max(0.75, min(1.10, 1.0 - 0.12 * negative_pressure + 0.04 * positive_damping)))
+    return {
+        "enabled": True,
+        "modifier": float(modifier),
+        "gex_norm": float(avg_norm),
+        "gex_norm_z": float(avg_z),
+        "coverage": float(total_weight / max(1e-9, _gross(desired or {}))),
+        "symbols": rows,
+        "usage": "volatility_regime_conditioning_not_direction",
+    }
+
+
 def _apply_portfolio_vol_target(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     out = dict(desired or {})
-    pv = _portfolio_vol_proxy(con, out)
+    pv = _portfolio_vol_proxy(con, out, info)
     if pv is None:
         return out
 
     info["portfolio_vol_proxy"] = float(pv)
+    gex_modifier = _gex_vol_target_modifier(con, out, int(info.get("ts_ms") or 0))
+    effective_target = float(VOL_TARGET) * float(gex_modifier.get("modifier", 1.0) or 1.0)
     info["portfolio_vol_target"] = float(VOL_TARGET)
+    info["portfolio_vol_effective_target"] = float(effective_target)
+    info["portfolio_gex_vol_modifier"] = dict(gex_modifier)
     info["portfolio_vol_hard_block"] = float(PORTFOLIO_VOL_HARD_BLOCK)
 
     # Hard block if configured
@@ -1404,15 +1530,26 @@ def _apply_portfolio_vol_target(con, desired: Dict[str, Dict[str, Any]], info: D
         return out
 
     # Scale entire portfolio to target (if pv > target)
-    if float(VOL_TARGET) > 0.0 and float(pv) > float(VOL_TARGET) + 1e-12:
-        scale = float(VOL_TARGET) / float(pv) if pv > 1e-12 else 0.0
+    if float(effective_target) > 0.0 and float(pv) > float(effective_target) + 1e-12:
+        scale = float(effective_target) / float(pv) if pv > 1e-12 else 0.0
         for sym in list(out.keys()):
             try:
                 sw = _signed_weight(out[sym])
                 out[sym]["weight"] = float(sw) * float(scale)
                 out[sym].setdefault("reason", {})
                 if isinstance(out[sym]["reason"], dict):
-                    out[sym]["reason"]["portfolio_vol_target"] = {"pre_vol": float(pv), "target": float(VOL_TARGET), "scale": float(scale)}
+                    out[sym]["reason"]["portfolio_vol_target"] = {
+                        "pre_vol": float(pv),
+                        "target": float(effective_target),
+                        "base_target": float(VOL_TARGET),
+                        "scale": float(scale),
+                        "vol_source": str(
+                            ((info.get("portfolio_vol_inputs") or {}).get(str(sym)) or {}).get("source")
+                            or VOL_FORECAST_SOURCE
+                            or "trailing"
+                        ),
+                        "gex_modifier": float(gex_modifier.get("modifier", 1.0) or 1.0),
+                    }
             except Exception as e:
                 _warn_nonfatal("PORTFOLIO_RISK_VOL_TARGET_APPLY_FAILED", e, once_key=f"vol_target:{sym}", symbol=str(sym))
         info["portfolio_vol_scaled"] = True

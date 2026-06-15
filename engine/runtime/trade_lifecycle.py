@@ -31,6 +31,25 @@ def _select_present_columns(con, table_name: str, requested: List[str]) -> List[
     return [name for name in requested if name in available]
 
 
+def _select_columns_or_null(con, table_name: str, requested: List[str]) -> tuple[str, List[str]]:
+    available = _table_columns(con, table_name)
+    expressions = [
+        name if name in available else f"NULL AS {name}"
+        for name in requested
+    ]
+    return ", ".join(expressions), list(requested)
+
+
+def _order_by_available(con, table_name: str, requested: List[tuple[str, str]], fallback: str = "rowid DESC") -> str:
+    available = _table_columns(con, table_name)
+    parts = [
+        f"{column} {direction}".strip()
+        for column, direction in requested
+        if column in available
+    ]
+    return ", ".join(parts) if parts else str(fallback)
+
+
 def _row_to_dict(row, columns: List[str]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if not row:
@@ -365,57 +384,58 @@ def trace_trade_lifecycle(
         report["steps"]["prediction"] = prediction
 
         if _table_exists(con, "prediction_history") and symbol and horizon_s is not None:
-            if event_id is not None:
+            prediction_history_columns = [
+                "id",
+                "ts_ms",
+                "event_id",
+                "symbol",
+                "horizon_s",
+                "predicted_z",
+                "confidence",
+                "confidence_raw",
+                "prediction_strength",
+                "model_name",
+                "model_id",
+                "model_version",
+            ]
+            prediction_history_select, prediction_history_columns = _select_columns_or_null(
+                con,
+                "prediction_history",
+                prediction_history_columns,
+            )
+            prediction_history_available = _table_columns(con, "prediction_history")
+            prediction_history_order = _order_by_available(
+                con,
+                "prediction_history",
+                [("ts_ms", "ASC"), ("id", "ASC")],
+            )
+            if event_id is not None and {"event_id", "symbol", "horizon_s"}.issubset(prediction_history_available):
                 prediction_history = _fetch_all(
                     con,
-                    """
-                    SELECT id, ts_ms, event_id, symbol, horizon_s, predicted_z, confidence,
-                           confidence_raw, prediction_strength, model_name, model_id, model_version
+                    f"""
+                    SELECT {prediction_history_select}
                     FROM prediction_history
                     WHERE event_id=? AND symbol=? AND horizon_s=?
-                    ORDER BY ts_ms ASC, id ASC
+                    ORDER BY {prediction_history_order}
                     """,
                     (int(event_id), str(symbol), int(horizon_s)),
-                    [
-                        "id",
-                        "ts_ms",
-                        "event_id",
-                        "symbol",
-                        "horizon_s",
-                        "predicted_z",
-                        "confidence",
-                        "confidence_raw",
-                        "prediction_strength",
-                        "model_name",
-                        "model_id",
-                        "model_version",
-                    ],
+                    prediction_history_columns,
                 )
-            elif prediction and prediction.get("event_id") is not None:
+            elif (
+                prediction
+                and prediction.get("event_id") is not None
+                and {"event_id", "symbol", "horizon_s"}.issubset(prediction_history_available)
+            ):
                 prediction_history = _fetch_all(
                     con,
-                    """
-                    SELECT id, ts_ms, event_id, symbol, horizon_s, predicted_z, confidence,
-                           confidence_raw, prediction_strength, model_name, model_id, model_version
+                    f"""
+                    SELECT {prediction_history_select}
                     FROM prediction_history
                     WHERE event_id=? AND symbol=? AND horizon_s=?
-                    ORDER BY ts_ms ASC, id ASC
+                    ORDER BY {prediction_history_order}
                     """,
                     (int(prediction["event_id"]), str(symbol), int(horizon_s)),
-                    [
-                        "id",
-                        "ts_ms",
-                        "event_id",
-                        "symbol",
-                        "horizon_s",
-                        "predicted_z",
-                        "confidence",
-                        "confidence_raw",
-                        "prediction_strength",
-                        "model_name",
-                        "model_id",
-                        "model_version",
-                    ],
+                    prediction_history_columns,
                 )
         report["steps"]["prediction_history"] = prediction_history
 
@@ -570,69 +590,60 @@ def trace_trade_lifecycle(
 
         marketplace = None
         if _table_exists(con, "model_marketplace_scores") and resolved_symbol and horizon_s is not None:
-            if resolved_model_id:
+            marketplace_columns = [
+                "model_id",
+                "model_name",
+                "symbol",
+                "horizon_s",
+                "regime",
+                "stage",
+                "score",
+                "trades",
+                "wins",
+                "losses",
+                "gross_pnl",
+                "net_pnl",
+                "avg_confidence",
+                "last_signal_ts_ms",
+                "updated_ts_ms",
+                "meta_json",
+            ]
+            marketplace_select, marketplace_columns = _select_columns_or_null(
+                con,
+                "model_marketplace_scores",
+                marketplace_columns,
+            )
+            marketplace_available = _table_columns(con, "model_marketplace_scores")
+            marketplace_order = _order_by_available(
+                con,
+                "model_marketplace_scores",
+                [("updated_ts_ms", "DESC"), ("updated_ts", "DESC"), ("id", "DESC")],
+            )
+            if resolved_model_id and {"model_id", "symbol", "horizon_s"}.issubset(marketplace_available):
                 marketplace = _fetch_one(
                     con,
-                    """
-                    SELECT model_id, model_name, symbol, horizon_s, regime, stage, score,
-                           trades, wins, losses, gross_pnl, net_pnl, avg_confidence,
-                           last_signal_ts_ms, updated_ts_ms, meta_json
+                    f"""
+                    SELECT {marketplace_select}
                     FROM model_marketplace_scores
                     WHERE model_id=? AND symbol=? AND horizon_s=?
-                    ORDER BY updated_ts_ms DESC
+                    ORDER BY {marketplace_order}
                     LIMIT 1
                     """,
                     (str(resolved_model_id), str(resolved_symbol), int(horizon_s)),
-                    [
-                        "model_id",
-                        "model_name",
-                        "symbol",
-                        "horizon_s",
-                        "regime",
-                        "stage",
-                        "score",
-                        "trades",
-                        "wins",
-                        "losses",
-                        "gross_pnl",
-                        "net_pnl",
-                        "avg_confidence",
-                        "last_signal_ts_ms",
-                        "updated_ts_ms",
-                        "meta_json",
-                    ],
+                    marketplace_columns,
                 )
-            elif model_name:
+            elif model_name and {"model_name", "symbol", "horizon_s"}.issubset(marketplace_available):
                 marketplace = _fetch_one(
                     con,
-                    """
-                    SELECT model_id, model_name, symbol, horizon_s, regime, stage, score,
-                           trades, wins, losses, gross_pnl, net_pnl, avg_confidence,
-                           last_signal_ts_ms, updated_ts_ms, meta_json
+                    f"""
+                    SELECT {marketplace_select}
                     FROM model_marketplace_scores
                     WHERE model_name=? AND symbol=? AND horizon_s=?
-                    ORDER BY updated_ts_ms DESC
+                    ORDER BY {marketplace_order}
                     LIMIT 1
                     """,
                     (str(model_name), str(resolved_symbol), int(horizon_s)),
-                    [
-                        "model_id",
-                        "model_name",
-                        "symbol",
-                        "horizon_s",
-                        "regime",
-                        "stage",
-                        "score",
-                        "trades",
-                        "wins",
-                        "losses",
-                        "gross_pnl",
-                        "net_pnl",
-                        "avg_confidence",
-                        "last_signal_ts_ms",
-                        "updated_ts_ms",
-                        "meta_json",
-                    ],
+                    marketplace_columns,
                 )
         report["steps"]["marketplace_score"] = marketplace
 

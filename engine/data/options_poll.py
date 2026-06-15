@@ -14,9 +14,15 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
 
-load_dotenv()
+    load_dotenv()
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "dotenv" and "No module named 'dotenv'" not in str(exc):
+        raise
+except Exception:
+    logging.getLogger(__name__).debug("dotenv load skipped", exc_info=True)
 
 from engine.data._credentials import get_data_credential
 from engine.data.default_symbols import parse_symbol_limit
@@ -1311,7 +1317,9 @@ def _run_once(providers: List[str]) -> Dict[str, Any]:
                         error=error_text,
                         now_ms=ts_ms,
                     )
-                except dbapi.OperationalError as exc:
+                except Exception as exc:
+                    if not dbapi.is_transient_write_error(exc):
+                        raise
                     _rollback_if_active(conw)
                     _warn_nonfatal(
                         "OPTIONS_POLL_SYMBOL_FAILURE_RECORD_FAILED",

@@ -58,7 +58,7 @@ fi
 "$PYTHON_VENV/bin/pip" install -r requirements.txt
 
 if [[ -f package.json ]]; then
-  npm install
+  npm ci
 fi
 
 "$PYTHON_VENV/bin/python" -c "from engine.runtime.db_repair import repair; import json; print(json.dumps(repair(), indent=2))"

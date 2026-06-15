@@ -24,6 +24,7 @@ from engine.runtime.storage import run_write_txn
 
 
 _METRICS_INIT_LOCK = threading.Lock()
+_METRICS_INIT_LOCAL = threading.local()
 _METRICS_DB_READY = False
 _METRICS_DB_READY_PATH = ""
 LOG = logging.getLogger("engine.runtime.metrics_store")
@@ -92,6 +93,15 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
     )
     if once_key:
         _WARNED_NONFATAL_KEYS.add(once_key)
+
+
+def _metrics_enabled() -> bool:
+    return str(os.environ.get("RUNTIME_METRICS_ENABLED", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 class _RuntimeMetricsBuffer:
@@ -368,6 +378,19 @@ def init_runtime_metrics_db() -> bool:
     # Metrics tables are created lazily so instrumentation can be imported early
     # without requiring an explicit bootstrap ordering.
     global _METRICS_DB_READY, _METRICS_DB_READY_PATH
+    if not _metrics_enabled():
+        return False
+    if bool(getattr(_METRICS_INIT_LOCAL, "active", False)):
+        return False
+    _METRICS_INIT_LOCAL.active = True
+    try:
+        return _init_runtime_metrics_db_inner()
+    finally:
+        _METRICS_INIT_LOCAL.active = False
+
+
+def _init_runtime_metrics_db_inner() -> bool:
+    global _METRICS_DB_READY, _METRICS_DB_READY_PATH
 
     db_path_key = _current_db_path_key()
 
@@ -540,6 +563,8 @@ def write_runtime_metric(
     tags: Optional[Dict] = None,
     ts_ms: Optional[int] = None,
 ) -> None:
+    if not _metrics_enabled():
+        return
     # Metrics are best-effort observability writes; callers should not assume
     # they are part of core transactional correctness.
     if not init_runtime_metrics_db():
@@ -557,6 +582,8 @@ def write_runtime_metric(
 
 
 def write_runtime_snapshot(snapshot: Dict, ts_ms: Optional[int] = None) -> None:
+    if not _metrics_enabled():
+        return
     if not init_runtime_metrics_db():
         return
 

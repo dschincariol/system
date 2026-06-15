@@ -132,6 +132,37 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
     return notes, errors
 
 
+def _api_mutation_auth_gate() -> Tuple[List[str], List[str]]:
+    notes: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.api.auth_config import (
+            format_mutation_auth_config_error,
+            safe_dev_localhost_fallback_enabled,
+            validate_mutation_auth_config,
+        )
+
+        state = validate_mutation_auth_config()
+        if bool(state.get("ok")):
+            notes.append(
+                "api mutation auth ok "
+                f"strict={int(bool(state.get('strict')))} "
+                f"token_configured={int(bool(state.get('dashboard_api_token_configured')))} "
+                f"localhost_dev_fallback={int(bool(safe_dev_localhost_fallback_enabled()))}"
+            )
+            return notes, errors
+
+        errors.append(format_mutation_auth_config_error(state))
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_API_MUTATION_AUTH_FAILED",
+            e,
+            once_key="api_mutation_auth_gate",
+        )
+        errors.append(f"api mutation auth validation failed: {type(e).__name__}: {e}")
+    return notes, errors
+
+
 def _ensure_schemas() -> List[str]:
     notes: List[str] = []
     from engine.runtime.storage import init_db
@@ -271,6 +302,7 @@ def _run_cmd(name: str, argv: List[str], timeout_s: int, *, smoke_db_path: str |
 
 
 _SMOKE_FATAL_OUTPUT_PATTERNS = (
+    "sqlite3.operationalerror: database is locked",
     "operationalerror: database is locked",
     "best_effort_deferred_lock_contention",
 )
@@ -301,6 +333,20 @@ def _prepare_isolated_smoke_db() -> Tuple[List[str], List[str], List[str], str |
     if not _isolated_smoke_db_enabled():
         warnings.append("preflight smoke DB isolation disabled by PREFLIGHT_ISOLATE_SMOKE_DB")
         return notes, warnings, errors, None, None
+
+    try:
+        from engine.runtime.storage import get_db_validation_snapshot
+
+        validation = dict(get_db_validation_snapshot(include_quick_check=False) or {})
+        if str(validation.get("storage") or "").strip().lower() == "postgres":
+            notes.append("preflight smoke DB isolation not required for Postgres runtime storage")
+            return notes, warnings, errors, None, None
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_SMOKE_DB_STORAGE_CHECK_FAILED",
+            e,
+            once_key="smoke_db_storage_check",
+        )
 
     try:
         from engine.runtime.storage import DB_PATH
@@ -470,6 +516,17 @@ def main() -> int:
         else:
             for error in config_errors:
                 print("[config]", error)
+        return 3
+
+    auth_notes, auth_errors = _api_mutation_auth_gate()
+    result["steps"].extend(auth_notes)
+    if auth_errors:
+        result["errors"].extend(auth_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in auth_errors:
+                print("[api-auth]", error)
         return 3
 
     comp_errs = _compile_files(KEY_FILES)

@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from engine.runtime.failure_diagnostics import log_failure
 from engine.strategy.discovery.base import (
     CandidateFeature,
     EvaluationResult,
@@ -24,6 +25,20 @@ _EPS = 1.0e-12
 _BINARY_OPERATORS = ("+", "-", "*", "/")
 _UNARY_OPERATORS = ("log", "abs", "sqrt")
 LOG = get_logger("engine.strategy.discovery.pysr_discoverer")
+
+
+def _warn_nonfatal(code: str, error: BaseException | None = None, **extra: Any) -> None:
+    log_failure(
+        LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error or code),
+        error=error,
+        level=30,
+        component="engine.strategy.discovery.pysr_discoverer",
+        extra=extra or None,
+        persist=False,
+    )
 
 
 class PySRDiscoverer:
@@ -205,11 +220,12 @@ class PySRDiscoverer:
         error: BaseException | None = None,
     ) -> list[CandidateFeature]:
         error_type = type(error).__name__ if error is not None else ""
-        LOG.warning(
-            "pysr_fallback_used symbol=%s reason=%s error_type=%s",
-            str(symbol),
-            str(reason),
-            error_type,
+        _warn_nonfatal(
+            "PYSR_FALLBACK_USED",
+            error,
+            symbol=str(symbol),
+            reason=str(reason),
+            error_type=error_type,
         )
         try:
             from engine.runtime.metrics import emit_counter
@@ -226,19 +242,21 @@ class PySRDiscoverer:
             )
         except Exception as metrics_exc:
             metric_error_type = type(metrics_exc).__name__
-            LOG.warning(
-                "pysr_fallback_metric_emit_failed symbol=%s error_type=%s",
-                str(symbol),
-                metric_error_type,
+            _warn_nonfatal(
+                "PYSR_FALLBACK_METRIC_EMIT_FAILED",
+                metrics_exc,
+                symbol=str(symbol),
+                error_type=metric_error_type,
             )
         try:
             return self._propose_with_fallback(str(symbol), x, y, feature_columns)
         except Exception as fallback_exc:
-            LOG.warning(
-                "pysr_fallback_failed symbol=%s reason=%s error_type=%s",
-                str(symbol),
-                str(reason),
-                type(fallback_exc).__name__,
+            _warn_nonfatal(
+                "PYSR_FALLBACK_FAILED",
+                fallback_exc,
+                symbol=str(symbol),
+                reason=str(reason),
+                error_type=type(fallback_exc).__name__,
             )
             return []
 

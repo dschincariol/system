@@ -16,6 +16,7 @@ from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.observability import record_component_health
 from engine.runtime.storage import (
+    connect,
     run_write_txn,
     _ensure_price_quotes_schema,
     _ensure_price_quotes_raw_schema,
@@ -25,6 +26,7 @@ from engine.runtime.async_writer import enqueue_price_persistence, get_async_wri
 from engine.runtime.telemetry_append_buffer import enqueue_price_quotes_raw_rows
 from engine.runtime.timeseries_write_policy import get_timeseries_write_policy
 from engine.runtime.event_bus import publish_event
+from engine.data.price_hygiene import filter_split_like_price_rows
 from engine.data.provider_registry import get_provider_definition
 
 LOG = get_logger("runtime.price_router")
@@ -401,6 +403,39 @@ def publish_price_events(
         }
 
     merged = _merge_best_by_symbol(normalized, received_ts_ms)
+    price_merged = list(merged)
+    try:
+        filter_con = con
+        close_filter_con = False
+        if filter_con is None:
+            filter_con = connect(readonly=True)
+            close_filter_con = True
+        try:
+            candidates = [dict(row, _row_index=idx) for idx, row in enumerate(merged)]
+            accepted, _flagged = filter_split_like_price_rows(
+                filter_con,
+                candidates,
+                price_key="last",
+                ts_key="timestamp",
+                source_key="provider",
+            )
+            accepted_indexes = {
+                int(row.get("_row_index"))
+                for row in accepted
+                if str(row.get("_row_index") if row.get("_row_index") is not None else "").strip()
+            }
+            price_merged = [row for idx, row in enumerate(merged) if int(idx) in accepted_indexes]
+        finally:
+            if close_filter_con:
+                filter_con.close()
+    except Exception as exc:
+        _warn_nonfatal(
+            "PRICE_ROUTER_SPLIT_LIKE_FILTER_FAILED",
+            exc,
+            once_key="price_router_split_like_filter_failed",
+            row_count=int(len(merged)),
+        )
+        price_merged = list(merged)
 
     raw_rows = [
         (
@@ -448,7 +483,7 @@ def publish_price_events(
             r.get("last"),
             str(r.get("provider") or r.get("source") or ""),
         )
-        for r in merged
+        for r in price_merged
     ]
     pg_price_rows = [
         {
@@ -467,7 +502,7 @@ def publish_price_events(
             "last_update_ts_ms": int(r.get("last_update_ts_ms") or r.get("timestamp") or 0),
             "ingest_ts_ms": int(r.get("ingest_ts_ms") or received_ts_ms),
         }
-        for r in merged
+        for r in price_merged
     ]
     pg_quote_rows = [
         {
@@ -634,9 +669,24 @@ def publish_price_events(
                           THEN excluded.source
                           ELSE price_quotes.source
                         END,
-                      last_trade_ts_ms=GREATEST(COALESCE(price_quotes.last_trade_ts_ms, 0), COALESCE(excluded.last_trade_ts_ms, 0)),
-                      last_quote_ts_ms=GREATEST(COALESCE(price_quotes.last_quote_ts_ms, 0), COALESCE(excluded.last_quote_ts_ms, 0)),
-                      last_update_ts_ms=GREATEST(COALESCE(price_quotes.last_update_ts_ms, 0), COALESCE(excluded.last_update_ts_ms, 0))
+                      last_trade_ts_ms=
+                        CASE
+                          WHEN COALESCE(price_quotes.last_trade_ts_ms, 0) >= COALESCE(excluded.last_trade_ts_ms, 0)
+                          THEN COALESCE(price_quotes.last_trade_ts_ms, 0)
+                          ELSE COALESCE(excluded.last_trade_ts_ms, 0)
+                        END,
+                      last_quote_ts_ms=
+                        CASE
+                          WHEN COALESCE(price_quotes.last_quote_ts_ms, 0) >= COALESCE(excluded.last_quote_ts_ms, 0)
+                          THEN COALESCE(price_quotes.last_quote_ts_ms, 0)
+                          ELSE COALESCE(excluded.last_quote_ts_ms, 0)
+                        END,
+                      last_update_ts_ms=
+                        CASE
+                          WHEN COALESCE(price_quotes.last_update_ts_ms, 0) >= COALESCE(excluded.last_update_ts_ms, 0)
+                          THEN COALESCE(price_quotes.last_update_ts_ms, 0)
+                          ELSE COALESCE(excluded.last_update_ts_ms, 0)
+                        END
                     """,
                     quote_rows,
                 )
@@ -679,7 +729,7 @@ def publish_price_events(
                     "volume": r.get("volume"),
                     "source": str(r.get("source") or r.get("provider") or ""),
                 }
-                for r in merged
+                for r in price_merged
                 if str(r.get("symbol") or "").strip() and int(r.get("timestamp") or 0) > 0 and _as_float(r.get("last")) is not None
             ]
             feature_symbols = sorted(

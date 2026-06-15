@@ -8,8 +8,15 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from psycopg import Error as PsycopgError
-from psycopg.errors import UndefinedFunction
+try:
+    from psycopg import Error as PsycopgError
+    from psycopg.errors import UndefinedFunction
+except ModuleNotFoundError:
+    class PsycopgError(Exception):  # type: ignore[no-redef]
+        pass
+
+    class UndefinedFunction(Exception):  # type: ignore[no-redef]
+        pass
 
 from engine.audit.chain import coerce_row_for_hash, order_by_clause, row_identifier, table_columns
 from engine.audit.hashing import compute_row_hash

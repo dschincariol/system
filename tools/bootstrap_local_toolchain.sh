@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="${PYTHON_VENV:-$ROOT/.venv}"
+PYTHON_BIN="${PYTHON_BIN:-python3.11}"
+NODE_VERSION="${NODE_VERSION:-20.19.4}"
+SHIM_DIR="${TRADING_TOOLCHAIN_SHIM_DIR:-$HOME/.local/bin}"
+INSTALL_USER_SHIMS="${TRADING_INSTALL_USER_SHIMS:-1}"
+
+log() {
+  printf '[toolchain] %s\n' "$*"
+}
+
+die() {
+  printf '[toolchain] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found on PATH"
+}
+
+require_python_311() {
+  "$1" - <<'PY'
+import sys
+
+if sys.version_info[:2] != (3, 11):
+    raise SystemExit(f"python_3_11_required:{sys.version}")
+PY
+}
+
+version_at_least() {
+  local actual="$1"
+  local minimum="$2"
+  local actual_major actual_minor actual_patch min_major min_minor min_patch
+  IFS=. read -r actual_major actual_minor actual_patch <<<"$actual"
+  IFS=. read -r min_major min_minor min_patch <<<"$minimum"
+  actual_patch="${actual_patch:-0}"
+  min_patch="${min_patch:-0}"
+
+  if (( actual_major > min_major )); then return 0; fi
+  if (( actual_major < min_major )); then return 1; fi
+  if (( actual_minor > min_minor )); then return 0; fi
+  if (( actual_minor < min_minor )); then return 1; fi
+  (( actual_patch >= min_patch ))
+}
+
+node_ok() {
+  local node_bin="$1"
+  local version major
+  [[ -x "$node_bin" ]] || return 1
+  version="$("$node_bin" -p 'process.versions.node' 2>/dev/null)" || return 1
+  IFS=. read -r major _minor _patch <<<"$version"
+  [[ "$major" == "20" ]] && version_at_least "$version" "20.17.0"
+}
+
+npm_ok() {
+  local npm_bin="$1"
+  local npm_dir version major
+  [[ -x "$npm_bin" || -L "$npm_bin" ]] || return 1
+  npm_dir="$(dirname "$npm_bin")"
+  version="$(PATH="$npm_dir:$PATH" "$npm_bin" --version 2>/dev/null)" || return 1
+  IFS=. read -r major _minor _patch <<<"$version"
+  [[ "$major" == "10" ]]
+}
+
+node_platform() {
+  case "$(uname -s)" in
+    Linux) printf 'linux' ;;
+    Darwin) printf 'darwin' ;;
+    *) die "unsupported Node.js bootstrap platform: $(uname -s)" ;;
+  esac
+}
+
+node_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64) printf 'x64' ;;
+    aarch64 | arm64) printf 'arm64' ;;
+    *) die "unsupported Node.js bootstrap architecture: $(uname -m)" ;;
+  esac
+}
+
+install_node_into_venv() {
+  local platform arch name archive src_dir url tmp
+  platform="$(node_platform)"
+  arch="$(node_arch)"
+  name="node-v${NODE_VERSION}-${platform}-${arch}"
+  src_dir="$VENV_DIR/src/$name"
+  archive="$VENV_DIR/src/${name}.tar.xz"
+  url="https://nodejs.org/dist/v${NODE_VERSION}/${name}.tar.xz"
+
+  require_command curl
+  require_command tar
+  mkdir -p "$VENV_DIR/src"
+
+  if [[ ! -x "$src_dir/bin/node" ]]; then
+    log "downloading Node.js $NODE_VERSION for $platform-$arch"
+    tmp="${archive}.tmp"
+    curl -fsSL "$url" -o "$tmp"
+    mv "$tmp" "$archive"
+    tar -xJf "$archive" -C "$VENV_DIR/src"
+  fi
+
+  mkdir -p "$VENV_DIR/bin"
+  ln -sfn "$src_dir/bin/node" "$VENV_DIR/bin/node"
+  ln -sfn "$src_dir/bin/node" "$VENV_DIR/bin/nodejs"
+  ln -sfn "$src_dir/bin/npm" "$VENV_DIR/bin/npm"
+  ln -sfn "$src_dir/bin/npx" "$VENV_DIR/bin/npx"
+}
+
+ensure_venv() {
+  require_command "$PYTHON_BIN"
+  require_python_311 "$PYTHON_BIN"
+
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    log "creating Python venv at $VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+  fi
+
+  require_python_311 "$VENV_DIR/bin/python"
+  log "installing Python dependencies from requirements.txt"
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel setuptools
+  "$VENV_DIR/bin/python" -m pip install -r "$ROOT/requirements.txt"
+}
+
+ensure_node() {
+  if node_ok "$VENV_DIR/bin/node" && npm_ok "$VENV_DIR/bin/npm"; then
+    log "using existing venv Node.js $("$VENV_DIR/bin/node" --version) and npm $(PATH="$VENV_DIR/bin:$PATH" "$VENV_DIR/bin/npm" --version)"
+    return 0
+  fi
+
+  install_node_into_venv
+  node_ok "$VENV_DIR/bin/node" || die "Node.js in $VENV_DIR/bin/node does not satisfy >=20.17.0 <21"
+  npm_ok "$VENV_DIR/bin/npm" || die "npm in $VENV_DIR/bin/npm does not satisfy >=10.0.0 <11"
+}
+
+install_symlink_shim() {
+  local name="$1"
+  local target="$2"
+  local shim="$SHIM_DIR/$name"
+
+  [[ -x "$target" || -L "$target" ]] || die "cannot install $name shim; target missing: $target"
+  mkdir -p "$SHIM_DIR"
+
+  if [[ -e "$shim" && ! -L "$shim" ]]; then
+    die "refusing to replace non-symlink command shim: $shim"
+  fi
+
+  ln -sfn "$target" "$shim"
+}
+
+install_python_shim() {
+  local name="$1"
+  local target="$2"
+  local shim="$SHIM_DIR/$name"
+  local tmp
+
+  [[ -x "$target" ]] || die "cannot install $name shim; target missing: $target"
+  mkdir -p "$SHIM_DIR"
+
+  if [[ -e "$shim" && ! -L "$shim" ]] && ! grep -q "trading-system local python shim" "$shim" 2>/dev/null; then
+    die "refusing to replace non-symlink command shim: $shim"
+  fi
+
+  tmp="${shim}.tmp"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# trading-system local python shim; generated by tools/bootstrap_local_toolchain.sh\n'
+    printf 'exec %q "$@"\n' "$target"
+  } >"$tmp"
+  chmod 0755 "$tmp"
+  mv "$tmp" "$shim"
+}
+
+install_user_shims() {
+  if [[ "$INSTALL_USER_SHIMS" != "1" ]]; then
+    log "skipping user command shims because TRADING_INSTALL_USER_SHIMS=$INSTALL_USER_SHIMS"
+    return 0
+  fi
+
+  install_python_shim python "$VENV_DIR/bin/python"
+  install_python_shim python3 "$VENV_DIR/bin/python"
+  install_symlink_shim node "$VENV_DIR/bin/node"
+  install_symlink_shim nodejs "$VENV_DIR/bin/nodejs"
+  install_symlink_shim npm "$VENV_DIR/bin/npm"
+  install_symlink_shim npx "$VENV_DIR/bin/npx"
+
+  case ":$PATH:" in
+    *":$SHIM_DIR:"*) ;;
+    *) log "warning: $SHIM_DIR is not on PATH; add it before running documented gates" ;;
+  esac
+}
+
+main() {
+  cd "$ROOT"
+  ensure_venv
+  ensure_node
+
+  log "installing Node dependencies from package-lock.json"
+  PATH="$VENV_DIR/bin:$PATH" "$VENV_DIR/bin/npm" ci
+
+  install_user_shims
+
+  log "python: $("$VENV_DIR/bin/python" --version)"
+  log "node: $("$VENV_DIR/bin/node" --version)"
+  log "npm: $(PATH="$VENV_DIR/bin:$PATH" "$VENV_DIR/bin/npm" --version)"
+  log "bootstrap complete"
+}
+
+main "$@"

@@ -6,6 +6,7 @@ import requests
 
 from engine.artifacts.store import LocalArtifactStore
 from engine.data._credentials import get_data_credential
+from engine.data.time_utils import utc_ms_from_datetime
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 
@@ -131,10 +132,14 @@ def ingest_transcripts(
                 ts_ms = 0
                 if date_text:
                     try:
-                        ts_ms = int(dt.datetime.fromisoformat(date_text.replace("Z", "+00:00")).timestamp() * 1000)
+                        parsed = dt.datetime.fromisoformat(date_text.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None or parsed.utcoffset() is None:
+                            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+                        ts_ms = utc_ms_from_datetime(parsed, field_name="transcript_date")
                     except Exception:
                         try:
-                            ts_ms = int(dt.datetime.strptime(date_text[:10], "%Y-%m-%d").timestamp() * 1000)
+                            parsed = dt.datetime.strptime(date_text[:10], "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+                            ts_ms = utc_ms_from_datetime(parsed, field_name="transcript_date")
                         except Exception:
                             ts_ms = 0
                 transcript_id = str(item.get("symbol") or symbol).strip().upper()

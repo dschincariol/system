@@ -52,6 +52,17 @@ class _BusyJobs:
         raise AssertionError("api path should use a bounded jobs listing")
 
 
+class _EmptyJobsDb:
+    def execute(self, _sql, _params=()):
+        return self
+
+    def fetchall(self):
+        return []
+
+    def close(self):
+        pass
+
+
 def test_postgres_symbol_price_status_update_uses_jsonb_not_sqlite_json(monkeypatch):
     price_router = importlib.reload(importlib.import_module("engine.runtime.price_router"))
     db = _FakePostgresStorage()
@@ -120,3 +131,26 @@ def test_readiness_degrades_instead_of_blocking_on_busy_jobs(monkeypatch):
     assert response["ready"] is False
     assert response["execution_allowed"] is False
     assert "jobs_list_timeout" in response["reasons"]
+
+
+def test_jobs_endpoint_degrades_with_timeout_evidence(monkeypatch):
+    api_jobs = importlib.reload(importlib.import_module("engine.api.api_jobs"))
+
+    monkeypatch.setattr(
+        api_jobs,
+        "ALLOWED_JOBS",
+        {"ingestion_runtime": ("engine/runtime/ingestion_runtime.py", "daemon", "runtime", {})},
+    )
+    monkeypatch.setattr(api_jobs, "PIPELINE_ORDER", ["ingestion_runtime"])
+    monkeypatch.setattr(api_jobs, "JOB_ORDER", ["ingestion_runtime"])
+    monkeypatch.setattr(api_jobs, "_db_connect", lambda **_kwargs: _EmptyJobsDb())
+    monkeypatch.setattr(api_jobs, "_pid_is_running", lambda _pid: False)
+
+    response = api_jobs.api_get_jobs({}, ctx={"JOBS": _BusyJobs()})
+
+    assert response["ok"] is False
+    assert response["degraded"] is True
+    assert response["status"] == "degraded"
+    assert response["live_list_available"] is False
+    assert "jobs_list_timeout" in response["reasons"]
+    assert response["jobs"][0]["name"] == "ingestion_runtime"

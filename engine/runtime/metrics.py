@@ -15,6 +15,10 @@ from typing import Any, Dict, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.test_isolation import apply_runtime_test_defaults
+
+apply_runtime_test_defaults()
+
 _WARNED_NONFATAL_KEYS: set[str] = set()
 LOG = get_logger("runtime.metrics")
 _GAUGE_MIN_EMIT_INTERVAL_MS = max(
@@ -23,6 +27,16 @@ _GAUGE_MIN_EMIT_INTERVAL_MS = max(
 )
 _LAST_GAUGE_EMISSION_LOCK = threading.Lock()
 _LAST_GAUGE_EMISSION: Dict[tuple[str, str, tuple[tuple[str, str], ...]], tuple[str, int]] = {}
+_EMIT_LOCAL = threading.local()
+
+
+def _metrics_enabled() -> bool:
+    return str(os.environ.get("RUNTIME_METRICS_ENABLED", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _now_ms() -> int:
@@ -77,6 +91,49 @@ def _metric_tags(**kwargs: Any) -> Dict[str, str]:
 
 
 def emit_metric(
+    metric: str,
+    value: Any,
+    *,
+    metric_type: str = "gauge",
+    service: str = "trading-engine",
+    component: Optional[str] = None,
+    job: Optional[str] = None,
+    symbol: Optional[str] = None,
+    strategy: Optional[str] = None,
+    provider: Optional[str] = None,
+    broker: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    span_id: Optional[str] = None,
+    ts_ms: Optional[int] = None,
+    extra_tags: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not _metrics_enabled():
+        return
+    if bool(getattr(_EMIT_LOCAL, "active", False)):
+        return
+    _EMIT_LOCAL.active = True
+    try:
+        _emit_metric_inner(
+            metric,
+            value,
+            metric_type=metric_type,
+            service=service,
+            component=component,
+            job=job,
+            symbol=symbol,
+            strategy=strategy,
+            provider=provider,
+            broker=broker,
+            trace_id=trace_id,
+            span_id=span_id,
+            ts_ms=ts_ms,
+            extra_tags=extra_tags,
+        )
+    finally:
+        _EMIT_LOCAL.active = False
+
+
+def _emit_metric_inner(
     metric: str,
     value: Any,
     *,
@@ -160,6 +217,10 @@ def emit_timing(metric: str, latency_ms: Any, **kwargs: Any) -> None:
 
 
 def emit_snapshot(metrics: Dict[str, Any], *, tags: Optional[Dict[str, Any]] = None, ts_ms: Optional[int] = None) -> None:
+    if not _metrics_enabled():
+        return
+    if bool(getattr(_EMIT_LOCAL, "active", False)):
+        return
     # Snapshots are coarse multi-metric dumps, separate from the row-per-metric
     # stream written by emit_metric().
     try:

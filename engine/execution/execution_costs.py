@@ -5,12 +5,31 @@ Execution subsystem module for `execution_costs`.
 """
 
 # dev_core/execution_costs.py
+import logging
 import os
 from typing import Dict, Optional
+
+from engine.runtime.failure_diagnostics import log_failure
+
+LOG = logging.getLogger(__name__)
 
 DEFAULT_FEES_BPS = float(os.environ.get("EXEC_FEES_BPS", "0.5"))          # commission/fees
 DEFAULT_SLIPPAGE_BPS = float(os.environ.get("EXEC_SLIPPAGE_BPS", "2.0"))  # impact/queue/slip
 DEFAULT_SPREAD_BPS_CAP = float(os.environ.get("EXEC_SPREAD_BPS_CAP", "30.0"))
+
+
+def _warn_nonfatal(code: str, error: BaseException, **extra: object) -> None:
+    log_failure(
+        LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error),
+        error=error,
+        level=logging.WARNING,
+        component="engine.execution.execution_costs",
+        extra=extra or None,
+        persist=False,
+    )
 
 def _bps(x: float) -> float:
     return float(x) * 1e4
@@ -41,7 +60,12 @@ def estimate_cost_bps(
     if spread_bps_override is not None:
         try:
             spread_bps = max(0.0, float(spread_bps_override))
-        except Exception:
+        except (TypeError, ValueError) as e:
+            _warn_nonfatal(
+                "EXECUTION_COST_SPREAD_OVERRIDE_PARSE_FAILED",
+                e,
+                value=repr(spread_bps_override),
+            )
             spread_bps = 0.0
     elif bid is not None and ask is not None:
         try:
@@ -49,7 +73,14 @@ def estimate_cost_bps(
             if px > 0:
                 # expected crossing cost approx half spread (entry)
                 spread_bps = min(DEFAULT_SPREAD_BPS_CAP, _bps(0.5 * spr / float(px)))
-        except Exception:
+        except (TypeError, ValueError) as e:
+            _warn_nonfatal(
+                "EXECUTION_COST_SPREAD_PARSE_FAILED",
+                e,
+                px=repr(px),
+                bid=repr(bid),
+                ask=repr(ask),
+            )
             spread_bps = 0.0
 
     extra_bps = max(0.0, float(extra_cost_bps or 0.0))

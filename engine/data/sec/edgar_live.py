@@ -180,6 +180,7 @@ def fetch_recent_filings(ticker: str, limit: int = 25) -> list:
     forms = recent.get("form") or []
     accs = recent.get("accessionNumber") or []
     fdates = recent.get("filingDate") or []
+    acceptance_datetimes = recent.get("acceptanceDateTime") or []
     rdates = recent.get("reportDate") or []
     prim_docs = recent.get("primaryDocument") or []
 
@@ -192,6 +193,11 @@ def fetch_recent_filings(ticker: str, limit: int = 25) -> list:
             fd = str(fdates[i])
             rd = str(rdates[i]) if i < len(rdates) and rdates[i] else None
             primary = str(prim_docs[i])
+            acceptance_datetime = (
+                str(acceptance_datetimes[i])
+                if i < len(acceptance_datetimes) and acceptance_datetimes[i]
+                else None
+            )
 
             # construct primary doc URL (standard SEC archives path)
             acc_nodash = acc.replace("-", "")
@@ -202,6 +208,7 @@ def fetch_recent_filings(ticker: str, limit: int = 25) -> list:
                     "accession": acc,
                     "form": form,
                     "filed_date": fd,
+                    "acceptance_datetime": acceptance_datetime,
                     "report_date": rd,
                     "cik": cik,
                     "company_name": company_name,

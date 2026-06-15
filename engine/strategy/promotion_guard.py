@@ -27,6 +27,16 @@ from engine.strategy.statistical_gates import (
     promotion_gate_config_from_env,
 )
 from engine.strategy.promotion_audit import record_statistical_evidence
+from engine.strategy.feature_neutralization import (
+    extract_feature_rows,
+    feature_neutral_ic,
+    neutralize_feature_ids,
+)
+from engine.strategy.era_boost import (
+    coerce_optional_labels as _shared_coerce_optional_labels,
+    era_labels_for as _shared_era_labels_for,
+    month_label as _shared_month_label,
+)
 from engine.strategy.statistics.factor_threshold import (
     FactorThresholdResult,
     harvey_liu_zhu_threshold_result,
@@ -68,6 +78,7 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("promotion_guard")
 _NORMAL = NormalDist()
+_EPS = 1e-12
 
 # ------            -- ------------------------------------------------------
 # Coverage / sanity thresholds (metric-based promotion)
@@ -174,6 +185,504 @@ def _clean_numeric_series(values: Any) -> list[float]:
     return out
 
 
+def _safe_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if raw in (None, ""):
+        return float(default)
+    try:
+        value = float(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "PROMOTION_GUARD_FLOAT_ENV_PARSE_FAILED",
+            e,
+            once_key=f"float_env:{name}",
+            env_name=str(name),
+            raw_value=str(raw),
+        )
+        return float(default)
+    return float(value) if math.isfinite(value) else float(default)
+
+
+def _safe_bool_env(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    if raw in (None, ""):
+        return int(default)
+    try:
+        return int(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "PROMOTION_GUARD_INT_ENV_PARSE_FAILED",
+            e,
+            once_key=f"int_env:{name}",
+            env_name=str(name),
+            raw_value=str(raw),
+        )
+        return int(default)
+
+
+def _series_sharpe(values: Any) -> float:
+    arr = _clean_numeric_series(values)
+    n = int(len(arr))
+    if n <= 1:
+        return 0.0
+    mean = sum(arr) / float(n)
+    variance = sum((value - mean) ** 2 for value in arr) / float(max(1, n - 1))
+    std = math.sqrt(max(0.0, variance))
+    if std <= _EPS:
+        if mean > 0.0:
+            return 10.0
+        if mean < 0.0:
+            return -10.0
+        return 0.0
+    return float(mean / std)
+
+
+def _align_series(left: list[float], right: list[float]) -> tuple[list[float], list[float]]:
+    n = min(int(len(left)), int(len(right)))
+    if n <= 0:
+        return [], []
+    return list(left[:n]), list(right[:n])
+
+
+def _pearson_corr(left: list[float], right: list[float]) -> float | None:
+    x, y = _align_series(left, right)
+    n = int(len(x))
+    if n < 2:
+        return None
+    mean_x = sum(x) / float(n)
+    mean_y = sum(y) / float(n)
+    dx = [value - mean_x for value in x]
+    dy = [value - mean_y for value in y]
+    var_x = sum(value * value for value in dx)
+    var_y = sum(value * value for value in dy)
+    denom = math.sqrt(max(0.0, var_x * var_y))
+    if denom <= _EPS:
+        return 1.0 if all(abs(a - b) <= _EPS for a, b in zip(x, y)) else 0.0
+    return float(max(-1.0, min(1.0, sum(a * b for a, b in zip(dx, dy)) / denom)))
+
+
+def _series_ic(predictions: Any, realized: Any) -> float | None:
+    corr = _pearson_corr(_clean_numeric_series(predictions), _clean_numeric_series(realized))
+    return None if corr is None else float(corr)
+
+
+def _feature_neutral_ic_payload(
+    *,
+    challenger_predictions: Any,
+    realized_returns: Any,
+    neutralization_features: Any = None,
+    candidate_features: Any = None,
+) -> Dict[str, Any]:
+    predictions = _clean_numeric_series(challenger_predictions)
+    realized = _clean_numeric_series(realized_returns)
+    feature_ids = neutralize_feature_ids()
+    feature_rows = extract_feature_rows(neutralization_features, feature_ids)
+    if not feature_rows:
+        feature_rows = extract_feature_rows(candidate_features, feature_ids)
+    n = min(int(len(predictions)), int(len(realized)), int(len(feature_rows)))
+    threshold = _safe_float_env("PROMOTION_MAX_FACTOR_DEPENDENCE", 0.10)
+    if n < 8:
+        return {
+            "applied": False,
+            "passed": True,
+            "flagged": False,
+            "status": "insufficient_aligned_rows",
+            "n": int(n),
+            "min_n": 8,
+            "feature_ids": list(feature_ids),
+            "max_factor_dependence": float(threshold),
+        }
+    metric = feature_neutral_ic(
+        predictions[:n],
+        realized[:n],
+        feature_rows[:n],
+        feature_ids=feature_ids,
+        min_symbols=8,
+    )
+    gap = float(metric.get("raw_minus_fnc") or 0.0)
+    flagged = bool(gap > float(threshold))
+    return {
+        **dict(metric),
+        "applied": bool(metric.get("applied")),
+        "passed": True,
+        "flagged": bool(flagged),
+        "status": "flagged_factor_dependence" if flagged else "evaluated",
+        "max_factor_dependence": float(threshold),
+        "log_only": True,
+    }
+
+
+def _stddev(values: list[float]) -> float:
+    arr = [float(value) for value in list(values or []) if math.isfinite(float(value))]
+    n = int(len(arr))
+    if n <= 1:
+        return 0.0
+    mean = sum(arr) / float(n)
+    return float(math.sqrt(sum((value - mean) ** 2 for value in arr) / float(n - 1)))
+
+
+def _bottom_quartile_mean(values: list[float]) -> float | None:
+    arr = sorted(float(value) for value in list(values or []) if math.isfinite(float(value)))
+    if not arr:
+        return None
+    count = max(1, int(math.ceil(float(len(arr)) * 0.25)))
+    bucket = arr[:count]
+    return float(sum(bucket) / float(len(bucket)))
+
+
+def _month_label(ts_ms: Any) -> str:
+    return _shared_month_label(ts_ms)
+
+
+def _coerce_optional_labels(values: Any) -> list[str]:
+    return _shared_coerce_optional_labels(values)
+
+
+def _era_labels_for(
+    *,
+    n_obs: int,
+    timestamps: Any = None,
+    era_labels: Any = None,
+    regime_labels: Any = None,
+) -> tuple[list[str], Dict[str, Any]]:
+    labels, diagnostics = _shared_era_labels_for(
+        n_obs=int(n_obs),
+        timestamps=timestamps,
+        era_labels=era_labels,
+        regime_labels=regime_labels,
+    )
+    return labels, dict(diagnostics)
+
+
+def _era_table(
+    *,
+    returns: list[float],
+    labels: list[str],
+    predictions: Any = None,
+    realized: Any = None,
+    min_obs: int = 2,
+) -> list[Dict[str, Any]]:
+    n = min(int(len(returns)), int(len(labels)))
+    pred = _clean_numeric_series(predictions)
+    actual = _clean_numeric_series(realized)
+    by_era: Dict[str, Dict[str, list[float]]] = {}
+    for idx in range(n):
+        label = str(labels[idx] or "unknown")
+        bucket = by_era.setdefault(label, {"returns": [], "predictions": [], "realized": []})
+        bucket["returns"].append(float(returns[idx]))
+        if idx < len(pred) and idx < len(actual):
+            bucket["predictions"].append(float(pred[idx]))
+            bucket["realized"].append(float(actual[idx]))
+
+    rows: list[Dict[str, Any]] = []
+    for label in sorted(by_era.keys()):
+        bucket = by_era[label]
+        ret = list(bucket.get("returns") or [])
+        if len(ret) < int(max(1, min_obs)):
+            continue
+        ic = _series_ic(bucket.get("predictions"), bucket.get("realized")) if bucket.get("predictions") else None
+        rows.append(
+            {
+                "era": str(label),
+                "n_obs": int(len(ret)),
+                "cost_adjusted_sharpe": float(_series_sharpe(ret)),
+                "ic": (None if ic is None else float(ic)),
+                "pnl": float(sum(ret)),
+                "mean_return": float(sum(ret) / float(len(ret))) if ret else 0.0,
+            }
+        )
+    return rows
+
+
+def _era_regime_robustness_gate(
+    *,
+    challenger_series: list[float],
+    champion_series: list[float],
+    evaluation_timestamps: Any = None,
+    era_labels: Any = None,
+    regime_labels: Any = None,
+    challenger_predictions: Any = None,
+    realized_returns: Any = None,
+) -> tuple[Dict[str, Any], bool]:
+    min_obs = max(2, _safe_int_env("PROMOTION_MIN_ERA_OBS", 2))
+    labels, label_diag = _era_labels_for(
+        n_obs=len(challenger_series),
+        timestamps=evaluation_timestamps,
+        era_labels=era_labels,
+        regime_labels=regime_labels,
+    )
+    if not bool(label_diag.get("applied")):
+        return dict(label_diag), True
+
+    challenger_rows = _era_table(
+        returns=list(challenger_series),
+        labels=list(labels),
+        predictions=challenger_predictions,
+        realized=realized_returns,
+        min_obs=int(min_obs),
+    )
+    champion_rows = _era_table(
+        returns=list(champion_series[: len(labels)]),
+        labels=list(labels[: len(champion_series)]),
+        min_obs=int(min_obs),
+    )
+    challenger_sharpes = [float(row.get("cost_adjusted_sharpe") or 0.0) for row in challenger_rows]
+    champion_sharpes = [float(row.get("cost_adjusted_sharpe") or 0.0) for row in champion_rows]
+    challenger_worst = _bottom_quartile_mean(challenger_sharpes)
+    champion_worst = _bottom_quartile_mean(champion_sharpes)
+
+    env_threshold_raw = os.environ.get("PROMOTION_MIN_WORST_ERA_SHARPE")
+    if env_threshold_raw not in (None, ""):
+        min_worst = _safe_float_env("PROMOTION_MIN_WORST_ERA_SHARPE", 0.0)
+        threshold_source = "env"
+    elif champion_worst is not None:
+        min_worst = float(champion_worst)
+        threshold_source = "champion_worst_quartile"
+    else:
+        min_worst = float("-inf")
+        threshold_source = "unbounded_no_champion_context"
+
+    max_std = _safe_float_env("PROMOTION_MAX_ERA_STD", 2.0)
+    std_log_only = _safe_bool_env("PROMOTION_ERA_STD_LOG_ONLY", True)
+    era_std = _stddev(challenger_sharpes)
+    enough_eras = len(challenger_rows) >= 1
+    worst_passed = bool(challenger_worst is not None and float(challenger_worst) >= float(min_worst))
+    std_within_threshold = bool(era_std <= float(max_std))
+    std_passed = bool(std_within_threshold or std_log_only)
+    passed = bool(enough_eras and worst_passed and std_passed)
+    status = "evaluated"
+    if not enough_eras:
+        status = "insufficient_eras"
+    elif not worst_passed:
+        status = "worst_quartile_sharpe_below_threshold"
+    elif not std_within_threshold and std_log_only:
+        status = "era_std_above_threshold_log_only"
+    elif not std_within_threshold:
+        status = "era_std_above_threshold"
+
+    payload: Dict[str, Any] = {
+        "applied": True,
+        "status": status,
+        "passed": bool(passed),
+        "bucket_mode": str(label_diag.get("bucket_mode") or ""),
+        "min_era_obs": int(min_obs),
+        "era_count": int(len(challenger_rows)),
+        "champion_era_count": int(len(champion_rows)),
+        "worst_quartile_sharpe": (None if challenger_worst is None else float(challenger_worst)),
+        "champion_worst_quartile_sharpe": (None if champion_worst is None else float(champion_worst)),
+        "min_worst_era_sharpe": (None if not math.isfinite(float(min_worst)) else float(min_worst)),
+        "min_worst_era_sharpe_source": str(threshold_source),
+        "era_score_std": float(era_std),
+        "max_era_std": float(max_std),
+        "era_std_log_only": bool(std_log_only),
+        "era_std_within_threshold": bool(std_within_threshold),
+        "eras": challenger_rows,
+        "champion_eras": champion_rows,
+    }
+    return payload, bool(passed)
+
+
+def _iter_return_series_map(values: Any) -> list[tuple[str, list[float]]]:
+    if values is None:
+        return []
+    rows: list[tuple[str, Any]] = []
+    if isinstance(values, dict):
+        rows = [(str(label), raw) for label, raw in values.items()]
+    elif isinstance(values, (list, tuple)):
+        if values and all(not isinstance(item, (list, tuple, dict)) for item in values):
+            rows = [("pool", values)]
+        else:
+            rows = [(f"pool_{idx}", raw) for idx, raw in enumerate(values, start=1)]
+    else:
+        rows = [("pool", values)]
+
+    out: list[tuple[str, list[float]]] = []
+    for label, raw in rows:
+        series = _clean_numeric_series(raw)
+        if len(series) >= 2:
+            out.append((str(label or f"pool_{len(out) + 1}"), series))
+    return out
+
+
+def _equally_weighted_pool_series(
+    values: Any,
+    *,
+    exclude_labels: set[str] | None = None,
+) -> tuple[list[float], list[str]]:
+    excluded = {str(label or "").strip() for label in set(exclude_labels or set()) if str(label or "").strip()}
+    series_rows = [
+        (label, series)
+        for label, series in _iter_return_series_map(values)
+        if str(label or "").strip() not in excluded
+    ]
+    if not series_rows:
+        return [], []
+    n = min(len(series) for _label, series in series_rows)
+    if n < 2:
+        return [], []
+    labels = [str(label) for label, _series in series_rows]
+    pool = [
+        sum(float(series[idx]) for _label, series in series_rows) / float(len(series_rows))
+        for idx in range(int(n))
+    ]
+    return pool, labels
+
+
+def _portfolio_blend_metrics(
+    *,
+    challenger_series: list[float],
+    baseline_series: list[float],
+    sleeve_weight: float,
+) -> Dict[str, Any]:
+    base, challenger = _align_series(list(baseline_series), list(challenger_series))
+    n = int(len(base))
+    if n < 2:
+        return {
+            "applied": False,
+            "status": "insufficient_aligned_returns",
+            "passed": True,
+            "n_obs": int(n),
+        }
+    weight = max(0.0, min(1.0, float(sleeve_weight)))
+    with_challenger = [
+        ((1.0 - weight) * float(base_value)) + (weight * float(challenger_value))
+        for base_value, challenger_value in zip(base, challenger)
+    ]
+    baseline_sharpe = _series_sharpe(base)
+    with_challenger_sharpe = _series_sharpe(with_challenger)
+    baseline_pnl = float(sum(base))
+    with_challenger_pnl = float(sum(with_challenger))
+    return {
+        "applied": True,
+        "status": "evaluated",
+        "n_obs": int(n),
+        "sleeve_weight": float(weight),
+        "baseline_sharpe": float(baseline_sharpe),
+        "with_challenger_sharpe": float(with_challenger_sharpe),
+        "marginal_sharpe": float(with_challenger_sharpe - baseline_sharpe),
+        "baseline_pnl": float(baseline_pnl),
+        "with_challenger_pnl": float(with_challenger_pnl),
+        "marginal_pnl": float(with_challenger_pnl - baseline_pnl),
+    }
+
+
+def _pool_contribution_gates(
+    *,
+    challenger_series: list[float],
+    champion_series: list[float],
+    model_id: str,
+    model_name: str,
+    candidate_version: str,
+    models_returns: Any = None,
+    pool_returns: Any = None,
+    max_pool_corr: float | None = None,
+    corr_sharpe_uplift: float | None = None,
+    min_mpc: float | None = None,
+    mpc_weight: float | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any], bool]:
+    context = pool_returns if pool_returns is not None else models_returns
+    threshold = float(
+        max_pool_corr
+        if max_pool_corr is not None
+        else _safe_float_env("PROMOTION_MAX_POOL_CORR", 0.70)
+    )
+    uplift = float(
+        corr_sharpe_uplift
+        if corr_sharpe_uplift is not None
+        else _safe_float_env("PROMOTION_CORR_SHARPE_UPLIFT", 0.10)
+    )
+    min_mpc_value = float(min_mpc if min_mpc is not None else _safe_float_env("PROMOTION_MIN_MPC", 0.0))
+    sleeve = float(mpc_weight if mpc_weight is not None else _safe_float_env("PROMOTION_MPC_WEIGHT", 0.10))
+    excluded = {
+        str(model_id or "").strip(),
+        str(model_name or "").strip(),
+        str(candidate_version or "").strip(),
+        "challenger",
+    }
+    pool_series, pool_labels = _equally_weighted_pool_series(context, exclude_labels=excluded)
+
+    if context is None:
+        skipped = {
+            "applied": False,
+            "status": "no_pool_context",
+            "passed": True,
+            "max_pool_corr": float(threshold),
+        }
+        mpc_skipped = {
+            "applied": False,
+            "status": "no_pool_context",
+            "passed": True,
+            "min_mpc": float(min_mpc_value),
+            "sleeve_weight": float(max(0.0, min(1.0, sleeve))),
+        }
+        return skipped, mpc_skipped, True
+
+    champion_corr = _pearson_corr(challenger_series, champion_series)
+    pool_corr = _pearson_corr(challenger_series, pool_series)
+    corr_values = [value for value in (champion_corr, pool_corr) if value is not None]
+    challenger_sharpe = _series_sharpe(challenger_series)
+    champion_sharpe = _series_sharpe(champion_series)
+    pool_sharpe = _series_sharpe(pool_series)
+    incumbent_sharpe = champion_sharpe if champion_series else pool_sharpe
+    max_corr = max(corr_values) if corr_values else 0.0
+    high_corr = bool(corr_values and float(max_corr) > float(threshold))
+    required_uplift_sharpe = float(incumbent_sharpe) * (1.0 + max(0.0, float(uplift)))
+    uplift_override = bool(high_corr and float(challenger_sharpe) >= float(required_uplift_sharpe))
+    corr_passed = bool((not high_corr) or uplift_override)
+    corr_payload = {
+        "applied": bool(corr_values),
+        "status": (
+            "high_correlation_uplift_override"
+            if uplift_override
+            else ("high_correlation_without_uplift" if high_corr else ("evaluated" if corr_values else "insufficient_aligned_returns"))
+        ),
+        "passed": bool(corr_passed),
+        "champion_corr": (None if champion_corr is None else float(champion_corr)),
+        "pool_corr": (None if pool_corr is None else float(pool_corr)),
+        "max_correlation": float(max_corr),
+        "max_pool_corr": float(threshold),
+        "corr_sharpe_uplift": float(uplift),
+        "challenger_sharpe": float(challenger_sharpe),
+        "incumbent_sharpe": float(incumbent_sharpe),
+        "required_uplift_sharpe": float(required_uplift_sharpe),
+        "uplift_override": bool(uplift_override),
+        "pool_model_labels": list(pool_labels),
+    }
+
+    baseline = pool_series if pool_series else champion_series
+    mpc_payload = _portfolio_blend_metrics(
+        challenger_series=challenger_series,
+        baseline_series=baseline,
+        sleeve_weight=float(sleeve),
+    )
+    mpc_payload.update(
+        {
+            "min_mpc": float(min_mpc_value),
+            "baseline_source": "pool" if pool_series else ("champion" if champion_series else "none"),
+            "pool_model_labels": list(pool_labels),
+        }
+    )
+    if bool(mpc_payload.get("applied")):
+        mpc_passed = bool(
+            float(mpc_payload.get("marginal_sharpe") or 0.0) >= float(min_mpc_value)
+            and float(mpc_payload.get("marginal_pnl") or 0.0) >= -_EPS
+        )
+        mpc_payload["passed"] = bool(mpc_passed)
+        if not mpc_passed:
+            mpc_payload["status"] = "non_positive_marginal_contribution"
+    else:
+        mpc_payload["passed"] = True
+
+    return corr_payload, mpc_payload, bool(corr_passed and bool(mpc_payload.get("passed")))
+
+
 def _two_sided_normal_p_value(t_stat: float) -> float:
     if not math.isfinite(float(t_stat)):
         return 0.0 if float(t_stat) > 0.0 else 1.0
@@ -274,6 +783,14 @@ def assess_challenger(
     candidate_version: str | None = None,
     challenger_returns: Any = None,
     champion_returns: Any = None,
+    models_returns: Any = None,
+    pool_returns: Any = None,
+    evaluation_timestamps: Any = None,
+    era_labels: Any = None,
+    regime_labels: Any = None,
+    challenger_predictions: Any = None,
+    realized_returns: Any = None,
+    neutralization_features: Any = None,
     candidate_features: Any = None,
     new_features: Any = None,
     current_feature_ids: Any = None,
@@ -281,6 +798,10 @@ def assess_challenger(
     feature_returns: Any = None,
     feature_p_values: Any = None,
     feature_t_stats: Any = None,
+    max_pool_corr: float | None = None,
+    corr_sharpe_uplift: float | None = None,
+    min_mpc: float | None = None,
+    mpc_weight: float | None = None,
     alpha: float = 0.05,
     fdr_q: float = 0.10,
     random_state: int = 42,
@@ -296,9 +817,13 @@ def assess_challenger(
     Harvey-Liu-Zhu `|t| > 3.0` factor threshold.
     """
 
-    model_key = str(model_id or model_name or "").strip()
+    model_key = str(model_id or "").strip()
     if not model_key:
-        model_key = str(candidate_version or "unknown_model").strip() or "unknown_model"
+        raise ValueError(
+            "ambiguous_model_id: assess_challenger requires explicit model_id "
+            f"model_name={str(model_name or '').strip() or '<missing>'} "
+            f"candidate_version={str(candidate_version or '').strip() or '<missing>'}"
+        )
     evidence_ts = _now_ms()
     diagnostics: Dict[str, Any] = {
         "enabled": True,
@@ -459,7 +984,80 @@ def assess_challenger(
         diagnostics["tests"]["benjamini_hochberg_fdr"] = {"applied": False, "passed": True, "status": "no_new_features"}
         diagnostics["tests"]["harvey_liu_zhu_factor_threshold"] = {"applied": False, "passed": True, "status": "no_new_features"}
 
-    diagnostics["passed"] = bool(reality.passed and feature_gate_passed)
+    pool_corr_payload, mpc_payload, pool_gates_passed = _pool_contribution_gates(
+        challenger_series=challenger_series,
+        champion_series=champion_series,
+        model_id=str(model_key),
+        model_name=str(model_name or ""),
+        candidate_version=str(candidate_version or ""),
+        models_returns=models_returns,
+        pool_returns=pool_returns,
+        max_pool_corr=max_pool_corr,
+        corr_sharpe_uplift=corr_sharpe_uplift,
+        min_mpc=min_mpc,
+        mpc_weight=mpc_weight,
+    )
+    diagnostics["tests"]["pool_correlation"] = dict(pool_corr_payload)
+    diagnostics["tests"]["marginal_portfolio_contribution"] = dict(mpc_payload)
+    if persist and bool(pool_corr_payload.get("applied")):
+        record_statistical_evidence(
+            con=con,
+            ts=int(evidence_ts),
+            model_id=str(model_key),
+            test_name="pool_correlation",
+            decision=("pass" if bool(pool_corr_payload.get("passed")) else "fail"),
+            payload=dict(pool_corr_payload),
+        )
+    if persist and bool(mpc_payload.get("applied")):
+        record_statistical_evidence(
+            con=con,
+            ts=int(evidence_ts),
+            model_id=str(model_key),
+            test_name="marginal_portfolio_contribution",
+            decision=("pass" if bool(mpc_payload.get("passed")) else "fail"),
+            payload=dict(mpc_payload),
+        )
+
+    fnc_payload = _feature_neutral_ic_payload(
+        challenger_predictions=challenger_predictions,
+        realized_returns=realized_returns,
+        neutralization_features=neutralization_features,
+        candidate_features=candidate_features,
+    )
+    diagnostics["tests"]["feature_neutral_ic"] = dict(fnc_payload)
+    diagnostics["feature_neutral_ic"] = dict(fnc_payload)
+    if persist and bool(fnc_payload.get("applied")):
+        record_statistical_evidence(
+            con=con,
+            ts=int(evidence_ts),
+            model_id=str(model_key),
+            test_name="feature_neutral_ic",
+            t_stat=float(fnc_payload.get("raw_minus_fnc") or 0.0),
+            decision=("flag" if bool(fnc_payload.get("flagged")) else "pass"),
+            payload=dict(fnc_payload),
+        )
+
+    era_payload, era_gate_passed = _era_regime_robustness_gate(
+        challenger_series=challenger_series,
+        champion_series=champion_series,
+        evaluation_timestamps=evaluation_timestamps,
+        era_labels=era_labels,
+        regime_labels=regime_labels,
+        challenger_predictions=challenger_predictions,
+        realized_returns=realized_returns,
+    )
+    diagnostics["tests"]["era_regime_robustness"] = dict(era_payload)
+    if persist and bool(era_payload.get("applied")):
+        record_statistical_evidence(
+            con=con,
+            ts=int(evidence_ts),
+            model_id=str(model_key),
+            test_name="era_regime_robustness",
+            decision=("pass" if bool(era_payload.get("passed")) else "fail"),
+            payload=dict(era_payload),
+        )
+
+    diagnostics["passed"] = bool(reality.passed and feature_gate_passed and pool_gates_passed and era_gate_passed)
     diagnostics["status"] = "pass" if bool(diagnostics["passed"]) else "fail"
     return bool(diagnostics["passed"]), diagnostics
 
@@ -471,7 +1069,7 @@ def set_guard(key: str, value: str) -> None:
     init_db()
     con = connect()
     try:
-        
+        _ensure_guard_schema(con)
 
         con.execute(
             """
@@ -485,10 +1083,23 @@ def set_guard(key: str, value: str) -> None:
         con.close()
 
 
+def _ensure_guard_schema(con) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_promotion_guard (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_ts_ms INTEGER NOT NULL
+        )
+        """
+    )
+
+
 def get_guard(key: str, default: str) -> str:
     init_db()
     con = connect()
     try:
+        _ensure_guard_schema(con)
         r = con.execute(
             "SELECT value FROM model_promotion_guard WHERE key=?",
             (str(key),),
@@ -515,6 +1126,10 @@ def cpcv_gate_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "label_horizon",
         "max_pbo",
         "min_path_sharpe",
+        "costs_enabled",
+        "retrain_cadence_replay",
+        "retrain_cadence_ms",
+        "gated_backtest",
     ):
         if key in overrides:
             merged[key] = overrides.get(key)
@@ -527,6 +1142,22 @@ def cpcv_gate_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
     merged["label_horizon"] = int(max(0, int(merged.get("label_horizon") or 0)))
     merged["max_pbo"] = float(max(0.0, float(merged.get("max_pbo") or 0.0)))
     merged["min_path_sharpe"] = float(merged.get("min_path_sharpe") or 0.0)
+    merged["costs_enabled"] = str(merged.get("costs_enabled", True)).strip().lower() in {"1", "true", "yes", "y", "on"}
+    merged["retrain_cadence_replay"] = str(merged.get("retrain_cadence_replay", True)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    merged["retrain_cadence_ms"] = int(max(1, int(merged.get("retrain_cadence_ms") or 1)))
+    merged["gated_backtest"] = str(merged.get("gated_backtest", True)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
     return merged
 
 
@@ -538,6 +1169,37 @@ def _cpcv_run_mismatch_fields(run: Dict[str, Any], gate_config: Dict[str, Any]) 
         mismatch.append("n_test_splits")
     if abs(float(run.get("embargo_pct") or 0.0) - float(gate_config.get("embargo_pct") or 0.0)) > 1e-9:
         mismatch.append("embargo_pct")
+    diagnostics = dict(run.get("diagnostics") or {})
+    cpcv_diagnostics = dict(diagnostics.get("cpcv") or {})
+    has_modern_diagnostics = any(
+        key in diagnostics
+        for key in (
+            "metric_basis",
+            "cpcv",
+            "gated_backtest",
+            "retrain_cadence_replay",
+        )
+    )
+    if not has_modern_diagnostics:
+        return mismatch
+    metric_basis = str(
+        diagnostics.get("metric_basis")
+        or cpcv_diagnostics.get("metric_basis")
+        or ""
+    ).strip()
+    required_basis = "gated_cost_adjusted" if bool(gate_config.get("gated_backtest", True)) else "cost_adjusted"
+    if bool(gate_config.get("costs_enabled", True)) and metric_basis != str(required_basis):
+        mismatch.append("metric_basis")
+    gated_diag = dict(diagnostics.get("gated_backtest") or cpcv_diagnostics.get("gated_backtest") or {})
+    if bool(gate_config.get("gated_backtest", True)) and not bool(gated_diag.get("enabled")):
+        mismatch.append("gated_backtest")
+    replay_diag = dict(diagnostics.get("retrain_cadence_replay") or cpcv_diagnostics.get("retrain_cadence_replay") or {})
+    if bool(gate_config.get("retrain_cadence_replay", True)) and not bool(replay_diag.get("enabled")):
+        mismatch.append("retrain_cadence_replay")
+    if bool(replay_diag.get("enabled")) and int(replay_diag.get("cadence_ms") or 0) != int(
+        gate_config.get("retrain_cadence_ms") or 0
+    ):
+        mismatch.append("retrain_cadence_ms")
     return mismatch
 
 
@@ -567,6 +1229,10 @@ def _materialize_cpcv_run(
                 n_test_splits=int(gate_config.get("n_test_splits") or 0),
                 embargo_pct=float(gate_config.get("embargo_pct") or 0.0),
                 label_horizon=int(gate_config.get("label_horizon") or 0),
+                replay_retrain_cadence=bool(gate_config.get("retrain_cadence_replay", True)),
+                retrain_cadence_ms=int(gate_config.get("retrain_cadence_ms") or 0),
+                cost_config={"enabled": bool(gate_config.get("costs_enabled", True))},
+                gated_backtest=bool(gate_config.get("gated_backtest", True)),
             )
             or {}
         )

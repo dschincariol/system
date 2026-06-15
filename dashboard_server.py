@@ -622,9 +622,9 @@ _STARTUP_ORCHESTRATOR_THREAD_STARTED = False
 # -------------            -- ------------------------------------------------------
 SERVER_SHUTDOWN_TOKEN = os.environ.get("SERVER_SHUTDOWN_TOKEN", "").strip()
 
-# Optional API token for any mutating endpoints (start/stop jobs, pipeline run, training mode, etc).
-# - If empty: mutating endpoints are allowed ONLY from localhost.
-# - If set: token is required for ALL mutating endpoints (local + remote).
+# Optional in explicit safe local dev only; required for production/live
+# mutation routes. The transport enforces generated-token requirements and
+# gates any localhost no-token fallback behind explicit safe dev/test env.
 DASHBOARD_API_TOKEN = os.environ.get("DASHBOARD_API_TOKEN", "").strip()
 
 SERVER_STARTED_AT_MS = int(time.time() * 1000)
@@ -915,7 +915,8 @@ def _wrap_operator_console_routes(BaseHandler):
                 self.end_headers()
                 if body:
                     self.wfile.write(body)
-            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as e:
+                _warn_nonfatal("DASHBOARD_SERVER_OPERATOR_SEND_DISCONNECTED", e, endpoint="operator_console")
                 return
 
         def _operator_send_json(self, status: int, obj: dict, headers: Optional[dict] = None):
@@ -927,6 +928,7 @@ def _wrap_operator_console_routes(BaseHandler):
                 with open(_OPERATOR_UI_HTML_PATH, "rb") as f:
                     body = f.read()
             except Exception as e:
+                _warn_nonfatal("DASHBOARD_SERVER_OPERATOR_UI_MISSING", e, path=str(_OPERATOR_UI_HTML_PATH))
                 self._operator_send_json(404, {
                     "ok": False,
                     "error": "operator_ui_missing",
@@ -989,6 +991,7 @@ def _wrap_operator_console_routes(BaseHandler):
                 body = e.read()
                 response_headers = dict(e.headers.items()) if getattr(e, "headers", None) else {}
             except Exception as e:
+                _warn_nonfatal("DASHBOARD_SERVER_OPERATOR_SIDECAR_PROXY_FAILED", e, endpoint=str(target))
                 self._operator_send_json(503, {
                     "ok": False,
                     "error": "operator_sidecar_unavailable",
@@ -2097,14 +2100,16 @@ _STORAGE_REQUIRED_ROUTE_PATHS = frozenset(
 def _dashboard_storage_request_timeout_s() -> float:
     try:
         return max(0.05, float(os.environ.get("DASHBOARD_STORAGE_REQUEST_TIMEOUT_S", "0.5") or 0.5))
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_STORAGE_REQUEST_TIMEOUT_PARSE_FAILED", e)
         return 0.5
 
 
 def _dashboard_storage_startup_timeout_s() -> float:
     try:
         return max(0.05, float(os.environ.get("DASHBOARD_STORAGE_STARTUP_TIMEOUT_S", "2.0") or 2.0))
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_STORAGE_STARTUP_TIMEOUT_PARSE_FAILED", e)
         return 2.0
 
 
@@ -2114,7 +2119,8 @@ def _dashboard_strict_runtime_storage_required() -> bool:
 
         safety = get_runtime_safety_context()
         return bool((safety or {}).get("strict_runtime"))
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_STRICT_STORAGE_CONTEXT_FAILED", e)
         env = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "").strip().lower()
         mode = str(os.environ.get("ENGINE_MODE") or "").strip().lower()
         supervised = str(os.environ.get("ENGINE_SUPERVISED") or "").strip().lower() in ("1", "true", "yes", "on")
@@ -2173,7 +2179,8 @@ def _dashboard_storage_unavailable_payload(endpoint: str, error: BaseException |
             error=error,
             readiness=storage_readiness_snapshot(),
         )
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_STORAGE_UNAVAILABLE_PAYLOAD_FAILED", e, endpoint=str(endpoint or ""))
         return {
             "ok": False,
             "error": "storage_unavailable",
@@ -2188,7 +2195,8 @@ def _is_dashboard_storage_unavailable_error(error: BaseException) -> bool:
         from engine.runtime.storage_pool import is_storage_acquisition_error
 
         return bool(is_storage_acquisition_error(error))
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_STORAGE_ERROR_CLASSIFY_FAILED", e)
         return "couldn't get a connection" in str(error or "").lower()
 
 
@@ -2198,7 +2206,8 @@ def _dashboard_storage_known_unavailable() -> bool:
 
         snapshot = storage_readiness_snapshot()
         return bool(snapshot.get("checked") and snapshot.get("ok") is False)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_STORAGE_READINESS_STATUS_FAILED", e)
         return False
 
 
@@ -2208,7 +2217,8 @@ def _dashboard_storage_known_ready() -> bool:
 
         snapshot = storage_readiness_snapshot()
         return bool(snapshot.get("checked") and snapshot.get("ok") is True)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_STORAGE_READY_STATUS_FAILED", e)
         return False
 
 
@@ -4974,6 +4984,11 @@ def _capture_ui_metrics_source(name: str, handler, parsed=None, ctx=None):
         return handler(parsed, ctx)
     except Exception as e:
         if _is_dashboard_storage_unavailable_error(e):
+            _warn_nonfatal(
+                "DASHBOARD_SERVER_UI_METRICS_SOURCE_STORAGE_UNAVAILABLE",
+                e,
+                endpoint=str(name),
+            )
             return _dashboard_storage_unavailable_payload(str(name), e)
         _warn_nonfatal(
             "DASHBOARD_SERVER_UI_METRICS_SOURCE_FAILED",

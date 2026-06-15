@@ -59,6 +59,7 @@ _READINESS_STATE: dict[str, Any] = {
     "ts_ms": 0,
     "last_ok_ts_ms": 0,
     "last_failure_ts_ms": 0,
+    "conninfo_fingerprint": "",
 }
 
 
@@ -92,13 +93,24 @@ def _failure_cooldown_s() -> float:
         return 2.0
 
 
-def _recent_unavailable_error() -> StoragePoolTimeout | None:
+def _conninfo_fingerprint(conninfo: str | None) -> str:
+    text = str(conninfo or "").strip()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _recent_unavailable_error(conninfo: str | None = None) -> StoragePoolTimeout | None:
     cooldown_s = _failure_cooldown_s()
     if cooldown_s <= 0:
         return None
     with _READINESS_LOCK:
         snapshot = dict(_READINESS_STATE)
     if not bool(snapshot.get("checked")) or snapshot.get("ok") is not False:
+        return None
+    fingerprint = _conninfo_fingerprint(conninfo)
+    snapshot_fingerprint = str(snapshot.get("conninfo_fingerprint") or "")
+    if fingerprint and snapshot_fingerprint and fingerprint != snapshot_fingerprint:
         return None
     failed_ms = int(snapshot.get("last_failure_ts_ms") or snapshot.get("ts_ms") or 0)
     if failed_ms <= 0:
@@ -235,6 +247,7 @@ def _set_storage_readiness(
     error: BaseException | None = None,
     timeout_s: float | None = None,
     detail: str = "",
+    conninfo: str | None = None,
 ) -> dict[str, Any]:
     now_ms = _now_ms()
     error_type, error_text = _format_storage_error(error)
@@ -252,6 +265,7 @@ def _set_storage_readiness(
                 "error_type": "" if ok else error_type,
                 "timeout_s": None if timeout_s is None else current_acquire_timeout_s(timeout_s),
                 "ts_ms": now_ms,
+                "conninfo_fingerprint": _conninfo_fingerprint(conninfo),
             }
         )
         if ok:
@@ -400,7 +414,7 @@ def get_pool(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = 
         if _POOL is not None:
             return _POOL
         if not bool(bypass_failure_cooldown):
-            recent_error = _recent_unavailable_error()
+            recent_error = _recent_unavailable_error(conninfo)
             if recent_error is not None:
                 raise recent_error
 
@@ -444,13 +458,15 @@ def get_pool(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = 
 def acquire(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = False):
     conn = None
     effective_timeout_s = current_acquire_timeout_s(timeout_s)
+    conninfo = ""
     try:
+        conninfo = _dsn()
         conn = get_pool(
             timeout_s=effective_timeout_s,
             bypass_failure_cooldown=bool(bypass_failure_cooldown),
         ).getconn(timeout=float(effective_timeout_s))
         _configure_connection(conn)
-        _set_storage_readiness(ok=True, timeout_s=effective_timeout_s, detail="ok")
+        _set_storage_readiness(ok=True, timeout_s=effective_timeout_s, detail="ok", conninfo=conninfo)
         return conn
     except StoragePoolTimeout as exc:
         if "postgres_recently_unavailable" not in str(exc):
@@ -459,6 +475,7 @@ def acquire(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = F
                 error=exc,
                 timeout_s=effective_timeout_s,
                 detail="postgres_pool_timeout",
+                conninfo=conninfo,
             )
         raise
     except PoolTimeout as exc:
@@ -468,6 +485,7 @@ def acquire(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = F
             error=wrapped,
             timeout_s=effective_timeout_s,
             detail="postgres_pool_timeout",
+            conninfo=conninfo,
         )
         raise wrapped from exc
     except Exception as exc:
@@ -476,6 +494,7 @@ def acquire(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = F
             error=exc,
             timeout_s=effective_timeout_s,
             detail="postgres_acquire_failed",
+            conninfo=conninfo,
         )
         if conn is not None:
             try:
@@ -499,18 +518,21 @@ def probe_storage_readiness(
 
     effective_timeout_s = current_acquire_timeout_s(timeout_s)
     conn = None
+    conninfo = ""
     try:
+        conninfo = _dsn()
         conn = acquire(timeout_s=effective_timeout_s, bypass_failure_cooldown=bool(force))
         with conn.cursor() as cur:
             cur.execute("SELECT 1")
             cur.fetchone()
-        return _set_storage_readiness(ok=True, timeout_s=effective_timeout_s, detail="ok")
+        return _set_storage_readiness(ok=True, timeout_s=effective_timeout_s, detail="ok", conninfo=conninfo)
     except Exception as exc:
         return _set_storage_readiness(
             ok=False,
             error=exc,
             timeout_s=effective_timeout_s,
             detail="postgres_readiness_probe_failed",
+            conninfo=conninfo,
         )
     finally:
         if conn is not None:

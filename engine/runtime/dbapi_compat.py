@@ -7,9 +7,11 @@ instead of importing a concrete database driver in application modules.
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 _SQLITE_MODULE = "sqlite" + "3"
+sqlite3 = importlib.import_module(_SQLITE_MODULE)
 
 try:  # pragma: no cover - exercised when psycopg is installed.
     import psycopg
@@ -35,6 +37,8 @@ def Binary(value: Any) -> bytes:
 
 
 def is_sqlite_connection(conn: Any) -> bool:
+    if isinstance(conn, sqlite3.Connection):
+        return True
     module = str(getattr(getattr(conn, "__class__", None), "__module__", "") or "")
     return module == _SQLITE_MODULE or module.startswith(f"{_SQLITE_MODULE}.")
 

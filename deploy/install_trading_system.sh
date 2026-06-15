@@ -61,7 +61,7 @@ install_nodesource_node20() {
   apt-get install -y nodejs
 
   node_major="$(node -p "Number(process.versions.node.split('.')[0])")"
-  if ! [[ "$node_major" =~ ^[0-9]+$ ]] || (( node_major < 18 )); then
+  if ! [[ "$node_major" =~ ^[0-9]+$ ]] || (( node_major != 20 )); then
     echo "node_version_too_old:$(node --version 2>/dev/null || echo missing)" >&2
     exit 1
   fi
@@ -179,11 +179,11 @@ TRADING_REPO="$REPO_DIR" PYTHON_VENV="$VENV_DIR" PYTHON_BIN="python3.11" \
 
 cd "$REPO_DIR"
 node_major="$(node -p "Number(process.versions.node.split('.')[0])")"
-if ! [[ "$node_major" =~ ^[0-9]+$ ]] || (( node_major < 18 )); then
+if ! [[ "$node_major" =~ ^[0-9]+$ ]] || (( node_major != 20 )); then
   echo "node_version_too_old_before_npm_install:$(node --version 2>/dev/null || echo missing)" >&2
   exit 1
 fi
-npm install
+npm ci
 
 chmod +x "$REPO_DIR"/deploy/install_trading_system.sh
 chmod +x "$REPO_DIR"/deploy/bin/*.sh

@@ -28,6 +28,7 @@ import random
 import threading
 from typing import Dict, List, Optional, Tuple, Any
 
+from engine.runtime import dbapi_compat as dbapi
 from engine.runtime.storage import connect, connect_rw_direct, init_db
 from engine.runtime.failure_diagnostics import log_failure
 from engine.strategy.strategy_selector import choose_strategy_name, load_strategy_module
@@ -37,6 +38,7 @@ from engine.strategy.black_litterman import (
     compute_equilibrium_returns,
 )
 from engine.strategy.confidence_engine import describe_signal_confidence
+from engine.strategy.conformal import conformal_mode, extract_conformal_payload
 from engine.data.universe import get_active_symbols
 from engine.strategy.symbol_blacklist import is_blacklisted
 from engine.strategy.portfolio_risk_gate import apply_portfolio_risk_gate
@@ -97,6 +99,17 @@ def _is_sqlite_busy_error(error: BaseException | None) -> bool:
 
 
 def _table_exists(con, table_name: str) -> bool:
+    if dbapi.is_sqlite_connection(con):
+        row = con.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type='table' AND name=?
+            LIMIT 1
+            """,
+            (str(table_name),),
+        ).fetchone()
+        return bool(row)
     row = con.execute(
         """
         SELECT 1
@@ -562,6 +575,24 @@ def _eff_max_positions() -> int:
     if _capital_mode() == "preserve":
         v = int(max(0, int(PORTFOLIO_PRESERVE_MAX_POSITIONS)))
     return int(v)
+
+
+def apply_max_position_constraint(
+    desired: Dict[str, Dict[str, Any]] | None,
+    *,
+    max_positions: int | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Keep the live max-position rule reusable for gated backtests."""
+    desired_map = dict(desired or {})
+    eff_max_pos = int(_eff_max_positions() if max_positions is None else max_positions)
+    if eff_max_pos >= 0 and len(desired_map) > int(eff_max_pos):
+        items = sorted(
+            desired_map.items(),
+            key=lambda kv: abs(float((kv[1] or {}).get("weight", 0.0))),
+            reverse=True,
+        )
+        desired_map = dict(items[: int(eff_max_pos)])
+    return desired_map
 
 
 def _eff_gross_cap() -> float:
@@ -3297,6 +3328,18 @@ def _merge_model_intent_reason(reason: Dict[str, Any], alert: Dict[str, Any]) ->
     return out
 
 
+def _conformal_size_multiplier_from_reason(reason: Dict[str, Any]) -> Optional[float]:
+    payload = extract_conformal_payload(reason or {})
+    if not payload or not bool(payload.get("available", True)):
+        return None
+    if not bool(payload.get("interval_excludes_zero")):
+        return None
+    value = _coerce_float(payload.get("size_mult", payload.get("conformal_size_mult")))
+    if value is None:
+        return None
+    return float(max(0.0, min(1.0, value)))
+
+
 def _load_recent_alert_candidates(con, lookback_s: int) -> List[Dict]:
     from engine.runtime.state_cache import cache_get_or_load
 
@@ -4653,7 +4696,8 @@ def _portfolio_flip_lambda() -> float:
     raw = os.environ.get("TS_PORTFOLIO_FLIP_LAMBDA", "0.001")
     try:
         value = float(raw)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_FLIP_LAMBDA_PARSE_FAILED", e, once_key="flip_lambda_parse", value=str(raw))
         return 0.001
     if not math.isfinite(value):
         return 0.001
@@ -5665,14 +5709,7 @@ def compute_rebalance() -> Dict:  # pyright: ignore[reportGeneralTypeIssues]
             _model_div = None
 
         # hard cap max positions (keep largest abs weights) (dynamic under preserve)
-        eff_max_pos = int(_eff_max_positions())
-        if eff_max_pos >= 0 and len(desired) > int(eff_max_pos):
-            items = sorted(
-                desired.items(),
-                key=lambda kv: abs(float((kv[1] or {}).get("weight", 0.0))),
-                reverse=True,
-            )
-            desired = dict(items[: int(eff_max_pos)])
+        desired = apply_max_position_constraint(desired)
 
         # ---            -- ------------------------------------------------------
         # Allocation mode is explicit when requested, otherwise preserves the
@@ -5978,6 +6015,20 @@ def compute_rebalance() -> Dict:  # pyright: ignore[reportGeneralTypeIssues]
         # Phase 5.2: POSITION SIZE POLICY (confidence -> factor)
         # (must happen BEFORE orders are emitted)
         # ---            -- ------------------------------------------------------
+        if conformal_mode() == "gate_and_size":
+            try:
+                for desired_key in list(desired.keys()):
+                    reason = _ensure_reason_dict(desired.get(desired_key))
+                    conformal_mult = _conformal_size_multiplier_from_reason(reason)
+                    if conformal_mult is None:
+                        continue
+                    desired[desired_key]["weight"] = float(desired[desired_key]["weight"]) * float(conformal_mult)
+                    reason["conformal_size_factor"] = float(conformal_mult)
+                    reason["conformal_sizing_applied"] = True
+            except Exception as e:
+                _record_degraded_phase("conformal_sizing", "PORTFOLIO_CONFORMAL_SIZING_FAILED", e)
+                _warn_nonfatal("PORTFOLIO_CONFORMAL_SIZING_FAILED", e, once_key="conformal_sizing")
+
         try:
             from engine.strategy.size_policy import load_latest_size_policy, size_factor
             from engine.strategy.drawdown_state import get_current_drawdown

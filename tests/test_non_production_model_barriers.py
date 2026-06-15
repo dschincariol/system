@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -58,6 +60,7 @@ class NonProductionModelBarrierTests(unittest.TestCase):
             {"MSFT", "NVDA", "TSLA"},
         )
 
+    @pytest.mark.requires_postgres
     def test_rebalance_selector_metadata_is_live_only(self) -> None:
         storage, portfolio = _reload_modules(
             "engine.runtime.storage",

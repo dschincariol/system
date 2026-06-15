@@ -43,7 +43,7 @@ EXCLUDE_FILE_GLOBS = {
     "**/_version.py",
 }
 
-CLI_ENTRYPOINT_RE = re.compile(r'if\s+__name__\s*==\s*[\'\"]\__main__\__[\'\"]', re.MULTILINE)
+CLI_ENTRYPOINT_RE = re.compile(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]', re.MULTILINE)
 PRIVATE_OK_PRINT_FILES = {
     "engine/audit/cli.py",  # CLI tool, prints are output
 }
@@ -134,6 +134,75 @@ def excerpt(source: str, line: int, context: int = 2) -> str:
     return "\n".join(out)
 
 
+SUPPRESSION_RE = re.compile(
+    r"system-audit:\s*ignore(?:\[(?P<categories>[^\]]+)\])?",
+    re.IGNORECASE,
+)
+
+
+def _suppression_applies(src: str, line: int, end_line: int, category: str) -> bool:
+    lines = src.splitlines()
+    start = max(1, int(line) - 2)
+    stop = min(len(lines), int(end_line) + 1)
+    for idx in range(start, stop + 1):
+        text = lines[idx - 1]
+        if category.lower() == "silent_except" and "no-op-guard: allow" in text:
+            return True
+        match = SUPPRESSION_RE.search(text)
+        if not match:
+            continue
+        raw_categories = (match.group("categories") or "").strip()
+        if not raw_categories:
+            return True
+        categories = {
+            item.strip().lower()
+            for item in re.split(r"[, ]+", raw_categories)
+            if item.strip()
+        }
+        if category.lower() in categories:
+            return True
+    return False
+
+
+def _base_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Subscript):
+        return _base_name(node.value)
+    return ""
+
+
+def _protocol_method_ids(tree: ast.AST) -> set[int]:
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not any(_base_name(base) == "Protocol" for base in node.bases):
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                ids.add(id(stmt))
+    return ids
+
+
+def _function_line_ranges(tree: ast.AST, *names: str) -> list[tuple[int, int]]:
+    wanted = {str(name) for name in names}
+    ranges: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in wanted:
+            continue
+        ranges.append((int(node.lineno), int(getattr(node, "end_lineno", node.lineno))))
+    return ranges
+
+
+def _line_in_ranges(line: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start <= int(line) <= end for start, end in ranges)
+
+
 # ---------- AST detectors ----------
 
 class _BodyAnalyzer:
@@ -206,8 +275,11 @@ class _BodyAnalyzer:
 
 
 def detect_stubs_and_not_impl(tree: ast.AST, src: str, rel: str, st: AuditState) -> None:
+    protocol_methods = _protocol_method_ids(tree)
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if id(node) in protocol_methods:
             continue
         if any(isinstance(d, ast.Name) and d.id in {"abstractmethod", "abstractproperty"} for d in node.decorator_list):
             continue
@@ -220,6 +292,8 @@ def detect_stubs_and_not_impl(tree: ast.AST, src: str, rel: str, st: AuditState)
         if kind is None:
             continue
         category = "not_impl" if kind == "NotImplementedError-only" else "stub"
+        if _suppression_applies(src, node.lineno, getattr(node, "end_lineno", node.lineno), category):
+            continue
         sub = subsystem_of(rel)
         st.emit(
             subsystem=sub,
@@ -249,23 +323,28 @@ def _handler_is_silent(handler: ast.ExceptHandler) -> tuple[bool, str]:
     body = handler.body
     if len(body) == 1 and isinstance(body[0], ast.Pass):
         return True, "except: pass"
-    # except: log.debug(...)  with no re-raise
-    only_logs = all(_is_logging_call(stmt) for stmt in body)
+    # except: log.debug/info(...) with no re-raise is too quiet for production.
+    # warning/error/exception paths are intentionally observable nonfatal paths.
+    log_levels = [_logging_call_level(stmt) for stmt in body]
+    only_logs = all(level is not None for level in log_levels)
     if only_logs and not any(isinstance(s, ast.Raise) for s in body):
-        return True, "except: <log only, no re-raise>"
+        quiet_levels = {"debug", "info"}
+        if all(str(level) in quiet_levels for level in log_levels):
+            return True, "except: <debug/info only, no re-raise>"
     return False, ""
 
 
-def _is_logging_call(stmt: ast.stmt) -> bool:
+def _logging_call_level(stmt: ast.stmt) -> str | None:
     if not isinstance(stmt, ast.Expr):
-        return False
+        return None
     call = stmt.value
     if not isinstance(call, ast.Call):
-        return False
+        return None
     func = call.func
     if isinstance(func, ast.Attribute):
-        return func.attr in {"debug", "info", "warning", "error", "exception", "warn"}
-    return False
+        if func.attr in {"debug", "info", "warning", "error", "exception", "warn"}:
+            return str(func.attr)
+    return None
 
 
 def detect_silent_exceptions(tree: ast.AST, src: str, rel: str, st: AuditState) -> None:
@@ -279,6 +358,8 @@ def detect_silent_exceptions(tree: ast.AST, src: str, rel: str, st: AuditState) 
                 continue
             sub = subsystem_of(rel)
             cat = "bare_except" if is_bare and not silent else ("silent_except" if silent else "bare_except")
+            if _suppression_applies(src, h.lineno, getattr(h, "end_lineno", h.lineno), cat):
+                continue
             label_text = "except <bare>: ..." if is_bare else label
             st.emit(
                 subsystem=sub,
@@ -311,6 +392,8 @@ def detect_suspicious_literal_returns(tree: ast.AST, src: str, rel: str, st: Aud
             continue
         if node.name.startswith("_"):
             continue
+        if node.name == "main":
+            continue
         body = node.body
         if not body:
             continue
@@ -324,8 +407,15 @@ def detect_suspicious_literal_returns(tree: ast.AST, src: str, rel: str, st: Aud
         all_literal = all(
             r.value is not None and isinstance(r.value, ast.Constant) for r in returns
         )
+        literal_values = {
+            (type(r.value.value).__name__, repr(r.value.value))
+            for r in returns
+            if isinstance(r.value, ast.Constant)
+        }
         all_simple_literal = (
             all_literal
+            and len(literal_values) == 1
+            and literal_values != {("NoneType", "None")}
             and len(returns) >= 1
             and len(body) >= 3  # not a one-liner
         )
@@ -432,22 +522,25 @@ def detect_magic_localhost(src: str, rel: str, st: AuditState) -> None:
 PRINT_RE = re.compile(r'(?<![\w.])print\s*\(')
 
 
-def detect_print_in_engine(src: str, rel: str, st: AuditState) -> None:
+def detect_print_in_engine(tree: ast.AST, src: str, rel: str, st: AuditState) -> None:
     if not (rel.startswith("engine/") or rel.startswith("services/")):
         return
     if rel in PRIVATE_OK_PRINT_FILES:
         return
     has_main = bool(CLI_ENTRYPOINT_RE.search(src))
+    if has_main:
+        # Executable job modules use stdout/stderr as their CLI contract. Keep
+        # importable library modules visible, but do not count command output as
+        # production telemetry debt.
+        return
+    cli_main_ranges = _function_line_ranges(tree, "main")
     for m in PRINT_RE.finditer(src):
         line = src.count("\n", 0, m.start()) + 1
         line_text = src.splitlines()[line - 1] if line - 1 < len(src.splitlines()) else ""
         if line_text.lstrip().startswith("#"):
             continue
-        # If file has __main__ entry, prints below it are likely CLI output
-        if has_main:
-            main_match = CLI_ENTRYPOINT_RE.search(src)
-            if main_match and m.start() > main_match.start():
-                continue
+        if _line_in_ranges(line, cli_main_ranges):
+            continue
         sub = subsystem_of(rel)
         cat = "print_in_engine"
         st.emit(
@@ -550,7 +643,7 @@ def audit_file(path: Path, st: AuditState) -> None:
     detect_suspicious_literal_returns(tree, src, rel, st)
     detect_mock_in_prod(tree, src, rel, st)
     detect_magic_localhost(src, rel, st)
-    detect_print_in_engine(src, rel, st)
+    detect_print_in_engine(tree, src, rel, st)
     detect_markers(src, rel, st)
 
 

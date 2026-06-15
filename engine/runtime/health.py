@@ -67,6 +67,7 @@ HEALTH_MODEL_SERVING_MIN_SAMPLE = int(os.environ.get("HEALTH_MODEL_SERVING_MIN_S
 HEALTH_MODEL_SERVING_MAX_FALLBACK_RATE = float(os.environ.get("HEALTH_MODEL_SERVING_MAX_FALLBACK_RATE", "0.05"))
 HEALTH_MODEL_SERVING_MAX_ROWS = int(os.environ.get("HEALTH_MODEL_SERVING_MAX_ROWS", "500"))
 HEALTH_ALERT_LIFECYCLE_WINDOW_S = float(os.environ.get("HEALTH_ALERT_LIFECYCLE_WINDOW_S", "86400"))
+PROVIDER_CIRCUIT_BREAKER_ERRORS = int(os.environ.get("PROVIDER_CIRCUIT_BREAKER_ERRORS", "3"))
 
 HEALTH_MIN_LABELS = int(os.environ.get("HEALTH_MIN_LABELS", "10"))
 HEALTH_MIN_MODEL_SUPPORT = int(os.environ.get("HEALTH_MIN_MODEL_SUPPORT", "10"))
@@ -236,8 +237,8 @@ def _risk_state_value_readonly(con, key: str, default: str = "") -> str:
         if owns_con:
             try:
                 db.close()
-            except Exception:
-                pass
+            except Exception as e:
+                _warn("health.risk_state_value.close", e, key=str(key))
 
 
 def _portfolio_runtime_snapshot(con=None) -> Dict[str, Any]:
@@ -564,17 +565,66 @@ def _pnl_attribution_orphan_snapshot(con) -> Dict[str, Any]:
     }
     if not _table_exists(con, "pnl_attribution"):
         return out
-    if not _table_exists(con, "trade_attribution_ledger"):
-        out["detail"] = "trade_attribution_ledger_table_missing"
-        return out
     pnl_cols = {str(col).strip().lower() for col in (_get_table_cols(con, "pnl_attribution") or [])}
-    ledger_cols = {str(col).strip().lower() for col in (_get_table_cols(con, "trade_attribution_ledger") or [])}
     if not {"ts_ms", "source_alert_id", "model_id", "symbol"}.issubset(pnl_cols):
+        out["available"] = True
+        out["ok"] = False
         out["detail"] = "pnl_attribution_columns_missing"
         return out
-    if not {"id", "ts_ms", "source_alert_id", "model_id", "symbol", "suppression_reason"}.issubset(ledger_cols):
-        out["detail"] = "trade_attribution_ledger_columns_missing"
+
+    def _latest_pnl_rows_as_unaudited(detail: str) -> Dict[str, Any]:
+        try:
+            latest_row = con.execute("SELECT MAX(ts_ms) FROM pnl_attribution").fetchone() or (None,)
+            snapshot_ts_ms = _int_or(latest_row[0])
+            out["available"] = True
+            out["snapshot_ts_ms"] = int(snapshot_ts_ms) if snapshot_ts_ms > 0 else None
+            if snapshot_ts_ms <= 0:
+                out["detail"] = "empty"
+                return out
+            count_row = con.execute(
+                """
+                SELECT COUNT(*), MAX(ts_ms)
+                FROM pnl_attribution
+                WHERE ts_ms = ?
+                """,
+                (int(snapshot_ts_ms),),
+            ).fetchone() or (0, None)
+            sample_rows = con.execute(
+                """
+                SELECT ts_ms, source_alert_id, model_id, symbol
+                FROM pnl_attribution
+                WHERE ts_ms = ?
+                ORDER BY source_alert_id DESC, COALESCE(NULLIF(TRIM(model_id), ''), 'baseline') ASC, UPPER(TRIM(symbol)) ASC
+                LIMIT 5
+                """,
+                (int(snapshot_ts_ms),),
+            ).fetchall() or []
+        except Exception as e:
+            _warn("health.pnl_attribution_unaudited.query", e)
+            out["ok"] = False
+            out["detail"] = f"{detail}:{type(e).__name__}:{e}"
+            return out
+        out["orphan_row_count"] = _int_or(count_row[0])
+        out["latest_orphan_ts_ms"] = (_int_or(count_row[1]) or None)
+        out["sample_keys"] = [
+            {
+                "ts_ms": (_int_or(row[0]) or None),
+                "source_alert_id": (_int_or(row[1]) or None),
+                "model_id": str(row[2] or "").strip() or "baseline",
+                "symbol": str(row[3] or "").strip().upper(),
+            }
+            for row in sample_rows
+        ]
+        out["ok"] = int(out["orphan_row_count"] or 0) == 0
+        out["audit_detail"] = str(detail)
+        out["detail"] = "ok" if out["ok"] else "orphan_pnl_rows_detected"
         return out
+
+    if not _table_exists(con, "trade_attribution_ledger"):
+        return _latest_pnl_rows_as_unaudited("trade_attribution_ledger_table_missing")
+    ledger_cols = {str(col).strip().lower() for col in (_get_table_cols(con, "trade_attribution_ledger") or [])}
+    if not {"id", "ts_ms", "source_alert_id", "model_id", "symbol", "suppression_reason"}.issubset(ledger_cols):
+        return _latest_pnl_rows_as_unaudited("trade_attribution_ledger_columns_missing")
     try:
         latest_row = con.execute("SELECT MAX(ts_ms) FROM pnl_attribution").fetchone() or (None,)
         snapshot_ts_ms = _int_or(latest_row[0])
@@ -1011,6 +1061,21 @@ def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
 
 def _ingestion_source_definitions() -> Dict[str, Dict[str, Any]]:
     critical_sources = _csv_env_set("CRITICAL_INGESTION_SOURCES", "prices,options")
+    enabled_jobs: set[str] = {
+        str(name or "").strip()
+        for name in str(os.environ.get("INGESTION_CHILD_JOBS", "") or "").split(",")
+        if str(name or "").strip()
+    }
+    try:
+        from services.data_source_manager import desired_ingestion_jobs
+
+        enabled_jobs.update(
+            str(name or "").strip()
+            for name in (desired_ingestion_jobs(read_only=True) or [])
+            if str(name or "").strip()
+        )
+    except Exception as e:
+        _warn("health.enabled_ingestion_jobs", e)
     enabled_market_jobs: set[str] = set()
     try:
         from engine.data.provider_registry import get_enabled_market_data_job_names
@@ -1029,8 +1094,79 @@ def _ingestion_source_definitions() -> Dict[str, Dict[str, Any]]:
     macro_poll_s = max(300.0, _float_or(os.environ.get("MACRO_POLL_SECONDS"), 21600.0))
     weather_forecast_poll_s = max(300.0, _float_or(os.environ.get("WEATHER_POLL_SECONDS"), 21600.0))
     weather_alerts_poll_s = max(60.0, _float_or(os.environ.get("WEATHER_ALERTS_POLL_SECONDS"), 900.0))
+    sec_poll_s = max(300.0, _float_or(os.environ.get("SEC_POLL_SECONDS"), 900.0))
+    form4_poll_s = max(300.0, _float_or(os.environ.get("FORM4_POLL_SECONDS"), 1800.0))
     price_poll_s = max(1.0, _float_or(os.environ.get("POLL_SECONDS"), 30.0))
     options_poll_s = max(30.0, _float_or(os.environ.get("OPTIONS_POLL_SECONDS"), 300.0))
+    sec_components: List[Dict[str, Any]] = [
+        {
+            "name": "poll_sec_filings",
+            "kind": "pipeline",
+            "required": True,
+            "expected_cadence_s": float(sec_poll_s),
+            "stale_after_s": float(max(sec_poll_s * 3.0, 3600.0)),
+        },
+    ]
+    if "ingest_form4" in enabled_jobs or "form4" in critical_sources:
+        sec_components.append(
+            {
+                "name": "ingest_form4",
+                "kind": "pipeline",
+                "required": True,
+                "expected_cadence_s": float(form4_poll_s),
+                "stale_after_s": float(max(form4_poll_s * 3.0, 3600.0)),
+            }
+        )
+    alt_data_aliases = {
+        "alt",
+        "alt_data",
+        "alternative_data",
+        "congressional",
+        "quiver",
+        "quiver_gov",
+        "fundamentals",
+        "fundamentals_pit",
+        "13f",
+        "inst_13f",
+        "etf_flows",
+        "finra",
+        "finra_short",
+        "cftc",
+        "cftc_cot",
+        "crypto_funding",
+        "crypto_positioning",
+    }
+    alt_data_critical = bool(alt_data_aliases & critical_sources)
+    alt_job_specs = [
+        ("ingest_congressional_trades", "CONGRESSIONAL_POLL_SECONDS", 21600.0, {"congressional", "alt_data", "alt"}),
+        ("ingest_quiver_gov", "QUIVER_GOV_POLL_SECONDS", 21600.0, {"quiver", "quiver_gov", "alt_data", "alt"}),
+        ("ingest_fundamentals_pit", "FUNDAMENTALS_PIT_POLL_SECONDS", 86400.0, {"fundamentals", "fundamentals_pit", "alt_data", "alt"}),
+        ("ingest_13f", "INST_13F_POLL_SECONDS", 86400.0, {"13f", "inst_13f", "alt_data", "alt"}),
+        ("ingest_etf_flows", "ETF_FLOWS_POLL_SECONDS", 86400.0, {"etf_flows", "alt_data", "alt"}),
+        ("ingest_finra_short_interest", "FINRA_SHORT_INTEREST_POLL_SECONDS", 86400.0, {"finra", "finra_short", "alt_data", "alt"}),
+        ("ingest_finra_short_volume", "FINRA_SHORT_VOLUME_POLL_SECONDS", 86400.0, {"finra", "finra_short", "alt_data", "alt"}),
+        ("ingest_cftc_cot", "CFTC_COT_POLL_SECONDS", 86400.0, {"cftc", "cftc_cot", "alt_data", "alt"}),
+        ("ingest_crypto_funding", "CRYPTO_FUNDING_POLL_SECONDS", 28800.0, {"crypto_funding", "crypto_positioning", "alt_data", "alt"}),
+    ]
+    alt_components: List[Dict[str, Any]] = []
+    alt_cadences: List[float] = []
+    for job_name, env_name, default_s, aliases in alt_job_specs:
+        include_job = job_name in enabled_jobs or bool(set(aliases) & critical_sources)
+        if not include_job:
+            continue
+        cadence_s = max(300.0, _float_or(os.environ.get(env_name), float(default_s)))
+        alt_cadences.append(float(cadence_s))
+        alt_components.append(
+            {
+                "name": job_name,
+                "kind": "pipeline",
+                "required": True,
+                "expected_cadence_s": float(cadence_s),
+                "stale_after_s": float(max(cadence_s * 3.0, 3600.0)),
+            }
+        )
+    alt_expected_cadence_s = min(alt_cadences) if alt_cadences else 86400.0
+    alt_stale_after_s = max([cadence * 3.0 for cadence in alt_cadences] or [86400.0])
     return {
         "prices": {
             "critical": "prices" in critical_sources,
@@ -1120,6 +1256,20 @@ def _ingestion_source_definitions() -> Dict[str, Dict[str, Any]]:
                     "stale_after_s": float(max(macro_poll_s * 2.0, 21600.0)),
                 },
             ],
+        },
+        "sec": {
+            "critical": bool({"sec", "form4", "filings"} & critical_sources),
+            "policy": "all_required",
+            "expected_cadence_s": float(min(sec_poll_s, form4_poll_s)),
+            "stale_after_s": float(max(sec_poll_s * 3.0, form4_poll_s * 3.0, 3600.0)),
+            "components": sec_components,
+        },
+        "alt_data": {
+            "critical": bool(alt_data_critical),
+            "policy": "all_required",
+            "expected_cadence_s": float(alt_expected_cadence_s),
+            "stale_after_s": float(max(alt_stale_after_s, 3600.0)),
+            "components": alt_components,
         },
         "weather": {
             "critical": "weather" in critical_sources,
@@ -1303,7 +1453,12 @@ def _build_ingestion_freshness_snapshot(
         required_components = [row for row in components if bool(row.get("required"))] or list(components)
         policy = str(source_spec.get("policy") or "all_required").strip().lower()
 
-        if policy == "any_fresh":
+        if not components:
+            source_stale = bool(source_spec.get("critical"))
+            source_last_update_ts_ms = 0
+            source_lag_s = None
+            source_failed = False
+        elif policy == "any_fresh":
             fresh_components = [row for row in components if not bool(row.get("stale_threshold_breach"))]
             healthy_fresh_components = [row for row in fresh_components if not bool(row.get("failed"))]
             source_stale = len(fresh_components) == 0
@@ -1347,6 +1502,8 @@ def _build_ingestion_freshness_snapshot(
 
         if source_failed:
             advisory_reason_codes.append(f"source_degraded:{source_name}")
+            if bool(source_spec.get("critical")):
+                runtime_reason_codes.append(f"critical_source_failed:{source_name}")
 
         latest_update_ts_ms = max(
             [_int_or(row.get("last_update_ts_ms")) for row in components if _int_or(row.get("last_update_ts_ms")) > 0] or [0]
@@ -1364,6 +1521,7 @@ def _build_ingestion_freshness_snapshot(
             "freshness_lag_s": source_lag_s,
             "stale_threshold_breach": bool(source_stale),
             "stale": bool(source_stale),
+            "failed": bool(source_failed),
             "reason_codes": _dedupe_strs(source_reason_codes),
             "pipeline_names": [str(row.get("name") or "") for row in components],
             "pipelines": {str(row.get("name") or ""): row for row in components},
@@ -1371,17 +1529,21 @@ def _build_ingestion_freshness_snapshot(
         reason_codes.extend(list(sources[source_name].get("reason_codes") or []))
 
     stale_sources = sorted(name for name, row in sources.items() if bool(row.get("stale")))
+    failed_sources = sorted(name for name, row in sources.items() if bool(row.get("failed")))
     critical_sources = sorted(name for name, row in sources.items() if bool(row.get("critical")))
     stale_critical_sources = sorted(name for name in stale_sources if bool((sources.get(name) or {}).get("critical")))
+    failed_critical_sources = sorted(name for name in failed_sources if bool((sources.get(name) or {}).get("critical")))
 
     return {
-        "ok": len(stale_critical_sources) == 0,
-        "critical_ok": len(stale_critical_sources) == 0,
-        "all_sources_ok": len(stale_sources) == 0,
-        "degraded": len(stale_critical_sources) > 0,
+        "ok": len(stale_critical_sources) == 0 and len(failed_critical_sources) == 0,
+        "critical_ok": len(stale_critical_sources) == 0 and len(failed_critical_sources) == 0,
+        "all_sources_ok": len(stale_sources) == 0 and len(failed_sources) == 0,
+        "degraded": len(stale_critical_sources) > 0 or len(failed_critical_sources) > 0,
         "critical_sources": critical_sources,
         "stale_sources": stale_sources,
+        "failed_sources": failed_sources,
         "stale_critical_sources": stale_critical_sources,
+        "failed_critical_sources": failed_critical_sources,
         "runtime_reason_codes": _dedupe_strs(runtime_reason_codes),
         "advisory_reason_codes": _dedupe_strs(advisory_reason_codes),
         "reason_codes": _dedupe_strs(reason_codes + runtime_reason_codes + advisory_reason_codes),
@@ -2501,7 +2663,9 @@ def get_health_snapshot():
                 "degraded": True,
                 "critical_sources": ["prices", "options"],
                 "stale_sources": ["prices", "options"],
+                "failed_sources": [],
                 "stale_critical_sources": ["prices", "options"],
+                "failed_critical_sources": [],
                 "runtime_reason_codes": ["critical_source_stale:prices", "critical_source_stale:options"],
                 "advisory_reason_codes": [],
                 "reason_codes": ["critical_source_stale:prices", "critical_source_stale:options"],
@@ -2570,13 +2734,14 @@ def get_health_snapshot():
             providers = {}
             healthy_n = 0
             ingestion_runtime = dict(out.get("ingestion_runtime") or {})
+            runtime_mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+            strict_provider_telemetry = runtime_mode_name in ("shadow", "live")
 
             for row in fetch_provider_health_rows():
                 ts_ms = row.get("ts_ms")
                 if ts_ms is None:
                     continue
                 age_s = (now_ms - int(ts_ms)) / 1000.0
-                p_ok = bool(row.get("ok")) and age_s < effective_prices_max_age_s
                 provider_name = str(row.get("provider") or "")
                 provider_meta = None
                 provider_fatal = None
@@ -2594,10 +2759,29 @@ def get_health_snapshot():
                 except Exception as e:
                     _warn("health.providers.session_fatal", e, provider=provider_name)
                     provider_fatal = None
+                error_count = _int_or(row.get("error_count"))
+                last_success_ts_ms = _int_or(row.get("last_success_ts_ms"))
+                last_success_age_s = (
+                    round(max(0, now_ms - int(last_success_ts_ms)) / 1000.0, 1)
+                    if last_success_ts_ms > 0
+                    else None
+                )
+                latest_row_ok = bool(row.get("ok")) and age_s < effective_prices_max_age_s
+                circuit_open = bool(
+                    int(PROVIDER_CIRCUIT_BREAKER_ERRORS) > 0
+                    and error_count >= int(PROVIDER_CIRCUIT_BREAKER_ERRORS)
+                    and not latest_row_ok
+                )
+                p_ok = bool(latest_row_ok and not provider_fatal and not circuit_open)
                 providers[provider_name] = {
                     "ok": p_ok,
                     "age_s": round(age_s, 1),
                     "last_ts_ms": int(ts_ms),
+                    "last_success_ts_ms": int(last_success_ts_ms) if last_success_ts_ms > 0 else None,
+                    "last_success_age_s": last_success_age_s,
+                    "error_count": int(error_count),
+                    "circuit_open": bool(circuit_open),
+                    "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
                     "latency_ms": (
                         None
                         if row.get("latency_ms") is None
@@ -2621,16 +2805,31 @@ def get_health_snapshot():
                     if not isinstance(provider_info, dict):
                         continue
                     age_s = round(_int_or(provider_info.get("age_ms"), 10**12) / 1000.0, 1)
-                    p_ok = bool(provider_info.get("ok"))
+                    circuit_open = bool(provider_info.get("circuit_open"))
+                    provider_fatal = provider_info.get("session_fatal")
+                    p_ok = bool(provider_info.get("ok")) and not circuit_open and not provider_fatal
                     providers[str(provider_name)] = {
                         "ok": p_ok,
                         "age_s": age_s,
                         "last_ts_ms": _int_or(provider_info.get("last_ts_ms")),
+                        "last_success_ts_ms": (
+                            _int_or(provider_info.get("last_success_ts_ms"))
+                            if provider_info.get("last_success_ts_ms") is not None
+                            else None
+                        ),
+                        "last_success_age_s": (
+                            round(_int_or(provider_info.get("last_success_age_ms")) / 1000.0, 1)
+                            if provider_info.get("last_success_age_ms") is not None
+                            else None
+                        ),
+                        "error_count": _int_or(provider_info.get("error_count")),
+                        "circuit_open": circuit_open,
+                        "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
                         "latency_ms": (_int_or(provider_info.get("latency_ms")) if provider_info.get("latency_ms") is not None else None),
                         "n_symbols": _int_or(provider_info.get("n_symbols")),
                         "error": (None if provider_info.get("error") is None else str(provider_info.get("error"))),
                         "session_last_failure": provider_info.get("session_last_failure"),
-                        "session_fatal": provider_info.get("session_fatal"),
+                        "session_fatal": provider_fatal,
                     }
                     if p_ok:
                         healthy_n += 1
@@ -2644,17 +2843,20 @@ def get_health_snapshot():
                     if last_price_ts_ms > 0:
                         price_age_s = (now_ms - int(last_price_ts_ms)) / 1000.0
                         derived_ok = bool((out.get("prices") or {}).get("ok"))
+                        counts_as_healthy = bool(derived_ok and not strict_provider_telemetry)
                         providers["derived_from_prices"] = {
-                            "ok": derived_ok,
+                            "ok": counts_as_healthy,
                             "age_s": round(price_age_s, 1),
                             "last_ts_ms": int(last_price_ts_ms),
+                            "synthetic": True,
+                            "strict_provider_telemetry": bool(strict_provider_telemetry),
                             "latency_ms": None,
                             "n_symbols": 0,
-                            "error": None if derived_ok else "provider_health_missing",
+                            "error": None if counts_as_healthy else "provider_health_missing",
                             "session_last_failure": None,
                             "session_fatal": None,
                         }
-                        if derived_ok:
+                        if counts_as_healthy:
                             healthy_n = max(healthy_n, 1)
                 except Exception as e:
                     _warn("health.providers.derived_from_prices", e)

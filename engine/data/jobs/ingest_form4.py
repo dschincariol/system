@@ -1,5 +1,16 @@
 """
 Disabled-by-default SEC Form 4 ingestion daemon.
+
+README - insider feature group
+Source: SEC EDGAR Form 4 / 4/A ownership filings, normalized into
+``insider_transactions`` by source transaction id.
+Cadence: supervised daemon, default ``FORM4_POLL_SECONDS=1800`` seconds.
+Availability lag: features may only use EDGAR acceptance/filing availability
+(``availability_ts_ms`` / ``filing_ts_ms``), never the transaction date.
+Caveats: Form 4s can arrive up to two business days after a trade, amendments
+can revise rows, 10b5-1 plan detection is text-derived when present, and
+routine/opportunistic labels require at least three prior calendar years of
+available insider trade history.
 """
 
 from __future__ import annotations
@@ -16,6 +27,7 @@ from engine.data.sec.form4_live import (
     fetch_form4_transactions,
     refresh_form4_transaction_resolution,
 )
+from engine.data.sec.form4_classifier import classify_insider_trade
 from engine.data.universe import get_active_symbols
 from engine.runtime.config import (
     FORM4_BACKFILL_DAYS,
@@ -46,6 +58,9 @@ LOCK_STALE_AFTER_S = int(os.environ.get("JOB_LOCK_STALE_AFTER_S", "300"))
 HEARTBEAT_EVERY_S = float(os.environ.get("HEARTBEAT_EVERY_S", "15.0"))
 SYMBOL_LIMIT = parse_symbol_limit(os.environ.get("FORM4_SYMBOL_LIMIT", os.environ.get("SEC_SYMBOL_LIMIT")), 600)
 FILING_LIMIT = int(os.environ.get("FORM4_FILING_LIMIT", "60"))
+MAX_BACKOFF_SECONDS = float(os.environ.get("FORM4_MAX_BACKOFF_SECONDS", "7200"))
+
+__all__ = ["classify_insider_trade", "main"]
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -120,7 +135,7 @@ def _reconcile_unresolved_rows(conw, *, allowed_symbols: List[str]) -> List[Dict
     return refreshed
 
 
-def _run_once() -> None:
+def _run_once() -> bool:
     manager = get_manager()
     symbols = list(dict.fromkeys(_load_symbols()))
 
@@ -202,6 +217,7 @@ def _run_once() -> None:
         },
     )
     put_job_heartbeat(JOB_NAME, OWNER, PID, extra_json=json.dumps(status, separators=(",", ":"), sort_keys=True))
+    return len(errors) == 0
 
 
 def main() -> None:
@@ -223,6 +239,7 @@ def main() -> None:
         raise SystemExit(2)
 
     last_hb_s = 0.0
+    consecutive_failures = 0
     try:
         while True:
             if not manager.is_job_enabled(JOB_NAME, default=False):
@@ -239,8 +256,10 @@ def main() -> None:
                 )
                 last_hb_s = now_s
             try:
-                _run_once()
+                cycle_ok = bool(_run_once())
+                consecutive_failures = 0 if cycle_ok else consecutive_failures + 1
             except Exception as exc:
+                consecutive_failures += 1
                 LOGGER.exception("form4_cycle_failed")
                 status = record_pipeline_status(
                     JOB_NAME,
@@ -253,7 +272,11 @@ def main() -> None:
                 )
                 manager.record_job_status(JOB_NAME, ok=False, message="form4 cycle failed", error=str(exc))
                 put_job_heartbeat(JOB_NAME, OWNER, PID, extra_json=json.dumps(status, separators=(",", ":"), sort_keys=True))
-            time.sleep(max(1.0, float(POLL_SECONDS)))
+            backoff_s = min(
+                float(MAX_BACKOFF_SECONDS),
+                float(POLL_SECONDS) * (2 ** min(6, int(consecutive_failures))),
+            )
+            time.sleep(max(1.0, float(backoff_s)))
     finally:
         release_job_lock(JOB_NAME, OWNER, PID)
 

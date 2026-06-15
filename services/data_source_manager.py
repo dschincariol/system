@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import requests
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.platform import default_ibkr_host
 from engine.runtime.data_source_log_store import (
     append_data_source_log_row,
     delete_data_source_logs_for_source,
@@ -90,8 +91,11 @@ _BASE_CREDENTIAL_RUNTIME_ENV_KEYS = (
     "OPENAI_API_KEY",
     "POLYGON_API_KEY",
     "POLYGON_KEY",
+    "QUIVER_API_KEY",
     "REDDIT_CLIENT_ID",
     "REDDIT_CLIENT_SECRET",
+    "SHARADAR_API_KEY",
+    "SIMFIN_API_KEY",
     "TRADIER_API_TOKEN",
 )
 _SAFE_NO_CREDENTIAL_ENV = {
@@ -131,7 +135,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _safe_no_credential_local_dev_env() -> bool:
+    raw = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
+    if raw == "production":
+        raw = "prod"
+    elif raw == "development":
+        raw = "dev"
+    return raw in {"dev", "test"}
+
+
 def safe_no_credential_market_data_mode() -> bool:
+    if not _safe_no_credential_local_dev_env():
+        return False
     if _env_flag("ALLOW_CREDENTIAL_DATA_PROVIDERS_IN_SAFE", False):
         return False
     mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
@@ -152,8 +167,12 @@ def credential_runtime_env_keys() -> tuple[str, ...]:
             for env_name in (definition.credential_env or {}).values():
                 if str(env_name or "").strip():
                     keys.add(str(env_name).strip())
-    except Exception:
-        pass
+    except Exception as e:
+        _warn_nonfatal(
+            "DATA_SOURCE_MANAGER_CREDENTIAL_CATALOG_KEYS_FAILED",
+            e,
+            once_key="credential_runtime_env_keys",
+        )
     return tuple(sorted(keys))
 
 
@@ -413,6 +432,40 @@ def _default_catalog() -> Dict[str, SourceDefinition]:
                 "poll_seconds": "CONGRESSIONAL_POLL_SECONDS",
                 "senate_source_url": "CONGRESSIONAL_SENATE_SOURCE_URL",
                 "house_source_url": "CONGRESSIONAL_HOUSE_SOURCE_URL",
+            },
+        ),
+        "quiver_gov": SourceDefinition(
+            source_type="legislative_provider",
+            display_name="Quiver Government Flow",
+            provider_name="quiver_gov",
+            job_name="ingest_quiver_gov",
+            default_enabled=False,
+            credential_env={"api_key": "QUIVER_API_KEY"},
+            setting_env={
+                "poll_seconds": "QUIVER_GOV_POLL_SECONDS",
+                "base_url": "QUIVER_BASE_URL",
+                "auth_scheme": "QUIVER_AUTH_SCHEME",
+                "congress_endpoint": "QUIVER_CONGRESS_ENDPOINT",
+                "lobbying_endpoint": "QUIVER_LOBBYING_ENDPOINT",
+                "contracts_endpoint": "QUIVER_CONTRACTS_ENDPOINT",
+            },
+        ),
+        "fundamentals_pit": SourceDefinition(
+            source_type="fundamentals_provider",
+            display_name="PIT Fundamentals",
+            provider_name="fundamentals_pit",
+            job_name="ingest_fundamentals_pit",
+            default_enabled=False,
+            credential_env={
+                "simfin_api_key": "SIMFIN_API_KEY",
+                "sharadar_api_key": "SHARADAR_API_KEY",
+            },
+            setting_env={
+                "poll_seconds": "FUNDAMENTALS_PIT_POLL_SECONDS",
+                "mode": "FUNDAMENTALS_PIT_MODE",
+                "simfin_bulk_url": "SIMFIN_BULK_URL",
+                "sharadar_bulk_url": "SHARADAR_BULK_URL",
+                "rate_limit_sleep_s": "FUNDAMENTALS_PIT_RATE_LIMIT_SLEEP_S",
             },
         ),
         "earnings": SourceDefinition(
@@ -1705,14 +1758,14 @@ class DataSourceManager:
 
     def build_job_environment(self, job_name: str) -> Dict[str, str]:
         self.initialize()
+        job_name_s = str(job_name or "").strip()
         if safe_no_credential_market_data_mode():
-            if str(job_name or "").strip() == "poll_prices":
+            if job_name_s == "poll_prices":
                 return dict(_SAFE_NO_CREDENTIAL_ENV)
-            return {}
         rows = [
             row
             for row in self.list_sources(include_credentials=True)
-            if str(row.get("job_name") or "") == str(job_name or "")
+            if str(row.get("job_name") or "") == job_name_s
             and bool(row.get("enabled"))
         ]
         env: Dict[str, str] = {}
@@ -1741,7 +1794,7 @@ class DataSourceManager:
                 if value is not None and str(value).strip() != "":
                     env[str(env_name)] = self._env_string(value)
 
-        if job_name == "options_poll" and any(
+        if job_name_s == "options_poll" and any(
             str(row.get("provider_name") or "").strip().lower() == "polygon"
             and bool(row.get("enabled"))
             and str((row.get("credentials") or {}).get("api_key") or "").strip()
@@ -1749,23 +1802,23 @@ class DataSourceManager:
         ):
             option_providers.append("polygon")
 
-        if job_name == "poll_prices":
+        if job_name_s == "poll_prices":
             chain = self._provider_chain(price_providers)
             if chain:
                 env["LIVE_PRICE_PROVIDER_CHAIN"] = ",".join(chain)
             env["POLYGON_REST_ENABLED"] = "1" if "polygon" in chain else "0"
             env["YFINANCE_ENABLED"] = "1" if "yfinance" in chain else "0"
             env["CCXT_ENABLED"] = "1" if "ccxt" in chain else "0"
-        elif job_name == "stream_prices_polygon_ws":
+        elif job_name_s == "stream_prices_polygon_ws":
             env["POLYGON_WS_ENABLED"] = "1"
-        elif job_name == "stream_prices_ibkr":
+        elif job_name_s == "stream_prices_ibkr":
             env["IBKR_ENABLED"] = "1"
-        elif job_name == "options_poll":
+        elif job_name_s == "options_poll":
             chain = self._provider_chain(option_providers)
             if chain:
                 env["OPTIONS_PROVIDER_CHAIN"] = ",".join(chain)
             env["TRADIER_ENABLED"] = "1" if "tradier" in chain else "0"
-        elif job_name == "ingest_now":
+        elif job_name_s == "ingest_now":
             enabled_keys = {str(row.get("source_key") or "") for row in rows}
             env["INGEST_NOW_ENABLE_COMPANY_NEWS"] = "1" if "company_news" in enabled_keys else "0"
             env["INGEST_NOW_ENABLE_TRANSCRIPTS"] = "1" if "transcripts" in enabled_keys else "0"
@@ -2384,7 +2437,7 @@ class DataSourceManager:
                 return _ok("weather_alerts_connection_ok", status_code=int(response.status_code))
 
             if provider_name == "ibkr":
-                host = str(settings.get("host") or os.environ.get("IBKR_HOST") or "127.0.0.1").strip()
+                host = str(settings.get("host") or os.environ.get("IBKR_HOST") or default_ibkr_host()).strip()
                 port = int(str(settings.get("port") or os.environ.get("IBKR_PORT") or "7497").strip())
                 with socket.create_connection((host, port), timeout=5.0):
                     pass

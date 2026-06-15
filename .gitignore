@@ -157,6 +157,9 @@ ruff_*.json
 ruff-*.json
 ruff_report.json
 ruff-report.json
+docs/System_Audit_Layer1*
+!docs/System_Audit_Layer1_P0P1_Triage.md
+docs/job_migration_l*_p*.md
 
 # --------------------------------------------------
 # Model / artifact outputs

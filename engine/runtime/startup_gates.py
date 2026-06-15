@@ -12,7 +12,13 @@ from typing import Any, Dict, Iterable, Optional
 from engine.runtime.config_schema import ConfigError, load_runtime_config
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.platform import default_data_root
+from engine.runtime.platform import (
+    default_dashboard_host,
+    default_data_root,
+    default_pg_dsn,
+    is_loopback_host as _platform_is_loopback_host,
+    normalize_loopback_host,
+)
 from engine.runtime.runtime_meta import meta_get
 
 
@@ -159,17 +165,11 @@ def _compact_boot_diagnostics(value: Any) -> Dict[str, Any]:
 
 
 def _normalize_host(host: str) -> str:
-    text = str(host or "").strip()
-    if not text:
-        return "127.0.0.1"
-    if text == "localhost":
-        return "127.0.0.1"
-    return text
+    return normalize_loopback_host(host)
 
 
 def _is_loopback_host(host: str) -> bool:
-    text = _normalize_host(host).lower()
-    return text in {"127.0.0.1", "::1"}
+    return _platform_is_loopback_host(host)
 
 
 def _parse_bool(name: str, default: bool) -> bool:
@@ -275,7 +275,7 @@ def get_startup_config_snapshot(repo_root: str | Path | None = None) -> Dict[str
         errors.append({"key": "ENGINE_MODE", "detail": str(e), "component": "runtime"})
 
     try:
-        host = _normalize_host(str(os.environ.get("DASHBOARD_HOST", "127.0.0.1") or "127.0.0.1"))
+        host = _normalize_host(str(os.environ.get("DASHBOARD_HOST", default_dashboard_host()) or default_dashboard_host()))
         if not host:
             raise ConfigError("DASHBOARD_HOST must be non-empty")
         parsed["dashboard_host"] = host
@@ -491,7 +491,7 @@ def _required_ui_assets(repo_root: str | Path | None = None) -> tuple[Path, ...]
 
 def _probe_port_available(host: str, port: int) -> Dict[str, Any]:
     bind_host = _normalize_host(host)
-    family = socket.AF_INET6 if ":" in bind_host and bind_host != "127.0.0.1" else socket.AF_INET
+    family = socket.AF_INET6 if ":" in bind_host and bind_host != default_dashboard_host() else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -584,7 +584,7 @@ def evaluate_prebind_startup_gates(
 ) -> Dict[str, Any]:
     config = get_startup_config_snapshot(repo_root)
     paths = _resolve_startup_paths(repo_root)
-    resolved_host = _normalize_host(str(host or config.get("parsed", {}).get("dashboard_host") or "127.0.0.1"))
+    resolved_host = _normalize_host(str(host or config.get("parsed", {}).get("dashboard_host") or default_dashboard_host()))
     resolved_port = int(port or config.get("parsed", {}).get("dashboard_port") or 8000)
     ui_assets = _required_ui_assets(repo_root)
     log_probe = _probe_directory_writable(paths["log_dir"])
@@ -693,7 +693,7 @@ def evaluate_runtime_startup_gates(
     paths = _resolve_startup_paths(repo)
     boot_diagnostics = _json_meta_get("dashboard_boot_diagnostics")
     lifecycle = dict(health.get("lifecycle") or {})
-    resolved_host = str(config.get("parsed", {}).get("dashboard_host") or "127.0.0.1")
+    resolved_host = str(config.get("parsed", {}).get("dashboard_host") or default_dashboard_host())
     resolved_port = int(config.get("parsed", {}).get("dashboard_port") or 8000)
     port_probe = _probe_port_available(resolved_host, resolved_port)
     dashboard_bound_meta = bool(str(meta_get("dashboard_bound_ts_ms", "") or "").strip()) or bool(

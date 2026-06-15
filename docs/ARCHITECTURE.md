@@ -67,7 +67,7 @@ The observed startup order is:
    - Loads `.env`.
    - Clears the dead local proxy sentinel `http://127.0.0.1:9` if present.
    - Creates default `logs/` and `data/`.
-   - Sets `TRADING_LOGS`, `TRADING_DATA`, and `DB_PATH` (default `${TRADING_DATA}/trading.db`).
+   - Sets `TRADING_LOGS`, `TRADING_DATA`, and `DB_PATH`. `DB_PATH` is a local data-root/legacy compatibility hint; Postgres connection targets come from `TS_PG_DSN` or platform defaults.
 2. `start_system.py` writes startup breadcrumbs into `runtime_meta`.
    - `startup_trace`
    - `import_smoke`
@@ -412,12 +412,15 @@ The terminal is intentionally risk-gated. It does not place broker orders direct
 
 | Location | Owner | What is stored there |
 | --- | --- | --- |
-| `${TRADING_DATA}/trading.db` | `engine/runtime/storage.py` | Primary SQLite runtime database. This is where `runtime_meta`, `predictions`, `prediction_history`, `decision_log`, `portfolio_orders`, `execution_orders`, `execution_fills`, `pnl_attribution`, `kill_switch_state`, `champion_assignments`, `data_sources`, and related tables live. |
-| `${TRADING_DATA}/trading.db-wal` and `${TRADING_DATA}/trading.db-shm` | SQLite WAL mode | Write-ahead-log sidecars used by the primary runtime DB. |
+| Postgres database selected by `TS_PG_DSN` or `engine.runtime.platform.default_pg_dsn()` | `engine/runtime/storage.py` -> `engine/runtime/storage_pg.py` | Primary runtime store. This is where `runtime_meta`, `predictions`, `prediction_history`, `decision_log`, `portfolio_orders`, `execution_orders`, `execution_fills`, `pnl_attribution`, `kill_switch_state`, `champion_assignments`, `data_sources`, schema migration state, and related tables live. |
+| `DB_PATH` / `TRADING_DATA` local data root | `start_system.py`, `start_ingestion.py`, `engine/runtime/db_guard.py` | Local data directory and legacy identity path for older callers, diagnostics, artifacts, and test backends. It is not the production database location. File-shaped legacy defaults such as `${TRADING_DATA}/trading.db` are tolerated and normalized to their parent directory by `db_guard`. |
+| temporary SQLite files under pytest temp roots | `engine/runtime/storage_sqlite.py`, `engine/runtime/test_isolation.py`, `tests/conftest.py` | Isolated unit-test storage when `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`. This path prevents tests from probing ambient Postgres/PgBouncer. |
 | `logs/` | `start_system.py` and `boot/operator_server.js` | `runtime.pid`, `ingestion.pid`, `runtime.log`, and ingestion stdout/stderr log files. |
 | `data/operator/` | `boot/operator_server.js` | Operator state, operator secrets, and AI patch backup metadata. |
 | `data/ai_operator_log.jsonl` | `services/operator_ai/agent.js` | Diagnostics-only operator AI analysis log. |
-| optional PostgreSQL price storage | started best-effort by `start_system.py` | Secondary price persistence path when configured. |
+| optional Timescale/price sidecars | `engine/runtime/storage_pg_prices.py`, `engine/runtime/timescale_client.py`, read routers | Append-heavy market-data and telemetry paths when enabled and validated. These sidecars complement the primary Postgres runtime storage and may be routed with fallback during migration windows. |
+
+Storage boot is fail closed in production-like modes. `db_guard.ensure_db_ok()` must acquire Postgres, `bootstrap_first_run()` and `storage.init_db()` apply migrations and repairs, `get_db_validation_snapshot(strict=True)` validates the schema, and startup gates expose blocking `database_reachable` and `schema_valid` checks. If Postgres is unavailable, the runtime reports degraded/unavailable storage and should not be considered ready for trading.
 
 ## Repo Map By Responsibility
 

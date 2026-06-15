@@ -1,8 +1,10 @@
 # Trading System Database Map
 
-This document explains the main SQLite database used by the repo in human terms.
+This document explains the main runtime database/storage contract used by the repo in human terms.
 
-It is not meant to replace the schema in `engine/runtime/storage.py`. It is meant to make the schema understandable.
+Last verified against code: 2026-06-11
+
+It is not meant to replace the schema in `engine/runtime/storage.py` or `engine/runtime/storage_pg.py`. It is meant to make the schema understandable.
 
 If you want the short version:
 
@@ -15,13 +17,28 @@ If you want the short version:
 
 ## 1. Where The Database Lives
 
-The database path is resolved by `engine/runtime/storage.py`.
+The public storage facade is `engine/runtime/storage.py`. Current production-like storage is backed by `engine/runtime/storage_pg.py`; older SQLite-era file paths and constraints may still appear in tests, compatibility helpers, repair helpers, and historical docs.
 
-In a normal local setup, the main file is usually:
+Runtime connection targets come from `TS_PG_DSN` or platform defaults. `DB_PATH` now means "local data root / legacy identity path" for diagnostics, artifacts, and test backends. In supervised or production-like modes it should be an absolute directory such as `/var/lib/trading`; file-shaped legacy values are tolerated by `db_guard.resolve_db_path()` and normalized to their parent directory.
+
+In older local SQLite-oriented setups, and in the isolated SQLite test backend, the main file was usually:
 
 - `data/trading.db`
 
-That file is the primary runtime persistence layer for the platform.
+Do not infer that new schema work is local-file-only. Treat the runtime storage facade and Postgres migrations as the primary persistence layer, and add migrations/tests for any schema or write-path change.
+
+Cold boot and migration ownership:
+
+- `bootstrap_first_run()`, `repair_schema()`, and `storage.init_db()` own boot-time schema creation and repair.
+- durable schema changes belong under `engine/runtime/schema/migrations/`
+- `get_db_validation_snapshot(strict=True)` is the runtime contract check used by production preflight and startup gates
+- when Postgres cannot be acquired or validation fails, the runtime should remain degraded or blocked rather than falling back to SQLite
+
+Test storage requirements:
+
+- pytest/unittest defaults set `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temp `DB_PATH`
+- tests that intentionally exercise real Postgres should use the `requires_postgres` marker and a reachable `TS_PG_DSN`
+- SQLite-specific tests are compatibility and contention-regression tests, not proof that production storage is available
 
 ## 2. How To Think About The Schema
 
@@ -144,6 +161,8 @@ These tables sit between raw data and trade decisions.
 | `factor_features` | factor-style features |
 | `factor_observations` | raw factor observations |
 | `factor_group_scores` | grouped factor scoring |
+| `tsfresh_feature_snapshots` | persisted tsfresh feature snapshots for train/serve reuse |
+| `feature_candidates`, `feature_evaluation`, `feature_registry` | discovered feature candidates, evaluation decisions, and accepted discovery metadata |
 
 ### Models, Drift, And Governance Tables
 
@@ -171,6 +190,8 @@ These tables answer:
 | `self_critic_alerts` | model self-critic warning records |
 | `shadow_predictions`, `shadow_metrics`, `shadow_training_runs` | shadow-model evaluation path |
 | `challenger_shadow_orders` | challenger shadow trading decisions or outcomes |
+| `hypothesis_registry` | legacy-compatible statistical promotion evidence |
+| `promotion_statistical_evidence` | current promotion-gate evidence for BH-FDR, Reality Check, pool, MPC, and era robustness payloads |
 
 ### Decisions And Alerts Tables
 
@@ -257,10 +278,12 @@ These tables support offline analysis more than live control.
 | --- | --- |
 | `backtest_scores` | backtest outputs |
 | `walk_forward_runs`, `walk_forward_scores` | walk-forward evaluation |
+| `backtest_cpcv_runs`, `backtest_cpcv_paths` | CPCV/PBO, cost-adjusted, and gated-backtest evidence |
 | `validation_scores` | validation results |
 | `model_metrics` | model performance summaries |
 | `embed_model_eval`, `embed_conf_calib` | embedding/evaluation calibration tables |
 | `temporal_model_eval` | evaluation for temporal models |
+| `causal_scores`, `causal_dags` | causal diagnostics and curated DAG definitions |
 
 ## 6. Important Table Shapes
 
@@ -281,6 +304,9 @@ This is the main "why did the system decide that?" table.
 | `confidence` | confidence estimate |
 | `model_name` | originating model |
 | `model_kind` | model family/kind |
+| `model_version` | artifact version, registry version, or equivalent model identifier |
+| `feature_set_tag` | persisted feature-schema tag used for train/serve auditability |
+| `components_json`, `component_vector` | nullable ensemble component payloads for blended decisions |
 | `features_json` | feature payload |
 | `explain_json` | explanation payload |
 | `extra_json` | extra context |
@@ -321,7 +347,7 @@ This is the compact current portfolio state by symbol.
 
 This table records intended changes to the portfolio.
 
-For the covered trading chain, `source_alert_id` and `prediction_id` are typed lineage columns backed by SQLite constraints. JSON remains audit context only.
+For the covered trading chain, `source_alert_id` and `prediction_id` are typed lineage columns backed by storage-level constraints where available. JSON remains audit context only.
 
 | Column | Meaning |
 | --- | --- |

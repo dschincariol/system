@@ -40,7 +40,9 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
+from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.platform import default_ibkr_host
 from engine.runtime.storage import connect
 from engine.execution.kill_switch import execution_allowed
 from engine.runtime.risk_state import get_state, set_state
@@ -56,6 +58,7 @@ from engine.execution.order_idempotency import (
     mark_order_submission_submitted,
     mark_order_submission_unknown,
 )
+from engine.execution.broker_action_audit import record_broker_action_audit
 from engine.execution.execution_liquidity_model import (
     attach_liquidity_context,
     get_execution_liquidity_snapshot,
@@ -75,6 +78,11 @@ try:
     from engine.cache.wrappers.execution_mode import read_execution_mode as _get_execution_mode  # type: ignore
 except Exception:
     _get_execution_mode = None  # type: ignore
+
+try:
+    from engine.execution.position_reconcile import pre_live_position_reconcile as _prelive_reconcile
+except Exception:
+    _prelive_reconcile = None  # type: ignore
 
 
 LOG = logging.getLogger("engine.execution.broker_ibkr_gateway")
@@ -160,7 +168,44 @@ def _real_trading_gate() -> Dict[str, Any]:
     )
 
 
-IBKR_HOST = os.environ.get("IBKR_HOST", "127.0.0.1").strip()
+def _prelive_reconcile_or_block(broker: str = "ibkr") -> Optional[Dict[str, Any]]:
+    if os.environ.get("EXECUTION_PRELIVE_RECONCILE", "1") != "1":
+        return None
+    if not callable(_prelive_reconcile):
+        return {
+            "ok": False,
+            "status": "prelive_reconcile_unavailable",
+            "broker": str(broker),
+            "fatal_reconcile": True,
+        }
+    try:
+        gate = _prelive_reconcile(broker=str(broker)) or {}
+    except Exception as exc:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_PRELIVE_RECONCILE_FAILED",
+            exc,
+            once_key="prelive_reconcile",
+            broker=str(broker),
+        )
+        return {
+            "ok": False,
+            "status": "prelive_reconcile_exception",
+            "broker": str(broker),
+            "fatal_reconcile": True,
+            "error": str(exc),
+        }
+    if bool(gate.get("ok", False)):
+        return None
+    return {
+        "ok": False,
+        "status": str(gate.get("status") or "prelive_reconcile_block"),
+        "broker": str(broker),
+        "fatal_reconcile": True,
+        "reconcile": dict(gate or {}),
+    }
+
+
+IBKR_HOST = os.environ.get("IBKR_HOST", default_ibkr_host()).strip()
 IBKR_PORT = int(os.environ.get("IBKR_PORT", "7497"))
 IBKR_CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "42"))
 
@@ -735,6 +780,9 @@ def apply_latest_portfolio_orders_live(
         gate = _real_trading_gate()
         if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
             return {"ok": False, "status": "real_trading_blocked", "broker": "ibkr", "gate": gate}
+        reconcile_block = _prelive_reconcile_or_block("ibkr")
+        if reconcile_block is not None:
+            return reconcile_block
 
     con = connect()
     try:
@@ -854,6 +902,34 @@ def apply_latest_portfolio_orders_live(
                     else "midday" if int((int(ts_ms) // 3600000) % 24) < 15
                     else "close"
                 )
+
+                audit = record_broker_action_audit(
+                    broker="ibkr",
+                    action="order_submit_attempt",
+                    status="attempted",
+                    symbol=str(symbol),
+                    qty=float(delta),
+                    portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                    mode=str(order_meta.get("execution_mode") or ""),
+                    payload={
+                        "order_type": str(order_type),
+                        "aggressiveness": str(aggressiveness),
+                        "source_order_id": o.get("source_order_id"),
+                        "source_alert_id": o.get("source_alert_id"),
+                        "estimated_notional": float(order_meta.get("estimated_notional") or 0.0),
+                    },
+                )
+                if not bool(audit.get("ok")):
+                    return {
+                        "ok": False,
+                        "status": "broker_action_audit_failed",
+                        "broker": "ibkr",
+                        "stop_failover": True,
+                        "detail": "pre_submit_audit_failed",
+                        "symbol": str(symbol),
+                        "submitted_n": int(n),
+                        "audit": dict(audit or {}),
+                    }
 
                 contract = _mk_stock_contract(symbol)
                 limit_px = None
@@ -1003,7 +1079,24 @@ def apply_latest_portfolio_orders_live(
                 )
                 live_positions[symbol] = float(current_qty) + float(delta)
                 n += 1
-                time.sleep(max(0.0, float(SLEEP_BETWEEN_ORDERS_S)))
+                wait_ok, wait_reason, wait_meta = wait_with_kill_interrupt(
+                    delay_s=max(0.0, float(SLEEP_BETWEEN_ORDERS_S)),
+                    con=con,
+                    symbol=str(symbol),
+                    model_id=str(order_meta.get("model_id") or ""),
+                    broker="ibkr",
+                    component="engine.execution.broker_ibkr_gateway",
+                    stage="adapter_order_sleep",
+                )
+                if not bool(wait_ok):
+                    return {
+                        "ok": False,
+                        "status": "blocked_kill_switch_mid_slice",
+                        "broker": "ibkr",
+                        "reason": str(wait_reason or "kill_switch_block"),
+                        "kill_meta": dict(wait_meta or {}),
+                        "submitted_n": int(n),
+                    }
 
             if order_id is not None:
                 set_state("ibkr_last_portfolio_orders_id", str(int(order_id)))
@@ -1145,6 +1238,15 @@ def get_order(order_id: str, timeout_s: float = 8.0) -> Dict[str, Any]:
 
 def cancel_order(order_id: str, timeout_s: float = 8.0) -> Dict[str, Any]:
     oid = int(order_id)
+    audit = record_broker_action_audit(
+        broker="ibkr",
+        action="order_cancel_attempt",
+        status="attempted",
+        broker_order_id=str(oid),
+        payload={"order_id": int(oid), "timeout_s": float(timeout_s)},
+    )
+    if not bool(audit.get("ok")):
+        return {"ok": False, **audit}
     app = _connect_ib()
     try:
         app.cancelOrder(int(oid))
@@ -1161,6 +1263,20 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     gate = _real_trading_gate()
     if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
         return {"ok": False, "status": "real_trading_blocked", "gate": gate, "broker": "ibkr"}
+    reconcile_block = _prelive_reconcile_or_block("ibkr")
+    if reconcile_block is not None:
+        return reconcile_block
+    audit = record_broker_action_audit(
+        broker="ibkr",
+        action="order_submit_attempt",
+        status="attempted",
+        symbol=str(symbol),
+        qty=float(qty),
+        client_order_id=str(client_oid),
+        payload={"order_type": "LIMIT", "limit_price": float(limit_price)},
+    )
+    if not bool(audit.get("ok")):
+        return {"ok": False, **audit}
     app = _connect_ib()
     try:
         oid = _consume_next_order_id(app)
@@ -1179,6 +1295,20 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     gate = _real_trading_gate()
     if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
         return {"ok": False, "status": "real_trading_blocked", "gate": gate, "broker": "ibkr"}
+    reconcile_block = _prelive_reconcile_or_block("ibkr")
+    if reconcile_block is not None:
+        return reconcile_block
+    audit = record_broker_action_audit(
+        broker="ibkr",
+        action="order_submit_attempt",
+        status="attempted",
+        symbol=str(symbol),
+        qty=float(qty),
+        client_order_id=str(client_oid),
+        payload={"order_type": "MARKET"},
+    )
+    if not bool(audit.get("ok")):
+        return {"ok": False, **audit}
     app = _connect_ib()
     try:
         oid = _consume_next_order_id(app)
@@ -1452,7 +1582,7 @@ def run_execution_stream_daemon(poll_sleep_s: float = 1.0) -> None:
                 except Exception as e:
                     _warn_nonfatal("BROKER_IBKR_GATEWAY_CONNECTION_CLOSE_FAILED", e, once_key="execution_stream_close", scope="run_execution_stream_daemon")
 
-            time.sleep(max(0.1, float(poll_sleep_s)))
+            app._exec_evt.wait(timeout=max(0.1, float(poll_sleep_s)))
 
     finally:
         try:

@@ -20,7 +20,13 @@ _DEFAULT_OVERRIDES: Dict[str, tuple[float, float]] = {
 def _finite_float(value: float, default: float = 0.0) -> float:
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError):
+        LOGGER.warning(
+            "almgren_chriss_finite_float_parse_failed value=%r default=%s",
+            value,
+            default,
+            exc_info=True,
+        )
         return float(default)
     return out if math.isfinite(out) else float(default)
 

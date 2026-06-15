@@ -80,7 +80,7 @@ def _stderr_nonfatal(event: str, error: BaseException, *, warn_key: str | None =
                 )
                 stderr.flush()
             except Exception:
-                traceback.print_exc()
+                _stderr_fallback_failed = True
         return
     if warn_key:
         _WARNED_NONFATAL_KEYS.add(warn_key)

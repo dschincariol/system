@@ -137,6 +137,29 @@ def _sql_for_table(table: str, con: Any) -> str:
         )
     return sql
 _TABLE_ORDER: tuple[str, ...] = tuple(_TABLE_SPECS.keys())
+_PREVIOUS_BUFFER_LOCK = globals().get("_BUFFER_LOCK")
+_PREVIOUS_BUFFER_STOP = globals().get("_BUFFER_STOP")
+_PREVIOUS_BUFFER_THREAD = globals().get("_BUFFER_THREAD")
+if _PREVIOUS_BUFFER_STOP is not None:
+    try:
+        _PREVIOUS_BUFFER_STOP.set()
+    except Exception:
+        LOG.debug("telemetry_append_buffer_reload_stop_failed", exc_info=True)
+if _PREVIOUS_BUFFER_LOCK is not None:
+    try:
+        with _PREVIOUS_BUFFER_LOCK:
+            _PREVIOUS_BUFFER_LOCK.notify_all()
+    except Exception:
+        LOG.debug("telemetry_append_buffer_reload_notify_failed", exc_info=True)
+if (
+    _PREVIOUS_BUFFER_THREAD is not None
+    and getattr(_PREVIOUS_BUFFER_THREAD, "is_alive", lambda: False)()
+    and _PREVIOUS_BUFFER_THREAD is not threading.current_thread()
+):
+    try:
+        _PREVIOUS_BUFFER_THREAD.join(timeout=1.0)
+    except Exception:
+        LOG.debug("telemetry_append_buffer_reload_join_failed", exc_info=True)
 _BUFFER_LOCK = threading.Condition()
 _BUFFER_PENDING: dict[str, list[tuple[Any, ...]]] = {name: [] for name in _TABLE_ORDER}
 _BUFFER_STOP = threading.Event()
@@ -166,6 +189,7 @@ _BUFFER_STATE: dict[str, Any] = {
 }
 _PRICE_PROVIDER_STATE_LOCK = threading.Lock()
 _PRICE_PROVIDER_STATE: dict[str, dict[str, int]] = {}
+_BUFFER_DB_PATH_KEY = str(os.environ.get("DB_PATH") or "").strip()
 
 
 def _staggered_flush_interval_s(base_interval_s: float, jitter_ratio: float) -> float:
@@ -181,6 +205,27 @@ def _telemetry_append_flush_backoff_s(consecutive_failures: int) -> float:
     failures = max(1, min(int(consecutive_failures), 5))
     base_interval_s = max(1.0, float(_BUFFER_EFFECTIVE_FLUSH_INTERVAL_S))
     return min(10.0, float(base_interval_s * (2 ** (failures - 1))))
+
+
+def _current_buffer_db_path_key() -> str:
+    return str(os.environ.get("DB_PATH") or "").strip()
+
+
+def _reset_buffer_for_current_db_path_if_needed() -> None:
+    global _BUFFER_DB_PATH_KEY
+    current = _current_buffer_db_path_key()
+    if current == _BUFFER_DB_PATH_KEY:
+        return
+    with _BUFFER_LOCK:
+        for table in _TABLE_ORDER:
+            _BUFFER_PENDING[table] = []
+        _BUFFER_STATE["buffered_rows"] = 0
+        _BUFFER_STATE["last_error"] = ""
+        _BUFFER_STATE["last_error_ts_ms"] = 0
+        _BUFFER_DB_PATH_KEY = current
+        _BUFFER_LOCK.notify_all()
+    with _PRICE_PROVIDER_STATE_LOCK:
+        _PRICE_PROVIDER_STATE.clear()
 
 
 _BUFFER_EFFECTIVE_FLUSH_INTERVAL_S = _staggered_flush_interval_s(
@@ -239,6 +284,7 @@ def _snapshot_locked() -> dict[str, Any]:
     state["flush_interval_s"] = float(_BUFFER_EFFECTIVE_FLUSH_INTERVAL_S)
     state["flush_interval_base_s"] = float(_BUFFER_FLUSH_INTERVAL_S)
     state["flush_jitter_ratio"] = float(_BUFFER_FLUSH_JITTER_RATIO)
+    state["db_path_key"] = str(_BUFFER_DB_PATH_KEY)
     state["pending_by_table"] = {
         name: int(len(_BUFFER_PENDING.get(name) or []))
         for name in _TABLE_ORDER
@@ -380,6 +426,7 @@ def _buffer_writer_loop() -> None:
     consecutive_failures = 0
     pending_since_s = 0.0
     while True:
+        _reset_buffer_for_current_db_path_if_needed()
         with _BUFFER_LOCK:
             while True:
                 if _buffered_row_count_locked() <= 0 and not _BUFFER_STOP.is_set():
@@ -434,6 +481,7 @@ def _ensure_buffer_thread_started() -> None:
     global _BUFFER_THREAD
     if not _BUFFER_ENABLED:
         return
+    _reset_buffer_for_current_db_path_if_needed()
     with _BUFFER_LOCK:
         if _BUFFER_THREAD is not None and _BUFFER_THREAD.is_alive():
             return
@@ -449,6 +497,7 @@ def _ensure_buffer_thread_started() -> None:
 def _enqueue_rows(table: str, rows: Sequence[tuple[Any, ...]]) -> bool:
     if not rows:
         return True
+    _reset_buffer_for_current_db_path_if_needed()
     table_name = str(table)
     if table_name not in _TABLE_SPECS:
         now_ms = int(time.time() * 1000)
@@ -706,6 +755,7 @@ def flush_telemetry_append_buffers(
     max_batches: int = 8,
     tables: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    _reset_buffer_for_current_db_path_if_needed()
     flushed = 0
     flush_batches = 0
     selected = [str(name) for name in (tables or []) if str(name) in _TABLE_SPECS] or None

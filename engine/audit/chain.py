@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any, Iterable, Mapping
 
-from psycopg.errors import UndefinedFunction
+try:
+    from psycopg.errors import UndefinedFunction
+except ModuleNotFoundError:
+    class UndefinedFunction(Exception):  # type: ignore[no-redef]
+        pass
 
 from engine.audit.hashing import compute_row_hash
 from engine.runtime.dbapi_compat import is_sqlite_connection, is_sqlite_error

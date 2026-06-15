@@ -63,7 +63,14 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "TRAIN_ENSEMBLE_META_FLOAT_PARSE_FAILED",
+            exc,
+            once_key=f"safe_float:{repr(value)[:80]}",
+            value=repr(value)[:240],
+            default=float(default),
+        )
         return float(default)
     if not math.isfinite(out):
         return float(default)
@@ -73,7 +80,14 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "TRAIN_ENSEMBLE_META_INT_PARSE_FAILED",
+            exc,
+            once_key=f"safe_int:{repr(value)[:80]}",
+            value=repr(value)[:240],
+            default=int(default),
+        )
         return int(default)
 
 
@@ -313,7 +327,7 @@ def run() -> Dict[str, Any]:
 def main() -> int:
     """CLI entrypoint for the stacked ensemble meta-learner training job."""
     result = run()
-    print(_json_dumps(result))
+    LOG.info("train_ensemble_meta_result result=%s", _json_dumps(result))
     return 0 if bool(result.get("ok")) else 1
 
 

@@ -12,11 +12,12 @@ import time
 import json
 import logging
 import threading
-from typing import Any, Callable, Dict, List, Tuple, Optional
+from typing import Any, Callable, Dict, List, Mapping, Tuple, Optional
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
+from engine.data.asset_map import asset_class_for_symbol
 from engine.model_registry import DEFAULT_MODEL_REGISTRY, get_active_model_name, get_active_model_spec, get_model_spec
 from engine.prediction_logger import DEFAULT_PREDICTION_LOGGER
 from engine.runtime.storage import connect
@@ -24,6 +25,7 @@ from engine.strategy.ensemble.blender import (
     EnsembleBlender as RidgeStackBlender,
     ensemble_mode as ridge_stack_ensemble_mode,
 )
+from engine.strategy.ensemble import hedge as hedge_ensemble
 from engine.strategy.ensemble_blender import (
     blend_predictions,
     clear_prediction_context,
@@ -42,6 +44,7 @@ from engine.strategy.confidence_engine import (
     calibrate_confidence_score,
     describe_signal_confidence,
 )
+from engine.strategy.conformal import apply_conformal_to_explain
 from engine.strategy.learning import (
     confidence_from_weight,
     confidence_from_n,
@@ -55,11 +58,17 @@ from engine.strategy.model_v2 import get_regime_prior, get_spillover_betas, get_
 # ------            -- ------------------------------------------------------
 from engine.strategy.embed_regressor import predict_with_embed_model
 from engine.strategy.gbm_regressor import load_gbm_model_record, predict_with_gbm_model
+from engine.strategy.models.lgbm_ranker import (
+    load_model_from_artifact as load_lgbm_ranker_model_from_artifact,
+    ranker_scores_to_signals,
+)
 from engine.strategy.models.lgbm_regressor import load_model_from_artifact as load_lgbm_model_from_artifact
 from engine.strategy.models.patchtst import load_model_from_artifact as load_patchtst_model_from_artifact
 from engine.strategy.models.xgb_regressor import load_model_from_artifact as load_xgb_model_from_artifact
 from engine.strategy.feature_expansion import build_feature_vector, feature_set_tag
 from engine.strategy.feature_registry import build_feature_snapshot, feature_set_tag_from_ids, resolve_feature_ids
+from engine.strategy.feature_neutralization import neutralize_mode, neutralize_predictions
+from engine.strategy.ood import score_ood
 from engine.strategy.model_config import (
     active_model_names,
     get_model_config,
@@ -136,6 +145,42 @@ def _registry_feature_set_tag(feature_ids: Any, *, model_name: str = "", model_s
             warn_key="predictor_feature_set_tag_from_registry_failed",
         )
         return str(feature_set_tag(resolved) or "").strip()
+
+
+def _attach_ood_diagnostics(
+    explain: Mapping[str, Any] | None,
+    model: Any,
+    feature_map: Mapping[str, Any] | None,
+    *,
+    warn_key: str,
+) -> Dict[str, Any]:
+    explain_dict = dict(explain or {})
+    try:
+        features_payload = {"features": dict(feature_map or {})}
+        if hasattr(model, "score_ood") and callable(getattr(model, "score_ood")):
+            ood_payload = dict(model.score_ood(features_payload) or {})
+        else:
+            ood_payload = dict(score_ood(getattr(model, "ood_profile", None), features_payload) or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_ood_score_failed",
+            "PREDICTOR_OOD_SCORE_FAILED",
+            e,
+            warn_key=str(warn_key or "predictor_ood_score_failed"),
+        )
+        return explain_dict
+    if not ood_payload:
+        return explain_dict
+    explain_dict["ood"] = dict(ood_payload)
+    if bool(ood_payload.get("available")):
+        score = _safe_float(ood_payload.get("ood_score", ood_payload.get("ood_distance")), 0.0)
+        explain_dict["ood_score"] = float(score)
+        explain_dict["ood_distance"] = float(score)
+        explain_dict["feature_ood_distance"] = float(score)
+        explain_dict["ood_threshold"] = _safe_float(ood_payload.get("threshold"), 0.0)
+        explain_dict["ood_hard_threshold"] = _safe_float(ood_payload.get("hard_threshold"), 0.0)
+        explain_dict["ood_range_violation_count"] = int(_safe_int(ood_payload.get("range_violation_count"), 0))
+    return explain_dict
 
 
 def _track_prediction_output(
@@ -459,6 +504,8 @@ def _model_family(model_name: str) -> str:
     name = str(model_name or "").strip().lower()
     if name == "lgbm_regressor" or name.startswith("lgbm_regressor"):
         return "lgbm_regressor"
+    if name == "lgbm_ranker" or name.startswith("lgbm_ranker"):
+        return "lgbm_ranker"
     if name == "xgb_regressor" or name.startswith("xgb_regressor"):
         return "xgb_regressor"
     if name == "patchtst" or name.startswith("patchtst"):
@@ -1048,6 +1095,12 @@ def _predict_via_tabular_artifact_adapter(
             "knn": knn_ex,
         },
     }
+    explain = _attach_ood_diagnostics(
+        explain,
+        model,
+        dict(feature_map or {}),
+        warn_key=f"predictor_ood_score_failed:{family}:{active_model_name}:{sym}:{h}",
+    )
     if active_family != family:
         explain["requested_model_family"] = str(active_family)
     z2, conf2, prior_ex = _blend_with_priors(sym, int(h), float(pred_z), float(max(1, n_support)))
@@ -1085,6 +1138,26 @@ def _predict_via_lgbm_adapter(
         knn_ex=knn_ex,
         regime_at_trade=regime_at_trade,
     )
+
+
+def _predict_via_lgbm_ranker_adapter(
+    query_vec: np.ndarray,
+    sym: str,
+    h: int,
+    *,
+    event: Optional[Dict] = None,
+    active_model_name: str,
+    active_model_version: str,
+    active_family: str,
+    feature_ids: List[str],
+    knn_z: float,
+    wsum: float,
+    knn_ex: Dict[str, Any],
+    regime_at_trade: str,
+) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+    del query_vec, sym, h, event, active_model_name, active_model_version
+    del active_family, feature_ids, knn_z, wsum, knn_ex, regime_at_trade
+    return None
 
 
 def _predict_via_xgb_adapter(
@@ -1194,6 +1267,12 @@ def _predict_via_patchtst_adapter(
             "knn": knn_ex,
         },
     }
+    explain = _attach_ood_diagnostics(
+        explain,
+        model,
+        dict(feature_map or {}),
+        warn_key=f"predictor_ood_score_failed:patchtst:{active_model_name}:{sym}:{h}",
+    )
     if active_family != "patchtst":
         explain["requested_model_family"] = str(active_family)
     z2, conf2, prior_ex = _blend_with_priors(sym, int(h), float(pred_z), float(max(1, n_support)))
@@ -1349,6 +1428,7 @@ _MODEL_ADAPTERS: Dict[str, Callable[..., Optional[Tuple[float, float, Dict[str, 
     "temporal_predictor": _predict_via_temporal_adapter,
     "gbm_regressor": _predict_via_gbm_adapter,
     "lgbm_regressor": _predict_via_lgbm_adapter,
+    "lgbm_ranker": _predict_via_lgbm_ranker_adapter,
     "xgb_regressor": _predict_via_xgb_adapter,
     "patchtst": _predict_via_patchtst_adapter,
     "embed_regressor": _predict_via_embed_adapter,
@@ -2424,6 +2504,223 @@ def _maybe_apply_ensemble_blend(
     return float(final_prediction), float(final_confidence), explain_dict
 
 
+def _hedge_component_vector(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "method": "hedge",
+        "mode": "hedge",
+        "components": dict(diagnostics.get("components") or {}),
+        "weights": dict(diagnostics.get("weights") or {}),
+        "qualified_models": list(diagnostics.get("qualified_models") or []),
+        "excluded_models": dict(diagnostics.get("excluded_models") or {}),
+        "missing_models": list(diagnostics.get("missing_models") or []),
+        "weight_ts_ms": int(diagnostics.get("weight_ts_ms") or 0),
+        "applied": bool(diagnostics.get("applied")),
+        "fallback_reason": str(diagnostics.get("fallback_reason") or ""),
+    }
+
+
+def _with_hedge_diagnostics(
+    base_prediction: Tuple[float, float, Dict[str, Any]],
+    *,
+    diagnostics: Dict[str, Any],
+) -> Tuple[float, float, Dict[str, Any]]:
+    z_base, conf_base, explain_base = base_prediction
+    explain_dict = dict(explain_base or {})
+    diagnostics = dict(diagnostics or {})
+    component_vector = _hedge_component_vector(diagnostics)
+    explain_dict["prediction_blend_mode"] = "hedge"
+    explain_dict["ensemble_blend"] = dict(diagnostics)
+    explain_dict["ensemble_output"] = {
+        "aggregated_confidence": float(conf_base),
+        "ensemble_size": int(len(diagnostics.get("components") or {})),
+        "fallback": bool(not diagnostics.get("applied")),
+        "fallback_reason": str(diagnostics.get("fallback_reason") or ""),
+        "final_prediction": float(z_base),
+        "method": "hedge",
+        "weight_ts": int(diagnostics.get("weight_ts_ms") or 0),
+    }
+    explain_dict["ensemble_components"] = dict(diagnostics.get("components") or {})
+    explain_dict["ensemble_weights"] = dict(diagnostics.get("weights") or {})
+    explain_dict["component_vector"] = dict(component_vector)
+    return float(z_base), float(conf_base), explain_dict
+
+
+def _maybe_apply_hedge_blend(
+    query_vec: np.ndarray,
+    sym: str,
+    h: int,
+    *,
+    top_k: int,
+    event: Optional[Dict],
+    active_model: Dict[str, Any],
+    base_prediction: Tuple[float, float, Dict[str, Any]],
+) -> Tuple[float, float, Dict[str, Any]]:
+    primary_model = dict(active_model or {})
+    primary_name = str(primary_model.get("model_name") or "").strip()
+    base_z, base_conf, base_explain = base_prediction
+    base_explain_dict = dict(base_explain or {})
+    ts_ms = _safe_int((event or {}).get("ts_ms"), int(time.time() * 1000))
+    diagnostics: Dict[str, Any] = {
+        "mode": "hedge",
+        "method": "hedge",
+        "requested_ts_ms": int(ts_ms),
+        "base_model_name": str(primary_name),
+        "qualified_models": [],
+        "components": {},
+        "weights": {},
+        "excluded_models": {},
+        "missing_models": [],
+        "applied": False,
+    }
+
+    con = None
+    try:
+        con = connect(readonly=True)
+        qualified = hedge_ensemble.qualified_model_pool(
+            con,
+            symbol=str(sym),
+            horizon=int(h),
+            champion_name=str(primary_name),
+            asof_ts_ms=int(ts_ms),
+        )
+        diagnostics["qualified_models"] = list(qualified)
+        if len(qualified) < 2:
+            diagnostics["fallback_reason"] = "insufficient_qualified_pool"
+            return _with_hedge_diagnostics(base_prediction, diagnostics=diagnostics)
+        weight_row = hedge_ensemble.load_hedge_weights(
+            con,
+            symbol=str(sym),
+            horizon=int(h),
+            qualified_models=list(qualified),
+            ensure=False,
+        )
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception as e:
+            _warn_nonfatal(
+                "predictor_hedge_connection_close_failed",
+                "PREDICTOR_HEDGE_CONNECTION_CLOSE_FAILED",
+                e,
+                warn_key=f"predictor_hedge_connection_close_failed:{sym}:{h}",
+                symbol=str(sym),
+                horizon_s=int(h),
+            )
+
+    if not weight_row:
+        diagnostics["fallback_reason"] = "no_hedge_weights"
+        return _with_hedge_diagnostics(base_prediction, diagnostics=diagnostics)
+
+    raw_weights = dict(weight_row.get("weights") or {})
+    diagnostics["weight_ts_ms"] = int(weight_row.get("ts_ms") or 0)
+    diagnostics["weight_regime"] = str(weight_row.get("regime") or "")
+    if list(weight_row.get("excluded_models") or []):
+        diagnostics["excluded_models"] = {
+            str(model): "not_qualified"
+            for model in list(weight_row.get("excluded_models") or [])
+            if str(model or "").strip()
+        }
+
+    components: Dict[str, Dict[str, Any]] = {}
+    missing: List[str] = []
+    excluded = dict(diagnostics.get("excluded_models") or {})
+
+    def _component_from_result(model_name: str, result: Tuple[float, float, Dict[str, Any]]) -> Dict[str, Any]:
+        z_model, conf_model, explain_model = result
+        explain_model = dict(explain_model or {})
+        return {
+            "prediction": float(z_model),
+            "confidence": float(max(0.0, min(1.0, conf_model))),
+            "model_name": str(explain_model.get("model_name") or model_name),
+            "model_id": str(explain_model.get("model_id") or explain_model.get("model_name") or model_name),
+            "model_kind": str(explain_model.get("model_kind") or ""),
+            "model_version": str(explain_model.get("model_version") or ""),
+        }
+
+    for model_name in sorted(raw_weights.keys()):
+        model_key = str(model_name or "").strip()
+        if not model_key:
+            continue
+        if model_key == primary_name:
+            components[model_key] = _component_from_result(model_key, base_prediction)
+            continue
+        try:
+            if not is_active_model_name(model_key):
+                excluded[model_key] = "inactive_model_config"
+                continue
+            model_spec = _resolve_active_model(str(sym), int(h), forced_model_name=model_key)
+            z_model, conf_model, explain_model = _predict_resolved_model(
+                query_vec,
+                str(sym),
+                int(h),
+                top_k=int(top_k),
+                active_model=dict(model_spec),
+                event=event,
+            )
+        except Exception as e:
+            _warn_nonfatal(
+                "predictor_hedge_component_failed",
+                "PREDICTOR_HEDGE_COMPONENT_FAILED",
+                e,
+                warn_key=f"predictor_hedge_component_failed:{sym}:{h}:{model_key}",
+                symbol=str(sym),
+                horizon_s=int(h),
+                model_name=str(model_key),
+            )
+            missing.append(str(model_key))
+            continue
+        components[model_key] = _component_from_result(model_key, (z_model, conf_model, explain_model))
+
+    diagnostics["components"] = dict(components)
+    diagnostics["missing_models"] = list(missing)
+    diagnostics["excluded_models"] = dict(excluded)
+    if len(components) < 2:
+        diagnostics["fallback_reason"] = "insufficient_component_predictions"
+        return _with_hedge_diagnostics(base_prediction, diagnostics=diagnostics)
+
+    available_weights = {
+        model: float(raw_weights.get(model, 0.0))
+        for model in components.keys()
+        if float(raw_weights.get(model, 0.0) or 0.0) > 0.0
+    }
+    blend_weights = hedge_ensemble._apply_floor(available_weights, floor=0.0)
+    if not blend_weights:
+        diagnostics["fallback_reason"] = "empty_available_weights"
+        return _with_hedge_diagnostics(base_prediction, diagnostics=diagnostics)
+
+    final_prediction = 0.0
+    final_confidence = 0.0
+    for model_name, weight in blend_weights.items():
+        component = dict(components.get(model_name) or {})
+        final_prediction += float(weight) * float(component.get("prediction") or 0.0)
+        final_confidence += float(weight) * float(component.get("confidence") or 0.0)
+
+    diagnostics["weights"] = {str(model): float(blend_weights[model]) for model in sorted(blend_weights)}
+    diagnostics["applied"] = True
+    diagnostics["fallback_reason"] = "partial_component_predictions" if (missing or excluded) else ""
+    diagnostics["final_prediction"] = float(final_prediction)
+    diagnostics["aggregated_confidence"] = float(max(0.0, min(1.0, final_confidence)))
+
+    explain_dict = dict(base_explain_dict)
+    component_vector = _hedge_component_vector(diagnostics)
+    explain_dict["prediction_blend_mode"] = "hedge"
+    explain_dict["ensemble_blend"] = dict(diagnostics)
+    explain_dict["ensemble_output"] = {
+        "aggregated_confidence": float(diagnostics["aggregated_confidence"]),
+        "ensemble_size": int(len(components)),
+        "fallback": False,
+        "fallback_reason": str(diagnostics.get("fallback_reason") or ""),
+        "final_prediction": float(final_prediction),
+        "method": "hedge",
+        "weight_ts": int(diagnostics.get("weight_ts_ms") or 0),
+    }
+    explain_dict["ensemble_components"] = dict(components)
+    explain_dict["ensemble_weights"] = dict(diagnostics["weights"])
+    explain_dict["component_vector"] = dict(component_vector)
+    return float(final_prediction), float(diagnostics["aggregated_confidence"]), explain_dict
+
+
 def _predict_single_model(
     query_vec: np.ndarray,
     sym: str,
@@ -2443,9 +2740,31 @@ def _predict_single_model(
         event=event,
     )
     if forced_model_name is None:
+        prediction_blend_mode = hedge_ensemble.prediction_blend_mode()
+        if prediction_blend_mode == "hedge":
+            try:
+                served = _maybe_apply_hedge_blend(
+                    query_vec,
+                    str(sym),
+                    int(h),
+                    top_k=int(top_k),
+                    event=event,
+                    active_model=dict(active_model or {}),
+                    base_prediction=served,
+                )
+            except Exception as e:
+                _warn_nonfatal(
+                    "predictor_hedge_blend_failed",
+                    "PREDICTOR_HEDGE_BLEND_FAILED",
+                    e,
+                    warn_key=f"predictor_hedge_blend_failed:{sym}:{h}",
+                    symbol=str(sym),
+                    horizon_s=int(h),
+                )
         ridge_mode = str(ridge_stack_ensemble_mode() or "blend").strip().lower()
         ridge_applied = False
-        if ridge_mode != "single_champion":
+        ensemble_enabled = bool(ensemble_blend_enabled())
+        if prediction_blend_mode != "hedge" and ensemble_enabled and ridge_mode != "single_champion":
             try:
                 served = _maybe_apply_stacked_ridge_ensemble(
                     query_vec,
@@ -2468,7 +2787,7 @@ def _predict_single_model(
                     symbol=str(sym),
                     horizon_s=int(h),
                 )
-        if ridge_mode != "single_champion" and not ridge_applied:
+        if prediction_blend_mode != "hedge" and ensemble_enabled and ridge_mode != "single_champion" and not ridge_applied:
             try:
                 served = _maybe_apply_ensemble_blend(
                     query_vec,
@@ -2548,6 +2867,275 @@ def _predict_single_model(
         source="legacy_predictor",
     )
     return float(z_final), float(conf_final), dict(explain_dict or {})
+
+
+def _maybe_apply_feature_neutralization(
+    out: Dict[Tuple[str, int], Tuple[float, float, Dict]],
+    *,
+    symbols: List[str],
+    horizon_s: int,
+) -> Dict[Tuple[str, int], Tuple[float, float, Dict]]:
+    mode = neutralize_mode()
+    if mode == "off":
+        return out
+
+    predictions: Dict[str, float] = {}
+    feature_snapshots: Dict[str, Dict[str, Any]] = {}
+    key_by_symbol: Dict[str, Tuple[str, int]] = {}
+    for raw_sym in symbols or []:
+        key = (str(raw_sym), int(horizon_s))
+        if key not in out:
+            continue
+        z0, _conf0, explain0 = out[key]
+        symbol_key = str(raw_sym).upper().strip()
+        if not symbol_key:
+            continue
+        predictions[symbol_key] = float(z0)
+        explain_dict = dict(explain0 or {})
+        snapshot = explain_dict.get("feature_snapshot")
+        feature_snapshots[symbol_key] = dict(snapshot or {}) if isinstance(snapshot, dict) else {}
+        key_by_symbol[symbol_key] = key
+
+    if not predictions:
+        return out
+
+    result = neutralize_predictions(
+        predictions,
+        feature_snapshots,
+        mode=str(mode),
+    )
+    diagnostics = result.diagnostics()
+    for symbol_key, key in key_by_symbol.items():
+        z0, conf0, explain0 = out[key]
+        explain_dict = dict(explain0 or {})
+        neutral_z = float(result.neutralized_predictions.get(symbol_key, z0))
+        served_z = neutral_z if mode == "serve" and bool(result.applied) else float(z0)
+        explain_dict["feature_neutralization"] = {
+            **diagnostics,
+            "symbol": str(symbol_key),
+            "raw_prediction": float(z0),
+            "neutralized_prediction": float(neutral_z),
+            "served_prediction": float(served_z),
+            "served": bool(mode == "serve" and bool(result.applied)),
+        }
+        if mode == "serve" and bool(result.applied):
+            explain_dict["raw_prediction_before_feature_neutralization"] = float(z0)
+        out[key] = (float(served_z), float(conf0), explain_dict)
+    return out
+
+
+def _ranker_equity_scope_symbol(symbol: str) -> bool:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return False
+    try:
+        asset_class = str(asset_class_for_symbol(sym) or "UNKNOWN").upper().strip()
+    except Exception:
+        asset_class = "UNKNOWN"
+    if asset_class in {"EQUITY", "EQUITIES", "US_EQUITY", "STOCK", "STOCKS"}:
+        return True
+    if asset_class in {"CRYPTO", "COMMODITY", "FX", "RATES", "OPTION", "OPTIONS"}:
+        return False
+    return bool(sym.replace(".", "").isalnum()) and not sym.endswith(("USD", "USDT"))
+
+
+def _ranker_selection_count(env_name: str, default_value: int, universe_n: int) -> int:
+    raw = os.environ.get(str(env_name))
+    default = max(0, int(default_value or 0))
+    value = _safe_int(raw, default) if raw is not None else default
+    return max(0, min(int(value), int(max(0, universe_n))))
+
+
+def _active_model_is_lgbm_ranker(active_model: Mapping[str, Any]) -> bool:
+    active = dict(active_model or {})
+    family = str(
+        active.get("model_family")
+        or active.get("family")
+        or _model_family(str(active.get("model_name") or ""))
+    ).strip()
+    return family == "lgbm_ranker"
+
+
+def _ranker_artifact_location(active_model: Mapping[str, Any]) -> Dict[str, str]:
+    active = dict(active_model or {})
+    loc = {
+        "alias": str(active.get("artifact_alias") or ""),
+        "sha256": str(active.get("artifact_sha256") or ""),
+        "path": str(active.get("artifact_path") or ""),
+    }
+    if any(str(loc.get(k) or "").strip() for k in ("alias", "sha256", "path")):
+        return loc
+    return _artifact_location_for_model(str(active.get("model_name") or ""))
+
+
+def _maybe_apply_lgbm_ranker_batch(
+    out: Dict[Tuple[str, int], Tuple[float, float, Dict]],
+    *,
+    symbols: List[str],
+    horizon_s: int,
+    top_k: int,
+    event: Optional[Dict],
+) -> Dict[Tuple[str, int], Tuple[float, float, Dict]]:
+    groups: Dict[Tuple[str, str, str, str, Tuple[str, ...]], Dict[str, Any]] = {}
+    for sym_raw in list(symbols or []):
+        sym = str(sym_raw or "").upper().strip()
+        if not sym or not _ranker_equity_scope_symbol(sym):
+            continue
+        try:
+            active = _resolve_active_model(sym, int(horizon_s))
+        except Exception as e:
+            _warn_nonfatal(
+                "predictor_lgbm_ranker_active_model_lookup_failed",
+                "PREDICTOR_LGBM_RANKER_ACTIVE_MODEL_LOOKUP_FAILED",
+                e,
+                warn_key=f"predictor_lgbm_ranker_active_model_lookup_failed:{sym}:{horizon_s}",
+                symbol=str(sym),
+                horizon_s=int(horizon_s),
+            )
+            continue
+        if not _active_model_is_lgbm_ranker(active):
+            continue
+        loc = _ranker_artifact_location(active)
+        if not any(str(loc.get(k) or "").strip() for k in ("alias", "sha256", "path")):
+            continue
+        feature_ids = resolve_feature_ids(
+            active.get("feature_ids"),
+            model_name=str(active.get("model_name") or ""),
+            model_spec=dict(active or {}),
+        )
+        key = (
+            str(active.get("model_name") or ""),
+            str(loc.get("alias") or ""),
+            str(loc.get("sha256") or ""),
+            str(loc.get("path") or ""),
+            tuple(str(fid) for fid in list(feature_ids or [])),
+        )
+        bucket = groups.setdefault(key, {"active": dict(active), "location": dict(loc), "symbols": [], "feature_ids": list(feature_ids)})
+        bucket["symbols"].append(str(sym))
+
+    if not groups:
+        return out
+
+    event_payload = dict(event or {})
+    if not event_payload:
+        event_payload = {"ts_ms": int(time.time() * 1000), "title": "", "body": "", "source": ""}
+
+    next_out = dict(out)
+    for _key, bucket in groups.items():
+        syms = [str(s) for s in list(bucket.get("symbols") or []) if str(s or "").strip()]
+        if len(syms) < 2:
+            continue
+        active = dict(bucket.get("active") or {})
+        loc = dict(bucket.get("location") or {})
+        try:
+            model = load_lgbm_ranker_model_from_artifact(
+                alias=str(loc.get("alias") or ""),
+                sha256=str(loc.get("sha256") or ""),
+                path=(str(loc.get("path") or "") or None),
+            )
+            feature_ids = list(getattr(model, "feature_ids", None) or bucket.get("feature_ids") or [])
+            feature_maps = [
+                _cached_or_build_feature_snapshot(
+                    event=event_payload,
+                    symbol=str(sym),
+                    feature_ids=list(feature_ids),
+                )
+                for sym in syms
+            ]
+            scores = model.predict(feature_maps)
+            default_leg = max(1, min(3, int(top_k or 3), len(syms) // 2 if len(syms) > 2 else 1))
+            top_n = _ranker_selection_count("LGBM_RANKER_TOP_K", default_leg, len(syms))
+            bottom_n = _ranker_selection_count("LGBM_RANKER_BOTTOM_K", default_leg, max(0, len(syms) - top_n))
+            signals = ranker_scores_to_signals(syms, scores, top_k=int(top_n), bottom_k=int(bottom_n))
+        except Exception as e:
+            _warn_nonfatal(
+                "predictor_lgbm_ranker_batch_failed",
+                "PREDICTOR_LGBM_RANKER_BATCH_FAILED",
+                e,
+                warn_key=f"predictor_lgbm_ranker_batch_failed:{active.get('model_name')}:{horizon_s}",
+                horizon_s=int(horizon_s),
+                model_name=str(active.get("model_name") or ""),
+            )
+            continue
+
+        feature_schema = dict(getattr(model, "feature_schema", {}) or active.get("feature_schema") or {})
+        training_metrics = dict(getattr(model, "training_metrics", {}) or {})
+        for idx, sym in enumerate(syms):
+            key = (str(sym), int(horizon_s))
+            if key not in next_out:
+                continue
+            z0, conf0, explain0 = next_out[key]
+            signal = dict(signals.get(str(sym)) or {})
+            if not signal:
+                continue
+            feature_map = dict(feature_maps[idx] or {}) if idx < len(feature_maps) else {}
+            served_z = float(signal.get("expected_z") or 0.0)
+            served_conf = float(signal.get("confidence") or 0.0)
+            explain = dict(explain0 or {})
+            explain.update(
+                {
+                    "model": "lgbm_ranker",
+                    "model_name": str(active.get("model_name") or getattr(model, "model_name", "") or "lgbm_ranker"),
+                    "model_id": str(active.get("model_id") or active.get("model_name") or getattr(model, "model_name", "") or "lgbm_ranker"),
+                    "model_family": "lgbm_ranker",
+                    "served_model_family": "lgbm_ranker",
+                    "model_kind": str(getattr(model, "model_kind", "lightgbm_ranker") or "lightgbm_ranker"),
+                    "model_version": str(active.get("model_version") or ""),
+                    "model_ts_ms": int(active.get("model_ts_ms") or 0),
+                    "model_spec_source_stage": str(active.get("spec_source_stage") or ""),
+                    "feature_ids": list(feature_ids),
+                    "feature_set_tag": _registry_feature_set_tag(
+                        list(feature_ids),
+                        model_name=str(active.get("model_name") or getattr(model, "model_name", "") or "lgbm_ranker"),
+                        model_spec=dict(feature_schema or {}),
+                    ),
+                    "feature_schema": dict(feature_schema),
+                    "feature_snapshot": feature_map,
+                    "prediction_strength": float(abs(served_z) * max(0.0, served_conf)),
+                    "selection_score": float(abs(served_z) * max(0.0, served_conf)),
+                    "rank_score": float(signal.get("rank_score") or 0.0),
+                    "should_trade": bool(signal.get("selected")),
+                    "ranker_selected": bool(signal.get("selected")),
+                    "ranker_side": str(signal.get("side") or "FLAT"),
+                    "ranker_rank": int(signal.get("rank") or 0),
+                    "training_metrics": dict(training_metrics),
+                    "artifact_alias": str(loc.get("alias") or ""),
+                    "lgbm_ranker_batch": {
+                        "applied": True,
+                        "universe_n": int(len(syms)),
+                        "top_k": int(top_n),
+                        "bottom_k": int(bottom_n),
+                        "raw_fallback_expected_z": float(z0),
+                        "raw_fallback_confidence": float(conf0),
+                    },
+                }
+            )
+            explain = _attach_ood_diagnostics(
+                explain,
+                model,
+                dict(feature_map or {}),
+                warn_key=f"predictor_ood_score_failed:lgbm_ranker:{active.get('model_name')}:{sym}:{horizon_s}",
+            )
+            try:
+                _track_prediction_output(
+                    symbol=str(sym),
+                    horizon_s=int(horizon_s),
+                    prediction=float(served_z),
+                    confidence=float(served_conf),
+                    explain=dict(explain or {}),
+                    source="lgbm_ranker_batch",
+                )
+            except Exception as e:
+                _warn_nonfatal(
+                    "predictor_lgbm_ranker_tracking_failed",
+                    "PREDICTOR_LGBM_RANKER_TRACKING_FAILED",
+                    e,
+                    warn_key=f"predictor_lgbm_ranker_tracking_failed:{sym}:{horizon_s}",
+                    symbol=str(sym),
+                    horizon_s=int(horizon_s),
+                )
+            next_out[key] = (float(served_z), float(served_conf), explain)
+    return next_out
 
 
 def predict_event(
@@ -2634,6 +3222,15 @@ def predict_event(
     out: Dict[Tuple[str, int], Tuple[float, float, Dict]] = dict(base)
 
     for h in horizons:
+        out = _maybe_apply_lgbm_ranker_batch(
+            out,
+            symbols=list(symbols or []),
+            horizon_s=int(h),
+            top_k=int(top_k),
+            event=event,
+        )
+
+    for h in horizons:
         zmap = {sym: out[(sym, int(h))][0] for sym in symbols if (sym, int(h)) in out}
         cmap = {sym: out[(sym, int(h))][1] for sym in symbols if (sym, int(h)) in out}
 
@@ -2671,6 +3268,13 @@ def predict_event(
                 "contributions": contribs,
             }
             out[(target, int(h))] = (float(z0 + adj), float(c0), ex0)
+
+    for h in horizons:
+        out = _maybe_apply_feature_neutralization(
+            out,
+            symbols=list(symbols or []),
+            horizon_s=int(h),
+        )
 
     # ---- confidence collapse detection ----
     try:
@@ -2724,7 +3328,16 @@ def predict_event(
                 signal_ts_ms=int(signal_ts_ms),
             )
             explain0 = apply_confidence_payload(explain0, payload)
-            out[(sym, int(h))] = (float(z0), float(payload["confidence"]), explain0)
+            final_conf, explain0, _conformal = apply_conformal_to_explain(
+                con=con_conf,
+                symbol=str(sym),
+                horizon_s=int(h),
+                prediction=float(z0),
+                confidence=float(payload["confidence"]),
+                explain=explain0,
+                signal_ts_ms=int(signal_ts_ms),
+            )
+            out[(sym, int(h))] = (float(z0), float(final_conf), explain0)
     except Exception as e:
         _warn_nonfatal(
             "predictor_confidence_payload_batch_failed",

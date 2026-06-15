@@ -339,6 +339,117 @@ def _is_etf_like(sym: str) -> bool:
     return s in base
 
 
+def _options_features_enabled() -> bool:
+    return str(os.environ.get("USE_OPTIONS_FEATURES", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_options_gex_regime(con, symbol: str, ts_ms: int) -> Dict[str, float]:
+    if not _options_features_enabled():
+        return {}
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return {"gex_norm_z": 0.0, "gex_sign": 0.0}
+    try:
+        row = con.execute(
+            """
+            SELECT snapshot_ts_ms, gex_norm, gex_norm_z, gex_sign
+            FROM options_symbol_features
+            WHERE symbol=?
+              AND snapshot_ts_ms <= ?
+            ORDER BY snapshot_ts_ms DESC, bucket_ts_ms DESC
+            LIMIT 1
+            """,
+            (str(sym), int(ts_ms)),
+        ).fetchone()
+    except Exception as exc:
+        _warn_nonfatal(
+            "regime_stack_options_gex_lookup_failed",
+            "REGIME_STACK_OPTIONS_GEX_LOOKUP_FAILED",
+            exc,
+            warn_key=f"regime_stack_options_gex_lookup_failed:{sym}",
+            symbol=str(sym),
+            ts_ms=int(ts_ms),
+        )
+        row = None
+    if not row:
+        return {"gex_norm_z": 0.0, "gex_sign": 0.0}
+    return {
+        "snapshot_ts_ms": float(_safe_f(row[0], 0.0)),
+        "gex_norm": float(_safe_f(row[1], 0.0)),
+        "gex_norm_z": float(max(-10.0, min(10.0, _safe_f(row[2], 0.0)))),
+        "gex_sign": float(max(-1.0, min(1.0, _safe_f(row[3], 0.0)))),
+    }
+
+
+def _cot_features_enabled() -> bool:
+    return str(os.environ.get("USE_COT_FEATURES", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_cot_regime(con, symbol: str, ts_ms: int) -> Dict[str, float]:
+    if not _cot_features_enabled():
+        return {}
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return {}
+    try:
+        from engine.data.cftc_cot import resolve_cot_features
+
+        features, _meta, available = resolve_cot_features(con, symbol=sym, ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "regime_stack_cot_lookup_failed",
+            "REGIME_STACK_COT_LOOKUP_FAILED",
+            exc,
+            warn_key=f"regime_stack_cot_lookup_failed:{sym}",
+            symbol=str(sym),
+            ts_ms=int(ts_ms),
+        )
+        return {}
+    if not available:
+        return {}
+    return {
+        "cot_commercial_net_pctile_3y": float(_safe_f((features or {}).get("cot_commercial_net_pctile_3y"), 0.5)),
+        "cot_noncomm_net_z": float(max(-10.0, min(10.0, _safe_f((features or {}).get("cot_noncomm_net_z"), 0.0)))),
+        "cot_noncomm_extreme_flag": float(_clamp01(_safe_f((features or {}).get("cot_noncomm_extreme_flag"), 0.0))),
+        "cot_open_interest_z": float(max(-10.0, min(10.0, _safe_f((features or {}).get("cot_open_interest_z"), 0.0)))),
+    }
+
+
+def _load_bocpd_regime(con, symbol: str, ts_ms: int) -> Dict[str, Any]:
+    try:
+        from engine.strategy.bocpd import feature_map_from_summary, load_latest_summary
+
+        summary = load_latest_summary(
+            con,
+            symbol=str(symbol or "SPY").upper().strip() or "SPY",
+            series_type="realized_vol",
+            as_of_ts_ms=int(ts_ms),
+        )
+        if not summary:
+            summary = load_latest_summary(
+                con,
+                symbol="*",
+                series_type="portfolio_correlation",
+                as_of_ts_ms=int(ts_ms),
+            )
+        features = feature_map_from_summary(summary)
+        return {
+            **features,
+            "summary_ts_ms": int((summary or {}).get("ts_ms") or 0),
+            "series_key": str((summary or {}).get("series_key") or ""),
+        }
+    except Exception as exc:
+        _warn_nonfatal(
+            "regime_stack_bocpd_lookup_failed",
+            "REGIME_STACK_BOCPD_LOOKUP_FAILED",
+            exc,
+            warn_key=f"regime_stack_bocpd_lookup_failed:{symbol or 'SPY'}",
+            symbol=str(symbol or "SPY"),
+            ts_ms=int(ts_ms),
+        )
+        return {"bocpd_cp_prob_5d": 0.0, "bocpd_run_length_z": 0.0, "summary_ts_ms": 0, "series_key": ""}
+
+
 def compute_regime_vector(
     *,
     symbol: Optional[str] = None,
@@ -528,6 +639,22 @@ def compute_regime_vector(
 
         }
 
+        cot_regime = _load_cot_regime(con, sym or "SPY", int(t))
+        cot_macro_pressure = 0.0
+        if cot_regime:
+            commercial_pctile = float(cot_regime.get("cot_commercial_net_pctile_3y", 0.5))
+            commercial_extreme = 1.0 if commercial_pctile > 0.90 or commercial_pctile < 0.10 else 0.0
+            noncomm_extreme = float(_clamp01(cot_regime.get("cot_noncomm_extreme_flag", 0.0)))
+            cot_macro_pressure = float(max(commercial_extreme, noncomm_extreme))
+            macro["cot_commercial_net_pctile_3y"] = float(commercial_pctile)
+            macro["cot_noncomm_net_z"] = float(cot_regime.get("cot_noncomm_net_z", 0.0))
+            macro["cot_noncomm_extreme_flag"] = float(noncomm_extreme)
+            macro["cot_commercial_extreme_flag"] = float(commercial_extreme)
+            macro["cot_open_interest_z"] = float(cot_regime.get("cot_open_interest_z", 0.0))
+            macro["cot_positioning_extreme"] = float(cot_macro_pressure)
+
+
+        options_gex = _load_options_gex_regime(con, sym or "SPY", int(t))
 
         micro = {
 
@@ -535,20 +662,40 @@ def compute_regime_vector(
             "liquidity_thin": thin_liquidity
 
         }
+        if options_gex:
+            micro["gex_norm_z"] = float(options_gex.get("gex_norm_z", 0.0))
+            micro["gex_sign"] = float(options_gex.get("gex_sign", 0.0))
+            micro["gex_vol_regime_pressure"] = float(
+                _clamp01(abs(float(options_gex.get("gex_norm_z", 0.0))) / 3.0)
+            )
 
+        bocpd_regime = _load_bocpd_regime(con, sym or "SPY", int(t))
+        bocpd_cp_prob = _clamp01(_safe_f(bocpd_regime.get("bocpd_cp_prob_5d"), 0.0))
+        bocpd_run_length_z = _safe_f(bocpd_regime.get("bocpd_run_length_z"), 0.0)
+        asset = {
+            "bocpd_cp_prob_5d": float(bocpd_cp_prob),
+            "bocpd_run_length_z": float(bocpd_run_length_z),
+        }
 
         # ------------------------------
         # CONFIDENCE
         # ------------------------------
 
-        macro_conf = _clamp01((abs(vix_z) + abs(rv20_z) + abs(credit_z)) / 6.0)
+        macro_conf = _clamp01((abs(vix_z) + abs(rv20_z) + abs(credit_z) + cot_macro_pressure) / 6.0)
 
         micro_conf = _clamp01(
             vol_cluster * 0.5 +
-            thin_liquidity * 0.5
+            thin_liquidity * 0.5 +
+            abs(float(options_gex.get("gex_norm_z", 0.0) if options_gex else 0.0)) * 0.10
         )
 
-        overall_conf = _clamp01((macro_conf + micro_conf) / 2.0)
+        asset_conf = (
+            _clamp01(0.50 + 0.50 * bocpd_cp_prob)
+            if int(bocpd_regime.get("summary_ts_ms") or 0) > 0
+            else _clamp01((macro_conf + micro_conf) / 2.0)
+        )
+
+        overall_conf = _clamp01((macro_conf + micro_conf + asset_conf) / 3.0)
 
 
         result = {
@@ -557,13 +704,16 @@ def compute_regime_vector(
 
             "macro": macro,
 
+            "asset": asset,
+
             "micro": micro,
 
             "regimes": {
 
                 "volatility": "CLUSTERED" if vol_cluster > 0.6 else "NORMAL",
                 "liquidity": "THIN" if thin_liquidity > 0.6 else "NORMAL",
-                "drawdown": "SHIFT" if dd_shift > 0.6 else "STABLE"
+                "drawdown": "SHIFT" if dd_shift > 0.6 else "STABLE",
+                "changepoint": "BREAK" if bocpd_cp_prob > 0.5 else "STABLE"
 
             },
 
@@ -571,6 +721,7 @@ def compute_regime_vector(
 
                 "overall": overall_conf,
                 "macro": macro_conf,
+                "asset": asset_conf,
                 "micro": micro_conf
 
             },
@@ -663,6 +814,9 @@ def compute_regime_vector(
             "etf_like": float(etf_like),
             "single_stock_like": float(_clamp01(1.0 - etf_like)),
         }
+        bocpd_regime = _load_bocpd_regime(con, sym or "SPY", int(t))
+        asset["bocpd_cp_prob_5d"] = float(_clamp01(_safe_f(bocpd_regime.get("bocpd_cp_prob_5d"), 0.0)))
+        asset["bocpd_run_length_z"] = float(_safe_f(bocpd_regime.get("bocpd_run_length_z"), 0.0))
 
         # ----------------------------
         # MICRO layer
@@ -838,6 +992,7 @@ def compute_regime_vector(
                 "liquidity": str(liq.get("label", "UNKNOWN")),
                 "drawdown": str(dd_shift.get("label", "UNKNOWN")),
                 "distribution": str(distribution_state),
+                "changepoint": "BREAK" if float(asset.get("bocpd_cp_prob_5d", 0.0)) > 0.5 else "STABLE",
             },
             "confidence": {
                 "overall": float(overall_conf),

@@ -70,6 +70,10 @@ def _warn_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
     )
 
 
+def _asyncpg_connect_available() -> bool:
+    return asyncpg is not None and callable(getattr(asyncpg, "connect", None))
+
+
 def _sqlite_summary(db_path: str, since_ts_ms: int) -> dict[str, Any]:
     del db_path
     out: dict[str, Any] = {}
@@ -114,7 +118,7 @@ def _sqlite_summary(db_path: str, since_ts_ms: int) -> dict[str, Any]:
 
 
 async def _timescale_summary_async(config: TimescaleConfig, since_ts_ms: int) -> dict[str, Any]:
-    if asyncpg is None:
+    if not _asyncpg_connect_available():
         raise RuntimeError("asyncpg_not_installed")
     conn = await asyncpg.connect(
         dsn=str(config.dsn),

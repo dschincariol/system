@@ -1,7 +1,16 @@
-"""
-FILE: poll_macro.py
+"""Scheduled macro ingestion job.
 
-Job entrypoint or scheduled task for `poll_macro`.
+README:
+- Source: FRED/ALFRED macro series via FRED ``series/observations`` realtime
+  vintages, with current FRED graph CSV only for non-revisioned commodity
+  passthroughs.
+- Cadence: ``MACRO_POLL_SECONDS`` (default 21,600 seconds / 6 hours).
+- Availability lag: feature rows use the series release/vintage timestamp;
+  point-in-time joins only see vintages with availability <= the requested
+  ``ts_ms``.
+- Caveats: ``MACRO_PIT_MODE=auto`` prefers vintage rows and falls back to
+  legacy current rows until the historical backfill has completed; set
+  ``MACRO_PIT_MODE=on`` to require vintage-backed features.
 """
 
 import json

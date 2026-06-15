@@ -181,7 +181,8 @@ from engine.runtime.locks import (
 def _job_history_write_timeout_s() -> float:
     try:
         return max(0.05, float(os.environ.get("JOBS_MANAGER_HISTORY_WRITE_TIMEOUT_S", "0.25") or 0.25))
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("JOBS_MANAGER_HISTORY_WRITE_TIMEOUT_PARSE_FAILED", e)
         return 0.25
 
 
@@ -199,20 +200,12 @@ def _write_job_history(job_name: str, action: str, detail: str, exit_code) -> No
         with timeout_ctx:
             _write_job_history_impl(job_name, action, detail, exit_code)
     except Exception as e:
-        try:
-            LOG.warning(
-                "job_history_write_failed",
-                extra={
-                    "event": "job_history_write_failed",
-                    "extra_json": {
-                        "job": str(job_name),
-                        "action": str(action),
-                        "error": f"{type(e).__name__}: {e}",
-                    },
-                },
-            )
-        except Exception:
-            pass
+        _warn_nonfatal(
+            "JOBS_MANAGER_JOB_HISTORY_WRITE_FAILED",
+            e,
+            job=str(job_name),
+            action=str(action),
+        )
 
 
 # ------------------------------

@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from psycopg.pq import TransactionStatus
+try:
+    from psycopg.pq import TransactionStatus
+except ModuleNotFoundError:
+    class TransactionStatus:  # type: ignore[no-redef]
+        IDLE = object()
+        INERROR = object()
 
 from engine.runtime.storage import connect, run_write_txn, _pid_is_running
 
+LOG = logging.getLogger(__name__)
 
 _CRC64_POLY = 0x42F0E1EBA9EA3693
 _CRC64_TABLE: tuple[int, ...] | None = None
@@ -49,6 +56,7 @@ def _transaction_failed(conn) -> bool:
     try:
         return conn.raw.info.transaction_status == TransactionStatus.INERROR
     except Exception:
+        LOG.warning("postgres_transaction_status_check_failed", exc_info=True)
         return False
 
 

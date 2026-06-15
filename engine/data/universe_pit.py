@@ -660,3 +660,51 @@ def filter_symbols_for_snapshot(
         "symbols": list(normalized_symbols),
         "fallback_reason": "no_pit_rows",
     }
+
+
+def label_window_within_symbol_lifecycle(
+    con,
+    *,
+    symbol: str,
+    start_ts_ms: int,
+    end_ts_ms: int,
+) -> bool:
+    """Return false when a forward-label window crosses a known delist date."""
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return False
+    if int(end_ts_ms) < int(start_ts_ms):
+        return False
+    if not _table_exists(con, "universe_pit"):
+        return True
+    try:
+        row = con.execute(
+            """
+            SELECT first_seen_ts, last_seen_ts, is_active
+            FROM universe_pit
+            WHERE symbol=?
+              AND first_seen_ts <= ?
+              AND (last_seen_ts IS NULL OR last_seen_ts >= ?)
+            ORDER BY first_seen_ts DESC
+            LIMIT 1
+            """,
+            (str(sym), int(start_ts_ms), int(start_ts_ms)),
+        ).fetchone()
+    except Exception as e:
+        _warn_nonfatal(
+            "UNIVERSE_PIT_LABEL_WINDOW_QUERY_FAILED",
+            e,
+            once_key=f"label_window:{sym}",
+            symbol=str(sym),
+            start_ts_ms=int(start_ts_ms),
+            end_ts_ms=int(end_ts_ms),
+        )
+        return True
+    if not row:
+        return True
+    _first_seen_ts, last_seen_ts, is_active = row
+    if last_seen_ts is None:
+        return True
+    if int(is_active or 0) == 1:
+        return True
+    return int(end_ts_ms) <= int(last_seen_ts)

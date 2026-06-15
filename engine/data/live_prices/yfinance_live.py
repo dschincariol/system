@@ -132,7 +132,12 @@ def _fetch_chart_json(
             return None
         r = _get_http_session().get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-            params={"interval": str(interval), "range": str(range_), "includePrePost": "false"},
+            params={
+                "interval": str(interval),
+                "range": str(range_),
+                "includePrePost": "false",
+                "events": "div,splits",
+            },
             timeout=float(timeout_s),
         )
         r.raise_for_status()

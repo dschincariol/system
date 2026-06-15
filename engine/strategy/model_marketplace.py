@@ -1793,6 +1793,18 @@ def _competition_key(
     )
 
 
+def _sqlite_table_columns_or_none(con, table_name: str) -> Optional[set[str]]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except Exception:
+        return None
+    return {
+        str(row[1] or "").strip()
+        for row in (rows or [])
+        if row and len(row) > 1
+    }
+
+
 def _horizon_bucket(horizon_s: int) -> str:
     hs = _safe_int(horizon_s, 0)
     if hs <= 0:
@@ -1812,6 +1824,9 @@ def _extract_stage_for_key(
     horizon_s: int,
     regime: str,
 ) -> str:
+    champion_cols = _sqlite_table_columns_or_none(con, "champion_assignments")
+    if champion_cols is not None and not {"model_name", "symbol", "horizon_s", "regime", "state"}.issubset(champion_cols):
+        return "challenger"
     try:
         row = con.execute(
             """
@@ -1846,6 +1861,56 @@ def _load_marketplace_snapshot_row(
     regime: str,
     stage: str,
 ) -> Dict[str, Any]:
+    score_cols = _sqlite_table_columns_or_none(con, "model_marketplace_scores")
+    if score_cols is not None and not {
+        "model_id",
+        "model_name",
+        "symbol",
+        "horizon_s",
+        "regime",
+        "score",
+        "trades",
+        "wins",
+        "losses",
+        "gross_pnl",
+        "net_pnl",
+        "avg_confidence",
+        "last_signal_ts_ms",
+        "meta_json",
+    }.issubset(score_cols):
+        return {
+            "model_name": str(model_name or "").strip(),
+            "model_id": _normalize_model_id(model_id),
+            "symbol": str(symbol or "").upper().strip(),
+            "horizon_s": int(horizon_s),
+            "regime": str(regime or "global"),
+            "stage": str(stage or "challenger"),
+            "score": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "gross_pnl": 0.0,
+            "net_pnl": 0.0,
+            "avg_confidence": 0.0,
+            "last_signal_ts_ms": 0,
+            "updated_ts_ms": _now_ms(),
+            "order_ids": set(),
+            "source_alert_ids": set(),
+            "meta": {
+                "realized_pnl": 0.0,
+                "model_id": _normalize_model_id(model_id),
+                "unrealized_pnl": 0.0,
+                "transaction_cost": 0.0,
+                "entry_price": None,
+                "exit_price": None,
+                "last_price": None,
+                "last_fill_price": None,
+                "filled_qty": 0.0,
+                "open_qty": 0.0,
+                "slippage_weighted_sum": 0.0,
+                "slippage_weight": 0.0,
+            },
+        }
     row = con.execute(
         """
         SELECT score, trades, wins, losses, gross_pnl, net_pnl, avg_confidence, last_signal_ts_ms, meta_json
@@ -2007,6 +2072,10 @@ def _write_marketplace_row(con, cur: Dict[str, Any], now: Optional[int] = None) 
         int(x) for x in source_alert_ids if x is not None
     )
     meta["horizon_bucket"] = _horizon_bucket(_safe_int(cur.get("horizon_s"), 0))
+    for key in ("evaluation_timestamps", "regime_labels", "challenger_predictions", "realized_returns"):
+        values = cur.get(key)
+        if isinstance(values, list) and values:
+            meta[key] = list(values)
 
     meta.pop("slippage_weighted_sum", None)
     meta.pop("slippage_weight", None)
@@ -2549,12 +2618,14 @@ def build_replay_validation_snapshot(
                     "net_preds": [],
                     "realized": [],
                     "baseline": [],
+                    "event_ts_ms": [],
                 }
                 grouped[key] = bucket
 
             bucket["preds"].append(predicted_z)
             bucket["net_preds"].append(net_pred_z)
             bucket["realized"].append(realized_z)
+            bucket["event_ts_ms"].append(ts_ms)
             if row[10] is not None:
                 bucket["baseline"].append(_safe_float(row[10], 0.0))
             if event_id > _safe_int(bucket.get("last_event_id"), 0):
@@ -2581,12 +2652,14 @@ def build_replay_validation_snapshot(
                     "net_preds": [],
                     "realized": [],
                     "baseline": [],
+                    "event_ts_ms": [],
                 }
                 grouped_all[all_key] = bucket_all
 
             bucket_all["preds"].append(predicted_z)
             bucket_all["net_preds"].append(net_pred_z)
             bucket_all["realized"].append(realized_z)
+            bucket_all["event_ts_ms"].append(ts_ms)
             if row[10] is not None:
                 bucket_all["baseline"].append(_safe_float(row[10], 0.0))
             if event_id > _safe_int(bucket_all.get("last_event_id"), 0):
@@ -2603,6 +2676,7 @@ def build_replay_validation_snapshot(
             preds = list(bucket.pop("preds", []) or [])
             net_preds = list(bucket.pop("net_preds", []) or [])
             baseline = list(bucket.pop("baseline", []) or [])
+            event_ts_ms = list(bucket.pop("event_ts_ms", []) or [])
             n = min(len(realized), len(net_preds))
             baseline_n = min(len(realized), len(baseline))
             net_rmse = _rmse(net_preds[:n], realized[:n])
@@ -2667,6 +2741,10 @@ def build_replay_validation_snapshot(
                 "signed_alpha": float(signed_alpha),
                 "window_end_ms": _safe_int(bucket.get("window_end_ms"), 0),
                 "last_event_id": _safe_int(bucket.get("last_event_id"), 0),
+                "evaluation_timestamps": [_safe_int(value, 0) for value in event_ts_ms[:n]],
+                "regime_labels": [str(bucket.get("regime") or "global") for _idx in range(int(n))],
+                "challenger_predictions": [float(_safe_float(value, 0.0)) for value in net_preds[:n]],
+                "realized_returns": [float(_safe_float(value, 0.0)) for value in realized[:n]],
                 "approved": bool(approved),
             }
 

@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Dict, Tuple
 
+from engine.runtime.test_isolation import running_python_tests
 from services.secrets.loader import SecretNotAvailable, load_secret
 
 _CACHE: Dict[Tuple[str, int], str] = {}
@@ -47,7 +48,7 @@ def _load_from_secret_provider(name: str) -> str:
 
 
 def _load_from_env_compat(name: str) -> str:
-    if str(os.environ.get("TS_SECRETS_PROVIDER") or "").strip():
+    if str(os.environ.get("TS_SECRETS_PROVIDER") or "").strip() and not running_python_tests():
         return ""
     if str(os.environ.get("TS_ENV") or "").strip().lower() == "production":
         return ""

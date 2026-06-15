@@ -33,6 +33,7 @@ class AltDataIngestionTests(unittest.TestCase):
             for key in (
                 "DB_PATH",
                 "USE_FORM4_DATA",
+                "USE_INSIDER_FEATURES",
                 "USE_CONGRESSIONAL_TRADE_DATA",
                 "USE_SYMBOL_SNAPSHOT_FEATURES",
                 "INGEST_FORM4_ENABLED",
@@ -124,6 +125,7 @@ class AltDataIngestionTests(unittest.TestCase):
             filing={
                 "accession": "0000320193-26-000001",
                 "filed_date": "2026-04-10",
+                "acceptance_datetime": "2026-04-10T18:45:36.000Z",
                 "primary_doc_url": "https://www.sec.gov/Archives/test.xml",
             },
             filing_symbol="AAPL",
@@ -141,6 +143,10 @@ class AltDataIngestionTests(unittest.TestCase):
         self.assertEqual(float(row["value"]), 17_550.0)
         self.assertEqual(str(row["security_type"]), "non_derivative")
         self.assertEqual(str(row["filing_accession"]), "0000320193-26-000001")
+        self.assertEqual(str(row["filing_accepted_at"]), "2026-04-10T18:45:36.000Z")
+        self.assertEqual(int(row["availability_ts_ms"]), int(row["filing_ts_ms"]))
+        self.assertGreater(int(row["availability_ts_ms"]), int(row["transaction_ts_ms"]))
+        self.assertFalse(bool(row["is_10b5_1_plan"]))
         self.assertIn("director", str(row["insider_role"]))
         self.assertIn("officer", str(row["insider_role"]))
         self.assertEqual(str(row["insider_title"]), "Chief Executive Officer")
@@ -278,25 +284,146 @@ class AltDataIngestionTests(unittest.TestCase):
         self.assertEqual(float(insider_value[0] or 0.0), 1100.0)
         self.assertEqual(str(congress_direction[0] or ""), "sell")
 
+    def test_form4_classifier_routine_opportunistic_boundaries(self) -> None:
+        (classifier,) = _reload_modules("engine.data.sec.form4_classifier")
+
+        def row(insider: str, date: str, source_id: str) -> dict:
+            return {
+                "source_transaction_id": source_id,
+                "insider_cik": insider,
+                "transaction_code": "P",
+                "transaction_date": date,
+                "transaction_ts_ms": classifier.parse_ts_ms(date),
+                "availability_ts_ms": classifier.parse_ts_ms(f"{date}T18:00:00Z"),
+            }
+
+        asof = int(classifier.parse_ts_ms("2026-04-12T00:00:00Z"))
+        routine_trade = row("0001", "2026-04-10", "routine-current")
+        routine_history = [
+            row("0001", "2023-04-05", "routine-2023"),
+            row("0001", "2024-04-05", "routine-2024"),
+            row("0001", "2025-04-05", "routine-2025"),
+        ]
+        self.assertEqual(
+            classifier.classify_insider_trade(routine_trade, routine_history + [routine_trade], asof_ts_ms=asof),
+            classifier.ROUTINE,
+        )
+
+        opportunistic_trade = row("0002", "2026-04-10", "opp-current")
+        opportunistic_history = [row("0002", "2023-01-05", "opp-2023-boundary")]
+        self.assertEqual(
+            classifier.classify_insider_trade(
+                opportunistic_trade,
+                opportunistic_history + [opportunistic_trade],
+                asof_ts_ms=asof,
+            ),
+            classifier.OPPORTUNISTIC,
+        )
+
+        insufficient_trade = row("0003", "2026-04-10", "insufficient-current")
+        insufficient_history = [
+            row("0003", "2024-04-05", "insufficient-2024"),
+            row("0003", "2025-04-05", "insufficient-2025"),
+        ]
+        self.assertEqual(
+            classifier.classify_insider_trade(
+                insufficient_trade,
+                insufficient_history + [insufficient_trade],
+                asof_ts_ms=asof,
+            ),
+            classifier.UNCLASSIFIED,
+        )
+
     def test_feature_snapshot_reads_persisted_alt_data_rows(self) -> None:
         os.environ["USE_FORM4_DATA"] = "1"
+        os.environ["USE_INSIDER_FEATURES"] = "1"
         os.environ["USE_CONGRESSIONAL_TRADE_DATA"] = "1"
         storage = self._init_storage()
         anchor_ts_ms = 1_776_000_000_000
-        sixty_days_ms = 60 * 24 * 3600 * 1000
+        day_ms = 24 * 3600 * 1000
+
+        con = storage.connect()
+        try:
+            con.execute(
+                "INSERT INTO price_quotes(ts_ms, symbol, last, volume, source) VALUES (?, ?, ?, ?, ?)",
+                (anchor_ts_ms - day_ms, "AAPL", 100.0, 1000.0, "unit"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        for idx, date in enumerate(("2023-01-05", "2024-01-05", "2025-01-05"), start=1):
+            storage.put_insider_transaction(
+                {
+                    "source_transaction_id": f"form4:history1:{idx}",
+                    "created_ts_ms": anchor_ts_ms - (900 + idx) * day_ms,
+                    "ingested_ts_ms": anchor_ts_ms - (900 + idx) * day_ms,
+                    "availability_ts_ms": anchor_ts_ms - (900 + idx) * day_ms,
+                    "symbol": "AAPL",
+                    "insider_cik": "0001",
+                    "insider_name": "Insider One",
+                    "transaction_code": "P",
+                    "transaction_type": "purchase",
+                    "direction": "buy",
+                    "value": 1000.0,
+                    "transaction_ts_ms": anchor_ts_ms - (900 + idx) * day_ms,
+                    "transaction_date": date,
+                }
+            )
+
+        for idx, date in enumerate(("2023-01-07", "2024-01-07", "2025-01-07"), start=1):
+            storage.put_insider_transaction(
+                {
+                    "source_transaction_id": f"form4:history3:{idx}",
+                    "created_ts_ms": anchor_ts_ms - (880 + idx) * day_ms,
+                    "ingested_ts_ms": anchor_ts_ms - (880 + idx) * day_ms,
+                    "availability_ts_ms": anchor_ts_ms - (880 + idx) * day_ms,
+                    "symbol": "AAPL",
+                    "insider_cik": "0003",
+                    "insider_name": "Insider Three",
+                    "transaction_code": "P",
+                    "transaction_type": "purchase",
+                    "direction": "buy",
+                    "value": 1000.0,
+                    "transaction_ts_ms": anchor_ts_ms - (880 + idx) * day_ms,
+                    "transaction_date": date,
+                }
+            )
+
+        for idx, date in enumerate(("2023-04-05", "2024-04-05", "2025-04-05"), start=1):
+            storage.put_insider_transaction(
+                {
+                    "source_transaction_id": f"form4:routine-history:{idx}",
+                    "created_ts_ms": anchor_ts_ms - (850 + idx) * day_ms,
+                    "ingested_ts_ms": anchor_ts_ms - (850 + idx) * day_ms,
+                    "availability_ts_ms": anchor_ts_ms - (850 + idx) * day_ms,
+                    "symbol": "AAPL",
+                    "insider_cik": "0002",
+                    "insider_name": "Routine Insider",
+                    "transaction_code": "P",
+                    "transaction_type": "purchase",
+                    "direction": "buy",
+                    "value": 1000.0,
+                    "transaction_ts_ms": anchor_ts_ms - (850 + idx) * day_ms,
+                    "transaction_date": date,
+                }
+            )
 
         storage.put_insider_transaction(
             {
                 "source_transaction_id": "form4:buy1",
                 "created_ts_ms": anchor_ts_ms,
                 "ingested_ts_ms": anchor_ts_ms,
+                "availability_ts_ms": anchor_ts_ms - (4 * day_ms),
                 "symbol": "AAPL",
                 "insider_cik": "0001",
                 "insider_name": "Insider One",
+                "insider_role": "officer",
+                "transaction_code": "P",
                 "transaction_type": "purchase",
                 "direction": "buy",
                 "value": 10000.0,
-                "transaction_ts_ms": anchor_ts_ms - (10 * 24 * 3600 * 1000),
+                "transaction_ts_ms": anchor_ts_ms - (10 * day_ms),
                 "transaction_date": "2026-04-01",
             }
         )
@@ -305,13 +432,15 @@ class AltDataIngestionTests(unittest.TestCase):
                 "source_transaction_id": "form4:sell1",
                 "created_ts_ms": anchor_ts_ms,
                 "ingested_ts_ms": anchor_ts_ms,
+                "availability_ts_ms": anchor_ts_ms - (5 * day_ms),
                 "symbol": "AAPL",
                 "insider_cik": "0001",
                 "insider_name": "Insider One",
+                "transaction_code": "S",
                 "transaction_type": "sale",
                 "direction": "sell",
                 "value": 3000.0,
-                "transaction_ts_ms": anchor_ts_ms - (5 * 24 * 3600 * 1000),
+                "transaction_ts_ms": anchor_ts_ms - (5 * day_ms),
                 "transaction_date": "2026-04-06",
             }
         )
@@ -320,14 +449,52 @@ class AltDataIngestionTests(unittest.TestCase):
                 "source_transaction_id": "form4:buy2",
                 "created_ts_ms": anchor_ts_ms,
                 "ingested_ts_ms": anchor_ts_ms,
+                "availability_ts_ms": anchor_ts_ms - (3 * day_ms),
                 "symbol": "AAPL",
-                "insider_cik": "0002",
-                "insider_name": "Insider Two",
+                "insider_cik": "0003",
+                "insider_name": "Insider Three",
+                "insider_role": "ten_percent_owner",
+                "transaction_code": "P",
                 "transaction_type": "purchase",
                 "direction": "buy",
                 "value": 7000.0,
-                "transaction_ts_ms": anchor_ts_ms - sixty_days_ms,
-                "transaction_date": "2026-02-10",
+                "transaction_ts_ms": anchor_ts_ms - (3 * day_ms),
+                "transaction_date": "2026-04-08",
+            }
+        )
+        storage.put_insider_transaction(
+            {
+                "source_transaction_id": "form4:routine-current",
+                "created_ts_ms": anchor_ts_ms,
+                "ingested_ts_ms": anchor_ts_ms,
+                "availability_ts_ms": anchor_ts_ms - (3 * day_ms),
+                "symbol": "AAPL",
+                "insider_cik": "0002",
+                "insider_name": "Routine Insider",
+                "transaction_code": "P",
+                "transaction_type": "purchase",
+                "direction": "buy",
+                "value": 50000.0,
+                "transaction_ts_ms": anchor_ts_ms - (3 * day_ms),
+                "transaction_date": "2026-04-08",
+            }
+        )
+        storage.put_insider_transaction(
+            {
+                "source_transaction_id": "form4:plan-current",
+                "created_ts_ms": anchor_ts_ms,
+                "ingested_ts_ms": anchor_ts_ms,
+                "availability_ts_ms": anchor_ts_ms - (2 * day_ms),
+                "symbol": "AAPL",
+                "insider_cik": "0001",
+                "insider_name": "Insider One",
+                "transaction_code": "P",
+                "transaction_type": "purchase",
+                "direction": "buy",
+                "value": 9000.0,
+                "transaction_ts_ms": anchor_ts_ms - (2 * day_ms),
+                "transaction_date": "2026-04-09",
+                "is_10b5_1_plan": True,
             }
         )
 
@@ -389,10 +556,11 @@ class AltDataIngestionTests(unittest.TestCase):
             "body": "Alt data snapshot test",
         }
         feature_ids = [
-            "insider.buy_count_30d",
-            "insider.sell_count_30d",
-            "insider.net_value_30d",
-            "insider.unique_insiders_90d",
+            "insider_opp_net_buy_30d",
+            "insider_opp_buy_count_30d",
+            "insider_cluster_buy_5d",
+            "insider_officer_buy_flag",
+            "insider_opp_sell_z",
             "congressional.buy_count_30d",
             "congressional.sell_count_30d",
             "congressional.net_signal_30d",
@@ -404,16 +572,109 @@ class AltDataIngestionTests(unittest.TestCase):
                 feature_ids=list(feature_ids),
             )
 
-        self.assertEqual(float(snapshot["insider.buy_count_30d"]), 1.0)
-        self.assertEqual(float(snapshot["insider.sell_count_30d"]), 1.0)
-        self.assertEqual(float(snapshot["insider.net_value_30d"]), 7000.0)
-        self.assertEqual(float(snapshot["insider.unique_insiders_90d"]), 2.0)
+        self.assertAlmostEqual(float(snapshot["insider_opp_net_buy_30d"]), 0.14, places=6)
+        self.assertEqual(float(snapshot["insider_opp_buy_count_30d"]), 2.0)
+        self.assertEqual(float(snapshot["insider_cluster_buy_5d"]), 2.0)
+        self.assertEqual(float(snapshot["insider_officer_buy_flag"]), 1.0)
+        self.assertEqual(float(snapshot["insider_opp_sell_z"]), 0.0)
         self.assertEqual(float(snapshot["congressional.buy_count_30d"]), 2.0)
         self.assertEqual(float(snapshot["congressional.sell_count_30d"]), 1.0)
         self.assertEqual(float(snapshot["congressional.net_signal_30d"]), 1.0)
 
+    def test_insider_feature_no_lookahead_uses_filing_availability(self) -> None:
+        os.environ["USE_INSIDER_FEATURES"] = "1"
+        storage = self._init_storage()
+        anchor_ts_ms = 1_776_000_000_000
+        day_ms = 24 * 3600 * 1000
+        con = storage.connect()
+        try:
+            con.execute(
+                "INSERT INTO price_quotes(ts_ms, symbol, last, volume, source) VALUES (?, ?, ?, ?, ?)",
+                (anchor_ts_ms - day_ms, "AAPL", 100.0, 1000.0, "unit"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        storage.put_insider_transaction(
+            {
+                "source_transaction_id": "form4:history-no-lookahead",
+                "created_ts_ms": anchor_ts_ms - (900 * day_ms),
+                "ingested_ts_ms": anchor_ts_ms - (900 * day_ms),
+                "availability_ts_ms": anchor_ts_ms - (900 * day_ms),
+                "symbol": "AAPL",
+                "insider_cik": "0009",
+                "transaction_code": "P",
+                "transaction_type": "purchase",
+                "direction": "buy",
+                "value": 1000.0,
+                "transaction_ts_ms": anchor_ts_ms - (900 * day_ms),
+                "transaction_date": "2023-01-05",
+            }
+        )
+        storage.put_insider_transaction(
+            {
+                "source_transaction_id": "form4:future-filing",
+                "created_ts_ms": anchor_ts_ms,
+                "ingested_ts_ms": anchor_ts_ms,
+                "availability_ts_ms": anchor_ts_ms + 1,
+                "filing_ts_ms": anchor_ts_ms + 1,
+                "symbol": "AAPL",
+                "insider_cik": "0009",
+                "transaction_code": "P",
+                "transaction_type": "purchase",
+                "direction": "buy",
+                "value": 10000.0,
+                "transaction_ts_ms": anchor_ts_ms - (10 * day_ms),
+                "transaction_date": "2026-04-01",
+            }
+        )
+
+        _, _, feature_registry, _ = _reload_runtime_modules(
+            "engine.strategy.feature_registry",
+            "engine.strategy.model_feature_snapshots",
+        )
+        event = {"ts_ms": anchor_ts_ms, "ref_ts_ms": anchor_ts_ms, "source": "rss:reuters"}
+        feature_ids = ["insider_opp_buy_count_30d", "insider_opp_net_buy_30d"]
+        with patch.object(feature_registry, "_schedule_feature_store_write", return_value=None):
+            before = feature_registry.build_feature_snapshot(event=event, symbol="AAPL", feature_ids=feature_ids)
+            after = feature_registry.build_feature_snapshot(
+                event={**event, "ts_ms": anchor_ts_ms + 2, "ref_ts_ms": anchor_ts_ms + 2},
+                symbol="AAPL",
+                feature_ids=feature_ids,
+            )
+
+        self.assertEqual(float(before["insider_opp_buy_count_30d"]), 0.0)
+        self.assertEqual(float(before["insider_opp_net_buy_30d"]), 0.0)
+        self.assertEqual(float(after["insider_opp_buy_count_30d"]), 1.0)
+        self.assertAlmostEqual(float(after["insider_opp_net_buy_30d"]), 0.1, places=6)
+
+    def test_insider_feature_schema_round_trip_and_job_registry(self) -> None:
+        os.environ["USE_INSIDER_FEATURES"] = "1"
+        _, _, feature_registry, job_registry = _reload_runtime_modules(
+            "engine.strategy.feature_registry",
+            "engine.runtime.job_registry",
+        )
+        feature_ids = [
+            "insider_opp_net_buy_30d",
+            "insider_opp_buy_count_30d",
+            "insider_cluster_buy_5d",
+            "insider_officer_buy_flag",
+            "insider_opp_sell_z",
+        ]
+
+        self.assertEqual(
+            feature_registry.resolve_feature_ids(model_spec={"feature_schema": {"feature_ids": list(feature_ids)}}),
+            feature_ids,
+        )
+        self.assertIn("insider", feature_registry.feature_set_tag_from_ids(feature_ids))
+        self.assertIn("ingest_form4", job_registry.ALLOWED_JOBS)
+        self.assertEqual(job_registry.ALLOWED_JOBS["ingest_form4"][3]["cadence_seconds"], 1800)
+        importlib.reload(importlib.import_module("engine.data.jobs.ingest_form4"))
+
     def test_disabled_alt_data_features_are_filtered_out(self) -> None:
         os.environ["USE_FORM4_DATA"] = "0"
+        os.environ["USE_INSIDER_FEATURES"] = "0"
         os.environ["USE_CONGRESSIONAL_TRADE_DATA"] = "0"
         self._init_storage()
         _, _, feature_registry, _ = _reload_runtime_modules(
@@ -422,13 +683,13 @@ class AltDataIngestionTests(unittest.TestCase):
         )
 
         default_ids = feature_registry.default_feature_ids()
-        self.assertFalse(any(fid.startswith("insider.") for fid in default_ids))
+        self.assertFalse(any(fid.startswith("insider.") or fid.startswith("insider_") for fid in default_ids))
         self.assertFalse(any(fid.startswith("congressional.") for fid in default_ids))
         self.assertEqual(
             feature_registry.resolve_feature_ids(
                 model_spec={
                     "feature_ids": [
-                        "insider.buy_count_30d",
+                        "insider_opp_buy_count_30d",
                         "congressional.net_signal_30d",
                         "base.source_credibility",
                     ]

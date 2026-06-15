@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from xml.etree import ElementTree as ET
 
@@ -18,6 +17,7 @@ import requests
 from engine.artifacts.store import LocalArtifactStore
 from engine.data.ingest.news_enrichment import infer_symbols
 from engine.data.sec import edgar_live
+from engine.data.sec.form4_classifier import parse_ts_ms as _parse_form4_ts_ms
 from engine.runtime.config import FORM4_BACKFILL_DAYS as CONFIG_FORM4_BACKFILL_DAYS
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -152,25 +152,7 @@ def _bool_text(value: Any) -> bool:
 
 
 def _parse_ts_ms(value: Any) -> Optional[int]:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try:
-            parsed = datetime.strptime(raw, fmt)
-            parsed = parsed.replace(tzinfo=timezone.utc)
-            return int(parsed.timestamp() * 1000)
-        except ValueError:
-            continue
-    try:
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(raw)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return int(parsed.timestamp() * 1000)
-    except Exception:
-        return None
+    return _parse_form4_ts_ms(value)
 
 
 def _transaction_kind(code: str, acquired_disposed: str) -> tuple[str, str]:
@@ -203,6 +185,22 @@ def _transaction_kind(code: str, acquired_disposed: str) -> tuple[str, str]:
 def _stable_id(parts: Sequence[Any]) -> str:
     payload = "|".join(str(part or "").strip() for part in parts)
     return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
+
+
+def _node_text_blob(node: ET.Element | None) -> str:
+    if node is None:
+        return ""
+    try:
+        return " ".join(str(part or "").strip() for part in node.itertext() if str(part or "").strip())
+    except Exception:
+        return ""
+
+
+def _detect_10b5_1_plan(*values: Any) -> bool:
+    text = " ".join(str(value or "") for value in values if value is not None)
+    normalized = text.lower().replace("\u2011", "-").replace("\u2010", "-").replace("\u2013", "-").replace("\u2014", "-")
+    compact = "".join(ch for ch in normalized if ch.isalnum())
+    return "10b51" in compact or "10b5-1" in normalized or "10b5 1" in normalized
 
 
 def _cik_to_ticker(value: Any) -> str:
@@ -383,8 +381,18 @@ def parse_form4_xml(
     explicit_symbol = _normalize_symbol(_text(issuer, "issuerTradingSymbol"))
     filing_accession = str((filing or {}).get("accession") or "").strip()
     filing_date = str((filing or {}).get("filed_date") or _text(root, "periodOfReport") or "").strip() or None
-    filing_ts_ms = _parse_ts_ms(filing_date)
+    filing_accepted_at = (
+        str(
+            (filing or {}).get("acceptance_datetime")
+            or (filing or {}).get("acceptanceDateTime")
+            or (filing or {}).get("filing_accepted_at")
+            or ""
+        ).strip()
+        or None
+    )
+    filing_ts_ms = _parse_ts_ms(filing_accepted_at) or _parse_ts_ms(filing_date)
     ingested_ts = int(ingested_ts_ms or int(time.time() * 1000))
+    document_plan_flag = _detect_10b5_1_plan(_node_text_blob(root))
 
     owners: List[Dict[str, Any]] = []
     for owner_node in _children(root, "reportingOwner"):
@@ -433,6 +441,7 @@ def parse_form4_xml(
                 or _text(tx_node, "ownershipNature", "natureOfOwnership", "value")
                 or ""
             ).strip() or None
+            is_10b5_1_plan = bool(document_plan_flag or _detect_10b5_1_plan(_node_text_blob(tx_node)))
             source_transaction_id = _stable_id(
                 (
                     filing_accession,
@@ -448,6 +457,7 @@ def parse_form4_xml(
             diagnostics_json = dict(resolution_meta)
             diagnostics_json["reporting_owner_count"] = int(len(owners))
             diagnostics_json["acquired_disposed_code"] = acquired_disposed or None
+            diagnostics_json["is_10b5_1_plan"] = bool(is_10b5_1_plan)
             row = {
                 "source_transaction_id": str(source_transaction_id),
                 "created_ts_ms": int(ingested_ts),
@@ -457,7 +467,9 @@ def parse_form4_xml(
                 "filing_identifier": filing_accession or None,
                 "filing_url": (filing or {}).get("primary_doc_url"),
                 "filing_ts_ms": filing_ts_ms,
+                "availability_ts_ms": filing_ts_ms,
                 "filing_date": filing_date,
+                "filing_accepted_at": filing_accepted_at,
                 "transaction_ts_ms": transaction_ts_ms,
                 "transaction_date": transaction_date,
                 "symbol": resolved_symbol,
@@ -475,6 +487,7 @@ def parse_form4_xml(
                 "price": price,
                 "value": value,
                 "ownership_nature": ownership_nature,
+                "is_10b5_1_plan": bool(is_10b5_1_plan),
                 "payload_json": {
                     "filing": dict(filing or {}),
                     "issuer_name": issuer_name or None,
@@ -483,6 +496,9 @@ def parse_form4_xml(
                     "period_of_report": _text(root, "periodOfReport"),
                     "document_type": _text(root, "documentType"),
                     "security_type": security_type,
+                    "filing_accepted_at": filing_accepted_at,
+                    "availability_ts_ms": filing_ts_ms,
+                    "is_10b5_1_plan": bool(is_10b5_1_plan),
                     "reporting_owners": owners,
                 },
                 "diagnostics_json": diagnostics_json,

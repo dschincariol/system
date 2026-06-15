@@ -51,6 +51,33 @@ def test_replay_day_handles_empty_day(tmp_path: Path, monkeypatch: pytest.Monkey
     assert "no_data_for_date" in _gap_codes(payload)
 
 
+def test_replay_day_reports_connection_close_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "close-fails.db"
+    sqlite3.connect(str(db_path)).close()
+
+    class CloseFailingConnection:
+        def __init__(self, inner: sqlite3.Connection) -> None:
+            self._inner = inner
+
+        def execute(self, *args, **kwargs):
+            return self._inner.execute(*args, **kwargs)
+
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    def _connect():
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        return CloseFailingConnection(con)
+
+    monkeypatch.setattr(api_replay, "connect_ro", _connect)
+
+    payload = api_replay.api_get_replay_day({"date": "2026-01-02", "tz": "UTC", "symbol": "SPY"}, None)
+
+    assert payload["ok"] is True
+    assert "connection_close_failed" in _gap_codes(payload)
+
+
 def test_replay_day_storage_unavailable_returns_structured_503(monkeypatch: pytest.MonkeyPatch) -> None:
     from engine.runtime.storage_pool import StoragePoolTimeout
 

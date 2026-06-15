@@ -26,6 +26,7 @@ services:
       TRADING_DATA: /app/data
       TRADING_LOGS: /app/logs
       DB_PATH: /app/data/trading.db
+      TS_PG_DSN: host=timescaledb port=5432 user=${TIMESCALE_USER:?set TIMESCALE_USER} dbname=${TIMESCALE_DB:?set TIMESCALE_DB} password=${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}
       TIMESCALE_ENABLED: ${TIMESCALE_ENABLED:-1}
       TIMESCALE_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}:${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}
       TIMESCALE_PRICES_ENABLED: ${TIMESCALE_PRICES_ENABLED:-1}
@@ -33,6 +34,8 @@ services:
       PRICE_READ_BACKEND: ${PRICE_READ_BACKEND:-auto}
       TELEMETRY_READ_BACKEND: ${TELEMETRY_READ_BACKEND:-auto}
       LIVE_CACHE_BACKEND: ${LIVE_CACHE_BACKEND:-redis}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      TS_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
       LIVE_CACHE_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
       OBJECT_STORE_ENDPOINT: http://minio:9000
       OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:?set OBJECT_STORE_BUCKET}
@@ -46,8 +49,10 @@ services:
       PREFLIGHT_REQUIRE_REDIS: ${PREFLIGHT_REQUIRE_REDIS:-1}
       PREFLIGHT_REQUIRE_OBJECT_STORAGE: ${PREFLIGHT_REQUIRE_OBJECT_STORAGE:-1}
       PREFLIGHT_EXTERNAL_TIMEOUT_S: ${PREFLIGHT_EXTERNAL_TIMEOUT_S:-2.0}
+      DATA_SOURCE_MASTER_KEY_FILE: /run/secrets/data_source_master_key
       AUTO_BOOT_DAEMONS: ${AUTO_BOOT_DAEMONS:-0}
-      START_INGESTION_WITH_SERVER: ${START_INGESTION_WITH_SERVER:-1}
+      START_INGESTION_WITH_SERVER: ${START_INGESTION_WITH_SERVER:-0}
+      MODEL_SCORING_ENABLED: ${MODEL_SCORING_ENABLED:-0}
       POLYGON_REST_ENABLED: ${POLYGON_REST_ENABLED:-0}
       POLYGON_WS_ENABLED: ${POLYGON_WS_ENABLED:-0}
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
@@ -69,6 +74,8 @@ services:
       - trading-logs:/app/logs
       - artifact-mirror:/app/artifact_mirror
       - training-datasets:/app/training_datasets
+    secrets:
+      - data_source_master_key
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -153,3 +160,7 @@ volumes:
   trading-logs:
   artifact-mirror:
   training-datasets:
+
+secrets:
+  data_source_master_key:
+    file: ${DATA_SOURCE_MASTER_KEY_FILE:?set DATA_SOURCE_MASTER_KEY_FILE}

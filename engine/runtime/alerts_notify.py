@@ -15,6 +15,7 @@ from typing import Any
 from engine.runtime.event_log import record_state_transition
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import LOCALHOST_NAME
 from engine.runtime.storage import connect, init_db, run_write_txn
 
 LOG = get_logger("runtime.alerts_notify")
@@ -55,9 +56,10 @@ def _env_float(
 
 
 def _notification_config() -> dict[str, Any]:
+    default_email_from = f"alerts@{LOCALHOST_NAME}"
     return {
         "email_to": str(os.environ.get("EQ_CRIT_EMAIL_TO", "") or "").strip(),
-        "email_from": str(os.environ.get("EQ_CRIT_EMAIL_FROM", "alerts@localhost") or "alerts@localhost").strip(),
+        "email_from": str(os.environ.get("EQ_CRIT_EMAIL_FROM", default_email_from) or default_email_from).strip(),
         "smtp_host": str(os.environ.get("EQ_CRIT_SMTP_HOST", "") or "").strip(),
         "smtp_port": _env_int("EQ_CRIT_SMTP_PORT", 25, minimum=1, maximum=65535),
         "webhook_url": str(os.environ.get("EQ_CRIT_WEBHOOK_URL", "") or "").strip(),
@@ -271,7 +273,7 @@ def _smtp_send_message(
     from email.message import EmailMessage
 
     msg = EmailMessage()
-    msg["From"] = str(from_addr or "alerts@localhost")
+    msg["From"] = str(from_addr or f"alerts@{LOCALHOST_NAME}")
     msg["To"] = str(to_addrs or "")
     msg["Subject"] = str(subject or "")
     msg.set_content(str(body or ""))

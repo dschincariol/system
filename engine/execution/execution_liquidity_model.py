@@ -70,6 +70,33 @@ def _percentile(vals: List[float], p: float) -> float:
     return float(s[idx])
 
 
+def _table_columns(con: Any, table_name: str) -> set[str]:
+    try:
+        return {
+            str(row[1] or "").strip()
+            for row in (con.execute(f"PRAGMA table_info({table_name})").fetchall() or [])
+            if row and len(row) > 1
+        }
+    except Exception as e:
+        _warn_nonfatal(
+            "execution_liquidity_model_table_columns_failed",
+            "EXECUTION_LIQUIDITY_MODEL_TABLE_COLUMNS_FAILED",
+            e,
+            warn_key=f"table_columns:{table_name}",
+            table=str(table_name),
+        )
+        return set()
+
+
+def _quote_exprs(con: Any) -> tuple[str, str]:
+    columns = _table_columns(con, "price_quotes")
+    if not columns:
+        return "spread", "source"
+    spread_expr = "spread" if "spread" in columns else "NULL AS spread"
+    source_expr = "source" if "source" in columns else "NULL AS source"
+    return spread_expr, source_expr
+
+
 def _rolling_adv(con, symbol: str, lookback_ms: int) -> float:
     # ADV is derived from recent quote volume snapshots and is intentionally
     # approximate; it is used for slicing heuristics, not accounting.
@@ -253,9 +280,10 @@ def get_true_nbbo_snapshot(
 
     con = connect(readonly=True)
     try:
+        spread_expr, source_expr = _quote_exprs(con)
         row = con.execute(
-            """
-            SELECT ts_ms, bid, ask, last, spread, source
+            f"""
+            SELECT ts_ms, bid, ask, last, {spread_expr}, {source_expr}
             FROM price_quotes
             WHERE symbol = ?
               AND ts_ms <= ?

@@ -54,7 +54,11 @@ def _warn(scope: str, err: Exception, **extra) -> None:
 
 
 def _is_busy_error(err: Exception) -> bool:
-    return isinstance(err, dbapi.OperationalError) and dbapi.is_transient_write_error(err)
+    if isinstance(err, dbapi.OperationalError) and dbapi.is_transient_write_error(err):
+        return True
+    return dbapi.is_sqlite_error(err, "OperationalError") and (
+        "locked" in str(err).lower() or "busy" in str(err).lower()
+    )
 
 
 def _dropped_ipc_result(

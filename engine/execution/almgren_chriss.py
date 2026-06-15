@@ -51,7 +51,14 @@ def almgren_chriss_enabled() -> bool:
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "ALMGREN_CHRISS_FLOAT_PARSE_FAILED",
+            exc,
+            once_key=f"safe_float:{repr(value)[:80]}",
+            value=repr(value)[:240],
+            default=float(default),
+        )
         return float(default)
     if not math.isfinite(out):
         return float(default)
@@ -61,7 +68,15 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _clamp(value: Any, lo: float, hi: float) -> float:
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "ALMGREN_CHRISS_CLAMP_PARSE_FAILED",
+            exc,
+            once_key=f"clamp:{repr(value)[:80]}",
+            value=repr(value)[:240],
+            low=float(lo),
+            high=float(hi),
+        )
         out = float(lo)
     if not math.isfinite(out):
         out = float(lo)

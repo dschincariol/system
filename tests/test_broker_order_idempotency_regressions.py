@@ -198,19 +198,88 @@ class BrokerAdapterLineageRegressionTests(unittest.TestCase):
                                                     with patch.object(alpaca, "_load_latest_prices", return_value={"AAPL": 100.0}):
                                                         with patch.object(alpaca, "_apply_execution_risk_caps", side_effect=lambda **kwargs: (kwargs["delta_qty"], {})):
                                                             with patch.object(alpaca, "_price_at_or_before", return_value=100.0):
-                                                                with patch.object(alpaca, "claim_order_submission", return_value=guard) as claim_mock:
-                                                                    result = alpaca.apply_latest_portfolio_orders_live(
-                                                                        dry_run=False,
-                                                                        override_orders=[{"symbol": "AAPL", "to_side": "LONG", "to_weight": 0.10}],
-                                                                        override_order_id=88,
-                                                                        override_ts_ms=1_710_000_000_000,
-                                                                    )
+                                                                with patch.object(alpaca, "_prelive_reconcile_or_block", return_value=None):
+                                                                    with patch.object(alpaca, "record_broker_action_audit", return_value={"ok": True, "event_id": 1}):
+                                                                        with patch.object(alpaca, "claim_order_submission", return_value=guard) as claim_mock:
+                                                                            result = alpaca.apply_latest_portfolio_orders_live(
+                                                                                dry_run=False,
+                                                                                override_orders=[{"symbol": "AAPL", "to_side": "LONG", "to_weight": 0.10}],
+                                                                                override_order_id=88,
+                                                                                override_ts_ms=1_710_000_000_000,
+                                                                            )
 
         self.assertTrue(bool(result.get("ok")))
         self.assertEqual(int(result.get("submitted_n") or 0), 0)
         self.assertEqual(claim_mock.call_count, 1)
         self.assertEqual(int(claim_mock.call_args.kwargs.get("portfolio_orders_id") or 0), 88)
         self.assertEqual(int(claim_mock.call_args.kwargs.get("portfolio_ts_ms") or 0), 1_710_000_000_000)
+
+    def test_alpaca_direct_live_adapter_blocks_on_prelive_reconcile_before_broker_reads(self) -> None:
+        (alpaca,) = _reload_modules("engine.execution.broker_alpaca_rest")
+        reconcile_block = {
+            "ok": False,
+            "status": "mismatch",
+            "broker": "alpaca",
+            "fatal_reconcile": True,
+        }
+
+        with patch.object(alpaca, "KEY_ID", "key"):
+            with patch.object(alpaca, "SECRET", "secret"):
+                with patch.object(alpaca, "_real_trading_gate", return_value={"ok": True, "real_trading_allowed": True}):
+                    with patch.object(alpaca, "_prelive_reconcile_or_block", return_value=reconcile_block):
+                        with patch.object(alpaca, "connect", side_effect=AssertionError("storage should not open after reconcile block")):
+                            with patch.object(alpaca, "get_account", side_effect=AssertionError("account read should not happen")):
+                                with patch.object(alpaca, "_submit_market_order", side_effect=AssertionError("broker submit should not happen")):
+                                    result = alpaca.apply_latest_portfolio_orders_live(
+                                        dry_run=False,
+                                        override_orders=[{"symbol": "AAPL", "qty": 1.0}],
+                                        override_order_id=88,
+                                        override_ts_ms=1_710_000_000_000,
+                                    )
+
+        self.assertFalse(bool(result.get("ok")))
+        self.assertEqual(str(result.get("status") or ""), "mismatch")
+        self.assertTrue(bool(result.get("fatal_reconcile")))
+
+    def test_alpaca_submit_helper_blocks_when_pre_submit_audit_fails(self) -> None:
+        (alpaca,) = _reload_modules("engine.execution.broker_alpaca_rest")
+
+        with patch.object(alpaca, "_real_trading_gate", return_value={"ok": True, "real_trading_allowed": True}):
+            with patch.object(alpaca, "_prelive_reconcile_or_block", return_value=None):
+                with patch.object(
+                    alpaca,
+                    "record_broker_action_audit",
+                    return_value={"ok": False, "status": "broker_action_audit_failed", "broker": "alpaca"},
+                ):
+                    with patch.object(alpaca, "_submit_market_order", side_effect=AssertionError("broker submit should not happen")):
+                        result = alpaca.submit_market_order("AAPL", 1.0, "cid-1")
+
+        self.assertFalse(bool(result.get("ok")))
+        self.assertEqual(str(result.get("status") or ""), "broker_action_audit_failed")
+
+    def test_ibkr_direct_live_adapter_blocks_on_prelive_reconcile_before_connect(self) -> None:
+        (ibkr,) = _reload_modules("engine.execution.broker_ibkr_gateway")
+        reconcile_block = {
+            "ok": False,
+            "status": "baseline_missing",
+            "broker": "ibkr",
+            "fatal_reconcile": True,
+        }
+
+        with patch.object(ibkr, "_real_trading_gate", return_value={"ok": True, "real_trading_allowed": True}):
+            with patch.object(ibkr, "_prelive_reconcile_or_block", return_value=reconcile_block):
+                with patch.object(ibkr, "connect", side_effect=AssertionError("storage should not open after reconcile block")):
+                    with patch.object(ibkr, "_connect_ib", side_effect=AssertionError("broker connect should not happen")):
+                        result = ibkr.apply_latest_portfolio_orders_live(
+                            dry_run=False,
+                            override_orders=[{"symbol": "AAPL", "qty": 1.0}],
+                            override_order_id=88,
+                            override_ts_ms=1_710_000_000_000,
+                        )
+
+        self.assertFalse(bool(result.get("ok")))
+        self.assertEqual(str(result.get("status") or ""), "baseline_missing")
+        self.assertTrue(bool(result.get("fatal_reconcile")))
 
 
 class BrokerSimIdempotencyRegressionTests(unittest.TestCase):

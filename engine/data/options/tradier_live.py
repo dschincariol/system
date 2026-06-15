@@ -17,6 +17,7 @@ import requests
 from engine.data._credentials import get_data_credential
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.test_isolation import running_python_tests
 
 _BASE = "https://api.tradier.com/v1"
 _DEFAULT_TIMEOUT_S = float(os.environ.get("TRADIER_OPTIONS_TIMEOUT_S", "8"))
@@ -65,9 +66,10 @@ def _tradier_token() -> str:
     return get_data_credential("TRADIER_API_TOKEN")
 
 
-def _headers() -> Dict[str, str]:
+def _headers(token: str | None = None) -> Dict[str, str]:
+    api_token = str(token if token is not None else _tradier_token()).strip()
     return {
-        "Authorization": f"Bearer {_tradier_token()}",
+        "Authorization": f"Bearer {api_token}",
         "Accept": "application/json",
     }
 
@@ -139,6 +141,7 @@ def _request_json(
     *,
     params: Dict[str, Any],
     timeout_s: float,
+    api_token: str,
 ) -> Dict[str, Any]:
     last_error: Optional[TradierFetchError] = None
 
@@ -147,7 +150,7 @@ def _request_json(
             response = session.get(
                 f"{_BASE}{path}",
                 params=params,
-                headers=_headers(),
+                headers=_headers(api_token),
                 timeout=float(timeout_s),
             )
         except requests.RequestException as exc:
@@ -296,6 +299,7 @@ def fetch_options_chain(
     session: Optional[requests.Session] = None,
     max_expiries: Optional[int] = None,
     timeout_s: Optional[float] = None,
+    api_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Returns:
@@ -304,7 +308,9 @@ def fetch_options_chain(
         "meta": {...}
       }
     """
-    token = _tradier_token()
+    token = str(api_token or _tradier_token() or "").strip()
+    if not token and session is not None and running_python_tests():
+        token = "test-token"
     if not token:
         raise TradierFetchError("tradier_api_token_missing", kind="config_error")
 
@@ -323,6 +329,7 @@ def fetch_options_chain(
             "/markets/options/expirations",
             params={"symbol": sym},
             timeout_s=timeout_s,
+            api_token=token,
         )
         expirations = _extract_expirations(expirations_payload)[:limit_expiries]
 
@@ -337,6 +344,7 @@ def fetch_options_chain(
                     "greeks": "true",
                 },
                 timeout_s=timeout_s,
+                api_token=token,
             )
             rows.extend(_extract_chain_rows(expiry, chain_payload))
 

@@ -486,10 +486,7 @@ def run_causal_scoring(
                     )
                     written += 1
                     decisions[decision] = int(decisions.get(decision, 0) + 1)
-        try:
-            con.commit()
-        except Exception:
-            logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+        con.commit()
         return {
             "ok": True,
             "written": int(written),

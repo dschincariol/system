@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import os
 import subprocess
 import sys
 import unittest
@@ -19,6 +21,7 @@ from tools.runtime_graph_check import (
     _run_timeseries_sidecar_startup_check,
     _validate_supervisor_graph,
     bootstrap_validation_env,
+    run_canonical_validation,
 )
 
 
@@ -57,6 +60,26 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertNotIn("start_ingestion", modules)
         self.assertNotIn("start_system", modules)
         self.assertNotIn("engine.app", modules)
+
+    def test_startup_bootstrap_uses_sqlite_backend_by_default(self) -> None:
+        with patch.dict(os.environ, {"TRADING_VALIDATION_MODE": "startup"}, clear=True):
+            env = bootstrap_validation_env()
+
+        self.assertEqual(str(env.get("TS_STORAGE_BACKEND") or ""), "sqlite")
+
+    def test_startup_bootstrap_preserves_production_backend_requirement(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_VALIDATION_MODE": "startup",
+                "TS_STORAGE_BACKEND": "",
+                "TS_ENV": "production",
+            },
+            clear=True,
+        ):
+            env = bootstrap_validation_env()
+
+        self.assertEqual(str(env.get("TS_STORAGE_BACKEND") or ""), "")
 
     def test_embedded_startup_validation_detects_blocking_checks(self) -> None:
         message = _embedded_startup_validation_error(
@@ -181,6 +204,17 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertIn("ensure_schema", str(cmd[2]))
         self.assertIn("get_timeseries_storage_snapshot", str(cmd[2]))
         self.assertIn("RUNTIME_GRAPH_TIMESERIES_SCHEMA_TIMEOUT_S", str(cmd[2]))
+
+    def test_startup_runtime_graph_accepts_registered_job_entrypoints(self) -> None:
+        with (
+            patch("tools.runtime_graph_check._collect_entrypoint_imports", return_value=[]),
+            patch("tools.runtime_graph_check._run_cold_boot_db_bootstrap_check", return_value={"ok": True}),
+            patch("tools.runtime_graph_check._run_timeseries_sidecar_startup_check", return_value={"ok": True}),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            exit_code = run_canonical_validation(mode="startup")
+
+        self.assertEqual(exit_code, 0)
 
 
 if __name__ == "__main__":

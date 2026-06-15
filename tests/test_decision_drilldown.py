@@ -1,12 +1,28 @@
 import json
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from engine.api import api_dashboard_reads, api_read_advanced
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_decision_json_decode_failure_warns_and_preserves_raw(monkeypatch) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(api_read_advanced, "_warn_nonfatal", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    row = api_read_advanced._decision_decode_json_fields({"decision_json": "{bad-json", "symbol": "AAPL"})
+
+    assert row["decision_json"] == "{bad-json"
+    assert row["symbol"] == "AAPL"
+    assert calls
+    assert calls[0][0][0] == "API_READ_ADVANCED_DECISION_JSON_DECODE_FAILED"
+    assert calls[0][1]["field"] == "decision_json"
 
 
 def _init_decision_drilldown_db(db_path: Path) -> None:
@@ -235,6 +251,9 @@ def test_dashboard_decision_handler_accepts_lineage_identifiers(monkeypatch) -> 
 
 
 def test_frontend_decision_helper_renders_available_and_unavailable_stages() -> None:
+    if not shutil.which("node"):
+        pytest.skip("node executable is not available")
+
     script = """
         import {
           buildDecisionDetailUrl,

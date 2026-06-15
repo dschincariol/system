@@ -4,11 +4,25 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import tempfile
 from pathlib import Path
 
 from engine.runtime.platform import default_data_root
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _running_python_tests() -> bool:
+    argv = " ".join(str(part or "") for part in sys.argv).lower()
+    return bool(
+        str(os.environ.get("TS_TESTING") or "").strip().lower() in {"1", "true", "yes", "on"}
+        or "pytest" in argv
+        or "unittest" in argv
+        or "discover" in argv
+        or "tests/" in argv
+        or " tests" in argv
+    )
 
 
 def artifacts_root() -> Path:
@@ -19,6 +33,9 @@ def artifacts_root() -> Path:
         runtime_data = str(os.environ.get(env_name) or "").strip()
         if runtime_data:
             return (Path(runtime_data).expanduser() / "artifacts").resolve()
+    if _running_python_tests():
+        root = Path(tempfile.gettempdir()) / f"trading-system-tests-{os.getpid()}"
+        return (root / "artifacts").resolve()
     return (default_data_root() / "artifacts").resolve()
 
 

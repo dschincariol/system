@@ -30,6 +30,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.execution.execution_slicing_engine import build_order_slices
+from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger, log_event
 from engine.runtime.metrics import emit_counter, emit_timing
@@ -41,15 +42,32 @@ from engine.runtime.tracing import trace_event
 # unavailable during execution-path safety checks.
 _execution_gate_snapshot = None  # type: ignore
 _ALLOWED_JOBS = {}  # type: ignore
+_IMPORT_LOG = logging.getLogger("execution.broker_router")
+
+
+def _import_nonfatal(code: str, error: BaseException) -> None:
+    log_failure(
+        _IMPORT_LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error),
+        error=error,
+        level=logging.WARNING,
+        component="engine.execution.broker_router",
+        persist=False,
+    )
+
 
 try:
     from engine.cache.wrappers.kill_switch import read_kill_switch as _kill_switch_snapshot  # type: ignore
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_KILL_SWITCH_WRAPPER_IMPORT_FAILED", e)
     _kill_switch_snapshot = None  # type: ignore
 
 try:
     from engine.cache.wrappers.execution_mode import read_execution_mode as _get_execution_mode  # type: ignore
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_EXECUTION_MODE_WRAPPER_IMPORT_FAILED", e)
     _get_execution_mode = None  # type: ignore
 
 _read_execution_health = None  # type: ignore
@@ -57,13 +75,15 @@ _read_execution_health = None  # type: ignore
 # Best-effort DB access for realized slippage distribution
 try:
     from engine.runtime.storage import connect  # type: ignore
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_RUNTIME_STORAGE_IMPORT_FAILED", e)
     connect = None  # type: ignore
 
 # Adaptive slicing (best-effort; router remains loadable)
 try:
     from engine.strategy.adaptive_order_slicer import AdaptiveOrderSlicer  # type: ignore
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_ADAPTIVE_ORDER_SLICER_IMPORT_FAILED", e)
     AdaptiveOrderSlicer = None  # type: ignore
 
 
@@ -78,7 +98,8 @@ _ibkr_apply = None
 # Pre-live reconciliation gate (hard block on mismatch)
 try:
     from engine.execution.position_reconcile import pre_live_position_reconcile as _prelive_reconcile
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_POSITION_RECONCILE_IMPORT_FAILED", e)
     _prelive_reconcile = None
 
 
@@ -267,7 +288,13 @@ def _jobs_from_db_snapshot() -> List[Dict[str, Any]]:
 
     try:
         max_stale_s = float(os.environ.get("HEALTH_JOBS_MAX_STALE_S", "180"))
-    except Exception:
+    except ValueError as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_HEALTH_MAX_STALE_PARSE_FAILED",
+            e,
+            once_key="jobs_from_db_snapshot_max_stale",
+            value=os.environ.get("HEALTH_JOBS_MAX_STALE_S", ""),
+        )
         max_stale_s = 180.0
 
     now_ms = int(time.time() * 1000)
@@ -288,11 +315,17 @@ def _jobs_from_db_snapshot() -> List[Dict[str, Any]]:
                         e,
                         once_key="jobs_from_db_snapshot_close",
                     )
-        except Exception:
+        except Exception as e:
+            _warn_nonfatal(
+                "BROKER_ROUTER_JOB_SNAPSHOT_LOAD_FAILED",
+                e,
+                once_key="jobs_from_db_snapshot_load",
+            )
             rows = []
 
         out: List[Dict[str, Any]] = []
         for r in rows or []:
+            name = "<unknown>"
             try:
                 name = str(r[0] or "")
                 hb = int(r[1] or 0)
@@ -303,7 +336,13 @@ def _jobs_from_db_snapshot() -> List[Dict[str, Any]]:
                     spec = _ALLOWED_JOBS.get(name)
                     if isinstance(spec, (list, tuple)) and len(spec) >= 2:
                         mode = str(spec[1] or "")
-                except Exception:
+                except Exception as e:
+                    _warn_nonfatal(
+                        "BROKER_ROUTER_ALLOWED_JOB_LOOKUP_FAILED",
+                        e,
+                        once_key=f"allowed_job_lookup:{name}",
+                        job_name=str(name),
+                    )
                     mode = ""
 
                 out.append({"name": name, "running": bool(running), "mode": mode})
@@ -475,6 +514,7 @@ def _apply_entry_delay(
     *,
     order: Optional[Dict[str, Any]],
     dry_run: bool,
+    broker_name: str = "",
     slice_audit: Optional[List[Dict[str, Any]]] = None,
     order_index: Optional[int] = None,
 ) -> int:
@@ -494,15 +534,36 @@ def _apply_entry_delay(
         )
 
     if (not bool(dry_run)) and delay_ms > 0:
-        time.sleep(float(delay_ms) / 1000.0)
+        ok, reason, meta = wait_with_kill_interrupt(
+            delay_s=float(delay_ms) / 1000.0,
+            symbol=str((order or {}).get("symbol") or "").upper().strip(),
+            model_id=str((order or {}).get("model_id") or ""),
+            broker=str(broker_name or ""),
+            component="engine.execution.broker_router",
+            stage="entry_delay",
+        )
+        if not bool(ok):
+            if isinstance(slice_audit, list):
+                slice_audit.append(
+                    {
+                        "symbol": str((order or {}).get("symbol") or "").upper().strip(),
+                        "order_index": (int(order_index) if order_index is not None else None),
+                        "stage": "entry_delay",
+                        "delay_ms": int(delay_ms),
+                        "interrupted": True,
+                        "reason": str(reason or "kill_switch_block"),
+                        "meta": dict(meta or {}),
+                    }
+                )
+            return -int(delay_ms)
 
     return int(delay_ms)
 
 
-def _apply_batch_entry_delay(*, orders: Optional[List[dict]], dry_run: bool) -> int:
+def _apply_batch_entry_delay(*, orders: Optional[List[dict]], dry_run: bool, broker_name: str = "") -> int:
     if not orders:
         return 0
-    return _apply_entry_delay(order=dict((orders or [None])[0] or {}), dry_run=bool(dry_run))
+    return _apply_entry_delay(order=dict((orders or [None])[0] or {}), dry_run=bool(dry_run), broker_name=str(broker_name or ""))
 
 
 def _parse_failover_chain() -> List[str]:
@@ -609,13 +670,55 @@ def _adaptive_execute_orders(
             _apply_entry_delay(
                 order=order,
                 dry_run=bool(dry_run),
+                broker_name=str(broker_name),
                 slice_audit=slice_audit,
                 order_index=int(oidx),
             )
+            if slice_audit and bool(slice_audit[-1].get("interrupted")):
+                all_ok = False
+                last_res = {
+                    "ok": False,
+                    "status": "blocked_kill_switch_during_entry_delay",
+                    "broker": str(broker_name),
+                    "reason": str(slice_audit[-1].get("reason") or "kill_switch_block"),
+                    "kill_meta": dict(slice_audit[-1].get("meta") or {}),
+                }
+                break
 
             for sidx, so in enumerate(list(sliced_orders or [dict(order)])):
                 interval_ms = int(so.get("slice_interval_ms") or 0)
                 style = str(so.get("slice_style") or "single").strip().lower()
+                gate_ok, gate_reason, gate_meta = wait_with_kill_interrupt(
+                    delay_s=0.0,
+                    symbol=str(so.get("symbol") or symbol).upper().strip(),
+                    model_id=str(so.get("model_id") or ""),
+                    broker=str(broker_name),
+                    component="engine.execution.broker_router",
+                    stage="slice_boundary",
+                )
+                if not bool(gate_ok):
+                    all_ok = False
+                    last_res = {
+                        "ok": False,
+                        "status": "blocked_kill_switch_mid_slice",
+                        "broker": str(broker_name),
+                        "reason": str(gate_reason or "kill_switch_block"),
+                        "kill_meta": dict(gate_meta or {}),
+                    }
+                    slice_audit.append(
+                        {
+                            "symbol": symbol,
+                            "order_index": int(oidx),
+                            "slice_index": int(sidx),
+                            "slice_qty": float(so.get("qty") or 0.0),
+                            "delay_ms": int(interval_ms),
+                            "style": str(style),
+                            "ok": False,
+                            "status": "blocked_kill_switch_mid_slice",
+                            "reason": str(gate_reason or "kill_switch_block"),
+                        }
+                    )
+                    break
 
                 r = _call_adapter(
                     fn,
@@ -646,7 +749,37 @@ def _adaptive_execute_orders(
                     break
 
                 if interval_ms > 0 and sidx < (len(sliced_orders) - 1) and (not bool(dry_run)):
-                    time.sleep(float(interval_ms) / 1000.0)
+                    wait_ok, wait_reason, wait_meta = wait_with_kill_interrupt(
+                        delay_s=float(interval_ms) / 1000.0,
+                        symbol=str(so.get("symbol") or symbol).upper().strip(),
+                        model_id=str(so.get("model_id") or ""),
+                        broker=str(broker_name),
+                        component="engine.execution.broker_router",
+                        stage="slice_sleep",
+                    )
+                    if not bool(wait_ok):
+                        all_ok = False
+                        last_res = {
+                            "ok": False,
+                            "status": "blocked_kill_switch_mid_slice",
+                            "broker": str(broker_name),
+                            "reason": str(wait_reason or "kill_switch_block"),
+                            "kill_meta": dict(wait_meta or {}),
+                        }
+                        slice_audit.append(
+                            {
+                                "symbol": symbol,
+                                "order_index": int(oidx),
+                                "slice_index": int(sidx),
+                                "slice_qty": float(so.get("qty") or 0.0),
+                                "delay_ms": int(interval_ms),
+                                "style": str(style),
+                                "ok": False,
+                                "status": "blocked_kill_switch_mid_slice",
+                                "reason": str(wait_reason or "kill_switch_block"),
+                            }
+                        )
+                        break
 
             if not all_ok:
                 break
@@ -767,7 +900,9 @@ def _apply_one(
             if isinstance(ad, dict) and ad.get("status") != "adaptive_disabled":
                 res = ad or {}
             else:
-                _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+                delay_res = _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run), broker_name="sim")
+                if int(delay_res) < 0:
+                    return {"ok": False, "status": "blocked_kill_switch_during_entry_delay", "broker": "sim"}
                 res = _call_adapter(
                     sim_apply,
                     dry_run=dry_run,
@@ -776,7 +911,9 @@ def _apply_one(
                     override_ts_ms=override_ts_ms,
                 ) or {}
         else:
-            _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+            delay_res = _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run), broker_name="sim")
+            if int(delay_res) < 0:
+                return {"ok": False, "status": "blocked_kill_switch_during_entry_delay", "broker": "sim"}
             res = _call_adapter(
                 sim_apply,
                 dry_run=dry_run,
@@ -829,7 +966,9 @@ def _apply_one(
             if isinstance(ad, dict) and ad.get("status") != "adaptive_disabled":
                 res = ad or {}
             else:
-                _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+                delay_res = _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run), broker_name="alpaca")
+                if int(delay_res) < 0:
+                    return {"ok": False, "status": "blocked_kill_switch_during_entry_delay", "broker": "alpaca"}
                 res = _call_adapter(
                     alpaca_apply,
                     dry_run=dry_run,
@@ -838,7 +977,9 @@ def _apply_one(
                     override_ts_ms=override_ts_ms,
                 ) or {}
         else:
-            _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+            delay_res = _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run), broker_name="alpaca")
+            if int(delay_res) < 0:
+                return {"ok": False, "status": "blocked_kill_switch_during_entry_delay", "broker": "alpaca"}
             res = _call_adapter(
                 alpaca_apply,
                 dry_run=dry_run,
@@ -868,7 +1009,9 @@ def _apply_one(
             if isinstance(ad, dict) and ad.get("status") != "adaptive_disabled":
                 res = ad or {}
             else:
-                _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+                delay_res = _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run), broker_name="ibkr")
+                if int(delay_res) < 0:
+                    return {"ok": False, "status": "blocked_kill_switch_during_entry_delay", "broker": "ibkr"}
                 res = _call_adapter(
                     ibkr_apply,
                     dry_run=dry_run,
@@ -877,7 +1020,9 @@ def _apply_one(
                     override_ts_ms=override_ts_ms,
                 ) or {}
         else:
-            _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run))
+            delay_res = _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run), broker_name="ibkr")
+            if int(delay_res) < 0:
+                return {"ok": False, "status": "blocked_kill_switch_during_entry_delay", "broker": "ibkr"}
             res = _call_adapter(
                 ibkr_apply,
                 dry_run=dry_run,
@@ -1149,13 +1294,28 @@ def apply_new_portfolio_orders_router(
                             "lineage": lineage,
                         },
                     )
-                    time.sleep(
-                        backoff_delay_s(
-                            int(attempt_num),
-                            base_s=float(BROKER_ROUTER_RETRY_BASE_S),
-                            max_s=float(BROKER_ROUTER_RETRY_MAX_S),
-                        )
+                    retry_delay_s = backoff_delay_s(
+                        int(attempt_num),
+                        base_s=float(BROKER_ROUTER_RETRY_BASE_S),
+                        max_s=float(BROKER_ROUTER_RETRY_MAX_S),
                     )
+                    if float(retry_delay_s) > 0.0:
+                        retry_wait_ok, retry_wait_reason, retry_wait_meta = wait_with_kill_interrupt(
+                            delay_s=float(retry_delay_s),
+                            symbol=str((lineage.get("symbols") or [""])[0] or ""),
+                            broker=str(name),
+                            component="engine.execution.broker_router",
+                            stage="broker_retry_backoff",
+                        )
+                        if not bool(retry_wait_ok):
+                            return {
+                                "ok": False,
+                                "status": "blocked_kill_switch_during_retry_backoff",
+                                "broker": str(name),
+                                "reason": str(retry_wait_reason or "kill_switch_block"),
+                                "kill_meta": dict(retry_wait_meta or {}),
+                                "failover_attempts": attempts,
+                            }
                     continue
                 break
 
@@ -1204,13 +1364,28 @@ def apply_new_portfolio_orders_router(
                             "lineage": lineage,
                         },
                     )
-                    time.sleep(
-                        backoff_delay_s(
-                            int(attempt_num),
-                            base_s=float(BROKER_ROUTER_RETRY_BASE_S),
-                            max_s=float(BROKER_ROUTER_RETRY_MAX_S),
-                        )
+                    retry_delay_s = backoff_delay_s(
+                        int(attempt_num),
+                        base_s=float(BROKER_ROUTER_RETRY_BASE_S),
+                        max_s=float(BROKER_ROUTER_RETRY_MAX_S),
                     )
+                    if float(retry_delay_s) > 0.0:
+                        retry_wait_ok, retry_wait_reason, retry_wait_meta = wait_with_kill_interrupt(
+                            delay_s=float(retry_delay_s),
+                            symbol=str((lineage.get("symbols") or [""])[0] or ""),
+                            broker=str(name),
+                            component="engine.execution.broker_router",
+                            stage="broker_retry_backoff",
+                        )
+                        if not bool(retry_wait_ok):
+                            return {
+                                "ok": False,
+                                "status": "blocked_kill_switch_during_retry_backoff",
+                                "broker": str(name),
+                                "reason": str(retry_wait_reason or "kill_switch_block"),
+                                "kill_meta": dict(retry_wait_meta or {}),
+                                "failover_attempts": attempts,
+                            }
                     continue
                 break
 
@@ -1290,4 +1465,3 @@ def submit_order(order: dict, *, dry_run: bool = False, broker: Optional[str] = 
                 os.environ.pop("BROKER_FAILOVER", None)
             else:
                 os.environ["BROKER_FAILOVER"] = previous
-

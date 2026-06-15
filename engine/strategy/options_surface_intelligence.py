@@ -9,9 +9,10 @@ rest of the strategy stack can consume.
 import math
 import logging
 import statistics
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from engine.data.time_utils import utc_ms_from_datetime
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.factor_universe import put_factor_feature
@@ -67,11 +68,11 @@ def _safe_str(x: Any) -> str:
 
 def _days_to_exp(expiry: str, ts_ms: int) -> Optional[float]:
     try:
-        dt = datetime.strptime(str(expiry), "%Y-%m-%d")
+        dt = datetime.strptime(str(expiry), "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except Exception as e:
         _warn_nonfatal("OPTIONS_SURFACE_EXPIRY_PARSE_FAILED", e, once_key="days_to_exp", expiry=str(expiry), ts_ms=int(ts_ms))
         return None
-    days = (dt.timestamp() * 1000.0 - float(ts_ms)) / 86400000.0
+    days = (float(utc_ms_from_datetime(dt, field_name="options_surface_expiry")) - float(ts_ms)) / 86400000.0
     if not math.isfinite(days):
         return None
     return float(days)

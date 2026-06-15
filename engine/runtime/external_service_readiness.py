@@ -373,11 +373,10 @@ def _check_object_storage_service(*, required: bool, timeout_s: float) -> dict[s
     )
     if not endpoint:
         status["errors"].append("object_storage required but endpoint is missing")
-        return status
-    scheme = str(urlparse(endpoint if "://" in endpoint else f"http://{endpoint}").scheme or "").strip().lower()
-    if scheme and scheme not in _HTTP_SCHEMES:
-        status["errors"].append(f"object_storage has unsupported endpoint scheme: {scheme}")
-        return status
+    else:
+        scheme = str(urlparse(endpoint if "://" in endpoint else f"http://{endpoint}").scheme or "").strip().lower()
+        if scheme and scheme not in _HTTP_SCHEMES:
+            status["errors"].append(f"object_storage has unsupported endpoint scheme: {scheme}")
     if not bucket:
         status["errors"].append("object_storage bucket is missing")
     if not access_key:
@@ -386,25 +385,27 @@ def _check_object_storage_service(*, required: bool, timeout_s: float) -> dict[s
         status["errors"].append("object_storage secret key is missing")
     if not host or not port:
         status["errors"].append("object_storage endpoint missing host or port")
-        return status
-    reachable, error = _probe_object_storage_bucket(
-        endpoint=endpoint,
-        bucket=bucket,
-        access_key=access_key,
-        secret_key=secret_key,
-        region=_clean_text(os.environ.get("OBJECT_STORE_REGION") or os.environ.get("AWS_REGION")),
-        timeout_s=timeout_s,
-    )
-    status["reachable"] = bool(reachable)
-    if reachable:
-        status["ok"] = not bool(status["errors"])
-        status["notes"].append(f"object_storage bucket check ok target={target} bucket={bucket}")
+    if status["errors"]:
+        status["reachable"] = False
     else:
-        message = f"object_storage unreachable target={target} error={error or 'unknown'}"
-        if status["required"]:
-            status["errors"].append(message)
+        reachable, error = _probe_object_storage_bucket(
+            endpoint=endpoint,
+            bucket=bucket,
+            access_key=access_key,
+            secret_key=secret_key,
+            region=_clean_text(os.environ.get("OBJECT_STORE_REGION") or os.environ.get("AWS_REGION")),
+            timeout_s=timeout_s,
+        )
+        status["reachable"] = bool(reachable)
+        if reachable:
+            status["ok"] = True
+            status["notes"].append(f"object_storage bucket check ok target={target} bucket={bucket}")
         else:
-            status["warnings"].append(message)
+            message = f"object_storage unreachable target={target} error={error or 'unknown'}"
+            if status["required"]:
+                status["errors"].append(message)
+            else:
+                status["warnings"].append(message)
 
     mirror_root = _clean_text(os.environ.get("ARTIFACT_STORE_MIRROR_ROOT"))
     if mirror_root:

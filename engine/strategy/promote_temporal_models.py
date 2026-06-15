@@ -20,10 +20,9 @@ from engine.runtime.storage import (
 )
 from engine.model_registry import register_model
 from engine.strategy.model_lifecycle import (
-    mark_version_live,
     record_version_performance,
     register_model_version,
-    retire_underperforming_versions,
+    update_model_version_status,
     version_from_ts,
 )
 from engine.strategy.model_marketplace import upsert_marketplace_candidate
@@ -396,17 +395,22 @@ def main() -> int:
                         "signed_alpha": float(signed_alpha or 0.0),
                     },
                 )
-                mark_version_live(
+                update_model_version_status(
                     "temporal_predictor",
                     str(model_version),
-                    stage="champion",
-                    meta_patch={"promote_key": str(promote_key), "promoted_ts_ms": int(now_ms)},
+                    stage="challenger",
+                    status="candidate",
+                    live_ready=False,
+                    meta_patch={
+                        "promote_key": str(promote_key),
+                        "promotion_deferred_ts_ms": int(now_ms),
+                        "deferred_reason": "competition_registry_promotion_required",
+                    },
                 )
-                retire_underperforming_versions("temporal_predictor", protect_versions=[str(model_version)])
 
                 audit(
                     actor="auto",
-                    action="promote_temporal",
+                    action="candidate_temporal",
                     model_name="temporal_predictor",
                     regime=str(promote_key),
                     reason={
@@ -423,6 +427,7 @@ def main() -> int:
                         "rmse_improvement": rmse_improvement,
                         "diracc_delta": diracc_delta,
                         "compare": allow_reason,
+                        "required_path": "competition_replay_validation_and_model_registry_promotion",
                     },
                     to_artifact_sha256=(str(artifact_sha256) if artifact_sha256 else None),
                 )

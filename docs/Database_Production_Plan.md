@@ -6,7 +6,9 @@ logic are out of scope here.
 
 ## 1. Current state
 
-The persistence backbone today is a **single SQLite database in WAL
+Status note, 2026-06: this document is now historical migration planning. The current production-like runtime uses the Postgres-backed storage facade in `engine/runtime/storage_pg.py`; `engine/runtime/storage_sqlite.py` is retained for isolated Python tests and compatibility coverage. Use `docs/README_DATABASE_MAP.md`, `docs/ARCHITECTURE.md`, `.env.example`, and the runtime code as the current contract.
+
+At the time this plan was written, the persistence backbone was a **single SQLite database in WAL
 mode** holding **~210 distinct tables** (verified by grep against
 `engine/runtime/storage.py` and the per-module create statements). It
 covers four very different workloads on one file:
@@ -233,13 +235,12 @@ of them.
   capital: RTO ≤ 15 min, RPO ≤ 1 min.
 - Snapshot DB size; project growth at 6 months and 24 months.
 
-### Phase 1 — Storage abstraction (this is Codex prompt 04)
+### Phase 1 — Storage abstraction (completed in current runtime)
 
-- Land the `Storage` Protocol with `SQLiteStorage` and a stubbed
-  `PostgresStorage`.
-- All call sites typed against the Protocol.
-- Behavior under default `TS_STORAGE_BACKEND=sqlite` is byte-identical
-  to today.
+- The public facade remains `engine/runtime/storage.py`.
+- Production-like operation routes to `engine/runtime/storage_pg.py`.
+- Isolated Python tests route to `engine/runtime/storage_sqlite.py` through `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`.
+- `DB_PATH` is no longer a production database file path; it is a local data-root/legacy compatibility hint.
 
 ### Phase 2 — Stand up Postgres + Timescale (1 week)
 
@@ -315,6 +316,7 @@ SQLite stays warm until Phase 6.
   annual retained forever (or as policy requires).
 - Quarterly restore drill into a clean instance — restoration is only
   proven when you have actually done it.
+- In this repository, production-style backup and restore ownership lives under `ops/backup/` and `ops/server/systemd/`. The older `deploy/bin/backup_trading_db.sh` is a SQLite-file backup helper and is not sufficient for the current Postgres-backed runtime.
 
 ### 6.2 Secrets management
 
@@ -376,9 +378,7 @@ review.
   Persistence change must be invisible to them.
 - **The `engine.runtime.storage` module's public API.** It is a fine
   facade. The work in prompt 04 keeps the API; this plan reuses it.
-- **SQLite as the developer-machine default.** Local development on
-  Postgres is friction; SQLite stays as the dev mode, Postgres is
-  production. Prompt 04's adapter pattern enables this directly.
+- **SQLite for isolated Python tests.** Local test runs use SQLite by default to avoid probing ambient PgBouncer/Postgres. Developer and production-like runtime behavior should be validated against the Postgres facade when storage availability matters.
 
 ## 8. Cost and sizing — order of magnitude
 

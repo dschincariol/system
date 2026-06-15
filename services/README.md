@@ -5,10 +5,10 @@ The `services/` tree contains sidecar or auxiliary services that are not part of
 ## Current Content
 
 - `operator_ai/`
-  Operator-adjacent service code such as [agent.js](c:\Users\dschi\Documents\GitHub\Trading-System-\services\operator_ai\agent.js).
-- [data_source_manager.py](c:\Users\dschi\Documents\GitHub\Trading-System-\services\data_source_manager.py)
+  Operator-adjacent service code such as [agent.js](operator_ai/agent.js).
+- [data_source_manager.py](data_source_manager.py)
   DB-backed source catalog and source-of-truth manager for configurable ingestion sources, including lifecycle reconciliation, health snapshots, one-time legacy env import, and runtime environment projection.
-- [credential_encryption.py](c:\Users\dschi\Documents\GitHub\Trading-System-\services\credential_encryption.py)
+- [credential_encryption.py](credential_encryption.py)
   AES-GCM helpers used to store data-source credentials encrypted at rest in the database and return masked copies to operator-facing UIs.
 
 ## Data Source Management Contract
@@ -16,7 +16,7 @@ The `services/` tree contains sidecar or auxiliary services that are not part of
 The current contract for provider/source configuration is:
 
 - provider credentials and source-specific settings are stored in `data_sources`
-- the Data Sources Control Center at [ui/data_sources.html](c:\Users\dschi\Documents\GitHub\Trading-System-\ui\data_sources.html) is the human-facing setup surface
+- the Data Sources Control Center at [ui/data_sources.html](../ui/data_sources.html) is the human-facing setup surface
 - `.env` is no longer the live source of truth for provider credentials
 - legacy provider values can be imported once into the DB during manager initialization
 - runtime env projection still exists only so existing jobs that read `os.environ` continue to work while the DB remains authoritative
@@ -25,7 +25,7 @@ Keep the encryption root outside the database. The database stores encrypted pro
 
 ## Operator AI Contract
 
-[operator_ai/agent.js](c:\Users\dschi\Documents\GitHub\Trading-System-\services\operator_ai\agent.js) is now a real bounded service module, not a placeholder.
+[operator_ai/agent.js](operator_ai/agent.js) is now a real bounded service module, not a placeholder.
 
 It currently:
 

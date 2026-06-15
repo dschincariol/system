@@ -1,6 +1,6 @@
 # Trading System — Handoff Document
 
-**Purpose:** Upload this file into a Claude app Project (claude.ai → Projects → Trading System) so any new chat there starts with full context. Produced from a Claude Code session on 2026-04-11.
+**Purpose:** Upload this file into a Claude app Project (claude.ai -> Projects -> Trading System) so any new chat there starts with full context. Originally produced from a Claude Code session on 2026-04-11 and last verified against code on 2026-06-11.
 
 ---
 
@@ -20,23 +20,26 @@ Owner and primary developer of a comprehensive Python-based supervised trading s
 
 ---
 
-## 3. System Architecture Audit (April 2026)
+## 3. System Architecture Audit (Last verified 2026-06-11)
 
-Full-stack supervised trading system, ~400+ Python files, SQLite (WAL mode), ~100+ registered jobs.
+Full-stack supervised trading system, ~400+ Python files, Postgres-backed runtime storage facade, ~100+ registered jobs.
 
-### Data Sources (10)
-Prices (CCXT / IBKR / Polygon / yfinance), News/RSS (Reuters/Bloomberg/FT/WSJ), SEC/EDGAR, Social (Reddit/StockTwits), GDELT, Weather (NOAA), Options (Polygon), Earnings (FMP), Macro (CPI/GDP/Rates/Oil/Gas), Transcripts.
+### Data Sources
+Prices (CCXT / IBKR / Polygon / yfinance), News/RSS, SEC/EDGAR, Social (Reddit/StockTwits), GDELT, Weather (NOAA), Options (Polygon), Earnings (FMP), Macro, Transcripts, Form 4 insider data, congressional trades, and point-in-time universe snapshots.
 
 ### Features
-100+ named features in `engine/strategy/feature_registry.py` across 10 groups: base, price (30+), events, macro, tech, stress, social, weather, options, availability. Schema-driven train/serve parity — training writes a feature contract; serving reads the same contract back.
+Schema-driven train/serve parity through `engine/strategy/feature_registry.py`. The default serving set is about 111 feature ids; the full catalog is much larger when optional/shadow groups are enabled. Current groups include base, price, events, macro, HMM regime, tech, stress, social, weather, options-symbol, availability, tsfresh, NLP/FinBERT/news, filings, and transcripts.
 
-### ML Models (3 families + 1 shadow)
-- **regime_stats_v2** — Bayesian priors + spillover betas (baseline)
-- **embed_regressor** — Ridge + Torch MLP
-- **temporal_predictor** — sequence model on embedding windows
-- **RL linear policy** — shadow-only, no live execution authority
+### ML Models
+- **LightGBM** — `engine/strategy/models/lgbm_regressor.py`
+- **XGBoost** — `engine/strategy/models/xgb_regressor.py`
+- **sklearn/GBM-style regressors** — `engine/strategy/models/gbm_model.py`, `engine/strategy/gbm_regressor.py`
+- **PatchTST** — `engine/strategy/models/patchtst.py`
+- **Ridge meta-ensemble** — `engine/strategy/ensemble/ridge_meta.py`
+- **Legacy/fallback paths** — embed regressors, temporal predictors, and regime/statistical baselines still exist as schema-aware maintenance paths
+- **Shadow RL** — advisory/shadow only, no live execution authority
 
-All managed through champion/challenger competition with: model marketplace, replay validation, self-critic, promotion cooldowns, drift detection, registry-backed feature schemas.
+All managed through champion/challenger competition with model marketplace, replay validation, self-critic, promotion cooldowns, drift detection, registry-backed feature schemas, CPCV/gated backtest evidence, statistical gates, pool/MPC gates, and era/regime robustness checks.
 
 ### Strategy Plane
 Multi-model predictor routing, canonical model intent (`engine/strategy/model_intent.py`), portfolio construction (max 3 positions, anti-flip-flop, min hold), 3-layer regime stack (macro / asset-class / microstructure), alpha lifecycle with TTL and half-life decay, strategy selector (baseline/conservative).
@@ -55,7 +58,7 @@ Dashboard server + browser UI, operator AI (bounded LLM diagnostics, not a secon
 ```mermaid
 flowchart LR
     A[External data providers] --> B[Ingestion jobs]
-    B --> C[SQLite storage]
+    B --> C[Runtime storage facade]
     C --> D[Feature + label builders]
     D --> E[Models + prediction jobs]
     E --> F[Decision logic]
@@ -81,7 +84,7 @@ flowchart LR
 
 ### Critical files
 - `start_system.py`, `dashboard_server.py` — boot
-- `engine/runtime/storage.py` — SQLite center of gravity
+- `engine/runtime/storage.py` — runtime storage facade
 - `engine/runtime/job_registry.py` — canonical job catalog
 - `engine/strategy/feature_registry.py` — feature catalog
 - `engine/strategy/predictor.py` — live prediction + model routing
@@ -94,45 +97,35 @@ flowchart LR
 
 ---
 
-## 4. Gaps vs. World-Class Systems
+## 4. Remaining Gaps vs. World-Class Systems
 
 Comparison against Renaissance, Two Sigma, WorldQuant, Citadel, Jane Street, Man AHL, Bridgewater, and academic SOTA (Gu/Kelly/Xiu 2020, Harvey/Liu/Zhu 2016, de Prado 2018, Almgren-Chriss 2000):
 
 | Gap | Why it matters | Where to address |
 |---|---|---|
-| No multiple-hypothesis correction | ~95% of published factors are false positives (Harvey/Liu/Zhu). Current promotion doesn't correct for selection bias. | `champion_manager.py`, promotion guard |
-| No automated feature discovery | WorldQuant's Alphas platform generates millions of candidates. System relies on hand-coded features. | `feature_registry.py`, new feature generation job |
-| No Combinatorial Purged CV | Standard CV leaks across the time axis. de Prado's CPCV is the industry standard for robust backtesting. | New `engine/strategy/cpcv.py` + backtest job |
-| No realistic transaction cost model | Missing Almgren-Chriss market impact model. | `engine/execution/execution_policy_engine.py` |
-| Hardcoded hyperparameters (200+ env vars) | Should be Bayesian-optimized (Optuna). | Configuration surface across strategy/risk |
-| No deep learning model families | Missing transformers (PatchTST/iTransformer), GNNs, TabNet, even LightGBM/XGBoost | New model families in `engine/strategy/` |
-| No ensemble blending | Single champion wins; stacking would be more robust. | New `engine/strategy/ensemble_blender.py` |
-| No causal discovery | Correlation-driven features. Missing Granger/DoWhy/DAG inference. | New research module |
-| SQLite bottleneck | Industry uses TimescaleDB / kdb+ for time-series workloads at scale. | `engine/runtime/storage.py` — long-term migration |
-| No streaming architecture | Batch ingestion limits responsiveness. Kafka would enable real-time signals. | Infrastructure, Phase 3 |
-| Missing alt data | No satellite imagery, credit card proxies, Form 4 insider, congressional STOCK Act. | New ingestion jobs |
-| No closed-loop alpha discovery | System has pieces but no end-to-end auto-generate → backtest → shadow → promote → retire loop. | Phase 4 work |
-| No deep RL portfolio manager | FinRL / PPO / SAC could optimize portfolio directly. | Phase 4 work |
-| No L2 microstructure modeling | Missing order book alpha — informed-trade detection, lead-lag. | Phase 5 work |
-
+| Scale-out storage/streaming still incomplete | Current storage has a Postgres-backed facade, but Kafka-style event streaming and dedicated feature-store/hot-cache layers are not fully built. | `engine/runtime/`, ingestion runtime, Phase 3 infrastructure |
+| Universe and instrument coverage still narrower than the north star | More US equities, global ETFs, futures, FX, and direct options execution remain future expansion. | universe, data, execution |
+| More alternative data remains valuable | Form 4 and congressional paths exist, but satellite, credit-card proxies, deeper web data, and richer transcript workflows are not complete. | `engine/data/jobs/`, `engine/strategy/feature_registry.py` |
+| Graph/iTransformer/TabNet families not yet first-class | LightGBM/XGBoost/GBM/PatchTST landed, but broader deep tabular/graph sequence families are still open. | `engine/strategy/models/` |
+| Closed-loop alpha discovery is partial | Discovery, evaluation, backtest, shadow, and promotion pieces exist, but the full auto-generate -> backtest -> shadow -> promote -> retire loop still needs orchestration hardening. | discovery, promotion, governance jobs |
+| Deep RL portfolio manager remains future work | Shadow RL exists, but no PPO/SAC live allocator has authority. | `engine/strategy/jobs/run_rl_shadow.py`, future RL modules |
+| L2 microstructure and direct options strategies remain future edge work | Current execution handles broker routing and cost/slippage realism, but L2 alpha and systematic options strategies are not fully built. | `engine/execution/`, future data sources |
 ---
 
 ## 5. Five-Phase Optimization Roadmap
 
 ### Phase 1 (P0 CRITICAL — Months 1–3) — Foundation
-- Multiple hypothesis testing: Benjamini-Hochberg FDR, Harvey/Liu/Zhu t>3.0 threshold, White's Reality Check
-- Automated feature discovery: tsfresh (700+ auto features), PySR/gplearn (symbolic regression), combinatorial feature generator
-- Rigorous backtesting: de Prado's Combinatorial Purged CV, Almgren-Chriss transaction costs, survivorship-bias correction
-- Auto hyperparameter optimization: Optuna Bayesian optimization replacing hardcoded env vars
+- DONE: Multiple hypothesis testing via Benjamini-Hochberg FDR, Harvey/Liu/Zhu thresholding, White's Reality Check, and deflated Sharpe.
+- DONE: Automated feature discovery hooks via tsfresh and PySR/symbolic feature paths.
+- DONE/PARTIAL: Rigorous backtesting via CPCV/PBO, cost-adjusted metrics, gated backtests, retrain-cadence replay, and PIT universe support; continue hardening survivorship-bias and data-hygiene coverage.
+- DONE/PARTIAL: Optuna tuning and parameter-surface robustness; broader config cleanup remains ongoing.
 
 ### Phase 2 (P1 HIGH — Months 3–6) — Intelligence
-- Deep learning model families: PatchTST / iTransformer, Graph Attention Networks, TabNet, LightGBM/XGBoost as new families
-- Enhanced NLP: FinBERT sentiment, LLM earnings call analysis, SEC filing diff detection
-- Causal discovery: Granger causality, DoWhy / CausalML, DAG inference
-- Ensemble blending: stacked generalization meta-learner instead of single champion selection
+- DONE/PARTIAL: LightGBM, XGBoost, sklearn GBM, PatchTST, FinBERT/NLP feature groups, causal diagnostics, Ridge meta-ensemble, and shadow RL are present.
+- FUTURE: iTransformer, graph models, TabNet, richer LLM transcript/filing workflows, and live-authority deep RL remain open.
 
 ### Phase 3 (P1 — Months 6–9) — Scale
-- Data infrastructure: SQLite → TimescaleDB, add Kafka streaming, Feast feature store, Redis caching
+- Data infrastructure: continue Postgres/runtime-storage hardening; add Kafka streaming, Feast feature store, and Redis caching
 - Universe expansion: all US equities + global ETFs + full crypto + futures + FX, dynamic position limits
 - Additional alt data: satellite imagery, credit card proxies, web scraping, Form 4 insider, congressional STOCK Act
 
@@ -151,16 +144,15 @@ Comparison against Renaissance, Two Sigma, WorldQuant, Citadel, Jane Street, Man
 
 ## 6. Five Immediate Quick Wins
 
-Each is 1–2 weeks of focused work. Detailed, self-contained implementation prompts are in `docs/handoff/QUICK_WINS.md`.
+These were originally 1-2 week implementation prompts. They are now DONE in the current code and preserved in `docs/handoff/QUICK_WINS.md` as a historical prompt archive.
 
-1. **Harvey/Liu/Zhu t > 3.0 promotion threshold** — gate all new champions behind a t-statistic check with Deflated Sharpe Ratio and Benjamini-Hochberg FDR. Creates `engine/strategy/statistical_gates.py` and wires into `champion_manager.py`.
-2. **de Prado Combinatorial Purged Cross-Validation** — new `engine/strategy/cpcv.py` with purge/embargo, CPCV splits, PBO computation, wired into promotion guard.
-3. **tsfresh automated feature extraction** — 700+ auto-generated time-series features registered in `feature_registry.py` under a new `tsfresh.*` group.
-4. **LightGBM model family** — new `engine/strategy/gbm_regressor.py` mirroring the `embed_regressor.py` pattern, routed through `predictor.py`.
-5. **Stacked ensemble blending** — new `engine/strategy/ensemble_blender.py` with multiple blend modes (equal / inverse-variance / stacked / regime-conditional), opt-in via env flag.
+1. **DONE — Statistical promotion gates** — `engine/strategy/statistical_gates.py`, `engine/strategy/promotion_guard.py`, `engine/strategy/promotion_audit.py`
+2. **DONE — CPCV / PBO / gated promotion backtests** — `engine/strategy/cpcv.py`, `engine/strategy/gated_backtest.py`, `engine/strategy/jobs/backtest_cpcv.py`
+3. **DONE — tsfresh automated feature extraction** — `engine/strategy/tsfresh_features.py`, `engine/data/jobs/compute_tsfresh_snapshots.py`, `engine/strategy/feature_registry.py`
+4. **DONE — LightGBM/XGBoost/GBM/PatchTST families** — `engine/strategy/models/`, `engine/strategy/jobs/train_lgbm_models.py`, `engine/strategy/jobs/train_xgb_models.py`, `engine/strategy/jobs/train_patchtst_models.py`
+5. **DONE — Ridge meta-ensemble blending** — `engine/strategy/ensemble/ridge_meta.py`, `engine/strategy/jobs/train_ensemble_meta.py`
 
-**Recommended execution order:** 1 → 2 → 4 → 3 → 5
-(Gates first so we know what to trust → rigorous backtesting → new model family → more features → blend everything.)
+Historical execution order was 1 -> 2 -> 4 -> 3 -> 5.
 
 ---
 
@@ -168,6 +160,6 @@ Each is 1–2 weeks of focused work. Detailed, self-contained implementation pro
 
 If you're starting a fresh chat in the Claude app Project:
 1. This document is in the Project knowledge base — it loads automatically.
-2. The companion `QUICK_WINS.md` contains 5 ready-to-execute implementation prompts.
-3. For actual file edits and command execution, switch to Claude Code in VS Code at `C:\Users\dschi\Documents\GitHub\Trading-System-\`. The memory files there auto-load the same context.
+2. The companion `QUICK_WINS.md` is a historical prompt archive; its quick wins are marked DONE with module pointers.
+3. For actual file edits and command execution, work in the active Trading-System checkout. This verification pass used `/home/david/gitsandbox/system/system`.
 4. When designing new work, consult the roadmap and favor automated/self-evaluating approaches that fit the model-vs-runtime contract (models propose, runtime gates).

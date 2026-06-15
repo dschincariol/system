@@ -573,6 +573,16 @@ _SAFE_NO_CREDENTIAL_SERVICE_READY_GATES = {
     "pnl_calculation_valid",
 }
 
+_SAFE_NO_CREDENTIAL_SKIPPABLE_GATE_REASONS = {
+    "critical_features_valid": {"feature_validation_missing", "data_pipeline_gate_unreported"},
+    "model_inputs_valid": {"model_input_validation_missing", "data_pipeline_gate_unreported"},
+    "scoring_pipeline_operational": {"scoring_pipeline_unreported", "data_pipeline_gate_unreported"},
+    "execution_engine_initialized": {"execution_gate_unreported"},
+    "order_state_consistent": {"execution_gate_unreported"},
+    "position_state_consistent": {"execution_gate_unreported"},
+    "pnl_calculation_valid": {"execution_gate_unreported"},
+}
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(str(name), "")
@@ -595,10 +605,17 @@ def _safe_no_credential_readiness_mode() -> bool:
     return bool(_env_flag("DISABLE_LIVE_EXECUTION", True) and _env_flag("KILL_SWITCH_GLOBAL", True))
 
 
-def _mark_safe_no_credential_service_gate(gates: dict, name: str) -> None:
+def _mark_safe_no_credential_service_gate(gates: dict, name: str, *, force: bool = False) -> None:
     gate = gates.get(name)
     if not isinstance(gate, dict) or bool(gate.get("ok")):
         return
+    if not force:
+        allowed_reasons = set(_SAFE_NO_CREDENTIAL_SKIPPABLE_GATE_REASONS.get(str(name), set()))
+        reason = str(gate.get("reason") or gate.get("detail") or "").strip()
+        reason_codes = {str(code or "").strip() for code in list(gate.get("reason_codes") or [])}
+        reason_codes.discard("")
+        if reason not in allowed_reasons and not reason_codes.intersection(allowed_reasons):
+            return
     gate["ok"] = True
     gate["critical"] = False
     gate["safe_mode_skipped"] = True
@@ -1183,12 +1200,19 @@ def _build_production_validation(snapshot, *, ctx=None, runtime_watchdogs=None) 
         source="startup_validation",
     )
 
-    safe_no_credential_mode = _safe_no_credential_readiness_mode()
+    safe_no_credential_mode = bool(_safe_no_credential_readiness_mode())
     if safe_no_credential_mode:
         for gate_name in _SAFE_NO_CREDENTIAL_SERVICE_READY_GATES:
             _mark_safe_no_credential_service_gate(gates, gate_name)
-        if bool(ui_gate.get("ok")) and len(missing_ui_handlers) == 0:
-            _mark_safe_no_credential_service_gate(gates, "critical_ui_dependencies_available")
+        if bool(ui_gate.get("ok")) and (
+            len(bad_ui_endpoints) == 0
+            or (ctx is None and runtime_watchdogs is None and len(missing_ui_handlers) == 0)
+        ):
+            _mark_safe_no_credential_service_gate(
+                gates,
+                "critical_ui_dependencies_available",
+                force=ctx is None and runtime_watchdogs is None,
+            )
 
     critical_failures = [name for name in _PRODUCTION_GATE_ORDER if not bool((gates.get(name) or {}).get("ok")) and name in _PRODUCTION_CRITICAL_GATES]
     warning_failures = [name for name in _PRODUCTION_GATE_ORDER if not bool((gates.get(name) or {}).get("ok")) and name not in _PRODUCTION_CRITICAL_GATES]
@@ -1638,13 +1662,13 @@ def _build_lightweight_services_snapshot(health):
     if running_count <= 0:
         try:
             running_count = int(job_summary.get("running") or job_summary.get("running_count") or 0)
-        except Exception:
+        except (TypeError, ValueError):
             running_count = 0
     total_count = len(services)
     try:
         total_count = max(total_count, int(job_summary.get("total") or 0))
-    except Exception:
-        pass
+    except (TypeError, ValueError):
+        total_count = len(services)
 
     engine_running = running_count > 0
     summary_ok = job_summary.get("ok")
@@ -2098,9 +2122,6 @@ def _build_system_state_snapshot(_parsed, ctx=None):
     ts_ms = _ts_ms()
     timestamps = {"ts_ms": ts_ms, "snapshot_ts_ms": ts_ms}
 
-    jobs = []
-    job_errors = []
-
     try:
         health_raw = _cached_health_snapshot(allow_sync_on_miss=False)
     except Exception as e:
@@ -2109,6 +2130,21 @@ def _build_system_state_snapshot(_parsed, ctx=None):
 
     if not isinstance(health_raw, dict):
         health_raw = {"ok": False, "reasons": ["health_snapshot_invalid"]}
+
+    health_jobs = health_raw.get("jobs") if isinstance(health_raw.get("jobs"), dict) else {}
+    health_job_summary = health_raw.get("job_summary") if isinstance(health_raw.get("job_summary"), dict) else {}
+    if health_jobs or health_job_summary:
+        jobs = []
+        for name, row in dict(health_jobs or {}).items():
+            if not isinstance(row, dict):
+                continue
+            job_row = dict(row)
+            job_row.setdefault("name", str(name))
+            job_row.setdefault("job", str(name))
+            jobs.append(job_row)
+        job_errors = []
+    else:
+        jobs, job_errors = _get_jobs_payload(ctx)
 
     kill_switches = dict((health_raw or {}).get("kill_switches") or {})
     kill_switch_errors = []
@@ -2338,6 +2374,19 @@ def _recent_runtime_errors(limit: int = 10):
     rows_out = []
     con = None
     try:
+        for row in fetch_recent_runtime_failure_events(limit=int(limit)):
+            payload = dict(row.get("payload") or {})
+            rows_out.append({
+                "ts_ms": int(row.get("ts_ms") or 0),
+                "severity": "ERROR",
+                "code": str(payload.get("root_cause_code") or ""),
+                "title": str(payload.get("failure_scope") or row.get("event_source") or ""),
+                "message": str(payload.get("error_message") or ""),
+                "detail": str(payload.get("error_type") or ""),
+            })
+    except Exception as e:
+        _warn("api_system.recent_runtime_errors.event_log_query", e, limit=int(limit))
+    try:
         con = connect_ro_direct(timeout_s=0.25, busy_timeout_ms=250)
         alert_columns = set()
         try:
@@ -2382,26 +2431,6 @@ def _recent_runtime_errors(limit: int = 10):
                 limit=int(limit),
             )
 
-        if not rows_out:
-            rows = con.execute(
-                """
-                SELECT ts_ms, job_name, event, detail, exit_code
-                FROM job_history
-                WHERE event IN ('exit', 'start_failed', 'stop_hard_kill', 'autorestart_failed', 'autorestart_stall_detected')
-                ORDER BY ts_ms DESC
-                LIMIT ?
-                """,
-                (int(limit),),
-            ).fetchall() or []
-            for row in rows:
-                rows_out.append({
-                    "ts_ms": int(row[0] or 0),
-                    "severity": "WARN",
-                    "code": str(row[2] or ""),
-                    "title": str(row[1] or ""),
-                    "message": str(row[3] or ""),
-                    "detail": (None if row[4] is None else str(row[4])),
-                })
         try:
             seen = {
                 (
@@ -2412,25 +2441,35 @@ def _recent_runtime_errors(limit: int = 10):
                 for item in rows_out
                 if isinstance(item, dict)
             }
-            for row in fetch_recent_runtime_failure_events(limit=int(limit)):
-                payload = dict(row.get("payload") or {})
-                item = {
-                    "ts_ms": int(row.get("ts_ms") or 0),
-                    "severity": "ERROR",
-                    "code": str(payload.get("root_cause_code") or ""),
-                    "title": str(payload.get("failure_scope") or row.get("event_source") or ""),
-                    "message": str(payload.get("error_message") or ""),
-                    "detail": str(payload.get("error_type") or ""),
-                }
-                dedupe_key = (item["ts_ms"], item["code"], item["message"])
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                rows_out.append(item)
+            if not rows_out:
+                rows = con.execute(
+                    """
+                    SELECT ts_ms, job_name, event, detail, exit_code
+                    FROM job_history
+                    WHERE event IN ('exit', 'start_failed', 'stop_hard_kill', 'autorestart_failed', 'autorestart_stall_detected')
+                    ORDER BY ts_ms DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall() or []
+                for row in rows:
+                    item = {
+                        "ts_ms": int(row[0] or 0),
+                        "severity": "WARN",
+                        "code": str(row[2] or ""),
+                        "title": str(row[1] or ""),
+                        "message": str(row[3] or ""),
+                        "detail": (None if row[4] is None else str(row[4])),
+                    }
+                    dedupe_key = (item["ts_ms"], item["code"], item["message"])
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    rows_out.append(item)
             rows_out.sort(key=lambda item: int((item or {}).get("ts_ms") or 0), reverse=True)
             rows_out = rows_out[: int(limit)]
         except Exception as e:
-            _warn("api_system.recent_runtime_errors.event_log_query", e, limit=int(limit))
+            _warn("api_system.recent_runtime_errors.job_history_query", e, limit=int(limit))
         return rows_out
     except Exception as e:
         _warn("api_system.recent_runtime_errors.fetch", e, limit=int(limit))

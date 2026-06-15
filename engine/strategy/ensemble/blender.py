@@ -11,12 +11,27 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect
 
 
 ENSEMBLE_WEIGHTS_TABLE = "ensemble_weights"
 ELIGIBLE_STAGES = {"champion", "challenger"}
 LOG = logging.getLogger(__name__)
+
+
+def _warn_nonfatal(code: str, error: BaseException | None = None, **extra: Any) -> None:
+    log_failure(
+        LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error or code),
+        error=error,
+        level=logging.WARNING,
+        component="engine.strategy.ensemble.blender",
+        extra=extra or None,
+        persist=False,
+    )
 
 
 def ensemble_mode() -> str:
@@ -33,10 +48,9 @@ def _own_connection(con):
 
 
 def _commit_if_possible(con) -> None:
-    try:
-        con.commit()
-    except Exception:
-        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+    commit = getattr(con, "commit", None)
+    if callable(commit):
+        commit()
 
 
 def ensure_schema(con=None) -> None:
@@ -231,7 +245,13 @@ def _family_from_model_name(model_name: str) -> str:
 def _safe_stage_rows(con, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
     try:
         return _rows_to_dicts(con.execute(sql, params))
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "ENSEMBLE_STAGE_ROWS_QUERY_FAILED",
+            e,
+            sql=str(sql),
+            params=repr(params),
+        )
         return []
 
 
@@ -344,7 +364,8 @@ def _parse_component_result(family: str, value: Any) -> dict[str, Any] | None:
 def _safe_finite_float(value: Any) -> float | None:
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError):
+        LOG.debug("ensemble_float_parse_failed value=%r", value, exc_info=True)
         return None
     return float(out) if math.isfinite(out) else None
 
@@ -479,12 +500,13 @@ class EnsembleBlender:
         diagnostics["fallback_cascade_depth"] = int(depth)
         reason = str(diagnostics.get("fallback_reason") or "")
         if depth >= 1:
-            LOG.warning(
-                "ensemble_fallback_depth symbol=%s horizon=%s depth=%s reason=%s",
-                str(symbol),
-                int(horizon),
-                int(depth),
-                reason,
+            _warn_nonfatal(
+                "ENSEMBLE_FALLBACK_DEPTH",
+                None,
+                symbol=str(symbol),
+                horizon=int(horizon),
+                depth=int(depth),
+                reason=reason,
             )
         if depth >= 2:
             LOG.error(
@@ -585,7 +607,14 @@ class EnsembleBlender:
         for family in sorted(eligible_weights):
             try:
                 parsed = _parse_component_result(str(family), predict_family(str(family)))
-            except Exception:
+            except Exception as e:
+                _warn_nonfatal(
+                    "ENSEMBLE_COMPONENT_PREDICTION_FAILED",
+                    e,
+                    family=str(family),
+                    symbol=str(symbol),
+                    horizon=int(horizon),
+                )
                 parsed = None
             if parsed is None:
                 missing.append(str(family))

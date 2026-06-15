@@ -36,6 +36,7 @@ from engine.strategy.model_lifecycle import (
     record_version_performance,
     register_model_version,
     retire_underperforming_versions,
+    update_model_version_status,
     version_from_ts,
 )
 from engine.strategy.embed_regressor import load_feature_schema
@@ -525,6 +526,7 @@ def main() -> int:
         for model_cfg in model_configs:
             variant_name = str(model_cfg.get("model_name") or MODEL_NAME).strip() or MODEL_NAME
             variant_stage = "shadow" if _variant_requires_shadow_only(model_cfg) else "challenger"
+            registry_stage = "shadow" if str(variant_stage) == "shadow" else "challenger"
             mutation_kind = _variant_mutation_kind(model_cfg)
             env_overrides = {
                 MODEL_INSTANCE_CONFIG_JSON_ENV: json.dumps(model_cfg, separators=(",", ":"), sort_keys=True),
@@ -586,7 +588,7 @@ def main() -> int:
                 model_version=str(model_version),
                 model_kind=str(kind),
                 mutation_kind=str(mutation_kind),
-                stage=str(variant_stage),
+                stage=str(registry_stage),
                 status="validated",
                 live_ready=False,
                 training_job_name=JOB_NAME,
@@ -622,7 +624,7 @@ def main() -> int:
                 model_name=variant_name,
                 model_kind=kind,
                 model_ts_ms=int(snap),
-                stage=str(variant_stage),
+                stage=str(registry_stage),
                 metrics=metrics,
                 note="pipeline_train_and_eval:auto_config",
             )
@@ -677,6 +679,7 @@ def main() -> int:
 
             prev_kind = champion.get("model_kind") if champion else None
             prev_ts = champion.get("model_ts_ms") if champion else None
+            promoted_regimes: List[str] = []
 
             for regime in ACTIVE_REGIMES:
                 now_s = time.time()
@@ -714,7 +717,7 @@ def main() -> int:
                     print(f"[PROMOTE] model={variant_name} skip regime={regime} n_reg={n_reg} < min_reg={min_reg}")
                     continue
 
-                promote_with_snapshot_and_db_watch(
+                promoted = promote_with_snapshot_and_db_watch(
                     variant_name,
                     kind,
                     int(snap),
@@ -723,26 +726,67 @@ def main() -> int:
                     extra_reason={"compare": cmp_reason, "guard": guard_reason, "metrics": metrics},
                 )
 
-                print(f"[PROMOTE] model={variant_name} promoted challenger -> champion key={regime}")
+                if promoted:
+                    promoted_regimes.append(str(regime))
+                    print(f"[PROMOTE] model={variant_name} promoted challenger -> champion key={regime}")
+                else:
+                    print(f"[BLOCKED] model={variant_name} registry promotion failed key={regime}")
 
-            mark_version_live(
-                variant_name,
-                str(model_version),
-                stage="champion",
-                meta_patch={"promoted_ts_ms": int(time.time() * 1000), "model_id": str(metrics.get("model_id") or variant_name)},
-            )
-            retire_underperforming_versions(variant_name, protect_versions=[str(model_version)])
-            audit(
-                actor="auto",
-                action="promote",
-                model_name=variant_name,
-                from_kind=prev_kind,
-                from_ts_ms=prev_ts,
-                to_kind=kind,
-                to_ts_ms=int(snap),
-                reason={"compare": cmp_reason, "guard": guard_reason, "metrics": metrics},
-            )
-            print(f"[PROMOTE] model={variant_name} champion <- {kind} @ {int(snap)}")
+            if promoted_regimes:
+                mark_version_live(
+                    variant_name,
+                    str(model_version),
+                    stage="champion",
+                    meta_patch={
+                        "promoted_ts_ms": int(time.time() * 1000),
+                        "model_id": str(metrics.get("model_id") or variant_name),
+                        "promoted_regimes": list(promoted_regimes),
+                    },
+                )
+                retire_underperforming_versions(variant_name, protect_versions=[str(model_version)])
+                audit(
+                    actor="auto",
+                    action="promote",
+                    model_name=variant_name,
+                    from_kind=prev_kind,
+                    from_ts_ms=prev_ts,
+                    to_kind=kind,
+                    to_ts_ms=int(snap),
+                    reason={
+                        "compare": cmp_reason,
+                        "guard": guard_reason,
+                        "metrics": metrics,
+                        "promoted_regimes": list(promoted_regimes),
+                    },
+                )
+                print(f"[PROMOTE] model={variant_name} champion <- {kind} @ {int(snap)}")
+            else:
+                update_model_version_status(
+                    variant_name,
+                    str(model_version),
+                    stage="challenger",
+                    status="candidate",
+                    live_ready=False,
+                    meta_patch={
+                        "promotion_deferred_ts_ms": int(time.time() * 1000),
+                        "model_id": str(metrics.get("model_id") or variant_name),
+                        "deferred_reason": "registry_promotion_not_completed",
+                    },
+                )
+                audit(
+                    actor="auto",
+                    action="block",
+                    model_name=variant_name,
+                    to_kind=kind,
+                    to_ts_ms=int(snap),
+                    reason={
+                        "error": "registry_promotion_not_completed",
+                        "compare": cmp_reason,
+                        "guard": guard_reason,
+                        "metrics": metrics,
+                    },
+                )
+                print(f"[BLOCKED] model={variant_name} version remains challenger; no registry promotion completed")
             trained_variants += 1
 
         # 1.5) Evaluate temporal shadow models (A.7)

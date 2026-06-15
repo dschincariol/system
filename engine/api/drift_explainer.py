@@ -3,16 +3,39 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
 from typing import Any
 
+from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.logging import get_logger
 from engine.runtime.storage import connect_ro_direct
 
 
 DEFAULT_TOP_N = 8
 DEFAULT_STALE_AFTER_MS = int(os.environ.get("DRIFT_EXPLAINER_STALE_AFTER_MS", str(6 * 60 * 60 * 1000)))
+LOG = get_logger("engine.api.drift_explainer")
+_WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
+    if once_key and once_key in _WARNED_NONFATAL_KEYS:
+        return
+    log_failure(
+        LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error),
+        error=error,
+        level=logging.WARNING,
+        component="engine.api.drift_explainer",
+        extra=extra or None,
+        persist=False,
+    )
+    if once_key:
+        _WARNED_NONFATAL_KEYS.add(once_key)
 
 
 def _now_ms() -> int:
@@ -829,5 +852,5 @@ def build_drift_explainer_snapshot(
         if owns:
             try:
                 con.close()
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_nonfatal("DRIFT_EXPLAINER_CLOSE_FAILED", e, once_key="close_failed")

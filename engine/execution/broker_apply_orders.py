@@ -64,6 +64,21 @@ from engine.execution.order_command_boundary import (
     record_order_event as record_execution_event,
 )
 
+_IMPORT_LOG = logging.getLogger("execution.broker_apply_orders")
+
+
+def _import_nonfatal(code: str, error: BaseException) -> None:
+    log_failure(
+        _IMPORT_LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error),
+        error=error,
+        level=logging.WARNING,
+        component="engine.execution.broker_apply_orders",
+        persist=False,
+    )
+
 
 def _execution_gate_snapshot() -> Dict[str, Any]:
     return execution_gate_snapshot(get_execution_mode_fn=get_execution_mode)
@@ -71,7 +86,8 @@ def _execution_gate_snapshot() -> Dict[str, Any]:
 # Newer path (preferred)
 try:
     from engine.strategy.portfolio_execution_intents import load_latest_execution_intents  # type: ignore
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_APPLY_ORDERS_PORTFOLIO_EXECUTION_INTENTS_IMPORT_FAILED", e)
     load_latest_execution_intents = None  # type: ignore
 
 # EPE import
@@ -82,13 +98,15 @@ except Exception as e:
 
 try:
     from engine.execution.execution_ai_advisor import persist_execution_advisories  # type: ignore
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_APPLY_ORDERS_EXECUTION_AI_ADVISOR_IMPORT_FAILED", e)
     persist_execution_advisories = None  # type: ignore
 
 # Optional dual execution (IBKR)
 try:
     from engine.execution.dual_execution import apply_portfolio_orders_dual_ibkr  # type: ignore
-except Exception:
+except Exception as e:
+    _import_nonfatal("BROKER_APPLY_ORDERS_DUAL_EXECUTION_IMPORT_FAILED", e)
     apply_portfolio_orders_dual_ibkr = None  # type: ignore
 
 
@@ -224,8 +242,15 @@ def _print(out: Dict[str, Any]) -> None:
     try:
         sys.stdout.write(json.dumps(out, separators=(",", ":"), sort_keys=True) + "\n")
         sys.stdout.flush()
-    except Exception:
-        print(out)
+    # system-audit: ignore[silent_except] stdout status emission is
+    # best-effort and must not change already-applied order side effects.
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_APPLY_ORDERS_STDOUT_WRITE_FAILED",
+            e,
+            once_key="stdout_write",
+            payload_preview=str(out)[:500],
+        )
 
 
 def _summarize_order_lineage(orders: Optional[List[dict]]) -> Dict[str, Any]:

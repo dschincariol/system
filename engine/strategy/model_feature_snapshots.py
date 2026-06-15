@@ -23,17 +23,42 @@ from engine.data.finbert_sentiment import (
     USE_FINBERT_SENTIMENT,
     resolve_finbert_sentiment_snapshot,
 )
+from engine.data.sec.form4_classifier import (
+    OPPORTUNISTIC,
+    availability_ts_ms as _insider_availability_ts_ms,
+    classify_insider_trade,
+    insider_key as _insider_key,
+    role_buy_weight as _insider_role_buy_weight,
+    transaction_value as _insider_transaction_value,
+)
+from engine.data.finra_short import (
+    asof_date as _finra_asof_date,
+    parse_date as _parse_finra_date,
+    short_interest_surprise as _short_interest_surprise,
+    short_volume_ratio_z as _short_volume_ratio_z,
+)
+from engine.data.crypto_positioning import compute_positioning_features as _compute_crypto_positioning_features
 from engine.data.weather_features import get_weather_feature_snapshot
 from engine.data.weather_mapping import load_weather_region_map, symbol_regions
 from engine.data.asset_map import asset_class_for_symbol
 from engine.runtime.storage import connect, get_timescale_client, register_after_commit
 from engine.strategy.feature_registry import (
+    BOCPD_FEATURE_IDS,
     CONGRESSIONAL_FEATURE_IDS,
+    COT_FEATURE_IDS,
+    CRYPTO_POSITIONING_FEATURE_IDS,
     EVENT_FEATURE_IDS,
+    ETF_FLOW_FEATURE_IDS,
+    FUNDAMENTALS_PIT_FEATURE_IDS,
+    GOV_FEATURE_IDS,
+    INST_13F_FEATURE_IDS,
     INSIDER_FEATURE_IDS,
     MACRO_FEATURE_IDS as _BASE_MACRO_FEATURE_IDS,
+    NEWS_FLOW_FEATURE_IDS,
     OPTIONS_FEATURE_IDS,
     PRICE_FEATURE_IDS,
+    SHORT_FEATURE_IDS,
+    TECH_FEATURE_IDS,
     UNIFIED_MACRO_FEATURE_IDS as MACRO_FEATURE_IDS,
     UNIFIED_SOCIAL_FEATURE_IDS as SOCIAL_FEATURE_IDS,
     UNIFIED_SYMBOL_FEATURE_IDS,
@@ -49,8 +74,12 @@ DEFAULT_EVENT_LOOKBACK_HOURS = max(6, int(os.environ.get("MODEL_FEATURE_EVENT_LO
 DEFAULT_OPTIONS_BUCKET_SEC = max(60, int(os.environ.get("OPTIONS_INTRADAY_BUCKET_SEC", "900")))
 DEFAULT_SOCIAL_BUCKET_SEC = max(60, int(os.environ.get("SOCIAL_DEFAULT_BUCKET_SEC", "300")))
 DEFAULT_SNAPSHOT_BUCKET_SEC = max(60, int(os.environ.get("MODEL_FEATURE_SNAPSHOT_BUCKET_SEC", "300")))
-DEFAULT_INSIDER_LOOKBACK_DAYS = max(30, int(CONFIG_FORM4_BACKFILL_DAYS))
+DEFAULT_INSIDER_LOOKBACK_DAYS = max(4 * 366, int(CONFIG_FORM4_BACKFILL_DAYS))
 DEFAULT_CONGRESSIONAL_LOOKBACK_DAYS = max(30, int(CONFIG_CONGRESSIONAL_BACKFILL_DAYS))
+DEFAULT_SHORT_VOLUME_LOOKBACK_DAYS = max(45, int(os.environ.get("FINRA_SHORT_VOLUME_FEATURE_LOOKBACK_DAYS", "45")))
+DEFAULT_SHORT_INTEREST_LOOKBACK_READINGS = max(6, int(os.environ.get("FINRA_SHORT_INTEREST_FEATURE_LOOKBACK_READINGS", "24")))
+DEFAULT_SHORT_SI_EWMA_ALPHA = float(os.environ.get("SHORT_SI_EWMA_ALPHA", "0.5"))
+DEFAULT_CRYPTO_POSITIONING_LOOKBACK_DAYS = max(30, int(os.environ.get("CRYPTO_POSITIONING_FEATURE_LOOKBACK_DAYS", "30")))
 DEFAULT_WEATHER_PROVIDER = str(os.environ.get("WEATHER_PROVIDER", "open_meteo")).strip().lower()
 DEFAULT_WEATHER_ALERTS_PROVIDER = str(os.environ.get("WEATHER_ALERTS_PROVIDER", "nws")).strip().lower()
 FINBERT_FEATURE_IDS = list(_FINBERT_FEATURE_IDS) if USE_FINBERT_SENTIMENT else []
@@ -205,7 +234,23 @@ def summarize_model_feature_snapshots(
     *,
     max_examples: int = 8,
 ) -> Dict[str, Any]:
-    groups = ("price", "events", "macro", "options", "social", "weather")
+    groups = (
+        "price",
+        "events",
+        "macro",
+        "options",
+        "insider",
+        "short",
+        "crypto_positioning",
+        "news_flow",
+        "etf_flow",
+        "cot",
+        "inst_13f",
+        "gov",
+        "fundamentals",
+        "social",
+        "weather",
+    )
     availability_counts = {group: 0 for group in groups}
     violations: List[Dict[str, Any]] = []
     lookahead_violations = 0
@@ -228,6 +273,34 @@ def summarize_model_feature_snapshots(
             "macro.effective_ts_ms": ((source_timestamps.get("macro") or {}).get("effective_ts_ms")),
             "options.bucket_ts_ms": ((source_timestamps.get("options") or {}).get("bucket_ts_ms")),
             "options.snapshot_ts_ms": ((source_timestamps.get("options") or {}).get("snapshot_ts_ms")),
+            "insider.latest_availability_ts_ms": ((source_timestamps.get("insider") or {}).get("latest_availability_ts_ms")),
+            "short.latest_short_volume_availability_ts_ms": (
+                (source_timestamps.get("short") or {}).get("latest_short_volume_availability_ts_ms")
+            ),
+            "short.latest_short_interest_availability_ts_ms": (
+                (source_timestamps.get("short") or {}).get("latest_short_interest_availability_ts_ms")
+            ),
+            "crypto_positioning.latest_availability_ts_ms": (
+                (source_timestamps.get("crypto_positioning") or {}).get("latest_availability_ts_ms")
+            ),
+            "news_flow.latest_availability_ts_ms": (
+                (source_timestamps.get("news_flow") or {}).get("latest_availability_ts_ms")
+            ),
+            "etf_flow.latest_availability_ts_ms": (
+                (source_timestamps.get("etf_flow") or {}).get("latest_availability_ts_ms")
+            ),
+            "cot.latest_availability_ts_ms": (
+                (source_timestamps.get("cot") or {}).get("latest_availability_ts_ms")
+            ),
+            "inst_13f.latest_availability_ts_ms": (
+                (source_timestamps.get("inst_13f") or {}).get("latest_availability_ts_ms")
+            ),
+            "gov.latest_availability_ts_ms": (
+                (source_timestamps.get("gov") or {}).get("latest_availability_ts_ms")
+            ),
+            "fundamentals.latest_publish_ts_ms": (
+                (source_timestamps.get("fundamentals") or {}).get("latest_publish_ts_ms")
+            ),
             "social.bucket_ts_ms": ((source_timestamps.get("social") or {}).get("bucket_ts_ms")),
             "sentiment.ts_ms": ((source_timestamps.get("sentiment") or {}).get("ts_ms")),
             "weather.forecast_run_ts_ms": ((source_timestamps.get("weather") or {}).get("forecast_run_ts_ms")),
@@ -641,6 +714,38 @@ def _load_price_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
     return features, source_meta, available
 
 
+def _load_tech_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in TECH_FEATURE_IDS}
+    source_meta: Dict[str, Any] = {
+        "har_forecast_ts_ms": None,
+        "har_forecast_asof_ts_ms": None,
+        "har_forecast_source": None,
+    }
+    try:
+        from engine.strategy.har_rv import latest_har_forecast
+
+        row = latest_har_forecast(con, str(symbol), ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_tech_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_TECH_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_tech_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        row = None
+    if not row:
+        return features, source_meta, False
+
+    features["tech.har_rv_forecast_1d"] = float(_safe_float(row.get("forecast_vol_1d"), 0.0))
+    features["tech.har_rv_forecast_ratio"] = float(_safe_float(row.get("forecast_ratio"), 0.0))
+    source_meta["har_forecast_ts_ms"] = int(row.get("ts_ms") or 0)
+    source_meta["har_forecast_asof_ts_ms"] = row.get("asof_ts_ms")
+    source_meta["har_forecast_source"] = str(row.get("source") or "")
+    return features, source_meta, True
+
+
 def _load_event_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
     features = {fid: 0.0 for fid in EVENT_FEATURE_IDS}
     cutoff_24h = int(ts_ms) - int(DEFAULT_EVENT_LOOKBACK_HOURS) * 3600 * 1000
@@ -650,8 +755,8 @@ def _load_event_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
           e.ts_ms,
           e.importance_score,
           n.sentiment_score,
-          n.novelty_score,
-          n.is_duplicate
+          COALESCE(n.embedding_novelty_score, n.novelty_score),
+          COALESCE(n.stale_flag, n.is_duplicate)
         FROM events e
         LEFT JOIN news_event_features n
           ON n.event_id = e.id
@@ -668,8 +773,8 @@ def _load_event_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
 
     count_1h = 0
     count_6h = 0
-    sentiments_now: List[float] = []
-    sentiments_prev: List[float] = []
+    sentiments_now: List[Tuple[float, float]] = []
+    sentiments_prev: List[Tuple[float, float]] = []
     novelty_6h: List[float] = []
     dupes_6h = 0
     importance_24h: List[float] = []
@@ -686,20 +791,30 @@ def _load_event_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
         if age_ms <= 6 * 3600_000:
             count_6h += 1
             velocity_6h += math.exp(-age_h)
-            novelty_6h.append(_safe_float(novelty_score, 0.0))
+            novelty_value = _safe_float(novelty_score, 0.0)
+            novelty_6h.append(novelty_value)
             dupes_6h += 1 if _safe_int(is_duplicate, 0) else 0
+            weight = max(0.05, min(1.0, novelty_value))
             if age_ms <= 3 * 3600_000:
-                sentiments_now.append(_safe_float(sentiment_score, 0.0))
+                sentiments_now.append((_safe_float(sentiment_score, 0.0), weight))
             else:
-                sentiments_prev.append(_safe_float(sentiment_score, 0.0))
+                sentiments_prev.append((_safe_float(sentiment_score, 0.0), weight))
 
     features["events.count_1h"] = float(count_1h)
     features["events.count_6h"] = float(count_6h)
     features["events.count_24h"] = float(len(rows))
     features["events.velocity_6h"] = float(velocity_6h)
     features["events.sentiment_trend_6h"] = float(
-        (sum(sentiments_now) / len(sentiments_now) if sentiments_now else 0.0)
-        - (sum(sentiments_prev) / len(sentiments_prev) if sentiments_prev else 0.0)
+        (
+            sum(value * weight for value, weight in sentiments_now) / max(1e-9, sum(weight for _value, weight in sentiments_now))
+            if sentiments_now
+            else 0.0
+        )
+        - (
+            sum(value * weight for value, weight in sentiments_prev) / max(1e-9, sum(weight for _value, weight in sentiments_prev))
+            if sentiments_prev
+            else 0.0
+        )
     )
     features["events.avg_novelty_6h"] = float(sum(novelty_6h) / len(novelty_6h)) if novelty_6h else 0.0
     features["events.duplicate_share_6h"] = float(dupes_6h / max(1, count_6h)) if count_6h > 0 else 0.0
@@ -710,30 +825,115 @@ def _load_event_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
     return features, {"latest_event_ts_ms": int(latest_event_ts_ms), "window_start_ts_ms": int(cutoff_24h)}, True
 
 
+def _storage_row_dict(row: Any) -> Dict[str, Any]:
+    if hasattr(row, "keys"):
+        return {str(key): row[key] for key in row.keys()}
+    return {}
+
+
+def _insider_direction(row: Dict[str, Any]) -> str:
+    code = str(row.get("transaction_code") or "").strip().upper()
+    if code == "P":
+        return "buy"
+    if code == "S":
+        return "sell"
+    return str(row.get("direction") or "").strip().lower()
+
+
+def _adv_dollar_volume(con, *, symbol: str, ts_ms: int) -> float:
+    window_start = int(ts_ms) - int(30 * 24 * 3600 * 1000)
+    try:
+        rows = con.execute(
+            """
+            SELECT last, volume
+            FROM price_quotes
+            WHERE symbol = ?
+              AND ts_ms <= ?
+              AND ts_ms >= ?
+              AND last IS NOT NULL
+              AND volume IS NOT NULL
+            ORDER BY ts_ms DESC
+            LIMIT 390
+            """,
+            (str(symbol), int(ts_ms), int(window_start)),
+        ).fetchall()
+    except Exception:
+        rows = []
+    values = [
+        float(_safe_float(row[0], 0.0) * _safe_float(row[1], 0.0))
+        for row in rows or []
+        if _safe_float(row[0], 0.0) > 0.0 and _safe_float(row[1], 0.0) > 0.0
+    ]
+    if not values:
+        return 1.0
+    return float(max(1.0, sum(values) / max(1, len(values))))
+
+
+def _insider_opp_sell_z(classified_rows: Sequence[Tuple[Dict[str, Any], str]], *, ts_ms: int, window_start: int) -> float:
+    history_start = int(ts_ms) - int(390 * 24 * 3600 * 1000)
+    current_sell_value = 0.0
+    daily_history: Dict[int, float] = {}
+    for row, label in classified_rows:
+        if label != OPPORTUNISTIC or _insider_direction(row) != "sell":
+            continue
+        avail = int(_insider_availability_ts_ms(row) or 0)
+        if avail <= 0 or avail > int(ts_ms):
+            continue
+        value = float(_insider_transaction_value(row))
+        if value <= 0.0:
+            continue
+        if avail >= int(window_start):
+            current_sell_value += float(value)
+        elif avail >= int(history_start):
+            bucket = int(avail // 86_400_000)
+            daily_history[bucket] = float(daily_history.get(bucket, 0.0) + value)
+    values = list(daily_history.values())
+    if len(values) < 2:
+        return 0.0
+    mean = float(sum(values) / len(values))
+    variance = float(sum((value - mean) ** 2 for value in values) / max(1, len(values) - 1))
+    std = math.sqrt(max(0.0, variance))
+    if std <= 1e-9:
+        return 0.0
+    return float(max(-10.0, min(10.0, (current_sell_value - mean) / std)))
+
+
 def _load_insider_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
     features = {fid: 0.0 for fid in INSIDER_FEATURE_IDS}
     if not INSIDER_FEATURE_IDS:
-        return features, {"latest_transaction_ts_ms": None, "window_start_ts_ms": None}, False
+        return features, {"latest_availability_ts_ms": None, "window_start_ts_ms": None}, False
 
-    window_90d_start = int(ts_ms) - int(90 * 24 * 3600 * 1000)
     window_30d_start = int(ts_ms) - int(30 * 24 * 3600 * 1000)
-    query_start = min(int(window_90d_start), int(ts_ms) - int(DEFAULT_INSIDER_LOOKBACK_DAYS * 24 * 3600 * 1000))
+    window_5d_start = int(ts_ms) - int(5 * 24 * 3600 * 1000)
+    query_start = int(ts_ms) - int(DEFAULT_INSIDER_LOOKBACK_DAYS * 24 * 3600 * 1000)
     try:
         rows = con.execute(
             """
             SELECT
-              COALESCE(transaction_ts_ms, filing_ts_ms, ingested_ts_ms) AS event_ts_ms,
+              id,
+              source_transaction_id,
+              COALESCE(availability_ts_ms, filing_ts_ms, ingested_ts_ms, created_ts_ms) AS availability_ts_ms,
+              transaction_ts_ms,
+              transaction_date,
               direction,
+              transaction_code,
+              transaction_type,
+              security_type,
               value,
               shares,
               price,
               insider_cik,
-              insider_name
+              insider_name,
+              insider_role,
+              insider_title,
+              is_10b5_1_plan,
+              payload_json,
+              diagnostics_json
             FROM insider_transactions
             WHERE symbol = ?
-              AND COALESCE(transaction_ts_ms, filing_ts_ms, ingested_ts_ms) <= ?
-              AND COALESCE(transaction_ts_ms, filing_ts_ms, ingested_ts_ms) >= ?
-            ORDER BY COALESCE(transaction_ts_ms, filing_ts_ms, ingested_ts_ms) DESC, id DESC
+              AND COALESCE(availability_ts_ms, filing_ts_ms, ingested_ts_ms, created_ts_ms, 0) <= ?
+              AND COALESCE(availability_ts_ms, filing_ts_ms, ingested_ts_ms, created_ts_ms, 0) >= ?
+            ORDER BY COALESCE(availability_ts_ms, filing_ts_ms, ingested_ts_ms, created_ts_ms, 0) ASC, id ASC
             """,
             (str(symbol), int(ts_ms), int(query_start)),
         ).fetchall()
@@ -741,43 +941,397 @@ def _load_insider_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, floa
         rows = []
 
     if not rows:
-        return features, {"latest_transaction_ts_ms": None, "window_start_ts_ms": int(query_start)}, False
+        return features, {"latest_availability_ts_ms": None, "window_start_ts_ms": int(query_start)}, False
 
-    buy_count_30d = 0
-    sell_count_30d = 0
+    row_dicts = [_storage_row_dict(row) for row in rows or []]
+    row_dicts = [row for row in row_dicts if row]
+    classified_rows: List[Tuple[Dict[str, Any], str]] = [
+        (row, classify_insider_trade(row, row_dicts, asof_ts_ms=int(ts_ms)))
+        for row in row_dicts
+    ]
+
     net_value_30d = 0.0
-    unique_insiders_90d: set[str] = set()
-    latest_transaction_ts_ms = _safe_int(rows[0][0], 0)
+    buy_count_30d = 0
+    cluster_buyers_5d: set[str] = set()
+    officer_buy_weight = 0.0
+    latest_availability = max([int(_insider_availability_ts_ms(row) or 0) for row in row_dicts] or [0])
+    adv_dollars = _adv_dollar_volume(con, symbol=str(symbol), ts_ms=int(ts_ms))
 
-    for event_ts_ms, direction, value, shares, price, insider_cik, insider_name in rows or []:
-        event_ts_ms = _safe_int(event_ts_ms, 0)
-        if event_ts_ms <= 0:
+    for row, label in classified_rows:
+        if label != OPPORTUNISTIC:
             continue
-        direction_key = str(direction or "").strip().lower()
-        value_num = _safe_float(value, 0.0)
-        if value_num <= 0.0:
-            shares_num = _safe_float(shares, 0.0)
-            price_num = _safe_float(price, 0.0)
-            if shares_num > 0.0 and price_num > 0.0:
-                value_num = float(shares_num * price_num)
-
-        insider_key = str(insider_cik or insider_name or "").strip().upper()
-        if event_ts_ms >= int(window_90d_start) and insider_key:
-            unique_insiders_90d.add(insider_key)
-        if event_ts_ms < int(window_30d_start):
+        avail = int(_insider_availability_ts_ms(row) or 0)
+        if avail <= 0 or avail > int(ts_ms) or avail < int(window_30d_start):
             continue
+        direction_key = _insider_direction(row)
+        value_num = float(_insider_transaction_value(row))
         if direction_key == "buy":
             buy_count_30d += 1
             net_value_30d += float(value_num)
+            officer_buy_weight = max(float(officer_buy_weight), float(_insider_role_buy_weight(row)))
+            if avail >= int(window_5d_start):
+                key = _insider_key(row)
+                if key:
+                    cluster_buyers_5d.add(key)
         elif direction_key == "sell":
-            sell_count_30d += 1
             net_value_30d -= float(value_num)
 
-    features["insider.buy_count_30d"] = float(buy_count_30d)
-    features["insider.sell_count_30d"] = float(sell_count_30d)
-    features["insider.net_value_30d"] = float(net_value_30d)
-    features["insider.unique_insiders_90d"] = float(len(unique_insiders_90d))
-    return features, {"latest_transaction_ts_ms": int(latest_transaction_ts_ms), "window_start_ts_ms": int(query_start)}, True
+    features["insider_opp_net_buy_30d"] = float(net_value_30d / max(1.0, adv_dollars))
+    features["insider_opp_buy_count_30d"] = float(buy_count_30d)
+    features["insider_cluster_buy_5d"] = float(len(cluster_buyers_5d))
+    features["insider_officer_buy_flag"] = float(officer_buy_weight)
+    features["insider_opp_sell_z"] = float(
+        _insider_opp_sell_z(classified_rows, ts_ms=int(ts_ms), window_start=int(window_30d_start))
+    )
+    return (
+        features,
+        {
+            "latest_availability_ts_ms": int(latest_availability) if latest_availability > 0 else None,
+            "window_start_ts_ms": int(query_start),
+            "normalizer": "adv_dollar_volume_30d",
+            "normalizer_value": float(adv_dollars),
+        },
+        True,
+    )
+
+
+def _earnings_window_proximity(con, *, symbol: str, ts_ms: int) -> float:
+    anchor_day = _finra_asof_date(int(ts_ms))
+    try:
+        rows = con.execute(
+            """
+            SELECT earnings_date, updated_ts_ms
+            FROM earnings_calendar
+            WHERE symbol = ?
+              AND COALESCE(updated_ts_ms, 0) <= ?
+            """,
+            (str(symbol), int(ts_ms)),
+        ).fetchall()
+    except Exception:
+        return 0.0
+    nearest_days: int | None = None
+    for row in rows or []:
+        try:
+            earnings_day = _parse_finra_date(row[0])
+        except Exception:
+            continue
+        distance = abs((earnings_day - anchor_day).days)
+        if nearest_days is None or distance < nearest_days:
+            nearest_days = int(distance)
+    if nearest_days is None or nearest_days > 5:
+        return 0.0
+    return float(max(0.0, min(1.0, 1.0 - (float(nearest_days) / 5.0))))
+
+
+def _load_short_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in SHORT_FEATURE_IDS}
+    if not SHORT_FEATURE_IDS:
+        return (
+            features,
+            {
+                "latest_short_volume_availability_ts_ms": None,
+                "latest_short_interest_availability_ts_ms": None,
+            },
+            False,
+        )
+
+    anchor_day = _finra_asof_date(int(ts_ms)).isoformat()
+    volume_start = int(ts_ms) - int(DEFAULT_SHORT_VOLUME_LOOKBACK_DAYS * 24 * 3600 * 1000)
+    try:
+        volume_rows = con.execute(
+            """
+            SELECT
+              trade_date,
+              trade_ts_ms,
+              availability_ts_ms,
+              short_volume,
+              short_exempt_volume,
+              total_volume,
+              market
+            FROM finra_short_sale_volume
+            WHERE symbol = ?
+              AND availability_ts_ms <= ?
+              AND availability_ts_ms >= ?
+              AND trade_date < ?
+            ORDER BY trade_ts_ms DESC, availability_ts_ms DESC, id DESC
+            LIMIT 64
+            """,
+            (str(symbol), int(ts_ms), int(volume_start), str(anchor_day)),
+        ).fetchall()
+    except Exception:
+        volume_rows = []
+    volume_dicts = [_storage_row_dict(row) for row in volume_rows or []]
+    volume_dicts = [row for row in volume_dicts if row]
+    features["short_vol_ratio_z20"] = float(_short_volume_ratio_z(volume_dicts, lookback=20))
+    latest_volume_availability = max([_safe_int(row.get("availability_ts_ms"), 0) for row in volume_dicts] or [0])
+    latest_volume_trade_date = None
+    if volume_dicts:
+        latest_volume_trade_date = str(
+            max(
+                volume_dicts,
+                key=lambda row: _safe_int(row.get("trade_ts_ms") or row.get("availability_ts_ms"), 0),
+            ).get("trade_date")
+            or ""
+        )
+
+    try:
+        si_rows = con.execute(
+            """
+            SELECT
+              settlement_date,
+              settlement_ts_ms,
+              dissemination_date,
+              dissemination_ts_ms,
+              availability_ts_ms,
+              short_interest_shares,
+              days_to_cover
+            FROM finra_short_interest
+            WHERE symbol = ?
+              AND availability_ts_ms <= ?
+            ORDER BY availability_ts_ms DESC, settlement_ts_ms DESC, id DESC
+            LIMIT ?
+            """,
+            (str(symbol), int(ts_ms), int(DEFAULT_SHORT_INTEREST_LOOKBACK_READINGS)),
+        ).fetchall()
+    except Exception:
+        si_rows = []
+    si_dicts = [_storage_row_dict(row) for row in si_rows or []]
+    si_dicts = [row for row in si_dicts if row]
+    surprise, dtc_delta = _short_interest_surprise(
+        si_dicts,
+        alpha=float(DEFAULT_SHORT_SI_EWMA_ALPHA),
+        shares_normalizer=None,
+    )
+    features["si_surprise"] = float(max(-10.0, min(10.0, surprise)))
+    features["days_to_cover_delta"] = float(max(-10.0, min(10.0, dtc_delta)))
+    earnings_window = _earnings_window_proximity(con, symbol=str(symbol), ts_ms=int(ts_ms))
+    features["si_surprise_x_earnings_window"] = float(features["si_surprise"] * float(earnings_window))
+    latest_si_availability = max([_safe_int(row.get("availability_ts_ms"), 0) for row in si_dicts] or [0])
+    latest_si_settlement_date = None
+    if si_dicts:
+        latest_si_settlement_date = str(
+            max(
+                si_dicts,
+                key=lambda row: _safe_int(row.get("settlement_ts_ms") or row.get("availability_ts_ms"), 0),
+            ).get("settlement_date")
+            or ""
+        )
+
+    return (
+        features,
+        {
+            "latest_short_volume_availability_ts_ms": int(latest_volume_availability) if latest_volume_availability > 0 else None,
+            "latest_short_volume_trade_date": latest_volume_trade_date or None,
+            "latest_short_interest_availability_ts_ms": int(latest_si_availability) if latest_si_availability > 0 else None,
+            "latest_short_interest_settlement_date": latest_si_settlement_date or None,
+            "short_volume_window_start_ts_ms": int(volume_start),
+            "short_interest_readings": int(len(si_dicts)),
+            "earnings_window_proximity": float(earnings_window),
+            "si_surprise_normalizer": "trailing_short_interest_std",
+        },
+        bool(volume_dicts or si_dicts),
+    )
+
+
+def _load_crypto_positioning_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in CRYPTO_POSITIONING_FEATURE_IDS}
+    meta = {
+        "latest_availability_ts_ms": None,
+        "latest_funding_ts_ms": None,
+        "window_start_ts_ms": None,
+    }
+    if not CRYPTO_POSITIONING_FEATURE_IDS:
+        return features, meta, False
+    if str(asset_class_for_symbol(symbol)).upper() != "CRYPTO":
+        return features, meta, False
+
+    window_start = int(ts_ms) - int(DEFAULT_CRYPTO_POSITIONING_LOOKBACK_DAYS * 24 * 3600 * 1000)
+    try:
+        rows = con.execute(
+            """
+            SELECT
+              exchange,
+              perp_market,
+              spot_market,
+              funding_ts_ms,
+              availability_ts_ms,
+              funding_rate,
+              perp_basis_pct,
+              mark_price,
+              spot_price,
+              is_live
+            FROM crypto_funding_rates
+            WHERE symbol = ?
+              AND availability_ts_ms <= ?
+              AND availability_ts_ms >= ?
+            ORDER BY funding_ts_ms ASC, availability_ts_ms ASC, id ASC
+            """,
+            (str(symbol), int(ts_ms), int(window_start)),
+        ).fetchall()
+    except Exception:
+        rows = []
+
+    row_dicts = [_storage_row_dict(row) for row in rows or []]
+    row_dicts = [row for row in row_dicts if row]
+    if not row_dicts:
+        meta["window_start_ts_ms"] = int(window_start)
+        return features, meta, False
+
+    computed = _compute_crypto_positioning_features(row_dicts, asof_ts_ms=int(ts_ms))
+    for fid in CRYPTO_POSITIONING_FEATURE_IDS:
+        features[fid] = float(_safe_float(computed.get(fid), 0.0))
+    latest = max(row_dicts, key=lambda row: _safe_int(row.get("availability_ts_ms"), 0))
+    return (
+        features,
+        {
+            "latest_availability_ts_ms": _safe_int(latest.get("availability_ts_ms"), 0) or None,
+            "latest_funding_ts_ms": _safe_int(latest.get("funding_ts_ms"), 0) or None,
+            "window_start_ts_ms": int(window_start),
+            "exchange": str(latest.get("exchange") or ""),
+            "perp_market": str(latest.get("perp_market") or ""),
+            "basis_available": 1 if any(_safe_float(row.get("perp_basis_pct")) is not None for row in row_dicts) else 0,
+            "rows": int(len(row_dicts)),
+        },
+        True,
+    )
+
+
+def _load_news_flow_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in NEWS_FLOW_FEATURE_IDS}
+    if not NEWS_FLOW_FEATURE_IDS:
+        return features, {"latest_availability_ts_ms": None}, False
+    try:
+        from engine.data.news_flow import resolve_news_flow_features
+
+        resolved, meta, available = resolve_news_flow_features(con, symbol=str(symbol), ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_news_flow_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_NEWS_FLOW_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_news_flow_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_availability_ts_ms": None}, False
+    for fid in NEWS_FLOW_FEATURE_IDS:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_etf_flow_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in ETF_FLOW_FEATURE_IDS}
+    if not ETF_FLOW_FEATURE_IDS:
+        return features, {"latest_availability_ts_ms": None, "latest_asof_date": None}, False
+    try:
+        from engine.data.etf_flows import resolve_etf_flow_features
+
+        resolved, meta, available = resolve_etf_flow_features(con, symbol=str(symbol), ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_etf_flow_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_ETF_FLOW_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_etf_flow_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_availability_ts_ms": None, "latest_asof_date": None}, False
+    for fid in ETF_FLOW_FEATURE_IDS:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_cot_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in COT_FEATURE_IDS}
+    if not COT_FEATURE_IDS:
+        return features, {"latest_availability_ts_ms": None, "contracts": []}, False
+    try:
+        from engine.data.cftc_cot import resolve_cot_features
+
+        resolved, meta, available = resolve_cot_features(con, symbol=str(symbol), ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_cot_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_COT_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_cot_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_availability_ts_ms": None, "contracts": []}, False
+    for fid in COT_FEATURE_IDS:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_inst_13f_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in INST_13F_FEATURE_IDS}
+    if not INST_13F_FEATURE_IDS:
+        return features, {"latest_availability_ts_ms": None, "holding_managers": []}, False
+    try:
+        from engine.data.inst_13f import resolve_13f_features
+
+        resolved, meta, available = resolve_13f_features(con, symbol=str(symbol), ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_inst_13f_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_INST_13F_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_inst_13f_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_availability_ts_ms": None, "holding_managers": []}, False
+    for fid in INST_13F_FEATURE_IDS:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_gov_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in GOV_FEATURE_IDS}
+    if not GOV_FEATURE_IDS:
+        return features, {"latest_availability_ts_ms": None, "sector": ""}, False
+    try:
+        from engine.data.quiver_gov import resolve_gov_features
+
+        resolved, meta, available = resolve_gov_features(con, symbol=str(symbol), ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_gov_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_GOV_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_gov_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_availability_ts_ms": None, "sector": ""}, False
+    for fid in GOV_FEATURE_IDS:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_fundamentals_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in FUNDAMENTALS_PIT_FEATURE_IDS}
+    if not FUNDAMENTALS_PIT_FEATURE_IDS:
+        return features, {"latest_publish_ts_ms": None, "mode": "disabled"}, False
+    try:
+        from engine.data.fundamentals_pit import resolve_fundamentals_features
+
+        resolved, meta, available = resolve_fundamentals_features(con, symbol=str(symbol), ts_ms=int(ts_ms))
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_fundamentals_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_FUNDAMENTALS_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_fundamentals_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_publish_ts_ms": None, "mode": "pit"}, False
+    for fid in FUNDAMENTALS_PIT_FEATURE_IDS:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
 
 
 def _load_congressional_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
@@ -841,21 +1395,9 @@ def _load_finbert_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, floa
 
 
 def _factor_feature_row_asof(con, *, feature_id: str, ts_ms: int) -> Tuple[float, Optional[int], Optional[int]]:
-    row = con.execute(
-        """
-        SELECT value, asof_ts, effective_ts
-        FROM factor_features
-        WHERE feature_id = ?
-          AND asof_ts <= ?
-          AND effective_ts <= ?
-        ORDER BY asof_ts DESC, effective_ts DESC
-        LIMIT 1
-        """,
-        (str(feature_id), int(ts_ms), int(ts_ms)),
-    ).fetchone()
-    if not row:
-        return 0.0, None, None
-    return _safe_float(row[0], 0.0), _safe_int(row[1], 0), _safe_int(row[2], 0)
+    from engine.data.factor_ingestion import macro_feature_row_asof
+
+    return macro_feature_row_asof(con, feature_id=str(feature_id), ts_ms=int(ts_ms))
 
 
 def _load_macro_group(con, *, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
@@ -917,15 +1459,19 @@ def _load_options_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, floa
               unusual_volume_score,
               call_put_volume_ratio,
               call_put_oi_ratio,
-              signal_score
+              signal_score,
+              gex_norm_z,
+              gex_sign,
+              opt_flow_imbalance_z
             FROM options_symbol_features
             WHERE symbol = ?
               AND bucket_sec = ?
               AND bucket_ts_ms <= ?
-            ORDER BY bucket_ts_ms DESC
+              AND snapshot_ts_ms <= ?
+            ORDER BY bucket_ts_ms DESC, snapshot_ts_ms DESC
             LIMIT 1
             """,
-            (symbol_key, int(bucket_sec), int(_bucket_start(ts_ms, bucket_sec))),
+            (symbol_key, int(bucket_sec), int(_bucket_start(ts_ms, bucket_sec)), int(ts_ms)),
         ).fetchone()
 
     row = _fetch(DEFAULT_OPTIONS_BUCKET_SEC)
@@ -944,6 +1490,9 @@ def _load_options_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, floa
     features["options_symbol.call_put_volume_ratio"] = float(_safe_float(row[7], 1.0))
     features["options_symbol.call_put_oi_ratio"] = float(_safe_float(row[8], 1.0))
     features["options_symbol.signal_score"] = float(_safe_float(row[9], 0.0))
+    features["options_symbol.gex_norm_z"] = float(_safe_float(row[10], 0.0))
+    features["options_symbol.gex_sign"] = float(_safe_float(row[11], 0.0))
+    features["options_symbol.opt_flow_imbalance_z"] = float(_safe_float(row[12], 0.0))
     return features, {
         "bucket_ts_ms": _safe_int(row[0], 0),
         "snapshot_ts_ms": _safe_int(row[1], 0),
@@ -1098,6 +1647,44 @@ def _load_weather_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, floa
     return features, source_meta, available
 
 
+def _load_bocpd_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in BOCPD_FEATURE_IDS}
+    try:
+        from engine.strategy.bocpd import feature_map_from_summary, load_latest_summary
+
+        summary = load_latest_summary(
+            con,
+            symbol=str(symbol),
+            series_type="realized_vol",
+            as_of_ts_ms=int(ts_ms),
+        )
+        if not summary:
+            summary = load_latest_summary(
+                con,
+                symbol="*",
+                series_type="portfolio_correlation",
+                as_of_ts_ms=int(ts_ms),
+            )
+        if not summary:
+            return features, {"summary_ts_ms": None, "series_key": None, "series_type": None}, False
+        features.update(feature_map_from_summary(summary))
+        return features, {
+            "summary_ts_ms": _safe_int(summary.get("ts_ms"), 0) or None,
+            "series_key": str(summary.get("series_key") or ""),
+            "series_type": str(summary.get("series_type") or ""),
+        }, True
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_bocpd_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_BOCPD_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_bocpd_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"summary_ts_ms": None, "series_key": None, "series_type": None}, False
+
+
 def build_model_feature_snapshot(
     *,
     symbol: str,
@@ -1129,6 +1716,22 @@ def build_model_feature_snapshot(
                 ts_ms=int(anchor_ts_ms),
             )
             price_features, price_meta, price_available = ({fid: 0.0 for fid in PRICE_FEATURE_IDS}, {"quote_ts_ms": None}, False)
+        try:
+            tech_features, tech_meta, tech_available = _load_tech_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_tech_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_TECH_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_tech_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            tech_features, tech_meta, tech_available = (
+                {fid: 0.0 for fid in TECH_FEATURE_IDS},
+                {"har_forecast_ts_ms": None},
+                False,
+            )
         try:
             event_features, event_meta, event_available = _load_event_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
         except Exception as exc:
@@ -1165,7 +1768,7 @@ def build_model_feature_snapshot(
             )
             options_features, options_meta, options_available = ({fid: 0.0 for fid in OPTIONS_FEATURE_IDS}, {"snapshot_ts_ms": None}, False)
         try:
-            insider_features, insider_meta, _insider_available = _load_insider_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
+            insider_features, insider_meta, insider_available = _load_insider_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
         except Exception as exc:
             _warn_nonfatal(
                 "model_feature_snapshots_insider_group_failed",
@@ -1175,7 +1778,170 @@ def build_model_feature_snapshot(
                 symbol=symbol_key,
                 ts_ms=int(anchor_ts_ms),
             )
-            insider_features, insider_meta = ({fid: 0.0 for fid in INSIDER_FEATURE_IDS}, {"latest_transaction_ts_ms": None})
+            insider_features, insider_meta, insider_available = (
+                {fid: 0.0 for fid in INSIDER_FEATURE_IDS},
+                {"latest_availability_ts_ms": None},
+                False,
+            )
+        try:
+            short_features, short_meta, short_available = _load_short_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_short_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_SHORT_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_short_group_failed",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            short_features, short_meta, short_available = (
+                {fid: 0.0 for fid in SHORT_FEATURE_IDS},
+                {
+                    "latest_short_volume_availability_ts_ms": None,
+                    "latest_short_interest_availability_ts_ms": None,
+                },
+                False,
+            )
+        try:
+            crypto_positioning_features, crypto_positioning_meta, crypto_positioning_available = _load_crypto_positioning_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_crypto_positioning_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_CRYPTO_POSITIONING_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_crypto_positioning_group_failed",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            crypto_positioning_features, crypto_positioning_meta, crypto_positioning_available = (
+                {fid: 0.0 for fid in CRYPTO_POSITIONING_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "latest_funding_ts_ms": None},
+                False,
+            )
+        try:
+            news_flow_features, news_flow_meta, news_flow_available = _load_news_flow_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_news_flow_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_NEWS_FLOW_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_news_flow_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            news_flow_features, news_flow_meta, news_flow_available = (
+                {fid: 0.0 for fid in NEWS_FLOW_FEATURE_IDS},
+                {"latest_availability_ts_ms": None},
+                False,
+            )
+        try:
+            etf_flow_features, etf_flow_meta, etf_flow_available = _load_etf_flow_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_etf_flow_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_ETF_FLOW_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_etf_flow_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            etf_flow_features, etf_flow_meta, etf_flow_available = (
+                {fid: 0.0 for fid in ETF_FLOW_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "latest_asof_date": None},
+                False,
+            )
+        try:
+            cot_features, cot_meta, cot_available = _load_cot_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_cot_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_COT_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_cot_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            cot_features, cot_meta, cot_available = (
+                {fid: 0.0 for fid in COT_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "contracts": []},
+                False,
+            )
+        try:
+            inst_13f_features, inst_13f_meta, inst_13f_available = _load_inst_13f_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_inst_13f_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_INST_13F_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_inst_13f_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            inst_13f_features, inst_13f_meta, inst_13f_available = (
+                {fid: 0.0 for fid in INST_13F_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "holding_managers": []},
+                False,
+            )
+        try:
+            gov_features, gov_meta, gov_available = _load_gov_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_gov_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_GOV_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_gov_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            gov_features, gov_meta, gov_available = (
+                {fid: 0.0 for fid in GOV_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "sector": ""},
+                False,
+            )
+        try:
+            fundamentals_features, fundamentals_meta, fundamentals_available = _load_fundamentals_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_fundamentals_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_FUNDAMENTALS_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_fundamentals_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            fundamentals_features, fundamentals_meta, fundamentals_available = (
+                {fid: 0.0 for fid in FUNDAMENTALS_PIT_FEATURE_IDS},
+                {"latest_publish_ts_ms": None, "mode": "pit"},
+                False,
+            )
         try:
             congressional_features, congressional_meta, _congressional_available = _load_congressional_group(
                 con,
@@ -1228,27 +1994,64 @@ def build_model_feature_snapshot(
                 ts_ms=int(anchor_ts_ms),
             )
             weather_features, weather_meta, weather_available = ({fid: 0.0 for fid in WEATHER_FEATURE_IDS}, {"forecast_run_ts_ms": None}, False)
+        try:
+            bocpd_features, bocpd_meta, bocpd_available = _load_bocpd_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_bocpd_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_BOCPD_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_bocpd_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            bocpd_features, bocpd_meta, bocpd_available = (
+                {fid: 0.0 for fid in BOCPD_FEATURE_IDS},
+                {"summary_ts_ms": None, "series_key": None, "series_type": None},
+                False,
+            )
 
         for mapping in (
             price_features,
+            tech_features,
             event_features,
             macro_features,
             options_features,
             insider_features,
+            short_features,
+            crypto_positioning_features,
+            news_flow_features,
+            etf_flow_features,
+            cot_features,
+            inst_13f_features,
+            gov_features,
+            fundamentals_features,
             congressional_features,
             social_features,
             finbert_features,
             weather_features,
+            bocpd_features,
         ):
             group_features.update(mapping)
 
         availability = {
             "price": bool(price_available),
+            "tech": bool(tech_available),
             "events": bool(event_available),
             "macro": bool(macro_available),
             "options": bool(options_available),
+            "insider": bool(insider_available),
+            "short": bool(short_available),
+            "crypto_positioning": bool(crypto_positioning_available),
+            "news_flow": bool(news_flow_available),
+            "etf_flow": bool(etf_flow_available),
+            "cot": bool(cot_available),
+            "inst_13f": bool(inst_13f_available),
+            "gov": bool(gov_available),
+            "fundamentals": bool(fundamentals_available),
             "social": bool(social_available),
             "weather": bool(weather_available),
+            "bocpd_regime": bool(bocpd_available),
         }
         group_features["availability.price"] = 1.0 if availability["price"] else 0.0
         group_features["availability.events"] = 1.0 if availability["events"] else 0.0
@@ -1260,14 +2063,24 @@ def build_model_feature_snapshot(
         source_timestamps.update(
             {
                 "price": price_meta,
+                "tech": tech_meta,
                 "events": event_meta,
                 "macro": macro_meta,
                 "options": options_meta,
                 "insider": insider_meta,
+                "short": short_meta,
+                "crypto_positioning": crypto_positioning_meta,
+                "news_flow": news_flow_meta,
+                "etf_flow": etf_flow_meta,
+                "cot": cot_meta,
+                "inst_13f": inst_13f_meta,
+                "gov": gov_meta,
+                "fundamentals": fundamentals_meta,
                 "congressional": congressional_meta,
                 "social": social_meta,
                 "sentiment": finbert_meta,
                 "weather": weather_meta,
+                "bocpd_regime": bocpd_meta,
             }
         )
 

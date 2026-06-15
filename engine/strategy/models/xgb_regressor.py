@@ -23,6 +23,7 @@ from engine.strategy.models.lgbm_regressor import (
     register_shadow_model as _register_tabular_shadow_model,
     run_tabular_training_job,
 )
+from engine.strategy.ood import build_ood_profile, summarize_ood_profile
 
 FAMILY = "xgb_regressor"
 DEFAULT_MODEL_NAME = FAMILY
@@ -84,7 +85,7 @@ class XGBRegressorModel(LGBMRegressorModel):
 
     @property
     def feature_schema(self) -> dict[str, Any]:
-        return _feature_schema(self.feature_ids)
+        return _feature_schema(self.feature_ids, preprocessing=getattr(self, "feature_preprocessing", {}))
 
     def _new_estimator(self) -> Any:
         try:
@@ -96,25 +97,36 @@ class XGBRegressorModel(LGBMRegressorModel):
 
     def fit(self, X: Any, y: Any, sample_weight: Any = None) -> "XGBRegressorModel":
         columns = _expected_columns(self.feature_ids, model_name=self.model_name, model_spec=self.feature_schema)
-        X_arr = _matrix_from_features(X, columns)
+        X_arr, preprocessing, _accounting = _matrix_from_features(
+            X,
+            columns,
+            phase="train",
+            model_name=self.model_name,
+            fit_preprocessing=True,
+            return_metadata=True,
+        )
         y_arr = np.asarray(y, dtype=np.float32).reshape(-1)
         if int(X_arr.shape[0]) != int(y_arr.shape[0]):
             raise ValueError("xgb_row_count_mismatch")
         self.feature_ids = list(columns)
+        self.feature_preprocessing = dict(preprocessing or {})
         model = self._new_estimator()
         fit_kwargs: dict[str, Any] = {}
         if sample_weight is not None:
             fit_kwargs["sample_weight"] = np.asarray(sample_weight, dtype=np.float32).reshape(-1)
         model.fit(X_arr, y_arr, **fit_kwargs)
         self.model = model
+        self.ood_profile = build_ood_profile(X_arr, columns)
         self.training_metrics = {
             "n_train": int(y_arr.shape[0]),
             "model_family": FAMILY,
             "model_kind": DEFAULT_MODEL_KIND,
             "backend": "xgboost",
             "feature_schema": self.feature_schema,
+            "ood_profile_summary": summarize_ood_profile(self.ood_profile),
             **_fit_eval_metrics(model, X_arr, y_arr),
         }
+        self.persisted_feature_schema = dict(self.feature_schema)
         return self
 
     @classmethod

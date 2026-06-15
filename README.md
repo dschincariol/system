@@ -75,8 +75,6 @@ Data-source configuration has one canonical contract:
   Canonical Diataxis map for the repository docs.
 - [docs/MAINTAINER_INDEX.md](docs/MAINTAINER_INDEX.md)
   Shortest path for engineers reading or changing the codebase.
-- [docs/DOCS_AUDIT.md](docs/DOCS_AUDIT.md)
-  Current documentation inventory, duplication analysis, and remediation priorities.
 - [docs/REFERENCE_CONFIGURATION_GLOSSARY.md](docs/REFERENCE_CONFIGURATION_GLOSSARY.md)
   Configuration and environment contract.
 - [docs/REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](docs/REFERENCE_DATA_SOURCE_CONTROL_PLANE.md)
@@ -100,8 +98,6 @@ Supplementary but useful:
 - [docs/README_SEQUENCE_DIAGRAMS.md](docs/README_SEQUENCE_DIAGRAMS.md)
 - [docs/README_DEVELOPER_MAP.md](docs/README_DEVELOPER_MAP.md)
 - [docs/README_FUNCTION_MAP.md](docs/README_FUNCTION_MAP.md)
-- [docs/DOCS_AUDIT.md](docs/DOCS_AUDIT.md)
-- [docs/FINAL_DOCS_AUDIT.md](docs/FINAL_DOCS_AUDIT.md)
 - [docs/README_UI_REDESIGN_PLAN.md](docs/README_UI_REDESIGN_PLAN.md)
 - `docs/handoff/*`
 
@@ -123,11 +119,26 @@ Supplementary but useful:
 ## Local Bootstrap And Validation
 
 - Copy [.env.example](.env.example) to `.env` for a new workstation.
+- On Linux/macOS development machines, run `bash tools/bootstrap_local_toolchain.sh` from the repo root. It creates or updates `.venv` with Python 3.11, installs `requirements.txt`, installs Node.js 20.19.4 with npm 10.8.2 inside `.venv` when needed, runs `npm ci`, and links the `python`, `python3`, `node`, `npm`, and `npx` command names into `$HOME/.local/bin` by default.
 - Install Python dependencies with `python -m pip install -r requirements.txt`.
-- Install Node dependencies with `npm ci`.
+- Use Node.js 20 LTS (`>=20.17.0 <21`) with npm 10.x for the operator UI. The checked-in `.npmrc` enforces this during `npm ci`.
+- Install Node dependencies reproducibly with `npm ci`; do not edit or vendor `node_modules/`.
 - Prefer `ENGINE_MODE=safe` and `EXECUTION_MODE=safe` until the environment, providers, and operator controls are verified.
+- Run `npm run check:ui` after `npm ci` to validate local asset references, dashboard JS syntax, and browser-helper tests before shipping UI changes.
 - Run `python tools/validate_repo.py` before merging.
 - Run `python tools/validate_repo.py --live` only when a running operator plus engine instance is available and a bounded live smoke test is intended.
+
+Deterministic local gate commands after bootstrap:
+
+```bash
+python --version
+python tools/git_worktree_triage.py
+python -m pytest --version
+node --version
+npm --version
+npm run check:ui
+python tools/validate_dependency_lock.py
+```
 
 Useful supporting checks:
 

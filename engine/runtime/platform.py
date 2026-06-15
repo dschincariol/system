@@ -1,4 +1,4 @@
-"""Platform-aware runtime defaults for application storage paths and DSNs."""
+"""Platform-aware runtime defaults for application storage paths, DSNs, and local hosts."""
 
 from __future__ import annotations
 
@@ -6,6 +6,13 @@ import os
 import re
 import sys
 from pathlib import Path
+
+LOOPBACK_HOST = "127.0.0.1"
+LOCALHOST_NAME = "localhost"
+LOOPBACK_HOSTS = frozenset({LOOPBACK_HOST, "::1", LOCALHOST_NAME})
+DEFAULT_DASHBOARD_HOST = LOOPBACK_HOST
+DEFAULT_DASHBOARD_DEV_PORT = 8000
+DEFAULT_IBKR_HOST = LOOPBACK_HOST
 
 
 def is_linux() -> bool:
@@ -23,6 +30,30 @@ def _dsn_value(value: str) -> str:
     if any(ch.isspace() for ch in text) or "'" in text or "\\" in text:
         return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
     return text
+
+
+def normalize_loopback_host(host: str | None) -> str:
+    text = str(host or "").strip()
+    if not text or text.lower() == LOCALHOST_NAME:
+        return LOOPBACK_HOST
+    return text
+
+
+def is_loopback_host(host: str | None) -> bool:
+    text = normalize_loopback_host(host).lower()
+    return text in {LOOPBACK_HOST, "::1"}
+
+
+def default_dashboard_host() -> str:
+    return DEFAULT_DASHBOARD_HOST
+
+
+def default_dashboard_dev_port() -> int:
+    return int(DEFAULT_DASHBOARD_DEV_PORT)
+
+
+def default_ibkr_host() -> str:
+    return DEFAULT_IBKR_HOST
 
 
 def default_pg_user() -> str:
@@ -63,18 +94,31 @@ def pg_password_secret_name(user: str | None = None) -> str:
 
 
 def _load_pg_password(user: str | None = None) -> str:
+    configured = str(os.environ.get("TS_PG_PASSWORD") or "").strip()
+    if configured:
+        return configured
+
     role = pg_password_secret_name(user).removeprefix("pg_password_").upper()
+    from services.secrets.loader import load_secret
+
+    if (
+        str(os.environ.get("TS_SECRETS_PROVIDER") or "").strip()
+        or str(os.environ.get("TS_DEV_SECRETS_DIR") or "").strip()
+        or str(os.environ.get("CREDENTIALS_DIRECTORY") or "").strip()
+    ):
+        return load_secret(pg_password_secret_name(user)).decode("utf-8", "ignore").rstrip("\r\n")
+
     for name in (
         f"TS_PG_PASSWORD_{role}",
         f"TS_PG_{role}_PASSWORD",
-        "TS_PG_PASSWORD",
-        "PGPASSWORD",
     ):
         value = str(os.environ.get(name) or "").strip()
         if value:
             return value
 
-    from services.secrets.loader import load_secret
+    value = str(os.environ.get("PGPASSWORD") or "").strip()
+    if value:
+        return value
 
     return load_secret(pg_password_secret_name(user)).decode("utf-8", "ignore").rstrip("\r\n")
 

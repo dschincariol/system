@@ -8,6 +8,7 @@ import os
 import logging
 import threading
 import time
+from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, Optional, Set
 
 from engine.runtime.failure_diagnostics import log_failure
@@ -20,7 +21,7 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-class BaseProviderSession:
+class BaseProviderSession(ABC):
     provider_name = "provider"
 
     def __init__(self, provider_name: Optional[str] = None) -> None:
@@ -69,15 +70,18 @@ class BaseProviderSession:
         self._gap_event_count = 0
         self._last_symbol_event_key: Dict[str, str] = {}
 
+    @abstractmethod
     def connect(self) -> None:
         raise NotImplementedError
 
     def authenticate(self) -> None:
         self._authenticated = True
 
+    @abstractmethod
     def subscribe(self, symbols: Iterable[str]) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def unsubscribe(self, symbols: Iterable[str]) -> None:
         raise NotImplementedError
 
@@ -97,6 +101,7 @@ class BaseProviderSession:
         if desired:
             self.subscribe(desired)
 
+    @abstractmethod
     def close(self) -> None:
         raise NotImplementedError
 
@@ -152,10 +157,13 @@ class BaseProviderSession:
             time.sleep(min(float(sleep_ms) / 1000.0, remaining_s))
 
     def snapshot(self) -> Dict[str, Dict[str, Any]]:
-        return {}
+        """Optional snapshot hook for providers with no current level-1 cache."""
+        return dict()
 
     def perform_gap_fill(self, symbols: Iterable[str], since_ts_ms: int) -> Dict[str, Dict[str, Any]]:
-        return {}
+        """Optional historical catch-up hook; unsupported providers return no rows."""
+        del symbols, since_ts_ms
+        return dict()
 
     def detect_capabilities(self) -> Dict[str, Any]:
         return self.telemetry_snapshot().get("capabilities") or {}
@@ -239,7 +247,8 @@ class BaseProviderSession:
             self._last_error = str(error)[:400]
 
     def merge_snapshot(self, rows: Dict[str, Dict[str, Any]]) -> None:
-        return
+        """Optional hook for sessions that maintain a local snapshot cache."""
+        del rows
 
     def note_dedup_drop(self) -> None:
         with self._lock:

@@ -230,38 +230,44 @@ class BaseModel(ABC):
         model_name_s = str(model_name or self.model_name)
         symbol_s = str(symbol).upper()
         artifact_uri_text = str(artifact_uri or "").strip()
-        alias = (
-            artifact_uri_text
-            if artifact_uri_text.startswith("model:")
-            else f"model:{model_name_s}:{symbol_s}:current"
-        )
-        prefer_joblib = Path(artifact_uri).suffix.lower() == ".joblib"
-        payload = dumps_pickle_artifact(self, prefer_joblib=prefer_joblib)
-        ref = LocalArtifactStore().put(
-            payload,
-            content_type=("application/vnd.joblib" if prefer_joblib else "application/x-python-pickle"),
-            kind="model",
-            alias=alias,
-            metadata={
-                **merged_metadata,
-                "model_name": model_name_s,
-                "symbol": symbol_s,
-                "version": str(version),
-            },
-        )
-        merged_metadata["artifact_manifest"] = {
-            "alias": str(alias),
-            "sha256": ref.sha256,
-            "size_bytes": int(ref.size),
-            "content_type": ref.content_type,
-            "kind": ref.kind,
-        }
+        prefer_joblib = Path(artifact_uri_text).suffix.lower() == ".joblib"
+        register_artifact_uri = artifact_uri_text
+        if artifact_uri_text and not artifact_uri_text.startswith("model:") and "://" not in artifact_uri_text:
+            artifact_path = self.save_artifact(artifact_uri_text)
+            register_artifact_uri = str(artifact_path)
+        else:
+            alias = (
+                artifact_uri_text
+                if artifact_uri_text.startswith("model:")
+                else f"model:{model_name_s}:{symbol_s}:current"
+            )
+            payload = dumps_pickle_artifact(self, prefer_joblib=prefer_joblib)
+            ref = LocalArtifactStore().put(
+                payload,
+                content_type=("application/vnd.joblib" if prefer_joblib else "application/x-python-pickle"),
+                kind="model",
+                alias=alias,
+                metadata={
+                    **merged_metadata,
+                    "model_name": model_name_s,
+                    "symbol": symbol_s,
+                    "version": str(version),
+                },
+            )
+            register_artifact_uri = str(alias)
+            merged_metadata["artifact_manifest"] = {
+                "alias": str(alias),
+                "sha256": ref.sha256,
+                "size_bytes": int(ref.size),
+                "content_type": ref.content_type,
+                "kind": ref.kind,
+            }
         return register_model(
             symbol=symbol_s,
             model_name=model_name_s,
             model_kind=str(self.model_kind),
             version=str(version),
-            artifact_uri=str(alias),
+            artifact_uri=str(register_artifact_uri),
             metadata=merged_metadata,
             performance_metrics=merged_metrics,
             training_data_window=(dict(training_data_window or {}) if training_data_window is not None else None),

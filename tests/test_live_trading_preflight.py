@@ -23,7 +23,7 @@ def test_live_trading_preflight_accepts_explicit_live_acknowledgement():
     state = live_trading_preflight(
         engine_mode="live",
         dashboard_host="127.0.0.1",
-        dashboard_api_token="secret",
+        dashboard_api_token="live-token-1234567890",
         live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
     )
 
@@ -41,3 +41,15 @@ def test_live_trading_preflight_requires_token_for_remote_bind_even_when_safe():
 
     assert state["ok"] is False
     assert state["reason"] == "dashboard_api_token_required_for_remote_bind"
+
+
+def test_live_trading_preflight_rejects_placeholder_token():
+    state = live_trading_preflight(
+        engine_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="change-me",
+        live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
+    )
+
+    assert state["ok"] is False
+    assert "dashboard_api_token_invalid_for_live:default_dashboard_api_token" in state["blockers"]

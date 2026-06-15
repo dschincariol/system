@@ -681,7 +681,7 @@ def refresh_news_symbol_features(con, symbol: str, bucket_sec: int = 3600) -> Op
     lookback_6h = now_ms - 6 * 3600_000
     rows = con.execute(
         """
-        SELECT ts_ms, sentiment_score, novelty_score, is_duplicate, cluster_key
+        SELECT ts_ms, sentiment_score, COALESCE(embedding_novelty_score, novelty_score), COALESCE(stale_flag, is_duplicate), cluster_key
         FROM news_event_features
         WHERE symbol = ?
           AND ts_ms >= ?
@@ -728,8 +728,8 @@ def refresh_news_symbol_features(con, symbol: str, bucket_sec: int = 3600) -> Op
         )
         return row
 
-    sentiments_now: List[float] = []
-    sentiments_prev: List[float] = []
+    sentiments_now: List[Tuple[float, float]] = []
+    sentiments_prev: List[Tuple[float, float]] = []
     novelty_values: List[float] = []
     dupes = 0
     clusters_6h: Set[str] = set()
@@ -737,11 +737,13 @@ def refresh_news_symbol_features(con, symbol: str, bucket_sec: int = 3600) -> Op
     for ts_ms, sentiment, novelty, is_duplicate, cluster_key in rows:
         age_h = max(0.0, (now_ms - int(ts_ms)) / 3600000.0)
         velocity += math.exp(-age_h)
+        novelty_num = float(novelty or 0.0)
+        sentiment_weight = max(0.05, min(1.0, novelty_num))
         if age_h <= 3.0:
-            sentiments_now.append(float(sentiment or 0.0))
+            sentiments_now.append((float(sentiment or 0.0), float(sentiment_weight)))
         else:
-            sentiments_prev.append(float(sentiment or 0.0))
-        novelty_values.append(float(novelty or 0.0))
+            sentiments_prev.append((float(sentiment or 0.0), float(sentiment_weight)))
+        novelty_values.append(float(novelty_num))
         dupes += 1 if int(is_duplicate or 0) else 0
         if cluster_key:
             clusters_6h.add(str(cluster_key))
@@ -758,9 +760,17 @@ def refresh_news_symbol_features(con, symbol: str, bucket_sec: int = 3600) -> Op
         (sym, int(now_ms - 24 * 3600_000)),
     ).fetchall()
     clusters_24h = {str(r[0]) for r in rows_24h or [] if r and r[0]}
-    avg_sentiment = float(sum(float(v) for v in sentiments_now) / len(sentiments_now)) if sentiments_now else 0.0
+    avg_sentiment = (
+        float(sum(value * weight for value, weight in sentiments_now) / max(1e-9, sum(weight for _value, weight in sentiments_now)))
+        if sentiments_now
+        else 0.0
+    )
     avg_novelty = float(sum(float(v) for v in novelty_values) / len(novelty_values)) if novelty_values else 0.0
-    prev_sentiment = float(sum(float(v) for v in sentiments_prev) / len(sentiments_prev)) if sentiments_prev else 0.0
+    prev_sentiment = (
+        float(sum(value * weight for value, weight in sentiments_prev) / max(1e-9, sum(weight for _value, weight in sentiments_prev)))
+        if sentiments_prev
+        else 0.0
+    )
     row = {
         "symbol": sym,
         "bucket_ts_ms": bucket_ts_ms,

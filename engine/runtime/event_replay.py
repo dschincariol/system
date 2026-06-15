@@ -1291,6 +1291,8 @@ def _fetch_pnl_attribution(con, *, min_ts_ms: int, max_ts_ms: int) -> List[Dict[
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return int(default)
     try:
         return int(value)
     except Exception as e:
@@ -1320,6 +1322,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _is_finite_nonnegative(value: Any) -> bool:
+    if value is None:
+        return False
     try:
         out = float(value)
     except Exception as e:

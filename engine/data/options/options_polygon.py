@@ -16,6 +16,7 @@ from engine.runtime.logging import get_logger
 
 
 _BASE = "https://api.polygon.io"
+_POLYGON_KEY = ""
 LOG = get_logger("engine.data.options.options_polygon")
 
 
@@ -30,7 +31,7 @@ def _get_session() -> requests.Session:
 
 
 def _polygon_key() -> str:
-    return get_data_credential("POLYGON_API_KEY")
+    return str(_POLYGON_KEY or get_data_credential("POLYGON_API_KEY") or "").strip()
 
 
 def _sanitize_error_text(value: object, polygon_key: str | None = None) -> str:

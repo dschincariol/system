@@ -482,6 +482,131 @@ class OptionsIngestionReliabilityTests(unittest.TestCase):
         self.assertFalse(bool(options_source.get("stale")))
         self.assertIn("source_degraded:options", list(snapshot.get("advisory_reason_codes") or []))
 
+    def test_health_freshness_escalates_fresh_failed_critical_source(self) -> None:
+        prev_critical_sources = os.environ.get("CRITICAL_INGESTION_SOURCES")
+        try:
+            os.environ["CRITICAL_INGESTION_SOURCES"] = "prices,macro"
+            (health,) = _reload_modules("engine.runtime.health")
+            now_ms = int(time.time() * 1000)
+
+            snapshot = health._build_ingestion_freshness_snapshot(
+                now_ms=int(now_ms),
+                prices_snapshot={"ok": True, "last_ts_ms": int(now_ms)},
+                options_snapshot={"ok": True, "last_ingested_ts_ms": int(now_ms)},
+                ingestion_runtime_snapshot={"last_publish_ts_ms": int(now_ms)},
+                pipeline_statuses={
+                    "poll_macro": {
+                        "ok": False,
+                        "updated_ts_ms": int(now_ms),
+                        "last_ingested_ts_ms": int(now_ms),
+                        "last_error": "fred_http_403",
+                    },
+                },
+            )
+        finally:
+            if prev_critical_sources is None:
+                os.environ.pop("CRITICAL_INGESTION_SOURCES", None)
+            else:
+                os.environ["CRITICAL_INGESTION_SOURCES"] = prev_critical_sources
+
+        macro_source = dict(snapshot.get("sources", {}).get("macro") or {})
+        self.assertEqual(macro_source.get("status"), "degraded")
+        self.assertTrue(bool(macro_source.get("critical")))
+        self.assertFalse(bool(snapshot.get("critical_ok")))
+        self.assertIn("macro", list(snapshot.get("failed_critical_sources") or []))
+        self.assertIn("critical_source_failed:macro", list(snapshot.get("runtime_reason_codes") or []))
+        self.assertIn("source_degraded:macro", list(snapshot.get("advisory_reason_codes") or []))
+
+    def test_health_freshness_exposes_sec_and_form4_failures(self) -> None:
+        prev_critical_sources = os.environ.get("CRITICAL_INGESTION_SOURCES")
+        prev_child_jobs = os.environ.get("INGESTION_CHILD_JOBS")
+        try:
+            os.environ["CRITICAL_INGESTION_SOURCES"] = "sec,form4"
+            os.environ["INGESTION_CHILD_JOBS"] = "poll_sec_filings,ingest_form4"
+            (health,) = _reload_modules("engine.runtime.health")
+            now_ms = int(time.time() * 1000)
+
+            snapshot = health._build_ingestion_freshness_snapshot(
+                now_ms=int(now_ms),
+                prices_snapshot={"ok": True, "last_ts_ms": int(now_ms)},
+                options_snapshot={"ok": True, "last_ingested_ts_ms": int(now_ms)},
+                ingestion_runtime_snapshot={"last_publish_ts_ms": int(now_ms)},
+                pipeline_statuses={
+                    "poll_sec_filings": {
+                        "ok": True,
+                        "updated_ts_ms": int(now_ms),
+                        "last_ingested_ts_ms": int(now_ms),
+                    },
+                    "ingest_form4": {
+                        "ok": False,
+                        "updated_ts_ms": int(now_ms),
+                        "last_ingested_ts_ms": int(now_ms),
+                        "last_error": "edgar_rate_limited",
+                    },
+                },
+            )
+        finally:
+            if prev_critical_sources is None:
+                os.environ.pop("CRITICAL_INGESTION_SOURCES", None)
+            else:
+                os.environ["CRITICAL_INGESTION_SOURCES"] = prev_critical_sources
+            if prev_child_jobs is None:
+                os.environ.pop("INGESTION_CHILD_JOBS", None)
+            else:
+                os.environ["INGESTION_CHILD_JOBS"] = prev_child_jobs
+
+        sec_source = dict(snapshot.get("sources", {}).get("sec") or {})
+        self.assertTrue(bool(sec_source.get("critical")))
+        self.assertIn("poll_sec_filings", list(sec_source.get("pipeline_names") or []))
+        self.assertIn("ingest_form4", list(sec_source.get("pipeline_names") or []))
+        self.assertEqual(sec_source.get("status"), "degraded")
+        self.assertIn("sec", list(snapshot.get("failed_critical_sources") or []))
+        self.assertIn("critical_source_failed:sec", list(snapshot.get("runtime_reason_codes") or []))
+
+    def test_health_freshness_exposes_alt_data_failures(self) -> None:
+        prev_critical_sources = os.environ.get("CRITICAL_INGESTION_SOURCES")
+        prev_child_jobs = os.environ.get("INGESTION_CHILD_JOBS")
+        try:
+            os.environ["CRITICAL_INGESTION_SOURCES"] = "etf_flows"
+            os.environ["INGESTION_CHILD_JOBS"] = "ingest_etf_flows"
+            data_source_manager, health = _reload_modules(
+                "services.data_source_manager",
+                "engine.runtime.health",
+            )
+            now_ms = int(time.time() * 1000)
+
+            with patch.object(data_source_manager, "desired_ingestion_jobs", return_value=["ingest_etf_flows"]):
+                snapshot = health._build_ingestion_freshness_snapshot(
+                    now_ms=int(now_ms),
+                    prices_snapshot={"ok": True, "last_ts_ms": int(now_ms)},
+                    options_snapshot={"ok": True, "last_ingested_ts_ms": int(now_ms)},
+                    ingestion_runtime_snapshot={"last_publish_ts_ms": int(now_ms)},
+                    pipeline_statuses={
+                        "ingest_etf_flows": {
+                            "ok": False,
+                            "updated_ts_ms": int(now_ms),
+                            "last_ingested_ts_ms": int(now_ms),
+                            "last_error": "etf_flows_provider_503",
+                        },
+                    },
+                )
+        finally:
+            if prev_critical_sources is None:
+                os.environ.pop("CRITICAL_INGESTION_SOURCES", None)
+            else:
+                os.environ["CRITICAL_INGESTION_SOURCES"] = prev_critical_sources
+            if prev_child_jobs is None:
+                os.environ.pop("INGESTION_CHILD_JOBS", None)
+            else:
+                os.environ["INGESTION_CHILD_JOBS"] = prev_child_jobs
+
+        alt_source = dict(snapshot.get("sources", {}).get("alt_data") or {})
+        self.assertTrue(bool(alt_source.get("critical")))
+        self.assertEqual(alt_source.get("status"), "degraded")
+        self.assertIn("ingest_etf_flows", list(alt_source.get("pipeline_names") or []))
+        self.assertIn("alt_data", list(snapshot.get("failed_critical_sources") or []))
+        self.assertIn("critical_source_failed:alt_data", list(snapshot.get("runtime_reason_codes") or []))
+
     def test_health_freshness_marks_fresh_failed_social_as_degraded(self) -> None:
         (health,) = _reload_modules("engine.runtime.health")
         now_ms = int(time.time() * 1000)

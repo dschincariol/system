@@ -7,12 +7,15 @@ import logging
 import math
 import os
 import time
-from typing import Any, Callable, Dict, Sequence
+from typing import Any, Callable, Dict, Mapping, Sequence
 
 import numpy as np
 
+from engine.backtest.deflated_sharpe import deflated_sharpe_ratio
+from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect_ro, init_db, record_backtest_cpcv_run
+from engine.strategy.gated_backtest import run_gated_backtest
 
 
 LOG = logging.getLogger("engine.strategy.cpcv")
@@ -103,12 +106,267 @@ def _compute_sharpe(values: Sequence[float] | np.ndarray) -> float:
     return float((mean / std) * math.sqrt(float(arr.size)))
 
 
+def _compute_sortino(values: Sequence[float] | np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 1:
+        return 0.0
+    downside = arr[arr < 0.0]
+    if downside.size <= 1:
+        return 10.0 if float(arr.mean()) > 0.0 else 0.0
+    downside_std = float(downside.std(ddof=1))
+    if downside_std <= _EPS:
+        return 10.0 if float(arr.mean()) > 0.0 else 0.0
+    return float((float(arr.mean()) / downside_std) * math.sqrt(float(arr.size)))
+
+
+def _total_return(values: Sequence[float] | np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return 0.0
+    return float(np.prod(1.0 + arr) - 1.0)
+
+
+def _max_drawdown(values: Sequence[float] | np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return 0.0
+    equity = np.cumprod(1.0 + arr)
+    peak = np.maximum.accumulate(equity)
+    drawdown = (equity / np.maximum(peak, _EPS)) - 1.0
+    return float(abs(np.min(drawdown)))
+
+
+def _metrics_from_returns(values: Sequence[float] | np.ndarray) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    total = _total_return(arr)
+    drawdown = _max_drawdown(arr)
+    return {
+        "n": int(arr.size),
+        "mean_return": float(arr.mean()) if arr.size else 0.0,
+        "total_return": float(total),
+        "sharpe": float(_compute_sharpe(arr)),
+        "sortino": float(_compute_sortino(arr)),
+        "max_drawdown": float(drawdown),
+        "calmar": float(total / drawdown) if drawdown > _EPS else (10.0 if total > 0.0 else 0.0),
+    }
+
+
 def _returns_from_predictions(predictions: np.ndarray, realized: np.ndarray) -> np.ndarray:
     pred = np.asarray(predictions, dtype=float).reshape(-1)
     y = np.asarray(realized, dtype=float).reshape(-1)
     if pred.size != y.size:
         raise ValueError("prediction_and_realized_size_mismatch")
     return np.sign(pred) * y
+
+
+def _default_commission_bps(asset_class: str) -> float:
+    explicit = os.environ.get("CPCV_COMMISSION_BPS")
+    if explicit not in (None, ""):
+        return max(0.0, _safe_float_env("CPCV_COMMISSION_BPS", 0.0))
+    asset = str(asset_class or "").upper().strip()
+    if "CRYPTO" in asset:
+        default = _safe_float_env(
+            "CPCV_CRYPTO_COMMISSION_BPS",
+            _safe_float_env("CPCV_CRYPTO_TAKER_BPS", _safe_float_env("CPCV_CRYPTO_MAKER_BPS", 0.0)),
+        )
+        return max(0.0, float(default))
+    return max(0.0, _safe_float_env("CPCV_EQUITY_COMMISSION_BPS", 1.0))
+
+
+def cpcv_cost_config_from_env(config: Mapping[str, Any] | None = None) -> Dict[str, Any]:
+    """Resolve transaction-cost defaults for CPCV promotion backtests."""
+    cfg = dict(config or {})
+    asset_class = str(cfg.get("asset_class") or os.environ.get("CPCV_ASSET_CLASS") or "US_EQUITY").strip().upper()
+    if not asset_class:
+        asset_class = "US_EQUITY"
+    sigma_default = _safe_float_env("CPCV_SIGMA_DAILY_BPS", _safe_float_env("CPCV_SIGMA_DAILY", 200.0))
+    out = {
+        "enabled": bool(cfg.get("enabled", _safe_bool_env("CPCV_COSTS_ENABLED", True))),
+        "asset_class": asset_class,
+        "commission_bps": float(cfg.get("commission_bps", _default_commission_bps(asset_class))),
+        "half_spread_bps": float(cfg.get("half_spread_bps", _safe_float_env("CPCV_HALF_SPREAD_BPS", 1.0))),
+        "notional": float(cfg.get("notional", _safe_float_env("CPCV_TRADE_NOTIONAL", 100_000.0))),
+        "adv": float(cfg.get("adv", _safe_float_env("CPCV_ADV", 10_000_000.0))),
+        "sigma_daily": float(cfg.get("sigma_daily", sigma_default)),
+        "participation": float(cfg.get("participation", _safe_float_env("CPCV_PARTICIPATION", 0.10))),
+    }
+    out["commission_bps"] = max(0.0, float(out["commission_bps"]))
+    out["half_spread_bps"] = max(0.0, float(out["half_spread_bps"]))
+    out["notional"] = max(0.0, float(out["notional"]))
+    out["adv"] = max(_EPS, float(out["adv"]))
+    out["sigma_daily"] = max(0.0, float(out["sigma_daily"]))
+    out["participation"] = max(0.0, min(1.0, float(out["participation"])))
+    return out
+
+
+def _cost_components_for_turnover(
+    turnover: float,
+    *,
+    cost_config: Mapping[str, Any],
+    cost_model: AlmgrenChrissCost | None = None,
+) -> Dict[str, float]:
+    turnover_f = max(0.0, float(turnover or 0.0))
+    if turnover_f <= _EPS or not bool(cost_config.get("enabled", True)):
+        return {
+            "turnover": float(turnover_f),
+            "commission_bps": 0.0,
+            "half_spread_bps": 0.0,
+            "temporary_impact_bps": 0.0,
+            "permanent_impact_bps_excluded": 0.0,
+            "total_cost_bps": 0.0,
+            "cost_return": 0.0,
+        }
+    model = cost_model or AlmgrenChrissCost()
+    base_notional = max(0.0, float(cost_config.get("notional") or 0.0))
+    trade_notional = float(base_notional) * float(turnover_f)
+    components = model.components_bps(
+        notional=float(trade_notional),
+        adv=max(_EPS, float(cost_config.get("adv") or 0.0)),
+        sigma_daily=max(0.0, float(cost_config.get("sigma_daily") or 0.0)),
+        participation=max(0.0, min(1.0, float(cost_config.get("participation") or 0.0))),
+        half_spread_bps=0.0,
+        asset_class=str(cost_config.get("asset_class") or "US_EQUITY"),
+    )
+    commission_bps = max(0.0, float(cost_config.get("commission_bps") or 0.0))
+    half_spread_bps = max(0.0, float(cost_config.get("half_spread_bps") or 0.0))
+    temporary_bps = max(0.0, float(components.get("temporary_impact_bps") or 0.0))
+    total_bps = float(commission_bps + half_spread_bps + temporary_bps)
+    return {
+        "turnover": float(turnover_f),
+        "commission_bps": float(commission_bps),
+        "half_spread_bps": float(half_spread_bps),
+        "temporary_impact_bps": float(temporary_bps),
+        "permanent_impact_bps_excluded": float(components.get("permanent_impact_bps") or 0.0),
+        "total_cost_bps": float(total_bps),
+        "cost_return": float(turnover_f * total_bps / 10000.0),
+    }
+
+
+def _apply_transaction_costs_to_returns(
+    predictions: Sequence[float] | np.ndarray,
+    realized: Sequence[float] | np.ndarray,
+    *,
+    cost_config: Mapping[str, Any] | None = None,
+    initial_position: float = 0.0,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    pred = np.asarray(predictions, dtype=float).reshape(-1)
+    y = np.asarray(realized, dtype=float).reshape(-1)
+    if pred.size != y.size:
+        raise ValueError("prediction_and_realized_size_mismatch")
+    cfg = cpcv_cost_config_from_env(cost_config)
+    positions = np.sign(pred)
+    frictionless = positions * y
+    adjusted = np.asarray(frictionless, dtype=float).copy()
+    cost_returns: list[float] = []
+    turnovers: list[float] = []
+    component_rows: list[Dict[str, float]] = []
+    previous = float(np.sign(initial_position))
+    for idx, position in enumerate(positions):
+        turnover = abs(float(position) - float(previous))
+        components = _cost_components_for_turnover(turnover, cost_config=cfg)
+        cost_return = float(components.get("cost_return") or 0.0)
+        adjusted[idx] = float(adjusted[idx]) - float(cost_return)
+        turnovers.append(float(turnover))
+        cost_returns.append(float(cost_return))
+        component_rows.append(components)
+        previous = float(position)
+    return adjusted, {
+        "enabled": bool(cfg.get("enabled")),
+        "config": dict(cfg),
+        "positions": [float(value) for value in positions.tolist()],
+        "turnover": [float(value) for value in turnovers],
+        "cost_returns": [float(value) for value in cost_returns],
+        "components": component_rows,
+        "total_turnover": float(np.sum(np.asarray(turnovers, dtype=float))) if turnovers else 0.0,
+        "total_cost_return": float(np.sum(np.asarray(cost_returns, dtype=float))) if cost_returns else 0.0,
+        "frictionless_returns": [float(value) for value in frictionless.tolist()],
+        "cost_adjusted_returns": [float(value) for value in adjusted.tolist()],
+    }
+
+
+def _retrain_cadence_ms_from_env() -> int:
+    explicit = _safe_int_env("CPCV_RETRAIN_CADENCE_MS", 0)
+    if explicit > 0:
+        return int(explicit)
+    return int(max(1, _safe_int_env("MODEL_LIFECYCLE_RETRAIN_INTERVAL_MS", 6 * 60 * 60 * 1000)))
+
+
+def _predict_with_retrain_cadence(
+    *,
+    X: np.ndarray,
+    y: np.ndarray,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    sample_times_ms: np.ndarray,
+    model_factory: Callable[[], Any],
+    retrain_cadence_ms: int,
+    min_train_samples: int,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    ordered_test = np.asarray(test_idx, dtype=int)
+    if ordered_test.size <= 0:
+        return ordered_test, np.asarray([], dtype=float), {"enabled": True, "fit_count": 0, "fit_events": []}
+    order = np.argsort(sample_times_ms[ordered_test], kind="stable")
+    ordered_test = ordered_test[order]
+
+    train_all = np.asarray(train_idx, dtype=int)
+    train_times = np.asarray(sample_times_ms[train_all], dtype=float)
+    predictions: list[float] = []
+    kept_indices: list[int] = []
+    fit_events: list[Dict[str, Any]] = []
+    skipped_no_history = 0
+    model = None
+    last_fit_ts: float | None = None
+    cadence = int(retrain_cadence_ms or 0)
+
+    for sample_idx in ordered_test:
+        decision_ts = float(sample_times_ms[int(sample_idx)])
+        needs_fit = model is None or cadence <= 0 or last_fit_ts is None or (decision_ts - float(last_fit_ts)) >= float(cadence)
+        if needs_fit:
+            eligible = train_all[train_times < decision_ts]
+            eligible = np.sort(np.unique(eligible.astype(int, copy=False)))
+            if eligible.size < int(min_train_samples):
+                if model is None:
+                    skipped_no_history += 1
+                    continue
+            else:
+                model = model_factory()
+                model.fit(X[eligible], y[eligible])
+                last_fit_ts = float(decision_ts)
+                if len(fit_events) < 100:
+                    fit_events.append(
+                        {
+                            "decision_ts_ms": int(decision_ts),
+                            "train_size": int(eligible.size),
+                            "train_min_ts_ms": int(float(np.min(sample_times_ms[eligible]))),
+                            "train_max_ts_ms": int(float(np.max(sample_times_ms[eligible]))),
+                        }
+                    )
+
+        if model is None:
+            skipped_no_history += 1
+            continue
+        pred = np.asarray(model.predict(X[[int(sample_idx)]]), dtype=float).reshape(-1)
+        if pred.size <= 0 or not math.isfinite(float(pred[0])):
+            continue
+        kept_indices.append(int(sample_idx))
+        predictions.append(float(pred[0]))
+
+    return (
+        np.asarray(kept_indices, dtype=int),
+        np.asarray(predictions, dtype=float),
+        {
+            "enabled": True,
+            "cadence_ms": int(cadence),
+            "fit_count": int(len(fit_events)),
+            "fit_events": fit_events,
+            "skipped_no_history": int(skipped_no_history),
+            "min_train_samples": int(min_train_samples),
+        },
+    )
 
 
 def make_cpcv_splits(
@@ -306,6 +564,14 @@ def cpcv_backtest(
     n_test_splits: int,
     embargo_pct: float,
     label_horizon: int,
+    *,
+    sample_times_ms: Sequence[int | float] | np.ndarray | None = None,
+    cost_config: Mapping[str, Any] | None = None,
+    replay_retrain_cadence: bool = False,
+    retrain_cadence_ms: int | None = None,
+    min_train_samples: int = 2,
+    gated_backtest: bool = False,
+    symbols: Sequence[Any] | np.ndarray | None = None,
 ) -> Dict[str, Any]:
     """Run CPCV backtesting over feature and label arrays."""
     try:
@@ -348,9 +614,43 @@ def cpcv_backtest(
             "diagnostics": {"n_features": int(X.shape[0]), "n_labels": int(y.shape[0])},
         }
 
-    finite_mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+    if sample_times_ms is not None:
+        sample_times = np.asarray(sample_times_ms, dtype=float).reshape(-1)
+        if sample_times.size != y.shape[0]:
+            return {
+                "ok": False,
+                "status": "sample_time_length_mismatch",
+                "n_paths": 0,
+                "mean_sharpe": 0.0,
+                "median_sharpe": 0.0,
+                "pbo": 1.0,
+                "paths": [],
+                "diagnostics": {"n_sample_times": int(sample_times.size), "n_labels": int(y.shape[0])},
+            }
+    else:
+        sample_times = np.arange(int(y.shape[0]), dtype=float)
+
+    symbol_values: np.ndarray | None = None
+    if symbols is not None:
+        symbol_values = np.asarray(symbols, dtype=object).reshape(-1)
+        if symbol_values.size != y.shape[0]:
+            return {
+                "ok": False,
+                "status": "symbol_length_mismatch",
+                "n_paths": 0,
+                "mean_sharpe": 0.0,
+                "median_sharpe": 0.0,
+                "pbo": 1.0,
+                "paths": [],
+                "diagnostics": {"n_symbols": int(symbol_values.size), "n_labels": int(y.shape[0])},
+            }
+
+    finite_mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1) & np.isfinite(sample_times)
     X = X[finite_mask]
     y = y[finite_mask]
+    sample_times = sample_times[finite_mask]
+    if symbol_values is not None:
+        symbol_values = symbol_values[finite_mask]
     n_samples = int(y.shape[0])
     splits = make_cpcv_splits(n_samples, n_splits, n_test_splits)
     if n_samples <= 0 or not splits:
@@ -372,6 +672,14 @@ def cpcv_backtest(
     paths: list[Dict[str, Any]] = []
     in_sample_scores: list[float] = []
     out_of_sample_scores: list[float] = []
+    frictionless_out_scores: list[float] = []
+    cost_cfg = cpcv_cost_config_from_env(cost_config)
+    replay_enabled = bool(replay_retrain_cadence)
+    gated_enabled = bool(gated_backtest)
+    metric_basis = "gated_cost_adjusted" if gated_enabled else "cost_adjusted"
+    resolved_retrain_cadence_ms = int(
+        retrain_cadence_ms if retrain_cadence_ms is not None else _retrain_cadence_ms_from_env()
+    )
 
     for path_idx, (train_idx_raw, test_idx) in enumerate(splits):
         train_idx_purged = purge_train_indices(train_idx_raw, test_idx, label_horizon)
@@ -397,11 +705,78 @@ def cpcv_backtest(
             model = model_factory()
             model.fit(X[train_idx], y[train_idx])
             train_predictions = np.asarray(model.predict(X[train_idx]), dtype=float).reshape(-1)
-            test_predictions = np.asarray(model.predict(X[test_idx]), dtype=float).reshape(-1)
-            train_returns = _returns_from_predictions(train_predictions, y[train_idx])
-            test_returns = _returns_from_predictions(test_predictions, y[test_idx])
+            train_frictionless = _returns_from_predictions(train_predictions, y[train_idx])
+            train_returns, train_costs = _apply_transaction_costs_to_returns(
+                train_predictions,
+                y[train_idx],
+                cost_config=cost_cfg,
+            )
             train_sharpe = float(_compute_sharpe(train_returns))
+
+            replay_meta: Dict[str, Any] = {"enabled": False}
+            if replay_enabled:
+                effective_test_idx, test_predictions, replay_meta = _predict_with_retrain_cadence(
+                    X=X,
+                    y=y,
+                    train_idx=train_idx,
+                    test_idx=test_idx,
+                    sample_times_ms=sample_times,
+                    model_factory=model_factory,
+                    retrain_cadence_ms=int(resolved_retrain_cadence_ms),
+                    min_train_samples=int(max(2, int(min_train_samples or 2))),
+                )
+            else:
+                effective_test_idx = np.asarray(test_idx, dtype=int)
+                test_predictions = np.asarray(model.predict(X[effective_test_idx]), dtype=float).reshape(-1)
+
+            if effective_test_idx.size <= 0 or test_predictions.size <= 0:
+                paths.append(
+                    {
+                        "path_idx": int(path_idx),
+                        "status": "skipped_no_replay_predictions" if replay_enabled else "skipped_no_predictions",
+                        "train_size_raw": int(train_idx_raw.size),
+                        "train_size": int(train_idx.size),
+                        "test_size": int(test_idx.size),
+                        "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
+                        "embargoed_rows": int(max(0, train_idx_purged.size - train_idx.size)),
+                        "returns": [],
+                        "frictionless_returns": [],
+                        "cost_adjusted_returns": [],
+                        "sharpe": 0.0,
+                        "frictionless_sharpe": 0.0,
+                        "train_sharpe": float(train_sharpe),
+                        "retrain_replay": dict(replay_meta),
+                    }
+                )
+                continue
+
+            test_frictionless = _returns_from_predictions(test_predictions, y[effective_test_idx])
+            gated_meta: Dict[str, Any] = {"enabled": False}
+            if gated_enabled:
+                gated_result = run_gated_backtest(
+                    test_predictions,
+                    y[effective_test_idx],
+                    sample_times_ms=sample_times[effective_test_idx],
+                    symbols=(symbol_values[effective_test_idx] if symbol_values is not None else None),
+                    cost_config=cost_cfg,
+                    model_id="cpcv_candidate",
+                )
+                test_returns = np.asarray(gated_result.get("returns") or [], dtype=float).reshape(-1)
+                test_frictionless = np.asarray(gated_result.get("frictionless_returns") or [], dtype=float).reshape(-1)
+                test_costs = {
+                    "gated": dict(gated_result.get("costs") or {}),
+                    "diagnostics": dict(gated_result.get("diagnostics") or {}),
+                }
+                gated_meta = dict(gated_result.get("diagnostics") or {})
+                gated_meta["enabled"] = True
+            else:
+                test_returns, test_costs = _apply_transaction_costs_to_returns(
+                    test_predictions,
+                    y[effective_test_idx],
+                    cost_config=cost_cfg,
+                )
             test_sharpe = float(_compute_sharpe(test_returns))
+            frictionless_test_sharpe = float(_compute_sharpe(test_frictionless))
         except Exception as e:
             _warn_nonfatal(
                 "CPCV_BACKTEST_PATH_FAILED",
@@ -420,7 +795,10 @@ def cpcv_backtest(
                     "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
                     "embargoed_rows": int(max(0, train_idx_purged.size - train_idx.size)),
                     "returns": [],
+                    "frictionless_returns": [],
+                    "cost_adjusted_returns": [],
                     "sharpe": 0.0,
+                    "frictionless_sharpe": 0.0,
                     "train_sharpe": 0.0,
                     "error": f"{type(e).__name__}:{e}",
                 }
@@ -429,26 +807,56 @@ def cpcv_backtest(
 
         in_sample_scores.append(float(train_sharpe))
         out_of_sample_scores.append(float(test_sharpe))
+        frictionless_out_scores.append(float(frictionless_test_sharpe))
+        cost_adjusted_metrics = _metrics_from_returns(test_returns)
+        frictionless_metrics = _metrics_from_returns(test_frictionless)
         paths.append(
             {
                 "path_idx": int(path_idx),
                 "status": "ok",
                 "train_size_raw": int(train_idx_raw.size),
                 "train_size": int(train_idx.size),
-                "test_size": int(test_idx.size),
+                "test_size": int(effective_test_idx.size),
+                "test_size_raw": int(test_idx.size),
                 "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
                 "embargoed_rows": int(max(0, train_idx_purged.size - train_idx.size)),
                 "returns": [float(value) for value in np.asarray(test_returns, dtype=float).reshape(-1)],
+                "cost_adjusted_returns": [float(value) for value in np.asarray(test_returns, dtype=float).reshape(-1)],
+                "frictionless_returns": [float(value) for value in np.asarray(test_frictionless, dtype=float).reshape(-1)],
                 "sharpe": float(test_sharpe),
+                "cost_adjusted_sharpe": float(test_sharpe),
+                "frictionless_sharpe": float(frictionless_test_sharpe),
+                "sortino": float(cost_adjusted_metrics.get("sortino") or 0.0),
+                "calmar": float(cost_adjusted_metrics.get("calmar") or 0.0),
+                "total_return": float(cost_adjusted_metrics.get("total_return") or 0.0),
+                "max_drawdown": float(cost_adjusted_metrics.get("max_drawdown") or 0.0),
+                "frictionless_metrics": frictionless_metrics,
+                "cost_adjusted_metrics": cost_adjusted_metrics,
+                "costs": {
+                    "train": dict(train_costs),
+                    "test": dict(test_costs),
+                },
+                "retrain_replay": dict(replay_meta),
+                "gated_backtest": dict(gated_meta),
                 "train_sharpe": float(train_sharpe),
+                "train_frictionless_sharpe": float(_compute_sharpe(train_frictionless)),
+                "test_indices": [int(value) for value in np.asarray(effective_test_idx, dtype=int).reshape(-1).tolist()],
             }
         )
 
     valid_path_rows = [row for row in paths if str(row.get("status") or "") == "ok"]
     out_scores_arr = np.asarray(out_of_sample_scores, dtype=float)
+    frictionless_scores_arr = np.asarray(frictionless_out_scores, dtype=float)
     mean_sharpe = float(np.mean(out_scores_arr)) if out_scores_arr.size > 0 else 0.0
     median_sharpe = float(np.median(out_scores_arr)) if out_scores_arr.size > 0 else 0.0
+    frictionless_mean_sharpe = float(np.mean(frictionless_scores_arr)) if frictionless_scores_arr.size > 0 else 0.0
+    frictionless_median_sharpe = float(np.median(frictionless_scores_arr)) if frictionless_scores_arr.size > 0 else 0.0
     pbo_result = compute_pbo(in_sample_scores, out_of_sample_scores)
+    dsr_result = deflated_sharpe_ratio(
+        out_of_sample_scores,
+        realized_sharpe=median_sharpe,
+        n_trials=max(1, len(out_of_sample_scores)),
+    )
     ok = bool(valid_path_rows)
 
     return {
@@ -457,9 +865,13 @@ def cpcv_backtest(
         "n_paths": int(len(valid_path_rows)),
         "mean_sharpe": float(mean_sharpe),
         "median_sharpe": float(median_sharpe),
+        "frictionless_mean_sharpe": float(frictionless_mean_sharpe),
+        "frictionless_median_sharpe": float(frictionless_median_sharpe),
+        "deflated_sharpe": dsr_result.to_dict(),
         "pbo": float(pbo_result.get("pbo") or 1.0),
         "paths": valid_path_rows,
         "diagnostics": {
+            "metric_basis": str(metric_basis),
             "n_samples": int(n_samples),
             "n_splits": int(n_splits),
             "n_test_splits": int(n_test_splits),
@@ -470,7 +882,31 @@ def cpcv_backtest(
             "skipped_paths": int(max(0, len(paths) - len(valid_path_rows))),
             "in_sample_scores": [float(value) for value in in_sample_scores],
             "out_of_sample_scores": [float(value) for value in out_of_sample_scores],
+            "frictionless_out_of_sample_scores": [float(value) for value in frictionless_out_scores],
             "pbo_result": dict(pbo_result),
+            "deflated_sharpe": dsr_result.to_dict(),
+            "metrics": {
+                "cost_adjusted": {
+                    "mean_sharpe": float(mean_sharpe),
+                    "median_sharpe": float(median_sharpe),
+                    "path_sharpes": [float(value) for value in out_of_sample_scores],
+                },
+                "frictionless": {
+                    "mean_sharpe": float(frictionless_mean_sharpe),
+                    "median_sharpe": float(frictionless_median_sharpe),
+                    "path_sharpes": [float(value) for value in frictionless_out_scores],
+                },
+            },
+            "cost_model": dict(cost_cfg),
+            "gated_backtest": {
+                "enabled": bool(gated_enabled),
+                "metric_basis": str(metric_basis),
+            },
+            "retrain_cadence_replay": {
+                "enabled": bool(replay_enabled),
+                "cadence_ms": int(resolved_retrain_cadence_ms),
+                "min_train_samples": int(max(2, int(min_train_samples or 2))),
+            },
         },
     }
 
@@ -812,6 +1248,10 @@ def run_backtest_cpcv_job(
     n_test_splits: int | None = None,
     embargo_pct: float | None = None,
     label_horizon: int | None = None,
+    replay_retrain_cadence: bool | None = None,
+    retrain_cadence_ms: int | None = None,
+    cost_config: Mapping[str, Any] | None = None,
+    gated_backtest: bool | None = None,
 ) -> Dict[str, Any]:
     """Load a candidate dataset and run the repo's CPCV backtest workflow."""
     init_db()
@@ -840,8 +1280,23 @@ def run_backtest_cpcv_job(
         embargo_pct if embargo_pct is not None else _safe_float_env("CPCV_EMBARGO_PCT", 0.01)
     )
     resolved_label_horizon = int(label_horizon if label_horizon is not None else _resolve_label_horizon(rows))
+    resolved_replay_retrain = bool(
+        replay_retrain_cadence
+        if replay_retrain_cadence is not None
+        else _safe_bool_env("CPCV_RETRAIN_CADENCE_REPLAY", True)
+    )
+    resolved_retrain_cadence_ms = int(
+        retrain_cadence_ms if retrain_cadence_ms is not None else _retrain_cadence_ms_from_env()
+    )
+    resolved_gated_backtest = bool(
+        gated_backtest
+        if gated_backtest is not None
+        else _safe_bool_env("CPCV_GATED_BACKTEST", True)
+    )
 
     features, labels, feature_meta = _build_feature_matrix(rows)
+    sample_times = [int(row.get("event_ts_ms") or row.get("prediction_ts_ms") or idx) for idx, row in enumerate(rows)]
+    symbols = [str(row.get("symbol") or f"ASSET_{idx:05d}") for idx, row in enumerate(rows)]
     cpcv_result = cpcv_backtest(
         features,
         labels,
@@ -850,7 +1305,14 @@ def run_backtest_cpcv_job(
         n_test_splits=resolved_n_test_splits,
         embargo_pct=resolved_embargo_pct,
         label_horizon=resolved_label_horizon,
+        sample_times_ms=sample_times,
+        cost_config=cost_config,
+        replay_retrain_cadence=resolved_replay_retrain,
+        retrain_cadence_ms=resolved_retrain_cadence_ms,
+        gated_backtest=resolved_gated_backtest,
+        symbols=symbols,
     )
+    metric_basis = "gated_cost_adjusted" if resolved_gated_backtest else "cost_adjusted"
 
     diagnostics = {
         "dataset": {
@@ -867,6 +1329,24 @@ def run_backtest_cpcv_job(
             "version_info": _candidate_identity(resolved_model_name, resolved_candidate_version),
         },
         "cpcv": dict(cpcv_result.get("diagnostics") or {}),
+        "metric_basis": str(metric_basis),
+        "frictionless": {
+            "mean_sharpe": float(cpcv_result.get("frictionless_mean_sharpe") or 0.0),
+            "median_sharpe": float(cpcv_result.get("frictionless_median_sharpe") or 0.0),
+        },
+        "cost_adjusted": {
+            "mean_sharpe": float(cpcv_result.get("mean_sharpe") or 0.0),
+            "median_sharpe": float(cpcv_result.get("median_sharpe") or 0.0),
+            "deflated_sharpe": dict(cpcv_result.get("deflated_sharpe") or {}),
+        },
+        "retrain_cadence_replay": {
+            "enabled": bool(resolved_replay_retrain),
+            "cadence_ms": int(resolved_retrain_cadence_ms),
+        },
+        "gated_backtest": {
+            "enabled": bool(resolved_gated_backtest),
+            "metric_basis": str(metric_basis),
+        },
     }
 
     run_id = record_backtest_cpcv_run(
@@ -880,6 +1360,7 @@ def run_backtest_cpcv_job(
         mean_sharpe=float(cpcv_result.get("mean_sharpe") or 0.0),
         median_sharpe=float(cpcv_result.get("median_sharpe") or 0.0),
         pbo=float(cpcv_result.get("pbo") or 1.0),
+        deflated_sharpe=float(dict(cpcv_result.get("deflated_sharpe") or {}).get("deflated_sharpe") or 0.0),
         diagnostics=diagnostics,
     )
 
@@ -892,6 +1373,9 @@ def run_backtest_cpcv_job(
         "n_paths": int(cpcv_result.get("n_paths") or 0),
         "mean_sharpe": float(cpcv_result.get("mean_sharpe") or 0.0),
         "median_sharpe": float(cpcv_result.get("median_sharpe") or 0.0),
+        "frictionless_mean_sharpe": float(cpcv_result.get("frictionless_mean_sharpe") or 0.0),
+        "frictionless_median_sharpe": float(cpcv_result.get("frictionless_median_sharpe") or 0.0),
+        "deflated_sharpe": dict(cpcv_result.get("deflated_sharpe") or {}),
         "pbo": float(cpcv_result.get("pbo") or 1.0),
         "diagnostics": diagnostics,
     }
@@ -907,12 +1391,17 @@ def cpcv_config_from_env() -> Dict[str, Any]:
         "label_horizon": int(max(0, _safe_int_env("CPCV_LABEL_HORIZON", 0))),
         "max_pbo": float(max(0.0, _safe_float_env("CPCV_MAX_PBO", 0.5))),
         "min_path_sharpe": float(_safe_float_env("CPCV_MIN_PATH_SHARPE", 0.5)),
+        "costs_enabled": bool(_safe_bool_env("CPCV_COSTS_ENABLED", True)),
+        "retrain_cadence_replay": bool(_safe_bool_env("CPCV_RETRAIN_CADENCE_REPLAY", True)),
+        "retrain_cadence_ms": int(max(1, _retrain_cadence_ms_from_env())),
+        "gated_backtest": bool(_safe_bool_env("CPCV_GATED_BACKTEST", True)),
     }
 
 
 __all__ = [
     "compute_pbo",
     "cpcv_backtest",
+    "cpcv_cost_config_from_env",
     "cpcv_config_from_env",
     "embargo_train_indices",
     "make_cpcv_splits",

@@ -18,6 +18,8 @@ GENERATED_MARKERS = (
     "logs/",
     "tmp/",
     "data/retraining/",
+    "docs/system_audit_layer1",
+    "docs/job_migration_l",
     ".coverage",
 )
 RUNTIME_SUFFIXES = (
@@ -32,6 +34,7 @@ RUNTIME_SUFFIXES = (
 )
 SOURCE_PREFIXES = (
     ".dockerignore",
+    ".gitignore",
     ".github/",
     "boot/",
     "dashboard_server.py",
@@ -73,6 +76,8 @@ def _category(path: str) -> str:
     lower = path.lower()
     if any(marker in lower for marker in GENERATED_MARKERS) or lower.endswith(RUNTIME_SUFFIXES):
         return "generated_or_runtime"
+    if lower == ".npmrc":
+        return "secrets_or_local_config"
     if lower == ".env.example":
         return "docs"
     if lower.startswith(".env") or "secret" in lower or "credential" in lower:

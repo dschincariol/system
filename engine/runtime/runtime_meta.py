@@ -68,28 +68,70 @@ _existing_buffer_inflight = globals().get("_BEST_EFFORT_BUFFER_INFLIGHT")
 _existing_buffer_stop = globals().get("_BEST_EFFORT_BUFFER_STOP")
 _existing_buffer_thread = globals().get("_BEST_EFFORT_BUFFER_THREAD")
 _existing_buffer_state = globals().get("_BEST_EFFORT_BUFFER_STATE")
+_RUNTIME_META_DB_PATH_CHANGED = bool(
+    _PREVIOUS_RUNTIME_META_DB_PATH
+    and _PREVIOUS_RUNTIME_META_DB_PATH != _RUNTIME_META_DB_PATH
+)
 
-_BEST_EFFORT_META_LOCK = _existing_meta_lock if _existing_meta_lock is not None else threading.Lock()
+if _RUNTIME_META_DB_PATH_CHANGED:
+    if _existing_buffer_stop is not None:
+        try:
+            _existing_buffer_stop.set()
+        except Exception as e:
+            _stderr_nonfatal("RUNTIME_META_BEST_EFFORT_RELOAD_STOP_FAILED", e)
+    if _existing_buffer_lock is not None:
+        try:
+            with _existing_buffer_lock:
+                _existing_buffer_lock.notify_all()
+        except Exception as e:
+            _stderr_nonfatal("RUNTIME_META_BEST_EFFORT_RELOAD_NOTIFY_FAILED", e)
+    if (
+        isinstance(_existing_buffer_thread, threading.Thread)
+        and _existing_buffer_thread.is_alive()
+        and _existing_buffer_thread is not threading.current_thread()
+    ):
+        try:
+            _existing_buffer_thread.join(timeout=1.0)
+        except Exception as e:
+            _stderr_nonfatal("RUNTIME_META_BEST_EFFORT_RELOAD_JOIN_FAILED", e)
+
+_BEST_EFFORT_META_LOCK = (
+    threading.Lock()
+    if _RUNTIME_META_DB_PATH_CHANGED or _existing_meta_lock is None
+    else _existing_meta_lock
+)
 _BEST_EFFORT_META_RECENT: dict[str, dict[str, Any]] = (
-    _existing_meta_recent if isinstance(_existing_meta_recent, dict) else {}
+    {}
+    if _RUNTIME_META_DB_PATH_CHANGED or not isinstance(_existing_meta_recent, dict)
+    else _existing_meta_recent
 )
 _BEST_EFFORT_BUFFER_LOCK = (
-    _existing_buffer_lock if _existing_buffer_lock is not None else threading.Condition()
+    threading.Condition()
+    if _RUNTIME_META_DB_PATH_CHANGED or _existing_buffer_lock is None
+    else _existing_buffer_lock
 )
 _BEST_EFFORT_BUFFER_PENDING: dict[str, dict[str, Any]] = (
-    _existing_buffer_pending if isinstance(_existing_buffer_pending, dict) else {}
+    {}
+    if _RUNTIME_META_DB_PATH_CHANGED or not isinstance(_existing_buffer_pending, dict)
+    else _existing_buffer_pending
 )
 _BEST_EFFORT_BUFFER_INFLIGHT: dict[str, dict[str, Any]] = (
-    _existing_buffer_inflight if isinstance(_existing_buffer_inflight, dict) else {}
+    {}
+    if _RUNTIME_META_DB_PATH_CHANGED or not isinstance(_existing_buffer_inflight, dict)
+    else _existing_buffer_inflight
 )
 _BEST_EFFORT_BUFFER_STOP = (
-    _existing_buffer_stop if _existing_buffer_stop is not None else threading.Event()
+    threading.Event()
+    if _RUNTIME_META_DB_PATH_CHANGED or _existing_buffer_stop is None
+    else _existing_buffer_stop
 )
 _BEST_EFFORT_BUFFER_THREAD: threading.Thread | None = (
-    _existing_buffer_thread if isinstance(_existing_buffer_thread, threading.Thread) else None
+    None
+    if _RUNTIME_META_DB_PATH_CHANGED or not isinstance(_existing_buffer_thread, threading.Thread)
+    else _existing_buffer_thread
 )
 _BEST_EFFORT_BUFFER_STATE: dict[str, Any] = (
-    _existing_buffer_state if isinstance(_existing_buffer_state, dict) else {
+    _existing_buffer_state if (not _RUNTIME_META_DB_PATH_CHANGED and isinstance(_existing_buffer_state, dict)) else {
         "buffered_keys": 0,
         "flush_batches": 0,
         "flushed_keys": 0,
@@ -100,26 +142,6 @@ _BEST_EFFORT_BUFFER_STATE: dict[str, Any] = (
         "last_error_ts_ms": 0,
     }
 )
-
-if _PREVIOUS_RUNTIME_META_DB_PATH and _PREVIOUS_RUNTIME_META_DB_PATH != _RUNTIME_META_DB_PATH:
-    with _BEST_EFFORT_META_LOCK:
-        _BEST_EFFORT_META_RECENT.clear()
-    with _BEST_EFFORT_BUFFER_LOCK:
-        _BEST_EFFORT_BUFFER_PENDING.clear()
-        _BEST_EFFORT_BUFFER_INFLIGHT.clear()
-        _BEST_EFFORT_BUFFER_STATE.update(
-            {
-                "buffered_keys": 0,
-                "flush_batches": 0,
-                "flushed_keys": 0,
-                "dropped_keys": 0,
-                "last_enqueue_ts_ms": 0,
-                "last_flush_ts_ms": 0,
-                "last_error": "",
-                "last_error_ts_ms": 0,
-            }
-        )
-        _BEST_EFFORT_BUFFER_LOCK.notify_all()
 
 _BEST_EFFORT_BUFFER_STATE = dict(_BEST_EFFORT_BUFFER_STATE)
 _BEST_EFFORT_BUFFER_STATE.update(
@@ -233,7 +255,35 @@ def _note_best_effort_buffer_state(**updates: Any) -> None:
         _BEST_EFFORT_BUFFER_STATE.update(dict(updates or {}))
 
 
+def _current_runtime_meta_db_path() -> str:
+    return str(os.environ.get("DB_PATH") or "").strip()
+
+
+def _reset_best_effort_buffer_for_current_db_path_if_needed() -> None:
+    global _RUNTIME_META_DB_PATH
+    current = _current_runtime_meta_db_path()
+    if current == _RUNTIME_META_DB_PATH:
+        return
+    with _BEST_EFFORT_META_LOCK:
+        _BEST_EFFORT_META_RECENT.clear()
+    with _BEST_EFFORT_BUFFER_LOCK:
+        _BEST_EFFORT_BUFFER_PENDING.clear()
+        _BEST_EFFORT_BUFFER_INFLIGHT.clear()
+        _BEST_EFFORT_BUFFER_STATE.update(
+            {
+                "buffered_keys": 0,
+                "last_enqueue_ts_ms": 0,
+                "last_flush_ts_ms": 0,
+                "last_error": "",
+                "last_error_ts_ms": 0,
+            }
+        )
+        _RUNTIME_META_DB_PATH = current
+        _BEST_EFFORT_BUFFER_LOCK.notify_all()
+
+
 def _get_pending_best_effort_value(key_s: str) -> tuple[bool, str | None]:
+    _reset_best_effort_buffer_for_current_db_path_if_needed()
     key_name = str(key_s or "").strip()
     with _BEST_EFFORT_BUFFER_LOCK:
         pending = _BEST_EFFORT_BUFFER_PENDING.get(key_name)
@@ -267,6 +317,7 @@ def _note_best_effort_write(key_s: str, value_s: str) -> None:
 def _enqueue_best_effort_write(key_s: str, value_s: str) -> bool:
     if (not _BEST_EFFORT_BUFFER_ENABLED) or (not _should_buffer_best_effort_key(key_s)):
         return False
+    _reset_best_effort_buffer_for_current_db_path_if_needed()
     now_ms = int(time.time() * 1000)
     with _BEST_EFFORT_BUFFER_LOCK:
         key_name = str(key_s)
@@ -384,7 +435,9 @@ def _best_effort_flush_ready() -> bool:
 def _best_effort_writer_loop() -> None:
     consecutive_failures = 0
     while True:
-        with _BEST_EFFORT_BUFFER_LOCK:
+        _reset_best_effort_buffer_for_current_db_path_if_needed()
+        buffer_condition = _BEST_EFFORT_BUFFER_LOCK
+        with buffer_condition:
             while True:
                 if _BEST_EFFORT_BUFFER_STOP.is_set() and not _BEST_EFFORT_BUFFER_PENDING:
                     return
@@ -402,7 +455,7 @@ def _best_effort_writer_loop() -> None:
                         int(oldest_enqueued_ts_ms + _BEST_EFFORT_BUFFER_FLUSH_INTERVAL_MS - now_ms),
                     )
                     wait_s = max(0.01, float(remaining_ms) / 1000.0)
-                _BEST_EFFORT_BUFFER_LOCK.wait(timeout=wait_s)
+                buffer_condition.wait(timeout=wait_s)
         if should_defer_noncritical_startup_write():
             _BEST_EFFORT_BUFFER_STOP.wait(timeout=float(noncritical_startup_write_wait_s()))
             continue
@@ -447,6 +500,7 @@ def _ensure_best_effort_writer_thread() -> None:
 
 
 def flush_best_effort_runtime_meta_buffer(*, max_batches: int | None = None) -> dict[str, Any]:
+    _reset_best_effort_buffer_for_current_db_path_if_needed()
     batches = 0
     flushed = 0
     while True:
@@ -486,6 +540,7 @@ def shutdown_best_effort_runtime_meta_buffer(*, timeout_s: float = 2.0) -> dict[
 
 
 def runtime_meta_best_effort_buffer_snapshot() -> dict[str, Any]:
+    _reset_best_effort_buffer_for_current_db_path_if_needed()
     with _BEST_EFFORT_BUFFER_LOCK:
         state = dict(_BEST_EFFORT_BUFFER_STATE)
         state["buffered_keys"] = int(len(_BEST_EFFORT_BUFFER_PENDING))
@@ -497,6 +552,7 @@ def runtime_meta_best_effort_buffer_snapshot() -> dict[str, Any]:
     state["flush_jitter_ratio"] = float(_BEST_EFFORT_BUFFER_FLUSH_JITTER_RATIO)
     state["batch_size"] = int(_BEST_EFFORT_BUFFER_MAX_BATCH)
     state["buffer_max_keys"] = int(_BEST_EFFORT_BUFFER_MAX_KEYS)
+    state["db_path"] = str(_RUNTIME_META_DB_PATH)
     return state
 
 
@@ -551,7 +607,9 @@ def _run_meta_write(
             busy_timeout_ms=busy_timeout_ms,
         )
         return
-    except dbapi.OperationalError as e:
+    except Exception as e:
+        if not (isinstance(e, dbapi.OperationalError) or dbapi.is_sqlite_error(e, "OperationalError")):
+            raise
         if "write_transaction_already_active" not in str(e or ""):
             raise
     # A stale pooled write handle can survive helper boundaries in long-lived

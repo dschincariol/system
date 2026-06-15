@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-MODEL_NAME = "gbm_regressor.unit"
+MODEL_NAME = "gbm_regressor_AAPL_1710000123456_abcdef1"
 MODEL_VERSION = "gbm-20260411-test"
 HORIZON_S = 300
 FEATURE_IDS = [
@@ -54,6 +55,7 @@ class GBMRegressorTests(unittest.TestCase):
                 "GBM_LEARNING_RATE",
                 "GBM_N_ESTIMATORS",
                 "GBM_MIN_CHILD_SAMPLES",
+                "TS_ARTIFACTS_ROOT",
             )
         }
         self._configure_env(use_gbm=True)
@@ -107,6 +109,7 @@ class GBMRegressorTests(unittest.TestCase):
         os.environ["GBM_LEARNING_RATE"] = "0.1"
         os.environ["GBM_N_ESTIMATORS"] = "16"
         os.environ["GBM_MIN_CHILD_SAMPLES"] = "1"
+        os.environ["TS_ARTIFACTS_ROOT"] = str(Path(self.tmp.name) / "artifacts")
 
     def _reload_stack(self):
         return _reload_modules(
@@ -203,7 +206,7 @@ class GBMRegressorTests(unittest.TestCase):
             model_name=MODEL_NAME,
             model_kind="lightgbm",
             model_ts_ms=created_ts,
-            stage="shadow",
+            stage="challenger",
             metrics=stage_metrics,
             regime="global",
         )
@@ -222,6 +225,40 @@ class GBMRegressorTests(unittest.TestCase):
             },
             meta=dict(stage_metrics),
         )
+        from engine.runtime.runtime_meta import meta_set
+        from engine.strategy.promotion_audit import record_statistical_evidence
+
+        record_statistical_evidence(
+            model_id=MODEL_NAME,
+            test_name="white_reality_check",
+            p_value=0.01,
+            decision="pass",
+            payload={"source": "gbm_regressor_fixture"},
+        )
+        replay_ts_ms = int(time.time() * 1000)
+        replay_payload = {
+            "ok": True,
+            "updated_ts_ms": int(replay_ts_ms),
+            "models": {
+                f"{MODEL_NAME}|AAPL|{HORIZON_S}|global": {
+                    "model_name": MODEL_NAME,
+                    "model_id": MODEL_NAME,
+                    "symbol": "AAPL",
+                    "horizon_s": HORIZON_S,
+                    "regime": "global",
+                    "model_kind": "lightgbm",
+                    "model_ts_ms": int(created_ts),
+                    "approved": True,
+                }
+            },
+        }
+        replay_status = {"ok": True, "status": "ready", "updated_ts_ms": int(replay_ts_ms)}
+        meta_set("competition_replay_validation", json.dumps(replay_payload, separators=(",", ":"), sort_keys=True))
+        meta_set(
+            "competition_replay_validation_status",
+            json.dumps(replay_status, separators=(",", ":"), sort_keys=True),
+        )
+        self.registry.promote_to_champion(MODEL_NAME, "lightgbm", created_ts, regime="global")
         self.lifecycle.mark_version_live(MODEL_NAME, MODEL_VERSION, stage="champion")
         return {
             "blob": blob,

@@ -20,8 +20,8 @@ if str(_ROOT) not in sys.path:
 
 from engine.backtest.cpcv import CombinatorialPurgedKFold
 from engine.backtest.deflated_sharpe import deflated_sharpe_ratio
-from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
 from engine.runtime.storage import connect, init_db, record_backtest_cpcv_path_result
+from engine.strategy.cpcv import _apply_transaction_costs_to_returns, cpcv_cost_config_from_env
 
 MS_PER_DAY = 86_400_000
 
@@ -320,19 +320,6 @@ def _max_drawdown(returns: Iterable[float]) -> float:
     return float(abs(np.min(drawdown)))
 
 
-def _path_cost_bps(cost_model: AlmgrenChrissCost, cfg: Dict[str, Any]) -> float:
-    return float(
-        cost_model.cost_bps(
-            notional=float(cfg.get("notional") or 0.0),
-            adv=float(cfg.get("adv") or 1.0),
-            sigma_daily=float(cfg.get("sigma_daily") or 0.0),
-            participation=float(cfg.get("participation") or 0.0),
-            half_spread_bps=float(cfg.get("half_spread_bps") or 0.0),
-            asset_class=str(cfg.get("asset_class") or "US_EQUITY"),
-        )
-    )
-
-
 def run_cpcv_backtest(cfg: Dict[str, Any], *, con=None, persist: bool = True) -> Dict[str, Any]:
     owns_connection = con is None
     if con is None:
@@ -360,8 +347,7 @@ def run_cpcv_backtest(cfg: Dict[str, Any], *, con=None, persist: bool = True) ->
             embargo=float(cfg.get("embargo_pct") or 0.0),
             label_end_times=label_end,
         )
-        cost_model = AlmgrenChrissCost()
-        fixed_cost_bps = _path_cost_bps(cost_model, cfg)
+        cost_config = cpcv_cost_config_from_env(cfg)
 
         paths: list[dict] = []
         for path_index, (train_idx, test_idx) in enumerate(splitter.split(X)):
@@ -375,16 +361,24 @@ def run_cpcv_backtest(cfg: Dict[str, Any], *, con=None, persist: bool = True) ->
                 pred = model.predict(X[test_idx])
                 model_source = "fold_trained_linear_baseline"
             gross = np.sign(pred) * y[test_idx]
-            net = gross - (float(fixed_cost_bps) / 10000.0)
+            net, cost_meta = _apply_transaction_costs_to_returns(
+                pred,
+                y[test_idx],
+                cost_config=cost_config,
+            )
             path = {
                 "path_index": int(path_index),
                 "train_size": int(train_idx.size),
                 "test_size": int(test_idx.size),
                 "sharpe": float(_sharpe(net)),
+                "frictionless_sharpe": float(_sharpe(gross)),
                 "total_return": float(np.prod(1.0 + net) - 1.0),
                 "max_drawdown": float(_max_drawdown(net)),
                 "returns": [float(value) for value in net.tolist()],
-                "cost_bps": float(fixed_cost_bps),
+                "cost_adjusted_returns": [float(value) for value in net.tolist()],
+                "frictionless_returns": [float(value) for value in gross.tolist()],
+                "cost_model": dict(cost_config),
+                "costs": dict(cost_meta),
                 "model_source": str(model_source),
                 "test_start_ts": int(rows[int(test_idx[0])]["ts_ms"]),
                 "test_end_ts": int(rows[int(test_idx[-1])]["ts_ms"]),
@@ -420,6 +414,7 @@ def run_cpcv_backtest(cfg: Dict[str, Any], *, con=None, persist: bool = True) ->
                         **path,
                         "deflated_sharpe": dsr.to_dict(),
                         "deflated_sharpe_best": dsr_best.to_dict(),
+                        "metric_basis": "cost_adjusted",
                         "dataset_source": str(dataset.get("source") or ""),
                     },
                     con=con,
@@ -436,6 +431,10 @@ def run_cpcv_backtest(cfg: Dict[str, Any], *, con=None, persist: bool = True) ->
             "mean_sharpe": float(np.mean(sharpes)) if sharpes else 0.0,
             "deflated_sharpe": dsr_best.to_dict(),
             "paths": paths,
+            "metric_basis": "cost_adjusted",
+            "frictionless_mean_sharpe": (
+                float(np.mean([float(path.get("frictionless_sharpe") or 0.0) for path in paths])) if paths else 0.0
+            ),
             "dataset_source": str(dataset.get("source") or ""),
             "uses_precomputed_predictions": bool(uses_precomputed),
         }

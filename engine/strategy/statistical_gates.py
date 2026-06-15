@@ -730,7 +730,10 @@ def passes_promotion_gate(returns, n_competing_trials, config=None, models_retur
         "white_reality_check": dict((multiple_testing or {}).get("white_reality_check") or {}),
         "spa_test": dict((multiple_testing or {}).get("spa_test") or {}),
         "spa_pass": bool((multiple_testing or {}).get("blocking_passed", True)),
-        "t_pass": bool(math.isfinite(t_statistic) and float(t_statistic) >= float(threshold_t)),
+        "t_pass": bool(
+            (math.isfinite(t_statistic) or float(t_statistic) == float("inf"))
+            and float(t_statistic) >= float(threshold_t)
+        ),
         "dsr_pass": bool(float(deflated_sharpe) >= float(cfg.get("min_deflated_sharpe") or 0.0)),
         "passed": True,
     }

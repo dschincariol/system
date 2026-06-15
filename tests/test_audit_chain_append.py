@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from audit_chain_test_utils import connect, create_audit_table, row_dict
+from tests.audit_chain_test_utils import connect, create_audit_table, row_dict
 
 from engine.audit.chain import append_chain_row, coerce_row_for_hash, table_columns
 from engine.audit.hashing import compute_row_hash

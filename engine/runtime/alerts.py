@@ -921,6 +921,8 @@ def emit_alert(
         _warn("alerts.exec_cost_filter", e, symbol=str(symbol), horizon_s=int(horizon_s))
 
     signal_regime = _extract_signal_regime(symbol, explain)
+    if signal_regime:
+        explain.setdefault("regime", str(signal_regime))
     rule = choose_rule(expected_z, confidence, symbol, horizon_s, rules, regime=signal_regime)
     if not rule:
         return None

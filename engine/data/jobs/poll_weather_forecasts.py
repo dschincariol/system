@@ -255,7 +255,13 @@ def _run_once() -> None:
                 continue
             try:
                 if WEATHER_PROVIDER != "open_meteo":
-                    logging.info("provider=%s not supported by this poller yet; skipping", WEATHER_PROVIDER)
+                    message = f"unsupported_weather_provider:{WEATHER_PROVIDER}"
+                    _warn_state(
+                        "POLL_WEATHER_FORECASTS_UNSUPPORTED_PROVIDER",
+                        message,
+                        provider=str(WEATHER_PROVIDER),
+                    )
+                    errors.append(message)
                     break
                 payload = _fetch_open_meteo_daily(lat, lon)
                 daily = (payload or {}).get("daily") or {}
@@ -330,6 +336,9 @@ def _run_once() -> None:
             except Exception as exc:
                 _warn_nonfatal("POLL_WEATHER_FORECASTS_REGION_FETCH_FAILED", exc, once_key=f"region_fetch:{region_id}", region_id=str(region_id))
                 errors.append(f"{region_id}:{exc}")
+
+        if not errors and inserted_rows <= 0 and event_rows <= 0:
+            errors.append("weather_forecast_empty_response")
 
         health_error = None if not errors else "; ".join(errors[:3])
         append_weather_provider_health(

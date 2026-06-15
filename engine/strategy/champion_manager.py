@@ -888,6 +888,10 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
                         "score_weight": 0.0,
                         "score": 0.0,
                         "event_pnls": [],
+                        "evaluation_timestamps": [],
+                        "regime_labels": [],
+                        "challenger_predictions": [],
+                        "realized_returns": [],
                         "symbols": set(),
                         "horizons": set(),
                         "regimes": set(),
@@ -912,7 +916,30 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
                     _safe_int(rec.get("last_trade_ts_ms"), 0),
                     _safe_int(meta.get("last_signal_ts_ms"), _safe_int(updated_ts_ms, 0)),
                 )
-                rec["event_pnls"].append(float(total_pnl))
+                realized_trade_pnls = []
+                raw_trade_pnls = meta.get("realized_trade_pnls")
+                if isinstance(raw_trade_pnls, list):
+                    for raw_trade_pnl in raw_trade_pnls:
+                        try:
+                            trade_pnl = float(raw_trade_pnl)
+                        except Exception as e:
+                            _warn_nonfatal(
+                                "CHAMPION_MANAGER_RANKING_TRADE_PNL_PARSE_FAILED",
+                                e,
+                                once_key="ranking_trade_pnl_parse",
+                                value=repr(raw_trade_pnl)[:128],
+                            )
+                            continue
+                        if trade_pnl == trade_pnl and trade_pnl not in (float("inf"), float("-inf")):
+                            realized_trade_pnls.append(float(trade_pnl))
+                if realized_trade_pnls:
+                    rec["event_pnls"].extend(realized_trade_pnls)
+                else:
+                    rec["event_pnls"].append(float(total_pnl))
+                for key in ("evaluation_timestamps", "regime_labels", "challenger_predictions", "realized_returns"):
+                    values = meta.get(key)
+                    if isinstance(values, list) and values:
+                        rec.setdefault(key, []).extend(list(values))
                 rec["trade_count"] = _safe_int(rec.get("trade_count"), 0) + _safe_int(trades, 0)
                 rec["wins"] = _safe_int(rec.get("wins"), 0) + _safe_int(wins, 0)
                 rec["losses"] = _safe_int(rec.get("losses"), 0) + _safe_int(losses, 0)
@@ -974,6 +1001,11 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
                     "symbols": sorted(str(x) for x in (row.get("symbols") or set()) if str(x).strip()),
                     "horizons": sorted(int(x) for x in (row.get("horizons") or set())),
                     "regimes": sorted(str(x) for x in (row.get("regimes") or set()) if str(x).strip()),
+                    "evaluation_timestamps": list(row.get("evaluation_timestamps") or []),
+                    "regime_labels": list(row.get("regime_labels") or []),
+                    "challenger_predictions": list(row.get("challenger_predictions") or []),
+                    "realized_returns": list(row.get("realized_returns") or []),
+                    "event_pnls": list(row.get("event_pnls") or []),
                     "source": str(row.get("source") or ""),
                 }
                 con.execute(
@@ -1403,6 +1435,13 @@ def _promotion_candidate_version(row: Optional[Dict[str, Any]]) -> str:
     return str(candidate.get("model_name") or "").strip()
 
 
+def _promotion_stat_gate_cache_key(row: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+    candidate = dict(row or {})
+    metrics = dict(candidate.get("metrics") or {})
+    model_id = str(candidate.get("model_id") or metrics.get("model_id") or "").strip()
+    return str(model_id), str(_promotion_candidate_version(candidate))
+
+
 def _promotion_feature_ids(row: Optional[Dict[str, Any]]) -> List[str]:
     contract = _extract_feature_contract(row)
     ids = contract.get("feature_ids")
@@ -1419,10 +1458,53 @@ def _promotion_feature_gate_payload(row: Optional[Dict[str, Any]]) -> Dict[str, 
     meta = dict(candidate.get("meta") or {})
     metrics = dict(candidate.get("metrics") or {})
     out: Dict[str, Any] = {}
-    for key in ("candidate_features", "new_features", "feature_returns", "feature_p_values", "feature_t_stats"):
+    for key in (
+        "candidate_features",
+        "new_features",
+        "feature_returns",
+        "feature_p_values",
+        "feature_t_stats",
+        "neutralization_features",
+        "feature_snapshots",
+        "feature_values",
+        "features_matrix",
+    ):
         value = meta.get(key, metrics.get(key))
         if value is not None:
             out[key] = value
+    return out
+
+
+def _promotion_era_gate_payload(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    candidate = dict(row or {})
+    meta = dict(candidate.get("meta") or {})
+    metrics = dict(candidate.get("metrics") or {})
+    out: Dict[str, Any] = {}
+    aliases = {
+        "evaluation_timestamps": (
+            "evaluation_timestamps",
+            "event_timestamps",
+            "event_ts_ms",
+            "signal_ts_ms",
+            "ts_ms",
+        ),
+        "era_labels": ("era_labels", "eras", "calendar_eras"),
+        "regime_labels": ("regime_labels", "regimes", "regime_series"),
+        "challenger_predictions": (
+            "challenger_predictions",
+            "predictions",
+            "predicted_z",
+            "net_predictions",
+            "net_pred_z",
+        ),
+        "realized_returns": ("realized_returns", "realized", "realized_z", "labels", "target"),
+    }
+    for output_key, keys in aliases.items():
+        for key in keys:
+            value = meta.get(key, metrics.get(key))
+            if isinstance(value, list) and value:
+                out[output_key] = value
+                break
     return out
 
 
@@ -1495,13 +1577,14 @@ def _evaluate_promotion_stat_gate(
     model_name = str(candidate.get("model_name") or "").strip()
     if not model_name:
         return False, {"enabled": False, "status": "missing_model_name", "passed": False}
-    gate_config = _promotion_gate_overrides(candidate)
     env_gate_enabled = str(os.environ.get("CHAMPION_PROMOTION_USE_STAT_GATE", "0")).strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
     }
+    metrics = dict(candidate.get("metrics") or {})
+    gate_config = _promotion_gate_overrides(candidate)
     config_gate_enabled = bool(
         gate_config.get("enabled")
         or gate_config.get("use_gate")
@@ -1514,31 +1597,103 @@ def _evaluate_promotion_stat_gate(
         "yes",
         "on",
     }
-    if not env_gate_enabled and not config_gate_enabled:
-        if cpcv_gate_enabled:
+    legacy_gate_enabled = bool(env_gate_enabled or config_gate_enabled or cpcv_gate_enabled)
+    evidence_model_id = str(candidate.get("model_id") or metrics.get("model_id") or "").strip()
+    if not evidence_model_id:
+        if config_gate_enabled:
+            legacy_config = dict(gate_config or {})
+            nested_cpcv = dict(legacy_config.get("cpcv") or {}) if isinstance(legacy_config.get("cpcv"), dict) else {}
+            cpcv_requested = bool(cpcv_gate_enabled or nested_cpcv.get("enabled"))
+            if not cpcv_requested:
+                nested_cpcv["enabled"] = False
+                legacy_config["cpcv"] = nested_cpcv
             configured_passed, configured_diagnostics = evaluate_statistical_promotion_gate(
                 model_name=model_name,
                 candidate_version=_promotion_candidate_version(candidate),
                 returns=_promotion_return_series(candidate),
                 n_competing_trials=int(n_competing_trials),
                 models_returns=models_returns,
-                config=gate_config,
+                config=legacy_config,
                 persist=False,
             )
+            statistical_gate = dict((configured_diagnostics or {}).get("statistical_gate") or {})
             payload = dict(configured_diagnostics or {})
-            payload["requested_gate_config"] = dict(gate_config)
-            payload["required_by_candidate"] = False
+            payload["enabled"] = True
+            payload["applied"] = True
+            payload["model_name"] = str(model_name)
+            payload["candidate_version"] = _promotion_candidate_version(candidate)
+            payload["legacy_stat_gate"] = dict(configured_diagnostics or {})
+            payload["configured_gate"] = dict(configured_diagnostics or {})
+            payload["record_legacy_hypothesis"] = bool(statistical_gate.get("enabled"))
+            payload["required_by_candidate"] = True
+            payload["validation_enabled"] = True
+            payload["passed"] = bool(configured_passed)
+            payload["status"] = (
+                str((configured_diagnostics or {}).get("status") or "configured_gate_failed")
+                if not bool(configured_passed)
+                else str((configured_diagnostics or {}).get("status") or "evaluated")
+            )
+            payload["missing_model_id_advisory"] = True
             return bool(configured_passed), payload
-        return True, {"enabled": False, "applied": False, "status": "disabled", "passed": True}
+        return False, {
+            "enabled": True,
+            "applied": True,
+            "status": "missing_model_id",
+            "passed": False,
+            "model_name": str(model_name),
+            "candidate_version": _promotion_candidate_version(candidate),
+        }
     feature_payload = _promotion_feature_gate_payload(candidate)
-    metrics = dict(candidate.get("metrics") or {})
-    evidence_model_id = str(candidate.get("model_id") or metrics.get("model_id") or model_name).strip()
+    era_payload = _promotion_era_gate_payload(candidate)
+    challenger_returns = _promotion_return_series(candidate)
+    champion_returns = _promotion_return_series(champion_row)
+    aligned_observations = (
+        min(len(challenger_returns), len(champion_returns))
+        if champion_returns
+        else len(challenger_returns)
+    )
+    min_assessment_observations = max(
+        2,
+        _safe_int(os.environ.get("CHAMPION_PROMOTION_MIN_OBSERVATIONS"), 50),
+    )
+    if not legacy_gate_enabled and int(aligned_observations) < int(min_assessment_observations):
+        return True, {
+            "enabled": True,
+            "applied": False,
+            "status": "insufficient_observations_advisory",
+            "passed": True,
+            "model_id": str(evidence_model_id),
+            "model_name": str(model_name),
+            "candidate_version": _promotion_candidate_version(candidate),
+            "n_observations": int(aligned_observations),
+            "min_observations": int(min_assessment_observations),
+            "legacy_stat_gate": {
+                "enabled": False,
+                "applied": False,
+                "status": "disabled",
+                "passed": True,
+            },
+            "record_legacy_hypothesis": False,
+            "validation_enabled": False,
+        }
     passed, diagnostics = assess_challenger(
         model_id=str(evidence_model_id),
         model_name=model_name,
         candidate_version=_promotion_candidate_version(candidate),
-        challenger_returns=_promotion_return_series(candidate),
-        champion_returns=_promotion_return_series(champion_row),
+        challenger_returns=challenger_returns,
+        champion_returns=champion_returns,
+        models_returns=models_returns,
+        evaluation_timestamps=era_payload.get("evaluation_timestamps"),
+        era_labels=era_payload.get("era_labels"),
+        regime_labels=era_payload.get("regime_labels"),
+        challenger_predictions=era_payload.get("challenger_predictions"),
+        realized_returns=era_payload.get("realized_returns"),
+        neutralization_features=(
+            feature_payload.get("neutralization_features")
+            or feature_payload.get("feature_snapshots")
+            or feature_payload.get("feature_values")
+            or feature_payload.get("features_matrix")
+        ),
         current_feature_ids=_promotion_feature_ids(champion_row),
         challenger_feature_ids=_promotion_feature_ids(candidate),
         candidate_features=feature_payload.get("candidate_features"),
@@ -1549,26 +1704,39 @@ def _evaluate_promotion_stat_gate(
         con=con,
     )
     payload = dict(diagnostics or {})
-    if gate_config:
+    if legacy_gate_enabled:
+        legacy_config = dict(gate_config or {})
+        nested_cpcv = dict(legacy_config.get("cpcv") or {}) if isinstance(legacy_config.get("cpcv"), dict) else {}
+        cpcv_requested = bool(cpcv_gate_enabled or nested_cpcv.get("enabled"))
+        if not cpcv_requested:
+            nested_cpcv["enabled"] = False
+            legacy_config["cpcv"] = nested_cpcv
         configured_passed, configured_diagnostics = evaluate_statistical_promotion_gate(
             model_name=model_name,
             candidate_version=_promotion_candidate_version(candidate),
             returns=_promotion_return_series(candidate),
             n_competing_trials=int(n_competing_trials),
             models_returns=models_returns,
-            config=gate_config,
+            config=legacy_config,
             persist=False,
         )
+        statistical_gate = dict((configured_diagnostics or {}).get("statistical_gate") or {})
+        payload["legacy_stat_gate"] = dict(configured_diagnostics or {})
         payload["configured_gate"] = dict(configured_diagnostics or {})
+        payload["record_legacy_hypothesis"] = bool(statistical_gate.get("enabled"))
         payload["passed"] = bool(payload.get("passed")) and bool(configured_passed)
         payload["status"] = (
             str((configured_diagnostics or {}).get("status") or "configured_gate_failed")
             if not bool(configured_passed)
             else str(payload.get("status") or "evaluated")
         )
-        payload["requested_gate_config"] = dict(gate_config)
-        payload["required_by_candidate"] = True
+        payload["requested_gate_config"] = dict(legacy_config)
+        payload["required_by_candidate"] = bool(config_gate_enabled)
+        payload["validation_enabled"] = True
         return bool(passed and configured_passed), payload
+    payload["legacy_stat_gate"] = {"enabled": False, "applied": False, "status": "disabled", "passed": True}
+    payload["record_legacy_hypothesis"] = False
+    payload["validation_enabled"] = True
     return bool(passed), payload
 
 
@@ -1908,9 +2076,34 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
         con = connect()
         try:
             _ensure_post_commit_schema(con)
+            stat_gate_cache: Dict[Tuple[str, str], Tuple[bool, Dict[str, Any]]] = {}
 
             def _enqueue_post_commit(fn_name: str, *args, **kwargs) -> None:
                 _queue_post_commit_action(con, str(fn_name), *args, **kwargs)
+
+            def _cached_promotion_stat_gate(
+                target_row: Optional[Dict[str, Any]],
+                trial_count: int,
+                *,
+                candidate_returns: Optional[Dict[str, List[float]]],
+                incumbent_row: Optional[Dict[str, Any]],
+            ) -> Tuple[bool, Dict[str, Any]]:
+                cache_key = _promotion_stat_gate_cache_key(target_row)
+                if cache_key[0] and cache_key in stat_gate_cache:
+                    cached_ok, cached_payload = stat_gate_cache[cache_key]
+                    payload = dict(cached_payload or {})
+                    payload["cache_hit"] = True
+                    return bool(cached_ok), payload
+                ok, payload = _evaluate_promotion_stat_gate(
+                    target_row,
+                    int(trial_count),
+                    models_returns=candidate_returns,
+                    champion_row=incumbent_row,
+                    con=con,
+                )
+                if cache_key[0]:
+                    stat_gate_cache[cache_key] = (bool(ok), dict(payload or {}))
+                return bool(ok), dict(payload or {})
 
             rows = con.execute(
                 """
@@ -1980,7 +2173,7 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
             for _, candidates in grouped.items():
                 if not candidates:
                     continue
-                candidates = sorted(
+                ranked_candidates = sorted(
                     candidates,
                     key=lambda x: (
                         -_primary_comparison_metric(
@@ -1995,7 +2188,8 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                         -_safe_float(x.get("score"), 0.0),
                     ),
                 )
-                best = candidates[0]
+                candidates = ranked_candidates
+                best = next((row for row in ranked_candidates if _candidate_is_live_promotable(row)), ranked_candidates[0])
                 best_metrics = _candidate_runtime_metrics(best)
                 current = get_champion_assignment(
                     "global",
@@ -2137,12 +2331,11 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                 stat_gate: Dict[str, Any] = {}
                 target_name = str((target or {}).get("model_name") or "")
                 if target_name and target_name != str(current_name):
-                    stat_gate_ok, stat_gate = _evaluate_promotion_stat_gate(
+                    stat_gate_ok, stat_gate = _cached_promotion_stat_gate(
                         target,
                         _promotion_trial_count(candidates),
-                        models_returns=_promotion_models_returns(candidates),
-                        champion_row=current_row,
-                        con=con,
+                        candidate_returns=_promotion_models_returns(candidates),
+                        incumbent_row=current_row,
                     )
                     if bool((stat_gate or {}).get("record_legacy_hypothesis")):
                         _enqueue_post_commit(
@@ -2401,12 +2594,11 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
             global_stat_gate: Dict[str, Any] = {}
             global_target_name = str((global_target or {}).get("model_name") or "").strip()
             if global_target_name and global_target_name != str(global_current_name):
-                global_stat_gate_ok, global_stat_gate = _evaluate_promotion_stat_gate(
+                global_stat_gate_ok, global_stat_gate = _cached_promotion_stat_gate(
                     global_target,
                     max(1, len(global_rows)),
-                    models_returns=_promotion_models_returns(global_rows),
-                    champion_row=global_current_row,
-                    con=con,
+                    candidate_returns=_promotion_models_returns(global_rows),
+                    incumbent_row=global_current_row,
                 )
                 if bool((global_stat_gate or {}).get("record_legacy_hypothesis")):
                     _enqueue_post_commit(

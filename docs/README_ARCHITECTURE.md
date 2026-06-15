@@ -2,6 +2,8 @@
 
 This document explains the repo in plain English.
 
+Last verified against code: 2026-06-11
+
 If you want the shortest answer, this system is a supervised trading platform that:
 
 - gathers market and external data
@@ -35,7 +37,7 @@ It is a trading engine plus a dashboarded operating system around that engine.
 | Layer | Purpose | Main Files |
 | --- | --- | --- |
 | Boot and supervision | Starts the runtime, validates startup, launches services, tracks lifecycle | `start_system.py`, `dashboard_server.py`, `start_ingestion.py`, `engine/runtime/` |
-| Storage and coordination | SQLite persistence, locks, runtime metadata, event logging | `engine/runtime/storage.py`, `engine/runtime/locks.py`, `engine/runtime/runtime_meta.py` |
+| Storage and coordination | Runtime persistence facade, locks, runtime metadata, event logging | `engine/runtime/storage.py`, `engine/runtime/storage_pg.py`, `engine/runtime/locks.py`, `engine/runtime/runtime_meta.py` |
 | Data ingestion | Pulls prices plus non-price sources; non-price feeds are normalized into the shared `events` layer before downstream use | `engine/data/`, `engine/jobs/`, `engine/runtime/ingestion_runtime.py` |
 | Strategy and models | Builds features, labels, trains models, predicts, forms decisions | `engine/strategy/` |
 | Portfolio and allocation | Turns decisions into target exposures and position changes | `engine/strategy/portfolio.py`, `engine/runtime/strategy_allocator.py` |
@@ -70,7 +72,7 @@ A newer sixth loop now exists around operator repair:
 ```mermaid
 flowchart LR
     A[External data providers] --> B[Ingestion jobs]
-    B --> C[SQLite storage]
+    B --> C[Runtime storage facade]
     C --> D[Feature and label builders]
     D --> E[Models and prediction jobs]
     E --> F[Decision logic]
@@ -127,7 +129,8 @@ flowchart TD
 
 ## 6. Storage Model
 
-The persistent center of gravity is SQLite, managed through `engine/runtime/storage.py`.
+The persistent center of gravity is the runtime storage facade in `engine/runtime/storage.py`.
+Current production-like storage is Postgres-backed through `engine/runtime/storage_pg.py`; older SQLite-era wording may still appear in historical docs or tests, but new storage behavior should be treated as a migration-backed runtime contract.
 
 This matters because nearly every major subsystem reads from or writes to the same storage layer:
 
@@ -242,23 +245,63 @@ The important ownership is:
   loads the active model spec and serves against that schema
 - `engine/model_registry.py`
   stores the active model contract in registry metrics
-- `engine/strategy/embed_regressor.py`
-  persists embed-model feature schemas
-- `engine/strategy/train_temporal_predictor.py`
-  persists temporal feature schemas
-- `engine/strategy/temporal_predictor.py`
-  loads temporal schema for live inference
+- `engine/strategy/models/lgbm_regressor.py`
+  persists and validates LightGBM feature schemas
+- `engine/strategy/models/xgb_regressor.py`
+  persists and validates XGBoost feature schemas
+- `engine/strategy/models/gbm_model.py` and `engine/strategy/gbm_regressor.py`
+  own sklearn/GBM-style model artifacts
+- `engine/strategy/models/patchtst.py`
+  owns PatchTST artifacts and schema validation
+- `engine/strategy/ensemble/ridge_meta.py`
+  owns the deterministic Ridge meta-ensemble contract
+- `engine/strategy/embed_regressor.py`, `engine/strategy/train_temporal_predictor.py`, and `engine/strategy/temporal_predictor.py`
+  remain legacy/fallback schema-aware paths
 
 In practical terms, training now writes a feature contract and serving reads that same contract back. Decision logs also persist the named feature snapshot used at inference time.
+
+### Current feature inventory
+
+`engine/strategy/feature_registry.py` is the source of truth. The default serving set is about 111 feature ids. The full registered catalog is larger because optional and shadow groups include NLP embeddings, filings, transcripts, tsfresh, symbolic/discovered features, and other opt-in surfaces.
+
+Current groups visible in the registry include:
+
+- base, price, events, macro, HMM regime, tech, stress, social, weather, options-symbol, and availability
+- tsfresh and discovery-backed features
+- NLP/FinBERT/news, filings, and transcript feature groups
+- optional insider/Form 4, congressional, sentiment, and symbolic feature paths when their flags and dependencies are enabled
+
+Every new feature still needs an explicit feature id and must round-trip through the persisted feature schema.
+
+### Current model families
+
+The current code centers on:
+
+- LightGBM: `engine/strategy/models/lgbm_regressor.py`, trained by `engine/strategy/jobs/train_lgbm_models.py`
+- XGBoost: `engine/strategy/models/xgb_regressor.py`, trained by `engine/strategy/jobs/train_xgb_models.py`
+- sklearn/GBM-style regressors: `engine/strategy/models/gbm_model.py`, `engine/strategy/gbm_regressor.py`, `engine/strategy/jobs/train_gbm_regressor.py`
+- PatchTST: `engine/strategy/models/patchtst.py`, trained by `engine/strategy/jobs/train_patchtst_models.py`
+- Ridge meta-ensemble: `engine/strategy/ensemble/ridge_meta.py`, `engine/strategy/jobs/train_ensemble_meta.py`, and `engine/strategy/jobs/train_ensemble.py`
+
+Legacy schema-aware paths for embed regressors, temporal predictors, and regime/statistical baselines still exist, but they are not the only or primary model description anymore.
+
+### Promotion, backtesting, and HPO reality
+
+Promotion evidence now flows through the existing champion/challenger path rather than a parallel gate system:
+
+- `engine/strategy/promotion_guard.py` applies White's Reality Check, BH-FDR/Harvey-Liu-Zhu statistical gates, pool-correlation and marginal-portfolio-contribution gates, and era/regime robustness checks.
+- `engine/strategy/cpcv.py` provides CPCV/PBO, deflated Sharpe, cost-adjusted metrics, retrain-cadence replay, and an option to route evaluation through gated backtests.
+- `engine/strategy/gated_backtest.py` replays intents through the live portfolio/execution-policy/broker-sim path for promotion-grade evaluation.
+- `engine/strategy/optuna_tuner.py` integrates Optuna tuning and parameter-surface robustness checks.
 
 ### How machine learning works end to end
 
 The trading ML path in this repo is intentionally split into clear phases:
 
 1. data preparation
-   ingestion jobs write prices, events, labels, embeddings, and related derived features into SQLite
+   ingestion jobs write prices, events, labels, embeddings, PIT universe rows, and related derived features into runtime storage
 2. training
-   model-family-specific jobs train artifacts such as regime statistics, embed regressors, or temporal predictors
+   model-family-specific jobs train artifacts such as LightGBM, XGBoost, sklearn GBM, PatchTST, Ridge ensemble, and legacy/fallback models
 3. provenance capture
    training writes `feature_ids`, `feature_set_tag`, `feature_schema`, dataset snapshots, and version metadata into the registry/lifecycle surfaces
 4. live model selection
@@ -269,6 +312,19 @@ The trading ML path in this repo is intentionally split into clear phases:
    portfolio, risk, and execution layers consume model intent, but they still own the final safety gates
 
 That last point matters: the model proposes; the runtime decides what is actually allowed.
+
+### Data ingestion job inventory
+
+The current data job directory includes price/news/event processing plus newer alternative-data and feature-generation jobs, including:
+
+- `ingest_now.py`, `poll_macro.py`, `earnings_poll.py`, `sec_poll.py`, `gdelt_poll.py`
+- social jobs for Reddit and StockTwits
+- weather forecast and alert polling/ingestion jobs
+- options ingestion and calibration jobs
+- `backfill_universe_pit.py` and `update_universe.py`
+- Form 4 and congressional trade ingestion jobs
+- event processors for base, live, enriched, and shadow paths
+- `process_finbert_sentiment.py`, `snapshot_model_features.py`, and `compute_tsfresh_snapshots.py`
 
 ### What "AI" means in this repo
 

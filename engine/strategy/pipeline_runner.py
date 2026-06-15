@@ -6,6 +6,7 @@ Owns auto-pipeline scheduling for strategy-oriented background workflows such as
 the data/model pipeline, challenger updates, and size-policy refreshes.
 """
 
+import logging
 import os
 import time
 
@@ -21,6 +22,8 @@ LAST_AUTO_CHALLENGER_HEARTBEAT_TS = None
 
 LAST_AUTO_SIZE_POLICY_TS = None
 LAST_AUTO_SIZE_POLICY_HEARTBEAT_TS = None
+
+LOG = logging.getLogger(__name__)
 
 from engine.runtime.storage import connect as _db_connect
 from engine.runtime.ipc import market_data_status
@@ -123,10 +126,10 @@ def auto_pipeline_loop(JOBS):
             res = run_pipeline(JOBS)
 
             if AUTO_PIPELINE_LOG:
-                print("[auto_pipeline]", res)
+                LOG.info("auto_pipeline result=%s", res)
         except Exception as e:
             if AUTO_PIPELINE_LOG:
-                print("[auto_pipeline] ERROR:", e)
+                LOG.log(logging.WARNING, "auto_pipeline failed: %s", e, exc_info=True)
 
         time.sleep(max(5.0, float(AUTO_PIPELINE_INTERVAL_S)))
 
@@ -155,16 +158,16 @@ def auto_challenger_loop(JOBS):
             md = _max_drift_ratio()
             if AUTO_CHALLENGER_MIN_DRIFT > 0.0 and md < AUTO_CHALLENGER_MIN_DRIFT:
                 if AUTO_CHALLENGER_LOG:
-                    print(f"[auto_challenger] skipped drift={md:.3f}")
+                    LOG.info("auto_challenger skipped drift=%.3f", md)
             else:
                 LAST_AUTO_CHALLENGER_TS = int(time.time())
                 res = JOBS.start("pipeline_train_and_eval")
 
                 if AUTO_CHALLENGER_LOG:
-                    print("[auto_challenger]", res)
+                    LOG.info("auto_challenger result=%s", res)
         except Exception as e:
             if AUTO_CHALLENGER_LOG:
-                print("[auto_challenger] ERROR:", e)
+                LOG.log(logging.WARNING, "auto_challenger failed: %s", e, exc_info=True)
 
         time.sleep(max(30.0, float(AUTO_CHALLENGER_INTERVAL_S)))
 
@@ -184,9 +187,9 @@ def auto_size_policy_loop(JOBS):
             res = JOBS.start("train_size_policy")
 
             if AUTO_SIZE_POLICY_LOG:
-                print("[auto_size_policy]", res)
+                LOG.info("auto_size_policy result=%s", res)
         except Exception as e:
             if AUTO_SIZE_POLICY_LOG:
-                print("[auto_size_policy] ERROR:", e)
+                LOG.log(logging.WARNING, "auto_size_policy failed: %s", e, exc_info=True)
 
         time.sleep(max(60.0, float(AUTO_SIZE_POLICY_INTERVAL_S)))

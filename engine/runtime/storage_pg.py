@@ -345,6 +345,7 @@ class StorageConnection:
         def _untrack() -> None:
             try:
                 self._open_cursors.remove(cursor)
+            # system-audit: ignore[silent_except] cursor may already be untracked by close/reset.
             except ValueError:
                 pass
 
@@ -995,6 +996,10 @@ def _pid_is_running(pid: int) -> bool:
         return False
 
 
+def _raise_schema_error(code: str, error: BaseException, **extra: Any) -> None:
+    raise RuntimeError(f"{code}:{type(error).__name__}:{error}:{extra or {}}")
+
+
 def _table_exists(con: StorageConnection, table: str) -> bool:
     row = con.execute(
         """
@@ -1053,8 +1058,6 @@ def init_db(schema: str | None = None):
                 from engine.execution.execution_ledger import init_execution_ledger
 
                 init_execution_ledger()
-                _ensure_alert_prediction_schema()
-                _ensure_sqlite_compat_bigints()
                 _PK_CACHE.clear()
                 _AUTO_INIT_SCHEMAS.add(schema_name())
                 return applied
@@ -1248,7 +1251,9 @@ def get_db_debug_snapshot(*, include_quick_check: bool = True) -> dict[str, Any]
 
 
 def get_timescale_client():
-    return None
+    from engine.runtime.timescale_client import get_timescale_client as _get_timescale_client
+
+    return _get_timescale_client()
 
 
 def init_timeseries_storage() -> dict[str, Any]:
@@ -1391,7 +1396,27 @@ def put_event(ts_ms, source, title, body, url, event_key, meta_json=None):
 
 def put_normalized_event(event: dict[str, Any], con: StorageConnection | None = None):
     payload = dict(event or {})
-    now_ms = int(payload.get("ts_ms") or payload.get("timestamp") or time.time() * 1000)
+    observed_ts_ms = int(time.time() * 1000)
+    source_ts_ms = int(payload.get("timestamp") or payload.get("ts_ms") or observed_ts_ms)
+    meta_payload = payload.get("meta_json") or payload
+    if isinstance(meta_payload, str):
+        try:
+            meta_payload = json.loads(meta_payload)
+        except json.JSONDecodeError:
+            meta_payload = {"raw_meta_json": meta_payload}
+    meta = dict(meta_payload or {}) if isinstance(meta_payload, dict) else {}
+    pipeline_timing = dict(meta.get("pipeline_timing") or {})
+    pipeline_timing.setdefault("source_event_ts_ms", int(source_ts_ms))
+    pipeline_timing["db_observed_ts_ms"] = int(max(observed_ts_ms, source_ts_ms))
+    pipeline_timing["ingestion_to_db_latency_ms"] = int(max(0, int(pipeline_timing["db_observed_ts_ms"]) - int(source_ts_ms)))
+    meta["pipeline_timing"] = pipeline_timing
+    now_ms = int(source_ts_ms)
+    raw_payload = payload.get("raw_payload")
+    if raw_payload is not None and not isinstance(raw_payload, str):
+        raw_payload = json.dumps(raw_payload, separators=(",", ":"), sort_keys=True, default=str)
+    derived_features = payload.get("derived_features")
+    if derived_features is not None and not isinstance(derived_features, str):
+        derived_features = json.dumps(derived_features, separators=(",", ":"), sort_keys=True, default=str)
     row = {
         "ts_ms": now_ms,
         "timestamp": now_ms,
@@ -1401,8 +1426,13 @@ def put_normalized_event(event: dict[str, Any], con: StorageConnection | None = 
         "title": payload.get("title") or payload.get("event_title") or "",
         "body": payload.get("body"),
         "url": payload.get("url"),
+        "importance_score": payload.get("importance_score"),
+        "raw_payload": raw_payload,
+        "derived_features": derived_features,
         "event_key": payload.get("event_key") or payload.get("source_id"),
-        "meta_json": payload.get("meta_json") or payload,
+        "source_id": payload.get("source_id"),
+        "dedupe_hash": payload.get("dedupe_hash"),
+        "meta_json": meta,
     }
     if row.get("event_key"):
         return _upsert_dict(
@@ -1448,11 +1478,80 @@ def _payload_writer(table: str, row: dict[str, Any], con: StorageConnection | No
                 "event_id": payload.get("event_id"),
                 "payload_json": payload,
             },
-            returning_id=True,
+            returning_id=False,
             con=con,
         )
         or 0
     )
+
+
+_NEWS_EVENT_FEATURE_COLUMNS = (
+    "event_id",
+    "ts_ms",
+    "symbol",
+    "cluster_key",
+    "headline_key",
+    "sentiment_score",
+    "novelty_score",
+    "is_duplicate",
+    "duplicate_count",
+    "company_match_method",
+    "company_match_conf",
+    "source_count",
+    "payload_json",
+    "meta_json",
+    "embedding_backend",
+    "embedding_model_name",
+    "embedding_novelty_score",
+    "embedding_max_similarity",
+    "stale_flag",
+    "novelty_computed_ts_ms",
+    "finbert_label",
+    "finbert_score",
+    "finbert_confidence",
+    "finbert_pos",
+    "finbert_neg",
+    "finbert_neu",
+)
+
+
+def _news_event_feature_row(payload: dict[str, Any]) -> dict[str, Any]:
+    source = dict(payload or {})
+    row: dict[str, Any] = {
+        "ts_ms": int(source.get("ts_ms") or source.get("ts") or time.time() * 1000),
+        "payload_json": source,
+    }
+    for column in _NEWS_EVENT_FEATURE_COLUMNS:
+        if column in {"ts_ms", "payload_json"}:
+            continue
+        if column == "symbol" and source.get(column) is not None:
+            symbol = str(source.get(column) or "").strip().upper()
+            if symbol:
+                row[column] = symbol
+            continue
+        if column in source:
+            row[column] = source.get(column)
+    for column in ("is_duplicate", "stale_flag"):
+        if column in row:
+            row[column] = int(bool(row[column]))
+    for column in ("event_id", "duplicate_count", "source_count", "novelty_computed_ts_ms"):
+        if row.get(column) is not None:
+            row[column] = int(row[column])
+    for column in (
+        "sentiment_score",
+        "novelty_score",
+        "company_match_conf",
+        "embedding_novelty_score",
+        "embedding_max_similarity",
+        "finbert_score",
+        "finbert_confidence",
+        "finbert_pos",
+        "finbert_neg",
+        "finbert_neu",
+    ):
+        if row.get(column) is not None:
+            row[column] = float(row[column])
+    return row
 
 
 _INSIDER_TRANSACTION_COLUMNS = (
@@ -1467,7 +1566,9 @@ _INSIDER_TRANSACTION_COLUMNS = (
     "filing_identifier",
     "filing_url",
     "filing_ts_ms",
+    "availability_ts_ms",
     "filing_date",
+    "filing_accepted_at",
     "transaction_ts_ms",
     "transaction_date",
     "issuer_name",
@@ -1484,6 +1585,7 @@ _INSIDER_TRANSACTION_COLUMNS = (
     "price",
     "value",
     "ownership_nature",
+    "is_10b5_1_plan",
     "entity_id",
     "resolution_status",
     "resolution_method",
@@ -1524,14 +1626,73 @@ _CONGRESSIONAL_TRADE_COLUMNS = (
     "diagnostics_json",
 )
 
+_FINRA_SHORT_SALE_VOLUME_COLUMNS = (
+    "ts_ms",
+    "symbol",
+    "trade_date",
+    "trade_ts_ms",
+    "availability_ts_ms",
+    "source_record_id",
+    "source_url",
+    "ingested_ts_ms",
+    "short_volume",
+    "short_exempt_volume",
+    "total_volume",
+    "market",
+    "payload_json",
+    "diagnostics_json",
+)
+
+_FINRA_SHORT_INTEREST_COLUMNS = (
+    "ts_ms",
+    "symbol",
+    "settlement_date",
+    "settlement_ts_ms",
+    "dissemination_date",
+    "dissemination_ts_ms",
+    "availability_ts_ms",
+    "source_record_id",
+    "ingested_ts_ms",
+    "short_interest_shares",
+    "days_to_cover",
+    "payload_json",
+    "diagnostics_json",
+)
+
+_CRYPTO_FUNDING_RATE_COLUMNS = (
+    "ts_ms",
+    "symbol",
+    "exchange",
+    "perp_market",
+    "spot_market",
+    "funding_ts_ms",
+    "availability_ts_ms",
+    "funding_rate",
+    "mark_price",
+    "index_price",
+    "spot_price",
+    "spot_ts_ms",
+    "perp_ts_ms",
+    "perp_basis_pct",
+    "source_record_id",
+    "ingested_ts_ms",
+    "is_live",
+    "payload_json",
+    "diagnostics_json",
+)
+
 
 def _alt_data_row(payload: dict[str, Any], columns: tuple[str, ...]) -> dict[str, Any]:
     source = dict(payload or {})
     ts_ms = int(
         source.get("ts_ms")
+        or source.get("availability_ts_ms")
         or source.get("transaction_ts_ms")
         or source.get("disclosure_ts_ms")
         or source.get("filing_ts_ms")
+        or source.get("trade_ts_ms")
+        or source.get("settlement_ts_ms")
+        or source.get("funding_ts_ms")
         or source.get("ingested_ts_ms")
         or source.get("created_ts_ms")
         or time.time() * 1000
@@ -1571,7 +1732,18 @@ def _alt_data_upsert(
 
 
 def put_news_event_feature(row: dict[str, Any], con: StorageConnection | None = None) -> None:
-    _payload_writer("news_event_features", row, con=con)
+    payload = _news_event_feature_row(dict(row or {}))
+    if payload.get("event_id") is None:
+        _payload_writer("news_event_features", row, con=con)
+        return
+    _upsert_dict(
+        "news_event_features",
+        payload,
+        conflict_column="event_id",
+        conflict_columns=("event_id", "ts_ms"),
+        returning_id=False,
+        con=con,
+    )
 
 
 def _payload_dict(value: Any) -> dict[str, Any]:
@@ -1603,6 +1775,40 @@ def put_finbert_sentiment_enrichment(row: dict[str, Any], con: StorageConnection
             ),
         )
         if event_id is not None:
+            event_id_int = int(event_id)
+            symbol_clean = str(symbol).upper() if symbol is not None and str(symbol).strip() else None
+            existing = db.execute(
+                "SELECT 1 FROM news_event_features WHERE event_id=? LIMIT 1",
+                (event_id_int,),
+            ).fetchone()
+            params = (
+                ts_ms,
+                symbol_clean,
+                payload.get("label"),
+                payload.get("score"),
+                payload.get("confidence"),
+                payload.get("pos"),
+                payload.get("neg"),
+                payload.get("neu"),
+                event_id_int,
+            )
+            if existing is not None:
+                db.execute(
+                    """
+                    UPDATE news_event_features
+                    SET ts_ms=?,
+                        symbol=COALESCE(?, symbol),
+                        finbert_label=?,
+                        finbert_score=?,
+                        finbert_confidence=?,
+                        finbert_pos=?,
+                        finbert_neg=?,
+                        finbert_neu=?
+                    WHERE event_id=?
+                    """,
+                    params,
+                )
+                return
             db.execute(
                 """
                 INSERT INTO news_event_features(
@@ -1610,20 +1816,11 @@ def put_finbert_sentiment_enrichment(row: dict[str, Any], con: StorageConnection
                   finbert_label, finbert_score, finbert_confidence,
                   finbert_pos, finbert_neg, finbert_neu
                 ) VALUES (?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(event_id) DO UPDATE SET
-                  ts_ms=excluded.ts_ms,
-                  symbol=COALESCE(excluded.symbol, news_event_features.symbol),
-                  finbert_label=excluded.finbert_label,
-                  finbert_score=excluded.finbert_score,
-                  finbert_confidence=excluded.finbert_confidence,
-                  finbert_pos=excluded.finbert_pos,
-                  finbert_neg=excluded.finbert_neg,
-                  finbert_neu=excluded.finbert_neu
                 """,
                 (
-                    int(event_id),
+                    event_id_int,
                     ts_ms,
-                    str(symbol).upper() if symbol is not None and str(symbol).strip() else None,
+                    symbol_clean,
                     payload.get("label"),
                     payload.get("score"),
                     payload.get("confidence"),
@@ -1663,6 +1860,36 @@ def put_congressional_trade(row: dict[str, Any], con: StorageConnection | None =
         row,
         columns=_CONGRESSIONAL_TRADE_COLUMNS,
         conflict_column="source_trade_id",
+        con=con,
+    )
+
+
+def put_finra_short_sale_volume(row: dict[str, Any], con: StorageConnection | None = None) -> int:
+    return _alt_data_upsert(
+        "finra_short_sale_volume",
+        row,
+        columns=_FINRA_SHORT_SALE_VOLUME_COLUMNS,
+        conflict_column="source_record_id",
+        con=con,
+    )
+
+
+def put_finra_short_interest(row: dict[str, Any], con: StorageConnection | None = None) -> int:
+    return _alt_data_upsert(
+        "finra_short_interest",
+        row,
+        columns=_FINRA_SHORT_INTEREST_COLUMNS,
+        conflict_column="source_record_id",
+        con=con,
+    )
+
+
+def put_crypto_funding_rate(row: dict[str, Any], con: StorageConnection | None = None) -> int:
+    return _alt_data_upsert(
+        "crypto_funding_rates",
+        row,
+        columns=_CRYPTO_FUNDING_RATE_COLUMNS,
+        conflict_column="source_record_id",
         con=con,
     )
 
@@ -1728,12 +1955,61 @@ def load_latest_finbert_sentiment_enrichment(
 def record_prediction_explanation(**kwargs: Any) -> int:
     row = dict(kwargs or {})
     con = row.pop("con", None)
+    row.setdefault("created_ts", int(time.time() * 1000))
     return int(_insert_dict("prediction_explanations", row, returning_id=True, con=con) or 0)
 
 
 def fetch_prediction_explanations(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
-    del args, kwargs
-    return []
+    if args:
+        kwargs.setdefault("symbol", args[0])
+    con = kwargs.pop("con", None)
+    limit = _bounded_limit(kwargs.pop("limit", None), default=25, maximum=500)
+    filters: list[str] = []
+    params: list[Any] = []
+    for key in ("symbol", "model_family", "model_name", "version", "explanation_type"):
+        value = kwargs.get(key)
+        if value not in (None, ""):
+            filters.append(f"{_ident(key)}=?")
+            params.append(str(value))
+    ts_value = kwargs.get("ts")
+    if ts_value not in (None, ""):
+        filters.append("ts<=?")
+        params.append(int(ts_value))
+    where_sql = ("WHERE " + " AND ".join(filters)) if filters else ""
+    columns = (
+        "id",
+        "symbol",
+        "ts",
+        "model_family",
+        "model_name",
+        "version",
+        "explanation_type",
+        "top_features",
+        "base_value",
+        "diagnostics",
+        "created_ts",
+    )
+
+    def _read(db: StorageConnection) -> list[dict[str, Any]]:
+        rows = db.execute(
+            f"""
+            SELECT {', '.join(columns)}
+            FROM prediction_explanations
+            {where_sql}
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params) + (limit,),
+        ).fetchall()
+        return [
+            _format_plain_row(row, columns, json_columns=("top_features", "diagnostics"))
+            for row in rows
+        ]
+
+    if con is not None:
+        return _read(con)
+    with connect(readonly=True) as db:
+        return _read(db)
 
 
 def fetch_latest_prediction_explanation(*args: Any, **kwargs: Any):
@@ -1809,7 +2085,9 @@ def record_alpha_lifecycle(**kwargs: Any) -> int:
 
 
 def record_drift_retrain_event(**kwargs: Any) -> int:
-    return int(_insert_dict("drift_retrain_events", kwargs, returning_id=True) or 0)
+    row = dict(kwargs or {})
+    row.setdefault("created_ts", int(time.time() * 1000))
+    return int(_insert_dict("drift_retrain_events", row, returning_id=True) or 0)
 
 
 def record_model_hyperparameter_registry(con: StorageConnection | None = None, **kwargs: Any) -> int:
@@ -2289,9 +2567,21 @@ def fetch_audit_record(
 def fetch_recent_promotion_statistical_evidence(
     limit: int = 50,
     *,
+    model_id: str | None = None,
     con: StorageConnection | None = None,
 ) -> list[dict[str, Any]]:
-    return fetch_recent_audit_records("promotion_statistical_evidence", limit=limit, con=con)
+    extra_where: list[str] = []
+    extra_params: list[Any] = []
+    if model_id:
+        extra_where.append("model_id=?")
+        extra_params.append(str(model_id))
+    return _fetch_audit_records(
+        "promotion_statistical_evidence",
+        limit=limit,
+        con=con,
+        extra_where=extra_where,
+        extra_params=extra_params,
+    )
 
 
 def fetch_recent_decisions(

@@ -26,6 +26,27 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
+def _env_truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _production_validation_profile(env: Dict[str, str]) -> bool:
+    if _env_truthy(env.get("TRADING_VALIDATION_REQUIRE_PROD_DEPS")):
+        return True
+    profile_values = (
+        env.get("TS_ENV"),
+        env.get("ENV"),
+        env.get("NODE_ENV"),
+        env.get("ENGINE_MODE"),
+        env.get("OPERATOR_MODE"),
+    )
+    return any(str(value or "").strip().lower() in {"prod", "production", "live"} for value in profile_values)
+
+
+def _is_missing_optional_module(error: ModuleNotFoundError, module_name: str) -> bool:
+    return getattr(error, "name", "") == module_name or f"No module named '{module_name}'" in str(error)
+
+
 def bootstrap_validation_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -53,6 +74,12 @@ def bootstrap_validation_env(extra_env: Optional[Dict[str, str]] = None) -> Dict
         os.environ["TRADING_VALIDATION_IMPORT_DASHBOARD"] = "0"
     if not str(os.environ.get("TRADING_VALIDATION_IMPORT_HEAVY_ENTRYPOINTS", "") or "").strip():
         os.environ["TRADING_VALIDATION_IMPORT_HEAVY_ENTRYPOINTS"] = "0"
+    if (
+        str(os.environ.get("TRADING_VALIDATION_MODE", "") or "").strip().lower() == "startup"
+        and not str(os.environ.get("TS_STORAGE_BACKEND", "") or "").strip()
+        and not _production_validation_profile(dict(os.environ))
+    ):
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
 
     current_pythonpath = str(os.environ.get("PYTHONPATH", "") or "")
     pythonpath_parts = [ROOT]
@@ -63,6 +90,9 @@ def bootstrap_validation_env(extra_env: Optional[Dict[str, str]] = None) -> Dict
     try:
         from dotenv import load_dotenv
         load_dotenv(os.path.join(ROOT, ".env"), override=False)
+    except ModuleNotFoundError as e:
+        if not _is_missing_optional_module(e, "dotenv"):
+            raise
     except Exception as e:
         sys.stderr.write(f"[runtime_graph_check.bootstrap_validation_env] {type(e).__name__}: {e}\n")
         sys.stderr.flush()
@@ -194,6 +224,7 @@ def _run_cold_boot_db_bootstrap_check(*, timeout_s: float = 180.0) -> Dict[str, 
                 "AUTO_BOOT_DAEMONS": "0",
                 "SQLITE_TRACE_REPORT_EVERY_S": "0",
                 "TRADING_VALIDATION_MODE": "startup",
+                "TS_STORAGE_BACKEND": "sqlite",
                 "TS_PG_SCHEMA_PER_DB_PATH": "1",
             }
         )
@@ -256,6 +287,7 @@ def _run_timeseries_sidecar_startup_check(*, timeout_s: float = 180.0) -> Dict[s
                 "AUTO_BOOT_DAEMONS": "0",
                 "SQLITE_TRACE_REPORT_EVERY_S": "0",
                 "TRADING_VALIDATION_MODE": "startup",
+                "TS_STORAGE_BACKEND": "sqlite",
                 "TS_PG_SCHEMA_PER_DB_PATH": "1",
             }
         )
@@ -321,6 +353,23 @@ def _run_timeseries_sidecar_startup_check(*, timeout_s: float = 180.0) -> Dict[s
         }
 
 
+def _cleanup_validation_schema_for_result(label: str, result: Dict[str, object]) -> None:
+    db_path = str((result or {}).get("db_path") or "").strip()
+    if not db_path:
+        return
+    if _env_truthy(os.environ.get("TRADING_KEEP_VALIDATION_PG_SCHEMAS")):
+        return
+    try:
+        from tools.validation_pg_cleanup import cleanup_schema_for_db_path
+
+        cleanup = cleanup_schema_for_db_path(db_path)
+        dropped = list(cleanup.get("dropped") or [])
+        if dropped:
+            print(f"OK   {label}_schema_cleanup dropped={','.join(str(item) for item in dropped)}")
+    except Exception as exc:
+        print(f"WARN {label}_schema_cleanup -> {type(exc).__name__}: {exc}")
+
+
 def _walk_engine_modules() -> List[str]:
     modules: List[str] = []
     if not os.path.isdir(ENGINE_DIR):
@@ -345,13 +394,15 @@ def _walk_python_files(root_dir: str) -> List[str]:
 
 
 def run_canonical_validation(mode: str = "full", extra_env: Optional[Dict[str, str]] = None) -> int:
-    bootstrap_validation_env(extra_env=extra_env)
+    mode_name = str(mode or "full").strip().lower() or "full"
+    bootstrap_env = dict(extra_env or {})
+    bootstrap_env.setdefault("TRADING_VALIDATION_MODE", mode_name)
+    bootstrap_validation_env(extra_env=bootstrap_env)
 
     if not os.path.isdir(ENGINE_DIR):
         print(f"FAIL engine_dir -> missing engine directory: {ENGINE_DIR}")
         return 1
 
-    mode_name = str(mode or "full").strip().lower()
     full_mode = mode_name == "full"
 
     print("\nCANONICAL VALIDATION\n")
@@ -474,6 +525,7 @@ def run_canonical_validation(mode: str = "full", extra_env: Optional[Dict[str, s
         _record_message(errors, "cold_boot_db", str(cold_boot_db))
     else:
         print("OK   cold_boot_db")
+    _cleanup_validation_schema_for_result("cold_boot_db", cold_boot_db)
 
     print("\nTIMESERIES SIDECAR CHECK\n")
     timeseries_sidecars = _run_timeseries_sidecar_startup_check()
@@ -482,6 +534,7 @@ def run_canonical_validation(mode: str = "full", extra_env: Optional[Dict[str, s
         _record_message(errors, "timeseries_sidecars", str(timeseries_sidecars))
     else:
         print("OK   timeseries_sidecars")
+    _cleanup_validation_schema_for_result("timeseries_sidecars", timeseries_sidecars)
 
     if full_mode:
         print("\nPREFLIGHT CHECK\n")

@@ -74,7 +74,13 @@ def ensemble_max_weight() -> float:
     """Return the per-family weight cap applied after normalization."""
     try:
         value = float(os.environ.get("ENSEMBLE_MAX_WEIGHT", "0.75") or 0.75)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "ENSEMBLE_MAX_WEIGHT_PARSE_FAILED",
+            exc,
+            once_key="env:ENSEMBLE_MAX_WEIGHT",
+            value=os.environ.get("ENSEMBLE_MAX_WEIGHT", ""),
+        )
         value = 0.75
     return float(min(1.0, max(0.0, value)))
 
@@ -83,7 +89,13 @@ def ensemble_min_agreement() -> float:
     """Return the minimum agreement score required before applying a blend."""
     try:
         value = float(os.environ.get("ENSEMBLE_MIN_AGREEMENT", "0.0") or 0.0)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "ENSEMBLE_MIN_AGREEMENT_PARSE_FAILED",
+            exc,
+            once_key="env:ENSEMBLE_MIN_AGREEMENT",
+            value=os.environ.get("ENSEMBLE_MIN_AGREEMENT", ""),
+        )
         value = 0.0
     return float(min(1.0, max(0.0, value)))
 
@@ -92,7 +104,13 @@ def ensemble_meta_retrain_s() -> int:
     """Return the minimum interval between stacked meta-learner retraining runs."""
     try:
         value = int(os.environ.get("ENSEMBLE_META_RETRAIN_S", "86400") or 86400)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "ENSEMBLE_META_RETRAIN_S_PARSE_FAILED",
+            exc,
+            once_key="env:ENSEMBLE_META_RETRAIN_S",
+            value=os.environ.get("ENSEMBLE_META_RETRAIN_S", ""),
+        )
         value = 86400
     return int(max(1, value))
 
@@ -100,7 +118,14 @@ def ensemble_meta_retrain_s() -> int:
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "ENSEMBLE_FLOAT_PARSE_FAILED",
+            exc,
+            once_key=f"safe_float:{repr(value)[:80]}",
+            value=repr(value)[:240],
+            default=float(default),
+        )
         return float(default)
     if not math.isfinite(out):
         return float(default)
@@ -110,7 +135,14 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal(
+            "ENSEMBLE_INT_PARSE_FAILED",
+            exc,
+            once_key=f"safe_int:{repr(value)[:80]}",
+            value=repr(value)[:240],
+            default=int(default),
+        )
         return int(default)
 
 
@@ -125,7 +157,12 @@ def _json_loads(payload: Any, default: Any) -> Any:
         return payload
     try:
         out = json.loads(payload.decode("utf-8", errors="replace") if isinstance(payload, (bytes, bytearray)) else str(payload))
-    except Exception:
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        _warn_nonfatal(
+            "ENSEMBLE_JSON_PARSE_FAILED",
+            exc,
+            once_key=f"json_loads:{repr(payload)[:80]}",
+        )
         return default
     if default is None:
         return out

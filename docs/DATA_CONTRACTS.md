@@ -9,10 +9,12 @@ This document records the concrete contracts that are visible in the inspected c
 | `INTEGER` timestamps | Unix epoch in milliseconds unless the field name ends with `_s`. |
 | `REAL` | Floating-point numeric value. Units are listed per field. |
 | `TEXT` | Stored string value. |
-| `BOOLEAN` | Logical true/false value in API payloads, or a persisted `0/1`-style flag in SQLite-backed paths. |
-| `JSON object` / `JSON array` | Parsed JSON in API responses, or JSON-encoded text in DB columns ending in `_json`. |
+| `BOOLEAN` | Logical true/false value in API payloads and Postgres-backed rows. The isolated SQLite test backend may persist `0/1`-style flags. |
+| `JSON object` / `JSON array` | Parsed JSON in API responses. Postgres stores JSON-shaped columns as JSON/JSONB where migrations define them; compatibility cursors may expose JSONB values as JSON-encoded text to preserve older SQLite-shaped callers. |
 | Required | The producer always writes it, or the consumer path assumes it exists. |
 | Optional | Present only when the producer has enough context, or only when the underlying table version contains that column. |
+
+Runtime storage note: production and production-like operation use the Postgres-backed facade in `engine/runtime/storage_pg.py`. SQLite remains an isolated Python test backend and a compatibility dialect for older call sites; it is not the production source of truth.
 
 ## 1. Canonical Model Intent
 
@@ -182,8 +184,9 @@ Failure if malformed:
 Important caveat:
 
 - The portfolio path uses `from_weight`, `to_weight`, and `delta_weight` as allocation-style fields.
-- The browser terminal order-entry path writes `delta_weight = qty` with `from_weight = 0.0` and `to_weight = 0.0`.
-- Consumers that assume `delta_weight` is always a normalized portfolio weight will misread terminal-originated intents.
+- The browser terminal order-entry path writes manual quantity intent rows with `from_weight = 0.0`, `to_weight = 0.0`, and `delta_weight = 0.0`.
+- Terminal quantity is stored in `explain_json.terminal_order`, not in any weight field. That object carries `sizing="quantity"`, `symbol`, `side`, positive `qty`, signed `signed_qty`, and `flatten`.
+- Keeping terminal `delta_weight` neutral prevents weight-based risk, stability, and budget readers from mistaking a share quantity for a portfolio allocation.
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
@@ -196,9 +199,9 @@ Important caveat:
 | `to_side` | `TEXT` | No | Target side when known. | side |
 | `from_weight` | `REAL` | Yes | Prior portfolio weight in the strategy path. | weight fraction |
 | `to_weight` | `REAL` | Yes | Target portfolio weight in the strategy path. | weight fraction |
-| `delta_weight` | `REAL` | Yes | Weight delta in the portfolio path, or raw order quantity in the terminal path. | weight fraction or quantity |
+| `delta_weight` | `REAL` | Yes | Weight delta in the portfolio path. Terminal quantity rows keep this at `0.0`; the quantity lives in `explain_json.terminal_order`. | weight fraction |
 | `source_alert_id` | `INTEGER` | No | Link back to the alert/signal row. | alert id |
-| `explain_json` | `JSON object` | No | Explainability and model metadata. | JSON |
+| `explain_json` | `JSON object` | No | Explainability and model metadata. Terminal quantity rows include `terminal_order` with `sizing`, `symbol`, `side`, `qty`, `signed_qty`, and `flatten`. | JSON |
 
 Optional columns that the execution-intent loader reads when present:
 
@@ -243,7 +246,10 @@ Failure if malformed:
 | `to_side` | `TEXT` | No | Target side. | side |
 | `from_weight` | `REAL` | Yes | Copied source weight. | weight fraction |
 | `to_weight` | `REAL` | Yes | Copied target weight. | weight fraction |
-| `delta_weight` | `REAL` | Yes | Copied delta. Terminal-originated rows may carry quantity-like values here. | weight fraction or quantity |
+| `delta_weight` | `REAL` | Yes | Effective weight delta. Manual terminal quantity intents keep this at `0.0` so downstream weight consumers do not treat shares as allocation. | weight fraction |
+| `qty` | `REAL` | No | Signed explicit quantity for terminal-originated quantity intents. Positive means buy/increase long exposure; negative means sell/increase short or reduce long exposure. | broker quantity |
+| `order_sizing` | `TEXT` | No | Set to `quantity` when `qty` came from a terminal quantity payload. | sizing mode |
+| `terminal_order` | `BOOLEAN` | No | Present and true when the execution intent was derived from `explain_json.terminal_order`. | boolean |
 | `reason` | `TEXT` | No | Optional reason column when the table version has it. | reason |
 | `source_alert_id` | `INTEGER` | No | Alert lineage. | alert id |
 | `source_rule_id` | `TEXT` | No | Optional source rule column when present. | rule id |

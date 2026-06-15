@@ -23,6 +23,7 @@ _TABLE_RE = re.compile(
 # re-applies after the long bootstrap transaction. They define the durable
 # canonical table set for a fresh DB alongside init_db's main executescript.
 _POST_BOOTSTRAP_STORAGE_HELPERS = (
+    "_ensure_runtime_baseline_schema",
     "_ensure_runtime_aux_schema",
     "_ensure_strategy_metrics_schema",
     "_ensure_universe_audit_schema",
@@ -296,6 +297,9 @@ _CRITICAL_TABLE_SPECS = {
         "explain_json": {"type": "TEXT", "pk": 0},
         "extra_json": {"type": "TEXT", "pk": 0},
         "components_json": {"type": "TEXT", "pk": 0},
+        "component_vector": {"type": "TEXT", "pk": 0},
+        "prev_hash": {"type": "BLOB", "pk": 0},
+        "row_hash": {"type": "BLOB", "pk": 0},
     },
     "predictions": {
         "id": {"type": "INTEGER", "pk": 1},

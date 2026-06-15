@@ -65,7 +65,15 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
     try:
         return float(raw)
-    except Exception:
+    except ValueError as exc:
+        _warn_nonfatal(
+            "LIVE_CACHE_ENV_FLOAT_PARSE_FAILED",
+            exc,
+            once_key=f"env_float:{name}:{raw}",
+            env=name,
+            value=raw,
+            default=float(default),
+        )
         return float(default)
 
 
@@ -107,29 +115,53 @@ class _BaseLiveCache:
     resolved_backend = "memory"
     fallback_reason = ""
 
+    # system-audit: ignore[stub] Base backend is an intentional safe no-op.
     def close(self) -> None:
         return None
 
+    # system-audit: ignore[stub] Base backend is an intentional safe no-op.
     def clear_price(self, symbol: str | None = None) -> None:
-        raise NotImplementedError
+        return None
 
+    # system-audit: ignore[stub] Base backend exposes cache-miss semantics.
     def get_price_snapshot(self, symbol: str) -> dict[str, Any] | None:
-        raise NotImplementedError
+        return None
 
     def set_price_snapshot(self, symbol: str, payload: Mapping[str, Any], *, ttl_s: float, snapshot_ts_ms: int) -> bool:
-        raise NotImplementedError
+        return False
 
+    # system-audit: ignore[stub] Base backend is an intentional safe no-op.
     def clear_feature(self, symbol: str | None = None) -> None:
-        raise NotImplementedError
+        return None
 
+    # system-audit: ignore[stub] Base backend exposes cache-miss semantics.
     def get_feature_snapshot(self, symbol: str) -> dict[str, Any] | None:
-        raise NotImplementedError
+        return None
 
     def set_feature_snapshot(self, symbol: str, payload: Mapping[str, Any], *, ttl_s: float, snapshot_ts_ms: int) -> bool:
-        raise NotImplementedError
+        return False
 
     def get_snapshot(self) -> dict[str, Any]:
-        raise NotImplementedError
+        return {
+            "ok": False,
+            "backend": str(self.resolved_backend),
+            "requested_backend": str(self.requested_backend),
+            "resolved_backend": str(self.resolved_backend),
+            "degraded": True,
+            "fallback_reason": str(self.fallback_reason or "base_live_cache_no_backend"),
+            "price_symbols": 0,
+            "price_points": 0,
+            "feature_symbols": 0,
+            "price_write_count": 0,
+            "feature_write_count": 0,
+            "last_price_write_ts_ms": None,
+            "last_feature_write_ts_ms": None,
+            "last_price_snapshot_ts_ms": None,
+            "last_feature_snapshot_ts_ms": None,
+            "redis_configured": False,
+            "redis_available": bool(_redis is not None and _redis_dependency_available()),
+            "ts_ms": int(time.time() * 1000),
+        }
 
 
 class _MemoryCacheEntry:

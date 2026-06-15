@@ -191,6 +191,7 @@ def api_get_jobs(parsed, _body=None, ctx=None):
 
     stale_after_s = int(float(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180")))
 
+    list_errors = []
     try:
         try:
             running = JOBS.list_jobs(timeout_s=max(0.05, float(_API_JOB_LIST_TIMEOUT_S)), include_persisted=False) or []
@@ -198,9 +199,11 @@ def api_get_jobs(parsed, _body=None, ctx=None):
             running = JOBS.list_jobs() or []
     except TimeoutError as e:
         _warn("jobs_list_timeout", e)
+        list_errors.append("jobs_list_timeout")
         running = []
     except Exception as e:
         _warn("jobs_list", e)
+        list_errors.append(f"jobs_list_error:{e}")
         running = []
 
     running_by_name = {}
@@ -332,7 +335,11 @@ def api_get_jobs(parsed, _body=None, ctx=None):
         out.append(row)
 
     payload = {
-        "ok": True,
+        "ok": len(list_errors) == 0,
+        "status": "degraded" if list_errors else "ok",
+        "degraded": bool(list_errors),
+        "reasons": list(list_errors),
+        "live_list_available": not bool(list_errors),
         "ts_ms": now_ms,
         "jobs": out,
         "pipeline_order": list(PIPELINE_ORDER or []),

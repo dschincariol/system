@@ -46,15 +46,21 @@ def _fetch_bucket(con, symbol: str, ts_ms: int, bucket_sec: int) -> Optional[Dic
           unusual_volume_score,
           call_put_volume_ratio,
           call_put_oi_ratio,
-          signal_score
+          signal_score,
+          gex_norm,
+          gex_norm_z,
+          gex_sign,
+          opt_flow_imbalance,
+          opt_flow_imbalance_z
         FROM options_symbol_features
         WHERE symbol = ?
           AND bucket_sec = ?
           AND bucket_ts_ms <= ?
-        ORDER BY bucket_ts_ms DESC
+          AND snapshot_ts_ms <= ?
+        ORDER BY bucket_ts_ms DESC, snapshot_ts_ms DESC
         LIMIT 1
         """,
-        (str(symbol), int(bucket_sec), int(_bucket_start(ts_ms, bucket_sec))),
+        (str(symbol), int(bucket_sec), int(_bucket_start(ts_ms, bucket_sec)), int(ts_ms)),
     ).fetchone()
     if not row:
         return None
@@ -67,6 +73,11 @@ def _fetch_bucket(con, symbol: str, ts_ms: int, bucket_sec: int) -> Optional[Dic
         "call_put_volume_ratio": float(row[5] or 1.0),
         "call_put_oi_ratio": float(row[6] or 1.0),
         "signal_score": float(row[7] or 0.0),
+        "gex_norm": float(row[8] or 0.0),
+        "gex_norm_z": float(row[9] or 0.0),
+        "gex_sign": float(row[10] or 0.0),
+        "opt_flow_imbalance": float(row[11] or 0.0),
+        "opt_flow_imbalance_z": float(row[12] or 0.0),
     }
 
 

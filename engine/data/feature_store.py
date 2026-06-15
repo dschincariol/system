@@ -73,6 +73,13 @@ FEATURE_REQUIRED_NAMES = tuple(
 )
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
     if once_key and once_key in _WARNED_NONFATAL_KEYS:
         return
@@ -389,13 +396,23 @@ _CACHE_DB_PATH = ""
 
 
 def _sqlite_feature_snapshot_reads_enabled() -> bool:
-    return bool(FEATURE_STORE_SQLITE_WRITE_ENABLED)
+    return bool(_sqlite_feature_snapshot_writes_enabled())
+
+
+def _sqlite_feature_snapshot_writes_enabled() -> bool:
+    return bool(_env_flag("FEATURE_STORE_SQLITE_WRITE_ENABLED", FEATURE_STORE_SQLITE_WRITE_ENABLED))
+
+
+def _sqlite_busy(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return "locked" in text or "busy" in text or "write_lock_timeout" in text
 
 
 def _feature_store_write_mode(*, timescale_enabled: bool) -> str:
-    if FEATURE_STORE_SQLITE_WRITE_ENABLED and bool(timescale_enabled):
+    sqlite_enabled = _sqlite_feature_snapshot_writes_enabled()
+    if sqlite_enabled and bool(timescale_enabled):
         return "sqlite+timescale"
-    if FEATURE_STORE_SQLITE_WRITE_ENABLED:
+    if sqlite_enabled:
         return "sqlite"
     if bool(timescale_enabled):
         return "timescale"
@@ -495,35 +512,47 @@ def _load_latest_snapshot_from_db(symbol: str) -> Dict[str, Any] | None:
     _reset_cache_if_db_changed()
     if not _sqlite_feature_snapshot_reads_enabled():
         return None
-    con = connect(readonly=True)
-    try:
-        row = con.execute(
-            """
-            SELECT features_json
-            FROM market_features
-            WHERE symbol = ?
-            ORDER BY ts_ms DESC, v DESC
-            LIMIT 1
-            """,
-            (str(symbol),),
-        ).fetchone()
-    except Exception as exc:
-        row = None
+    row = None
+    last_error: BaseException | None = None
+    attempts = max(1, int(_safe_int(os.environ.get("FEATURE_STORE_DB_RECOVERY_RETRIES"), 3)))
+    for attempt in range(int(attempts)):
+        con = connect(readonly=True)
+        try:
+            row = con.execute(
+                """
+                SELECT features_json
+                FROM market_features
+                WHERE symbol = ?
+                ORDER BY ts_ms DESC, v DESC
+                LIMIT 1
+                """,
+                (str(symbol),),
+            ).fetchone()
+            last_error = None
+            break
+        except Exception as exc:
+            row = None
+            last_error = exc
+            if _sqlite_busy(exc) and int(attempt) < int(attempts) - 1:
+                time.sleep(min(0.05 * float(attempt + 1), 0.25))
+                continue
+            break
+        finally:
+            try:
+                con.close()
+            except Exception as exc:
+                _warn_nonfatal(
+                    "FEATURE_STORE_DB_CLOSE_FAILED",
+                    exc,
+                    once_key="feature_store_db_close_failed",
+                )
+    if last_error is not None:
         _warn_nonfatal(
             "FEATURE_STORE_DB_RECOVERY_FAILED",
-            exc,
+            last_error,
             once_key=f"feature_store_db_recovery_failed:{symbol}",
             symbol=str(symbol),
         )
-    finally:
-        try:
-            con.close()
-        except Exception as exc:
-            _warn_nonfatal(
-                "FEATURE_STORE_DB_CLOSE_FAILED",
-                exc,
-                once_key="feature_store_db_close_failed",
-            )
 
     if not row:
         return None
@@ -546,39 +575,50 @@ def _load_feature_snapshot_asof(symbol: str, ts_ms: int, *, con: Any | None = No
     if not _sqlite_feature_snapshot_reads_enabled():
         return None
     owns = con is None
-    if con is None:
-        con = connect(readonly=True)
-    try:
-        row = con.execute(
-            """
-            SELECT features_json
-            FROM market_features
-            WHERE symbol = ?
-              AND ts_ms <= ?
-            ORDER BY ts_ms DESC, v DESC
-            LIMIT 1
-            """,
-            (str(symbol), int(ts_ms)),
-        ).fetchone()
-    except Exception as exc:
-        row = None
+    row = None
+    last_error: BaseException | None = None
+    attempts = 1 if not owns else max(1, int(_safe_int(os.environ.get("FEATURE_STORE_DB_RECOVERY_RETRIES"), 3)))
+    for attempt in range(int(attempts)):
+        active_con = con if con is not None else connect(readonly=True)
+        try:
+            row = active_con.execute(
+                """
+                SELECT features_json
+                FROM market_features
+                WHERE symbol = ?
+                  AND ts_ms <= ?
+                ORDER BY ts_ms DESC, v DESC
+                LIMIT 1
+                """,
+                (str(symbol), int(ts_ms)),
+            ).fetchone()
+            last_error = None
+            break
+        except Exception as exc:
+            row = None
+            last_error = exc
+            if owns and _sqlite_busy(exc) and int(attempt) < int(attempts) - 1:
+                time.sleep(min(0.05 * float(attempt + 1), 0.25))
+                continue
+            break
+        finally:
+            if owns:
+                try:
+                    active_con.close()
+                except Exception as exc:
+                    _warn_nonfatal(
+                        "FEATURE_STORE_ASOF_DB_CLOSE_FAILED",
+                        exc,
+                        once_key="feature_store_asof_db_close_failed",
+                    )
+    if last_error is not None:
         _warn_nonfatal(
             "FEATURE_STORE_ASOF_DB_LOOKUP_FAILED",
-            exc,
+            last_error,
             once_key=f"feature_store_asof_db_lookup_failed:{symbol}",
             symbol=str(symbol),
             ts_ms=int(ts_ms),
         )
-    finally:
-        if owns:
-            try:
-                con.close()
-            except Exception as exc:
-                _warn_nonfatal(
-                    "FEATURE_STORE_ASOF_DB_CLOSE_FAILED",
-                    exc,
-                    once_key="feature_store_asof_db_close_failed",
-                )
     if not row:
         return None
     try:
@@ -823,7 +863,7 @@ def get_feature_store_snapshot(*, timescale_snapshot: Mapping[str, Any] | None =
         "degraded_reasons": degraded_reasons,
         "write_mode": str(write_mode),
         "read_mode": str(_feature_store_read_mode()),
-        "sqlite_write_enabled": bool(FEATURE_STORE_SQLITE_WRITE_ENABLED),
+        "sqlite_write_enabled": bool(_sqlite_feature_snapshot_writes_enabled()),
         "sqlite_read_fallback_enabled": bool(_sqlite_feature_snapshot_reads_enabled()),
         "sqlite_table": "market_features",
         "sqlite_db_path": (_current_db_path() or None),
@@ -874,7 +914,7 @@ def _persist_feature_snapshots(
     if not persistable:
         return 0
 
-    if not FEATURE_STORE_SQLITE_WRITE_ENABLED:
+    if not _sqlite_feature_snapshot_writes_enabled():
         _register_feature_snapshot_side_effects(con, persistable)
         return int(len(persistable))
 
@@ -903,7 +943,7 @@ def store_features(symbol: str, features: Mapping[str, Any], *, con: Any | None 
         operation="store_features",
         context={"symbol": str(snapshot.get("symbol") or ""), "ts_ms": int(snapshot.get("ts_ms") or 0)},
     )
-    if con is not None and not FEATURE_STORE_SQLITE_WRITE_ENABLED:
+    if con is not None and not _sqlite_feature_snapshot_writes_enabled():
         return copy.deepcopy(snapshot)
     return _get_cached_snapshot(str(snapshot.get("symbol") or symbol)) or copy.deepcopy(snapshot)
 
@@ -1062,10 +1102,14 @@ def get_features(symbol: str) -> Dict[str, Any]:
         return _zero_feature_snapshot("")
 
     cached = _get_cached_snapshot(symbol_key)
+    db_snapshot = _load_latest_snapshot_from_db(symbol_key)
+    cached_ts_ms = _safe_int((cached or {}).get("ts_ms"), 0)
+    db_ts_ms = _safe_int((db_snapshot or {}).get("ts_ms"), 0)
+    if db_snapshot is not None and int(db_ts_ms) >= int(cached_ts_ms):
+        return _set_cached_snapshot(db_snapshot)
     if cached is not None:
         return cached
 
-    db_snapshot = _load_latest_snapshot_from_db(symbol_key)
     price_snapshot = _default_price_cache.get_symbol_snapshot(symbol_key)
     latest_price_ts_ms = int(price_snapshot.asof_ts_ms or 0)
     latest_feature_ts_ms = _safe_int((db_snapshot or {}).get("ts_ms"), 0)

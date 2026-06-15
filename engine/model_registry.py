@@ -167,6 +167,7 @@ def _can_reuse_existing_model_registry() -> bool:
         if con is not None:
             try:
                 con.close()
+            # system-audit: ignore[silent_except] read-only connection close is best-effort cleanup.
             except Exception:
                 pass
 
@@ -223,6 +224,7 @@ def _model_registry_schema_ready() -> bool:
         if con is not None:
             try:
                 con.close()
+            # system-audit: ignore[silent_except] read-only connection close is best-effort cleanup.
             except Exception:
                 pass
 
@@ -633,6 +635,11 @@ for _family_name, _training_entrypoint, _inference_entrypoint in (
         "engine.strategy.models.lgbm_regressor.LGBMRegressorModel",
     ),
     (
+        "lgbm_ranker",
+        "engine.strategy.jobs.train_lgbm_ranker_models",
+        "engine.strategy.models.lgbm_ranker.LGBMRankerModel",
+    ),
+    (
         "xgb_regressor",
         "engine.strategy.jobs.train_xgb_models",
         "engine.strategy.models.xgb_regressor.XGBRegressorModel",
@@ -897,6 +904,20 @@ def init_model_registry(con=None) -> None:
                 str(r[1] or "").strip().lower()
                 for r in (con.execute("PRAGMA table_info(model_registry)").fetchall() or [])
             }
+            if "model_kind" not in cols:
+                con.execute("ALTER TABLE model_registry ADD COLUMN model_kind TEXT NOT NULL DEFAULT ''")
+            if "model_ts_ms" not in cols:
+                con.execute("ALTER TABLE model_registry ADD COLUMN model_ts_ms INTEGER NOT NULL DEFAULT 0")
+            if "stage" not in cols:
+                con.execute("ALTER TABLE model_registry ADD COLUMN stage TEXT NOT NULL DEFAULT 'shadow'")
+            if "regime" not in cols:
+                con.execute("ALTER TABLE model_registry ADD COLUMN regime TEXT NOT NULL DEFAULT 'global'")
+            if "metrics_json" not in cols:
+                con.execute("ALTER TABLE model_registry ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'")
+            if "created_ts_ms" not in cols:
+                con.execute("ALTER TABLE model_registry ADD COLUMN created_ts_ms INTEGER")
+            if "note" not in cols:
+                con.execute("ALTER TABLE model_registry ADD COLUMN note TEXT")
             if "status" not in cols:
                 con.execute("ALTER TABLE model_registry ADD COLUMN status TEXT")
             if "last_promotion_ts_ms" not in cols:
@@ -913,6 +934,12 @@ def init_model_registry(con=None) -> None:
                   WHEN stage='challenger' THEN 'challenger'
                   ELSE 'inactive'
                 END)
+                """
+            )
+            con.execute(
+                """
+                UPDATE model_registry
+                SET created_ts_ms=COALESCE(created_ts_ms, created_ts, updated_ts, 0)
                 """
             )
             con.execute(
@@ -966,6 +993,11 @@ def _register_stage_model(
     history.
     """
     reg = str(regime if regime is not None else (key if key is not None else "global"))
+    if str(stage or "").strip().lower() == "champion":
+        raise RuntimeError(
+            "direct champion registration is disabled; register the model as challenger "
+            "and promote through promote_to_champion"
+        )
     init_model_registry()
     metrics = dict(metrics or {})
     metrics.setdefault("artifact_alias", _default_artifact_alias(str(model_name), str(reg)))
@@ -1143,7 +1175,7 @@ def list_recent(
         con.close()
 
 
-def _require_latest_statistical_evidence_pass(con, *, model_id: str) -> None:
+def _require_latest_statistical_evidence_pass(con, *, model_id: str) -> Dict[str, Any]:
     from engine.strategy.promotion_audit import latest_statistical_evidence_decision
 
     model_key = str(model_id or "").strip()
@@ -1152,6 +1184,228 @@ def _require_latest_statistical_evidence_pass(con, *, model_id: str) -> None:
         raise RuntimeError(
             f"cannot promote model={model_key}: latest statistical evidence decision={decision.get('decision') or 'missing'}"
         )
+    return dict(decision)
+
+
+def _candidate_replay_models(snapshot: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    models = snapshot.get("models") if isinstance(snapshot, dict) else None
+    if isinstance(models, dict):
+        return [
+            (str(key), dict(value))
+            for key, value in models.items()
+            if isinstance(value, dict)
+        ]
+    if isinstance(models, list):
+        return [
+            (str(idx), dict(value))
+            for idx, value in enumerate(models)
+            if isinstance(value, dict)
+        ]
+    return []
+
+
+def _require_fresh_replay_validation_pass(
+    *,
+    model_id: str,
+    model_kind: str,
+    model_ts_ms: int,
+    regime: str,
+) -> Dict[str, Any]:
+    from engine.strategy.model_marketplace import get_cached_replay_validation_snapshot
+
+    model_key = str(model_id or "").strip()
+    kind_key = str(model_kind or "").strip()
+    reg_key = str(regime or "global").strip() or "global"
+    ts_key = int(model_ts_ms)
+    state = get_cached_replay_validation_snapshot()
+    if not bool(state.get("ok")) or not bool(state.get("fresh")):
+        raise RuntimeError(
+            f"cannot promote model={model_key}: replay validation missing or stale "
+            f"status={state.get('status') or 'missing'} age_ms={state.get('age_ms')}"
+        )
+
+    snapshot = dict(state.get("snapshot") or {})
+    for row_key, row in _candidate_replay_models(snapshot):
+        row_model_name = str(row.get("model_name") or "").strip()
+        row_model_id = str(row.get("model_id") or "").strip()
+        row_regime = str(row.get("regime") or reg_key).strip() or reg_key
+        row_kind = str(row.get("model_kind") or "").strip()
+        row_ts = _safe_int(row.get("model_ts_ms"))
+        if not bool(row.get("approved")):
+            continue
+        if model_key not in {row_model_name, row_model_id, str(row_key).split("|", 1)[0]}:
+            continue
+        if row_regime != reg_key:
+            continue
+        if row_kind != kind_key:
+            continue
+        if row_ts is None or int(row_ts) != ts_key:
+            continue
+        return {
+            "model_key": str(row_key),
+            "updated_ts_ms": int(state.get("updated_ts_ms") or 0),
+            "age_ms": int(state.get("age_ms") or 0),
+            "model_name": row_model_name,
+            "model_id": row_model_id,
+            "model_kind": row_kind,
+            "model_ts_ms": int(row_ts),
+            "regime": row_regime,
+            "approved": True,
+        }
+
+    raise RuntimeError(
+        f"cannot promote model={model_key}: missing fresh approved replay validation "
+        f"for kind={kind_key} ts={ts_key} regime={reg_key}"
+    )
+
+
+def _require_system_promotion_guard_pass() -> Dict[str, Any]:
+    from engine.strategy.promotion_guard import promotion_allowed
+
+    allowed, reason = promotion_allowed()
+    reason_dict = dict(reason or {})
+    if not bool(allowed):
+        blockers = reason_dict.get("blockers") or []
+        raise RuntimeError(f"cannot promote model: promotion guard blocked blockers={blockers}")
+    return reason_dict
+
+
+def _ensure_model_promotion_audit_schema(con) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_promotion_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          actor TEXT NOT NULL,
+          action TEXT NOT NULL,
+          model_name TEXT NOT NULL,
+          from_model_kind TEXT,
+          from_model_ts_ms INTEGER,
+          to_model_kind TEXT,
+          to_model_ts_ms INTEGER,
+          reason_json TEXT,
+          regime TEXT,
+          prev_hash BLOB,
+          row_hash BLOB
+        )
+        """
+    )
+    cols = {
+        str(row[1] or "").strip().lower()
+        for row in (con.execute("PRAGMA table_info(model_promotion_audit)").fetchall() or [])
+        if row and len(row) > 1
+    }
+    for column_name, column_type in (
+        ("prev_hash", "BLOB"),
+        ("row_hash", "BLOB"),
+        ("reason_json", "TEXT"),
+        ("regime", "TEXT"),
+    ):
+        if column_name not in cols:
+            con.execute(f"ALTER TABLE model_promotion_audit ADD COLUMN {column_name} {column_type}")
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_model_promo_audit_name_regime_ts
+          ON model_promotion_audit(model_name, regime, ts_ms)
+        """
+    )
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_model_promo_audit_ts
+          ON model_promotion_audit(ts_ms)
+        """
+    )
+
+
+def _append_model_promotion_audit_row(
+    con,
+    *,
+    actor: str,
+    action: str,
+    model_name: str,
+    from_kind: Optional[str] = None,
+    from_ts_ms: Optional[int] = None,
+    to_kind: Optional[str] = None,
+    to_ts_ms: Optional[int] = None,
+    reason: Optional[Dict[str, Any]] = None,
+    regime: Optional[str] = None,
+) -> None:
+    from engine.audit.chain import append_chain_row
+
+    _ensure_model_promotion_audit_schema(con)
+    append_chain_row(
+        "model_promotion_audit",
+        {
+            "ts_ms": _now_ms(),
+            "actor": str(actor),
+            "action": str(action),
+            "model_name": str(model_name),
+            "from_model_kind": (str(from_kind) if from_kind else None),
+            "from_model_ts_ms": (int(from_ts_ms) if from_ts_ms is not None else None),
+            "to_model_kind": (str(to_kind) if to_kind else None),
+            "to_model_ts_ms": (int(to_ts_ms) if to_ts_ms is not None else None),
+            "reason_json": dict(reason or {}),
+            "regime": (str(regime) if regime is not None else None),
+        },
+        con,
+    )
+
+
+def _audit_blocked_promotion(
+    *,
+    actor: str,
+    model_name: str,
+    to_kind: Optional[str],
+    to_ts_ms: Optional[int],
+    regime: str,
+    error: BaseException,
+) -> None:
+    try:
+        def _write(con):
+            _append_model_promotion_audit_row(
+                con,
+                actor=str(actor),
+                action="block",
+                model_name=str(model_name),
+                to_kind=(str(to_kind) if to_kind else None),
+                to_ts_ms=(int(to_ts_ms) if to_ts_ms is not None else None),
+                regime=str(regime),
+                reason={
+                    "error": "promotion_gate_blocked",
+                    "detail": repr(error),
+                    "registry_gate_version": 1,
+                },
+            )
+
+        run_write_txn(_write)
+    except Exception as audit_error:
+        _warn_nonfatal(
+            "model_registry_promotion_block_audit_failed",
+            "MODEL_REGISTRY_PROMOTION_BLOCK_AUDIT_FAILED",
+            audit_error,
+            warn_key=f"promotion_block_audit:{model_name}:{regime}",
+            model_name=str(model_name),
+            regime=str(regime),
+        )
+
+
+def _promotion_gate_reason(
+    *,
+    statistical: Dict[str, Any],
+    replay: Dict[str, Any],
+    guard: Dict[str, Any],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "registry_gate_version": 1,
+        "statistical_evidence": {
+            "decision": str(statistical.get("decision") or ""),
+            "rows": len(list(statistical.get("rows") or [])),
+        },
+        "replay_validation": dict(replay or {}),
+        "promotion_guard": dict(guard or {}),
+        "extra": dict(extra or {}),
+    }
 
 
 def promote_to_champion(
@@ -1161,6 +1415,8 @@ def promote_to_champion(
     *,
     regime: Optional[str] = None,
     key: Optional[str] = None,
+    actor: str = "model_registry",
+    reason: Optional[Dict[str, Any]] = None,
 ) -> Union[None, Tuple[Optional[str], Optional[int]]]:
     """
     Supported call patterns:
@@ -1178,7 +1434,51 @@ def promote_to_champion(
     # the durable champion handoff that serving code later reads.
     if b is None and isinstance(a, str) and (regime is None) and (key is None):
         reg = str(a or "global")
-        promoted: dict[str, Any] = {"kind": None, "ts": None}
+        promoted: dict[str, Any] = {"kind": None, "ts": None, "gate_reason": {}}
+        try:
+            con = _connect_ro()
+            try:
+                row = con.execute(
+                    """
+                    SELECT model_kind, model_ts_ms
+                    FROM model_registry
+                    WHERE model_name=? AND regime=? AND stage='challenger'
+                    ORDER BY created_ts_ms DESC
+                    LIMIT 1
+                    """,
+                    (str(model_name), str(reg)),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError(f"cannot promote missing challenger model={model_name} regime={reg}")
+                promoted["kind"] = str(row[0])
+                promoted["ts"] = int(row[1])
+                statistical = _require_latest_statistical_evidence_pass(con, model_id=str(model_name))
+            finally:
+                con.close()
+
+            replay = _require_fresh_replay_validation_pass(
+                model_id=str(model_name),
+                model_kind=str(promoted["kind"]),
+                model_ts_ms=int(promoted["ts"]),
+                regime=str(reg),
+            )
+            guard_reason = _require_system_promotion_guard_pass()
+            promoted["gate_reason"] = _promotion_gate_reason(
+                statistical=statistical,
+                replay=replay,
+                guard=guard_reason,
+                extra=reason,
+            )
+        except Exception as e:
+            _audit_blocked_promotion(
+                actor=str(actor),
+                model_name=str(model_name),
+                to_kind=(str(promoted["kind"]) if promoted.get("kind") else None),
+                to_ts_ms=(int(promoted["ts"]) if promoted.get("ts") is not None else None),
+                regime=str(reg),
+                error=e,
+            )
+            raise
 
         def _write(con):
             now_ms = _now_ms()
@@ -1194,10 +1494,21 @@ def promote_to_champion(
             ).fetchone()
             if not row:
                 raise RuntimeError(f"cannot promote missing challenger model={model_name} regime={reg}")
+            if str(row[0]) != str(promoted["kind"]) or int(row[1]) != int(promoted["ts"]):
+                raise RuntimeError(f"cannot promote model={model_name}: challenger changed during promotion")
 
-            promoted["kind"] = str(row[0])
-            promoted["ts"] = int(row[1])
-            _require_latest_statistical_evidence_pass(con, model_id=str(model_name))
+            prev = con.execute(
+                """
+                SELECT model_kind, model_ts_ms
+                FROM model_registry
+                WHERE model_name=? AND regime=? AND stage='champion'
+                ORDER BY created_ts_ms DESC
+                LIMIT 1
+                """,
+                (str(model_name), str(reg)),
+            ).fetchone()
+            prev_kind = prev[0] if prev else None
+            prev_ts = int(prev[1]) if prev and prev[1] is not None else None
 
             con.execute(
                 """
@@ -1218,8 +1529,31 @@ def promote_to_champion(
                 """,
                 (int(now_ms), int(now_ms), str(model_name), str(promoted["kind"]), int(promoted["ts"]), str(reg)),
             )
+            _append_model_promotion_audit_row(
+                con,
+                actor=str(actor),
+                action="promote",
+                model_name=str(model_name),
+                from_kind=prev_kind,
+                from_ts_ms=prev_ts,
+                to_kind=str(promoted["kind"]),
+                to_ts_ms=int(promoted["ts"]),
+                regime=str(reg),
+                reason=dict(promoted.get("gate_reason") or {}),
+            )
 
-        run_write_txn(_write)
+        try:
+            run_write_txn(_write)
+        except Exception as e:
+            _audit_blocked_promotion(
+                actor=str(actor),
+                model_name=str(model_name),
+                to_kind=str(promoted["kind"]),
+                to_ts_ms=int(promoted["ts"]),
+                regime=str(reg),
+                error=e,
+            )
+            raise
         logging.info(
             "PROMOTED champion model=%s regime=%s kind=%s ts=%s",
             model_name,
@@ -1237,6 +1571,49 @@ def promote_to_champion(
     reg = str(regime if regime is not None else (key if key is not None else "global"))
 
     prev_state: dict[str, Any] = {"kind": None, "ts": None}
+    try:
+        con = _connect_ro()
+        try:
+            exists = con.execute(
+                """
+                SELECT 1
+                FROM model_registry
+                WHERE model_name=? AND model_kind=? AND model_ts_ms=? AND regime=?
+                LIMIT 1
+                """,
+                (str(model_name), str(to_kind), int(to_ts_ms), str(reg)),
+            ).fetchone()
+            if not exists:
+                raise RuntimeError(
+                    f"cannot promote missing model record model={model_name} regime={reg} kind={to_kind} ts={to_ts_ms}"
+                )
+            statistical = _require_latest_statistical_evidence_pass(con, model_id=str(model_name))
+        finally:
+            con.close()
+
+        replay = _require_fresh_replay_validation_pass(
+            model_id=str(model_name),
+            model_kind=str(to_kind),
+            model_ts_ms=int(to_ts_ms),
+            regime=str(reg),
+        )
+        guard_reason = _require_system_promotion_guard_pass()
+        gate_reason = _promotion_gate_reason(
+            statistical=statistical,
+            replay=replay,
+            guard=guard_reason,
+            extra=reason,
+        )
+    except Exception as e:
+        _audit_blocked_promotion(
+            actor=str(actor),
+            model_name=str(model_name),
+            to_kind=str(to_kind),
+            to_ts_ms=int(to_ts_ms),
+            regime=str(reg),
+            error=e,
+        )
+        raise
 
     def _write(con):
         now_ms = _now_ms()
@@ -1267,7 +1644,6 @@ def promote_to_champion(
             raise RuntimeError(
                 f"cannot promote missing model record model={model_name} regime={reg} kind={to_kind} ts={to_ts_ms}"
             )
-        _require_latest_statistical_evidence_pass(con, model_id=str(model_name))
 
         con.execute(
             """
@@ -1288,8 +1664,31 @@ def promote_to_champion(
             """,
             (int(now_ms), int(now_ms), str(model_name), str(to_kind), int(to_ts_ms), str(reg)),
         )
+        _append_model_promotion_audit_row(
+            con,
+            actor=str(actor),
+            action="promote",
+            model_name=str(model_name),
+            from_kind=prev_state["kind"],
+            from_ts_ms=prev_state["ts"],
+            to_kind=str(to_kind),
+            to_ts_ms=int(to_ts_ms),
+            regime=str(reg),
+            reason=dict(gate_reason),
+        )
 
-    run_write_txn(_write)
+    try:
+        run_write_txn(_write)
+    except Exception as e:
+        _audit_blocked_promotion(
+            actor=str(actor),
+            model_name=str(model_name),
+            to_kind=str(to_kind),
+            to_ts_ms=int(to_ts_ms),
+            regime=str(reg),
+            error=e,
+        )
+        raise
 
     logging.info("PROMOTED champion model=%s regime=%s kind=%s ts=%s", model_name, reg, to_kind, to_ts_ms)
     return (prev_state["kind"], prev_state["ts"])

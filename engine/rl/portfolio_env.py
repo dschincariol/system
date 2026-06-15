@@ -250,6 +250,7 @@ class PortfolioEnv(gym.Env if gym is not None else object):  # type: ignore[misc
         self._last_info = dict(info)
         return obs, reward, terminated, truncated, info
 
+    # system-audit: ignore[stub] Gym Env.close hook has no owned handles here.
     def close(self) -> None:
         return None
 

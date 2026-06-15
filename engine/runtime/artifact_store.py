@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlparse
+
+LOG = logging.getLogger(__name__)
 
 OBJECT_STORAGE_SCHEMES = frozenset({"artifact", "az", "azure", "gs", "minio", "s3"})
 ARTIFACT_MIRROR_ROOT_ENV = "ARTIFACT_STORE_MIRROR_ROOT"
@@ -24,7 +27,8 @@ def _safe_int(value: Any) -> int | None:
         return None
     try:
         return int(value)
-    except Exception:
+    except (TypeError, ValueError):
+        LOG.debug("artifact_manifest_int_parse_failed value=%r", value, exc_info=True)
         return None
 
 
@@ -125,7 +129,12 @@ def build_artifact_manifest(
         if size_bytes is None and local_path.exists():
             try:
                 size_bytes = int(local_path.stat().st_size)
-            except Exception:
+            except OSError:
+                LOG.warning(
+                    "artifact_manifest_local_size_failed path=%s",
+                    local_path,
+                    exc_info=True,
+                )
                 size_bytes = None
         return {
             "artifact_uri": str(artifact_uri_text),
@@ -151,7 +160,12 @@ def build_artifact_manifest(
         if size_bytes is None and local_path.exists():
             try:
                 size_bytes = int(local_path.stat().st_size)
-            except Exception:
+            except OSError:
+                LOG.warning(
+                    "artifact_manifest_file_size_failed path=%s",
+                    local_path,
+                    exc_info=True,
+                )
                 size_bytes = None
         return {
             "artifact_uri": str(artifact_uri_text),

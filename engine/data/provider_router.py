@@ -22,6 +22,7 @@ ANOMALY_THRESHOLD_BPS = float(os.environ.get("PROVIDER_ANOMALY_BPS", "25"))
 STALE_THRESHOLD_MS = int(os.environ.get("PROVIDER_STALE_MS", "120000"))
 QUORUM_BPS = float(os.environ.get("PROVIDER_QUORUM_BPS", "8"))
 FAILOVER_MIN_SCORE = float(os.environ.get("PROVIDER_FAILOVER_MIN_SCORE", "0.15"))
+PROVIDER_CIRCUIT_BREAKER_ERRORS = int(os.environ.get("PROVIDER_CIRCUIT_BREAKER_ERRORS", "3"))
 
 _PROVIDER_STALE_MS = {
     "polygon_ws": int(os.environ.get("PROVIDER_STALE_MS_POLYGON_WS", "8000")),
@@ -73,9 +74,28 @@ def _bps(a: float, b: float) -> float:
 
 
 def _latest_provider_health(con) -> Dict[str, Dict]:
+    try:
+        cols = {
+            str(row[1] or "")
+            for row in (con.execute("PRAGMA table_info(price_provider_health)").fetchall() or [])
+            if row and len(row) > 1
+        }
+    except Exception as e:
+        _warn_nonfatal(
+            "PROVIDER_ROUTER_HEALTH_COLUMNS_QUERY_FAILED",
+            e,
+            once_key="latest_provider_health_columns",
+        )
+        cols = set()
+    if not cols:
+        return {}
+    last_success_expr = "h.last_success_ts_ms" if "last_success_ts_ms" in cols else "NULL"
+    error_count_expr = "h.error_count" if "error_count" in cols else "NULL"
     rows = con.execute(
-        """
+        f"""
         SELECT h.provider, h.ts_ms, h.ok, h.latency_ms, h.n_symbols, h.error
+             , {last_success_expr} AS last_success_ts_ms
+             , {error_count_expr} AS error_count
         FROM price_provider_health h
         JOIN (
             SELECT provider, MAX(ts_ms) AS max_ts_ms
@@ -88,13 +108,15 @@ def _latest_provider_health(con) -> Dict[str, Dict]:
     ).fetchall()
 
     out: Dict[str, Dict] = {}
-    for provider, ts_ms, ok, latency_ms, n_symbols, error in rows or []:
+    for provider, ts_ms, ok, latency_ms, n_symbols, error, last_success_ts_ms, error_count in rows or []:
         out[str(provider)] = {
             "ts_ms": int(ts_ms or 0),
             "ok": int(ok or 0),
             "latency_ms": int(latency_ms or 0),
             "n_symbols": int(n_symbols or 0),
             "error": (str(error) if error else None),
+            "last_success_ts_ms": (int(last_success_ts_ms) if last_success_ts_ms is not None else None),
+            "error_count": int(error_count or 0),
         }
     return out
 
@@ -166,7 +188,16 @@ def compute_provider_health() -> Dict[str, Dict]:
             session_age_ms = int(sess.get("last_msg_age_ms") or 10**9) if sess else 10**9
             db_ok = bool(int(rec.get("ok") or 0) == 1 and age_ms <= stale_ms)
             session_ok = bool(session_connected and session_age_ms <= stale_ms)
-            ok = bool(db_ok or session_ok)
+            error_count = int(rec.get("error_count") or 0)
+            last_success_ts_ms = int(rec.get("last_success_ts_ms") or 0)
+            last_success_age_ms = max(0, ts - last_success_ts_ms) if last_success_ts_ms > 0 else None
+            circuit_open = bool(
+                int(PROVIDER_CIRCUIT_BREAKER_ERRORS) > 0
+                and error_count >= int(PROVIDER_CIRCUIT_BREAKER_ERRORS)
+                and not db_ok
+                and not session_ok
+            )
+            ok = bool((db_ok or session_ok) and not circuit_open)
 
             freshness_ms = min(
                 int(rec.get("latency_ms") or age_ms),
@@ -180,6 +211,8 @@ def compute_provider_health() -> Dict[str, Dict]:
             score = max(0.0, latency_score * (1.0 - age_penalty))
             if ok:
                 score = max(FAILOVER_MIN_SCORE, latency_score)
+            if circuit_open:
+                score = 0.0
 
             out[str(provider)] = {
                 "provider": str(provider),
@@ -191,7 +224,12 @@ def compute_provider_health() -> Dict[str, Dict]:
                 "latency_ms": int(rec.get("latency_ms") or session_age_ms or age_ms),
                 "n_symbols": int(rec.get("n_symbols") or sess.get("subscribed_symbol_count") or 0),
                 "error": (rec.get("error") or sess.get("last_error")),
-                "status": ("OK" if ok else "STALE"),
+                "status": ("OK" if ok else ("CIRCUIT_OPEN" if circuit_open else "STALE")),
+                "circuit_open": bool(circuit_open),
+                "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
+                "error_count": int(error_count),
+                "last_success_ts_ms": int(last_success_ts_ms) if last_success_ts_ms > 0 else None,
+                "last_success_age_ms": last_success_age_ms,
                 "session_connected": bool(session_connected),
                 "session_last_msg_age_ms": int(session_age_ms),
                 "capabilities": dict(sess.get("capabilities") or {}),

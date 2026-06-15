@@ -100,3 +100,43 @@ def test_patchtst_cuda_trained_config_loads_on_cpu_with_warning(monkeypatch, tmp
     loaded = module.PatchTSTRegressor.load(model_dir)
 
     assert loaded.device.type == "cpu"
+
+
+def test_patchtst_load_rejects_feature_set_tag_drift(monkeypatch, tmp_path):
+    monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
+    module = importlib.import_module("engine.strategy.models.patchtst")
+    monkeypatch.setattr(module, "_emit_config_feature_schema_load_failure", lambda **kwargs: None)
+    X, y = _sequence_dataset(n=8, seq_len=8, n_features=3, n_horizons=2)
+
+    reg = module.PatchTSTRegressor(
+        model_name="patchtst.tag_drift",
+        feature_ids=list(FEATURE_IDS),
+        seq_len=8,
+        n_horizons=2,
+        patch_len=4,
+        stride=2,
+        n_layers=1,
+        n_heads=2,
+        d_model=16,
+        dropout=0.0,
+        seed=7,
+        device="cpu",
+    )
+    reg.fit(X, y, epochs=1, lr=0.01, weight_decay=0.0)
+    model_dir = reg.save(tmp_path / "patchtst_tag_drift")
+    persisted_tag = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))["feature_schema"][
+        "feature_set_tag"
+    ]
+
+    monkeypatch.setattr(module, "feature_set_tag_from_ids", lambda ids: "mutated-patchtst-tag")
+
+    try:
+        module.PatchTSTRegressor.load(model_dir)
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("PatchTSTRegressor.load accepted feature_set_tag drift")
+
+    assert "feature_schema_drift" in message
+    assert persisted_tag in message
+    assert "mutated-patchtst-tag" in message

@@ -182,8 +182,32 @@ TABLE_CLASS["model_feature_snapshots"] = _h(
     write_rate="high",
     read_pattern="latest snapshot by (symbol, feature_set_tag, ts_ms) and replay windows",
 )
+TABLE_CLASS["har_rv_forecasts"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    rationale="point-in-time HAR-RV volatility forecasts used by sizing and Monte Carlo risk inputs",
+    write_rate="medium",
+    read_pattern="latest forecast by (symbol, ts_ms) and walk-forward validation windows",
+)
 _add(("news_event_features", "options_event_features"), FEATURE_SERIES)
 TABLE_CLASS["news_symbol_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
+TABLE_CLASS["news_story_embeddings"] = _r(
+    "backend-aware per-story news embeddings and novelty scores keyed by event/symbol/model",
+    write_rate="medium",
+    read_pattern="symbol/backend availability-window novelty comparisons and feature snapshots",
+)
+TABLE_CLASS["news_flow_features"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="asof_ts_ms",
+    rationale="materialized point-in-time news novelty/staleness feature cache",
+    write_rate="medium",
+    read_pattern="latest news-flow feature snapshot by symbol/time/backend",
+)
 TABLE_CLASS["options_symbol_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
 TABLE_CLASS["social_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
 TABLE_CLASS["social_regimes"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
@@ -240,12 +264,177 @@ TABLE_CLASS["sec_filings"] = FEATURE_SERIES
 TABLE_CLASS["insider_transactions"] = _r(
     "low-rate alternative data table upserted by source transaction id",
     write_rate="low",
-    read_pattern="source id upsert and symbol/time feature snapshot reads",
+    read_pattern="source id upsert and symbol/availability-time feature snapshot reads",
 )
 TABLE_CLASS["congressional_trades"] = _r(
     "low-rate alternative data table upserted by source trade id",
     write_rate="low",
     read_pattern="source id upsert and symbol/time feature snapshot reads",
+)
+TABLE_CLASS["finra_short_sale_volume"] = _r(
+    "daily FINRA short-sale volume rows upserted by source record id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/availability-time feature snapshot reads",
+)
+TABLE_CLASS["finra_short_interest"] = _r(
+    "bi-monthly FINRA short-interest rows upserted by source record id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/availability-time feature snapshot reads",
+)
+TABLE_CLASS["finbert_sentiment_enrichments"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="asof_ts_ms",
+    rationale="point-in-time FinBERT sentiment enrichments keyed by symbol/source availability",
+    write_rate="medium",
+    read_pattern="latest sentiment enrichment by symbol/time/source",
+)
+TABLE_CLASS["crypto_funding_rates"] = _r(
+    "hourly crypto perpetual funding and basis rows upserted by exchange funding event",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/availability-time feature snapshot reads",
+)
+TABLE_CLASS["etf_shares_outstanding"] = _r(
+    "daily ETF shares-outstanding rows upserted by symbol/as-of source record id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/availability-time feature snapshot reads",
+)
+TABLE_CLASS["etf_flow_features"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="asof_ts_ms",
+    rationale="materialized point-in-time ETF unexpected-flow feature cache",
+    write_rate="medium",
+    read_pattern="latest ETF flow feature snapshot by symbol/time",
+)
+TABLE_CLASS["cftc_cot_positions"] = _r(
+    "weekly CFTC COT rows upserted by source report/contract id",
+    write_rate="low",
+    read_pattern="source id upsert and contract/availability-time feature snapshot reads",
+)
+TABLE_CLASS["cot_contract_symbol_map"] = _r(
+    "config table mapping CFTC futures contracts into model symbols and macro topics",
+    write_rate="low",
+    read_pattern="symbol-to-contract mapping lookups",
+)
+TABLE_CLASS["cot_symbol_features"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="asof_ts_ms",
+    rationale="materialized point-in-time COT positioning feature cache",
+    write_rate="low",
+    read_pattern="latest COT feature snapshot by symbol/time",
+)
+TABLE_CLASS["inst_13f_manager_universe"] = _r(
+    "configured 13F manager universe with active flags and turnover thresholds",
+    write_rate="low",
+    read_pattern="manager configuration lookup",
+)
+TABLE_CLASS["inst_13f_filings"] = _r(
+    "quarterly SEC 13F filing metadata keyed by manager/accession and EDGAR acceptance time",
+    write_rate="low",
+    read_pattern="manager/latest filing lookup by availability time",
+)
+TABLE_CLASS["inst_13f_holdings"] = _r(
+    "raw 13F information-table holdings keyed by manager/accession/CUSIP row",
+    write_rate="low",
+    read_pattern="symbol and manager/report feature snapshot reads",
+)
+TABLE_CLASS["inst_13f_cusip_symbol_map"] = _r(
+    "13F CUSIP-to-symbol mapping cache and manual review table",
+    write_rate="low",
+    read_pattern="CUSIP mapping lookups",
+)
+TABLE_CLASS["inst_13f_symbol_features"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="asof_ts_ms",
+    rationale="materialized point-in-time 13F low-turnover manager overlay cache",
+    write_rate="low",
+    read_pattern="latest 13F overlay feature snapshot by symbol/time",
+)
+TABLE_CLASS["quiver_congressional_trades"] = _r(
+    "Quiver congressional trade disclosures keyed by source record id and disclosure availability time",
+    write_rate="low",
+    read_pattern="source id upsert, dedupe-key lookup, and symbol/disclosure-time feature snapshot reads",
+)
+TABLE_CLASS["quiver_lobbying_filings"] = _r(
+    "Quiver lobbying spend disclosures keyed by source record id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/sector availability-time feature snapshot reads",
+)
+TABLE_CLASS["quiver_gov_contracts"] = _r(
+    "Quiver government contract award disclosures keyed by source record id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/sector availability-time feature snapshot reads",
+)
+TABLE_CLASS["gov_member_committee_map"] = _r(
+    "static congressional member-to-committee conditioning map",
+    write_rate="low",
+    read_pattern="member committee lookup for gov feature conditioning",
+)
+TABLE_CLASS["gov_committee_sector_map"] = _r(
+    "static committee-to-sector conditioning map",
+    write_rate="low",
+    read_pattern="committee sector lookup for gov feature conditioning",
+)
+TABLE_CLASS["gov_member_leadership_map"] = _r(
+    "static congressional leadership member map",
+    write_rate="low",
+    read_pattern="member leadership lookup for gov feature conditioning",
+)
+TABLE_CLASS["gov_symbol_sector_map"] = _r(
+    "symbol-to-sector map for government-flow feature conditioning",
+    write_rate="low",
+    read_pattern="symbol sector lookup",
+)
+TABLE_CLASS["gov_symbol_features"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="asof_ts_ms",
+    rationale="materialized point-in-time Quiver government-flow feature cache",
+    write_rate="low",
+    read_pattern="latest gov feature snapshot by symbol/time",
+)
+TABLE_CLASS["fundamentals_pit"] = _r(
+    "immutable point-in-time fundamentals vendor metric publications keyed by source record id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/metric publish-time feature snapshot reads",
+)
+TABLE_CLASS["fundamentals_pit_backfill_state"] = _r(
+    "resumable PIT fundamentals bulk-load cursors by vendor",
+    write_rate="low",
+    read_pattern="vendor/state-key backfill cursor lookup",
+)
+TABLE_CLASS["fundamentals_pit_symbol_features"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="asof_ts_ms",
+    rationale="materialized point-in-time fundamentals feature cache",
+    write_rate="low",
+    read_pattern="latest fundamentals feature snapshot by symbol/time",
+)
+TABLE_CLASS["macro_series_vintages"] = _r(
+    "ALFRED/FRED macro observations keyed by series, observation date, and vintage date",
+    write_rate="low",
+    read_pattern="series vintage upserts and point-in-time macro feature materialization",
+)
+TABLE_CLASS["macro_vintage_backfill_state"] = _r(
+    "resumable state for one-time macro vintage backfills",
+    write_rate="low",
+    read_pattern="primary-key lookup by macro series id",
 )
 TABLE_CLASS["weather_alerts"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "issued_ts"})
 TABLE_CLASS["weather_forecast_region_daily"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "run_ts"})
@@ -319,6 +508,10 @@ _add(
         "model_oos_predictions",
         "temporal_predictions",
         "rl_strategy_policy_decisions",
+        "tracked_predictions",
+        "prediction_explanations",
+        "triple_barrier_labels",
+        "rl_shadow_decisions",
     ),
     DECISION_SERIES,
 )
@@ -377,6 +570,8 @@ _add(
         "promotion_statistical_evidence",
         "portfolio_kill_snapshots",
         "portfolio_risk_snapshots",
+        "data_source_audit",
+        "position_reconcile_bootstrap_audit",
     ),
     AUDIT_SERIES,
 )
@@ -407,6 +602,8 @@ _add(
         "portfolio_position_corr_snapshots",
         "portfolio_model_corr_snapshots",
         "pnl_decomposition",
+        "realized_outcomes",
+        "equity_drift",
         "rl_shadow_eval",
         "rl_shadow_actions",
         "strategy_promotion_log",
@@ -449,6 +646,7 @@ _TRAINING_RATIONALE = "training/model artifact metadata; looked up by model/run 
 _add(
     (
         "model_registry",
+        "tracked_model_registry",
         "feature_registry",
         "strategy_registry",
         "sleeve_registry",
@@ -463,6 +661,7 @@ _add(
         "rl_policies",
         "rl_strategy_policy_models",
         "causal_dags",
+        "hypothesis_registry",
         "timescale_schema_version",
         "artifacts",
         "artifact_aliases",
@@ -479,6 +678,10 @@ _add(
         "broker_shadow_order_state",
         "position_reconcile_baseline",
         "trade_suppression_state",
+        "position_reconcile_state",
+        "regime_state",
+        "bocpd_regime_state",
+        "champion_residual_adwin_state",
         "runtime_meta",
         "execution_meta",
         "runtime_metrics_state",
@@ -544,7 +747,11 @@ _add(
 _add(
     (
         "alpha_decay_metrics",
+        "alpha_candidates",
         "backtest_scores",
+        "backtest_cpcv_runs",
+        "backtest_cpcv_path_results",
+        "bocpd_ensemble_triggers",
         "challenger_shadow_orders",
         "embed_conf_calib",
         "embed_model_eval",
@@ -585,10 +792,16 @@ _add(
         "feature_candidates",
         "feature_evaluation",
         "ensemble_blend_weights",
+        "ensemble_weights",
         "ensemble_family_performance",
+        "drift_retrain_events",
         "narrative_clusters",
         "narrative_members",
         "competition_post_commit_actions",
+        "model_hyperparameter_registry",
+        "model_best_params",
+        "model_performance",
+        "rl_training_runs",
     ),
     _r(_TRAINING_RATIONALE, write_rate="low to medium", read_pattern="model/run keyed lookup and latest status reads"),
 )

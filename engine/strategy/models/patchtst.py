@@ -18,6 +18,7 @@ import torch.nn as nn
 from engine.artifacts.serialization import dumps_torch_payload, loads_torch_payload
 from engine.artifacts.store import LocalArtifactStore
 from engine.model_registry import register_model, register_model_family
+from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect, init_db
 from engine.strategy import feature_registry
 from engine.strategy.feature_registry import build_feature_snapshot, feature_set_tag_from_ids
@@ -28,9 +29,15 @@ from engine.strategy.model_lifecycle import (
     update_model_version_status,
     version_from_ts,
 )
-from engine.strategy.models.lgbm_regressor import _artifact_payload_from_alias, _expected_columns, _safe_float
+from engine.strategy.models.lgbm_regressor import (
+    _artifact_payload_from_alias,
+    _expected_columns,
+    _preprocess_feature_matrix,
+    _safe_float,
+)
 from engine.strategy.models.lgbm_regressor import _resolve_retrain_schema_guard
 from engine.strategy.ensemble.oos_store import upsert_oos_predictions
+from engine.strategy.ood import build_ood_profile, score_ood, summarize_ood_profile
 
 FAMILY = "patchtst"
 DEFAULT_SEQ_LEN = int(os.environ.get("PATCHTST_SEQ_LEN", "128"))
@@ -43,6 +50,7 @@ DEFAULT_D_MODEL = int(os.environ.get("PATCHTST_D_MODEL", "64"))
 DEFAULT_DROPOUT = float(os.environ.get("PATCHTST_DROPOUT", "0.1"))
 DEFAULT_MIN_SAMPLES = int(os.environ.get("PATCHTST_MIN_SAMPLES", "20"))
 DEFAULT_LOOKBACK_DAYS = int(os.environ.get("PATCHTST_LOOKBACK_DAYS", "365"))
+DEFAULT_HORIZON_S = int(os.environ.get("PATCHTST_HORIZON_S", os.environ.get("MODEL_HORIZON_MEDIUM_S", "3600")))
 
 
 def _register_family() -> None:
@@ -75,9 +83,15 @@ def _set_seed(seed: int) -> None:
         logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
 
 
-def _feature_schema(feature_ids: Sequence[Any], *, seq_len: int, n_horizons: int) -> dict[str, Any]:
+def _feature_schema(
+    feature_ids: Sequence[Any],
+    *,
+    seq_len: int,
+    n_horizons: int,
+    preprocessing: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     ids = [str(item).strip() for item in list(feature_ids or []) if str(item or "").strip()]
-    return {
+    schema = {
         "feature_ids": list(ids),
         "feature_set_tag": str(feature_set_tag_from_ids(list(ids))),
         "feature_count": int(len(ids)),
@@ -87,19 +101,136 @@ def _feature_schema(feature_ids: Sequence[Any], *, seq_len: int, n_horizons: int
             "layout": "batch,seq_len,n_features",
         },
     }
+    if isinstance(preprocessing, Mapping) and preprocessing:
+        schema["preprocessing"] = dict(preprocessing)
+    return schema
+
+
+def _emit_config_feature_schema_load_failure(
+    *,
+    config: Mapping[str, Any],
+    artifact_schema: Mapping[str, Any],
+    current_schema: Mapping[str, Any],
+    reason: str,
+    error: BaseException,
+) -> None:
+    artifact_tag = str(artifact_schema.get("feature_set_tag") or "").strip()
+    current_tag = str(current_schema.get("feature_set_tag") or "").strip()
+    extra = {
+        "model_name": str(config.get("model_name") or FAMILY),
+        "family": FAMILY,
+        "artifact_feature_set_tag": str(artifact_tag),
+        "current_feature_set_tag": str(current_tag),
+        "artifact_feature_ids": list(artifact_schema.get("feature_ids") or []),
+        "current_feature_ids": list(current_schema.get("feature_ids") or []),
+        "reason": str(reason),
+    }
+    logger = logging.getLogger(__name__)
+    logger.error(
+        "feature_schema_load_validation_failed model_name=%s family=%s artifact_feature_set_tag=%s current_feature_set_tag=%s reason=%s",
+        extra["model_name"],
+        FAMILY,
+        artifact_tag or "<missing>",
+        current_tag or "<missing>",
+        str(reason),
+    )
+    log_failure(
+        logger,
+        event="feature_schema_load_validation_failed",
+        code="FEATURE_SCHEMA_LOAD_VALIDATION_FAILED",
+        message=str(error),
+        error=error,
+        level=logging.ERROR,
+        component="engine.strategy.models.patchtst",
+        extra=extra,
+        persist=True,
+    )
+    try:
+        from engine.runtime.alerts import emit_runtime_alert
+
+        emit_runtime_alert(
+            event_title="Model feature schema load validation failed",
+            symbol="SYSTEM",
+            severity="ERROR",
+            rule_id="FEATURE_SCHEMA_LOAD_VALIDATION_FAILED",
+            explain=extra,
+            detail={"error": str(error)},
+            source="model_load_validation",
+            dedupe_scope=f"{FAMILY}:{extra['model_name']}:{reason}:{artifact_tag}:{current_tag}",
+        )
+    except Exception:
+        logger.debug("Ignored recoverable exception.", exc_info=True)
 
 
 def _assert_config_feature_schema_current(config: Mapping[str, Any]) -> list[str]:
-    feature_ids = list(config.get("feature_ids") or [])
+    feature_ids = [
+        str(item).strip()
+        for item in list(config.get("feature_ids") or [])
+        if str(item or "").strip()
+    ]
+    artifact_schema = dict(config.get("feature_schema") or {}) if isinstance(config.get("feature_schema"), Mapping) else {}
+    if not feature_ids and isinstance(artifact_schema.get("feature_ids"), list):
+        feature_ids = [
+            str(item).strip()
+            for item in list(artifact_schema.get("feature_ids") or [])
+            if str(item or "").strip()
+        ]
     current = _expected_columns(
         feature_ids,
         model_name=str(config.get("model_name") or FAMILY),
         model_spec={"feature_ids": feature_ids},
     )
-    if current != feature_ids:
-        raise ValueError(
-            f"feature_schema_drift: model trained with {feature_ids} but registry expects {current}"
+    current_schema = _feature_schema(
+        current,
+        seq_len=int(config.get("seq_len") or DEFAULT_SEQ_LEN),
+        n_horizons=int(config.get("n_horizons") or DEFAULT_N_HORIZONS),
+    )
+    artifact_ids = [
+        str(item).strip()
+        for item in list(artifact_schema.get("feature_ids") or feature_ids)
+        if str(item or "").strip()
+    ]
+    artifact_tag = str(artifact_schema.get("feature_set_tag") or "").strip()
+    current_tag = str(current_schema.get("feature_set_tag") or "").strip()
+
+    error: ValueError | None = None
+    reason = ""
+    if not artifact_tag:
+        reason = "missing_feature_set_tag"
+        error = ValueError(
+            "feature_schema_drift: artifact_feature_set_tag=<missing> "
+            f"current_feature_set_tag={current_tag or '<missing>'}"
         )
+    elif artifact_ids != feature_ids:
+        reason = "artifact_column_list_mismatch"
+        error = ValueError(
+            "feature_schema_drift: "
+            f"artifact_feature_set_tag={artifact_tag} current_feature_set_tag={current_tag} "
+            f"artifact_columns={artifact_ids} config_columns={feature_ids}"
+        )
+    elif current != feature_ids:
+        reason = "registry_column_list_mismatch"
+        error = ValueError(
+            "feature_schema_drift: "
+            f"artifact_feature_set_tag={artifact_tag} current_feature_set_tag={current_tag} "
+            f"artifact_columns={feature_ids} current_columns={current}"
+        )
+    elif artifact_tag != current_tag:
+        reason = "feature_set_tag_mismatch"
+        error = ValueError(
+            "feature_schema_drift: "
+            f"artifact_feature_set_tag={artifact_tag} current_feature_set_tag={current_tag} "
+            f"artifact_columns={feature_ids} current_columns={current}"
+        )
+    if error is not None:
+        _emit_config_feature_schema_load_failure(
+            config=config,
+            artifact_schema={**dict(artifact_schema), "feature_ids": list(artifact_ids)},
+            current_schema=current_schema,
+            reason=reason,
+            error=error,
+        )
+        raise error
     return feature_ids
 
 
@@ -128,7 +259,7 @@ def _sequence_array_from_features(features: Any, columns: Sequence[str], *, seq_
             raise ValueError(f"patchtst_seq_len_mismatch:{int(arr.shape[1])}:{int(seq_len)}")
         if int(arr.shape[2]) != int(len(cols)):
             raise ValueError(f"patchtst_feature_count_mismatch:{int(arr.shape[2])}:{int(len(cols))}")
-        return np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+        return arr.astype(np.float32, copy=False)
 
     if isinstance(features, Sequence) and not isinstance(features, (str, bytes, bytearray)):
         samples = list(features)
@@ -139,11 +270,35 @@ def _sequence_array_from_features(features: Any, columns: Sequence[str], *, seq_
                 if len(steps) != int(seq_len):
                     raise ValueError("patchtst_sequence_length_mismatch")
                 rows.append([
-                    [_safe_float(dict(step).get(col), 0.0) if isinstance(step, Mapping) else 0.0 for col in cols]
+                    [_safe_float(dict(step).get(col), float("nan")) if isinstance(step, Mapping) else float("nan") for col in cols]
                     for step in steps
                 ])
             return np.asarray(rows, dtype=np.float32)
     raise TypeError(f"unsupported_patchtst_feature_payload:{type(features).__name__}")
+
+
+def _preprocess_sequence_array(
+    matrix: np.ndarray,
+    columns: Sequence[str],
+    *,
+    feature_schema: Mapping[str, Any] | None = None,
+    phase: str = "serve",
+    model_name: str = "",
+    fit_preprocessing: bool = False,
+) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError("patchtst_requires_3d_input")
+    n_samples, seq_len, n_features = arr.shape
+    flat, preprocessing, accounting = _preprocess_feature_matrix(
+        arr.reshape(int(n_samples) * int(seq_len), int(n_features)),
+        columns,
+        feature_schema=feature_schema,
+        phase=phase,
+        model_name=model_name,
+        fit_preprocessing=fit_preprocessing,
+    )
+    return flat.reshape(int(n_samples), int(seq_len), int(n_features)).astype(np.float32), preprocessing, accounting
 
 
 class PatchTST(nn.Module):
@@ -243,13 +398,20 @@ class PatchTSTRegressor:
         self.x_std: np.ndarray | None = None
         self.y_mean: np.ndarray | None = None
         self.y_std: np.ndarray | None = None
+        self.feature_preprocessing: dict[str, Any] = {}
         self.training_metrics: dict[str, Any] = {}
+        self.ood_profile: dict[str, Any] = {}
         if self.feature_ids:
             self._build_model(n_features=len(self.feature_ids))
 
     @property
     def feature_schema(self) -> dict[str, Any]:
-        return _feature_schema(self.feature_ids, seq_len=self.seq_len, n_horizons=self.n_horizons)
+        return _feature_schema(
+            self.feature_ids,
+            seq_len=self.seq_len,
+            n_horizons=self.n_horizons,
+            preprocessing=getattr(self, "feature_preprocessing", {}),
+        )
 
     def _build_model(self, *, n_features: int) -> None:
         _set_seed(self.seed)
@@ -277,7 +439,14 @@ class PatchTSTRegressor:
         return_losses: bool = False,
     ) -> list[float] | "PatchTSTRegressor":
         columns = _expected_columns(self.feature_ids, model_name=self.model_name, model_spec=self.feature_schema)
-        X_arr = _sequence_array_from_features(X, columns, seq_len=self.seq_len)
+        X_raw = _sequence_array_from_features(X, columns, seq_len=self.seq_len)
+        X_arr, preprocessing, _accounting = _preprocess_sequence_array(
+            X_raw,
+            columns,
+            phase="train",
+            model_name=self.model_name,
+            fit_preprocessing=True,
+        )
         y_arr = np.asarray(y, dtype=np.float32)
         if y_arr.ndim == 1:
             y_arr = y_arr.reshape(-1, 1)
@@ -286,6 +455,7 @@ class PatchTSTRegressor:
         if int(y_arr.shape[1]) != int(self.n_horizons):
             self.n_horizons = int(y_arr.shape[1])
         self.feature_ids = list(columns)
+        self.feature_preprocessing = dict(preprocessing or {})
         self._build_model(n_features=int(X_arr.shape[2]))
         assert self.model is not None
 
@@ -295,6 +465,7 @@ class PatchTSTRegressor:
         self.y_mean = y_arr.mean(axis=0).astype(np.float32)
         self.y_std = y_arr.std(axis=0).astype(np.float32)
         self.y_std = np.where(self.y_std < 1e-6, 1.0, self.y_std).astype(np.float32)
+        self.ood_profile = build_ood_profile(X_arr[:, -1, :], columns)
 
         Xn = ((X_arr - self.x_mean.reshape(1, 1, -1)) / self.x_std.reshape(1, 1, -1)).astype(np.float32)
         yn = ((y_arr - self.y_mean.reshape(1, -1)) / self.y_std.reshape(1, -1)).astype(np.float32)
@@ -331,6 +502,7 @@ class PatchTSTRegressor:
             "model_family": FAMILY,
             "model_kind": self.model_kind,
             "feature_schema": dict(self.feature_schema),
+            "ood_profile_summary": summarize_ood_profile(self.ood_profile),
         }
         return losses if return_losses else self
 
@@ -338,7 +510,14 @@ class PatchTSTRegressor:
         if self.model is None or self.x_mean is None or self.x_std is None or self.y_mean is None or self.y_std is None:
             raise RuntimeError("patchtst_model_not_fitted")
         columns = _expected_columns(self.feature_ids, model_name=self.model_name, model_spec=self.feature_schema)
-        X_arr = _sequence_array_from_features(X, columns, seq_len=self.seq_len)
+        X_raw = _sequence_array_from_features(X, columns, seq_len=self.seq_len)
+        X_arr, _preprocessing, _accounting = _preprocess_sequence_array(
+            X_raw,
+            columns,
+            feature_schema=self.feature_schema,
+            phase="serve",
+            model_name=self.model_name,
+        )
         Xn = ((X_arr - self.x_mean.reshape(1, 1, -1)) / self.x_std.reshape(1, 1, -1)).astype(np.float32)
         self.model.eval()
         with torch.no_grad():
@@ -379,7 +558,14 @@ class PatchTSTRegressor:
         obj.x_std = np.asarray(config.get("x_std"), dtype=np.float32)
         obj.y_mean = np.asarray(config.get("y_mean"), dtype=np.float32)
         obj.y_std = np.asarray(config.get("y_std"), dtype=np.float32)
+        schema = config.get("feature_schema")
+        obj.feature_preprocessing = (
+            dict((schema or {}).get("preprocessing") or {})
+            if isinstance(schema, Mapping)
+            else {}
+        )
         obj.training_metrics = dict(config.get("training_metrics") or {})
+        obj.ood_profile = dict(config.get("ood_profile") or {})
         if obj.model is None:
             obj._build_model(n_features=len(obj.feature_ids))
         payload = loads_torch_payload((target / "state.pt").read_bytes(), map_location=str(load_device))
@@ -407,6 +593,7 @@ class PatchTSTRegressor:
             "y_mean": [] if self.y_mean is None else self.y_mean.astype(float).tolist(),
             "y_std": [] if self.y_std is None else self.y_std.astype(float).tolist(),
             "training_metrics": dict(self.training_metrics or {}),
+            "ood_profile": dict(getattr(self, "ood_profile", {}) or {}),
         }
 
     def to_bytes(self) -> bytes:
@@ -440,12 +627,22 @@ class PatchTSTRegressor:
         obj.x_std = np.asarray(config.get("x_std"), dtype=np.float32)
         obj.y_mean = np.asarray(config.get("y_mean"), dtype=np.float32)
         obj.y_std = np.asarray(config.get("y_std"), dtype=np.float32)
+        schema = config.get("feature_schema")
+        obj.feature_preprocessing = (
+            dict((schema or {}).get("preprocessing") or {})
+            if isinstance(schema, Mapping)
+            else {}
+        )
         obj.training_metrics = dict(config.get("training_metrics") or {})
+        obj.ood_profile = dict(config.get("ood_profile") or {})
         if obj.model is None:
             obj._build_model(n_features=len(obj.feature_ids))
         obj.model.load_state_dict(dict(raw.get("state_dict") or {}))
         obj.model.eval()
         return obj
+
+    def score_ood(self, features: Any) -> dict[str, Any]:
+        return score_ood(getattr(self, "ood_profile", None), features)
 
 
 def persist_model_artifact(model: PatchTSTRegressor, *, symbol: str = "*", version: str) -> dict[str, Any]:
@@ -461,6 +658,7 @@ def persist_model_artifact(model: PatchTSTRegressor, *, symbol: str = "*", versi
             "symbol": str(symbol or "*").upper(),
             "version": str(version),
             "feature_schema": dict(model.feature_schema),
+            "ood_profile_summary": summarize_ood_profile(getattr(model, "ood_profile", None)),
         },
     )
     return {"alias": str(alias), "sha256": str(ref.sha256), "size_bytes": int(ref.size), "content_type": ref.content_type}
@@ -601,7 +799,7 @@ def _load_sequence_training_rows(cfg: Mapping[str, Any]) -> tuple[np.ndarray, np
             window = ordered[idx - seq_len + 1 : idx + 1]
             X_rows.append(
                 np.asarray(
-                    [[_safe_float(step[1].get(feature_id), 0.0) for feature_id in feature_ids] for step in window],
+                    [[_safe_float(step[1].get(feature_id), float("nan")) for feature_id in feature_ids] for step in window],
                     dtype=np.float32,
                 )
             )
@@ -616,6 +814,22 @@ def main() -> int:
     init_db()
     plan = load_lifecycle_plan(FAMILY)
     cfg = _resolve_training_config(plan)
+    try:
+        from engine.data.universe_pit import resolve_training_window_universe
+
+        con_universe = connect(readonly=True)
+        try:
+            pit_universe = resolve_training_window_universe(
+                con_universe,
+                configured_symbols=list(cfg.get("symbol_universe") or ["*"]),
+                lookback_days=int(cfg.get("training_window_days") or DEFAULT_LOOKBACK_DAYS),
+            )
+        finally:
+            con_universe.close()
+        if list(pit_universe.get("symbols") or []):
+            cfg["symbol_universe"] = list(pit_universe.get("symbols") or [])
+    except Exception:
+        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
     built = _load_sequence_training_rows(cfg)
     min_samples = int(os.environ.get("PATCHTST_MIN_SAMPLES", str(DEFAULT_MIN_SAMPLES)))
     if built is None or int(built[0].shape[0]) < max(2, min_samples):

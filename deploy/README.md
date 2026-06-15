@@ -5,24 +5,26 @@ The `deploy/` directory contains installation and service automation for hosted 
 ## Structure
 
 - `bin/`
-  Install, backup, service-control, and upgrade scripts.
+  Install, legacy SQLite backup, service-control, and upgrade scripts.
 - `compose/`
   External dependency stack plus runtime/operator compose assets for Timescale/Postgres, Redis, MinIO-style object storage, and the current app deployment path.
 - `systemd/`
   Service and timer units.
-- [install_trading_system.sh](c:\Users\dschi\Documents\GitHub\Trading-System-\deploy\install_trading_system.sh)
+- [install_trading_system.sh](install_trading_system.sh)
   Main install entrypoint for Linux-style environments.
 
 ## Maintenance Guidance
 
 - For a single Linux production server, use the canonical host bootstrap in
-  [ops/server/README.md](c:\Users\dschi\Documents\GitHub\Trading-System-\ops\server\README.md).
+  [ops/server/README.md](../ops/server/README.md).
   Build a filtered mirrorable folder with
-  [tools/build_linux_deploy_bundle.ps1](c:\Users\dschi\Documents\GitHub\Trading-System-\tools\build_linux_deploy_bundle.ps1),
+  [tools/build_linux_deploy_bundle.ps1](../tools/build_linux_deploy_bundle.ps1),
   then follow
-  [LINUX_SERVER_CODEX_DEPLOY.md](c:\Users\dschi\Documents\GitHub\Trading-System-\deploy\LINUX_SERVER_CODEX_DEPLOY.md).
+  [LINUX_SERVER_CODEX_DEPLOY.md](LINUX_SERVER_CODEX_DEPLOY.md).
 - Keep deployment scripts aligned with real entrypoints:
-  [start_system.py](c:\Users\dschi\Documents\GitHub\Trading-System-\start_system.py), [boot/operator_server.js](c:\Users\dschi\Documents\GitHub\Trading-System-\boot\operator_server.js), and [start_ingestion.py](c:\Users\dschi\Documents\GitHub\Trading-System-\start_ingestion.py).
+  [start_system.py](../start_system.py), [boot/operator_server.js](../boot/operator_server.js), and [start_ingestion.py](../start_ingestion.py).
 - If environment variables are added to startup code, update the install scripts, service units, and any deployment wrapper that injects those values.
-- Use [compose/docker-compose.external-services.yml](c:\Users\dschi\Documents\GitHub\Trading-System-\deploy\compose\docker-compose.external-services.yml) when you need a local or staging dependency stack for Timescale/Postgres, Redis, and object storage. Copy [compose/.env.example](c:\Users\dschi\Documents\GitHub\Trading-System-\deploy\compose\.env.example) to `.env` in the compose directory and set approved image tags plus credentials before bringing it up.
-- Use [compose/docker-compose.stack.yml](c:\Users\dschi\Documents\GitHub\Trading-System-\deploy\compose\docker-compose.stack.yml) together with the external-services file when you want the current runtime and operator deployed as containers. See [compose/README.md](c:\Users\dschi\Documents\GitHub\Trading-System-\deploy\compose\README.md) for the exact command and the operator sidecar constraint in container mode.
+- Production/live deployments must inject generated `DASHBOARD_API_TOKEN` and `OPERATOR_API_TOKEN` values. The Python runtime fails closed on missing, placeholder, or too-short dashboard mutation tokens, and the no-token localhost mutation fallback is dev-only.
+- Use [compose/docker-compose.external-services.yml](compose/docker-compose.external-services.yml) when you need a local or staging dependency stack for Timescale/Postgres, Redis, and object storage. Copy [compose/.env.example](compose/.env.example) to `.env` in the compose directory and set approved image tags plus credentials before bringing it up.
+- Use [compose/docker-compose.stack.yml](compose/docker-compose.stack.yml) together with the external-services file when you want the current runtime and operator deployed as containers. See [compose/README.md](compose/README.md) for the exact command and the operator sidecar constraint in container mode.
+- Use [../ops/backup](../ops/backup) and [../ops/server/systemd](../ops/server/systemd) for current Postgres base backups, WAL archive, pruning, and restore drills. [bin/backup_trading_db.sh](bin/backup_trading_db.sh) is retained for legacy/local SQLite-file backups and is not a production recovery plan for the Postgres-backed runtime.

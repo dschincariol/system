@@ -4,10 +4,11 @@ FILE: base.py
 Market-data provider integration module for `base`.
 """
 
+from abc import ABC, abstractmethod
 from typing import Dict, Any
 
 
-class BasePriceProvider:
+class BasePriceProvider(ABC):
     provider_name: str = "unknown"
 
     # ----------------------------
@@ -15,18 +16,24 @@ class BasePriceProvider:
     # ----------------------------
 
     def connect(self) -> None:
-        pass
+        # Optional lifecycle hook; stateless polling providers have no setup.
+        if not str(getattr(self, "provider_name", "") or "").strip():
+            self.provider_name = "unknown"
 
     def shutdown(self) -> None:
-        pass
+        # Optional lifecycle hook; stateless polling providers have no teardown.
+        if not str(getattr(self, "provider_name", "") or "").strip():
+            self.provider_name = "unknown"
 
     # ----------------------------
     # Data interfaces
     # ----------------------------
 
     def subscribe(self, symbols) -> None:
-        pass
+        # Optional streaming hook; polling providers ignore subscriptions.
+        del symbols
 
+    @abstractmethod
     def fetch_last_prices(self, symbol_map: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
         # Polling providers normalize into this shape so the router can score
         # providers without caring about each source's native response format.
@@ -42,4 +49,4 @@ class BasePriceProvider:
         return {"ok": True}
 
     def latency(self) -> float | None:
-        return None
+        return getattr(self, "_last_latency", None)

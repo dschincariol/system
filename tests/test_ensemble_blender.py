@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from engine.strategy.ensemble.blender import EnsembleBlender, ensure_schema, persist_weights
+from engine.strategy.ensemble.blender import EnsembleBlender, _commit_if_possible, ensure_schema, persist_weights
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +29,15 @@ def _allow_families(con, families=("embed_regressor", "temporal_predictor")):
         "INSERT INTO model_registry(model_name, stage, updated_ts_ms) VALUES (?, ?, ?)",
         [(family, "champion", 1) for family in families],
     )
+
+
+def test_commit_if_possible_propagates_commit_failure() -> None:
+    class _CommitFails:
+        def commit(self) -> None:
+            raise RuntimeError("commit failed")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        _commit_if_possible(_CommitFails())
 
 
 def test_blender_falls_back_to_single_champion_without_weights():

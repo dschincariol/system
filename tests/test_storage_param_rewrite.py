@@ -56,6 +56,16 @@ def test_rewrites_case_then_placeholder_before_else():
     )
 
 
+def test_rewrites_between_placeholders():
+    sql = "SELECT * FROM predictions WHERE ts_ms BETWEEN ? AND ? ORDER BY ts_ms"
+    assert to_pg_params(sql) == "SELECT * FROM predictions WHERE ts_ms BETWEEN %s AND %s ORDER BY ts_ms"
+
+
+def test_rewrites_limit_offset_placeholders():
+    sql = "SELECT * FROM event_log ORDER BY id LIMIT ? OFFSET ?"
+    assert to_pg_params(sql) == "SELECT * FROM event_log ORDER BY id LIMIT %s OFFSET %s"
+
+
 def test_preserves_json_question_array_operators():
     sql = "SELECT * FROM events WHERE meta_json ?| array['a', 'b'] AND tags ?& array['x'] AND symbol=?"
     assert to_pg_params(sql) == (

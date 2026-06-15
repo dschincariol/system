@@ -104,6 +104,22 @@ class ExternalServiceReadinessTests(unittest.TestCase):
         self.assertFalse(bool(summary.get("ok")))
         self.assertTrue(any("artifact_mirror_root missing" in item for item in summary.get("errors") or []))
 
+    def test_required_object_storage_missing_credentials_skips_bucket_probe(self) -> None:
+        self._set_env("PREFLIGHT_REQUIRE_OBJECT_STORAGE", "1")
+        self._set_env("OBJECT_STORE_ENDPOINT", "http://minio.local:9000")
+        self._set_env("OBJECT_STORE_BUCKET", None)
+        self._set_env("OBJECT_STORE_ACCESS_KEY", None)
+        self._set_env("OBJECT_STORE_SECRET_KEY", None)
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_probe_object_storage_bucket", side_effect=AssertionError("probe should not run")):
+            summary = readiness.check_external_service_readiness()
+
+        self.assertFalse(bool(summary.get("ok")))
+        self.assertTrue(any("bucket is missing" in item for item in summary.get("errors") or []))
+        self.assertTrue(any("access key is missing" in item for item in summary.get("errors") or []))
+        self.assertTrue(any("secret key is missing" in item for item in summary.get("errors") or []))
+
     def test_required_object_storage_bucket_probe_failure_fails(self) -> None:
         self._set_env("PREFLIGHT_REQUIRE_OBJECT_STORAGE", "1")
         self._set_env("OBJECT_STORE_ENDPOINT", "http://minio.local:9000")

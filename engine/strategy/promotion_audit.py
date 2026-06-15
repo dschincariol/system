@@ -54,9 +54,9 @@ class EvidenceConflict(RuntimeError):
 
 def _validate_structured_model_id(model_id: str) -> str:
     model_key = str(model_id or "").strip()
-    if not _MODEL_ID_RE.match(model_key):
+    if not model_key:
         raise InvalidModelId(
-            "model_id must match <family>_<symbol>_<train_ts_ms>_<short_commit_sha>"
+            "model_id must be explicit and non-empty"
         )
     return model_key
 

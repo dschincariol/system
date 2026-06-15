@@ -18,7 +18,9 @@ INSIDER_COLUMNS: tuple[tuple[str, str], ...] = (
     ("filing_identifier", "TEXT"),
     ("filing_url", "TEXT"),
     ("filing_ts_ms", "BIGINT"),
+    ("availability_ts_ms", "BIGINT"),
     ("filing_date", "TEXT"),
+    ("filing_accepted_at", "TEXT"),
     ("transaction_ts_ms", "BIGINT"),
     ("transaction_date", "TEXT"),
     ("issuer_name", "TEXT"),
@@ -35,6 +37,7 @@ INSIDER_COLUMNS: tuple[tuple[str, str], ...] = (
     ("price", "DOUBLE PRECISION"),
     ("value", "DOUBLE PRECISION"),
     ("ownership_nature", "TEXT"),
+    ("is_10b5_1_plan", "BOOLEAN"),
     ("entity_id", "TEXT"),
     ("resolution_status", "TEXT"),
     ("resolution_method", "TEXT"),
@@ -97,7 +100,9 @@ def up(conn) -> None:
             filing_identifier TEXT,
             filing_url TEXT,
             filing_ts_ms BIGINT,
+            availability_ts_ms BIGINT,
             filing_date TEXT,
+            filing_accepted_at TEXT,
             transaction_ts_ms BIGINT,
             transaction_date TEXT,
             issuer_name TEXT,
@@ -114,6 +119,7 @@ def up(conn) -> None:
             price DOUBLE PRECISION,
             value DOUBLE PRECISION,
             ownership_nature TEXT,
+            is_10b5_1_plan BOOLEAN,
             entity_id TEXT,
             resolution_status TEXT,
             resolution_method TEXT,
@@ -133,6 +139,12 @@ def up(conn) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_insider_transactions_symbol_ts
           ON insider_transactions(symbol, transaction_ts_ms DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_insider_transactions_symbol_availability
+          ON insider_transactions(symbol, availability_ts_ms DESC)
         """
     )
     conn.execute(

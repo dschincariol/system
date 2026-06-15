@@ -82,7 +82,13 @@ def _safe_json_dict(value) -> dict:
         try:
             parsed = json.loads(value)
             return dict(parsed) if isinstance(parsed, dict) else {}
-        except Exception:
+        except Exception as e:
+            _warn_nonfatal(
+                "API_GOVERNANCE_JSON_DICT_PARSE_FAILED",
+                e,
+                once_key="safe_json_dict",
+                value_preview=str(value)[:120],
+            )
             return {}
     return {}
 
@@ -92,7 +98,13 @@ def _safe_int(value, default: int = 0) -> int:
         if value is None or value == "":
             return int(default)
         return int(value)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "API_GOVERNANCE_SAFE_INT_FAILED",
+            e,
+            once_key="safe_int",
+            value_type=type(value).__name__,
+        )
         return int(default)
 
 
@@ -101,7 +113,13 @@ def _safe_float(value):
         if value is None or value == "":
             return None
         out = float(value)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "API_GOVERNANCE_SAFE_FLOAT_FAILED",
+            e,
+            once_key="safe_float",
+            value_type=type(value).__name__,
+        )
         return None
     return float(out) if math.isfinite(out) else None
 

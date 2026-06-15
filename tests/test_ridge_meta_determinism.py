@@ -30,8 +30,15 @@ def test_unconstrained_ridge_is_deterministic_and_matches_sklearn():
     first = RidgeStackEnsemble(alpha=alpha, nonneg=False).fit(rows)
     second = RidgeStackEnsemble(alpha=alpha, nonneg=False).fit(rows)
     expected = Ridge(alpha=alpha, fit_intercept=True).fit(X, y)
+    heldout = [
+        {"f0": float(row[0]), "f1": float(row[1]), "f2": float(row[2]), "f3": float(row[3])}
+        for row in X[:17]
+    ]
 
-    np.testing.assert_allclose(_coef_vector(first), _coef_vector(second), atol=1e-9, rtol=0.0)
-    assert abs(first.intercept_ - second.intercept_) < 1e-9
+    assert np.array_equal(_coef_vector(first), _coef_vector(second))
+    assert first.intercept_ == second.intercept_
+    assert first.to_dict() == second.to_dict()
     np.testing.assert_allclose(_coef_vector(first), expected.coef_, atol=1e-9, rtol=0.0)
     assert abs(first.intercept_ - float(expected.intercept_)) < 1e-9
+    assert np.array_equal(first.predict(heldout), second.predict(heldout))
+    np.testing.assert_allclose(first.predict(heldout), expected.predict(X[:17]), atol=1e-9, rtol=0.0)

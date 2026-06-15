@@ -995,8 +995,15 @@ def api_get_replay_day(parsed: Any, _ctx=None) -> Dict[str, Any]:
         try:
             if con is not None:
                 con.close()
-        except Exception:
-            pass
+        except Exception as e:
+            _add_gap(
+                gaps,
+                stream="storage",
+                code="connection_close_failed",
+                message="Replay database connection close failed after query.",
+                severity="warn",
+                error_type=type(e).__name__,
+            )
 
     counts = _counts(
         candles=candles,

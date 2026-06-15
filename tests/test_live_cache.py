@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -32,6 +34,8 @@ class LiveCacheTests(unittest.TestCase):
         self._set_env("FEATURE_STORE_TTL_S", "3600")
         self._set_env("LIVE_CACHE_BACKEND", None)
         self._set_env("LIVE_CACHE_REDIS_URL", None)
+        self._set_env("REDIS_URL", None)
+        self._set_env("REDIS_CACHE_URL", None)
 
     def tearDown(self) -> None:
         try:
@@ -80,6 +84,7 @@ class LiveCacheTests(unittest.TestCase):
         self.assertTrue(bool(snapshot.get("degraded")))
         self.assertIn("redis_dependency_unavailable", str(snapshot.get("fallback_reason") or ""))
 
+    @pytest.mark.requires_postgres
     def test_price_and_feature_surfaces_report_live_cache_backend(self) -> None:
         storage, live_cache, price_cache, feature_store = _reload_modules(
             "engine.runtime.storage",
@@ -146,6 +151,19 @@ class LiveCacheTests(unittest.TestCase):
             live_cache.close_live_cache()
 
         warn_nonfatal.assert_called_once()
+
+    def test_base_live_cache_contract_is_safe_noop(self) -> None:
+        (live_cache,) = _reload_modules("engine.runtime.live_cache")
+        backend = live_cache._BaseLiveCache()
+
+        backend.clear_price("AAPL")
+        backend.clear_feature("AAPL")
+
+        self.assertIsNone(backend.get_price_snapshot("AAPL"))
+        self.assertIsNone(backend.get_feature_snapshot("AAPL"))
+        self.assertFalse(backend.set_price_snapshot("AAPL", {"price": 1.0}, ttl_s=1.0, snapshot_ts_ms=1))
+        self.assertFalse(backend.set_feature_snapshot("AAPL", {"x": 1.0}, ttl_s=1.0, snapshot_ts_ms=1))
+        self.assertEqual(str(backend.get_snapshot().get("fallback_reason") or ""), "base_live_cache_no_backend")
 
 
 if __name__ == "__main__":

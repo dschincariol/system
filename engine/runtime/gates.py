@@ -956,18 +956,29 @@ def execution_gate_snapshot(
         allow_execution_pipeline = True
         reason = "mode_shadow_live_runtime" if runtime_state == "LIVE" else "mode_shadow_degraded_runtime"
     elif mode == "live":
-        live_preflight_state = live_trading_preflight(engine_mode=mode)
         if armed is None:
             reason = "mode_live_unarmed_unknown"
         elif armed != 1:
             reason = "mode_live_unarmed"
-        elif not bool(live_preflight_state.get("ok")):
-            reason = str(live_preflight_state.get("reason") or "live_trading_preflight_failed")
+        elif runtime_state != "LIVE":
+            reason = {
+                "BOOTING": "runtime_state_booting",
+                "SCHEMA_REPAIR": "runtime_state_schema_repair",
+                "WARMING_UP": "runtime_state_warming_up",
+                "DEGRADED": "runtime_state_degraded",
+                "SHUTDOWN": "runtime_state_shutdown",
+                "KILL_SWITCH": "runtime_state_kill_switch",
+                "UNKNOWN": "runtime_state_unknown",
+            }.get(runtime_state, f"runtime_state_{str(runtime_state or 'unknown').lower()}")
         else:
-            real_trading_allowed = True
-            allow_execution_pipeline = True
-            allow_simulation = True
-            reason = "mode_live_armed" if runtime_state == "LIVE" else "mode_live_armed_degraded_runtime"
+            live_preflight_state = live_trading_preflight(engine_mode=mode)
+            if not bool(live_preflight_state.get("ok")):
+                reason = str(live_preflight_state.get("reason") or "live_trading_preflight_failed")
+            else:
+                real_trading_allowed = True
+                allow_execution_pipeline = True
+                allow_simulation = True
+                reason = "mode_live_armed"
     else:
         reason = f"mode_unknown:{mode}"
 

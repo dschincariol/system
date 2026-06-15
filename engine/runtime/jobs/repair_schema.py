@@ -83,7 +83,7 @@ def _read_effective_version(cur) -> int:
 
     if legacy and legacy[0] is not None:
         try:
-            return int(str(legacy[0]).strip())
+            return int(float(str(legacy[0]).strip()))
         except Exception as e:
             sys.stderr.write(
                 f"[repair_schema] legacy_schema_version_parse_failed:"
@@ -262,6 +262,32 @@ def _ensure_required_runtime_tables(cur) -> None:
     ON trades(ts_ms DESC)
     """)
 
+    for _options_table in ("options_symbol_features", "options_event_features"):
+        try:
+            exists = cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (str(_options_table),),
+            ).fetchone()
+        except Exception:
+            exists = None
+        if exists:
+            try:
+                _ensure_columns(
+                    cur,
+                    str(_options_table),
+                    (
+                        ("gex_raw", "REAL"),
+                        ("gex_norm", "REAL NOT NULL DEFAULT 0.0"),
+                        ("gex_norm_z", "REAL NOT NULL DEFAULT 0.0"),
+                        ("gex_sign", "REAL NOT NULL DEFAULT 0.0"),
+                        ("opt_flow_imbalance", "REAL NOT NULL DEFAULT 0.0"),
+                        ("opt_flow_imbalance_z", "REAL NOT NULL DEFAULT 0.0"),
+                        ("gex_zero_gamma_flip", "REAL"),
+                    ),
+                )
+            except Exception as e:
+                _warn_nonfatal("REPAIR_SCHEMA_OPTIONS_GEX_FLOW_COLUMNS_FAILED", e, table=str(_options_table))
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS insider_transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,7 +302,9 @@ def _ensure_required_runtime_tables(cur) -> None:
         filing_identifier TEXT,
         filing_url TEXT,
         filing_ts_ms INTEGER,
+        availability_ts_ms INTEGER,
         filing_date TEXT,
+        filing_accepted_at TEXT,
         transaction_ts_ms INTEGER,
         transaction_date TEXT,
         issuer_name TEXT,
@@ -293,6 +321,7 @@ def _ensure_required_runtime_tables(cur) -> None:
         price REAL,
         value REAL,
         ownership_nature TEXT,
+        is_10b5_1_plan INTEGER,
         entity_id TEXT,
         resolution_status TEXT,
         resolution_method TEXT,
@@ -316,7 +345,9 @@ def _ensure_required_runtime_tables(cur) -> None:
             ("filing_identifier", "TEXT"),
             ("filing_url", "TEXT"),
             ("filing_ts_ms", "INTEGER"),
+            ("availability_ts_ms", "INTEGER"),
             ("filing_date", "TEXT"),
+            ("filing_accepted_at", "TEXT"),
             ("transaction_ts_ms", "INTEGER"),
             ("transaction_date", "TEXT"),
             ("issuer_name", "TEXT"),
@@ -333,6 +364,7 @@ def _ensure_required_runtime_tables(cur) -> None:
             ("price", "REAL"),
             ("value", "REAL"),
             ("ownership_nature", "TEXT"),
+            ("is_10b5_1_plan", "INTEGER"),
             ("entity_id", "TEXT"),
             ("resolution_status", "TEXT"),
             ("resolution_method", "TEXT"),
@@ -343,6 +375,10 @@ def _ensure_required_runtime_tables(cur) -> None:
     cur.execute("""
     CREATE INDEX IF NOT EXISTS idx_insider_transactions_symbol_ts
     ON insider_transactions(symbol, transaction_ts_ms DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_insider_transactions_symbol_availability
+    ON insider_transactions(symbol, availability_ts_ms DESC)
     """)
     cur.execute("""
     CREATE INDEX IF NOT EXISTS idx_insider_transactions_resolution_ts
@@ -429,6 +465,351 @@ def _ensure_required_runtime_tables(cur) -> None:
     CREATE INDEX IF NOT EXISTS idx_congressional_trades_resolution_ts
     ON congressional_trades(resolution_status, transaction_ts_ms DESC)
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS finra_short_sale_volume (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_ms INTEGER,
+        symbol TEXT,
+        trade_date TEXT,
+        trade_ts_ms INTEGER,
+        availability_ts_ms INTEGER,
+        source_record_id TEXT,
+        source_url TEXT,
+        ingested_ts_ms INTEGER,
+        short_volume REAL,
+        short_exempt_volume REAL,
+        total_volume REAL,
+        market TEXT,
+        payload_json JSONB,
+        diagnostics_json JSONB
+    )
+    """)
+    _ensure_columns(
+        cur,
+        "finra_short_sale_volume",
+        (
+            ("id", "BIGSERIAL"),
+            ("ts_ms", "INTEGER"),
+            ("symbol", "TEXT"),
+            ("trade_date", "TEXT"),
+            ("trade_ts_ms", "INTEGER"),
+            ("availability_ts_ms", "INTEGER"),
+            ("source_record_id", "TEXT"),
+            ("source_url", "TEXT"),
+            ("ingested_ts_ms", "INTEGER"),
+            ("short_volume", "REAL"),
+            ("short_exempt_volume", "REAL"),
+            ("total_volume", "REAL"),
+            ("market", "TEXT"),
+            ("payload_json", "JSONB"),
+            ("diagnostics_json", "JSONB"),
+        ),
+    )
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_finra_short_sale_volume_source_record_id
+    ON finra_short_sale_volume(source_record_id)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_finra_short_sale_volume_symbol_availability
+    ON finra_short_sale_volume(symbol, availability_ts_ms DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_finra_short_sale_volume_symbol_trade_date
+    ON finra_short_sale_volume(symbol, trade_date DESC)
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS finra_short_interest (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_ms INTEGER,
+        symbol TEXT,
+        settlement_date TEXT,
+        settlement_ts_ms INTEGER,
+        dissemination_date TEXT,
+        dissemination_ts_ms INTEGER,
+        availability_ts_ms INTEGER,
+        source_record_id TEXT,
+        ingested_ts_ms INTEGER,
+        short_interest_shares REAL,
+        days_to_cover REAL,
+        payload_json JSONB,
+        diagnostics_json JSONB
+    )
+    """)
+    _ensure_columns(
+        cur,
+        "finra_short_interest",
+        (
+            ("id", "BIGSERIAL"),
+            ("ts_ms", "INTEGER"),
+            ("symbol", "TEXT"),
+            ("settlement_date", "TEXT"),
+            ("settlement_ts_ms", "INTEGER"),
+            ("dissemination_date", "TEXT"),
+            ("dissemination_ts_ms", "INTEGER"),
+            ("availability_ts_ms", "INTEGER"),
+            ("source_record_id", "TEXT"),
+            ("ingested_ts_ms", "INTEGER"),
+            ("short_interest_shares", "REAL"),
+            ("days_to_cover", "REAL"),
+            ("payload_json", "JSONB"),
+            ("diagnostics_json", "JSONB"),
+        ),
+    )
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_finra_short_interest_source_record_id
+    ON finra_short_interest(source_record_id)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_finra_short_interest_symbol_availability
+    ON finra_short_interest(symbol, availability_ts_ms DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_finra_short_interest_symbol_settlement
+    ON finra_short_interest(symbol, settlement_ts_ms DESC)
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS crypto_funding_rates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_ms INTEGER,
+        symbol TEXT,
+        exchange TEXT,
+        perp_market TEXT,
+        spot_market TEXT,
+        funding_ts_ms INTEGER,
+        availability_ts_ms INTEGER,
+        funding_rate REAL,
+        mark_price REAL,
+        index_price REAL,
+        spot_price REAL,
+        spot_ts_ms INTEGER,
+        perp_ts_ms INTEGER,
+        perp_basis_pct REAL,
+        source_record_id TEXT,
+        ingested_ts_ms INTEGER,
+        is_live INTEGER,
+        payload_json JSONB,
+        diagnostics_json JSONB
+    )
+    """)
+    _ensure_columns(
+        cur,
+        "crypto_funding_rates",
+        (
+            ("id", "BIGSERIAL"),
+            ("ts_ms", "INTEGER"),
+            ("symbol", "TEXT"),
+            ("exchange", "TEXT"),
+            ("perp_market", "TEXT"),
+            ("spot_market", "TEXT"),
+            ("funding_ts_ms", "INTEGER"),
+            ("availability_ts_ms", "INTEGER"),
+            ("funding_rate", "REAL"),
+            ("mark_price", "REAL"),
+            ("index_price", "REAL"),
+            ("spot_price", "REAL"),
+            ("spot_ts_ms", "INTEGER"),
+            ("perp_ts_ms", "INTEGER"),
+            ("perp_basis_pct", "REAL"),
+            ("source_record_id", "TEXT"),
+            ("ingested_ts_ms", "INTEGER"),
+            ("is_live", "INTEGER"),
+            ("payload_json", "JSONB"),
+            ("diagnostics_json", "JSONB"),
+        ),
+    )
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_crypto_funding_rates_source_record_id
+    ON crypto_funding_rates(source_record_id)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_crypto_funding_rates_symbol_availability
+    ON crypto_funding_rates(symbol, availability_ts_ms DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_crypto_funding_rates_symbol_funding
+    ON crypto_funding_rates(symbol, funding_ts_ms DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_crypto_funding_rates_exchange_market
+    ON crypto_funding_rates(exchange, perp_market, funding_ts_ms DESC)
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS macro_series_vintages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        series_id TEXT NOT NULL,
+        obs_date TEXT NOT NULL,
+        obs_ts_ms INTEGER,
+        vintage_date TEXT NOT NULL,
+        vintage_ts_ms INTEGER,
+        realtime_end TEXT,
+        value REAL,
+        availability_ts_ms INTEGER NOT NULL,
+        source TEXT,
+        ingested_ts_ms INTEGER,
+        payload_json JSONB,
+        diagnostics_json JSONB
+    )
+    """)
+    _ensure_columns(
+        cur,
+        "macro_series_vintages",
+        (
+            ("id", "BIGSERIAL"),
+            ("series_id", "TEXT"),
+            ("obs_date", "TEXT"),
+            ("obs_ts_ms", "INTEGER"),
+            ("vintage_date", "TEXT"),
+            ("vintage_ts_ms", "INTEGER"),
+            ("realtime_end", "TEXT"),
+            ("value", "REAL"),
+            ("availability_ts_ms", "INTEGER"),
+            ("source", "TEXT"),
+            ("ingested_ts_ms", "INTEGER"),
+            ("payload_json", "JSONB"),
+            ("diagnostics_json", "JSONB"),
+        ),
+    )
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_macro_series_vintages_series_obs_vintage
+    ON macro_series_vintages(series_id, obs_date, vintage_date)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_macro_series_vintages_series_availability
+    ON macro_series_vintages(series_id, availability_ts_ms DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_macro_series_vintages_series_obs
+    ON macro_series_vintages(series_id, obs_ts_ms DESC)
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS macro_vintage_backfill_state (
+        series_id TEXT PRIMARY KEY,
+        status TEXT,
+        last_vintage_date TEXT,
+        updated_ts_ms INTEGER,
+        cursor_json JSONB,
+        error TEXT
+    )
+    """)
+    _ensure_columns(
+        cur,
+        "macro_vintage_backfill_state",
+        (
+            ("series_id", "TEXT"),
+            ("status", "TEXT"),
+            ("last_vintage_date", "TEXT"),
+            ("updated_ts_ms", "INTEGER"),
+            ("cursor_json", "JSONB"),
+            ("error", "TEXT"),
+        ),
+    )
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS news_story_embeddings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        publish_ts_ms INTEGER,
+        availability_ts_ms INTEGER NOT NULL,
+        source TEXT,
+        embedding_backend TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        dim INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        text_hash TEXT,
+        novelty_score REAL NOT NULL DEFAULT 1.0,
+        max_similarity REAL NOT NULL DEFAULT 0.0,
+        stale_flag INTEGER NOT NULL DEFAULT 0,
+        matched_event_id INTEGER,
+        ingested_ts_ms INTEGER,
+        payload_json JSONB,
+        diagnostics_json JSONB
+    )
+    """)
+    _ensure_columns(
+        cur,
+        "news_story_embeddings",
+        (
+            ("id", "BIGSERIAL"),
+            ("event_id", "INTEGER"),
+            ("symbol", "TEXT"),
+            ("publish_ts_ms", "INTEGER"),
+            ("availability_ts_ms", "INTEGER"),
+            ("source", "TEXT"),
+            ("embedding_backend", "TEXT"),
+            ("model_name", "TEXT"),
+            ("dim", "INTEGER"),
+            ("vector", "BLOB"),
+            ("text_hash", "TEXT"),
+            ("novelty_score", "REAL"),
+            ("max_similarity", "REAL"),
+            ("stale_flag", "INTEGER"),
+            ("matched_event_id", "INTEGER"),
+            ("ingested_ts_ms", "INTEGER"),
+            ("payload_json", "JSONB"),
+            ("diagnostics_json", "JSONB"),
+        ),
+    )
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_news_story_embeddings_event_space
+    ON news_story_embeddings(event_id, symbol, embedding_backend, model_name)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_news_story_embeddings_symbol_space_avail
+    ON news_story_embeddings(symbol, embedding_backend, model_name, availability_ts_ms DESC)
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS news_flow_features (
+        symbol TEXT NOT NULL,
+        asof_ts_ms INTEGER NOT NULL,
+        bucket_ts_ms INTEGER NOT NULL,
+        embedding_backend TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        news_novelty_max_24h REAL NOT NULL DEFAULT 0.0,
+        news_stale_share_24h REAL NOT NULL DEFAULT 0.0,
+        news_velocity_z REAL NOT NULL DEFAULT 0.0,
+        fresh_neg_news_flag REAL NOT NULL DEFAULT 0.0,
+        event_count_24h INTEGER NOT NULL DEFAULT 0,
+        source_max_availability_ts_ms INTEGER,
+        created_ts_ms INTEGER,
+        meta_json JSONB,
+        PRIMARY KEY(symbol, asof_ts_ms, embedding_backend, model_name)
+    )
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_news_flow_features_symbol_asof
+    ON news_flow_features(symbol, asof_ts_ms DESC)
+    """)
+
+    try:
+        _ensure_columns(
+            cur,
+            "news_event_features",
+            (
+                ("payload_json", "JSONB"),
+                ("embedding_backend", "TEXT"),
+                ("embedding_model_name", "TEXT"),
+                ("embedding_novelty_score", "REAL"),
+                ("embedding_max_similarity", "REAL"),
+                ("stale_flag", "INTEGER"),
+                ("novelty_computed_ts_ms", "INTEGER"),
+            ),
+        )
+    except Exception as e:
+        _warn_nonfatal("REPAIR_SCHEMA_NEWS_EVENT_FEATURE_COLUMNS_FAILED", e)
+    try:
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_news_event_features_event_id
+        ON news_event_features(event_id)
+        """)
+    except Exception as e:
+        _warn_nonfatal("REPAIR_SCHEMA_NEWS_EVENT_FEATURE_EVENT_ID_INDEX_FAILED", e)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ensemble_blend_weights (
@@ -622,15 +1003,26 @@ def _ensure_required_runtime_tables(cur) -> None:
 
     execution_order_columns = _table_columns("execution_orders")
     execution_order_additions = (
+        ("client_order_id", "TEXT"),
+        ("broker", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("portfolio_orders_id", "INTEGER"),
+        ("source_alert_id", "INTEGER"),
         ("order_uid", "TEXT"),
         ("prediction_id", "INTEGER"),
         ("model_id", "TEXT NOT NULL DEFAULT 'baseline'"),
         ("model_version", "TEXT"),
+        ("symbol", "TEXT NOT NULL DEFAULT ''"),
+        ("qty", "REAL NOT NULL DEFAULT 0"),
+        ("submit_ts_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("ref_px", "REAL"),
         ("expected_px", "REAL"),
         ("mid_px", "REAL"),
         ("bid_px", "REAL"),
         ("ask_px", "REAL"),
         ("spread_bps", "REAL"),
+        ("broker_order_id", "TEXT"),
+        ("status", "TEXT NOT NULL DEFAULT 'submitted'"),
+        ("extra_json", "TEXT"),
     )
     for column_name, column_ddl in execution_order_additions:
         if column_name not in execution_order_columns:
@@ -638,8 +1030,17 @@ def _ensure_required_runtime_tables(cur) -> None:
 
     execution_fill_columns = _table_columns("execution_fills")
     execution_fill_additions = (
+        ("client_order_id", "TEXT NOT NULL DEFAULT ''"),
+        ("fill_id", "TEXT"),
+        ("broker", "TEXT"),
         ("model_id", "TEXT NOT NULL DEFAULT 'baseline'"),
         ("model_version", "TEXT"),
+        ("symbol", "TEXT NOT NULL DEFAULT ''"),
+        ("ts_ms", "INTEGER"),
+        ("submit_ts_ms", "INTEGER"),
+        ("fill_ts_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("fill_qty", "REAL NOT NULL DEFAULT 0"),
+        ("fill_px", "REAL NOT NULL DEFAULT 0"),
         ("expected_px", "REAL"),
         ("mid_px", "REAL"),
         ("bid_px", "REAL"),

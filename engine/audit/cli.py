@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import sys
 
@@ -54,6 +55,8 @@ def _verify(args) -> int:
         if con is not None:
             try:
                 con.rollback()
+            # system-audit: ignore[silent_except] rollback is best-effort and
+            # must not shadow the primary audit verification failure.
             except Exception:
                 # fallback: rollback inside the error handler is best-effort.
                 # The original `exc` is the failure operators care about; we

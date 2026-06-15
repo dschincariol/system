@@ -3104,10 +3104,10 @@ async function verifyHealth(options = {}) {
   }
 
   const env = readEnv();
-  const port = Number(env.DASHBOARD_PORT || 8000);
-  const hostRaw = String(env.DASHBOARD_HOST || "127.0.0.1");
+  const port = Number(process.env.DASHBOARD_PORT || env.DASHBOARD_PORT || 8000);
+  const hostRaw = String(process.env.DASHBOARD_HOST || env.DASHBOARD_HOST || "127.0.0.1");
   const host = _normalizeDashHostForLoopback(hostRaw);
-  const override = String(env.OPERATOR_HEALTH_URL || "").trim();
+  const override = String(process.env.OPERATOR_HEALTH_URL || env.OPERATOR_HEALTH_URL || "").trim();
 
   const url = override || `http://${host}:${port}/api/health`;
 

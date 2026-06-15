@@ -22,10 +22,9 @@ def _own_connection(con):
 
 
 def _commit_if_possible(con) -> None:
-    try:
-        con.commit()
-    except Exception:
-        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+    commit = getattr(con, "commit", None)
+    if callable(commit):
+        commit()
 
 
 def _create_oos_table(con, table_name: str = OOS_TABLE) -> None:

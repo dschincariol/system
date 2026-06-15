@@ -375,6 +375,8 @@ def _fetch_sqlite_provider_health_rows() -> list[dict[str, Any]]:
         latency_expr = "latency_ms" if "latency_ms" in cols else "NULL"
         n_symbols_expr = "n_symbols" if "n_symbols" in cols else "NULL"
         error_expr = "error" if "error" in cols else "NULL"
+        last_success_expr = "last_success_ts_ms" if "last_success_ts_ms" in cols else "NULL"
+        error_count_expr = "error_count" if "error_count" in cols else "NULL"
         rows = con.execute(
             f"""
             WITH latest AS (
@@ -388,7 +390,9 @@ def _fetch_sqlite_provider_health_rows() -> list[dict[str, Any]]:
                 h.ok,
                 {latency_expr} AS latency_ms,
                 {n_symbols_expr} AS n_symbols,
-                {error_expr} AS error
+                {error_expr} AS error,
+                {last_success_expr} AS last_success_ts_ms,
+                {error_count_expr} AS error_count
             FROM price_provider_health h
             JOIN latest l
               ON l.provider = h.provider
@@ -404,6 +408,8 @@ def _fetch_sqlite_provider_health_rows() -> list[dict[str, Any]]:
                 "latency_ms": (float(row[3]) if row[3] is not None else None),
                 "n_symbols": (int(row[4]) if row[4] is not None else None),
                 "error": (str(row[5]) if row[5] is not None else None),
+                "last_success_ts_ms": (int(row[6]) if row[6] is not None else None),
+                "error_count": (int(row[7]) if row[7] is not None else None),
             }
             for row in rows
         ]
@@ -428,7 +434,9 @@ def _fetch_timescale_provider_health_rows() -> list[dict[str, Any]]:
                   h.ok,
                   h.latency_ms,
                   h.n_symbols,
-                  h.error
+                  h.error,
+                  h.last_success_ts_ms,
+                  h.error_count
                 FROM {schema_ref}.price_provider_health h
                 JOIN latest l
                   ON l.provider = h.provider
@@ -445,6 +453,8 @@ def _fetch_timescale_provider_health_rows() -> list[dict[str, Any]]:
                 "latency_ms": (float(row[3]) if row[3] is not None else None),
                 "n_symbols": (int(row[4]) if row[4] is not None else None),
                 "error": (str(row[5]) if row[5] is not None else None),
+                "last_success_ts_ms": (int(row[6]) if row[6] is not None else None),
+                "error_count": (int(row[7]) if row[7] is not None else None),
             }
             for row in rows
         ]

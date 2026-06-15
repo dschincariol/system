@@ -14,33 +14,33 @@ The `engine/execution/` tree turns approved portfolio or strategy intents into b
 
 ## Core Files
 
-- [broker_router.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\broker_router.py)
+- [broker_router.py](broker_router.py)
   Broker selection and broker abstraction boundary.
-- [broker_sim.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\broker_sim.py)
+- [broker_sim.py](broker_sim.py)
   Simulation broker used in non-live modes.
-- [kill_switch.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\kill_switch.py)
+- [kill_switch.py](kill_switch.py)
   Execution safety switches.
-- [execution_mode.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\execution_mode.py)
+- [execution_mode.py](execution_mode.py)
   Runtime execution-mode state and policy.
-- [execution_policy_engine.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\execution_policy_engine.py)
+- [execution_policy_engine.py](execution_policy_engine.py)
   Policy layer before actual broker submission.
-- [execution_poll_and_attrib.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\execution_poll_and_attrib.py)
+- [execution_poll_and_attrib.py](execution_poll_and_attrib.py)
   Polling fills and attribution path.
-- [execution_ledger.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\execution_ledger.py)
+- [execution_ledger.py](execution_ledger.py)
   Shared persistence and read helpers for broker order state, fills, and lifecycle evidence.
-- [trade_attribution_ledger.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\trade_attribution_ledger.py)
+- [trade_attribution_ledger.py](trade_attribution_ledger.py)
   Post-trade attribution ledger.
-- [almgren_chriss.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\almgren_chriss.py)
+- [almgren_chriss.py](almgren_chriss.py)
   Optional transaction-cost estimator used by newer execution-analytics and slicing decisions.
-- [broker_fill_utils.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\broker_fill_utils.py)
+- [broker_fill_utils.py](broker_fill_utils.py)
   Normalization helpers that turn broker-specific fill payloads into common execution records.
-- [broker_alpaca_rest.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\broker_alpaca_rest.py)
+- [broker_alpaca_rest.py](broker_alpaca_rest.py)
   Alpaca adapter used for broker-side order submission and status reads.
-- [broker_ibkr_gateway.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\broker_ibkr_gateway.py)
+- [broker_ibkr_gateway.py](broker_ibkr_gateway.py)
   IBKR gateway adapter used by live broker-routing paths.
-- [broker_apply_orders.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\broker_apply_orders.py)
+- [broker_apply_orders.py](broker_apply_orders.py)
   Main order-application path that enforces execution barriers, intent loading, shaping, and broker submission.
-- [execution_ai_advisor.py](c:\Users\dschi\Documents\GitHub\Trading-System-\engine\execution\execution_ai_advisor.py)
+- [execution_ai_advisor.py](execution_ai_advisor.py)
   Advisory-only read layer that summarizes historical slippage/latency and persists operator-facing execution guidance.
 
 ## Important Constraint

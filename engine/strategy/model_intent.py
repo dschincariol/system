@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.strategy.conformal import conformal_mode, extract_conformal_payload
+from engine.strategy.ood import extract_ood_payload
 
 LOG = get_logger("strategy.model_intent")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -154,6 +156,49 @@ def build_model_intent(
         sm = _safe_float(ex.get("size_mult"))
         if sm is not None:
             intent["size_mult"] = float(sm)
+
+    ood_payload = extract_ood_payload(ex)
+    if ood_payload:
+        ood_score = _safe_float(ood_payload.get("ood_score", ood_payload.get("ood_distance")))
+        if ood_score is not None:
+            intent["ood_score"] = float(ood_score)
+            intent["ood_distance"] = float(ood_score)
+        ood_threshold = _safe_float(ood_payload.get("threshold", ood_payload.get("ood_threshold")))
+        if ood_threshold is not None:
+            intent["ood_threshold"] = float(ood_threshold)
+        ood_hard = _safe_float(ood_payload.get("hard_threshold", ood_payload.get("ood_hard_threshold")))
+        if ood_hard is not None:
+            intent["ood_hard_threshold"] = float(ood_hard)
+        violation_count = _safe_float(ood_payload.get("range_violation_count", ood_payload.get("ood_range_violation_count")))
+        if violation_count is not None:
+            intent["ood_range_violation_count"] = int(violation_count)
+
+    conformal_payload = extract_conformal_payload(ex)
+    if conformal_payload:
+        interval_lower = _safe_float(conformal_payload.get("interval_lower", conformal_payload.get("lower")))
+        interval_upper = _safe_float(conformal_payload.get("interval_upper", conformal_payload.get("upper")))
+        interval_width = _safe_float(conformal_payload.get("interval_width"))
+        conformal_confidence = _safe_float(conformal_payload.get("confidence"))
+        conformal_size_mult = _safe_float(conformal_payload.get("size_mult"))
+        excludes_zero = bool(conformal_payload.get("interval_excludes_zero"))
+        intent["conformal"] = dict(conformal_payload)
+        intent["interval_excludes_zero"] = bool(excludes_zero)
+        intent["conformal_interval_excludes_zero"] = bool(excludes_zero)
+        if interval_lower is not None:
+            intent["conformal_interval_lower"] = float(interval_lower)
+        if interval_upper is not None:
+            intent["conformal_interval_upper"] = float(interval_upper)
+        if interval_width is not None:
+            intent["conformal_interval_width"] = float(interval_width)
+        if conformal_confidence is not None:
+            intent["conformal_confidence"] = float(max(0.0, min(1.0, conformal_confidence)))
+        if conformal_size_mult is not None:
+            intent["conformal_size_mult"] = float(max(0.0, min(1.0, conformal_size_mult)))
+        if conformal_confidence is not None and conformal_mode() in {"gate", "gate_and_size"}:
+            conf_c = float(max(0.0, min(1.0, conformal_confidence)))
+            intent["confidence"] = float(conf_c)
+            intent["probability"] = float(conf_c)
+            intent["uncertainty"] = float(1.0 - conf_c)
 
     tradability = ex.get("tradability")
     if isinstance(tradability, dict):

@@ -18,13 +18,38 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _local_dev_env() -> bool:
+    raw = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
+    if raw == "production":
+        raw = "prod"
+    elif raw == "development":
+        raw = "dev"
+    return raw in {"dev", "test"}
+
+
+def _safe_no_credential_runtime_mode_from_env() -> bool:
+    if not _local_dev_env():
+        return False
+    if _env_flag("ALLOW_CREDENTIAL_DATA_PROVIDERS_IN_SAFE", False):
+        return False
+    mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+    execution_mode = str(os.environ.get("EXECUTION_MODE") or "safe").strip().lower()
+    broker = str(os.environ.get("BROKER") or "sim").strip().lower()
+    broker_name = str(os.environ.get("BROKER_NAME") or broker or "sim").strip().lower()
+    if mode != "safe" or execution_mode not in {"safe", "paper", "sim-paper", "sim_paper"}:
+        return False
+    if broker != "sim" or broker_name != "sim":
+        return False
+    return bool(_env_flag("DISABLE_LIVE_EXECUTION", True) and _env_flag("KILL_SWITCH_GLOBAL", True))
+
+
 def _safe_no_credential_runtime_mode() -> bool:
     try:
         from services.data_source_manager import safe_no_credential_market_data_mode
 
         return bool(safe_no_credential_market_data_mode())
     except Exception:
-        return False
+        return _safe_no_credential_runtime_mode_from_env()
 
 
 def run_post_bind_boot(dashboard_module, handler_ctx: Dict[str, Any]) -> None:

@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from engine.runtime import dbapi_compat as dbapi
 from engine.runtime.failure_diagnostics import log_failure
+from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
 from engine.runtime.storage import connect, connect_rw_direct, run_write_txn
 from engine.execution.almgren_chriss import estimate_almgren_chriss_costs  # legacy patch target
 from engine.execution.deployable_capital import compute_deployable_equity
@@ -292,17 +293,31 @@ def _earnings_proximity_decay(con, symbol: str, ts_ms: int) -> float:
         return 0.0
 
     try:
+        if not _table_exists(con, "earnings_calendar"):
+            return 0.0
         today = _ymd_from_ts_ms(int(ts_ms))
-        row = con.execute(
-            """
-            SELECT earnings_date
-            FROM earnings_calendar
-            WHERE symbol=?
-            ORDER BY ABS(earnings_date::date - ?::date) ASC
-            LIMIT 1
-            """,
-            (sym, str(today)),
-        ).fetchone()
+        if dbapi.is_sqlite_connection(con):
+            row = con.execute(
+                """
+                SELECT earnings_date
+                FROM earnings_calendar
+                WHERE symbol=?
+                ORDER BY ABS(julianday(earnings_date) - julianday(?)) ASC
+                LIMIT 1
+                """,
+                (sym, str(today)),
+            ).fetchone()
+        else:
+            row = con.execute(
+                """
+                SELECT earnings_date
+                FROM earnings_calendar
+                WHERE symbol=?
+                ORDER BY ABS(earnings_date::date - ?::date) ASC
+                LIMIT 1
+                """,
+                (sym, str(today)),
+            ).fetchone()
         if not row:
             return 0.0
 
@@ -310,10 +325,16 @@ def _earnings_proximity_decay(con, symbol: str, ts_ms: int) -> float:
         if not ed:
             return 0.0
 
-        jd = con.execute(
-            "SELECT (?::date - ?::date)",
-            (str(ed), str(today)),
-        ).fetchone()
+        if dbapi.is_sqlite_connection(con):
+            jd = con.execute(
+                "SELECT julianday(?) - julianday(?)",
+                (str(ed), str(today)),
+            ).fetchone()
+        else:
+            jd = con.execute(
+                "SELECT (?::date - ?::date)",
+                (str(ed), str(today)),
+            ).fetchone()
         if not jd or jd[0] is None:
             return 0.0
 
@@ -501,6 +522,17 @@ def _is_shadow_book(book_key: Optional[str]) -> bool:
 
 
 def _table_exists(con, table_name: str) -> bool:
+    if dbapi.is_sqlite_connection(con):
+        row = con.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type='table' AND name=?
+            LIMIT 1
+            """,
+            (str(table_name),),
+        ).fetchone()
+        return bool(row)
     row = con.execute(
         """
         SELECT 1
@@ -515,6 +547,17 @@ def _table_exists(con, table_name: str) -> bool:
 
 
 def _index_exists(con, index_name: str) -> bool:
+    if dbapi.is_sqlite_connection(con):
+        row = con.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type='index' AND name=?
+            LIMIT 1
+            """,
+            (str(index_name),),
+        ).fetchone()
+        return bool(row)
     row = con.execute(
         """
         SELECT 1
@@ -1214,6 +1257,93 @@ def _estimate_optional_cost_model(
 
 def _fee(notional: float) -> float:
     return abs(float(notional or 0.0)) * (BROKER_FEE_BPS / 10000.0)
+
+
+def _offline_ac_cost_components(
+    turnover: float,
+    *,
+    cost_config: Optional[Dict[str, Any]] = None,
+    cost_model: Optional[Any] = None,
+) -> Dict[str, float]:
+    cfg = dict(cost_config or {})
+    turnover_f = max(0.0, _safe_f(turnover, 0.0))
+    if turnover_f <= 1e-12 or not bool(cfg.get("enabled", True)):
+        return {
+            "turnover": float(turnover_f),
+            "commission_bps": 0.0,
+            "half_spread_bps": 0.0,
+            "temporary_impact_bps": 0.0,
+            "total_cost_bps": 0.0,
+            "cost_return": 0.0,
+        }
+
+    model = cost_model if cost_model is not None else AlmgrenChrissCost()
+    base_notional = max(0.0, _safe_f(cfg.get("notional"), 100_000.0))
+    half_spread_bps = max(0.0, _safe_f(cfg.get("half_spread_bps"), 1.0))
+    components = model.components_bps(
+        notional=float(base_notional) * float(turnover_f),
+        adv=max(1e-12, _safe_f(cfg.get("adv"), 10_000_000.0)),
+        sigma_daily=max(0.0, _safe_f(cfg.get("sigma_daily"), 200.0)),
+        participation=max(0.0, min(1.0, _safe_f(cfg.get("participation"), 0.10))),
+        half_spread_bps=0.0,
+        asset_class=str(cfg.get("asset_class") or "US_EQUITY"),
+    )
+    commission_bps = max(0.0, _safe_f(cfg.get("commission_bps"), float(BROKER_FEE_BPS)))
+    temporary_bps = max(0.0, _safe_f(components.get("temporary_impact_bps"), 0.0))
+    total_bps = float(commission_bps + half_spread_bps + temporary_bps)
+    return {
+        "turnover": float(turnover_f),
+        "commission_bps": float(commission_bps),
+        "half_spread_bps": float(half_spread_bps),
+        "temporary_impact_bps": float(temporary_bps),
+        "total_cost_bps": float(total_bps),
+        "cost_return": float(turnover_f * total_bps / 10000.0),
+    }
+
+
+def simulate_weight_order_batch(
+    *,
+    orders: List[Dict[str, Any]],
+    realized_returns_by_symbol: Dict[str, List[float]],
+    previous_weights: Optional[Dict[str, float]] = None,
+    cost_config: Optional[Dict[str, Any]] = None,
+    cost_model: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Deterministic broker-sim replay for offline target-weight batches."""
+    prior = {str(k).upper().strip(): _safe_f(v, 0.0) for k, v in dict(previous_weights or {}).items()}
+    weights: Dict[str, float] = {}
+    for order in list(orders or []):
+        symbol = str((order or {}).get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        raw_weight = abs(_safe_f((order or {}).get("to_weight"), _safe_f((order or {}).get("qty"), 0.0)))
+        side = str((order or {}).get("side") or "").upper().strip()
+        weights[symbol] = float(raw_weight if side != "SELL" else -raw_weight)
+
+    turnover = sum(
+        abs(float(weights.get(symbol, 0.0)) - float(prior.get(symbol, 0.0)))
+        for symbol in sorted(set(weights.keys()) | set(prior.keys()))
+    )
+    gross_return = 0.0
+    for symbol, weight in weights.items():
+        realized_values = [
+            _safe_f(value, 0.0)
+            for value in list((realized_returns_by_symbol or {}).get(str(symbol).upper().strip(), []) or [])
+        ]
+        if not realized_values:
+            continue
+        gross_return += float(weight) * float(sum(realized_values) / float(len(realized_values)))
+    costs = _offline_ac_cost_components(turnover, cost_config=cost_config, cost_model=cost_model)
+    cost_return = float(costs.get("cost_return") or 0.0)
+    return {
+        "ok": True,
+        "weights": dict(weights),
+        "gross_return": float(gross_return),
+        "cost_return": float(cost_return),
+        "net_return": float(gross_return - cost_return),
+        "turnover": float(turnover),
+        "costs": dict(costs),
+    }
 
 
 def _write_fill(

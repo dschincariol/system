@@ -48,6 +48,13 @@ def _stub_training_config(monkeypatch, *, family: str, model_name: str, feature_
             ),
         ),
         (
+            "lgbm_ranker",
+            lambda plan: importlib.import_module("engine.strategy.models.lgbm_ranker")._resolve_training_config(
+                "lgbm_ranker",
+                plan,
+            ),
+        ),
+        (
             "patchtst",
             lambda plan: importlib.import_module("engine.strategy.models.patchtst")._resolve_training_config(plan),
         ),
@@ -80,6 +87,7 @@ def test_retrain_feature_schema_change_requires_operator_ack(monkeypatch, family
 def test_lgbm_load_rejects_feature_schema_drift(monkeypatch, tmp_path):
     monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
     module = importlib.import_module("engine.strategy.models.lgbm_regressor")
+    monkeypatch.setattr(module, "_emit_feature_schema_load_failure", lambda **kwargs: None)
 
     X = [
         {"a": float(i), "b": float(i % 3), "c": float(i % 5)}
@@ -106,3 +114,42 @@ def test_lgbm_load_rejects_feature_schema_drift(monkeypatch, tmp_path):
     monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: ["a", "c", "b"])
     with pytest.raises(ValueError, match="feature_schema_drift"):
         module.LGBMRegressorModel.load(path)
+
+
+def test_lgbm_load_rejects_feature_set_tag_drift(monkeypatch, tmp_path):
+    monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
+    module = importlib.import_module("engine.strategy.models.lgbm_regressor")
+    monkeypatch.setattr(module, "_emit_feature_schema_load_failure", lambda **kwargs: None)
+
+    X = [
+        {"a": float(i), "b": float(i % 3), "c": float(i % 5)}
+        for i in range(24)
+    ]
+    y = np.asarray(
+        [(0.7 * row["a"]) - (1.2 * row["b"]) + (0.3 * row["c"]) for row in X],
+        dtype=np.float32,
+    )
+    model = module.train_lgbm_regressor(
+        X,
+        y,
+        feature_ids=list(FEATURE_IDS),
+        hyperparams={
+            "n_estimators": 8,
+            "num_leaves": 4,
+            "min_child_samples": 1,
+            "learning_rate": 0.1,
+        },
+        model_name="lgbm_regressor.schema_tag_drift",
+    )
+    persisted_tag = str(model.persisted_feature_schema["feature_set_tag"])
+    path = model.save(tmp_path / "lgbm_tag.joblib")
+
+    monkeypatch.setattr(module, "feature_set_tag_from_ids", lambda ids: "mutated-feature-tag")
+
+    with pytest.raises(ValueError) as exc:
+        module.LGBMRegressorModel.load(path)
+
+    message = str(exc.value)
+    assert "feature_schema_drift" in message
+    assert persisted_tag in message
+    assert "mutated-feature-tag" in message

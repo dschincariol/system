@@ -21,6 +21,7 @@ from engine.data.provider_sessions import IBKRSession, ProviderSessionManager
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.lifecycle_state import DEGRADED, LIVE, WARMING_UP, set_state
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import default_ibkr_host
 from engine.runtime.runtime_meta import meta_set
 from engine.runtime.storage import (
     acquire_job_lock,
@@ -96,7 +97,7 @@ for _sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
 
 
 def _build_manager() -> ProviderSessionManager:
-    host = str(os.environ.get("IBKR_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    host = str(os.environ.get("IBKR_HOST", default_ibkr_host()) or default_ibkr_host()).strip()
     port = int(str(os.environ.get("IBKR_PORT", "7497") or "7497").strip())
     client_id = int(str(os.environ.get("IBKR_CLIENT_ID", "1") or "1").strip())
     data_type = int(str(os.environ.get("IBKR_MARKET_DATA_TYPE", "1") or "1").strip())

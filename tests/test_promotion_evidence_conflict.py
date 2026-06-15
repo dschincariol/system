@@ -52,3 +52,15 @@ def test_assess_challenger_rejects_duplicate_model_evidence_unmarked() -> None:
     assert exc.value.model_id == "duplicate_AAPL_1700000000006_abcdef7"
     assert exc.value.evidence_kind == "white_reality_check"
     con.close()
+
+
+def test_assess_challenger_requires_explicit_model_id() -> None:
+    with pytest.raises(ValueError, match="ambiguous_model_id"):
+        promotion_guard.assess_challenger(
+            model_name="shared_family",
+            candidate_version="v1",
+            challenger_returns=[0.02] * 40,
+            champion_returns=[0.0] * 40,
+            bootstrap_samples=99,
+            persist=False,
+        )

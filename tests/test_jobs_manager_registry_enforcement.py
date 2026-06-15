@@ -99,6 +99,7 @@ def test_registry_includes_safe_bootstrap_job_files() -> None:
         "shadow_train": "engine/strategy/jobs/shadow_train_job.py",
         "strategy_governance": "engine/strategy/jobs/strategy_governance_job.py",
         "trade_pipeline": "engine/strategy/jobs/trade_pipeline_job.py",
+        "alpaca_trade_updates_stream": "engine/execution/jobs/alpaca_trade_updates_stream.py",
         "compute_exec_labels": "engine/execution/jobs/compute_exec_labels.py",
         "compute_exec_labels_from_fills": "engine/execution/jobs/compute_exec_labels_from_fills.py",
         "compute_exec_z": "engine/execution/jobs/compute_exec_z.py",
@@ -111,6 +112,15 @@ def test_registry_includes_safe_bootstrap_job_files() -> None:
 
     result = job_registry.validate_runtime_architecture(import_check=False)
     assert result["ok"] is True
+
+
+def test_alpaca_trade_updates_stream_has_validator_entrypoint() -> None:
+    script = job_registry.ALLOWED_JOBS["alpaca_trade_updates_stream"][0]
+
+    result = job_registry.validate_job_registry_paths(import_check=False)
+
+    assert result["ok"] is True
+    assert f"missing_callable_entrypoint:alpaca_trade_updates_stream:{script}" not in result["errors"]
 
 
 def test_registry_validation_still_flags_untracked_job_files(monkeypatch) -> None:

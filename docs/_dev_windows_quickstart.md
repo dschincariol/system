@@ -1,11 +1,11 @@
 # Windows Dev Quickstart
 
-Target: Windows PowerShell, Python 3.11 x64, Node 20 preferred, safe/dev mode.
+Target: Windows PowerShell, Python 3.11 x64, Node 20 LTS, safe/dev mode.
 
 ## Prerequisites
 
 - Python 3.11 x64 available through `py -3.11`
-- Node 20.x, or any Node >=18
+- Node 20 LTS (`>=20.17.0 <21`) with npm 10.x
 - Git
 - Docker Desktop for local Timescale/PostgreSQL, Redis, and MinIO
 
@@ -36,6 +36,7 @@ py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip wheel setuptools
 .venv\Scripts\pip.exe install -r requirements.txt
 npm ci
+npm run check:ui
 ```
 
 Pre-cache the sentence-transformers model so first boot does not block on the download:
@@ -65,6 +66,7 @@ Do not add IBKR, Alpaca, CCXT, Polygon, Tradier, or other live/premium credentia
 
 ```powershell
 .venv\Scripts\python.exe tools\validate_repo.py
+npm run check:ui
 ```
 
 ## Start

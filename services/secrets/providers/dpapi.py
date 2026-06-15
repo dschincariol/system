@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from services.secrets.loader import SecretNotAvailable
+from services.secrets.loader import SecretNotAvailable, validate_secret_name
 
 
 def _secrets_dir() -> Path:
@@ -21,9 +21,7 @@ def _secrets_dir() -> Path:
 
 
 def _secret_path(name: str) -> Path:
-    secret_name = str(name or "").strip()
-    if not secret_name or secret_name != Path(secret_name).name:
-        raise SecretNotAvailable(f"invalid_secret_name:{secret_name}")
+    secret_name = validate_secret_name(name)
     return _secrets_dir() / f"{secret_name}.dpapi"
 
 
@@ -98,9 +96,10 @@ def _zero_original_buffer(data: object) -> bool:
 def protect_secret(name: str, data: bytes, *, secrets_dir: str | os.PathLike[str] | None = None) -> Path:
     """Encrypt and store a secret for tests and developer provisioning."""
     win32crypt = _win32crypt()
-    path = (Path(secrets_dir).expanduser() if secrets_dir is not None else _secret_path(name).parent) / f"{name}.dpapi"
+    secret_name = validate_secret_name(name)
+    path = (Path(secrets_dir).expanduser() if secrets_dir is not None else _secret_path(secret_name).parent) / f"{secret_name}.dpapi"
     path.parent.mkdir(parents=True, exist_ok=True)
-    encrypted = win32crypt.CryptProtectData(bytes(data), str(name), None, None, None, 0)
+    encrypted = win32crypt.CryptProtectData(bytes(data), str(secret_name), None, None, None, 0)
     path.write_bytes(encrypted)
     return path
 
@@ -127,4 +126,15 @@ def load(name: str) -> bytes:
         _zero_bytearray(plaintext)
 
 
-__all__ = ["load", "protect_secret"]
+def delete(name: str) -> bool:
+    path = _secret_path(name)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SecretNotAvailable(f"secret_delete_failed:{name}:{type(exc).__name__}:{exc}") from exc
+
+
+__all__ = ["delete", "load", "protect_secret"]

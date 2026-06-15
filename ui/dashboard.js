@@ -5874,6 +5874,8 @@ async function loadDashboardExecutionScreen() {
   const avgSlippageLegacy = numOrNull(metrics && metrics.avg_slippage);
   const totalFees = numOrNull(metrics && metrics.total_fees);
   const avgFillLatencyMs = numOrNull(metrics && metrics.avg_time_to_fill_ms);
+  const avgFillDetectionLatencyMs = numOrNull(metrics && metrics.avg_fill_detection_latency_ms);
+  const latestKillReactionLatencyMs = numOrNull(metrics && metrics.latest_kill_reaction_latency_ms);
   const avgSpreadBps = numOrNull(metrics && metrics.avg_spread_at_entry_bps);
   const byStrategy = asArray(metrics && metrics.by_strategy);
   const topStrategy = byStrategy
@@ -5928,6 +5930,16 @@ async function loadDashboardExecutionScreen() {
         label: "Fill Latency",
         value: avgFillLatencyMs == null ? "—" : `${formatDecimal(avgFillLatencyMs, 0)} ms`,
         meta: latestFillTs ? `last fill ${fmtTime(latestFillTs)}` : "no recent fill timestamp",
+      },
+      {
+        label: "Fill Detection",
+        value: avgFillDetectionLatencyMs == null ? "—" : `${formatDecimal(avgFillDetectionLatencyMs, 0)} ms`,
+        meta: "broker event to local ledger update",
+      },
+      {
+        label: "Kill Reaction",
+        value: latestKillReactionLatencyMs == null ? "—" : `${formatDecimal(latestKillReactionLatencyMs, 0)} ms`,
+        meta: latestKillReactionLatencyMs == null ? "no recent kill reaction metric" : "latest slice-boundary stop",
       },
       {
         label: "Avg Spread",

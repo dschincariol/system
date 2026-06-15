@@ -19,19 +19,27 @@ def _table_exists(conn, table: str) -> bool:
     return bool(row)
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = ?
+          AND column_name = ?
+        """,
+        (str(table), str(column)),
+    ).fetchone()
+    return bool(row)
+
+
 def _add_column(conn, table: str, column: str, definition: str) -> None:
     if not _table_exists(conn, table):
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
 
 
-def up(conn) -> None:
-    for table in ("predictions", "prediction_history"):
-        _add_column(conn, table, "regime_time_ms", "BIGINT")
-        _add_column(conn, table, "volatility_regime", "TEXT")
-        _add_column(conn, table, "trend_regime", "TEXT")
-        _add_column(conn, table, "liquidity_regime", "TEXT")
-
+def _ensure_regime_state_schema(conn) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS regime_state (
@@ -45,6 +53,99 @@ def up(conn) -> None:
         )
         """
     )
+    for column, definition in (
+        ("time", "BIGINT"),
+        ("symbol", "TEXT"),
+        ("volatility_regime", "TEXT"),
+        ("trend_regime", "TEXT"),
+        ("liquidity_regime", "TEXT"),
+        ("created_ts_ms", "BIGINT"),
+    ):
+        conn.execute(f"ALTER TABLE regime_state ADD COLUMN IF NOT EXISTS {column} {definition}")
+    has_ts_ms = _column_exists(conn, "regime_state", "ts_ms")
+    time_expr = "COALESCE(time, ts_ms, created_ts_ms, 0)" if has_ts_ms else "COALESCE(time, created_ts_ms, 0)"
+    created_expr = "COALESCE(created_ts_ms, time, ts_ms, 0)" if has_ts_ms else "COALESCE(created_ts_ms, time, 0)"
+    conn.execute(
+        f"""
+        UPDATE regime_state
+        SET
+          time = {time_expr},
+          symbol = COALESCE(symbol, ''),
+          volatility_regime = COALESCE(volatility_regime, 'unknown'),
+          trend_regime = COALESCE(trend_regime, 'unknown'),
+          liquidity_regime = COALESCE(liquidity_regime, 'unknown'),
+          created_ts_ms = {created_expr}
+        WHERE
+          time IS NULL OR symbol IS NULL OR volatility_regime IS NULL
+          OR trend_regime IS NULL OR liquidity_regime IS NULL
+          OR created_ts_ms IS NULL
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM regime_state a
+        USING regime_state b
+        WHERE a.ctid < b.ctid
+          AND a.symbol = b.symbol
+          AND a.time = b.time
+        """
+    )
+    conn.execute("ALTER TABLE regime_state ALTER COLUMN time SET NOT NULL")
+    conn.execute("ALTER TABLE regime_state ALTER COLUMN symbol SET NOT NULL")
+    conn.execute("ALTER TABLE regime_state ALTER COLUMN volatility_regime SET NOT NULL")
+    conn.execute("ALTER TABLE regime_state ALTER COLUMN trend_regime SET NOT NULL")
+    conn.execute("ALTER TABLE regime_state ALTER COLUMN liquidity_regime SET NOT NULL")
+    conn.execute("ALTER TABLE regime_state ALTER COLUMN created_ts_ms SET NOT NULL")
+    conn.execute(
+        """
+        ALTER TABLE regime_state
+          ALTER COLUMN created_ts_ms
+          SET DEFAULT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+        """
+    )
+    conn.execute(
+        """
+        DO $$
+        DECLARE
+          pk_name TEXT;
+          pk_cols TEXT[];
+        BEGIN
+          SELECT c.conname, array_agg(a.attname ORDER BY keys.ordinality)
+            INTO pk_name, pk_cols
+          FROM pg_constraint c
+          JOIN unnest(c.conkey) WITH ORDINALITY AS keys(attnum, ordinality)
+            ON TRUE
+          JOIN pg_attribute a
+            ON a.attrelid = c.conrelid
+           AND a.attnum = keys.attnum
+          WHERE c.conrelid = 'regime_state'::regclass
+            AND c.contype = 'p'
+          GROUP BY c.conname
+          LIMIT 1;
+
+          IF pk_cols = ARRAY['symbol', 'time']::TEXT[] THEN
+            RETURN;
+          END IF;
+
+          IF pk_name IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE regime_state DROP CONSTRAINT %I', pk_name);
+          END IF;
+
+          ALTER TABLE regime_state
+            ADD CONSTRAINT regime_state_pkey PRIMARY KEY(symbol, time);
+        END $$;
+        """
+    )
+
+
+def up(conn) -> None:
+    for table in ("predictions", "prediction_history"):
+        _add_column(conn, table, "regime_time_ms", "BIGINT")
+        _add_column(conn, table, "volatility_regime", "TEXT")
+        _add_column(conn, table, "trend_regime", "TEXT")
+        _add_column(conn, table, "liquidity_regime", "TEXT")
+
+    _ensure_regime_state_schema(conn)
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_regime_state_symbol_time_desc

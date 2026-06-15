@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import pkgutil
 import threading
 from types import ModuleType
@@ -11,6 +12,7 @@ from typing import Iterable
 
 MIGRATION_LOCK_KEY = 0x54535F534348454D
 _APPLY_LOCK = threading.Lock()
+LOG = logging.getLogger(__name__)
 
 
 def _migration_modules(package: str) -> list[ModuleType]:
@@ -92,7 +94,7 @@ def apply_migrations(
 
 def main() -> None:
     applied = apply_migrations()
-    print({"applied": applied})
+    LOG.info("schema_migrations_applied applied=%s", applied)
 
 
 if __name__ == "__main__":

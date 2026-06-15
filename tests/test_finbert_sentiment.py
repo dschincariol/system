@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -139,6 +141,7 @@ class FinbertSentimentTests(unittest.TestCase):
         self.assertEqual(float(out["confidence"]), 0.0)
         self.assertTrue(bool(out["payload_json"]["missing_text"]))
 
+    @pytest.mark.requires_postgres
     def test_persistence_write_and_read_round_trip(self) -> None:
         storage = self._init_storage()
         row = {
@@ -189,6 +192,7 @@ class FinbertSentimentTests(unittest.TestCase):
             con.close()
         self.assertEqual(int(rows[0] or 0), 2)
 
+    @pytest.mark.requires_postgres
     def test_feature_registry_integration_uses_persisted_sentiment(self) -> None:
         os.environ["USE_FINBERT_SENTIMENT"] = "1"
         os.environ["USE_SYMBOL_SNAPSHOT_FEATURES"] = "1"
@@ -268,6 +272,7 @@ class FinbertSentimentTests(unittest.TestCase):
         self.assertEqual(float(snapshot["sentiment.finbert.confidence"]), 0.82)
         self.assertIn("finbert", feature_registry.feature_set_tag_from_ids(feature_ids))
 
+    @pytest.mark.requires_postgres
     def test_disabled_path_startup_imports_without_finbert_model_load(self) -> None:
         os.environ["USE_FINBERT_SENTIMENT"] = "0"
         os.environ["USE_SYMBOL_SNAPSHOT_FEATURES"] = "1"
@@ -301,6 +306,7 @@ class FinbertSentimentTests(unittest.TestCase):
         self.assertGreater(float(snapshot["base.source_credibility"]), 0.0)
         self.assertEqual(float(snapshot["base.scheduled_flag"]), 1.0)
 
+    @pytest.mark.requires_postgres
     def test_disabled_path_remains_backward_compatible(self) -> None:
         os.environ["USE_FINBERT_SENTIMENT"] = "0"
         os.environ["USE_SYMBOL_SNAPSHOT_FEATURES"] = "1"

@@ -123,7 +123,8 @@ def _is_timescale_hypertable(con, table_name: str) -> bool:
             (str(table_name),),
         ).fetchone()
         return bool(row)
-    except Exception:
+    except Exception as e:
+        _warn("crash_recovery.is_timescale_hypertable", e, table=str(table_name))
         return False
 
 
@@ -238,8 +239,13 @@ def _audit_event(
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
             try:
                 con.rollback()
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                _warn(
+                    "crash_recovery.audit_event.duplicate_rollback",
+                    rollback_error,
+                    event_type=str(event_type),
+                    replay_key=str(replay_key),
+                )
             return False
         _warn("crash_recovery.audit_event", e, event_type=str(event_type), replay_key=str(replay_key))
         return False

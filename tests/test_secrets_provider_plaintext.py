@@ -25,6 +25,19 @@ def test_plaintext_provider_reads_raw_bytes(monkeypatch, tmp_path):
     assert provider.load("master_key") == b"raw"
 
 
+def test_plaintext_provider_delete_removes_secret(monkeypatch, tmp_path):
+    monkeypatch.setenv("TS_DEV_SECRETS_DIR", str(tmp_path))
+    monkeypatch.delenv("TS_ENV", raising=False)
+    secret_path = tmp_path / "old_key"
+    secret_path.write_bytes(b"raw")
+
+    with pytest.warns(RuntimeWarning):
+        provider = _fresh_plaintext_module()
+    assert provider.delete("old_key") is True
+    assert not secret_path.exists()
+    assert provider.delete("old_key") is False
+
+
 def test_plaintext_provider_refuses_production(monkeypatch):
     monkeypatch.setenv("TS_ENV", "production")
 

@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional
 
+from engine.api.auth_config import dashboard_api_token_issue
+from engine.runtime.platform import LOOPBACK_HOSTS, default_dashboard_host
+
 
 _TRUTHY_VALUES = {"1", "true", "yes", "on"}
-_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 DEFAULT_LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_LIVE_TRADING"
 
 
@@ -52,8 +54,8 @@ def live_trading_preflight(
     host = str(
         dashboard_host
         if dashboard_host is not None
-        else os.environ.get("DASHBOARD_HOST", "127.0.0.1")
-    ).strip() or "127.0.0.1"
+        else os.environ.get("DASHBOARD_HOST", default_dashboard_host())
+    ).strip() or default_dashboard_host()
     require_token = (
         bool(require_dashboard_api_token)
         if require_dashboard_api_token is not None
@@ -66,10 +68,16 @@ def live_trading_preflight(
     )
 
     blockers = []
-    if host not in _LOOPBACK_HOSTS and not token:
+    token_issue = dashboard_api_token_issue(token, strict=(mode == "live"))
+    if host not in LOOPBACK_HOSTS and not token:
         blockers.append("dashboard_api_token_required_for_remote_bind")
-    if mode == "live" and require_token and not token:
-        blockers.append("dashboard_api_token_required_for_live")
+    elif host not in LOOPBACK_HOSTS and token_issue:
+        blockers.append(f"dashboard_api_token_invalid_for_remote_bind:{token_issue}")
+    if mode == "live" and require_token:
+        if not token:
+            blockers.append("dashboard_api_token_required_for_live")
+        elif token_issue:
+            blockers.append(f"dashboard_api_token_invalid_for_live:{token_issue}")
     phrase = _confirmation_phrase()
     if mode == "live" and require_confirm and confirm != phrase:
         blockers.append("live_trading_confirmation_required")

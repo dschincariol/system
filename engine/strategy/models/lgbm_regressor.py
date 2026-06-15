@@ -7,6 +7,7 @@ construction.
 """
 
 from __future__ import annotations
+import inspect
 import logging
 
 import json
@@ -27,9 +28,18 @@ from engine.artifacts.serialization import (
 )
 from engine.artifacts.store import LocalArtifactStore
 from engine.model_registry import register_model, register_model_family
+from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect, init_db
 from engine.strategy import feature_registry
 from engine.strategy.feature_registry import build_feature_snapshot, feature_set_tag_from_ids
+from engine.strategy.era_boost import (
+    era_boost_config_from_env,
+    era_labels_for,
+    era_score_table,
+    score_std,
+    validation_degraded,
+    worst_half_eras,
+)
 from engine.strategy.model_lifecycle import (
     load_lifecycle_plan,
     record_version_performance,
@@ -38,6 +48,7 @@ from engine.strategy.model_lifecycle import (
     version_from_ts,
 )
 from engine.strategy.ensemble.oos_store import upsert_oos_predictions
+from engine.strategy.ood import build_ood_profile, score_ood, summarize_ood_profile
 
 FAMILY = "lgbm_regressor"
 DEFAULT_MODEL_NAME = FAMILY
@@ -86,7 +97,13 @@ def _expected_columns(
     model_spec: Mapping[str, Any] | None = None,
 ) -> list[str]:
     fn = getattr(feature_registry, "expected_columns", None)
-    ids = [str(item).strip() for item in list(feature_ids or []) if str(item or "").strip()]
+    if isinstance(feature_ids, (set, frozenset)):
+        raw_ids = sorted(feature_ids, key=lambda item: str(item or "").strip())
+    elif isinstance(feature_ids, Mapping):
+        raw_ids = sorted(feature_ids.keys(), key=lambda item: str(item or "").strip())
+    else:
+        raw_ids = list(feature_ids or [])
+    ids = [str(item).strip() for item in raw_ids if str(item or "").strip()]
     spec = dict(model_spec or {})
     if ids and "feature_ids" not in spec:
         spec["feature_ids"] = list(ids)
@@ -109,25 +126,329 @@ def _expected_columns(
     )
 
 
-def _feature_schema(feature_ids: Sequence[Any]) -> dict[str, Any]:
+def _feature_nan_alert_pct() -> float:
+    return max(0.0, min(100.0, _safe_float(os.environ.get("FEATURE_NAN_ALERT_PCT"), 20.0)))
+
+
+def _winsor_lower_pct() -> float:
+    return max(0.0, min(100.0, _safe_float(os.environ.get("FEATURE_WINSOR_LOWER_PCT"), 0.5)))
+
+
+def _winsor_upper_pct() -> float:
+    return max(0.0, min(100.0, _safe_float(os.environ.get("FEATURE_WINSOR_UPPER_PCT"), 99.5)))
+
+
+def _feature_schema(feature_ids: Sequence[Any], preprocessing: Mapping[str, Any] | None = None) -> dict[str, Any]:
     columns = [str(item).strip() for item in list(feature_ids or []) if str(item or "").strip()]
-    return {
+    schema = {
         "feature_ids": list(columns),
         "feature_set_tag": str(feature_set_tag_from_ids(list(columns))),
         "feature_count": int(len(columns)),
     }
+    if isinstance(preprocessing, Mapping) and preprocessing:
+        schema["preprocessing"] = dict(preprocessing)
+    return schema
+
+
+def _coerce_raw_feature_value(value: Any, default: float = float("nan")) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    return float(out) if math.isfinite(out) else float(default)
+
+
+def _feature_imputation_accounting(matrix: np.ndarray, columns: Sequence[str]) -> dict[str, Any]:
+    arr = np.asarray(matrix, dtype=np.float32)
+    cols = [str(col) for col in list(columns or [])]
+    rows = int(arr.shape[0]) if arr.ndim == 2 else 0
+    features: dict[str, dict[str, float | int]] = {}
+    total = 0
+    if arr.ndim == 2:
+        mask = ~np.isfinite(arr)
+        for idx, col in enumerate(cols):
+            count = int(np.sum(mask[:, idx])) if idx < int(mask.shape[1]) else 0
+            total += count
+            features[str(col)] = {
+                "nan_count": int(count),
+                "nan_pct": float((100.0 * count / rows) if rows > 0 else 0.0),
+            }
+    return {
+        "rows": int(rows),
+        "feature_count": int(len(cols)),
+        "total_nan_count": int(total),
+        "features": features,
+    }
+
+
+def _emit_feature_nan_accounting(
+    accounting: Mapping[str, Any],
+    *,
+    phase: str,
+    model_name: str,
+) -> None:
+    rows = int(accounting.get("rows") or 0)
+    total = int(accounting.get("total_nan_count") or 0)
+    feature_stats = dict(accounting.get("features") or {})
+    LOG.info(
+        "feature_nan_accounting phase=%s model_name=%s rows=%d total_nan_count=%d",
+        str(phase),
+        str(model_name or ""),
+        int(rows),
+        int(total),
+    )
+    alert_pct = _feature_nan_alert_pct()
+    breached = {
+        str(fid): dict(stats)
+        for fid, stats in feature_stats.items()
+        if _safe_float((stats or {}).get("nan_pct"), 0.0) > float(alert_pct)
+    }
+    if not breached:
+        return
+    getattr(LOG, "warning")(
+        "feature_nan_alert phase=%s model_name=%s alert_pct=%s breached_features=%s",
+        str(phase),
+        str(model_name or ""),
+        float(alert_pct),
+        ",".join(sorted(breached)),
+    )
+    log_failure(
+        LOG,
+        event="feature_nan_alert",
+        code="FEATURE_NAN_ALERT",
+        message="Feature imputation rate exceeded FEATURE_NAN_ALERT_PCT.",
+        error=RuntimeError("feature_nan_alert"),
+        level=logging.WARNING,
+        component="engine.strategy.models.lgbm_regressor",
+        extra={
+            "phase": str(phase),
+            "model_name": str(model_name or ""),
+            "alert_pct": float(alert_pct),
+            "breached_features": breached,
+            "rows": int(rows),
+            "total_nan_count": int(total),
+        },
+        persist=True,
+    )
+
+
+def _compute_winsor_bounds(matrix: np.ndarray, columns: Sequence[str]) -> dict[str, dict[str, float]]:
+    arr = np.asarray(matrix, dtype=np.float32)
+    lower_pct = _winsor_lower_pct()
+    upper_pct = _winsor_upper_pct()
+    if upper_pct < lower_pct:
+        lower_pct, upper_pct = upper_pct, lower_pct
+    bounds: dict[str, dict[str, float]] = {}
+    for idx, col in enumerate([str(item) for item in list(columns or [])]):
+        vals = arr[:, idx] if arr.ndim == 2 and idx < int(arr.shape[1]) else np.asarray([], dtype=np.float32)
+        finite = vals[np.isfinite(vals)]
+        if int(finite.size) <= 0:
+            lo = hi = 0.0
+        else:
+            lo, hi = np.percentile(finite.astype(np.float64), [lower_pct, upper_pct])
+            if not math.isfinite(float(lo)) or not math.isfinite(float(hi)):
+                lo = float(np.min(finite))
+                hi = float(np.max(finite))
+            if float(lo) > float(hi):
+                lo, hi = hi, lo
+        bounds[str(col)] = {"lower": float(lo), "upper": float(hi)}
+    return bounds
+
+
+def _build_feature_preprocessing(matrix: np.ndarray, columns: Sequence[str]) -> dict[str, Any]:
+    lower_pct = _winsor_lower_pct()
+    upper_pct = _winsor_upper_pct()
+    if upper_pct < lower_pct:
+        lower_pct, upper_pct = upper_pct, lower_pct
+    return {
+        "imputation": {
+            "strategy": "non_finite_to_zero",
+            "nan_alert_pct": float(_feature_nan_alert_pct()),
+        },
+        "winsorization": {
+            "enabled": True,
+            "lower_pct": float(lower_pct),
+            "upper_pct": float(upper_pct),
+            "bounds": _compute_winsor_bounds(matrix, columns),
+        },
+    }
+
+
+def _preprocess_feature_matrix(
+    matrix: np.ndarray,
+    columns: Sequence[str],
+    *,
+    feature_schema: Mapping[str, Any] | None = None,
+    phase: str = "serve",
+    model_name: str = "",
+    fit_preprocessing: bool = False,
+) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    cols = [str(col) for col in list(columns or [])]
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError("feature_matrix_invalid_shape")
+    if int(arr.shape[1]) != int(len(cols)):
+        raise ValueError(f"feature_count_mismatch:{int(arr.shape[1])}:{int(len(cols))}")
+
+    accounting = _feature_imputation_accounting(arr, cols)
+    _emit_feature_nan_accounting(accounting, phase=str(phase), model_name=str(model_name or ""))
+
+    preprocessing: dict[str, Any]
+    if fit_preprocessing:
+        preprocessing = _build_feature_preprocessing(arr, cols)
+    else:
+        schema = dict(feature_schema or {})
+        preprocessing = dict(schema.get("preprocessing") or {}) if isinstance(schema.get("preprocessing"), Mapping) else {}
+
+    winsor = dict(preprocessing.get("winsorization") or {}) if isinstance(preprocessing.get("winsorization"), Mapping) else {}
+    bounds = dict(winsor.get("bounds") or {}) if isinstance(winsor.get("bounds"), Mapping) else {}
+    if bool(winsor.get("enabled", bool(bounds))) and bounds:
+        clipped = arr.astype(np.float32, copy=True)
+        for idx, col in enumerate(cols):
+            bound = bounds.get(col)
+            if not isinstance(bound, Mapping):
+                continue
+            lo = _safe_float(bound.get("lower"), float("nan"))
+            hi = _safe_float(bound.get("upper"), float("nan"))
+            if not (math.isfinite(lo) and math.isfinite(hi)):
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            finite_mask = np.isfinite(clipped[:, idx])
+            clipped[finite_mask, idx] = np.clip(clipped[finite_mask, idx], float(lo), float(hi))
+        arr = clipped
+
+    arr = np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return arr, preprocessing, accounting
+
+
+def _persisted_feature_schema(loaded: Any) -> dict[str, Any]:
+    schema = getattr(loaded, "persisted_feature_schema", None)
+    if not isinstance(schema, Mapping):
+        metrics = getattr(loaded, "training_metrics", None)
+        if isinstance(metrics, Mapping):
+            schema = metrics.get("feature_schema")
+    if isinstance(schema, Mapping):
+        return dict(schema)
+    return {}
+
+
+def _emit_feature_schema_load_failure(
+    *,
+    loaded: Any,
+    artifact_schema: Mapping[str, Any],
+    current_schema: Mapping[str, Any],
+    reason: str,
+    error: BaseException,
+) -> None:
+    artifact_tag = str(artifact_schema.get("feature_set_tag") or "").strip()
+    current_tag = str(current_schema.get("feature_set_tag") or "").strip()
+    extra = {
+        "model_name": str(getattr(loaded, "model_name", "") or ""),
+        "family": str(getattr(loaded, "family", FAMILY) or FAMILY),
+        "artifact_feature_set_tag": str(artifact_tag),
+        "current_feature_set_tag": str(current_tag),
+        "artifact_feature_ids": list(artifact_schema.get("feature_ids") or []),
+        "current_feature_ids": list(current_schema.get("feature_ids") or []),
+        "reason": str(reason),
+    }
+    LOG.error(
+        "feature_schema_load_validation_failed model_name=%s family=%s artifact_feature_set_tag=%s current_feature_set_tag=%s reason=%s",
+        extra["model_name"],
+        extra["family"],
+        artifact_tag or "<missing>",
+        current_tag or "<missing>",
+        str(reason),
+    )
+    log_failure(
+        LOG,
+        event="feature_schema_load_validation_failed",
+        code="FEATURE_SCHEMA_LOAD_VALIDATION_FAILED",
+        message=str(error),
+        error=error,
+        level=logging.ERROR,
+        component="engine.strategy.models.lgbm_regressor",
+        extra=extra,
+        persist=True,
+    )
+    try:
+        from engine.runtime.alerts import emit_runtime_alert
+
+        emit_runtime_alert(
+            event_title="Model feature schema load validation failed",
+            symbol="SYSTEM",
+            severity="ERROR",
+            rule_id="FEATURE_SCHEMA_LOAD_VALIDATION_FAILED",
+            explain=extra,
+            detail={"error": str(error)},
+            source="model_load_validation",
+            dedupe_scope=f"{extra['family']}:{extra['model_name']}:{reason}:{artifact_tag}:{current_tag}",
+        )
+    except Exception:
+        LOG.debug("Ignored recoverable exception.", exc_info=True)
 
 
 def _assert_loaded_feature_schema_current(loaded: Any) -> None:
+    loaded_feature_ids = [
+        str(item).strip()
+        for item in list(getattr(loaded, "feature_ids", []) or [])
+        if str(item or "").strip()
+    ]
     current = _expected_columns(
-        loaded.feature_ids,
-        model_name=loaded.model_name,
-        model_spec={"feature_ids": loaded.feature_ids},
+        loaded_feature_ids,
+        model_name=getattr(loaded, "model_name", DEFAULT_MODEL_NAME),
+        model_spec={"feature_ids": loaded_feature_ids},
     )
-    if current != loaded.feature_ids:
-        raise ValueError(
-            f"feature_schema_drift: model trained with {loaded.feature_ids} but registry expects {current}"
+    current_schema = _feature_schema(current)
+    artifact_schema = _persisted_feature_schema(loaded)
+    if not artifact_schema:
+        artifact_schema = {"feature_ids": list(loaded_feature_ids), "feature_set_tag": ""}
+    artifact_ids = [
+        str(item).strip()
+        for item in list(artifact_schema.get("feature_ids") or loaded_feature_ids)
+        if str(item or "").strip()
+    ]
+    artifact_tag = str(artifact_schema.get("feature_set_tag") or "").strip()
+    current_tag = str(current_schema.get("feature_set_tag") or "").strip()
+
+    error: ValueError | None = None
+    reason = ""
+    if not artifact_tag:
+        reason = "missing_feature_set_tag"
+        error = ValueError(
+            "feature_schema_drift: artifact_feature_set_tag=<missing> "
+            f"current_feature_set_tag={current_tag or '<missing>'}"
         )
+    elif artifact_ids != loaded_feature_ids:
+        reason = "artifact_column_list_mismatch"
+        error = ValueError(
+            "feature_schema_drift: "
+            f"artifact_feature_set_tag={artifact_tag} current_feature_set_tag={current_tag} "
+            f"artifact_columns={artifact_ids} loaded_columns={loaded_feature_ids}"
+        )
+    elif current != loaded_feature_ids:
+        reason = "registry_column_list_mismatch"
+        error = ValueError(
+            "feature_schema_drift: "
+            f"artifact_feature_set_tag={artifact_tag} current_feature_set_tag={current_tag} "
+            f"artifact_columns={loaded_feature_ids} current_columns={current}"
+        )
+    elif artifact_tag != current_tag:
+        reason = "feature_set_tag_mismatch"
+        error = ValueError(
+            "feature_schema_drift: "
+            f"artifact_feature_set_tag={artifact_tag} current_feature_set_tag={current_tag} "
+            f"artifact_columns={loaded_feature_ids} current_columns={current}"
+        )
+    if error is not None:
+        _emit_feature_schema_load_failure(
+            loaded=loaded,
+            artifact_schema={**dict(artifact_schema), "feature_ids": list(artifact_ids)},
+            current_schema=current_schema,
+            reason=reason,
+            error=error,
+        )
+        raise error
 
 
 def _current_model_artifact_alias(family: str, model_name: str, symbol: str = "*") -> str:
@@ -224,7 +545,16 @@ def _coerce_feature_map(row: Any) -> dict[str, Any]:
     return {}
 
 
-def _matrix_from_features(features: Any, columns: Sequence[str]) -> np.ndarray:
+def _matrix_from_features(
+    features: Any,
+    columns: Sequence[str],
+    *,
+    feature_schema: Mapping[str, Any] | None = None,
+    phase: str = "serve",
+    model_name: str = "",
+    fit_preprocessing: bool = False,
+    return_metadata: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
     cols = [str(col) for col in list(columns or [])]
     if not cols:
         raise ValueError("feature_columns_required")
@@ -237,19 +567,35 @@ def _matrix_from_features(features: Any, columns: Sequence[str]) -> np.ndarray:
             raise ValueError("feature_matrix_invalid_shape")
         if int(arr.shape[1]) != int(len(cols)):
             raise ValueError(f"feature_count_mismatch:{int(arr.shape[1])}:{int(len(cols))}")
-        return np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+        result = _preprocess_feature_matrix(
+            arr,
+            cols,
+            feature_schema=feature_schema,
+            phase=phase,
+            model_name=model_name,
+            fit_preprocessing=fit_preprocessing,
+        )
+        return result if return_metadata else result[0]
 
     if hasattr(features, "loc") and hasattr(features, "columns"):
         arr = features.loc[:, cols].to_numpy(dtype=np.float32)
-        return np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+        result = _preprocess_feature_matrix(
+            arr,
+            cols,
+            feature_schema=feature_schema,
+            phase=phase,
+            model_name=model_name,
+            fit_preprocessing=fit_preprocessing,
+        )
+        return result if return_metadata else result[0]
 
     if isinstance(features, Mapping):
         feature_map = _coerce_feature_map(features)
-        values = [feature_map.get(col, 0.0) for col in cols]
+        values = [feature_map.get(col, float("nan")) for col in cols]
         if any(isinstance(value, (list, tuple, np.ndarray)) for value in values):
             columns_values = [np.asarray(value, dtype=np.float32).reshape(-1) for value in values]
             row_count = max(int(value.shape[0]) for value in columns_values)
-            matrix = np.zeros((row_count, len(cols)), dtype=np.float32)
+            matrix = np.full((row_count, len(cols)), np.nan, dtype=np.float32)
             for idx, value in enumerate(columns_values):
                 if int(value.shape[0]) == 1 and row_count > 1:
                     matrix[:, idx] = float(value[0])
@@ -257,23 +603,56 @@ def _matrix_from_features(features: Any, columns: Sequence[str]) -> np.ndarray:
                     matrix[:, idx] = value
                 else:
                     raise ValueError("feature_column_length_mismatch")
-            return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
-        return np.asarray([[_safe_float(feature_map.get(col), 0.0) for col in cols]], dtype=np.float32)
+            result = _preprocess_feature_matrix(
+                matrix,
+                cols,
+                feature_schema=feature_schema,
+                phase=phase,
+                model_name=model_name,
+                fit_preprocessing=fit_preprocessing,
+            )
+            return result if return_metadata else result[0]
+        matrix = np.asarray([[_coerce_raw_feature_value(feature_map.get(col)) for col in cols]], dtype=np.float32)
+        result = _preprocess_feature_matrix(
+            matrix,
+            cols,
+            feature_schema=feature_schema,
+            phase=phase,
+            model_name=model_name,
+            fit_preprocessing=fit_preprocessing,
+        )
+        return result if return_metadata else result[0]
 
     if isinstance(features, Sequence) and not isinstance(features, (str, bytes, bytearray)):
         rows = list(features)
         if rows and all(isinstance(row, Mapping) for row in rows):
             matrix = [
-                [_safe_float(_coerce_feature_map(row).get(col), 0.0) for col in cols]
+                [_coerce_raw_feature_value(_coerce_feature_map(row).get(col)) for col in cols]
                 for row in rows
             ]
-            return np.asarray(matrix, dtype=np.float32)
+            result = _preprocess_feature_matrix(
+                np.asarray(matrix, dtype=np.float32),
+                cols,
+                feature_schema=feature_schema,
+                phase=phase,
+                model_name=model_name,
+                fit_preprocessing=fit_preprocessing,
+            )
+            return result if return_metadata else result[0]
         arr = np.asarray(rows, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
         if int(arr.shape[1]) != int(len(cols)):
             raise ValueError(f"feature_count_mismatch:{int(arr.shape[1])}:{int(len(cols))}")
-        return np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+        result = _preprocess_feature_matrix(
+            arr,
+            cols,
+            feature_schema=feature_schema,
+            phase=phase,
+            model_name=model_name,
+            fit_preprocessing=fit_preprocessing,
+        )
+        return result if return_metadata else result[0]
 
     raise TypeError(f"unsupported_feature_payload:{type(features).__name__}")
 
@@ -315,6 +694,158 @@ def _fit_eval_metrics(model: Any, X: np.ndarray, y: np.ndarray) -> dict[str, flo
     return {"rmse": float(rmse), "directional_acc": float(directional)}
 
 
+def _as_weight_array(sample_weight: Any, n_rows: int) -> np.ndarray:
+    if sample_weight is None:
+        return np.ones(int(n_rows), dtype=np.float32)
+    arr = np.asarray(sample_weight, dtype=np.float32).reshape(-1)
+    if int(arr.shape[0]) != int(n_rows):
+        raise ValueError("lgbm_sample_weight_row_count_mismatch")
+    arr = np.where(np.isfinite(arr), arr, 1.0).astype(np.float32, copy=False)
+    return np.maximum(arr, 0.0).astype(np.float32, copy=False)
+
+
+def _mse_loss(model: Any, X: np.ndarray | None, y: np.ndarray | None) -> float | None:
+    if X is None or y is None or int(np.asarray(y).reshape(-1).shape[0]) <= 0:
+        return None
+    pred = np.asarray(model.predict(X), dtype=np.float64).reshape(-1)
+    truth = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = min(int(pred.size), int(truth.size))
+    if n <= 0:
+        return None
+    err = truth[:n] - pred[:n]
+    return float(np.mean(err * err))
+
+
+def _fit_lgbm_continuation(
+    *,
+    model_factory: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    columns: Sequence[str],
+    sample_weight: np.ndarray,
+    init_model: Any,
+) -> Any:
+    estimator = model_factory()
+    estimator.fit(
+        X,
+        y,
+        sample_weight=np.asarray(sample_weight, dtype=np.float32).reshape(-1),
+        feature_name=list(columns),
+        init_model=init_model,
+    )
+    return estimator
+
+
+def _apply_regression_era_boost(
+    *,
+    model_factory: Any,
+    initial_model: Any,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    columns: Sequence[str],
+    base_sample_weight: np.ndarray,
+    train_timestamps: Any = None,
+    train_era_labels: Any = None,
+    validation_matrix: np.ndarray | None = None,
+    validation_target: np.ndarray | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    cfg = era_boost_config_from_env()
+    labels, label_diag = era_labels_for(
+        n_obs=int(y_train.shape[0]),
+        timestamps=train_timestamps,
+        era_labels=train_era_labels,
+    )
+    payload: dict[str, Any] = {
+        "enabled": bool(cfg.get("enabled")),
+        "applied": False,
+        "config": dict(cfg),
+        "label_diagnostics": dict(label_diag),
+    }
+    if not bool(cfg.get("enabled")):
+        return initial_model, payload
+    if not bool(label_diag.get("applied")) or len(labels) < int(y_train.shape[0]):
+        payload["status"] = "missing_training_eras"
+        return initial_model, payload
+
+    score_kind = str(cfg.get("score_kind") or "neg_mse")
+    initial_pred = np.asarray(initial_model.predict(X_train), dtype=np.float64).reshape(-1)
+    before_table = era_score_table(y_train, initial_pred, labels, score_kind=score_kind)
+    payload["before"] = {
+        "era_scores": before_table,
+        "era_score_std": float(score_std(before_table)),
+    }
+    if len(before_table) < 2:
+        payload["status"] = "insufficient_eras"
+        return initial_model, payload
+
+    current = initial_model
+    current_val_loss = _mse_loss(current, validation_matrix, validation_target)
+    iterations: list[dict[str, Any]] = []
+    base_weights = _as_weight_array(base_sample_weight, int(y_train.shape[0]))
+    multiplier = float(cfg.get("weight_multiplier") or 2.0)
+
+    for iteration in range(int(cfg.get("iters") or 1)):
+        train_pred = np.asarray(current.predict(X_train), dtype=np.float64).reshape(-1)
+        table = era_score_table(y_train, train_pred, labels, score_kind=score_kind)
+        worst = set(worst_half_eras(table))
+        if not worst:
+            iterations.append({"iteration": int(iteration + 1), "status": "no_worst_eras"})
+            break
+        weights = base_weights.copy()
+        for idx, label in enumerate(labels[: int(weights.shape[0])]):
+            if str(label) in worst:
+                weights[idx] = float(weights[idx]) * float(multiplier)
+        candidate = _fit_lgbm_continuation(
+            model_factory=model_factory,
+            X=X_train,
+            y=y_train,
+            columns=columns,
+            sample_weight=weights,
+            init_model=current.booster_,
+        )
+        candidate_val_loss = _mse_loss(candidate, validation_matrix, validation_target)
+        degraded = (
+            current_val_loss is not None
+            and candidate_val_loss is not None
+            and validation_degraded(
+                prior_loss=float(current_val_loss),
+                candidate_loss=float(candidate_val_loss),
+                max_degrade=float(cfg.get("max_degrade") or 0.0),
+            )
+        )
+        iteration_payload = {
+            "iteration": int(iteration + 1),
+            "worst_eras": sorted(worst),
+            "weight_source_eras": sorted({str(label) for label in labels}),
+            "weighted_rows": int(sum(1 for label in labels if str(label) in worst)),
+            "validation_loss_before": (None if current_val_loss is None else float(current_val_loss)),
+            "validation_loss_after": (None if candidate_val_loss is None else float(candidate_val_loss)),
+            "accepted": bool(not degraded),
+        }
+        iterations.append(iteration_payload)
+        if degraded:
+            payload["status"] = "stopped_validation_degrade"
+            break
+        current = candidate
+        current_val_loss = candidate_val_loss
+
+    final_pred = np.asarray(current.predict(X_train), dtype=np.float64).reshape(-1)
+    after_table = era_score_table(y_train, final_pred, labels, score_kind=score_kind)
+    payload.update(
+        {
+            "applied": True,
+            "status": str(payload.get("status") or "completed"),
+            "iterations": iterations,
+            "after": {
+                "era_scores": after_table,
+                "era_score_std": float(score_std(after_table)),
+            },
+            "validation_rows": int(0 if validation_target is None else np.asarray(validation_target).reshape(-1).shape[0]),
+        }
+    )
+    return current, payload
+
+
 class LGBMRegressorModel:
     """LightGBM regressor with schema-bound feature vectorization."""
 
@@ -336,6 +867,14 @@ class LGBMRegressorModel:
         self.hyperparams.update(dict(hyperparams or {}))
         self.model = model
         self.training_metrics = dict(training_metrics or {})
+        self.ood_profile = dict(getattr(self, "ood_profile", {}) or {})
+        metrics_schema = self.training_metrics.get("feature_schema") if isinstance(self.training_metrics, Mapping) else None
+        self.feature_preprocessing = (
+            dict((metrics_schema or {}).get("preprocessing") or {})
+            if isinstance(metrics_schema, Mapping)
+            else {}
+        )
+        self.persisted_feature_schema = dict(self.feature_schema)
 
     @staticmethod
     def _default_hyperparams() -> dict[str, Any]:
@@ -354,7 +893,7 @@ class LGBMRegressorModel:
 
     @property
     def feature_schema(self) -> dict[str, Any]:
-        return _feature_schema(self.feature_ids)
+        return _feature_schema(self.feature_ids, preprocessing=getattr(self, "feature_preprocessing", {}))
 
     def _new_estimator(self) -> Any:
         try:
@@ -363,38 +902,121 @@ class LGBMRegressorModel:
             raise RuntimeError("lightgbm_not_installed") from exc
         return lgb.LGBMRegressor(**dict(self.hyperparams))
 
-    def fit(self, X: Any, y: Any, sample_weight: Any = None) -> "LGBMRegressorModel":
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        sample_weight: Any = None,
+        *,
+        era_timestamps: Any = None,
+        era_labels: Any = None,
+        validation_data: tuple[Any, Any] | None = None,
+        validation_timestamps: Any = None,
+        validation_era_labels: Any = None,
+    ) -> "LGBMRegressorModel":
         columns = _expected_columns(self.feature_ids, model_name=self.model_name, model_spec=self.feature_schema)
-        X_arr = _matrix_from_features(X, columns)
+        X_arr, preprocessing, _accounting = _matrix_from_features(
+            X,
+            columns,
+            phase="train",
+            model_name=self.model_name,
+            fit_preprocessing=True,
+            return_metadata=True,
+        )
         y_arr = np.asarray(y, dtype=np.float32).reshape(-1)
         if int(X_arr.shape[0]) != int(y_arr.shape[0]):
             raise ValueError("lgbm_row_count_mismatch")
+        base_sample_weight = _as_weight_array(sample_weight, int(y_arr.shape[0]))
         self.feature_ids = list(columns)
+        self.feature_preprocessing = dict(preprocessing or {})
         model = self._new_estimator()
         fit_kwargs: dict[str, Any] = {"feature_name": list(columns)}
         if sample_weight is not None:
-            fit_kwargs["sample_weight"] = np.asarray(sample_weight, dtype=np.float32).reshape(-1)
+            fit_kwargs["sample_weight"] = base_sample_weight
         model.fit(X_arr, y_arr, **fit_kwargs)
+
+        validation_matrix = None
+        validation_target = None
+        if validation_data is not None:
+            val_X, val_y = validation_data
+            validation_matrix = _matrix_from_features(
+                val_X,
+                columns,
+                feature_schema=_feature_schema(columns, preprocessing=dict(preprocessing or {})),
+                phase="serve",
+                model_name=self.model_name,
+            )
+            validation_target = np.asarray(val_y, dtype=np.float32).reshape(-1)
+            if int(validation_matrix.shape[0]) != int(validation_target.shape[0]):
+                raise ValueError("lgbm_validation_row_count_mismatch")
+
+        era_cfg = era_boost_config_from_env()
+        if bool(era_cfg.get("enabled")):
+            boost_hyperparams = dict(self.hyperparams)
+            boost_hyperparams["n_estimators"] = int(era_cfg.get("rounds") or 20)
+
+            def _factory() -> Any:
+                try:
+                    import lightgbm as lgb
+                except ImportError as exc:  # pragma: no cover - dependency is declared
+                    raise RuntimeError("lightgbm_not_installed") from exc
+                return lgb.LGBMRegressor(**boost_hyperparams)
+
+            model, era_payload = _apply_regression_era_boost(
+                model_factory=_factory,
+                initial_model=model,
+                X_train=X_arr,
+                y_train=y_arr,
+                columns=columns,
+                base_sample_weight=base_sample_weight,
+                train_timestamps=era_timestamps,
+                train_era_labels=era_labels,
+                validation_matrix=validation_matrix,
+                validation_target=validation_target,
+            )
+        else:
+            era_payload = {"enabled": False, "applied": False, "config": dict(era_cfg)}
         self.model = model
+        self.ood_profile = build_ood_profile(X_arr, columns)
         self.training_metrics = {
             "n_train": int(y_arr.shape[0]),
             "model_family": str(self.family),
             "model_kind": str(self.model_kind),
             "feature_schema": self.feature_schema,
+            "ood_profile_summary": summarize_ood_profile(self.ood_profile),
             **_fit_eval_metrics(model, X_arr, y_arr),
         }
+        if bool(era_payload.get("enabled")):
+            # Validation labels are intentionally not persisted in the weight
+            # source payload; they are only used for the stop/rollback guard.
+            era_payload["validation_label_diagnostics"] = era_labels_for(
+                n_obs=(0 if validation_target is None else int(validation_target.shape[0])),
+                timestamps=validation_timestamps,
+                era_labels=validation_era_labels,
+            )[1]
+            self.training_metrics["era_boost"] = dict(era_payload)
+        self.persisted_feature_schema = dict(self.feature_schema)
         return self
 
     def predict(self, X: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("lgbm_model_not_fitted")
         columns = _expected_columns(self.feature_ids, model_name=self.model_name, model_spec=self.feature_schema)
-        X_arr = _matrix_from_features(X, columns)
+        X_arr = _matrix_from_features(
+            X,
+            columns,
+            feature_schema=getattr(self, "persisted_feature_schema", None) or self.feature_schema,
+            phase="serve",
+            model_name=self.model_name,
+        )
         raw = self.model.predict(X_arr)
         return np.asarray(raw, dtype=np.float32).reshape(-1)
 
     def predict_one(self, features: Mapping[str, Any]) -> float:
         return float(self.predict(features)[0])
+
+    def score_ood(self, features: Any) -> dict[str, Any]:
+        return score_ood(getattr(self, "ood_profile", None), features)
 
     def save(self, path: str | Path) -> Path:
         target = Path(path)
@@ -430,12 +1052,104 @@ def train_lgbm_regressor(
     sample_weight: Any = None,
     hyperparams: Mapping[str, Any] | None = None,
     model_name: str = DEFAULT_MODEL_NAME,
+    era_timestamps: Any = None,
+    era_labels: Any = None,
+    validation_data: tuple[Any, Any] | None = None,
+    validation_timestamps: Any = None,
+    validation_era_labels: Any = None,
 ) -> LGBMRegressorModel:
     return LGBMRegressorModel(
         model_name=str(model_name or DEFAULT_MODEL_NAME),
         feature_ids=feature_ids,
         hyperparams=hyperparams,
-    ).fit(X, y, sample_weight=sample_weight)
+    ).fit(
+        X,
+        y,
+        sample_weight=sample_weight,
+        era_timestamps=era_timestamps,
+        era_labels=era_labels,
+        validation_data=validation_data,
+        validation_timestamps=validation_timestamps,
+        validation_era_labels=validation_era_labels,
+    )
+
+
+def evaluate_lgbm_regressor(model: LGBMRegressorModel, X: Any, y: Any) -> dict[str, Any]:
+    """Evaluate a schema-bound LightGBM regressor on held-out rows."""
+
+    y_arr = np.asarray(y, dtype=np.float32).reshape(-1)
+    preds = np.asarray(model.predict(X), dtype=np.float32).reshape(-1)
+    if int(preds.shape[0]) != int(y_arr.shape[0]):
+        raise ValueError("lgbm_eval_row_count_mismatch")
+    if int(y_arr.shape[0]) <= 0:
+        return {"rmse": 0.0, "mae": 0.0, "n_eval": 0}
+    err = y_arr - preds
+    return {
+        "rmse": float(np.sqrt(np.mean(err * err))),
+        "mae": float(np.mean(np.abs(err))),
+        "n_eval": int(y_arr.shape[0]),
+    }
+
+
+def continue_lgbm_regressor(
+    model: LGBMRegressorModel,
+    X: Any,
+    y: Any,
+    *,
+    num_boost_round: int = 25,
+    sample_weight: Any = None,
+) -> LGBMRegressorModel:
+    """Continue a persisted LightGBM booster on a recent window.
+
+    PatchTST and other non-LightGBM families are intentionally out of scope for
+    this incremental path; they continue to use full retrains.
+    """
+
+    if model.model is None or not hasattr(model.model, "booster_"):
+        raise RuntimeError("lgbm_incremental_requires_fitted_booster")
+    columns = _expected_columns(model.feature_ids, model_name=model.model_name, model_spec=model.feature_schema)
+    X_arr = _matrix_from_features(
+        X,
+        columns,
+        feature_schema=getattr(model, "persisted_feature_schema", None) or model.feature_schema,
+        phase="serve",
+        model_name=model.model_name,
+    )
+    y_arr = np.asarray(y, dtype=np.float32).reshape(-1)
+    if int(X_arr.shape[0]) != int(y_arr.shape[0]):
+        raise ValueError("lgbm_incremental_row_count_mismatch")
+
+    hyperparams = dict(model.hyperparams or {})
+    hyperparams["n_estimators"] = max(1, int(num_boost_round or 25))
+    refreshed = LGBMRegressorModel(
+        model_name=str(model.model_name),
+        feature_ids=list(columns),
+        hyperparams=hyperparams,
+    )
+    refreshed.feature_preprocessing = dict(getattr(model, "feature_preprocessing", {}) or {})
+    refreshed.persisted_feature_schema = dict(getattr(model, "persisted_feature_schema", None) or model.feature_schema)
+    estimator = refreshed._new_estimator()
+    fit_kwargs: dict[str, Any] = {
+        "feature_name": list(columns),
+        "init_model": model.model.booster_,
+    }
+    if sample_weight is not None:
+        fit_kwargs["sample_weight"] = np.asarray(sample_weight, dtype=np.float32).reshape(-1)
+    estimator.fit(X_arr, y_arr, **fit_kwargs)
+    refreshed.model = estimator
+    refreshed.ood_profile = build_ood_profile(X_arr, columns)
+    refreshed.training_metrics = {
+        **dict(model.training_metrics or {}),
+        "incremental_refresh": True,
+        "n_refresh": int(y_arr.shape[0]),
+        "num_boost_round": int(hyperparams["n_estimators"]),
+        "model_family": str(refreshed.family),
+        "model_kind": str(refreshed.model_kind),
+        "feature_schema": refreshed.feature_schema,
+        "ood_profile_summary": summarize_ood_profile(refreshed.ood_profile),
+        **_fit_eval_metrics(estimator, X_arr, y_arr),
+    }
+    return refreshed
 
 
 def persist_model_artifact(
@@ -458,6 +1172,7 @@ def persist_model_artifact(
             "symbol": str(symbol or "*").upper(),
             "version": str(version),
             "feature_schema": dict(model.feature_schema),
+            "ood_profile_summary": summarize_ood_profile(getattr(model, "ood_profile", None)),
         },
     )
     return {
@@ -619,7 +1334,7 @@ def _load_training_rows(
             "source": str(source or ""),
         }
         snapshot = build_feature_snapshot(event=event, symbol=sym, feature_ids=list(feature_ids))
-        X_rows.append({feature_id: _safe_float(dict(snapshot).get(feature_id), 0.0) for feature_id in feature_ids})
+        X_rows.append({feature_id: _coerce_raw_feature_value(dict(snapshot).get(feature_id)) for feature_id in feature_ids})
         y_rows.append(_safe_float(impact_z, 0.0))
         meta_rows.append({"symbol": str(sym), "ts": int(ts_ms or 0), "horizon": int(horizon_s)})
     if include_metadata:
@@ -640,6 +1355,23 @@ def run_tabular_training_job(
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - int(cfg.get("training_window_days") or DEFAULT_LOOKBACK_DAYS) * 86_400_000
     feature_ids = list(cfg.get("feature_ids") or [])
+    try:
+        from engine.data.universe_pit import resolve_training_window_universe
+
+        con_universe = connect(readonly=True)
+        try:
+            pit_universe = resolve_training_window_universe(
+                con_universe,
+                configured_symbols=list(cfg.get("symbol_universe") or ["*"]),
+                lookback_days=int(cfg.get("training_window_days") or DEFAULT_LOOKBACK_DAYS),
+                as_of_ts_ms=int(now_ms),
+            )
+        finally:
+            con_universe.close()
+        if list(pit_universe.get("symbols") or []):
+            cfg["symbol_universe"] = list(pit_universe.get("symbols") or [])
+    except Exception:
+        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
     loaded_rows = _load_training_rows(
         cutoff_ms=int(cutoff_ms),
         horizon_s=int(cfg.get("horizon_s") or DEFAULT_HORIZON_S),
@@ -664,7 +1396,20 @@ def run_tabular_training_job(
         feature_ids=list(feature_ids),
         hyperparams=dict(cfg.get("hyperparams") or {}),
     )
-    model.fit(X_train, y_train)
+    fit_kwargs = {
+        "era_timestamps": [int((meta or {}).get("ts") or 0) for meta in meta_rows[:split]],
+        "validation_data": (X_eval, y_eval),
+        "validation_timestamps": [int((meta or {}).get("ts") or 0) for meta in meta_eval],
+    }
+    try:
+        signature = inspect.signature(model.fit)
+        parameters = dict(signature.parameters)
+        if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+            fit_kwargs = {key: value for key, value in fit_kwargs.items() if key in parameters}
+    # system-audit: ignore[silent_except] signature probing is optional compatibility filtering.
+    except (TypeError, ValueError):
+        pass
+    model.fit(X_train, y_train, **fit_kwargs)
     try:
         eval_pred = model.predict(X_eval)
         oos_run_id = str(uuid.uuid4())
@@ -734,6 +1479,8 @@ def main() -> int:
 __all__ = [
     "FAMILY",
     "LGBMRegressorModel",
+    "continue_lgbm_regressor",
+    "evaluate_lgbm_regressor",
     "load_model_from_artifact",
     "main",
     "persist_model_artifact",

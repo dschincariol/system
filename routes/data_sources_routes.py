@@ -12,6 +12,7 @@ import sys
 import time
 
 from engine.api.http_parsing import qs as _qs
+from engine.api.auth_config import safe_dev_localhost_fallback_enabled
 from services.data_source_manager import get_manager
 
 
@@ -86,7 +87,8 @@ def api_get_data_sources(parsed, _body=None, ctx=None):
         "templates": manager.list_source_templates(),
         "runtime": manager.get_runtime_snapshot(),
         "auth": {
-            "token_required": bool(str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip()),
+            "token_required": bool(str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip())
+            or not safe_dev_localhost_fallback_enabled(),
             "actor_required": True,
         },
         "desired_ingestion_jobs": manager.get_desired_ingestion_jobs(),

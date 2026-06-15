@@ -94,15 +94,18 @@ def get_timeseries_write_policy() -> TimeseriesWritePolicy:
     sqlite_write_enabled = _env_flag("PRICE_ROUTER_SQLITE_WRITE_ENABLED", "1")
     return TimeseriesWritePolicy(
         sqlite_write_enabled=bool(sqlite_write_enabled),
-        sqlite_prices_enabled=_env_flag(
-            "PRICE_ROUTER_SQLITE_PRICES_ENABLED",
-            "1" if sqlite_write_enabled else "0",
+        sqlite_prices_enabled=bool(
+            sqlite_write_enabled
+            and _env_flag("PRICE_ROUTER_SQLITE_PRICES_ENABLED", "1")
         ),
-        sqlite_quotes_enabled=_env_flag(
-            "PRICE_ROUTER_SQLITE_QUOTES_ENABLED",
-            "1" if sqlite_write_enabled else "0",
+        sqlite_quotes_enabled=bool(
+            sqlite_write_enabled
+            and _env_flag("PRICE_ROUTER_SQLITE_QUOTES_ENABLED", "1")
         ),
-        sqlite_raw_enabled=_env_flag("PRICE_ROUTER_SQLITE_RAW_ENABLED", "0"),
+        sqlite_raw_enabled=bool(
+            sqlite_write_enabled
+            and _env_flag("PRICE_ROUTER_SQLITE_RAW_ENABLED", "0")
+        ),
         require_async_during_cutover=_env_flag(
             "PRICE_ROUTER_REQUIRE_ASYNC_DURING_CUTOVER",
             "1",

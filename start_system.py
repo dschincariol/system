@@ -31,15 +31,28 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
+
+def _early_log_nonfatal(event: str, error: BaseException, **extra: Any) -> None:
+    try:
+        logging.getLogger("start_system.bootstrap").log(
+            logging.WARNING,
+            str(event),
+            exc_info=(type(error), error, error.__traceback__),
+            extra={
+                "event": str(event),
+                "component": "start_system",
+                "extra_json": dict(extra or {}),
+            },
+        )
+    except Exception:
+        _logging_unavailable = True
+
+
 try:
     import psutil  # type: ignore
 except Exception as e:
     psutil = None  # type: ignore
-    try:
-        sys.stderr.write(f"[start_system] psutil_import_failed: {type(e).__name__}: {e}\n")
-        sys.stderr.flush()
-    except Exception:
-        traceback.print_exc()
+    _early_log_nonfatal("START_SYSTEM_PSUTIL_IMPORT_FAILED", e)
 
 # ------------------------------------------------------------------
 # Absolute base directory (works under systemd + Windows)
@@ -64,11 +77,7 @@ def _env_file_has_nonempty_value(env_path: Path, key: str) -> bool:
     except FileNotFoundError:
         missing = True
     except Exception as e:
-        try:
-            sys.stderr.write(f"[start_system] env_file_read_failed: {type(e).__name__}: {e}\n")
-            sys.stderr.flush()
-        except Exception:
-            traceback.print_exc()
+        _early_log_nonfatal("START_SYSTEM_ENV_FILE_READ_FAILED", e, path=str(env_path), key=str(key))
     return False
 
 
@@ -188,17 +197,9 @@ def _safe_print(*args, **kwargs) -> None:
     try:
         print(*args, **kwargs)
     except OSError as e:
-        try:
-            sys.stderr.write(f"[start_system] safe_print_failed: {type(e).__name__}: {e}\n")
-            sys.stderr.flush()
-        except Exception:
-            traceback.print_exc()
+        _early_log_nonfatal("START_SYSTEM_SAFE_PRINT_FAILED", e)
     except Exception as e:
-        try:
-            sys.stderr.write(f"[start_system] safe_print_failed: {type(e).__name__}: {e}\n")
-            sys.stderr.flush()
-        except Exception:
-            traceback.print_exc()
+        _early_log_nonfatal("START_SYSTEM_SAFE_PRINT_FAILED", e)
 
 def _bootstrap_start_system_env() -> None:
     sys.dont_write_bytecode = True
@@ -356,11 +357,7 @@ def _initialize_data_source_manager_env() -> None:
         get_manager().initialize()
         get_manager().apply_runtime_environment()
     except Exception as e:
-        try:
-            sys.stderr.write(f"[start_system] data_source_manager_init_failed: {type(e).__name__}: {e}\n")
-            sys.stderr.flush()
-        except Exception:
-            traceback.print_exc()
+        _early_log_nonfatal("START_SYSTEM_DATA_SOURCE_MANAGER_INIT_FAILED", e)
 
 def _json_default(value):
     try:
@@ -370,11 +367,7 @@ def _json_default(value):
             return f"{type(value).__name__}: {value}"
         return str(value)
     except Exception as e:
-        try:
-            sys.stderr.write(f"[start_system] JSON_DEFAULT_FAILED: {type(e).__name__}: {e}\n")
-            sys.stderr.flush()
-        except Exception:
-            traceback.print_exc()
+        _early_log_nonfatal("START_SYSTEM_JSON_DEFAULT_FAILED", e, value_type=type(value).__name__)
         return repr(value)
 
 def _meta_set_json(key: str, payload) -> None:
@@ -945,13 +938,12 @@ def _log_swallowed(event: str, **extra) -> None:
             flush=False,
         )
     except Exception as e:
-        try:
-            sys.stderr.write(
-                f"[start_system] {event}: logging_failed: {type(e).__name__}: {e}; extra={json.dumps(extra or {}, default=_json_default, sort_keys=True)}\n"
-            )
-            sys.stderr.flush()
-        except Exception:
-            traceback.print_exc()
+        _early_log_nonfatal(
+            "START_SYSTEM_STRUCTURED_LOG_FAILURE_FAILED",
+            e,
+            original_event=str(event),
+            extra_keys=sorted(str(key) for key in list((extra or {}).keys())[:20]) if isinstance(extra, dict) else [],
+        )
 
 try:
     from engine.runtime.event_log import append_event
@@ -969,11 +961,20 @@ _INGESTION_RESTART_BLOCKED = False
 _INGESTION_WATCHDOG_THREAD: Optional[threading.Thread] = None
 _STARTUP_HEALTH_THREAD: Optional[threading.Thread] = None
 
+
+def _start_ingestion_with_server_enabled() -> bool:
+    enabled = str(os.environ.get("START_INGESTION_WITH_SERVER", "1")).strip().lower()
+    return enabled in ("1", "true", "yes", "on")
+
+
 def _watch_ingestion() -> None:
     global _INGESTION_PROC, _INGESTION_RESTART_TIMES, _INGESTION_RESTART_BLOCKED
 
     while not _INGESTION_WATCHDOG_STOP.is_set():
         try:
+            if not _start_ingestion_with_server_enabled():
+                return
+
             if _INGESTION_RESTART_BLOCKED:
                 _INGESTION_WATCHDOG_STOP.wait(max(0.25, float(_INGESTION_WATCHDOG_SLEEP_S)))
                 continue
@@ -1703,6 +1704,10 @@ def _terminate_ingestion() -> None:
 def _ensure_ingestion_watchdog_started() -> None:
     global _INGESTION_WATCHDOG_THREAD
 
+    if not _start_ingestion_with_server_enabled():
+        _INGESTION_WATCHDOG_STOP.set()
+        return
+
     thread = _INGESTION_WATCHDOG_THREAD
     if thread is not None and thread.is_alive():
         return
@@ -1715,8 +1720,7 @@ def _ensure_ingestion_watchdog_started() -> None:
 def _spawn_ingestion_if_enabled() -> None:
     global _INGESTION_PROC, _INGESTION_RESTART_BLOCKED, _INGESTION_RESTART_TIMES
 
-    enabled = str(os.environ.get("START_INGESTION_WITH_SERVER", "1")).strip().lower()
-    if enabled not in ("1", "true", "yes", "on"):
+    if not _start_ingestion_with_server_enabled():
         _INGESTION_RESTART_BLOCKED = False
         _terminate_ingestion()
         return
@@ -1986,7 +1990,8 @@ def _run_dashboard_server(run_server, *, mode: str) -> None:
 def _coerce_ts_ms(value: Any) -> int:
     try:
         return int(str(value or "0").strip() or "0")
-    except Exception:
+    except Exception as e:
+        _log_swallowed("COERCE_TS_MS_FAILED", error=str(e), value_type=type(value).__name__)
         return 0
 
 
@@ -1995,7 +2000,8 @@ def _dashboard_stop_requested() -> bool:
         module = sys.modules.get("dashboard_server")
         event = getattr(module, "_SERVER_STOP_EVENT", None) if module is not None else None
         return bool(callable(getattr(event, "is_set", None)) and event.is_set())
-    except Exception:
+    except Exception as e:
+        _log_swallowed("DASHBOARD_STOP_REQUEST_CHECK_FAILED", error=str(e))
         return False
 
 
@@ -2010,7 +2016,8 @@ def _dashboard_returned_after_clean_shutdown(
 
         if str(lifecycle.get("state") or "").strip().upper() == str(SHUTTING_DOWN):
             return True
-    except Exception:
+    except Exception as e:
+        _log_swallowed("DASHBOARD_SHUTTING_DOWN_STATE_IMPORT_FAILED", error=str(e))
         if str(lifecycle.get("state") or "").strip().upper() in {"SHUTTING_DOWN", "SHUTDOWN", "SHUTTING"}:
             return True
 

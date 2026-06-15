@@ -1,7 +1,18 @@
 import sqlite3
 
-from engine.strategy.ensemble.oos_store import ensure_schema, read_oos_predictions, upsert_oos_prediction
+import pytest
+
+from engine.strategy.ensemble.oos_store import _commit_if_possible, ensure_schema, read_oos_predictions, upsert_oos_prediction
 from engine.strategy.jobs.fill_ensemble_oos_targets import fill_targets_from_labels
+
+
+def test_commit_if_possible_propagates_commit_failure() -> None:
+    class _CommitFails:
+        def commit(self) -> None:
+            raise RuntimeError("commit failed")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        _commit_if_possible(_CommitFails())
 
 
 def test_oos_store_upsert_and_read_preserves_primary_key():

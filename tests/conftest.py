@@ -13,6 +13,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from engine.runtime.test_isolation import (  # noqa: E402
+    apply_runtime_test_defaults,
+    cleanup_runtime_test_state,
+    reset_runtime_test_env,
+)
+
+apply_runtime_test_defaults()
+reset_runtime_test_env()
+
+os.environ.setdefault("TS_TESTING", "1")
+os.environ.setdefault("TS_STORAGE_BACKEND", "sqlite")
+os.environ.setdefault("TS_PG_POOL_TIMEOUT", "0.1")
+os.environ.setdefault("TS_PG_CONNECT_TIMEOUT", "1")
+
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "linux_only: test runs only on Linux")
@@ -120,9 +134,27 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture(autouse=True)
-def _default_test_secrets(monkeypatch, tmp_path):
-    if os.environ.get("TS_SECRETS_PROVIDER"):
-        return
+def _default_test_secrets(monkeypatch, tmp_path, request):
+    cleanup_runtime_test_state(timeout_s=0.5)
+    reset_runtime_test_env()
+
+    for key in (
+        "PGPASSWORD",
+        "TS_PG_PASSWORD",
+        "TS_PG_PASSWORD_APP",
+        "TS_PG_APP_PASSWORD",
+        "TS_PG_PASSWORD_INGEST",
+        "TS_PG_INGEST_PASSWORD",
+        "TS_PG_PASSWORD_READER",
+        "TS_PG_READER_PASSWORD",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    node_path = str(getattr(request.node, "fspath", "") or "")
+    if not node_path.endswith("test_secrets_loader.py"):
+        monkeypatch.setenv("TS_CREDENTIAL_AUDIT_ENABLED", "0")
+    else:
+        monkeypatch.setenv("TS_CREDENTIAL_AUDIT_ENABLED", "1")
     secret_dir = tmp_path / "test_secrets"
     secret_dir.mkdir()
     for name, value in {
@@ -135,3 +167,8 @@ def _default_test_secrets(monkeypatch, tmp_path):
     monkeypatch.setenv("TS_SECRETS_PROVIDER", "plaintext")
     monkeypatch.setenv("TS_DEV_SECRETS_DIR", str(secret_dir))
     monkeypatch.delenv("TS_ENV", raising=False)
+    try:
+        yield
+    finally:
+        cleanup_runtime_test_state(timeout_s=0.5)
+        reset_runtime_test_env()

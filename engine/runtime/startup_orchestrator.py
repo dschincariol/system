@@ -19,6 +19,7 @@ from engine.runtime.health import run_preflight
 from engine.runtime.db_repair import repair as repair_db
 from engine.runtime.runtime_meta import meta_set
 from engine.runtime.ipc import market_data_status
+from engine.runtime.test_isolation import running_python_tests
 
 
 class StartupOrchestrator:
@@ -40,6 +41,8 @@ class StartupOrchestrator:
         self.daemon_start_timeout_s = max(1.0, float(os.environ.get("STARTUP_DAEMON_START_TIMEOUT_S", "10")))
         self.oneshot_start_timeout_s = max(1.0, float(os.environ.get("STARTUP_ONESHOT_START_TIMEOUT_S", "15")))
         self._warned_nonfatal_keys: set[str] = set()
+        self._progress_persist_lock = threading.Lock()
+        self._progress_persist_inflight = False
 
     def _isolated_ingestion_enabled(self) -> bool:
         raw = str(os.environ.get("START_INGESTION_WITH_SERVER", "0") or "").strip().lower()
@@ -102,6 +105,7 @@ class StartupOrchestrator:
             meta_set(
                 "startup_orchestrator_progress",
                 json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str),
+                best_effort=True,
             )
         except Exception as e:
             self._warn_nonfatal(
@@ -115,9 +119,20 @@ class StartupOrchestrator:
         # blocks on metadata writes.
         snapshot_steps = list(steps or [])
         snapshot_final = dict(final) if isinstance(final, dict) else None
+        if running_python_tests():
+            self._persist_progress(snapshot_steps, final=snapshot_final)
+            return
+        with self._progress_persist_lock:
+            if self._progress_persist_inflight:
+                return
+            self._progress_persist_inflight = True
 
         def _runner() -> None:
-            self._persist_progress(snapshot_steps, final=snapshot_final)
+            try:
+                self._persist_progress(snapshot_steps, final=snapshot_final)
+            finally:
+                with self._progress_persist_lock:
+                    self._progress_persist_inflight = False
 
         try:
             threading.Thread(

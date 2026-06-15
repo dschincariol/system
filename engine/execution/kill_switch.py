@@ -588,6 +588,19 @@ def set_kill_switch(
 
     if publish_side_effects:
         try:
+            from engine.execution.kill_switch_reactivity import notify_kill_switch_state_changed
+
+            notify_kill_switch_state_changed(enabled=bool(en), ts_ms=int(now_ms))
+        except Exception as e:
+            _warn_nonfatal(
+                "KILL_SWITCH_REACTIVITY_NOTIFY_FAILED",
+                e,
+                once_key=f"reactivity_notify:{scope_n}:{key_n}:{en}",
+                scope=str(scope_n),
+                key=str(key_n),
+                enabled=int(en),
+            )
+        try:
             from engine.cache.wrappers.kill_switch import prime_kill_switch
 
             prime_kill_switch()

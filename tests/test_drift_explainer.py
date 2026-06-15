@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from engine.api import drift_explainer
 from engine.api.drift_explainer import build_drift_explainer_snapshot
 
 
@@ -130,6 +131,29 @@ def test_drift_explainer_handles_no_active_drift() -> None:
     assert payload["status"]["severity"] == "OK"
     assert any(row["source"] == "equity_drift" for row in payload["contributors"])
     assert any(item["field"] == "affected.models" for item in payload["unavailable"])
+
+
+def test_drift_explainer_warns_on_owned_connection_close_failure(monkeypatch) -> None:
+    inner = sqlite3.connect(":memory:")
+    _init_schema(inner)
+
+    class CloseFailsConnection:
+        def execute(self, *args, **kwargs):
+            return inner.execute(*args, **kwargs)
+
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(drift_explainer, "connect_ro_direct", lambda: CloseFailsConnection())
+    monkeypatch.setattr(drift_explainer, "_warn_nonfatal", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    payload = drift_explainer.build_drift_explainer_snapshot(now_ms=1_700_000_000_000)
+    inner.close()
+
+    assert payload["ok"] is True
+    assert calls
+    assert calls[0][0][0] == "DRIFT_EXPLAINER_CLOSE_FAILED"
 
 
 def test_drift_explainer_handles_active_drift_with_available_attribution() -> None:

@@ -4,6 +4,30 @@ from typing import Any, Callable, Dict
 
 WarnNonfatal = Callable[..., None]
 
+
+def _is_sqlite_connection(con: Any) -> bool:
+    module = str(type(con).__module__ or "").lower()
+    if "sqlite" in module:
+        return True
+    if "storage_pg" in module or "psycopg" in module:
+        return False
+    raw = getattr(con, "raw", None)
+    raw_module = str(type(raw).__module__ or "").lower()
+    if "storage_pg" in raw_module or "psycopg" in raw_module:
+        return False
+    try:
+        con.execute("SELECT sqlite_version()").fetchone()
+        return True
+    except Exception:
+        rollback = getattr(con, "rollback", None)
+        if callable(rollback):
+            try:
+                rollback()
+            # system-audit: ignore[silent_except] no-op-guard: allow sqlite probe rollback is best-effort cleanup.
+            except Exception:
+                pass
+        return False
+
 OWNED_LIVE_TABLE_COLUMN_SPECS: Dict[str, Dict[str, Dict[str, object]]] = {
     "prices": {
         "ts_ms": {"type": "INTEGER", "pk": 2},
@@ -226,7 +250,17 @@ CREATE INDEX IF NOT EXISTS idx_options_symbol_ingestion_disabled
 
 
 def _table_exists(con, table: str) -> bool:
-    row = con.execute(
+    if _is_sqlite_connection(con):
+        cursor = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (str(table),),
+        )
+        fetchone = getattr(cursor, "fetchone", None)
+        if not callable(fetchone):
+            return False
+        row = fetchone()
+        return bool(row)
+    cursor = con.execute(
         """
         SELECT 1
         FROM information_schema.tables
@@ -235,11 +269,24 @@ def _table_exists(con, table: str) -> bool:
         LIMIT 1
         """,
         (str(table),),
-    ).fetchone()
+    )
+    fetchone = getattr(cursor, "fetchone", None)
+    if not callable(fetchone):
+        return False
+    row = fetchone()
     return bool(row)
 
 
 def _table_column_specs(con, table: str) -> Dict[str, Dict[str, object]]:
+    if _is_sqlite_connection(con):
+        rows = con.execute(f"PRAGMA table_info({str(table)})").fetchall() or []
+        return {
+            str(row[1]).strip().lower(): {
+                "type": str(row[2] or "").strip().upper(),
+                "pk": int(row[5] or 0),
+            }
+            for row in rows
+        }
     rows = con.execute(
         """
         SELECT
@@ -278,8 +325,20 @@ def _has_column(con, table: str, col: str) -> bool:
     return str(col).strip().lower() in _table_column_specs(con, str(table))
 
 
+def _execute_script(con, script: str) -> None:
+    executescript = getattr(con, "executescript", None)
+    if callable(executescript):
+        executescript(script)
+        return
+    for statement in str(script or "").split(";"):
+        sql = statement.strip()
+        if sql:
+            con.execute(sql)
+
+
 def ensure_prices_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
     needs_rebuild = False
+    legacy_table = ""
     if _table_exists(con, "prices"):
         expected_specs = OWNED_LIVE_TABLE_COLUMN_SPECS["prices"]
         actual_specs = _table_column_specs(con, "prices")
@@ -293,8 +352,14 @@ def ensure_prices_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
                 for column_name, expected_spec in expected_specs.items()
             )
         )
-    if needs_rebuild and _table_exists(con, "prices") and not _table_exists(con, "prices_legacy_exact_once"):
-        con.execute("ALTER TABLE prices RENAME TO prices_legacy_exact_once")
+    if needs_rebuild and _table_exists(con, "prices"):
+        legacy_table = "prices_legacy_exact_once"
+        if _table_exists(con, legacy_table):
+            idx = 2
+            while _table_exists(con, f"prices_legacy_exact_once_{idx}"):
+                idx += 1
+            legacy_table = f"prices_legacy_exact_once_{idx}"
+        con.execute(f"ALTER TABLE prices RENAME TO {legacy_table}")
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS prices (
@@ -313,9 +378,13 @@ def ensure_prices_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
           ON prices(symbol, ts_ms)
         """
     )
-    if _table_exists(con, "prices_legacy_exact_once"):
+    if not _is_sqlite_connection(con):
+        con.execute("ALTER TABLE prices ADD COLUMN IF NOT EXISTS extra_json JSONB")
+    if not legacy_table and _table_exists(con, "prices_legacy_exact_once"):
+        legacy_table = "prices_legacy_exact_once"
+    if legacy_table and _table_exists(con, legacy_table):
         try:
-            legacy_specs = _table_column_specs(con, "prices_legacy_exact_once")
+            legacy_specs = _table_column_specs(con, legacy_table)
             legacy_columns = set(legacy_specs)
             price_expr = "price" if "price" in legacy_columns else ("px" if "px" in legacy_columns else "NULL")
             if "px" in legacy_columns and "price" in legacy_columns:
@@ -326,12 +395,12 @@ def ensure_prices_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
                 px_expr = "price"
             else:
                 px_expr = "NULL"
-            source_expr = "source" if "source" in legacy_columns else "NULL"
+            source_expr = "source" if "source" in legacy_columns else ("provider" if "provider" in legacy_columns else "NULL")
             con.execute(
                 f"""
                 INSERT OR REPLACE INTO prices(ts_ms, symbol, price, px, source)
                 SELECT ts_ms, symbol, {price_expr}, {px_expr}, {source_expr}
-                FROM prices_legacy_exact_once
+                FROM {legacy_table}
                 """
             )
         except Exception as e:
@@ -565,7 +634,8 @@ def ensure_ingestion_pipeline_health_schema(con, *, warn_nonfatal: WarnNonfatal)
 
 
 def ensure_price_feed_lock_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
-    con.executescript(
+    _execute_script(
+        con,
         """
         CREATE TABLE IF NOT EXISTS price_feed_lock(
           id INTEGER PRIMARY KEY,
@@ -575,6 +645,21 @@ def ensure_price_feed_lock_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
         );
         """
     )
+    if not _is_sqlite_connection(con):
+        for column_name, ddl in (
+            ("owner", "TEXT NOT NULL DEFAULT ''"),
+            ("pid", "BIGINT NOT NULL DEFAULT 0"),
+            ("ts_ms", "BIGINT NOT NULL DEFAULT 0"),
+        ):
+            try:
+                con.execute(f"ALTER TABLE price_feed_lock ADD COLUMN IF NOT EXISTS {column_name} {ddl};")
+            except Exception as e:
+                warn_nonfatal(
+                    "STORAGE_PRICE_FEED_LOCK_MIGRATION_FAILED",
+                    e,
+                    table="price_feed_lock",
+                    column=str(column_name),
+                )
     for column_name, ddl in (
         ("owner", "TEXT NOT NULL DEFAULT ''"),
         ("pid", "INTEGER NOT NULL DEFAULT 0"),
@@ -593,7 +678,8 @@ def ensure_price_feed_lock_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
 
 
 def ensure_options_symbol_ingestion_state_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
-    con.executescript(
+    _execute_script(
+        con,
         """
         CREATE TABLE IF NOT EXISTS options_symbol_ingestion_state (
           symbol TEXT NOT NULL PRIMARY KEY,

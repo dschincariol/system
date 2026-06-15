@@ -57,7 +57,7 @@ Closest current substitutes:
 | [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md) | Canonical | Data-source UI, routes, storage tables, mutation payloads, and runtime lifecycle rules. |
 | [DATA_CONTRACTS.md](DATA_CONTRACTS.md) | Canonical | Current payload, row, and response contracts that cross subsystem boundaries. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | Canonical | Runtime observability signals, operator APIs, and telemetry ownership. |
-| [README_DATABASE_MAP.md](README_DATABASE_MAP.md) | Canonical | SQLite table families, key tables, and data-flow-oriented schema reference. |
+| [README_DATABASE_MAP.md](README_DATABASE_MAP.md) | Canonical | Runtime storage table families, key tables, and data-flow-oriented schema reference. |
 | [DOCSTRING_STYLE.md](DOCSTRING_STYLE.md) | Canonical | NumPy-style docstring contract for touched Python modules, classes, and functions. |
 | [openapi/README.md](openapi/README.md) | Canonical | Location and maintenance rule for the incremental OpenAPI source of truth. |
 | [README_FUNCTION_MAP.md](README_FUNCTION_MAP.md) | Supplementary | Function-level navigation for large Python entrypoints and major subsystems. |
@@ -85,7 +85,6 @@ Known reference gaps:
 | [../CHANGELOG.md](../CHANGELOG.md) | Canonical | You need the forward-maintained record of notable changes from the documented baseline onward. |
 | [adr/README.md](adr/README.md) | Canonical | You need the decision log format or need to add or supersede an ADR. |
 | [LICENSING_NOTE.md](LICENSING_NOTE.md) | Canonical | You need the current repo licensing status and the reason external reuse is blocked. |
-| [FINAL_DOCS_AUDIT.md](FINAL_DOCS_AUDIT.md) | Supplementary | You need the outcome of the latest final documentation verification pass. |
 
 ## Explanation
 
@@ -96,7 +95,6 @@ Known reference gaps:
 | [README_ARCHITECTURE.md](README_ARCHITECTURE.md) | Supplementary | You want a shorter architecture-oriented walkthrough alongside the canonical architecture reference. |
 | [README_SEQUENCE_DIAGRAMS.md](README_SEQUENCE_DIAGRAMS.md) | Canonical | You need startup, decision, governance, or dashboard flows in sequence form. |
 | [README_DEVELOPER_MAP.md](README_DEVELOPER_MAP.md) | Supplementary | You want a narrative cross-repo navigation guide and common edit paths. |
-| [DOCS_AUDIT.md](DOCS_AUDIT.md) | Supplementary | You need the current documentation inventory, duplication analysis, and prioritized gaps. |
 | [STORAGE_MIGRATION_BACKLOG.md](STORAGE_MIGRATION_BACKLOG.md) | Supplementary | You are executing or reviewing the phased SQLite to Postgres or Timescale migration backlog and need the phase gates, audits, and rollback rules. |
 | [README_UI_REDESIGN_PLAN.md](README_UI_REDESIGN_PLAN.md) | Supplementary | You are evaluating forward-looking UI restructuring work, not current runtime behavior. |
 | [handoff/TRADING_SYSTEM_HANDOFF.md](handoff/TRADING_SYSTEM_HANDOFF.md) | Supplementary | You need recent AI-session context or strategic roadmap material. |

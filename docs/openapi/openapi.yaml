@@ -141,6 +141,74 @@ components:
         execution_barrier:
           $ref: '#/components/schemas/ExecutionBarrier'
       additionalProperties: true
+    TerminalOrderRequest:
+      type: object
+      required: [symbol, side, qty]
+      description: |
+        Browser-terminal manual quantity order request. A successful request is
+        persisted as a `portfolio_orders` row with neutral weight fields:
+        `from_weight = 0.0`, `to_weight = 0.0`, and `delta_weight = 0.0`.
+        Quantity is stored in `explain_json.terminal_order`, where `qty` is
+        positive and `signed_qty` is derived from `side` (`BUY` positive,
+        `SELL` negative).
+      properties:
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [BUY, SELL]
+        qty:
+          type: number
+          exclusiveMinimum: 0
+          description: Positive share/unit quantity requested by the operator.
+      additionalProperties: true
+    TerminalOrderResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [BUY, SELL]
+        qty:
+          type: number
+        error:
+          type: string
+        gate:
+          $ref: '#/components/schemas/ExecutionBarrier'
+      additionalProperties: true
+    TerminalFlattenRequest:
+      type: object
+      required: [symbol]
+      description: |
+        Browser-terminal flatten request. The server reads the current broker
+        position, derives side and absolute quantity, and persists the same
+        neutral-weight terminal quantity encoding used by manual orders with
+        `explain_json.terminal_order.flatten = true`.
+      properties:
+        symbol:
+          type: string
+      additionalProperties: true
+    TerminalFlattenResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        symbol:
+          type: string
+        flatten_qty:
+          type: number
+        message:
+          type: string
+        error:
+          type: string
+        gate:
+          $ref: '#/components/schemas/ExecutionBarrier'
+      additionalProperties: true
 paths:
   /api/health:
     get:
@@ -824,6 +892,11 @@ paths:
         intent only when `execution_gate_snapshot()` reports that real trading
         is currently allowed. When `DASHBOARD_API_TOKEN` is configured, the
         transport layer requires `X-API-Token` or `token`.
+
+        Manual quantity is not stored in `delta_weight`. Successful requests
+        persist neutral weight fields and carry quantity under
+        `explain_json.terminal_order`; the execution-intent loader exposes that
+        as signed `qty` with `order_sizing = "quantity"`.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -831,24 +904,14 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [symbol, side, qty]
-              properties:
-                symbol:
-                  type: string
-                side:
-                  type: string
-                  enum: [BUY, SELL]
-                qty:
-                  type: number
-              additionalProperties: true
+              $ref: '#/components/schemas/TerminalOrderRequest'
       responses:
         '200':
           description: Terminal order acknowledgement or execution-blocked response.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/FreeformObject'
+                $ref: '#/components/schemas/TerminalOrderResponse'
         '403':
           description: Mutation auth failed.
           content:
@@ -865,6 +928,11 @@ paths:
         and quantity, and writes a portfolio-order intent instead of mutating
         positions directly. When `DASHBOARD_API_TOKEN` is configured, the
         transport layer requires `X-API-Token` or `token`.
+
+        Flatten uses the same terminal quantity contract as manual orders:
+        neutral weight fields in `portfolio_orders`, positive absolute quantity
+        and derived signed quantity in `explain_json.terminal_order`, and
+        `flatten = true`.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -872,19 +940,14 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [symbol]
-              properties:
-                symbol:
-                  type: string
-              additionalProperties: true
+              $ref: '#/components/schemas/TerminalFlattenRequest'
       responses:
         '200':
           description: Terminal flatten acknowledgement, no-position message, or execution-blocked response.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/FreeformObject'
+                $ref: '#/components/schemas/TerminalFlattenResponse'
         '403':
           description: Mutation auth failed.
           content:

@@ -307,11 +307,18 @@ def init_hmm_regime_schema() -> None:
 
 
 def _ensure_hmm_artifact_columns(con) -> None:
-    for sql in (
-        "ALTER TABLE hmm_regime_models ADD COLUMN IF NOT EXISTS artifact_sha256 TEXT",
-        "ALTER TABLE hmm_regime_models ADD COLUMN IF NOT EXISTS artifact_alias TEXT",
+    cols = {
+        str(row[1] or "").strip().lower()
+        for row in (con.execute("PRAGMA table_info(hmm_regime_models)").fetchall() or [])
+        if row and len(row) > 1
+    }
+    for column_name in (
+        "artifact_sha256",
+        "artifact_alias",
     ):
-        con.execute(sql)
+        if column_name not in cols:
+            con.execute(f"ALTER TABLE hmm_regime_models ADD COLUMN {column_name} TEXT")
+            cols.add(column_name)
 
 
 def _hmm_artifact_alias(symbol: str) -> str:

@@ -77,7 +77,10 @@ def main() -> int:
             component="engine.execution.jobs.repair_trade_attribution_history",
             persist=False,
         )
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    LOG.info(
+        "repair_trade_attribution_history_result result=%s",
+        json.dumps(payload, indent=2, sort_keys=True),
+    )
     return 0 if bool(payload.get("ok")) else 2
 
 

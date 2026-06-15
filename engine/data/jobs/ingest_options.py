@@ -2,6 +2,19 @@
 FILE: ingest_options.py
 
 Job entrypoint or scheduled task for `ingest_options`.
+
+README:
+- Source: Polygon options snapshots normalized into ``options_chain_v2`` and
+  mirrored legacy option-chain rows where available.
+- Cadence: registered in ``engine/runtime/job_registry.py`` with an explicit
+  300 second cadence; individual symbols degrade independently on provider
+  errors.
+- Availability lag: raw contract snapshots and derived symbol features use the
+  provider snapshot timestamp as availability. Feature consumers must require
+  ``snapshot_ts_ms <= asof_ts_ms``.
+- Caveats: GEX is a naive dealer-positioning convention used for volatility
+  regime conditioning, not direction. Flow imbalance is a snapshot proxy built
+  from volume and OI changes, not trade-level signed order flow.
 """
 
 import os

@@ -12,10 +12,14 @@ Use this checklist before moving from safe/paper operation to live trading.
 
 ## Storage
 
-- SQLite is used only for control-plane state, configuration, audit records, and small local state.
-- High-volume price/quote/raw writes use async/Timescale or another append-oriented store.
+- Postgres runtime storage is reachable through `TS_PG_DSN` or the platform default DSN, and `python engine/runtime/prod_preflight.py --json` reports the storage contract as healthy.
+- `DB_PATH` points at an absolute local data directory for artifacts, diagnostics, and legacy identity only. It is not the runtime database.
+- SQLite is used only for isolated Python tests or explicit legacy compatibility checks, not live control-plane state.
+- High-volume price/quote/raw writes use async/Timescale or another append-oriented store when those sidecars are enabled.
+- Storage readiness and startup gates are fail closed: unresolved `database_reachable` or `schema_valid` blockers must prevent live enablement.
 - `PRICE_ROUTER_BLOCK_SYNC_SQLITE_IN_LIVE=1`
 - `PRICE_ROUTER_ALLOW_SYNC_SQLITE_IN_LIVE=0` unless a live exception is explicitly documented.
+- Postgres backup, WAL archive, and restore-drill evidence under `ops/backup/` is current enough for the intended RPO/RTO.
 
 ## Paper Soak
 

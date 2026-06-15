@@ -12,6 +12,7 @@ import textwrap
 import pytest
 
 from services.credential_encryption import decrypt_credentials, encrypt_credentials
+from services.secrets import loader
 from services.secrets.rotation import re_encrypt_data_sources
 
 
@@ -38,6 +39,7 @@ def test_re_encrypt_data_sources_moves_rows_to_new_key(monkeypatch, tmp_path):
     monkeypatch.setenv("TS_SECRETS_PROVIDER", "plaintext")
     monkeypatch.setenv("TS_DEV_SECRETS_DIR", str(secret_dir))
     monkeypatch.delenv("TS_ENV", raising=False)
+    monkeypatch.setattr(loader, "_insert_access_log", lambda **_kwargs: None)
     sys.modules.pop("services.secrets.providers.plaintext", None)
 
     con = sqlite3.connect(":memory:")
@@ -73,6 +75,9 @@ def test_re_encrypt_data_sources_moves_rows_to_new_key(monkeypatch, tmp_path):
     assert result["scanned"] == 5
     assert result["rotated"] == 5
     assert result["verified"] == 5
+    assert result["old_key_deleted"] == 1
+    assert not (secret_dir / "key_a").exists()
+    assert (secret_dir / "key_b").exists()
 
     rows = con.execute("SELECT credentials_enc, key_version FROM data_sources ORDER BY id").fetchall()
     for idx, row in enumerate(rows):

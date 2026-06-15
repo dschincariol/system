@@ -18,6 +18,13 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _rows_to_dicts(cursor) -> list[dict[str, Any]]:
     rows = cursor.fetchall()
     columns = [desc[0] for desc in (cursor.description or [])]
@@ -95,10 +102,18 @@ def fill_targets_from_labels(
         cutoff_ts = int(now_value - max(0, delay_value))
         rows = _candidate_target_rows(con, cutoff_ts=cutoff_ts, limit=limit_value)
         updated = update_targets(rows, con=con, ensure=False)
-        try:
-            con.commit()
-        except Exception:
-            logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+        hedge_refresh: dict[str, Any] | None = None
+        if int(updated) > 0 and _env_bool("ENSEMBLE_HEDGE_REFRESH_ON_TARGET_FILL", True):
+            try:
+                from engine.strategy.ensemble.hedge import refresh_hedge_weights
+
+                hedge_refresh = refresh_hedge_weights(con=con, now_ms=now_value)
+            except Exception as exc:
+                hedge_refresh = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+        con.commit()
         return {
             "ok": True,
             "updated_count": int(updated),
@@ -106,6 +121,7 @@ def fill_targets_from_labels(
             "cutoff_ts": int(cutoff_ts),
             "delay_ms": int(delay_value),
             "limit": int(limit_value),
+            "hedge_refresh": hedge_refresh,
         }
     finally:
         if own:

@@ -70,8 +70,10 @@ def _load_prices(
     """
     Returns ascending list[(ts_ms, price)] up to ts_ms inclusive.
     """
+    owns = False
     if con is None:
         con = connect()
+        owns = True
     try:
         rows = con.execute(
             """
@@ -84,16 +86,17 @@ def _load_prices(
             (str(symbol), int(ts_ms), int(lookback)),
         ).fetchall()
     finally:
-        try:
-            con.close()
-        except Exception as e:
-            _warn_nonfatal(
-                "TECH_INDICATORS_CLOSE_FAILED",
-                e,
-                once_key="load_prices_close",
-                symbol=str(symbol),
-                ts_ms=int(ts_ms),
-            )
+        if owns:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "TECH_INDICATORS_CLOSE_FAILED",
+                    e,
+                    once_key="load_prices_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
 
     out = []
     for t, p in (rows or []):
@@ -345,6 +348,16 @@ def compute_tech_features(symbol: str, ts_ms: int) -> Dict[str, float]:
 
         vv = vol_of_vol(px, RV_N, VOV_N)
         out["vol_of_vol"] = float(vv)
+
+        try:
+            from engine.strategy.har_rv import har_feature_values
+
+            har_values = har_feature_values(con, str(symbol).upper(), int(ts_ms)) or {}
+            out["har_rv_forecast_1d"] = float(har_values.get("tech.har_rv_forecast_1d", 0.0) or 0.0)
+            out["har_rv_forecast_ratio"] = float(har_values.get("tech.har_rv_forecast_ratio", 0.0) or 0.0)
+        except Exception:
+            out["har_rv_forecast_1d"] = 0.0
+            out["har_rv_forecast_ratio"] = 0.0
 
         out.update(_market_regime_features(px))
 

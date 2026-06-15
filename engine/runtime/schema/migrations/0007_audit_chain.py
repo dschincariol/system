@@ -11,6 +11,7 @@ from engine.runtime.schema.table_classification import audit_tables
 
 id = 7
 description = "audit ledger hash chains"
+LOG = logging.getLogger(__name__)
 
 
 def up(conn) -> None:
@@ -83,7 +84,7 @@ def _update_hashes(
         ):
             return
     except Exception:
-        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+        LOG.debug("audit_chain_ctid_backfill_failed table=%s", table_name, exc_info=True)
     conn.execute(
         f"UPDATE {_ident(table_name)} SET prev_hash = ?, row_hash = ? WHERE rowid = ?",
         (prev_hash, row_hash, int(index) + 1),
@@ -98,6 +99,7 @@ def _try_execute(conn, savepoint_name: str, sql: str, params=None) -> bool:
         conn.execute(f"RELEASE SAVEPOINT {sp}")
         return True
     except Exception:
+        LOG.debug("audit_chain_try_execute_failed savepoint=%s sql=%s", savepoint_name, sql, exc_info=True)
         try:
             conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
         finally:
@@ -113,6 +115,7 @@ def _try_fetchone(conn, savepoint_name: str, sql: str, params=None):
         conn.execute(f"RELEASE SAVEPOINT {sp}")
         return True, row
     except Exception:
+        LOG.debug("audit_chain_try_fetchone_failed savepoint=%s sql=%s", savepoint_name, sql, exc_info=True)
         try:
             conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
         finally:
@@ -157,11 +160,12 @@ def _table_exists(conn, table_name: str) -> bool:
         if row:
             return True
     else:
-        logging.getLogger(__name__).debug("Ignored recoverable exception.")
+        LOG.debug("audit_chain_information_schema_table_lookup_failed table=%s", table_name)
     try:
         row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (str(table_name),)).fetchone()
         return bool(row)
     except Exception:
+        LOG.warning("audit_chain_sqlite_table_lookup_failed table=%s", table_name, exc_info=True)
         return False
 
 
@@ -183,11 +187,17 @@ def _column_exists(conn, table_name: str, column_name: str) -> bool:
         if row:
             return True
     else:
-        logging.getLogger(__name__).debug("Ignored recoverable exception.")
+        LOG.debug("audit_chain_information_schema_column_lookup_failed table=%s column=%s", table_name, column_name)
     try:
         rows = conn.execute(f"PRAGMA table_info({_ident(table_name)})").fetchall() or []
         return any(str(row[1]) == str(column_name) for row in rows)
     except Exception:
+        LOG.warning(
+            "audit_chain_sqlite_column_lookup_failed table=%s column=%s",
+            table_name,
+            column_name,
+            exc_info=True,
+        )
         return False
 
 
@@ -196,7 +206,7 @@ def _row_dict(row, columns: list[str]) -> dict[str, Any]:
         try:
             return {str(key): row[key] for key in row.keys()}
         except Exception:
-            logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+            LOG.debug("audit_chain_row_mapping_conversion_failed", exc_info=True)
     return {str(columns[idx]): row[idx] for idx in range(min(len(columns), len(row)))}
 
 

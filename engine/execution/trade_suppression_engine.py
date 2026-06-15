@@ -420,8 +420,12 @@ def evaluate_trade_suppression(
     actor: str = "system",
     mode: str = "unknown",
     broker: str = "unknown",
+    initialize_storage: bool = True,
+    now_ms: int | None = None,
+    persist_runtime_state: bool = True,
 ) -> Dict[str, Any]:
-    init_db()
+    if bool(initialize_storage):
+        init_db()
 
     owns = False
     if con is None:
@@ -448,7 +452,7 @@ def evaluate_trade_suppression(
             execution_degradation=execution_degradation,
         )
 
-        ts_ms = _now_ms()
+        ts_ms = int(now_ms if now_ms is not None else _now_ms())
         audit = {
             "fp_streak": int(fp_streak),
             "slippage": slip,
@@ -520,15 +524,16 @@ def evaluate_trade_suppression(
             ),
         )
 
-        try:
-            set_state("tse_state", str(action.get("state") or "NONE"))
-            set_state("tse_action", str(action.get("action") or "NONE"))
-            set_state("tse_reason", str(action.get("reason") or ""))
-            set_state("tse_size_mult", str(float(action.get("size_mult") or 1.0)))
-            set_state("tse_throttle_mult", str(float(action.get("throttle_mult") or 1.0)))
-            set_state("execution_pause", "1" if int(action.get("hard_block") or 0) == 1 else "0")
-        except Exception as e:
-            _warn_nonfatal("TRADE_SUPPRESSION_ENGINE_STATE_WRITE_FAILED", e, state=str(action.get("state") or "NONE"))
+        if bool(persist_runtime_state):
+            try:
+                set_state("tse_state", str(action.get("state") or "NONE"))
+                set_state("tse_action", str(action.get("action") or "NONE"))
+                set_state("tse_reason", str(action.get("reason") or ""))
+                set_state("tse_size_mult", str(float(action.get("size_mult") or 1.0)))
+                set_state("tse_throttle_mult", str(float(action.get("throttle_mult") or 1.0)))
+                set_state("execution_pause", "1" if int(action.get("hard_block") or 0) == 1 else "0")
+            except Exception as e:
+                _warn_nonfatal("TRADE_SUPPRESSION_ENGINE_STATE_WRITE_FAILED", e, state=str(action.get("state") or "NONE"))
 
         return {
             "ok": True,

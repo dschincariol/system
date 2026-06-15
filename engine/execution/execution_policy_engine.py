@@ -53,6 +53,9 @@ from engine.strategy.regime_stack import (
     regime_compatibility,
     regime_model_version,
 )
+from engine.strategy.meta_labeling import score_order_meta_label
+from engine.strategy.conformal import conformal_gate_from_payload
+from engine.strategy.ood import ood_gate_from_payload
 
 
 LOG = logging.getLogger("engine.execution.execution_policy_engine")
@@ -289,7 +292,14 @@ def _normalize_signal_ts(o: Dict[str, Any], default_signal_ts_ms: Optional[int])
 def _regime_compatibility(con, symbol: str, signal_ts: int, o: Dict[str, Any]) -> Tuple[float, Optional[Dict[str, Any]]]:
     try:
         regime_vec = compute_regime_vector(symbol=symbol, ts_ms=int(signal_ts), con=con)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "EXECUTION_POLICY_ENGINE_REGIME_VECTOR_FAILED",
+            e,
+            once_key=f"regime_vector:{symbol}",
+            symbol=str(symbol),
+            signal_ts=int(signal_ts),
+        )
         regime_vec = None
 
     try:
@@ -298,7 +308,14 @@ def _regime_compatibility(con, symbol: str, signal_ts: int, o: Dict[str, Any]) -
             regime_comp = float(regime_compatibility(prof, regime_vec))
         else:
             regime_comp = 1.0
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "EXECUTION_POLICY_ENGINE_REGIME_COMPAT_FAILED",
+            e,
+            once_key=f"regime_compat:{symbol}",
+            symbol=str(symbol),
+            signal_ts=int(signal_ts),
+        )
         regime_comp = 1.0
 
     if not (regime_comp == regime_comp):
@@ -429,6 +446,15 @@ def apply_execution_policy(
     portfolio_orders_batch_id: Optional[int] = None,
     portfolio_orders_id: Optional[int] = None,
     default_signal_ts_ms: Optional[int] = None,
+    now_ms: Optional[int] = None,
+    initialize_storage: bool = True,
+    execution_allowed_fn: Any = None,
+    trade_suppression_fn: Any = None,
+    capital_preservation_fn: Any = None,
+    execution_mode_fn: Any = None,
+    risk_state_getter_fn: Any = None,
+    regime_compatibility_fn: Any = None,
+    execution_feedback_fn: Any = None,
 ) -> List[Dict[str, Any]]:
     """Filter and transform candidate orders into execution-ready instructions.
 
@@ -482,7 +508,8 @@ def apply_execution_policy(
     Initializes execution tables, reads runtime risk state, and writes
     suppression or decision-audit records for blocked or transformed orders.
     """
-    init_db()
+    if bool(initialize_storage):
+        init_db()
 
     payload = list(intents if intents is not None else (orders or []))
     shaped: List[Dict[str, Any]] = []
@@ -496,7 +523,8 @@ def apply_execution_policy(
     try:
         _ensure_tables(con)
 
-        allow, ks_reason, ks_meta = execution_allowed(con=con, symbol=None, regime=None)
+        resolved_execution_allowed = execution_allowed_fn or execution_allowed
+        allow, ks_reason, ks_meta = resolved_execution_allowed(con=con, symbol=None, regime=None)
         if not allow:
             for o in payload:
                 if isinstance(o, dict):
@@ -508,11 +536,16 @@ def apply_execution_policy(
                     )
             return []
 
-        tse = evaluate_trade_suppression(
+        now_ms = int(now_ms if now_ms is not None else _now_ms())
+        resolved_trade_suppression = trade_suppression_fn or evaluate_trade_suppression
+        tse = resolved_trade_suppression(
             con=con,
             actor=str(actor or "system"),
             mode=str(mode or "unknown"),
             broker=str(broker or "unknown"),
+            initialize_storage=bool(initialize_storage),
+            now_ms=int(now_ms),
+            persist_runtime_state=bool(initialize_storage),
         ) or {"state": "NONE", "action": "NONE", "size_mult": 1.0, "throttle_mult": 1.0, "hard_block": False}
 
         if bool(tse.get("hard_block")):
@@ -522,18 +555,23 @@ def apply_execution_policy(
                         o=o,
                         reason=f"tse_hard_block:{str(tse.get('reason') or '')}",
                         decision_json={"blocked_by": "tse", "tse": tse},
-                        execution_policy_json={"tse": tse, "execution_mode": get_execution_mode()},
+                        execution_policy_json={"tse": tse, "execution_mode": (execution_mode_fn or get_execution_mode)()},
                     )
             return []
 
-        now_ms = _now_ms()
-
         try:
-            cpm_snapshot = update_capital_preservation_mode(con=con) or {}
-        except Exception:
+            resolved_capital_preservation = capital_preservation_fn or update_capital_preservation_mode
+            cpm_snapshot = resolved_capital_preservation(con=con) or {}
+        except Exception as e:
+            _warn_nonfatal(
+                "EXECUTION_POLICY_ENGINE_CPM_UPDATE_FAILED",
+                e,
+                once_key="capital_preservation_update",
+            )
             cpm_snapshot = {}
 
-        capital_mode = str(get_state("capital_mode", "normal") or "normal").lower()
+        resolved_risk_state_getter = risk_state_getter_fn or get_state
+        capital_mode = str(resolved_risk_state_getter("capital_mode", "normal") or "normal").lower()
         work_orders = list(payload)
 
         if capital_mode == "preserve" and work_orders:
@@ -541,17 +579,32 @@ def apply_execution_policy(
             for idx, o in enumerate(work_orders):
                 try:
                     qty_score = abs(_safe_float(o.get("qty"), 0.0))
-                except Exception:
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_PRESERVE_QTY_SCORE_FAILED",
+                        e,
+                        once_key="capital_preservation_qty_score",
+                    )
                     qty_score = 0.0
 
                 try:
                     conf_score = max(0.01, float(o.get("confidence") or 1.0))
-                except Exception:
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_PRESERVE_CONF_SCORE_FAILED",
+                        e,
+                        once_key="capital_preservation_conf_score",
+                    )
                     conf_score = 1.0
 
                 try:
                     z_score = max(1.0, abs(float(o.get("expected_z") or o.get("zscore") or 0.0)))
-                except Exception:
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_PRESERVE_Z_SCORE_FAILED",
+                        e,
+                        once_key="capital_preservation_z_score",
+                    )
                     z_score = 1.0
 
                 ranked.append((-(qty_score * conf_score * z_score), idx))
@@ -655,7 +708,8 @@ def apply_execution_policy(
             sim_chunk_pct = float(sim_chunk_pct) * max(0.15, alpha_rem)
 
             volatility = _safe_float(o.get("volatility"), 0.0)
-            regime_comp, regime_vec = _regime_compatibility(con, symbol, signal_ts, o)
+            resolved_regime_compatibility = regime_compatibility_fn or _regime_compatibility
+            regime_comp, regime_vec = resolved_regime_compatibility(con, symbol, signal_ts, o)
 
             size_scale = max(float(EPE_MIN_REGIME_COMPAT_SCALE), float(regime_comp))
             size_scale = max(0.0, min(1.0, float(size_scale)))
@@ -694,7 +748,8 @@ def apply_execution_policy(
             cache_key = (str(symbol), str(broker or "unknown").strip().lower())
             feedback_snapshot = feedback_cache.get(cache_key)
             if feedback_snapshot is None:
-                feedback_snapshot = load_execution_feedback_snapshot(
+                resolved_execution_feedback = execution_feedback_fn or load_execution_feedback_snapshot
+                feedback_snapshot = resolved_execution_feedback(
                     con,
                     symbol=str(symbol),
                     broker=str(broker or "unknown"),
@@ -753,9 +808,159 @@ def apply_execution_policy(
             )
             size_scale = max(0.0, min(1.0, float(size_scale)))
 
+            try:
+                meta_label_gate = score_order_meta_label(con, o, regime_vec=regime_vec)
+            except Exception as e:
+                _warn_nonfatal(
+                    "EXECUTION_POLICY_ENGINE_META_LABEL_SCORE_FAILED",
+                    e,
+                    once_key=f"meta_label_score:{symbol}",
+                    symbol=str(symbol),
+                )
+                meta_label_gate = {
+                    "enabled": True,
+                    "applied": False,
+                    "probability": None,
+                    "multiplier": 1.0,
+                    "reason": f"score_failed:{type(e).__name__}",
+                }
+            meta_label_mult = max(0.0, min(1.0, _safe_float(meta_label_gate.get("multiplier"), 1.0)))
+            size_scale *= float(meta_label_mult)
+            size_scale = max(0.0, min(1.0, float(size_scale)))
+
+            try:
+                conformal_gate = conformal_gate_from_payload(o)
+            except Exception as e:
+                _warn_nonfatal(
+                    "EXECUTION_POLICY_ENGINE_CONFORMAL_GATE_FAILED",
+                    e,
+                    once_key=f"conformal_gate:{symbol}",
+                    symbol=str(symbol),
+                )
+                conformal_gate = {
+                    "enabled": True,
+                    "applied": False,
+                    "mode": str(os.environ.get("CONFORMAL_MODE", "log_only") or "log_only"),
+                    "hard_block": False,
+                    "reason": f"score_failed:{type(e).__name__}",
+                }
+            if bool(conformal_gate.get("hard_block")):
+                _log_suppression_event(
+                    o=o,
+                    reason="conformal_interval_straddles_zero",
+                    decision_json={
+                        "blocked_by": "conformal_interval",
+                        "scale": 0.0,
+                        "conformal_gate": dict(conformal_gate),
+                        "meta_label": dict(meta_label_gate),
+                        "tse": tse,
+                    },
+                    execution_policy_json={
+                        "conformal_gate": dict(conformal_gate),
+                        "meta_label": dict(meta_label_gate),
+                        "tse": tse,
+                        "scale": 0.0,
+                    },
+                )
+                continue
+
+            try:
+                ood_gate = ood_gate_from_payload(o)
+            except Exception as e:
+                _warn_nonfatal(
+                    "EXECUTION_POLICY_ENGINE_OOD_GATE_FAILED",
+                    e,
+                    once_key=f"ood_gate:{symbol}",
+                    symbol=str(symbol),
+                )
+                ood_gate = {
+                    "enabled": True,
+                    "applied": False,
+                    "mode": str(os.environ.get("OOD_MODE", "log_only") or "log_only"),
+                    "multiplier": 1.0,
+                    "hard_block": False,
+                    "reason": f"score_failed:{type(e).__name__}",
+                }
+            ood_mult = max(0.0, min(1.0, _safe_float(ood_gate.get("multiplier"), 1.0)))
+            if bool(ood_gate.get("hard_block")):
+                _log_suppression_event(
+                    o=o,
+                    reason="ood_hard_block",
+                    decision_json={
+                        "blocked_by": "ood_hard_block",
+                        "scale": 0.0,
+                        "ood_gate": dict(ood_gate),
+                        "meta_label": dict(meta_label_gate),
+                        "tse": tse,
+                    },
+                    execution_policy_json={
+                        "ood_gate": dict(ood_gate),
+                        "meta_label": dict(meta_label_gate),
+                        "tse": tse,
+                        "scale": 0.0,
+                    },
+                )
+                continue
+            size_scale *= float(ood_mult)
+            size_scale = max(0.0, min(1.0, float(size_scale)))
+
             shaped_order = _scale_order_fields(o, size_scale)
             effective_abs_qty = _effective_abs_qty(shaped_order)
             if effective_abs_qty <= float(TSE_MIN_ABS_QTY):
+                if bool(meta_label_gate.get("applied")) and float(meta_label_mult) <= 0.0:
+                    original_qty = (
+                        _safe_float(o.get("qty"), 0.0)
+                        if "qty" in o and o.get("qty") is not None
+                        else _safe_float(o.get("to_weight"), 0.0)
+                    )
+                    compressed_qty = (
+                        _safe_float(shaped_order.get("qty"), 0.0)
+                        if "qty" in shaped_order and shaped_order.get("qty") is not None
+                        else _safe_float(shaped_order.get("to_weight"), 0.0)
+                    )
+                    meta = {
+                        "original_qty": float(original_qty),
+                        "compressed_qty": float(compressed_qty),
+                    }
+                    _log_suppression_event(
+                        o=o,
+                        reason="meta_label_size_compression_scaled_to_zero",
+                        decision_json={
+                            "blocked_by": "meta_label_size_compression",
+                            "scale": size_scale,
+                            "meta_label": dict(meta_label_gate),
+                            "meta": meta,
+                        },
+                        execution_policy_json={"meta_label": dict(meta_label_gate), "scale": size_scale, "meta": meta},
+                    )
+                    continue
+                if bool(ood_gate.get("applied")) and float(ood_mult) <= 0.0:
+                    original_qty = (
+                        _safe_float(o.get("qty"), 0.0)
+                        if "qty" in o and o.get("qty") is not None
+                        else _safe_float(o.get("to_weight"), 0.0)
+                    )
+                    compressed_qty = (
+                        _safe_float(shaped_order.get("qty"), 0.0)
+                        if "qty" in shaped_order and shaped_order.get("qty") is not None
+                        else _safe_float(shaped_order.get("to_weight"), 0.0)
+                    )
+                    meta = {
+                        "original_qty": float(original_qty),
+                        "compressed_qty": float(compressed_qty),
+                    }
+                    _log_suppression_event(
+                        o=o,
+                        reason="ood_size_compression_scaled_to_zero",
+                        decision_json={
+                            "blocked_by": "ood_size_compression",
+                            "scale": size_scale,
+                            "ood_gate": dict(ood_gate),
+                            "meta": meta,
+                        },
+                        execution_policy_json={"ood_gate": dict(ood_gate), "scale": size_scale, "meta": meta},
+                    )
+                    continue
                 if tse_action == "SIZE_COMPRESSION":
                     original_qty = (
                         _safe_float(o.get("qty"), 0.0)
@@ -807,7 +1012,7 @@ def apply_execution_policy(
                 "alpha_remaining": float(alpha_rem),
                 "order_type": str(order_type),
                 "aggressiveness": str(aggressiveness),
-                "execution_mode": get_execution_mode(),
+                "execution_mode": (execution_mode_fn or get_execution_mode)(),
                 "regime_model_version": str(regime_model_version()),
                 "regime_compat": float(regime_comp),
                 "tse": tse,
@@ -820,6 +1025,9 @@ def apply_execution_policy(
                 "alpha_intent": dict(alpha_intent),
                 "execution_decision": dict(execution_decision),
                 "execution_feedback": dict(feedback_snapshot or {}),
+                "meta_label": dict(meta_label_gate),
+                "conformal_gate": dict(conformal_gate),
+                "ood_gate": dict(ood_gate),
             }
 
             if "qty" in shaped_order and shaped_order.get("qty") is not None:
@@ -860,6 +1068,15 @@ def apply_execution_policy(
                     row["expected_slippage_bps"] = float(execution_decision.get("expected_slippage_bps") or 0.0)
                     row["expected_fill_latency_ms"] = int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms)
                     row["slippage_size_mult"] = float(execution_decision.get("size_mult") or 1.0)
+                    row["meta_label_probability"] = meta_label_gate.get("probability")
+                    row["meta_label_size_mult"] = float(meta_label_mult)
+                    row["meta_label_gate"] = dict(meta_label_gate)
+                    row["conformal_interval_excludes_zero"] = conformal_gate.get("interval_excludes_zero")
+                    row["conformal_size_mult"] = float(conformal_gate.get("size_mult") or 1.0)
+                    row["conformal_gate"] = dict(conformal_gate)
+                    row["ood_score"] = ood_gate.get("ood_score")
+                    row["ood_size_mult"] = float(ood_mult)
+                    row["ood_gate"] = dict(ood_gate)
                     row["execution_feedback_snapshot"] = dict(feedback_snapshot or {})
                     row["entry_limit_offset_bps"] = float(execution_decision.get("limit_offset_bps") or 0.0)
                     row["epe_broker_sim_overrides"] = {
@@ -928,6 +1145,15 @@ def apply_execution_policy(
             row["expected_slippage_bps"] = float(execution_decision.get("expected_slippage_bps") or 0.0)
             row["expected_fill_latency_ms"] = int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms)
             row["slippage_size_mult"] = float(execution_decision.get("size_mult") or 1.0)
+            row["meta_label_probability"] = meta_label_gate.get("probability")
+            row["meta_label_size_mult"] = float(meta_label_mult)
+            row["meta_label_gate"] = dict(meta_label_gate)
+            row["conformal_interval_excludes_zero"] = conformal_gate.get("interval_excludes_zero")
+            row["conformal_size_mult"] = float(conformal_gate.get("size_mult") or 1.0)
+            row["conformal_gate"] = dict(conformal_gate)
+            row["ood_score"] = ood_gate.get("ood_score")
+            row["ood_size_mult"] = float(ood_mult)
+            row["ood_gate"] = dict(ood_gate)
             row["execution_feedback_snapshot"] = dict(feedback_snapshot or {})
             row["entry_limit_offset_bps"] = float(execution_decision.get("limit_offset_bps") or 0.0)
             row["epe_broker_sim_overrides"] = {

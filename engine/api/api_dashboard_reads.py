@@ -172,6 +172,17 @@ def api_get_audit_records(parsed, _ctx=None):
         try:
             table = require_allowed_table_name(table)
         except (AssertionError, ValueError) as e:
+            log_failure(
+                LOG,
+                event="api_dashboard_reads_unauthorized_table",
+                code="API_DASHBOARD_READS_UNAUTHORIZED_TABLE",
+                message=str(e),
+                error=e,
+                level=logging.WARNING,
+                component="engine.api.api_dashboard_reads",
+                extra={"table": str(table)},
+                persist=False,
+            )
             return {
                 "ok": False,
                 "error": "unauthorized_table",

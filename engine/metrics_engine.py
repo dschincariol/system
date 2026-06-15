@@ -56,6 +56,19 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _safe_binary_flag(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        numeric = int(value)
+    except Exception:
+        try:
+            numeric = int(float(str(value).strip()))
+        except Exception:
+            return None
+    return numeric if numeric in (0, 1) else None
+
+
 def _safe_json_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
@@ -684,14 +697,16 @@ def compute_model_performance_stats(*, con=None) -> Dict[str, Any]:
             pnl_series = [float(item.get("net_pnl") or 0.0) for item in items]
             realized_series = [float(item.get("realized_pnl") or 0.0) for item in items]
             label_accuracy_values = [
-                int(item["prediction_correct"])
+                int(flag)
                 for item in items
-                if item.get("prediction_correct") in (0, 1)
+                for flag in (_safe_binary_flag(item.get("prediction_correct")),)
+                if flag is not None
             ]
             pnl_accuracy_values = [
-                int(item["pnl_correct"])
+                int(flag)
                 for item in items
-                if item.get("pnl_correct") in (0, 1)
+                for flag in (_safe_binary_flag(item.get("pnl_correct")),)
+                if flag is not None
             ]
             accuracy = (
                 (sum(label_accuracy_values) / float(len(label_accuracy_values)))
@@ -877,8 +892,8 @@ def list_prediction_feedback(
                     "fees": (float(row[16]) if row[16] is not None else None),
                     "slippage_bps": (float(row[17]) if row[17] is not None else None),
                     "trade_count": int(row[18] or 0),
-                    "prediction_correct": (int(row[19]) if row[19] in (0, 1) else None),
-                    "pnl_correct": (int(row[20]) if row[20] in (0, 1) else None),
+                    "prediction_correct": _safe_binary_flag(row[19]),
+                    "pnl_correct": _safe_binary_flag(row[20]),
                     "meta": _safe_json_dict(row[21]),
                 }
             )

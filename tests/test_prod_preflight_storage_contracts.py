@@ -157,30 +157,31 @@ class ProdPreflightStorageContractTests(unittest.TestCase):
             prod_preflight = self._load_module()
             with patch.object(sys, "argv", ["prod_preflight.py"]):
                 with patch.object(prod_preflight, "_runtime_config_gate", return_value=(["runtime config ok"], [])):
-                    with patch.object(prod_preflight, "_compile_files", return_value=[]):
-                        with patch.object(prod_preflight, "_ensure_schemas", return_value=["core db ok"]):
-                            with patch.object(
-                                prod_preflight,
-                                "_verify_sqlite_contract",
-                                return_value=(
-                                    [],
-                                    ["sqlite contract invalid missing indexes: idx_prices_symbol_ts"],
-                                    {
-                                        "ok": False,
-                                        "missing_indexes": ["idx_prices_symbol_ts"],
-                                        "schema_version": 11,
-                                        "expected_schema_version": 11,
-                                        "schema_version_ok": True,
-                                        "quick_check": "ok",
-                                    },
-                                ),
-                            ):
+                    with patch.object(prod_preflight, "_api_mutation_auth_gate", return_value=(["api mutation auth ok"], [])):
+                        with patch.object(prod_preflight, "_compile_files", return_value=[]):
+                            with patch.object(prod_preflight, "_ensure_schemas", return_value=["core db ok"]):
                                 with patch.object(
                                     prod_preflight,
-                                    "_run_cmd",
-                                    side_effect=AssertionError("smoke jobs should not run"),
+                                    "_verify_sqlite_contract",
+                                    return_value=(
+                                        [],
+                                        ["sqlite contract invalid missing indexes: idx_prices_symbol_ts"],
+                                        {
+                                            "ok": False,
+                                            "missing_indexes": ["idx_prices_symbol_ts"],
+                                            "schema_version": 11,
+                                            "expected_schema_version": 11,
+                                            "schema_version_ok": True,
+                                            "quick_check": "ok",
+                                        },
+                                    ),
                                 ):
-                                    rc = prod_preflight.main()
+                                    with patch.object(
+                                        prod_preflight,
+                                        "_run_cmd",
+                                        side_effect=AssertionError("smoke jobs should not run"),
+                                    ):
+                                        rc = prod_preflight.main()
 
         self.assertEqual(rc, 3)
 

@@ -33,11 +33,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
-from engine.execution.execution_ledger import log_submit, log_fill
+from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
+from engine.execution.execution_ledger import init_execution_ledger, log_submit, log_fill
 from engine.strategy.alpha_lifecycle_engine import apply_alpha_lifecycle
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.storage import connect
+from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
+from engine.runtime.storage import connect, run_write_txn
 from engine.execution.kill_switch import execution_allowed
 from engine.runtime.risk_state import get_state, set_state
 from engine.execution.deployable_capital import compute_deployable_equity
@@ -46,20 +48,40 @@ from engine.execution.order_idempotency import (
     mark_order_submission_submitted,
     mark_order_submission_unknown,
 )
+from engine.execution.broker_action_audit import record_broker_action_audit
 from engine.cache.wrappers.kill_switch import read_kill_switch as kill_switch_snapshot
 from engine.cache.wrappers.execution_mode import read_execution_mode as get_execution_mode
 
 execution_gate_snapshot = None
 
+try:
+    from engine.execution.position_reconcile import pre_live_position_reconcile as _prelive_reconcile
+except Exception:
+    _prelive_reconcile = None  # type: ignore
+
+try:
+    import websocket  # type: ignore
+except Exception as _WEBSOCKET_IMPORT_ERROR:
+    websocket = None  # type: ignore
+else:
+    _WEBSOCKET_IMPORT_ERROR = None
+
 
 BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
 KEY_ID = os.environ.get("ALPACA_KEY_ID", "").strip()
 SECRET = os.environ.get("ALPACA_SECRET_KEY", "").strip()
+STREAM_URL = os.environ.get("ALPACA_STREAM_URL", "").strip()
 
 ORDER_TIF = os.environ.get("ALPACA_ORDER_TIF", "day").strip()
 ORDER_TYPE = os.environ.get("ALPACA_ORDER_TYPE", "market").strip()
 MAX_ORDERS_PER_PASS = int(os.environ.get("ALPACA_MAX_ORDERS_PER_PASS", "25"))
 SLEEP_BETWEEN_ORDERS_S = float(os.environ.get("ALPACA_SLEEP_BETWEEN_ORDERS_S", "0.25"))
+TRADE_UPDATES_WS_ENABLED = os.environ.get("ALPACA_TRADE_UPDATES_WS_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+TRADE_UPDATES_PING_INTERVAL_S = float(os.environ.get("ALPACA_TRADE_UPDATES_PING_INTERVAL_S", "20"))
+TRADE_UPDATES_PING_TIMEOUT_S = float(os.environ.get("ALPACA_TRADE_UPDATES_PING_TIMEOUT_S", "10"))
+TRADE_UPDATES_RECONNECT_BASE_S = float(os.environ.get("ALPACA_TRADE_UPDATES_RECONNECT_BASE_S", "1.0"))
+TRADE_UPDATES_RECONNECT_MAX_S = float(os.environ.get("ALPACA_TRADE_UPDATES_RECONNECT_MAX_S", "30.0"))
+TRADE_UPDATES_GAP_LOOKBACK_S = int(os.environ.get("ALPACA_TRADE_UPDATES_GAP_LOOKBACK_S", "3600"))
 
 LIM_OFF_BPS_PASSIVE = float(os.environ.get("ALPACA_LIMIT_OFFSET_BPS_PASSIVE", "5.0"))
 LIM_OFF_BPS_NEUTRAL = float(os.environ.get("ALPACA_LIMIT_OFFSET_BPS_NEUTRAL", "2.0"))
@@ -135,6 +157,259 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _alpaca_stream_url() -> str:
+    if STREAM_URL:
+        return str(STREAM_URL)
+    base = str(BASE_URL or "").strip().lower()
+    if "paper-api.alpaca.markets" in base:
+        return "wss://paper-api.alpaca.markets/stream"
+    if "api.alpaca.markets" in base:
+        return "wss://api.alpaca.markets/stream"
+    return str(BASE_URL or "https://paper-api.alpaca.markets").rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/stream"
+
+
+def _decode_ws_payload(message: Any) -> List[Dict[str, Any]]:
+    if isinstance(message, (bytes, bytearray)):
+        message = bytes(message).decode("utf-8")
+    if isinstance(message, str):
+        payload = json.loads(message or "{}")
+    else:
+        payload = message
+    if isinstance(payload, list):
+        return [dict(x) for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        return [dict(payload)]
+    return []
+
+
+def _alpaca_side_sign(side: Any) -> float:
+    side_s = str(side or "").strip().lower()
+    if side_s in {"sell", "sell_short", "short"}:
+        return -1.0
+    return 1.0
+
+
+def _signed_alpaca_qty(qty: Any, side: Any) -> float:
+    return float(abs(_safe_float(qty, 0.0))) * float(_alpaca_side_sign(side))
+
+
+def _alpaca_event_ts_ms(update: Dict[str, Any], order: Dict[str, Any]) -> int:
+    for value in (
+        update.get("timestamp"),
+        update.get("time"),
+        update.get("updated_at"),
+        order.get("updated_at"),
+        order.get("filled_at"),
+        order.get("canceled_at"),
+        order.get("created_at"),
+    ):
+        if value not in (None, ""):
+            return parse_broker_timestamp_ms(value, default_ms=int(time.time() * 1000))
+    return int(time.time() * 1000)
+
+
+def _alpaca_terminal_status(event: str, order: Dict[str, Any]) -> str:
+    raw = str(order.get("status") or event or "").strip().lower()
+    aliases = {
+        "cancelled": "canceled",
+        "partial_fill": "partially_filled",
+        "fill": "filled",
+    }
+    return aliases.get(raw, raw or "unknown")
+
+
+def _merge_order_extra(existing_json: Any, *, event_id: str, event: str, source: str, payload: Dict[str, Any]) -> str:
+    try:
+        existing = json.loads(existing_json or "{}")
+        if not isinstance(existing, dict):
+            existing = {}
+    except Exception:
+        existing = {}
+    events = list(existing.get("alpaca_trade_update_events") or [])
+    if event_id and event_id not in events:
+        events.append(str(event_id))
+    existing["alpaca_trade_update_events"] = events[-50:]
+    existing["last_alpaca_trade_update"] = {
+        "event_id": str(event_id or ""),
+        "event": str(event or ""),
+        "source": str(source or ""),
+        "payload": dict(payload or {}),
+    }
+    return json.dumps(existing, separators=(",", ":"), sort_keys=True, default=str)
+
+
+def _existing_fill_abs_qty(con, client_order_id: str) -> float:
+    row = con.execute(
+        """
+        SELECT COALESCE(SUM(ABS(fill_qty)), 0.0)
+        FROM execution_fills
+        WHERE client_order_id=?
+        """,
+        (str(client_order_id),),
+    ).fetchone()
+    return float((row or [0.0])[0] or 0.0)
+
+
+def apply_alpaca_trade_update(update: Dict[str, Any], *, source: str = "websocket", received_ts_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Apply one Alpaca ``trade_updates`` payload through the execution ledger.
+
+    The WebSocket and REST poller both flow through this function. Fill writes
+    are idempotent and delta-aware, so a poll after a WebSocket event recovers
+    gaps without double-applying already observed partial fills.
+    """
+    payload = dict(update or {})
+    if str(payload.get("stream") or "") == "trade_updates" and isinstance(payload.get("data"), dict):
+        payload = dict(payload.get("data") or {})
+    order = dict(payload.get("order") or payload)
+    event = str(payload.get("event") or order.get("status") or "").strip().lower()
+    broker_order_id = str(order.get("id") or payload.get("order_id") or payload.get("id") or "").strip()
+    client_order_id = str(order.get("client_order_id") or payload.get("client_order_id") or broker_order_id or "").strip()
+    symbol = str(order.get("symbol") or payload.get("symbol") or "").strip().upper()
+    side = order.get("side") or payload.get("side")
+    event_ts_ms = _alpaca_event_ts_ms(payload, order)
+    received_ms = int(received_ts_ms or time.time() * 1000)
+    detection_latency_ms = max(0, int(received_ms - int(event_ts_ms)))
+    event_id = str(
+        payload.get("execution_id")
+        or payload.get("event_id")
+        or payload.get("id")
+        or f"{broker_order_id}:{event}:{event_ts_ms}:{payload.get('qty') or order.get('filled_qty') or ''}"
+    ).strip()
+    status = _alpaca_terminal_status(event, order)
+
+    if not client_order_id:
+        return {"ok": False, "status": "missing_client_order_id", "event": event}
+
+    init_execution_ledger()
+
+    def _write(conw) -> Dict[str, Any]:
+        existing = conw.execute(
+            """
+            SELECT client_order_id, extra_json
+            FROM execution_orders
+            WHERE client_order_id=?
+               OR (? <> '' AND broker_order_id=?)
+            ORDER BY submit_ts_ms DESC
+            LIMIT 1
+            """,
+            (str(client_order_id), str(broker_order_id), str(broker_order_id)),
+        ).fetchone()
+        if existing and existing[0]:
+            client_id = str(existing[0])
+            extra_json = existing[1]
+        else:
+            client_id = str(client_order_id)
+            extra_json = None
+
+        if existing:
+            conw.execute(
+                """
+                UPDATE execution_orders
+                SET status=?,
+                    broker_order_id=COALESCE(NULLIF(?, ''), broker_order_id),
+                    extra_json=?
+                WHERE client_order_id=?
+                """,
+                (
+                    str(status or "unknown"),
+                    str(broker_order_id),
+                    _merge_order_extra(
+                        extra_json,
+                        event_id=str(event_id),
+                        event=str(event),
+                        source=str(source),
+                        payload={**payload, "fill_detection_latency_ms": int(detection_latency_ms)},
+                    ),
+                    str(client_id),
+                ),
+            )
+
+        fill_events = {"fill", "partial_fill", "filled", "partially_filled"}
+        if event not in fill_events and status not in fill_events:
+            return {"ok": True, "status": "order_state_updated", "event": event, "client_order_id": str(client_id)}
+
+        cumulative_abs = _safe_float(order.get("filled_qty"), 0.0)
+        existing_abs = _existing_fill_abs_qty(conw, str(client_id))
+        event_qty_abs = _safe_float(payload.get("qty"), 0.0)
+        if event_qty_abs <= 0.0:
+            event_qty_abs = max(0.0, float(cumulative_abs) - float(existing_abs))
+        elif cumulative_abs > 0.0:
+            event_qty_abs = min(float(event_qty_abs), max(0.0, float(cumulative_abs) - float(existing_abs)))
+
+        if event_qty_abs <= 1e-12:
+            return {
+                "ok": True,
+                "status": "duplicate_or_no_delta",
+                "event": event,
+                "client_order_id": str(client_id),
+                "existing_abs_qty": float(existing_abs),
+                "cumulative_abs_qty": float(cumulative_abs),
+            }
+
+        fill_px = _safe_float(payload.get("price") or order.get("filled_avg_price") or order.get("limit_price"), 0.0)
+        if fill_px <= 0.0:
+            return {"ok": False, "status": "missing_fill_price", "event": event, "client_order_id": str(client_id)}
+
+        fill_id = str(event_id or f"{broker_order_id}:{source}:{cumulative_abs}:{event_ts_ms}")
+        log_fill(
+            client_order_id=str(client_id),
+            fill_id=str(fill_id),
+            broker="alpaca",
+            symbol=str(symbol or order.get("symbol") or ""),
+            qty=_signed_alpaca_qty(float(event_qty_abs), side),
+            fill_px=float(fill_px),
+            fill_ts_ms=int(event_ts_ms),
+            fees=None,
+            extra={
+                **dict(payload or {}),
+                "broker_order_id": str(broker_order_id),
+                "source": str(source),
+                "event": str(event),
+                "event_id": str(event_id),
+                "order_status": str(status),
+                "cumulative_filled_qty": float(cumulative_abs),
+                "existing_abs_qty_before_event": float(existing_abs),
+                "fill_detection_latency_ms": int(detection_latency_ms),
+                "liquidity": str(order.get("order_class") or ""),
+            },
+            con=conw,
+        )
+        return {
+            "ok": True,
+            "status": "fill_logged",
+            "event": event,
+            "client_order_id": str(client_id),
+            "fill_id": str(fill_id),
+            "fill_detection_latency_ms": int(detection_latency_ms),
+        }
+
+    result = run_write_txn(
+        _write,
+        table="execution_fills",
+        operation="apply_alpaca_trade_update",
+        context={"client_order_id": str(client_order_id), "event_id": str(event_id), "source": str(source)},
+    )
+    if bool((result or {}).get("ok")):
+        emit_counter(
+            "alpaca_trade_update_event",
+            1,
+            component="engine.execution.broker_alpaca_rest",
+            broker="alpaca",
+            symbol=(str(symbol) if symbol else None),
+            extra_tags={"event": str(event or ""), "source": str(source or "")},
+        )
+        if str((result or {}).get("status") or "") == "fill_logged":
+            emit_timing(
+                "fill_detection_latency_ms",
+                int(detection_latency_ms),
+                component="engine.execution.broker_alpaca_rest",
+                broker="alpaca",
+                symbol=(str(symbol) if symbol else None),
+                extra_tags={"source": str(source or "")},
+            )
+    return dict(result or {"ok": False, "status": "unknown"})
+
+
 # ============================================================
 # HTTP Helpers
 # ============================================================
@@ -176,6 +451,43 @@ def _real_trading_gate() -> Dict[str, Any]:
     )
 
 
+def _prelive_reconcile_or_block(broker: str = "alpaca") -> Optional[Dict[str, Any]]:
+    if os.environ.get("EXECUTION_PRELIVE_RECONCILE", "1") != "1":
+        return None
+    if not callable(_prelive_reconcile):
+        return {
+            "ok": False,
+            "status": "prelive_reconcile_unavailable",
+            "broker": str(broker),
+            "fatal_reconcile": True,
+        }
+    try:
+        gate = _prelive_reconcile(broker=str(broker)) or {}
+    except Exception as exc:
+        _warn_nonfatal(
+            "BROKER_ALPACA_PRELIVE_RECONCILE_FAILED",
+            exc,
+            once_key="prelive_reconcile",
+            broker=str(broker),
+        )
+        return {
+            "ok": False,
+            "status": "prelive_reconcile_exception",
+            "broker": str(broker),
+            "fatal_reconcile": True,
+            "error": str(exc),
+        }
+    if bool(gate.get("ok", False)):
+        return None
+    return {
+        "ok": False,
+        "status": str(gate.get("status") or "prelive_reconcile_block"),
+        "broker": str(broker),
+        "fatal_reconcile": True,
+        "reconcile": dict(gate or {}),
+    }
+
+
 # ============================================================
 # Account / Positions
 # ============================================================
@@ -194,6 +506,15 @@ def get_order(order_id: str) -> Dict[str, Any]:
 
 
 def cancel_order(order_id: str) -> Dict[str, Any]:
+    audit = record_broker_action_audit(
+        broker="alpaca",
+        action="order_cancel_attempt",
+        status="attempted",
+        broker_order_id=str(order_id),
+        payload={"order_id": str(order_id)},
+    )
+    if not bool(audit.get("ok")):
+        return {"ok": False, **audit}
     return _req("DELETE", f"/v2/orders/{str(order_id)}")
 
 
@@ -476,6 +797,20 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     gate = _real_trading_gate()
     if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
         return {"ok": False, "status": "real_trading_blocked", "gate": gate, "broker": "alpaca"}
+    reconcile_block = _prelive_reconcile_or_block("alpaca")
+    if reconcile_block is not None:
+        return reconcile_block
+    audit = record_broker_action_audit(
+        broker="alpaca",
+        action="order_submit_attempt",
+        status="attempted",
+        symbol=str(symbol),
+        qty=float(qty),
+        client_order_id=str(client_oid),
+        payload={"order_type": "LIMIT", "limit_price": float(limit_price)},
+    )
+    if not bool(audit.get("ok")):
+        return {"ok": False, **audit}
     return _submit_limit_order(symbol, qty, limit_price, client_oid)
 
 
@@ -483,6 +818,20 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     gate = _real_trading_gate()
     if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
         return {"ok": False, "status": "real_trading_blocked", "gate": gate, "broker": "alpaca"}
+    reconcile_block = _prelive_reconcile_or_block("alpaca")
+    if reconcile_block is not None:
+        return reconcile_block
+    audit = record_broker_action_audit(
+        broker="alpaca",
+        action="order_submit_attempt",
+        status="attempted",
+        symbol=str(symbol),
+        qty=float(qty),
+        client_order_id=str(client_oid),
+        payload={"order_type": "MARKET"},
+    )
+    if not bool(audit.get("ok")):
+        return {"ok": False, **audit}
     return _submit_market_order(symbol, qty, client_oid)
 
 
@@ -518,6 +867,11 @@ def apply_latest_portfolio_orders_live(
 
     if not KEY_ID or not SECRET:
         return {"ok": False, "status": "missing_credentials"}
+
+    if not bool(dry_run):
+        reconcile_block = _prelive_reconcile_or_block("alpaca")
+        if reconcile_block is not None:
+            return reconcile_block
 
     con = connect()
     try:
@@ -642,6 +996,33 @@ def apply_latest_portfolio_orders_live(
             aggressiveness = str(o.get("aggressiveness") or "").upper().strip()
             order_meta = dict(o or {})
             order_meta["portfolio_risk_caps"] = dict(risk_cap_audit or {})
+
+            audit = record_broker_action_audit(
+                broker="alpaca",
+                action="order_submit_attempt",
+                status="attempted",
+                symbol=str(symbol),
+                qty=float(delta),
+                portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                mode=str(order_meta.get("execution_mode") or ""),
+                payload={
+                    "order_type": str(order_type or "MARKET"),
+                    "aggressiveness": str(aggressiveness or ""),
+                    "source_order_id": o.get("source_order_id"),
+                    "source_alert_id": o.get("source_alert_id"),
+                },
+            )
+            if not bool(audit.get("ok")):
+                return {
+                    "ok": False,
+                    "status": "broker_action_audit_failed",
+                    "broker": "alpaca",
+                    "stop_failover": True,
+                    "detail": "pre_submit_audit_failed",
+                    "symbol": str(symbol),
+                    "submitted_n": int(n),
+                    "audit": dict(audit or {}),
+                }
 
             guard = claim_order_submission(
                 con=con,
@@ -785,7 +1166,24 @@ def apply_latest_portfolio_orders_live(
             pos[symbol] = float(cur_qty) + float(delta)
             submitted.append({"symbol": symbol, "delta_qty": delta})
             n += 1
-            time.sleep(max(0.0, SLEEP_BETWEEN_ORDERS_S))
+            wait_ok, wait_reason, wait_meta = wait_with_kill_interrupt(
+                delay_s=max(0.0, float(SLEEP_BETWEEN_ORDERS_S)),
+                con=con,
+                symbol=str(symbol),
+                model_id=str(order_meta.get("model_id") or ""),
+                broker="alpaca",
+                component="engine.execution.broker_alpaca_rest",
+                stage="adapter_order_sleep",
+            )
+            if not bool(wait_ok):
+                return {
+                    "ok": False,
+                    "status": "blocked_kill_switch_mid_slice",
+                    "broker": "alpaca",
+                    "reason": str(wait_reason or "kill_switch_block"),
+                    "kill_meta": dict(wait_meta or {}),
+                    "submitted_n": int(n),
+                }
 
         if order_id is not None:
             set_state("alpaca_last_portfolio_orders_id", str(int(order_id)))
@@ -813,26 +1211,13 @@ def poll_and_log_fills(after_ts_ms: int) -> Dict[str, Any]:
             filled_avg = o.get("filled_avg_price")
             if not filled_avg:
                 continue
-
-            fill_ts_ms = parse_broker_timestamp_ms(
-                o.get("updated_at") or o.get("filled_at") or o.get("created_at"),
-                default_ms=int(time.time() * 1000),
+            result = apply_alpaca_trade_update(
+                {"event": str(o.get("status") or "fill"), "order": dict(o or {})},
+                source="poll",
+                received_ts_ms=int(time.time() * 1000),
             )
-            log_fill(
-                client_order_id=cid,
-                fill_id=str(o.get("id") or o.get("client_order_id") or ""),
-                broker="alpaca",
-                symbol=str(o.get("symbol") or ""),
-                qty=filled_qty,
-                fill_px=float(filled_avg),
-                fill_ts_ms=fill_ts_ms,
-                fees=None,
-                extra={
-                    **dict(o or {}),
-                    "liquidity": str(o.get("order_class") or ""),
-                },
-            )
-            n += 1
+            if str((result or {}).get("status") or "") == "fill_logged":
+                n += 1
         except Exception as e:
             _warn_nonfatal(
                 "ALPACA_FILL_LOG_FAILED",
@@ -844,3 +1229,102 @@ def poll_and_log_fills(after_ts_ms: int) -> Dict[str, Any]:
             continue
 
     return {"ok": True, "fills_logged": n}
+
+
+def run_trade_updates_stream_daemon(stop_event: Any = None) -> None:
+    """Run the Alpaca ``trade_updates`` WebSocket with REST gap recovery."""
+    if not TRADE_UPDATES_WS_ENABLED:
+        LOG.info("alpaca_trade_updates_ws_disabled")
+        return
+    if websocket is None:
+        raise RuntimeError(f"websocket-client unavailable: {_WEBSOCKET_IMPORT_ERROR}")
+    if not KEY_ID or not SECRET:
+        log_failure(
+            LOG,
+            event="alpaca_trade_updates_ws_missing_credentials",
+            code="ALPACA_TRADE_UPDATES_WS_MISSING_CREDENTIALS",
+            message="Alpaca trade update stream skipped because credentials are missing.",
+            level=logging.WARNING,
+            component="engine.execution.broker_alpaca_rest",
+            persist=False,
+        )
+        return
+
+    backoff_s = max(0.1, float(TRADE_UPDATES_RECONNECT_BASE_S))
+    last_event_ts_ms = int(time.time() * 1000) - int(TRADE_UPDATES_GAP_LOOKBACK_S * 1000)
+
+    def _should_stop() -> bool:
+        return bool(stop_event is not None and callable(getattr(stop_event, "is_set", None)) and stop_event.is_set())
+
+    while not _should_stop():
+        connected_at_ms = int(time.time() * 1000)
+        last_message_ms = connected_at_ms
+
+        def _on_open(ws) -> None:
+            ws.send(json.dumps({"action": "auth", "key": KEY_ID, "secret": SECRET}))
+            ws.send(json.dumps({"action": "listen", "data": {"streams": ["trade_updates"]}}))
+            emit_counter("alpaca_trade_updates_ws_connect", 1, component="engine.execution.broker_alpaca_rest", broker="alpaca")
+
+        def _on_message(_ws, message) -> None:
+            nonlocal last_event_ts_ms, last_message_ms
+            received_ms = int(time.time() * 1000)
+            last_message_ms = int(received_ms)
+            for payload in _decode_ws_payload(message):
+                stream = str(payload.get("stream") or "")
+                if stream and stream != "trade_updates":
+                    continue
+                result = apply_alpaca_trade_update(payload, source="websocket", received_ts_ms=int(received_ms))
+                if bool((result or {}).get("ok")):
+                    last_event_ts_ms = max(last_event_ts_ms, int(received_ms))
+
+        def _on_error(_ws, error) -> None:
+            _warn_nonfatal(
+                "ALPACA_TRADE_UPDATES_WS_ERROR",
+                error if isinstance(error, BaseException) else RuntimeError(str(error)),
+                once_key="trade_updates_ws_error",
+            )
+
+        def _on_close(_ws, _status_code, _msg) -> None:
+            age_ms = max(0, int(time.time() * 1000) - int(last_message_ms))
+            emit_gauge(
+                "alpaca_trade_updates_ws_heartbeat_age_ms",
+                int(age_ms),
+                component="engine.execution.broker_alpaca_rest",
+                broker="alpaca",
+            )
+
+        ws_app = websocket.WebSocketApp(
+            _alpaca_stream_url(),
+            on_open=_on_open,
+            on_message=_on_message,
+            on_error=_on_error,
+            on_close=_on_close,
+        )
+        try:
+            ws_app.run_forever(
+                ping_interval=max(1, int(TRADE_UPDATES_PING_INTERVAL_S)),
+                ping_timeout=max(1, int(TRADE_UPDATES_PING_TIMEOUT_S)),
+            )
+        finally:
+            try:
+                after_ms = max(
+                    0,
+                    int(min(last_event_ts_ms, connected_at_ms) - int(TRADE_UPDATES_GAP_LOOKBACK_S * 1000)),
+                )
+                poll_and_log_fills(after_ts_ms=int(after_ms))
+            except Exception as e:
+                _warn_nonfatal(
+                    "ALPACA_TRADE_UPDATES_GAP_RECOVERY_FAILED",
+                    e,
+                    once_key="trade_updates_gap_recovery",
+                    after_ts_ms=int(last_event_ts_ms),
+                )
+
+        if _should_stop():
+            break
+        sleep_s = min(float(TRADE_UPDATES_RECONNECT_MAX_S), float(backoff_s))
+        if stop_event is not None and callable(getattr(stop_event, "wait", None)):
+            stop_event.wait(timeout=float(sleep_s))
+        else:
+            time.sleep(float(sleep_s))
+        backoff_s = min(float(TRADE_UPDATES_RECONNECT_MAX_S), max(0.1, float(backoff_s) * 2.0))

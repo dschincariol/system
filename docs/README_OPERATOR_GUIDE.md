@@ -185,7 +185,9 @@ Typical operator influence includes:
 ## 8. What The Operator Should Not Assume
 
 - A dashboard panel is not necessarily the source of truth.
-  The source of truth is usually runtime state plus SQLite storage.
+  The source of truth is usually runtime state plus Postgres-backed runtime storage. SQLite files are test or legacy-compatibility artifacts unless a specific test run opted into `TS_STORAGE_BACKEND=sqlite`.
+- A live runtime does not fall back to SQLite when Postgres is down.
+  Treat storage readiness failures, `database_reachable` blockers, and schema-validation blockers as fail-closed conditions.
 - An advisory is not an execution command.
   Advisory means informational unless explicitly wired otherwise.
 - A quiet dashboard does not always mean a healthy system.

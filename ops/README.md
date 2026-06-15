@@ -11,12 +11,12 @@ These scripts are generally not part of the hot runtime path, but they are impor
 
 ## Examples
 
-- [check_events.py](c:\Users\dschi\Documents\GitHub\Trading-System-\ops\check_events.py)
-- [check_labels.py](c:\Users\dschi\Documents\GitHub\Trading-System-\ops\check_labels.py)
-- [check_predictions.py](c:\Users\dschi\Documents\GitHub\Trading-System-\ops\check_predictions.py)
-- [compute_drift.py](c:\Users\dschi\Documents\GitHub\Trading-System-\ops\compute_drift.py)
-- [train_model_v2.py](c:\Users\dschi\Documents\GitHub\Trading-System-\ops\train_model_v2.py)
-- [alerts_service.py](c:\Users\dschi\Documents\GitHub\Trading-System-\ops\alerts_service.py)
+- [check_events.py](check_events.py)
+- [check_labels.py](check_labels.py)
+- [check_predictions.py](check_predictions.py)
+- [compute_drift.py](compute_drift.py)
+- [train_model_v2.py](train_model_v2.py)
+- [alerts_service.py](alerts_service.py)
 
 ## Maintenance Guidance
 

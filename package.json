@@ -14,8 +14,8 @@
     "test:news": "python tools/news_ingestion_selftest.py",
     "smoke:pipeline": "python tools/pipeline_smoke_test.py",
     "validate": "python tools/validate_repo.py",
-    "check:ui": "python tools/check_local_asset_refs.py && python tools/check_dashboard_ui_contract.py && node --test tests/test_command_palette_helpers.mjs tests/test_symbol_context.mjs tests/test_mobile_ops_helpers.mjs tests/test_replay_ui_helpers.mjs",
-    "test:ui": "python tools/check_local_asset_refs.py && python -m pytest tests/test_dashboard_ui_contract.py tests/test_ui_asset_refs.py tests/test_mobile_ops_surface.py && node --test tests/test_command_palette_helpers.mjs tests/test_symbol_context.mjs tests/test_mobile_ops_helpers.mjs tests/test_replay_ui_helpers.mjs",
+    "check:ui": "node tools/run_ui_checks.mjs",
+    "test:ui": "node tools/run_ui_checks.mjs --pytest",
     "validate:live": "python tools/validate_repo.py --live",
     "validate:deps": "python tools/validate_dependency_lock.py",
     "worktree:triage": "python tools/git_worktree_triage.py",
@@ -25,7 +25,8 @@
     "upgrade": "bash deploy/bin/upgrade_trading_system.sh"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.17.0 <21",
+    "npm": ">=10.0.0 <11"
   },
   "dependencies": {
     "express": "4.22.1",

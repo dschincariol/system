@@ -26,6 +26,7 @@ import random
 from typing import Optional
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.data.universe_pit import label_window_within_symbol_lifecycle
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import (
     connect,
@@ -122,6 +123,13 @@ def price_at_or_after(con, symbol: str, ts_ms: int) -> Optional[float]:
 
 
 def compute_return(con, symbol: str, event_ts: int, horizon_ms: int) -> Optional[float]:
+    if not label_window_within_symbol_lifecycle(
+        con,
+        symbol=str(symbol),
+        start_ts_ms=int(event_ts),
+        end_ts_ms=int(event_ts) + int(horizon_ms),
+    ):
+        return None
     p0 = price_at_or_after(con, symbol, event_ts)
     p1 = price_at_or_after(con, symbol, event_ts + horizon_ms)
     if p0 is None or p1 is None:

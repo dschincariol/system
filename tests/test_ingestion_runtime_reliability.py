@@ -208,6 +208,110 @@ class IngestionRuntimeReliabilityTests(unittest.TestCase):
             os.environ["SQLITE_LIVENESS_QUEUE_ENABLED"] = str(self.prev_liveness_queue_enabled)
         self.tmp.cleanup()
 
+    def test_provider_router_opens_circuit_after_repeated_health_failures(self) -> None:
+        storage, live_schema, provider_router = _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.storage_live_ingestion_schema",
+            "engine.data.provider_router",
+        )
+        storage.init_db()
+        now_ms = int(time.time() * 1000)
+        schema_con = storage.connect()
+        try:
+            live_schema.ensure_price_provider_health_schema(
+                schema_con,
+                warn_nonfatal=lambda *_args, **_kwargs: None,
+            )
+            schema_con.commit()
+        finally:
+            schema_con.close()
+        con = sqlite3.connect(os.environ["DB_PATH"])
+        try:
+            con.execute(
+                """
+                INSERT INTO price_provider_health(
+                  provider, ts_ms, ok, latency_ms, n_symbols, error,
+                  last_success_ts_ms, error_count
+                )
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "polygon",
+                    int(now_ms),
+                    0,
+                    250,
+                    0,
+                    "credential_error:403",
+                    int(now_ms - 60_000),
+                    3,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        health = provider_router.compute_provider_health()
+        polygon = dict(health.get("polygon") or {})
+
+        self.assertFalse(bool(polygon.get("ok")))
+        self.assertTrue(bool(polygon.get("circuit_open")))
+        self.assertEqual(str(polygon.get("status")), "CIRCUIT_OPEN")
+        self.assertEqual(int(polygon.get("error_count") or 0), 3)
+        self.assertEqual(float(polygon.get("score") or 0.0), 0.0)
+
+    def test_weather_forecast_unsupported_provider_records_failure(self) -> None:
+        (weather_forecasts,) = _reload_modules("engine.data.jobs.poll_weather_forecasts")
+        provider_health: dict[str, object] = {}
+        pipeline_status: dict[str, object] = {}
+        manager_status: dict[str, object] = {}
+
+        class _Manager:
+            def record_job_status(self, job_name, ok, message="", error="", meta=None):
+                manager_status.update(
+                    {
+                        "job_name": job_name,
+                        "ok": bool(ok),
+                        "message": str(message),
+                        "error": str(error or ""),
+                        "meta": dict(meta or {}),
+                    }
+                )
+
+        def _record_pipeline_status(job_name, **kwargs):
+            pipeline_status.update({"job_name": job_name, **kwargs})
+            return {"job_name": job_name, **kwargs}
+
+        def _append_weather_provider_health(**kwargs):
+            provider_health.update(dict(kwargs))
+
+        with patch.object(weather_forecasts, "WEATHER_PROVIDER", "unsupported_weather"):
+            with patch.object(weather_forecasts, "get_manager", return_value=_Manager()):
+                with patch.object(
+                    weather_forecasts,
+                    "_load_region_map",
+                    return_value={"regions": {"midwest": {"lat": 41.88, "lon": -87.63}}},
+                ):
+                    with patch.object(weather_forecasts, "put_job_heartbeat", return_value=None):
+                        with patch.object(weather_forecasts, "touch_job_lock", return_value=None):
+                            with patch.object(
+                                weather_forecasts,
+                                "append_weather_provider_health",
+                                side_effect=_append_weather_provider_health,
+                            ):
+                                with patch.object(
+                                    weather_forecasts,
+                                    "record_pipeline_status",
+                                    side_effect=_record_pipeline_status,
+                                ):
+                                    weather_forecasts._run_once()
+
+        self.assertFalse(bool(provider_health.get("ok")))
+        self.assertIn("unsupported_weather_provider", str(provider_health.get("error") or ""))
+        self.assertFalse(bool(pipeline_status.get("ok")))
+        self.assertIn("unsupported_weather_provider", str(pipeline_status.get("error") or ""))
+        self.assertFalse(bool(manager_status.get("ok")))
+        self.assertIn("unsupported_weather_provider", str(manager_status.get("error") or ""))
+
     def test_polling_price_max_age_reads_sqlite_row_heartbeat_payloads(self) -> None:
         (storage, ingestion_runtime) = _reload_modules(
             "engine.runtime.storage",

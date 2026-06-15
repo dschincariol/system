@@ -8,13 +8,16 @@ import os
 import socket
 import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
 import psycopg
 
+from engine.runtime.test_isolation import apply_runtime_test_defaults, running_python_tests
 from engine.runtime.metrics import emit_counter
 from engine.runtime.observability import record_component_health
+
+apply_runtime_test_defaults()
 
 LOG = logging.getLogger(__name__)
 
@@ -31,6 +34,30 @@ class SecretNotAvailable(RuntimeError):
     """Raised when a named secret cannot be loaded from the selected provider."""
 
 
+def validate_secret_name(name: str) -> str:
+    """Return a normalized secret name or raise when it could escape a provider root."""
+    secret_name = str(name or "").strip()
+    if not secret_name:
+        raise SecretNotAvailable("secret_name_required")
+
+    posix_path = PurePosixPath(secret_name)
+    windows_path = PureWindowsPath(secret_name)
+    path_parts = tuple(posix_path.parts) + tuple(windows_path.parts)
+    if (
+        "/" in secret_name
+        or "\\" in secret_name
+        or ":" in secret_name
+        or secret_name in {".", ".."}
+        or posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or windows_path.root
+        or any(part in {".", ".."} for part in path_parts)
+    ):
+        raise SecretNotAvailable(f"invalid_secret_name:{secret_name}")
+    return secret_name
+
+
 def _default_provider_name() -> str:
     if sys.platform.startswith("win"):
         return "dpapi"
@@ -41,22 +68,46 @@ def selected_provider_name() -> str:
     return str(os.environ.get("TS_SECRETS_PROVIDER") or _default_provider_name()).strip().lower()
 
 
-def _provider_loader(provider_name: str) -> Callable[[str], bytes]:
+def _credential_audit_enabled() -> bool:
+    configured = os.environ.get("TS_CREDENTIAL_AUDIT_ENABLED")
+    if configured is None and running_python_tests():
+        return False
+    return str(configured if configured is not None else "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _provider_module(provider_name: str):
     module_name = _PROVIDER_MODULES.get(str(provider_name or "").strip().lower())
     if not module_name:
         raise SecretNotAvailable(f"unknown_secrets_provider:{provider_name}")
     try:
-        module = importlib.import_module(module_name)
+        return importlib.import_module(module_name)
     except RuntimeError:
         raise
     except Exception as exc:
         raise SecretNotAvailable(
             f"secrets_provider_unavailable:{provider_name}:{type(exc).__name__}:{exc}"
         ) from exc
+
+
+def _provider_loader(provider_name: str) -> Callable[[str], bytes]:
+    module = _provider_module(provider_name)
     load = getattr(module, "load", None)
     if not callable(load):
         raise SecretNotAvailable(f"secrets_provider_missing_load:{provider_name}")
     return load
+
+
+def _provider_deleter(provider_name: str) -> Callable[[str], bool]:
+    module = _provider_module(provider_name)
+    delete = getattr(module, "delete", None)
+    if not callable(delete):
+        raise SecretNotAvailable(f"secrets_provider_missing_delete:{provider_name}")
+    return delete
 
 
 def _service_name() -> str:
@@ -105,6 +156,8 @@ def _insert_access_log(
 
 
 def _record_access(*, name: str, provider: str, ok: bool, error: str = "") -> None:
+    if not _credential_audit_enabled():
+        return
     if bool(getattr(_AUDIT_LOCAL, "active", False)):
         return
     _AUDIT_LOCAL.active = True
@@ -151,9 +204,7 @@ def load_secret(name: str) -> bytes:
     Callers must consume the returned bytes immediately and avoid retaining
     plaintext secret material longer than the operation requires.
     """
-    secret_name = str(name or "").strip()
-    if not secret_name:
-        raise SecretNotAvailable("secret_name_required")
+    secret_name = validate_secret_name(name)
     provider = selected_provider_name()
     try:
         data = _provider_loader(provider)(secret_name)
@@ -176,4 +227,35 @@ def load_secret(name: str) -> bytes:
         raise wrapped from exc
 
 
-__all__ = ["SecretNotAvailable", "load_secret", "selected_provider_name"]
+def delete_secret(name: str) -> bool:
+    """Delete a named secret from the configured provider.
+
+    This is intended for post-rotation cleanup after all data has been
+    verified under the replacement key. Providers return ``False`` when the
+    named secret is already absent.
+    """
+    secret_name = validate_secret_name(name)
+    provider = selected_provider_name()
+    try:
+        deleted = bool(_provider_deleter(provider)(secret_name))
+        _record_access(name=secret_name, provider=provider, ok=True)
+        return deleted
+    except SecretNotAvailable as exc:
+        _record_access(name=secret_name, provider=provider, ok=False, error=str(exc))
+        raise
+    except RuntimeError as exc:
+        _record_access(name=secret_name, provider=provider, ok=False, error=str(exc))
+        raise
+    except Exception as exc:
+        wrapped = SecretNotAvailable(f"secret_delete_unavailable:{secret_name}:{type(exc).__name__}:{exc}")
+        _record_access(name=secret_name, provider=provider, ok=False, error=str(wrapped))
+        raise wrapped from exc
+
+
+__all__ = [
+    "SecretNotAvailable",
+    "delete_secret",
+    "load_secret",
+    "selected_provider_name",
+    "validate_secret_name",
+]

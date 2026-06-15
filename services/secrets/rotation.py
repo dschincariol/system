@@ -26,6 +26,7 @@ class RotationResult:
     rotated: int
     skipped: int
     verified: int
+    old_key_deleted: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -33,6 +34,7 @@ class RotationResult:
             "rotated": int(self.rotated),
             "skipped": int(self.skipped),
             "verified": int(self.verified),
+            "old_key_deleted": int(self.old_key_deleted),
         }
 
 
@@ -98,11 +100,70 @@ def re_encrypt_blob(blob: str, *, old_key_name: str, new_key_name: str) -> str:
     return encrypt_credentials(payload, key_name=str(new_key_name))
 
 
+def _delete_verified_old_key(
+    *,
+    old_key_name: str,
+    new_key_name: str,
+    target_key_version: str,
+    rotated: int,
+    verified: int,
+) -> int:
+    if rotated <= 0:
+        return 0
+    if str(old_key_name) in {str(new_key_name), str(target_key_version)}:
+        return 0
+    if verified < rotated:
+        raise SecretRotationError(
+            "credential_rotation_old_key_delete_blocked:verification_incomplete:"
+            f"rotated={int(rotated)}:verified={int(verified)}"
+        )
+    try:
+        from services.secrets.loader import delete_secret
+
+        deleted = bool(delete_secret(str(old_key_name)))
+    except Exception as exc:
+        emit_counter(
+            "credential_rotation_old_key_delete_failures",
+            1,
+            component="services.secrets.rotation",
+            extra_tags={
+                "old_key_name": str(old_key_name),
+                "new_key_name": str(new_key_name),
+                "error_class": type(exc).__name__,
+            },
+        )
+        LOG.error(
+            "credential_rotation_old_key_delete_failed old_key=%s new_key=%s error_class=%s error=%s",
+            str(old_key_name),
+            str(new_key_name),
+            type(exc).__name__,
+            exc,
+        )
+        raise SecretRotationError(
+            f"credential_rotation_old_key_delete_failed:{old_key_name}:{type(exc).__name__}:{exc}"
+        ) from exc
+    if deleted:
+        emit_counter(
+            "credential_rotation_old_key_deleted",
+            1,
+            component="services.secrets.rotation",
+            extra_tags={"old_key_name": str(old_key_name), "new_key_name": str(new_key_name)},
+        )
+        LOG.info(
+            "credential_rotation_old_key_deleted old_key=%s new_key=%s",
+            str(old_key_name),
+            str(new_key_name),
+        )
+        return 1
+    return 0
+
+
 def re_encrypt_data_sources(
     *,
     old_key_name: str = "master_key",
     new_key_name: str = "master_key.next",
     final_key_version: str | None = None,
+    delete_old_key: bool = True,
     storage_module: Any | None = None,
 ) -> dict[str, int]:
     """Re-encrypt every populated ``data_sources.credentials_enc`` row.
@@ -166,11 +227,23 @@ def re_encrypt_data_sources(
         decrypt_key_name=new_key_name,
         storage_module=storage_module,
     )
+    old_key_deleted = (
+        _delete_verified_old_key(
+            old_key_name=old_key_name,
+            new_key_name=new_key_name,
+            target_key_version=target_key_version,
+            rotated=len(updates),
+            verified=verified,
+        )
+        if delete_old_key
+        else 0
+    )
     return RotationResult(
         scanned=len(rows),
         rotated=len(updates),
         skipped=skipped,
         verified=verified,
+        old_key_deleted=old_key_deleted,
     ).as_dict()
 
 

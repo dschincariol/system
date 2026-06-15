@@ -111,3 +111,17 @@ def test_safe_mode_projection_sanitizes_child_env_dict(monkeypatch) -> None:
     assert "ALPACA_KEY_ID" not in env
     assert "ALPACA_SECRET_KEY" not in env
     assert "OPENAI_API_KEY" not in env
+
+
+def test_credential_runtime_env_keys_warns_when_catalog_fails(monkeypatch) -> None:
+    import services.data_source_manager as module
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(module, "_warn_nonfatal", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(module, "_default_catalog", lambda: (_ for _ in ()).throw(RuntimeError("catalog failed")))
+
+    keys = module.credential_runtime_env_keys()
+
+    assert "OPENAI_API_KEY" in keys
+    assert calls
+    assert calls[0][0][0] == "DATA_SOURCE_MANAGER_CREDENTIAL_CATALOG_KEYS_FAILED"

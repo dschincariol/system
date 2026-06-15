@@ -349,14 +349,21 @@ ALLOWED_JOBS = {
     "engine/data/options_poll.py",
     "daemon",
     None,
-    {"execution": False},
+    {"execution": False, "schedule": "every 300s", "cadence_seconds": 300},
 ),
 
 "poll_macro": (
     "engine/data/jobs/poll_macro.py",
     "daemon",
     None,
-    {"execution": False},
+    {"execution": False, "schedule": "every 21600s", "cadence_seconds": 21600},
+),
+
+"backfill_macro_vintages": (
+    "engine/data/jobs/backfill_macro_vintages.py",
+    "oneshot",
+    None,
+    {"execution": False, "schedule": "manual one-shot", "pipeline_stage": "macro_backfill"},
 ),
 
 "snapshot_model_features": (
@@ -507,6 +514,33 @@ ALLOWED_JOBS = {
     {"execution": False, "pipeline_stage": "ensemble_target_fill"},
 ),
 
+"adwin_residual_drift": (
+    "engine/strategy/jobs/adwin_residual_drift.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "drift",
+        "resource_class": "training",
+        "resource_priority": 36,
+        "slot_cost": 1,
+    },
+),
+
+"triple_barrier_labels": (
+    "engine/strategy/jobs/triple_barrier_labels.py",
+    "oneshot",
+    None,
+    {"execution": False, "pipeline_stage": "meta_labeling"},
+),
+
+"train_meta_label_model": (
+    "engine/strategy/jobs/train_meta_label_model.py",
+    "oneshot",
+    None,
+    {"execution": False, "pipeline_stage": "model_training"},
+),
+
 "causal_scoring": (
     "engine/strategy/jobs/causal_scoring.py",
     "oneshot",
@@ -525,6 +559,33 @@ ALLOWED_JOBS = {
     "oneshot",
     None,
     {"execution": False, "pipeline_stage": "drift"},
+),
+
+"har_rv_forecast": (
+    "engine/strategy/jobs/har_rv_forecast.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "risk_forecast",
+        "resource_class": "training",
+        "resource_priority": 33,
+        "slot_cost": 1,
+    },
+),
+
+"bocpd_regime_update": (
+    "engine/strategy/jobs/bocpd_regime_update.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "schedule": "daily",
+        "pipeline_stage": "regime",
+        "resource_class": "training",
+        "resource_priority": 37,
+        "slot_cost": 1,
+    },
 ),
 
 "shadow_metrics": (
@@ -606,6 +667,33 @@ ALLOWED_JOBS = {
     {
         "execution": False,
         "pipeline_stage": "lgbm_train",
+        "resource_class": "training",
+        "resource_priority": 40,
+        "slot_cost": 1,
+    },
+),
+
+"incremental_lgbm_refresh": (
+    "engine/strategy/jobs/incremental_lgbm_refresh.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "schedule": "nightly",
+        "pipeline_stage": "lgbm_refresh",
+        "resource_class": "training",
+        "resource_priority": 39,
+        "slot_cost": 1,
+    },
+),
+
+"train_lgbm_ranker_models": (
+    "engine/strategy/jobs/train_lgbm_ranker_models.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "lgbm_ranker_train",
         "resource_class": "training",
         "resource_priority": 40,
         "slot_cost": 1,
@@ -737,6 +825,22 @@ ALLOWED_JOBS = {
     },
 ),
 
+"llm_factor_discovery": (
+    "engine/strategy/jobs/llm_factor_discovery.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "schedule": "weekly/manual",
+        "cadence_seconds": 604800,
+        "pipeline_stage": "feature_discovery",
+        "resource_class": "training",
+        "resource_priority": 30,
+        "slot_cost": 1,
+        "requires_secret": "ANTHROPIC_API_KEY",
+    },
+),
+
 "drift_triggered_retrain": (
     "engine/strategy/jobs/drift_triggered_retrain.py",
     "oneshot",
@@ -851,7 +955,7 @@ ALLOWED_JOBS = {
     "engine/data/jobs/ingest_options.py",
     "oneshot",
     None,
-    {"execution": False},
+    {"execution": False, "schedule": "every 300s", "cadence_seconds": 300},
 ),
 
 "poll_earnings": (
@@ -879,7 +983,68 @@ ALLOWED_JOBS = {
     "engine/data/jobs/ingest_form4.py",
     "daemon",
     None,
-    {"execution": False},
+    {"execution": False, "schedule": "every 1800s", "cadence_seconds": 1800},
+),
+
+"ingest_finra_short_volume": (
+    "engine/data/jobs/ingest_finra_short_volume.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 21600s", "cadence_seconds": 21600},
+),
+
+"ingest_finra_short_interest": (
+    "engine/data/jobs/ingest_finra_short_interest.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 86400s", "cadence_seconds": 86400},
+),
+
+"ingest_crypto_funding": (
+    "engine/data/jobs/ingest_crypto_funding.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "settlement-aligned 00/08/16 UTC", "cadence_seconds": 28800},
+),
+
+"ingest_etf_flows": (
+    "engine/data/jobs/ingest_etf_flows.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 86400s", "cadence_seconds": 86400},
+),
+
+"ingest_cftc_cot": (
+    "engine/data/jobs/ingest_cftc_cot.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 86400s", "cadence_seconds": 86400},
+),
+
+"ingest_13f": (
+    "engine/data/jobs/ingest_13f.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "quarterly source; poll every 86400s", "cadence_seconds": 86400, "source_cadence": "quarterly"},
+),
+
+"ingest_quiver_gov": (
+    "engine/data/jobs/ingest_quiver_gov.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 86400s", "cadence_seconds": 86400, "requires_secret": "QUIVER_API_KEY"},
+),
+
+"ingest_fundamentals_pit": (
+    "engine/data/jobs/ingest_fundamentals_pit.py",
+    "daemon",
+    None,
+    {
+        "execution": False,
+        "schedule": "every 86400s",
+        "cadence_seconds": 86400,
+        "requires_secret_any": ["SIMFIN_API_KEY", "SHARADAR_API_KEY"],
+    },
 ),
 
 "ingest_congressional_trades": (
@@ -923,6 +1088,21 @@ ALLOWED_JOBS = {
         "resource_priority": 78,
         "slot_cost": 1,
         "pipeline_stage": "nlp_news",
+    },
+),
+
+"process_news_flow": (
+    "engine/data/jobs/process_news_flow.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "schedule": "every 900s",
+        "cadence_seconds": 900,
+        "resource_class": "inference",
+        "resource_priority": 77,
+        "slot_cost": 1,
+        "pipeline_stage": "news_flow",
     },
 ),
 
@@ -1216,6 +1396,8 @@ ALLOWED_JOBS = {
     None,
     {
         "execution": True,
+        "schedule": "every 300s (gap recovery)",
+        "cadence_seconds": 300,
         "resource_class": "execution",
         "resource_priority": 100,
         "slot_cost": 1,
@@ -1255,6 +1437,21 @@ ALLOWED_JOBS = {
         "resource_class": "execution",
         "resource_priority": 100,
         "slot_cost": 1,
+    },
+),
+
+"alpaca_trade_updates_stream": (
+    "engine/execution/jobs/alpaca_trade_updates_stream.py",
+    "daemon",
+    None,
+    {
+        "execution": True,
+        "resource_class": "execution",
+        "resource_priority": 100,
+        "slot_cost": 1,
+        "streaming": True,
+        "gap_recovery_job": "execution_poll_and_attrib",
+        "requires_secret": "ALPACA_KEY_ID,ALPACA_SECRET_KEY",
     },
 ),
 
@@ -1317,11 +1514,12 @@ def _build_pipeline_order() -> List[str]:
     if _finbert_pipeline_enabled():
         order.append("process_finbert_sentiment")
     if _nlp_pipeline_enabled():
-        order.extend(["embed_news", "embed_filings", "embed_transcripts"])
+        order.extend(["embed_news", "process_news_flow", "embed_filings", "embed_transcripts"])
     order.extend(
         [
             "label_due_events",
             "fill_ensemble_oos_targets",
+            "triple_barrier_labels",
         ]
     )
     if _causal_scoring_enabled():
@@ -1329,11 +1527,16 @@ def _build_pipeline_order() -> List[str]:
     order.append("compute_drift")
     if _hmm_pipeline_enabled():
         order.append("train_hmm_regime")
+    order.append("har_rv_forecast")
+    order.append("bocpd_regime_update")
     order.append("shadow_metrics")
     if _gbm_pipeline_enabled():
         order.append("train_gbm_regressor")
     if _model_family_pipeline_enabled("lgbm_regressor", "USE_LGBM_REGRESSOR"):
         order.append("train_lgbm_models")
+    if _model_family_pipeline_enabled("lgbm_ranker", "USE_LGBM_RANKER"):
+        order.append("train_lgbm_ranker_models")
+    order.append("train_meta_label_model")
     if _model_family_pipeline_enabled("xgb_regressor", "USE_XGB_REGRESSOR"):
         order.append("train_xgb_models")
     if _model_family_pipeline_enabled("patchtst", "USE_PATCHTST"):

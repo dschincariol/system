@@ -4,13 +4,13 @@ The `boot/` directory contains the local launch and operator surface for the sys
 
 ## File Roles
 
-- [start_operator.bat](c:\Users\dschi\Documents\GitHub\Trading-System-\boot\start_operator.bat)
+- [start_operator.bat](start_operator.bat)
   Main Windows launcher used by local users.
-- [start_operator.sh](c:\Users\dschi\Documents\GitHub\Trading-System-\boot\start_operator.sh)
+- [start_operator.sh](start_operator.sh)
   Shell launcher for non-Windows environments.
-- [operator_server.js](c:\Users\dschi\Documents\GitHub\Trading-System-\boot\operator_server.js)
+- [operator_server.js](operator_server.js)
   Local Node operator service on port `4001` that proxies dashboard/runtime reads, owns guided controls, and manages launcher/process workflows.
-- [operator_ui.html](c:\Users\dschi\Documents\GitHub\Trading-System-\boot\operator_ui.html)
+- [operator_ui.html](operator_ui.html)
   Browser UI for operator controls, bootstrap diagnostics, service health, and guided recovery actions.
   It links operators into the main dashboard, repair tooling, and newer control-plane surfaces such as the Data Sources Control Center and terminal.
 
@@ -18,8 +18,8 @@ The `boot/` directory contains the local launch and operator surface for the sys
 
 The operator layer is no longer a second source-configuration system.
 
-- Use [ui/data_sources.html](c:\Users\dschi\Documents\GitHub\Trading-System-\ui\data_sources.html) as the single source of truth for provider setup, credential storage, testing, enablement, and resets.
-- Provider credentials and source-specific settings are stored in the database through [services/data_source_manager.py](c:\Users\dschi\Documents\GitHub\Trading-System-\services\data_source_manager.py), not maintained as live `.env` feed config.
+- Use [ui/data_sources.html](../ui/data_sources.html) as the single source of truth for provider setup, credential storage, testing, enablement, and resets.
+- Provider credentials and source-specific settings are stored in the database through [services/data_source_manager.py](../services/data_source_manager.py), not maintained as live `.env` feed config.
 - The operator service may still return deprecation responses on old feed-config routes so stale callers can be redirected cleanly.
 
 ## Current Operator Repair Surfaces

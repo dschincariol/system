@@ -68,39 +68,40 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
             with patch.object(sys, "argv", ["prod_preflight.py", "--json"]):
                 with patch.object(sys, "stdout", stdout):
                     with patch.object(prod_preflight, "_runtime_config_gate", return_value=(["runtime config ok"], [])):
-                        with patch.object(prod_preflight, "_compile_files", return_value=[]):
-                            with patch.object(prod_preflight, "_ensure_schemas", return_value=["core db ok"]):
-                                with patch.object(
-                                    prod_preflight,
-                                    "_verify_sqlite_contract",
-                                    return_value=(["sqlite contract ok"], [], {"ok": True}),
-                                ):
+                        with patch.object(prod_preflight, "_api_mutation_auth_gate", return_value=(["api mutation auth ok"], [])):
+                            with patch.object(prod_preflight, "_compile_files", return_value=[]):
+                                with patch.object(prod_preflight, "_ensure_schemas", return_value=["core db ok"]):
                                     with patch.object(
                                         prod_preflight,
-                                        "_check_external_services",
-                                        return_value=([], [], [], []),
+                                        "_verify_sqlite_contract",
+                                        return_value=(["sqlite contract ok"], [], {"ok": True}),
                                     ):
                                         with patch.object(
                                             prod_preflight,
-                                            "SMOKE_CMDS",
-                                            [("engine.strategy.jobs.train_size_policy", ["python", "-m", "x"])],
+                                            "_check_external_services",
+                                            return_value=([], [], [], []),
                                         ):
                                             with patch.object(
                                                 prod_preflight,
-                                                "_run_cmd",
-                                                return_value=(1, "[size_policy] not enough samples: 0 < 200"),
+                                                "SMOKE_CMDS",
+                                                [("engine.strategy.jobs.train_size_policy", ["python", "-m", "x"])],
                                             ):
                                                 with patch.object(
                                                     prod_preflight,
-                                                    "_exec_cost_gate_sanity",
-                                                    return_value=([], []),
+                                                    "_run_cmd",
+                                                    return_value=(1, "[size_policy] not enough samples: 0 < 200"),
                                                 ):
                                                     with patch.object(
                                                         prod_preflight,
-                                                        "_capital_reconciliation_sanity",
-                                                        return_value=([], [], []),
+                                                        "_exec_cost_gate_sanity",
+                                                        return_value=([], []),
                                                     ):
-                                                        rc = prod_preflight.main()
+                                                        with patch.object(
+                                                            prod_preflight,
+                                                            "_capital_reconciliation_sanity",
+                                                            return_value=([], [], []),
+                                                        ):
+                                                            rc = prod_preflight.main()
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(rc, 2)
@@ -142,6 +143,20 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
                 "smoke failed: engine.execution.broker_sim output matched best_effort_deferred_lock_contention",
             ),
         )
+
+    def test_api_mutation_auth_gate_fails_closed_in_prod_without_token(self) -> None:
+        prod_preflight = _reload_module()
+
+        with patch.dict(
+            os.environ,
+            {"ENV": "prod", "ENGINE_MODE": "safe", "EXECUTION_MODE": "safe"},
+            clear=True,
+        ):
+            notes, errors = prod_preflight._api_mutation_auth_gate()
+
+        self.assertEqual(notes, [])
+        self.assertTrue(errors)
+        self.assertIn("DASHBOARD_API_TOKEN must be set", errors[0])
 
 
 if __name__ == "__main__":

@@ -1048,7 +1048,13 @@ def _writes_paused(telemetry: Optional[Dict[str, Any]]) -> bool:
 def _snapshot_record_ts(record: Dict[str, Any]) -> int:
     try:
         return int((record or {}).get("ts_ms") or (record or {}).get("event_ts_ms") or (record or {}).get("timestamp") or 0)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "STREAM_PRICES_POLYGON_SNAPSHOT_TS_PARSE_FAILED",
+            e,
+            once_key="snapshot_record_ts",
+            record_keys=sorted(str(key) for key in list((record or {}).keys())[:20]),
+        )
         return 0
 
 

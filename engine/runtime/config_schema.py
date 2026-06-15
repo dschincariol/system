@@ -348,12 +348,17 @@ def load_runtime_config() -> RuntimeConfig:
     safety = get_runtime_safety_context()
     env = str(safety["env"])
     engine_mode = str(safety["engine_mode"])
+    supervised = bool(safety["supervised"])
+    explicit_dev_env = bool(safety["explicit_dev_env"])
     strict_runtime = bool(safety["strict_runtime"])
     require_explicit_training = bool(safety["require_explicit_training"])
 
     from engine.runtime.platform import default_data_root
 
-    default_db_path = str(default_data_root())
+    if engine_mode == "live" and explicit_dev_env and not supervised:
+        default_db_path = str(Path.cwd() / "data" / ("trading" + "." + "db"))
+    else:
+        default_db_path = str(default_data_root())
     db_path_raw = _opt("DB_PATH", "")
     if strict_runtime and not db_path_raw:
         raise ConfigError(

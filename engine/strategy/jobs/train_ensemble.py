@@ -9,15 +9,37 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
 
+from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect
+
+LOG = logging.getLogger(__name__)
+
+
+def _warn_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
+    log_failure(
+        LOG,
+        event=str(code).lower(),
+        code=str(code),
+        message=str(error),
+        error=error,
+        level=logging.WARNING,
+        component="engine.strategy.jobs.train_ensemble",
+        extra=extra or None,
+        persist=False,
+    )
+
+
 try:
     from engine.runtime.storage import fetch_latest_model_hyperparameters
-except Exception:  # pragma: no cover - older storage facades may not expose it
+except Exception as e:  # pragma: no cover - older storage facades may not expose it
+    _warn_nonfatal(
+        "ENSEMBLE_HYPERPARAMETER_FETCHER_IMPORT_FAILED",
+        e,
+    )
     fetch_latest_model_hyperparameters = None  # type: ignore[assignment]
 from engine.strategy.ensemble.blender import filter_weights_by_eligibility, persist_weights
 from engine.strategy.ensemble.oos_store import read_oos_predictions, trailing_start_ts
 from engine.strategy.ensemble.ridge_meta import RidgeStackEnsemble
-
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -58,6 +80,7 @@ def _mapping_or_none(value: Any) -> Mapping[str, Any] | None:
 
             parsed = json.loads(value)
         except Exception:
+            LOG.debug("ensemble_mapping_json_parse_failed value=%r", value, exc_info=True)
             return None
         if isinstance(parsed, Mapping):
             return parsed
@@ -133,9 +156,11 @@ def _catalog_alpha(symbol: str, horizon: int) -> float | None:
                     kwargs["model_family"],
                     kwargs.get("tuner"),
                 )
-            except Exception:
+            except Exception as e:
+                _warn_nonfatal("ENSEMBLE_CATALOG_ALPHA_POSITIONAL_FETCH_FAILED", e, kwargs=repr(kwargs))
                 continue
-        except Exception:
+        except Exception as e:
+            _warn_nonfatal("ENSEMBLE_CATALOG_ALPHA_FETCH_FAILED", e, kwargs=repr(kwargs))
             continue
         alpha = _extract_alpha_from_catalog_row(row)
         if alpha is not None:
@@ -174,9 +199,11 @@ def _catalog_lambda_prior(symbol: str, horizon: int) -> float | None:
                     kwargs["model_family"],
                     kwargs.get("tuner"),
                 )
-            except Exception:
+            except Exception as e:
+                _warn_nonfatal("ENSEMBLE_CATALOG_LAMBDA_POSITIONAL_FETCH_FAILED", e, kwargs=repr(kwargs))
                 continue
-        except Exception:
+        except Exception as e:
+            _warn_nonfatal("ENSEMBLE_CATALOG_LAMBDA_FETCH_FAILED", e, kwargs=repr(kwargs))
             continue
         value = _extract_lambda_prior_from_catalog_row(row)
         if value is not None:
@@ -222,7 +249,8 @@ def _table_exists(con, table: str) -> bool:
     try:
         row = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (str(table),)).fetchone()
         return bool(row)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("ENSEMBLE_TABLE_EXISTS_FAILED", e, table=str(table))
         return False
 
 
@@ -252,7 +280,14 @@ def _latest_causal_score_for_family(
             """,
             tuple(params),
         ).fetchone()
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "ENSEMBLE_CAUSAL_SCORE_LOOKUP_FAILED",
+            e,
+            family=str(family),
+            target=str(target or ""),
+            window=str(window or ""),
+        )
         return None
     return _float_or_none(row[0]) if row else None
 
@@ -420,13 +455,17 @@ def run(*, con=None) -> dict[str, Any]:
                     skipped += 1
                 else:
                     persisted.append(result)
-            except Exception:
+            except Exception as e:
+                _warn_nonfatal(
+                    "ENSEMBLE_WEIGHT_PERSIST_FAILED",
+                    e,
+                    symbol=str(symbol),
+                    horizon=int(horizon),
+                    families=sorted(str(family) for family in weights),
+                )
                 skipped += 1
                 continue
-        try:
-            con.commit()
-        except Exception:
-            logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+        con.commit()
         unique_alphas = sorted({float(value) for value in alpha_by_group.values()})
         summary_alpha = (
             float(unique_alphas[0])
@@ -455,7 +494,7 @@ def run(*, con=None) -> dict[str, Any]:
 
 
 def main() -> None:
-    print(run())
+    LOG.info("train_ensemble_result result=%s", run())
 
 
 if __name__ == "__main__":

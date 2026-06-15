@@ -17,6 +17,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 
 def _run(label: str, args: list[str], env: dict[str, str]) -> None:
     print(f"\n=== {label} ===")
@@ -25,6 +28,30 @@ def _run(label: str, args: list[str], env: dict[str, str]) -> None:
     if label in {"unit-tests", "pytest-tests"}:
         run_env = _unit_test_env(env)
     subprocess.run(args, check=True, cwd=str(ROOT), env=run_env)
+
+
+def _cleanup_validation_pg_schemas(env: dict[str, str]) -> None:
+    if _env_truthy(env.get("TRADING_KEEP_VALIDATION_PG_SCHEMAS")):
+        return
+    if not str(env.get("TS_PG_DSN") or "").strip():
+        return
+    previous = dict(os.environ)
+    try:
+        os.environ.update(env)
+        from tools.validation_pg_cleanup import cleanup_validation_schemas, schema_for_db_path
+
+        current_db_path = str(env.get("DB_PATH") or "").strip()
+        exclude = [schema_for_db_path(current_db_path)] if current_db_path else []
+        result = cleanup_validation_schemas(exclude=exclude)
+        dropped = list(result.get("dropped") or [])
+        if dropped:
+            print(f"\n=== validation-pg-schema-cleanup ===")
+            print(f"dropped {len(dropped)} hashed validation schema(s)")
+    except Exception as exc:
+        print(f"\nWARNING validation-pg-schema-cleanup failed: {type(exc).__name__}: {exc}")
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
 
 
 def _project_python() -> str:
@@ -199,12 +226,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.live:
         checks.append(("pipeline-smoke", [python, "tools/pipeline_smoke_test.py"]))
 
-    for label, command in checks:
-        try:
-            _run(label, command, env)
-        except subprocess.CalledProcessError as exc:
-            print(f"\nValidation failed during {label}.")
-            return exc.returncode or 1
+    try:
+        for label, command in checks:
+            try:
+                _run(label, command, env)
+            except subprocess.CalledProcessError as exc:
+                print(f"\nValidation failed during {label}.")
+                return exc.returncode or 1
+    finally:
+        _cleanup_validation_pg_schemas(env)
 
     print("\nValidation complete.")
     if not args.live:

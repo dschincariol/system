@@ -285,6 +285,8 @@ class RegimeDetector:
         self._submitted_count = 0
         self._completed_count = 0
         self._inflight_count = 0
+        self._failure_count = 0
+        self._last_failure: dict[str, Any] | None = None
 
     def submit_refresh_nowait(
         self,
@@ -357,9 +359,11 @@ class RegimeDetector:
         with self._flush_condition:
             while True:
                 if self._completed_count >= self._submitted_count and self._inflight_count <= 0 and self._queue.empty():
+                    self._raise_background_failure_locked()
                     return True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
+                    self._raise_background_failure_locked()
                     return False
                 self._flush_condition.wait(timeout=remaining)
 
@@ -404,11 +408,20 @@ class RegimeDetector:
                 self._persist_state(state)
                 self._store_cached(state)
             except Exception as exc:
-                _warn_nonfatal(
-                    "REGIME_DETECTOR_COMPUTE_FAILED",
-                    exc,
-                    symbol=str(payload.get("symbol") or ""),
-                    time=int(_safe_int(payload.get("time"), 0)),
+                self._record_background_failure(payload, exc)
+                log_failure(
+                    LOG,
+                    event="regime_detector_background_refresh_failed",
+                    code="REGIME_DETECTOR_REFRESH_FAILED",
+                    message="Regime detector background refresh failed.",
+                    error=exc,
+                    level=logging.ERROR,
+                    component="engine.regime_detector",
+                    persist=False,
+                    extra={
+                        "symbol": str(payload.get("symbol") or ""),
+                        "time": int(_safe_int(payload.get("time"), 0)),
+                    },
                 )
             finally:
                 self._mark_completed(1)
@@ -552,6 +565,34 @@ class RegimeDetector:
             self._inflight_count = max(0, self._inflight_count - resolved)
             self._completed_count += resolved
             self._flush_condition.notify_all()
+
+    def _record_background_failure(self, payload: Mapping[str, Any], exc: BaseException) -> None:
+        with self._flush_condition:
+            self._failure_count += 1
+            self._last_failure = {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "symbol": str((payload or {}).get("symbol") or ""),
+                "time": int(_safe_int((payload or {}).get("time"), 0)),
+            }
+            self._flush_condition.notify_all()
+
+    def _raise_background_failure_locked(self) -> None:
+        failure = self._last_failure
+        if not failure:
+            return
+        count = int(self._failure_count or 1)
+        self._last_failure = None
+        self._failure_count = 0
+        symbol = str(failure.get("symbol") or "")
+        failure_time = int(_safe_int(failure.get("time"), 0))
+        error_type = str(failure.get("error_type") or "RuntimeError")
+        error_message = str(failure.get("error_message") or "unknown error")
+        raise RuntimeError(
+            "regime detector background refresh failed "
+            f"(failures={count}, symbol={symbol}, time={failure_time}): "
+            f"{error_type}: {error_message}"
+        )
 
 
 DEFAULT_REGIME_DETECTOR = RegimeDetector()

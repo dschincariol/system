@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from engine.runtime.storage import connect, _table_exists
 from engine.runtime.risk_state import set_state
+from engine.strategy.har_rv import resolve_vol_forecast
 
 
 MC_SIMULATIONS = int(float(os.environ.get("MC_SIMULATIONS", "1500")))
@@ -25,6 +26,7 @@ MC_REFRESH_MIN_INTERVAL_S = float(os.environ.get("MC_REFRESH_MIN_INTERVAL_S", "3
 MC_STRESS_VOL_MULT = float(os.environ.get("MC_STRESS_VOL_MULT", "1.35"))
 MC_STRESS_CORR_MULT = float(os.environ.get("MC_STRESS_CORR_MULT", "1.20"))
 MC_STRESS_NEGATIVE_DRIFT = float(os.environ.get("MC_STRESS_NEGATIVE_DRIFT", "0.0025"))
+VOL_FORECAST_SOURCE = str(os.environ.get("VOL_FORECAST_SOURCE", "trailing") or "trailing").strip().lower()
 
 _LOCK = threading.Lock()
 _RUNNING = False
@@ -150,7 +152,7 @@ def _normalize_weights(weights: List[float]) -> List[float]:
     return [float(w) / gross for w in weights]
 
 
-def _build_inputs(con, desired: Dict[str, Any]) -> Tuple[List[str], List[float], List[float], List[float], List[List[float]]]:
+def _build_inputs(con, desired: Dict[str, Any]) -> Tuple[List[str], List[float], List[float], List[float], List[List[float]], Dict[str, Dict[str, Any]]]:
     rows = []
     for sym, payload in (desired or {}).items():
         w = float(payload.get("weight", 0.0) or 0.0)
@@ -164,8 +166,33 @@ def _build_inputs(con, desired: Dict[str, Any]) -> Tuple[List[str], List[float],
     histories = [_load_history(con, sym, MC_LOOKBACK) for sym in symbols]
     vols = []
     drifts = []
-    for h in histories:
-        vols.append(max(0.0001, _stdev(h)))
+    vol_meta: Dict[str, Dict[str, Any]] = {}
+    now_ms = _now_ms()
+    for idx, h in enumerate(histories):
+        symbol = symbols[idx]
+        trailing_vol = max(0.0001, _stdev(h))
+        resolved = resolve_vol_forecast(
+            con,
+            symbol,
+            ts_ms=int(now_ms),
+            source=str(VOL_FORECAST_SOURCE or "trailing"),
+            trailing_lookback=int(MC_LOOKBACK),
+        )
+        forecast_vol = resolved.get("vol")
+        if forecast_vol is None or float(forecast_vol or 0.0) <= 0.0:
+            vol_value = float(trailing_vol)
+            source = "trailing"
+        else:
+            vol_value = float(forecast_vol)
+            source = str(resolved.get("resolved_source") or resolved.get("source") or VOL_FORECAST_SOURCE)
+        vols.append(max(0.0001, float(vol_value)))
+        vol_meta[str(symbol)] = {
+            "source": str(source),
+            "forecast_ratio": resolved.get("forecast_ratio"),
+            "forecast_ts_ms": resolved.get("ts_ms"),
+            "fallback": bool(resolved.get("fallback", False)),
+            "trailing_vol": float(trailing_vol),
+        }
         drifts.append(_mean(h))
 
     n = len(symbols)
@@ -176,7 +203,7 @@ def _build_inputs(con, desired: Dict[str, Any]) -> Tuple[List[str], List[float],
             corr[i][j] = c
             corr[j][i] = c
 
-    return symbols, weights, vols, drifts, corr
+    return symbols, weights, vols, drifts, corr, vol_meta
 
 
 def _cholesky(cov):
@@ -261,7 +288,7 @@ def _worker(desired):
         # The worker owns one full refresh and then exits; external callers are
         # responsible for throttling/scheduling rather than a long-running loop here.
         _write_status("running", pending=True)
-        symbols, weights, vols, drifts, corr = _build_inputs(con, desired or {})
+        symbols, weights, vols, drifts, corr, vol_meta = _build_inputs(con, desired or {})
 
         if not symbols:
             info = {
@@ -323,6 +350,7 @@ def _worker(desired):
             },
             "inputs": {
                 "volatility": {symbols[i]: float(vols[i]) for i in range(len(symbols))},
+                "volatility_source": {symbols[i]: dict(vol_meta.get(symbols[i]) or {}) for i in range(len(symbols))},
                 "drift": {symbols[i]: float(drifts[i]) for i in range(len(symbols))},
                 "correlation": {symbols[i]: {symbols[j]: float(corr[i][j]) for j in range(len(symbols))} for i in range(len(symbols))},
             },

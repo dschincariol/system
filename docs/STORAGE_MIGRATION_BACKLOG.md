@@ -1,6 +1,6 @@
 # Storage Migration Backlog
 
-This document is the execution backlog for moving the repository's hot, append-heavy data paths from the main SQLite database to the existing Postgres or Timescale sidecars, while keeping SQLite as the control-plane store.
+This document is a historical execution backlog for moving hot, append-heavy data paths away from SQLite-era storage. The current production-like runtime uses the Postgres-backed storage facade in `engine/runtime/storage_pg.py`; SQLite is retained for isolated Python tests, compatibility shims, and historical contention-regression coverage.
 
 This is a supplementary planning document. It does not override the current storage contracts documented in [README_DATABASE_MAP.md](README_DATABASE_MAP.md), [ARCHITECTURE.md](ARCHITECTURE.md), or the runtime code.
 
@@ -8,22 +8,22 @@ This is a supplementary planning document. It does not override the current stor
 
 Primary goals:
 
-- Remove lock-contention pressure from the main SQLite file.
+- Remove lock-contention pressure from SQLite-era paths and prevent new production runtime dependencies on SQLite semantics.
 - Keep cold boot and startup validation safe while the migration is in progress.
 - Cut over writes first, then reads, then retire obsolete SQLite writes only after parity and health gates pass.
 - Keep every phase reversible by environment flags until the final retirement step.
 
 Non-goals:
 
-- Do not remove SQLite from the repo wholesale.
-- Do not migrate low-rate control-plane tables that are working acceptably in SQLite today.
+- Do not remove SQLite from the repo wholesale; it is still the isolated Python test backend.
+- Do not reintroduce production control-plane dependence on a local SQLite file.
 - Do not change startup or storage contracts without adding matching validation coverage.
 
 ## 2. Storage Split
 
-### Stays on SQLite
+### Historical SQLite Control-Plane Set
 
-These tables are the control-plane store and should remain SQLite unless a separate program is approved:
+These tables were previously treated as the control-plane SQLite set. In the current runtime they belong to the Postgres-backed storage facade unless a test explicitly opts into `TS_STORAGE_BACKEND=sqlite`:
 
 - `runtime_meta`
 - `schema_version`
@@ -37,9 +37,9 @@ These tables are the control-plane store and should remain SQLite unless a separ
 - `pnl_attribution`
 - other low-rate operator, governance, and transactional state tables that are not top contention sources
 
-### Stays on Separate SQLite Liveness DB
+### Historical Separate SQLite Liveness DB
 
-These should remain isolated from the main SQLite file:
+These were previously isolated from the main SQLite file. In the current Postgres runtime, persisted liveness goes through the Postgres facade and the `SQLITE_LIVENESS_*` knobs remain compatibility/test controls:
 
 - `job_locks`
 - `job_heartbeats`
@@ -279,7 +279,7 @@ Suggested burn-in configuration:
 - `TIMESCALE_ENABLED=1`
 - `TIMESCALE_DSN=...`
 - `TIMESCALE_TELEMETRY_MIRROR_ENABLED=1`
-- `TELEMETRY_READ_BACKEND=sqlite`
+- historical burn-in pinned telemetry reads to SQLite; current router defaults use `TELEMETRY_READ_BACKEND=auto` and choose validated Timescale reads only when the validation gate is healthy
 - `TELEMETRY_READ_REQUIRE_VALIDATION=1`
 
 Validation bundle:
@@ -345,7 +345,7 @@ Work items:
   Owner: `engine/runtime/`
 - `SM-402` Ensure all price ingress paths publish through [engine/runtime/price_router.py](../engine/runtime/price_router.py) and not ad hoc SQLite writes.
   Owner: `engine/runtime/`, `engine/data/`, `engine/jobs/`
-- `SM-403` Keep SQLite price writes enabled during burn-in to preserve fallback and parity checks.
+- `SM-403` Keep SQLite price writes enabled during historical burn-in to preserve fallback and parity checks.
   Owner: `ops/`, `deploy/`
 
 Suggested burn-in configuration:
@@ -355,7 +355,7 @@ Suggested burn-in configuration:
 - `ASYNC_PRICE_WRITER_ENABLED=1`
 - `PRICE_ROUTER_REQUIRE_ASYNC_DURING_CUTOVER=1`
 - `PRICE_ROUTER_SQLITE_WRITE_ENABLED=1`
-- `PRICE_READ_BACKEND=sqlite`
+- historical burn-in pinned price reads to SQLite; current router defaults use `PRICE_READ_BACKEND=auto` and choose validated Timescale reads only when the validation gate is healthy
 - `PRICE_READ_REQUIRE_VALIDATION=1`
 
 Validation bundle:
@@ -462,7 +462,7 @@ python -m pytest tests/test_telemetry_read_routing.py -q
 Exit criteria:
 
 - migrated tables no longer appear as top SQLite contention sources
-- SQLite remains the control-plane database only
+- SQLite remains only the isolated Python test backend and compatibility surface
 
 ## 13. Backlog Ledger
 
@@ -489,8 +489,8 @@ Use this table to track execution status as work starts.
 The migration is complete only when all of the following are true:
 
 - cold boot and startup validation remain green
-- SQLite is no longer the write bottleneck for prices and telemetry
+- SQLite is no longer a production runtime dependency for prices, telemetry, or control-plane state
 - read cutovers are controlled by validators and routers, not manual guesswork
 - Timescale or Postgres is primary for the designated hot data families
-- SQLite remains the control-plane store with an isolated liveness DB
+- SQLite remains available only as the isolated Python test backend and compatibility surface
 - canonical docs are updated to describe the final split accurately

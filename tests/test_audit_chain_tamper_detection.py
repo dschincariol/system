@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from audit_chain_test_utils import connect, create_audit_table
+from tests.audit_chain_test_utils import connect, create_audit_table
 
 from engine.audit.chain import append_chain_row
 from engine.audit.verifier import verify_table

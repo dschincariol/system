@@ -49,6 +49,18 @@ sudo bash ops/server/verify.sh
 
 The verifier checks PostgreSQL, TimescaleDB, Redis over its Unix socket, PgBouncer over `/var/run/postgresql/.s.PGSQL.6432`, filesystem ownership, and systemd unit syntax.
 
+## Backup And Restore
+
+Current runtime storage is Postgres-backed. Backup ownership for this host layer is:
+
+- `ops/backup/wal_archive.sh` for continuous WAL archiving into `/var/backups/trading/wal/`
+- `ops/backup/base_backup.sh` for scheduled `pg_basebackup` plus `pg_verifybackup`
+- `ops/backup/state_snapshot.sh` and `ops/backup/artifact_snapshot.sh` for configuration and artifact evidence
+- `ops/backup/prune.sh` for retention pruning
+- `ops/backup/restore.sh` and `ops/backup/restore_drill.sh` for clean-target restore verification
+
+Bootstrap installs the matching `trading-base-backup`, `trading-backup-prune`, and `trading-restore-drill` systemd units and timers. A backup is not considered operationally valid until a restore drill has produced a passing report.
+
 ## Deployment Layout
 
 - App checkout: `/opt/trading/app`

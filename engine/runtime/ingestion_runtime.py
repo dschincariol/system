@@ -14,7 +14,6 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -22,11 +21,9 @@ try:
     import psutil
 except Exception as e:
     psutil = None
-    try:
-        sys.stderr.write(f"[ingestion_runtime] psutil_import_failed: {type(e).__name__}: {e}\n")
-        sys.stderr.flush()
-    except Exception:
-        traceback.print_exc() if "traceback" in globals() else None
+    _PSUTIL_IMPORT_ERROR = e
+else:
+    _PSUTIL_IMPORT_ERROR = None
 
 from engine.data.provider_registry import get_enabled_market_data_job_names
 from engine.runtime.ipc import publish_channel_state, publish_message
@@ -199,6 +196,14 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
             value_type=type(value).__name__,
         )
         return float(default)
+
+
+if _PSUTIL_IMPORT_ERROR is not None:
+    _warn_failure(
+        "INGESTION_RUNTIME_PSUTIL_IMPORT_FAILED",
+        _PSUTIL_IMPORT_ERROR,
+        degradation="process_tree_checks_fall_back_to_pid_signals",
+    )
 
 
 def _child_proc(info: Dict[str, object]) -> Optional[subprocess.Popen]:
@@ -666,8 +671,12 @@ def _safe_no_credential_ingestion_mode() -> bool:
 
         if safe_no_credential_market_data_mode():
             return bool(_env_flag("YFINANCE_ENABLED", True))
-    except Exception:
-        pass
+    except Exception as e:
+        _warn_failure(
+            "INGESTION_RUNTIME_SAFE_NO_CREDENTIAL_MODE_CHECK_FAILED",
+            e,
+            degradation="safe_mode_env_fallback",
+        )
 
     mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
     execution_mode = str(os.environ.get("EXECUTION_MODE") or "safe").strip().lower()

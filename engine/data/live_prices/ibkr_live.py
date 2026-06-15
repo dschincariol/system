@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import default_ibkr_host
 
 try:
     from ib_insync import IB, Stock, Contract
@@ -82,7 +83,7 @@ class IBKRPriceProvider:
         if strict_runtime and (not host_raw or not port_raw or not client_id_raw):
             raise RuntimeError("IBKR_HOST/IBKR_PORT/IBKR_CLIENT_ID are required in supervised/prod runtime")
 
-        self.host = host_raw or "127.0.0.1"
+        self.host = host_raw or default_ibkr_host()
         self.port = int(port_raw or "7497")
         self.client_id = int(client_id_raw or "77")
         self.currency = os.environ.get("IBKR_CURRENCY", "USD").strip() or "USD"

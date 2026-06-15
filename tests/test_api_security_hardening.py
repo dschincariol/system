@@ -73,6 +73,16 @@ def _post_json(url: str, *, token: str | None = None, extra_headers: dict[str, s
         return response.status, dict(response.headers), json.loads(response.read().decode("utf-8"))
 
 
+def _enable_safe_dev_localhost_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.setenv("TS_API_ALLOW_LOCALHOST_MUTATIONS_WITHOUT_TOKEN", "1")
+    monkeypatch.delenv("TS_ENV", raising=False)
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.delenv("PROD_LOCK", raising=False)
+
+
 def test_production_import_refuses_unset_dashboard_token() -> None:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT)
@@ -90,6 +100,159 @@ def test_production_import_refuses_unset_dashboard_token() -> None:
 
     assert result.returncode != 0
     assert "InsecureConfiguration" in result.stderr
+
+
+def test_production_handler_refuses_missing_dashboard_token(tmp_path: Path, monkeypatch) -> None:
+    import engine.api.http_transport as http_transport
+
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.delenv("DASHBOARD_API_TOKEN", raising=False)
+
+    try:
+        _build_handler(
+            routes=[("POST", "/api/operator/emergency_stop", "stop")],
+            handlers={"stop": lambda *_args: {"ok": True}},
+            token="",
+            static_dir=tmp_path,
+        )
+        raise AssertionError("handler unexpectedly allowed missing production token")
+    except http_transport.InsecureConfiguration as exc:
+        assert "DASHBOARD_API_TOKEN must be set" in str(exc)
+
+
+def test_live_handler_refuses_default_dashboard_token(tmp_path: Path, monkeypatch) -> None:
+    import engine.api.http_transport as http_transport
+
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "live")
+    monkeypatch.setenv("EXECUTION_MODE", "live")
+
+    try:
+        _build_handler(
+            routes=[("POST", "/api/operator/emergency_stop", "stop")],
+            handlers={"stop": lambda *_args: {"ok": True}},
+            token="change-me",
+            static_dir=tmp_path,
+        )
+        raise AssertionError("handler unexpectedly allowed default live token")
+    except http_transport.InsecureConfiguration as exc:
+        assert "placeholder/default" in str(exc)
+
+
+def test_production_mutation_accepts_valid_dashboard_token(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/operator/emergency_stop", "stop")],
+        handlers={"stop": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        status, _headers, body = _post_json(
+            f"{base_url}/api/operator/emergency_stop",
+            token=token,
+        )
+
+    assert status == 200
+    assert body["ok"] is True
+
+
+def test_production_mutation_rejects_invalid_dashboard_token(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/operator/emergency_stop", "stop")],
+        handlers={"stop": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        try:
+            _post_json(
+                f"{base_url}/api/operator/emergency_stop",
+                token="wrong-token",
+            )
+            raise AssertionError("request unexpectedly succeeded")
+        except HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 401
+            assert body["error"] == "unauthorized"
+
+
+def test_localhost_fallback_requires_explicit_safe_dev_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.delenv("PROD_LOCK", raising=False)
+    monkeypatch.delenv("TS_API_ALLOW_LOCALHOST_MUTATIONS_WITHOUT_TOKEN", raising=False)
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/operator/restart_feeds", "restart")],
+        handlers={"restart": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token="",
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        try:
+            _post_json(f"{base_url}/api/operator/restart_feeds")
+            raise AssertionError("request unexpectedly succeeded")
+        except HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 403
+            assert body["error"] == "forbidden_localhost_fallback_disabled"
+
+    _enable_safe_dev_localhost_fallback(monkeypatch)
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/operator/restart_feeds", "restart")],
+        handlers={"restart": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token="",
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        status, _headers, body = _post_json(f"{base_url}/api/operator/restart_feeds")
+        assert status == 200
+        assert body["ok"] is True
+
+
+def test_mutation_writes_audit_event(tmp_path: Path, monkeypatch) -> None:
+    import engine.api.http_transport as http_transport
+
+    events = []
+    monkeypatch.setattr(http_transport, "_append_mutation_audit_event", lambda payload: events.append(dict(payload)))
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/data_sources/test", "test_source")],
+        handlers={"test_source": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token="audit-token-1234567890",
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        status, _headers, body = _post_json(
+            f"{base_url}/api/data_sources/test",
+            token="audit-token-1234567890",
+        )
+
+    assert status == 200
+    assert body["ok"] is True
+    assert events
+    assert events[-1]["outcome"] == "completed"
+    assert events[-1]["path"] == "/api/data_sources/test"
+    assert events[-1]["token_present"] is True
+    assert events[-1]["auth_kind"] == "dashboard_api_token"
 
 
 def test_audit_records_rejects_unauthorized_table_identifier(tmp_path: Path) -> None:
@@ -114,7 +277,8 @@ def test_audit_records_rejects_unauthorized_table_identifier(tmp_path: Path) -> 
             assert body["error"] == "unauthorized_table"
 
 
-def test_token_set_requires_token_even_from_localhost(tmp_path: Path) -> None:
+def test_token_set_requires_token_even_from_localhost(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("PROD_LOCK", raising=False)
     handler_cls = _build_handler(
         routes=[("POST", "/api/operator/emergency_stop", "stop")],
         handlers={"stop": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
@@ -136,6 +300,7 @@ def test_trusted_proxy_x_forwarded_for_disables_localhost_fallback(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    _enable_safe_dev_localhost_fallback(monkeypatch)
     monkeypatch.setenv("TS_DASHBOARD_TRUSTED_PROXIES", "127.0.0.1/32")
 
     handler_cls = _build_handler(
@@ -158,7 +323,8 @@ def test_trusted_proxy_x_forwarded_for_disables_localhost_fallback(
             assert "localhost" in body["error"]
 
 
-def test_destructive_http_rate_limit_returns_429_retry_after(tmp_path: Path) -> None:
+def test_destructive_http_rate_limit_returns_429_retry_after(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("PROD_LOCK", raising=False)
     clock = _Clock()
     limiter = ApiRateLimiter(
         token_limit_per_min=60,

@@ -31,6 +31,16 @@ TIMESCALE_SCHEMA_VERSION = 4
 _CLIENT_LOCK = threading.Lock()
 _CLIENT: "TimescaleClient | None" = None
 _SCHEMA_LOCK_KEY = 761_112_019
+
+
+def _asyncpg_pool_available() -> bool:
+    return asyncpg is not None and callable(getattr(asyncpg, "create_pool", None))
+
+
+def _asyncpg_connect_available() -> bool:
+    return asyncpg is not None and callable(getattr(asyncpg, "connect", None))
+
+
 _TIMESCALE_REQUIRED_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "timescale_schema_version": ("version", "applied_at", "status", "notes"),
     "data_source_logs": ("sqlite_rowid", "time", "source_key", "level", "event_type", "message", "detail_json"),
@@ -386,13 +396,13 @@ class TimescaleClient:
     def start(self) -> dict[str, Any]:
         if not self.enabled:
             return self.get_snapshot()
-        if asyncpg is None:
-            raise RuntimeError("timescaledb_enabled_but_asyncpg_is_not_installed")
         already_started = False
         with self._state_lock:
             if self._thread is not None and self._thread.is_alive():
                 already_started = True
             else:
+                if not _asyncpg_pool_available():
+                    raise RuntimeError("timescaledb_enabled_but_asyncpg_is_not_installed")
                 self._thread_started.clear()
                 thread = threading.Thread(
                     target=self._thread_main,
@@ -522,7 +532,7 @@ class TimescaleClient:
             "degraded_reasons": degraded_reasons,
             "enabled": bool(self.enabled),
             "dsn_configured": bool(self._config.dsn),
-            "driver_available": asyncpg is not None,
+            "driver_available": _asyncpg_pool_available(),
             "queue_depth": int(queue_depth),
             "queue_maxsize": int(self._config.queue_maxsize),
             "backpressure_timeout_s": float(self._config.backpressure_timeout_s),
@@ -706,7 +716,7 @@ class TimescaleClient:
         async with self._pool_lock:
             if self._pool is not None:
                 return self._pool
-            if asyncpg is None:
+            if not _asyncpg_pool_available():
                 raise RuntimeError("asyncpg_not_available")
             if not self._config.dsn:
                 raise RuntimeError("timescale_dsn_not_configured")

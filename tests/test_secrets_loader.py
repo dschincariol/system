@@ -33,6 +33,25 @@ def test_plaintext_happy_path_logs_success(monkeypatch, tmp_path):
     assert events == [{"name": "master_key", "provider": "plaintext", "ok": True, "error": ""}]
 
 
+def test_plaintext_delete_secret_removes_file_and_logs_success(monkeypatch, tmp_path):
+    secret_dir = tmp_path / "secrets"
+    secret_dir.mkdir()
+    secret_path = secret_dir / "old_key"
+    secret_path.write_bytes(b"alpha")
+    events = []
+
+    monkeypatch.setenv("TS_SECRETS_PROVIDER", "plaintext")
+    monkeypatch.setenv("TS_DEV_SECRETS_DIR", str(secret_dir))
+    monkeypatch.delenv("TS_ENV", raising=False)
+    monkeypatch.setattr(loader, "_insert_access_log", lambda **kwargs: events.append(kwargs))
+    sys.modules.pop("services.secrets.providers.plaintext", None)
+
+    with pytest.warns(RuntimeWarning):
+        assert loader.delete_secret("old_key") is True
+    assert not secret_path.exists()
+    assert events == [{"name": "old_key", "provider": "plaintext", "ok": True, "error": ""}]
+
+
 def test_access_log_write_failure_is_observable_without_blocking_secret_read(monkeypatch, tmp_path):
     secret_dir = tmp_path / "secrets"
     secret_dir.mkdir()
@@ -106,3 +125,33 @@ def test_unknown_provider_raises_typed(monkeypatch):
 
     with pytest.raises(loader.SecretNotAvailable, match="unknown_secrets_provider:nope"):
         loader.load_secret("master_key")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../etc/passwd",
+        "subdir/secret",
+        "subdir\\secret",
+        "/absolute/path",
+        "C:\\absolute\\path",
+        "C:relative",
+        ".",
+        "..",
+    ],
+)
+def test_loader_rejects_path_like_secret_names_before_provider(monkeypatch, name):
+    monkeypatch.setenv("TS_SECRETS_PROVIDER", "plaintext")
+    provider_called = False
+
+    def _fail_provider_loader(_provider):
+        nonlocal provider_called
+        provider_called = True
+        raise AssertionError("provider loader should not be called for invalid secret names")
+
+    monkeypatch.setattr(loader, "_provider_loader", _fail_provider_loader)
+    monkeypatch.setattr(loader, "_insert_access_log", lambda **_kwargs: None)
+
+    with pytest.raises(loader.SecretNotAvailable, match="invalid_secret_name"):
+        loader.load_secret(name)
+    assert provider_called is False

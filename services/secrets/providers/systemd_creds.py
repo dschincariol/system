@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from services.secrets.loader import SecretNotAvailable
+from services.secrets.loader import SecretNotAvailable, validate_secret_name
 
 
 def _credential_path(name: str) -> Path:
@@ -15,9 +15,7 @@ def _credential_path(name: str) -> Path:
     directory = str(os.environ.get("CREDENTIALS_DIRECTORY") or "").strip()
     if not directory:
         raise SecretNotAvailable("credentials_directory_missing")
-    secret_name = str(name or "").strip()
-    if not secret_name or secret_name != Path(secret_name).name:
-        raise SecretNotAvailable(f"invalid_secret_name:{secret_name}")
+    secret_name = validate_secret_name(name)
     return Path(directory) / secret_name
 
 
@@ -31,4 +29,15 @@ def load(name: str) -> bytes:
         raise SecretNotAvailable(f"secret_read_failed:{name}:{type(exc).__name__}:{exc}") from exc
 
 
-__all__ = ["load"]
+def delete(name: str) -> bool:
+    path = _credential_path(name)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SecretNotAvailable(f"secret_delete_failed:{name}:{type(exc).__name__}:{exc}") from exc
+
+
+__all__ = ["delete", "load"]

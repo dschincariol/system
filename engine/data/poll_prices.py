@@ -16,7 +16,6 @@ import time
 import json
 import random
 import statistics
-import traceback
 import importlib
 from typing import Dict, Any, Tuple, List, Optional
 
@@ -61,6 +60,7 @@ from engine.data.default_symbols import load_default_symbols
 from engine.data.provider_registry import get_polling_provider_names
 from engine.data.provider_router import compute_provider_health, detect_cross_provider_anomalies, select_best_quotes_from_snapshots
 from engine.data.provider_sessions import BaseProviderSession, ProviderSessionManager
+from engine.data.price_hygiene import is_split_like_price_jump, log_split_like_price_row
 from engine.runtime.alerts import emit_alert
 from engine.runtime.ingestion_status import record_pipeline_status
 from engine.runtime.logging import get_logger, log_event
@@ -1822,6 +1822,16 @@ def main() -> None:
                             if PRICE_OUTLIER_REJECT_ENABLED:
                                 continue
 
+                        if hist and is_split_like_price_jump(hist[-1], px_f):
+                            log_split_like_price_row(
+                                symbol=str(sym),
+                                ts_ms=int(ts_ms),
+                                previous_price=float(hist[-1]),
+                                current_price=float(px_f),
+                                source=str(p.get("source") or p.get("provider") or "poll_prices"),
+                            )
+                            continue
+
                         price_rows.append((int(ts_ms), str(sym), float(px_f)))
 
                         bid = p.get("bid")
@@ -2072,9 +2082,12 @@ if __name__ == "__main__":
                 error=f"{type(e).__name__}: {e}",
                 message="poll_prices unhandled exception",
             )
-            msg = f"poll_prices_unhandled_exception {type(e).__name__}: {e}"
-            print(msg, file=sys.stderr, flush=True)
-            traceback.print_exc()
+            _log_nonfatal(
+                "poll_prices_unhandled_exception",
+                e,
+                error_type=type(e).__name__,
+                error_message=str(e),
+            )
         except Exception as status_error:
             _log_nonfatal(
                 "poll_prices_unhandled_exception_record_failed",

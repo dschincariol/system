@@ -44,7 +44,8 @@ def _safe_float(value: Any, default: float | None = None) -> float | None:
         return default
     try:
         return float(value)
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        _warn_nonfatal("MODEL_CACHE_FLOAT_PARSE_FAILED", exc, value=repr(value)[:120], default=default)
         return default
 
 
@@ -53,7 +54,8 @@ def _current_db_path() -> str:
         from engine.runtime.db_guard import resolve_db_path
 
         return str(resolve_db_path())
-    except Exception:
+    except Exception as exc:
+        _warn_nonfatal("MODEL_CACHE_DB_PATH_RESOLVE_FAILED", exc)
         return ""
 
 

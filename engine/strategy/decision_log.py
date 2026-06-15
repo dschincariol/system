@@ -161,6 +161,8 @@ def log_decision(
         explain_payload["component_vector"] = dict(component_vector or {})
         extra_payload["component_vector"] = dict(component_vector or {})
     components_payload: Optional[Dict[str, Any]] = component_vector
+    if components_payload is None and isinstance(explain_payload.get("component_vector"), dict):
+        components_payload = dict(explain_payload.get("component_vector") or {})
     if components_payload is None and ensemble_components is not None:
         components_payload = {"components": dict(ensemble_components or {})}
         if ensemble_weights is not None:
@@ -194,26 +196,36 @@ def log_decision(
             return None
 
     def _write(con):
+        try:
+            decision_log_columns = {
+                str(row[1])
+                for row in (con.execute("PRAGMA table_info(decision_log)").fetchall() or [])
+            }
+        except Exception:
+            decision_log_columns = set()
+        row_payload = {
+            "ts_ms": int(now_ms),
+            "event_id": int(event_id),
+            "symbol": str(symbol),
+            "horizon_s": int(horizon_s),
+            "predicted_z": float(predicted_z),
+            "confidence": float(confidence),
+            "model_name": str(model_name),
+            "model_kind": (str(model_kind) if model_kind is not None else None),
+            "model_ts_ms": (int(model_ts_ms) if model_ts_ms is not None else None),
+            "model_version": (str(model_version) if model_version is not None else None),
+            "features_hash": (str(features_hash) if features_hash is not None else None),
+            "feature_set_tag": feature_set_tag_value,
+            "features_json": _dump(features_json),
+            "explain_json": _dump(explain_payload),
+            "extra_json": _dump(extra_payload),
+            "components_json": _dump(components_payload),
+        }
+        if not decision_log_columns or "component_vector" in decision_log_columns:
+            row_payload["component_vector"] = _dump(components_payload)
         append_chain_row(
             "decision_log",
-            {
-                "ts_ms": int(now_ms),
-                "event_id": int(event_id),
-                "symbol": str(symbol),
-                "horizon_s": int(horizon_s),
-                "predicted_z": float(predicted_z),
-                "confidence": float(confidence),
-                "model_name": str(model_name),
-                "model_kind": (str(model_kind) if model_kind is not None else None),
-                "model_ts_ms": (int(model_ts_ms) if model_ts_ms is not None else None),
-                "model_version": (str(model_version) if model_version is not None else None),
-                "features_hash": (str(features_hash) if features_hash is not None else None),
-                "feature_set_tag": feature_set_tag_value,
-                "features_json": _dump(features_json),
-                "explain_json": _dump(explain_payload),
-                "extra_json": _dump(extra_payload),
-                "components_json": _dump(components_payload),
-            },
+            row_payload,
             con,
         )
 
@@ -239,6 +251,7 @@ def log_decision(
                 "explain_json": (explain_payload or None),
                 "extra_json": (extra_payload or None),
                 "components_json": (components_payload or None),
+                "component_vector": (components_payload or None),
             },
             ts_ms=int(now_ms),
             con=con,

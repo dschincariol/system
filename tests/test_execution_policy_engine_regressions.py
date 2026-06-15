@@ -204,6 +204,94 @@ class ExecutionPolicyEngineRegressionTests(unittest.TestCase):
         policy = json.loads(str(audit_row[0] or "{}"))
         self.assertEqual(int(policy.get("slices") or 0), 7)
 
+    def test_ood_log_only_audits_without_suppressing(self) -> None:
+        now_ms = 1_710_000_010_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 1.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "ood_score": 9.0,
+            "ood_threshold": 1.5,
+            "ood_hard_threshold": 3.0,
+            "source_order_id": 301,
+        }
+
+        with patch.dict(os.environ, {"OOD_MODE": "log_only"}, clear=False):
+            with self._patch_policy_dependencies():
+                with patch.object(
+                    self.execution_policy_engine,
+                    "score_order_meta_label",
+                    return_value={"enabled": False, "applied": False, "probability": None, "multiplier": 1.0},
+                ):
+                    with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                        shaped = self.execution_policy_engine.apply_execution_policy(
+                            [order],
+                            con=self.con,
+                            actor="test",
+                            mode="paper",
+                            broker="sim",
+                        )
+
+        self.assertGreater(len(shaped), 0)
+        self.assertTrue(all(float(row.get("ood_size_mult") or 0.0) == 1.0 for row in shaped))
+        audit_row = self.con.execute(
+            "SELECT policy_json FROM execution_policy_audit ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(audit_row)
+        policy = json.loads(str(audit_row[0] or "{}"))
+        ood_gate = dict(policy.get("ood_gate") or {})
+        self.assertEqual(str(ood_gate.get("mode") or ""), "log_only")
+        self.assertEqual(str(ood_gate.get("action") or ""), "LOG_ONLY")
+
+    def test_ood_suppress_mode_hard_blocks_far_vector(self) -> None:
+        now_ms = 1_710_000_020_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 1.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "ood_score": 4.0,
+            "ood_threshold": 1.5,
+            "ood_hard_threshold": 3.0,
+            "source_order_id": 302,
+        }
+
+        with patch.dict(os.environ, {"OOD_MODE": "suppress"}, clear=False):
+            with self._patch_policy_dependencies():
+                with patch.object(
+                    self.execution_policy_engine,
+                    "score_order_meta_label",
+                    return_value={"enabled": False, "applied": False, "probability": None, "multiplier": 1.0},
+                ):
+                    with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                        shaped = self.execution_policy_engine.apply_execution_policy(
+                            [order],
+                            con=self.con,
+                            actor="test",
+                            mode="paper",
+                            broker="sim",
+                        )
+
+        self.assertEqual(shaped, [])
+        row = self.con.execute(
+            "SELECT suppression_reason, decision_json FROM trade_attribution_ledger ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row[0] or ""), "ood_hard_block")
+        decision = json.loads(str(row[1] or "{}"))
+        self.assertEqual(str(decision.get("blocked_by") or ""), "ood_hard_block")
+
     def test_alpha_decay_boundary_suppresses_order_at_exact_ttl(self) -> None:
         now_ms = 1_710_000_100_000
         order = {
@@ -242,6 +330,53 @@ class ExecutionPolicyEngineRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(suppression_row)
         self.assertEqual(str(suppression_row[0] or ""), "alpha_decay_expired")
+
+    def test_meta_label_probability_scales_size_and_is_audited(self) -> None:
+        now_ms = 1_710_000_150_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 10.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.8,
+            "expected_z": 1.2,
+            "meta_label_probability": 0.55,
+            "source_order_id": 303,
+        }
+
+        with self._patch_policy_dependencies():
+            with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                shaped = self.execution_policy_engine.apply_execution_policy(
+                    [order],
+                    con=self.con,
+                    actor="test",
+                    mode="paper",
+                    broker="sim",
+                )
+
+        self.assertTrue(shaped)
+        self.assertAlmostEqual(sum(float(row.get("qty") or 0.0) for row in shaped), 5.0, places=9)
+        for row in shaped:
+            self.assertAlmostEqual(float(row.get("meta_label_size_mult") or 0.0), 0.5, places=9)
+
+        audit_row = self.con.execute(
+            """
+            SELECT decision_json, policy_json
+            FROM execution_policy_audit
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        self.assertIsNotNone(audit_row)
+        decision = json.loads(str(audit_row[0] or "{}"))
+        policy = json.loads(str(audit_row[1] or "{}"))
+        self.assertIn("meta_label", decision)
+        self.assertAlmostEqual(float(decision["meta_label"]["probability"]), 0.55, places=9)
+        self.assertAlmostEqual(float(decision["meta_label"]["multiplier"]), 0.5, places=9)
+        self.assertIn("meta_label", policy)
 
 
 class ExecutionPolicyEngineStorageFreeTests(unittest.TestCase):

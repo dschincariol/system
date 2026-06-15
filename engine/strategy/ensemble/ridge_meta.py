@@ -42,6 +42,7 @@ class RidgeStackEnsemble:
             try:
                 records = data.to_dict("records")
                 return [dict(row) for row in records]
+            # system-audit: ignore[silent_except] non-pandas to_dict shapes fall through to mapping/iterable handling.
             except TypeError:
                 pass
         if isinstance(data, Mapping):

@@ -21,10 +21,12 @@ import json
 import os
 import time
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
 
+from engine.data.time_utils import utc_ms_from_datetime
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import (
     init_db,
@@ -98,8 +100,11 @@ def _sha(s: str) -> str:
 def _parse_ts_ms(created_at: str) -> int:
     # StockTwits created_at is ISO 8601, e.g. 2020-01-01T12:34:56Z
     try:
-        t = time.strptime(str(created_at).replace("Z", "UTC"), "%Y-%m-%dT%H:%M:%S%Z")
-        return int(time.mktime(t) * 1000)
+        raw = str(created_at or "").strip()
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return utc_ms_from_datetime(parsed, field_name="stocktwits_created_at")
     except Exception as e:
         _warn_nonfatal("POLL_STOCKTWITS_TS_PARSE_FAILED", e, once_key="parse_ts_ms", created_at=str(created_at or ""))
         return int(time.time() * 1000)

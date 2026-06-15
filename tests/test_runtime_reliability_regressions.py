@@ -228,7 +228,7 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
         os.environ["EXECUTION_MODE"] = "live"
         os.environ["ENGINE_MODE"] = "live"
         os.environ["ALLOW_TRAINING"] = "0"
-        os.environ["DASHBOARD_API_TOKEN"] = "test-token"
+        os.environ["DASHBOARD_API_TOKEN"] = "live-token-1234567890"
         os.environ["LIVE_TRADING_CONFIRM"] = "I_UNDERSTAND_LIVE_TRADING"
         os.environ.pop("OPERATOR_MODE", None)
         os.environ.pop("MODE", None)
@@ -1456,7 +1456,7 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             alt_tmp.cleanup()
             self._restore_shadow_env(prev_env)
 
-    def test_execution_gate_allows_advisory_ingestion_degradation(self) -> None:
+    def test_execution_gate_blocks_live_trading_when_runtime_degraded(self) -> None:
         prev_env = self._set_live_env()
         try:
             storage, runtime_meta, gates = _reload_modules(
@@ -1483,12 +1483,12 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
                 get_execution_mode_fn=lambda: {"mode": "live", "armed": 1},
             )
 
-            self.assertTrue(bool(live_degraded["allow_execution_pipeline"]))
-            self.assertTrue(bool(live_degraded["allow_execution"]))
-            self.assertTrue(bool(live_degraded["real_trading_allowed"]))
+            self.assertFalse(bool(live_degraded["allow_execution_pipeline"]))
+            self.assertFalse(bool(live_degraded["allow_execution"]))
+            self.assertFalse(bool(live_degraded["real_trading_allowed"]))
             self.assertEqual(str(live_degraded["severity"]), "DEGRADED")
             self.assertTrue(bool(live_degraded["conditional_allow"]))
-            self.assertEqual(str(live_degraded["reason"]), "mode_live_armed_degraded_runtime")
+            self.assertEqual(str(live_degraded["reason"]), "runtime_state_degraded")
         finally:
             self._restore_shadow_env(prev_env)
 
@@ -1822,6 +1822,27 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             state = execution_mode.get_execution_mode()
 
         self.assertEqual(str(state["mode"]), "paper")
+
+    def test_execution_allowed_for_real_trading_requires_live_runtime_state(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            storage, lifecycle_state, execution_mode = _reload_modules(
+                "engine.runtime.storage",
+                "engine.runtime.lifecycle_state",
+                "engine.execution.execution_mode",
+            )
+            storage.init_db()
+            execution_mode.set_execution_mode("live", actor="test", reason="live_mode")
+            execution_mode.set_execution_armed(1, actor="test", reason="armed")
+            lifecycle_state.set_state(lifecycle_state.DEGRADED, "critical_source_failed:prices")
+
+            allowed, reason, detail = execution_mode.execution_allowed_for_real_trading()
+
+            self.assertFalse(bool(allowed))
+            self.assertEqual(str(reason), "runtime_state_degraded")
+            self.assertEqual(str((detail.get("runtime_state") or {}).get("state")), lifecycle_state.DEGRADED)
+        finally:
+            self._restore_shadow_env(prev_env)
 
     def test_kill_switch_respects_caller_transaction_boundaries(self) -> None:
         storage, kill_switch = _reload_modules(

@@ -26,6 +26,7 @@ import math
 import logging
 from typing import Optional, Tuple, List
 
+from engine.data.universe_pit import label_window_within_symbol_lifecycle
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import (
@@ -236,6 +237,13 @@ def main():
                     continue
 
                 ts_eval_target = ts_pred_ms + horizon_s * 1000
+                if not label_window_within_symbol_lifecycle(
+                    con,
+                    symbol=str(sym),
+                    start_ts_ms=int(ts_pred_ms),
+                    end_ts_ms=int(ts_eval_target),
+                ):
+                    continue
                 exitp = _nearest_price_at_or_after(con, sym, ts_eval_target)
                 if not exitp:
                     continue

@@ -1371,7 +1371,7 @@ def _current_model_exposure_fraction_from_context(
     model_id_n = _normalize_model_id(model_id_raw) if model_id_raw else ""
     name = str(model_name or "").strip()
     reg = str(regime or "global").strip() or "global"
-    if (not name and not model_id_n) or equity <= 1e-9:
+    if not name and not model_id_n:
         return 0.0
 
     state_by_model_id = exposure_context.get("state_by_model_id") or {}
@@ -1389,6 +1389,8 @@ def _current_model_exposure_fraction_from_context(
             return float(state_exposure)
 
     if not name:
+        return 0.0
+    if equity <= 1e-9:
         return 0.0
     exposure = float(position_by_model_name.get((str(name), str(reg)), 0.0) or 0.0)
     return float(exposure) / float(max(1e-9, equity))

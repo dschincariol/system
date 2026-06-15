@@ -24,6 +24,18 @@ def test_dpapi_round_trip(monkeypatch, tmp_path):
     assert dpapi.load("master_key") == b"secret"
 
 
+def test_dpapi_delete_removes_encrypted_blob(monkeypatch, tmp_path):
+    from services.secrets.providers import dpapi
+
+    monkeypatch.setenv("TS_DPAPI_SECRETS_DIR", str(tmp_path))
+    secret_path = tmp_path / "old_key.dpapi"
+    secret_path.write_bytes(b"encrypted")
+
+    assert dpapi.delete("old_key") is True
+    assert not secret_path.exists()
+    assert dpapi.delete("old_key") is False
+
+
 def test_dpapi_load_zeroes_plaintext_buffers_after_return(monkeypatch, tmp_path):
     from services.secrets.providers import dpapi
 

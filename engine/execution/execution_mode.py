@@ -573,20 +573,49 @@ def execution_allowed_for_real_trading(
         mode = str(state.get("mode", "paper"))
         armed = int(state.get("armed", 0))
 
-        if os.environ.get("DISABLE_LIVE_EXECUTION", "0") == "1":
-            return False, "env_disable_live", {"mode": mode, "armed": armed}
-
         if mode != "live":
             return False, "mode_not_live", {"mode": mode, "armed": armed}
 
         if armed != 1:
             return False, "live_not_armed", {"mode": mode, "armed": armed}
 
+        try:
+            from engine.runtime.lifecycle_state import LIVE as _RUNTIME_LIVE
+            from engine.runtime.lifecycle_state import get_state as _get_runtime_state
+
+            runtime_snapshot = dict(_get_runtime_state() or {})
+            runtime_state = str(runtime_snapshot.get("state") or "").strip().upper()
+        except Exception as exc:
+            _warn_nonfatal(
+                "EXECUTION_MODE_RUNTIME_STATE_LOAD_FAILED",
+                exc,
+                once_key="execution_mode_runtime_state_load",
+            )
+            return False, "runtime_state_unavailable", {
+                "mode": mode,
+                "armed": armed,
+            }
+
+        if runtime_state != str(_RUNTIME_LIVE):
+            return False, f"runtime_state_{runtime_state.lower() or 'unknown'}", {
+                "mode": mode,
+                "armed": armed,
+                "runtime_state": runtime_snapshot,
+            }
+
+        if os.environ.get("DISABLE_LIVE_EXECUTION", "0") == "1":
+            return False, "env_disable_live", {
+                "mode": mode,
+                "armed": armed,
+                "runtime_state": runtime_snapshot,
+            }
+
         live_preflight = live_trading_preflight(engine_mode=mode)
         if not bool(live_preflight.get("ok")):
             return False, str(live_preflight.get("reason") or "live_trading_preflight_failed"), {
                 "mode": mode,
                 "armed": armed,
+                "runtime_state": runtime_snapshot,
                 "live_trading_preflight": live_preflight,
             }
 

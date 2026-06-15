@@ -71,6 +71,7 @@ def main() -> None:
             SELECT derived_features, meta_json
             FROM events
             WHERE source='fmp_transcript'
+            ORDER BY ts_ms DESC, id DESC
             LIMIT 1
             """
         ).fetchone()

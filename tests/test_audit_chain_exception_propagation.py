@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from audit_chain_test_utils import connect, create_audit_table
+from tests.audit_chain_test_utils import connect, create_audit_table
 
 from engine.audit.chain import append_chain_row
 

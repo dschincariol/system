@@ -2,6 +2,8 @@
 
 This document explains where the code lives and how to navigate it.
 
+Last verified against code: 2026-06-11
+
 It is written for developers who need to answer:
 
 - where should I look first?
@@ -52,7 +54,8 @@ That gives you system flow before subsystem detail.
 | --- | --- |
 | `start_system.py` | top-level Python runtime bootstrap and lifecycle |
 | `dashboard_server.py` | HTTP boundary, dashboard serving, API wiring |
-| `engine/runtime/storage.py` | DB connections, schema, persistence helpers |
+| `engine/runtime/storage.py` | public runtime storage facade and persistence helpers |
+| `engine/runtime/storage_pg.py` | current Postgres-backed storage implementation |
 | `engine/runtime/locks.py` | coordination and lock behavior |
 | `engine/runtime/runtime_meta.py` | shared runtime metadata surface |
 | `engine/runtime/job_registry.py` | canonical job registry |
@@ -124,12 +127,17 @@ Look in:
 - `engine/model_registry.py`
 - `engine/runtime/job_registry.py`
 - `engine/runtime/storage.py`
+- `engine/strategy/promotion_guard.py`
+- `engine/strategy/champion_manager.py`
 
 If the model has its own feature contract, also look in:
 
 - `engine/strategy/feature_registry.py`
 - `engine/strategy/feature_expansion.py`
 - the trainer for that model family
+- `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, or `engine/strategy/models/patchtst.py` for the current active model-family patterns
+- `engine/strategy/ensemble/ridge_meta.py` for meta-ensemble behavior
+- legacy/fallback paths such as `engine/strategy/embed_regressor.py` and `engine/strategy/temporal_predictor.py` only when maintaining those paths
 
 ### Change portfolio behavior
 
@@ -239,6 +247,11 @@ For this functional area, do not add new operator-side `.env` feed-config flows.
 | Data-source control plane | `services/data_source_manager.py`, `services/credential_encryption.py`, `routes/data_sources_routes.py`, `ui/data_sources.html`, `ui/data_sources.js`, `ui/data_sources.css` |
 | Browser terminal | `engine/terminal/api/api_terminal.py`, `engine/terminal/api/api_terminal_orders.py`, `ui/terminal/terminal.html`, `ui/terminal/terminal.js`, `ui/terminal/terminal_theme.css` |
 | Trade lifecycle and attribution audit | `engine/runtime/trade_lifecycle.py`, `engine/strategy/jobs/trade_lifecycle_audit_job.py`, `engine/execution/execution_ledger.py`, `engine/execution/trade_attribution_ledger.py`, `tests/test_trade_lifecycle_regressions.py` |
+| Current model families | `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, `engine/strategy/models/patchtst.py`, `engine/strategy/ensemble/ridge_meta.py` |
+| Promotion and statistical gates | `engine/strategy/promotion_guard.py`, `engine/strategy/statistical_gates.py`, `engine/strategy/champion_manager.py` |
+| CPCV and promotion-grade backtests | `engine/strategy/cpcv.py`, `engine/strategy/gated_backtest.py`, `engine/strategy/jobs/backtest_cpcv.py`, `engine/strategy/jobs/backtest_walk_forward.py` |
+| HPO and feature discovery | `engine/strategy/optuna_tuner.py`, `engine/strategy/tsfresh_features.py`, `engine/strategy/discovery/tsfresh_discoverer.py`, `engine/strategy/discovery/pysr_discoverer.py`, `engine/data/jobs/compute_tsfresh_snapshots.py` |
+| Causal diagnostics | `engine/causal/granger.py`, `engine/causal/dowhy_runner.py`, `engine/causal/scores.py`, `engine/strategy/jobs/causal_scoring.py` |
 
 ### Current AI-driven strategy contract
 
@@ -255,12 +268,14 @@ The main ownership points are:
 
 - `engine/model_registry.py`
   canonical record for the active model contract
-- `engine/strategy/embed_regressor.py`
-  embed-model schema persistence
-- `engine/strategy/train_temporal_predictor.py`
-  temporal schema persistence at train time
-- `engine/strategy/temporal_predictor.py`
-  temporal schema loading at serve time
+- `engine/strategy/feature_registry.py` and `engine/strategy/feature_expansion.py`
+  canonical feature id ordering and vector assembly
+- `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, and `engine/strategy/models/patchtst.py`
+  current model-family schema persistence and load-time validation
+- `engine/strategy/ensemble/ridge_meta.py`
+  deterministic Ridge meta-ensemble behavior
+- `engine/strategy/embed_regressor.py`, `engine/strategy/train_temporal_predictor.py`, and `engine/strategy/temporal_predictor.py`
+  legacy/fallback schema-aware model paths
 - `engine/data/jobs/process_events*.py`
   canonical `model_intent` emission
 - `engine/strategy/portfolio.py`
@@ -320,7 +335,7 @@ If a new model path introduces `feature_ids` but does not persist them into regi
 - Do not bypass `engine/runtime/storage.py` with random ad hoc DB logic.
 - Do not add background loops that ignore the runtime job registry and supervision model.
 - Do not let advisory or analytics features silently become authoritative behavior.
-- Do not make heavy blocking writes on hot startup paths without understanding SQLite contention.
+- Do not make heavy blocking writes on hot startup paths without understanding runtime storage contention and migration impact.
 - Do not let model-controlled outputs bypass `engine/strategy/portfolio.py`, `engine/risk/`, or `engine/execution/`.
 - Do not add a new model family that serves with a different feature layout than the one it trained on.
 

@@ -7,7 +7,7 @@ import time
 import warnings
 from pathlib import Path
 
-from services.secrets.loader import SecretNotAvailable
+from services.secrets.loader import SecretNotAvailable, validate_secret_name
 
 _PRODUCTION_CHECK_TTL_S = 60.0
 _production_check_at = 0.0
@@ -52,12 +52,14 @@ def _secrets_dir() -> Path:
     return Path.home() / ".trading" / "secrets"
 
 
+def _secret_path(name: str) -> Path:
+    secret_name = validate_secret_name(name)
+    return _secrets_dir() / secret_name
+
+
 def load(name: str) -> bytes:
     _ensure_not_production()
-    secret_name = str(name or "").strip()
-    if not secret_name or secret_name != Path(secret_name).name:
-        raise SecretNotAvailable(f"invalid_secret_name:{secret_name}")
-    path = _secrets_dir() / secret_name
+    path = _secret_path(name)
     try:
         return path.read_bytes()
     except FileNotFoundError as exc:
@@ -66,4 +68,16 @@ def load(name: str) -> bytes:
         raise SecretNotAvailable(f"secret_read_failed:{name}:{type(exc).__name__}:{exc}") from exc
 
 
-__all__ = ["load"]
+def delete(name: str) -> bool:
+    _ensure_not_production()
+    path = _secret_path(name)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SecretNotAvailable(f"secret_delete_failed:{name}:{type(exc).__name__}:{exc}") from exc
+
+
+__all__ = ["delete", "load"]

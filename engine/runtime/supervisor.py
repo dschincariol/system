@@ -257,6 +257,12 @@ class RuntimeSupervisor:
                 _write_supervisor_analysis(analysis)
                 return {"ok": True, "delegated": True, "jobs": jobs, "supervisor_analysis": analysis}
             except TimeoutError as e:
+                _warn_nonfatal(
+                    "supervisor_delegate_status_timeout",
+                    "SUPERVISOR_DELEGATE_STATUS_TIMEOUT",
+                    e,
+                    warn_key="supervisor_delegate_status_timeout",
+                )
                 analysis = {
                     "ok": False,
                     "restart_loops_detected": False,

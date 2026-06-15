@@ -8,9 +8,11 @@ import time
 import json
 import hashlib
 import logging
+import datetime as _dt
 from typing import Dict, Any, List, Tuple
 
 import requests
+from engine.data.time_utils import utc_ms_from_datetime
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 
@@ -93,11 +95,10 @@ def _ts_ms_from_gdelt_seen(seendate: str) -> int:
 
     # Fast path: YYYY-MM-DD HH:MM:SS
     try:
-        import datetime as _dt
         if len(s) >= 19 and s[4] == "-" and s[7] == "-" and s[10] in (" ", "T"):
             s2 = s[:19].replace("T", " ")
-            dt = _dt.datetime.strptime(s2, "%Y-%m-%d %H:%M:%S")
-            return int(dt.timestamp() * 1000)
+            parsed = _dt.datetime.strptime(s2, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_dt.timezone.utc)
+            return utc_ms_from_datetime(parsed, field_name="gdelt_seen_date")
     except Exception as e:
         _warn_nonfatal(
             "GDELT_INGEST_PARSE_TS_FAST_PATH_FAILED",
@@ -168,9 +169,8 @@ def ingest_gdelt_doc(
 
     # GDELT expects STARTDATETIME / ENDDATETIME in YYYYMMDDHHMMSS
     try:
-        import datetime as _dt
-        start_dt = _dt.datetime.utcfromtimestamp(start_ts).strftime("%Y%m%d%H%M%S")
-        end_dt = _dt.datetime.utcfromtimestamp(now).strftime("%Y%m%d%H%M%S")
+        start_dt = _dt.datetime.fromtimestamp(start_ts, _dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+        end_dt = _dt.datetime.fromtimestamp(now, _dt.timezone.utc).strftime("%Y%m%d%H%M%S")
     except Exception:
         start_dt = None
         end_dt = None

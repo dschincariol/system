@@ -81,8 +81,18 @@ def test_atexit_register_is_called_during_module_import(monkeypatch: pytest.Monk
     monkeypatch.setattr(_atexit_mod, "register", _capturing_register)
 
     # Drop any cached module so the re-import re-runs module body.
+    runtime_pkg = importlib.import_module("engine.runtime")
+    old_module = sys.modules.get("engine.runtime.storage_pool")
+    old_attr = getattr(runtime_pkg, "storage_pool", None)
     sys.modules.pop("engine.runtime.storage_pool", None)
-    storage_pool = importlib.import_module("engine.runtime.storage_pool")
+    try:
+        storage_pool = importlib.import_module("engine.runtime.storage_pool")
+    finally:
+        if old_module is not None:
+            sys.modules["engine.runtime.storage_pool"] = old_module
+            setattr(runtime_pkg, "storage_pool", old_module)
+        elif old_attr is not None:
+            setattr(runtime_pkg, "storage_pool", old_attr)
 
     target = storage_pool.close_pooled_connections
     assert target in captured, (

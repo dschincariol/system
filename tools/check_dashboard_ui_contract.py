@@ -38,6 +38,7 @@ LOCAL_API_PREFIXES = ("/api/",)
 LOCAL_WEBSOCKET_PREFIXES = ("/ws/", "/socket/")
 JS_SOURCE_SUFFIXES = {".js", ".mjs", ".cjs"}
 SCANNABLE_ASSET_SUFFIXES = {".html", ".js", ".mjs", ".cjs", ".css"}
+REQUIRED_NODE_VERSION = ">=20.17.0 <21"
 
 ROUTE_TEMPLATE_SEGMENT_RE = re.compile(r"^\{[^{}]+\}$")
 TEMPLATE_EXPR_RE = re.compile(r"\$\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}")
@@ -414,7 +415,47 @@ def find_js_syntax_issues(
 ) -> list[JsSyntaxIssue]:
     node = node_executable or shutil.which("node")
     if not node:
-        return [JsSyntaxIssue(source_path="node", detail="node_executable_not_found")]
+        return [
+            JsSyntaxIssue(
+                source_path="node",
+                detail=(
+                    "Node.js executable not found on PATH. Install Node.js 20 LTS "
+                    f"({REQUIRED_NODE_VERSION}) with npm 10, run npm ci, then rerun npm run check:ui."
+                ),
+            )
+        ]
+
+    version_result = subprocess.run(
+        [node, "-p", "process.versions.node"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    version_text = (version_result.stdout or version_result.stderr or "").strip()
+    version_match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
+    if version_result.returncode != 0 or not version_match:
+        return [
+            JsSyntaxIssue(
+                source_path="node",
+                detail=(
+                    "Unable to determine Node.js version. Install Node.js 20 LTS "
+                    f"({REQUIRED_NODE_VERSION}) with npm 10, run npm ci, then rerun npm run check:ui."
+                ),
+            )
+        ]
+    major, minor, patch = (int(part) for part in version_match.groups())
+    if major != 20 or (major, minor, patch) < (20, 17, 0):
+        return [
+            JsSyntaxIssue(
+                source_path="node",
+                detail=(
+                    f"Unsupported Node.js version {version_text}. Dashboard UI validation requires "
+                    f"Node.js {REQUIRED_NODE_VERSION}; install Node.js 20 LTS, run npm ci, "
+                    "then rerun npm run check:ui."
+                ),
+            )
+        ]
 
     issues: list[JsSyntaxIssue] = []
     for rel_path in sorted({_normalize_repo_rel(path) for path in js_paths}):
@@ -434,6 +475,11 @@ def find_js_syntax_issues(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report static dashboard UI contract refs.")
     parser.add_argument("--root", default=str(ROOT))
+    parser.add_argument(
+        "--node-executable",
+        default=None,
+        help="Node.js executable to use for JS syntax checks. Defaults to node on PATH.",
+    )
     parser.add_argument("--list-endpoints", action="store_true")
     parser.add_argument("--list-assets", action="store_true")
     args = parser.parse_args(argv)
@@ -441,7 +487,11 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).resolve()
     assets, asset_issues = collect_dashboard_asset_graph(root=root)
     endpoint_refs = collect_dashboard_endpoint_references(root=root)
-    syntax_issues = find_js_syntax_issues(collect_dashboard_js_modules(root=root), root=root)
+    syntax_issues = find_js_syntax_issues(
+        collect_dashboard_js_modules(root=root),
+        root=root,
+        node_executable=args.node_executable,
+    )
 
     if args.list_assets:
         for path in sorted(assets):

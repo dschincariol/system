@@ -23,10 +23,7 @@ def run(*, table: str | None = None, batch_size: int = 10000, emit_findings: boo
     storage.init_db()
     with storage.connect() as conn:
         results = verify_all(conn, table=table, batch_size=batch_size, emit_findings=emit_findings)
-        try:
-            conn.commit()
-        except Exception:
-            logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+        conn.commit()
 
     rows_verified = sum(result.rows_verified for result in results)
     findings = sum(len(result.findings) for result in results)

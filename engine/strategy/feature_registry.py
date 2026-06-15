@@ -3,9 +3,11 @@ FILE: feature_registry.py
 
 Schema-driven feature resolution for train/serve parity.
 
-Public feature-id and expected-column helpers preserve registry insertion
-order. Serving column order must not be derived from unordered containers, so
-training and online inference receive the same deterministic feature vector.
+Public feature-id and expected-column helpers preserve explicit registry
+insertion order by default. Serving column order must not be derived from
+unordered containers; callers that pass an unordered feature-id collection are
+canonicalized by feature_id before validation so training and online inference
+receive the same deterministic feature vector.
 """
 
 from __future__ import annotations
@@ -22,7 +24,6 @@ from engine.runtime.config import (
     FEATURE_STORE_READS_ENABLED,
     FEATURE_STORE_VERSION,
     USE_CONGRESSIONAL_TRADE_DATA,
-    USE_FORM4_DATA,
 )
 from engine.data.asset_map import asset_class_for_symbol
 from engine.data.finbert_sentiment import (
@@ -50,6 +51,30 @@ USE_TSFRESH_FEATURES = os.environ.get("USE_TSFRESH_FEATURES", "0") == "1"
 USE_NLP_FEATURES = os.environ.get("USE_NLP_FEATURES", "0") == "1"
 FINBERT_FEATURE_IDS = list(_FINBERT_FEATURE_IDS) if USE_FINBERT_SENTIMENT else []
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        return bool(default)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+USE_INSIDER_FEATURES = _env_bool("USE_INSIDER_FEATURES", False)
+USE_SHORT_FEATURES = _env_bool("USE_SHORT_FEATURES", False)
+USE_FUNDING_FEATURES = _env_bool("USE_FUNDING_FEATURES", False)
+USE_NEWS_FLOW_FEATURES = _env_bool("USE_NEWS_FLOW_FEATURES", False)
+USE_ETF_FLOW_FEATURES = _env_bool("USE_ETF_FLOW_FEATURES", False)
+USE_COT_FEATURES = _env_bool("USE_COT_FEATURES", False)
+USE_13F_FEATURES = _env_bool("USE_13F_FEATURES", False)
+USE_GOV_FEATURES = _env_bool("USE_GOV_FEATURES", False)
+USE_FUNDAMENTALS_PIT_FEATURES = _env_bool("USE_FUNDAMENTALS_PIT_FEATURES", False)
+USE_BOCPD_FEATURES = _env_bool("USE_BOCPD_FEATURES", False)
+
 BASE_FEATURE_IDS = [
     "base.source_credibility",
     "base.log_recency_hours",
@@ -69,6 +94,20 @@ TECH_FEATURE_IDS = [
     "tech.atr_pct",
     "tech.rv_20",
     "tech.vol_of_vol",
+    "tech.har_rv_forecast_1d",
+    "tech.har_rv_forecast_ratio",
+]
+
+META_LABEL_FEATURE_IDS = [
+    "meta_label.primary_abs_z",
+    "meta_label.primary_confidence",
+    "meta_label.side_sign",
+    "meta_label.vol_level",
+    "meta_label.vol_ratio",
+    "meta_label.rolling_hit_rate",
+    "meta_label.regime_risk_off",
+    "meta_label.regime_confidence",
+    "meta_label.ood_distance",
 ]
 
 STRESS_FEATURE_IDS = [
@@ -129,7 +168,7 @@ WEATHER_FEATURE_IDS = [
     "weather.storm_risk",
 ]
 
-OPTIONS_FEATURE_IDS = [
+_BASE_OPTIONS_FEATURE_IDS = [
     "options_symbol.iv_rank",
     "options_symbol.iv_rank_short",
     "options_symbol.skew_25d",
@@ -140,11 +179,83 @@ OPTIONS_FEATURE_IDS = [
     "options_symbol.signal_score",
 ]
 
+_OPTIONS_GEX_FLOW_FEATURE_IDS = [
+    "options_symbol.gex_norm_z",
+    "options_symbol.gex_sign",
+    "options_symbol.opt_flow_imbalance_z",
+]
+
+OPTIONS_FEATURE_IDS = list(_BASE_OPTIONS_FEATURE_IDS) + (
+    list(_OPTIONS_GEX_FLOW_FEATURE_IDS) if USE_OPTIONS_FEATURES else []
+)
+
 _ALL_INSIDER_FEATURE_IDS = [
-    "insider.buy_count_30d",
-    "insider.sell_count_30d",
-    "insider.net_value_30d",
-    "insider.unique_insiders_90d",
+    "insider_opp_net_buy_30d",
+    "insider_opp_buy_count_30d",
+    "insider_cluster_buy_5d",
+    "insider_officer_buy_flag",
+    "insider_opp_sell_z",
+]
+
+_ALL_SHORT_FEATURE_IDS = [
+    "short_vol_ratio_z20",
+    "si_surprise",
+    "days_to_cover_delta",
+    "si_surprise_x_earnings_window",
+]
+
+_ALL_CRYPTO_POSITIONING_FEATURE_IDS = [
+    "funding_rate_now",
+    "funding_z_30d",
+    "funding_extreme_flag",
+    "funding_cum_3d",
+    "perp_basis_pct",
+    "basis_z_30d",
+]
+
+_ALL_NEWS_FLOW_FEATURE_IDS = [
+    "news_novelty_max_24h",
+    "news_stale_share_24h",
+    "news_velocity_z",
+    "fresh_neg_news_flag",
+]
+
+_ALL_ETF_FLOW_FEATURE_IDS = [
+    "etf_unexpected_flow_z",
+    "etf_flow_3d_sum_z",
+    "etf_flow_reversal_flag",
+]
+
+_ALL_COT_FEATURE_IDS = [
+    "cot_commercial_net_pctile_3y",
+    "cot_noncomm_net_z",
+    "cot_noncomm_extreme_flag",
+    "cot_open_interest_z",
+]
+
+_ALL_INST_13F_FEATURE_IDS = [
+    "13f_consensus_holders",
+    "13f_conviction_max",
+    "13f_new_position_flag",
+    "13f_add_flag",
+]
+
+_ALL_GOV_FEATURE_IDS = [
+    "congress_committee_buy_30d",
+    "congress_leadership_trade_flag",
+    "congress_sale_signal_30d",
+    "lobbying_spend_z_yoy",
+    "gov_contract_award_z",
+]
+
+_ALL_FUNDAMENTALS_PIT_FEATURE_IDS = [
+    "fund_revenue",
+    "fund_eps",
+    "fund_gross_margin",
+    "fund_net_margin",
+    "fund_shares",
+    "fund_book_value",
+    "fund_fcf",
 ]
 
 _ALL_CONGRESSIONAL_FEATURE_IDS = [
@@ -153,7 +264,15 @@ _ALL_CONGRESSIONAL_FEATURE_IDS = [
     "congressional.net_signal_30d",
 ]
 
-INSIDER_FEATURE_IDS = list(_ALL_INSIDER_FEATURE_IDS) if USE_FORM4_DATA else []
+INSIDER_FEATURE_IDS = list(_ALL_INSIDER_FEATURE_IDS) if USE_INSIDER_FEATURES else []
+SHORT_FEATURE_IDS = list(_ALL_SHORT_FEATURE_IDS) if USE_SHORT_FEATURES else []
+CRYPTO_POSITIONING_FEATURE_IDS = list(_ALL_CRYPTO_POSITIONING_FEATURE_IDS) if USE_FUNDING_FEATURES else []
+NEWS_FLOW_FEATURE_IDS = list(_ALL_NEWS_FLOW_FEATURE_IDS) if USE_NEWS_FLOW_FEATURES else []
+ETF_FLOW_FEATURE_IDS = list(_ALL_ETF_FLOW_FEATURE_IDS) if USE_ETF_FLOW_FEATURES else []
+COT_FEATURE_IDS = list(_ALL_COT_FEATURE_IDS) if USE_COT_FEATURES else []
+INST_13F_FEATURE_IDS = list(_ALL_INST_13F_FEATURE_IDS) if USE_13F_FEATURES else []
+GOV_FEATURE_IDS = list(_ALL_GOV_FEATURE_IDS) if USE_GOV_FEATURES else []
+FUNDAMENTALS_PIT_FEATURE_IDS = list(_ALL_FUNDAMENTALS_PIT_FEATURE_IDS) if USE_FUNDAMENTALS_PIT_FEATURES else []
 CONGRESSIONAL_FEATURE_IDS = list(_ALL_CONGRESSIONAL_FEATURE_IDS) if USE_CONGRESSIONAL_TRADE_DATA else []
 
 SOCIAL_REGIME_FEATURE_IDS = [
@@ -182,6 +301,11 @@ HMM_REGIME_FEATURE_IDS = [
     "hmm_regime.label_neutral_prob",
     "hmm_regime.label_volatile_prob",
     "hmm_regime.label_risk_off_prob",
+]
+
+BOCPD_FEATURE_IDS = [
+    "bocpd_cp_prob_5d",
+    "bocpd_run_length_z",
 ]
 
 PRICE_FEATURE_IDS = [
@@ -295,9 +419,18 @@ UNIFIED_SYMBOL_FEATURE_IDS = (
     + list(UNIFIED_MACRO_FEATURE_IDS)
     + list(OPTIONS_FEATURE_IDS)
     + list(INSIDER_FEATURE_IDS)
+    + list(SHORT_FEATURE_IDS)
+    + list(CRYPTO_POSITIONING_FEATURE_IDS)
+    + list(NEWS_FLOW_FEATURE_IDS)
+    + list(ETF_FLOW_FEATURE_IDS)
+    + list(COT_FEATURE_IDS)
+    + list(INST_13F_FEATURE_IDS)
+    + list(GOV_FEATURE_IDS)
+    + list(FUNDAMENTALS_PIT_FEATURE_IDS)
     + list(CONGRESSIONAL_FEATURE_IDS)
     + list(UNIFIED_SOCIAL_FEATURE_IDS)
     + list(WEATHER_FEATURE_IDS)
+    + (list(BOCPD_FEATURE_IDS) if USE_BOCPD_FEATURES else [])
     + list(FINBERT_FEATURE_IDS)
     + (list(NLP_FEATURE_IDS) if USE_NLP_FEATURES else [])
     + list(AVAILABILITY_FEATURE_IDS)
@@ -309,13 +442,18 @@ FEATURE_GROUPS = {
     "events": list(EVENT_FEATURE_IDS),
     "macro": list(UNIFIED_MACRO_FEATURE_IDS),
     "hmm_regime": list(HMM_REGIME_FEATURE_IDS),
+    "regime": list(HMM_REGIME_FEATURE_IDS) + list(BOCPD_FEATURE_IDS),
+    "bocpd_regime": list(BOCPD_FEATURE_IDS),
     "options_symbol": list(OPTIONS_FEATURE_IDS),
+    "options": list(OPTIONS_FEATURE_IDS),
     "social": list(UNIFIED_SOCIAL_FEATURE_IDS),
     "weather": list(WEATHER_FEATURE_IDS),
     "availability": list(AVAILABILITY_FEATURE_IDS),
     "tech": list(TECH_FEATURE_IDS),
+    "meta_label": list(META_LABEL_FEATURE_IDS),
     "stress": list(STRESS_FEATURE_IDS),
     "tsfresh": list(TSFRESH_FEATURE_IDS),
+    "discovered_llm": [],
     "nlp_finbert_news_v1": list(NLP_FINBERT_NEWS_FEATURE_IDS),
     "nlp_filings_v1": list(NLP_FILINGS_FEATURE_IDS),
     "nlp_transcripts_v1": list(NLP_TRANSCRIPTS_FEATURE_IDS),
@@ -324,6 +462,22 @@ if FINBERT_FEATURE_IDS:
     FEATURE_GROUPS["sentiment"] = list(FINBERT_FEATURE_IDS)
 if INSIDER_FEATURE_IDS:
     FEATURE_GROUPS["insider"] = list(INSIDER_FEATURE_IDS)
+if SHORT_FEATURE_IDS:
+    FEATURE_GROUPS["short"] = list(SHORT_FEATURE_IDS)
+if CRYPTO_POSITIONING_FEATURE_IDS:
+    FEATURE_GROUPS["crypto_positioning"] = list(CRYPTO_POSITIONING_FEATURE_IDS)
+if NEWS_FLOW_FEATURE_IDS:
+    FEATURE_GROUPS["news_flow"] = list(NEWS_FLOW_FEATURE_IDS)
+if ETF_FLOW_FEATURE_IDS:
+    FEATURE_GROUPS["etf_flow"] = list(ETF_FLOW_FEATURE_IDS)
+if COT_FEATURE_IDS:
+    FEATURE_GROUPS["cot"] = list(COT_FEATURE_IDS)
+if INST_13F_FEATURE_IDS:
+    FEATURE_GROUPS["inst_13f"] = list(INST_13F_FEATURE_IDS)
+if GOV_FEATURE_IDS:
+    FEATURE_GROUPS["gov"] = list(GOV_FEATURE_IDS)
+if FUNDAMENTALS_PIT_FEATURE_IDS:
+    FEATURE_GROUPS["fundamentals"] = list(FUNDAMENTALS_PIT_FEATURE_IDS)
 if CONGRESSIONAL_FEATURE_IDS:
     FEATURE_GROUPS["congressional"] = list(CONGRESSIONAL_FEATURE_IDS)
 
@@ -354,7 +508,20 @@ FEATURE_GROUP_METADATA["lexical_sentiment_v0"] = {
 def list_groups() -> Dict[str, Dict[str, Any]]:
     """Return schema-versioned feature group metadata."""
 
-    return {str(name): dict(meta) for name, meta in FEATURE_GROUP_METADATA.items()}
+    out = {str(name): dict(meta) for name, meta in FEATURE_GROUP_METADATA.items()}
+    llm_ids = [
+        str(getattr(record, "feature_id", "") or "")
+        for record in _load_discovered_feature_records(stage=None)
+        if str(getattr(record, "source", "") or "") == "llm_factor"
+    ]
+    out["discovered_llm"] = {
+        **dict(out.get("discovered_llm") or {}),
+        "feature_ids": [fid for fid in llm_ids if fid],
+        "schema_version": "experimental",
+        "default_enabled": False,
+        "stage": FEATURE_STAGE_SHADOW,
+    }
+    return out
 
 _SOURCE_CRED = {
     "rss:reuters": 0.9,
@@ -371,6 +538,22 @@ _SNAPSHOT_PREFIXES = (
     "macro.",
     "options_symbol.",
     "insider.",
+    "insider_",
+    "short_",
+    "si_",
+    "days_to_cover_",
+    "funding_",
+    "perp_",
+    "basis_",
+    "news_",
+    "fresh_neg_news_",
+    "etf_",
+    "cot_",
+    "13f_",
+    "congress_",
+    "lobbying_",
+    "gov_",
+    "fund_",
     "congressional.",
     "social.",
     "social_regime.",
@@ -378,6 +561,8 @@ _SNAPSHOT_PREFIXES = (
     "sentiment.",
     "nlp.",
     "availability.",
+    "meta_label.",
+    "bocpd_",
 )
 LOG = get_logger("engine.strategy.feature_registry")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -391,9 +576,16 @@ def validate_lexical_sentiment_deprecation_marker(value: str | None = None) -> b
         and _LEXICAL_SENTIMENT_DEPRECATED_AFTER_RE.fullmatch(marker) is not None
     )
     if not ok:
-        LOG.warning(
-            "startup_warning lexical_sentiment_deprecated_after_invalid marker=%r expected=sha_or_iso_timestamp",
-            marker,
+        getattr(LOG, "warning")("startup_warning lexical sentiment deprecation marker is invalid marker=%s", marker)
+        log_failure(
+            LOG,
+            event="feature_registry_lexical_sentiment_marker_invalid",
+            code="FEATURE_REGISTRY_LEXICAL_SENTIMENT_MARKER_INVALID",
+            message="lexical sentiment deprecation marker is invalid",
+            level=30,
+            component="engine.strategy.feature_registry",
+            extra={"marker": marker},
+            persist=False,
         )
     return bool(ok)
 
@@ -584,8 +776,24 @@ def default_feature_ids() -> List[str]:
             out.extend(WEATHER_FEATURE_IDS)
         if USE_OPTIONS_FEATURES:
             out.extend(OPTIONS_FEATURE_IDS)
-        if USE_FORM4_DATA:
+        if USE_INSIDER_FEATURES:
             out.extend(INSIDER_FEATURE_IDS)
+        if USE_SHORT_FEATURES:
+            out.extend(SHORT_FEATURE_IDS)
+        if USE_FUNDING_FEATURES:
+            out.extend(CRYPTO_POSITIONING_FEATURE_IDS)
+        if USE_NEWS_FLOW_FEATURES:
+            out.extend(NEWS_FLOW_FEATURE_IDS)
+        if USE_ETF_FLOW_FEATURES:
+            out.extend(ETF_FLOW_FEATURE_IDS)
+        if USE_COT_FEATURES:
+            out.extend(COT_FEATURE_IDS)
+        if USE_13F_FEATURES:
+            out.extend(INST_13F_FEATURE_IDS)
+        if USE_GOV_FEATURES:
+            out.extend(GOV_FEATURE_IDS)
+        if USE_FUNDAMENTALS_PIT_FEATURES:
+            out.extend(FUNDAMENTALS_PIT_FEATURE_IDS)
         if USE_CONGRESSIONAL_TRADE_DATA:
             out.extend(CONGRESSIONAL_FEATURE_IDS)
         if USE_SOCIAL_FEATURES:
@@ -598,6 +806,8 @@ def default_feature_ids() -> List[str]:
         out.extend(TECH_FEATURE_IDS)
     if USE_STRESS_FEATURES:
         out.extend(STRESS_FEATURE_IDS)
+    if USE_BOCPD_FEATURES:
+        out.extend(BOCPD_FEATURE_IDS)
     if USE_TSFRESH_FEATURES:
         out.extend(get_default_tsfresh_feature_ids())
     if USE_FACTOR_UNIVERSE:
@@ -655,6 +865,10 @@ def _parse_feature_ids(value: Any) -> List[str]:
         raw = value
     elif isinstance(value, tuple):
         raw = list(value)
+    elif isinstance(value, (set, frozenset)):
+        raw = sorted(value, key=lambda item: str(item or "").strip())
+    elif isinstance(value, dict):
+        raw = sorted(value.keys(), key=lambda item: str(item or "").strip())
     elif isinstance(value, str):
         raw = [part.strip() for part in value.split(",")]
     else:
@@ -761,8 +975,24 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
         parts.append("wx")
     if any(fid.startswith("options_symbol.") for fid in ids):
         parts.append("options")
-    if any(fid.startswith("insider.") for fid in ids):
+    if any(fid.startswith("insider.") or fid.startswith("insider_") for fid in ids):
         parts.append("insider")
+    if any(fid in SHORT_FEATURE_IDS or fid.startswith(("short_", "si_", "days_to_cover_")) for fid in ids):
+        parts.append("short")
+    if any(fid in CRYPTO_POSITIONING_FEATURE_IDS or fid.startswith(("funding_", "perp_", "basis_")) for fid in ids):
+        parts.append("crypto_positioning")
+    if any(fid in NEWS_FLOW_FEATURE_IDS or fid.startswith(("news_", "fresh_neg_news_")) for fid in ids):
+        parts.append("news_flow")
+    if any(fid in ETF_FLOW_FEATURE_IDS or fid.startswith("etf_") for fid in ids):
+        parts.append("etf_flow")
+    if any(fid in COT_FEATURE_IDS or fid.startswith("cot_") for fid in ids):
+        parts.append("cot")
+    if any(fid in INST_13F_FEATURE_IDS or fid.startswith("13f_") for fid in ids):
+        parts.append("inst_13f")
+    if any(fid in GOV_FEATURE_IDS or fid.startswith(("congress_", "lobbying_", "gov_")) for fid in ids):
+        parts.append("gov")
+    if any(fid in FUNDAMENTALS_PIT_FEATURE_IDS or fid.startswith("fund_") for fid in ids):
+        parts.append("fundamentals")
     if any(fid.startswith("congressional.") for fid in ids):
         parts.append("congressional")
     if any(fid.startswith("social.") for fid in ids):
@@ -781,6 +1011,8 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
         parts.append("factors")
     if any(fid.startswith("symbolic.") for fid in ids):
         parts.append("symbolic")
+    if any(fid.startswith("discovered.llm.") for fid in ids):
+        parts.append("discovered_llm")
     if any(fid.startswith("discovered.") for fid in ids):
         parts.append("discovery")
     return "+".join(parts)
@@ -856,15 +1088,16 @@ def _load_stress(ts_ms: int) -> Dict[str, Any]:
 
 def _load_macro(ts_ms: int) -> Dict[str, float]:
     try:
-        from engine.runtime.factor_universe import _get_feature_asof
+        from engine.data.factor_ingestion import macro_feature_row_asof
         from engine.runtime.storage import connect
 
         con = connect()
         try:
-            return {
-                fid: float(_get_feature_asof(con, fid, int(ts_ms)) or 0.0)
-                for fid in MACRO_FEATURE_IDS
-            }
+            out: Dict[str, float] = {}
+            for fid in MACRO_FEATURE_IDS:
+                value, _asof_ts, _effective_ts = macro_feature_row_asof(con, feature_id=str(fid), ts_ms=int(ts_ms))
+                out[str(fid)] = float(value or 0.0)
+            return out
         finally:
             try:
                 con.close()
@@ -957,6 +1190,49 @@ def _load_hmm_regime(symbol: str, ts_ms: int) -> Dict[str, float]:
             "FEATURE_REGISTRY_HMM_REGIME_LOAD_FAILED",
             e,
             once_key="load_hmm_regime",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return {}
+
+
+def _load_bocpd_regime(symbol: str, ts_ms: int) -> Dict[str, float]:
+    try:
+        from engine.runtime.storage import connect
+        from engine.strategy.bocpd import feature_map_from_summary, load_latest_summary
+
+        con = connect()
+        try:
+            summary = load_latest_summary(
+                con,
+                symbol=str(symbol),
+                series_type="realized_vol",
+                as_of_ts_ms=int(ts_ms),
+            )
+            if not summary:
+                summary = load_latest_summary(
+                    con,
+                    symbol="*",
+                    series_type="portfolio_correlation",
+                    as_of_ts_ms=int(ts_ms),
+                )
+            return feature_map_from_summary(summary)
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_BOCPD_REGIME_CLOSE_FAILED",
+                    e,
+                    once_key="load_bocpd_regime_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_BOCPD_REGIME_LOAD_FAILED",
+            e,
+            once_key="load_bocpd_regime",
             symbol=str(symbol),
             ts_ms=int(ts_ms),
         )
@@ -1182,7 +1458,7 @@ def _evaluate_discovered_feature(fid: str, *, event: Dict[str, Any], symbol: str
     source = str(definition.get("source") or "").strip().lower()
     params = dict(definition.get("params") or {})
 
-    if source == "pysr":
+    if source in {"pysr", "llm_factor"}:
         try:
             import pandas as pd
 
@@ -1211,7 +1487,7 @@ def _evaluate_discovered_feature(fid: str, *, event: Dict[str, Any], symbol: str
             _warn_nonfatal(
                 "FEATURE_REGISTRY_DISCOVERED_PYSR_EVAL_FAILED",
                 e,
-                once_key=f"discovered_pysr_eval:{fid}",
+                    once_key=f"discovered_expr_eval:{fid}",
                 feature_id=str(fid),
             )
             return 0.0
@@ -1292,7 +1568,7 @@ def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids:
     ids = resolve_feature_ids(feature_ids)
     ctx = _build_context(event=event, symbol=str(symbol))
     snap: Dict[str, float] = {}
-    tech = stress = macro = social = weather = options = social_regime = hmm_regime = tsfresh = factors = finbert = nlp = None
+    tech = stress = macro = social = weather = options = social_regime = hmm_regime = bocpd_regime = tsfresh = factors = finbert = nlp = None
     snapshot = None
     if int(ctx["ts_ms"] or 0) > 0 and any(_feature_uses_symbol_snapshot(fid) for fid in ids):
         snapshot = _load_symbol_snapshot(str(symbol), int(ctx["ts_ms"]))
@@ -1351,6 +1627,10 @@ def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids:
             if hmm_regime is None:
                 hmm_regime = _load_hmm_regime(str(symbol), int(ctx["ts_ms"]))
             snap[fid] = float((hmm_regime or {}).get(fid, 0.0) or 0.0)
+        elif fid.startswith("bocpd_"):
+            if bocpd_regime is None:
+                bocpd_regime = _load_bocpd_regime(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((bocpd_regime or {}).get(fid, 0.0) or 0.0)
         elif fid.startswith("sentiment.finbert."):
             if finbert is None:
                 finbert, _finbert_meta, _ = resolve_finbert_sentiment_snapshot(

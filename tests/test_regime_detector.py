@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -43,6 +44,122 @@ class RegimeDetectorTests(unittest.TestCase):
         except Exception:
             pass
         self.tmp.cleanup()
+
+    def _regime_state_schema(self):
+        con = self.storage.connect(readonly=True)
+        try:
+            rows = con.execute("PRAGMA table_info(regime_state)").fetchall()
+        finally:
+            con.close()
+        return {str(row[1]): {"notnull": int(row[3] or 0), "pk": int(row[5] or 0)} for row in rows}
+
+    def test_fresh_sqlite_regime_state_schema_has_symbol_time_contract(self) -> None:
+        columns = self._regime_state_schema()
+        for column in ("time", "symbol", "volatility_regime", "trend_regime", "liquidity_regime"):
+            self.assertIn(column, columns)
+            self.assertEqual(int(columns[column]["notnull"]), 1)
+        self.assertEqual(int(columns["symbol"]["pk"]), 1)
+        self.assertEqual(int(columns["time"]["pk"]), 2)
+
+    def test_init_db_repairs_legacy_regime_state_without_symbol(self) -> None:
+        try:
+            self.public_regime.shutdown_regime_detector(timeout_s=1.0)
+        except Exception:
+            pass
+        legacy_path = Path(self.tmp.name) / "legacy_regime_detector.db"
+        raw = sqlite3.connect(str(legacy_path))
+        try:
+            raw.execute(
+                """
+                CREATE TABLE regime_state (
+                  time INTEGER,
+                  volatility_regime TEXT,
+                  trend_regime TEXT,
+                  liquidity_regime TEXT
+                )
+                """
+            )
+            raw.execute(
+                """
+                INSERT INTO regime_state(time, volatility_regime, trend_regime, liquidity_regime)
+                VALUES(?,?,?,?)
+                """,
+                (1_700_000_000_000, "high", "bearish", "thin"),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        os.environ["DB_PATH"] = str(legacy_path)
+        self.storage, self.engine_regime, self.public_regime = _reload_modules(
+            "engine.runtime.storage",
+            "engine.regime_detector",
+            "regime_detector",
+        )
+        self.storage.init_db()
+
+        columns = self._regime_state_schema()
+        self.assertEqual(int(columns["symbol"]["pk"]), 1)
+        self.assertEqual(int(columns["time"]["pk"]), 2)
+
+        con = self.storage.connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO regime_state(time, symbol, volatility_regime, trend_regime, liquidity_regime)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(symbol, time) DO UPDATE SET
+                  volatility_regime=excluded.volatility_regime,
+                  trend_regime=excluded.trend_regime,
+                  liquidity_regime=excluded.liquidity_regime
+                """,
+                (1_700_000_000_001, "AMD", "low", "range", "normal"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        con = self.storage.connect(readonly=True)
+        try:
+            row = con.execute(
+                "SELECT symbol, time, volatility_regime FROM regime_state WHERE symbol='AMD'"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertIsNotNone(row)
+        self.assertEqual((str(row[0]), int(row[1]), str(row[2])), ("AMD", 1_700_000_000_001, "low"))
+
+    def test_flush_surfaces_background_persistence_failure(self) -> None:
+        snapshot = {
+            "symbol": "AMD",
+            "ts_ms": 1_700_000_000_000,
+            "features": {
+                "volatility_20": 0.045,
+                "volatility_60": 0.020,
+                "atr_pct_14": 0.025,
+                "trend_strength_20": 1.4,
+                "momentum_1d": 0.004,
+                "volume_rel_20": 1.0,
+                "dollar_volume_rel_20": 1.0,
+                "volume_nonzero_share_20": 1.0,
+                "dollar_volume_last": 2_000_000.0,
+            },
+        }
+        with patch.object(
+            self.engine_regime.DEFAULT_REGIME_DETECTOR,
+            "_persist_state",
+            side_effect=sqlite3.OperationalError("forced regime_state persist failure"),
+        ):
+            self.assertTrue(
+                self.public_regime.submit_regime_refresh_nowait(
+                    "AMD",
+                    feature_snapshot=snapshot,
+                    ts_ms=int(snapshot["ts_ms"]),
+                    source="unit_test_failure",
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "forced regime_state persist failure"):
+                self.public_regime.flush_regime_detector(3.0)
 
     def test_submit_refresh_computes_and_persists_regime_asynchronously(self) -> None:
         snapshot = {

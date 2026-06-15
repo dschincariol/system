@@ -5,6 +5,7 @@ Runtime subsystem module for `state_cache`.
 """
 
 import copy
+import logging
 import os
 import threading
 import time
@@ -12,6 +13,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 
 _DEFAULT_TTL_S = float(os.environ.get("STATE_CACHE_DEFAULT_TTL_S", "1.0"))
+LOG = logging.getLogger(__name__)
 
 
 class _StateCache:
@@ -44,7 +46,15 @@ class _StateCache:
 
         try:
             ttl = float(_DEFAULT_TTL_S if ttl_s is None else ttl_s)
-        except Exception:
+        except (TypeError, ValueError):
+            LOG.warning(
+                "state_cache_ttl_parse_failed namespace=%s key=%s ttl_s=%r default=%s",
+                ns,
+                kk,
+                ttl_s,
+                _DEFAULT_TTL_S,
+                exc_info=True,
+            )
             ttl = float(_DEFAULT_TTL_S)
 
         expires_at = 0.0 if ttl <= 0.0 else (time.time() + ttl)

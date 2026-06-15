@@ -149,6 +149,28 @@ def _shadow_book_snapshot(con, model_id: str) -> dict:
     }
 
 
+def _diagnostic_rows(con, table: str, sql: str, schema_errors: list[dict[str, Any]]):
+    if not _table_exists(con, table):
+        return []
+    try:
+        return con.execute(sql).fetchall()
+    except Exception as e:
+        _warn_nonfatal(
+            "API_READ_ADVANCED_DIAGNOSTIC_QUERY_FAILED",
+            e,
+            once_key=f"diagnostic_query_failed:{table}",
+            table=str(table),
+        )
+        schema_errors.append(
+            {
+                "table": str(table),
+                "error": str(e),
+                "code": "diagnostic_query_failed",
+            }
+        )
+        return []
+
+
 # --------------------------------------------------
 # MODEL DIAGNOSTICS
 # --------------------------------------------------
@@ -162,17 +184,18 @@ def get_model_diagnostics():
         # These diagnostics are read-only aggregations for operator/model
         # inspection and should never mutate training/runtime state.
         out = {}
+        schema_errors: list[dict[str, Any]] = []
 
-        try:
-            rows = con.execute(
-                """
-                SELECT symbol, horizon_s, regime, n, mean_impact_z
-                FROM model_stats_regime
-                ORDER BY symbol, horizon_s, regime
-                """
-            ).fetchall()
-        except Exception:
-            rows = []
+        rows = _diagnostic_rows(
+            con,
+            "model_stats_regime",
+            """
+            SELECT symbol, horizon_s, regime, n, mean_impact_z
+            FROM model_stats_regime
+            ORDER BY symbol, horizon_s, regime
+            """,
+            schema_errors,
+        )
 
         priors = {}
         for sym, h, reg, n, mean_z in rows:
@@ -183,32 +206,32 @@ def get_model_diagnostics():
             })
         out["regime_priors"] = priors
 
-        try:
-            rows = con.execute(
-                """
-                SELECT symbol, horizon_s, n, mean_impact_z
-                FROM model_stats
-                ORDER BY symbol, horizon_s
-                """
-            ).fetchall()
-        except Exception:
-            rows = []
+        rows = _diagnostic_rows(
+            con,
+            "model_stats",
+            """
+            SELECT symbol, horizon_s, n, mean_impact_z
+            FROM model_stats
+            ORDER BY symbol, horizon_s
+            """,
+            schema_errors,
+        )
 
         out["global_priors"] = [
             {"symbol": r[0], "horizon_s": r[1], "n": int(r[2]), "mean_z": float(r[3])}
             for r in rows
         ]
 
-        try:
-            rows = con.execute(
-                """
-                SELECT target_symbol, driver_symbol, horizon_s, n, beta
-                FROM spillover_beta
-                ORDER BY target_symbol, horizon_s, n DESC
-                """
-            ).fetchall()
-        except Exception:
-            rows = []
+        rows = _diagnostic_rows(
+            con,
+            "spillover_beta",
+            """
+            SELECT target_symbol, driver_symbol, horizon_s, n, beta
+            FROM spillover_beta
+            ORDER BY target_symbol, horizon_s, n DESC
+            """,
+            schema_errors,
+        )
 
         spill = {}
         for tgt, drv, h, n, beta in rows:
@@ -266,17 +289,17 @@ def get_model_diagnostics():
             for row in ensemble_weights_rows or []
         ]
 
-        try:
-            ensemble_prediction_rows = con.execute(
-                """
-                SELECT symbol, ts, blended_prediction, family_preds_json, weights_json, agreement
-                FROM ensemble_predictions
-                ORDER BY ts DESC, id DESC
-                LIMIT 25
-                """
-            ).fetchall() if _table_exists(con, "ensemble_predictions") else []
-        except Exception:
-            ensemble_prediction_rows = []
+        ensemble_prediction_rows = _diagnostic_rows(
+            con,
+            "ensemble_predictions",
+            """
+            SELECT symbol, ts, blended_prediction, family_preds_json, weights_json, agreement
+            FROM ensemble_predictions
+            ORDER BY ts DESC, id DESC
+            LIMIT 25
+            """,
+            schema_errors,
+        )
         out["ensemble_recent_predictions"] = [
             {
                 "symbol": str(row[0] or ""),
@@ -290,17 +313,17 @@ def get_model_diagnostics():
         ]
         out["prediction_explanations"] = fetch_prediction_explanations(limit=25)
 
-        try:
-            ensemble_perf_rows = con.execute(
-                """
-                SELECT window_start_ts, window_end_ts, family, n_predictions, realized_sharpe, hit_rate
-                FROM ensemble_family_performance
-                ORDER BY window_end_ts DESC, id DESC
-                LIMIT 50
-                """
-            ).fetchall() if _table_exists(con, "ensemble_family_performance") else []
-        except Exception:
-            ensemble_perf_rows = []
+        ensemble_perf_rows = _diagnostic_rows(
+            con,
+            "ensemble_family_performance",
+            """
+            SELECT window_start_ts, window_end_ts, family, n_predictions, realized_sharpe, hit_rate
+            FROM ensemble_family_performance
+            ORDER BY window_end_ts DESC, id DESC
+            LIMIT 50
+            """,
+            schema_errors,
+        )
         out["ensemble_family_performance"] = [
             {
                 "window_start_ts": int(row[0] or 0),
@@ -312,6 +335,9 @@ def get_model_diagnostics():
             }
             for row in ensemble_perf_rows or []
         ]
+        if schema_errors:
+            out["diagnostics_status"] = "schema_error"
+            out["schema_errors"] = list(schema_errors)
 
         return out
     finally:
@@ -1434,8 +1460,14 @@ def _decision_decode_json_fields(row: dict[str, Any] | None) -> dict[str, Any]:
             try:
                 out[str(key)] = json.loads(value) if value.strip() else {}
                 continue
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_nonfatal(
+                    "API_READ_ADVANCED_DECISION_JSON_DECODE_FAILED",
+                    e,
+                    once_key=f"decision_json_decode:{key}",
+                    field=str(key),
+                    value_excerpt=str(value)[:256],
+                )
         out[str(key)] = value
     return out
 
@@ -1501,7 +1533,13 @@ def _decision_int(value: Any) -> int | None:
             return None
         out = int(value)
         return out if out > 0 else None
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "API_READ_ADVANCED_DECISION_INT_PARSE_FAILED",
+            e,
+            once_key="decision_int",
+            value_type=type(value).__name__,
+        )
         return None
 
 
@@ -1519,7 +1557,13 @@ def _decision_dict(value: Any) -> dict[str, Any]:
         try:
             parsed = json.loads(value)
             return parsed if isinstance(parsed, dict) else {}
-        except Exception:
+        except Exception as e:
+            _warn_nonfatal(
+                "API_READ_ADVANCED_DECISION_DICT_PARSE_FAILED",
+                e,
+                once_key="decision_dict",
+                value_type=type(value).__name__,
+            )
             return {}
     return {}
 
@@ -1559,7 +1603,13 @@ def _normalize_decision_record(record: dict[str, Any] | None) -> dict[str, Any] 
 def _format_decision_confidence(value: Any) -> str:
     try:
         n = float(value)
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal(
+            "API_READ_ADVANCED_DECISION_CONFIDENCE_FORMAT_FAILED",
+            e,
+            once_key="decision_confidence",
+            value_type=type(value).__name__,
+        )
         return "unavailable"
     if not (n == n):
         return "unavailable"
@@ -2079,8 +2129,12 @@ def get_decision_detail(
         if con is not None:
             try:
                 con.close()
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_nonfatal(
+                    "API_READ_ADVANCED_DECISION_DETAIL_CLOSE_FAILED",
+                    e,
+                    once_key="decision_detail_close_failed",
+                )
 
     stages = _build_decision_stages(detail, related)
     if not detail and not any(

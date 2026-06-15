@@ -28,6 +28,10 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+
+def _is_missing_optional_module(error: ModuleNotFoundError, module_name: str) -> bool:
+    return getattr(error, "name", "") == module_name or f"No module named '{module_name}'" in str(error)
+
 _SAFE_NO_CREDENTIAL_BOOTSTRAP_ENV = {
     "POLYGON_REST_ENABLED": "0",
     "POLYGON_WS_ENABLED": "0",
@@ -69,8 +73,11 @@ _BOOTSTRAP_CREDENTIAL_RUNTIME_ENV_KEYS = (
     "OPENAI_API_KEY",
     "POLYGON_API_KEY",
     "POLYGON_KEY",
+    "QUIVER_API_KEY",
     "REDDIT_CLIENT_ID",
     "REDDIT_CLIENT_SECRET",
+    "SHARADAR_API_KEY",
+    "SIMFIN_API_KEY",
     "TRADIER_API_TOKEN",
 )
 
@@ -149,6 +156,9 @@ def _bootstrap_stderr_event(event: str, error: BaseException, **extra) -> None:
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
+except ModuleNotFoundError as e:
+    if not _is_missing_optional_module(e, "dotenv"):
+        _bootstrap_stderr_event("runtime_bootstrap_dotenv_load_failed", e)
 except Exception as e:
     _bootstrap_stderr_event("runtime_bootstrap_dotenv_load_failed", e)
 

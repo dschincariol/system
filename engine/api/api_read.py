@@ -14,6 +14,7 @@ Pure read-only DB queries.
 """
 
 import json
+import os
 import time
 import logging
 from typing import Any
@@ -315,6 +316,33 @@ def get_execution_metrics(model_id: str = ""):
     def _load():
         con = _db_connect()
         try:
+            def _latest_runtime_metric(metric_name: str):
+                try:
+                    if not _table_exists(con, "runtime_metrics"):
+                        return None
+                    row_metric = con.execute(
+                        """
+                        SELECT value_num
+                        FROM runtime_metrics
+                        WHERE metric=?
+                        ORDER BY ts_ms DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (str(metric_name),),
+                    ).fetchone()
+                    if row_metric and row_metric[0] is not None:
+                        return float(row_metric[0])
+                except Exception as e:
+                    _warn_nonfatal(
+                        "API_READ_LATEST_RUNTIME_METRIC_FAILED",
+                        e,
+                        warn_key=f"latest_runtime_metric:{metric_name}",
+                        metric=str(metric_name),
+                    )
+                    return None
+                return None
+
+            latest_kill_reaction_latency_ms = _latest_runtime_metric("kill_reaction_latency_ms")
             if _table_exists(con, "execution_fills"):
                 # Prefer canonical execution_fills/execution_orders when they
                 # exist, but keep a legacy fallback below for older schemas.
@@ -394,6 +422,8 @@ def get_execution_metrics(model_id: str = ""):
                     ).fetchall()
 
                 by_strategy = {}
+                fill_detection_latency_sum = 0.0
+                fill_detection_latency_n = 0
                 for sym, expected_px, fill_px, slippage_bps, fill_latency_ms, spread_bps, fees, fill_extra_json, order_extra_json in detail_rows or []:
                     fill_extra = {}
                     order_extra = {}
@@ -439,6 +469,8 @@ def get_execution_metrics(model_id: str = ""):
                             "_expected_n": 0,
                             "_actual_sum": 0.0,
                             "_actual_n": 0,
+                            "_detection_latency_sum": 0.0,
+                            "_detection_latency_n": 0,
                             "symbols": set(),
                         },
                     )
@@ -463,6 +495,17 @@ def get_execution_metrics(model_id: str = ""):
                     if fill_px is not None:
                         bucket["_actual_sum"] += float(fill_px)
                         bucket["_actual_n"] += 1
+                    detection_latency_ms = fill_extra.get("fill_detection_latency_ms")
+                    if detection_latency_ms is not None:
+                        try:
+                            detection_latency_f = max(0.0, float(detection_latency_ms))
+                        except Exception:
+                            detection_latency_f = None
+                        if detection_latency_f is not None:
+                            bucket["_detection_latency_sum"] += float(detection_latency_f)
+                            bucket["_detection_latency_n"] += 1
+                            fill_detection_latency_sum += float(detection_latency_f)
+                            fill_detection_latency_n += 1
 
                 strategy_rows = []
                 for _, bucket in sorted(by_strategy.items(), key=lambda kv: (-kv[1]["n_fills"], kv[0])):
@@ -477,6 +520,11 @@ def get_execution_metrics(model_id: str = ""):
                             "avg_expected_fill_price": (bucket["_expected_sum"] / bucket["_expected_n"]) if bucket["_expected_n"] else 0.0,
                             "avg_actual_fill_price": (bucket["_actual_sum"] / bucket["_actual_n"]) if bucket["_actual_n"] else 0.0,
                             "total_fees": float(bucket["total_fees"]),
+                            "avg_fill_detection_latency_ms": (
+                                bucket["_detection_latency_sum"] / bucket["_detection_latency_n"]
+                                if bucket["_detection_latency_n"]
+                                else None
+                            ),
                         }
                     )
 
@@ -491,6 +539,12 @@ def get_execution_metrics(model_id: str = ""):
                     "avg_spread_at_entry_bps": float((row or [0, 0, 0, 0, 0, 0])[5] or 0.0),
                     "avg_expected_fill_price": float((row or [0, 0, 0, 0, 0, 0, 0])[6] or 0.0),
                     "avg_actual_fill_price": float((row or [0, 0, 0, 0, 0, 0, 0, 0])[7] or 0.0),
+                    "avg_fill_detection_latency_ms": (
+                        float(fill_detection_latency_sum) / float(fill_detection_latency_n)
+                        if fill_detection_latency_n
+                        else None
+                    ),
+                    "latest_kill_reaction_latency_ms": latest_kill_reaction_latency_ms,
                     "by_strategy": strategy_rows,
                     "total_slippage": float((row or [0, 0])[1] or 0.0),
                     "total_cost": float((row or [0, 0, 0])[2] or 0.0),
@@ -524,6 +578,8 @@ def get_execution_metrics(model_id: str = ""):
                 "total_fees": float(row[2] or 0.0),
                 "total_cost": float(row[3] or 0.0),
                 "avg_slippage": float(row[4] or 0.0),
+                "avg_fill_detection_latency_ms": None,
+                "latest_kill_reaction_latency_ms": latest_kill_reaction_latency_ms,
             }
         finally:
             con.close()
@@ -541,12 +597,36 @@ def get_feed_status():
             for row in fetch_provider_health_rows():
                 ts_ms = row.get("ts_ms")
                 age_s = None if ts_ms is None else round((now_ms - int(ts_ms)) / 1000.0, 1)
+                last_success_ts_ms = row.get("last_success_ts_ms")
+                last_success_age_s = (
+                    None
+                    if last_success_ts_ms is None
+                    else round((now_ms - int(last_success_ts_ms)) / 1000.0, 1)
+                )
+                error_count = (
+                    int(row.get("error_count"))
+                    if row.get("error_count") is not None
+                    else None
+                )
+                circuit_open = bool(
+                    error_count is not None
+                    and error_count >= int(os.environ.get("PROVIDER_CIRCUIT_BREAKER_ERRORS", "3"))
+                    and not bool(row.get("ok"))
+                )
                 providers.append(
                     {
                         "provider": str(row.get("provider") or ""),
                         "ok": bool(row.get("ok")),
                         "ts_ms": (int(ts_ms) if ts_ms is not None else None),
                         "age_s": age_s,
+                        "last_success_ts_ms": (
+                            int(last_success_ts_ms)
+                            if last_success_ts_ms is not None
+                            else None
+                        ),
+                        "last_success_age_s": last_success_age_s,
+                        "error_count": error_count,
+                        "circuit_open": circuit_open,
                         "latency_ms": (
                             float(row.get("latency_ms"))
                             if row.get("latency_ms") is not None
