@@ -392,6 +392,50 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
         self.assertIn("PORTFOLIO_RISK_VOL_HARD_BLOCK unset", message)
         self.assertIn("KILL_SWITCH_MODEL_MAX_DRAWDOWN unset", message)
 
+    def test_live_runtime_config_requires_confirmation_phrase(self) -> None:
+        db_path = str((Path.cwd() / "runtime_config_live_confirmation_unset.db").resolve())
+        with patch.dict(
+            os.environ,
+            {
+                "ENGINE_MODE": "live",
+                "DB_PATH": db_path,
+                "ALLOW_TRAINING": "0",
+                **LIVE_RISK_THRESHOLDS,
+            },
+            clear=True,
+        ):
+            from engine.runtime.config_schema import ConfigError
+
+            with self.assertRaises(ConfigError) as ctx:
+                self._load()
+
+        message = str(ctx.exception)
+        self.assertIn("live trading confirmation invalid", message)
+        self.assertIn("live_trading_confirmation_required", message)
+        self.assertIn("LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING", message)
+
+    def test_live_runtime_config_rejects_disabled_confirmation_requirement(self) -> None:
+        db_path = str((Path.cwd() / "runtime_config_live_confirmation_disabled.db").resolve())
+        with patch.dict(
+            os.environ,
+            {
+                "ENGINE_MODE": "live",
+                "DB_PATH": db_path,
+                "ALLOW_TRAINING": "0",
+                "LIVE_TRADING_CONFIRM": "I_UNDERSTAND_LIVE_TRADING",
+                "LIVE_TRADING_REQUIRE_CONFIRMATION": "0",
+                **LIVE_RISK_THRESHOLDS,
+            },
+            clear=True,
+        ):
+            from engine.runtime.config_schema import ConfigError
+
+            with self.assertRaises(ConfigError) as ctx:
+                self._load()
+
+        message = str(ctx.exception)
+        self.assertIn("live_trading_confirmation_cannot_be_disabled", message)
+
     def test_prod_preflight_runtime_config_gate_rejects_unset_live_risk_thresholds(self) -> None:
         db_path = str((Path.cwd() / "prod_preflight_live_risk_unset.db").resolve())
         with patch.dict(

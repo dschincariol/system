@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 from unittest.mock import patch
 
+from engine.runtime.live_trading_preflight import DEFAULT_LIVE_CONFIRM_PHRASE
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -286,6 +288,8 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
     def _set_mode(self, mode: str, *, armed: int = 0) -> None:
         os.environ["EXECUTION_MODE"] = str(mode)
         os.environ["ENGINE_MODE"] = str(mode)
+        if str(mode).strip().lower() == "live" and int(armed or 0) == 1:
+            os.environ.setdefault("LIVE_TRADING_CONFIRM", DEFAULT_LIVE_CONFIRM_PHRASE)
         self._reload_runtime_modules()
         self.execution_mode.set_execution_mode(str(mode), actor="test", reason="unit_test")
         self.execution_mode.set_execution_armed(int(armed), actor="test", reason="unit_test")

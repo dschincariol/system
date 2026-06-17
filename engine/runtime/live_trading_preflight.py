@@ -21,6 +21,7 @@ from engine.runtime.platform import LOOPBACK_HOSTS, default_dashboard_host
 
 
 _TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_FALSEY_VALUES = {"0", "false", "no", "off"}
 DEFAULT_LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_LIVE_TRADING"
 
 
@@ -31,13 +32,101 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in _TRUTHY_VALUES
 
 
+def _env_bool_snapshot(name: str, default: bool = False) -> tuple[bool, bool, str]:
+    raw = str(os.environ.get(name, "")).strip()
+    lowered = raw.lower()
+    if lowered == "":
+        return bool(default), False, raw
+    if lowered in _TRUTHY_VALUES:
+        return True, False, raw
+    if lowered in _FALSEY_VALUES:
+        return False, False, raw
+    return bool(default), True, raw
+
+
 def _normalize_mode(value: Any, default: str = "safe") -> str:
     mode = str(value or default).strip().lower() or default
     return mode if mode in {"safe", "paper", "shadow", "live", "dev", "development"} else default
 
 
 def _confirmation_phrase() -> str:
-    return str(os.environ.get("LIVE_TRADING_CONFIRM_PHRASE") or DEFAULT_LIVE_CONFIRM_PHRASE).strip()
+    return DEFAULT_LIVE_CONFIRM_PHRASE
+
+
+def live_confirmation_snapshot(
+    *,
+    engine_mode: Optional[str] = None,
+    live_confirm: Optional[str] = None,
+    require_confirmation: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Return the canonical live-confirmation contract.
+
+    Live confirmation is intentionally not runtime-configurable. Operators arm
+    it by setting LIVE_TRADING_CONFIRM to the built-in phrase in deployment
+    configuration for the target host.
+    """
+
+    mode = _normalize_mode(engine_mode if engine_mode is not None else os.environ.get("ENGINE_MODE"), "safe")
+    confirm = str(
+        live_confirm
+        if live_confirm is not None
+        else os.environ.get("LIVE_TRADING_CONFIRM", "")
+    ).strip()
+    phrase = _confirmation_phrase()
+    phrase_override = str(os.environ.get("LIVE_TRADING_CONFIRM_PHRASE") or "").strip()
+    if require_confirmation is None:
+        requested_required, invalid_required, raw_required = _env_bool_snapshot(
+            "LIVE_TRADING_REQUIRE_CONFIRMATION",
+            True,
+        )
+    else:
+        requested_required = bool(require_confirmation)
+        invalid_required = False
+        raw_required = "1" if requested_required else "0"
+
+    blockers: list[str] = []
+    required = bool(mode == "live")
+    if required:
+        if invalid_required:
+            blockers.append("live_trading_confirmation_requirement_invalid")
+        if phrase_override:
+            blockers.append("live_trading_confirmation_phrase_override_forbidden")
+        if not requested_required:
+            blockers.append("live_trading_confirmation_cannot_be_disabled")
+        if confirm != phrase:
+            blockers.append("live_trading_confirmation_required")
+
+    blockers = list(dict.fromkeys(blockers))
+    return {
+        "ok": not blockers,
+        "required": required,
+        "mode": mode,
+        "reason": "ok" if not blockers else blockers[0],
+        "blockers": blockers,
+        "expected_phrase": phrase,
+        "configured": bool(confirm),
+        "require_confirmation_raw": raw_required,
+        "require_confirmation_requested": bool(requested_required),
+        "require_confirmation_invalid": bool(invalid_required),
+        "phrase_override_configured": bool(phrase_override),
+    }
+
+
+def assert_live_trading_confirmation(
+    *,
+    engine_mode: Optional[str] = None,
+    live_confirm: Optional[str] = None,
+    require_confirmation: Optional[bool] = None,
+) -> Dict[str, Any]:
+    state = live_confirmation_snapshot(
+        engine_mode=engine_mode,
+        live_confirm=live_confirm,
+        require_confirmation=require_confirmation,
+    )
+    if not bool(state.get("ok")):
+        blockers = ",".join(str(item) for item in list(state.get("blockers") or []))
+        raise RuntimeError(f"live_trading_confirmation_failed:{blockers}")
+    return state
 
 
 def _execution_mode_state() -> Dict[str, Any]:
@@ -230,11 +319,6 @@ def live_environment_contract_snapshot(
         if require_dashboard_api_token is not None
         else _env_bool("LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN", True)
     )
-    require_confirm = (
-        bool(require_confirmation)
-        if require_confirmation is not None
-        else _env_bool("LIVE_TRADING_REQUIRE_CONFIRMATION", True)
-    )
 
     blockers: list[str] = []
     if mode == "live" and exec_mode != "live":
@@ -262,9 +346,14 @@ def live_environment_contract_snapshot(
             blockers.append("dashboard_api_token_required_for_live")
         elif token_issue:
             blockers.append(f"dashboard_api_token_invalid_for_live:{token_issue}")
+    confirmation = live_confirmation_snapshot(
+        engine_mode=mode,
+        live_confirm=confirm,
+        require_confirmation=require_confirmation,
+    )
+    if mode == "live" and not bool(confirmation.get("ok")):
+        blockers.extend(str(item) for item in list(confirmation.get("blockers") or []))
     phrase = _confirmation_phrase()
-    if mode == "live" and require_confirm and confirm != phrase:
-        blockers.append("live_trading_confirmation_required")
 
     blockers = list(dict.fromkeys(blockers))
     return {
@@ -277,8 +366,9 @@ def live_environment_contract_snapshot(
         "dashboard_host": host,
         "dashboard_api_token_configured": bool(token),
         "dashboard_api_token_issue": token_issue,
-        "confirmation_required": bool(mode == "live" and require_confirm),
-        "confirmation_phrase": phrase if mode == "live" and require_confirm else "",
+        "confirmation_required": bool(confirmation.get("required")),
+        "confirmation_phrase": phrase if bool(confirmation.get("required")) else "",
+        "confirmation": dict(confirmation or {}),
         "broker_contract": dict(broker_contract or {}),
         "broker_preflight": dict(broker_preflight or {}),
         "initial_kill_switch_hold": dict(initial_kill_switch_hold or {}),
@@ -322,12 +412,6 @@ def live_trading_preflight(
         if require_dashboard_api_token is not None
         else _env_bool("LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN", True)
     )
-    require_confirm = (
-        bool(require_confirmation)
-        if require_confirmation is not None
-        else _env_bool("LIVE_TRADING_REQUIRE_CONFIRMATION", True)
-    )
-
     contract = live_environment_contract_snapshot(
         engine_mode=mode,
         execution_mode=exec_mode,
@@ -335,7 +419,7 @@ def live_trading_preflight(
         dashboard_api_token=token,
         live_confirm=confirm,
         require_dashboard_api_token=require_token,
-        require_confirmation=require_confirm,
+        require_confirmation=require_confirmation,
     )
     blockers = list(contract.get("blockers") or [])
     if mode == "live" and live_execution_disabled():
@@ -368,8 +452,9 @@ def live_trading_preflight(
         "blockers": blockers,
         "dashboard_host": host,
         "dashboard_api_token_configured": bool(token),
-        "confirmation_required": bool(mode == "live" and require_confirm),
-        "confirmation_phrase": phrase if mode == "live" and require_confirm else "",
+        "confirmation_required": bool((contract.get("confirmation") or {}).get("required")),
+        "confirmation_phrase": phrase if bool((contract.get("confirmation") or {}).get("required")) else "",
+        "confirmation": dict(contract.get("confirmation") or {}),
         "deployment_contract": dict(contract or {}),
         "prelive_reconcile": dict(prelive_reconcile or {}),
         "broker_contract": dict(contract.get("broker_contract") or {}),
@@ -403,7 +488,9 @@ def assert_dashboard_security_config(
 
 __all__ = [
     "DEFAULT_LIVE_CONFIRM_PHRASE",
+    "assert_live_trading_confirmation",
     "assert_dashboard_security_config",
+    "live_confirmation_snapshot",
     "live_environment_contract_snapshot",
     "live_trading_preflight",
 ]

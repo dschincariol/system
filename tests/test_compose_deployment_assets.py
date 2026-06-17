@@ -155,6 +155,8 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("INFERENCE_HEALTH_PROBE_SYMBOLS: ${INFERENCE_HEALTH_PROBE_SYMBOLS:-AMD}", stack_text)
         self.assertIn("INFERENCE_HEALTH_PROBE_INTERVAL_S: ${INFERENCE_HEALTH_PROBE_INTERVAL_S:-20}", stack_text)
         self.assertIn("KILL_SWITCH_GLOBAL: ${KILL_SWITCH_GLOBAL:-1}", stack_text)
+        self.assertIn("LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-0}", stack_text)
+        self.assertIn("LIVE_TRADING_CONFIRM=0", env_example_text)
         self.assertIn("BROKER_NAME: ${BROKER_NAME:-sim}", stack_text)
         self.assertIn("BROKER_FAILOVER: ${BROKER_FAILOVER:-sim}", stack_text)
 

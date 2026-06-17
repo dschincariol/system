@@ -7,6 +7,7 @@ This checklist is grounded in the deployment artifacts under `deploy/`, the runt
 - Copy `.env.example` to `.env` and set the required runtime values for the target host.
 - Keep `ENGINE_MODE=safe` and `EXECUTION_MODE=safe` for the initial bring-up.
 - Set `DASHBOARD_API_TOKEN` to a generated high-entropy value for every production or live deployment, even when the dashboard binds to loopback. Do not use placeholders such as `change-me`, `secret`, or short test tokens.
+- Keep `LIVE_TRADING_CONFIRM` unset or `0` during production bring-up. Set it to the exact built-in phrase `I_UNDERSTAND_LIVE_TRADING` only in the target host's operator-controlled deployment configuration when live execution is intentionally being enabled.
 - Leave `TS_API_ALLOW_LOCALHOST_MUTATIONS_WITHOUT_TOKEN=0` or unset outside explicit local dev/test. The no-token localhost mutation fallback is accepted only when the environment is dev/test, both engine and execution modes are safe/dev, and that flag is enabled.
 - For the compose operator sidecar, set `OPERATOR_API_TOKEN`; live smoke must send it as `OPERATOR_API_TOKEN` or `PIPELINE_SMOKE_OPERATOR_TOKEN`.
 - Provide a credential-encryption root with `DATA_SOURCE_MASTER_KEY` or `DATA_SOURCE_MASTER_KEY_FILE`.
@@ -90,6 +91,7 @@ The repository already includes these deployment assets:
 - Confirm the runtime is not in `BOOTING`, `WARMING_UP`, `SHUTDOWN`, `KILL_SWITCH`, or unknown lifecycle state.
 - Confirm `DISABLE_LIVE_EXECUTION` is unset or explicitly false (`0`, `false`, `no`, or `off`). A truthy or unknown non-empty value is a hard live-capital block in the runtime gate, kill-switch cascade, broker router, broker adapters, and terminal order-entry APIs.
 - Confirm `ENGINE_MODE=live` and `EXECUTION_MODE=live`; environment mode alone does not arm execution.
+- Confirm `LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING`. The expected phrase is fixed in code; `LIVE_TRADING_CONFIRM_PHRASE` overrides and `LIVE_TRADING_REQUIRE_CONFIRMATION=0` are rejected in live mode.
 - Confirm `LIVE_BROKER`, `BROKER`, `BROKER_NAME`, and `BROKER_FAILOVER` identify the intended live broker and do not include `sim`, `paper`, or `sandbox`.
 - Confirm `GET /api/broker/config` shows the intended active broker, masked credentials, and the expected last passing test result; confirm `GET /api/broker/audit` contains the recent configuration and test actions.
 - Confirm the initial deployment hold has `KILL_SWITCH_GLOBAL=1` until operator signoff. Clearing that hold is not sufficient to trade; live execution still requires the audited DB `execution_mode` row to be `mode=live, armed=1`.

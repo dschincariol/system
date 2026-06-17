@@ -41,6 +41,8 @@ def fresh_backup_restore_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("BACKUP_EVIDENCE_RTO_S", "300")
     monkeypatch.setenv("EXECUTION_MODE", "live")
     monkeypatch.setenv("KILL_SWITCH_GLOBAL", "1")
+    monkeypatch.setenv("LIVE_TRADING_REQUIRE_CONFIRMATION", "1")
+    monkeypatch.delenv("LIVE_TRADING_CONFIRM_PHRASE", raising=False)
 
 
 def _set_live_broker_contract(monkeypatch, broker: str = "alpaca", *, credentials: bool = True) -> None:
@@ -95,6 +97,43 @@ def test_live_trading_preflight_accepts_explicit_live_acknowledgement(monkeypatc
 
     assert state["ok"] is True
     assert state["blockers"] == []
+
+
+def test_live_trading_preflight_uses_fixed_confirmation_phrase(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    monkeypatch.setenv("LIVE_TRADING_CONFIRM_PHRASE", "TRADE")
+    _set_live_broker_contract(monkeypatch)
+
+    state = live_trading_preflight(
+        engine_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="live-token-1234567890",
+        live_confirm="TRADE",
+    )
+
+    assert state["ok"] is False
+    assert state["confirmation_phrase"] == DEFAULT_LIVE_CONFIRM_PHRASE
+    assert "live_trading_confirmation_phrase_override_forbidden" in state["blockers"]
+    assert "live_trading_confirmation_required" in state["blockers"]
+
+
+def test_live_trading_preflight_rejects_disabled_confirmation_requirement(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    monkeypatch.setenv("LIVE_TRADING_REQUIRE_CONFIRMATION", "0")
+    _set_live_broker_contract(monkeypatch)
+
+    state = live_trading_preflight(
+        engine_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="live-token-1234567890",
+        live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
+    )
+
+    assert state["ok"] is False
+    assert "live_trading_confirmation_cannot_be_disabled" in state["blockers"]
+    assert state["confirmation"]["required"] is True
 
 
 def test_live_trading_preflight_requires_execution_mode_live(monkeypatch):
@@ -195,6 +234,7 @@ def test_live_trading_preflight_accepts_live_armed_db_with_audit(monkeypatch):
     monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
     monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
     monkeypatch.setenv("KILL_SWITCH_GLOBAL", "0")
+    monkeypatch.setenv("LIVE_TRADING_CONFIRM", DEFAULT_LIVE_CONFIRM_PHRASE)
     _set_live_broker_contract(monkeypatch)
 
     from engine.execution import execution_mode
@@ -215,6 +255,29 @@ def test_live_trading_preflight_accepts_live_armed_db_with_audit(monkeypatch):
     assert state["execution_arming_audit"]["required"] is True
     assert state["execution_arming_audit"]["audit"]["row_hash_present"] is True
     assert state["initial_kill_switch_hold"]["signed_off"] is True
+
+
+def test_execution_mode_refuses_live_arming_without_confirmation(monkeypatch):
+    monkeypatch.delenv("LIVE_TRADING_CONFIRM", raising=False)
+
+    from engine.cache.wrappers import execution_mode as cached_execution_mode
+    from engine.execution import execution_mode
+    from engine.runtime import storage
+
+    storage.init_db()
+    execution_mode.set_execution_mode("live", actor="ops", reason="signoff")
+
+    with pytest.raises(RuntimeError) as direct_error:
+        execution_mode.set_execution_armed(1, actor="ops", reason="signoff")
+    assert "live_trading_confirmation_required" in str(direct_error.value)
+
+    with pytest.raises(RuntimeError) as cached_error:
+        cached_execution_mode.set_execution_mode("live", actor="ops", reason="signoff", armed=1)
+    assert "live_trading_confirmation_required" in str(cached_error.value)
+
+    state = execution_mode.get_execution_mode()
+    assert state["mode"] == "live"
+    assert int(state["armed"]) == 0
 
 
 def test_live_trading_preflight_rejects_alpaca_paper_endpoint_in_live(monkeypatch):

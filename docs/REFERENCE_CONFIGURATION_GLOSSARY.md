@@ -38,7 +38,7 @@ It is grounded in:
 | `DASHBOARD_STORAGE_REQUEST_TIMEOUT_S`, `DASHBOARD_STORAGE_STARTUP_TIMEOUT_S` | Dashboard storage readiness/request bounds | Used by [dashboard_server.py](../dashboard_server.py) and the HTTP transport to return structured 503 responses instead of letting read handlers stall on Postgres acquisition. |
 | `ENGINE_MODE`, `EXECUTION_MODE`, `OPERATOR_MODE` | Runtime and operator operating modes | Read across startup, system-state, API, and UI safety surfaces. Safe mode is the default posture. |
 | `DISABLE_LIVE_EXECUTION` | Emergency live-capital kill switch | Read by runtime gates, kill-switch checks, broker routing/adapters, live preflight, and terminal order-entry. Unset or explicit false values (`0`, `false`, `no`, `off`) allow normal live eligibility checks; any other non-empty value blocks live execution. |
-| `LIVE_TRADING_CONFIRM`, `LIVE_TRADING_CONFIRM_PHRASE`, `LIVE_TRADING_REQUIRE_CONFIRMATION`, `LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN` | Live-mode confirmation and dashboard-token contract | [engine/runtime/live_trading_preflight.py](../engine/runtime/live_trading_preflight.py). |
+| `LIVE_TRADING_CONFIRM`, `LIVE_TRADING_REQUIRE_CONFIRMATION`, `LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN` | Live-mode confirmation and dashboard-token contract. The expected confirmation phrase is fixed in code; phrase overrides and disabled live confirmation are rejected in live mode. | [engine/runtime/live_trading_preflight.py](../engine/runtime/live_trading_preflight.py). |
 | `TRADING_DATA`, `TRADING_LOGS`, `DATA_DIR`, `LOG_DIR` | Resolved runtime data and log directories | [start_system.py](../start_system.py) and [start_ingestion.py](../start_ingestion.py) normalize these before the runtime starts. |
 
 ## Startup Validation And Lifecycle

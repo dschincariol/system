@@ -244,6 +244,31 @@ def validate_live_risk_thresholds(safety: dict[str, object] | None = None) -> di
     return snapshot
 
 
+def validate_live_trading_confirmation(safety: dict[str, object] | None = None) -> dict[str, object]:
+    ctx = safety if safety is not None else get_runtime_safety_context()
+    required = bool(str(ctx.get("engine_mode") or "").lower() == "live" and bool(ctx.get("strict_runtime")))
+    if not required:
+        return {
+            "required": False,
+            "ok": True,
+            "blockers": [],
+        }
+
+    from engine.runtime.live_trading_preflight import (
+        DEFAULT_LIVE_CONFIRM_PHRASE,
+        live_confirmation_snapshot,
+    )
+
+    snapshot = live_confirmation_snapshot(engine_mode="live")
+    if not bool(snapshot.get("ok")):
+        blockers = "; ".join(str(item) for item in list(snapshot.get("blockers") or []))
+        raise ConfigError(
+            "live trading confirmation invalid: "
+            f"{blockers}; expected LIVE_TRADING_CONFIRM={DEFAULT_LIVE_CONFIRM_PHRASE}"
+        )
+    return snapshot
+
+
 def _normalize_env_name(raw: str) -> str:
     env = str(raw or "").strip().lower()
     if env == "production":
@@ -580,6 +605,7 @@ def load_runtime_config() -> RuntimeConfig:
     pit_universe_backfill_enabled = _opt_bool("PIT_UNIVERSE_BACKFILL_ENABLED", default=False)
     _validate_new_subsystem_flags()
     validate_live_risk_thresholds(safety)
+    validate_live_trading_confirmation(safety)
 
     if strict_runtime and not Path(db_path).is_absolute():
         raise ConfigError(f"DB_PATH must resolve to an absolute path in supervised/prod mode: {db_path_raw}")
