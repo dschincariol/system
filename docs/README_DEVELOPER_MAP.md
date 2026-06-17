@@ -2,7 +2,7 @@
 
 This document explains where the code lives and how to navigate it.
 
-Last verified against code: 2026-06-11
+Last verified against code: 2026-06-17
 
 It is written for developers who need to answer:
 
@@ -62,6 +62,9 @@ That gives you system flow before subsystem detail.
 | `engine/runtime/jobs_manager.py` | job launch/stop/status orchestration |
 | `engine/runtime/startup_orchestrator.py` | startup sequencing |
 | `engine/runtime/supervisor.py` | runtime supervision |
+| `engine/runtime/live_trading_preflight.py` | fail-closed live deployment contract, confirmation, broker, backup-evidence, and arming-audit checks |
+| `engine/runtime/live_execution_control.py` | shared emergency live-capital controls, `DISABLE_LIVE_EXECUTION`, and pre-live reconciliation policy |
+| `engine/runtime/backup_evidence.py` | backup, WAL archive, and restore-drill freshness policy used by live preflight |
 | `engine/model_registry.py` | canonical model registry and model feature contract lookup |
 | `engine/strategy/model_intent.py` | canonical model-owned decision payload |
 | `engine/strategy/feature_registry.py` | named feature resolver registry |
@@ -72,6 +75,8 @@ That gives you system flow before subsystem detail.
 | `services/operator_ai/agent.js` | bounded LLM diagnosis over support snapshots and watchdog context |
 | `engine/execution/execution_policy_engine.py` | execution shaping and policy |
 | `engine/execution/broker_router.py` | broker routing logic |
+| `engine/execution/broker_failover_policy.py` | live broker identity, failover-chain validation, and non-retryable broker failure classification |
+| `engine/execution/broker_submission_recovery.py` | fail-closed recovery marker for broker-accepted orders missing local durable submission state |
 | `ui/dashboard.html` | main dashboard shell |
 | `ui/dashboard.js` | main dashboard behavior |
 | `services/data_source_manager.py` | DB-authoritative source catalog, credential storage contract, runtime env projection, and lifecycle reconciliation |
@@ -91,6 +96,9 @@ These files are high-risk edit surfaces:
 | `dashboard_server.py` | API/UI boundary and runtime wiring |
 | `engine/strategy/portfolio.py` | direct effect on portfolio behavior |
 | `engine/execution/execution_policy_engine.py` | direct effect on execution behavior |
+| `engine/runtime/live_trading_preflight.py` | controls whether live mode can pass startup/preflight |
+| `engine/runtime/live_execution_control.py` | emergency live-capital kill switch and pre-live reconciliation policy |
+| `engine/execution/broker_failover_policy.py` | prevents unsafe live broker failover chains |
 | `boot/operator_server.js` | operator controls, repair actions, and local patch workflow |
 
 ## 5. Where To Make Common Changes
@@ -156,7 +164,33 @@ Look in:
 - `engine/execution/execution_policy_engine.py`
 - `engine/execution/broker_router.py`
 - `engine/execution/broker_apply_orders.py`
+- `engine/execution/broker_failover_policy.py`
+- `engine/execution/broker_submission_recovery.py`
 - `engine/execution/kill_switch.py`
+- `engine/runtime/live_execution_control.py`
+- `engine/runtime/live_trading_preflight.py`
+
+### Change broker configuration or live activation
+
+Look in:
+
+- `engine/api/api_broker_config.py`
+- `engine/execution/broker_failover_policy.py`
+- `engine/runtime/live_trading_preflight.py`
+- `engine/runtime/live_execution_control.py`
+- `engine/runtime/schema/migrations/0053_broker_config_control_plane.py`
+- `docs/openapi/openapi.yaml`
+- `docs/PRODUCTION_CHECKLIST.md`
+- `docs/REFERENCE_CONFIGURATION_GLOSSARY.md`
+
+### Change alert lifecycle behavior
+
+Look in:
+
+- `engine/api/api_write.py`
+- `engine/runtime/alerts.py`
+- `engine/runtime/schema/migrations/0054_alert_lifecycle.py`
+- dashboard alert UI modules under `ui/`
 
 ## 6. Main Runtime Data Path
 
@@ -192,6 +226,9 @@ In practice it contains:
 | human alignment summary endpoint | reports noisy or low-value alert patterns |
 | execution advisory endpoints | lists advisories and stores operator actions |
 | governance summary endpoint | reports promotion/safety state |
+| broker config endpoints | reads, writes, tests, and audits broker configuration without editing `.env` |
+| market/replay endpoints | serves OHLCV candle aggregation, server-sent market streams, and historical day replay payloads |
+| terminal order endpoints | writes gated quantity/flatten intents and records pre-trade rejection reasons |
 
 ## 8. UI Layer Map
 
@@ -246,6 +283,10 @@ For this functional area, do not add new operator-side `.env` feed-config flows.
 | Operator AI diagnostics and guarded patching | `services/operator_ai/agent.js`, `boot/operator_server.js`, `engine/api/api_system.py`, `boot/operator_ui.html` |
 | Data-source control plane | `services/data_source_manager.py`, `services/credential_encryption.py`, `routes/data_sources_routes.py`, `ui/data_sources.html`, `ui/data_sources.js`, `ui/data_sources.css` |
 | Browser terminal | `engine/terminal/api/api_terminal.py`, `engine/terminal/api/api_terminal_orders.py`, `ui/terminal/terminal.html`, `ui/terminal/terminal.js`, `ui/terminal/terminal_theme.css` |
+| Broker configuration control plane | `engine/api/api_broker_config.py`, `engine/runtime/schema/migrations/0053_broker_config_control_plane.py` |
+| Live execution safety gates | `engine/runtime/live_trading_preflight.py`, `engine/runtime/live_execution_control.py`, `engine/execution/broker_failover_policy.py`, `engine/execution/broker_submission_recovery.py` |
+| Backup/restore evidence gate | `engine/runtime/backup_evidence.py`, `ops/backup/backup_restore_evidence.sh`, `ops/server/install_backup_evidence_gate.sh` |
+| Alert lifecycle shelving and expiry | `engine/api/api_write.py`, `engine/runtime/schema/migrations/0054_alert_lifecycle.py` |
 | Trade lifecycle and attribution audit | `engine/runtime/trade_lifecycle.py`, `engine/strategy/jobs/trade_lifecycle_audit_job.py`, `engine/execution/execution_ledger.py`, `engine/execution/trade_attribution_ledger.py`, `tests/test_trade_lifecycle_regressions.py` |
 | Current model families | `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, `engine/strategy/models/patchtst.py`, `engine/strategy/ensemble/ridge_meta.py` |
 | Promotion and statistical gates | `engine/strategy/promotion_guard.py`, `engine/strategy/statistical_gates.py`, `engine/strategy/champion_manager.py` |

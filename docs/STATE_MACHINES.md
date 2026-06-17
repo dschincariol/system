@@ -99,7 +99,9 @@ This diagram follows the order in `engine.execution.kill_switch.execution_allowe
 flowchart TD
     A[execution_allowed()] --> B{lifecycle == LIVE?}
     B -->|no| B1[block<br/>reason from lifecycle]
-    B -->|yes| C{env kill switches active?}
+    B -->|yes| C0{DISABLE_LIVE_EXECUTION truthy<br/>and mode live?}
+    C0 -->|yes| C0A[block<br/>disable_live_execution_env]
+    C0 -->|no| C{env kill switches active?}
     C -->|yes| C1[block<br/>env global/symbol/regime/model]
     C -->|no| D{capital_guard.trading_allowed()?}
     D -->|no| D1[block<br/>capital guard hard stop]
@@ -124,6 +126,7 @@ flowchart TD
 Operational notes:
 
 - the DB kill-switch lookup order is global, then model, then regime, then symbol
+- `DISABLE_LIVE_EXECUTION` is evaluated before capital/data/job checks for live-mode execution; any non-empty value except `0`, `false`, `no`, or `off` blocks with `disable_live_execution_env`
 - a global activation also forces lifecycle `KILL_SWITCH`
 - a global clear returns lifecycle to `DEGRADED`
 - `broker_apply_orders.py` does not rely on this cascade alone; it also checks the broader runtime barrier from `execution_gate_snapshot()`
@@ -139,6 +142,7 @@ It hard-blocks or downgrades execution when any of the following are true:
 - execution degradation is critical
 - portfolio risk state blocks execution
 - active kill switches are present
+- `DISABLE_LIVE_EXECUTION` is truthy while mode is `live`
 
 The important distinction in that snapshot is:
 

@@ -28,15 +28,26 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from engine.execution.broker_failover_policy import terminal_broker_failure
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
 from engine.execution.execution_ledger import init_execution_ledger, log_submit, log_fill
+from engine.execution.broker_submission_recovery import (
+    record_submission_unrecorded,
+    unrecorded_submission_gate,
+)
 from engine.strategy.alpha_lifecycle_engine import apply_alpha_lifecycle
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.live_execution_control import (
+    disabled_live_execution_gate,
+    live_execution_disabled,
+    prelive_reconcile_policy_gate,
+)
 from engine.runtime.logging import get_logger
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.storage import connect, run_write_txn
@@ -107,6 +118,110 @@ EXEC_DIRECTION_CONCENTRATION_CAP = float(
 )
 LOG = get_logger("engine.execution.broker_alpaca_rest")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+class AlpacaCredentialError(RuntimeError):
+    """Raised when required Alpaca credentials are absent."""
+
+
+class AlpacaAuthenticationError(RuntimeError):
+    """Raised when Alpaca rejects configured credentials."""
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _alpaca_live_endpoint_required() -> bool:
+    return (
+        str(os.environ.get("ENGINE_MODE", "") or "").strip().lower() == "live"
+        or str(os.environ.get("EXECUTION_MODE", "") or "").strip().lower() == "live"
+        or str(os.environ.get("ENV", "") or "").strip().lower() in {"prod", "production"}
+    )
+
+
+def alpaca_credentials_status(*, require_live_endpoint: Optional[bool] = None) -> Dict[str, Any]:
+    key_id = str(os.environ.get("ALPACA_KEY_ID", KEY_ID) or "").strip()
+    secret = str(os.environ.get("ALPACA_SECRET_KEY", SECRET) or "").strip()
+    base_url = str(os.environ.get("ALPACA_BASE_URL", BASE_URL) or "").strip()
+    require_live = _alpaca_live_endpoint_required() if require_live_endpoint is None else bool(require_live_endpoint)
+    missing = []
+    invalid = []
+    if not key_id:
+        missing.append("ALPACA_KEY_ID")
+    if not secret:
+        missing.append("ALPACA_SECRET_KEY")
+    if require_live and "paper-api.alpaca.markets" in base_url.lower():
+        invalid.append("ALPACA_BASE_URL")
+    status = "configured"
+    if missing:
+        status = "missing_credentials"
+    elif invalid:
+        status = "alpaca_paper_endpoint_for_live"
+    return {
+        "ok": not missing and not invalid,
+        "broker": "alpaca",
+        "status": status,
+        "required_live_endpoint": bool(require_live),
+        "configured_fields": {
+            "ALPACA_BASE_URL": bool(base_url),
+            "ALPACA_KEY_ID": bool(key_id),
+            "ALPACA_SECRET_KEY": bool(secret),
+        },
+        "base_url": base_url,
+        "missing": missing,
+        "invalid": invalid,
+    }
+
+
+def _alpaca_terminal_failure(
+    *,
+    status: str,
+    failure_kind: str,
+    detail: str = "",
+    error: Any = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return terminal_broker_failure(
+        broker="alpaca",
+        status=status,
+        failure_kind=failure_kind,
+        detail=detail,
+        error=error,
+        extra=extra,
+    )
+
+
+def _alpaca_credentials_block() -> Optional[Dict[str, Any]]:
+    state = alpaca_credentials_status(require_live_endpoint=_alpaca_live_endpoint_required())
+    if bool(state.get("ok")):
+        return None
+    status = str(state.get("status") or "missing_credentials")
+    return _alpaca_terminal_failure(
+        status=status,
+        failure_kind="configuration" if status == "alpaca_paper_endpoint_for_live" else "credential",
+        detail=status,
+        extra={"credentials": state},
+    )
+
+
+def _alpaca_exception_failure(exc: BaseException) -> Optional[Dict[str, Any]]:
+    if isinstance(exc, AlpacaCredentialError):
+        return _alpaca_terminal_failure(
+            status="missing_credentials",
+            failure_kind="credential",
+            detail="alpaca_credentials_missing",
+            error=str(exc),
+        )
+    if isinstance(exc, AlpacaAuthenticationError):
+        return _alpaca_terminal_failure(
+            status="auth_failed",
+            failure_kind="auth",
+            detail="alpaca_auth_failed",
+            error=str(exc),
+            extra={"http_status": getattr(exc, "status_code", None)},
+        )
+    return None
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -426,18 +541,28 @@ def _req(method: str, path: str, payload: Optional[dict] = None) -> Any:
     # Transport errors are allowed to raise here; callers decide whether a
     # given Alpaca failure is retryable, degradable, or execution-blocking.
     if not KEY_ID or not SECRET:
-        raise RuntimeError("alpaca credentials missing")
+        raise AlpacaCredentialError("alpaca credentials missing")
     url = BASE_URL.rstrip("/") + path
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
     r = urllib.request.Request(url, data=data, headers=_headers(), method=method.upper())
-    with urllib.request.urlopen(r, timeout=20) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
+    try:
+        with urllib.request.urlopen(r, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        if int(getattr(exc, "code", 0) or 0) in (401, 403):
+            raise AlpacaAuthenticationError(
+                f"alpaca_auth_failed:{int(getattr(exc, 'code', 0) or 0)}",
+                status_code=int(getattr(exc, "code", 0) or 0),
+            ) from exc
+        raise
 
 
 def _real_trading_gate() -> Dict[str, Any]:
+    if live_execution_disabled():
+        return disabled_live_execution_gate(source="engine.execution.broker_alpaca_rest")
     if execution_gate_snapshot is None:
         return {
             "ok": False,
@@ -452,6 +577,17 @@ def _real_trading_gate() -> Dict[str, Any]:
 
 
 def _prelive_reconcile_or_block(broker: str = "alpaca") -> Optional[Dict[str, Any]]:
+    policy_block = prelive_reconcile_policy_gate(
+        source="engine.execution.broker_alpaca_rest",
+        engine_mode="live",
+        broker=str(broker),
+        audit_override=True,
+    )
+    if policy_block is not None:
+        return policy_block
+    unrecorded_block = unrecorded_submission_gate(broker=str(broker), connect_fn=connect)
+    if unrecorded_block is not None:
+        return unrecorded_block
     if os.environ.get("EXECUTION_PRELIVE_RECONCILE", "1") != "1":
         return None
     if not callable(_prelive_reconcile):
@@ -800,6 +936,9 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     reconcile_block = _prelive_reconcile_or_block("alpaca")
     if reconcile_block is not None:
         return reconcile_block
+    credentials_block = _alpaca_credentials_block()
+    if credentials_block is not None:
+        return credentials_block
     audit = record_broker_action_audit(
         broker="alpaca",
         action="order_submit_attempt",
@@ -811,7 +950,20 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     )
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
-    return _submit_limit_order(symbol, qty, limit_price, client_oid)
+    try:
+        return _submit_limit_order(symbol, qty, limit_price, client_oid)
+    except (AlpacaCredentialError, AlpacaAuthenticationError) as exc:
+        failure = _alpaca_exception_failure(exc)
+        if failure is not None:
+            _warn_nonfatal(
+                "ALPACA_ORDER_SUBMIT_TERMINAL_CREDENTIAL_FAILURE",
+                exc,
+                once_key=f"order_submit_limit:{failure.get('status')}",
+                status=str(failure.get("status") or ""),
+                symbol=str(symbol),
+            )
+            return failure
+        raise
 
 
 def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, Any]:
@@ -821,6 +973,9 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     reconcile_block = _prelive_reconcile_or_block("alpaca")
     if reconcile_block is not None:
         return reconcile_block
+    credentials_block = _alpaca_credentials_block()
+    if credentials_block is not None:
+        return credentials_block
     audit = record_broker_action_audit(
         broker="alpaca",
         action="order_submit_attempt",
@@ -832,7 +987,20 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     )
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
-    return _submit_market_order(symbol, qty, client_oid)
+    try:
+        return _submit_market_order(symbol, qty, client_oid)
+    except (AlpacaCredentialError, AlpacaAuthenticationError) as exc:
+        failure = _alpaca_exception_failure(exc)
+        if failure is not None:
+            _warn_nonfatal(
+                "ALPACA_ORDER_SUBMIT_TERMINAL_CREDENTIAL_FAILURE",
+                exc,
+                once_key=f"order_submit_market:{failure.get('status')}",
+                status=str(failure.get("status") or ""),
+                symbol=str(symbol),
+            )
+            return failure
+        raise
 
 
 def _limit_from_px(px: float, qty: float, aggressiveness: str) -> float:
@@ -865,8 +1033,9 @@ def apply_latest_portfolio_orders_live(
         if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
             return {"ok": False, "status": "real_trading_blocked", "gate": gate, "broker": "alpaca"}
 
-    if not KEY_ID or not SECRET:
-        return {"ok": False, "status": "missing_credentials"}
+    credentials_block = _alpaca_credentials_block()
+    if credentials_block is not None:
+        return credentials_block
 
     if not bool(dry_run):
         reconcile_block = _prelive_reconcile_or_block("alpaca")
@@ -916,7 +1085,19 @@ def apply_latest_portfolio_orders_live(
         if not allow0:
             return {"ok": False, "status": "blocked_kill_switch_global"}
 
-        acct = get_account()
+        try:
+            acct = get_account()
+        except (AlpacaCredentialError, AlpacaAuthenticationError) as exc:
+            failure = _alpaca_exception_failure(exc)
+            if failure is not None:
+                _warn_nonfatal(
+                    "ALPACA_ACCOUNT_TERMINAL_CREDENTIAL_FAILURE",
+                    exc,
+                    once_key=f"account_read:{failure.get('status')}",
+                    status=str(failure.get("status") or ""),
+                )
+                return failure
+            raise
         eq = float(acct.get("equity") or 0.0)
         bp = float(acct.get("buying_power") or 0.0)
         cash = float(acct.get("cash") or 0.0)
@@ -1062,6 +1243,26 @@ def apply_latest_portfolio_orders_live(
                     res = _submit_limit_order(symbol, delta, limit_px, client_oid)
                 else:
                     res = _submit_market_order(symbol, delta, client_oid)
+            except (AlpacaCredentialError, AlpacaAuthenticationError) as e:
+                failure = _alpaca_exception_failure(e)
+                if failure is not None:
+                    failure.update(
+                        {
+                            "order_uid": str(order_uid),
+                            "client_order_id": str(client_oid),
+                            "symbol": str(symbol),
+                            "submitted_n": int(n),
+                        }
+                    )
+                    _warn_nonfatal(
+                        "ALPACA_PORTFOLIO_SUBMIT_TERMINAL_CREDENTIAL_FAILURE",
+                        e,
+                        once_key=f"portfolio_submit:{failure.get('status')}",
+                        status=str(failure.get("status") or ""),
+                        symbol=str(symbol),
+                    )
+                    return failure
+                raise
             except Exception as e:
                 try:
                     mark_order_submission_unknown(
@@ -1091,19 +1292,20 @@ def apply_latest_portfolio_orders_live(
                     "submitted_n": int(n),
                 }
 
+            broker_order_id = str((res or {}).get("id") or "")
+            source_alert_id = (
+                _safe_int(o.get("source_alert_id"))
+                if isinstance(o, dict) and o.get("source_alert_id") is not None
+                else None
+            )
+            submit_ts_ms = int(time.time() * 1000)
             try:
-                broker_order_id = str((res or {}).get("id") or "")
-                source_alert_id = (
-                    _safe_int(o.get("source_alert_id"))
-                    if isinstance(o, dict) and o.get("source_alert_id") is not None
-                    else None
-                )
                 log_submit(
                     client_order_id=client_oid,
                     broker="alpaca",
                     symbol=symbol,
                     qty=delta,
-                    submit_ts_ms=int(time.time() * 1000),
+                    submit_ts_ms=int(submit_ts_ms),
                     ref_px=float(px),
                     broker_order_id=broker_order_id,
                     portfolio_orders_id=order_id,
@@ -1112,14 +1314,79 @@ def apply_latest_portfolio_orders_live(
                     order_uid=str(order_uid),
                     idempotency_status="submitted",
                 )
+            except Exception as e:
+                _warn_nonfatal(
+                    "BROKER_ALPACA_LOG_SUBMIT_FAILED",
+                    e,
+                    once_key="alpaca_log_submit",
+                    symbol=str(symbol),
+                    client_order_id=str(client_oid),
+                    order_uid=str(order_uid),
+                )
+                return record_submission_unrecorded(
+                    con=con,
+                    broker="alpaca",
+                    symbol=str(symbol),
+                    qty=float(delta),
+                    order_uid=str(order_uid),
+                    client_order_id=str(client_oid),
+                    broker_order_id=broker_order_id,
+                    submit_ts_ms=int(submit_ts_ms),
+                    portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                    portfolio_ts_ms=int(ts_ms),
+                    source_order_id=(
+                        _safe_int(o.get("source_order_id"))
+                        if isinstance(o, dict) and o.get("source_order_id") is not None
+                        else None
+                    ),
+                    source_alert_id=source_alert_id,
+                    payload={**dict(order_meta or {}), "order_uid": str(order_uid), "idempotency_status": "submission_unrecorded"},
+                    error=e,
+                    stage="log_submit",
+                    submitted_n=int(n),
+                )
+
+            try:
                 mark_order_submission_submitted(
                     con=con,
                     order_uid=str(order_uid),
                     client_order_id=str(client_oid),
                     broker_order_id=broker_order_id,
-                    submit_ts_ms=int(time.time() * 1000),
+                    submit_ts_ms=int(submit_ts_ms),
+                )
+            except Exception as e:
+                _warn_nonfatal(
+                    "BROKER_ALPACA_MARK_ORDER_SUBMISSION_SUBMITTED_FAILED",
+                    e,
+                    once_key="alpaca_mark_order_submission_submitted",
+                    symbol=str(symbol),
+                    client_order_id=str(client_oid),
+                    order_uid=str(order_uid),
+                )
+                return record_submission_unrecorded(
+                    con=con,
+                    broker="alpaca",
+                    symbol=str(symbol),
+                    qty=float(delta),
+                    order_uid=str(order_uid),
+                    client_order_id=str(client_oid),
+                    broker_order_id=broker_order_id,
+                    submit_ts_ms=int(submit_ts_ms),
+                    portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                    portfolio_ts_ms=int(ts_ms),
+                    source_order_id=(
+                        _safe_int(o.get("source_order_id"))
+                        if isinstance(o, dict) and o.get("source_order_id") is not None
+                        else None
+                    ),
+                    source_alert_id=source_alert_id,
+                    payload={**dict(order_meta or {}), "order_uid": str(order_uid), "idempotency_status": "submission_unrecorded"},
+                    error=e,
+                    stage="mark_order_submission_submitted",
+                    submitted_n=int(n),
                 )
 
+            try:
                 if (
                     order_type == "LIMIT"
                     and limit_px is not None
@@ -1155,9 +1422,9 @@ def apply_latest_portfolio_orders_live(
                     )
             except Exception as e:
                 _warn_nonfatal(
-                    "BROKER_ALPACA_LOG_SUBMIT_FAILED",
+                    "BROKER_ALPACA_RECORD_OPEN_ORDER_FAILED",
                     e,
-                    once_key="alpaca_log_submit",
+                    once_key="alpaca_record_open_order",
                     symbol=str(symbol),
                     client_order_id=str(client_oid),
                     order_uid=str(order_uid),
@@ -1207,7 +1474,6 @@ def poll_and_log_fills(after_ts_ms: int) -> Dict[str, Any]:
             if not cid:
                 continue
 
-            filled_qty = float(o.get("filled_qty") or 0.0)
             filled_avg = o.get("filled_avg_price")
             if not filled_avg:
                 continue

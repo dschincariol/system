@@ -10,6 +10,7 @@ status, calibration, and governance-summary reads for operator and UI callers.
 
 import json
 import math
+import os
 import time
 
 from engine.api.internal_access import db_connect
@@ -179,6 +180,32 @@ _COMPARISON_METRICS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
 )
 
 
+def _metric_gate_threshold(key: str, direction: str) -> dict | None:
+    raw_key = str(key or "").strip().lower()
+    if raw_key == "n_eval":
+        value = _safe_float(os.environ.get("PROMOTE_MIN_EVAL_ROWS", "200"))
+        return {
+            "value": value,
+            "operator": ">=",
+            "source": "PROMOTE_MIN_EVAL_ROWS",
+        } if value is not None else None
+    if raw_key == "rmse":
+        value = _safe_float(os.environ.get("PROMOTE_MAX_ABS_RMSE", "10.0"))
+        return {
+            "value": value,
+            "operator": "<=",
+            "source": "PROMOTE_MAX_ABS_RMSE",
+        } if value is not None else None
+    if raw_key == "mae":
+        value = _safe_float(os.environ.get("PROMOTE_MAX_ABS_BIAS", "5.0"))
+        return {
+            "value": value,
+            "operator": "<=",
+            "source": "PROMOTE_MAX_ABS_BIAS",
+        } if value is not None else None
+    return None
+
+
 def _comparison_metrics(champion: dict | None, challenger: dict | None) -> list[dict]:
     ch_metrics = _metrics_for(champion or {})
     challenger_metrics = _metrics_for(challenger or {})
@@ -189,6 +216,7 @@ def _comparison_metrics(champion: dict | None, challenger: dict | None) -> list[
         delta = None
         if champion_value is not None and challenger_value is not None:
             delta = float(challenger_value - champion_value)
+        threshold = _metric_gate_threshold(key, direction)
         out.append({
             "key": key,
             "label": label,
@@ -196,6 +224,7 @@ def _comparison_metrics(champion: dict | None, challenger: dict | None) -> list[
             "champion": champion_value,
             "challenger": challenger_value,
             "delta": delta,
+            "gate_threshold": threshold,
             "state": "available" if champion_value is not None or challenger_value is not None else "unavailable",
         })
     return out

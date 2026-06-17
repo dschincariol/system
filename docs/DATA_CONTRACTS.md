@@ -187,6 +187,7 @@ Important caveat:
 - The browser terminal order-entry path writes manual quantity intent rows with `from_weight = 0.0`, `to_weight = 0.0`, and `delta_weight = 0.0`.
 - Terminal quantity is stored in `explain_json.terminal_order`, not in any weight field. That object carries `sizing="quantity"`, `symbol`, `side`, positive `qty`, signed `signed_qty`, and `flatten`.
 - Keeping terminal `delta_weight` neutral prevents weight-based risk, stability, and budget readers from mistaking a share quantity for a portfolio allocation.
+- Terminal routes apply backend pre-trade controls before writing this row. Missing/stale price, max quantity, max notional, and duplicate-recent-order rejections are written to `terminal_intent_rejections` instead of `portfolio_orders`.
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
@@ -450,6 +451,7 @@ Important semantic detail:
 
 - `allowed` is the same concept as `allow_execution_pipeline`.
 - `real_trading_allowed` is stricter and only becomes true in live mode when the runtime is armed and not otherwise blocked.
+- When `DISABLE_LIVE_EXECUTION` is truthy, live-mode snapshots return `reason=disable_live_execution_env`, `allowed=false`, and `real_trading_allowed=false` even if runtime state is `LIVE` and armed.
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
@@ -472,8 +474,182 @@ Important semantic detail:
 | `active` | `JSON object` | No | Active kill-switch summary when present. | JSON |
 | `portfolio_risk` | `JSON object` | No | Portfolio-risk payload when present. | JSON |
 | `conditional_allow` | `BOOLEAN` | No | Conditional allow flag when present. | boolean |
+| `disable_live_execution` | `BOOLEAN` | No | True when the `DISABLE_LIVE_EXECUTION` env emergency block is active. | boolean |
 
-## 11. Operator Emergency Stop Response
+## 11. Terminal Pre-Trade Rejection Row
+
+Producer:
+- `engine.terminal.api.api_terminal_orders._record_terminal_rejection(...)`
+
+Consumers:
+- `engine.terminal.api.api_terminal.py`
+- terminal charts/markers and operator diagnostics that need to explain why a manual intent was rejected
+
+Failure if malformed:
+- operators lose evidence for why a terminal order or flatten request did not become a `portfolio_orders` intent
+- duplicate, cap, stale-price, or missing-price safeguards become hard to audit
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `id` | `INTEGER` | Yes | Rejection row id. | row id |
+| `ts_ms` | `INTEGER` | Yes | Rejection time. | ms |
+| `symbol` | `TEXT` | Yes | Requested symbol, upper-cased or `UNKNOWN`. | symbol |
+| `side` | `TEXT` | No | Requested side for the rejected intent. | side |
+| `qty` | `REAL` | No | Requested positive quantity. | broker quantity |
+| `reason_code` | `TEXT` | Yes | Stable code such as `missing_price`, `stale_price`, `max_qty_exceeded`, `max_notional_exceeded`, or `duplicate_recent_order`. | code |
+| `reason` | `TEXT` | Yes | Operator-facing reason. | text |
+| `source` | `TEXT` | Yes | Source surface. Current writer uses `terminal`. | source |
+| `detail_json` | `JSON object` | Yes | Price snapshot, cap, duplicate-window, or other rejection evidence. | JSON |
+
+## 12. Broker Configuration Control Plane
+
+Producers:
+- `engine.api.api_broker_config.api_post_broker_config(...)`
+- `engine.api.api_broker_config.api_post_broker_test_connection(...)`
+
+Consumers:
+- dashboard/operator broker configuration UI
+- production support checks and audit review
+
+Failure if malformed:
+- operators can activate a broker without a passing test result
+- encrypted credentials can be exposed or become unreadable
+- broker configuration changes lose the audit trail needed for live handoff
+
+### `GET /api/broker/config`
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Route success flag. | boolean |
+| `ts_ms` | `INTEGER` | Yes | Response time. | ms |
+| `config` | `JSON object` | Yes | Public broker configuration. | JSON |
+
+The returned `config` object includes:
+
+- `active_broker`
+- `paper_live_mode`
+- `active`
+- `disabled`
+- `failover_order`
+- `base_url`
+- `host`
+- `port`
+- `client_id`
+- `timeout_s`
+- `retry_policy`
+- `credentials_configured`
+- `masked_credentials`
+- `credential_age`
+- `last_test_result`
+- `secrets_masked=true`
+
+Credentials are never returned in clear text. Stored credentials live under the encrypted `broker.credentials_enc` key in `broker_meta`.
+
+### `broker_meta`
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `key` | `TEXT` | Yes | Metadata key. Current broker config keys include `broker.config`, `broker.credentials_enc`, `broker.credentials_key_version`, and `broker.last_test`. | key |
+| `value` | `TEXT` | Yes | JSON string or encrypted credential blob. | mixed |
+| `updated_ts_ms` | `INTEGER` | Yes | Last update time. | ms |
+
+### `broker_config_audit`
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `id` | `INTEGER` | Yes | Audit row id. | row id |
+| `ts_ms` | `INTEGER` | Yes | Audit time. | ms |
+| `action` | `TEXT` | Yes | `config_update`, `test_connection`, or a blocked activation action. | action |
+| `actor` | `TEXT` | Yes | Operator/source actor. | actor |
+| `active_broker` | `TEXT` | No | Broker involved in the action. | broker |
+| `success` | `BOOLEAN` | Yes | Whether the action succeeded. SQLite compatibility may expose this as `0/1`. | boolean |
+| `message` | `TEXT` | No | Short result message. | text |
+| `detail_json` | `JSON object` | Yes | Structured details. Credentials must be omitted, encrypted, or represented only by `credentials_supplied`. | JSON |
+
+### `POST /api/broker/config`
+
+Mutation input may include config fields plus optional `credentials` and `actor`. The handler normalizes:
+
+- `active_broker`
+- `paper_live_mode`
+- `active`
+- `disabled`
+- `failover_order`
+- `base_url`
+- `host`
+- `port`
+- `client_id`
+- `timeout_s`
+- `retry_policy`
+
+Activation of a non-`sim` broker is blocked with `error=broker_test_required` unless the stored last test passed for the same broker.
+
+### `POST /api/broker/test_connection`
+
+The test response includes:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Test result. | boolean |
+| `broker` | `TEXT` | Yes | Tested broker. | broker |
+| `state` | `TEXT` | Yes | `passed` or `failed`. | state |
+| `latency_ms` | `REAL` | Yes | Test duration. | ms |
+| `reasons` | `JSON array[string]` | Yes | Failure reasons. | reason codes |
+| `tested_ts_ms` | `INTEGER` | Yes | Test timestamp. | ms |
+
+## 13. Alert Lifecycle Rows
+
+Producers:
+- `engine.api.api_write.ack_alert(...)`
+- `engine.api.api_write.shelve_alert(...)`
+- `engine.api.api_write.resolve_alert(...)`
+
+Consumers:
+- dashboard alert surfaces
+- operator audit and incident review
+
+Failure if malformed:
+- alert acknowledgement expiry and shelving state become ambiguous
+- incident reviewers lose actor/reason/source evidence
+
+### `alert_acks`
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `alert_id` | `INTEGER` | Yes | Acknowledged alert id. | alert id |
+| `acked_ts_ms` | `INTEGER` | Yes | Acknowledgement time. | ms |
+| `acked_by` | `TEXT` | No | Operator/source actor. | actor |
+| `source` | `TEXT` | No | Source surface. | source |
+| `expires_ts_ms` | `INTEGER` | No | Expiry time for temporary acknowledgement. | ms |
+| `reason` | `TEXT` | No | Operator reason. | text |
+
+### `alert_shelves`
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `alert_id` | `INTEGER` | Yes | Shelved alert id. | alert id |
+| `shelved_ts_ms` | `INTEGER` | Yes | Shelving time. | ms |
+| `expires_ts_ms` | `INTEGER` | Yes | Expiry time. | ms |
+| `shelved_by` | `TEXT` | No | Operator/source actor. | actor |
+| `reason` | `TEXT` | Yes | Required shelving reason. | text |
+| `source` | `TEXT` | No | Source surface. | source |
+| `severity` | `TEXT` | No | Alert severity at shelving time. | severity |
+| `detail_json` | `JSON object` | Yes | Structured shelving metadata, currently including duration. | JSON |
+
+### `alert_lifecycle_events`
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `id` | `INTEGER` | Yes | Event row id. | row id |
+| `alert_id` | `INTEGER` | Yes | Alert id. | alert id |
+| `ts_ms` | `INTEGER` | Yes | Lifecycle event time. | ms |
+| `lifecycle_state` | `TEXT` | Yes | `acknowledged`, `shelved`, or `resolved`. | state |
+| `actor` | `TEXT` | No | Operator/source actor. | actor |
+| `reason` | `TEXT` | No | Operator reason. | text |
+| `source` | `TEXT` | No | Source surface. | source |
+| `detail_json` | `JSON object` | Yes | Structured action detail. | JSON |
+
+## 14. Operator Emergency Stop Response
 
 Producer:
 - `engine.api.api_operator_handlers.api_post_operator_emergency_stop(...)`
@@ -494,7 +670,7 @@ Failure if malformed:
 | `operator_stop` | `JSON object` | Yes | Embedded response from `api_post_operator_stop(...)`. | JSON |
 | `safety_errors` | `JSON array[string]` | Yes | Errors from kill-switch activation or execution disarming. | errors |
 
-## 12. Engine Support Snapshot
+## 15. Engine Support Snapshot
 
 Producer:
 - `engine.api.api_system.api_get_support_snapshot(...)`
@@ -554,7 +730,7 @@ Snapshot schema:
 | `job_restart_counters` | `JSON object` | Yes | Restart counters keyed by job name. | counts |
 | `job_summary` | `JSON object` | Yes | Aggregate job summary. | JSON |
 
-## 13. Operator Snapshot From `boot/operator_server.js`
+## 16. Operator Snapshot From `boot/operator_server.js`
 
 Producer:
 - `boot/operator_server.js` via `buildOperatorSnapshot(mode)`
@@ -591,7 +767,7 @@ Snapshot schema:
 | `snapshot_meta` | `JSON object` | Yes | Snapshot metadata. | JSON |
 | `diagnostics` | `JSON object` | Yes | Operator-side diagnostics summary. | JSON |
 
-## 14. Diagnostics-Only Operator AI Result
+## 17. Diagnostics-Only Operator AI Result
 
 Producer:
 - `services/operator_ai/agent.js`
@@ -619,7 +795,7 @@ Current mutability constraint:
 | `action` | `null` | Yes | Top-level action, also non-executable here. | null |
 | `executed` | `null` | Yes | Reserved execution result. | null |
 
-## 15. Data-Source Control-Plane Record
+## 18. Data-Source Control-Plane Record
 
 Producers:
 - `services.data_source_manager._materialize_source(...)`
@@ -668,7 +844,7 @@ Failure if malformed:
 | `supports_test` | `BOOLEAN` | Yes | Whether the source exposes a test operation. | boolean |
 | `credentials` | `JSON object` | No | Only included when the manager is explicitly asked for full credentials. | JSON |
 
-## 16. Data-Source List, Lifecycle, And Test Responses
+## 19. Data-Source List, Lifecycle, And Test Responses
 
 Producer:
 - `routes/data_sources_routes.py`

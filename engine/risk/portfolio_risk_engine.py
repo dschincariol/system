@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.data.asset_map import asset_class_for_symbol
-from engine.strategy.drawdown_state import get_current_drawdown
+from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.strategy.risk import realized_vol_from_prices, corr_from_prices
 from engine.strategy.har_rv import resolve_vol_forecast
 from engine.runtime.risk_state import set_state, get_state_row
@@ -95,6 +95,8 @@ PORTFOLIO_RISK_USE_MONTE_CARLO = os.environ.get("PORTFOLIO_RISK_USE_MONTE_CARLO"
 PORTFOLIO_RISK_MC_MAX_AGE_S = int(os.environ.get("PORTFOLIO_RISK_MC_MAX_AGE_S", "900"))
 PORTFOLIO_RISK_MC_VAR_95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_VAR_95_BLOCK", "0.0"))
 PORTFOLIO_RISK_MC_VAR_99_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_VAR_99_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_CVAR_95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_CVAR_95_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_CVAR_99_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_CVAR_99_BLOCK", "0.0"))
 PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK", "0.0"))
 PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK", "0.0"))
 
@@ -217,6 +219,8 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
         "age_s": float(age_ms) / 1000.0,
         "var_95": float(_safe_float(info.get("var_95"), 0.0)),
         "var_99": float(_safe_float(info.get("var_99"), 0.0)),
+        "cvar_95": float(_safe_float(info.get("cvar_95"), 0.0)),
+        "cvar_99": float(_safe_float(info.get("cvar_99"), 0.0)),
         "worst_simulated_drawdown": float(_safe_float(info.get("worst_simulated_drawdown"), 0.0)),
         "drawdown_p95": float(_safe_float((info.get("drawdown_percentiles") or {}).get("p95"), 0.0)),
         "drawdown_p99": float(_safe_float((info.get("drawdown_percentiles") or {}).get("p99"), 0.0)),
@@ -230,6 +234,8 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
 
     var_95_loss = max(0.0, -float(out["var_95"]))
     var_99_loss = max(0.0, -float(out["var_99"]))
+    cvar_95_loss = max(0.0, -float(out["cvar_95"]))
+    cvar_99_loss = max(0.0, -float(out["cvar_99"]))
     dd_p95 = max(0.0, float(out["drawdown_p95"]))
     dd_worst = max(0.0, float(out["worst_simulated_drawdown"]))
 
@@ -243,6 +249,14 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
     if float(PORTFOLIO_RISK_MC_VAR_99_BLOCK) > 0.0 and var_99_loss >= float(PORTFOLIO_RISK_MC_VAR_99_BLOCK):
         blocked = True
         reasons.append({"type": "monte_carlo_var_99_block", "value": float(var_99_loss), "threshold": float(PORTFOLIO_RISK_MC_VAR_99_BLOCK)})
+
+    if float(PORTFOLIO_RISK_MC_CVAR_95_BLOCK) > 0.0 and cvar_95_loss >= float(PORTFOLIO_RISK_MC_CVAR_95_BLOCK):
+        blocked = True
+        reasons.append({"type": "monte_carlo_cvar_95_block", "value": float(cvar_95_loss), "threshold": float(PORTFOLIO_RISK_MC_CVAR_95_BLOCK)})
+
+    if float(PORTFOLIO_RISK_MC_CVAR_99_BLOCK) > 0.0 and cvar_99_loss >= float(PORTFOLIO_RISK_MC_CVAR_99_BLOCK):
+        blocked = True
+        reasons.append({"type": "monte_carlo_cvar_99_block", "value": float(cvar_99_loss), "threshold": float(PORTFOLIO_RISK_MC_CVAR_99_BLOCK)})
 
     if float(PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK) > 0.0 and dd_p95 >= float(PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK):
         blocked = True
@@ -1664,12 +1678,10 @@ def apply_portfolio_risk_engine(
 
     info: Dict[str, Any] = {"enabled": True, "ts_ms": int(now_ms)}
 
-    dd = 0.0
-    try:
-        dd = float(get_current_drawdown(con))
-    except Exception:
-        dd = 0.0
-    info["drawdown"] = float(dd)
+    drawdown_diagnostic = evaluate_current_drawdown(con)
+    info["drawdown_state"] = drawdown_diagnostic.to_dict()
+    dd = float(drawdown_diagnostic.drawdown or 0.0) if drawdown_diagnostic.ok else 0.0
+    info["drawdown"] = (float(dd) if drawdown_diagnostic.ok else None)
 
     state_snapshot = _exposure_snapshot(state or {})
     info["state_exposure"] = state_snapshot
@@ -1694,7 +1706,15 @@ def apply_portfolio_risk_engine(
     blocked = False
     block_reason: Optional[Dict[str, Any]] = None
 
-    if float(DD_HARD_BLOCK) > 0.0 and float(dd) >= float(DD_HARD_BLOCK):
+    if not drawdown_diagnostic.ok:
+        blocked = True
+        block_reason = {
+            "type": "drawdown_state_unavailable",
+            "reason_code": str(drawdown_diagnostic.reason_code),
+            "drawdown_state": drawdown_diagnostic.to_dict(),
+        }
+
+    if drawdown_diagnostic.ok and float(DD_HARD_BLOCK) > 0.0 and float(dd) >= float(DD_HARD_BLOCK):
         blocked = True
         block_reason = {"type": "drawdown_hard_block", "dd": float(dd), "threshold": float(DD_HARD_BLOCK)}
 

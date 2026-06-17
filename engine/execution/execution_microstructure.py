@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect
+from engine.execution.broker_submission_recovery import record_submission_unrecorded
 from engine.execution.execution_ledger import log_submit
 
 REPRICE_INTERVAL_S = float(os.environ.get("EPE_REPRICE_INTERVAL_S", "60"))
@@ -53,6 +54,12 @@ def _warn_nonfatal(event: str, code: str, error: BaseException, *, warn_key: str
     )
     if warn_key:
         _WARNED_NONFATAL_KEYS.add(warn_key)
+
+
+class _SubmissionUnrecorded(RuntimeError):
+    def __init__(self, result: Dict[str, Any]) -> None:
+        super().__init__(str((result or {}).get("status") or "submission_unrecorded"))
+        self.result = dict(result or {})
 
 
 def _ensure_tables(con) -> None:
@@ -324,6 +331,80 @@ def manage_open_orders() -> Dict[str, Any]:
         if not rows:
             return {**out, "open_due": 0}
 
+        def _raise_submission_unrecorded(
+            *,
+            open_id: int,
+            symbol: str,
+            qty: float,
+            client_order_id: str,
+            broker_order_id: Optional[str],
+            submit_ts_ms: int,
+            attempts: int,
+            portfolio_orders_id,
+            source_alert_id,
+            payload: Dict[str, Any],
+            error: BaseException,
+            stage: str,
+        ) -> None:
+            result = record_submission_unrecorded(
+                con=con,
+                broker="alpaca",
+                symbol=str(symbol),
+                qty=float(qty),
+                order_uid=f"microstructure:alpaca:{str(client_order_id)}",
+                client_order_id=str(client_order_id),
+                broker_order_id=(str(broker_order_id) if broker_order_id is not None else None),
+                submit_ts_ms=int(submit_ts_ms or _now_ms()),
+                portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
+                portfolio_ts_ms=None,
+                source_order_id=None,
+                source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
+                payload={**dict(payload or {}), "open_order_id": int(open_id)},
+                error=error,
+                stage=str(stage or "log_submit"),
+                submitted_n=0,
+            )
+            try:
+                con.execute(
+                    """
+                    UPDATE exec_open_orders
+                    SET updated_ts_ms=?, qty=?, client_order_id=?, broker_order_id=?,
+                        attempts=?, status='submission_unrecorded', next_action_ts_ms=0
+                    WHERE id=?
+                    """,
+                    (
+                        int(now),
+                        float(qty),
+                        str(client_order_id),
+                        str(broker_order_id) if broker_order_id is not None else None,
+                        int(attempts),
+                        int(open_id),
+                    ),
+                )
+                _log_event(
+                    con,
+                    open_id,
+                    "submission_unrecorded",
+                    {
+                        "client_order_id": str(client_order_id),
+                        "broker_order_id": str(broker_order_id or ""),
+                        "stage": str(stage or "log_submit"),
+                        "needs_reconcile": True,
+                    },
+                )
+            except Exception as row_exc:
+                _warn_nonfatal(
+                    "execution_microstructure_submission_unrecorded_row_update_failed",
+                    "EXECUTION_MICROSTRUCTURE_SUBMISSION_UNRECORDED_ROW_UPDATE_FAILED",
+                    row_exc,
+                    warn_key=f"execution_microstructure_submission_unrecorded_row:{open_id}:{client_order_id}",
+                    symbol=str(symbol),
+                    client_order_id=str(client_order_id),
+                    broker_order_id=str(broker_order_id or ""),
+                    open_order_id=int(open_id),
+                )
+            raise _SubmissionUnrecorded(result)
+
         # lazy import to avoid cycles
         try:
             from engine.execution.broker_alpaca_rest import get_order as alpaca_get_order
@@ -424,23 +505,25 @@ def manage_open_orders() -> Dict[str, Any]:
                         submit_ok = False
 
                     if submit_ok:
+                        submit_ts_ms = int(_now_ms())
+                        retry_payload = {
+                            "timeout_escalation": True,
+                            "retry_missing_broker_order_id": True,
+                            "prev_client_order_id": client_oid,
+                            "meta": meta,
+                        }
                         try:
                             log_submit(
                                 client_order_id=new_client_oid,
                                 broker="alpaca",
                                 symbol=symbol,
                                 qty=float(qty),
-                                submit_ts_ms=int(_now_ms()),
+                                submit_ts_ms=int(submit_ts_ms),
                                 ref_px=float(limit_px) if limit_px is not None else 0.0,
                                 broker_order_id=str(new_broker_oid) if new_broker_oid else None,
                                 portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
                                 source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
-                                extra={
-                                    "timeout_escalation": True,
-                                    "retry_missing_broker_order_id": True,
-                                    "prev_client_order_id": client_oid,
-                                    "meta": meta,
-                                },
+                                extra=retry_payload,
                             )
                         except Exception as exc:
                             _warn_nonfatal(
@@ -450,6 +533,20 @@ def manage_open_orders() -> Dict[str, Any]:
                                 symbol=symbol,
                                 client_order_id=new_client_oid,
                                 broker_order_id=new_broker_oid,
+                            )
+                            _raise_submission_unrecorded(
+                                open_id=open_id,
+                                symbol=symbol,
+                                qty=float(qty),
+                                client_order_id=new_client_oid,
+                                broker_order_id=new_broker_oid,
+                                submit_ts_ms=int(submit_ts_ms),
+                                attempts=int(attempts + 1),
+                                portfolio_orders_id=portfolio_orders_id,
+                                source_alert_id=source_alert_id,
+                                payload=retry_payload,
+                                error=exc,
+                                stage="log_submit",
                             )
 
                         con.execute(
@@ -644,28 +741,30 @@ def manage_open_orders() -> Dict[str, Any]:
                         out["updated"] += 1
                         continue
 
+                    submit_ts_ms = int(_now_ms())
+                    market_payload = {
+                        "timeout_escalation": True,
+                        "escalated_from_client_order_id": client_oid,
+                        "escalated_from_order_type": "LIMIT",
+                        "escalated_from_aggressiveness": str(r[5] or ""),
+                        "escalated_to_order_type": "MARKET",
+                        "attempts": int(attempts),
+                        "max_attempts": int(max_attempts),
+                        "remaining_qty": float(remaining_qty),
+                        "meta": meta,
+                    }
                     try:
                         log_submit(
                             client_order_id=new_client_oid,
                             broker="alpaca",
                             symbol=symbol,
                             qty=float(remaining_qty),
-                            submit_ts_ms=int(_now_ms()),
+                            submit_ts_ms=int(submit_ts_ms),
                             ref_px=float(limit_px),
                             broker_order_id=str(new_broker_oid) if new_broker_oid else None,
                             portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
                             source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
-                            extra={
-                                "timeout_escalation": True,
-                                "escalated_from_client_order_id": client_oid,
-                                "escalated_from_order_type": "LIMIT",
-                                "escalated_from_aggressiveness": str(r[5] or ""),
-                                "escalated_to_order_type": "MARKET",
-                                "attempts": int(attempts),
-                                "max_attempts": int(max_attempts),
-                                "remaining_qty": float(remaining_qty),
-                                "meta": meta,
-                            },
+                            extra=market_payload,
                         )
                     except Exception as exc:
                         _warn_nonfatal(
@@ -675,6 +774,20 @@ def manage_open_orders() -> Dict[str, Any]:
                             symbol=symbol,
                             client_order_id=new_client_oid,
                             broker_order_id=new_broker_oid,
+                        )
+                        _raise_submission_unrecorded(
+                            open_id=open_id,
+                            symbol=symbol,
+                            qty=float(remaining_qty),
+                            client_order_id=new_client_oid,
+                            broker_order_id=new_broker_oid,
+                            submit_ts_ms=int(submit_ts_ms),
+                            attempts=int(next_attempt),
+                            portfolio_orders_id=portfolio_orders_id,
+                            source_alert_id=source_alert_id,
+                            payload=market_payload,
+                            error=exc,
+                            stage="log_submit",
                         )
 
                     con.execute(
@@ -776,26 +889,28 @@ def manage_open_orders() -> Dict[str, Any]:
                     out["updated"] += 1
                     continue
 
+                submit_ts_ms = int(_now_ms())
+                limit_payload = {
+                    "timeout_escalation": True,
+                    "reprice_attempt": int(next_attempt),
+                    "prev_client_order_id": client_oid,
+                    "escalated_from_aggressiveness": str(r[5] or ""),
+                    "escalated_to_aggressiveness": str(next_aggr),
+                    "remaining_qty": float(remaining_qty),
+                    "meta": meta,
+                }
                 try:
                     log_submit(
                         client_order_id=new_client_oid,
                         broker="alpaca",
                         symbol=symbol,
                         qty=float(remaining_qty),
-                        submit_ts_ms=int(_now_ms()),
+                        submit_ts_ms=int(submit_ts_ms),
                         ref_px=float(new_limit),
                         broker_order_id=str(new_broker_oid) if new_broker_oid else None,
                         portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
                         source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
-                        extra={
-                            "timeout_escalation": True,
-                            "reprice_attempt": int(next_attempt),
-                            "prev_client_order_id": client_oid,
-                            "escalated_from_aggressiveness": str(r[5] or ""),
-                            "escalated_to_aggressiveness": str(next_aggr),
-                            "remaining_qty": float(remaining_qty),
-                            "meta": meta,
-                        },
+                        extra=limit_payload,
                     )
                 except Exception as exc:
                     _warn_nonfatal(
@@ -805,6 +920,20 @@ def manage_open_orders() -> Dict[str, Any]:
                         symbol=symbol,
                         client_order_id=new_client_oid,
                         broker_order_id=new_broker_oid,
+                    )
+                    _raise_submission_unrecorded(
+                        open_id=open_id,
+                        symbol=symbol,
+                        qty=float(remaining_qty),
+                        client_order_id=new_client_oid,
+                        broker_order_id=new_broker_oid,
+                        submit_ts_ms=int(submit_ts_ms),
+                        attempts=int(next_attempt),
+                        portfolio_orders_id=portfolio_orders_id,
+                        source_alert_id=source_alert_id,
+                        payload=limit_payload,
+                        error=exc,
+                        stage="log_submit",
                     )
 
                 con.execute(
@@ -847,6 +976,19 @@ def manage_open_orders() -> Dict[str, Any]:
                     },
                 )
                 out["updated"] += 1
+
+            except _SubmissionUnrecorded as exc:
+                out["errors"] += 1
+                try:
+                    con.commit()
+                except Exception as commit_exc:
+                    _warn_nonfatal(
+                        "execution_microstructure_submission_unrecorded_commit_failed",
+                        "EXECUTION_MICROSTRUCTURE_SUBMISSION_UNRECORDED_COMMIT_FAILED",
+                        commit_exc,
+                        warn_key=f"execution_microstructure_submission_unrecorded_commit:{r[0] if r else 'unknown'}",
+                    )
+                return {**out, "open_due": len(rows), **dict(exc.result)}
 
             except Exception as exc:
                 _warn_nonfatal(

@@ -15,6 +15,7 @@ Delegates to injected:
 """
 
 import json
+import hashlib
 import hmac
 import inspect
 import ipaddress
@@ -293,21 +294,200 @@ class StreamingResponse:
 _DESTRUCTIVE_ENDPOINT_PATHS = frozenset(
     {
         "/api/operator/emergency_stop",
+        "/api/operator/stop",
+        "/api/operator/restart",
+        "/api/operator/restart_engine",
+        "/api/operator/autofix",
         "/api/operator/restart_feeds",
         "/api/system/repair_schema",
         "/api/repair_schema",
+        "/api/jobs/start",
+        "/api/jobs/stop",
+        "/api/pipeline/run",
+        "/api/terminal/order",
+        "/api/terminal/flatten",
+        "/api/data_sources/delete",
+        "/api/data_sources/update",
     }
 )
 
-_CONFIRMATION_ENDPOINTS = {
-    "/api/promotion/enable": "PROMOTION",
-    "/api/models/promote": "PROMOTION",
-    "/api/system/fix": "SYSTEM_FIX",
-    "/api/size_policy/train": "TRAIN_SIZE_POLICY",
-    "/api/strategy/size_policy/train": "TRAIN_SIZE_POLICY",
-    "/api/promotion/rollback": "ROLLBACK_CHAMPION",
-    "/api/champion/rollback": "ROLLBACK_CHAMPION",
+_CONFIRMATION_REGISTRY = {
+    "/api/operator/emergency_stop": {
+        "action_id": "operator.emergency_stop",
+        "required_token": "KILL",
+        "severity": "emergency",
+        "consequence": "Immediately stops operator jobs, trips the global kill switch, and disarms execution.",
+        "hold_ms": 3000,
+        "require_ack": True,
+        "require_actor": True,
+        "require_source": True,
+    },
+    "/api/operator/stop": {
+        "action_id": "operator.stop",
+        "required_token": "STOP_OPERATOR",
+        "severity": "high",
+        "consequence": "Stops operator-controlled runtime processes.",
+        "require_ack": True,
+    },
+    "/api/operator/restart": {
+        "action_id": "operator.restart",
+        "required_token": "RESTART_OPERATOR",
+        "severity": "high",
+        "consequence": "Restarts operator-controlled runtime processes.",
+        "require_ack": True,
+    },
+    "/api/operator/restart_engine": {
+        "action_id": "operator.restart",
+        "required_token": "RESTART_OPERATOR",
+        "severity": "high",
+        "consequence": "Restarts operator-controlled runtime processes.",
+        "require_ack": True,
+    },
+    "/api/operator/autofix": {
+        "action_id": "operator.autofix",
+        "required_token": "SYSTEM_FIX",
+        "severity": "high",
+        "consequence": "Runs automatic repair steps against startup/runtime issues.",
+        "require_ack": True,
+    },
+    "/api/jobs/start": {
+        "action_id": "jobs.start",
+        "required_token": "JOB_ACTION",
+        "severity": "high",
+        "consequence": "Starts a runtime job and may change live data or system state.",
+        "require_ack": True,
+    },
+    "/api/jobs/stop": {
+        "action_id": "jobs.stop",
+        "required_token": "JOB_ACTION",
+        "severity": "high",
+        "consequence": "Stops a runtime job and may reduce data freshness or protection coverage.",
+        "require_ack": True,
+    },
+    "/api/pipeline/run": {
+        "action_id": "pipeline.run",
+        "required_token": "RUN_PIPELINE",
+        "severity": "high",
+        "consequence": "Runs the training/evaluation pipeline and may update model evidence.",
+        "require_ack": True,
+    },
+    "/api/terminal/order": {
+        "action_id": "terminal.order",
+        "required_token": "TRADE",
+        "severity": "high",
+        "consequence": "Records a terminal order intent for the execution pipeline.",
+        "require_ack": True,
+        "threshold_policy": {"policy": "always"},
+    },
+    "/api/terminal/flatten": {
+        "action_id": "terminal.flatten",
+        "required_token": "FLATTEN",
+        "severity": "high",
+        "consequence": "Records a flatten intent for the selected symbol.",
+        "hold_ms": 1500,
+        "require_ack": True,
+        "threshold_policy": {"policy": "always"},
+    },
+    "/api/data_sources/delete": {
+        "action_id": "data_sources.delete",
+        "required_token": "DELETE_SOURCE",
+        "severity": "high",
+        "consequence": "Deletes a configured data source and reconciles ingestion jobs.",
+        "require_ack": True,
+    },
+    "/api/data_sources/update": {
+        "action_id": "data_sources.reset_credentials",
+        "required_token": "RESET_CREDENTIALS",
+        "severity": "high",
+        "consequence": "Clears stored credentials for a configured data source.",
+        "require_ack": True,
+        "body_policy": {"requires_any": ("clear_credential_fields",)},
+    },
+    "/api/broker/config": {
+        "action_id": "broker.activate",
+        "required_token": "ACTIVATE_BROKER",
+        "severity": "high",
+        "consequence": "Changes active broker configuration or live activation state.",
+        "require_ack": True,
+        "body_policy": {"truthy_any": ("active", "activate", "enabled")},
+    },
+    "/api/promotion/enable": {
+        "action_id": "promotion.enable",
+        "required_token": "PROMOTION",
+        "severity": "high",
+        "consequence": "Changes model promotion automation state.",
+    },
+    "/api/models/promote": {
+        "action_id": "models.promote",
+        "required_token": "PROMOTION",
+        "severity": "high",
+        "consequence": "Promotes a model candidate.",
+    },
+    "/api/system/fix": {
+        "action_id": "system.fix",
+        "required_token": "SYSTEM_FIX",
+        "severity": "high",
+        "consequence": "Runs automatic system repair actions.",
+    },
+    "/api/size_policy/train": {
+        "action_id": "size_policy.train",
+        "required_token": "TRAIN_SIZE_POLICY",
+        "severity": "high",
+        "consequence": "Trains and writes size-policy calibration.",
+    },
+    "/api/strategy/size_policy/train": {
+        "action_id": "size_policy.train",
+        "required_token": "TRAIN_SIZE_POLICY",
+        "severity": "high",
+        "consequence": "Trains and writes size-policy calibration.",
+    },
+    "/api/promotion/rollback": {
+        "action_id": "promotion.rollback",
+        "required_token": "ROLLBACK_CHAMPION",
+        "severity": "high",
+        "consequence": "Rolls the champion model back to a retired candidate.",
+    },
+    "/api/champion/rollback": {
+        "action_id": "promotion.rollback",
+        "required_token": "ROLLBACK_CHAMPION",
+        "severity": "high",
+        "consequence": "Rolls the champion model back to a retired candidate.",
+    },
 }
+_CONFIRMATION_ENDPOINTS = {
+    path: str(spec.get("required_token") or "")
+    for path, spec in _CONFIRMATION_REGISTRY.items()
+}
+
+
+def _truthy_confirmation_value(value) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "ack", "confirmed"}
+
+
+def _route_confirmation_spec(path: str, body) -> dict | None:
+    spec = _CONFIRMATION_REGISTRY.get(str(path or ""))
+    if not spec:
+        return None
+    payload = body if isinstance(body, dict) else {}
+    body_policy = spec.get("body_policy") if isinstance(spec.get("body_policy"), dict) else {}
+    requires_any = tuple(body_policy.get("requires_any") or ())
+    if requires_any and not any(payload.get(key) for key in requires_any):
+        return None
+    truthy_any = tuple(body_policy.get("truthy_any") or ())
+    if truthy_any and not any(_truthy_confirmation_value(payload.get(key)) for key in truthy_any):
+        return None
+    return dict(spec)
+
+
+def _confirmation_hash(spec: dict | None) -> str:
+    text = str((spec or {}).get("consequence") or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _append_mutation_audit_event(payload: dict) -> None:
@@ -859,17 +1039,56 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             )
 
         def _require_mutation_confirmation(self, parsed_path, body):
-            expected = _CONFIRMATION_ENDPOINTS.get(str(parsed_path or ""))
-            if not expected:
+            spec = _route_confirmation_spec(str(parsed_path or ""), body)
+            self._mutation_confirmation = None
+            if not spec:
                 return None
+            expected = str(spec.get("required_token") or "").strip()
             payload = dict(body or {}) if isinstance(body, dict) else {}
-            actual = str(payload.get("confirm") or "").strip()
-            if hmac.compare_digest(actual, str(expected)):
+            actual = str(payload.get("confirmation") or payload.get("confirm") or "").strip()
+            method = "typed_phrase" if payload.get("confirmation") is not None else "legacy_confirm"
+            actor = str(payload.get("actor") or payload.get("who") or "").strip()
+            source = str(payload.get("source") or payload.get("source_surface") or "").strip()
+            hold_ms = 0
+            try:
+                hold_ms = int(float(payload.get("confirmation_hold_ms") or payload.get("hold_ms") or 0))
+            except Exception:
+                hold_ms = 0
+            required_hold_ms = int(float(spec.get("hold_ms") or 0))
+            missing = []
+            if not hmac.compare_digest(actual, str(expected)):
+                missing.append("confirmation")
+            if bool(spec.get("require_ack")) and not _truthy_confirmation_value(payload.get("consequence_ack")):
+                missing.append("consequence_ack")
+            if bool(spec.get("require_actor")) and not actor:
+                missing.append("actor")
+            if bool(spec.get("require_source")) and not source:
+                missing.append("source")
+            if required_hold_ms > 0 and hold_ms < required_hold_ms:
+                missing.append("confirmation_hold_ms")
+            if not missing:
+                self._mutation_confirmation = {
+                    "action_id": str(spec.get("action_id") or ""),
+                    "severity": str(spec.get("severity") or ""),
+                    "required_confirm": expected,
+                    "confirmation_method": method,
+                    "actor": actor,
+                    "source_surface": source,
+                    "confirmation_hold_ms": int(hold_ms),
+                    "consequence_hash": _confirmation_hash(spec),
+                    "threshold_policy": dict(spec.get("threshold_policy") or {}),
+                }
                 return None
             return {
                 "ok": False,
                 "error": "confirmation_required",
                 "required_confirm": str(expected),
+                "required_token": str(expected),
+                "required_fields": missing,
+                "action_id": str(spec.get("action_id") or ""),
+                "severity": str(spec.get("severity") or ""),
+                "consequence": str(spec.get("consequence") or ""),
+                "min_hold_ms": required_hold_ms,
                 "meta": {"status": 422},
             }
 
@@ -888,6 +1107,11 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
         ):
             try:
                 supplied_token = self._request_api_token()
+                confirmation = (
+                    dict(self._mutation_confirmation or {})
+                    if isinstance(getattr(self, "_mutation_confirmation", None), dict)
+                    else {}
+                )
                 request_id = (
                     self.headers.get("X-Request-ID")
                     or self.headers.get("X-Correlation-ID")
@@ -917,6 +1141,23 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 }
                 if confirmed is not None:
                     payload["confirmed"] = bool(confirmed)
+                spec = _route_confirmation_spec(str(path or ""), {})
+                if confirmation:
+                    payload.update({
+                        "action_id": confirmation.get("action_id", ""),
+                        "confirmation_method": confirmation.get("confirmation_method", ""),
+                        "actor": confirmation.get("actor", ""),
+                        "source_surface": confirmation.get("source_surface", ""),
+                        "confirmation_severity": confirmation.get("severity", ""),
+                        "consequence_hash": confirmation.get("consequence_hash", ""),
+                        "threshold_policy": confirmation.get("threshold_policy", {}),
+                    })
+                elif spec:
+                    payload.update({
+                        "action_id": str(spec.get("action_id") or ""),
+                        "confirmation_severity": str(spec.get("severity") or ""),
+                        "consequence_hash": _confirmation_hash(spec),
+                    })
                 _append_mutation_audit_event(payload)
             except Exception as e:
                 _warn(
@@ -941,6 +1182,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             self._response_output_valid = None
             self._response_streaming = False
             self._request_body_valid = True
+            self._mutation_confirmation = None
 
             self._normalize_ui_legacy_path()
 
@@ -1209,7 +1451,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                             error="",
                             confirmed=(
                                 True
-                                if str(parsed.path or "") in _CONFIRMATION_ENDPOINTS
+                                if self._mutation_confirmation is not None
                                 else None
                             ),
                         )
@@ -1249,7 +1491,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                         error=str(result_dict.get("error") or ""),
                         confirmed=(
                             True
-                            if str(parsed.path or "") in _CONFIRMATION_ENDPOINTS
+                            if self._mutation_confirmation is not None
                             else None
                         ),
                     )

@@ -20,6 +20,7 @@ tags:
   - name: operator
   - name: jobs
   - name: data-sources
+  - name: broker-config
   - name: terminal
 components:
   securitySchemes:
@@ -208,6 +209,103 @@ components:
           type: string
         gate:
           $ref: '#/components/schemas/ExecutionBarrier'
+      additionalProperties: true
+    BrokerConfigResponse:
+      type: object
+      required: [ok, ts_ms, config]
+      properties:
+        ok:
+          type: boolean
+        ts_ms:
+          type: integer
+        config:
+          type: object
+          additionalProperties: true
+          properties:
+            active_broker:
+              type: string
+            paper_live_mode:
+              type: string
+            active:
+              type: boolean
+            disabled:
+              type: boolean
+            failover_order:
+              type: array
+              items:
+                type: string
+            credentials_configured:
+              type: boolean
+            masked_credentials:
+              type: object
+              additionalProperties: true
+            credential_age:
+              type: object
+              additionalProperties: true
+            last_test_result:
+              type: object
+              additionalProperties: true
+            secrets_masked:
+              type: boolean
+      additionalProperties: true
+    BrokerConfigMutationRequest:
+      type: object
+      description: |
+        Broker configuration update. Optional `credentials` are encrypted before
+        storage and are never returned in clear text. Activating a non-`sim`
+        broker requires a prior passing `/api/broker/test_connection` result for
+        the same broker.
+      properties:
+        actor:
+          type: string
+        active_broker:
+          type: string
+        paper_live_mode:
+          type: string
+        active:
+          type: boolean
+        disabled:
+          type: boolean
+        failover_order:
+          type: array
+          items:
+            type: string
+        base_url:
+          type: string
+        host:
+          type: string
+        port:
+          type: string
+        client_id:
+          type: string
+        timeout_s:
+          type: number
+        retry_policy:
+          type: object
+          additionalProperties: true
+        credentials:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    BrokerTestResponse:
+      type: object
+      required: [ok, broker, state, latency_ms, reasons, tested_ts_ms]
+      properties:
+        ok:
+          type: boolean
+        broker:
+          type: string
+        state:
+          type: string
+          enum: [passed, failed]
+        latency_ms:
+          type: number
+        reasons:
+          type: array
+          items:
+            type: string
+        tested_ts_ms:
+          type: integer
       additionalProperties: true
 paths:
   /api/health:
@@ -760,6 +858,104 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/broker/config:
+    get:
+      tags: [broker-config]
+      summary: Return broker configuration with masked credentials and last test state.
+      operationId: getBrokerConfig
+      responses:
+        '200':
+          description: Public broker configuration payload from `engine.api.api_broker_config.api_get_broker_config`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrokerConfigResponse'
+    post:
+      tags: [broker-config]
+      summary: Persist broker configuration and optional encrypted credentials.
+      operationId: postBrokerConfig
+      description: |
+        This route stores broker configuration in runtime storage, encrypts
+        supplied credentials, and writes `broker_config_audit`. Non-`sim`
+        activation is blocked until a passing connection test exists for the
+        selected broker. When `DASHBOARD_API_TOKEN` is configured, the
+        transport layer requires `X-API-Token` or `token`.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrokerConfigMutationRequest'
+      responses:
+        '200':
+          description: Updated public broker configuration or validation failure.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/BrokerConfigResponse'
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/broker/test_connection:
+    post:
+      tags: [broker-config]
+      summary: Test broker configuration before activation.
+      operationId: postBrokerTestConnection
+      description: |
+        The request may include a full config and optional credentials, or the
+        handler will use the stored config and stored encrypted credentials.
+        The result is persisted as `broker.last_test` and audited in
+        `broker_config_audit`.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrokerConfigMutationRequest'
+      responses:
+        '200':
+          description: Broker connection test result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrokerTestResponse'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/broker/audit:
+    get:
+      tags: [broker-config]
+      summary: Return recent broker configuration audit rows.
+      operationId: getBrokerAudit
+      responses:
+        '200':
+          description: Broker audit rows with credentials stripped from details.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, rows]
+                properties:
+                  ok:
+                    type: boolean
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                additionalProperties: true
   /api/terminal/watchlist:
     get:
       tags: [terminal]

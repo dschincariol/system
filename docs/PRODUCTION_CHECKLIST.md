@@ -18,6 +18,8 @@ This checklist is grounded in the deployment artifacts under `deploy/`, the runt
 - Bring up the Postgres/PgBouncer endpoint required by `TS_PG_DSN` before runtime bring-up. Postgres runtime storage is mandatory for production-like operation; SQLite is not a production fallback.
 - If Timescale sidecars, Redis, or object storage are part of the target stack, bring them up from `deploy/compose/docker-compose.external-services.yml` or the equivalent approved deployment layer before runtime bring-up.
 - Set `DB_PATH` to an absolute local data directory such as `/var/lib/trading`. It remains a data-root/legacy compatibility hint, not the Postgres database target.
+- On a single-server systemd host, confirm `/etc/credstore.encrypted/` contains encrypted credentials named `master_key`, `pg_password_app`, `pg_password_ingest`, and `pg_password_reader`, and that service units expose only the needed entries with `LoadCredentialEncrypted=`.
+- Confirm the runtime process can read/search/write the `DB_PATH` data root before schema initialization. `prod_preflight.py` validates this before touching Postgres so missing `CREDENTIALS_DIRECTORY` or bad `/var/lib/trading` permissions fail with provisioning errors instead of late schema errors.
 
 ## 2. Deployment Artifacts Present In Repo
 
@@ -40,8 +42,12 @@ The repository already includes these deployment assets:
 - `ops/backup/wal_archive.sh`
 - `ops/backup/restore.sh`
 - `ops/backup/restore_drill.sh`
+- `ops/backup/backup_restore_evidence.sh`
+- `ops/server/install_backup_evidence_gate.sh`
 - `ops/server/systemd/trading-base-backup.service`
 - `ops/server/systemd/trading-base-backup.timer`
+- `ops/server/systemd/trading-backup-evidence.service`
+- `ops/server/systemd/trading-backup-evidence.timer`
 - `ops/server/systemd/trading-restore-drill.service`
 - `ops/server/systemd/trading-restore-drill.timer`
 - `deploy/compose/README.md`
@@ -53,6 +59,7 @@ The repository already includes these deployment assets:
 - Run `python tools/validate_dependency_lock.py` after dependency manifest changes.
 - Run `python tools/validate_repo.py` before merge for the full deterministic validation set.
 - Run `python engine/runtime/prod_preflight.py --json` when you want the explicit production preflight and smoke-cycle result.
+- Treat `prod_preflight.py` provisioning errors as hard blockers. Missing systemd credentials, missing required Postgres role password credentials, or an unreadable/unwritable runtime data root must be fixed in the host/unit layer before retrying.
 - Treat an API-auth preflight failure as a hard production blocker. Production/live mode must have a non-placeholder `DASHBOARD_API_TOKEN`; localhost-only fallback is dev-only.
 - When external dependencies are enabled, set `PREFLIGHT_REQUIRE_TIMESCALE=1`, `PREFLIGHT_REQUIRE_REDIS=1`, and/or `PREFLIGHT_REQUIRE_OBJECT_STORAGE=1` so production preflight fails closed on missing or unreachable dependency endpoints.
 
@@ -72,6 +79,7 @@ The repository already includes these deployment assets:
 
 - Use `ui/data_sources.html` as the source-of-truth setup surface for provider credentials and source-specific settings.
 - Data-source CRUD, terminal order-entry, operator control, job-control, and repair/governance mutation routes are POST-only and pass through dashboard mutation auth, rate limiting, and append-only `api_mutation` event logging before handler execution.
+- Use `/api/broker/config`, `/api/broker/test_connection`, and `/api/broker/audit` as the broker configuration control plane. Do not activate a non-`sim` broker until the connection test passes for the same broker and the audit rows show the expected operator action.
 - For first container bring-up, use compose `.env` only as a bootstrap contract for runtime provider variables: `POLYGON_API_KEY`, `POLYGON_REST_ENABLED`, `POLYGON_WS_ENABLED`, `TRADIER_API_TOKEN`, `TRADIER_ENABLED`, `OPTIONS_PROVIDER_CHAIN`, `OPTIONS_CRITICAL_SYMBOLS`, `ALPACA_BASE_URL`, `ALPACA_KEY_ID`, and `ALPACA_SECRET_KEY`.
 - Do not enable live provider flags until `python engine/runtime/prod_preflight.py --json` passes dependency readiness and the operator readiness endpoints are reachable.
 - Use `POST /api/data_sources/test` through the UI or API before enabling a newly configured source.
@@ -80,6 +88,13 @@ The repository already includes these deployment assets:
 ## 6. Before Enabling Real Trading
 
 - Confirm the runtime is not in `BOOTING`, `WARMING_UP`, `SHUTDOWN`, `KILL_SWITCH`, or unknown lifecycle state.
+- Confirm `DISABLE_LIVE_EXECUTION` is unset or explicitly false (`0`, `false`, `no`, or `off`). A truthy or unknown non-empty value is a hard live-capital block in the runtime gate, kill-switch cascade, broker router, broker adapters, and terminal order-entry APIs.
+- Confirm `ENGINE_MODE=live` and `EXECUTION_MODE=live`; environment mode alone does not arm execution.
+- Confirm `LIVE_BROKER`, `BROKER`, `BROKER_NAME`, and `BROKER_FAILOVER` identify the intended live broker and do not include `sim`, `paper`, or `sandbox`.
+- Confirm `GET /api/broker/config` shows the intended active broker, masked credentials, and the expected last passing test result; confirm `GET /api/broker/audit` contains the recent configuration and test actions.
+- Confirm the initial deployment hold has `KILL_SWITCH_GLOBAL=1` until operator signoff. Clearing that hold is not sufficient to trade; live execution still requires the audited DB `execution_mode` row to be `mode=live, armed=1`.
+- Confirm provider credentials are real for the selected broker. Alpaca live mode must not use `https://paper-api.alpaca.markets`; IBKR live mode must set `IBKR_HOST`, `IBKR_PORT`, and `IBKR_CLIENT_ID` explicitly.
+- Confirm pre-live position reconciliation is enabled with `EXECUTION_PRELIVE_RECONCILE` unset or true. Any break-glass override must include non-placeholder actor and reason values and must be visible in runtime event evidence.
 - Confirm `/api/execution/barrier` shows the expected mode, arming state, and reason.
 - Confirm there are no active global or model kill switches that should still block execution.
 - Confirm portfolio-risk APIs and broker-facing status APIs are healthy enough for the intended mode.
@@ -90,6 +105,8 @@ The repository already includes these deployment assets:
 
 - Keep Postgres base backups, WAL archive, backup pruning, and restore-drill timers configured through `ops/backup/` and `ops/server/systemd/`. The older `deploy/bin/backup_trading_db.sh` copies a SQLite file and is not sufficient for the current Postgres-backed runtime.
 - Treat restores as part of operations: run the restore drill into a clean target on the agreed cadence and keep the latest drill report with the backup evidence.
+- Before live promotion, run `ops/backup/backup_restore_evidence.sh` on the target server. Keep the timestamped report and `latest_backup_restore_evidence.json`; live preflight and model promotion guard fail closed when verified backup, WAL archive evidence, restore drill freshness, or restore duration violates the configured `BACKUP_EVIDENCE_*` RPO/RTO policy.
+- On the Compose production server, install this gate with `sudo bash ops/server/install_backup_evidence_gate.sh --compose --restart-postgres --run-evidence`. This applies the TimescaleDB WAL archive bind mount/settings, installs the 60-second evidence refresh timer, and runs version-matched backup/restore tools from the Timescale image.
 - Keep `logs/` available for runtime and operator log tails.
 - Use `/api/operator/runtime_watchdogs`, `/api/operator/provider_telemetry`, and `/api/operator/support_snapshot` as the first-line operational checks.
 - Run `python tools/validate_repo.py --live` only against an intentionally running stack when a live smoke test is required.

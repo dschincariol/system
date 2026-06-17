@@ -45,6 +45,40 @@ allow_direct="${TS_RESTORE_DRILL_ALLOW_DIRECT:-0}"
 start_epoch="$(date +%s)"
 pgbouncer_pidfile="${work_dir}/pgbouncer.pid"
 
+if [ -n "${TS_RESTORE_DOCKER_IMAGE:-}" ] && [ "${TS_RESTORE_DRILL_IN_DOCKER:-0}" != "1" ]; then
+  command -v docker >/dev/null 2>&1 || die docker_missing "image=${TS_RESTORE_DOCKER_IMAGE}"
+  mkdir -p "$drill_dir" "$work_root"
+  base_mount="${TS_RESTORE_BASE_BACKUP_DIR:-${TS_BACKUP_BASE_DIR:-/var/backups/trading/base}}"
+  wal_mount="${TS_BACKUP_WAL_DIR:-/var/backups/trading/wal}"
+  docker run --rm \
+    --network "${TS_RESTORE_DOCKER_NETWORK:-none}" \
+    --user "${TS_RESTORE_DOCKER_USER:-postgres}" \
+    -v "${repo_root}:${repo_root}:ro" \
+    -v "${base_mount}:${base_mount}" \
+    -v "${wal_mount}:${wal_mount}" \
+    -v "${drill_dir}:${drill_dir}" \
+    -e TS_RESTORE_DRILL_IN_DOCKER=1 \
+    -e TS_RESTORE_SCRIPT \
+    -e TS_RESTORE_SANITY_SQL \
+    -e TS_RESTORE_BASE_BACKUP_DIR \
+    -e TS_BACKUP_BASE_DIR \
+    -e TS_BACKUP_WAL_DIR \
+    -e TS_RESTORE_DRILL_DIR \
+    -e TS_RESTORE_DRILL_WORK_ROOT \
+    -e TS_RESTORE_DRILL_STAMP \
+    -e TS_RESTORE_PORT \
+    -e TS_RESTORE_PGBOUNCER_PORT \
+    -e TS_RESTORE_DB \
+    -e TS_RESTORE_USER \
+    -e TS_RESTORE_DRILL_KEEP_DATA \
+    -e TS_RESTORE_DRILL_ALLOW_DIRECT \
+    -e TS_RESTORE_TIMEOUT_S \
+    -e PGDATABASE \
+    "${TS_RESTORE_DOCKER_IMAGE}" \
+    bash "${script_dir}/restore_drill.sh"
+  exit $?
+fi
+
 mkdir -p "$drill_dir" "$work_dir"
 
 cleanup() {
@@ -95,6 +129,7 @@ write_report() {
       printf 'restore_drill_failed\n'
     fi
   } > "$report"
+  ln -sfn "$(basename "$report")" "${drill_dir}/latest_restore_drill.txt"
 }
 
 start_pgbouncer() {
@@ -133,8 +168,10 @@ run_drill() {
   [ -f "$sanity_sql" ] || die sanity_sql_missing "path=${sanity_sql}"
 
   log info drill_started "work_dir=${work_dir} datadir=${datadir} report=${report}"
-  TS_RESTORE_PORT="$restore_port" TS_RESTORE_DB="$restore_db" TS_RESTORE_USER="$restore_user" \
-    bash "$restore_script" --target-time latest --into "$datadir" --allow-trade-paused --force
+  if ! TS_RESTORE_PORT="$restore_port" TS_RESTORE_DB="$restore_db" TS_RESTORE_USER="$restore_user" \
+    bash "$restore_script" --target-time latest --into "$datadir" --allow-trade-paused --force; then
+    die restore_failed "datadir=${datadir} port=${restore_port}"
+  fi
 
   if start_pgbouncer; then
     PGUSER="$restore_user" psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$pgbouncer_port" -d "$restore_db" -f "$sanity_sql" > "$sanity_log" 2>&1

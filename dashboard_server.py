@@ -2075,6 +2075,10 @@ _STORAGE_REQUIRED_ROUTE_PATHS = frozenset(
         "/api/pnl/summary",
         "/api/risk/summary",
         "/api/risk/portfolio",
+        "/api/risk/monte_carlo",
+        "/api/alpha_decay",
+        "/api/regime/context",
+        "/api/regime/history",
         "/api/execution_metrics",
         "/api/execution/metrics",
         "/api/execution/stats",
@@ -2093,6 +2097,7 @@ _STORAGE_REQUIRED_ROUTE_PATHS = frozenset(
         "/api/terminal/fills",
         "/api/terminal/equity",
         "/api/terminal/markers",
+        "/api/terminal/decision_overlays",
     }
 )
 
@@ -2427,6 +2432,11 @@ except Exception:
     ROUTE_SPECS_UI_METRICS = []
     build_ui_metrics_snapshot = None
 
+try:
+    from engine.api.api_broker_config import ROUTE_SPECS_BROKER_CONFIG
+except Exception:
+    ROUTE_SPECS_BROKER_CONFIG = []
+
 # (optional) terminal route modules are consolidated via ROUTE_SPECS_TERMINAL_ALL below
 
 # -------------------------------------------------------------------
@@ -2549,6 +2559,7 @@ _FALLBACK_ROUTE_SPECS = [
     {"method": "GET",  "path": "/api/system/kill_switches",           "handler": "api_get_kill_switches"},  # alias
     {"method": "GET",  "path": "/api/alerts/by_id",                   "handler": "api_get_alert_by_id"},
     {"method": "POST", "path": "/api/alerts/{id}/ack",                "handler": "api_post_alert_ack"},
+    {"method": "POST", "path": "/api/alerts/{id}/shelve",             "handler": "api_post_alert_shelve"},
     {"method": "POST", "path": "/api/alerts/{id}/resolve",            "handler": "api_post_alert_resolve"},
     {"method": "GET",  "path": "/api/ui/decisions",                   "handler": "api_get_recent_decisions"},
     {"method": "GET",  "path": "/api/ui/decision",                    "handler": "api_get_decision_detail"},
@@ -2582,6 +2593,7 @@ _FALLBACK_ROUTE_SPECS = [
     {"method": "GET",  "path": "/api/terminal/fills",                 "handler": "api_get_terminal_fills"},
     {"method": "GET",  "path": "/api/terminal/equity",                "handler": "api_get_terminal_equity"},
     {"method": "GET",  "path": "/api/terminal/markers",               "handler": "api_get_terminal_markers"},
+    {"method": "GET",  "path": "/api/terminal/decision_overlays",     "handler": "api_get_terminal_decision_overlays"},
 
     {"method": "POST", "path": "/api/terminal/order",                 "handler": "api_post_terminal_order"},
     {"method": "POST", "path": "/api/terminal/flatten",               "handler": "api_post_terminal_flatten"},
@@ -2608,6 +2620,7 @@ _RAW_ROUTE_SPECS = (
     + list(ROUTE_SPECS_REPLAY)
     + list(ROUTE_SPECS_DATA_SOURCES)
     + list(ROUTE_SPECS_UI_METRICS)
+    + list(ROUTE_SPECS_BROKER_CONFIG)
     + list(_terminal_routes)
     + list(_FALLBACK_ROUTE_SPECS)
 )
@@ -4169,6 +4182,9 @@ from engine.api.api_system import (
     api_get_telemetry_history,
     api_get_execution_barrier,
     api_get_monte_carlo_risk,
+    api_get_alpha_decay,
+    api_get_regime_context,
+    api_get_regime_history,
     api_get_drift_explainer,
     api_get_supervisor_status,
     api_get_runtime_config,
@@ -4219,6 +4235,7 @@ try:
         api_get_terminal_fills,
         api_get_terminal_equity,
         api_get_terminal_markers,
+        api_get_terminal_decision_overlays,
     )
 except Exception:
     api_get_terminal_watchlist = _unavailable("api_get_terminal_watchlist")
@@ -4228,6 +4245,7 @@ except Exception:
     api_get_terminal_fills = _unavailable("api_get_terminal_fills")
     api_get_terminal_equity = _unavailable("api_get_terminal_equity")
     api_get_terminal_markers = _unavailable("api_get_terminal_markers")
+    api_get_terminal_decision_overlays = _unavailable("api_get_terminal_decision_overlays")
 
 try:
     from engine.terminal.api.api_terminal_orders import (
@@ -4500,12 +4518,52 @@ def api_post_alert_ack(parsed, body=None, _ctx=None):
     payload = body if isinstance(body, dict) else {}
     actor = str(payload.get("actor") or payload.get("who") or "operator").strip() or "operator"
     source = str(payload.get("source") or "dashboard").strip() or "dashboard"
+    reason = str(payload.get("reason") or "").strip()
+    timeout_ms = payload.get("timeout_ms")
+    try:
+        timeout_ms = int(float(timeout_ms)) if timeout_ms is not None else None
+    except Exception:
+        timeout_ms = None
     try:
         from engine.api.api_write import ack_alert
 
-        return ack_alert(alert_id, who=actor, source=source)
+        return ack_alert(alert_id, who=actor, source=source, reason=reason, timeout_ms=timeout_ms)
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_ALERT_ACK_FAILED", e, alert_id=alert_id)
+        return {"ok": False, "error": str(e)}
+
+
+def api_post_alert_shelve(parsed, body=None, _ctx=None):
+    alert_id = _alert_id_from_request(parsed, body)
+    if alert_id <= 0:
+        return {"ok": False, "error": "missing_id"}
+    payload = body if isinstance(body, dict) else {}
+    actor = str(payload.get("actor") or payload.get("who") or "operator").strip() or "operator"
+    reason = str(payload.get("reason") or "").strip()
+    source = str(payload.get("source") or "dashboard").strip() or "dashboard"
+    severity = str(payload.get("severity") or "").strip()
+    try:
+        expires_ts_ms = int(float(payload.get("expires_ts_ms") or 0)) or None
+    except Exception:
+        expires_ts_ms = None
+    try:
+        duration_ms = int(float(payload.get("duration_ms") or 0)) or None
+    except Exception:
+        duration_ms = None
+    try:
+        from engine.api.api_write import shelve_alert
+
+        return shelve_alert(
+            alert_id,
+            who=actor,
+            reason=reason,
+            source=source,
+            expires_ts_ms=expires_ts_ms,
+            duration_ms=duration_ms,
+            severity=severity,
+        )
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_ALERT_SHELVE_FAILED", e, alert_id=alert_id)
         return {"ok": False, "error": str(e)}
 
 
@@ -5103,6 +5161,19 @@ except Exception:
     api_post_data_source_disable = None
     api_post_data_source_test = None
 
+try:
+    from engine.api.api_broker_config import (
+        api_get_broker_audit,
+        api_get_broker_config,
+        api_post_broker_config,
+        api_post_broker_test_connection,
+    )
+except Exception:
+    api_get_broker_audit = None
+    api_get_broker_config = None
+    api_post_broker_config = None
+    api_post_broker_test_connection = None
+
 API_HANDLERS = {
     # SYSTEM
     "api_get_kill_switches": api_get_kill_switches,
@@ -5135,6 +5206,9 @@ API_HANDLERS = {
     "api_get_execution_barrier": api_get_execution_barrier,
     "api_get_db_health": api_get_db_health,
     "api_get_monte_carlo_risk": api_get_monte_carlo_risk,
+    "api_get_alpha_decay": api_get_alpha_decay,
+    "api_get_regime_context": api_get_regime_context,
+    "api_get_regime_history": api_get_regime_history,
     "api_get_drift_explainer": api_get_drift_explainer,
 
     # UI console lifecycle
@@ -5179,6 +5253,12 @@ API_HANDLERS = {
     "api_post_data_source_disable": api_post_data_source_disable,
     "api_post_data_source_test": api_post_data_source_test,
 
+    # BROKER CONFIG
+    "api_get_broker_config": api_get_broker_config,
+    "api_post_broker_config": api_post_broker_config,
+    "api_post_broker_test_connection": api_post_broker_test_connection,
+    "api_get_broker_audit": api_get_broker_audit,
+
     # OPS
     "api_get_alerts": api_get_alerts,
     "api_get_notifications_status": api_get_notifications_status,
@@ -5216,6 +5296,7 @@ API_HANDLERS = {
     # UI hard-deps (aliases + additional endpoints)
     "api_get_alert_by_id": api_get_alert_by_id,
     "api_post_alert_ack": api_post_alert_ack,
+    "api_post_alert_shelve": api_post_alert_shelve,
     "api_post_alert_resolve": api_post_alert_resolve,
     "api_get_recent_decisions": api_get_recent_decisions,
     "api_get_decision_detail": api_get_decision_detail,
@@ -5249,6 +5330,7 @@ API_HANDLERS = {
     "api_get_terminal_fills": api_get_terminal_fills,
     "api_get_terminal_equity": api_get_terminal_equity,
     "api_get_terminal_markers": api_get_terminal_markers,
+    "api_get_terminal_decision_overlays": api_get_terminal_decision_overlays,
 
     "api_post_terminal_order": api_post_terminal_order,
     "api_post_terminal_flatten": api_post_terminal_flatten,

@@ -11,7 +11,9 @@ except Exception:  # pragma: no cover - fallback for minimal test envs.
 _ALLOWED_TABLES: frozenset[str] = frozenset(
     {
         "alert_acks",
+        "alert_lifecycle_events",
         "alert_resolutions",
+        "alert_shelves",
         "alerts",
         "broker_fills",
         "broker_fills_v2",

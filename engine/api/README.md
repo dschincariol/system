@@ -19,9 +19,15 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
 - [api_read.py](api_read.py)
   Core read APIs.
 - [api_write.py](api_write.py)
-  Mutating APIs.
+  Mutating APIs, including alert acknowledgement, shelving, resolution, job-history writes, and promotion guard toggles.
 - [api_dashboard_reads.py](api_dashboard_reads.py)
   Dashboard-specific read aggregation.
+- [api_market.py](api_market.py)
+  OHLCV candle aggregation and server-sent market stream endpoints.
+- [api_replay.py](api_replay.py)
+  Historical day replay aggregation endpoint.
+- [api_broker_config.py](api_broker_config.py)
+  Broker configuration read/write/test/audit control-plane endpoints with encrypted credential storage and masked reads.
 - [api_ops.py](api_ops.py)
   Route metadata for ops, diagnostics, execution analytics, and governance read surfaces.
 - [api_ops_handlers.py](api_ops_handlers.py)
@@ -40,6 +46,14 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
 `POST /api/terminal/order` and `POST /api/terminal/flatten` do not submit directly to a broker. After the real-trading execution barrier allows the request, they persist a `portfolio_orders` intent for the normal execution pipeline.
 
 Manual quantity orders keep portfolio-weight fields neutral: `from_weight = 0.0`, `to_weight = 0.0`, and `delta_weight = 0.0`. The requested quantity is stored in `explain_json.terminal_order` with `sizing = "quantity"`, positive `qty`, and signed `signed_qty`; `BUY` derives a positive signed quantity and `SELL` derives a negative signed quantity. The execution-intent loader turns that payload into `qty`, `order_sizing = "quantity"`, and `terminal_order = true`, while preserving neutral weights so weight-based consumers do not mistake share quantity for allocation.
+
+Before writing an intent, terminal mutations also enforce fresh price, max quantity, max notional, optional per-symbol caps, and duplicate-recent-order controls. Rejections are persisted to `terminal_intent_rejections` with stable reason codes.
+
+## Broker Config Contract
+
+`GET /api/broker/config`, `POST /api/broker/config`, `POST /api/broker/test_connection`, and `GET /api/broker/audit` are mounted from `api_broker_config.py`.
+
+This surface stores broker config in `broker_meta`, encrypts supplied credentials with `services.credential_encryption`, masks credentials on reads, requires a passing connection test before activating a non-`sim` broker, and records `broker_config_audit` rows for updates, tests, and blocked activations.
 
 ## Operator Diagnostic Contract
 

@@ -7,8 +7,6 @@ for the local/service runtime.
 
 import atexit
 import base64
-import importlib
-import importlib.util
 import json
 import logging
 import os
@@ -66,6 +64,8 @@ if os.path.abspath(__file__) != os.path.abspath(EXPECTED_PATH):
 
 
 def _env_file_has_nonempty_value(env_path: Path, key: str) -> bool:
+    if not env_path.exists():
+        return False
     try:
         for raw_line in env_path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
@@ -74,8 +74,6 @@ def _env_file_has_nonempty_value(env_path: Path, key: str) -> bool:
             name, value = line.split("=", 1)
             if name.strip() == key and value.strip():
                 return True
-    except FileNotFoundError:
-        missing = True
     except Exception as e:
         _early_log_nonfatal("START_SYSTEM_ENV_FILE_READ_FAILED", e, path=str(env_path), key=str(key))
     return False
@@ -1874,6 +1872,76 @@ def _perform_startup_health_validation(*, mode: str) -> None:
         raise
 
 
+def _request_dashboard_runtime_stop(reason: str) -> None:
+    stopped = False
+    _INGESTION_WATCHDOG_STOP.set()
+    try:
+        from dashboard_server import stop_server
+
+        stop_server()
+        stopped = True
+    except Exception as stop_err:
+        _log_swallowed("STARTUP_HEALTH_STOP_SERVER_FAILED", error=str(stop_err), reason=str(reason))
+
+    try:
+        runtime_shutdown()
+        stopped = True
+    except Exception as shutdown_err:
+        _log_swallowed("STARTUP_HEALTH_RUNTIME_SHUTDOWN_FAILED", error=str(shutdown_err), reason=str(reason))
+
+    try:
+        _terminate_ingestion()
+        stopped = True
+    except Exception as ingestion_err:
+        _log_swallowed("STARTUP_HEALTH_INGESTION_TERMINATE_FAILED", error=str(ingestion_err), reason=str(reason))
+
+    if not stopped:
+        _log_swallowed("STARTUP_HEALTH_RUNTIME_STOP_NOT_CONFIRMED", reason=str(reason))
+
+
+def _handle_late_startup_health_validation_failure(exc: BaseException, *, mode: str, scope: str) -> None:
+    reason = f"late_startup_health_validation_failed:{type(exc).__name__}:{exc}"
+    os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+    os.environ["KILL_SWITCH_GLOBAL"] = "1"
+    os.environ["STARTUP_HEALTH_LATE_FAILURE"] = reason[:2000]
+    _record_phase(
+        "STARTUP_HEALTH",
+        status="failed",
+        detail=reason,
+        extra={
+            "mode": str(mode),
+            "scope": str(scope),
+            "execution_disabled": True,
+            "kill_switch_global": True,
+        },
+    )
+    _meta_set_json(
+        "startup_health_late_failure",
+        {
+            "ok": False,
+            "mode": str(mode),
+            "scope": str(scope),
+            "reason": reason,
+            "ts_ms": int(time.time() * 1000),
+        },
+    )
+
+    try:
+        from engine.runtime.lifecycle_state import KILL_SWITCH, set_state
+
+        set_state(KILL_SWITCH, reason[:2000])
+    except Exception as kill_err:
+        _log_swallowed("STARTUP_HEALTH_KILL_SWITCH_STATE_FAILED", error=str(kill_err), reason=reason)
+        try:
+            from engine.runtime.lifecycle_state import DEGRADED, set_state
+
+            set_state(DEGRADED, reason[:2000])
+        except Exception as degraded_err:
+            _log_swallowed("STARTUP_HEALTH_DEGRADED_STATE_FAILED", error=str(degraded_err), reason=reason)
+
+    _request_dashboard_runtime_stop(reason)
+
+
 def _start_startup_health_validation_async(*, mode: str) -> threading.Thread:
     global _STARTUP_HEALTH_THREAD
 
@@ -1886,12 +1954,11 @@ def _start_startup_health_validation_async(*, mode: str) -> threading.Thread:
             _perform_startup_health_validation(mode=str(mode))
         except Exception as e:
             _log_swallowed("STARTUP_HEALTH_ASYNC_FATAL", mode=str(mode), error=str(e))
-            try:
-                from dashboard_server import stop_server
-
-                stop_server()
-            except Exception as stop_err:
-                _log_swallowed("STARTUP_HEALTH_ASYNC_STOP_SERVER_FAILED", error=str(stop_err))
+            _handle_late_startup_health_validation_failure(
+                e,
+                mode=str(mode),
+                scope="async_post_bind_validation",
+            )
 
     thread = threading.Thread(
         target=_runner,
@@ -1980,15 +2047,11 @@ def _run_dashboard_server_post_bind_validation(
                 port=int(port),
                 error=str(e),
             )
-            try:
-                from dashboard_server import stop_server
-
-                stop_server()
-            except Exception as stop_err:
-                _log_swallowed(
-                    "STARTUP_HEALTH_BIND_WAIT_STOP_SERVER_FAILED",
-                    error=str(stop_err),
-                )
+            _handle_late_startup_health_validation_failure(
+                e,
+                mode=str(mode),
+                scope="dashboard_bind_wait",
+            )
 
     threading.Thread(
         target=_runner,

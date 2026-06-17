@@ -3817,6 +3817,7 @@ def get_health_snapshot():
             "duplicate_order_risk_detected",
             "missing_fills_detected",
             "fill_missing_local_order_reference",
+            "broker_submission_unrecorded_needs_reconcile",
             "order_position_mismatch",
             "invalid_account_balance_state",
             "pricing_unavailable_for_unrealized_pnl",

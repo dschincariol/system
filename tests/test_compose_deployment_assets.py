@@ -52,6 +52,58 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn('"$${MINIO_ROOT_PASSWORD}"', text)
         self.assertIn('mc mb --ignore-existing "local/$${OBJECT_STORE_BUCKET}"', text)
 
+    def test_timescaledb_compose_archives_wal_to_host_backup_dir(self) -> None:
+        external_compose = REPO_ROOT / "deploy" / "compose" / "docker-compose.external-services.yml"
+        env_example = REPO_ROOT / "deploy" / "compose" / ".env.example"
+        text = external_compose.read_text(encoding="utf-8")
+        env_text = env_example.read_text(encoding="utf-8")
+
+        self.assertIn("${TRADING_BACKUP_ROOT:-/var/backups/trading}:/var/backups/trading", text)
+        self.assertIn("archive_mode=on", text)
+        self.assertIn("archive_command=test ! -f /var/backups/trading/wal/%f", text)
+        self.assertIn("archive_timeout=60s", text)
+        self.assertIn("TRADING_BACKUP_ROOT=/var/backups/trading", env_text)
+        self.assertIn("TRADING_BACKUP_WAL_DIR=/var/backups/trading/wal", env_text)
+
+    def test_runtime_compose_mounts_backup_evidence_read_only(self) -> None:
+        stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
+        env_example_text = (REPO_ROOT / "deploy" / "compose" / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("${TRADING_BACKUP_ROOT:-/var/backups/trading}:/var/backups/trading:ro", stack_text)
+        self.assertIn("PREFLIGHT_REQUIRE_BACKUP_EVIDENCE: ${PREFLIGHT_REQUIRE_BACKUP_EVIDENCE:-1}", stack_text)
+        self.assertIn(
+            "BACKUP_EVIDENCE_PATH: ${BACKUP_EVIDENCE_PATH:-/var/backups/trading/evidence/latest_backup_restore_evidence.json}",
+            stack_text,
+        )
+        self.assertIn("BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S: ${BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S:-93600}", stack_text)
+        self.assertIn("BACKUP_EVIDENCE_RPO_S: ${BACKUP_EVIDENCE_RPO_S:-120}", stack_text)
+        self.assertIn("BACKUP_EVIDENCE_WAL_RPO_S: ${BACKUP_EVIDENCE_WAL_RPO_S:-120}", stack_text)
+        self.assertIn("BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S: ${BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S:-7776000}", stack_text)
+        self.assertIn("BACKUP_EVIDENCE_RTO_S: ${BACKUP_EVIDENCE_RTO_S:-1800}", stack_text)
+
+        for key in (
+            "PREFLIGHT_REQUIRE_BACKUP_EVIDENCE=1",
+            "BACKUP_EVIDENCE_PATH=/var/backups/trading/evidence/latest_backup_restore_evidence.json",
+            "BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S=93600",
+            "BACKUP_EVIDENCE_RPO_S=120",
+            "BACKUP_EVIDENCE_WAL_RPO_S=120",
+            "BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=7776000",
+            "BACKUP_EVIDENCE_RTO_S=1800",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, env_example_text)
+
+    def test_backup_scripts_support_compose_docker_pg_tools(self) -> None:
+        base_backup = (REPO_ROOT / "ops" / "backup" / "base_backup.sh").read_text(encoding="utf-8")
+        restore_drill = (REPO_ROOT / "ops" / "backup" / "restore_drill.sh").read_text(encoding="utf-8")
+        installer = (REPO_ROOT / "ops" / "server" / "install_backup_evidence_gate.sh").read_text(encoding="utf-8")
+
+        self.assertIn("TS_BACKUP_DOCKER_IMAGE", base_backup)
+        self.assertIn("TS_BACKUP_DOCKER_EXEC_CONTAINER", base_backup)
+        self.assertIn("TS_RESTORE_DOCKER_IMAGE", restore_drill)
+        self.assertIn("--compose", installer)
+        self.assertIn("install_compose_systemd_overrides", installer)
+
     def test_runtime_compose_exposes_provider_and_broker_contract(self) -> None:
         stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
         env_example_text = (REPO_ROOT / "deploy" / "compose" / ".env.example").read_text(encoding="utf-8")
@@ -65,12 +117,19 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "TRADIER_API_TOKEN",
             "OPTIONS_PROVIDER_CHAIN",
             "OPTIONS_CRITICAL_SYMBOLS",
+            "LIVE_BROKER",
             "BROKER_NAME",
             "BROKER",
+            "BROKER_FAILOVER",
             "ALPACA_BASE_URL",
             "ALPACA_KEY_ID",
             "ALPACA_SECRET_KEY",
+            "IBKR_HOST",
+            "IBKR_PORT",
+            "IBKR_CLIENT_ID",
             "OPERATOR_API_TOKEN",
+            "LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN",
+            "LIVE_TRADING_REQUIRE_CONFIRMATION",
             "AUTO_PIPELINE",
             "AUTO_PIPELINE_INCLUDE_EXECUTION",
             "AUTO_PIPELINE_START_DELAY_S",
@@ -97,6 +156,7 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("INFERENCE_HEALTH_PROBE_INTERVAL_S: ${INFERENCE_HEALTH_PROBE_INTERVAL_S:-20}", stack_text)
         self.assertIn("KILL_SWITCH_GLOBAL: ${KILL_SWITCH_GLOBAL:-1}", stack_text)
         self.assertIn("BROKER_NAME: ${BROKER_NAME:-sim}", stack_text)
+        self.assertIn("BROKER_FAILOVER: ${BROKER_FAILOVER:-sim}", stack_text)
 
     def test_operator_package_lock_matches_manifest_dependencies(self) -> None:
         manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))

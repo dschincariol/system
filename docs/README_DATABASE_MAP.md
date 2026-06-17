@@ -2,7 +2,7 @@
 
 This document explains the main runtime database/storage contract used by the repo in human terms.
 
-Last verified against code: 2026-06-11
+Last verified against code: 2026-06-17
 
 It is not meant to replace the schema in `engine/runtime/storage.py` or `engine/runtime/storage_pg.py`. It is meant to make the schema understandable.
 
@@ -202,6 +202,8 @@ These tables are closest to the "thinking" and "warning" surfaces of the system.
 | `decision_log` | recorded decisions, explanations, and feature context |
 | `alerts` | alert records shown to operators or consumed by policies |
 | `alert_acks` | acknowledgement actions |
+| `alert_shelves` | temporary operator shelving state with expiry and required reason |
+| `alert_lifecycle_events` | append-only alert acknowledgement/shelving/resolution event stream |
 | `alert_resolutions` | alert closure or resolution records |
 | `alert_interactions` | passive UI/operator interaction tracking |
 | `decision_views` | decision detail view logging |
@@ -252,11 +254,13 @@ These tables track order handling and realized market interaction.
 | `execution_health_state` | summary execution health |
 | `execution_alerts` | execution-specific alerting |
 | `execution_order_idempotency` | duplicate-protection and order lifecycle safety |
+| `terminal_intent_rejections` | terminal order/flatten pre-trade rejection audit rows |
 | `execution_divergence` | divergence between expected and actual execution state |
 | `broker_fills` | broker-specific fill records |
 | `broker_order_state` | broker order snapshots |
 | `broker_connection_health` | broker health and connectivity state |
 | `broker_account`, `broker_positions`, `broker_meta` | broker-facing account and position snapshots |
+| `broker_config_audit` | broker configuration update, activation, and connection-test audit rows |
 
 ### Operator And Advisory Tables
 
@@ -269,6 +273,8 @@ These tables support operator-facing observability and advisory workflows in the
 | `execution_ai_advisory` | non-authoritative execution advice records |
 | `execution_ai_advisory_actions` | operator approval/rejection audit for advisories |
 | `model_governance_log` | dashboard-facing governance summary snapshots |
+| `broker_config_audit` | broker configuration and connection-test audit trail |
+| `terminal_intent_rejections` | terminal pre-trade rejection evidence |
 
 ### Research And Evaluation Tables
 
@@ -328,6 +334,22 @@ This is the main warning/attention table for operators and policy layers.
 | `title`, `message` | human-readable alert text |
 | `status` | lifecycle state |
 | `detail_json` | detailed payload |
+
+### `alert_acks`, `alert_shelves`, and `alert_lifecycle_events`
+
+These tables record operator alert lifecycle actions without treating the alert row itself as the only source of lifecycle truth.
+
+| Table | Column | Meaning |
+| --- | --- | --- |
+| `alert_acks` | `alert_id` | acknowledged alert id |
+| `alert_acks` | `acked_ts_ms`, `acked_by`, `source` | who acknowledged the alert and when |
+| `alert_acks` | `expires_ts_ms`, `reason` | acknowledgement expiry and optional operator reason |
+| `alert_shelves` | `alert_id` | shelved alert id |
+| `alert_shelves` | `shelved_ts_ms`, `expires_ts_ms` | shelving interval |
+| `alert_shelves` | `shelved_by`, `reason`, `source`, `severity` | shelving actor, required reason, source, and alert severity context |
+| `alert_shelves` | `detail_json` | structured shelving metadata |
+| `alert_lifecycle_events` | `alert_id`, `ts_ms`, `lifecycle_state` | append-only lifecycle event |
+| `alert_lifecycle_events` | `actor`, `reason`, `source`, `detail_json` | operator/source context for the lifecycle action |
 
 ### `portfolio_state`
 
@@ -429,6 +451,33 @@ This is an operator-facing advisory table.
 | `features_json` | feature evidence |
 | `advisory_json` | full structured advisory payload |
 
+### `broker_meta` and `broker_config_audit`
+
+The broker configuration API stores current broker settings in `broker_meta` and records operator-visible history in `broker_config_audit`.
+
+| Table | Column | Meaning |
+| --- | --- | --- |
+| `broker_meta` | `key` | config key such as `broker.config`, `broker.credentials_enc`, `broker.credentials_key_version`, or `broker.last_test` |
+| `broker_meta` | `value` | JSON or encrypted credential blob |
+| `broker_meta` | `updated_ts_ms` | last update time |
+| `broker_config_audit` | `ts_ms`, `action`, `actor` | audit timestamp, action, and operator/source actor |
+| `broker_config_audit` | `active_broker`, `success`, `message` | broker context and result |
+| `broker_config_audit` | `detail_json` | structured details with credentials omitted or encrypted before storage |
+
+### `terminal_intent_rejections`
+
+This table records terminal order-entry requests that fail backend pre-trade controls before any `portfolio_orders` intent is written.
+
+| Column | Meaning |
+| --- | --- |
+| `id` | rejection row id |
+| `ts_ms` | rejection time |
+| `symbol`, `side`, `qty` | requested terminal intent |
+| `reason_code` | stable rejection code such as `missing_price`, `stale_price`, `max_qty_exceeded`, `max_notional_exceeded`, or `duplicate_recent_order` |
+| `reason` | operator-facing rejection message |
+| `source` | source surface, currently `terminal` |
+| `detail_json` | price, cap, duplicate-window, or gate detail |
+
 ### `model_governance_log`
 
 This is the current dashboard-facing governance summary table.
@@ -508,172 +557,12 @@ If you change the schema, keep these rules:
 5. keep dashboard-only analytics tables separate from execution-authoritative tables
 6. preserve backward compatibility where possible
 
-## 10. Live Table Appendix
+## 10. Current Table Register
 
-The following table names were present in the local `data/trading.db` when this document was created.
+Do not use a local `data/trading.db` snapshot as a production schema catalog. The current table register is maintained in:
 
-This list is useful as a catalog, but the grouped sections above are the better way to understand the schema.
+- [Database_Schema.md](Database_Schema.md)
+- [engine/runtime/schema/table_classification.py](../engine/runtime/schema/table_classification.py)
+- the migration files under [engine/runtime/schema/migrations/](../engine/runtime/schema/migrations)
 
-```text
-active_feature_policy
-alert_acks
-alert_interactions
-alert_resolutions
-alerts
-alpha_decay_metrics
-alpha_decay_runtime_history
-alpha_decay_strategy_metrics
-backtest_scores
-broker_account
-broker_connection_health
-broker_fills
-broker_meta
-broker_order_state
-broker_positions
-capital_efficiency
-challenger_shadow_orders
-champion_assignments
-crash_recovery_audit
-decision_log
-decision_views
-domain_blacklist
-domain_perf
-earnings_calendar
-embed_conf_calib
-embed_model_eval
-embed_models2
-equity_history
-event_embeddings
-event_embeddings_seq
-event_log
-event_log_state
-events
-exec_conf_calib
-exec_open_orders
-exec_order_events
-execution_ai_advisory
-execution_ai_advisory_actions
-execution_alerts
-execution_capital_efficiency
-execution_divergence
-execution_fill_quality
-execution_fills
-execution_health_state
-execution_meta
-execution_metrics
-execution_mode
-execution_mode_audit
-execution_order_idempotency
-execution_orders
-execution_policy_audit
-factor_features
-factor_group_scores
-factor_groups
-factor_observations
-factor_registry
-feature_distribution_drift
-gdelt_macro_features
-ingest_slippage
-ipc_channels
-ipc_messages
-job_checkpoints
-job_heartbeats
-job_history
-job_locks
-kill_switch_audit
-kill_switch_state
-labels
-labels_exec
-market_features
-market_microstructure_signals
-model_drift
-model_governance_log
-model_marketplace_scores
-model_metrics
-model_post_promo_results
-model_post_promo_watch
-model_promotion_audit
-model_promotion_cooldown
-model_promotion_guard
-model_registry
-model_stats
-model_stats_regime
-model_weather_effect
-options_chain
-options_chain_v2
-options_surface
-options_surface_agg
-pipeline_stage_audit
-pnl_attribution
-portfolio_bt_points
-portfolio_bt_runs
-portfolio_equity_state
-portfolio_kill_snapshots
-portfolio_meta
-portfolio_orders
-portfolio_risk_snapshots
-portfolio_state
-position_reconcile_audit
-position_reconcile_baseline
-predictions
-price_anomalies
-price_bars
-price_feed_lock
-price_provider_health
-price_quotes
-price_quotes_raw
-prices
-residual_distribution_drift
-risk_events
-risk_state
-rl_policies
-rl_shadow_actions
-rl_shadow_eval
-rules_audit
-runtime_meta
-runtime_metrics
-schema_version
-sec_filings
-self_critic_alerts
-shadow_capital_scores
-shadow_metrics
-shadow_order_intents
-shadow_predictions
-shadow_training_runs
-size_policy
-size_policy_points
-sleeve_allocations
-sleeve_metrics
-sleeve_registry
-social_features
-social_posts
-social_regimes
-spillover_beta
-strategy_allocations
-strategy_allocator_history
-strategy_allocator_scores
-strategy_cooldowns
-strategy_metrics
-strategy_promotion_log
-strategy_registry
-strategy_shadow_runs
-suppression_opportunity
-symbol_universe
-symbols
-temporal_model_eval
-temporal_models
-temporal_predictions
-temporal_shadow_eval
-trade_attribution_ledger
-trade_decision_snapshot
-trade_suppression_audit
-trade_suppression_state
-trades
-universe_audit
-validation_scores
-walk_forward_runs
-walk_forward_scores
-weather_alerts
-weather_forecast_region_daily
-weather_provider_health
-```
+When a table is added, update the migration, table classification, this database map when the table changes a documented family, and [DATA_CONTRACTS.md](DATA_CONTRACTS.md) when the table crosses module or operator boundaries.

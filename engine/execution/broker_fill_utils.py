@@ -11,6 +11,7 @@ Utilities to aggregate broker fills into realized entry/exit prices.
 
 from datetime import datetime, timezone
 import logging
+import json
 from typing import Optional, Dict, Any
 
 from engine.runtime.failure_diagnostics import log_failure
@@ -20,6 +21,22 @@ from engine.runtime.storage import connect
 LOG = get_logger("execution.broker_fill_utils")
 
 _WARNED_NONFATAL_KEYS: set[str] = set()
+_NON_REAL_FILL_SOURCES = {
+    "sim",
+    "paper",
+    "paper_sim",
+    "shadow",
+    "shadow_sim",
+    "rl",
+    "rl_shadow",
+    "rl_sim",
+    "sim_training",
+    "training",
+    "paper_training",
+    "backtest",
+    "offline_sim",
+    "synthetic_training",
+}
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -50,6 +67,61 @@ def _vwap(rows):
     if qty_sum <= 0:
         return None
     return notional / qty_sum
+
+
+def _broker_fills_columns(con) -> set[str]:
+    try:
+        rows = con.execute("PRAGMA table_info(broker_fills)").fetchall() or []
+        return {str(row[1] or "").strip() for row in rows if len(row) > 1}
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_FILL_UTILS_COLUMNS_LOOKUP_FAILED",
+            e,
+            once_key="broker_fills_columns",
+        )
+        return set()
+
+
+def _json_obj(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if value in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_FILL_UTILS_JSON_PARSE_FAILED",
+            e,
+            once_key="json_obj_parse",
+            value=repr(value)[:120],
+        )
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _source_is_training_or_shadow(source: Any) -> bool:
+    text = str(source or "").strip().lower()
+    if not text:
+        return False
+    if text in _NON_REAL_FILL_SOURCES:
+        return True
+    return text.startswith("shadow") or text.startswith("rl_") or "training" in text
+
+
+def _is_real_broker_fill(*, source: Any, book_key: Any, explain_json: Any) -> bool:
+    if str(book_key or "").strip():
+        return False
+    if _source_is_training_or_shadow(source):
+        return False
+    explain = _json_obj(explain_json)
+    if str(explain.get("book_key") or explain.get("shadow_book_key") or "").strip():
+        return False
+    if str(explain.get("source") or "").strip() and _source_is_training_or_shadow(explain.get("source")):
+        return False
+    if explain.get("shadow_model_id") not in (None, ""):
+        return False
+    return True
 
 
 def parse_broker_timestamp_ms(value: Any, *, default_ms: Optional[int] = None) -> int:
@@ -109,6 +181,8 @@ def get_realized_trade(
     symbol: str,
     entry_ts_ms: int,
     exit_ts_ms: int,
+    book_key: Optional[str] = None,
+    real_only: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
     Returns realized execution info using broker_fills.
@@ -133,19 +207,43 @@ def get_realized_trade(
             )
             return None
 
+        cols = _broker_fills_columns(con)
+        price_expr = "price" if "price" in cols else "px"
+        side_expr = "side" if "side" in cols else "CASE WHEN qty >= 0 THEN 'BUY' ELSE 'SELL' END"
+        fees_expr = "fees" if "fees" in cols else "0.0"
+        source_expr = "source" if "source" in cols else "NULL"
+        book_key_expr = "book_key" if "book_key" in cols else "NULL"
+        explain_expr = "explain_json" if "explain_json" in cols else "NULL"
+        predicates = [
+            "UPPER(TRIM(symbol)) = UPPER(TRIM(?))",
+            "ts_ms BETWEEN ? AND ?",
+        ]
+        params: list[Any] = [
+            symbol,
+            int(entry_ts_ms - BUFFER_MS),
+            int(exit_ts_ms + BUFFER_MS),
+        ]
+        if real_only:
+            if "book_key" in cols:
+                predicates.append("COALESCE(NULLIF(TRIM(CAST(book_key AS TEXT)), ''), '') = ''")
+            if "source" in cols:
+                placeholders = ",".join("?" for _ in sorted(_NON_REAL_FILL_SOURCES))
+                predicates.append(
+                    f"LOWER(TRIM(COALESCE(CAST(source AS TEXT), 'real'))) NOT IN ({placeholders})"
+                )
+                params.extend(sorted(_NON_REAL_FILL_SOURCES))
+        elif book_key is not None and "book_key" in cols:
+            predicates.append("COALESCE(CAST(book_key AS TEXT), '') = ?")
+            params.append(str(book_key))
+
         rows = con.execute(
-            """
-            SELECT price, qty, side, ts_ms, fees
+            f"""
+            SELECT {price_expr}, qty, {side_expr}, ts_ms, {fees_expr}, {source_expr}, {book_key_expr}, {explain_expr}
             FROM broker_fills
-            WHERE symbol=?
-              AND ts_ms BETWEEN ? AND ?
+            WHERE {" AND ".join(predicates)}
             ORDER BY ts_ms ASC
             """,
-            (
-                symbol,
-                int(entry_ts_ms - BUFFER_MS),
-                int(exit_ts_ms + BUFFER_MS),
-            ),
+            tuple(params),
         ).fetchall()
 
         if not rows:
@@ -156,7 +254,13 @@ def get_realized_trade(
         fees_total = 0.0
         side = None
 
-        for price, qty, s, ts, fees in rows:
+        for price, qty, s, ts, fees, fill_source, fill_book_key, explain_json in rows:
+            if real_only and not _is_real_broker_fill(
+                source=fill_source,
+                book_key=fill_book_key,
+                explain_json=explain_json,
+            ):
+                continue
             fees_total += float(fees or 0.0)
             if side is None:
                 side = s

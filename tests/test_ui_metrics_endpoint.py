@@ -43,7 +43,9 @@ def test_ui_metrics_snapshot_full_sources_has_stable_shape() -> None:
             "blocked": False,
             "status": "ok",
             "ts_ms": now_ms - 3_000,
-            "history": [{"ts_ms": now_ms - 3_000, "gross": 0.4, "net": -0.1, "drawdown": 0.03}],
+            "caps": {"gross": 1.0, "net": 0.6, "drawdown": 0.06, "vol_target": 0.02},
+            "vol_target": {"enabled": True, "target_vol": 0.02, "scale": 0.9, "ts_ms": now_ms - 3_000},
+            "history": [{"ts_ms": now_ms - 3_000, "gross": 0.4, "net": -0.1, "vol_proxy": 0.018, "drawdown": 0.03}],
         },
         broker={
             "ok": True,
@@ -70,6 +72,9 @@ def test_ui_metrics_snapshot_full_sources_has_stable_shape() -> None:
     assert payload["positions"]["target_count"] == 1
     assert payload["positions"]["live_count"] == 1
     assert payload["risk"]["ready"] is True
+    assert payload["risk"]["vol_proxy"] == 0.018
+    assert payload["risk"]["caps"]["drawdown"] == 0.06
+    assert payload["risk"]["vol_target"]["target_vol"] == 0.02
     assert payload["sources"]["pnl"]["missing"] is False
     assert payload["summary"]["missing_sources"] == []
 

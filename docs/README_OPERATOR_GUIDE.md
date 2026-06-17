@@ -223,6 +223,7 @@ Common reasons include:
 - governance blocked promotion or use
 - execution mode is restrictive
 - kill switch is active
+- `DISABLE_LIVE_EXECUTION` is truthy in the process environment
 
 Model-level execution kill switch is also active through the same execution gate.
 It is additive to the global kill switch and blocks only the affected model's orders.

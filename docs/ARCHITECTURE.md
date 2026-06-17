@@ -214,6 +214,7 @@ The execution path is multi-stage and intentionally layered.
 2. `engine/execution/broker_apply_orders.py` is the main live order-application entrypoint.
 3. `broker_apply_orders.py` evaluates the hard execution barrier from `engine/runtime/gates.py`.
 4. It then applies additional live-only controls:
+   - `DISABLE_LIVE_EXECUTION` emergency live-capital kill switch
    - execution mode and arming checks
    - payload freshness checks
    - preflight
@@ -229,6 +230,7 @@ Two execution gates coexist by design:
 
 - `execution_gate_snapshot()` is the broad runtime barrier. It blocks execution when lifecycle, execution mode, portfolio risk, or kill-switch state make the runtime unsafe.
 - `engine.execution.kill_switch.execution_allowed()` is the more detailed kill-switch cascade used inside broker paths and other jobs.
+- `DISABLE_LIVE_EXECUTION` is a process-environment emergency stop for live capital. Any non-empty value except `0`, `false`, `no`, or `off` blocks live mode even when the runtime is `LIVE` and armed.
 
 ### Post-submit path
 

@@ -14,6 +14,11 @@ from typing import Any, Dict, Optional, Tuple, List
 
 from engine.audit.chain import append_chain_row
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.live_execution_control import (
+    DISABLE_LIVE_EXECUTION_ENV,
+    DISABLE_LIVE_EXECUTION_REASON,
+    live_execution_disabled,
+)
 from engine.runtime.storage import DB_PATH, connect, _table_exists, run_write_txn
 from engine.runtime.event_log import append_event
 
@@ -249,6 +254,39 @@ def _env_global_enabled() -> bool:
         if _env_truthy(os.environ.get(k)):
             return True
     return False
+
+def _env_live_mode_requested() -> bool:
+    for name in ("EXECUTION_MODE", "ENGINE_MODE", "OPERATOR_MODE", "MODE"):
+        if str(os.environ.get(name, "") or "").strip().lower() == "live":
+            return True
+    return False
+
+def _db_live_mode_requested(con: Any) -> bool:
+    if con is None:
+        return False
+    try:
+        if not _table_exists(con, "execution_mode"):
+            return False
+        row = con.execute("SELECT mode FROM execution_mode WHERE id=1").fetchone()
+        return bool(row and str(row[0] or "").strip().lower() == "live")
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_EXECUTION_MODE_LIVE_CHECK_FAILED",
+            e,
+            once_key="execution_mode_live_check",
+        )
+        return False
+
+def _live_execution_disabled_block(con: Any = None) -> Optional[Tuple[bool, str, Dict[str, Any]]]:
+    if not live_execution_disabled():
+        return None
+    if not (_env_live_mode_requested() or _db_live_mode_requested(con)):
+        return None
+    return False, DISABLE_LIVE_EXECUTION_REASON, {
+        "scope": "global",
+        "key": DISABLE_LIVE_EXECUTION_ENV,
+        "env": DISABLE_LIVE_EXECUTION_ENV,
+    }
 
 def _parse_csv_env(name: str) -> Dict[str, bool]:
     raw = _s(os.environ.get(name))
@@ -767,6 +805,17 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 
 def _equity_series(con, lookback_ms: Optional[int] = None, limit: Optional[int] = None) -> List[Tuple[int, float]]:
+    try:
+        if not _table_exists(con, "equity_history"):
+            return []
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_EQUITY_SERIES_TABLE_CHECK_FAILED",
+            e,
+            once_key="equity_series_table_check",
+        )
+        return []
+
     q = "SELECT ts_ms, equity FROM equity_history"
     args: List[Any] = []
     if lookback_ms is not None and int(lookback_ms) > 0:
@@ -775,7 +824,15 @@ def _equity_series(con, lookback_ms: Optional[int] = None, limit: Optional[int] 
     q += " ORDER BY ts_ms ASC"
     if limit is not None and int(limit) > 0:
         q += f" LIMIT {int(limit)}"
-    rows = con.execute(q, tuple(args)).fetchall()
+    try:
+        rows = con.execute(q, tuple(args)).fetchall()
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_EQUITY_SERIES_QUERY_FAILED",
+            e,
+            once_key="equity_series_query",
+        )
+        return []
     out: List[Tuple[int, float]] = []
     for ts_ms, equity in rows or []:
         try:
@@ -1102,6 +1159,39 @@ def _capital_risk_trigger(con) -> Optional[Dict[str, Any]]:
 
     now_ms = _now_ms()
 
+    try:
+        from engine.strategy.drawdown_state import evaluate_current_drawdown
+
+        drawdown_state = evaluate_current_drawdown(con, now_ms=int(now_ms))
+        drawdown_state_payload = drawdown_state.to_dict()
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_DRAWDOWN_STATE_EVALUATION_FAILED",
+            e,
+            once_key="drawdown_state_evaluation",
+        )
+        drawdown_state_payload = {
+            "ok": False,
+            "reason_code": "DRAWDOWN_STATE_EVALUATION_FAILED",
+            "error_type": type(e).__name__,
+            "error": str(e),
+        }
+
+    live_mode_requested = bool(_env_live_mode_requested() or _db_live_mode_requested(con))
+    if not bool(drawdown_state_payload.get("ok")):
+        if not live_mode_requested:
+            return None
+        reason_code = str(drawdown_state_payload.get("reason_code") or "DRAWDOWN_STATE_UNAVAILABLE")
+        return {
+            "reason": f"capital_drawdown_state_unavailable reason={reason_code}",
+            "meta": {
+                "trigger": "drawdown_state_unavailable",
+                "reason_code": reason_code,
+                "drawdown_state": drawdown_state_payload,
+                "ts_ms": int(now_ms),
+            },
+        }
+
     day_series = _equity_series(con, lookback_ms=86400000)
     if len(day_series) >= 2:
         day_dd = _drawdown_pct(day_series)
@@ -1332,6 +1422,10 @@ def execution_allowed(
                 "key": lifecycle_state or "UNKNOWN"
             }
 
+    disabled_live_block = _live_execution_disabled_block(con)
+    if disabled_live_block is not None:
+        return disabled_live_block
+
     # ENV overrides (fail-closed)
     if _env_global_enabled():
         return False, "kill_switch_env_global", {"scope": "global", "key": "global"}
@@ -1351,6 +1445,10 @@ def execution_allowed(
         owns = True
 
     try:
+        disabled_live_block = _live_execution_disabled_block(con)
+        if disabled_live_block is not None:
+            return disabled_live_block
+
         try:
             from engine.runtime.storage import init_db
             init_db()
@@ -1408,7 +1506,25 @@ def execution_allowed(
                 meta.setdefault("until_ts_ms", int(now_ms + cooldown_ms))
             meta.setdefault("trigger_type", _s(meta.get("trigger") or "capital_risk"))
 
-            snapshot_payload = _portfolio_snapshot(con, meta=meta)
+            try:
+                snapshot_payload = _portfolio_snapshot(con, meta=meta)
+            except Exception as e:
+                _warn_nonfatal(
+                    "KILL_SWITCH_PORTFOLIO_SNAPSHOT_FOR_CAPITAL_BREACH_FAILED",
+                    e,
+                    once_key="portfolio_snapshot_for_capital_breach",
+                )
+                snapshot_payload = {
+                    "ts_ms": int(now_ms),
+                    "equity": 0.0,
+                    "gross_exposure": 0.0,
+                    "net_exposure": 0.0,
+                    "per_symbol_weights": {},
+                    "positions": [],
+                    "rolling_drawdown": 0.0,
+                    "var_pct": 0.0,
+                    "metadata": dict(meta or {}),
+                }
             meta.setdefault("equity", float(snapshot_payload.get("equity", 0.0)))
             meta.setdefault("positions", int(len(snapshot_payload.get("positions") or [])))
             meta.setdefault("concentration", float(_safe_float((meta or {}).get("weight", meta.get("top3_weight", 0.0)), 0.0)))

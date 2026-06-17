@@ -58,6 +58,7 @@ Operator read path:
 
 - Dashboard: [ui/dashboard.html](ui/dashboard.html)
 - Data-source management: [ui/data_sources.html](ui/data_sources.html)
+- Broker configuration: dashboard broker panel backed by `/api/broker/config`, `/api/broker/test_connection`, and `/api/broker/audit`
 - Operator console: [boot/operator_ui.html](boot/operator_ui.html) and [boot/operator_server.js](boot/operator_server.js)
 - Browser terminal: [ui/terminal/terminal.html](ui/terminal/terminal.html)
 

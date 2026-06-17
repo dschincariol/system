@@ -36,6 +36,15 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "BROKER_START_CASH",
         "EXECUTION_MODE",
         "ENGINE_MODE",
+        "OPERATOR_MODE",
+        "MODE",
+        "ENGINE_RUNTIME_MODE",
+        "RUNTIME_MODE",
+        "ENV",
+        "TS_ENV",
+        "PROD_LOCK",
+        "LIVE_TRADING_CONFIRM",
+        "STARTUP_HEALTH_LATE_FAILURE",
         "EXEC_ADAPTIVE_SLICING",
         "BROKER_LATENCY_SLEEP",
         "KILL_SWITCH_GLOBAL",
@@ -44,7 +53,24 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "KILL_SWITCH_SYMBOLS",
         "KILL_SWITCH_REGIMES",
         "KILL_SWITCH_MODELS",
+        "KILL_SWITCH_REQUIRE_FRESH_DATA",
+        "KILL_SWITCH_REQUIRE_FRESH_JOBS",
+        "KILL_SWITCH_REQUIRED_JOBS",
+        "KILL_SWITCH_MODEL_MAX_DRAWDOWN",
+        "KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES",
+        "CAPITAL_AWARE_KILL_SWITCH",
+        "MODEL_AWARE_KILL_SWITCH",
+        "CAPITAL_STOP_DRAWDOWN",
+        "DRAWDOWN_MIN_HISTORY_POINTS",
         "DISABLE_LIVE_EXECUTION",
+        "EXECUTION_PRELIVE_RECONCILE",
+        "EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS",
+        "EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_ACTOR",
+        "EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_REASON",
+        "TS_STORAGE_BACKEND",
+        "TS_PG_DSN",
+        "PG_DSN",
+        "TIMESCALE_DSN",
         "TS_PG_SCHEMA",
         "TS_PG_SCHEMA_PER_DB_PATH",
         "TS_REDIS_KEY_PREFIX",
@@ -61,6 +87,15 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["BROKER_NAME"] = "sim"
         os.environ["BROKER_FAILOVER"] = "sim"
         os.environ["BROKER_START_CASH"] = "100000"
+        os.environ.pop("OPERATOR_MODE", None)
+        os.environ.pop("MODE", None)
+        os.environ.pop("ENGINE_RUNTIME_MODE", None)
+        os.environ.pop("RUNTIME_MODE", None)
+        os.environ.pop("ENV", None)
+        os.environ.pop("TS_ENV", None)
+        os.environ.pop("PROD_LOCK", None)
+        os.environ.pop("LIVE_TRADING_CONFIRM", None)
+        os.environ.pop("STARTUP_HEALTH_LATE_FAILURE", None)
         os.environ["EXEC_ADAPTIVE_SLICING"] = "0"
         os.environ["BROKER_LATENCY_SLEEP"] = "0"
         os.environ["KILL_SWITCH_GLOBAL"] = "0"
@@ -69,7 +104,24 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["KILL_SWITCH_SYMBOLS"] = ""
         os.environ["KILL_SWITCH_REGIMES"] = ""
         os.environ["KILL_SWITCH_MODELS"] = ""
+        os.environ["KILL_SWITCH_REQUIRE_FRESH_DATA"] = "1"
+        os.environ["KILL_SWITCH_REQUIRE_FRESH_JOBS"] = "1"
+        os.environ["KILL_SWITCH_REQUIRED_JOBS"] = "ingestion_runtime,process_events"
+        os.environ["KILL_SWITCH_MODEL_MAX_DRAWDOWN"] = "0"
+        os.environ["KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES"] = "0"
+        os.environ["CAPITAL_AWARE_KILL_SWITCH"] = "1"
+        os.environ["MODEL_AWARE_KILL_SWITCH"] = "1"
+        os.environ["CAPITAL_STOP_DRAWDOWN"] = "0.25"
+        os.environ["DRAWDOWN_MIN_HISTORY_POINTS"] = "5"
         os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+        os.environ["EXECUTION_PRELIVE_RECONCILE"] = "1"
+        os.environ.pop("EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS", None)
+        os.environ.pop("EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_ACTOR", None)
+        os.environ.pop("EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_REASON", None)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
+        os.environ.pop("TS_PG_DSN", None)
+        os.environ.pop("PG_DSN", None)
+        os.environ.pop("TIMESCALE_DSN", None)
         os.environ.pop("TS_PG_SCHEMA", None)
         os.environ["TS_PG_SCHEMA_PER_DB_PATH"] = "1"
         os.environ["TS_REDIS_KEY_PREFIX"] = f"broker_apply_orders_modes_{Path(self.tmp.name).name}"
@@ -77,6 +129,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["ENGINE_MODE"] = "paper"
 
         self._reload_runtime_modules()
+        self._reset_runtime_controls()
 
     def tearDown(self) -> None:
         try:
@@ -97,9 +150,13 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         (
             _,
             self.storage,
+            self.state_cache,
+            self.risk_state,
             self.runtime_meta,
             self.lifecycle_state,
             self.execution_mode,
+            self.drawdown_state,
+            self.capital_guard,
             self.kill_switch,
             self.portfolio_execution_intents,
             self.execution_policy_engine,
@@ -109,9 +166,13 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         ) = _reload_modules(
             "engine.runtime.db_guard",
             "engine.runtime.storage",
+            "engine.runtime.state_cache",
+            "engine.runtime.risk_state",
             "engine.runtime.runtime_meta",
             "engine.runtime.lifecycle_state",
             "engine.execution.execution_mode",
+            "engine.strategy.drawdown_state",
+            "engine.strategy.capital_guard",
             "engine.execution.kill_switch",
             "engine.strategy.portfolio_execution_intents",
             "engine.execution.execution_policy_engine",
@@ -119,6 +180,23 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
             "engine.execution.broker_sim",
             "engine.execution.broker_apply_orders",
         )
+
+    def _reset_runtime_controls(self) -> None:
+        self.storage.init_db()
+        for namespace in ("risk_state", "risk_state_row", "api_read", "portfolio_snapshot"):
+            self.state_cache.cache_invalidate_namespace(namespace)
+        for key, value in (
+            ("trading_state", "enabled"),
+            ("stop_reason", ""),
+            ("portfolio_risk_block", "0"),
+            ("portfolio_risk_info", ""),
+            ("portfolio_risk_status", ""),
+            ("execution_pause", "0"),
+            ("tse_state", "NONE"),
+            ("tse_action", "NONE"),
+            ("tse_reason", ""),
+        ):
+            self.risk_state.set_state(key, value)
 
     def _db_fetchone(self, sql: str, params: Iterable[Any] = ()) -> Any:
         con = self.storage.connect_ro_direct()
@@ -418,6 +496,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertEqual(self._db_fetchone("SELECT status FROM order_events ORDER BY id DESC LIMIT 1"), "blocked")
 
     def test_live_mode_blocked_when_not_allowed(self) -> None:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "0"
         now_ms = self._seed_runtime_live()
         self._set_mode("live", armed=0)
         self._seed_portfolio_order(ts_ms=now_ms)
@@ -437,6 +516,62 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_events") or 0), 1)
         self.assertEqual(self._db_fetchone("SELECT event_type FROM order_events ORDER BY id DESC LIMIT 1"), "execution_block")
         self.assertEqual(self._db_fetchone("SELECT status FROM order_events ORDER BY id DESC LIMIT 1"), "blocked")
+
+    def test_live_mode_armed_blocked_by_disable_live_execution(self) -> None:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+        now_ms = self._seed_runtime_live()
+        self._set_mode("live", armed=1)
+        self._seed_portfolio_order(ts_ms=now_ms)
+
+        rc, out, _ = self._run_main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "kill_switch")
+        self.assertEqual(out["reason"], "disable_live_execution_env")
+        self.assertEqual(out["meta"]["key"], "DISABLE_LIVE_EXECUTION")
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+        self.assertEqual(
+            int(self._db_fetchone("SELECT COUNT(*) FROM event_log WHERE event_type='order_decision'") or 0),
+            0,
+        )
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_commands") or 0), 0)
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_events") or 0), 1)
+        self.assertEqual(self._db_fetchone("SELECT event_type FROM order_events ORDER BY id DESC LIMIT 1"), "execution_block")
+        self.assertEqual(self._db_fetchone("SELECT status FROM order_events ORDER BY id DESC LIMIT 1"), "blocked")
+
+    def test_live_mode_blocks_disabled_prelive_reconcile_before_position_reconcile(self) -> None:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "0"
+        os.environ["EXECUTION_PRELIVE_RECONCILE"] = "0"
+        now_ms = self._seed_runtime_live()
+        self._set_mode("live", armed=1)
+        self._seed_portfolio_order(ts_ms=now_ms)
+
+        allow_live_gate = {
+            "ok": True,
+            "allowed": True,
+            "allow_execution_pipeline": True,
+            "real_trading_allowed": True,
+            "mode": "live",
+            "armed": 1,
+            "reason": "mode_live_armed",
+        }
+
+        with patch.object(self.broker_apply_orders, "execution_gate_snapshot", return_value=allow_live_gate):
+            with patch("engine.runtime.health.run_preflight", return_value={"ok": True}):
+                with patch.object(
+                    self.broker_apply_orders,
+                    "pre_live_position_reconcile",
+                    side_effect=AssertionError("position reconcile should not run after policy block"),
+                ):
+                    rc, out, _ = self._run_main(competition_policy={})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "position_reconcile_policy")
+        self.assertEqual(out["reason"], "prelive_reconcile_disabled_for_live")
+        self.assertFalse(bool(out["prelive_reconcile_policy"]["ok"]))
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
 
     def test_execution_policy_applied(self) -> None:
         now_ms = self._seed_runtime_live()

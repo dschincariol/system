@@ -206,6 +206,9 @@ def _normalize_exposure_and_risk(
     risk_history = _as_list(portfolio_risk.get("history"))
     risk_latest = _as_dict(risk_history[0] if risk_history else {})
     risk_summary_block = _as_dict(portfolio_risk.get("summary"))
+    risk_info = _as_dict(portfolio_risk.get("info"))
+    risk_caps = _as_dict(portfolio_risk.get("caps"))
+    vol_target = _as_dict(portfolio_risk.get("vol_target"))
 
     gross = _pick_num(
         risk_summary.get("gross_exposure"),
@@ -217,7 +220,12 @@ def _normalize_exposure_and_risk(
         risk_latest.get("net"),
         risk_summary_block.get("net"),
     )
-    drawdown = _pick_num(risk_summary.get("max_drawdown_pct"), risk_latest.get("drawdown"))
+    drawdown = _pick_num(risk_summary.get("max_drawdown_pct"), risk_latest.get("drawdown"), risk_summary_block.get("drawdown"))
+    vol_proxy = _pick_num(
+        risk_latest.get("vol_proxy"),
+        risk_summary_block.get("portfolio_vol_proxy"),
+        risk_info.get("portfolio_vol_proxy"),
+    )
     barrier = _as_dict(risk_summary.get("execution_barrier"))
     risk_status = str(portfolio_risk.get("status") or "unknown")
     blocked = (
@@ -241,6 +249,9 @@ def _normalize_exposure_and_risk(
     }
     risk = {
         "max_drawdown_pct": drawdown,
+        "vol_proxy": vol_proxy,
+        "vol_target": vol_target,
+        "caps": risk_caps,
         "status": risk_status,
         "blocked": blocked,
         "execution_barrier": barrier,

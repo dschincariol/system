@@ -11,6 +11,17 @@ services:
       - "${TIMESCALE_PORT:-5432}:5432"
     volumes:
       - timescaledb-data:/var/lib/postgresql/data
+      - ${TRADING_BACKUP_ROOT:-/var/backups/trading}:/var/backups/trading
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /var/backups/trading/wal/%f && cp %p /var/backups/trading/wal/%f || test -f /var/backups/trading/wal/%f
+      - -c
+      - archive_timeout=60s
     healthcheck:
       test:
         - CMD-SHELL

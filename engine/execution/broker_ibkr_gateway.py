@@ -39,9 +39,19 @@ import logging
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
+from engine.execution.broker_failover_policy import terminal_broker_failure
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
+from engine.execution.broker_submission_recovery import (
+    record_submission_unrecorded,
+    unrecorded_submission_gate,
+)
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.live_execution_control import (
+    disabled_live_execution_gate,
+    live_execution_disabled,
+    prelive_reconcile_policy_gate,
+)
 from engine.runtime.platform import default_ibkr_host
 from engine.runtime.storage import connect
 from engine.execution.kill_switch import execution_allowed
@@ -87,6 +97,10 @@ except Exception:
 
 LOG = logging.getLogger("engine.execution.broker_ibkr_gateway")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+class IBKRCredentialError(RuntimeError):
+    """Raised when required IBKR connection credentials/config are absent."""
 
 
 def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
@@ -139,6 +153,87 @@ def _safe_i(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _explicit_ibkr_config_required() -> bool:
+    return (
+        str(os.environ.get("ENGINE_MODE", "") or "").strip().lower() == "live"
+        or str(os.environ.get("ENGINE_SUPERVISED", "")).strip().lower() in ("1", "true", "yes", "y", "on")
+        or str(os.environ.get("ENV", "")).strip().lower() in ("prod", "production")
+    )
+
+
+def ibkr_credentials_status(*, require_explicit: Optional[bool] = None) -> Dict[str, Any]:
+    required = _explicit_ibkr_config_required() if require_explicit is None else bool(require_explicit)
+    raw_host = str(os.environ.get("IBKR_HOST", "") or "").strip()
+    raw_port = str(os.environ.get("IBKR_PORT", "") or "").strip()
+    raw_client_id = str(os.environ.get("IBKR_CLIENT_ID", "") or "").strip()
+
+    host = raw_host or default_ibkr_host()
+    port = _safe_i(raw_port or "7497", 7497)
+    client_id = _safe_i(raw_client_id or "42", 42)
+
+    missing = []
+    if required and not raw_host:
+        missing.append("IBKR_HOST")
+    if required and not raw_port:
+        missing.append("IBKR_PORT")
+    if required and not raw_client_id:
+        missing.append("IBKR_CLIENT_ID")
+
+    invalid = []
+    if port <= 0 or port > 65535:
+        invalid.append("IBKR_PORT")
+    if client_id < 0:
+        invalid.append("IBKR_CLIENT_ID")
+
+    ok = not missing and not invalid
+    return {
+        "ok": ok,
+        "broker": "ibkr",
+        "status": "configured" if ok else "missing_credentials",
+        "required_explicit": bool(required),
+        "configured_fields": {
+            "IBKR_HOST": bool(raw_host),
+            "IBKR_PORT": bool(raw_port),
+            "IBKR_CLIENT_ID": bool(raw_client_id),
+        },
+        "missing": missing,
+        "invalid": invalid,
+        "host": host,
+        "port": int(port),
+        "client_id": int(client_id),
+    }
+
+
+def _ibkr_terminal_failure(
+    *,
+    status: str,
+    failure_kind: str,
+    detail: str = "",
+    error: Any = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return terminal_broker_failure(
+        broker="ibkr",
+        status=status,
+        failure_kind=failure_kind,
+        detail=detail,
+        error=error,
+        extra=extra,
+    )
+
+
+def _ibkr_credentials_block(*, require_explicit: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+    state = ibkr_credentials_status(require_explicit=require_explicit)
+    if bool(state.get("ok")):
+        return None
+    return _ibkr_terminal_failure(
+        status="missing_credentials",
+        failure_kind="credential",
+        detail="ibkr_connection_credentials_missing",
+        extra={"credentials": state},
+    )
+
+
 def _set_order_total_quantity(order: Any, qty: float) -> None:
     # ibapi's runtime object accepts numeric assignment here, but its Python
     # surface is not typed precisely enough for static analysis.
@@ -155,6 +250,8 @@ def _consume_next_order_id(app: Any) -> int:
 
 
 def _real_trading_gate() -> Dict[str, Any]:
+    if live_execution_disabled():
+        return disabled_live_execution_gate(source="engine.execution.broker_ibkr_gateway")
     if _execution_gate_snapshot is None or _kill_switch_snapshot is None or _get_execution_mode is None:
         return {
             "ok": False,
@@ -169,6 +266,17 @@ def _real_trading_gate() -> Dict[str, Any]:
 
 
 def _prelive_reconcile_or_block(broker: str = "ibkr") -> Optional[Dict[str, Any]]:
+    policy_block = prelive_reconcile_policy_gate(
+        source="engine.execution.broker_ibkr_gateway",
+        engine_mode="live",
+        broker=str(broker),
+        audit_override=True,
+    )
+    if policy_block is not None:
+        return policy_block
+    unrecorded_block = unrecorded_submission_gate(broker=str(broker), connect_fn=connect)
+    if unrecorded_block is not None:
+        return unrecorded_block
     if os.environ.get("EXECUTION_PRELIVE_RECONCILE", "1") != "1":
         return None
     if not callable(_prelive_reconcile):
@@ -206,8 +314,8 @@ def _prelive_reconcile_or_block(broker: str = "ibkr") -> Optional[Dict[str, Any]
 
 
 IBKR_HOST = os.environ.get("IBKR_HOST", default_ibkr_host()).strip()
-IBKR_PORT = int(os.environ.get("IBKR_PORT", "7497"))
-IBKR_CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "42"))
+IBKR_PORT = _safe_i(os.environ.get("IBKR_PORT", "7497"), 7497)
+IBKR_CLIENT_ID = _safe_i(os.environ.get("IBKR_CLIENT_ID", "42"), 42)
 
 ORDER_TIF = os.environ.get("IBKR_ORDER_TIF", "DAY").strip().upper()
 MAX_ORDERS_PER_PASS = int(os.environ.get("IBKR_MAX_ORDERS_PER_PASS", "25"))
@@ -444,18 +552,12 @@ def _apply_execution_risk_caps(
 def _connect_ib():
     # Connection setup is intentionally strict in supervised/prod mode so a
     # partially configured IBKR deployment fails early and visibly.
-    strict_runtime = (
-        str(os.environ.get("ENGINE_SUPERVISED", "")).strip().lower() in ("1", "true", "yes", "y", "on")
-        or str(os.environ.get("ENV", "")).strip().lower() in ("prod", "production")
-    )
-    if strict_runtime:
-        missing = [
-            name
-            for name in ("IBKR_HOST", "IBKR_PORT", "IBKR_CLIENT_ID")
-            if not str(os.environ.get(name, "") or "").strip()
-        ]
-        if missing:
-            raise RuntimeError("missing_required_ibkr_env:" + ",".join(missing))
+    config_state = ibkr_credentials_status(require_explicit=_explicit_ibkr_config_required())
+    if not bool(config_state.get("ok")):
+        missing = ",".join(str(item) for item in list(config_state.get("missing") or []))
+        invalid = ",".join(str(item) for item in list(config_state.get("invalid") or []))
+        detail = missing or invalid or "unknown"
+        raise IBKRCredentialError("missing_required_ibkr_env:" + detail)
 
     from ibapi.client import EClient
     from ibapi.wrapper import EWrapper
@@ -577,7 +679,11 @@ def _connect_ib():
             self._open_orders_end_evt.set()
 
     app = App()
-    app.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID)
+    app.connect(
+        str(config_state.get("host") or IBKR_HOST),
+        int(config_state.get("port") or IBKR_PORT),
+        clientId=int(config_state.get("client_id") or IBKR_CLIENT_ID),
+    )
 
     t = threading.Thread(target=app.run, daemon=True)
     t.start()
@@ -780,6 +886,9 @@ def apply_latest_portfolio_orders_live(
         gate = _real_trading_gate()
         if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
             return {"ok": False, "status": "real_trading_blocked", "broker": "ibkr", "gate": gate}
+        credentials_block = _ibkr_credentials_block(require_explicit=True)
+        if credentials_block is not None:
+            return credentials_block
         reconcile_block = _prelive_reconcile_or_block("ibkr")
         if reconcile_block is not None:
             return reconcile_block
@@ -1013,33 +1122,99 @@ def apply_latest_portfolio_orders_live(
                 order_meta["order_uid"] = str(order_uid)
                 order_meta["idempotency_status"] = "submitted"
 
-                log_submit(
-                    client_order_id=str(client_order_id),
-                    broker="ibkr",
-                    symbol=symbol,
-                    qty=float(delta),
-                    submit_ts_ms=int(submit_ts_ms),
-                    ref_px=float(px),
-                    broker_order_id=str(oid),
-                    portfolio_orders_id=order_id,
-                    source_alert_id=source_alert_id,
-                    extra=order_meta,
-                    expected_px=float(px),
-                    mid_px=float(px),
-                    bid_px=bid_px,
-                    ask_px=ask_px,
-                    spread_bps=float(spread_bps),
-                    order_uid=str(order_uid),
-                    idempotency_status="submitted",
-                )
+                try:
+                    log_submit(
+                        client_order_id=str(client_order_id),
+                        broker="ibkr",
+                        symbol=symbol,
+                        qty=float(delta),
+                        submit_ts_ms=int(submit_ts_ms),
+                        ref_px=float(px),
+                        broker_order_id=str(oid),
+                        portfolio_orders_id=order_id,
+                        source_alert_id=source_alert_id,
+                        extra=order_meta,
+                        expected_px=float(px),
+                        mid_px=float(px),
+                        bid_px=bid_px,
+                        ask_px=ask_px,
+                        spread_bps=float(spread_bps),
+                        order_uid=str(order_uid),
+                        idempotency_status="submitted",
+                    )
+                except Exception as e:
+                    _warn_nonfatal(
+                        "BROKER_IBKR_GATEWAY_LOG_SUBMIT_FAILED",
+                        e,
+                        once_key="log_submit",
+                        client_order_id=str(client_order_id),
+                        broker_order_id=str(oid),
+                        order_uid=str(order_uid),
+                        symbol=str(symbol),
+                    )
+                    return record_submission_unrecorded(
+                        con=con,
+                        broker="ibkr",
+                        symbol=str(symbol),
+                        qty=float(delta),
+                        order_uid=str(order_uid),
+                        client_order_id=str(client_order_id),
+                        broker_order_id=str(oid),
+                        submit_ts_ms=int(submit_ts_ms),
+                        portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                        portfolio_ts_ms=int(ts_ms),
+                        source_order_id=(
+                            _safe_i(o.get("source_order_id"))
+                            if isinstance(o, dict) and o.get("source_order_id") is not None
+                            else None
+                        ),
+                        source_alert_id=source_alert_id,
+                        payload={**dict(order_meta or {}), "order_uid": str(order_uid), "idempotency_status": "submission_unrecorded"},
+                        error=e,
+                        stage="log_submit",
+                        submitted_n=int(n),
+                    )
 
-                mark_order_submission_submitted(
-                    con=con,
-                    order_uid=str(order_uid),
-                    client_order_id=str(client_order_id),
-                    broker_order_id=str(oid),
-                    submit_ts_ms=int(submit_ts_ms),
-                )
+                try:
+                    mark_order_submission_submitted(
+                        con=con,
+                        order_uid=str(order_uid),
+                        client_order_id=str(client_order_id),
+                        broker_order_id=str(oid),
+                        submit_ts_ms=int(submit_ts_ms),
+                    )
+                except Exception as e:
+                    _warn_nonfatal(
+                        "BROKER_IBKR_GATEWAY_MARK_ORDER_SUBMISSION_SUBMITTED_FAILED",
+                        e,
+                        once_key="mark_order_submission_submitted",
+                        client_order_id=str(client_order_id),
+                        broker_order_id=str(oid),
+                        order_uid=str(order_uid),
+                        symbol=str(symbol),
+                    )
+                    return record_submission_unrecorded(
+                        con=con,
+                        broker="ibkr",
+                        symbol=str(symbol),
+                        qty=float(delta),
+                        order_uid=str(order_uid),
+                        client_order_id=str(client_order_id),
+                        broker_order_id=str(oid),
+                        submit_ts_ms=int(submit_ts_ms),
+                        portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                        portfolio_ts_ms=int(ts_ms),
+                        source_order_id=(
+                            _safe_i(o.get("source_order_id"))
+                            if isinstance(o, dict) and o.get("source_order_id") is not None
+                            else None
+                        ),
+                        source_alert_id=source_alert_id,
+                        payload={**dict(order_meta or {}), "order_uid": str(order_uid), "idempotency_status": "submission_unrecorded"},
+                        error=e,
+                        stage="mark_order_submission_submitted",
+                        submitted_n=int(n),
+                    )
 
                 if str(order_type).upper().strip() == "LIMIT":
                     try:
@@ -1173,6 +1348,16 @@ def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str
     started_ms = int(time.time() * 1000)
     last_error = None
     max_retries = max(1, int(retries or 1))
+    credentials_block = _ibkr_credentials_block(require_explicit=_explicit_ibkr_config_required())
+    if credentials_block is not None:
+        credentials_block.update(
+            {
+                "state": "configuration_invalid",
+                "latency_ms": int(time.time() * 1000) - int(started_ms),
+                "attempt": 0,
+            }
+        )
+        return credentials_block
 
     for attempt in range(1, max_retries + 1):
         app = None
@@ -1214,6 +1399,45 @@ def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str
         "latency_ms": int(time.time() * 1000) - int(started_ms),
         "attempt": int(max_retries),
         "error": str(last_error or "ibkr_connect_failed"),
+    }
+
+
+def ibkr_startup_preflight(*, validate_reachability: bool = True) -> Dict[str, Any]:
+    credentials = ibkr_credentials_status(require_explicit=True)
+    blockers: list[str] = []
+    if not bool(credentials.get("ok")):
+        blockers.append("ibkr_credentials_missing")
+        return {
+            "ok": False,
+            "broker": "ibkr",
+            "status": "missing_credentials",
+            "reason": blockers[0],
+            "blockers": blockers,
+            "credentials": credentials,
+            "retryable": False,
+            "stop_failover": True,
+        }
+
+    reachability: Dict[str, Any] = {"ok": True, "state": "not_checked"}
+    if bool(validate_reachability):
+        reachability = dict(
+            ping_broker_connection(
+                timeout_s=float(os.environ.get("IBKR_CONNECT_TIMEOUT_S", "8")),
+                retries=int(os.environ.get("IBKR_CONNECT_RETRIES", "2")),
+            )
+            or {}
+        )
+        if not bool(reachability.get("ok")):
+            blockers.append("ibkr_reachability_failed")
+
+    return {
+        "ok": not blockers,
+        "broker": "ibkr",
+        "status": "ok" if not blockers else "ibkr_reachability_failed",
+        "reason": "ok" if not blockers else blockers[0],
+        "blockers": blockers,
+        "credentials": credentials,
+        "reachability": reachability,
     }
 
 
@@ -1266,6 +1490,9 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     reconcile_block = _prelive_reconcile_or_block("ibkr")
     if reconcile_block is not None:
         return reconcile_block
+    credentials_block = _ibkr_credentials_block(require_explicit=True)
+    if credentials_block is not None:
+        return credentials_block
     audit = record_broker_action_audit(
         broker="ibkr",
         action="order_submit_attempt",
@@ -1298,6 +1525,9 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     reconcile_block = _prelive_reconcile_or_block("ibkr")
     if reconcile_block is not None:
         return reconcile_block
+    credentials_block = _ibkr_credentials_block(require_explicit=True)
+    if credentials_block is not None:
+        return credentials_block
     audit = record_broker_action_audit(
         broker="ibkr",
         action="order_submit_attempt",

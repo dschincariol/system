@@ -357,6 +357,7 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
         stale_missing_fill_count = int(integrity.get("stale_missing_fill_count") or 0)
         fills_without_order_count = int(integrity.get("fills_without_order_count") or 0)
         unreconciled_order_reference_count = int(integrity.get("unreconciled_order_reference_count") or 0)
+        submission_unrecorded_count = int(integrity.get("submission_unrecorded_count") or 0)
         inconsistent_position_count = int(integrity.get("inconsistent_position_count") or 0)
         pricing_unavailable_count = int(integrity.get("pricing_unavailable_count") or 0)
 
@@ -378,12 +379,13 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
                 ),
             },
             "order_state_consistent": {
-                "ok": bool(execution_tables.get("ok")) and duplicate_order_count == 0 and duplicate_fill_count == 0 and stale_missing_fill_count == 0 and fills_without_order_count == 0 and unreconciled_order_reference_count == 0,
+                "ok": bool(execution_tables.get("ok")) and duplicate_order_count == 0 and duplicate_fill_count == 0 and stale_missing_fill_count == 0 and fills_without_order_count == 0 and unreconciled_order_reference_count == 0 and submission_unrecorded_count == 0,
                 "detail": (
                     f"duplicate_order_count={duplicate_order_count} "
                     f"duplicate_fill_count={duplicate_fill_count} "
                     f"fills_without_order_count={fills_without_order_count} "
                     f"unreconciled_order_reference_count={unreconciled_order_reference_count} "
+                    f"submission_unrecorded_count={submission_unrecorded_count} "
                     f"stale_missing_fill_count={stale_missing_fill_count}"
                 ),
             },
@@ -485,6 +487,17 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
                     "value": {
                         "fills_without_order_count": int(fills_without_order_count),
                         "unreconciled_order_reference_count": int(unreconciled_order_reference_count),
+                    },
+                }
+            )
+        if submission_unrecorded_count > 0:
+            alerts.append(
+                {
+                    "severity": "critical",
+                    "alert_type": "broker_submission_unrecorded_needs_reconcile",
+                    "value": {
+                        "submission_unrecorded_count": int(submission_unrecorded_count),
+                        "submissions": list(integrity.get("submission_unrecorded") or [])[:20],
                     },
                 }
             )

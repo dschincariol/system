@@ -75,7 +75,7 @@ Closest current substitutes:
 
 Known reference gaps:
 
-- The OpenAPI baseline now exists under [openapi/openapi.yaml](openapi/openapi.yaml), but the broader aggregated `/api/*` surface in [engine/api/api_ops.py](../engine/api/api_ops.py), [engine/api/api_market.py](../engine/api/api_market.py), fallback routes in [dashboard_server.py](../dashboard_server.py), and the separate Node operator server in [boot/operator_server.js](../boot/operator_server.js) still needs additional coverage.
+- The OpenAPI baseline now exists under [openapi/openapi.yaml](openapi/openapi.yaml) and covers the high-value system, jobs, data-source, broker-config, and browser-terminal contracts. The broader aggregated `/api/*` surface in [engine/api/api_ops.py](../engine/api/api_ops.py), [engine/api/api_market.py](../engine/api/api_market.py), fallback routes in [dashboard_server.py](../dashboard_server.py), and the separate Node operator server in [boot/operator_server.js](../boot/operator_server.js) still needs additional coverage.
 
 ## Governance
 

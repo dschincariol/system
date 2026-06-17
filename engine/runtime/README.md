@@ -36,6 +36,12 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
   Persistent runtime lifecycle state machine.
 - [health.py](health.py)
   Health snapshots and preflight checks used by UI and bootstrap.
+- [live_trading_preflight.py](live_trading_preflight.py)
+  Central fail-closed live deployment contract: execution mode, dashboard token, confirmation phrase, broker environment, startup broker preflight, initial kill-switch hold, backup evidence, pre-live reconciliation, and execution arming audit.
+- [live_execution_control.py](live_execution_control.py)
+  Shared emergency live-capital controls for `DISABLE_LIVE_EXECUTION` and pre-live reconciliation break-glass policy.
+- [backup_evidence.py](backup_evidence.py)
+  Backup, WAL archive, and restore-drill evidence freshness checks used by production preflight and live trading preflight.
 - [ingestion_status.py](ingestion_status.py)
   Per-pipeline ingestion health snapshots, counters, freshness, and summaries consumed by diagnostics and provider monitoring.
 - [alerts.py](alerts.py)

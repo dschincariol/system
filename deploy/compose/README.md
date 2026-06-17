@@ -29,6 +29,19 @@ docker compose \
   up -d --build
 ```
 
+The external TimescaleDB service archives WAL to
+`${TRADING_BACKUP_WAL_DIR:-/var/backups/trading/wal}`. On a production host,
+install the backup evidence gate after the stack env is populated:
+
+```bash
+sudo bash ops/server/install_backup_evidence_gate.sh --compose --restart-postgres --run-evidence
+```
+
+That command creates the host backup layout, installs the backup and evidence
+systemd timers, restarts/recreates the TimescaleDB service to apply the WAL
+archive bind mount, and writes the first timestamped backup/WAL/restore
+evidence report.
+
 4. Run the production preflight against the runtime container:
 
 ```bash

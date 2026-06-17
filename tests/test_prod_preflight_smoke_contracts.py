@@ -158,6 +158,31 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn("DASHBOARD_API_TOKEN must be set", errors[0])
 
+    def test_backup_restore_evidence_gate_fails_closed_when_required(self) -> None:
+        prod_preflight = _reload_module()
+
+        with patch.dict(os.environ, {"ENGINE_MODE": "live"}, clear=False):
+            with patch(
+                "engine.runtime.backup_evidence.backup_restore_evidence_snapshot",
+                return_value={
+                    "ok": False,
+                    "fresh": False,
+                    "required": True,
+                    "reason": "backup_evidence_wal_archive_stale",
+                    "blockers": ["backup_evidence_wal_archive_stale"],
+                    "policy": {"wal_archive_max_age_s": 120},
+                    "base_backup": {},
+                    "wal_archive": {},
+                    "restore_drill": {},
+                },
+            ):
+                notes, warnings, errors, state = prod_preflight._backup_restore_evidence_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(state["reason"], "backup_evidence_wal_archive_stale")
+        self.assertEqual(errors, ["backup restore evidence invalid: backup_evidence_wal_archive_stale"])
+
 
 if __name__ == "__main__":
     unittest.main()

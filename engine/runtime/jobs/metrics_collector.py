@@ -153,20 +153,25 @@ def _collect_snapshot() -> Dict[str, Any]:
                       SUM(CASE WHEN status='claimed' THEN 1 ELSE 0 END),
                       SUM(CASE WHEN status='submit_inflight_unknown' THEN 1 ELSE 0 END),
                       SUM(CASE WHEN status='submitted' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN status='submission_unrecorded' THEN 1 ELSE 0 END),
                       MIN(CASE WHEN status='claimed' THEN claimed_ts_ms ELSE NULL END),
-                      MIN(CASE WHEN status='submit_inflight_unknown' THEN updated_ts_ms ELSE NULL END)
+                      MIN(CASE WHEN status='submit_inflight_unknown' THEN updated_ts_ms ELSE NULL END),
+                      MIN(CASE WHEN status='submission_unrecorded' THEN updated_ts_ms ELSE NULL END)
                     FROM execution_order_idempotency
                     """
                 ).fetchone()
-                metrics["execution_claimed_queue_depth"] = float((row or [0, 0, 0, None, None])[0] or 0.0)
-                metrics["execution_unknown_submit_depth"] = float((row or [0, 0, 0, None, None])[1] or 0.0)
-                metrics["execution_submitted_depth"] = float((row or [0, 0, 0, None, None])[2] or 0.0)
+                metrics["execution_claimed_queue_depth"] = float((row or [0, 0, 0, 0, None, None, None])[0] or 0.0)
+                metrics["execution_unknown_submit_depth"] = float((row or [0, 0, 0, 0, None, None, None])[1] or 0.0)
+                metrics["execution_submitted_depth"] = float((row or [0, 0, 0, 0, None, None, None])[2] or 0.0)
+                metrics["execution_submission_unrecorded_depth"] = float((row or [0, 0, 0, 0, None, None, None])[3] or 0.0)
 
-                oldest_claimed_ts_ms = int((row or [0, 0, 0, None, None])[3] or 0)
-                oldest_unknown_ts_ms = int((row or [0, 0, 0, None, None])[4] or 0)
+                oldest_claimed_ts_ms = int((row or [0, 0, 0, 0, None, None, None])[4] or 0)
+                oldest_unknown_ts_ms = int((row or [0, 0, 0, 0, None, None, None])[5] or 0)
+                oldest_unrecorded_ts_ms = int((row or [0, 0, 0, 0, None, None, None])[6] or 0)
 
                 metrics["execution_oldest_claimed_age_ms"] = float((now_ms - oldest_claimed_ts_ms) if oldest_claimed_ts_ms > 0 else -1.0)
                 metrics["execution_oldest_unknown_submit_age_ms"] = float((now_ms - oldest_unknown_ts_ms) if oldest_unknown_ts_ms > 0 else -1.0)
+                metrics["execution_oldest_submission_unrecorded_age_ms"] = float((now_ms - oldest_unrecorded_ts_ms) if oldest_unrecorded_ts_ms > 0 else -1.0)
             except Exception as e:
                 _warn_nonfatal("METRICS_COLLECTOR_EXECUTION_IDEMPOTENCY_FAILED", e, once_key="execution_idempotency")
 

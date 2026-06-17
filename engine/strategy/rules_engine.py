@@ -12,11 +12,11 @@ import logging
 from typing import Any, Dict
 
 from engine.execution.kill_switch import activate, clear
-from engine.strategy.drawdown_state import get_current_drawdown
+from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.execution.exec_stats import get_exec_winrate_global, get_exec_stats_by_symbol
 from engine.strategy.drift_utils import get_max_drift_ratio, get_symbol_max_drift_ratio
 from engine.runtime.failure_diagnostics import log_failure
-from engine.runtime.storage import connect
+from engine.runtime.storage import _table_exists, connect
 
 LOG = logging.getLogger("rules_engine")
 
@@ -69,6 +69,22 @@ def _warn_nonfatal(event: str, error: BaseException, **extra: Any) -> None:
         extra=extra,
         persist=False,
     )
+
+
+def _live_mode_requested(con=None) -> bool | None:
+    for name in ("EXECUTION_MODE", "ENGINE_MODE", "OPERATOR_MODE", "MODE"):
+        if str(os.environ.get(name, "") or "").strip().lower() == "live":
+            return True
+    if con is None:
+        return False
+    try:
+        if not _table_exists(con, "execution_mode"):
+            return False
+        mode_row = con.execute("SELECT mode FROM execution_mode WHERE id=1").fetchone()
+        return bool(mode_row and str(mode_row[0] or "").strip().lower() == "live")
+    except Exception as e:
+        _warn_nonfatal("rules_engine_live_mode_check_failed", e)
+        return None
 
 def _detect_realized_exec_cost_spike(con) -> Dict[str, Any]:
     """
@@ -213,17 +229,35 @@ def evaluate_rules() -> Dict[str, Any]:
             _warn_nonfatal("rules_engine_exec_cost_spike_evaluation_failed", e)
 
         # Global drawdown
-        dd = 0.0
-        try:
-            dd = float(get_current_drawdown(con))
-        except Exception:
-            dd = 0.0
-        out["drawdown"] = float(dd)
+        drawdown_state = evaluate_current_drawdown(con)
+        out["drawdown_state"] = drawdown_state.to_dict()
+        if not drawdown_state.ok:
+            out["drawdown"] = None
+            if _live_mode_requested(con) is not False:
+                meta = {
+                    "trigger": "drawdown_state_unavailable",
+                    "reason_code": str(drawdown_state.reason_code),
+                    "drawdown_state": drawdown_state.to_dict(),
+                }
+                activate(
+                    "global",
+                    "global",
+                    f"rules_drawdown_state_unavailable reason={drawdown_state.reason_code}",
+                    meta=meta,
+                    action="AUTO",
+                    con=con,
+                )
+                out["actions"].append(
+                    {"scope": "global", "key": "global", "enabled": 1, "reason": "drawdown_state_unavailable"}
+                )
+        else:
+            dd = float(drawdown_state.drawdown or 0.0)
+            out["drawdown"] = float(dd)
 
-        if dd >= MAX_DD:
+        if drawdown_state.ok and dd >= MAX_DD:
             activate("global", "global", f"rules_drawdown dd={dd:.3f}", meta={"dd": dd}, action="AUTO", con=con)
             out["actions"].append({"scope": "global", "key": "global", "enabled": 1, "reason": "drawdown"})
-        else:
+        elif drawdown_state.ok:
             if AUTO_RESUME:
                 clear("global", "global", reason="rules_drawdown_clear", meta={"dd": dd}, con=con)
 

@@ -181,7 +181,15 @@ select_backup() {
 clear_target_dir() {
   local target="$1"
   local resolved
-  resolved="$(realpath -m "$target")"
+  if ! resolved="$(realpath -m "$target" 2>/dev/null)" || [ -z "$resolved" ]; then
+    resolved="$(python3 - "$target" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).expanduser().resolve(strict=False))
+PY
+)"
+  fi
   case "$resolved" in
     /|/var|/var/lib|/var/backups|/tmp)
       die unsafe_target_dir "target=${resolved}"
@@ -233,6 +241,12 @@ psql_restore() {
   PGUSER="$restore_user" psql -X -v ON_ERROR_STOP=1 -h "$socket_dir" -p "$restore_port" -d "$restore_db" "$@"
 }
 
+write_env_line() {
+  local key="$1"
+  local value="$2"
+  printf '%s=%q\n' "$key" "$value"
+}
+
 start_recovered_postgres() {
   local target="$1"
   local log_file="${target}/restore-postgres.log"
@@ -262,7 +276,7 @@ smoke_query() {
 }
 
 trip_kill_switch() {
-  local now_ms
+  local now_ms audit_requires_hash
   now_ms="$(date +%s%3N)"
   psql_restore <<SQL
 CREATE SCHEMA IF NOT EXISTS trading;
@@ -297,9 +311,29 @@ ON CONFLICT(scope, key) DO UPDATE SET
   actor=excluded.actor,
   meta_json=excluded.meta_json,
   updated_ts_ms=excluded.updated_ts_ms;
+SQL
+  audit_requires_hash="$(
+    psql_restore -Atqc "
+      SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'trading'
+          AND table_name = 'kill_switch_audit'
+          AND column_name = 'row_hash'
+          AND is_nullable = 'NO'
+      );
+    " 2>/dev/null || true
+  )"
+  if [ "$audit_requires_hash" = "t" ]; then
+    log warn restore_audit_insert_skipped "message=kill_switch_state_is_paused audit_table_requires_runtime_hash_chain"
+    return 0
+  fi
+  if ! psql_restore <<SQL; then
 INSERT INTO kill_switch_audit(ts_ms, action, scope, key, enabled, actor, reason, meta_json)
 VALUES (${now_ms}, 'RESTORE', 'global', 'global', 1, 'ops.restore', 'restore_recovered_trade_pause', '{"restore_target_time":"${target_time}"}');
 SQL
+    log warn restore_audit_insert_failed "message=kill_switch_state_is_paused audit_table_requires_runtime_hash_chain"
+  fi
 }
 
 selected_backup="$(select_backup "$target_time")"
@@ -325,17 +359,17 @@ checkpoint_lsn="$(pg_controldata "$target_dir" 2>/dev/null | awk -F: '/Latest ch
 recovered_to_time="$(psql_restore -Atqc "SELECT COALESCE(pg_last_xact_replay_timestamp()::text, now()::text);" 2>/dev/null || true)"
 elapsed_s="$(($(date +%s) - started_at_epoch))"
 
-cat > "${target_dir}/restore.env" <<EOF
-PGDATA=${target_dir}
-PGHOST=${socket_dir}
-PGPORT=${restore_port}
-PGDATABASE=${restore_db}
-PGUSER=${restore_user}
-BACKUP_DIR=${selected_backup}
-TARGET_TIME=${target_time}
-CHECKPOINT_LSN=${checkpoint_lsn}
-RECOVERED_TO_TIME=${recovered_to_time}
-ELAPSED_S=${elapsed_s}
-EOF
+{
+  write_env_line PGDATA "$target_dir"
+  write_env_line PGHOST "$socket_dir"
+  write_env_line PGPORT "$restore_port"
+  write_env_line PGDATABASE "$restore_db"
+  write_env_line PGUSER "$restore_user"
+  write_env_line BACKUP_DIR "$selected_backup"
+  write_env_line TARGET_TIME "$target_time"
+  write_env_line CHECKPOINT_LSN "$checkpoint_lsn"
+  write_env_line RECOVERED_TO_TIME "$recovered_to_time"
+  write_env_line ELAPSED_S "$elapsed_s"
+} > "${target_dir}/restore.env"
 
 log info restore_complete "pgdata=${target_dir} port=${restore_port} checkpoint_lsn=${checkpoint_lsn:-unknown} recovered_to_time=${recovered_to_time:-unknown} elapsed_s=${elapsed_s} kill_switch=tripped"

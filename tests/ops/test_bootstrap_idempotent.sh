@@ -19,6 +19,10 @@ IMAGE="${TRADING_BOOTSTRAP_TEST_IMAGE:-debian:12}"
 docker run --rm \
   -e TRADING_INSTALL_PYTHON_REQUIREMENTS=0 \
   -e TRADING_ENABLE_UFW=0 \
+  -e TS_SECRET_MASTER_KEY=test-master-key \
+  -e TS_SECRET_PG_PASSWORD_APP=test-app-password \
+  -e TS_SECRET_PG_PASSWORD_INGEST=test-ingest-password \
+  -e TS_SECRET_PG_PASSWORD_READER=test-reader-password \
   -v "${REPO_ROOT}:/workspace:ro" \
   -w /workspace \
   "${IMAGE}" \

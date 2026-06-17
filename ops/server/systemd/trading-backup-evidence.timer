@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh trading backup/WAL/restore evidence
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+Persistent=true
+Unit=trading-backup-evidence.service
+
+[Install]
+WantedBy=timers.target

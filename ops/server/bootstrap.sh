@@ -30,6 +30,7 @@ BACKUP_WAL_DIR="${TRADING_BACKUP_WAL_DIR:-${BACKUP_ROOT}/wal}"
 BACKUP_STATE_DIR="${TRADING_BACKUP_STATE_DIR:-${BACKUP_ROOT}/state}"
 BACKUP_ARTIFACT_DIR="${TRADING_BACKUP_ARTIFACT_DIR:-${BACKUP_ROOT}/artifacts}"
 BACKUP_DRILL_DIR="${TRADING_BACKUP_DRILL_DIR:-${BACKUP_ROOT}/drills}"
+BACKUP_EVIDENCE_DIR="${TRADING_BACKUP_EVIDENCE_DIR:-${BACKUP_ROOT}/evidence}"
 
 ETC_DIR="${TRADING_ETC_DIR:-/etc/trading}"
 CREDSTORE_DIR="${TRADING_CREDSTORE_DIR:-/etc/credstore.encrypted}"
@@ -148,7 +149,9 @@ install_if_changed_from_file() {
   local owner="$4"
   local group="$5"
 
-  install -d -m 0755 "$(dirname "$target")"
+  if [ ! -d "$(dirname "$target")" ]; then
+    install -d -m 0755 "$(dirname "$target")"
+  fi
   if [ -f "$target" ] && cmp -s "$source" "$target"; then
     return 1
   fi
@@ -262,7 +265,8 @@ create_users_and_dirs() {
     "$BACKUP_WAL_DIR/.tmp" \
     "$BACKUP_STATE_DIR" \
     "$BACKUP_ARTIFACT_DIR" \
-    "$BACKUP_DRILL_DIR"
+    "$BACKUP_DRILL_DIR" \
+    "$BACKUP_EVIDENCE_DIR"
   do
     install -d -o "$TRADING_USER" -g "$TRADING_GROUP" -m 0770 "$dir"
   done
@@ -504,11 +508,16 @@ install_postgres_timescale() {
     die "could not find a TimescaleDB package for PostgreSQL ${POSTGRES_VERSION}"
   fi
 
-  apt_install_packages \
-    "postgresql-${POSTGRES_VERSION}" \
-    "postgresql-client-${POSTGRES_VERSION}" \
-    "postgresql-contrib-${POSTGRES_VERSION}" \
+  local packages=(
+    "postgresql-${POSTGRES_VERSION}"
+    "postgresql-client-${POSTGRES_VERSION}"
     "$timescale_pkg"
+  )
+  if apt-cache show "postgresql-contrib-${POSTGRES_VERSION}" 2>/dev/null | grep -q '^Package:'; then
+    packages+=("postgresql-contrib-${POSTGRES_VERSION}")
+  fi
+
+  apt_install_packages "${packages[@]}"
 
   ensure_group_membership postgres "$TRADING_GROUP"
   ensure_postgres_cluster
@@ -658,7 +667,7 @@ read_credstore_secret() {
   local name="$1" path
   path="${CREDSTORE_DIR}/${name}.cred"
   [ -r "$path" ] || die "missing encrypted credential ${path}"
-  systemd-creds decrypt "$path" -
+  systemd-creds decrypt --name="$name" "$path" -
 }
 
 write_runtime_env_files() {
@@ -679,6 +688,10 @@ OPERATOR_PORT=${OPERATOR_PORT}
 OPERATOR_ALLOWED_ORIGIN=http://127.0.0.1:${DASHBOARD_PORT}
 REDIS_SOCKET=${REDIS_SOCKET}
 PGBOUNCER_PORT=${PGBOUNCER_PORT}
+PGBASEBACKUP_BIN=/usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_basebackup
+PGVERIFYBACKUP_BIN=/usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_verifybackup
+PGCTL_BIN=/usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_ctl
+PGCONTROLDATA_BIN=/usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_controldata
 AUTO_BOOT_DAEMONS=0
 START_INGESTION_WITH_SERVER=0
 OPEN_DASHBOARD_BROWSER_ON_START=0
@@ -686,6 +699,11 @@ TRADING_STARTUP_HEALTH_FAIL_OPEN=0
 TRADING_STARTUP_HEALTH_ASYNC_BIND=1
 TRADING_IMPORT_SMOKE_IMPORT_JOBS=0
 TRADING_IMPORT_SMOKE_TIMEOUT_S=12.0
+BACKUP_EVIDENCE_PATH=${BACKUP_ROOT}/evidence/latest_backup_restore_evidence.json
+BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S=93600
+BACKUP_EVIDENCE_RPO_S=120
+BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=7776000
+BACKUP_EVIDENCE_RTO_S=1800
 TIMESCALE_ENABLED=1
 TIMESCALE_PRICES_ENABLED=1
 EOF
@@ -825,6 +843,8 @@ install_redis() {
   log "installing Redis"
   add_redis_repo
   apt_install_packages redis-server redis-tools
+  chown root:"$TRADING_GROUP" /etc/redis
+  chmod 0750 /etc/redis
 
   local mem_kb ram_bytes redis_maxmemory redis_supervised tmp
   mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
@@ -969,6 +989,7 @@ install_node_dependencies() {
 install_backup_scripts() {
   log "installing backup scripts"
   install -d -o root -g "$TRADING_GROUP" -m 0750 "$BACKUP_SCRIPT_DST_DIR"
+  install -d -o root -g "$TRADING_GROUP" -m 0750 "${INSTALL_ROOT}/tools"
   local script
   for script in \
     wal_archive.sh \
@@ -977,12 +998,14 @@ install_backup_scripts() {
     artifact_snapshot.sh \
     prune.sh \
     restore.sh \
-    restore_drill.sh
+    restore_drill.sh \
+    backup_restore_evidence.sh
   do
     if install_if_changed_from_file "${BACKUP_SCRIPT_SRC_DIR}/${script}" "${BACKUP_SCRIPT_DST_DIR}/${script}" 0755 root "$TRADING_GROUP"; then
       :
     fi
   done
+  install_if_changed_from_file "${REPO_ROOT}/tools/restore_sanity.sql" "${INSTALL_ROOT}/tools/restore_sanity.sql" 0644 root "$TRADING_GROUP" >/dev/null || true
 }
 
 install_systemd_units() {
@@ -996,6 +1019,8 @@ install_systemd_units() {
     trading-ingest.service \
     trading-base-backup.service \
     trading-base-backup.timer \
+    trading-backup-evidence.service \
+    trading-backup-evidence.timer \
     trading-state-snapshot.service \
     trading-state-snapshot.timer \
     trading-artifact-snapshot.service \
@@ -1020,6 +1045,7 @@ install_systemd_units() {
     fi
     for unit in \
       trading-base-backup.timer \
+      trading-backup-evidence.timer \
       trading-state-snapshot.timer \
       trading-artifact-snapshot.timer \
       trading-backup-prune.timer \

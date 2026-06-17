@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TRADING_USER="${TRADING_USER:-trading}"
 TRADING_GROUP="${TRADING_GROUP:-trading}"
+INSTALL_ROOT="${TRADING_INSTALL_ROOT:-/opt/trading}"
 DATA_ROOT="${TRADING_DATA_ROOT:-/var/lib/trading}"
 DB_DIR="${TRADING_DB_DIR:-${DATA_ROOT}/db}"
 REDIS_DIR="${TRADING_REDIS_DIR:-${DATA_ROOT}/redis}"
@@ -21,6 +22,7 @@ POSTGRES_SOCKET_DIR="${TRADING_POSTGRES_SOCKET_DIR:-/var/run/postgresql}"
 PGBOUNCER_PORT="${TRADING_PGBOUNCER_PORT:-6432}"
 REDIS_SOCKET="${TRADING_REDIS_SOCKET:-/var/run/redis/trading.sock}"
 SYSTEMD_DIR="${TRADING_SYSTEMD_DIR:-/etc/systemd/system}"
+BACKUP_SCRIPT_DIR="${TRADING_BACKUP_SCRIPT_DIR:-${INSTALL_ROOT}/ops/backup}"
 
 log() {
   printf '[verify] %s\n' "$*"
@@ -63,13 +65,14 @@ check_pgbouncer() {
   log "checking PgBouncer socket"
   [ -r "${CREDSTORE_DIR}/pg_password_app.cred" ] || fail "missing ${CREDSTORE_DIR}/pg_password_app.cred"
   local password result
-  password="$(systemd-creds decrypt "${CREDSTORE_DIR}/pg_password_app.cred" -)"
+  password="$(systemd-creds decrypt --name=pg_password_app "${CREDSTORE_DIR}/pg_password_app.cred" -)"
   result="$(PGPASSWORD="$password" psql -h "$POSTGRES_SOCKET_DIR" -p "$PGBOUNCER_PORT" -U ts_app -d "$POSTGRES_DB" -Atqc 'SELECT 1')"
   [ "$result" = "1" ] || fail "PgBouncer SELECT 1 returned ${result}"
 }
 
 check_dir() {
   local path="$1"
+  local expected_mode="${2:-750}"
   [ -d "$path" ] || fail "missing directory ${path}"
 
   local owner group mode
@@ -79,7 +82,7 @@ check_dir() {
 
   [ "$owner" = "$TRADING_USER" ] || fail "${path} owner=${owner}, expected ${TRADING_USER}"
   [ "$group" = "$TRADING_GROUP" ] || fail "${path} group=${group}, expected ${TRADING_GROUP}"
-  [ "$mode" = "750" ] || fail "${path} mode=${mode}, expected 750"
+  [ "$mode" = "$expected_mode" ] || fail "${path} mode=${mode}, expected ${expected_mode}"
 }
 
 check_filesystem() {
@@ -92,16 +95,36 @@ check_filesystem() {
     "$ARTIFACT_DIR" \
     "$NLP_MODELS_DIR" \
     "$APP_LOG_DIR" \
-    "$BACKUP_ROOT" \
-    "$BACKUP_BASE_DIR" \
-    "$BACKUP_WAL_DIR" \
     "$ETC_DIR"
   do
     check_dir "$dir"
   done
+  for dir in \
+    "$BACKUP_ROOT" \
+    "$BACKUP_BASE_DIR" \
+    "$BACKUP_WAL_DIR"
+  do
+    check_dir "$dir" 770
+  done
   [ -d "$CREDSTORE_DIR" ] || fail "missing directory ${CREDSTORE_DIR}"
   [ "$(stat -c '%U' "$CREDSTORE_DIR")" = "root" ] || fail "${CREDSTORE_DIR} owner must be root"
   [ "$(stat -c '%a' "$CREDSTORE_DIR")" = "700" ] || fail "${CREDSTORE_DIR} mode must be 700"
+}
+
+check_credstore() {
+  require_command systemd-creds
+  log "checking encrypted credential inventory"
+  local name path owner group mode
+  for name in master_key pg_password_app pg_password_ingest pg_password_reader; do
+    path="${CREDSTORE_DIR}/${name}.cred"
+    [ -r "$path" ] || fail "missing encrypted credential ${path}"
+    owner="$(stat -c '%U' "$path")"
+    group="$(stat -c '%G' "$path")"
+    mode="$(stat -c '%a' "$path")"
+    [ "$owner" = "root" ] || fail "${path} owner=${owner}, expected root"
+    [ "$group" = "root" ] || fail "${path} group=${group}, expected root"
+    [ "$mode" = "400" ] || fail "${path} mode=${mode}, expected 400"
+  done
 }
 
 check_systemd_units() {
@@ -119,12 +142,49 @@ check_systemd_units() {
   done
 }
 
+check_backup_assets() {
+  log "checking backup scripts and systemd units"
+  local script unit source_dir
+  for script in \
+    wal_archive.sh \
+    base_backup.sh \
+    state_snapshot.sh \
+    artifact_snapshot.sh \
+    prune.sh \
+    restore.sh \
+    restore_drill.sh \
+    backup_restore_evidence.sh
+  do
+    [ -x "${BACKUP_SCRIPT_DIR}/${script}" ] || fail "missing executable backup script ${BACKUP_SCRIPT_DIR}/${script}"
+  done
+
+  source_dir="$SYSTEMD_DIR"
+  if [ ! -f "${source_dir}/trading-base-backup.service" ]; then
+    source_dir="${SCRIPT_DIR}/systemd"
+  fi
+  for unit in \
+    trading-base-backup.service \
+    trading-base-backup.timer \
+    trading-backup-evidence.service \
+    trading-backup-evidence.timer \
+    trading-backup-prune.service \
+    trading-backup-prune.timer \
+    trading-restore-drill.service \
+    trading-restore-drill.timer
+  do
+    [ -f "${source_dir}/${unit}" ] || fail "missing backup systemd unit ${source_dir}/${unit}"
+    systemd-analyze verify "${source_dir}/${unit}"
+  done
+}
+
 main() {
   check_postgres
   check_redis
   check_pgbouncer
   check_filesystem
+  check_credstore
   check_systemd_units
+  check_backup_assets
   log "all checks passed"
 }
 

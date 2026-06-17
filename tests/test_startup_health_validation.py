@@ -1292,7 +1292,6 @@ class StartupHealthValidationTests(unittest.TestCase):
         )
 
         issue_codes = {str(item.get("code") or "") for item in list(snapshot.get("issues") or [])}
-        step_ids = {str(item.get("id") or ""): dict(item) for item in list(snapshot.get("steps") or [])}
 
         self.assertFalse(bool(snapshot["ok"]))
         self.assertFalse(bool(snapshot["timeseries_ok"]))
@@ -1745,6 +1744,136 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertIn("run_server", events)
         self.assertIn("async:safe", events)
         self.assertLess(events.index("run_server"), events.index("async:safe"))
+
+    def test_start_system_late_validation_failure_requests_full_runtime_stop(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTION_MODE": "live",
+                "ENGINE_MODE": "live",
+                "DISABLE_LIVE_EXECUTION": "0",
+                "KILL_SWITCH_GLOBAL": "0",
+                "EXECUTION_BLOCK_EVENT_BUS_CRITICAL_BACKPRESSURE": "0",
+            },
+            clear=False,
+        ):
+            storage, lifecycle_state, start_system = _reload_modules(
+                "engine.runtime.storage",
+                "engine.runtime.lifecycle_state",
+                "start_system",
+            )
+            storage.init_db()
+            lifecycle_state.set_state(lifecycle_state.LIVE, "unit_test_live")
+            start_system._INGESTION_WATCHDOG_STOP.clear()
+
+            calls: list[str] = []
+            fake_dashboard = types.ModuleType("dashboard_server")
+            fake_dashboard.stop_server = lambda: calls.append("stop_server")
+            previous_dashboard = sys.modules.get("dashboard_server")
+            sys.modules["dashboard_server"] = fake_dashboard
+            try:
+                with patch.object(start_system, "runtime_shutdown", side_effect=lambda: calls.append("runtime_shutdown")):
+                    with patch.object(start_system, "_terminate_ingestion", side_effect=lambda: calls.append("terminate_ingestion")):
+                        start_system._handle_late_startup_health_validation_failure(
+                            RuntimeError("unit_late_validation_failure"),
+                            mode="live",
+                            scope="unit_post_bind",
+                        )
+            finally:
+                if previous_dashboard is None:
+                    sys.modules.pop("dashboard_server", None)
+                else:
+                    sys.modules["dashboard_server"] = previous_dashboard
+
+            self.assertEqual(calls, ["stop_server", "runtime_shutdown", "terminate_ingestion"])
+            self.assertTrue(start_system._INGESTION_WATCHDOG_STOP.is_set())
+            self.assertEqual(os.environ.get("DISABLE_LIVE_EXECUTION"), "1")
+            self.assertEqual(os.environ.get("KILL_SWITCH_GLOBAL"), "1")
+            self.assertIn("unit_late_validation_failure", os.environ.get("STARTUP_HEALTH_LATE_FAILURE", ""))
+            self.assertEqual(str(lifecycle_state.get_state().get("state") or ""), lifecycle_state.KILL_SWITCH)
+
+    def test_start_system_async_late_validation_failure_blocks_live_execution_gate(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXECUTION_MODE": "live",
+                "ENGINE_MODE": "live",
+                "ALLOW_TRAINING": "0",
+                "DASHBOARD_API_TOKEN": "live-token-1234567890",
+                "LIVE_TRADING_CONFIRM": "I_UNDERSTAND_LIVE_TRADING",
+                "DISABLE_LIVE_EXECUTION": "0",
+                "KILL_SWITCH_GLOBAL": "0",
+                "EXECUTION_BLOCK_EVENT_BUS_CRITICAL_BACKPRESSURE": "0",
+            },
+            clear=False,
+        ):
+            storage, lifecycle_state, gates, start_system = _reload_modules(
+                "engine.runtime.storage",
+                "engine.runtime.lifecycle_state",
+                "engine.runtime.gates",
+                "start_system",
+            )
+            storage.init_db()
+            lifecycle_state.set_state(lifecycle_state.LIVE, "unit_test_live")
+
+            def _live_mode():
+                return {"mode": "live", "armed": 1}
+
+            with patch.object(gates, "live_trading_preflight", return_value={"ok": True, "reason": "ok"}):
+                before = gates.execution_gate_snapshot(
+                    system_state={"state": "LIVE", "mode": "live", "armed": 1},
+                    get_execution_mode_fn=_live_mode,
+                    kill_switches={},
+                    risk_state_getter=lambda _key, default=None: default,
+                )
+
+            self.assertTrue(bool(before["allowed"]))
+            self.assertTrue(bool(before["allow_execution_pipeline"]))
+            self.assertTrue(bool(before["real_trading_allowed"]))
+
+            stop_reasons: list[str] = []
+
+            def _fake_stop(reason: str) -> None:
+                stop_reasons.append(str(reason))
+
+            def _fail_validation(*, mode: str) -> None:
+                self.assertEqual(mode, "live")
+                raise RuntimeError("unit_late_validation_failure")
+
+            with patch.object(start_system, "_perform_startup_health_validation", side_effect=_fail_validation):
+                with patch.object(start_system, "_request_dashboard_runtime_stop", side_effect=_fake_stop):
+                    thread = start_system._start_startup_health_validation_async(mode="live")
+                    thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(stop_reasons), 1)
+            self.assertIn("late_startup_health_validation_failed", stop_reasons[0])
+            self.assertEqual(os.environ.get("DISABLE_LIVE_EXECUTION"), "1")
+            self.assertEqual(os.environ.get("KILL_SWITCH_GLOBAL"), "1")
+            self.assertIn("unit_late_validation_failure", os.environ.get("STARTUP_HEALTH_LATE_FAILURE", ""))
+            self.assertEqual(str(lifecycle_state.get_state().get("state") or ""), lifecycle_state.KILL_SWITCH)
+
+            stale_live_after_failure = gates.execution_gate_snapshot(
+                system_state={"state": "LIVE", "mode": "live", "armed": 1},
+                get_execution_mode_fn=_live_mode,
+                kill_switches={},
+                risk_state_getter=lambda _key, default=None: default,
+            )
+            self.assertFalse(bool(stale_live_after_failure["allowed"]))
+            self.assertFalse(bool(stale_live_after_failure["allow_execution_pipeline"]))
+            self.assertFalse(bool(stale_live_after_failure["real_trading_allowed"]))
+            self.assertEqual(str(stale_live_after_failure["reason"]), "disable_live_execution_env")
+
+            lifecycle_after_failure = gates.execution_gate_snapshot(
+                get_execution_mode_fn=_live_mode,
+                kill_switches={},
+                risk_state_getter=lambda _key, default=None: default,
+            )
+            self.assertFalse(bool(lifecycle_after_failure["allowed"]))
+            self.assertFalse(bool(lifecycle_after_failure["allow_execution_pipeline"]))
+            self.assertFalse(bool(lifecycle_after_failure["real_trading_allowed"]))
+            self.assertEqual(str(lifecycle_after_failure["runtime_state"]), "KILL_SWITCH")
+            self.assertEqual(str(lifecycle_after_failure["reason"]), "runtime_state_kill_switch")
 
     def test_start_system_stale_ingestion_markers_match_daemon_modules(self) -> None:
         (start_system,) = _reload_modules("start_system")

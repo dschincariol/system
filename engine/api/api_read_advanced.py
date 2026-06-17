@@ -30,6 +30,7 @@ from engine.runtime.storage import (
     fetch_recent_hypothesis_registry,
     fetch_recent_promotion_statistical_evidence,
 )
+from engine.strategy.shap_explainer import normalize_explanation_payload
 
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -1394,6 +1395,7 @@ _DECISION_DETAIL_TABLES = {
     "execution_policy_audit",
     "execution_orders",
     "execution_fills",
+    "prediction_explanations",
     "trade_attribution_ledger",
 }
 
@@ -1598,6 +1600,164 @@ def _normalize_decision_record(record: dict[str, Any] | None) -> dict[str, Any] 
         if model_version not in (None, ""):
             out["model_version"] = model_version
     return out
+
+
+def _decode_prediction_explanation_row(row: dict[str, Any] | None) -> dict[str, Any]:
+    out = dict(row or {})
+    for key in ("top_features", "diagnostics"):
+        value = out.get(key)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                out[key] = parsed if isinstance(parsed, (dict, list)) else value
+            except Exception as e:
+                _warn_nonfatal(
+                    "API_READ_ADVANCED_PREDICTION_EXPLANATION_JSON_FAILED",
+                    e,
+                    once_key=f"prediction_explanation_json:{key}",
+                    field=str(key),
+                )
+    return out
+
+
+def _attribution_candidate_payloads(
+    decision: dict[str, Any] | None,
+    related: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    candidates: list[tuple[str, dict[str, Any]]] = []
+
+    def _append(source: str, payload: Any) -> None:
+        item = _decision_dict(payload)
+        if not item:
+            return
+        if isinstance(item.get("prediction_explanation"), dict):
+            candidates.append((f"{source}.prediction_explanation", dict(item.get("prediction_explanation") or {})))
+        if any(key in item for key in ("top_features", "features", "contributions", "explanation_type")):
+            candidates.append((source, item))
+
+    if decision:
+        _append("decision.explain", decision.get("explain") or decision.get("explain_json"))
+        _append("decision.extra", decision.get("extra") or decision.get("extra_json"))
+
+    alert = related.get("alert") or {}
+    if alert:
+        _append("alert.explain_json", alert.get("explain") or alert.get("explain_json"))
+
+    for idx, row in enumerate(list(related.get("trade_attribution_ledger") or [])[:3]):
+        _append(f"trade_attribution_ledger[{idx}].signal_json", row.get("signal_json"))
+        _append(f"trade_attribution_ledger[{idx}].decision_json", row.get("decision_json"))
+        signal = _decision_dict(row.get("signal_json"))
+        _append(f"trade_attribution_ledger[{idx}].alert_explain", signal.get("alert_explain"))
+        _append(f"trade_attribution_ledger[{idx}].portfolio_explain", signal.get("portfolio_explain"))
+
+    for idx, row in enumerate(list(related.get("portfolio_orders") or [])[:3]):
+        _append(f"portfolio_orders[{idx}].explain_json", row.get("explain_json"))
+
+    return candidates
+
+
+def _normalize_decision_attribution_payload(
+    raw: dict[str, Any],
+    *,
+    source: str,
+    feature_ids: list[Any] | None = None,
+) -> dict[str, Any]:
+    normalized = normalize_explanation_payload(raw, feature_ids=feature_ids or raw.get("feature_ids") or [])
+    out = dict(normalized or {})
+    out["source"] = str(source)
+    if not list(out.get("top_features") or []):
+        out["available"] = False
+        out["unavailable_reason"] = "Explanation payload did not include feature contribution rows."
+    return out
+
+
+def _prediction_explanation_from_table(con, decision: dict[str, Any] | None) -> tuple[str, dict[str, Any]] | None:
+    if not decision or not _table_exists(con, "prediction_explanations"):
+        return None
+    columns = _decision_table_columns(con, "prediction_explanations")
+    required = {"symbol", "ts", "top_features"}
+    if not required <= set(columns):
+        return None
+
+    symbol = str(decision.get("symbol") or "").strip().upper()
+    if not symbol:
+        return None
+    ts_ms = _decision_int(decision.get("ts_ms"))
+    where = ["symbol=?"]
+    params: list[Any] = [symbol]
+    if ts_ms is not None:
+        where.append("ts<=?")
+        params.append(int(ts_ms))
+    model_name = str(decision.get("model_name") or "").strip()
+    if model_name and "model_name" in columns:
+        where.append("(model_name=? OR model_name IS NULL OR model_name='')")
+        params.append(model_name)
+    version = str(decision.get("model_version") or "").strip()
+    if version and "version" in columns:
+        where.append("(version=? OR version IS NULL OR version='')")
+        params.append(version)
+
+    try:
+        cur = con.execute(
+            f"""
+            SELECT *
+            FROM {_decision_quote_ident("prediction_explanations")}
+            WHERE {' AND '.join(where)}
+            ORDER BY ts DESC, id DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        payload = _decode_prediction_explanation_row(_decision_row_to_dict(cur, row))
+        return "prediction_explanations", payload
+    except Exception as e:
+        _warn_nonfatal(
+            "API_READ_ADVANCED_PREDICTION_EXPLANATION_LOOKUP_FAILED",
+            e,
+            once_key="prediction_explanation_lookup",
+        )
+        return None
+
+
+def _build_decision_attribution(
+    con,
+    *,
+    decision: dict[str, Any] | None,
+    related: dict[str, Any],
+) -> dict[str, Any]:
+    feature_ids: list[Any] = []
+    if isinstance((decision or {}).get("explain"), dict):
+        feature_ids = list(((decision or {}).get("explain") or {}).get("feature_ids") or [])
+
+    for source, raw in _attribution_candidate_payloads(decision, related):
+        payload = _normalize_decision_attribution_payload(raw, source=source, feature_ids=feature_ids)
+        if list(payload.get("top_features") or []):
+            return payload
+
+    table_payload = _prediction_explanation_from_table(con, decision)
+    if table_payload is not None:
+        source, raw = table_payload
+        payload = _normalize_decision_attribution_payload(raw, source=source, feature_ids=feature_ids)
+        if list(payload.get("top_features") or []):
+            return payload
+
+    model_family = str((decision or {}).get("model_kind") or (decision or {}).get("model_name") or "").strip()
+    return {
+        "available": False,
+        "source": "unavailable",
+        "explanation_type": "unavailable",
+        "is_shap": False,
+        "supports_shap": False,
+        "model_family": model_family,
+        "top_features": [],
+        "unavailable_reason": (
+            "No backend feature-contribution payload was found on the decision, linked alert, "
+            "trade attribution rows, or persisted prediction_explanations table."
+        ),
+    }
 
 
 def _format_decision_confidence(value: Any) -> str:
@@ -2065,6 +2225,13 @@ def get_decision_detail(
         "fills": [],
         "trade_attribution_ledger": [],
     }
+    attribution: dict[str, Any] = {
+        "available": False,
+        "source": "unavailable",
+        "explanation_type": "unavailable",
+        "top_features": [],
+        "unavailable_reason": "Decision attribution was not evaluated.",
+    }
     try:
         con = db_connect()
         portfolio_order = None
@@ -2119,6 +2286,11 @@ def get_decision_detail(
             related["trade_attribution_ledger"] = [ledger_row]
         if execution_order and not related.get("execution_orders"):
             related["execution_orders"] = [execution_order]
+        attribution = _build_decision_attribution(
+            con,
+            decision=detail,
+            related=related,
+        )
     except Exception as e:
         _warn_nonfatal(
             "API_READ_ADVANCED_DECISION_DETAIL_AGGREGATE_FAILED",
@@ -2148,6 +2320,7 @@ def get_decision_detail(
         "decision": detail,
         "stages": stages,
         "related": related,
+        "attribution": attribution,
         "meta": {
             "detail_version": 1,
             "decision_id": _decision_int((detail or {}).get("decision_id")),

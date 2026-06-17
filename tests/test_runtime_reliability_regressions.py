@@ -224,12 +224,30 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             "MODE": os.environ.get("MODE"),
             "DASHBOARD_API_TOKEN": os.environ.get("DASHBOARD_API_TOKEN"),
             "LIVE_TRADING_CONFIRM": os.environ.get("LIVE_TRADING_CONFIRM"),
+            "DISABLE_LIVE_EXECUTION": os.environ.get("DISABLE_LIVE_EXECUTION"),
+            "KILL_SWITCH_GLOBAL": os.environ.get("KILL_SWITCH_GLOBAL"),
+            "BROKER": os.environ.get("BROKER"),
+            "BROKER_NAME": os.environ.get("BROKER_NAME"),
+            "LIVE_BROKER": os.environ.get("LIVE_BROKER"),
+            "BROKER_FAILOVER": os.environ.get("BROKER_FAILOVER"),
+            "ALPACA_BASE_URL": os.environ.get("ALPACA_BASE_URL"),
+            "ALPACA_KEY_ID": os.environ.get("ALPACA_KEY_ID"),
+            "ALPACA_SECRET_KEY": os.environ.get("ALPACA_SECRET_KEY"),
         }
         os.environ["EXECUTION_MODE"] = "live"
         os.environ["ENGINE_MODE"] = "live"
         os.environ["ALLOW_TRAINING"] = "0"
         os.environ["DASHBOARD_API_TOKEN"] = "live-token-1234567890"
         os.environ["LIVE_TRADING_CONFIRM"] = "I_UNDERSTAND_LIVE_TRADING"
+        os.environ["DISABLE_LIVE_EXECUTION"] = "0"
+        os.environ["KILL_SWITCH_GLOBAL"] = "0"
+        os.environ["BROKER"] = "alpaca"
+        os.environ["BROKER_NAME"] = "alpaca"
+        os.environ["LIVE_BROKER"] = "alpaca"
+        os.environ["BROKER_FAILOVER"] = "alpaca"
+        os.environ["ALPACA_BASE_URL"] = "https://api.alpaca.markets"
+        os.environ["ALPACA_KEY_ID"] = "alpaca-key"
+        os.environ["ALPACA_SECRET_KEY"] = "alpaca-secret"
         os.environ.pop("OPERATOR_MODE", None)
         os.environ.pop("MODE", None)
         return prev
@@ -1492,6 +1510,117 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
         finally:
             self._restore_shadow_env(prev_env)
 
+    def test_execution_gate_reblocks_live_on_critical_health_reason_codes(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            (gates,) = _reload_modules("engine.runtime.gates")
+            critical_reason_codes = (
+                "ingestion_not_running",
+                "prices_stale_age_s=999.0",
+                "no_prices",
+                "providers_not_ok",
+                "broker_connection_unavailable",
+                "jobs_not_running",
+                "jobs_not_ok",
+                "execution_supervisor_critical",
+                "execution_supervisor_unavailable",
+            )
+
+            for reason_code in critical_reason_codes:
+                with self.subTest(reason_code=reason_code):
+                    with patch.object(
+                        gates,
+                        "live_trading_preflight",
+                        return_value={"ok": True, "reason": "ok"},
+                    ) as preflight:
+                        blocked = gates.execution_gate_snapshot(
+                            system_state={
+                                "state": "LIVE",
+                                "mode": "live",
+                                "armed": 1,
+                                "reasons": [reason_code],
+                                "critical_blockers": [reason_code],
+                            },
+                            kill_switches={},
+                            risk_state_getter=lambda _key, default=None: default,
+                        )
+
+                    self.assertFalse(bool(blocked["allow_execution_pipeline"]))
+                    self.assertFalse(bool(blocked["allow_execution"]))
+                    self.assertFalse(bool(blocked["real_trading_allowed"]))
+                    self.assertFalse(bool(blocked["allowed"]))
+                    self.assertEqual(str(blocked["severity"]), "CRITICAL")
+                    self.assertEqual(str(blocked["reason"]), reason_code)
+                    self.assertIn(reason_code, list(blocked["severity_reasons"] or []))
+                    preflight.assert_not_called()
+        finally:
+            self._restore_shadow_env(prev_env)
+
+    def test_execution_gate_blocks_live_armed_runtime_when_disable_live_execution_set(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            os.environ["DISABLE_LIVE_EXECUTION"] = "true"
+            (gates,) = _reload_modules("engine.runtime.gates")
+
+            blocked = gates.execution_gate_snapshot(
+                system_state={"state": "LIVE"},
+                get_execution_mode_fn=lambda: {"mode": "live", "armed": 1},
+                kill_switches={},
+                risk_state_getter=lambda _key, default=None: default,
+            )
+
+            self.assertFalse(bool(blocked["allow_execution_pipeline"]))
+            self.assertFalse(bool(blocked["allow_execution"]))
+            self.assertFalse(bool(blocked["real_trading_allowed"]))
+            self.assertFalse(bool(blocked["allowed"]))
+            self.assertEqual(str(blocked["reason"]), "disable_live_execution_env")
+            self.assertTrue(bool(blocked["disable_live_execution"]))
+            self.assertIn("disable_live_execution_env", list(blocked["severity_reasons"] or []))
+        finally:
+            self._restore_shadow_env(prev_env)
+
+    def test_execution_gate_blocks_env_global_kill_switch(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            os.environ["KILL_SWITCH_GLOBAL"] = "1"
+            (gates,) = _reload_modules("engine.runtime.gates")
+
+            with patch.object(gates, "live_trading_preflight", return_value={"ok": True, "reason": "ok"}) as preflight:
+                blocked = gates.execution_gate_snapshot(
+                    system_state={"state": "LIVE"},
+                    get_execution_mode_fn=lambda: {"mode": "live", "armed": 1},
+                    kill_switches={},
+                    risk_state_getter=lambda _key, default=None: default,
+                )
+
+            self.assertFalse(bool(blocked["allow_execution_pipeline"]))
+            self.assertFalse(bool(blocked["real_trading_allowed"]))
+            self.assertEqual(str(blocked["reason"]), "kill_switch_env_global")
+            self.assertIn("KILL_SWITCH_GLOBAL", list(blocked["active"] or []))
+            preflight.assert_not_called()
+        finally:
+            self._restore_shadow_env(prev_env)
+
+    def test_execution_gate_requires_audited_db_arming_source(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            (gates,) = _reload_modules("engine.runtime.gates")
+
+            with patch.object(gates, "live_trading_preflight", return_value={"ok": True, "reason": "ok"}) as preflight:
+                blocked = gates.execution_gate_snapshot(
+                    system_state={"state": "LIVE", "mode": "live", "armed": 1},
+                    kill_switches={},
+                    risk_state_getter=lambda _key, default=None: default,
+                )
+
+            self.assertFalse(bool(blocked["allow_execution_pipeline"]))
+            self.assertFalse(bool(blocked["real_trading_allowed"]))
+            self.assertEqual(str(blocked["reason"]), "mode_live_armed_not_from_audited_db")
+            self.assertEqual(str(blocked["armed_source"]), "system_state")
+            preflight.assert_not_called()
+        finally:
+            self._restore_shadow_env(prev_env)
+
     def test_execution_gate_blocks_critical_ingestion_degradation(self) -> None:
         prev_env = self._set_shadow_env()
         try:
@@ -1841,6 +1970,30 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             self.assertFalse(bool(allowed))
             self.assertEqual(str(reason), "runtime_state_degraded")
             self.assertEqual(str((detail.get("runtime_state") or {}).get("state")), lifecycle_state.DEGRADED)
+        finally:
+            self._restore_shadow_env(prev_env)
+
+    def test_execution_allowed_for_real_trading_blocks_disable_live_execution_truthy(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            os.environ["DISABLE_LIVE_EXECUTION"] = "on"
+            storage, lifecycle_state, execution_mode = _reload_modules(
+                "engine.runtime.storage",
+                "engine.runtime.lifecycle_state",
+                "engine.execution.execution_mode",
+            )
+            storage.init_db()
+            execution_mode.set_execution_mode("live", actor="test", reason="live_mode")
+            execution_mode.set_execution_armed(1, actor="test", reason="armed")
+            lifecycle_state.set_state(lifecycle_state.LIVE, "unit_test_live")
+
+            allowed, reason, detail = execution_mode.execution_allowed_for_real_trading()
+
+            self.assertFalse(bool(allowed))
+            self.assertEqual(str(reason), "disable_live_execution_env")
+            self.assertEqual(str(detail.get("mode")), "live")
+            self.assertEqual(int(detail.get("armed") or 0), 1)
+            self.assertEqual(str((detail.get("runtime_state") or {}).get("state")), lifecycle_state.LIVE)
         finally:
             self._restore_shadow_env(prev_env)
 

@@ -5,10 +5,15 @@ Use this checklist before moving from safe/paper operation to live trading.
 ## Required Environment
 
 - `ENGINE_MODE=live`
+- `EXECUTION_MODE=live`
+- `LIVE_BROKER`, `BROKER`, `BROKER_NAME`, and the first `BROKER_FAILOVER` entry identify the same intended live broker (`ibkr` or `alpaca`).
+- `BROKER_FAILOVER` does not include `sim`, `paper`, or `sandbox` in live mode.
 - `DASHBOARD_API_TOKEN` is set to a non-default secret.
 - `LIVE_TRADING_CONFIRM=I_UNDERSTAND_LIVE_TRADING`
-- `DISABLE_LIVE_EXECUTION` is unset or `0`.
+- `DISABLE_LIVE_EXECUTION` is unset or explicitly false (`0`, `false`, `no`, or `off`). Any other non-empty value is treated as enabled and blocks live execution.
+- `KILL_SWITCH_GLOBAL=1` remains armed for the initial live deployment hold until operator signoff. Real execution still requires audited DB arming through `execution_mode`/`execution_mode_audit`; environment variables must not arm execution.
 - `DASHBOARD_HOST` is loopback unless remote access is intentional and token-protected.
+- Alpaca live deployments use `ALPACA_BASE_URL=https://api.alpaca.markets`; the paper endpoint is rejected in live mode. IBKR live deployments set `IBKR_HOST`, `IBKR_PORT`, and `IBKR_CLIENT_ID` explicitly.
 
 ## Storage
 

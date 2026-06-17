@@ -1491,6 +1491,20 @@ def promotion_allowed() -> Tuple[bool, Dict[str, Any]]:
         reason["blockers"].append("disabled")
         return (False, reason)
 
+    try:
+        from engine.runtime.backup_evidence import backup_restore_evidence_snapshot
+
+        backup_evidence = backup_restore_evidence_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe"))
+        reason["backup_restore_evidence"] = dict(backup_evidence or {})
+        if bool(backup_evidence.get("required")) and not bool(backup_evidence.get("ok")):
+            reason["blockers"].extend(str(item) for item in list(backup_evidence.get("blockers") or []))
+    except Exception as e:
+        _warn_nonfatal("promotion_guard_backup_evidence_failed", e)
+        if str(os.environ.get("ENGINE_MODE", "")).strip().lower() == "live" or os.environ.get(
+            "PREFLIGHT_REQUIRE_BACKUP_EVIDENCE", "0"
+        ) == "1":
+            reason["blockers"].append("backup_evidence_unavailable")
+
     con = connect()
     try:
         now = _now_ms()

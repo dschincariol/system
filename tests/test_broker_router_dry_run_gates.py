@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import importlib
 import os
 import sys
@@ -70,6 +71,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         env = {
             "BROKER_FAILOVER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -121,6 +123,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         env = {
             "BROKER_FAILOVER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -153,6 +156,178 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         self.assertEqual(gate_snapshot.call_count, 2)
         live_adapter.assert_not_called()
         prelive_reconcile.assert_not_called()
+
+    def test_disable_live_execution_blocks_non_dry_route_before_adapter(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "BROKER_FAILOVER": "alpaca",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "yes",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            gate_snapshot = Mock(return_value={"ok": True, "allowed": True, "real_trading_allowed": True})
+            kill_switch_snapshot = Mock(return_value={"global": False})
+            get_execution_mode = Mock(return_value={"mode": "live", "armed": 1})
+            live_adapter = Mock(side_effect=AssertionError("live adapter should not execute when emergency disabled"))
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_snapshot", gate_snapshot))
+                stack.enter_context(patch.object(broker_router, "_kill_switch_snapshot", kill_switch_snapshot))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                stack.enter_context(patch.object(broker_router, "_alpaca_apply", live_adapter))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "execution_blocked")
+        self.assertEqual(result["gate"]["reason"], "disable_live_execution_env")
+        self.assertFalse(bool(result["gate"]["real_trading_allowed"]))
+        live_adapter.assert_not_called()
+        gate_snapshot.assert_not_called()
+        kill_switch_snapshot.assert_not_called()
+        get_execution_mode.assert_not_called()
+
+    def test_disabled_prelive_reconcile_blocks_live_route_before_adapter(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "BROKER_FAILOVER": "alpaca",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
+            "EXECUTION_PRELIVE_RECONCILE": "0",
+            "ENGINE_MODE": "live",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            gate_snapshot = Mock(return_value={"ok": True, "allowed": True, "real_trading_allowed": True})
+            kill_switch_snapshot = Mock(return_value={"global": False})
+            get_execution_mode = Mock(return_value={"mode": "live", "armed": 1})
+            live_adapter = Mock(side_effect=AssertionError("live adapter should not execute when pre-live reconcile is disabled"))
+            prelive_reconcile = Mock(side_effect=AssertionError("pre-live reconcile should not run when policy blocks first"))
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_snapshot", gate_snapshot))
+                stack.enter_context(patch.object(broker_router, "_kill_switch_snapshot", kill_switch_snapshot))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                stack.enter_context(patch.object(broker_router, "_alpaca_apply", live_adapter))
+                stack.enter_context(patch.object(broker_router, "_prelive_reconcile", prelive_reconcile))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                    override_order_id=202,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "prelive_reconcile_disabled_for_live")
+        self.assertTrue(bool(result["fatal_reconcile"]))
+        self.assertEqual(result["prelive_reconcile_policy"]["reason"], "prelive_reconcile_disabled_for_live")
+        live_adapter.assert_not_called()
+        prelive_reconcile.assert_not_called()
+
+    def test_missing_prelive_reconcile_import_blocks_live_route_before_adapter(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "ENGINE_MODE": "live",
+            "BROKER_FAILOVER": "alpaca",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
+            "EXECUTION_PRELIVE_RECONCILE": "1",
+        }
+        real_import = builtins.__import__
+
+        def _block_position_reconcile_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if (
+                name == "engine.execution.position_reconcile"
+                and "pre_live_position_reconcile" in tuple(fromlist or ())
+            ):
+                raise ImportError("unit test missing position reconcile provider")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch.dict(os.environ, env, clear=False):
+            with patch("builtins.__import__", side_effect=_block_position_reconcile_import):
+                (broker_router,) = _reload_modules("engine.execution.broker_router")
+            gate_snapshot = Mock(return_value={"ok": True, "allowed": True, "real_trading_allowed": True})
+            kill_switch_snapshot = Mock(return_value={"global": False})
+            get_execution_mode = Mock(return_value={"mode": "live", "armed": 1})
+            live_adapter = Mock(side_effect=AssertionError("live adapter should not execute without reconcile import"))
+            adaptive_execute = Mock(side_effect=AssertionError("adaptive execution should not run without reconcile import"))
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_snapshot", gate_snapshot))
+                stack.enter_context(patch.object(broker_router, "_kill_switch_snapshot", kill_switch_snapshot))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                stack.enter_context(patch.object(broker_router, "_alpaca_apply", live_adapter))
+                stack.enter_context(patch.object(broker_router, "_adaptive_execute_orders", adaptive_execute))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                    override_order_id=303,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "prelive_reconcile_unavailable")
+        self.assertEqual(result["reason"], "prelive_reconcile_provider_missing")
+        self.assertTrue(bool(result["fatal_reconcile"]))
+        self.assertFalse(bool(result["reconcile_provider_available"]))
+        self.assertEqual(result["broker"], "alpaca")
+        self.assertEqual(len(result["failover_attempts"]), 1)
+        self.assertEqual(result["failover_attempts"][0]["status"], "prelive_reconcile_unavailable")
+        live_adapter.assert_not_called()
+        adaptive_execute.assert_not_called()
+
+    def test_missing_prelive_reconcile_provider_blocks_live_route_before_adapter(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "ENGINE_MODE": "live",
+            "BROKER_FAILOVER": "ibkr",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
+            "EXECUTION_PRELIVE_RECONCILE": "true",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            gate_snapshot = Mock(return_value={"ok": True, "allowed": True, "real_trading_allowed": True})
+            kill_switch_snapshot = Mock(return_value={"global": False})
+            get_execution_mode = Mock(return_value={"mode": "live", "armed": 1})
+            live_adapter = Mock(side_effect=AssertionError("live adapter should not execute without reconcile provider"))
+            adaptive_execute = Mock(side_effect=AssertionError("adaptive execution should not run without reconcile provider"))
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_snapshot", gate_snapshot))
+                stack.enter_context(patch.object(broker_router, "_kill_switch_snapshot", kill_switch_snapshot))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                stack.enter_context(patch.object(broker_router, "_prelive_reconcile", None))
+                stack.enter_context(patch.object(broker_router, "_ibkr_apply", live_adapter))
+                stack.enter_context(patch.object(broker_router, "_adaptive_execute_orders", adaptive_execute))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                    override_order_id=404,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "prelive_reconcile_unavailable")
+        self.assertEqual(result["reason"], "prelive_reconcile_provider_missing")
+        self.assertTrue(bool(result["fatal_reconcile"]))
+        self.assertFalse(bool(result["reconcile_provider_available"]))
+        self.assertEqual(result["broker"], "ibkr")
+        self.assertEqual(len(result["failover_attempts"]), 1)
+        self.assertEqual(result["failover_attempts"][0]["status"], "prelive_reconcile_unavailable")
+        live_adapter.assert_not_called()
+        adaptive_execute.assert_not_called()
 
     def test_failover_path_triggers(self) -> None:
         orders = _sample_orders()
@@ -200,6 +375,114 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         gate_snapshot.assert_not_called()
         prelive_reconcile.assert_not_called()
 
+    def test_live_failover_rejects_alpaca_sim_chain_before_adapter(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "ENGINE_MODE": "live",
+            "BROKER_FAILOVER": "alpaca,sim",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            live_adapter = Mock(side_effect=AssertionError("alpaca adapter must not run for invalid live failover"))
+            sim_adapter = Mock(side_effect=AssertionError("sim adapter must not run after a live broker in live mode"))
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_alpaca_apply", live_adapter))
+                stack.enter_context(patch.object(broker_router, "_sim_apply", sim_adapter))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "live_failover_chain_invalid")
+        self.assertEqual(result["reason"], "sim_after_live_broker_forbidden")
+        self.assertTrue(bool(result["stop_failover"]))
+        self.assertEqual(result["failover_policy"]["chain"], ["alpaca", "sim"])
+        live_adapter.assert_not_called()
+        sim_adapter.assert_not_called()
+
+    def test_missing_credentials_result_stops_failover_and_retry(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "ENGINE_MODE": "live",
+            "BROKER_FAILOVER": "alpaca,ibkr",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "3",
+            "BROKER_ROUTER_RETRY_BASE_S": "0",
+            "BROKER_ROUTER_RETRY_MAX_S": "0",
+            "DISABLE_LIVE_EXECUTION": "0",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            apply_one = Mock(
+                side_effect=[
+                    {"ok": False, "status": "missing_credentials", "broker": "alpaca"},
+                    AssertionError("router must not retry or fail over after missing credentials"),
+                ]
+            )
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_apply_one", apply_one))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "missing_credentials")
+        self.assertEqual(result["broker"], "alpaca")
+        self.assertFalse(bool(result["retryable"]))
+        self.assertTrue(bool(result["stop_failover"]))
+        self.assertEqual(apply_one.call_count, 1)
+        self.assertEqual(len(result["failover_attempts"]), 1)
+
+    def test_auth_failure_result_stops_failover_and_retry(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "ENGINE_MODE": "live",
+            "BROKER_FAILOVER": "alpaca,ibkr",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "3",
+            "BROKER_ROUTER_RETRY_BASE_S": "0",
+            "BROKER_ROUTER_RETRY_MAX_S": "0",
+            "DISABLE_LIVE_EXECUTION": "0",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            apply_one = Mock(
+                side_effect=[
+                    {"ok": False, "status": "auth_failed", "broker": "alpaca"},
+                    AssertionError("router must not retry or fail over after broker auth failure"),
+                ]
+            )
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_apply_one", apply_one))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "auth_failed")
+        self.assertEqual(result["broker"], "alpaca")
+        self.assertFalse(bool(result["retryable"]))
+        self.assertTrue(bool(result["stop_failover"]))
+        self.assertEqual(apply_one.call_count, 1)
+        self.assertEqual(len(result["failover_attempts"]), 1)
+
     def test_execution_gate_snapshot_used(self) -> None:
         orders = _sample_orders()
         gate = {
@@ -211,6 +494,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         env = {
             "BROKER_FAILOVER": "sim",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
         }
 
         with patch.dict(os.environ, env, clear=False):

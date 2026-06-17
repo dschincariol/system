@@ -11,7 +11,7 @@ import logging
 from typing import Any, Dict, Tuple, List, Optional
 from engine.runtime.failure_diagnostics import log_failure
 
-from engine.strategy.drawdown_state import get_current_drawdown
+from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.data.weather_features import get_weather_feature_snapshot
 from engine.data.asset_map import asset_class_for_symbol
 
@@ -364,6 +364,31 @@ def _annotate(desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> None:
             _warn_nonfatal("PORTFOLIO_RISK_GATE_ANNOTATE_FAILED", e, once_key=f"annotate:{sym}", symbol=str(sym))
 
 
+def _hold_current_targets(
+    desired: Dict[str, Dict[str, Any]],
+    state: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for sym, row in (state or {}).items():
+        try:
+            out[str(sym)] = dict(row or {})
+            out[str(sym)].setdefault("side", str((row or {}).get("side") or "FLAT"))
+            out[str(sym)]["weight"] = abs(float((row or {}).get("weight", 0.0) or 0.0))
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_RISK_GATE_HOLD_CURRENT_TARGET_FAILED", e, once_key=f"hold_current:{sym}", symbol=str(sym))
+    for sym, row in (desired or {}).items():
+        if str(sym) in out:
+            continue
+        try:
+            flat = dict(row or {})
+            flat["side"] = "FLAT"
+            flat["weight"] = 0.0
+            out[str(sym)] = flat
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_RISK_GATE_FLAT_NEW_TARGET_FAILED", e, once_key=f"flat_new:{sym}", symbol=str(sym))
+    return out
+
+
 def apply_portfolio_risk_gate(
     con,
     desired: Dict[str, Dict[str, Any]],
@@ -380,12 +405,20 @@ def apply_portfolio_risk_gate(
     info: Dict[str, Any] = {"enabled": True}
 
     # drawdown snapshot
-    dd = 0.0
-    try:
-        dd = float(get_current_drawdown(con))
-    except Exception:
-        dd = 0.0
+    diagnostic = evaluate_current_drawdown(con)
+    info["drawdown_state"] = diagnostic.to_dict()
+    if not diagnostic.ok:
+        info["drawdown"] = None
+        info["blocked"] = True
+        info["block_reason"] = {
+            "type": "drawdown_state_unavailable",
+            "reason_code": str(diagnostic.reason_code),
+        }
+        out = _hold_current_targets(out, state or {})
+        _annotate(out, info)
+        return out, info
 
+    dd = float(diagnostic.drawdown or 0.0)
     info["drawdown"] = float(dd)
 
     # drawdown-based gross cap

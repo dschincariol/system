@@ -117,7 +117,7 @@ def _extract_confidence_metrics_from_explain(explain: dict) -> dict:
     }
 
 
-def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
     ids = []
     for alert_id in alert_ids or []:
         try:
@@ -132,17 +132,23 @@ def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[st
             continue
     ids = list(dict.fromkeys(ids))
     if not ids:
-        return {}, {}
+        return {}, {}, {}, {}
 
     placeholders = ",".join("?" for _ in ids)
     ack_map: dict[int, dict[str, Any]] = {}
     resolution_map: dict[int, dict[str, Any]] = {}
+    shelf_map: dict[int, dict[str, Any]] = {}
+    lifecycle_map: dict[int, list[dict[str, Any]]] = {}
+    now_ms = int(time.time() * 1000)
 
     if _table_exists(con, "alert_acks"):
         try:
+            cols = set(_table_cols(con, "alert_acks"))
+            expires_expr = "expires_ts_ms" if "expires_ts_ms" in cols else "NULL AS expires_ts_ms"
+            reason_expr = "reason" if "reason" in cols else "'' AS reason"
             rows = con.execute(
                 f"""
-                SELECT alert_id, acked_ts_ms, acked_by, source
+                SELECT alert_id, acked_ts_ms, acked_by, source, {expires_expr}, {reason_expr}
                 FROM alert_acks
                 WHERE alert_id IN ({placeholders})
                 """,
@@ -159,17 +165,66 @@ def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[st
                         row_preview=str(row)[:120],
                     )
                     continue
+                acked_ts_ms = int(row[1] or 0) if row[1] is not None else None
+                expires_ts_ms = int(row[4] or 0) if len(row) > 4 and row[4] is not None else None
+                expired = bool(expires_ts_ms and expires_ts_ms <= now_ms)
                 ack_map[alert_id] = {
-                    "acked": True,
-                    "acked_ts_ms": int(row[1] or 0) if row[1] is not None else None,
+                    "acked": not expired,
+                    "acked_ts_ms": acked_ts_ms,
                     "acked_by": str(row[2] or ""),
                     "ack_source": str(row[3] or ""),
+                    "ack_expires_ts_ms": expires_ts_ms,
+                    "ack_reason": str(row[5] or "") if len(row) > 5 else "",
+                    "ack_expired": expired,
+                    "lifecycle_state": "retriggered" if expired else "acknowledged",
+                    "next_escalation_ts_ms": expires_ts_ms,
                 }
         except Exception as e:
             _warn_nonfatal(
                 "API_READ_ALERT_ACKS_FAILED",
                 e,
                 warn_key="api_read_alert_acks_failed",
+            )
+
+    if _table_exists(con, "alert_shelves"):
+        try:
+            rows = con.execute(
+                f"""
+                SELECT alert_id, shelved_ts_ms, expires_ts_ms, shelved_by, reason, source, severity
+                FROM alert_shelves
+                WHERE alert_id IN ({placeholders})
+                """,
+                tuple(ids),
+            ).fetchall() or []
+            for row in rows:
+                try:
+                    alert_id = int(row[0])
+                except Exception as e:
+                    _warn_nonfatal(
+                        "API_READ_ALERT_SHELF_ROW_PARSE_FAILED",
+                        e,
+                        warn_key="api_read_alert_shelf_row_parse_failed",
+                        row_preview=str(row)[:120],
+                    )
+                    continue
+                expires_ts_ms = int(row[2] or 0) if row[2] is not None else 0
+                expired = bool(expires_ts_ms and expires_ts_ms <= now_ms)
+                shelf_map[alert_id] = {
+                    "shelved": not expired,
+                    "shelved_ts_ms": int(row[1] or 0) if row[1] is not None else None,
+                    "shelve_expires_ts_ms": expires_ts_ms,
+                    "shelved_by": str(row[3] or ""),
+                    "shelve_reason": str(row[4] or ""),
+                    "shelve_source": str(row[5] or ""),
+                    "shelve_severity": str(row[6] or ""),
+                    "shelve_expired": expired,
+                    "lifecycle_state": "shelve_expired" if expired else "shelved",
+                }
+        except Exception as e:
+            _warn_nonfatal(
+                "API_READ_ALERT_SHELVES_FAILED",
+                e,
+                warn_key="api_read_alert_shelves_failed",
             )
 
     if _table_exists(con, "alert_resolutions"):
@@ -208,7 +263,47 @@ def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[st
                 warn_key="api_read_alert_resolutions_failed",
             )
 
-    return ack_map, resolution_map
+    if _table_exists(con, "alert_lifecycle_events"):
+        try:
+            rows = con.execute(
+                f"""
+                SELECT alert_id, ts_ms, lifecycle_state, actor, reason, source, detail_json
+                FROM alert_lifecycle_events
+                WHERE alert_id IN ({placeholders})
+                ORDER BY alert_id ASC, ts_ms ASC
+                """,
+                tuple(ids),
+            ).fetchall() or []
+            for row in rows:
+                try:
+                    alert_id = int(row[0])
+                    detail = json.loads(str(row[6] or "{}"))
+                    if not isinstance(detail, dict):
+                        detail = {}
+                except Exception as e:
+                    _warn_nonfatal(
+                        "API_READ_ALERT_LIFECYCLE_ROW_PARSE_FAILED",
+                        e,
+                        warn_key="api_read_alert_lifecycle_row_parse_failed",
+                        row_preview=str(row)[:120],
+                    )
+                    continue
+                lifecycle_map.setdefault(alert_id, []).append({
+                    "ts_ms": int(row[1] or 0),
+                    "state": str(row[2] or ""),
+                    "actor": str(row[3] or ""),
+                    "reason": str(row[4] or ""),
+                    "source": str(row[5] or ""),
+                    "detail": detail,
+                })
+        except Exception as e:
+            _warn_nonfatal(
+                "API_READ_ALERT_LIFECYCLE_FAILED",
+                e,
+                warn_key="api_read_alert_lifecycle_failed",
+            )
+
+    return ack_map, resolution_map, shelf_map, lifecycle_map
 
 
 # ------------------------------
@@ -229,7 +324,7 @@ def get_alerts():
                 ORDER BY ts_ms DESC
                 LIMIT 50
             """).fetchall()
-            ack_map, resolution_map = _load_alert_state_maps(
+            ack_map, resolution_map, shelf_map, lifecycle_map = _load_alert_state_maps(
                 con,
                 [int(r[0]) for r in rows if r and r[0] is not None],
             )
@@ -286,9 +381,15 @@ def get_alerts():
                 ack_state = ack_map.get(alert_id, {})
                 if ack_state:
                     alert_row.update(ack_state)
+                shelf_state = shelf_map.get(alert_id, {})
+                if shelf_state:
+                    alert_row.update(shelf_state)
                 resolution_state = resolution_map.get(alert_id, {})
                 if resolution_state:
                     alert_row.update(resolution_state)
+                lifecycle = lifecycle_map.get(alert_id, [])
+                if lifecycle:
+                    alert_row["lifecycle"] = lifecycle
                 out_rows.append(alert_row)
 
             return {
@@ -1152,7 +1253,13 @@ def get_embed_conf_calib(horizon_s: int, model_kind: str, limit: int = 200):
 
         curve = []
         for i in range(min(len(xs), len(ys))):
-            curve.append({"x": float(xs[i]), "y": float(ys[i])})
+            curve.append({
+                "x": float(xs[i]),
+                "y": float(ys[i]),
+                "conf": float(xs[i]),
+                "acc": float(ys[i]),
+                "label": f"Bin {i + 1}",
+            })
 
         return {
             "ok": True,
@@ -1161,7 +1268,10 @@ def get_embed_conf_calib(horizon_s: int, model_kind: str, limit: int = 200):
             "ts_ms": int(ts_ms or 0),
             "conf_k": float(conf_k or 0.0),
             "n_points": int(n_points or len(curve)),
+            "sample_count": int(n_points or 0),
+            "count_available": False,
             "curve": curve,
+            "points": curve,
         }
     finally:
         con.close()

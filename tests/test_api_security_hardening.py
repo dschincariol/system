@@ -58,19 +58,36 @@ def _build_handler(*, routes, handlers, token="", ctx=None, static_dir: Path):
     )
 
 
-def _post_json(url: str, *, token: str | None = None, extra_headers: dict[str, str] | None = None):
+def _post_json(
+    url: str,
+    *,
+    token: str | None = None,
+    body: dict | None = None,
+    extra_headers: dict[str, str] | None = None,
+):
     headers = {"Content-Type": "application/json"}
     if token is not None:
         headers["X-API-Token"] = str(token)
     headers.update(extra_headers or {})
     req = Request(
         url,
-        data=b"{}",
+        data=json.dumps(body or {}).encode("utf-8"),
         headers=headers,
         method="POST",
     )
     with urlopen(req, timeout=5) as response:
         return response.status, dict(response.headers), json.loads(response.read().decode("utf-8"))
+
+
+def _emergency_confirmation() -> dict:
+    return {
+        "confirm": "KILL",
+        "confirmation": "KILL",
+        "consequence_ack": True,
+        "confirmation_hold_ms": 3000,
+        "actor": "security_test",
+        "source": "pytest",
+    }
 
 
 def _enable_safe_dev_localhost_fallback(monkeypatch) -> None:
@@ -158,10 +175,36 @@ def test_production_mutation_accepts_valid_dashboard_token(tmp_path: Path, monke
         status, _headers, body = _post_json(
             f"{base_url}/api/operator/emergency_stop",
             token=token,
+            body=_emergency_confirmation(),
         )
 
     assert status == 200
     assert body["ok"] is True
+
+
+def test_high_impact_mutation_rejects_missing_confirmation_with_valid_token(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/operator/emergency_stop", "stop")],
+        handlers={"stop": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        try:
+            _post_json(f"{base_url}/api/operator/emergency_stop", token=token)
+            raise AssertionError("request unexpectedly succeeded")
+        except HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 422
+            assert body["error"] == "confirmation_required"
+            assert body["action_id"] == "operator.emergency_stop"
+            assert body["required_token"] == "KILL"
 
 
 def test_production_mutation_rejects_invalid_dashboard_token(tmp_path: Path, monkeypatch) -> None:
@@ -343,6 +386,7 @@ def test_destructive_http_rate_limit_returns_429_retry_after(tmp_path: Path, mon
         status, _headers, first = _post_json(
             f"{base_url}/api/operator/emergency_stop",
             token="secret",
+            body=_emergency_confirmation(),
         )
         assert status == 200
         assert first["ok"] is True

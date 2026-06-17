@@ -396,6 +396,7 @@ def main():
                     symbol=str(sym),
                     entry_ts_ms=int(ts_ms),
                     exit_ts_ms=int(exit_ts),
+                    real_only=True,
                 )
 
                 if not trade:

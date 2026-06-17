@@ -31,7 +31,18 @@ from typing import Any, Dict, List, Optional
 
 from engine.execution.execution_slicing_engine import build_order_slices
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
+from engine.execution.broker_failover_policy import (
+    broker_exception_terminal_failure,
+    configured_failover_chain,
+    is_non_retryable_broker_result,
+    validate_live_failover_chain,
+)
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.live_execution_control import (
+    disabled_live_execution_gate,
+    live_execution_disabled,
+    prelive_reconcile_policy_gate,
+)
 from engine.runtime.logging import get_logger, log_event
 from engine.runtime.metrics import emit_counter, emit_timing
 from engine.runtime.observability import backoff_delay_s, record_component_health, record_rolling_rate
@@ -109,6 +120,7 @@ _SUCCESS_TRACE_MIN_MS = int(os.environ.get("BROKER_ROUTER_SUCCESS_TRACE_MIN_MS",
 BROKER_ROUTER_RETRY_ATTEMPTS = max(1, int(os.environ.get("BROKER_ROUTER_RETRY_ATTEMPTS", "2")))
 BROKER_ROUTER_RETRY_BASE_S = max(0.0, float(os.environ.get("BROKER_ROUTER_RETRY_BASE_S", "0.1")))
 BROKER_ROUTER_RETRY_MAX_S = max(0.0, float(os.environ.get("BROKER_ROUTER_RETRY_MAX_S", "1.0")))
+_PRELIVE_RECONCILE_FALSEY = {"0", "false", "f", "no", "n", "off", "none", "null"}
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -394,6 +406,13 @@ def _execution_gate_or_block(dry_run: bool) -> Optional[Dict[str, Any]]:
     if bool(dry_run):
         return None
 
+    if live_execution_disabled():
+        return {
+            "ok": False,
+            "status": "execution_blocked",
+            "gate": disabled_live_execution_gate(source="engine.execution.broker_router"),
+        }
+
     if _execution_gate_snapshot is None:
         return {"ok": False, "status": "execution_blocked_gate_unavailable"}
 
@@ -416,6 +435,17 @@ def _real_trading_gate_or_block(broker_name: str, dry_run: bool) -> Optional[Dic
     if bool(dry_run):
         return None
 
+    if live_execution_disabled():
+        return {
+            "ok": False,
+            "status": "real_trading_blocked",
+            "broker": str(broker_name),
+            "gate": disabled_live_execution_gate(
+                source="engine.execution.broker_router",
+                extra={"broker": str(broker_name)},
+            ),
+        }
+
     if _execution_gate_snapshot is None or _kill_switch_snapshot is None or _get_execution_mode is None:
         return {
             "ok": False,
@@ -436,6 +466,74 @@ def _real_trading_gate_or_block(broker_name: str, dry_run: bool) -> Optional[Dic
             "gate": gate,
         }
     return None
+
+
+def _prelive_reconcile_explicitly_disabled() -> bool:
+    raw = os.environ.get("EXECUTION_PRELIVE_RECONCILE")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in _PRELIVE_RECONCILE_FALSEY
+
+
+def _prelive_reconcile_or_block(
+    broker_name: str,
+    *,
+    correlation_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a fatal block when live pre-live reconcile cannot run cleanly."""
+
+    broker = str(broker_name or "").lower().strip()
+    policy_block = prelive_reconcile_policy_gate(
+        source="engine.execution.broker_router",
+        engine_mode="live",
+        broker=broker,
+        audit_override=True,
+        correlation_id=correlation_id,
+    )
+    if policy_block is not None:
+        return policy_block
+
+    if _prelive_reconcile_explicitly_disabled():
+        return None
+
+    prelive_reconcile = _prelive_reconcile
+    if not callable(prelive_reconcile):
+        return {
+            "ok": False,
+            "status": "prelive_reconcile_unavailable",
+            "reason": "prelive_reconcile_provider_missing",
+            "broker": broker,
+            "fatal_reconcile": True,
+            "reconcile_provider_available": False,
+        }
+
+    try:
+        gate = prelive_reconcile(broker=broker) or {}
+    except Exception as exc:
+        _warn_nonfatal(
+            "BROKER_ROUTER_PRELIVE_RECONCILE_FAILED",
+            exc,
+            once_key="prelive_reconcile",
+            broker=broker,
+        )
+        return {
+            "ok": False,
+            "status": "prelive_reconcile_exception",
+            "reason": "prelive_reconcile_provider_exception",
+            "broker": broker,
+            "fatal_reconcile": True,
+            "error": str(exc),
+        }
+
+    if bool(gate.get("ok", False)):
+        return None
+    return {
+        "ok": False,
+        "status": str(gate.get("status") or "prelive_reconcile_block"),
+        "broker": broker,
+        "fatal_reconcile": True,
+        "reconcile": dict(gate or {}),
+    }
 
 
 def _load_recent_slippage_bps(symbol: str, broker: str, n: int = 80) -> List[float]:
@@ -567,14 +665,7 @@ def _apply_batch_entry_delay(*, orders: Optional[List[dict]], dry_run: bool, bro
 
 
 def _parse_failover_chain() -> List[str]:
-    raw = (os.environ.get("BROKER_FAILOVER", "") or "").strip()
-    if raw:
-        parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
-        if parts:
-            return parts
-
-    name = str(os.environ.get("BROKER_NAME", os.environ.get("BROKER", "sim")) or "sim").lower().strip()
-    return [name] if name else ["sim"]
+    return configured_failover_chain()
 
 
 def _adaptive_execute_orders(
@@ -811,10 +902,30 @@ def _is_retryable_result(res: Optional[Dict[str, Any]]) -> bool:
         "execution_blocked_gate_unavailable",
         "execution_blocked_gate_providers_missing",
         "real_trading_blocked",
+        "prelive_reconcile_unavailable",
+        "prelive_reconcile_exception",
         "prelive_reconcile_block",
+        "needs_reconcile",
         "submit_inflight_unknown",
+        "submission_reconcile_gate_unavailable",
         "submission_unknown",
+        "submission_unrecorded",
+        "missing_credentials",
+        "auth_failed",
+        "authentication_failed",
+        "authorization_failed",
+        "invalid_credentials",
+        "credentials_invalid",
+        "ibkr_configuration_invalid",
     }
+
+
+def _apply_terminal_broker_policy(res: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(res or {})
+    if is_non_retryable_broker_result(out):
+        out["retryable"] = False
+        out["stop_failover"] = True
+    return out
 
 
 def _call_adapter(
@@ -939,15 +1050,13 @@ def _apply_one(
             return gate_block
 
     # Pre-live reconcile gate (never blocks dry_run)
-    prelive_reconcile = _prelive_reconcile
-    if is_live and (not bool(dry_run)) and callable(prelive_reconcile):
-        gate = prelive_reconcile(broker=name) or {}
-        if not bool(gate.get("ok", False)):
-            gate.setdefault("ok", False)
-            gate.setdefault("status", "prelive_reconcile_block")
-            gate["broker"] = name
-            gate["fatal_reconcile"] = True
-            return gate
+    if is_live and (not bool(dry_run)):
+        reconcile_block = _prelive_reconcile_or_block(
+            name,
+            correlation_id=(str(override_order_id) if override_order_id is not None else None),
+        )
+        if reconcile_block is not None:
+            return reconcile_block
 
     # ---------------- ALPACA ----------------
     if name in ("alpaca", "alpaca_rest"):
@@ -1087,13 +1196,30 @@ def apply_new_portfolio_orders_router(
 
     lineage = _lineage_summary(override_orders)
 
-    blocked = _execution_gate_or_block(dry_run=bool(dry_run))
-    if blocked is not None:
-        return blocked
-
     chain = _parse_failover_chain()
     if not chain:
         chain = ["sim"]
+
+    chain_policy = validate_live_failover_chain(
+        chain,
+        engine_mode=os.environ.get("ENGINE_MODE", "safe"),
+        dry_run=bool(dry_run),
+    )
+    if not bool(chain_policy.get("ok")):
+        return {
+            "ok": False,
+            "status": "live_failover_chain_invalid",
+            "reason": str(chain_policy.get("reason") or "sim_after_live_broker_forbidden"),
+            "broker": "failover_chain",
+            "stop_failover": True,
+            "retryable": False,
+            "failover_attempts": [],
+            "failover_policy": chain_policy,
+        }
+
+    blocked = _execution_gate_or_block(dry_run=bool(dry_run))
+    if blocked is not None:
+        return blocked
 
     attempts: List[Dict[str, Any]] = []
 
@@ -1108,6 +1234,7 @@ def apply_new_portfolio_orders_router(
                     override_order_id=override_order_id,
                     override_ts_ms=override_ts_ms,
                 ) or {}
+                res = _apply_terminal_broker_policy(res)
 
                 dur_ms = int((time.time() - t0) * 1000)
 
@@ -1320,6 +1447,50 @@ def apply_new_portfolio_orders_router(
                 break
 
             except Exception as e:
+                terminal_res = broker_exception_terminal_failure(broker=name, error=e)
+                if terminal_res is not None:
+                    _warn_nonfatal(
+                        "BROKER_ROUTER_TERMINAL_BROKER_FAILURE",
+                        e,
+                        once_key=f"broker_terminal:{name}:{terminal_res.get('status')}",
+                        broker=str(name),
+                        status=str(terminal_res.get("status") or ""),
+                        stop_failover=True,
+                    )
+                    dur_ms = int((time.time() - t0) * 1000)
+                    attempts.append(
+                        {
+                            "broker": name,
+                            "attempt": int(attempt_num),
+                            "ok": False,
+                            "status": str(terminal_res.get("status") or "broker_terminal_failure"),
+                            "error": str(e),
+                            "dur_ms": int(dur_ms),
+                        }
+                    )
+                    record_rolling_rate(
+                        "execution_success_rate",
+                        success=False,
+                        component="engine.execution.broker_router",
+                        extra_tags={"broker": str(name)},
+                    )
+                    record_component_health(
+                        "execution",
+                        ok=False,
+                        status=str(terminal_res.get("status") or "broker_terminal_failure"),
+                        detail=str(terminal_res.get("detail") or "broker_credentials_or_auth_failed"),
+                        latency_ms=float(dur_ms),
+                        extra={
+                            "broker": str(name),
+                            "attempts": int(len(attempts)),
+                            "order_count": int(lineage.get("order_count") or 0),
+                            "symbols": list(lineage.get("symbols") or []),
+                            "execution_targets": list(lineage.get("execution_targets") or []),
+                            "stop_failover": True,
+                        },
+                    )
+                    terminal_res["failover_attempts"] = attempts
+                    return terminal_res
                 _warn_nonfatal(
                     "BROKER_ROUTER_BROKER_ATTEMPT_FAILED",
                     e,

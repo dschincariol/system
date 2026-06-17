@@ -13,9 +13,9 @@ import time
 from typing import Dict, Any
 
 from engine.runtime.failure_diagnostics import log_failure
-from engine.strategy.drawdown_state import get_current_drawdown
+from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.runtime.risk_state import get_state, set_state
-from engine.runtime.storage import connect
+from engine.runtime.storage import _table_exists, connect
 
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -65,6 +65,62 @@ CAPITAL_PRESERVE_REGIME_SYMBOL = str(os.environ.get("CAPITAL_PRESERVE_REGIME_SYM
 CAPITAL_PRESERVE_REGIME_MIN_CONF = float(os.environ.get("CAPITAL_PRESERVE_REGIME_MIN_CONF", "0.55"))
 
 
+def _live_mode_requested(con=None) -> bool | None:
+    for name in ("EXECUTION_MODE", "ENGINE_MODE", "OPERATOR_MODE", "MODE"):
+        if str(os.environ.get(name, "") or "").strip().lower() == "live":
+            return True
+    if con is None:
+        return False
+    try:
+        if not _table_exists(con, "execution_mode"):
+            return False
+        row = con.execute("SELECT mode FROM execution_mode WHERE id=1").fetchone()
+        return bool(row and str(row[0] or "").strip().lower() == "live")
+    except Exception as e:
+        _warn_nonfatal("CAPITAL_GUARD_LIVE_MODE_CHECK_FAILED", e, once_key="live_mode_check")
+        return None
+
+
+def _drawdown_payload(diagnostic) -> Dict[str, Any]:
+    try:
+        if hasattr(diagnostic, "to_dict"):
+            return dict(diagnostic.to_dict())
+        return dict(diagnostic or {})
+    except Exception as e:
+        _warn_nonfatal("CAPITAL_GUARD_DRAWDOWN_DIAGNOSTIC_PAYLOAD_FAILED", e, once_key="drawdown_diag_payload")
+        return {"ok": False, "reason_code": "DRAWDOWN_DIAGNOSTIC_PAYLOAD_FAILED"}
+
+
+def _persist_drawdown_diagnostic(diagnostic) -> None:
+    payload = _drawdown_payload(diagnostic)
+    try:
+        set_state("capital_drawdown_diagnostic_json", json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        set_state("capital_drawdown_status", str(payload.get("reason_code") or "UNKNOWN"))
+    except Exception as e:
+        _warn_nonfatal(
+            "CAPITAL_GUARD_DRAWDOWN_DIAGNOSTIC_STATE_SET_FAILED",
+            e,
+            once_key="drawdown_diagnostic_state_set",
+        )
+
+
+def _stop_for_untrusted_drawdown(diagnostic) -> None:
+    payload = _drawdown_payload(diagnostic)
+    reason_code = str(payload.get("reason_code") or "DRAWDOWN_STATE_UNAVAILABLE")
+    _persist_drawdown_diagnostic(payload)
+    try:
+        set_state("trading_state", "stopped")
+        set_state("stop_reason", f"drawdown_state_unavailable:{reason_code}")
+        set_state("stop_ts_ms", str(int(time.time() * 1000)))
+    except Exception as e:
+        _warn_nonfatal(
+            "CAPITAL_GUARD_DRAWDOWN_UNAVAILABLE_STOP_STATE_SET_FAILED",
+            e,
+            once_key="drawdown_unavailable_stop_state_set",
+            reason_code=reason_code,
+        )
+
+
 def trading_allowed(con=None) -> bool:
     """Return whether account-level trading should remain enabled.
 
@@ -95,7 +151,16 @@ def trading_allowed(con=None) -> bool:
     if state != "enabled":
         return False
 
-    dd = get_current_drawdown(con)
+    diagnostic = evaluate_current_drawdown(con)
+    _persist_drawdown_diagnostic(diagnostic)
+    if not diagnostic.ok:
+        live_mode = _live_mode_requested(con)
+        if live_mode is not False:
+            _stop_for_untrusted_drawdown(diagnostic)
+            return False
+        return True
+
+    dd = float(diagnostic.drawdown or 0.0)
     if dd >= MAX_DRAWDOWN:
         set_state("trading_state", "stopped")
         set_state("stop_reason", f"drawdown={dd:.2%}")
@@ -121,7 +186,12 @@ def maybe_release_cooldown(con=None):
     if days < COOLDOWN_DAYS:
         return
 
-    dd = get_current_drawdown(con)
+    diagnostic = evaluate_current_drawdown(con)
+    _persist_drawdown_diagnostic(diagnostic)
+    if not diagnostic.ok:
+        return
+
+    dd = float(diagnostic.drawdown or 0.0)
     if dd < MAX_DRAWDOWN * 0.75:
         set_state("trading_state", "enabled")
         set_state("stop_reason", "")
@@ -143,11 +213,14 @@ def _drawdown_velocity(con=None) -> float:
         prev = float(get_state("capital_prev_drawdown", "0") or "0")
     except Exception:
         prev = 0.0
-    cur = 0.0
     try:
-        cur = float(get_current_drawdown(con) or 0.0)
+        diagnostic = evaluate_current_drawdown(con)
+        _persist_drawdown_diagnostic(diagnostic)
+        if not diagnostic.ok:
+            return float(CAPITAL_PRESERVE_DD_VELOCITY)
+        cur = float(diagnostic.drawdown or 0.0)
     except Exception:
-        cur = 0.0
+        cur = float(CAPITAL_PRESERVE_DD_VELOCITY)
     try:
         set_state("capital_prev_drawdown", str(cur))
     except Exception as e:

@@ -13,6 +13,12 @@ from typing import Any, Dict, List, Optional
 from engine.runtime.data_quality import build_data_pipeline_gate_snapshot
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.job_registry import ALLOWED_JOBS
+from engine.runtime.live_execution_control import (
+    DISABLE_LIVE_EXECUTION_REASON,
+    disabled_live_execution_gate,
+    env_flag_truthy,
+    live_execution_disabled,
+)
 from engine.runtime.live_trading_preflight import live_trading_preflight
 from engine.runtime.logging import get_logger
 
@@ -27,6 +33,7 @@ _EXECUTION_BLOCKED_DEGRADED_CODES_ENV = (
     "PORTFOLIO_RISK_GATE_FAILED,"
     "PORTFOLIO_TOTAL_RISK_FAILED"
 )
+_ENV_GLOBAL_KILL_SWITCH_KEYS = ("KILL_SWITCH_GLOBAL", "TRADING_KILL_SWITCH", "KILL_SWITCH")
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: object) -> None:
@@ -86,6 +93,21 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw == "":
         return bool(default)
     return raw in {"1", "true", "yes", "on"}
+
+
+def _env_global_kill_switch_snapshot() -> Dict[str, Any]:
+    active = []
+    env: Dict[str, str] = {}
+    for key in _ENV_GLOBAL_KILL_SWITCH_KEYS:
+        raw = str(os.environ.get(key, "") or "").strip()
+        env[key] = raw
+        if env_flag_truthy(key, False):
+            active.append(key)
+    return {
+        "active": bool(active),
+        "keys": active,
+        "env": env,
+    }
 
 
 _EXECUTION_BLOCKED_DEGRADED_CODES = {
@@ -460,6 +482,7 @@ def execution_gate_snapshot(
     env_mode: str = mode
     db_mode: Optional[str] = None
     armed: Optional[int] = None
+    armed_source = ""
     source = "env"
     reason = "ok"
     allow_execution_pipeline = False
@@ -574,12 +597,6 @@ def execution_gate_snapshot(
         if explicit not in (None, ""):
             return _normalize_severity(explicit), _dedupe_strs([str(explicit)])
 
-        if runtime_state in ("BOOTING", "WARMING_UP", "SCHEMA_REPAIR", "SHUTDOWN", "KILL_SWITCH", "UNKNOWN"):
-            return "CRITICAL", [f"runtime_state_{str(runtime_state or 'unknown').lower()}"]
-
-        if runtime_state == "LIVE":
-            return "WARNING", []
-
         reason_codes = _collect_reason_codes()
         critical_markers = (
             "critical_",
@@ -591,7 +608,10 @@ def execution_gate_snapshot(
             "kill_switch",
             "portfolio_risk",
             "broker_connection",
+            "broker_not_ready",
             "execution_supervisor_critical",
+            "execution_supervisor_unavailable",
+            "execution_health_gate_failed",
             "execution_not_allowed",
             "runtime_exit",
             "permanent_failure",
@@ -602,6 +622,7 @@ def execution_gate_snapshot(
             "schema_not_",
             "providers_not_ok",
             "jobs_not_running",
+            "jobs_not_ok",
             "all_ingestion_children_restart_disabled",
             "polygon_ws_",
             "ibkr_",
@@ -617,12 +638,18 @@ def execution_gate_snapshot(
             "graph_invalid",
         )
 
+        if runtime_state in ("BOOTING", "WARMING_UP", "SCHEMA_REPAIR", "SHUTDOWN", "KILL_SWITCH", "UNKNOWN"):
+            return "CRITICAL", [f"runtime_state_{str(runtime_state or 'unknown').lower()}"]
+
         critical_hits = [
             code for code in reason_codes
             if any(marker in str(code).lower() for marker in critical_markers)
         ]
         if critical_hits:
             return "CRITICAL", _dedupe_strs(critical_hits)
+
+        if runtime_state == "LIVE":
+            return "WARNING", []
 
         degraded_hits = [
             code for code in reason_codes
@@ -633,8 +660,29 @@ def execution_gate_snapshot(
 
         return "WARNING", []
 
+    def _runtime_state_block_reason() -> str:
+        if runtime_state != "LIVE":
+            return {
+                "BOOTING": "runtime_state_booting",
+                "SCHEMA_REPAIR": "runtime_state_schema_repair",
+                "WARMING_UP": "runtime_state_warming_up",
+                "DEGRADED": "runtime_state_degraded",
+                "SHUTDOWN": "runtime_state_shutdown",
+                "KILL_SWITCH": "runtime_state_kill_switch",
+                "UNKNOWN": "runtime_state_unknown",
+            }.get(runtime_state, f"runtime_state_{str(runtime_state or 'unknown').lower()}")
+
+        for reason_code in severity_reasons:
+            reason_text = str(reason_code or "").strip()
+            if not reason_text:
+                continue
+            if reason_text.upper() in ("CRITICAL", "DEGRADED", "WARNING"):
+                continue
+            return reason_text
+        return "runtime_critical_health"
+
     def _apply_mode_state(r: Any, source_name: str) -> None:
-        nonlocal mode, db_mode, armed, source
+        nonlocal mode, db_mode, armed, armed_source, source
 
         if isinstance(r, dict):
             if "mode" in r:
@@ -643,6 +691,7 @@ def execution_gate_snapshot(
             if "armed" in r:
                 try:
                     armed = int(r.get("armed") or 0)
+                    armed_source = source_name
                 except Exception as e:
                     _warn_nonfatal(
                         "RUNTIME_GATES_ARMED_PARSE_FAILED",
@@ -651,6 +700,7 @@ def execution_gate_snapshot(
                         source=source_name,
                     )
                     armed = None
+                    armed_source = source_name + ":parse_error"
             source = source_name
         elif isinstance(r, str):
             db_mode = _normalize_mode(r, mode)
@@ -738,17 +788,11 @@ def execution_gate_snapshot(
     gate_severity, severity_reasons = _classify_runtime_severity()
 
     # Boot/warmup/shutdown/unknown states remain hard-blocked. DEGRADED is only
-    # blocked when the degradation is classified as critical.
-    if runtime_state != "LIVE" and gate_severity == "CRITICAL":
-        blocked_reason = {
-            "BOOTING": "runtime_state_booting",
-            "SCHEMA_REPAIR": "runtime_state_schema_repair",
-            "WARMING_UP": "runtime_state_warming_up",
-            "DEGRADED": "runtime_state_degraded",
-            "SHUTDOWN": "runtime_state_shutdown",
-            "KILL_SWITCH": "runtime_state_kill_switch",
-            "UNKNOWN": "runtime_state_unknown",
-        }.get(runtime_state, f"runtime_state_{str(runtime_state or 'unknown').lower()}")
+    # blocked when the degradation is classified as critical. LIVE can also be
+    # re-blocked by critical health markers after the runtime has previously
+    # reached live.
+    if gate_severity == "CRITICAL":
+        blocked_reason = _runtime_state_block_reason()
 
         return {
             "ok": True,
@@ -929,6 +973,7 @@ def execution_gate_snapshot(
             "ts_ms": ts,
             "mode": mode,
             "armed": armed,
+            "armed_source": armed_source,
             "allow_execution": False,
             "allow_execution_pipeline": False,
             "allow_simulation": False,
@@ -944,6 +989,47 @@ def execution_gate_snapshot(
             "severity_reasons": _dedupe_strs(severity_reasons + ["kill_switch_active"]),
         }
 
+    if mode == "live" and live_execution_disabled():
+        return disabled_live_execution_gate(
+            source=source,
+            mode=mode,
+            armed=armed,
+            runtime_state=runtime_state,
+            extra={
+                "runtime_detail": runtime_detail,
+                "runtime_source": runtime_source,
+                "armed_source": armed_source,
+                "severity_reasons": _dedupe_strs(
+                    severity_reasons + [DISABLE_LIVE_EXECUTION_REASON]
+                ),
+                "conditional_allow": False,
+            },
+        )
+
+    env_kill = _env_global_kill_switch_snapshot()
+    if bool(env_kill.get("active")):
+        return {
+            "ok": True,
+            "ts_ms": ts,
+            "mode": mode,
+            "armed": armed,
+            "armed_source": armed_source,
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "allow_simulation": False,
+            "real_trading_allowed": False,
+            "allowed": False,
+            "reason": "kill_switch_env_global",
+            "source": source,
+            "active": list(env_kill.get("keys") or []),
+            "env_kill_switch": dict(env_kill),
+            "runtime_state": runtime_state,
+            "runtime_detail": runtime_detail,
+            "runtime_source": runtime_source,
+            "severity": "CRITICAL",
+            "severity_reasons": _dedupe_strs(severity_reasons + ["kill_switch_env_global"]),
+        }
+
     # Final mode mapping happens only after all global blocks have been checked,
     # so shadow/live never override kill switches or degraded runtime state.
     if mode == "safe":
@@ -956,10 +1042,30 @@ def execution_gate_snapshot(
         allow_execution_pipeline = True
         reason = "mode_shadow_live_runtime" if runtime_state == "LIVE" else "mode_shadow_degraded_runtime"
     elif mode == "live":
+        if live_execution_disabled():
+            return disabled_live_execution_gate(
+                source=source,
+                mode=mode,
+                armed=armed,
+                runtime_state=runtime_state,
+                extra={
+                    "runtime_detail": runtime_detail,
+                    "runtime_source": runtime_source,
+                    "armed_source": armed_source,
+                    "severity_reasons": _dedupe_strs(
+                        severity_reasons + [DISABLE_LIVE_EXECUTION_REASON]
+                    ),
+                    "conditional_allow": False,
+                    "execution_degraded": dict(execution_degraded_state),
+                    "live_trading_preflight": {},
+                },
+            )
         if armed is None:
             reason = "mode_live_unarmed_unknown"
         elif armed != 1:
             reason = "mode_live_unarmed"
+        elif "get_execution_mode_fn" not in str(armed_source or ""):
+            reason = "mode_live_armed_not_from_audited_db"
         elif runtime_state != "LIVE":
             reason = {
                 "BOOTING": "runtime_state_booting",
@@ -989,6 +1095,7 @@ def execution_gate_snapshot(
         "ts_ms": ts,
         "mode": mode,
         "armed": armed,
+        "armed_source": armed_source,
         "allow_execution": bool(allow_execution),
         "allow_execution_pipeline": bool(allow_execution_pipeline),
         "allow_simulation": bool(allow_simulation),

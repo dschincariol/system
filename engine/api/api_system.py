@@ -128,6 +128,9 @@ ROUTE_SPECS_SYSTEM = [
     ("GET",  "/api/execution/barrier",             "api_get_execution_barrier"),
     ("GET",  "/api/risk/portfolio",                "api_get_portfolio_risk"),
     ("GET",  "/api/risk/monte_carlo",              "api_get_monte_carlo_risk"),
+    ("GET",  "/api/alpha_decay",                   "api_get_alpha_decay"),
+    ("GET",  "/api/regime/context",                "api_get_regime_context"),
+    ("GET",  "/api/regime/history",                "api_get_regime_history"),
     ("GET",  "/api/drift/explainer",               "api_get_drift_explainer"),
 
     ("GET",  "/api/allocator/status",              "api_get_allocator_status"),
@@ -3932,6 +3935,17 @@ def api_get_monte_carlo_risk(_parsed, ctx=None):
                 "pending": pending,
                 "status": status,
                 "ts_ms": int(risk_ts_ms),
+                "chart_detail": {
+                    "mode": "unavailable",
+                    "has_distribution": False,
+                    "has_fan": False,
+                    "unavailable": [
+                        {
+                            "field": "monte_carlo_risk_info",
+                            "reason": "no Monte-Carlo risk summary has been persisted",
+                        }
+                    ],
+                },
             }
 
         data = json.loads(raw)
@@ -3944,10 +3958,465 @@ def api_get_monte_carlo_risk(_parsed, ctx=None):
         data["pending"] = bool(pending)
         data["status"] = str(status)
         data["ts_ms"] = int(data.get("ts_ms") or risk_ts_ms)
+        distribution = data.get("distribution")
+        fan = data.get("fan") or data.get("fan_chart") or data.get("paths_percentiles")
+        has_distribution = bool(distribution) and isinstance(distribution, (list, dict))
+        has_fan = bool(fan) and isinstance(fan, (list, dict))
+        unavailable = []
+        if not has_fan:
+            unavailable.append(
+                {
+                    "field": "fan_chart",
+                    "reason": "monte_carlo_risk_info stores summary VaR/CVaR/drawdown metrics only",
+                }
+            )
+        if not has_distribution:
+            unavailable.append(
+                {
+                    "field": "distribution",
+                    "reason": "monte_carlo_risk_info does not include simulated return distribution buckets",
+                }
+            )
+        data["chart_detail"] = {
+            "mode": "fan" if has_fan else ("distribution" if has_distribution else "summary"),
+            "has_distribution": bool(has_distribution),
+            "has_fan": bool(has_fan),
+            "unavailable": unavailable,
+        }
         return data
     except Exception as e:
         payload = _failure_out("api_system_monte_carlo_risk_failed", "API_SYSTEM_MONTE_CARLO_RISK_FAILED", e)
         return payload
+
+
+def api_get_alpha_decay(parsed=None, ctx=None):
+    """Return latest and historical alpha-decay risk metrics for charts."""
+    q = _qs(parsed) or {}
+    try:
+        limit = max(1, min(500, int(q.get("limit", "200") or "200")))
+    except Exception:
+        limit = 200
+
+    try:
+        from engine.runtime.storage import _table_exists, connect
+
+        con = connect(readonly=True)
+        try:
+            runtime = {}
+            runtime_history = []
+            if _table_exists(con, "alpha_decay_runtime_history"):
+                row = con.execute(
+                    """
+                    SELECT ts_ms, status, min_throttle_mult, severe_count, warn_count, detail_json
+                    FROM alpha_decay_runtime_history
+                    ORDER BY ts_ms DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row:
+                    runtime = {
+                        "ts_ms": int(row[0] or 0),
+                        "status": str(row[1] or "ok"),
+                        "min_throttle_mult": float(row[2] or 1.0),
+                        "severe_count": int(row[3] or 0),
+                        "warn_count": int(row[4] or 0),
+                        "detail": _safe_json_dict(row[5]),
+                    }
+
+                rows = con.execute(
+                    """
+                    SELECT ts_ms, status, min_throttle_mult, severe_count, warn_count, detail_json
+                    FROM alpha_decay_runtime_history
+                    ORDER BY ts_ms DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall() or []
+                for row in reversed(rows):
+                    runtime_history.append(
+                        {
+                            "ts_ms": int(row[0] or 0),
+                            "status": str(row[1] or "ok"),
+                            "min_throttle_mult": float(row[2] or 1.0),
+                            "severe_count": int(row[3] or 0),
+                            "warn_count": int(row[4] or 0),
+                            "detail": _safe_json_dict(row[5]),
+                        }
+                    )
+
+            strategies = []
+            strategy_history = []
+            if _table_exists(con, "alpha_decay_strategy_metrics"):
+                rows = con.execute(
+                    """
+                    SELECT m.strategy_name,
+                           m.ts_ms,
+                           m.window_days,
+                           m.bucket_s,
+                           m.rolling_sharpe,
+                           m.half_life_buckets,
+                           m.half_life_seconds,
+                           m.structural_break_z,
+                           m.severity,
+                           m.severity_score,
+                           m.throttle_mult,
+                           m.n_obs,
+                           m.detail_json
+                    FROM alpha_decay_strategy_metrics m
+                    JOIN (
+                      SELECT strategy_name, MAX(ts_ms) AS ts_ms
+                      FROM alpha_decay_strategy_metrics
+                      GROUP BY strategy_name
+                    ) t
+                    ON t.strategy_name=m.strategy_name AND t.ts_ms=m.ts_ms
+                    ORDER BY m.ts_ms DESC, m.strategy_name ASC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall() or []
+
+                for row in rows:
+                    strategies.append(
+                        {
+                            "strategy": str(row[0] or ""),
+                            "ts_ms": int(row[1] or 0),
+                            "window_days": int(row[2] or 0),
+                            "bucket_s": int(row[3] or 0),
+                            "rolling_sharpe": float(row[4] or 0.0),
+                            "half_life_buckets": (None if row[5] is None else float(row[5] or 0.0)),
+                            "half_life_seconds": (None if row[6] is None else float(row[6] or 0.0)),
+                            "structural_break_z": float(row[7] or 0.0),
+                            "severity": str(row[8] or "ok"),
+                            "severity_score": float(row[9] or 0.0),
+                            "throttle_mult": float(row[10] or 1.0),
+                            "n_obs": int(row[11] or 0),
+                            "detail": _safe_json_dict(row[12]),
+                        }
+                    )
+
+                rows = con.execute(
+                    """
+                    SELECT strategy_name,
+                           ts_ms,
+                           window_days,
+                           bucket_s,
+                           rolling_sharpe,
+                           half_life_buckets,
+                           half_life_seconds,
+                           structural_break_z,
+                           severity,
+                           severity_score,
+                           throttle_mult,
+                           n_obs,
+                           detail_json
+                    FROM alpha_decay_strategy_metrics
+                    ORDER BY ts_ms DESC, strategy_name ASC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall() or []
+                for row in reversed(rows):
+                    strategy_history.append(
+                        {
+                            "strategy": str(row[0] or ""),
+                            "ts_ms": int(row[1] or 0),
+                            "window_days": int(row[2] or 0),
+                            "bucket_s": int(row[3] or 0),
+                            "rolling_sharpe": float(row[4] or 0.0),
+                            "half_life_buckets": (None if row[5] is None else float(row[5] or 0.0)),
+                            "half_life_seconds": (None if row[6] is None else float(row[6] or 0.0)),
+                            "structural_break_z": float(row[7] or 0.0),
+                            "severity": str(row[8] or "ok"),
+                            "severity_score": float(row[9] or 0.0),
+                            "throttle_mult": float(row[10] or 1.0),
+                            "n_obs": int(row[11] or 0),
+                            "detail": _safe_json_dict(row[12]),
+                        }
+                    )
+
+            unavailable = []
+            if len(strategy_history) < 2:
+                unavailable.append(
+                    {
+                        "field": "strategy_history",
+                        "reason": "alpha_decay_strategy_metrics has fewer than two historical chart points",
+                    }
+                )
+            if len(runtime_history) < 2:
+                unavailable.append(
+                    {
+                        "field": "runtime_history",
+                        "reason": "alpha_decay_runtime_history has fewer than two historical chart points",
+                    }
+                )
+
+            return {
+                "ok": True,
+                "schema_version": 1,
+                "ready": bool(strategies or runtime),
+                "ts_ms": int((runtime or {}).get("ts_ms") or (strategy_history[-1].get("ts_ms") if strategy_history else 0) or _ts_ms()),
+                "runtime": runtime,
+                "runtime_history": runtime_history,
+                "strategies": strategies,
+                "strategy_history": strategy_history,
+                "unavailable": unavailable,
+            }
+        finally:
+            try:
+                con.close()
+            except Exception as close_error:
+                _warn("api_system.alpha_decay.close", close_error)
+    except Exception as e:
+        payload = _failure_out("api_system_alpha_decay_failed", "API_SYSTEM_ALPHA_DECAY_FAILED", e)
+        payload.setdefault("schema_version", 1)
+        payload.setdefault("runtime", {})
+        payload.setdefault("runtime_history", [])
+        payload.setdefault("strategies", [])
+        payload.setdefault("strategy_history", [])
+        payload.setdefault("unavailable", [{"field": "alpha_decay", "reason": str(e)}])
+        return payload
+
+
+def _regime_layer_label(layer: dict, fallback: str = "UNKNOWN") -> str:
+    if not isinstance(layer, dict) or not layer:
+        return str(fallback or "UNKNOWN").upper()
+    best_key = ""
+    best_value = float("-inf")
+    for key, value in layer.items():
+        if isinstance(value, bool):
+            numeric = 1.0 if value else 0.0
+        else:
+            try:
+                numeric = float(value)
+            except Exception as e:
+                _warn("api_system.regime_layer_label.numeric_parse", e)
+                continue
+        if numeric == numeric and numeric > best_value:
+            best_key = str(key)
+            best_value = float(numeric)
+    if not best_key:
+        return str(fallback or "UNKNOWN").upper()
+    return best_key.strip().upper() or str(fallback or "UNKNOWN").upper()
+
+
+def _regime_context_from_vector(vector: dict, *, source: str, symbol: str = "") -> dict:
+    regimes = vector.get("regimes") if isinstance(vector.get("regimes"), dict) else {}
+    confidence = vector.get("confidence") if isinstance(vector.get("confidence"), dict) else {}
+    ts_ms = int(vector.get("ts_ms") or _ts_ms())
+
+    macro_label = _regime_layer_label(vector.get("macro") if isinstance(vector.get("macro"), dict) else {}, regimes.get("volatility") or "UNKNOWN")
+    asset_label = _regime_layer_label(vector.get("asset") if isinstance(vector.get("asset"), dict) else {}, regimes.get("changepoint") or "UNKNOWN")
+    micro_fallback = regimes.get("liquidity") or regimes.get("drawdown") or regimes.get("distribution") or "UNKNOWN"
+    micro_label = _regime_layer_label(vector.get("micro") if isinstance(vector.get("micro"), dict) else {}, micro_fallback)
+
+    return {
+        "ok": True,
+        "schema_version": 1,
+        "source": str(source),
+        "symbol": str(symbol or "SPY").upper(),
+        "ts_ms": int(ts_ms),
+        "layers": {
+            "macro": {
+                "label": str(macro_label),
+                "confidence": float(confidence.get("macro", confidence.get("overall", 0.0)) or 0.0),
+                "ts_ms": int(ts_ms),
+            },
+            "asset": {
+                "label": str(asset_label),
+                "confidence": float(confidence.get("asset", confidence.get("overall", 0.0)) or 0.0),
+                "ts_ms": int(ts_ms),
+            },
+            "micro": {
+                "label": str(micro_label),
+                "confidence": float(confidence.get("micro", confidence.get("overall", 0.0)) or 0.0),
+                "ts_ms": int(ts_ms),
+            },
+        },
+        "regimes": dict(regimes or {}),
+        "confidence": dict(confidence or {}),
+        "raw": dict(vector or {}),
+    }
+
+
+def api_get_regime_context(parsed=None, ctx=None):
+    """Return a read-only, glanceable macro/asset/micro regime context."""
+    q = _qs(parsed) or {}
+    symbol = str(q.get("symbol") or "SPY").strip().upper() or "SPY"
+    try:
+        ts_raw = str(q.get("ts_ms") or "").strip()
+        ts_ms = int(ts_raw) if ts_raw else _ts_ms()
+    except Exception:
+        ts_ms = _ts_ms()
+
+    errors = []
+    try:
+        from engine.strategy.regime_stack import compute_regime_vector
+
+        vector = compute_regime_vector(symbol=symbol, ts_ms=int(ts_ms), include_hmm=False)
+        if isinstance(vector, dict) and vector:
+            payload = _regime_context_from_vector(vector, source="engine.strategy.regime_stack", symbol=symbol)
+            payload["degraded"] = False
+            return payload
+        errors.append("strategy_regime_vector_empty")
+    except Exception as e:
+        errors.append(f"strategy_regime_error:{e}")
+        _warn("api_system.regime_context.strategy", e)
+
+    try:
+        from engine.runtime.regime_stack import regime_stack_snapshot
+
+        snapshot = regime_stack_snapshot()
+        if isinstance(snapshot, dict):
+            payload = _regime_context_from_vector(snapshot, source="engine.runtime.regime_stack", symbol=symbol)
+            payload["degraded"] = True
+            payload["errors"] = errors
+            return payload
+        errors.append("runtime_regime_snapshot_invalid")
+    except Exception as e:
+        errors.append(f"runtime_regime_error:{e}")
+        _warn("api_system.regime_context.runtime", e)
+
+    return {
+        "ok": False,
+        "schema_version": 1,
+        "source": "unavailable",
+        "symbol": symbol,
+        "ts_ms": int(_ts_ms()),
+        "degraded": True,
+        "errors": errors,
+        "layers": {
+            "macro": {"label": "UNKNOWN", "confidence": 0.0, "ts_ms": int(_ts_ms())},
+            "asset": {"label": "UNKNOWN", "confidence": 0.0, "ts_ms": int(_ts_ms())},
+            "micro": {"label": "UNKNOWN", "confidence": 0.0, "ts_ms": int(_ts_ms())},
+        },
+        "regimes": {},
+        "confidence": {},
+        "raw": {},
+    }
+
+
+def _regime_vector_from_snapshot_payload(payload: dict, symbol: str) -> tuple[dict, str]:
+    if not isinstance(payload, dict) or not payload:
+        return {}, ""
+
+    if any(key in payload for key in ("macro", "asset", "micro", "regimes", "confidence")):
+        return dict(payload), str(symbol or "SPY").upper()
+
+    requested = str(symbol or "").strip().upper()
+    if requested and isinstance(payload.get(requested), dict):
+        return dict(payload.get(requested) or {}), requested
+
+    for key in sorted(payload.keys()):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return dict(value), str(key or "").upper()
+    return {}, ""
+
+
+def _regime_history_row_from_snapshot(ts_ms: int, raw_json: str, *, symbol: str) -> dict | None:
+    try:
+        parsed = json.loads(raw_json or "{}")
+    except Exception:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        return None
+
+    vector, source_symbol = _regime_vector_from_snapshot_payload(parsed, symbol)
+    if not vector:
+        return None
+    vector.setdefault("ts_ms", int(ts_ms or vector.get("ts_ms") or _ts_ms()))
+
+    context = _regime_context_from_vector(
+        vector,
+        source="trade_decision_snapshot",
+        symbol=source_symbol or symbol,
+    )
+    return {
+        "ts_ms": int(context.get("ts_ms") or ts_ms or 0),
+        "requested_symbol": str(symbol or "SPY").upper(),
+        "source_symbol": str(source_symbol or symbol or "SPY").upper(),
+        "source": "trade_decision_snapshot",
+        "layers": dict(context.get("layers") or {}),
+        "regimes": dict(context.get("regimes") or {}),
+        "confidence": dict(context.get("confidence") or {}),
+    }
+
+
+def api_get_regime_history(parsed=None, ctx=None):
+    """Return read-only regime-stack labels over time from decision snapshots."""
+    q = _qs(parsed) or {}
+    symbol = str(q.get("symbol") or "SPY").strip().upper() or "SPY"
+    try:
+        limit = max(1, min(500, int(q.get("limit", "120") or "120")))
+    except Exception:
+        limit = 120
+
+    rows_out = []
+    unavailable = []
+
+    try:
+        from engine.runtime.storage import _table_exists, connect
+
+        con = connect(readonly=True)
+        try:
+            if not _table_exists(con, "trade_decision_snapshot"):
+                unavailable.append(
+                    {
+                        "field": "trade_decision_snapshot",
+                        "reason": "table unavailable; historical regime stack snapshots are not persisted",
+                    }
+                )
+            else:
+                rows = con.execute(
+                    """
+                    SELECT ts_ms, regime_vectors_json
+                    FROM trade_decision_snapshot
+                    WHERE regime_vectors_json IS NOT NULL
+                    ORDER BY ts_ms DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall() or []
+                for ts_ms, raw_json in reversed(rows):
+                    item = _regime_history_row_from_snapshot(int(ts_ms or 0), raw_json, symbol=symbol)
+                    if item:
+                        rows_out.append(item)
+        finally:
+            try:
+                con.close()
+            except Exception as close_error:
+                _warn("api_system.regime_history.close", close_error)
+    except Exception as e:
+        unavailable.append({"field": "regime_history", "reason": str(e)})
+        _warn("api_system.regime_history.read", e)
+
+    if len(rows_out) < 2:
+        unavailable.append(
+            {
+                "field": "rows",
+                "reason": "fewer than two historical regime-stack points are available",
+            }
+        )
+
+    current = {}
+    try:
+        current = api_get_regime_context(parsed, ctx)
+    except Exception as e:
+        unavailable.append({"field": "current", "reason": str(e)})
+        _warn("api_system.regime_history.current", e)
+
+    latest_ts_ms = int(rows_out[-1].get("ts_ms") if rows_out else (current or {}).get("ts_ms") or _ts_ms())
+    return {
+        "ok": True,
+        "schema_version": 1,
+        "ready": len(rows_out) >= 2,
+        "source": "trade_decision_snapshot",
+        "symbol": symbol,
+        "ts_ms": latest_ts_ms,
+        "rows": rows_out,
+        "current": current if isinstance(current, dict) else {},
+        "unavailable": unavailable,
+    }
 
 
 def api_get_drift_explainer(_parsed, ctx=None):
@@ -4044,6 +4513,27 @@ def api_get_portfolio_risk(_parsed, ctx=None):
         status = str(get_state("portfolio_risk_status", "unknown") or "unknown")
         blocked = str(get_state("portfolio_risk_block", "0") or "0").strip() == "1"
         risk_ts_ms = int(get_state("portfolio_risk_ts_ms", str(ts_ms or summary_ts_ms or 0)) or (ts_ms or summary_ts_ms or 0) or 0)
+        vol_target_ts_ms = int(get_state("portfolio_vol_target_ts_ms", "0") or 0)
+
+        def _state_float(key: str):
+            value = get_state(key, "")
+            try:
+                if value is None or value == "":
+                    return None
+                out = float(value)
+                return out if out == out else None
+            except Exception as e:
+                _warn("api_system.portfolio_risk.state_float_parse", e)
+                return None
+
+        vol_target = {
+            "enabled": str(get_state("portfolio_vol_target_enabled", "0") or "0").strip().lower() in ("1", "true", "yes", "on"),
+            "target_vol": _state_float("portfolio_target_vol"),
+            "realized_vol_pre_target": _state_float("portfolio_realized_vol_pre_target"),
+            "realized_vol_post_target": _state_float("portfolio_realized_vol_post_target"),
+            "scale": _state_float("portfolio_vol_target_scale"),
+            "ts_ms": int(vol_target_ts_ms or 0),
+        }
 
         info = {}
         if raw:
@@ -4066,6 +4556,55 @@ def api_get_portfolio_risk(_parsed, ctx=None):
                     summary = {"value": parsed}
             except Exception:
                 summary = {"raw": summary_raw}
+
+        try:
+            from engine.risk import portfolio_risk_engine as _portfolio_risk_engine
+
+            default_caps = {
+                "gross": float(getattr(_portfolio_risk_engine, "MAX_GROSS", 1.0)),
+                "net": float(getattr(_portfolio_risk_engine, "MAX_NET", 0.6)),
+                "drawdown_throttle_start": float(getattr(_portfolio_risk_engine, "DD_THROTTLE_START", 0.06)),
+                "drawdown_hard_block": float(getattr(_portfolio_risk_engine, "DD_HARD_BLOCK", 0.15)),
+                "vol_target": float(getattr(_portfolio_risk_engine, "VOL_TARGET", 0.02)),
+                "vol_hard_block": float(getattr(_portfolio_risk_engine, "PORTFOLIO_VOL_HARD_BLOCK", 0.0)),
+            }
+        except Exception:
+            default_caps = {
+                "gross": 1.0,
+                "net": 0.6,
+                "drawdown_throttle_start": 0.06,
+                "drawdown_hard_block": 0.15,
+                "vol_target": 0.02,
+                "vol_hard_block": 0.0,
+            }
+
+        def _first_float(default, *values):
+            for value in values:
+                try:
+                    if value is None or value == "":
+                        continue
+                    out = float(value)
+                    if out == out:
+                        return out
+                except Exception as e:
+                    _warn("api_system.portfolio_risk.first_float_parse", e)
+                    continue
+            return float(default)
+
+        caps = {
+            "gross": _first_float(default_caps["gross"], info.get("cap_max_gross")),
+            "net": _first_float(default_caps["net"], info.get("cap_max_net")),
+            "drawdown": _first_float(default_caps["drawdown_throttle_start"], info.get("dd_throttle_start")),
+            "drawdown_throttle_start": _first_float(default_caps["drawdown_throttle_start"], info.get("dd_throttle_start")),
+            "drawdown_hard_block": _first_float(default_caps["drawdown_hard_block"], info.get("dd_hard_block")),
+            "vol_target": _first_float(
+                default_caps["vol_target"],
+                info.get("portfolio_vol_effective_target"),
+                vol_target.get("target_vol"),
+                info.get("portfolio_vol_target"),
+            ),
+            "vol_hard_block": _first_float(default_caps["vol_hard_block"], info.get("portfolio_vol_hard_block")),
+        }
 
         history = []
         con = connect(readonly=True)
@@ -4108,6 +4647,8 @@ def api_get_portfolio_risk(_parsed, ctx=None):
             "blocked": bool(blocked),
             "status": str(status),
             "ts_ms": int(risk_ts_ms),
+            "caps": caps,
+            "vol_target": vol_target,
             "summary": summary,
             "info": info,
             "history": history,

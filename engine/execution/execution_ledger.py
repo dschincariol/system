@@ -4766,6 +4766,17 @@ def audit_execution_integrity(
             order_params + (int(now_ms - pending_order_reconcile_ms),),
         ).fetchall()
 
+        submission_unrecorded_rows = []
+        if _table_exists(con, "execution_order_idempotency"):
+            submission_unrecorded_rows = con.execute(
+                """
+                SELECT order_uid, client_order_id, broker_order_id, symbol, updated_ts_ms, last_error
+                FROM execution_order_idempotency
+                WHERE LOWER(COALESCE(TRIM(status), '')) = 'submission_unrecorded'
+                ORDER BY updated_ts_ms ASC, order_uid ASC
+                """
+            ).fetchall()
+
         out_of_order_rows = con.execute(
             """
             SELECT f.client_order_id, f.fill_id, f.fill_ts_ms, f.id
@@ -4929,6 +4940,7 @@ def audit_execution_integrity(
         stale_missing_fill_count = int(len(stale_missing_fill_rows or []))
         fills_without_order_count = int(len(fills_without_order_rows or []))
         unreconciled_order_reference_count = int(len(unreconciled_order_reference_rows or []))
+        submission_unrecorded_count = int(len(submission_unrecorded_rows or []))
         out_of_order_fill_count = int(len(out_of_order_rows or []))
         inconsistent_position_count = int(len(position_mismatches))
         pricing_unavailable_count = int(len(pricing_unavailable_positions))
@@ -4938,6 +4950,7 @@ def audit_execution_integrity(
                 and duplicate_fill_count == 0
                 and fills_without_order_count == 0
                 and unreconciled_order_reference_count == 0
+                and submission_unrecorded_count == 0
                 and stale_missing_fill_count == 0
                 and inconsistent_position_count == 0
             ),
@@ -4948,6 +4961,7 @@ def audit_execution_integrity(
             "stale_missing_fill_count": int(stale_missing_fill_count),
             "fills_without_order_count": int(fills_without_order_count),
             "unreconciled_order_reference_count": int(unreconciled_order_reference_count),
+            "submission_unrecorded_count": int(submission_unrecorded_count),
             "out_of_order_fill_count": int(out_of_order_fill_count),
             "inconsistent_position_count": int(inconsistent_position_count),
             "pricing_unavailable_count": int(pricing_unavailable_count),
@@ -4994,6 +5008,17 @@ def audit_execution_integrity(
                     "submit_ts_ms": int(submit_ts_ms or 0),
                 }
                 for client_order_id, symbol, submit_ts_ms in (unreconciled_order_reference_rows or [])[:20]
+            ],
+            "submission_unrecorded": [
+                {
+                    "order_uid": str(order_uid or ""),
+                    "client_order_id": str(client_order_id or ""),
+                    "broker_order_id": str(broker_order_id or ""),
+                    "symbol": str(symbol or "").upper().strip(),
+                    "updated_ts_ms": int(updated_ts_ms or 0),
+                    "last_error": str(last_error or ""),
+                }
+                for order_uid, client_order_id, broker_order_id, symbol, updated_ts_ms, last_error in (submission_unrecorded_rows or [])[:20]
             ],
             "out_of_order_fills": [
                 {

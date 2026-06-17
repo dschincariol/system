@@ -2,6 +2,8 @@
 
 This document maps the main Python files to the most important functions and classes inside them.
 
+Last verified against code: 2026-06-17
+
 It is designed for the moment when someone asks:
 
 - "Which function actually does this?"
@@ -112,39 +114,39 @@ This file owns startup sequencing.
 
 ## 4. Storage Layer
 
-### `engine/runtime/storage.py`
+### `engine/runtime/storage.py`, `engine/runtime/storage_pg.py`, and `engine/runtime/storage_sqlite.py`
 
-This is one of the most important files in the repo. It owns the DB path, schema initialization, connections, safety behavior, and many shared read/write helpers.
+`engine/runtime/storage.py` is the public storage facade. In production-like operation it re-exports the Postgres implementation from `engine/runtime/storage_pg.py`; isolated Python tests can opt into `engine/runtime/storage_sqlite.py` through `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`.
 
 | Function or Class | What it does |
 | --- | --- |
-| `init_db()` | initializes or migrates the DB schema |
-| `connect()` | returns a routed DB connection |
-| `connect_ro()` | returns a read-only connection |
-| `connect_rw_direct()` | returns a direct write connection |
-| `run_write_txn(fn, ...)` | runs a write transaction with retry/safety handling |
-| `checkpoint_if_due()` | triggers WAL checkpoint behavior when needed |
-| `get_db_validation_snapshot()` | returns DB validation summary |
-| `get_db_debug_snapshot()` | returns richer DB and connection diagnostics |
-| `put_event(...)` | writes an event record |
-| `put_price(...)` | writes a price record |
-| `acquire_job_lock(...)` | obtains a runtime job lock |
-| `release_job_lock(...)` | releases a runtime job lock |
-| `touch_job_lock(...)` | heartbeats a runtime job lock |
-| `put_job_heartbeat(...)` | writes a job heartbeat |
-| `get_job_checkpoint(job_name)` | reads a job checkpoint |
-| `put_job_checkpoint(...)` | writes a job checkpoint |
+| `storage.init_db()` | facade entrypoint that initializes the selected backend schema |
+| `storage.init_timeseries_storage()` | initializes optional Timescale/feature/telemetry sidecars when enabled |
+| `storage.get_timeseries_storage_snapshot()` | returns optional sidecar readiness and degraded-state details |
+| `storage_pg.connect()` / `storage.connect()` | returns a routed DB connection through the active backend |
+| `storage_pg.connect_ro()` / `storage.connect_ro()` | returns a read-oriented connection through the active backend |
+| `storage_pg.run_write_txn(fn, ...)` / `storage.run_write_txn(fn, ...)` | runs a managed write transaction with backend safety behavior |
+| `storage_pg.get_db_validation_snapshot()` | returns strict Postgres schema validation used by preflight/startup |
+| `storage_pg.get_db_debug_snapshot()` | returns richer DB and connection diagnostics |
+| `storage_pg.put_event(...)` | writes an event row |
+| `storage_pg.put_price(...)` | writes a price row |
+| `storage_pg.acquire_job_lock(...)` | obtains a runtime job lock |
+| `storage_pg.release_job_lock(...)` | releases a runtime job lock |
+| `storage_pg.touch_job_lock(...)` | heartbeats a runtime job lock |
+| `storage_pg.put_job_heartbeat(...)` | writes a job heartbeat |
+| `storage_pg.get_job_checkpoint(job_name)` | reads a job checkpoint |
+| `storage_pg.put_job_checkpoint(...)` | writes a job checkpoint |
 
 ### Newer storage helpers added by the integration work
 
 | Function | What it does |
 | --- | --- |
-| `log_alert_interaction(...)` | stores passive alert/decision interaction rows |
-| `log_decision_view(...)` | stores decision-detail view events |
-| `fetch_recent_decisions(limit)` | returns decision cards for the dashboard |
-| `fetch_decision_detail(decision_id)` | builds a decision drilldown payload |
-| `fetch_human_alignment_report(...)` | computes operator-interaction analytics |
-| `append_event(...)` | writes structured runtime lifecycle events used by diagnostics and support snapshots |
+| `storage_pg.log_alert_interaction(...)` | stores passive alert/decision interaction rows |
+| `storage_pg.log_decision_view(...)` | stores decision-detail view events |
+| `storage_pg.fetch_recent_decisions(limit)` | returns decision cards for the dashboard |
+| `storage_pg.fetch_decision_detail(decision_id)` | builds a decision drilldown payload |
+| `storage_pg.fetch_human_alignment_report(...)` | computes operator-interaction analytics |
+| `engine.runtime.event_log.append_event(...)` | writes structured runtime lifecycle events used by diagnostics, execution mode changes, and support snapshots |
 
 ## 5. Strategy And Portfolio
 
@@ -202,6 +204,43 @@ This file routes orders to broker adapters and failover logic.
 | `_real_trading_gate_or_block(...)` | applies stricter real-trading gating |
 | `_call_adapter(...)` | invokes a broker adapter |
 | `_apply_one(...)` | applies one order through routing logic |
+
+### `engine/execution/broker_failover_policy.py`
+
+This file owns live-broker failover validation and terminal broker-failure classification.
+
+| Function | What it does |
+| --- | --- |
+| `canonical_broker_name(...)` | normalizes broker aliases such as `alpaca_rest` and IBKR variants |
+| `configured_failover_chain(...)` | reads the configured broker failover chain from environment |
+| `validate_live_failover_chain(...)` | blocks unsafe live chains, including sim/paper fallback in live mode |
+| `live_broker_environment_contract(...)` | validates `BROKER`, `BROKER_NAME`, `LIVE_BROKER`, and failover consistency without touching broker APIs |
+| `broker_startup_preflight(...)` | runs broker credential/reachability preflight for live chains |
+| `terminal_broker_failure(...)` | builds a standard terminal broker-failure payload that stops unsafe retry/failover behavior |
+| `is_non_retryable_broker_result(...)` | identifies failures that must stop failover, such as auth and configuration failures |
+| `broker_exception_terminal_failure(...)` | maps broker exceptions into non-retryable terminal failure payloads |
+
+### `engine/runtime/live_execution_control.py`
+
+This file centralizes emergency live-capital controls shared by gates, terminal order entry, and broker routing.
+
+| Function | What it does |
+| --- | --- |
+| `env_flag_truthy(...)` | treats unknown non-empty emergency flag values as true so safety controls fail closed |
+| `live_execution_disabled()` | returns whether `DISABLE_LIVE_EXECUTION` blocks live capital |
+| `disabled_live_execution_gate(...)` | builds the standard hard-block barrier payload |
+| `prelive_reconcile_policy_snapshot(...)` | validates whether live pre-submit reconciliation is required, enabled, or break-glass overridden |
+| `prelive_reconcile_policy_gate(...)` | returns a fatal block when pre-live reconciliation policy is not satisfied |
+| `record_prelive_reconcile_break_glass_audit(...)` | persists accepted break-glass reconciliation overrides into the runtime event log |
+
+### `engine/execution/broker_submission_recovery.py`
+
+This file protects against broker-accepted orders that local bookkeeping failed to record.
+
+| Function | What it does |
+| --- | --- |
+| `unrecorded_submission_gate(...)` | blocks broker routing when unreconciled accepted submissions exist for the broker |
+| `record_submission_unrecorded(...)` | marks a missing durable submission, emits a critical execution alert, audits the broker action, and records failure telemetry |
 
 ### `engine/execution/broker_apply_orders.py`
 
@@ -284,7 +323,40 @@ This file owns the broad system/operator diagnostic surface.
 | `api_get_provider_telemetry(...)` | returns provider/feed telemetry and runtime health correlation |
 | `api_get_service_status(...)` | returns engine/operator/runtime status summary |
 
+### `engine/api/api_broker_config.py`
+
+This file owns the broker configuration control-plane API.
+
+| Function | What it does |
+| --- | --- |
+| `api_get_broker_config(...)` | returns broker config with masked credentials and last test result |
+| `api_post_broker_config(...)` | persists normalized broker config and encrypted credentials; blocks non-sim activation until a passing test exists |
+| `api_post_broker_test_connection(...)` | runs a structured broker config test and stores the last result |
+| `api_get_broker_audit(...)` | returns recent broker config audit rows with credentials stripped |
+
+### `engine/api/api_write.py`
+
+This file owns write-side API helpers used by dashboard/operator mutation routes.
+
+| Function | What it does |
+| --- | --- |
+| `ack_alert(...)` | writes or refreshes an alert acknowledgement with expiry and lifecycle event |
+| `shelve_alert(...)` | shelves an alert with a required reason and bounded expiry |
+| `resolve_alert(...)` | records alert resolution and lifecycle event |
+| `write_job_event(...)` | delegates job-history writes to the runtime lock/history subsystem |
+| `set_promotion_enabled(...)` | updates the promotion guard flag |
+
+### `engine/runtime/backup_evidence.py`
+
+This file checks whether backup, WAL archive, and restore-drill evidence is fresh enough for live operation.
+
+| Function | What it does |
+| --- | --- |
+| `backup_restore_evidence_snapshot(...)` | returns base-backup, WAL, and restore-drill freshness against the configured RPO/RTO policy |
+
 ## 8. Dashboard Endpoints In `dashboard_server.py`
+
+### `dashboard_server.py`
 
 Because `dashboard_server.py` is still a large integration boundary, it contains many API functions directly.
 

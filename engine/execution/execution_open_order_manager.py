@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import connect
+from engine.execution.broker_submission_recovery import record_submission_unrecorded
 from engine.execution.execution_ledger import log_submit
 from engine.execution.execution_microstructure import (
     MAX_OPEN_ORDERS_PER_PASS,
@@ -46,6 +47,12 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
     )
     if once_key:
         _WARNED_NONFATAL_KEYS.add(once_key)
+
+
+class _SubmissionUnrecorded(RuntimeError):
+    def __init__(self, result: Dict[str, Any]) -> None:
+        super().__init__(str((result or {}).get("status") or "submission_unrecorded"))
+        self.result = dict(result or {})
 
 
 def manage_open_orders() -> Dict[str, Any]:
@@ -143,6 +150,81 @@ def manage_open_orders() -> Dict[str, Any]:
             )
             _log_event(con, open_id, "closed", details)
 
+        def _raise_submission_unrecorded(
+            *,
+            open_id: int,
+            broker: str,
+            symbol: str,
+            qty: float,
+            client_order_id: str,
+            broker_order_id: Optional[str],
+            submit_ts_ms: int,
+            attempts: int,
+            portfolio_orders_id,
+            source_alert_id,
+            payload: Dict[str, Any],
+            error: BaseException,
+            stage: str,
+        ) -> None:
+            result = record_submission_unrecorded(
+                con=con,
+                broker=str(broker),
+                symbol=str(symbol),
+                qty=float(qty),
+                order_uid=f"open_order:{str(broker).lower()}:{str(client_order_id)}",
+                client_order_id=str(client_order_id),
+                broker_order_id=(str(broker_order_id) if broker_order_id is not None else None),
+                submit_ts_ms=int(submit_ts_ms or _now_ms()),
+                portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
+                portfolio_ts_ms=None,
+                source_order_id=None,
+                source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
+                payload={**dict(payload or {}), "open_order_id": int(open_id)},
+                error=error,
+                stage=str(stage or "log_submit"),
+                submitted_n=0,
+            )
+            try:
+                con.execute(
+                    """
+                    UPDATE exec_open_orders
+                    SET updated_ts_ms=?, qty=?, client_order_id=?, broker_order_id=?,
+                        attempts=?, status='submission_unrecorded', next_action_ts_ms=0
+                    WHERE id=?
+                    """,
+                    (
+                        int(now),
+                        float(qty),
+                        str(client_order_id),
+                        str(broker_order_id) if broker_order_id is not None else None,
+                        int(attempts),
+                        int(open_id),
+                    ),
+                )
+                _log_event(
+                    con,
+                    open_id,
+                    "submission_unrecorded",
+                    {
+                        "client_order_id": str(client_order_id),
+                        "broker_order_id": str(broker_order_id or ""),
+                        "stage": str(stage or "log_submit"),
+                        "needs_reconcile": True,
+                    },
+                )
+            except Exception as row_exc:
+                _warn_nonfatal(
+                    "EXEC_OPEN_ORDER_SUBMISSION_UNRECORDED_ROW_UPDATE_FAILED",
+                    row_exc,
+                    once_key=f"submission_unrecorded_row:{open_id}:{client_order_id}",
+                    broker=str(broker),
+                    symbol=str(symbol),
+                    client_order_id=str(client_order_id),
+                    broker_order_id=str(broker_order_id or ""),
+                    open_order_id=int(open_id),
+                )
+            raise _SubmissionUnrecorded(result)
+
         def _resubmit_order(*, open_id: int, broker: str, symbol: str, remaining_qty: float, order_type: str, limit_px: Optional[float], client_oid: str, attempts: int, max_attempts: int, portfolio_orders_id, source_alert_id, meta: Dict[str, Any], event_name: str, status_hint: str) -> None:
             # Retries are persisted as new submits so the ledger reflects the
             # actual broker-facing order lineage, not just the original intent.
@@ -180,28 +262,30 @@ def manage_open_orders() -> Dict[str, Any]:
                     _log_event(con, open_id, "market_submit_failed", {"attempt": int(next_attempt), "prev_client_order_id": client_oid, "event": event_name, "status": status_hint})
                     return
 
+                submit_ts_ms = int(_now_ms())
+                market_payload = {
+                    "timeout_escalation": True,
+                    "retry_event": str(event_name),
+                    "retry_status": str(status_hint),
+                    "escalated_from_client_order_id": client_oid,
+                    "escalated_to_order_type": "MARKET",
+                    "attempts": int(next_attempt),
+                    "max_attempts": int(max_attempts),
+                    "remaining_qty": float(remaining_qty),
+                    "meta": meta,
+                }
                 try:
                     log_submit(
                         client_order_id=new_client_oid,
                         broker=str(broker),
                         symbol=symbol,
                         qty=float(remaining_qty),
-                        submit_ts_ms=int(_now_ms()),
+                        submit_ts_ms=int(submit_ts_ms),
                         ref_px=float(limit_px) if limit_px is not None else 0.0,
                         broker_order_id=str(new_broker_oid),
                         portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
                         source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
-                        extra={
-                            "timeout_escalation": True,
-                            "retry_event": str(event_name),
-                            "retry_status": str(status_hint),
-                            "escalated_from_client_order_id": client_oid,
-                            "escalated_to_order_type": "MARKET",
-                            "attempts": int(next_attempt),
-                            "max_attempts": int(max_attempts),
-                            "remaining_qty": float(remaining_qty),
-                            "meta": meta,
-                        },
+                        extra=market_payload,
                     )
                 except Exception as e:
                     _warn_nonfatal(
@@ -212,6 +296,21 @@ def manage_open_orders() -> Dict[str, Any]:
                         symbol=str(symbol),
                         client_order_id=str(new_client_oid),
                         open_order_id=int(open_id),
+                    )
+                    _raise_submission_unrecorded(
+                        open_id=open_id,
+                        broker=broker,
+                        symbol=symbol,
+                        qty=float(remaining_qty),
+                        client_order_id=new_client_oid,
+                        broker_order_id=str(new_broker_oid),
+                        submit_ts_ms=int(submit_ts_ms),
+                        attempts=next_attempt,
+                        portfolio_orders_id=portfolio_orders_id,
+                        source_alert_id=source_alert_id,
+                        payload=market_payload,
+                        error=e,
+                        stage="log_submit",
                     )
 
                 con.execute(
@@ -254,27 +353,29 @@ def manage_open_orders() -> Dict[str, Any]:
                 _log_event(con, open_id, "limit_replace_submit_failed", {"attempt": int(next_attempt), "limit_px": float(next_limit), "aggressiveness": str(next_aggr), "event": event_name, "status": status_hint})
                 return
 
+            submit_ts_ms = int(_now_ms())
+            limit_payload = {
+                "timeout_escalation": True,
+                "retry_event": str(event_name),
+                "retry_status": str(status_hint),
+                "reprice_attempt": int(next_attempt),
+                "prev_client_order_id": client_oid,
+                "escalated_to_aggressiveness": str(next_aggr),
+                "remaining_qty": float(remaining_qty),
+                "meta": meta,
+            }
             try:
                 log_submit(
                     client_order_id=new_client_oid,
                     broker=str(broker),
                     symbol=symbol,
                     qty=float(remaining_qty),
-                    submit_ts_ms=int(_now_ms()),
+                    submit_ts_ms=int(submit_ts_ms),
                     ref_px=float(next_limit),
                     broker_order_id=str(new_broker_oid),
                     portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
                     source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
-                    extra={
-                        "timeout_escalation": True,
-                        "retry_event": str(event_name),
-                        "retry_status": str(status_hint),
-                        "reprice_attempt": int(next_attempt),
-                        "prev_client_order_id": client_oid,
-                        "escalated_to_aggressiveness": str(next_aggr),
-                        "remaining_qty": float(remaining_qty),
-                        "meta": meta,
-                    },
+                    extra=limit_payload,
                 )
             except Exception as e:
                 _warn_nonfatal(
@@ -285,6 +386,21 @@ def manage_open_orders() -> Dict[str, Any]:
                     symbol=str(symbol),
                     client_order_id=str(new_client_oid),
                     open_order_id=int(open_id),
+                )
+                _raise_submission_unrecorded(
+                    open_id=open_id,
+                    broker=broker,
+                    symbol=symbol,
+                    qty=float(remaining_qty),
+                    client_order_id=new_client_oid,
+                    broker_order_id=str(new_broker_oid),
+                    submit_ts_ms=int(submit_ts_ms),
+                    attempts=next_attempt,
+                    portfolio_orders_id=portfolio_orders_id,
+                    source_alert_id=source_alert_id,
+                    payload=limit_payload,
+                    error=e,
+                    stage="log_submit",
                 )
 
             con.execute(
@@ -462,6 +578,19 @@ def manage_open_orders() -> Dict[str, Any]:
 
                 _resubmit_order(open_id=open_id, broker=broker, symbol=symbol, remaining_qty=float(remaining_qty), order_type=order_type, limit_px=(float(limit_px) if limit_px is not None else None), client_oid=client_oid, attempts=attempts, max_attempts=max_attempts, portfolio_orders_id=portfolio_orders_id, source_alert_id=source_alert_id, meta=meta, event_name="stale_retry", status_hint=st)
                 out["updated"] += 1
+
+            except _SubmissionUnrecorded as e:
+                out["errors"] += 1
+                try:
+                    con.commit()
+                except Exception as commit_exc:
+                    _warn_nonfatal(
+                        "EXEC_OPEN_ORDER_SUBMISSION_UNRECORDED_COMMIT_FAILED",
+                        commit_exc,
+                        once_key=f"submission_unrecorded_commit:{open_id}",
+                        open_id=int(open_id),
+                    )
+                return {**out, "open_due": len(rows), **dict(e.result)}
 
             except Exception as e:
                 _warn_nonfatal(

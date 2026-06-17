@@ -5,7 +5,7 @@ This directory is the canonical home for the repository's OpenAPI source of trut
 ## Current State
 
 - `openapi.yaml` establishes the baseline OpenAPI 3.1 document.
-- The baseline now covers the current system, jobs, data-source, and browser-terminal paths that are highest value for operators and maintainers.
+- The baseline now covers the current system, jobs, data-source, broker-config, and browser-terminal paths that are highest value for operators and maintainers.
 - Coverage is still incomplete for the rest of the aggregated `/api/*` surface.
 - Contributors should add or update the paths they touch instead of waiting for a full repo-wide backfill.
 

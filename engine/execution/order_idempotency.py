@@ -47,6 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_execution_order_idempotency_symbol_ts
 _WARNED_NONFATAL_KEYS: set[str] = set()
 _WARNED_NONFATAL_LOCK = threading.Lock()
 LOG = get_logger("execution.order_idempotency")
+SUBMISSION_UNRECORDED_STATUS = "submission_unrecorded"
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -329,6 +330,128 @@ def mark_order_submission_submitted(
         ),
     )
     _commit_if_outermost(con, had_transaction)
+
+
+def mark_order_submission_unrecorded(
+    *,
+    con,
+    broker: str,
+    order_uid: str,
+    client_order_id: str,
+    broker_order_id: Optional[str],
+    submit_ts_ms: int,
+    last_error: str,
+    symbol: Optional[str] = None,
+    portfolio_orders_id: Optional[int] = None,
+    portfolio_ts_ms: Optional[int] = None,
+    source_order_id: Optional[int] = None,
+    source_alert_id: Optional[int] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    init_order_idempotency(con)
+    now_ms = _now_ms()
+    had_transaction = bool(getattr(con, "in_transaction", False))
+    oid = str(order_uid or "").strip()
+    cid = str(client_order_id or "").strip()
+    broker_name = str(broker or "").strip().lower() or "unknown"
+    symbol_norm = _canon_upper(symbol) or _canon_upper((payload or {}).get("symbol")) or "UNKNOWN"
+    broker_oid = str(broker_order_id).strip() if broker_order_id is not None else None
+    submit_ts = int(submit_ts_ms or now_ms)
+    error_text = str(last_error or "accepted_broker_submission_unrecorded")
+    marker_payload = {
+        **dict(payload or {}),
+        "broker": broker_name,
+        "order_uid": oid,
+        "client_order_id": cid,
+        "broker_order_id": broker_oid,
+        "status": SUBMISSION_UNRECORDED_STATUS,
+        "needs_reconcile": True,
+        "last_error": error_text,
+    }
+
+    updated = con.execute(
+        """
+        UPDATE execution_order_idempotency
+        SET client_order_id=?,
+            broker_order_id=?,
+            status=?,
+            submit_ts_ms=COALESCE(submit_ts_ms, ?),
+            updated_ts_ms=?,
+            last_error=?
+        WHERE order_uid=?
+        """,
+        (
+            cid,
+            broker_oid,
+            SUBMISSION_UNRECORDED_STATUS,
+            int(submit_ts),
+            int(now_ms),
+            error_text,
+            oid,
+        ),
+    )
+    updated_n = int(getattr(updated, "rowcount", 0) or 0)
+    if updated_n <= 0:
+        con.execute(
+            """
+            INSERT INTO execution_order_idempotency(
+              order_uid,
+              broker,
+              portfolio_orders_id,
+              portfolio_ts_ms,
+              source_order_id,
+              source_alert_id,
+              symbol,
+              client_order_id,
+              broker_order_id,
+              status,
+              first_seen_ts_ms,
+              claimed_ts_ms,
+              updated_ts_ms,
+              submit_ts_ms,
+              last_error,
+              payload_json
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(order_uid) DO UPDATE SET
+              client_order_id=excluded.client_order_id,
+              broker_order_id=excluded.broker_order_id,
+              status=excluded.status,
+              submit_ts_ms=COALESCE(execution_order_idempotency.submit_ts_ms, excluded.submit_ts_ms),
+              updated_ts_ms=excluded.updated_ts_ms,
+              last_error=excluded.last_error
+            """,
+            (
+                oid,
+                broker_name,
+                _safe_i(portfolio_orders_id),
+                _safe_i(portfolio_ts_ms),
+                _safe_i(source_order_id if source_order_id is not None else marker_payload.get("source_order_id")),
+                _safe_i(source_alert_id if source_alert_id is not None else marker_payload.get("source_alert_id")),
+                symbol_norm,
+                cid,
+                broker_oid,
+                SUBMISSION_UNRECORDED_STATUS,
+                int(now_ms),
+                int(now_ms),
+                int(now_ms),
+                int(submit_ts),
+                error_text,
+                json.dumps(marker_payload, separators=(",", ":"), sort_keys=True),
+            ),
+        )
+    _commit_if_outermost(con, had_transaction)
+    return {
+        "ok": True,
+        "marker_written": True,
+        "status": SUBMISSION_UNRECORDED_STATUS,
+        "broker": broker_name,
+        "order_uid": oid,
+        "client_order_id": cid,
+        "broker_order_id": broker_oid,
+        "submit_ts_ms": int(submit_ts),
+        "updated_existing": bool(updated_n > 0),
+    }
 
 
 def mark_order_submission_unknown(

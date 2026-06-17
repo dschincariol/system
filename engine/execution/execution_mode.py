@@ -14,7 +14,7 @@ Modes:
 
 Live safety:
 - Requires mode='live' AND armed=1
-- DISABLE_LIVE_EXECUTION=1 always blocks
+- Truthy DISABLE_LIVE_EXECUTION always blocks real trading
 - Armed persisted and audited
 - Provider health gate optional
 """
@@ -26,6 +26,10 @@ from typing import Dict, Any, Optional, Tuple
 
 from engine.audit.chain import append_chain_row
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.live_execution_control import (
+    DISABLE_LIVE_EXECUTION_REASON,
+    live_execution_disabled,
+)
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import DB_PATH, _table_exists, connect, init_db, run_write_txn
 from engine.runtime.state_cache import cache_get, cache_set, cache_invalidate_namespace
@@ -603,8 +607,8 @@ def execution_allowed_for_real_trading(
                 "runtime_state": runtime_snapshot,
             }
 
-        if os.environ.get("DISABLE_LIVE_EXECUTION", "0") == "1":
-            return False, "env_disable_live", {
+        if live_execution_disabled():
+            return False, DISABLE_LIVE_EXECUTION_REASON, {
                 "mode": mode,
                 "armed": armed,
                 "runtime_state": runtime_snapshot,

@@ -40,12 +40,24 @@ The `engine/execution/` tree turns approved portfolio or strategy intents into b
   IBKR gateway adapter used by live broker-routing paths.
 - [broker_apply_orders.py](broker_apply_orders.py)
   Main order-application path that enforces execution barriers, intent loading, shaping, and broker submission.
+- [broker_failover_policy.py](broker_failover_policy.py)
+  Broker alias normalization, live failover-chain validation, broker environment contract checks, startup broker preflight, and non-retryable broker failure classification.
+- [broker_submission_recovery.py](broker_submission_recovery.py)
+  Recovery marker and fail-closed gate for broker-accepted submissions that could not be durably recorded locally.
 - [execution_ai_advisor.py](execution_ai_advisor.py)
   Advisory-only read layer that summarizes historical slippage/latency and persists operator-facing execution guidance.
 
 ## Important Constraint
 
 In `safe` mode, execution is intentionally blocked. If the dashboard shows execution as not started while the runtime is in `safe`, that is normally expected behavior rather than a startup failure.
+
+Live broker routing has additional fail-closed constraints:
+
+- `BROKER`, `BROKER_NAME`, `LIVE_BROKER`, and the first `BROKER_FAILOVER` entry must identify the intended live broker.
+- Live failover chains must not include `sim`, `paper`, or `sandbox`.
+- `DISABLE_LIVE_EXECUTION` blocks real trading when it is set to any non-empty value other than `0`, `false`, `no`, or `off`.
+- Pre-live reconciliation must run in live mode unless the break-glass environment contract is explicitly filled and audited.
+- Broker auth/configuration failures and unrecorded broker submissions stop failover instead of retrying into another broker.
 
 ## Extending Execution
 

@@ -9,6 +9,7 @@ alternative-data features.
 import os
 from pathlib import Path
 from dataclasses import dataclass
+import math
 
 
 class ConfigError(RuntimeError):
@@ -17,6 +18,46 @@ class ConfigError(RuntimeError):
 
 _ALLOWED_ENVS = {"dev", "prod", "test"}
 _ALLOWED_ENGINE_MODES = {"safe", "shadow", "live", "dev", "paper"}
+_PLACEHOLDER_VALUES = {
+    "changeme",
+    "change-me",
+    "default",
+    "dummy",
+    "example",
+    "none",
+    "null",
+    "placeholder",
+    "sample",
+    "tbd",
+    "test",
+    "todo",
+    "unset",
+}
+
+_LIVE_RISK_REQUIRED_ENABLED_FLAGS = (
+    "PORTFOLIO_USE_RISK_ENGINE",
+    "PORTFOLIO_RISK_USE_MONTE_CARLO",
+    "MODEL_AWARE_KILL_SWITCH",
+)
+_LIVE_RISK_REQUIRED_FLOAT_THRESHOLDS = (
+    "PORTFOLIO_RISK_MC_VAR_95_BLOCK",
+    "PORTFOLIO_RISK_MC_VAR_99_BLOCK",
+    "PORTFOLIO_RISK_MC_CVAR_95_BLOCK",
+    "PORTFOLIO_RISK_MC_CVAR_99_BLOCK",
+    "PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK",
+    "PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK",
+    "PORTFOLIO_RISK_VOL_HARD_BLOCK",
+    "KILL_SWITCH_MODEL_MAX_DRAWDOWN",
+)
+_LIVE_RISK_REQUIRED_INT_THRESHOLDS = (
+    "KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES",
+)
+_LIVE_RISK_ACCEPTANCE_OVERRIDE = "LIVE_RISK_THRESHOLD_ACCEPTANCE_OVERRIDE"
+_LIVE_RISK_ACCEPTANCE_AUDIT_FIELDS = (
+    "LIVE_RISK_THRESHOLD_ACCEPTANCE_ID",
+    "LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER",
+    "LIVE_RISK_THRESHOLD_ACCEPTANCE_REASON",
+)
 
 
 def _req(name: str) -> str:
@@ -61,6 +102,146 @@ def _opt_bool(name: str, default: bool = False) -> bool:
     if s in ("0", "false", "no", "n", "off"):
         return False
     raise ConfigError(f"Invalid bool for {name}: {v}")
+
+
+def _is_placeholder_value(raw: object) -> bool:
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return True
+    lowered = text.lower().replace("_", "-").replace(" ", "")
+    return lowered in _PLACEHOLDER_VALUES
+
+
+def _parse_bool_value(name: str, raw: object, default: bool) -> bool:
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    text = str(raw).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    raise ConfigError(f"Invalid bool for {name}: {raw}")
+
+
+def _live_risk_required(safety: dict[str, object] | None = None) -> bool:
+    ctx = safety if safety is not None else get_runtime_safety_context()
+    return bool(str(ctx.get("engine_mode") or "").lower() == "live" and bool(ctx.get("strict_runtime")))
+
+
+def _positive_float_issue(name: str) -> str | None:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return f"{name} unset"
+    if _is_placeholder_value(raw):
+        return f"{name} placeholder"
+    try:
+        value = float(str(raw).strip())
+    except Exception:
+        return f"{name} invalid"
+    if not math.isfinite(value) or value <= 0.0:
+        return f"{name} must be > 0"
+    return None
+
+
+def _positive_int_issue(name: str) -> str | None:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return f"{name} unset"
+    if _is_placeholder_value(raw):
+        return f"{name} placeholder"
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        return f"{name} invalid"
+    if value <= 0:
+        return f"{name} must be > 0"
+    return None
+
+
+def live_risk_threshold_validation_snapshot(
+    safety: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Return live-capital risk-threshold validation state.
+
+    Live capital must not rely on risk gates whose production defaults disable
+    blocking behaviour. A risk-acceptance override is allowed only when it is
+    explicitly enabled and carries audit metadata that can be surfaced by
+    preflight.
+    """
+
+    ctx = safety if safety is not None else get_runtime_safety_context()
+    required = _live_risk_required(ctx)
+    issues: list[str] = []
+    audit: dict[str, str] = {}
+
+    if not required:
+        return {
+            "required": False,
+            "ok": True,
+            "override": False,
+            "issues": [],
+            "audit": {},
+        }
+
+    for name in _LIVE_RISK_REQUIRED_ENABLED_FLAGS:
+        raw = os.environ.get(name)
+        if raw is not None and _is_placeholder_value(raw):
+            issues.append(f"{name} placeholder")
+            continue
+        try:
+            enabled = _parse_bool_value(name, raw, default=True)
+        except ConfigError as exc:
+            issues.append(str(exc))
+            continue
+        if not enabled:
+            issues.append(f"{name} disabled")
+
+    for name in _LIVE_RISK_REQUIRED_FLOAT_THRESHOLDS:
+        issue = _positive_float_issue(name)
+        if issue:
+            issues.append(issue)
+
+    for name in _LIVE_RISK_REQUIRED_INT_THRESHOLDS:
+        issue = _positive_int_issue(name)
+        if issue:
+            issues.append(issue)
+
+    try:
+        override = _parse_bool_value(
+            _LIVE_RISK_ACCEPTANCE_OVERRIDE,
+            os.environ.get(_LIVE_RISK_ACCEPTANCE_OVERRIDE),
+            default=False,
+        )
+    except ConfigError as exc:
+        issues.append(str(exc))
+        override = False
+
+    if override:
+        for field in _LIVE_RISK_ACCEPTANCE_AUDIT_FIELDS:
+            raw = os.environ.get(field)
+            if _is_placeholder_value(raw):
+                issues.append(f"{field} required for {_LIVE_RISK_ACCEPTANCE_OVERRIDE}=1")
+            else:
+                audit[field] = str(raw).strip()
+
+    ok = not issues or bool(override and len(audit) == len(_LIVE_RISK_ACCEPTANCE_AUDIT_FIELDS))
+    return {
+        "required": True,
+        "ok": bool(ok),
+        "override": bool(override and ok),
+        "issues": list(issues),
+        "audit": audit,
+        "required_thresholds": list(_LIVE_RISK_REQUIRED_FLOAT_THRESHOLDS + _LIVE_RISK_REQUIRED_INT_THRESHOLDS),
+        "required_enabled_flags": list(_LIVE_RISK_REQUIRED_ENABLED_FLAGS),
+    }
+
+
+def validate_live_risk_thresholds(safety: dict[str, object] | None = None) -> dict[str, object]:
+    snapshot = live_risk_threshold_validation_snapshot(safety)
+    if not bool(snapshot.get("ok")):
+        issues = "; ".join(str(item) for item in list(snapshot.get("issues") or []))
+        raise ConfigError(f"live risk thresholds invalid: {issues}")
+    return snapshot
 
 
 def _normalize_env_name(raw: str) -> str:
@@ -398,6 +579,7 @@ def load_runtime_config() -> RuntimeConfig:
     use_pit_universe = _opt_bool("USE_PIT_UNIVERSE", default=False)
     pit_universe_backfill_enabled = _opt_bool("PIT_UNIVERSE_BACKFILL_ENABLED", default=False)
     _validate_new_subsystem_flags()
+    validate_live_risk_thresholds(safety)
 
     if strict_runtime and not Path(db_path).is_absolute():
         raise ConfigError(f"DB_PATH must resolve to an absolute path in supervised/prod mode: {db_path_raw}")

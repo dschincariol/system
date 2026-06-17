@@ -25,7 +25,9 @@ import argparse
 import json
 import os
 import py_compile
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,6 +72,256 @@ SMOKE_CMDS = [
     ("engine.execution.broker_sim", [sys.executable, "-u", "-m", "engine.execution.broker_sim"]),
 ]
 _WARNED_NONFATAL_KEYS: set[str] = set()
+_PG_PASSWORD_RE = re.compile(r"(?:^|\s)password=", re.IGNORECASE)
+_DSN_USER_RE = re.compile(r"(?:^|\s)user=(?P<value>'(?:\\'|[^'])*'|\S+)")
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _looks_like_file_path(path: Path) -> bool:
+    return bool(path.suffix)
+
+
+def _split_names(raw: str) -> List[str]:
+    return [part.strip() for part in re.split(r"[\s,]+", str(raw or "")) if part.strip()]
+
+
+def _dsn_user(conninfo: str) -> str:
+    match = _DSN_USER_RE.search(str(conninfo or ""))
+    if not match:
+        fallback = "ts_app"
+        try:
+            from engine.runtime.platform import default_pg_user
+
+            fallback = str(default_pg_user())
+        except Exception:
+            fallback = "ts_app"
+        return fallback
+    value = str(match.group("value") or "").strip()
+    if value.startswith("'") and value.endswith("'"):
+        value = value[1:-1].replace("\\'", "'").replace("\\\\", "\\")
+    return value or "ts_app"
+
+
+def _pg_password_env_present(user: str) -> bool:
+    role = str(user or "ts_app").removeprefix("ts_").upper()
+    for name in (
+        "TS_PG_PASSWORD",
+        f"TS_PG_PASSWORD_{role}",
+        f"TS_PG_{role}_PASSWORD",
+        "PGPASSWORD",
+    ):
+        if str(os.environ.get(name) or "").strip():
+            return True
+    return False
+
+
+def _required_pg_credential_names() -> List[str]:
+    raw = str(
+        os.environ.get("PROD_PREFLIGHT_REQUIRED_CREDENTIALS")
+        or os.environ.get("PREFLIGHT_REQUIRED_CREDENTIALS")
+        or ""
+    ).strip()
+    if raw:
+        return _split_names(raw)
+
+    configured_dsn = str(os.environ.get("TS_PG_DSN") or "").strip()
+    if configured_dsn and _PG_PASSWORD_RE.search(configured_dsn):
+        return []
+
+    user = _dsn_user(configured_dsn)
+    if _pg_password_env_present(user):
+        return []
+
+    try:
+        from engine.runtime.platform import pg_password_secret_name
+
+        names = [str(pg_password_secret_name(user))]
+    except Exception:
+        names = ["pg_password_app"]
+
+    if _env_truthy("PROD_PREFLIGHT_REQUIRE_MASTER_KEY") or _env_truthy("PREFLIGHT_REQUIRE_MASTER_KEY"):
+        names.append("master_key")
+    return list(dict.fromkeys(names))
+
+
+def _runtime_data_root() -> Path:
+    raw = str(os.environ.get("DB_PATH") or "").strip()
+    if raw:
+        raw_path = Path(raw).expanduser()
+    else:
+        from engine.runtime.platform import default_data_root
+
+        raw_path = default_data_root()
+    return raw_path.parent if raw and _looks_like_file_path(raw_path) else raw_path
+
+
+def _credential_file_snapshot(path: Path) -> Dict[str, Any]:
+    early_state: Dict[str, Any] | None = None
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        early_state = {"ok": False, "reason": "missing", "path": str(path)}
+    except OSError as exc:
+        early_state = {"ok": False, "reason": f"stat_failed:{type(exc).__name__}:{exc}", "path": str(path)}
+    if early_state is not None:
+        return early_state
+    mode = stat.S_IMODE(st.st_mode)
+    ok = bool(path.is_file() and st.st_size > 0 and os.access(path, os.R_OK))
+    reason = "ok"
+    if not path.is_file():
+        reason = "not_regular_file"
+    elif st.st_size <= 0:
+        reason = "empty"
+    elif not os.access(path, os.R_OK):
+        reason = "not_readable"
+    return {
+        "ok": ok,
+        "reason": reason,
+        "path": str(path),
+        "mode": oct(mode),
+        "size": int(st.st_size),
+    }
+
+
+def _production_provisioning_gate() -> Tuple[List[str], List[str], Dict[str, Any]]:
+    """Validate production host prerequisites before storage/schema work."""
+
+    notes: List[str] = []
+    errors: List[str] = []
+    snapshot: Dict[str, Any] = {"credentials": {}, "data_root": {}}
+
+    required_names = _required_pg_credential_names()
+    try:
+        from services.secrets.loader import selected_provider_name, validate_secret_name
+
+        provider = selected_provider_name()
+        validated_names = [validate_secret_name(name) for name in required_names]
+    except Exception as exc:
+        provider = str(os.environ.get("TS_SECRETS_PROVIDER") or "systemd-creds").strip().lower()
+        validated_names = list(required_names)
+        errors.append(f"credential validation failed: {type(exc).__name__}: {exc}")
+
+    credential_state: Dict[str, Any] = {
+        "provider": provider,
+        "required_names": list(validated_names),
+    }
+    snapshot["credentials"] = credential_state
+
+    if validated_names:
+        if provider in {"systemd-creds", "systemd_creds"}:
+            cred_dir_raw = str(os.environ.get("CREDENTIALS_DIRECTORY") or "").strip()
+            credential_state["credentials_directory"] = cred_dir_raw
+            if not sys.platform.startswith("linux"):
+                errors.append("systemd credentials require Linux: TS_SECRETS_PROVIDER=systemd-creds")
+            elif not cred_dir_raw:
+                errors.append(
+                    "systemd credentials unavailable: CREDENTIALS_DIRECTORY is unset; "
+                    "run under a systemd unit with LoadCredentialEncrypted= for "
+                    + ",".join(validated_names)
+                )
+            else:
+                cred_dir = Path(cred_dir_raw)
+                if not cred_dir.exists():
+                    errors.append(f"systemd credentials directory missing: {cred_dir}")
+                elif not cred_dir.is_dir():
+                    errors.append(f"systemd credentials path is not a directory: {cred_dir}")
+                elif not os.access(cred_dir, os.R_OK | os.X_OK):
+                    errors.append(f"systemd credentials directory not readable/searchable: {cred_dir}")
+                else:
+                    files = {}
+                    for name in validated_names:
+                        state = _credential_file_snapshot(cred_dir / name)
+                        files[name] = state
+                        if not bool(state.get("ok")):
+                            errors.append(
+                                "systemd credential invalid: "
+                                f"{name} reason={state.get('reason')} path={state.get('path')}"
+                            )
+                    credential_state["files"] = files
+        elif provider == "plaintext":
+            secret_dir_raw = str(os.environ.get("TS_DEV_SECRETS_DIR") or "").strip()
+            credential_state["dev_secrets_dir"] = secret_dir_raw
+            if _env_truthy("PROD_PREFLIGHT_FORBID_PLAINTEXT_SECRETS", default=False):
+                errors.append("plaintext secrets provider forbidden by PROD_PREFLIGHT_FORBID_PLAINTEXT_SECRETS")
+            if not secret_dir_raw:
+                errors.append("plaintext credential directory missing: TS_DEV_SECRETS_DIR is unset")
+            else:
+                secret_dir = Path(secret_dir_raw)
+                files = {}
+                for name in validated_names:
+                    state = _credential_file_snapshot(secret_dir / name)
+                    files[name] = state
+                    if not bool(state.get("ok")):
+                        errors.append(
+                            "plaintext credential invalid: "
+                            f"{name} reason={state.get('reason')} path={state.get('path')}"
+                        )
+                credential_state["files"] = files
+        else:
+            errors.append(
+                "unsupported secrets provider for production preflight: "
+                f"{provider}; expected systemd-creds or an inline TS_PG_DSN password"
+            )
+    else:
+        credential_state["source"] = "inline_or_env_password"
+
+    try:
+        data_root = _runtime_data_root()
+        data_root_display = str(data_root)
+        data_state: Dict[str, Any] = {"path": data_root_display}
+        snapshot["data_root"] = data_state
+        if not data_root.is_absolute():
+            errors.append(f"runtime data root must be absolute: {data_root_display}")
+        elif not data_root.exists():
+            errors.append(
+                "runtime data root missing: "
+                f"{data_root_display}; create it with the trading service owner before schema init"
+            )
+        elif not data_root.is_dir():
+            errors.append(f"runtime data root is not a directory: {data_root_display}")
+        else:
+            st = data_root.stat()
+            mode = stat.S_IMODE(st.st_mode)
+            data_state.update(
+                {
+                    "mode": oct(mode),
+                    "uid": int(st.st_uid),
+                    "gid": int(st.st_gid),
+                    "current_uid": int(os.geteuid()) if hasattr(os, "geteuid") else None,
+                    "readable": bool(os.access(data_root, os.R_OK)),
+                    "writable": bool(os.access(data_root, os.W_OK)),
+                    "searchable": bool(os.access(data_root, os.X_OK)),
+                }
+            )
+            if not bool(data_state["readable"]):
+                errors.append(f"runtime data root not readable: {data_root_display}")
+            if not bool(data_state["writable"]):
+                errors.append(f"runtime data root not writable: {data_root_display}")
+            if not bool(data_state["searchable"]):
+                errors.append(f"runtime data root not searchable: {data_root_display}")
+    except Exception as exc:
+        errors.append(f"runtime data root validation failed: {type(exc).__name__}: {exc}")
+
+    if not errors:
+        if validated_names:
+            notes.append(f"credential source ok provider={provider} names={','.join(validated_names)}")
+        else:
+            notes.append("credential source ok provider=inline_or_env_password")
+        data_state = dict(snapshot.get("data_root") or {})
+        notes.append(
+            "runtime data root ok "
+            f"path={data_state.get('path')} "
+            f"mode={data_state.get('mode')} "
+            f"uid={data_state.get('uid')} gid={data_state.get('gid')}"
+        )
+
+    return notes, errors, snapshot
 
 
 def _t_ms() -> int:
@@ -105,13 +357,16 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
         from engine.runtime.config_schema import (
             ConfigError as RuntimeConfigError,
             get_runtime_safety_context,
+            live_risk_threshold_validation_snapshot,
             load_runtime_config,
         )
+        from engine.runtime.live_trading_preflight import live_trading_preflight
 
         ConfigError = RuntimeConfigError
 
         safety = get_runtime_safety_context()
         cfg = load_runtime_config()
+        live_risk = live_risk_threshold_validation_snapshot(safety)
         notes.append(
             "runtime config ok "
             f"env={safety.get('env')} "
@@ -120,6 +375,84 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             f"db_path={getattr(cfg, 'db_path', '')} "
             f"allow_training={int(bool(getattr(cfg, 'allow_training', False)))}"
         )
+        if bool(live_risk.get("required")):
+            if bool(live_risk.get("override")):
+                audit = dict(live_risk.get("audit") or {})
+                notes.append(
+                    "live risk thresholds override accepted "
+                    f"id={audit.get('LIVE_RISK_THRESHOLD_ACCEPTANCE_ID')} "
+                    f"owner={audit.get('LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER')} "
+                    f"issues={len(list(live_risk.get('issues') or []))}"
+                )
+            else:
+                notes.append(
+                    "live risk thresholds ok "
+                    f"thresholds={len(list(live_risk.get('required_thresholds') or []))} "
+                    f"enabled_flags={len(list(live_risk.get('required_enabled_flags') or []))}"
+                )
+        live_preflight = live_trading_preflight(
+            engine_mode=safety.get("engine_mode"),
+            execution_mode=os.environ.get("EXECUTION_MODE", ""),
+        )
+        if bool(live_preflight.get("required")):
+            live_env = dict(live_preflight.get("deployment_contract") or {})
+            prelive_reconcile = dict(live_preflight.get("prelive_reconcile") or {})
+            backup_restore_evidence = dict(live_preflight.get("backup_restore_evidence") or {})
+            execution_arming_audit = dict(live_preflight.get("execution_arming_audit") or {})
+            classified_blockers: set[str] = set()
+
+            if not bool(live_env.get("ok")):
+                env_blockers = [str(item) for item in list(live_env.get("blockers") or [])]
+                classified_blockers.update(env_blockers)
+                issues = "; ".join(env_blockers)
+                errors.append(f"live environment contract invalid: {issues or live_env.get('reason')}")
+
+            if bool(prelive_reconcile.get("required")):
+                reconcile_blockers = [str(item) for item in list(prelive_reconcile.get("blockers") or [])]
+                classified_blockers.update(reconcile_blockers)
+                if not bool(prelive_reconcile.get("ok")):
+                    issues = "; ".join(reconcile_blockers)
+                    errors.append(f"pre-live reconcile invalid: {issues or prelive_reconcile.get('reason')}")
+                elif bool(prelive_reconcile.get("override")):
+                    audit = dict(prelive_reconcile.get("audit") or {})
+                    notes.append(
+                        "pre-live reconcile break-glass accepted "
+                        f"actor={audit.get('actor')} "
+                        f"broker={audit.get('broker') or 'all'}"
+                    )
+
+            if bool(backup_restore_evidence.get("required")) and not bool(backup_restore_evidence.get("ok")):
+                backup_blockers = [str(item) for item in list(backup_restore_evidence.get("blockers") or [])]
+                classified_blockers.update(backup_blockers)
+                issues = "; ".join(backup_blockers)
+                errors.append(f"backup restore evidence invalid: {issues or backup_restore_evidence.get('reason')}")
+
+            if bool(execution_arming_audit.get("required")) and not bool(execution_arming_audit.get("ok")):
+                arming_blockers = [str(item) for item in list(execution_arming_audit.get("blockers") or [])]
+                classified_blockers.update(arming_blockers)
+                issues = "; ".join(arming_blockers)
+                errors.append(f"execution arming audit invalid: {issues or execution_arming_audit.get('reason')}")
+
+            other_blockers = [
+                str(item)
+                for item in list(live_preflight.get("blockers") or [])
+                if str(item) not in classified_blockers
+            ]
+            if other_blockers:
+                errors.append(f"live trading preflight invalid: {'; '.join(other_blockers)}")
+
+            if bool(live_preflight.get("ok")):
+                broker_contract = dict(live_env.get("broker_contract") or {})
+                initial_hold = dict(live_env.get("initial_kill_switch_hold") or {})
+                arming_audit = dict(live_preflight.get("execution_arming_audit") or {})
+                notes.append(
+                    "live environment contract ok "
+                    f"execution_mode={live_env.get('execution_mode')} "
+                    f"broker={broker_contract.get('broker')} "
+                    f"chain={','.join(str(item) for item in list(broker_contract.get('chain') or []))} "
+                    f"initial_kill_switch_armed={int(bool(initial_hold.get('armed')))} "
+                    f"execution_arming_audited={int(bool(arming_audit.get('ok')))}"
+                )
     except ConfigError as e:
         errors.append(f"runtime config invalid: {e}")
     except Exception as e:
@@ -269,6 +602,46 @@ def _check_external_services() -> Tuple[List[str], List[str], List[str], List[Di
         list(summary.get("errors") or []),
         [dict(item) for item in list(summary.get("services") or []) if isinstance(item, dict)],
     )
+
+
+def _backup_restore_evidence_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.backup_evidence import backup_restore_evidence_snapshot
+
+        state = dict(backup_restore_evidence_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe")) or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_BACKUP_EVIDENCE_FAILED",
+            e,
+            once_key="backup_evidence_gate",
+        )
+        return [], [], [f"backup restore evidence validation failed: {type(e).__name__}: {e}"], {}
+
+    policy = dict(state.get("policy") or {})
+    base = dict(state.get("base_backup") or {})
+    wal = dict(state.get("wal_archive") or {})
+    drill = dict(state.get("restore_drill") or {})
+    if bool(state.get("fresh")):
+        notes.append(
+            "backup restore evidence ok "
+            f"base_age_s={base.get('age_s')} "
+            f"wal_age_s={wal.get('age_s')} "
+            f"restore_drill_age_s={drill.get('age_s')} "
+            f"restore_rto_s={policy.get('restore_rto_s')}"
+        )
+    elif bool(state.get("required")):
+        blockers = ",".join(str(item) for item in list(state.get("blockers") or []))
+        errors.append(f"backup restore evidence invalid: {blockers or state.get('reason') or 'unknown'}")
+    else:
+        notes.append(
+            "backup restore evidence not required "
+            f"blockers={len(list(state.get('blockers') or []))} "
+            f"path={state.get('evidence_path')}"
+        )
+    return notes, warnings, errors, state
 
 
 def _run_cmd(name: str, argv: List[str], timeout_s: int, *, smoke_db_path: str | None = None) -> Tuple[int, str]:
@@ -503,10 +876,24 @@ def main() -> int:
         "smoke": [],
         "db_validation": {},
         "external_services": [],
+        "backup_restore_evidence": {},
+        "provisioning": {},
     }
 
     # Fail fast in dependency order: source integrity first, then schema,
     # then smoke jobs, then optional sanity checks.
+    provisioning_notes, provisioning_errors, provisioning = _production_provisioning_gate()
+    result["steps"].extend(provisioning_notes)
+    result["provisioning"] = dict(provisioning or {})
+    if provisioning_errors:
+        result["errors"].extend(provisioning_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in provisioning_errors:
+                print("[provisioning]", error)
+        return 3
+
     config_notes, config_errors = _runtime_config_gate()
     result["steps"].extend(config_notes)
     if config_errors:
@@ -574,6 +961,19 @@ def main() -> int:
         else:
             for error in external_errors:
                 print("[external]", error)
+        return 3
+
+    backup_notes, backup_warnings, backup_errors, backup_evidence = _backup_restore_evidence_gate()
+    result["steps"].extend(backup_notes)
+    result["warnings"].extend(backup_warnings)
+    result["backup_restore_evidence"] = dict(backup_evidence or {})
+    if backup_errors:
+        result["errors"].extend(backup_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in backup_errors:
+                print("[backup]", error)
         return 3
 
     smoke_db_notes, smoke_db_warnings, smoke_db_errors, smoke_db_path, smoke_db_temp_dir = _prepare_isolated_smoke_db()

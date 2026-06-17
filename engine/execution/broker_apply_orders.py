@@ -37,6 +37,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.live_execution_control import prelive_reconcile_policy_gate
 from engine.runtime.storage import connect, init_db, acquire_job_lock, release_job_lock, touch_job_lock, run_write_txn
 from engine.runtime.event_log import append_event, record_execution_block, record_order_decision
 from engine.runtime.logging import get_logger, log_event
@@ -82,6 +83,17 @@ def _import_nonfatal(code: str, error: BaseException) -> None:
 
 def _execution_gate_snapshot() -> Dict[str, Any]:
     return execution_gate_snapshot(get_execution_mode_fn=get_execution_mode)
+
+
+def _defer_initial_capital_block(reason: Any, meta: Optional[Dict[str, Any]]) -> bool:
+    reason_s = str(reason or "").strip()
+    if reason_s in {"capital_guard_block", "capital_guard_error", "capital_aware_kill_switch"}:
+        return True
+    meta_obj = dict(meta or {})
+    nested_meta = meta_obj.get("meta")
+    if isinstance(nested_meta, dict) and str(nested_meta.get("trigger") or "").strip() == "drawdown_state_unavailable":
+        return True
+    return str(meta_obj.get("trigger") or "").strip() == "drawdown_state_unavailable"
 
 # Newer path (preferred)
 try:
@@ -1141,6 +1153,7 @@ def main() -> int:
     real_payload: List[dict] = []
     shadow_payload_by_model: Dict[str, List[dict]] = {}
     command_id: Optional[str] = None
+    deferred_initial_kill_switch: Optional[Dict[str, Any]] = None
 
 # ------------------------------------------------------------
 # Signal freshness is enforced later using payload_ts_ms
@@ -1154,7 +1167,12 @@ def main() -> int:
         finally:
             con.close()
 
-        if not allow:
+        if not allow and _defer_initial_capital_block(ks_reason, ks_meta):
+            deferred_initial_kill_switch = {
+                "reason": str(ks_reason or ""),
+                "meta": dict(ks_meta or {}),
+            }
+        elif not allow:
             blocked_ts_ms = _now_ms()
             _record_execution_event_boundary(
                 event_type="execution_block",
@@ -1633,6 +1651,44 @@ def main() -> int:
         # 1) Position reconciliation (live brokers)
         # 2) Execution risk governor (defense in depth)
         # ------------------------------------------------------------
+        prelive_policy_block = prelive_reconcile_policy_gate(
+            source="engine.execution.broker_apply_orders",
+            engine_mode="live",
+            broker=str(BROKER_NAME),
+            audit_override=True,
+            correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
+        )
+        if prelive_policy_block is not None:
+            return _blocked(
+                started_ms=int(started_ms),
+                layer="position_reconcile_policy",
+                mode="live",
+                broker=str(BROKER_NAME),
+                reason=str(prelive_policy_block.get("reason") or prelive_policy_block.get("status") or "prelive_reconcile_policy_block"),
+                payload={"prelive_reconcile_policy": dict(prelive_policy_block)},
+                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
+            )
+
+        con_ks = connect()
+        try:
+            allow, ks_reason, ks_meta = execution_allowed(con=con_ks, symbol=None, regime=None)
+        finally:
+            con_ks.close()
+
+        if not allow:
+            payload = {"meta": dict(ks_meta or {})}
+            if deferred_initial_kill_switch is not None:
+                payload["deferred_initial_kill_switch"] = dict(deferred_initial_kill_switch)
+            return _blocked(
+                started_ms=int(started_ms),
+                layer="kill_switch",
+                mode="live",
+                broker=str(BROKER_NAME),
+                reason=str(ks_reason or "kill_switch_block"),
+                payload=payload,
+                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
+            )
+
         try:
             con2 = connect()
             try:

@@ -14,6 +14,8 @@ Env:
   EXECUTION_RECONCILE_ALLOW_BOOTSTRAP=0      (default 0)  -> if 1 and no baseline, create confirmed baseline
   TS_RECONCILE_BOOTSTRAP_TOKEN               expected operator bootstrap token
   TS_RECONCILE_BOOTSTRAP_CONFIRM             operator confirmation token for this bootstrap
+  POSITION_RECONCILE_FETCH_FAILURE_HALT_THRESHOLD=3
+  POSITION_RECONCILE_FETCH_FAILURE_COOLDOWN_MS=300000
 
 Tolerances:
   POSITION_RECONCILE_QTY_TOL=0.01            (absolute qty tolerance per symbol)
@@ -75,6 +77,34 @@ def _safe_f(x, d: float = 0.0) -> float:
     return float(d)
 
 
+def _safe_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(str(name))
+    try:
+        value = int(str(raw if raw is not None else default).strip())
+    except Exception as e:
+        _warn_nonfatal(
+            "POSITION_RECONCILE_INT_ENV_PARSE_FAILED",
+            e,
+            once_key=f"int_env:{name}",
+            env_name=str(name),
+            value_repr=repr(raw),
+            default=int(default),
+        )
+        value = int(default)
+    return max(int(minimum), int(value))
+
+
+def _fetch_failure_halt_config() -> Tuple[int, int]:
+    threshold = _safe_int_env("POSITION_RECONCILE_FETCH_FAILURE_HALT_THRESHOLD", 3, minimum=1)
+    raw_ms = os.environ.get("POSITION_RECONCILE_FETCH_FAILURE_COOLDOWN_MS")
+    if raw_ms is not None:
+        cooldown_ms = _safe_int_env("POSITION_RECONCILE_FETCH_FAILURE_COOLDOWN_MS", 300_000, minimum=0)
+    else:
+        cooldown_s = _safe_int_env("POSITION_RECONCILE_FETCH_FAILURE_COOLDOWN_S", 300, minimum=0)
+        cooldown_ms = int(cooldown_s) * 1000
+    return int(threshold), int(cooldown_ms)
+
+
 def _norm_positions(positions: List[Dict[str, Any]], ignore_lt: float) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for p in positions or []:
@@ -116,6 +146,10 @@ def _ensure_schema(con) -> None:
             re_reconcile_pending INTEGER NOT NULL DEFAULT 0,
             pending_since_ts_ms INTEGER,
             updated_ts_ms INTEGER NOT NULL,
+            fetch_failure_count INTEGER NOT NULL DEFAULT 0,
+            fetch_failure_first_ts_ms INTEGER,
+            fetch_failure_last_ts_ms INTEGER,
+            fetch_failure_halt_tripped INTEGER NOT NULL DEFAULT 0,
             detail_json TEXT
         )
         """
@@ -183,6 +217,22 @@ def _ensure_schema(con) -> None:
                     "POSITION_RECONCILE_BOOTSTRAP_AUDIT_MIGRATION_FAILED",
                     e,
                     once_key=f"bootstrap_audit_column:{column_name}",
+                    column=str(column_name),
+                )
+    for column_name, ddl in (
+        ("fetch_failure_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("fetch_failure_first_ts_ms", "INTEGER"),
+        ("fetch_failure_last_ts_ms", "INTEGER"),
+        ("fetch_failure_halt_tripped", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if not _has_column(con, "position_reconcile_state", column_name):
+            try:
+                con.execute(f"ALTER TABLE position_reconcile_state ADD COLUMN {column_name} {ddl}")
+            except Exception as e:
+                _warn_nonfatal(
+                    "POSITION_RECONCILE_STATE_MIGRATION_FAILED",
+                    e,
+                    once_key=f"state_column:{column_name}",
                     column=str(column_name),
                 )
 
@@ -326,6 +376,122 @@ def _set_re_reconcile_pending(
             int(ts_ms) if pending else None,
             int(ts_ms),
             json.dumps(detail or {}, separators=(",", ":"), sort_keys=True),
+        ),
+    )
+
+
+def _load_fetch_failure_state(con, broker: str) -> Dict[str, int]:
+    row = con.execute(
+        """
+        SELECT fetch_failure_count, fetch_failure_first_ts_ms,
+               fetch_failure_last_ts_ms, fetch_failure_halt_tripped
+        FROM position_reconcile_state
+        WHERE broker=?
+        LIMIT 1
+        """,
+        (str(broker),),
+    ).fetchone()
+    if not row:
+        return {
+            "count": 0,
+            "first_ts_ms": 0,
+            "last_ts_ms": 0,
+            "halt_tripped": 0,
+        }
+    return {
+        "count": int(row[0] or 0),
+        "first_ts_ms": int(row[1] or 0),
+        "last_ts_ms": int(row[2] or 0),
+        "halt_tripped": int(row[3] or 0),
+    }
+
+
+def _record_fetch_failure(
+    con,
+    *,
+    broker: str,
+    ts_ms: int,
+    error: str,
+    threshold: int,
+    cooldown_ms: int,
+) -> Dict[str, Any]:
+    prior = _load_fetch_failure_state(con, str(broker))
+    failure_count = int(prior.get("count") or 0) + 1
+    first_ts_ms = int(prior.get("first_ts_ms") or 0) or int(ts_ms)
+    elapsed_ms = max(0, int(ts_ms) - int(first_ts_ms))
+    threshold_reached = failure_count >= int(threshold)
+    cooldown_exceeded = bool(int(cooldown_ms) > 0 and elapsed_ms >= int(cooldown_ms))
+    persistent_halt = bool(threshold_reached or cooldown_exceeded)
+    detail = {
+        "error": str(error),
+        "fetch_failure_count": int(failure_count),
+        "fetch_failure_first_ts_ms": int(first_ts_ms),
+        "fetch_failure_last_ts_ms": int(ts_ms),
+        "fetch_failure_elapsed_ms": int(elapsed_ms),
+        "fetch_failure_halt_threshold": int(threshold),
+        "fetch_failure_cooldown_ms": int(cooldown_ms),
+        "fetch_failure_threshold_reached": bool(threshold_reached),
+        "fetch_failure_cooldown_exceeded": bool(cooldown_exceeded),
+        "persistent_halt": bool(persistent_halt),
+    }
+    con.execute(
+        """
+        INSERT INTO position_reconcile_state(
+            broker, re_reconcile_pending, pending_since_ts_ms, updated_ts_ms,
+            fetch_failure_count, fetch_failure_first_ts_ms,
+            fetch_failure_last_ts_ms, fetch_failure_halt_tripped, detail_json
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(broker) DO UPDATE SET
+          updated_ts_ms=excluded.updated_ts_ms,
+          fetch_failure_count=excluded.fetch_failure_count,
+          fetch_failure_first_ts_ms=excluded.fetch_failure_first_ts_ms,
+          fetch_failure_last_ts_ms=excluded.fetch_failure_last_ts_ms,
+          fetch_failure_halt_tripped=excluded.fetch_failure_halt_tripped,
+          detail_json=excluded.detail_json
+        """,
+        (
+            str(broker),
+            0,
+            None,
+            int(ts_ms),
+            int(failure_count),
+            int(first_ts_ms),
+            int(ts_ms),
+            1 if persistent_halt else int(prior.get("halt_tripped") or 0),
+            json.dumps(detail, separators=(",", ":"), sort_keys=True),
+        ),
+    )
+    return detail
+
+
+def _reset_fetch_failure_state(con, *, broker: str, ts_ms: int) -> None:
+    con.execute(
+        """
+        INSERT INTO position_reconcile_state(
+            broker, re_reconcile_pending, pending_since_ts_ms, updated_ts_ms,
+            fetch_failure_count, fetch_failure_first_ts_ms,
+            fetch_failure_last_ts_ms, fetch_failure_halt_tripped, detail_json
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(broker) DO UPDATE SET
+          updated_ts_ms=excluded.updated_ts_ms,
+          fetch_failure_count=0,
+          fetch_failure_first_ts_ms=NULL,
+          fetch_failure_last_ts_ms=NULL,
+          fetch_failure_halt_tripped=0,
+          detail_json=excluded.detail_json
+        """,
+        (
+            str(broker),
+            0,
+            None,
+            int(ts_ms),
+            0,
+            None,
+            None,
+            0,
+            json.dumps({"status": "positions_fetch_succeeded"}, separators=(",", ":"), sort_keys=True),
         ),
     )
 
@@ -532,17 +698,61 @@ def pre_live_position_reconcile(
     try:
         _ensure_schema(con)
 
+        fetch_failure_threshold, fetch_failure_cooldown_ms = _fetch_failure_halt_config()
         ok_b, bstatus, broker_pos = _broker_positions(str(broker))
         if not ok_b:
-            detail = {"error": bstatus}
             if not owns_txn:
                 owns_txn = _begin_owned_write(con)
+            detail = _record_fetch_failure(
+                con,
+                broker=str(broker),
+                ts_ms=int(ts_ms),
+                error=str(bstatus),
+                threshold=int(fetch_failure_threshold),
+                cooldown_ms=int(fetch_failure_cooldown_ms),
+            )
+            persistent_halt = bool(detail.get("persistent_halt"))
+            status = "positions_fetch_persistent_halt" if persistent_halt else "positions_fetch_failed"
+            if persistent_halt:
+                reason = "prelive_position_fetch_failures"
+                detail["kill_switch_reason"] = reason
+                try:
+                    set_kill_switch(
+                        scope="global",
+                        key="global",
+                        enabled=1,
+                        reason=reason,
+                        actor="position_reconcile",
+                        meta={
+                            "broker": str(broker),
+                            "status": str(status),
+                            "error": str(bstatus),
+                            "fetch_failure_count": int(detail.get("fetch_failure_count") or 0),
+                            "fetch_failure_first_ts_ms": int(detail.get("fetch_failure_first_ts_ms") or 0),
+                            "fetch_failure_last_ts_ms": int(detail.get("fetch_failure_last_ts_ms") or 0),
+                            "fetch_failure_elapsed_ms": int(detail.get("fetch_failure_elapsed_ms") or 0),
+                            "fetch_failure_halt_threshold": int(fetch_failure_threshold),
+                            "fetch_failure_cooldown_ms": int(fetch_failure_cooldown_ms),
+                            "operator_recovery_required": True,
+                        },
+                        action="TRIP",
+                        con=con,
+                    )
+                except Exception as e:
+                    detail["kill_switch_error"] = f"{type(e).__name__}:{e}"
+                    _warn_nonfatal(
+                        "POSITION_RECONCILE_FETCH_FAILURE_KILL_SWITCH_FAILED",
+                        e,
+                        once_key="fetch_failure_kill_switch_trip",
+                        broker=str(broker),
+                        failure_count=int(detail.get("fetch_failure_count") or 0),
+                    )
             _append_reconcile_audit(
                 con,
                 ts_ms=int(ts_ms),
                 broker=str(broker),
                 ok=False,
-                status="positions_fetch_failed",
+                status=str(status),
                 mismatched_n=0,
                 max_abs_qty_diff=0.0,
                 total_abs_qty_diff=0.0,
@@ -552,10 +762,11 @@ def pre_live_position_reconcile(
                 con.commit()
             return {
                 "ok": False,
-                "status": "positions_fetch_failed",
+                "status": str(status),
                 "broker": str(broker),
                 "detail": detail,
                 "fatal_reconcile": True,
+                "persistent_halt": bool(persistent_halt),
             }
 
         bmap = _norm_positions(broker_pos, ignore_lt=ignore_lt)
@@ -566,6 +777,7 @@ def pre_live_position_reconcile(
                 confirmed, token_status, actor, token_hash = _bootstrap_confirmation()
                 if not owns_txn:
                     owns_txn = _begin_owned_write(con)
+                _reset_fetch_failure_state(con, broker=str(broker), ts_ms=int(ts_ms))
                 if not confirmed:
                     detail = {
                         "error": "bootstrap_confirmation_required",
@@ -658,6 +870,7 @@ def pre_live_position_reconcile(
                 detail = {"error": "baseline_missing", "require_baseline": True, "allow_bootstrap": False}
                 if not owns_txn:
                     owns_txn = _begin_owned_write(con)
+                _reset_fetch_failure_state(con, broker=str(broker), ts_ms=int(ts_ms))
                 _append_reconcile_audit(
                     con,
                     ts_ms=int(ts_ms),
@@ -684,6 +897,7 @@ def pre_live_position_reconcile(
             confirmed, token_status, actor, token_hash = _bootstrap_confirmation()
             if not owns_txn:
                 owns_txn = _begin_owned_write(con)
+            _reset_fetch_failure_state(con, broker=str(broker), ts_ms=int(ts_ms))
             if not confirmed:
                 detail = {
                     "error": "bootstrap_confirmation_required",
@@ -775,6 +989,7 @@ def pre_live_position_reconcile(
             updated_baseline = bool(mismatched)
             if not owns_txn:
                 owns_txn = _begin_owned_write(con)
+            _reset_fetch_failure_state(con, broker=str(broker), ts_ms=int(ts_ms))
             if updated_baseline:
                 _save_baseline(con, str(broker), ts_ms, bmap)
             detail = {
@@ -844,6 +1059,7 @@ def pre_live_position_reconcile(
 
         if not owns_txn:
             owns_txn = _begin_owned_write(con)
+        _reset_fetch_failure_state(con, broker=str(broker), ts_ms=int(ts_ms))
         _append_reconcile_audit(
             con,
             ts_ms=int(ts_ms),

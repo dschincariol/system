@@ -1,0 +1,29 @@
+[Unit]
+Description=Trading backup/WAL/restore evidence gate
+Documentation=file:/opt/trading/app/ops/server/README.md
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=trading
+EnvironmentFile=-/etc/trading/trading.env
+EnvironmentFile=-/etc/trading/provider.env
+Environment=PGHOST=/var/run/postgresql
+Environment=PGPORT=5432
+Environment=PGUSER=postgres
+ExecStart=/bin/bash /opt/trading/ops/backup/backup_restore_evidence.sh
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-backup-evidence
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/trading /tmp /var/tmp
+
+[Install]
+WantedBy=multi-user.target

@@ -535,6 +535,7 @@ _add(
         "suppression_opportunity",
         "order_events",
         "trade_outcomes",
+        "terminal_intent_rejections",
     ),
     EXECUTION_SERIES,
 )
@@ -571,7 +572,10 @@ _add(
         "portfolio_kill_snapshots",
         "portfolio_risk_snapshots",
         "data_source_audit",
+        "drawdown_bootstrap_baseline",
         "position_reconcile_bootstrap_audit",
+        "alert_lifecycle_events",
+        "broker_config_audit",
     ),
     AUDIT_SERIES,
 )
@@ -690,6 +694,7 @@ _add(
         "job_locks",
         "job_heartbeats",
         "job_checkpoints",
+        "alert_shelves",
         "ipc_channels",
         "price_feed_lock",
         "options_symbol_ingestion_state",
@@ -836,6 +841,7 @@ FUTURE_CLASSIFIED_TABLES = frozenset(
 AUDIT_CHAIN_TABLES = frozenset(
     {
         "decision_log",
+        "drawdown_bootstrap_baseline",
         "execution_mode_audit",
         "execution_policy_audit",
         "kill_switch_audit",

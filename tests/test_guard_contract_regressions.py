@@ -106,6 +106,25 @@ def test_promotion_guard_blocks_when_equity_drift_is_critical(runtime_modules) -
     assert "equity_drift_crit" in reason["blockers"]
 
 
+def test_promotion_guard_blocks_live_when_backup_restore_evidence_missing(
+    runtime_modules,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ENGINE_MODE", "live")
+    monkeypatch.setenv("BACKUP_EVIDENCE_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.setenv("TS_BACKUP_BASE_DIR", str(tmp_path / "base"))
+    monkeypatch.setenv("TS_BACKUP_WAL_DIR", str(tmp_path / "wal"))
+    monkeypatch.setenv("TS_RESTORE_DRILL_DIR", str(tmp_path / "drills"))
+    (promotion_guard,) = _reload_modules("engine.strategy.promotion_guard")
+
+    allowed, reason = promotion_guard.promotion_allowed()
+
+    assert allowed is False
+    assert "backup_evidence_base_backup_missing" in reason["blockers"]
+    assert reason["backup_restore_evidence"]["required"] is True
+
+
 def test_global_risk_envelope_prefers_runtime_gate_snapshot(runtime_modules, monkeypatch: pytest.MonkeyPatch) -> None:
     gates, global_risk_envelope = _reload_modules(
         "engine.runtime.gates",

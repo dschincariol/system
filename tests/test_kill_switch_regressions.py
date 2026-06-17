@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -112,3 +113,29 @@ def test_execution_allowed_auto_expires_stale_cached_switch():
         assert str(row[1] or "") == "auto_expire"
     finally:
         con.close()
+
+
+def test_execution_allowed_blocks_live_mode_when_disable_live_execution_truthy():
+    kill_switch = importlib.reload(importlib.import_module("engine.execution.kill_switch"))
+    previous = {
+        "DISABLE_LIVE_EXECUTION": os.environ.get("DISABLE_LIVE_EXECUTION"),
+        "EXECUTION_MODE": os.environ.get("EXECUTION_MODE"),
+        "ENGINE_MODE": os.environ.get("ENGINE_MODE"),
+    }
+    try:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "yes"
+        os.environ["EXECUTION_MODE"] = "live"
+        os.environ["ENGINE_MODE"] = "live"
+        with patch.object(kill_switch, "_get_lifecycle_state", return_value={"state": "LIVE"}):
+            allowed, reason, meta = kill_switch.execution_allowed(con=None)
+
+        assert allowed is False
+        assert reason == "disable_live_execution_env"
+        assert meta["scope"] == "global"
+        assert meta["key"] == "DISABLE_LIVE_EXECUTION"
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

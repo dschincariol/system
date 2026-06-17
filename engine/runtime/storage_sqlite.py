@@ -3916,6 +3916,57 @@ def _ensure_runtime_baseline_schema(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_data_source_logs_source_ts
           ON data_source_logs(source_key, ts_ms DESC);
 
+        CREATE TABLE IF NOT EXISTS alert_shelves (
+          alert_id INTEGER PRIMARY KEY,
+          shelved_ts_ms INTEGER NOT NULL,
+          expires_ts_ms INTEGER NOT NULL,
+          shelved_by TEXT,
+          reason TEXT NOT NULL,
+          source TEXT,
+          severity TEXT,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS alert_lifecycle_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          alert_id INTEGER NOT NULL,
+          ts_ms INTEGER NOT NULL,
+          lifecycle_state TEXT NOT NULL,
+          actor TEXT,
+          reason TEXT,
+          source TEXT,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_alert_lifecycle_events_alert_ts
+          ON alert_lifecycle_events(alert_id, ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS broker_config_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          action TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          active_broker TEXT,
+          success INTEGER NOT NULL,
+          message TEXT,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_broker_config_audit_ts
+          ON broker_config_audit(ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS terminal_intent_rejections (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          symbol TEXT NOT NULL,
+          side TEXT,
+          qty REAL,
+          reason_code TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          source TEXT NOT NULL,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_terminal_intent_rejections_symbol_ts
+          ON terminal_intent_rejections(symbol, ts_ms DESC);
+
         CREATE TABLE IF NOT EXISTS strategy_metrics (
           strategy_name TEXT,
           window_days INTEGER,

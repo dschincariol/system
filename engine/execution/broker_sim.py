@@ -426,6 +426,8 @@ CREATE TABLE IF NOT EXISTS broker_fills (
   qty REAL NOT NULL,
   px REAL NOT NULL,
   source_order_id INTEGER,
+  source TEXT NOT NULL DEFAULT 'sim',
+  book_key TEXT,
   note TEXT,
   explain_json TEXT
 );
@@ -501,6 +503,7 @@ _BROKER_SCHEMA_TABLES = (
 )
 _BROKER_SCHEMA_INDEXES = (
     "idx_broker_fills_ts",
+    "idx_broker_fills_source_book_ts",
     "idx_broker_order_state_symbol",
     "idx_broker_shadow_positions_book",
     "idx_broker_shadow_order_state_book",
@@ -613,6 +616,36 @@ def _broker_positions_use_timeseries(con) -> bool:
     return "ts_ms" in _broker_positions_columns(con)
 
 
+def _broker_fills_columns(con) -> set[str]:
+    try:
+        return {
+            str(row[1] or "").strip()
+            for row in (con.execute("PRAGMA table_info(broker_fills)").fetchall() or [])
+        }
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_broker_fills_columns_failed",
+            "BROKER_SIM_BROKER_FILLS_COLUMNS_FAILED",
+            e,
+            warn_key="broker_fills_columns_failed",
+        )
+        return set()
+
+
+def _ensure_broker_fill_provenance_columns(con) -> None:
+    columns = _broker_fills_columns(con)
+    if "source" not in columns:
+        con.execute("ALTER TABLE broker_fills ADD COLUMN source TEXT NOT NULL DEFAULT 'sim'")
+    if "book_key" not in columns:
+        con.execute("ALTER TABLE broker_fills ADD COLUMN book_key TEXT")
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_broker_fills_source_book_ts
+          ON broker_fills(source, book_key, symbol, ts_ms)
+        """
+    )
+
+
 def _normalize_account_snapshot(
     cash_raw: Any,
     equity_raw: Any,
@@ -684,12 +717,14 @@ def _broker_schema_ready(con) -> bool:
     return (
         all(_table_exists(con, table_name) for table_name in _BROKER_SCHEMA_TABLES)
         and all(_index_exists(con, index_name) for index_name in _BROKER_SCHEMA_INDEXES)
+        and {"source", "book_key"}.issubset(_broker_fills_columns(con))
         and _broker_account_seeded(con)
     )
 
 
 def _ensure_tables(con):
     con.executescript(SCHEMA)
+    _ensure_broker_fill_provenance_columns(con)
     if not _broker_account_seeded(con):
         ts = _now_ms()
         # Preserve legacy defaults unless user explicitly sets env
@@ -1357,18 +1392,45 @@ def _write_fill(
     note: str = "",
     explain_json: Optional[str] = None,
     client_order_id: Optional[str] = None,
+    book_key: Optional[str] = None,
+    source: Optional[str] = None,
 ):
     from engine.runtime.state_cache import cache_invalidate_namespace
 
-    con.execute(
-        """
-        INSERT INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, note, explain_json)
-        VALUES(?,?,?,?,?,?,?)
-        """,
-        (int(ts_ms), str(symbol), float(qty), float(px), source_order_id, str(note or ""), explain_json),
-    )
+    fill_book_key = _book_key(book_key)
+    fill_source = str(source or ("shadow" if fill_book_key else "sim")).strip() or "sim"
+    columns = _broker_fills_columns(con)
+    if {"source", "book_key"}.issubset(columns):
+        con.execute(
+            """
+            INSERT INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, source, book_key, note, explain_json)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(ts_ms),
+                str(symbol),
+                float(qty),
+                float(px),
+                source_order_id,
+                str(fill_source),
+                fill_book_key,
+                str(note or ""),
+                explain_json,
+            ),
+        )
+    else:
+        con.execute(
+            """
+            INSERT INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, note, explain_json)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (int(ts_ms), str(symbol), float(qty), float(px), source_order_id, str(note or ""), explain_json),
+        )
     cache_invalidate_namespace("api_read", prefix="execution_stats")
     cache_invalidate_namespace("api_read", prefix="execution_metrics")
+
+    if fill_book_key:
+        return
 
     # --- execution ledger mirror (for slippage + pnl attribution parity) ---
     try:
@@ -1378,6 +1440,7 @@ def _write_fill(
             "note": note,
             "symbol": str(symbol),
             "broker": "sim",
+            "broker_fill_source": str(fill_source),
         }
         if explain_json:
             raw_payload["explain_json"] = explain_json
@@ -2068,67 +2131,69 @@ def apply_new_portfolio_orders(
                     meta=state_meta,
                 )
 
-            # --- execution ledger mirror (ensure metrics + attribution work in sim) ---
-            # Create/refresh execution_orders row keyed by the same client_order_id used by _write_fill.
-            try:
-                from engine.execution.execution_ledger import log_submit
-
-                _extra = dict(o or {})
+            # --- execution ledger mirror (ensure metrics + attribution work in real/paper sim) ---
+            # Shadow books are training/evaluation state and must not feed PnL attribution.
+            if not _is_shadow_book(book_key):
+                # Create/refresh execution_orders row keyed by the same client_order_id used by _write_fill.
                 try:
-                    ex = _extra.get("explain") or {}
-                    if isinstance(ex, dict):
-                        strat = (ex.get("strategy") or {}) if isinstance(ex.get("strategy"), dict) else {}
-                        if strat.get("name"):
-                            _extra["strategy_name"] = str(strat.get("name"))
-                except Exception as e:
-                    _warn_nonfatal(
-                        "broker_sim_strategy_name_extract_failed",
-                        "BROKER_SIM_STRATEGY_NAME_EXTRACT_FAILED",
-                        e,
-                        warn_key=f"broker_sim_strategy_name_extract_failed:{symbol}",
+                    from engine.execution.execution_ledger import log_submit
+
+                    _extra = dict(o or {})
+                    try:
+                        ex = _extra.get("explain") or {}
+                        if isinstance(ex, dict):
+                            strat = (ex.get("strategy") or {}) if isinstance(ex.get("strategy"), dict) else {}
+                            if strat.get("name"):
+                                _extra["strategy_name"] = str(strat.get("name"))
+                    except Exception as e:
+                        _warn_nonfatal(
+                            "broker_sim_strategy_name_extract_failed",
+                            "BROKER_SIM_STRATEGY_NAME_EXTRACT_FAILED",
+                            e,
+                            warn_key=f"broker_sim_strategy_name_extract_failed:{symbol}",
+                            symbol=str(symbol),
+                        )
+
+                    _extra["order_uid"] = str(order_uid)
+                    _extra["idempotency_status"] = "submitted"
+                    _extra["portfolio_risk_caps"] = dict(risk_cap_audit or {})
+
+                    submit_ts_ms = int(ts_ms)
+                    if not bool(getattr(con, "in_transaction", False)):
+                        _begin_managed_write(con)
+
+                    log_submit(
+                        client_order_id=str(client_order_id),
+                        broker="sim",
                         symbol=str(symbol),
+                        qty=float(delta),
+                        submit_ts_ms=int(submit_ts_ms),
+                        ref_px=float(px_mid),
+                        broker_order_id=None,
+                        portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                        source_alert_id=(int(o.get("source_alert_id")) if o.get("source_alert_id") is not None else None),
+                        extra=_extra,
+                        order_uid=str(order_uid),
+                        idempotency_status="submitted",
+                        con=con,
                     )
 
-                _extra["order_uid"] = str(order_uid)
-                _extra["idempotency_status"] = "submitted"
-                _extra["portfolio_risk_caps"] = dict(risk_cap_audit or {})
-
-                submit_ts_ms = int(ts_ms)
-                if not bool(getattr(con, "in_transaction", False)):
-                    _begin_managed_write(con)
-
-                log_submit(
-                    client_order_id=str(client_order_id),
-                    broker="sim",
-                    symbol=str(symbol),
-                    qty=float(delta),
-                    submit_ts_ms=int(submit_ts_ms),
-                    ref_px=float(px_mid),
-                    broker_order_id=None,
-                    portfolio_orders_id=(int(order_id) if order_id is not None else None),
-                    source_alert_id=(int(o.get("source_alert_id")) if o.get("source_alert_id") is not None else None),
-                    extra=_extra,
-                    order_uid=str(order_uid),
-                    idempotency_status="submitted",
-                    con=con,
-                )
-
-                mark_order_submission_submitted(
-                    con=con,
-                    order_uid=str(order_uid),
-                    client_order_id=str(client_order_id),
-                    broker_order_id=None,
-                    submit_ts_ms=int(submit_ts_ms),
-                )
-            except Exception as e:
-                _warn_nonfatal(
-                    "broker_sim_execution_ledger_submit_failed",
-                    "BROKER_SIM_EXECUTION_LEDGER_SUBMIT_FAILED",
-                    e,
-                    warn_key=f"broker_sim_execution_ledger_submit_failed:{symbol}:{order_id}",
-                    symbol=str(symbol),
-                    order_id=(int(order_id) if order_id is not None else None),
-                )
+                    mark_order_submission_submitted(
+                        con=con,
+                        order_uid=str(order_uid),
+                        client_order_id=str(client_order_id),
+                        broker_order_id=None,
+                        submit_ts_ms=int(submit_ts_ms),
+                    )
+                except Exception as e:
+                    _warn_nonfatal(
+                        "broker_sim_execution_ledger_submit_failed",
+                        "BROKER_SIM_EXECUTION_LEDGER_SUBMIT_FAILED",
+                        e,
+                        warn_key=f"broker_sim_execution_ledger_submit_failed:{symbol}:{order_id}",
+                        symbol=str(symbol),
+                        order_id=(int(order_id) if order_id is not None else None),
+                    )
 
             remaining = float(delta)
             position_qty_map[str(symbol).upper().strip()] = float(cur_qty) + float(delta)
@@ -2463,70 +2528,73 @@ def apply_new_portfolio_orders(
                     ),
                     explain_json=json.dumps(explain),
                     client_order_id=client_order_id,
+                    book_key=book_key,
+                    source=("shadow" if _is_shadow_book(book_key) else "sim"),
                 )
 
                 # best-effort execution labels (if the table exists)
-                try:
-                    label_extra = dict(explain)
-                    label_extra["placeholder_exec_label"] = True
-                    label_extra["placeholder_reason"] = "entry_fill_only"
-                    con.execute(
-                        """
-                        INSERT OR REPLACE INTO labels_exec (
-                          event_id,
-                          symbol,
-                          horizon_s,
-                          ts_ms,
-                          source,
-                          realized,
-                          side,
-                          gross_ret,
-                          net_ret,
-                          mid_in,
-                          mid_out,
-                          spread_in,
-                          fees_bps,
-                          slippage_bps,
-                          spread_bps,
-                          total_cost_bps,
-                          extra_json
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            int(o.get("event_id") or 0),
-                            symbol,
-                            int(o.get("horizon_s") or 0),
-                            int(fill_ts),
-                            "broker_sim_placeholder",
-                            0,
-                            1 if qty_cap > 0 else -1,
-                            0.0,
-                            0.0,
-                            float(px_mid_use),
-                            float(px_exec),
-                            float(exec_spread_bps),
-                            float(BROKER_FEE_BPS),
-                            float(local_slip_bps),
-                            float(exec_spread_bps),
-                            float(
-                                BROKER_FEE_BPS
-                                + float(local_slip_bps)
-                                + float(exec_spread_bps)
-                                + float(almgren_chriss.get("execution_cost_bps") or 0.0)
+                if not _is_shadow_book(book_key):
+                    try:
+                        label_extra = dict(explain)
+                        label_extra["placeholder_exec_label"] = True
+                        label_extra["placeholder_reason"] = "entry_fill_only"
+                        con.execute(
+                            """
+                            INSERT OR REPLACE INTO labels_exec (
+                              event_id,
+                              symbol,
+                              horizon_s,
+                              ts_ms,
+                              source,
+                              realized,
+                              side,
+                              gross_ret,
+                              net_ret,
+                              mid_in,
+                              mid_out,
+                              spread_in,
+                              fees_bps,
+                              slippage_bps,
+                              spread_bps,
+                              total_cost_bps,
+                              extra_json
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                int(o.get("event_id") or 0),
+                                symbol,
+                                int(o.get("horizon_s") or 0),
+                                int(fill_ts),
+                                "broker_sim_placeholder",
+                                0,
+                                1 if qty_cap > 0 else -1,
+                                0.0,
+                                0.0,
+                                float(px_mid_use),
+                                float(px_exec),
+                                float(exec_spread_bps),
+                                float(BROKER_FEE_BPS),
+                                float(local_slip_bps),
+                                float(exec_spread_bps),
+                                float(
+                                    BROKER_FEE_BPS
+                                    + float(local_slip_bps)
+                                    + float(exec_spread_bps)
+                                    + float(almgren_chriss.get("execution_cost_bps") or 0.0)
+                                ),
+                                json.dumps(label_extra, separators=(",", ":"), sort_keys=True),
                             ),
-                            json.dumps(label_extra, separators=(",", ":"), sort_keys=True),
-                        ),
-                    )
-                except Exception as e:
-                    _warn_nonfatal(
-                        "broker_sim_placeholder_exec_label_write_failed",
-                        "BROKER_SIM_PLACEHOLDER_EXEC_LABEL_WRITE_FAILED",
-                        e,
-                        warn_key=f"broker_sim_placeholder_exec_label_write_failed:{symbol}",
-                        symbol=str(symbol),
-                        source_order_id=int(o.get("source_order_id") or 0),
-                    )
+                        )
+                    except Exception as e:
+                        _warn_nonfatal(
+                            "broker_sim_placeholder_exec_label_write_failed",
+                            "BROKER_SIM_PLACEHOLDER_EXEC_LABEL_WRITE_FAILED",
+                            e,
+                            warn_key=f"broker_sim_placeholder_exec_label_write_failed:{symbol}",
+                            symbol=str(symbol),
+                            source_order_id=int(o.get("source_order_id") or 0),
+                        )
 
                 if _is_shadow_book(book_key):
                     con.execute(

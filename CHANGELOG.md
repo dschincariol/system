@@ -28,3 +28,4 @@ This changelog starts on 2026-04-12. Earlier repository history has not been ret
 - `docs/DOCS_AUDIT.md` updated to reflect the new governance layer and the remaining documentation gaps.
 - `README.md` updated so the canonical documentation set and documentation conventions point at the new governance artifacts.
 - `tools/validate_repo.py` now runs documentation validation as part of the canonical repository validation workflow.
+- Production handover documentation refreshed for broker configuration, live-execution safety, terminal pre-trade rejection rows, alert lifecycle state, backup evidence, and current storage/schema ownership.

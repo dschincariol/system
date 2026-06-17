@@ -37,6 +37,8 @@ It is grounded in:
 | `TS_PG_DSN`, `TS_PG_SCHEMA`, `TS_PG_POOL_TIMEOUT`, `TS_PG_POOL_SIZE` | Runtime Postgres connection, schema, and pool settings | [engine/runtime/storage_pool.py](../engine/runtime/storage_pool.py) and [engine/runtime/storage_pg.py](../engine/runtime/storage_pg.py). |
 | `DASHBOARD_STORAGE_REQUEST_TIMEOUT_S`, `DASHBOARD_STORAGE_STARTUP_TIMEOUT_S` | Dashboard storage readiness/request bounds | Used by [dashboard_server.py](../dashboard_server.py) and the HTTP transport to return structured 503 responses instead of letting read handlers stall on Postgres acquisition. |
 | `ENGINE_MODE`, `EXECUTION_MODE`, `OPERATOR_MODE` | Runtime and operator operating modes | Read across startup, system-state, API, and UI safety surfaces. Safe mode is the default posture. |
+| `DISABLE_LIVE_EXECUTION` | Emergency live-capital kill switch | Read by runtime gates, kill-switch checks, broker routing/adapters, live preflight, and terminal order-entry. Unset or explicit false values (`0`, `false`, `no`, `off`) allow normal live eligibility checks; any other non-empty value blocks live execution. |
+| `LIVE_TRADING_CONFIRM`, `LIVE_TRADING_CONFIRM_PHRASE`, `LIVE_TRADING_REQUIRE_CONFIRMATION`, `LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN` | Live-mode confirmation and dashboard-token contract | [engine/runtime/live_trading_preflight.py](../engine/runtime/live_trading_preflight.py). |
 | `TRADING_DATA`, `TRADING_LOGS`, `DATA_DIR`, `LOG_DIR` | Resolved runtime data and log directories | [start_system.py](../start_system.py) and [start_ingestion.py](../start_ingestion.py) normalize these before the runtime starts. |
 
 ## Startup Validation And Lifecycle
@@ -67,6 +69,31 @@ It is grounded in:
 | `TRADING_MASTER_KEY`, `TRADING_MASTER_KEY_FILE`, `APP_MASTER_KEY` | Backward-compatible fallback master-key inputs | [services/credential_encryption.py](../services/credential_encryption.py). |
 | `POLYGON_API_KEY`, `TRADIER_API_TOKEN`, `FINNHUB_API_KEY`, `FMP_API_KEY`, `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `SEC_USER_AGENT`, `SEC_FROM`, `WEATHER_HTTP_UA`, `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID` | Legacy/bootstrap credential and provider-setting inputs | Imported once by [services/data_source_manager.py](../services/data_source_manager.py) when the DB-backed control plane initializes. After import, the `data_sources` table is the source of truth. |
 | `OPENAI_API_KEY` | Key for optional LLM-backed integrations | Used by bounded AI-adjacent features, not by the core execution authority path. |
+
+## Broker, Terminal, And Live-Execution Safety
+
+| Variable Or Family | Meaning | Primary Consumers |
+| --- | --- | --- |
+| `BROKER`, `BROKER_NAME`, `LIVE_BROKER`, `INTENDED_LIVE_BROKER`, `BROKER_FAILOVER` | Broker identity and live failover chain. In live mode, broker identity must be consistent and the chain must not include `sim`, `paper`, or `sandbox`. | [engine/execution/broker_failover_policy.py](../engine/execution/broker_failover_policy.py), [engine/runtime/live_trading_preflight.py](../engine/runtime/live_trading_preflight.py). |
+| `BROKER_BASE_URL`, `ALPACA_BASE_URL`, `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY` | Alpaca endpoint and credential bootstrap inputs. Live preflight rejects paper endpoints for live use. | Broker adapters and [engine/api/api_broker_config.py](../engine/api/api_broker_config.py). |
+| `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID` | IBKR gateway connection settings. | [engine/execution/broker_ibkr_gateway.py](../engine/execution/broker_ibkr_gateway.py), [engine/api/api_broker_config.py](../engine/api/api_broker_config.py). |
+| `BROKER_TIMEOUT_S`, `BROKER_RETRY_ATTEMPTS`, `BROKER_RETRY_BACKOFF_S`, `BROKER_ROUTER_RETRY_ATTEMPTS`, `BROKER_ROUTER_RETRY_BASE_S`, `BROKER_ROUTER_RETRY_MAX_S` | Broker test and routing retry behavior. Auth/configuration failures remain non-retryable. | [engine/api/api_broker_config.py](../engine/api/api_broker_config.py), [engine/execution/broker_router.py](../engine/execution/broker_router.py). |
+| `EXECUTION_PRELIVE_RECONCILE` | Whether pre-live position reconciliation is enabled. Live mode requires it unless an audited break-glass override is supplied. | [engine/runtime/live_execution_control.py](../engine/runtime/live_execution_control.py), [engine/execution/broker_router.py](../engine/execution/broker_router.py). |
+| `EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS`, `EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_ACTOR`, `EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_REASON` | Break-glass override contract for disabling pre-live reconciliation in live mode. Actor and reason must be non-placeholder values and accepted overrides are event-logged. | [engine/runtime/live_execution_control.py](../engine/runtime/live_execution_control.py). |
+| `TERMINAL_MAX_QTY`, `TERMINAL_MAX_NOTIONAL`, `TERMINAL_PRICE_MAX_AGE_MS`, `TERMINAL_DUPLICATE_WINDOW_MS`, `TERMINAL_SYMBOL_CAPS_JSON` | Backend pre-trade controls for browser-terminal order and flatten intents. Rejections are stored in `terminal_intent_rejections`. | [engine/terminal/api/api_terminal_orders.py](../engine/terminal/api/api_terminal_orders.py). |
+| `ALERT_ACK_TIMEOUT_MS`, `ALERT_SHELVE_DEFAULT_MS`, `ALERT_SHELVE_MAX_MS` | Alert acknowledgement and shelving expiry defaults. | [engine/api/api_write.py](../engine/api/api_write.py). |
+
+## Backup Evidence And Restore Drills
+
+| Variable Or Family | Meaning | Primary Consumers |
+| --- | --- | --- |
+| `PREFLIGHT_REQUIRE_BACKUP_EVIDENCE` | Forces backup evidence to be required even outside live mode. Live mode requires it by default. | [engine/runtime/backup_evidence.py](../engine/runtime/backup_evidence.py), [engine/runtime/prod_preflight.py](../engine/runtime/prod_preflight.py). |
+| `BACKUP_EVIDENCE_PATH` | JSON evidence file path. Default is `/var/backups/trading/evidence/latest_backup_restore_evidence.json`. | [engine/runtime/backup_evidence.py](../engine/runtime/backup_evidence.py). |
+| `TS_BACKUP_BASE_DIR`, `TS_BACKUP_WAL_DIR`, `TS_RESTORE_DRILL_DIR` | Filesystem fallback locations for base backup, WAL archive, and restore-drill evidence. | [engine/runtime/backup_evidence.py](../engine/runtime/backup_evidence.py), `ops/backup/`. |
+| `BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S`, `BACKUP_MAX_AGE_S` | Maximum accepted verified base-backup age. | [engine/runtime/backup_evidence.py](../engine/runtime/backup_evidence.py). |
+| `BACKUP_EVIDENCE_WAL_RPO_S`, `BACKUP_EVIDENCE_RPO_S`, `BACKUP_RPO_S` | Maximum accepted WAL archive evidence age. | [engine/runtime/backup_evidence.py](../engine/runtime/backup_evidence.py). |
+| `BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S`, `RESTORE_DRILL_MAX_AGE_S` | Maximum accepted restore-drill evidence age. | [engine/runtime/backup_evidence.py](../engine/runtime/backup_evidence.py). |
+| `BACKUP_EVIDENCE_RESTORE_RTO_S`, `BACKUP_EVIDENCE_RTO_S`, `RESTORE_RTO_S` | Maximum accepted restore-drill recovery duration. | [engine/runtime/backup_evidence.py](../engine/runtime/backup_evidence.py). |
 
 ## Provider Toggles, Polling, And Freshness
 
