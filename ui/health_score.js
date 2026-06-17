@@ -25,6 +25,7 @@
 import { severityRank } from "./alerts.js";
 import { classifyMetricValue } from "./metric_glossary.js";
 import { unwrapHealthResponse } from "./runtime_status_summary.js";
+import { statusAriaLabel, statusClassName, statusPillClasses, statusToken } from "./utils.js";
 
 const FACTOR_WEIGHTS = Object.freeze({
   alerts: 25,
@@ -85,10 +86,10 @@ function worstClassification(values) {
 }
 
 function factorClassName(classification) {
-  if (classification === "normal") return "ok";
-  if (classification === "warning") return "warn";
-  if (classification === "critical") return "bad";
-  return "dim";
+  if (classification === "normal") return statusClassName("ok");
+  if (classification === "warning") return statusClassName("warn");
+  if (classification === "critical") return statusClassName("crit");
+  return statusClassName("unavailable");
 }
 
 function makeUnavailableFactor(key, label, weight, detail = "Waiting for live data.") {
@@ -98,7 +99,7 @@ function makeUnavailableFactor(key, label, weight, detail = "Waiting for live da
     weight,
     available: false,
     classification: "unknown",
-    className: "dim",
+    className: "unavailable",
     status: "unavailable",
     detail,
     points: 0,
@@ -325,10 +326,10 @@ function summarizeExecution(executionBarrier, executionDegraded, systemStatus = 
 }
 
 function overallBadge(worst, availableCount, totalCount) {
-  if (availableCount === 0) return { className: "dim", label: "waiting" };
-  if (worst === "critical") return { className: "bad", label: "degraded" };
+  if (availableCount === 0) return { className: "unavailable", label: "waiting" };
+  if (worst === "critical") return { className: "crit", label: "degraded" };
   if (worst === "warning") return { className: "warn", label: "watch" };
-  if (availableCount < totalCount) return { className: "dim", label: "partial" };
+  if (availableCount < totalCount) return { className: "unavailable", label: "partial" };
   return { className: "ok", label: "stable" };
 }
 
@@ -389,7 +390,10 @@ export function computeHealthScore({
 
 function buildFactorNode(factor) {
   const item = document.createElement("div");
-  item.className = `healthScoreFactor ${factor.className || "dim"}`;
+  const token = statusToken(factor.className || "unavailable");
+  item.className = `healthScoreFactor ${token.className}`;
+  item.dataset.status = token.key;
+  item.setAttribute("aria-label", statusAriaLabel(token.key, `${factor.label}: ${factor.status || "unavailable"}`));
 
   const name = document.createElement("div");
   name.className = "healthScoreFactorName";
@@ -424,7 +428,10 @@ export function renderHealthScoreSummary(
 
   const safe = scorecard || computeHealthScore({});
   valueEl.textContent = safe.score === null ? "—" : String(safe.score);
-  badgeEl.className = `pill ${safe.badgeClassName || "dim"}`;
+  const badgeToken = statusToken(safe.badgeClassName || "unavailable");
+  badgeEl.className = statusPillClasses(badgeToken.key);
+  badgeEl.dataset.status = badgeToken.key;
+  badgeEl.setAttribute("aria-label", statusAriaLabel(badgeToken.key, safe.badgeLabel || "waiting"));
   badgeEl.textContent = safe.badgeLabel || "waiting";
   coverageEl.textContent = safe.coverageText || "0/4 factors";
   summaryEl.textContent = safe.summary || "Waiting for enough live health inputs to compute the summary.";

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -110,6 +111,110 @@ class PortfolioBacktestContractTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "no_points")
         self.assertIsNone(result["run_id"])
+
+    def test_portfolio_pro_chart_view_model_annotations_and_fallback_mode(self) -> None:
+        script = r"""
+import assert from "node:assert/strict";
+import {
+  PORTFOLIO_DRAWDOWN_THROTTLE,
+  buildPortfolioBacktestProViewModel,
+  resolvePortfolioBacktestRenderMode
+} from "./ui/portfolio_backtest.js";
+
+const run = {
+  id: 7,
+  metrics: {
+    sharpe_simple: 1.234,
+    sortino_simple: 2.5,
+    calmar_simple: 0.75,
+    n_returns: 3,
+  },
+  points: [
+    {
+      ts_ms: 1_700_000_000_000,
+      equity: 1.0,
+      drawdown: 0,
+      detail: { positions: [{ symbol: "AAPL", side: "LONG", weight: 0.2 }] },
+    },
+    {
+      ts_ms: 1_700_000_060_000,
+      equity: 1.04,
+      drawdown: 0.02,
+      detail: {
+        positions: [
+          { symbol: "AAPL", side: "LONG", weight: 0.1 },
+          { symbol: "MSFT", side: "SHORT", weight: 0.2 },
+        ],
+      },
+    },
+    {
+      ts_ms: 1_700_000_120_000,
+      equity: 1.03,
+      drawdown: -0.03,
+      detail: {
+        positions: [
+          { symbol: "AAPL", side: "LONG", weight: 0.1 },
+          { symbol: "MSFT", side: "SHORT", weight: 0.2 },
+        ],
+        trade_costs: [{ symbol: "AAPL", delta_weight: -0.1, status: "estimated" }],
+      },
+    },
+  ],
+};
+
+const vm = buildPortfolioBacktestProViewModel(run);
+assert.equal(vm.ok, true);
+assert.equal(vm.drawdownThrottle, PORTFOLIO_DRAWDOWN_THROTTLE);
+assert.equal(vm.drawdownSeries[1].value, -0.02);
+assert.equal(vm.maxDrawdown, -0.03);
+assert.equal(vm.benchmarkSeries.length, 0);
+assert.match(vm.benchmarkState.text, /Benchmark unavailable/);
+assert.ok(vm.markers.some((row) => row.kind === "intended"));
+assert.ok(vm.markers.some((row) => row.kind === "filled" && row.side === "SELL"));
+
+const annotations = Object.fromEntries(vm.annotations.map((row) => [row.key, row]));
+assert.equal(annotations.sharpe.value, "1.23");
+assert.equal(annotations.sortino.value, "2.50");
+assert.equal(annotations.calmar.value, "0.75");
+assert.equal(annotations.turnover.value, "0.075");
+assert.equal(annotations.sample_count.value, "3");
+
+assert.deepEqual(
+  resolvePortfolioBacktestRenderMode({ proEnabled: false, lightweightAvailable: true, hasRenderableSeries: true }),
+  { mode: "canvas", reason: "feature_flag_disabled" },
+);
+assert.deepEqual(
+  resolvePortfolioBacktestRenderMode({ proEnabled: true, lightweightAvailable: false, hasRenderableSeries: true }),
+  { mode: "canvas", reason: "lightweight_charts_unavailable" },
+);
+assert.deepEqual(
+  resolvePortfolioBacktestRenderMode({ proEnabled: true, lightweightAvailable: true, hasRenderableSeries: true }),
+  { mode: "pro", reason: "pro_renderer_enabled" },
+);
+
+const benchmarkVm = buildPortfolioBacktestProViewModel({
+  ...run,
+  benchmark_symbol: "QQQ",
+  benchmark_points: [
+    { ts_ms: 1_700_000_000_000, close: 100 },
+    { ts_ms: 1_700_000_060_000, close: 105 },
+  ],
+});
+assert.equal(benchmarkVm.benchmarkState.available, true);
+assert.equal(benchmarkVm.benchmarkState.label, "QQQ");
+assert.equal(benchmarkVm.benchmarkSeries[0].value, 1.0);
+assert.equal(benchmarkVm.benchmarkSeries[1].value, 1.05);
+"""
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", script],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
 
 if __name__ == "__main__":

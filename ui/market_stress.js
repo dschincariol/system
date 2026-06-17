@@ -6,7 +6,102 @@
   view for operator monitoring.
 */
 
+import { renderChartAccessibility } from "./chart_a11y.js";
 import { applyInlineMetricAnnotation, setMetricValueAttribute } from "./tooltip.js";
+
+export function syncMarketStressSparklineSize(canvas) {
+  if (!canvas) return { width: 900, height: 48, ratio: 1 };
+  const rect = typeof canvas.getBoundingClientRect === "function"
+    ? canvas.getBoundingClientRect()
+    : {};
+  const attrWidth = Number(canvas.getAttribute?.("width"));
+  const attrHeight = Number(canvas.getAttribute?.("height"));
+  const cssWidth = Math.max(1, Math.round(
+    Number(rect.width) ||
+    Number(canvas.clientWidth) ||
+    (Number.isFinite(attrWidth) && attrWidth > 0 ? attrWidth : 900)
+  ));
+  const cssHeight = Math.max(1, Math.round(
+    Number(rect.height) ||
+    Number(canvas.clientHeight) ||
+    (Number.isFinite(attrHeight) && attrHeight > 0 ? attrHeight : 48)
+  ));
+  const ratio = Math.max(1, Number(typeof window !== "undefined" ? window.devicePixelRatio : 1) || 1);
+  const backingWidth = Math.round(cssWidth * ratio);
+  const backingHeight = Math.round(cssHeight * ratio);
+  if (canvas.width !== backingWidth) canvas.width = backingWidth;
+  if (canvas.height !== backingHeight) canvas.height = backingHeight;
+  return { width: cssWidth, height: cssHeight, ratio };
+}
+
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function numOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function stressBody(payload) {
+  const root = asObject(payload);
+  return asObject(root.stress && typeof root.stress === "object" ? root.stress : root);
+}
+
+export function buildMarketStressComponentRows(payload = {}) {
+  const s = stressBody(payload);
+  return [
+    { label: "VIX", metricKey: "vix", value: s.vix, zMetricKey: "z_vix", zValue: s.z_vix },
+    { label: "VVIX", metricKey: "vvix", value: s.vvix, zMetricKey: "z_vvix", zValue: s.z_vvix },
+    { label: "MOVE", metricKey: "move", value: s.move, zMetricKey: "z_move", zValue: s.z_move },
+    { label: "VIX1D/VIX", metricKey: "vix1d_over_vix", value: s.vix1d_over_vix, zMetricKey: null, zValue: null },
+    { label: "VIX9D/VIX", metricKey: "vix9d_over_vix", value: s.vix9d_over_vix, zMetricKey: null, zValue: null },
+    { label: "VIX3M/VIX", metricKey: "vix3m_over_vix", value: s.vix3m_over_vix, zMetricKey: null, zValue: null },
+    { label: "Term Z", metricKey: "z_term", value: null, zMetricKey: "z_term", zValue: s.z_term },
+    { label: "Credit LQD/HYG", metricKey: "credit_lqd_over_hyg", value: s.credit_lqd_over_hyg, zMetricKey: "z_credit", zValue: s.z_credit },
+    { label: "Rates TLT/SHY", metricKey: "rates_tlt_over_shy", value: s.rates_tlt_over_shy, zMetricKey: "z_rates", zValue: s.z_rates },
+  ];
+}
+
+export function buildMarketStressTopDriver(payload = {}) {
+  const s = stressBody(payload);
+  const score = numOrNull(s.stress_score);
+  const scoredRows = buildMarketStressComponentRows(s)
+    .map((row) => ({
+      ...row,
+      zNumber: numOrNull(row.zValue),
+    }))
+    .filter((row) => row.zNumber !== null);
+  scoredRows.sort((a, b) => Math.abs(b.zNumber) - Math.abs(a.zNumber));
+  const driver = scoredRows[0] || null;
+  const tone = score === null
+    ? "unavailable"
+    : (score >= 0.75 ? "crit" : score >= 0.55 ? "warn" : "ok");
+  const scoreText = score === null ? "Stress unavailable" : `Stress ${score.toFixed(2)}`;
+
+  if (!driver) {
+    return {
+      tone,
+      score,
+      scoreText,
+      label: "unavailable",
+      text: "Top driver unavailable.",
+      fallbackText: `${scoreText}. Top market-stress driver unavailable.`,
+    };
+  }
+
+  const direction = driver.zNumber >= 0 ? "above normal" : "below normal";
+  const text = `Driven by ${driver.label} (${Math.abs(driver.zNumber).toFixed(2)}z ${direction})`;
+  return {
+    tone,
+    score,
+    scoreText,
+    label: driver.label,
+    zValue: driver.zNumber,
+    text,
+    fallbackText: `${scoreText}. ${text}.`,
+  };
+}
 
 function resetMarketStressUI({
   badge,
@@ -54,6 +149,16 @@ function resetMarketStressUI({
     stripStress.textContent = "Market Stress —";
     setMetricValueAttribute(stripStress, null);
   }
+
+  renderChartAccessibility("marketStressSparkline", {
+    title: "Market stress history",
+    series: [],
+    emptyMessage: message,
+    errorMessage: message,
+    valueLabel: "stress score",
+    valueFormatter: (v) => Number(v).toFixed(3),
+    chartType: "canvas-sparkline",
+  });
 }
 
 export async function loadMarketStress(fetchJSON) {
@@ -126,17 +231,7 @@ export async function loadMarketStress(fetchJSON) {
       );
     }
 
-    const rows = [
-      { label: "VIX", metricKey: "vix", value: s.vix, zMetricKey: "z_vix", zValue: s.z_vix },
-      { label: "VVIX", metricKey: "vvix", value: s.vvix, zMetricKey: "z_vvix", zValue: s.z_vvix },
-      { label: "MOVE", metricKey: "move", value: s.move, zMetricKey: "z_move", zValue: s.z_move },
-      { label: "VIX1D/VIX", metricKey: "vix1d_over_vix", value: s.vix1d_over_vix, zMetricKey: null, zValue: null },
-      { label: "VIX9D/VIX", metricKey: "vix9d_over_vix", value: s.vix9d_over_vix, zMetricKey: null, zValue: null },
-      { label: "VIX3M/VIX", metricKey: "vix3m_over_vix", value: s.vix3m_over_vix, zMetricKey: null, zValue: null },
-      { label: "Term Z", metricKey: "z_term", value: null, zMetricKey: "z_term", zValue: s.z_term },
-      { label: "Credit LQD/HYG", metricKey: "credit_lqd_over_hyg", value: s.credit_lqd_over_hyg, zMetricKey: "z_credit", zValue: s.z_credit },
-      { label: "Rates TLT/SHY", metricKey: "rates_tlt_over_shy", value: s.rates_tlt_over_shy, zMetricKey: "z_rates", zValue: s.z_rates },
-    ];
+    const rows = buildMarketStressComponentRows(s);
 
     body.innerHTML = "";
 
@@ -228,14 +323,45 @@ export async function loadMarketStressHistory(fetchJSON) {
 
   try {
     const j = await fetchJSON("/api/market_stress_history");
-    const w = canvas.width;
-    const h = canvas.height;
+    const size = syncMarketStressSparklineSize(canvas);
+    const w = size.width;
+    const h = size.height;
+    if (typeof ctx.setTransform === "function") {
+      ctx.setTransform(size.ratio, 0, 0, size.ratio, 0, 0);
+    }
 
     ctx.clearRect(0, 0, w, h);
-    if (!j || !j.ok || !Array.isArray(j.series)) return;
+    if (!j || !j.ok || !Array.isArray(j.series)) {
+      renderChartAccessibility(canvas, {
+        title: "Market stress history",
+        series: [],
+        emptyMessage: j && j.error ? String(j.error) : "Market stress history is unavailable.",
+        errorMessage: j && j.error ? String(j.error) : "",
+        valueLabel: "stress score",
+        valueFormatter: (v) => Number(v).toFixed(3),
+        chartType: "canvas-sparkline",
+      });
+      return;
+    }
 
-    const ys = j.series.map(p => Number(p.stress_score || 0));
-    if (ys.length < 2) return;
+    const series = j.series
+      .map((p, index) => ({
+        time: p && (p.ts_ms ?? p.time ?? p.t ?? index + 1),
+        value: Number(p && p.stress_score),
+      }))
+      .filter((p) => Number.isFinite(p.value));
+    const ys = series.map((p) => p.value);
+    if (ys.length < 2) {
+      renderChartAccessibility(canvas, {
+        title: "Market stress history",
+        series,
+        emptyMessage: "Market stress history does not have enough points to draw.",
+        valueLabel: "stress score",
+        valueFormatter: (v) => Number(v).toFixed(3),
+        chartType: "canvas-sparkline",
+      });
+      return;
+    }
 
     const min = 0;
     const max = 1;
@@ -253,7 +379,30 @@ export async function loadMarketStressHistory(fetchJSON) {
 
     ctx.stroke();
 
-  } catch {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    renderChartAccessibility(canvas, {
+      title: "Market stress history",
+      series,
+      valueKey: "value",
+      timeKey: "time",
+      valueLabel: "stress score",
+      valueFormatter: (v) => Number(v).toFixed(3),
+      chartType: "canvas-sparkline",
+    });
+
+  } catch (e) {
+    const size = syncMarketStressSparklineSize(canvas);
+    if (typeof ctx.setTransform === "function") {
+      ctx.setTransform(size.ratio, 0, 0, size.ratio, 0, 0);
+    }
+    ctx.clearRect(0, 0, size.width, size.height);
+    renderChartAccessibility(canvas, {
+      title: "Market stress history",
+      series: [],
+      emptyMessage: "Market stress history failed to load.",
+      errorMessage: e && e.message ? e.message : "Market stress history failed to load.",
+      valueLabel: "stress score",
+      valueFormatter: (v) => Number(v).toFixed(3),
+      chartType: "canvas-sparkline",
+    });
   }
 }

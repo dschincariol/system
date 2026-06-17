@@ -93,25 +93,37 @@ export function buildDecisionStageRows(payload = {}) {
   if (!stages.length) {
     return [
       {
+        key: "decision_path",
         label: "Decision path",
         value: "unavailable",
+        status: "unavailable",
+        reason: "No stage data was returned for this drill-down.",
         meta: "No stage data was returned for this drill-down.",
         tone: "dim",
+        timestamp: "",
+        timestampMs: null,
       },
     ];
   }
 
   return stages.map((stage) => {
-    const status = prettyStatus(stage && stage.status);
+    const rawStatus = cleanString(stage && stage.status).toLowerCase() || "unavailable";
+    const status = prettyStatus(rawStatus);
     const unavailable = cleanString(stage && stage.unavailable_reason);
     const summary = cleanString(stage && stage.summary) || unavailable;
     const timestamp = formatStageTimestamp(stage && stage.ts_ms);
     const meta = [summary, timestamp].filter(Boolean).join(" | ") || "Stage detail unavailable.";
+    const timestampMs = Number(stage && stage.ts_ms);
     return {
+      key: cleanString(stage && stage.key),
       label: cleanString(stage && stage.label) || cleanString(stage && stage.key) || "Stage",
       value: status,
+      status: rawStatus,
+      reason: summary || "Stage detail unavailable.",
       meta,
-      tone: STAGE_TONES[cleanString(stage && stage.status).toLowerCase()] || "dim",
+      tone: STAGE_TONES[rawStatus] || "dim",
+      timestamp: timestamp.replace(/^ts\s+/, ""),
+      timestampMs: Number.isFinite(timestampMs) && timestampMs > 0 ? timestampMs : null,
     };
   });
 }

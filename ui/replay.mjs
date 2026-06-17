@@ -1,5 +1,8 @@
 "use strict";
 
+import { renderChartAccessibility } from "./chart_a11y.js";
+import { chartMarkerStyle, statusToken } from "./utils.js";
+
 const STATE = {
   payload: null,
   selectedIndex: 0,
@@ -355,14 +358,14 @@ function _renderSelected(vm) {
   `;
 }
 
-function _markerColor(kind, row) {
-  if (kind === "decision") return "#58a6ff";
-  if (kind === "order") return "#d29922";
+export function replayMarkerStyle(kind, row = {}) {
+  if (kind === "decision") return { color: statusToken("info").color, shape: "circle", label: "Decision" };
+  if (kind === "order") return { color: statusToken("warn").color, shape: "square", label: "Order" };
   if (kind === "fill") {
-    const side = String(row.side || "").toUpperCase();
-    return side.includes("SELL") || Number(row.qty || 0) < 0 ? "#ff6b6b" : "#2ea043";
+    const marker = chartMarkerStyle(row.side || row.label, Number(row.qty || 0));
+    return { color: marker.color, shape: marker.isBuy ? "triangle-up" : "triangle-down", label: marker.label };
   }
-  return "#9da7b1";
+  return { color: statusToken("neutral").color, shape: "circle", label: "Marker" };
 }
 
 function _priceForMarker(candles, marker) {
@@ -372,10 +375,52 @@ function _priceForMarker(candles, marker) {
   return candle ? candle.close : null;
 }
 
+function _renderReplayChartA11y(canvas, vm, errorMessage = "") {
+  if (!canvas || !vm) return;
+  const candles = vm.streams && Array.isArray(vm.streams.candles) ? vm.streams.candles : [];
+  const symbol = vm.symbol || "selected symbol";
+  const series = candles.map((c) => ({
+    time: c.ts_ms,
+    value: c.close,
+    open: c.open,
+    high: c.high,
+    low: c.low,
+    close: c.close,
+    volume: c.volume,
+  }));
+  const summary = series.length
+    ? `Historical replay: ${symbol} close ${_fmtNum(series[series.length - 1].close, 2)} across ${series.length} candles; decisions ${vm.counts.decisions}, orders ${vm.counts.orders}, fills ${vm.counts.fills}.`
+    : "";
+  const gapMessage = errorMessage || (!vm.ok && vm.gaps.length ? String(vm.gaps[0].message || vm.gaps[0].code || "Replay data is unavailable.") : "");
+  renderChartAccessibility(canvas, {
+    title: "Historical replay",
+    series,
+    timeKey: "time",
+    valueKey: "value",
+    valueLabel: "close",
+    valueFormatter: (v) => _fmtNum(v, 2),
+    summary,
+    emptyMessage: vm.noData ? "No replay data is available for the selected filters." : "No replay price series is available.",
+    errorMessage: gapMessage,
+    chartType: "canvas-replay",
+    columns: [
+      { label: "Time", value: (row) => _fmtTime(row.raw && row.raw.time) },
+      { label: "Open", value: (row) => _fmtNum(row.raw && row.raw.open, 2) },
+      { label: "High", value: (row) => _fmtNum(row.raw && row.raw.high, 2) },
+      { label: "Low", value: (row) => _fmtNum(row.raw && row.raw.low, 2) },
+      { label: "Close", value: (row) => _fmtNum(row.raw && row.raw.close, 2) },
+      { label: "Volume", value: (row) => _fmtNum(row.raw && row.raw.volume, 0) },
+    ],
+  });
+}
+
 export function renderReplayChart(canvas, vm) {
   if (!canvas || !vm) return;
   const ctx = canvas.getContext && canvas.getContext("2d");
-  if (!ctx) return;
+  if (!ctx) {
+    _renderReplayChartA11y(canvas, vm, "Replay chart could not get a canvas context.");
+    return;
+  }
   const ratio = Math.max(1, Math.min(2, Number(window.devicePixelRatio || 1)));
   const cssW = Math.max(320, Math.floor(canvas.clientWidth || canvas.width || 960));
   const cssH = Math.max(220, Math.floor(canvas.clientHeight || canvas.height || 280));
@@ -393,6 +438,7 @@ export function renderReplayChart(canvas, vm) {
     ctx.fillStyle = "#9da7b1";
     ctx.font = "12px Consolas, monospace";
     ctx.fillText(vm.noData ? "(no replay data)" : "(no price series)", 12, 24);
+    _renderReplayChartA11y(canvas, vm);
     return;
   }
 
@@ -445,7 +491,8 @@ export function renderReplayChart(canvas, vm) {
     if (!Number.isFinite(price)) continue;
     const x = xFor(marker.ts_ms);
     const y = yFor(price);
-    ctx.fillStyle = _markerColor(marker.markerKind, marker);
+    const markerStyle = replayMarkerStyle(marker.markerKind, marker);
+    ctx.fillStyle = markerStyle.color;
     ctx.beginPath();
     if (marker.markerKind === "order") {
       ctx.rect(x - 4, y - 4, 8, 8);
@@ -469,6 +516,7 @@ export function renderReplayChart(canvas, vm) {
     ctx.lineTo(x, cssH - padB);
     ctx.stroke();
   }
+  _renderReplayChartA11y(canvas, vm);
 }
 
 export function renderReplayPanel(payload = {}, root = null, options = {}) {

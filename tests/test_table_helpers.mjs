@@ -3,11 +3,15 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  STATUS_TOKENS,
   buildTableView,
   compareTableValues,
   filterTableRows,
+  statusClassName,
+  statusPillClasses,
   sortTableRows,
 } from "../ui/utils.js";
+import { cellColor, normalizeAlert, severityRank } from "../ui/alerts.js";
 
 const columns = [
   { key: "symbol", accessor: (row) => row && row.symbol },
@@ -15,6 +19,26 @@ const columns = [
   { key: "updated", accessor: (row) => row && row.updated },
   { key: "meta", accessor: (row) => row && row.meta },
 ];
+
+function hexToRgb(hex) {
+  const normalized = String(hex || "").replace("#", "");
+  return [0, 2, 4].map((start) => Number.parseInt(normalized.slice(start, start + 2), 16) / 255);
+}
+
+function relativeLuminance(hex) {
+  const [r, g, b] = hexToRgb(hex).map((channel) => (
+    channel <= 0.03928
+      ? channel / 12.92
+      : ((channel + 0.055) / 1.055) ** 2.4
+  ));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function contrastRatio(a, b) {
+  const high = Math.max(relativeLuminance(a), relativeLuminance(b));
+  const low = Math.min(relativeLuminance(a), relativeLuminance(b));
+  return (high + 0.05) / (low + 0.05);
+}
 
 test("table helpers filter nested values without mutating malformed payloads", () => {
   const rows = [
@@ -104,4 +128,54 @@ test("dashboard and terminal table wiring uses shared helpers and preserves dril
   assert.match(dashboardJs, /renderExecutionOrdersRows[\s\S]*decisionLookupForOrderIntent[\s\S]*_decisionLookupAttr/);
   assert.match(dashboardJs, /renderExecutionFillsRows[\s\S]*normalizeDecisionLookup[\s\S]*_decisionLookupAttr/);
   assert.match(dashboardJs, /renderSuppressedRows[\s\S]*_decisionLookupAttr/);
+});
+
+test("shared status vocabulary covers desktop mobile terminal states", () => {
+  assert.deepEqual(Object.keys(STATUS_TOKENS), [
+    "neutral",
+    "info",
+    "ok",
+    "warn",
+    "high",
+    "crit",
+    "blocked",
+    "unavailable",
+  ]);
+
+  assert.equal(statusClassName("bad"), "crit");
+  assert.equal(statusClassName("danger"), "crit");
+  assert.equal(statusClassName("dim"), "neutral");
+  assert.equal(statusClassName("blocked"), "blocked");
+  assert.equal(statusPillClasses("blocked").includes("status-blocked"), true);
+
+  assert.equal(normalizeAlert({ severity: "HIGH", message: "elevated" }).severity, "HIGH");
+  assert.equal(severityRank("CRIT") > severityRank("HIGH"), true);
+  assert.equal(severityRank("HIGH") > severityRank("WARN"), true);
+  assert.equal(cellColor({ severity: "HIGH", message: "elevated" }).key, "high");
+  assert.equal(cellColor({ severity: "CRIT", message: "critical" }).key, "crit");
+});
+
+test("status tokens and styles keep contrast and high-contrast fallbacks", () => {
+  for (const token of Object.values(STATUS_TOKENS)) {
+    assert.equal(contrastRatio(token.color, "#0f1522") >= 4.5, true, `${token.key} text contrast`);
+    assert.equal(contrastRatio(token.color, "#0f1522") >= 3, true, `${token.key} non-text contrast`);
+  }
+
+  for (const path of ["../ui/base.css", "../ui/mobile/mobile.css", "../ui/terminal/terminal_theme.css"]) {
+    const css = readFileSync(new URL(path, import.meta.url), "utf8");
+    assert.match(css, /prefers-reduced-motion:\s*reduce/);
+    assert.match(css, /prefers-contrast:\s*more/);
+    assert.match(css, /forced-colors:\s*active/);
+  }
+});
+
+test("alert heatmap has non-color semantics in production renderer", () => {
+  const alertsJs = readFileSync(new URL("../ui/alerts.js", import.meta.url), "utf8");
+
+  assert.match(alertsJs, /setAttribute\("role", "grid"\)/);
+  assert.match(alertsJs, /setAttribute\("aria-label", "Alert heatmap by symbol and horizon"\)/);
+  assert.match(alertsJs, /class="hmSwatch"[\s\S]*esc\(c\.glyph/);
+  assert.match(alertsJs, /class="hmStatusLabel"/);
+  assert.match(alertsJs, /cell\.dataset\.status = c\.key/);
+  assert.match(alertsJs, /cell\.setAttribute\("aria-label", aria\)/);
 });

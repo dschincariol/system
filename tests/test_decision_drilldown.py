@@ -114,6 +114,20 @@ def _init_decision_drilldown_db(db_path: Path) -> None:
                 pnl REAL
             );
 
+            CREATE TABLE prediction_explanations (
+                id INTEGER PRIMARY KEY,
+                symbol TEXT,
+                ts INTEGER,
+                model_family TEXT,
+                model_name TEXT,
+                version TEXT,
+                explanation_type TEXT,
+                top_features TEXT,
+                base_value REAL,
+                diagnostics TEXT,
+                created_ts INTEGER
+            );
+
             INSERT INTO alerts (
                 id, event_id, symbol, horizon_s, ts_ms, event_title, title, message
             ) VALUES (
@@ -201,6 +215,120 @@ def test_decision_detail_aggregates_existing_records(monkeypatch, tmp_path: Path
     assert stages["policy"]["summary"] == "max_position"
     assert stages["route"]["status"] == "suppressed"
     assert stages["outcome"]["status"] == "suppressed"
+    assert payload["attribution"]["available"] is False
+    assert "No backend feature-contribution payload" in payload["attribution"]["unavailable_reason"]
+
+
+def test_decision_detail_surfaces_prediction_explanation_contributions(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "decision_drilldown.sqlite"
+    _init_decision_drilldown_db(db_path)
+
+    explanation = {
+        "prediction_explanation": {
+            "available": True,
+            "explanation_type": "shap",
+            "is_shap": True,
+            "model_family": "gbm_regressor",
+            "top_features": [
+                {"feature_id": "news_score", "attribution": 0.32, "value": 1.4},
+                {"feature_id": "drawdown_pressure", "attribution": -0.12, "value": -0.6},
+            ],
+        }
+    }
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            "UPDATE decision_log SET model_name=?, explain_json=? WHERE id=1",
+            ("gbm_regressor.live", json.dumps(explanation)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    def connect():
+        return sqlite3.connect(str(db_path))
+
+    def fetch_decision_detail(decision_id: int):
+        con = sqlite3.connect(str(db_path))
+        try:
+            cur = con.execute("SELECT * FROM decision_log WHERE id=?", (int(decision_id),))
+            row = cur.fetchone()
+            columns = [item[0] for item in cur.description]
+            return dict(zip(columns, row)) if row else None
+        finally:
+            con.close()
+
+    monkeypatch.setattr(api_read_advanced, "db_connect", connect)
+    monkeypatch.setattr(api_read_advanced, "fetch_decision_detail", fetch_decision_detail)
+
+    payload = api_read_advanced.get_decision_detail(1)
+
+    assert payload["ok"] is True
+    attribution = payload["attribution"]
+    assert attribution["available"] is True
+    assert attribution["source"] == "decision.explain.prediction_explanation"
+    assert attribution["explanation_type"] == "shap"
+    assert attribution["is_shap"] is True
+    assert [row["feature_id"] for row in attribution["top_features"]] == [
+        "news_score",
+        "drawdown_pressure",
+    ]
+
+
+def test_decision_detail_uses_persisted_prediction_explanation_fallback(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "decision_drilldown.sqlite"
+    _init_decision_drilldown_db(db_path)
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            """
+            INSERT INTO prediction_explanations(
+                symbol, ts, model_family, model_name, version, explanation_type,
+                top_features, base_value, diagnostics, created_ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "AAPL",
+                1700000000100,
+                "gbm_regressor",
+                "temporal_predictor",
+                "2026.05.10",
+                "feature_value_proxy",
+                json.dumps([
+                    {"feature_id": "momentum_5m", "attribution": 0.5, "value": 2.0},
+                ]),
+                0.0,
+                json.dumps({"feature_set_tag": "features:v1"}),
+                1700000000101,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    def connect():
+        return sqlite3.connect(str(db_path))
+
+    def fetch_decision_detail(decision_id: int):
+        con = sqlite3.connect(str(db_path))
+        try:
+            cur = con.execute("SELECT * FROM decision_log WHERE id=?", (int(decision_id),))
+            row = cur.fetchone()
+            columns = [item[0] for item in cur.description]
+            return dict(zip(columns, row)) if row else None
+        finally:
+            con.close()
+
+    monkeypatch.setattr(api_read_advanced, "db_connect", connect)
+    monkeypatch.setattr(api_read_advanced, "fetch_decision_detail", fetch_decision_detail)
+
+    payload = api_read_advanced.get_decision_detail(1)
+
+    assert payload["ok"] is True
+    assert payload["attribution"]["available"] is True
+    assert payload["attribution"]["source"] == "prediction_explanations"
+    assert payload["attribution"]["top_features"][0]["feature_id"] == "momentum_5m"
 
 
 def test_decision_detail_handles_missing_and_lineage_lookup(monkeypatch, tmp_path: Path) -> None:

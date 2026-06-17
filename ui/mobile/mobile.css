@@ -6,10 +6,23 @@
   --text: #f0f2f4;
   --muted: #a9b0bb;
   --dim: #78818f;
-  --ok: #39c071;
-  --warn: #e0aa36;
-  --danger: #ef5f5f;
-  --info: #5ab0ff;
+  --status-neutral: #A7B0BC;
+  --status-info: #56B4E9;
+  --status-ok: #009E73;
+  --status-warn: #E69F00;
+  --status-high: #CC79A7;
+  --status-crit: #D55E00;
+  --status-blocked: #73B7E6;
+  --status-unavailable: #8B949E;
+  --status-ok-bg: rgba(0, 158, 115, 0.14);
+  --status-warn-bg: rgba(230, 159, 0, 0.15);
+  --status-crit-bg: rgba(213, 94, 0, 0.16);
+  --status-blocked-bg: rgba(115, 183, 230, 0.16);
+  --status-unavailable-bg: rgba(139, 148, 158, 0.13);
+  --ok: var(--status-ok);
+  --warn: var(--status-warn);
+  --danger: var(--status-crit);
+  --info: var(--status-info);
   --shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
   color-scheme: dark;
 }
@@ -79,17 +92,20 @@ input {
 }
 
 .surfaceBanner.ok {
-  border-color: rgba(57, 192, 113, 0.55);
+  border-color: var(--status-ok);
+  border-style: solid;
   color: var(--ok);
 }
 
 .surfaceBanner.warn {
-  border-color: rgba(224, 170, 54, 0.6);
+  border-color: var(--status-warn);
+  border-style: dashed;
   color: var(--warn);
 }
 
 .surfaceBanner.danger {
-  border-color: rgba(239, 95, 95, 0.7);
+  border-color: var(--status-crit);
+  border-style: double;
   color: var(--danger);
 }
 
@@ -148,6 +164,42 @@ input {
   line-height: 1.2;
 }
 
+.runtimeNarrative {
+  border-color: rgba(86, 180, 233, 0.45);
+}
+
+.runtimeHeadline {
+  margin: 0;
+  color: var(--text);
+  font-size: 17px;
+  line-height: 1.25;
+  font-weight: 850;
+}
+
+.runtimeMeaning {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.42;
+}
+
+.runtimeNextList {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.42;
+}
+
+.runtimeNextList li + li {
+  margin-top: 5px;
+}
+
+.runtimeStatusNote,
+.pnlTrend {
+  overflow-wrap: anywhere;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -164,20 +216,59 @@ input {
 
 .badge-ok {
   color: var(--ok);
-  border-color: rgba(57, 192, 113, 0.55);
-  background: rgba(57, 192, 113, 0.08);
+  border-color: var(--status-ok);
+  border-style: solid;
+  background: var(--status-ok-bg);
 }
 
 .badge-warn {
   color: var(--warn);
-  border-color: rgba(224, 170, 54, 0.6);
-  background: rgba(224, 170, 54, 0.08);
+  border-color: var(--status-warn);
+  border-style: dashed;
+  background: var(--status-warn-bg);
+}
+
+.badge-high {
+  color: var(--status-high);
+  border-color: var(--status-high);
+  border-style: dashed;
+  background: rgba(204, 121, 167, 0.15);
 }
 
 .badge-danger {
   color: var(--danger);
-  border-color: rgba(239, 95, 95, 0.65);
-  background: rgba(239, 95, 95, 0.09);
+  border-color: var(--status-crit);
+  border-style: double;
+  background: var(--status-crit-bg);
+}
+
+.badge-crit {
+  color: var(--danger);
+  border-color: var(--status-crit);
+  border-style: double;
+  background: var(--status-crit-bg);
+}
+
+.badge-blocked {
+  color: var(--status-blocked);
+  border-color: var(--status-blocked);
+  border-style: dashed;
+  background:
+    repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 2px, transparent 2px 8px),
+    var(--status-blocked-bg);
+}
+
+.badge-unavailable {
+  color: var(--status-unavailable);
+  border-color: var(--status-unavailable);
+  border-style: dotted;
+  background: var(--status-unavailable-bg);
+}
+
+.badge-info {
+  color: var(--status-info);
+  border-color: var(--status-info);
+  background: rgba(86,180,233,.14);
 }
 
 .badge-muted {
@@ -254,24 +345,27 @@ input {
 }
 
 .dataRow.danger {
-  border-color: rgba(239, 95, 95, 0.55);
+  border-color: var(--status-crit);
+  border-style: double;
 }
 
 .dataRow.warn {
-  border-color: rgba(224, 170, 54, 0.55);
+  border-color: var(--status-warn);
+  border-style: dashed;
 }
 
 .emergencyPanel {
-  border-color: rgba(239, 95, 95, 0.75);
+  border-color: var(--status-crit);
+  border-style: double;
   background: #1c1718;
 }
 
 .consequencePreview {
   padding: 11px;
-  border: 1px solid rgba(239, 95, 95, 0.55);
+  border: 3px double var(--status-crit);
   border-radius: 6px;
   color: #ffd4d4;
-  background: rgba(239, 95, 95, 0.08);
+  background: var(--status-crit-bg);
   font-size: 13px;
   line-height: 1.45;
   white-space: pre-wrap;
@@ -305,8 +399,8 @@ input {
   margin-top: 12px;
   overflow: hidden;
   color: #fff;
-  background: #8f2323;
-  border: 1px solid rgba(239, 95, 95, 0.9);
+  background: #6b2b08;
+  border: 3px double var(--status-crit);
   border-radius: 8px;
   font-weight: 900;
   cursor: pointer;
@@ -329,19 +423,20 @@ input {
   position: absolute;
   inset: 0 auto 0 0;
   width: var(--hold-progress, 0%);
-  background: rgba(239, 95, 95, 0.45);
+  background: rgba(213, 94, 0, 0.45);
   transition: width 80ms linear;
   z-index: 1;
 }
 
 .resultBlock.ok {
   color: var(--ok);
-  border-color: rgba(57, 192, 113, 0.55);
+  border-color: var(--status-ok);
 }
 
 .resultBlock.danger {
   color: var(--danger);
-  border-color: rgba(239, 95, 95, 0.6);
+  border-color: var(--status-crit);
+  border-style: double;
 }
 
 .footerBar {
@@ -374,6 +469,89 @@ input {
 
 .tone-danger {
   color: var(--danger) !important;
+}
+
+.badge-ok::before,
+.badge-warn::before,
+.badge-high::before,
+.badge-danger::before,
+.badge-crit::before,
+.badge-blocked::before,
+.badge-info::before,
+.badge-unavailable::before {
+  margin-right: 5px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.badge-ok::before { content: "OK"; }
+.badge-warn::before { content: "!"; }
+.badge-high::before { content: "!!"; }
+.badge-danger::before,
+.badge-crit::before { content: "X"; }
+.badge-blocked::before { content: "LOCK"; }
+.badge-info::before { content: "i"; }
+.badge-unavailable::before { content: "?"; }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .surfaceBanner,
+  .panel,
+  .metricTile,
+  .badge,
+  .dataRow,
+  .noteBlock,
+  .consequencePreview,
+  .holdButton {
+    border-width: 2px !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .surfaceBanner,
+  .panel,
+  .metricTile,
+  .badge,
+  .dataRow,
+  .noteBlock,
+  .consequencePreview,
+  .holdButton,
+  .secondaryButton,
+  .textInput {
+    forced-color-adjust: auto;
+    background: Canvas !important;
+    color: CanvasText !important;
+    border-color: CanvasText !important;
+    box-shadow: none !important;
+  }
+
+  .badge-warn,
+  .badge-high,
+  .badge-blocked,
+  .dataRow.warn {
+    border-style: dashed !important;
+  }
+
+  .badge-danger,
+  .badge-crit,
+  .dataRow.danger,
+  .emergencyPanel,
+  .consequencePreview {
+    border-style: double !important;
+  }
+
+  .badge-unavailable {
+    border-style: dotted !important;
+  }
 }
 
 @media (max-width: 360px) {

@@ -12,13 +12,19 @@ import {
   normalizePnl,
   normalizePositionRows,
   numberOrNull,
+  summarizePnlTrend,
   summarizeEmergencyResult,
 } from "./mobile_helpers.mjs";
+import { summarizeRuntimeStatus } from "../runtime_status_summary.js";
+import { statusAriaLabel, statusToken } from "../utils.js";
 
 const ENDPOINTS = Object.freeze({
   status: "/api/status",
+  systemState: "/api/system/state",
   health: "/api/health",
   readiness: "/api/readiness",
+  executionBarrier: "/api/execution/barrier",
+  marketStress: "/api/market_stress",
   watchdogs: "/api/operator/runtime_watchdogs",
   pnl: "/api/pnl",
   positions: "/api/terminal/positions",
@@ -43,6 +49,14 @@ const state = {
   pollTimer: 0,
 };
 
+const RUNTIME_STATUS_ENDPOINTS = Object.freeze([
+  "status",
+  "systemState",
+  "health",
+  "readiness",
+  "executionBarrier",
+]);
+
 function $(id) {
   return document.getElementById(id);
 }
@@ -54,13 +68,9 @@ function setText(id, value) {
 
 function setClass(el, base, tone) {
   if (!el) return;
-  const suffix = tone === "ok"
-    ? "badge-ok"
-    : tone === "warn"
-      ? "badge-warn"
-      : tone === "danger"
-        ? "badge-danger"
-        : "badge-muted";
+  const token = statusToken(tone === "danger" ? "crit" : tone);
+  const suffix = token.key === "neutral" ? "badge-muted" : `badge-${token.className}`;
+  el.dataset.status = token.key;
   el.className = `${base} ${suffix}`;
 }
 
@@ -69,11 +79,23 @@ function setBadge(id, text, tone = "muted") {
   if (!el) return;
   el.textContent = cleanText(text);
   setClass(el, "badge", tone);
+  const token = statusToken(tone === "danger" ? "crit" : tone);
+  el.setAttribute("aria-label", statusAriaLabel(token.key, cleanText(text)));
 }
 
-function endpointData(name) {
-  const row = normalizeEndpointResult(state.endpoints[name] || {});
+function endpointResult(name, endpoints = state.endpoints) {
+  return normalizeEndpointResult((endpoints || {})[name] || {});
+}
+
+function endpointData(name, endpoints = state.endpoints) {
+  const row = endpointResult(name, endpoints);
   return row.ok && row.data ? row.data : {};
+}
+
+function objectOrNull(value) {
+  return value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length
+    ? value
+    : null;
 }
 
 async function fetchJson(path, options = {}) {
@@ -138,6 +160,67 @@ function renderEndpointBanner() {
   banner.className = failed.length >= 3 ? "surfaceBanner danger" : "surfaceBanner warn";
 }
 
+function runtimeSummaryInputs(endpoints = state.endpoints) {
+  const status = endpointData("status", endpoints);
+  const health = objectOrNull(endpointData("health", endpoints)) || objectOrNull(status.health);
+  const readiness = objectOrNull(endpointData("readiness", endpoints)) || objectOrNull(status.readiness);
+  const systemState =
+    objectOrNull(endpointData("systemState", endpoints))
+    || objectOrNull(status.system_state_detail)
+    || objectOrNull(status.system_state)
+    || objectOrNull(status);
+  const executionBarrier =
+    objectOrNull(endpointData("executionBarrier", endpoints))
+    || objectOrNull(status.execution_barrier)
+    || objectOrNull(health && health.execution_barrier);
+  const marketStress =
+    objectOrNull(endpointData("marketStress", endpoints))
+    || objectOrNull(status.market_stress);
+
+  return {
+    systemState,
+    stressPayload: marketStress,
+    barrierPayload: executionBarrier,
+    healthPayload: health,
+    readinessPayload: readiness,
+  };
+}
+
+function runtimeEndpointFailures(endpoints = state.endpoints) {
+  return RUNTIME_STATUS_ENDPOINTS
+    .map((name) => [name, endpointResult(name, endpoints)])
+    .filter(([, result]) => !result.ok)
+    .map(([name, result]) => `${name}: ${cleanText(result.error, "endpoint_failed")}`);
+}
+
+export function renderMobileRuntimeNarrative(endpoints = state.endpoints) {
+  const summary = summarizeRuntimeStatus(runtimeSummaryInputs(endpoints));
+  setText("runtimeHeadline", summary.headline);
+  setText("runtimeMeaning", summary.meaning);
+  setBadge("runtimeSummaryBadge", summary.pills.mood.label, summary.pills.mood.cls);
+
+  const nextEl = $("runtimeNextList");
+  if (nextEl) {
+    nextEl.innerHTML = (summary.next || [])
+      .map((item) => `<li>${escapeHtml(item)}</li>`)
+      .join("");
+  }
+
+  const failures = runtimeEndpointFailures(endpoints);
+  const note = failures.length
+    ? `Partial status: ${failures.slice(0, 2).join(" | ")}. Guidance uses the status inputs that responded.`
+    : (summary.blockers && summary.blockers.length
+      ? `Active blockers: ${summary.blockers.slice(0, 2).join(" | ")}`
+      : "No critical runtime blockers reported by shared status logic.");
+  setText("runtimeStatusNote", note);
+
+  const host = $("runtimeNarrative");
+  if (host) {
+    host.setAttribute("aria-label", `${summary.headline}. ${summary.meaning}`);
+  }
+  return summary;
+}
+
 function renderSystem() {
   const status = endpointData("status");
   const health = endpointData("health");
@@ -174,19 +257,29 @@ function renderSystem() {
   setText("systemReasons", reasons.length ? reasons.join("\n") : "No active status reasons reported.");
 
   setBadge("heartbeatBadge", ready && healthOk ? "ok" : "degraded", ready && healthOk ? "ok" : "warn");
-  setBadge("overallBadge", killActive ? "kill" : ready && healthOk ? "ok" : "degraded", killActive ? "danger" : ready && healthOk ? "ok" : "warn");
+  setBadge("overallBadge", killActive ? "kill" : ready && healthOk ? "ok" : "degraded", killActive ? "blocked" : ready && healthOk ? "ok" : "warn");
 }
 
-function renderPnl() {
-  const result = normalizeEndpointResult(state.endpoints.pnl || {});
-  const pnl = normalizePnl(result.data || {});
+export function renderMobilePnl(endpoints = state.endpoints) {
+  const result = endpointResult("pnl", endpoints);
+  const payload = result.ok ? (result.data || {}) : { ok: false, error: result.error };
+  const pnl = normalizePnl(payload);
+  const trend = summarizePnlTrend(payload);
   const tone = pnl.ok && pnl.ready ? "ok" : "warn";
   setText("pnlTotal", formatMoney(pnl.total));
   setText("pnlMeta", pnl.ready ? "live snapshot" : "not ready");
   setText("pnlTotalDetail", formatMoney(pnl.total));
   setText("pnlUnrealized", formatMoney(pnl.unrealized));
   setText("pnlRealized", formatMoney(pnl.realized));
+  setText("pnlTrend", trend.text);
   setBadge("pnlBadge", pnl.ready ? "live" : "unavailable", tone);
+
+  const trendEl = $("pnlTrend");
+  if (trendEl) {
+    const token = statusToken(trend.tone);
+    trendEl.dataset.status = token.key;
+    trendEl.className = `noteBlock pnlTrend tone-${token.className}`;
+  }
 }
 
 function renderPositions() {
@@ -286,13 +379,14 @@ function renderEmergencyPreview() {
   };
   setText("consequencePreview", describeEmergencyConsequences(state.snapshot));
   const active = killSwitchIsActive(state.snapshot.killSwitches);
-  setBadge("killSwitchBadge", active ? "active" : "confirmation required", active ? "danger" : "warn");
+  setBadge("killSwitchBadge", active ? "active" : "confirmation required", active ? "blocked" : "warn");
 }
 
 function renderAll() {
   renderEndpointBanner();
+  renderMobileRuntimeNarrative();
   renderSystem();
-  renderPnl();
+  renderMobilePnl();
   renderPositions();
   renderAlerts();
   renderBrokerFeeds();

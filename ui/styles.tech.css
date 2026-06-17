@@ -50,9 +50,9 @@
   --accent: #3ff6d2;
 
   /* Status */
-  --ok: #22c55e;
-  --warn: #ffb020;
-  --bad: #ff4d6d;
+  --ok: var(--status-ok, #009E73);
+  --warn: var(--status-warn, #E69F00);
+  --bad: var(--status-crit, #D55E00);
 
   --radius: 14px;
 
@@ -140,8 +140,9 @@ body.theme-tech .systemStatusValue{
 
 .theme-tech .status_ok,
 body.theme-tech .status_ok{
-  border-color: rgba(34,197,94,0.45);
-  box-shadow: inset 0 0 0 1px rgba(34,197,94,0.10);
+  border-color: var(--status-ok, #009E73);
+  border-style: solid;
+  box-shadow: inset 0 0 0 1px var(--status-ok-bg, rgba(0,158,115,0.14));
 }
 
 .theme-tech .status_ok .systemStatusValue,
@@ -151,8 +152,9 @@ body.theme-tech .status_ok .systemStatusValue{
 
 .theme-tech .status_warning,
 body.theme-tech .status_warning{
-  border-color: rgba(255,176,32,0.45);
-  box-shadow: inset 0 0 0 1px rgba(255,176,32,0.10);
+  border-color: var(--status-warn, #E69F00);
+  border-style: dashed;
+  box-shadow: inset 0 0 0 1px var(--status-warn-bg, rgba(230,159,0,0.15));
 }
 
 .theme-tech .status_warning .systemStatusValue,
@@ -162,8 +164,9 @@ body.theme-tech .status_warning .systemStatusValue{
 
 .theme-tech .status_error,
 body.theme-tech .status_error{
-  border-color: rgba(255,77,109,0.45);
-  box-shadow: inset 0 0 0 1px rgba(255,77,109,0.10);
+  border-color: var(--status-crit, #D55E00);
+  border-style: double;
+  box-shadow: inset 0 0 0 1px var(--status-crit-bg, rgba(213,94,0,0.16));
 }
 
 .theme-tech .status_error .systemStatusValue,
@@ -346,17 +349,19 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .theme-tech .hud-status.ok{
-  border-color: rgba(34,197,94,0.35);
+  border-color: var(--status-ok, #009E73);
   color: var(--ok);
 }
 
 .theme-tech .hud-status.warn{
-  border-color: rgba(255,176,32,0.4);
+  border-color: var(--status-warn, #E69F00);
+  border-style: dashed;
   color: var(--warn);
 }
 
 .theme-tech .hud-status.err{
-  border-color: rgba(255,77,109,0.4);
+  border-color: var(--status-crit, #D55E00);
+  border-style: double;
   color: var(--bad);
 }
 
@@ -498,26 +503,26 @@ body.theme-tech .status_error .systemStatusValue{
 ============================================================ */
 
 .theme-tech #page-dashboard tr.event-critical td {
-  background: rgba(239,68,68,.12) !important;
-  border-left: 3px solid #ef4444;
+  background: var(--status-crit-bg, rgba(213,94,0,.16)) !important;
+  border-left: 5px double var(--status-crit, #D55E00);
 }
 
 .theme-tech #page-dashboard tr.event-warn td {
-  background: rgba(255,176,32,.12) !important;
-  border-left: 3px solid #ffb020;
+  background: var(--status-warn-bg, rgba(230,159,0,.15)) !important;
+  border-left: 4px dashed var(--status-warn, #E69F00);
 }
 
 .theme-tech #page-dashboard tr.event-info td {
-  background: rgba(56,189,248,.10) !important;
-  border-left: 3px solid #38bdf8;
+  background: var(--status-info-bg, rgba(86,180,233,.14)) !important;
+  border-left: 3px solid var(--status-info, #56B4E9);
 }
 
 .theme-tech #page-dashboard tr.event-critical:hover td {
-  background: rgba(239,68,68,.18) !important;
+  background: rgba(213,94,0,.22) !important;
 }
 
 .theme-tech #page-dashboard tr.event-warn:hover td {
-  background: rgba(255,176,32,.18) !important;
+  background: rgba(230,159,0,.22) !important;
 }
 
 .theme-tech #page-dashboard tr.event-info:hover td {
@@ -602,18 +607,18 @@ body.theme-tech .status_error .systemStatusValue{
 ============================================================ */
 
 .theme-tech #page-dashboard .alert-panel.alert-critical{
-  border: 2px solid rgba(239,68,68,.55);
+  border: 3px double var(--status-crit, #D55E00);
   box-shadow:
-    0 0 0 1px rgba(239,68,68,.25),
+    0 0 0 1px var(--status-crit-bg, rgba(213,94,0,.16)),
     0 24px 70px rgba(0,0,0,.75),
-    0 0 40px rgba(239,68,68,.18);
+    0 0 40px var(--status-crit-bg, rgba(213,94,0,.16));
 }
 
 .theme-tech #page-dashboard .alert-panel.alert-critical::before{
   background: linear-gradient(
     to bottom,
-    rgba(239,68,68,.85),
-    rgba(239,68,68,.25)
+    var(--status-crit, #D55E00),
+    var(--status-crit-bg, rgba(213,94,0,.16))
   );
 }
 
@@ -718,13 +723,14 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .plc-status-badge.online{
-  border-color:rgba(34,197,94,.5);
-  background:rgba(34,197,94,.18);
+  border-color:var(--status-ok, #009E73);
+  background:var(--status-ok-bg, rgba(0,158,115,.14));
 }
 
 .plc-status-badge.offline{
-  border-color:rgba(239,68,68,.5);
-  background:rgba(239,68,68,.18);
+  border-color:var(--status-crit, #D55E00);
+  border-style:double;
+  background:var(--status-crit-bg, rgba(213,94,0,.16));
 }
 
 /* Section label (Inputs / Sensors / Relays) */
@@ -773,8 +779,8 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .plc-relay-chip.on{
-  background:rgba(34,197,94,.18);
-  border-color:rgba(34,197,94,.5);
+  background:var(--status-ok-bg, rgba(0,158,115,.14));
+  border-color:var(--status-ok, #009E73);
 }
 
 .plc-relay-chip.off{
@@ -838,18 +844,18 @@ body.theme-tech .status_error .systemStatusValue{
 /* Status words pop (ONLINE / OFFLINE / IDLE etc) */
 #plcOperationalGrid.plc-control-grid .ok,
 #plcOperationalGrid.plc-control-grid .online {
-  color: #34d399;
+  color: var(--status-ok, #009E73);
   font-weight: 800;
 }
 
 #plcOperationalGrid.plc-control-grid .warn {
-  color: #fbbf24;
+  color: var(--status-warn, #E69F00);
   font-weight: 800;
 }
 
 #plcOperationalGrid.plc-control-grid .bad,
 #plcOperationalGrid.plc-control-grid .offline {
-  color: #fb7185;
+  color: var(--status-crit, #D55E00);
   font-weight: 800;
 }
 
@@ -962,9 +968,9 @@ body.theme-tech .status_error .systemStatusValue{
   border-radius: 999px;
   font-size: 11px;
   font-weight: 800;
-  border: 1px solid rgba(34,197,94,.5);
-  background: rgba(34,197,94,.18);
-  color: #34d399;
+  border: 1px solid var(--status-ok, #009E73);
+  background: var(--status-ok-bg, rgba(0,158,115,.14));
+  color: var(--status-ok, #009E73);
   width: fit-content;
 }
 
@@ -1099,9 +1105,9 @@ body.theme-tech .status_error .systemStatusValue{
 }
 
 .plc-relay-on {
-  background: rgba(34,197,94,.18);
-  border-color: rgba(34,197,94,.55);
-  color: #22c55e;
+  background: var(--status-ok-bg, rgba(0,158,115,.14));
+  border-color: var(--status-ok, #009E73);
+  color: var(--status-ok, #009E73);
 }
 
 .plc-relay-off {

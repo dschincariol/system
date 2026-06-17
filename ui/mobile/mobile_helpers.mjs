@@ -52,13 +52,116 @@ export function normalizeEndpointResult(result) {
 }
 
 export function normalizePnl(payload = {}) {
-  const data = payload && typeof payload.data === "object" ? payload.data : {};
+  const data = payload && typeof payload.data === "object" && !Array.isArray(payload.data) ? payload.data : {};
+  const ok = payload && payload.ok === false ? false : true;
   return {
-    ok: payload.ok !== false,
-    total: payload.total ?? data.total ?? data.today_pnl ?? data.pnl,
-    unrealized: payload.unrealized ?? data.unrealized ?? data.unrealized_pnl,
-    realized: payload.realized ?? data.realized ?? data.realized_pnl,
-    ready: !!(payload.meta && payload.meta.ready) || Object.keys(data).length > 0,
+    ok,
+    total: payload.total ?? payload.today_pnl ?? payload.day_pnl ?? payload.daily_pnl ?? payload.total_pnl ?? payload.pnl
+      ?? data.total ?? data.today_pnl ?? data.day_pnl ?? data.daily_pnl ?? data.total_pnl ?? data.pnl,
+    unrealized: payload.unrealized ?? payload.unrealized_pnl ?? data.unrealized ?? data.unrealized_pnl,
+    realized: payload.realized ?? payload.realized_pnl ?? data.realized ?? data.realized_pnl,
+    ready: ok && (!!(payload.meta && payload.meta.ready) || Object.keys(data).length > 0),
+  };
+}
+
+function _pnlSeriesSources(payload = {}) {
+  const data = payload && typeof payload.data === "object" && !Array.isArray(payload.data) ? payload.data : {};
+  return [
+    payload.history,
+    payload.rows,
+    payload.points,
+    payload.series,
+    payload.pnl,
+    payload.snapshots,
+    payload.timeline,
+    data.history,
+    data.rows,
+    data.points,
+    data.series,
+    data.pnl,
+    data.snapshots,
+    data.timeline,
+  ].filter(Array.isArray);
+}
+
+function _timestampMs(value) {
+  const raw = value && typeof value === "object"
+    ? value.ts_ms ?? value.timestamp_ms ?? value.time_ms ?? value.updated_ts_ms ?? value.ts ?? value.timestamp ?? value.time
+    : null;
+  const numeric = numberOrNull(raw);
+  if (numeric !== null) {
+    return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  }
+  if (typeof raw === "string") {
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function _pnlValue(value) {
+  if (typeof value === "number") return numberOrNull(value);
+  if (Array.isArray(value)) {
+    return numberOrNull(value[1] ?? value[0]);
+  }
+  if (!value || typeof value !== "object") return null;
+  return numberOrNull(
+    value.total
+    ?? value.total_pnl
+    ?? value.today_pnl
+    ?? value.day_pnl
+    ?? value.daily_pnl
+    ?? value.pnl
+    ?? value.value
+    ?? value.net_total
+  );
+}
+
+export function summarizePnlTrend(payload = {}) {
+  if (payload && payload.ok === false) {
+    return {
+      available: false,
+      tone: "unavailable",
+      text: `PnL trend unavailable: ${cleanText(payload.error, "endpoint_failed")}.`,
+    };
+  }
+
+  const points = [];
+  for (const rows of _pnlSeriesSources(payload)) {
+    for (const row of rows) {
+      const value = _pnlValue(row);
+      if (value === null) continue;
+      points.push({ value, tsMs: _timestampMs(row) });
+    }
+  }
+
+  const ordered = points.some((point) => point.tsMs !== null)
+    ? points.slice().sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0))
+    : points;
+
+  if (ordered.length < 2) {
+    const pnl = normalizePnl(payload);
+    return {
+      available: false,
+      tone: "unavailable",
+      text: pnl.ready
+        ? "PnL trend unavailable: /api/pnl returned only the latest snapshot."
+        : "PnL trend unavailable: /api/pnl is not ready.",
+    };
+  }
+
+  const first = ordered[0];
+  const last = ordered[ordered.length - 1];
+  const delta = last.value - first.value;
+  const direction = Math.abs(delta) < 0.005 ? "flat" : (delta > 0 ? "up" : "down");
+  const tone = direction === "up" ? "ok" : direction === "down" ? "danger" : "muted";
+  return {
+    available: true,
+    tone,
+    points: ordered.length,
+    delta,
+    direction,
+    text: `PnL trend: ${direction} ${formatMoney(Math.abs(delta))} over ${ordered.length} points (${formatMoney(first.value)} to ${formatMoney(last.value)}).`,
   };
 }
 

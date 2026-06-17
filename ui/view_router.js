@@ -23,7 +23,7 @@ const PERSONA_PANEL_ALLOWLISTS = {
   operations: {
     overview: [
       "telemetryStrip",
-      "operatorSummaryCard",
+      "operatorOverviewCard",
       "decisionBar",
       "livePnlCard",
       "systemHealthCard",
@@ -33,6 +33,7 @@ const PERSONA_PANEL_ALLOWLISTS = {
       "executionAdvisoryCard",
     ],
     operate: [
+      "operatorSummaryCard",
       "operatorStartupCard",
       "decisionBar",
       "jobConsoleCard",
@@ -63,7 +64,7 @@ const PERSONA_PANEL_ALLOWLISTS = {
   fund_manager: {
     overview: [
       "telemetryStrip",
-      "operatorSummaryCard",
+      "operatorOverviewCard",
       "decisionBar",
       "livePnlCard",
       "recentDecisionsCard",

@@ -34,6 +34,21 @@ WEBSOCKET_ENDPOINT_ALLOWLIST = {
     ),
 }
 
+CHART_A11Y_CONTRACT = {
+    "liveMarketChart": "liveMarketChartA11y",
+    "replayChart": "replayChartA11y",
+    "marketStressSparkline": "marketStressSparklineA11y",
+    "newsSentimentCanvas": "newsSentimentCanvasA11y",
+    "calibCanvas": "calibCanvasA11y",
+    "equityDriftCanvas": "equityDriftCanvasA11y",
+    "performanceDivergenceChart": "performanceDivergenceChartA11y",
+    "portfolioEquityCanvas": "portfolioEquityCanvasA11y",
+    "portfolioDdCanvas": "portfolioDdCanvasA11y",
+    "riskHistoryChart": "riskHistoryChartA11y",
+    "monteCarloFanChart": "monteCarloFanChartA11y",
+    "alphaDecayChart": "alphaDecayChartA11y",
+}
+
 FALLBACK_ONLY_UI_ENDPOINT_ALLOWLIST = {
     "/api/alerts/by_id": "Incident drawer detail remains dashboard-server fallback-only until alert detail routes move into ops route specs.",
     "/api/alerts/timeline": "Alert timeline cards use the dashboard-server alerts fallback until timeline ownership moves into ops route specs.",
@@ -161,6 +176,119 @@ def test_dashboard_html_js_surface_static_smoke():
         f"{issue.source_path}: {issue.detail}" for issue in syntax_issues
     )
     assert assets, "dashboard asset graph should not be empty"
+
+
+def test_chart_accessibility_fallback_contract_is_rendered_by_production_modules():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    terminal_html = (REPO_ROOT / "ui" / "terminal" / "terminal.html").read_text(encoding="utf-8")
+    helper = (REPO_ROOT / "ui" / "chart_a11y.js").read_text(encoding="utf-8")
+
+    assert "export function renderChartAccessibility" in helper
+    assert 'setAttribute("role"' in helper
+    assert 'setAttribute("aria-label"' in helper
+    assert 'setAttribute("tabindex"' in helper
+    assert "View chart data table" in helper
+
+    for chart_id, fallback_id in CHART_A11Y_CONTRACT.items():
+        assert f'id="{chart_id}"' in html
+        assert f'id="{fallback_id}"' in html
+
+    assert 'id="terminalChart"' in terminal_html
+    assert 'id="terminalChartA11y"' in terminal_html
+
+    production_renderers = [
+        "ui/charts.js",
+        "ui/market_stress.js",
+        "ui/news_panels.js",
+        "ui/replay.mjs",
+        "ui/pro_chart_engine.js",
+        "ui/terminal/pro_charting.js",
+        "ui/terminal/terminal.js",
+        "ui/risk_charts.js",
+    ]
+    for rel_path in production_renderers:
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        assert "chart_a11y.js" in text
+        assert "renderChartAccessibility" in text
+
+    generic_chart_callers = {
+        "ui/portfolio.js": ["Equity drift"],
+        "ui/portfolio_backtest.js": ["Portfolio equity curve", "Portfolio drawdown"],
+        "ui/model_performance_divergence.mjs": ["Model performance divergence"],
+        "ui/dashboard.js": ["Confidence calibration"],
+    }
+    for rel_path, expected_titles in generic_chart_callers.items():
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for title in expected_titles:
+            assert title in text
+
+
+def test_decision_modal_stepper_is_wired_to_production_payload_renderer():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    stepper_js = (REPO_ROOT / "ui" / "decision_stepper.js").read_text(encoding="utf-8")
+
+    assert 'id="decisionModalStepper"' in html
+    assert "from \"./decision_stepper.js\"" in dashboard_js
+    assert "renderDecisionStepper(stepperEl, payload || {})" in dashboard_js
+    assert "buildDecisionStageRows(payload || {})" in stepper_js
+    assert "aria-current=\"step\"" in stepper_js
+
+
+def test_risk_headroom_and_regime_ribbon_are_wired_to_dashboard():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    bullet_js = (REPO_ROOT / "ui" / "bullet_bars.js").read_text(encoding="utf-8")
+    regime_js = (REPO_ROOT / "ui" / "regime_ribbon.js").read_text(encoding="utf-8")
+
+    assert 'id="positionsRiskBars"' in html
+    assert 'id="positionsRegimeRibbon"' in html
+    assert 'data-screens="overview,positions"' in html
+    assert "from \"./bullet_bars.js\"" in dashboard_js
+    assert "from \"./regime_ribbon.js\"" in dashboard_js
+    assert "buildRiskHeadroomViewModel" in dashboard_js
+    assert "renderBulletBars(" in dashboard_js
+    assert "renderRegimeRibbon(" in dashboard_js
+    assert "/api/regime/context" in dashboard_js
+    assert "role=\"list\"" in bullet_js
+    assert "aria-label" in bullet_js
+    assert "Regime context unavailable." in regime_js
+
+
+def test_risk_history_monte_carlo_alpha_and_regime_charts_are_lazy_wired():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    risk_charts_js = (REPO_ROOT / "ui" / "risk_charts.js").read_text(encoding="utf-8")
+
+    for chart_id in ("riskHistoryChart", "monteCarloFanChart", "alphaDecayChart"):
+        assert f'id="{chart_id}"' in html
+        assert f'id="{chart_id}A11y"' in html
+
+    assert 'id="positionsRiskCharts"' in html
+    assert 'id="monteCarloRiskBars"' in html
+    assert 'id="regimeHistoryRibbon"' in html
+    assert 'await import("./risk_charts.js")' in dashboard_js
+    assert "loadRiskChartViews({" in dashboard_js
+    assert "/api/risk/monte_carlo" in risk_charts_js
+    assert "/api/alpha_decay" in risk_charts_js
+    assert "/api/regime/history" in risk_charts_js
+    assert "monte_carlo_risk_info stores summary" not in risk_charts_js
+    assert "Fan chart input unavailable" in risk_charts_js
+
+
+def test_kill_switch_status_rows_replace_pre_mouse_heuristic():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    kill_js = (REPO_ROOT / "ui" / "kill_switch_ui.js").read_text(encoding="utf-8")
+
+    assert 'id="systemStateText"' in html
+    assert "renderKillSwitchPills(state.kill_switches" in dashboard_js
+    assert "buildKillSwitchRows" in kill_js
+    assert "data-ks-action" in kill_js
+    assert "aria-label" in kill_js
+    assert "showKillSwitchExplanation" in kill_js
+    assert "clientY" not in kill_js
+    assert "lineHeight" not in kill_js
 
 
 def test_dashboard_unsafe_job_buttons_fail_closed_with_execution_barrier():

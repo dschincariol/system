@@ -6,9 +6,14 @@ from pathlib import Path
 
 from tools.check_local_asset_refs import (
     find_local_asset_reference_issues,
+    iter_scannable_paths,
     iter_local_asset_refs,
+    load_tracked_paths,
     resolve_local_asset_ref,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class UiAssetReferenceTests(unittest.TestCase):
@@ -99,6 +104,24 @@ class UiAssetReferenceTests(unittest.TestCase):
             for issue in issues
         ]
         self.assertEqual(issue_rows, [])
+
+    def test_chartjs_bundle_is_not_vendored_or_loaded(self) -> None:
+        blocked_path = "ui/vendor/chart.umd.min.js"
+        tracked_paths = load_tracked_paths(ROOT)
+
+        self.assertFalse((ROOT / blocked_path).exists())
+
+        runtime_mentions: list[str] = []
+        for rel_path in iter_scannable_paths(tracked_paths):
+            path = ROOT / rel_path
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for raw_ref, line, kind in iter_local_asset_refs(rel_path, text):
+                if raw_ref.split("?", 1)[0].split("#", 1)[0].endswith("chart.umd.min.js"):
+                    runtime_mentions.append(f"{rel_path}:{line}:{kind}:{raw_ref}")
+
+        self.assertEqual(runtime_mentions, [])
 
 
 if __name__ == "__main__":

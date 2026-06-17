@@ -24,6 +24,19 @@
       Connecting to control-plane endpoints.
     </section>
 
+    <section id="runtimeNarrative" class="panel runtimeNarrative" role="status" aria-live="polite" aria-labelledby="runtimeNarrativeTitle">
+      <div class="panelHeader">
+        <h2 id="runtimeNarrativeTitle">Operator Guidance</h2>
+        <span id="runtimeSummaryBadge" class="badge badge-muted">waiting</span>
+      </div>
+      <p id="runtimeHeadline" class="runtimeHeadline">Loading runtime guidance.</p>
+      <p id="runtimeMeaning" class="runtimeMeaning">Waiting for shared status inputs.</p>
+      <ol id="runtimeNextList" class="runtimeNextList">
+        <li>Connect to the mobile status endpoints.</li>
+      </ol>
+      <div id="runtimeStatusNote" class="noteBlock runtimeStatusNote">No runtime blockers loaded yet.</div>
+    </section>
+
     <section class="metricGrid" aria-label="Critical summary">
       <div class="metricTile">
         <span class="metricLabel">System</span>
@@ -71,6 +84,7 @@
         <div><dt>Unrealized</dt><dd id="pnlUnrealized">-</dd></div>
         <div><dt>Realized</dt><dd id="pnlRealized">-</dd></div>
       </dl>
+      <div id="pnlTrend" class="noteBlock pnlTrend">PnL trend unavailable until /api/pnl returns history.</div>
     </section>
 
     <section class="panel" aria-labelledby="positionsTitle">

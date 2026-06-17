@@ -7,20 +7,26 @@
 */
 
 import {
-  setProChartsState,
   startLiveMarketChart,
   stopLiveMarketChart,
   applyTerminalOverlays
 } from "./pro_charting.js";
+import { setProChartsState } from "../pro_chart_prefs.js";
 import {
   initSelectedSymbolContextFromUrl,
   updateSelectedSymbolContext
 } from "../symbol_context.mjs";
+import { renderChartAccessibility } from "../chart_a11y.js";
+import {
+  buildOverlayAccessibilitySummary,
+  decisionOverlayLegendItems,
+  normalizeDecisionOverlayPayload
+} from "../decision_overlays.js";
 import { buildTableView } from "../utils.js";
 
 const LS_KEY = "terminal.state.v1";
 const FETCH_TIMEOUT_MS = 15000;
-const FLATTEN_HOLD_MS = 1400;
+const FLATTEN_HOLD_MS = 1500;
 
 async function _fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
@@ -120,6 +126,7 @@ function initEls() {
   el.watchMeta = document.getElementById("watchMeta");
   el.chartTitle = document.getElementById("chartTitle");
   el.chartHealth = document.getElementById("chartHealth");
+  el.overlayLegend = document.getElementById("terminalOverlayLegend");
   el.xhairBox = document.getElementById("xhairBox");
   el.acctCash = document.getElementById("acctCash");
   el.acctEquity = document.getElementById("acctEquity");
@@ -136,6 +143,7 @@ function initEls() {
   el.safetyStatus = document.getElementById("tradingSafetyStatus");
   el.terminalArmChk = document.getElementById("terminalArmChk");
   el.ordQty = document.getElementById("ordQty");
+  el.orderPreview = document.getElementById("orderPreview");
   el.btnBuy = document.getElementById("btnBuy");
   el.btnSell = document.getElementById("btnSell");
   el.btnFlat = document.getElementById("btnFlat");
@@ -400,6 +408,7 @@ let _flattenHoldTimer = null;
 let _flattenHoldCompletedAt = 0;
 let _executionBarrier = normalizeExecutionBarrier(null);
 let _accountSnapshotAvailable = false;
+let _latestPositions = [];
 
 function setTerminalBanner(level, message) {
   if (!el.statusBanner) return;
@@ -511,6 +520,7 @@ function applyOrderBarrierState(accountAvailable) {
     const title = barrierBlockTitle();
     setOrderEntryEnabled(false, title);
     setFlattenEnabled(false, title);
+    renderOrderPreview();
     return;
   }
 
@@ -519,6 +529,43 @@ function applyOrderBarrierState(accountAvailable) {
     accountAvailable ? "" : "Order entry is disabled until the account snapshot is available."
   );
   setFlattenEnabled(true, "Hold to confirm flatten. Backend execution gates still apply.");
+  renderOrderPreview();
+}
+
+function currentOrderQty() {
+  const raw = el.ordQty ? el.ordQty.value : "";
+  const qty = Number(raw || 0);
+  return Number.isFinite(qty) ? qty : 0;
+}
+
+function latestPositionForSymbol(symbol) {
+  const sym = String(symbol || "").trim().toUpperCase();
+  return (_latestPositions || []).find((row) => String(row && row.symbol || "").trim().toUpperCase() === sym) || null;
+}
+
+function orderConfirmationPayload(token, holdMs = 0) {
+  return {
+    confirm: token,
+    confirmation: token,
+    confirmation_hold_ms: Math.max(0, Number(holdMs || 0)),
+    consequence_ack: true,
+    actor: "terminal_operator",
+    source: "terminal",
+  };
+}
+
+function renderOrderPreview(side = "") {
+  if (!el.orderPreview) return;
+  const qty = currentOrderQty();
+  const pos = latestPositionForSymbol(STATE.symbol);
+  const px = Number(pos && (pos.market_px ?? pos.avg_px));
+  const notional = Number.isFinite(px) && px > 0 && qty > 0 ? qty * px : null;
+  const gate = _executionBarrier.realTradingAllowed
+    ? `gate open (${_executionBarrier.mode})`
+    : `blocked: ${_executionBarrier.blockingReasons[0] || _executionBarrier.reason || "execution barrier"}`;
+  const priceText = Number.isFinite(px) && px > 0 ? `price ref ${fmtNum(px, 2)}` : "price ref unavailable";
+  const notionalText = notional == null ? "notional unavailable" : `est notional ${fmtNum(notional, 2)}`;
+  el.orderPreview.textContent = `${side || "Order"} ${STATE.symbol} qty ${fmtNum(qty, 4)} | ${priceText} | ${notionalText} | ${gate}`;
 }
 
 function canSubmitRealTrade(label) {
@@ -616,13 +663,21 @@ async function refreshSnapshot() {
     if (el.acctMeta) el.acctMeta.textContent = `snapshot latency ${Number(j.latency_ms || 0)}ms`;
 
     const pos = Array.isArray(j.positions) ? j.positions : [];
+    _latestPositions = pos;
 
     const ords = (j.orders && typeof j.orders === "object") ? j.orders : { broker: [], portfolio: [] };
     const bro = Array.isArray(ords.broker) ? ords.broker : [];
     const por = Array.isArray(ords.portfolio) ? ords.portfolio : [];
+    const rej = Array.isArray(ords.rejected) ? ords.rejected : [];
     const merged = [
       ...bro.slice(0, 150).map(r => ({ kind: "broker", ...r })),
       ...por.slice(0, 150).map(r => ({ kind: "portfolio", ...r })),
+      ...rej.slice(0, 150).map(r => ({
+        ...r,
+        kind: "rejected",
+        state: `REJECTED ${String(r && (r.reason_code || r.reason) || "rejected")}`,
+        action: r && (r.reason_code || r.reason || "rejected"),
+      })),
     ].sort((a, b) => Number(b.updated_ts_ms || b.ts_ms || 0) - Number(a.updated_ts_ms || a.ts_ms || 0));
 
     const fills = Array.isArray(j.fills) ? j.fills : [];
@@ -686,6 +741,38 @@ function renderWatch() {
   });
 }
 
+function markerShapeGlyph(shape) {
+  const raw = String(shape || "").trim();
+  if (raw === "arrowUp") return "^";
+  if (raw === "arrowDown") return "v";
+  if (raw === "square") return "[]";
+  if (raw === "circle") return "o";
+  return "-";
+}
+
+function renderOverlayLegend(payload) {
+  if (!el.overlayLegend) return;
+  const normalized = normalizeDecisionOverlayPayload(payload || {});
+  const items = decisionOverlayLegendItems(normalized);
+  const summary = buildOverlayAccessibilitySummary(normalized);
+  const windows = Array.isArray(normalized.windows) ? normalized.windows : [];
+  const levels = Array.isArray(normalized.price_lines) ? normalized.price_lines : [];
+  el.overlayLegend.setAttribute("aria-label", summary);
+  el.overlayLegend.innerHTML = `
+    <div class="overlayLegendItems">
+      ${items.map((item) => `
+        <span class="overlayLegendItem">
+          <span class="overlayLegendGlyph" style="border-color:${esc(item.color)}; color:${esc(item.color)}">${esc(markerShapeGlyph(item.shape))}</span>
+          <span>${esc(item.label)}</span>
+          <span class="mono muted">${esc(item.text)}</span>
+          <span class="mono">${esc(String(item.count))}</span>
+        </span>
+      `).join("")}
+    </div>
+    <div class="overlayLegendSummary">${esc(summary)} ${windows.length ? `Windows ${windows.length}.` : ""} ${levels.length ? `Levels ${levels.length}.` : ""}</div>
+  `;
+}
+
 async function bootChart() {
   const sym = String(STATE.symbol || "").trim().toUpperCase();
   if (!sym) return;
@@ -708,6 +795,14 @@ async function bootChart() {
     if (el.chartHealth) {
       el.chartHealth.textContent = e && e.message ? e.message : "chart unavailable";
     }
+    renderChartAccessibility("terminalChart", {
+      title: `Terminal market chart ${sym}`,
+      series: [],
+      emptyMessage: "Terminal chart is unavailable.",
+      errorMessage: e && e.message ? e.message : "chart unavailable",
+      valueLabel: "close",
+      chartType: "lightweight-chart",
+    });
     return;
   }
 
@@ -720,13 +815,25 @@ async function bootChart() {
 
   let markers = [];
   let equitySeries = [];
+  let decisionOverlay = null;
 
   try {
     if (overlays.markers) {
-      const mj = await fetchJson(`/api/terminal/markers?symbol=${encodeURIComponent(sym)}`);
-      if (mj && mj.ok && Array.isArray(mj.markers)) markers = mj.markers;
+      const mj = await fetchJson(`/api/terminal/decision_overlays?symbol=${encodeURIComponent(sym)}`);
+      if (mj && mj.ok) {
+        decisionOverlay = mj;
+        if (Array.isArray(mj.markers)) markers = mj.markers;
+      }
     }
-  } catch {}
+  } catch {
+    try {
+      const fallback = await fetchJson(`/api/terminal/markers?symbol=${encodeURIComponent(sym)}`);
+      if (fallback && fallback.ok) {
+        decisionOverlay = fallback;
+        if (Array.isArray(fallback.markers)) markers = fallback.markers;
+      }
+    } catch {}
+  }
 
   try {
     if (overlays.equity) {
@@ -740,7 +847,9 @@ async function bootChart() {
     overlays,
     markers,
     equitySeries,
+    decisionOverlay,
   });
+  renderOverlayLegend(overlays.markers ? (decisionOverlay || { markers }) : { markers: [] });
 
   if (el.chartHealth) el.chartHealth.textContent = "live";
 }
@@ -779,10 +888,12 @@ async function submitTerminalOrder(side, qty, label) {
   if (!canSubmitDirectionalOrder(label || side)) return;
   const cleanQty = Number(qty || 0);
   if (!Number.isFinite(cleanQty) || cleanQty <= 0) throw new Error("enter a positive quantity");
+  renderOrderPreview(side);
   const j = await postJson("/api/terminal/order", {
     symbol: STATE.symbol,
     side,
-    qty: cleanQty
+    qty: cleanQty,
+    ...orderConfirmationPayload("TRADE"),
   });
   if (j.ok) await refreshSnapshot();
 }
@@ -790,7 +901,8 @@ async function submitTerminalOrder(side, qty, label) {
 async function submitTerminalFlatten() {
   if (!canSubmitRealTrade("Flatten")) return;
   const j = await postJson("/api/terminal/flatten", {
-    symbol: STATE.symbol
+    symbol: STATE.symbol,
+    ...orderConfirmationPayload("FLATTEN", FLATTEN_HOLD_MS),
   });
   if (j.ok) await refreshSnapshot();
 }
@@ -876,7 +988,7 @@ function wire() {
       e.preventDefault();
       if (!canUseKeyboardTradingShortcut("Buy")) return;
       try {
-        await submitTerminalOrder("BUY", 100, "Buy");
+        await submitTerminalOrder("BUY", currentOrderQty(), "Buy");
       } catch (error) {
         setTerminalBanner("crit", `Buy shortcut failed: ${String(error && error.message ? error.message : error)}`);
       }
@@ -886,7 +998,7 @@ function wire() {
       e.preventDefault();
       if (!canUseKeyboardTradingShortcut("Sell")) return;
       try {
-        await submitTerminalOrder("SELL", 100, "Sell");
+        await submitTerminalOrder("SELL", currentOrderQty(), "Sell");
       } catch (error) {
         setTerminalBanner("crit", `Sell shortcut failed: ${String(error && error.message ? error.message : error)}`);
       }
@@ -906,6 +1018,8 @@ function wire() {
   const btnBuy = el.btnBuy;
   const btnSell = el.btnSell;
   const btnFlat = el.btnFlat;
+
+  if (ordQty) ordQty.addEventListener("input", () => renderOrderPreview());
 
   if (btnBuy && ordQty) btnBuy.addEventListener("click", async () => {
     try {

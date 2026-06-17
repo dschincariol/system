@@ -199,7 +199,13 @@ export async function loadEquityDrift(fetchJSON) {
       meta.textContent = "n/a";
       meta.className = "pill neutral dim status-neutral";
 
-      renderLineChart(canvas, []);
+      renderLineChart(canvas, [], {
+        a11yTitle: "Equity drift",
+        emptyMessage: "Equity drift data is unavailable.",
+        errorMessage: "Equity drift data is unavailable.",
+        valueLabel: "drift",
+        a11yValueFormatter: (v) => `${(Number(v) * 100).toFixed(2)}%`,
+      });
 
       return;
     }
@@ -211,7 +217,12 @@ export async function loadEquityDrift(fetchJSON) {
       meta.textContent = "empty";
       meta.className = "pill neutral dim status-neutral";
 
-      renderLineChart(canvas, []);
+      renderLineChart(canvas, [], {
+        a11yTitle: "Equity drift",
+        emptyMessage: "No equity drift points are available.",
+        valueLabel: "drift",
+        a11yValueFormatter: (v) => `${(Number(v) * 100).toFixed(2)}%`,
+      });
 
       return;
     }
@@ -219,13 +230,36 @@ export async function loadEquityDrift(fetchJSON) {
     meta.textContent = "live";
     meta.className = "pill ok";
 
-    const ys =
+    const series =
       pts
-        .map(p => Number(p.diff_equity_pct))
-        .filter(Number.isFinite);
+        .map((p, index) => {
+          const time = p && (p.ts_ms ?? p.time ?? p.t);
+          return {
+            time: time ?? index + 1,
+            xTime: time ?? null,
+            value: Number(p && p.diff_equity_pct),
+          };
+        })
+        .filter((p) => Number.isFinite(p.value));
+    const ys = series.map((p) => p.value);
 
     renderLineChart(canvas, ys, {
+      xValues: series.map((p) => p.xTime),
+      fmtX: (value, index) => {
+        const n = Number(value);
+        if (Number.isFinite(n) && n > 100_000_000_000) return fmtTime(n);
+        if (typeof value === "string" && value.trim()) {
+          const parsed = Date.parse(value);
+          if (Number.isFinite(parsed) && parsed > 0) return fmtTime(parsed);
+        }
+        return String(index + 1);
+      },
       topLabel: "equity drift (%)",
+      a11yTitle: "Equity drift",
+      a11ySeries: series,
+      a11yTimeKey: "time",
+      valueLabel: "drift",
+      a11yValueFormatter: (v) => `${(Number(v) * 100).toFixed(2)}%`,
       fmtY: (v) => `${(v * 100).toFixed(2)}%`,
       stroke: "#d29922",
       yMax: Math.max(0.01, Math.max(...ys, 0)),
@@ -237,7 +271,13 @@ export async function loadEquityDrift(fetchJSON) {
     meta.textContent = "error";
     meta.className = "pill crit bad";
 
-    renderLineChart(canvas, []);
+    renderLineChart(canvas, [], {
+      a11yTitle: "Equity drift",
+      emptyMessage: "Equity drift failed to load.",
+      errorMessage: e && e.message ? e.message : "Equity drift failed to load.",
+      valueLabel: "drift",
+      a11yValueFormatter: (v) => `${(Number(v) * 100).toFixed(2)}%`,
+    });
   }
 }
 

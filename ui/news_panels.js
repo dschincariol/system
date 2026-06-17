@@ -6,6 +6,7 @@
   dashboard-facing news endpoints.
 */
 
+import { renderChartAccessibility } from "./chart_a11y.js";
 import { esc, fmtTime } from "./utils.js";
 
 function _normalizeSymbol(value) {
@@ -24,6 +25,14 @@ function _drawNewsSentimentMessage(canvas, text) {
   ctx.fillStyle = "#9da7b1";
   ctx.font = "12px Consolas, monospace";
   ctx.fillText(String(text || "(no data)"), 12, 24);
+  renderChartAccessibility(canvas, {
+    title: "News sentiment",
+    series: [],
+    emptyMessage: String(text || "(no data)"),
+    valueLabel: "sentiment",
+    valueFormatter: (v) => Number(v).toFixed(3),
+    chartType: "canvas-line",
+  });
 }
 
 export async function loadNewsPanels(fetchJSON, options = {}) {
@@ -120,10 +129,14 @@ export async function loadNewsSentiment(fetchJSON, _options = {}) {
 
     ctx.clearRect(0, 0, w, h);
 
-    const ys =
+    const series =
       res.series
-        .map(p => Number(p.sentiment))
-        .filter(Number.isFinite);
+        .map((p, index) => ({
+          time: p && (p.ts_ms ?? p.time ?? p.t ?? index + 1),
+          value: Number(p && p.sentiment),
+        }))
+        .filter((p) => Number.isFinite(p.value));
+    const ys = series.map((p) => p.value);
 
     if (!ys.length) {
       _drawNewsSentimentMessage(canvas, res && res.meta && res.meta.ready === false ? "(news sentiment not ready)" : "(no sentiment data)");
@@ -148,7 +161,26 @@ export async function loadNewsSentiment(fetchJSON, _options = {}) {
 
     ctx.stroke();
 
+    renderChartAccessibility(canvas, {
+      title: "News sentiment",
+      series,
+      valueKey: "value",
+      timeKey: "time",
+      valueLabel: "sentiment",
+      valueFormatter: (v) => Number(v).toFixed(3),
+      chartType: "canvas-line",
+    });
+
   } catch (e) {
     _drawNewsSentimentMessage(canvas, e && e.message ? e.message : "error loading sentiment");
+    renderChartAccessibility(canvas, {
+      title: "News sentiment",
+      series: [],
+      emptyMessage: "News sentiment failed to load.",
+      errorMessage: e && e.message ? e.message : "error loading sentiment",
+      valueLabel: "sentiment",
+      valueFormatter: (v) => Number(v).toFixed(3),
+      chartType: "canvas-line",
+    });
   }
 }

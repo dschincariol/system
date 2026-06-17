@@ -25,7 +25,10 @@ import {
   freshnessTone,
   numOrNull,
   pickTimestamp,
-  safeJoin
+  safeJoin,
+  statusAriaLabel,
+  statusPillClasses,
+  statusToken
 } from "./utils.js";
 
 import { fetchJSON, fetchWithTimeout as _fetchWithTimeout } from "./api_client.js";
@@ -112,6 +115,9 @@ import {
   hasDecisionLookup,
   normalizeDecisionLookup
 } from "./decision_drilldown.mjs";
+import { renderDecisionStepper } from "./decision_stepper.js";
+import { renderDecisionAttribution } from "./decision_attribution.js";
+import { requestConfirmation } from "./confirmation_modal.mjs";
 
 import {
   closeIncidentDrawer,
@@ -119,6 +125,7 @@ import {
 } from "./alerts_ui.js";
 import {
   buildPromotionActionPayload,
+  buildPromotionComparisonBarViewModel,
   buildRollbackConsequencePreview,
   formatGateState,
   formatPromotionGateValue,
@@ -129,6 +136,7 @@ import {
   validatePromotionActionInput
 } from "./promotion_gate.mjs";
 import { loadOperatorSummary } from "./operator_summary.js";
+import { loadOperatorOverview } from "./operator_overview.js";
 import {
   loadMarketStress,
   loadMarketStressHistory
@@ -161,6 +169,11 @@ import {
   canonicalSourceNotes,
   normalizeUiMetricsPayload
 } from "./ui_metrics.js";
+import {
+  buildRiskHeadroomViewModel,
+  renderBulletBars
+} from "./bullet_bars.js";
+import { renderRegimeRibbon } from "./regime_ribbon.js";
 import {
   initMetricTooltips,
   applyInlineMetricAnnotation,
@@ -204,7 +217,7 @@ import {
   getProChartsState,
   setProChartsState,
   applyProChartsVisibility
-} from "./terminal/pro_charting.js";
+} from "./pro_chart_prefs.js";
 import {
   getSelectedSymbolContext,
   initSelectedSymbolContextFromUrl,
@@ -510,18 +523,21 @@ function setOperatorWsIndicator(state = "polling") {
   if (!badge || !dot || !label) return;
 
   const states = {
-    polling: { tone: "neutral", label: "polling", color: "#6e7681", title: "Polling only" },
-    connecting: { tone: "neutral", label: "connecting", color: "#6e7681", title: "Connecting to operator WebSocket" },
-    connected: { tone: "ok", label: "connected", color: "#2ea043", title: "Operator WebSocket connected" },
-    retrying: { tone: "crit", label: "retrying", color: "#ff6b6b", title: "Operator WebSocket disconnected; polling fallback active" },
-    disconnected: { tone: "crit", label: "disconnected", color: "#ff6b6b", title: "Operator WebSocket unavailable; polling fallback active" },
+    polling: { tone: "neutral", label: "polling", title: "Polling only" },
+    connecting: { tone: "neutral", label: "connecting", title: "Connecting to operator WebSocket" },
+    connected: { tone: "ok", label: "connected", title: "Operator WebSocket connected" },
+    retrying: { tone: "crit", label: "retrying", title: "Operator WebSocket disconnected; polling fallback active" },
+    disconnected: { tone: "crit", label: "disconnected", title: "Operator WebSocket unavailable; polling fallback active" },
   };
 
   const next = states[state] || states.polling;
+  const token = statusToken(next.tone);
   badge.className = buildPillClassName(badge, next.tone);
+  badge.dataset.status = token.key;
+  badge.setAttribute("aria-label", statusAriaLabel(token.key, next.label));
   badge.title = next.title;
   setTextContent(label, next.label);
-  dot.style.background = next.color;
+  dot.style.background = token.color;
 }
 
 function describeUiError(error) {
@@ -1143,7 +1159,6 @@ function layoutDashboardPanels(screen = ACTIVE_DASHBOARD_SCREEN) {
   const layouts = {
     overview: {
       left: [
-        "operatorSummaryCard",
         "livePnlCard",
         "marketStressPanel",
       ],
@@ -1160,6 +1175,7 @@ function layoutDashboardPanels(screen = ACTIVE_DASHBOARD_SCREEN) {
     },
     operate: {
       left: [
+        "operatorSummaryCard",
         "operatorStartupCard",
         "systemHealthCard",
         "alertsCard",
@@ -1411,6 +1427,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
   const normalized = normalizeDashboardScreen(screen);
   const tasksByScreen = {
     overview: [
+      loadOperatorOverview(fetchJSON, preloaded),
       loadPnL(),
       loadPerformanceDivergence(fetchJSON, document, renderLineChart),
       loadMarketStress(fetchJSON),
@@ -1421,6 +1438,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
       loadExecutionAdvisories(),
       loadExecutionByConfidence(fetchJSON, toast, OPERATOR_MODE),
       loadProCharts(fetchJSON),
+      loadPositionsExposureScreen(),
     ],
     operate: [
       loadStructuredReadiness(),
@@ -1435,6 +1453,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
       loadExecutionAdvisories(),
       loadExecutionOverlays(),
       loadBroker(fetchJSON),
+      loadBrokerConfigPanel(),
       loadExecutionByConfidence(fetchJSON, toast, OPERATOR_MODE),
     ],
     explain: [
@@ -1489,6 +1508,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
     ],
     execution: [
       loadDashboardExecutionScreen(),
+      loadBrokerConfigPanel(),
       loadExecutionByConfidence(fetchJSON, toast, OPERATOR_MODE),
       loadExecutionOverlays(),
     ],
@@ -2789,11 +2809,13 @@ function populateDecisionModal(payload) {
   const decision = payload && payload.decision ? payload.decision : null;
   const titleEl = document.getElementById("decisionModalTitle");
   const summaryEl = document.getElementById("decisionModalSummary");
+  const stepperEl = document.getElementById("decisionModalStepper");
   const stagesSummaryEl = document.getElementById("decisionModalStagesSummary");
   const relatedEl = document.getElementById("decisionModalRelated");
   const allocEl = document.getElementById("decisionModalAllocation");
   const inputsSummaryEl = document.getElementById("decisionModalInputsSummary");
   const inputsEl = document.getElementById("decisionModalInputs");
+  const attributionEl = document.getElementById("decisionModalAttribution");
   const riskSummaryEl = document.getElementById("decisionModalRiskSummary");
   const riskEl = document.getElementById("decisionModalRisk");
 
@@ -2802,6 +2824,7 @@ function populateDecisionModal(payload) {
     if (titleEl) titleEl.textContent = loading ? "Loading decision..." : "Decision unavailable";
     if (summaryEl) summaryEl.innerHTML = "";
     if (allocEl) allocEl.innerHTML = "";
+    renderDecisionStepper(stepperEl, payload || {});
     renderStructuredSummary(stagesSummaryEl, buildDecisionStageRows(payload || {}), {
       emptyText: loading ? "Loading decision details." : "No decision stages returned.",
       rawTarget: relatedEl,
@@ -2811,6 +2834,10 @@ function populateDecisionModal(payload) {
       emptyText: loading ? "Loading model input details." : String((payload && payload.error) || "No decision detail returned."),
       rawTarget: inputsEl,
       rawPayload: payload || { error: "no_decision_detail" },
+    });
+    renderDecisionAttribution(attributionEl, {
+      available: false,
+      unavailable_reason: loading ? "Loading backend-provided feature contributions." : "No decision detail returned.",
     });
     renderStructuredSummary(riskSummaryEl, [], {
       emptyText: loading ? "Loading risk and policy detail." : "No risk-gate detail returned.",
@@ -2838,6 +2865,8 @@ function populateDecisionModal(payload) {
     ["Risk impact", String(decision.risk_impact || "low")],
     ["Why", String(decision.why || "—")],
   ]);
+
+  renderDecisionStepper(stepperEl, payload || {});
 
   renderStructuredSummary(stagesSummaryEl, buildDecisionStageRows(payload || {}), {
     emptyText: "No decision stages returned.",
@@ -2897,6 +2926,11 @@ function populateDecisionModal(payload) {
       extra_json: decision.extra_json || {},
       components: decision.components || decision.components_json || {},
     },
+  });
+
+  renderDecisionAttribution(attributionEl, payload && payload.attribution ? payload.attribution : {
+    available: false,
+    unavailable_reason: "No backend-provided feature contributions were returned for this decision.",
   });
 
   renderStructuredSummary(riskSummaryEl, [
@@ -3511,23 +3545,19 @@ function setPill(id, ok, text) {
   const nextText = String(text || "—");
   el.className = buildPillClassName(el, ok ? "ok" : "crit");
   el.textContent = nextText;
+  el.setAttribute("aria-label", statusAriaLabel(ok ? "ok" : "crit", nextText));
   applyStalenessState(el);
   flashOnContentChange(el, nextText);
 }
 
 function normalizePillTone(tone) {
-  const raw = String(tone || "dim").trim().toLowerCase();
-  if (raw === "bad" || raw === "err") return "crit";
-  if (raw === "dim" || raw === "muted") return "neutral";
-  return raw || "neutral";
+  return statusToken(tone || "neutral").key;
 }
 
 function pillClassNames(tone) {
   const raw = String(tone || "dim").trim().toLowerCase();
   const normalized = normalizePillTone(raw);
-  const classes = ["pill", normalized];
-  if (normalized === "neutral") classes.push("dim", "status-neutral");
-  if (normalized === "warn") classes.push("status-warn");
+  const classes = statusPillClasses(normalized).split(/\s+/).filter(Boolean);
   if (raw === "bad") classes.push("bad");
   if (raw === "err") classes.push("bad", "err");
   return Array.from(new Set(classes.filter(Boolean))).join(" ");
@@ -3539,6 +3569,11 @@ function structuralPillClasses(el) {
 }
 
 function buildPillClassName(el, tone) {
+  const token = statusToken(tone || "neutral");
+  if (el) {
+    el.dataset.status = token.key;
+    el.setAttribute("aria-label", statusAriaLabel(token.key, el.textContent || ""));
+  }
   return Array.from(new Set([
     ...pillClassNames(tone).split(/\s+/).filter(Boolean),
     ...structuralPillClasses(el),
@@ -3570,6 +3605,7 @@ function setPillTone(id, tone, text, staleAgeMs = null, staleWarnMs = 60_000, st
   const nextText = String(text || "—");
   el.className = buildPillClassName(el, tone);
   el.textContent = nextText;
+  el.setAttribute("aria-label", statusAriaLabel(tone, nextText));
   applyStalenessState(el, staleAgeMs, staleWarnMs, staleCritMs);
   flashOnContentChange(el, nextText);
 }
@@ -4376,14 +4412,22 @@ async function commandPaletteSelectJob(name) {
   });
 }
 
-function confirmJobAction(name, action) {
+async function confirmJobAction(name, action) {
   const normalizedAction = String(action || "").trim().toLowerCase();
   const normalizedName = String(name || "").trim();
   const endpoint = normalizedAction === "stop" ? "/api/jobs/stop" : "/api/jobs/start";
-  return window.confirm(
-    `Confirm ${normalizedAction} job "${normalizedName}"?\n\n` +
-    `This uses the existing ${endpoint} endpoint. Continue only if this is the intended dashboard job action.`
-  );
+  return requestConfirmation({
+    title: `${normalizedAction === "stop" ? "Stop" : "Start"} job`,
+    action: `${normalizedAction} runtime job`,
+    target: normalizedName,
+    consequence: `This uses ${endpoint} and may change data freshness, execution coverage, or runtime state.`,
+    confirmText: "JOB_ACTION",
+    requireReason: true,
+    minReasonLength: 6,
+    submitLabel: `${normalizedAction === "stop" ? "Stop" : "Start"} job`,
+    actor: "operator",
+    source: "dashboard_jobs",
+  });
 }
 
 function wireJobActionButtons() {
@@ -5038,13 +5082,15 @@ async function loadPositionsExposureScreen() {
   const exposureGrid = document.getElementById("positionsExposureGrid");
   if (!exposureGrid) return;
 
-  const [uiMetricsRes, portfolioRes, riskPortfolioRes, riskSummaryRes, brokerRes, terminalRes] = await Promise.allSettled([
+  const selectedRegimeSymbol = _getSelectedSymbolOptional() || "SPY";
+  const [uiMetricsRes, portfolioRes, riskPortfolioRes, riskSummaryRes, brokerRes, terminalRes, regimeRes] = await Promise.allSettled([
     fetchJSON("/api/ui/metrics", { allowBusinessFalse: true }),
     fetchJSON("/api/portfolio"),
     fetchJSON("/api/risk/portfolio"),
     fetchJSON("/api/risk/summary"),
     fetchJSON("/api/broker"),
     fetchJSON("/api/terminal/positions"),
+    fetchJSON(`/api/regime/context?symbol=${encodeURIComponent(selectedRegimeSymbol)}`, { allowBusinessFalse: true }),
   ]);
 
   const uiMetrics = uiMetricsRes.status === "fulfilled" ? normalizeUiMetricsPayload(uiMetricsRes.value) : null;
@@ -5055,6 +5101,7 @@ async function loadPositionsExposureScreen() {
   const riskSummary = riskSummaryRes.status === "fulfilled" ? riskSummaryRes.value : null;
   const broker = brokerRes.status === "fulfilled" ? brokerRes.value : null;
   const terminal = terminalRes.status === "fulfilled" ? terminalRes.value : null;
+  const regime = regimeRes.status === "fulfilled" ? regimeRes.value : null;
 
   const stateRows = asArray(portfolio && portfolio.state);
   const orderRows = asArray(portfolio && portfolio.orders);
@@ -5150,6 +5197,32 @@ async function loadPositionsExposureScreen() {
     60_000,
     300_000
   );
+
+  renderBulletBars(
+    document.getElementById("positionsRiskBars"),
+    buildRiskHeadroomViewModel({
+      uiMetrics: useCanonicalMetrics ? uiMetrics : null,
+      portfolioRisk: riskPortfolio,
+      riskSummary,
+      blocked: barrierAllowed === false || (riskPortfolio && riskPortfolio.blocked === true),
+      source: useCanonicalMetrics ? "/api/ui/metrics" : "/api/risk/portfolio",
+    })
+  );
+  renderRegimeRibbon(document.getElementById("positionsRegimeRibbon"), regime || {
+    ok: false,
+    source: "/api/regime/context",
+    layers: {},
+  });
+  try {
+    const riskCharts = await import("./risk_charts.js");
+    await riskCharts.loadRiskChartViews({
+      fetchJSON,
+      portfolioRisk: riskPortfolio,
+      symbol: selectedRegimeSymbol,
+    });
+  } catch (e) {
+    console.warn("risk chart views failed", e);
+  }
 
   exposureGrid.innerHTML = buildStatGridMarkup([
     {
@@ -5549,7 +5622,24 @@ function buildExecutionOrderRows(payload) {
     };
   });
 
-  const rows = [...brokerRows.filter((row) => row.active), ...portfolioRows]
+  const rejectionRows = asArray(data.rejected).map((row) => {
+    const reasonCode = String((row && row.reason_code) || "rejected").trim();
+    const reason = String((row && row.reason) || reasonCode || "Terminal request rejected.").trim();
+    return {
+      kind: "rejected",
+      symbol: String((row && row.symbol) || "").trim().toUpperCase(),
+      side: normalizeExecutionSide(row && row.side) || "—",
+      size: numOrNull(row && row.qty) != null ? formatDecimal(Math.abs(numOrNull(row && row.qty)), 4) : "—",
+      status: `REJECTED ${reasonCode}`,
+      updatedTs: pickTimestamp(row && row.updated_ts_ms, row && row.ts_ms),
+      active: true,
+      sizeSource: "qty",
+      rejection_reason_code: reasonCode,
+      rejection_reason: reason,
+    };
+  });
+
+  const rows = [...brokerRows.filter((row) => row.active), ...portfolioRows, ...rejectionRows]
     .sort((a, b) => intOr(b.updatedTs, 0) - intOr(a.updatedTs, 0))
     .slice(0, 40);
 
@@ -5557,6 +5647,7 @@ function buildExecutionOrderRows(payload) {
     rows,
     brokerActive: brokerRows.filter((row) => row.active).length,
     portfolioActive: portfolioRows.length,
+    rejected: rejectionRows.length,
     usedWeightFallback: portfolioRows.some((row) => row.sizeSource === "weight"),
     usedNotionalFallback: brokerRows.some((row) => row.active && row.sizeSource === "notional"),
   };
@@ -5651,6 +5742,266 @@ function renderSuppressedTrades(payload, requestStatus = "fulfilled") {
     state: ageMsFromTimestamp(latestTs) >= 1_800_000 ? "stale" : "fresh",
     reason: `Loaded ${view.filteredRowsCount}/${suppressed.length} suppressed trade rows from the attribution ledger.`,
   });
+}
+
+let _latestBrokerConfig = null;
+
+function brokerConfigNode(id) {
+  return document.getElementById(id);
+}
+
+function setBrokerConfigInput(id, value) {
+  const node = brokerConfigNode(id);
+  if (!node || document.activeElement === node) return;
+  node.value = value == null ? "" : String(value);
+}
+
+function brokerConfigFormPayload({ active = false, disabled = false } = {}) {
+  const broker = brokerConfigNode("brokerConfigBroker");
+  const mode = brokerConfigNode("brokerConfigMode");
+  const baseUrl = brokerConfigNode("brokerConfigBaseUrl");
+  const host = brokerConfigNode("brokerConfigHost");
+  const port = brokerConfigNode("brokerConfigPort");
+  const clientId = brokerConfigNode("brokerConfigClientId");
+  const credentialsNode = brokerConfigNode("brokerConfigCredentials");
+  const payload = {
+    active_broker: String((broker && broker.value) || (_latestBrokerConfig && _latestBrokerConfig.active_broker) || "sim").trim().toLowerCase(),
+    paper_live_mode: String((mode && mode.value) || (_latestBrokerConfig && _latestBrokerConfig.paper_live_mode) || "safe").trim().toLowerCase(),
+    base_url: String((baseUrl && baseUrl.value) || "").trim(),
+    host: String((host && host.value) || "").trim(),
+    port: String((port && port.value) || "").trim(),
+    client_id: String((clientId && clientId.value) || "").trim(),
+    active: !!active,
+    disabled: !!disabled,
+    actor: "operator",
+    source: "dashboard_broker_config",
+  };
+  const rawCredentials = String((credentialsNode && credentialsNode.value) || "").trim();
+  if (rawCredentials) {
+    try {
+      const parsed = JSON.parse(rawCredentials);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("credentials must be a JSON object");
+      }
+      payload.credentials = parsed;
+    } catch (error) {
+      throw new Error(`Invalid credentials JSON: ${error && error.message ? error.message : error}`);
+    }
+  }
+  return payload;
+}
+
+function renderBrokerConfigUnavailable(reason) {
+  setPillTone("brokerConfigMeta", "unavailable", "unavailable");
+  setPillTone("brokerConfigModePill", "unavailable", "mode unavailable");
+  setPillTone("brokerConfigCredentialPill", "unavailable", "credentials unavailable");
+  setPillTone("brokerConfigTestPill", "unavailable", "test unavailable");
+  const grid = brokerConfigNode("brokerConfigGrid");
+  if (grid) {
+    grid.innerHTML = buildStatGridMarkup([
+      { label: "Broker", value: "—", meta: "configuration unavailable" },
+      { label: "Activation", value: "—", meta: String(reason || "request failed") },
+    ]);
+  }
+  renderEmptyTableBody("brokerConfigAuditBody", 4, "Broker config audit unavailable.");
+  renderNotes("brokerConfigNotes", [String(reason || "Broker config could not be loaded.")]);
+  setPanelState("brokerConfigPanel", {
+    state: "error",
+    reason: String(reason || "Broker configuration API unavailable."),
+  });
+}
+
+function renderBrokerConfig(payload, auditPayload, status = "fulfilled") {
+  if (!brokerConfigNode("brokerConfigGrid")) return;
+  if (status !== "fulfilled" || !payload || payload.ok === false) {
+    renderBrokerConfigUnavailable(payload && payload.error ? payload.error : "broker config request failed");
+    return;
+  }
+
+  const cfg = asObject(payload.config);
+  _latestBrokerConfig = cfg;
+  const lastTest = asObject(cfg.last_test_result);
+  const credentialMask = asObject(cfg.masked_credentials);
+  const activeBroker = String(cfg.active_broker || "sim").trim().toLowerCase() || "sim";
+  const mode = String(cfg.paper_live_mode || "safe").trim().toLowerCase() || "safe";
+  const active = cfg.active === true && cfg.disabled !== true;
+  const disabled = cfg.disabled === true;
+  const testOk = lastTest.ok === true;
+  const credentialKeys = Object.keys(credentialMask).filter(Boolean);
+
+  setBrokerConfigInput("brokerConfigBroker", activeBroker);
+  setBrokerConfigInput("brokerConfigMode", mode);
+  setBrokerConfigInput("brokerConfigBaseUrl", cfg.base_url || "");
+  setBrokerConfigInput("brokerConfigHost", cfg.host || "");
+  setBrokerConfigInput("brokerConfigPort", cfg.port || "");
+  setBrokerConfigInput("brokerConfigClientId", cfg.client_id || "");
+
+  setPillTone(
+    "brokerConfigMeta",
+    active ? "ok" : (disabled ? "blocked" : "warn"),
+    active ? `${activeBroker} active` : (disabled ? `${activeBroker} disabled` : `${activeBroker} inactive`)
+  );
+  setPillTone("brokerConfigModePill", mode === "live" ? "high" : (mode === "paper" ? "info" : "dim"), `mode ${mode}`);
+  setPillTone(
+    "brokerConfigCredentialPill",
+    cfg.credentials_configured ? "ok" : "warn",
+    cfg.credentials_configured ? `masked ${credentialKeys.length || "stored"}` : "no credentials"
+  );
+  setPillTone(
+    "brokerConfigTestPill",
+    testOk ? "ok" : "warn",
+    lastTest.state ? `test ${lastTest.state}` : "test not run",
+    lastTest.tested_ts_ms ? ageMsFromTimestamp(lastTest.tested_ts_ms) : null,
+    3_600_000,
+    86_400_000
+  );
+
+  const grid = brokerConfigNode("brokerConfigGrid");
+  if (grid) {
+    grid.innerHTML = buildStatGridMarkup([
+      {
+        label: "Broker",
+        value: activeBroker.toUpperCase(),
+        meta: active ? "active runtime broker" : (disabled ? "broker disabled" : "configured but inactive"),
+      },
+      {
+        label: "Endpoint",
+        value: cfg.base_url || cfg.host || "—",
+        meta: cfg.host && cfg.port ? `host ${cfg.host}:${cfg.port}` : "endpoint is masked or unset",
+      },
+      {
+        label: "Last Test",
+        value: lastTest.state || "not run",
+        meta: lastTest.tested_ts_ms
+          ? `${fmtTime(lastTest.tested_ts_ms)} · ${formatDecimal(lastTest.latency_ms, 1)}ms`
+          : "activation requires a passing test for non-sim brokers",
+      },
+      {
+        label: "Failover",
+        value: asArray(cfg.failover_order).join(" → ") || "—",
+        meta: "read-only runtime failover order",
+      },
+    ]);
+  }
+
+  const auditRows = asArray(auditPayload && auditPayload.rows);
+  const auditBody = brokerConfigNode("brokerConfigAuditBody");
+  if (auditBody) {
+    if (!auditRows.length) {
+      renderEmptyTableBody("brokerConfigAuditBody", 4, "No broker configuration audit rows.");
+    } else {
+      auditBody.innerHTML = auditRows.slice(0, 8).map((row) => `
+        <tr class="table-row">
+          <td class="mono metric-meta">${escapeHTML(fmtTime(row && row.ts_ms))}</td>
+          <td>${escapeHTML(row && row.action ? row.action : "—")}</td>
+          <td class="mono">${escapeHTML(row && row.active_broker ? row.active_broker : "—")}</td>
+          <td>${escapeHTML(row && row.success ? "OK" : "BLOCKED")} ${escapeHTML(row && row.message ? row.message : "")}</td>
+        </tr>
+      `).join("");
+    }
+  }
+
+  const notes = [];
+  notes.push(cfg.secrets_masked ? "Secrets are masked in read APIs." : "Credential masking state unavailable.");
+  if (activeBroker !== "sim" && !testOk) notes.push("Live/paper activation is blocked until this broker has a passing connection test.");
+  if (lastTest.reasons && asArray(lastTest.reasons).length) notes.push(`Last test reasons: ${asArray(lastTest.reasons).join(", ")}`);
+  if (cfg.credential_age && cfg.credential_age.credential_error) notes.push(`Credential read warning: ${cfg.credential_age.credential_error}`);
+  renderNotes("brokerConfigNotes", notes, "Broker configuration is loaded.");
+
+  setPanelState("brokerConfigPanel", {
+    state: active ? "fresh" : (disabled ? "blocked" : "stale"),
+    reason: active
+      ? `${activeBroker} is active.`
+      : (disabled ? `${activeBroker} is disabled.` : `${activeBroker} requires activation before use.`),
+  });
+}
+
+async function loadBrokerConfigPanel() {
+  if (!brokerConfigNode("brokerConfigGrid")) return;
+  const [configRes, auditRes] = await Promise.allSettled([
+    fetchJSON("/api/broker/config", { allowBusinessFalse: true }),
+    fetchJSON("/api/broker/audit", { allowBusinessFalse: true }),
+  ]);
+  const config = configRes.status === "fulfilled" ? configRes.value : null;
+  const audit = auditRes.status === "fulfilled" ? auditRes.value : { ok: true, rows: [] };
+  renderBrokerConfig(config, audit, configRes.status);
+}
+
+async function brokerConfigTestConnection() {
+  const payload = brokerConfigFormPayload({ active: false, disabled: false });
+  const result = await postJSONAllowBusinessFalse("/api/broker/test_connection", {
+    ...payload,
+    config: payload,
+  });
+  toast(result.ok ? "Broker connection test passed" : `Broker connection test failed: ${asArray(result.reasons).join(", ") || "unknown"}`, result.ok ? "ok" : "warn", 3600);
+  await loadBrokerConfigPanel();
+}
+
+async function brokerConfigActivate() {
+  const payload = brokerConfigFormPayload({ active: true, disabled: false });
+  const confirmation = await requestConfirmation({
+    title: "Activate broker configuration",
+    action: "activate broker configuration",
+    target: `${payload.active_broker.toUpperCase()} ${payload.paper_live_mode.toUpperCase()}`,
+    consequence: "This changes the runtime broker configuration used by the execution control plane. Non-sim brokers require a passing backend connection test.",
+    confirmText: "ACTIVATE_BROKER",
+    requireReason: true,
+    minReasonLength: 8,
+    submitLabel: "Activate broker",
+    actor: "operator",
+    source: "dashboard_broker_config",
+  });
+  if (!confirmation || !confirmation.confirmed) return;
+  await postJSON("/api/broker/config", {
+    ...payload,
+    ...confirmation.payload,
+    reason: confirmation.reason,
+  });
+  toast("Broker configuration activation submitted", "ok", 3200);
+  await loadBrokerConfigPanel();
+}
+
+async function brokerConfigDisable() {
+  const payload = brokerConfigFormPayload({ active: false, disabled: true });
+  await postJSON("/api/broker/config", payload);
+  toast("Broker configuration disabled", "warn", 3200);
+  await loadBrokerConfigPanel();
+}
+
+function wireBrokerConfigControls() {
+  const testBtn = brokerConfigNode("brokerConfigTestBtn");
+  const activateBtn = brokerConfigNode("brokerConfigActivateBtn");
+  const disableBtn = brokerConfigNode("brokerConfigDisableBtn");
+  if (testBtn && !testBtn._boundBrokerConfigTest) {
+    testBtn._boundBrokerConfigTest = true;
+    testBtn.addEventListener("click", async () => {
+      try {
+        await brokerConfigTestConnection();
+      } catch (error) {
+        toast(`Broker test failed: ${error && error.message ? error.message : error}`, "bad", 4200);
+      }
+    });
+  }
+  if (activateBtn && !activateBtn._boundBrokerConfigActivate) {
+    activateBtn._boundBrokerConfigActivate = true;
+    activateBtn.addEventListener("click", async () => {
+      try {
+        await brokerConfigActivate();
+      } catch (error) {
+        toast(`Broker activation failed: ${error && error.message ? error.message : error}`, "bad", 4800);
+      }
+    });
+  }
+  if (disableBtn && !disableBtn._boundBrokerConfigDisable) {
+    disableBtn._boundBrokerConfigDisable = true;
+    disableBtn.addEventListener("click", async () => {
+      try {
+        await brokerConfigDisable();
+      } catch (error) {
+        toast(`Broker disable failed: ${error && error.message ? error.message : error}`, "bad", 4200);
+      }
+    });
+  }
 }
 
 async function loadDashboardExecutionScreen() {
@@ -5788,12 +6139,15 @@ async function loadDashboardExecutionScreen() {
         const lookup = decisionLookupForOrderIntent(row, "execution_open_orders");
         const selectedClass = _symbolContextClassFor(row && row.symbol);
         const rowAttrs = hasDecisionLookup(lookup) ? _decisionLookupAttr(lookup, selectedClass) : _plainTableRowClass(selectedClass);
+        const statusText = row.rejection_reason
+          ? `${row.status || "REJECTED"} — ${row.rejection_reason}`
+          : (row.status || "—");
         return `
           <tr${rowAttrs}>
             <td class="mono">${escapeHTML(row.symbol || "—")}</td>
             <td>${escapeHTML(row.side || "—")}</td>
             <td class="mono table-cell-num">${escapeHTML(row.size || "—")}</td>
-            <td>${escapeHTML(row.status || "—")}</td>
+            <td>${escapeHTML(statusText)}</td>
           </tr>
         `;
       },
@@ -5807,6 +6161,7 @@ async function loadDashboardExecutionScreen() {
       : safeJoin([
           orderRows.brokerActive ? `broker ${formatDecimal(orderRows.brokerActive, 0)} active` : "",
           orderRows.portfolioActive ? `portfolio intents ${formatDecimal(orderRows.portfolioActive, 0)}` : "",
+          orderRows.rejected ? `rejected intents ${formatDecimal(orderRows.rejected, 0)}` : "",
           orderRows.usedWeightFallback ? "portfolio size falls back to weight deltas" : "",
           orderRows.usedNotionalFallback ? "some broker rows fall back to notional when qty is absent" : "",
         ]) || "No active order notes.";
@@ -6362,13 +6717,16 @@ async function refreshCalibCurves() {
 
 if (pre) pre.textContent = out ? JSON.stringify(out, null, 2) : "(no calib data)";
 
-if (
-  canvas &&
-  out &&
-  out.ok &&
-  Array.isArray(out.points)
-) {
-  drawCalibration(canvas, out.points);
+if (canvas) {
+  drawCalibration(
+    canvas,
+    out && out.ok ? out : [],
+    {
+      a11yTitle: "Confidence calibration",
+      emptyMessage: out && out.ok ? "No calibration points are available." : "Calibration data is unavailable.",
+      errorMessage: out && out.ok === false && out.error ? String(out.error) : "",
+    },
+  );
 }
 }
 
@@ -6437,9 +6795,75 @@ function normalizeModelRegistryPayload(payload) {
   };
 }
 
+function renderPromotionComparisonBars(target, payload) {
+  const el = typeof target === "string" ? document.getElementById(target) : target;
+  if (!el) return;
+
+  const vm = buildPromotionComparisonBarViewModel(payload, { staleAfterMs: 6 * 60 * 60 * 1000 });
+  if (!vm.bars.length) {
+    el.innerHTML = `
+      <div class="promotionComparisonBar" data-decision="unavailable">
+        <div class="promotionComparisonTop">
+          <div class="promotionComparisonTitle">No comparison metrics returned</div>
+          <span class="${escapeHTML(buildPillClassName(null, "unavailable"))}">Unavailable</span>
+        </div>
+        <div class="promotionComparisonFooter">Promotion decision cannot be compared against gates until champion and challenger metrics are available.</div>
+      </div>
+    `;
+    return;
+  }
+
+  el.innerHTML = vm.bars.map((bar) => {
+    const decisionTone =
+      bar.decision.state === "pass" ? "ok" :
+        bar.decision.state === "fail" ? "crit" :
+          bar.decision.state === "warn" ? "warn" :
+            "unavailable";
+    const sigTone = bar.significance.state === "pass" ? "ok" : bar.significance.state === "warn" ? "warn" : "neutral";
+    const thresholdStyle = bar.thresholdPct == null ? "" : `left:${bar.thresholdPct.toFixed(1)}%;`;
+    return `
+      <div class="promotionComparisonBar" data-decision="${escapeHTML(bar.decision.state)}">
+        <div class="promotionComparisonTop">
+          <div class="promotionComparisonTitle">${escapeHTML(bar.label)}</div>
+          <div class="promotionComparisonMeta">
+            <span class="${escapeHTML(buildPillClassName(null, decisionTone))}">${escapeHTML(bar.decision.label)}</span>
+            <span class="${escapeHTML(buildPillClassName(null, sigTone))}">${escapeHTML(bar.significance.label)}</span>
+            ${bar.stale ? `<span class="${escapeHTML(buildPillClassName(null, "warn"))}">stale data</span>` : ""}
+          </div>
+        </div>
+        <div class="promotionComparisonTrack" aria-label="${escapeHTML(`${bar.label}: ${bar.valueLabel}; ${bar.thresholdLabel}`)}">
+          <div class="promotionComparisonLane">
+            <div class="promotionComparisonLaneLabel">Champion</div>
+            <div class="promotionComparisonRail">
+              <div class="promotionComparisonFill is-champion" style="width:${bar.championPct.toFixed(1)}%;"></div>
+              ${thresholdStyle ? `<span class="promotionComparisonThreshold" style="${escapeHTML(thresholdStyle)}"></span>` : ""}
+            </div>
+            <div class="mono">${escapeHTML(formatPromotionGateValue(bar.champion))}</div>
+          </div>
+          <div class="promotionComparisonLane">
+            <div class="promotionComparisonLaneLabel">Challenger</div>
+            <div class="promotionComparisonRail">
+              <div class="promotionComparisonFill is-challenger" style="width:${bar.challengerPct.toFixed(1)}%;"></div>
+              ${thresholdStyle ? `<span class="promotionComparisonThreshold" style="${escapeHTML(thresholdStyle)}"></span>` : ""}
+            </div>
+            <div class="mono">${escapeHTML(formatPromotionGateValue(bar.challenger))}</div>
+          </div>
+        </div>
+        <div class="promotionComparisonFooter">
+          <span>${escapeHTML(bar.direction === "lower" ? "Lower is better" : "Higher is better")}</span>
+          <span>${escapeHTML(bar.thresholdLabel)}</span>
+          <span>Delta ${escapeHTML(formatPromotionGateValue(bar.delta))}</span>
+          <span>${escapeHTML(bar.staleLabel)}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
 function renderPromotionGate(payload) {
   const metaEl = document.getElementById("promotionGateMeta");
   const summaryEl = document.getElementById("promotionGateSummary");
+  const barsEl = document.getElementById("promotionGateBars");
   const comparisonBody = document.getElementById("promotionGateComparisonBody");
   const checklistBody = document.getElementById("promotionGateChecklistBody");
   const validationEl = document.getElementById("promotionGateValidation");
@@ -6500,6 +6924,8 @@ function renderPromotionGate(payload) {
       meta: forcePromote.reason || "No audit-safe force promotion endpoint is registered.",
     },
   ]);
+
+  renderPromotionComparisonBars(barsEl, gate.raw);
 
   comparisonBody.innerHTML = "";
   const metrics = gate.comparisonMetrics.length ? gate.comparisonMetrics : [];
@@ -6585,6 +7011,7 @@ async function loadPromotionGate() {
       rawTarget: "promotionGateRaw",
       rawPayload: { error: e && e.message ? e.message : String(e) },
     });
+    renderPromotionComparisonBars("promotionGateBars", { ok: false, comparison_metrics: [] });
     const metaEl = document.getElementById("promotionGateMeta");
     if (metaEl) {
       metaEl.textContent = "unavailable";
@@ -7142,6 +7569,7 @@ async function loadStructuredReadiness() {
     }
 
     renderSystemState(state, el, banner);
+    renderKillSwitchPills(state.kill_switches || {}, state.kill_switch_last_run || null, "systemStateText");
     updateDashboardLiveState({ systemState: state }, { sourceTs: extractRealtimeTs(state, Date.now()) });
     setPanelState("systemStateCard", {
       state: ageMsFromTimestamp(extractRealtimeTs(state, 0)) >= 300_000 ? "stale" : "fresh",
@@ -7344,15 +7772,22 @@ async function jobAction(name, action) {
     return;
   }
 
-  if (!confirmJobAction(normalizedName, normalizedAction)) {
+  const confirmation = await confirmJobAction(normalizedName, normalizedAction);
+  if (!confirmation.ok) {
     toast("Job action cancelled", "warn", 2200);
     return;
   }
 
   if (normalizedAction === "start") {
-    await postJSON(`/api/jobs/start?name=${encodeURIComponent(normalizedName)}`, { name: normalizedName });
+    await postJSON(`/api/jobs/start?name=${encodeURIComponent(normalizedName)}`, {
+      name: normalizedName,
+      ...confirmation.payload,
+    });
   } else if (normalizedAction === "stop") {
-    await postJSON(`/api/jobs/stop?name=${encodeURIComponent(normalizedName)}`, { name: normalizedName });
+    await postJSON(`/api/jobs/stop?name=${encodeURIComponent(normalizedName)}`, {
+      name: normalizedName,
+      ...confirmation.payload,
+    });
   }
 
   await refresh();
@@ -7941,18 +8376,26 @@ function wirePromotionButtons() {
         }
 
         const previewText = buildRollbackConsequencePreview(gate.raw);
-        if (!window.confirm(`${previewText}\n\nContinue to rollback justification?`)) return;
-
-        const justification = window.prompt("Enter rollback justification for the promotion audit log:");
-        const validation = validatePromotionActionInput({ justification });
-        if (!validation.ok) {
-          toast(`Rollback requires a justification of at least ${validation.minLength} characters`, "warn", 4200);
+        const confirmation = await requestConfirmation({
+          title: "Rollback champion",
+          action: "Rollback champion model",
+          target: (rollback.preview && rollback.preview.target) || "retired champion",
+          consequence: previewText,
+          confirmText: "ROLLBACK_CHAMPION",
+          requireReason: true,
+          minReasonLength: 12,
+          submitLabel: "Rollback champion",
+          actor: "operator",
+          source: "dashboard_promotion",
+        });
+        if (!confirmation.ok) {
+          toast("Rollback cancelled", "warn", 3200);
           return;
         }
 
-        const typedConfirm = window.prompt('Type ROLLBACK_CHAMPION to confirm rollback:');
-        if (String(typedConfirm || "").trim() !== "ROLLBACK_CHAMPION") {
-          toast("Rollback cancelled: confirmation token did not match", "warn", 3200);
+        const validation = validatePromotionActionInput({ justification: confirmation.reason });
+        if (!validation.ok) {
+          toast(`Rollback requires a justification of at least ${validation.minLength} characters`, "warn", 4200);
           return;
         }
 
@@ -7963,6 +8406,9 @@ function wirePromotionButtons() {
           justification: validation.justification,
           preview: rollback.preview || {},
           source: "dashboard",
+        });
+        Object.assign(payload, confirmation.payload, {
+          justification: validation.justification,
         });
         const res = await fetchJSON("/api/champion/rollback", {
           method: "POST",
@@ -8039,6 +8485,7 @@ function wireUI() {
   wireLogViewerControls();
   wireJobActionButtons();
   wireDashboardTableControls();
+  wireBrokerConfigControls();
 
   const whyCloseBtn = document.getElementById("btnCloseWhy");
   if (whyCloseBtn && !whyCloseBtn._boundWhyClose) {

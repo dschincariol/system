@@ -6,27 +6,46 @@
   the browser UI.
 */
 
-import { getProChartsState } from "./terminal/pro_charting.js";
+import { renderChartAccessibility } from "./chart_a11y.js";
+import {
+  addSeriesCompat,
+  applyIndicatorSeries,
+  applyMarkersToState,
+  applyPriceLinesToState,
+  clearMarkerLayer,
+  clearPriceLinesForState,
+  clearRetryTimer,
+  closeEventSource,
+  createIndicatorState,
+  createProChart,
+  disconnectResizeObserver,
+  ensureIndicatorStateForRows,
+  ensureLightweightCharts,
+  installProChartHealthTicker,
+  installVisibilityReconnect,
+  normalizeCandle,
+  proChartVolumeColor,
+  removeVisibilityHandler,
+  scheduleStreamReconnect,
+  updateIndicatorSeriesTail,
+  updateIndicatorState,
+  upsertSeriesPoint
+} from "./pro_chart_core.js";
+import {
+  applyDashboardProChartOverlayInputs,
+  getDashboardProChartOverlayState,
+  getProChartsState,
+  setDashboardProChartOverlayState
+} from "./pro_chart_prefs.js";
+import {
+  buildOverlayAccessibilitySummary,
+  decisionOverlayLegendItems,
+  normalizeDecisionOverlayPayload,
+} from "./decision_overlays.js";
 import {
   getSelectedSymbolContext,
   normalizeSelectedSymbol
 } from "./symbol_context.mjs";
-
-const LS_OV_VWAP = "dashboard.proCharts.ov.vwap";
-const LS_OV_EMA = "dashboard.proCharts.ov.ema";
-const LS_OV_TRADES = "dashboard.proCharts.ov.trades";
-const LS_OV_PNL = "dashboard.proCharts.ov.pnl";
-
-const DEFAULTS = {
-  libLocal: "/ui/vendor/lightweight-charts.standalone.production.js",
-  libCdn: "https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js",
-  overlays: {
-    vwap: true,
-    ema: true,
-    trades: true,
-    pnl: true,
-  },
-};
 
 const _DASH = {
   key: "",
@@ -43,6 +62,8 @@ const _DASH = {
   pnlSeries: null,
   markerLayer: null,
   markerSeries: null,
+  priceLineHandles: [],
+  decisionOverlayPayload: null,
 
   es: null,
   retryTimer: null,
@@ -54,6 +75,7 @@ const _DASH = {
   streamConnected: false,
   candlesData: [],
   volumeData: [],
+  indicatorState: createIndicatorState([]),
 
   crosshairEl: null,
   healthEl: null,
@@ -61,77 +83,8 @@ const _DASH = {
   visKey: "",
 };
 
-function _lsBoolGet(key, fallback) {
-  try {
-    const v = localStorage.getItem(key);
-    if (v === null || v === undefined) return !!fallback;
-    return v === "1";
-  } catch {
-    return !!fallback;
-  }
-}
-
-function _lsBoolSet(key, value) {
-  try { localStorage.setItem(key, value ? "1" : "0"); } catch {}
-}
-
-function _getOverlayState() {
-  return {
-    vwap: _lsBoolGet(LS_OV_VWAP, DEFAULTS.overlays.vwap),
-    ema: _lsBoolGet(LS_OV_EMA, DEFAULTS.overlays.ema),
-    trades: _lsBoolGet(LS_OV_TRADES, DEFAULTS.overlays.trades),
-    pnl: _lsBoolGet(LS_OV_PNL, DEFAULTS.overlays.pnl),
-  };
-}
-
-function _setOverlayState(patch) {
-  const next = { ..._getOverlayState(), ...(patch || {}) };
-  _lsBoolSet(LS_OV_VWAP, !!next.vwap);
-  _lsBoolSet(LS_OV_EMA, !!next.ema);
-  _lsBoolSet(LS_OV_TRADES, !!next.trades);
-  _lsBoolSet(LS_OV_PNL, !!next.pnl);
-  return next;
-}
-
-function _setOverlayInputs() {
-  const ov = _getOverlayState();
-  const map = {
-    proChartsOvVWAP: !!ov.vwap,
-    proChartsOvEMA: !!ov.ema,
-    proChartsOvTrades: !!ov.trades,
-    proChartsOvPnL: !!ov.pnl,
-  };
-
-  for (const [id, checked] of Object.entries(map)) {
-    const el = document.getElementById(id);
-    if (el) el.checked = checked;
-  }
-}
-
-async function _ensureLightweightCharts() {
-  if (window.LightweightCharts) return window.LightweightCharts;
-
-  async function load(src) {
-    return await new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = src;
-      s.async = true;
-      s.onload = () => resolve(true);
-      s.onerror = () => reject(new Error("failed to load " + src));
-      document.head.appendChild(s);
-    });
-  }
-
-  try { await load(DEFAULTS.libLocal); }
-  catch { await load(DEFAULTS.libCdn); }
-
-  if (!window.LightweightCharts) throw new Error("LightweightCharts not available");
-  return window.LightweightCharts;
-}
-
 function _destroyChartState() {
-  try { if (_DASH.retryTimer) clearTimeout(_DASH.retryTimer); } catch {}
-  _DASH.retryTimer = null;
+  clearRetryTimer(_DASH);
 
   try { if (_DASH.overlayTimer) clearInterval(_DASH.overlayTimer); } catch {}
   _DASH.overlayTimer = null;
@@ -139,27 +92,15 @@ function _destroyChartState() {
   try { if (_DASH.healthTimer) clearInterval(_DASH.healthTimer); } catch {}
   _DASH.healthTimer = null;
 
-  try { if (_DASH.es) _DASH.es.close(); } catch {}
-  _DASH.es = null;
+  closeEventSource(_DASH);
+  removeVisibilityHandler(_DASH);
 
-  try {
-    if (_DASH.visHandler) {
-      document.removeEventListener("visibilitychange", _DASH.visHandler);
-    }
-  } catch {}
-  _DASH.visHandler = null;
-  _DASH.visKey = "";
-
-  try { if (_DASH.resizeObserver) _DASH.resizeObserver.disconnect(); } catch {}
+  disconnectResizeObserver(_DASH.resizeObserver, _DASH.container);
   _DASH.resizeObserver = null;
 
-  try {
-    if (_DASH.markerLayer && typeof _DASH.markerLayer.detach === "function") {
-      _DASH.markerLayer.detach();
-    }
-  } catch {}
-  _DASH.markerLayer = null;
-  _DASH.markerSeries = null;
+  clearMarkerLayer(_DASH);
+  clearPriceLinesForState(_DASH);
+  _DASH.decisionOverlayPayload = null;
 
   try { if (_DASH.chart) _DASH.chart.remove(); } catch {}
   _DASH.chart = null;
@@ -176,84 +117,11 @@ function _destroyChartState() {
   _DASH.streamConnected = false;
   _DASH.candlesData = [];
   _DASH.volumeData = [];
-}
-
-function _safeNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function _normCandle(c) {
-  const time = Number(c?.t ?? c?.time ?? 0);
-  const open = _safeNum(c?.o ?? c?.open ?? c?.price ?? c?.last ?? c?.close);
-  const high = _safeNum(c?.h ?? c?.high ?? c?.price ?? c?.last ?? c?.close);
-  const low = _safeNum(c?.l ?? c?.low ?? c?.price ?? c?.last ?? c?.close);
-  const close = _safeNum(c?.c ?? c?.close ?? c?.price ?? c?.last);
-  const volume = _safeNum(c?.v ?? c?.volume ?? 0) ?? 0;
-
-  if (!Number.isFinite(time) || open === null || high === null || low === null || close === null) {
-    return null;
-  }
-
-  return {
-    time: Number(time),
-    open: Number(open),
-    high: Number(high),
-    low: Number(low),
-    close: Number(close),
-    volume: Number(volume),
-  };
+  _DASH.indicatorState = createIndicatorState([]);
 }
 
 function _volColor(c) {
-  if (!c) return "rgba(157,167,179,0.35)";
-  return Number(c.close) >= Number(c.open)
-    ? "rgba(46,160,67,0.45)"
-    : "rgba(255,107,107,0.45)";
-}
-
-function _computeVWAP(candles) {
-  let pv = 0;
-  let vv = 0;
-  const out = [];
-
-  for (const c of candles || []) {
-    const time = Number(c.time);
-    const close = Number(c.close);
-    const volume = Number(c.volume || 0);
-    if (!Number.isFinite(time) || !Number.isFinite(close)) continue;
-
-    if (Number.isFinite(volume) && volume > 0) {
-      pv += close * volume;
-      vv += volume;
-    }
-
-    out.push({
-      time,
-      value: vv > 0 ? (pv / vv) : close,
-    });
-  }
-
-  return out;
-}
-
-function _computeEMA(candles, period) {
-  const k = 2 / (Number(period) + 1);
-  let ema = null;
-  const out = [];
-
-  for (const c of candles || []) {
-    const time = Number(c.time);
-    const close = Number(c.close);
-    if (!Number.isFinite(time) || !Number.isFinite(close)) continue;
-
-    if (ema === null) ema = close;
-    else ema = (close * k) + (ema * (1 - k));
-
-    out.push({ time, value: ema });
-  }
-
-  return out;
+  return proChartVolumeColor(c, 0.45);
 }
 
 function _setMeta(text, cls = "pill dim") {
@@ -273,29 +141,6 @@ function _setHealthText(text) {
   } catch {}
 }
 
-function _upsertSeriesPoint(rows, point, limit = 1500) {
-  const next = Array.isArray(rows) ? rows.slice() : [];
-  if (!point) return next;
-  const time = Number(point.time);
-  if (!Number.isFinite(time)) return next;
-
-  const last = next[next.length - 1];
-  if (last && Number(last.time) === time) {
-    next[next.length - 1] = point;
-  } else if (last && time < Number(last.time)) {
-    const idx = next.findIndex((row) => Number(row.time) === time);
-    if (idx >= 0) next[idx] = point;
-  } else {
-    next.push(point);
-  }
-
-  if (next.length > limit) {
-    next.splice(0, next.length - limit);
-  }
-
-  return next;
-}
-
 export function getDashboardChartRuntime() {
   const healthText = String((_DASH.healthEl || document.getElementById("proChartsHealth"))?.textContent || "").trim();
   const hardError = /failed|error|unavailable/i.test(healthText) ? healthText : "";
@@ -309,116 +154,36 @@ export function getDashboardChartRuntime() {
 
 function _installHealthTicker() {
   _DASH.healthEl = document.getElementById("proChartsHealth");
-  if (_DASH.healthTimer) {
-    try { clearInterval(_DASH.healthTimer); } catch {}
-  }
-
-  _DASH.healthTimer = setInterval(() => {
-    if (!_DASH.healthEl) return;
-    if (!_DASH.lastUpdateMs) {
-      _setHealthText(_DASH.streamConnected ? "live stream" : "no data");
-      return;
-    }
-
-    const age = Date.now() - Number(_DASH.lastUpdateMs || 0);
-    if (_DASH.streamConnected) {
-      if (age < 1500) _setHealthText("live");
-      else if (age < 60_000) _setHealthText(`live • last candle ${Math.floor(age / 1000)}s`);
-      else _setHealthText(`stale ${Math.floor(age / 1000)}s`);
-      return;
-    }
-
-    if (age < 1500) _setHealthText("live");
-    else if (age < 5000) _setHealthText(`lag ${Math.floor(age)}ms`);
-    else _setHealthText(`stale ${Math.floor(age / 1000)}s`);
-  }, 750);
+  installProChartHealthTicker(_DASH, _DASH.healthEl, {
+    timerKey: "healthTimer",
+    setText: (text) => _setHealthText(text),
+  });
 }
 
 function _buildChart(container) {
-  const { createChart } = window.LightweightCharts;
-  container.innerHTML = "";
-
-  const chart = createChart(container, {
-    layout: {
-      background: { color: "#0a0d12" },
-      textColor: "#9da7b3",
+  const { chart, resizeObserver } = createProChart(container, {
+    includeInitialSize: true,
+    chartOptions: {
+      rightPriceScale: {
+        borderColor: "#30363d",
+        scaleMargins: { top: 0.08, bottom: 0.28 },
+      },
     },
-    grid: {
-      vertLines: { color: "#1f2630" },
-      horzLines: { color: "#1f2630" },
-    },
-    rightPriceScale: {
-      borderColor: "#30363d",
-      scaleMargins: { top: 0.08, bottom: 0.28 },
-    },
-    timeScale: {
-      borderColor: "#30363d",
-      timeVisible: true,
-      secondsVisible: false,
-      rightBarStaysOnScroll: true,
-    },
-    crosshair: { mode: 1 },
-    width: Math.max(10, Math.floor(container.clientWidth || 1200)),
-    height: Math.max(10, Math.floor(container.clientHeight || 420)),
   });
-
-  const ro = new ResizeObserver(() => {
-    const r = container.getBoundingClientRect();
-    chart.applyOptions({
-      width: Math.max(10, Math.floor(r.width)),
-      height: Math.max(10, Math.floor(r.height)),
-    });
-  });
-  ro.observe(container);
-  _DASH.resizeObserver = ro;
-
+  _DASH.resizeObserver = resizeObserver;
   return chart;
 }
 
-function _seriesDef(type) {
-  const lw = window.LightweightCharts || {};
-  const defs = {
-    line: lw.LineSeries,
-    area: lw.AreaSeries,
-    bar: lw.BarSeries,
-    histogram: lw.HistogramSeries,
-    candlestick: lw.CandlestickSeries,
-  };
-  return defs[type] || null;
-}
-
-function _addSeriesCompat(chart, type, options = {}) {
-  if (!chart) throw new Error("chart_missing");
-
-  const legacyFns = {
-    line: "addLineSeries",
-    area: "addAreaSeries",
-    bar: "addBarSeries",
-    histogram: "addHistogramSeries",
-    candlestick: "addCandlestickSeries",
-  };
-
-  const legacyName = legacyFns[type];
-  if (legacyName && typeof chart[legacyName] === "function") {
-    return chart[legacyName](options);
-  }
-
-  if (typeof chart.addSeries === "function") {
-    const def = _seriesDef(type);
-    if (def) return chart.addSeries(def, options);
-  }
-
-  throw new Error(`unsupported_series_type:${type}`);
-}
-
 function _clearTradeMarkers() {
-  try {
-    if (_DASH.markerLayer && typeof _DASH.markerLayer.detach === "function") {
-      _DASH.markerLayer.detach();
-    }
-  } catch {}
-  _DASH.markerLayer = null;
-  _DASH.markerSeries = null;
+  clearMarkerLayer(_DASH);
+}
+
+function _markerAnchorSeries() {
+  return _DASH.candleSeries || _DASH.lineSeries || null;
+}
+
+function _clearPriceLines() {
+  clearPriceLinesForState(_DASH, { anchor: _markerAnchorSeries() });
 }
 
 function _setCrosshairPanel() {
@@ -465,7 +230,7 @@ function _ensureOverlaySeries() {
   if (!_DASH.chart) return;
 
   if (!_DASH.volumeSeries && _DASH.candleSeries) {
-    _DASH.volumeSeries = _addSeriesCompat(_DASH.chart, "histogram", {
+    _DASH.volumeSeries = addSeriesCompat(_DASH.chart, "histogram", {
       priceFormat: { type: "volume" },
       priceScaleId: "",
       scaleMargins: { top: 0.78, bottom: 0.0 },
@@ -473,19 +238,19 @@ function _ensureOverlaySeries() {
   }
 
   if (!_DASH.vwapSeries) {
-    _DASH.vwapSeries = _addSeriesCompat(_DASH.chart, "line", { lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
+    _DASH.vwapSeries = addSeriesCompat(_DASH.chart, "line", { lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
   }
 
   if (!_DASH.ema20Series) {
-    _DASH.ema20Series = _addSeriesCompat(_DASH.chart, "line", { lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
+    _DASH.ema20Series = addSeriesCompat(_DASH.chart, "line", { lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
   }
 
   if (!_DASH.ema50Series) {
-    _DASH.ema50Series = _addSeriesCompat(_DASH.chart, "line", { lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
+    _DASH.ema50Series = addSeriesCompat(_DASH.chart, "line", { lineWidth: 1, lastValueVisible: false, priceLineVisible: false });
   }
 
   if (!_DASH.pnlSeries) {
-    _DASH.pnlSeries = _addSeriesCompat(_DASH.chart, "line", {
+    _DASH.pnlSeries = addSeriesCompat(_DASH.chart, "line", {
       lineWidth: 2,
       priceScaleId: "pnl",
       lastValueVisible: true,
@@ -505,7 +270,7 @@ function _normalizePriceResponse(rows) {
   const volume = [];
 
   for (const row of rows || []) {
-    const c = _normCandle(row);
+    const c = normalizeCandle(row);
     if (!c) continue;
 
     candles.push({
@@ -525,6 +290,60 @@ function _normalizePriceResponse(rows) {
   }
 
   return { candles, volume };
+}
+
+function _dashboardChartKeyParts() {
+  const parts = String(_DASH.key || "").split("::");
+  return {
+    symbol: parts[0] || "SPY",
+    tf: parts[1] || "",
+    type: parts[2] || "",
+  };
+}
+
+function _fmtFixed(value, digits = 4) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : "unavailable";
+}
+
+function _renderDashboardChartA11y({ errorMessage = "", emptyMessage = "" } = {}) {
+  const container = _DASH.container || document.getElementById("liveMarketChart");
+  if (!container) return;
+  const { symbol, tf, type } = _dashboardChartKeyParts();
+  const title = `Live market chart ${symbol}`;
+  const series = (_DASH.candlesData || []).map((c) => ({
+    time: Number(c.time),
+    value: Number(c.close),
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close),
+    volume: Number(c.volume || 0),
+  })).filter((c) => Number.isFinite(c.time) && Number.isFinite(c.value));
+  const overlaySummary = buildOverlayAccessibilitySummary(_DASH.decisionOverlayPayload || {});
+
+  renderChartAccessibility(container, {
+    title,
+    series,
+    timeKey: "time",
+    valueKey: "value",
+    valueLabel: "close",
+    valueFormatter: (v) => Number(v).toFixed(4),
+    emptyMessage: emptyMessage || `No candle history is available for ${symbol}${tf ? ` ${tf}` : ""}.`,
+    errorMessage,
+    chartType: "lightweight-chart",
+    columns: [
+      { label: "Time", value: (row) => row.timeText || row.index },
+      { label: "Open", value: (row) => _fmtFixed(row.raw && row.raw.open, 4) },
+      { label: "High", value: (row) => _fmtFixed(row.raw && row.raw.high, 4) },
+      { label: "Low", value: (row) => _fmtFixed(row.raw && row.raw.low, 4) },
+      { label: "Close", value: (row) => _fmtFixed(row.raw && row.raw.close, 4) },
+      { label: "Volume", value: (row) => _fmtFixed(row.raw && row.raw.volume, 0) },
+    ],
+    summary: series.length
+      ? `${title}: latest close ${Number(series[series.length - 1].close).toFixed(4)} across ${series.length} candles${tf ? ` on ${tf}` : ""}${type ? ` as ${type}` : ""}. ${overlaySummary}`
+      : "",
+  });
 }
 
 async function _fetchCandles(symbol, tf, limit = 1200) {
@@ -559,27 +378,35 @@ async function _fetchCandles(symbol, tf, limit = 1200) {
 
 async function _fetchTrades(symbol) {
   try {
-    const res = await fetch(`/api/terminal/markers?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    const res = await fetch(`/api/terminal/decision_overlays?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
     const text = await res.text();
     let json = null;
 
     try {
       json = text ? JSON.parse(text) : null;
     } catch {
-      return { markers: [], error: `invalid marker response (${res.status})` };
+      return { markers: [], overlay: null, error: `invalid marker response (${res.status})` };
     }
 
     if (!res.ok) {
-      return { markers: [], error: (json && json.error) ? String(json.error) : `marker http ${res.status}` };
+      return { markers: [], overlay: null, error: (json && json.error) ? String(json.error) : `marker http ${res.status}` };
     }
 
     if (!json || !json.ok || !Array.isArray(json.markers)) {
-      return { markers: [], error: (json && json.error) ? String(json.error) : "marker api error" };
+      return { markers: [], overlay: null, error: (json && json.error) ? String(json.error) : "marker api error" };
     }
 
-    return { markers: json.markers, error: null };
+    return { markers: json.markers, overlay: json, error: null };
   } catch (e) {
-    return { markers: [], error: e && e.message ? e.message : "marker fetch failed" };
+    try {
+      const res = await fetch(`/api/terminal/markers?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+      const text = await res.text();
+      const json = text ? JSON.parse(text) : null;
+      if (res.ok && json && json.ok && Array.isArray(json.markers)) {
+        return { markers: json.markers, overlay: json, error: null };
+      }
+    } catch {}
+    return { markers: [], overlay: null, error: e && e.message ? e.message : "marker fetch failed" };
   }
 }
 
@@ -636,7 +463,7 @@ export async function renderPriceChart(containerId) {
   const container = document.getElementById(containerId);
   if (!container) return null;
 
-  await _ensureLightweightCharts();
+  await ensureLightweightCharts();
 
   _DASH.container = container;
   _DASH.chart = _buildChart(container);
@@ -646,21 +473,21 @@ export async function renderPriceChart(containerId) {
   const type = String(st.type || "candle").trim();
 
   if (type === "line") {
-    _DASH.lineSeries = _addSeriesCompat(_DASH.chart, "line", { lineWidth: 2 });
+    _DASH.lineSeries = addSeriesCompat(_DASH.chart, "line", { lineWidth: 2 });
     _DASH.candleSeries = null;
   } else if (type === "area") {
-    _DASH.lineSeries = _addSeriesCompat(_DASH.chart, "area");
+    _DASH.lineSeries = addSeriesCompat(_DASH.chart, "area");
     _DASH.candleSeries = null;
   } else if (type === "bar") {
-    _DASH.candleSeries = _addSeriesCompat(_DASH.chart, "bar");
+    _DASH.candleSeries = addSeriesCompat(_DASH.chart, "bar");
     _DASH.lineSeries = null;
   } else {
-    _DASH.candleSeries = _addSeriesCompat(_DASH.chart, "candlestick");
+    _DASH.candleSeries = addSeriesCompat(_DASH.chart, "candlestick");
     _DASH.lineSeries = null;
   }
 
   if (_DASH.candleSeries && !_DASH.volumeSeries) {
-    _DASH.volumeSeries = _addSeriesCompat(_DASH.chart, "histogram", {
+    _DASH.volumeSeries = addSeriesCompat(_DASH.chart, "histogram", {
       priceFormat: { type: "volume" },
       priceScaleId: "",
       scaleMargins: { top: 0.78, bottom: 0.0 },
@@ -688,43 +515,8 @@ export function renderVolumeOverlay(chart, volumeData) {
 }
 
 export function renderTradeMarkers(chart, trades) {
-  if (!chart || !_DASH.candleSeries) return;
-
-  const markers = (trades || []).map((m) => {
-    const time = Number(m.t ?? m.time ?? 0);
-    const side = String(m.side || "").toUpperCase();
-    const kind = String(m.kind || "").toUpperCase();
-    const isBuy = side.includes("BUY") || side.includes("LONG") || Number(m.qty || 0) > 0;
-    const isEntry = kind === "FILL" || kind === "ENTRY" || kind === "INTENT";
-
-    return {
-      time,
-      position: isBuy ? "belowBar" : "aboveBar",
-      shape: isBuy ? "arrowUp" : "arrowDown",
-      color: isBuy ? "rgba(46,160,67,0.95)" : "rgba(255,107,107,0.95)",
-      text: String(m.text || (isEntry ? (isBuy ? "ENTRY" : "EXIT") : side || kind || "TRADE")).slice(0, 10),
-    };
-  }).filter((m) => Number.isFinite(m.time));
-
-  if (typeof _DASH.candleSeries.setMarkers === "function") {
-    try { _DASH.candleSeries.setMarkers(markers); } catch {}
-    return;
-  }
-
-  const createSeriesMarkers = window.LightweightCharts && window.LightweightCharts.createSeriesMarkers;
-  if (typeof createSeriesMarkers !== "function") return;
-
-  try {
-    if (!_DASH.markerLayer || _DASH.markerSeries !== _DASH.candleSeries) {
-      _clearTradeMarkers();
-      _DASH.markerLayer = createSeriesMarkers(_DASH.candleSeries, markers);
-      _DASH.markerSeries = _DASH.candleSeries;
-      return;
-    }
-    if (typeof _DASH.markerLayer.setMarkers === "function") {
-      _DASH.markerLayer.setMarkers(markers);
-    }
-  } catch {}
+  if (!chart) return;
+  applyMarkersToState(_DASH, trades || [], { anchor: _markerAnchorSeries() });
 }
 
 export function renderPortfolioOverlay(chart, pnlData) {
@@ -736,6 +528,42 @@ export function renderPortfolioOverlay(chart, pnlData) {
         .filter((p) => Number.isFinite(p.time) && Number.isFinite(p.value))
     );
   } catch {}
+}
+
+function _legendShapeGlyph(shape) {
+  const raw = String(shape || "");
+  if (raw === "arrowUp") return "^";
+  if (raw === "arrowDown") return "v";
+  if (raw === "square") return "[]";
+  if (raw === "circle") return "o";
+  return "-";
+}
+
+function _escapeAttr(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function _renderOverlayLegend(payload) {
+  const el = document.getElementById("proChartsOverlayLegend");
+  if (!el) return;
+  const normalized = normalizeDecisionOverlayPayload(payload || {});
+  const summary = buildOverlayAccessibilitySummary(normalized);
+  const items = decisionOverlayLegendItems(normalized);
+  el.setAttribute("aria-label", summary);
+  el.innerHTML =
+    `<div class="overlayLegendItems">${items.map((item) => (
+      `<span class="overlayLegendItem">` +
+      `<span class="overlayLegendGlyph" style="border-color:${_escapeAttr(item.color)}; color:${_escapeAttr(item.color)}">${_escapeAttr(_legendShapeGlyph(item.shape))}</span>` +
+      `<span>${_escapeAttr(item.label)}</span>` +
+      `<span class="mono muted">${_escapeAttr(item.text)}</span>` +
+      `<span class="mono">${_escapeAttr(String(item.count))}</span>` +
+      `</span>`
+    )).join("")}</div>` +
+    `<div class="overlayLegendSummary">${_escapeAttr(summary)} ${normalized.windows.length ? `Windows ${normalized.windows.length}.` : ""} ${normalized.price_lines.length ? `Levels ${normalized.price_lines.length}.` : ""}</div>`;
 }
 
 function _applyPriceSeries(candles) {
@@ -754,6 +582,7 @@ function _applyPriceSeries(candles) {
     value: Number(c.volume || 0),
     color: _volColor(c),
   }));
+  _DASH.indicatorState = createIndicatorState(_DASH.candlesData);
 
   if (_DASH.candleSeries) {
     try {
@@ -777,44 +606,48 @@ function _applyPriceSeries(candles) {
       );
     } catch {}
   }
+  _renderDashboardChartA11y();
 }
 
 function _applyIndicatorOverlays(candles, overlays) {
   if (!_DASH.chart) return;
   _ensureOverlaySeries();
-
-  if (overlays.vwap && _DASH.vwapSeries) {
-    try { _DASH.vwapSeries.setData(_computeVWAP(candles)); } catch {}
-  } else if (_DASH.vwapSeries) {
-    try { _DASH.vwapSeries.setData([]); } catch {}
-  }
-
-  if (overlays.ema && _DASH.ema20Series && _DASH.ema50Series) {
-    try { _DASH.ema20Series.setData(_computeEMA(candles, 20)); } catch {}
-    try { _DASH.ema50Series.setData(_computeEMA(candles, 50)); } catch {}
-  } else {
-    try { if (_DASH.ema20Series) _DASH.ema20Series.setData([]); } catch {}
-    try { if (_DASH.ema50Series) _DASH.ema50Series.setData([]); } catch {}
-  }
+  const src = Array.isArray(candles) ? candles : [];
+  _DASH.indicatorState = ensureIndicatorStateForRows(_DASH.indicatorState, src);
+  applyIndicatorSeries({
+    indicatorState: _DASH.indicatorState,
+    overlays,
+    vwapSeries: _DASH.vwapSeries,
+    ema20Series: _DASH.ema20Series,
+    ema50Series: _DASH.ema50Series,
+  });
 }
 
 async function _refreshOverlays(symbol, candles = _DASH.candlesData) {
-  const overlays = _getOverlayState();
+  const overlays = getDashboardProChartOverlayState();
 
   if (overlays.trades) {
     const tradesRes = await _fetchTrades(symbol);
-    renderTradeMarkers(_DASH.chart, tradesRes.markers);
+    const normalizedOverlay = normalizeDecisionOverlayPayload(tradesRes.overlay || { markers: tradesRes.markers || [] });
+    _DASH.decisionOverlayPayload = normalizedOverlay;
+    renderTradeMarkers(_DASH.chart, normalizedOverlay.markers);
+    applyPriceLinesToState(_DASH, normalizedOverlay.price_lines || [], { anchor: _markerAnchorSeries() });
+    _renderOverlayLegend(normalizedOverlay);
     if (tradesRes.error) {
       _setHealthText(`markers: ${tradesRes.error}`);
     }
-  } else if (_DASH.candleSeries) {
+  } else {
     try {
-      if (typeof _DASH.candleSeries.setMarkers === "function") {
-        _DASH.candleSeries.setMarkers([]);
+      const anchor = _markerAnchorSeries();
+      if (anchor && typeof anchor.setMarkers === "function") {
+        anchor.setMarkers([]);
       } else {
         _clearTradeMarkers();
       }
     } catch {}
+    _clearPriceLines();
+    _DASH.decisionOverlayPayload = null;
+    _renderOverlayLegend({ markers: [] });
   }
 
   if (overlays.pnl) {
@@ -828,13 +661,14 @@ async function _refreshOverlays(symbol, candles = _DASH.candlesData) {
   }
 
   _applyIndicatorOverlays(candles, overlays);
+  _renderDashboardChartA11y();
 }
 
 function _updateBar(bar) {
   if (!bar) return;
   _DASH.lastBar = bar;
   _DASH.lastUpdateMs = Date.now();
-  _DASH.candlesData = _upsertSeriesPoint(_DASH.candlesData, {
+  _DASH.candlesData = upsertSeriesPoint(_DASH.candlesData, {
     time: Number(bar.time),
     open: Number(bar.open),
     high: Number(bar.high),
@@ -842,7 +676,13 @@ function _updateBar(bar) {
     close: Number(bar.close),
     volume: Number(bar.volume || 0),
   });
-  _DASH.volumeData = _upsertSeriesPoint(_DASH.volumeData, {
+  const indicatorUpdate = updateIndicatorState(_DASH.indicatorState, {
+    time: Number(bar.time),
+    close: Number(bar.close),
+    volume: Number(bar.volume || 0),
+  });
+  _DASH.indicatorState = indicatorUpdate.needsRebuild ? createIndicatorState(_DASH.candlesData) : indicatorUpdate.state;
+  _DASH.volumeData = upsertSeriesPoint(_DASH.volumeData, {
     time: Number(bar.time),
     value: Number(bar.volume || 0),
     color: _volColor(bar),
@@ -877,53 +717,37 @@ function _updateBar(bar) {
     } catch {}
   }
 
-  _applyIndicatorOverlays(_DASH.candlesData, _getOverlayState());
+  const overlays = getDashboardProChartOverlayState();
+  _ensureOverlaySeries();
+  updateIndicatorSeriesTail({
+    indicatorState: _DASH.indicatorState,
+    overlays,
+    vwapSeries: _DASH.vwapSeries,
+    ema20Series: _DASH.ema20Series,
+    ema50Series: _DASH.ema50Series,
+  });
+  _renderDashboardChartA11y();
 }
 
 function _clearRetry() {
-  try { if (_DASH.retryTimer) clearTimeout(_DASH.retryTimer); } catch {}
-  _DASH.retryTimer = null;
+  clearRetryTimer(_DASH);
 }
 
 function _closeES() {
-  try { if (_DASH.es) _DASH.es.close(); } catch {}
-  _DASH.es = null;
+  closeEventSource(_DASH);
 }
 
 function _scheduleReconnect(openFn, key) {
-  _clearRetry();
-  const ms = Math.max(250, Math.min(15000, Number(_DASH.retryBackoffMs || 500)));
-  _DASH.retryBackoffMs = Math.min(15000, Math.floor(ms * 1.7));
-  _DASH.retryTimer = setTimeout(() => {
-    _DASH.retryTimer = null;
-    if (_DASH.key !== key) return;
-    if (document.hidden) return;
-    openFn();
-  }, ms);
+  scheduleStreamReconnect(_DASH, { key, open: openFn });
 }
 
 function _installVisibilityHandler(openFn, key) {
-  if (_DASH.visKey === key && _DASH.visHandler) return;
-
-  try {
-    if (_DASH.visHandler) {
-      document.removeEventListener("visibilitychange", _DASH.visHandler);
-    }
-  } catch {}
-
-  _DASH.visKey = key;
-  _DASH.visHandler = () => {
-    if (_DASH.key !== key) return;
-    if (document.hidden) {
-      _clearRetry();
-      _closeES();
-    } else {
-      _DASH.retryBackoffMs = 500;
-      openFn();
-    }
-  };
-
-  document.addEventListener("visibilitychange", _DASH.visHandler);
+  installVisibilityReconnect(_DASH, {
+    key,
+    open: openFn,
+    close: _closeES,
+    clearRetry: _clearRetry,
+  });
 }
 
 async function _startLiveStream(symbol, tf) {
@@ -948,7 +772,7 @@ async function _startLiveStream(symbol, tf) {
       es.addEventListener("candle", (ev) => {
         let payload = null;
         try { payload = JSON.parse(ev.data); } catch { return; }
-        const bar = _normCandle(payload);
+        const bar = normalizeCandle(payload);
         if (!bar) return;
         _DASH.streamConnected = true;
         _updateBar(bar);
@@ -977,7 +801,7 @@ export async function loadProCharts(fetchJSON) {
   const chartEl = document.getElementById("liveMarketChart");
   const symEl = document.getElementById("globalSymbol");
 
-  _setOverlayInputs();
+  applyDashboardProChartOverlayInputs();
 
   const st = getProChartsState();
   if (!st.enabled) {
@@ -1037,17 +861,28 @@ export async function loadProCharts(fetchJSON) {
     if (candleRes.error) {
       _setMeta(`${symbol} • ${tf} • ${type} • load failed`, "pill warn");
       _setHealthText(`candles: ${candleRes.error}`);
+      _renderDashboardChartA11y({ errorMessage: `Candles failed to load: ${candleRes.error}` });
     } else if (!candles.length) {
       _setMeta(`${symbol} • ${tf} • ${type} • no candles`, "pill warn");
       _setHealthText("no data");
+      _renderDashboardChartA11y({ emptyMessage: `No candles are available for ${symbol} ${tf}.` });
     } else {
       _setMeta(`${symbol} • ${tf} • ${type}`, "pill ok");
       _setHealthText(_DASH.lastUpdateMs ? "live" : "no data");
+      _renderDashboardChartA11y();
     }
   } catch (e) {
     console.error("loadProCharts failed", e);
     _setMeta("error", "pill bad");
     _setHealthText(e && e.message ? e.message : "error");
+    renderChartAccessibility(chartEl, {
+      title: "Live market chart",
+      series: [],
+      emptyMessage: "Live market chart failed to load.",
+      errorMessage: e && e.message ? e.message : "Live market chart failed to load.",
+      valueLabel: "close",
+      chartType: "lightweight-chart",
+    });
   }
 }
 
@@ -1057,7 +892,7 @@ export function bindProChartSymbolWatcher() {
     if (!el || el._proChartBound) return;
     el._proChartBound = true;
     el.addEventListener("change", async () => {
-      _setOverlayState({ [patchKey]: !!el.checked });
+      setDashboardProChartOverlayState({ [patchKey]: !!el.checked });
       if (typeof window._refreshProCharts === "function") {
         await window._refreshProCharts();
       }
@@ -1079,5 +914,5 @@ export function bindProChartSymbolWatcher() {
   bindRefresh("proChartsOvTrades", "trades");
   bindRefresh("proChartsOvPnL", "pnl");
 
-  _setOverlayInputs();
+  applyDashboardProChartOverlayInputs();
 }

@@ -64,7 +64,7 @@
 
       <label class="chk">
         <input id="ovMarkers" type="checkbox" checked>
-        <span>Fills</span>
+        <span>Decisions</span>
       </label>
 
       <label class="chk">
@@ -101,6 +101,8 @@
         <div id="terminalChart" class="chartCanvas"></div>
         <div id="xhairBox" class="xhair"></div>
       </div>
+      <div id="terminalOverlayLegend" class="overlayLegend" aria-live="polite"></div>
+      <div id="terminalChartA11y" class="chartA11y terminalChartA11y"></div>
     </section>
 
     <aside class="panel right">
@@ -133,6 +135,11 @@
 
   <div class="k">Qty</div>
   <div><input id="ordQty" class="inp" value="100"></div>
+
+  <div class="k">Preview</div>
+  <div id="orderPreview" class="orderPreview" role="status" aria-live="polite">
+    Awaiting terminal snapshot
+  </div>
 
   <div></div>
   <div class="orderActions">

@@ -15,10 +15,36 @@
   --color-bg-elevated: #232323;
   --color-border: rgba(255,255,255,0.06);
 
-  --color-ok: #2ecc71;
-  --color-warn: #f1c40f;
-  --color-crit: #e74c3c;
-  --color-neutral: #9aa0a6;
+  /* Okabe-Ito-compatible status system plus neutral grayscale baseline. */
+  --oi-blue: #0072B2;
+  --oi-sky: #56B4E9;
+  --oi-bluish-green: #009E73;
+  --oi-orange: #E69F00;
+  --oi-vermillion: #D55E00;
+  --oi-reddish-purple: #CC79A7;
+
+  --status-neutral: #A7B0BC;
+  --status-info: var(--oi-sky);
+  --status-ok: var(--oi-bluish-green);
+  --status-warn: var(--oi-orange);
+  --status-high: var(--oi-reddish-purple);
+  --status-crit: var(--oi-vermillion);
+  --status-blocked: #73B7E6;
+  --status-unavailable: #8B949E;
+
+  --status-neutral-bg: rgba(167,176,188,0.13);
+  --status-info-bg: rgba(86,180,233,0.14);
+  --status-ok-bg: rgba(0,158,115,0.14);
+  --status-warn-bg: rgba(230,159,0,0.15);
+  --status-high-bg: rgba(204,121,167,0.15);
+  --status-crit-bg: rgba(213,94,0,0.16);
+  --status-blocked-bg: rgba(115,183,230,0.16);
+  --status-unavailable-bg: rgba(139,148,158,0.13);
+
+  --color-ok: var(--status-ok);
+  --color-warn: var(--status-warn);
+  --color-crit: var(--status-crit);
+  --color-neutral: var(--status-neutral);
 
   /* Staleness */
   --stale-opacity: 0.5;
@@ -81,6 +107,22 @@
   color: var(--color-crit);
 }
 
+.status-high {
+  color: var(--status-high);
+}
+
+.status-info {
+  color: var(--status-info);
+}
+
+.status-blocked {
+  color: var(--status-blocked);
+}
+
+.status-unavailable {
+  color: var(--status-unavailable);
+}
+
 .status-neutral {
   color: var(--color-neutral);
 }
@@ -104,7 +146,7 @@
 }
 
 @keyframes flash {
-  from { background: rgba(46,204,113,0.15); }
+  from { background: var(--status-info-bg); }
   to { background: transparent; }
 }
 
@@ -133,7 +175,10 @@
 body.theme-tech .pill.crit,
 body.theme-tech .pill.bad,
 body.theme-tech .pill.err {
-  border-color: rgba(226,85,85,.75) !important;
+  color: var(--status-crit) !important;
+  background: var(--status-crit-bg) !important;
+  border-color: color-mix(in srgb, var(--status-crit) 78%, transparent) !important;
+  border-style: double !important;
 }
 
 body.theme-tech .pill.neutral,
@@ -145,6 +190,15 @@ body.theme-tech .pill.dim {
 
 body.theme-tech {
   --panel-surface: linear-gradient(180deg, rgba(15,26,43,.92), rgba(11,18,32,.92));
+  --ok: var(--status-ok) !important;
+  --warn: var(--status-warn) !important;
+  --crit: var(--status-crit) !important;
+  --bad: var(--status-crit) !important;
+  --info: var(--status-info) !important;
+  --green: var(--status-ok) !important;
+  --amber: var(--status-warn) !important;
+  --red: var(--status-crit) !important;
+  --blue: var(--status-info) !important;
 }
 
 body.theme-tech .screenShell,
@@ -176,6 +230,35 @@ body.theme-tech .pill-row-compact {
   gap: var(--space-md) !important;
   flex-wrap: wrap !important;
   margin: var(--space-md) 0 !important;
+}
+
+body.theme-tech .brokerConfigControls {
+  display: grid;
+  grid-template-columns: minmax(80px, max-content) minmax(160px, 1fr);
+  gap: var(--space-sm) var(--space-md);
+  align-items: center;
+  margin: var(--space-lg) 0;
+}
+
+body.theme-tech .brokerConfigControls input,
+body.theme-tech .brokerConfigControls select,
+body.theme-tech .brokerConfigControls textarea {
+  width: 100%;
+  min-width: 0;
+}
+
+body.theme-tech .brokerConfigControls textarea {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+body.theme-tech .brokerConfigControls .btn {
+  justify-self: start;
+}
+
+@media (max-width: 760px) {
+  body.theme-tech .brokerConfigControls {
+    grid-template-columns: 1fr;
+  }
 }
 
 body.theme-tech .screenTabGroup {
@@ -302,6 +385,297 @@ body.theme-tech .opsNote {
 body.theme-tech .pill {
   font-size: var(--font-label) !important;
 }
+
+.pill.ok,
+.badge-ok,
+.surfaceBanner.ok,
+.healthScoreFactor.ok {
+  color: var(--status-ok);
+  background: var(--status-ok-bg);
+  border-color: var(--status-ok);
+  border-style: solid;
+}
+
+.pill.warn,
+.badge-warn,
+.surfaceBanner.warn,
+.healthScoreFactor.warn {
+  color: var(--status-warn);
+  background: var(--status-warn-bg);
+  border-color: var(--status-warn);
+  border-style: dashed;
+}
+
+.pill.high,
+.badge-high,
+.healthScoreFactor.high {
+  color: var(--status-high);
+  background: var(--status-high-bg);
+  border-color: var(--status-high);
+  border-style: dashed;
+  box-shadow: inset 0 0 0 2px rgba(255,255,255,0.05);
+}
+
+.pill.crit,
+.pill.bad,
+.badge-crit,
+.badge-danger,
+.surfaceBanner.danger,
+.healthScoreFactor.crit,
+.healthScoreFactor.bad {
+  color: var(--status-crit);
+  background: var(--status-crit-bg);
+  border-color: var(--status-crit);
+  border-style: double;
+}
+
+.pill.blocked,
+.badge-blocked,
+.healthScoreFactor.blocked {
+  color: var(--status-blocked);
+  border-color: var(--status-blocked);
+  border-style: dashed;
+  background:
+    repeating-linear-gradient(135deg, rgba(255,255,255,0.08) 0 2px, transparent 2px 8px),
+    var(--status-blocked-bg);
+}
+
+.pill.info,
+.badge-info,
+.healthScoreFactor.info {
+  color: var(--status-info);
+  background: var(--status-info-bg);
+  border-color: var(--status-info);
+}
+
+.pill.unavailable,
+.badge-unavailable,
+.healthScoreFactor.unavailable {
+  color: var(--status-unavailable);
+  background: var(--status-unavailable-bg);
+  border-color: var(--status-unavailable);
+  border-style: dotted;
+}
+
+.pill.ok::before,
+.pill.warn::before,
+.pill.high::before,
+.pill.crit::before,
+.pill.bad::before,
+.pill.blocked::before,
+.pill.info::before,
+.pill.unavailable::before,
+.badge-ok::before,
+.badge-warn::before,
+.badge-high::before,
+.badge-crit::before,
+.badge-danger::before,
+.badge-blocked::before,
+.badge-info::before,
+.badge-unavailable::before {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.4em;
+  font-size: 0.82em;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.pill.ok::before,
+.badge-ok::before { content: "OK"; }
+.pill.warn::before,
+.badge-warn::before { content: "!"; }
+.pill.high::before,
+.badge-high::before { content: "!!"; }
+.pill.crit::before,
+.pill.bad::before,
+.badge-crit::before,
+.badge-danger::before { content: "X"; }
+.pill.blocked::before,
+.badge-blocked::before { content: "LOCK"; min-width: 3em; }
+.pill.info::before,
+.badge-info::before { content: "i"; }
+.pill.unavailable::before,
+.badge-unavailable::before { content: "?"; }
+
+.hmCell[data-status] {
+  border-left: 4px solid var(--status-neutral);
+}
+
+.hmCell[data-status="ok"] { border-left-color: var(--status-ok); }
+.hmCell[data-status="warn"] { border-left-color: var(--status-warn); border-left-style: dashed; }
+.hmCell[data-status="high"] { border-left-color: var(--status-high); border-left-style: dashed; }
+.hmCell[data-status="crit"] { border-left-color: var(--status-crit); border-left-style: double; }
+.hmCell[data-status="blocked"] { border-left-color: var(--status-blocked); border-left-style: dashed; }
+.hmCell[data-status="unavailable"] { border-left-color: var(--status-unavailable); border-left-style: dotted; }
+
+.hmSwatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #081018;
+  background: var(--hm-color, var(--status-neutral));
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.hmStatusLabel {
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--text, var(--text-primary, #e8f0fa));
+}
+
+.chartCanvas,
+.proChart,
+canvas.spark,
+canvas[id$="Chart"],
+canvas[id$="Canvas"] {
+  outline: 1px solid transparent;
+}
+
+.riskCharts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-lg);
+  margin-top: var(--space-lg);
+}
+
+.riskChartBlock {
+  min-width: 0;
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-lg);
+}
+
+.riskChartHeader,
+.mcBarHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  min-width: 0;
+}
+
+.riskChartHeader h3 {
+  margin: 0;
+  font-size: var(--font-data);
+  line-height: 1.2;
+}
+
+.riskChartBlock canvas {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin-top: var(--space-md);
+  border: 1px solid rgba(48,54,61,.75);
+  border-radius: 6px;
+  background: #0a0d12;
+}
+
+.mcBars {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-md);
+}
+
+.mcBar {
+  min-width: 0;
+}
+
+.mcBarHeader {
+  font-size: var(--font-label);
+  color: var(--text, #e8f0fa);
+}
+
+.mcBarTrack {
+  position: relative;
+  overflow: hidden;
+  height: 14px;
+  margin-top: var(--space-xs);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: rgba(255,255,255,0.035);
+}
+
+.mcBarFill {
+  display: block;
+  height: 100%;
+  background: rgba(86,180,233,0.72);
+}
+
+.mcBar-stress .mcBarFill {
+  background: rgba(230,159,0,0.74);
+}
+
+.riskUnavailable {
+  margin-top: var(--space-md);
+  color: var(--status-unavailable);
+  border: 1px dashed var(--color-border);
+  border-radius: 6px;
+  padding: var(--space-lg);
+  font-size: var(--font-data);
+}
+
+.regimeTimeline {
+  display: grid;
+  gap: var(--space-sm);
+  margin-top: var(--space-md);
+}
+
+.regimeTimelineRow {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: var(--space-md);
+  align-items: stretch;
+}
+
+.regimeTimelineLabel {
+  display: flex;
+  align-items: center;
+  color: var(--status-neutral);
+  font-size: var(--font-label);
+  font-weight: 800;
+}
+
+.regimeTimelineSegments {
+  display: flex;
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+}
+
+.regimeTimeSegment {
+  flex: 1 0 74px;
+  min-height: 44px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 5px 6px;
+  border-left: 3px solid var(--status-info);
+  background: rgba(255,255,255,0.025);
+  overflow-wrap: anywhere;
+}
+
+.regimeTimeSegment span {
+  font-size: var(--font-label);
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.regimeTimeSegment small {
+  color: var(--status-neutral);
+  font-size: var(--font-meta);
+}
+
+.regimeTime-ok { border-left-color: var(--status-ok); }
+.regimeTime-warn { border-left-color: var(--status-warn); }
+.regimeTime-info { border-left-color: var(--status-info); }
+.regimeTime-unavailable { border-left-color: var(--status-unavailable); }
 
 body.theme-tech .telemetryStrip > span,
 body.theme-tech #pnlTotal,
@@ -449,4 +823,106 @@ body.data-sources-screen tbody tr:hover td {
 body.theme-tech tr.symbolContextMatch td {
   background: rgba(88,166,255,0.11) !important;
   box-shadow: inset 3px 0 0 rgba(88,166,255,0.75);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .update-flash,
+  .pill,
+  .badge,
+  .hmCell,
+  .incidentItem,
+  .chartCanvas,
+  .proChart {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root,
+  body.theme-tech {
+    --color-border: rgba(255,255,255,0.32);
+    --border-soft: rgba(255,255,255,0.28);
+    --border-strong: rgba(255,255,255,0.42);
+  }
+
+  .pill,
+  .badge,
+  .surfaceBanner,
+  .healthScoreFactor,
+  .hmCell,
+  .dataRow,
+  .safetyStatus,
+  .termBanner {
+    border-width: 2px !important;
+  }
+
+  .chartCanvas,
+  .proChart,
+  canvas.spark,
+  canvas[id$="Chart"],
+  canvas[id$="Canvas"] {
+    outline: 2px solid CanvasText;
+    outline-offset: 2px;
+  }
+}
+
+@media (forced-colors: active) {
+  .pill,
+  .badge,
+  .surfaceBanner,
+  .healthScoreFactor,
+  .hmCell,
+  .hmSwatch,
+  .dataRow,
+  .safetyStatus,
+  .termBanner,
+  .chartCanvas,
+  .proChart {
+    forced-color-adjust: auto;
+    background: Canvas !important;
+    color: CanvasText !important;
+    border-color: CanvasText !important;
+    box-shadow: none !important;
+  }
+
+  .pill.ok,
+  .badge-ok,
+  .healthScoreFactor.ok,
+  .hmCell[data-status="ok"] {
+    border-style: solid !important;
+  }
+
+  .pill.warn,
+  .pill.high,
+  .pill.blocked,
+  .badge-warn,
+  .badge-high,
+  .badge-blocked,
+  .healthScoreFactor.warn,
+  .healthScoreFactor.high,
+  .healthScoreFactor.blocked,
+  .hmCell[data-status="warn"],
+  .hmCell[data-status="high"],
+  .hmCell[data-status="blocked"] {
+    border-style: dashed !important;
+  }
+
+  .pill.crit,
+  .pill.bad,
+  .badge-crit,
+  .badge-danger,
+  .healthScoreFactor.crit,
+  .healthScoreFactor.bad,
+  .hmCell[data-status="crit"] {
+    border-style: double !important;
+  }
+
+  .pill.unavailable,
+  .badge-unavailable,
+  .healthScoreFactor.unavailable,
+  .hmCell[data-status="unavailable"] {
+    border-style: dotted !important;
+  }
 }

@@ -5,7 +5,16 @@
   Extracted from ui/dashboard.js (Phase 4)
 */
 
-import { esc, escapeHTML, fmtTime } from "./utils.js";
+import {
+  esc,
+  escapeHTML,
+  fmtTime,
+  statusAriaLabel,
+  statusGlyph,
+  statusLabel,
+  statusPillClasses,
+  statusToken,
+} from "./utils.js";
 
 function _pickAlertValue(row, keys) {
   const source = row && typeof row === "object" ? row : {};
@@ -30,7 +39,8 @@ function _pickAlertTs(row) {
 function _normalizeSeverity(value) {
   const raw = String(value || "").trim().toUpperCase();
   if (raw === "CRIT") return "CRIT";
-  if (raw === "WARN" || raw === "HIGH") return "WARN";
+  if (raw === "HIGH") return "HIGH";
+  if (raw === "WARN") return "WARN";
   if (raw === "INFO") return "INFO";
   return "INFO";
 }
@@ -135,7 +145,8 @@ export function applyAlertLocalState(rows, localState = {}) {
 // -----------------------------
 export function severityRank(s) {
   const sev = _normalizeSeverity(s);
-  if (sev === "CRIT") return 3;
+  if (sev === "CRIT") return 4;
+  if (sev === "HIGH") return 3;
   if (sev === "WARN") return 2;
   if (sev === "INFO") return 1;
   return 0;
@@ -143,11 +154,22 @@ export function severityRank(s) {
 
 export function cellColor(r) {
   const alert = normalizeAlert(r);
-  if (!alert) return { cls: "neutral", sw: "#2f3640" };
-  if (alert.status === "resolved") return { cls: "ok", sw: "#2ea043" };
-  if (alert.severity === "CRIT") return { cls: "crit", sw: "#ff6b6b" };
-  if (alert.severity === "WARN") return { cls: "warn", sw: "#d29922" };
-  return { cls: "neutral", sw: "#6e7681" };
+  const tokenKey =
+    !alert ? "neutral"
+      : alert.status === "resolved" ? "ok"
+        : alert.severity === "CRIT" ? "crit"
+          : alert.severity === "HIGH" ? "high"
+            : alert.severity === "WARN" ? "warn"
+              : alert.severity === "INFO" ? "info"
+                : "neutral";
+  const token = statusToken(tokenKey);
+  return {
+    cls: token.className,
+    sw: token.color,
+    glyph: token.glyph,
+    label: token.label,
+    key: token.key,
+  };
 }
 
 // -----------------------------
@@ -244,6 +266,8 @@ export function renderHeatmap(host, rows, onSelectSymbol) {
   const syms = Object.keys(by).sort().slice(0, 22);
 
   host.innerHTML = "";
+  host.setAttribute("role", "grid");
+  host.setAttribute("aria-label", "Alert heatmap by symbol and horizon");
 
   const mk = (cls, html) => {
     const d = document.createElement("div");
@@ -265,16 +289,35 @@ export function renderHeatmap(host, rows, onSelectSymbol) {
     for (const h of horizons) {
       const best = scoreCell(by[sym][h] || []);
       const c = cellColor(best);
+      const severityLabel = best
+        ? (best.status === "resolved" ? "RESOLVED" : best.severity)
+        : "NONE";
+      const aria = best
+        ? `${sym}, ${labels[h]} horizon, ${statusAriaLabel(c.key, `${severityLabel} alert: ${best.message || best.event_title || "alert"}`)}`
+        : `${sym}, ${labels[h]} horizon, no alert`;
 
       const cell = mk(
-        "",
-        `<span class="hmSwatch" style="background:${c.sw};"></span>
+        `hmStatus-${c.key}`,
+        `<span class="hmSwatch" style="--hm-color:${c.sw};" aria-hidden="true">${esc(c.glyph || statusGlyph(c.key))}</span>
          <span class="mono">${sym}</span>
-         <span class="hmMeta">${best ? best.severity : "—"}</span>`
+         <span class="hmStatusLabel">${esc(best ? (c.label || statusLabel(c.key)) : "No alert")}</span>
+         <span class="hmMeta">${esc(severityLabel)}</span>`
       );
+      cell.tabIndex = 0;
+      cell.setAttribute("role", "button");
+      cell.setAttribute("aria-label", aria);
+      cell.dataset.status = c.key;
+      cell.dataset.severity = severityLabel;
 
       cell.addEventListener("click", () => {
         if (onSelectSymbol) onSelectSymbol(sym);
+      });
+      cell.addEventListener("keydown", (event) => {
+        if (!event) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          if (onSelectSymbol) onSelectSymbol(sym);
+        }
       });
 
       host.appendChild(cell);
@@ -327,10 +370,12 @@ export function renderIncidentQueue(host, rows, opts) {
 
       const item = document.createElement("div");
       item.className = "incidentItem";
+      item.dataset.sev = r.status === "resolved" ? "OK" : String(r.severity || "INFO").toUpperCase();
+      item.dataset.status = c.key;
       item.tabIndex = 0;
       item.innerHTML = `
         <div class="incidentTop">
-          <span class="pill ${c.cls}">
+          <span class="${statusPillClasses(c.key, "incidentSeverity")}" data-status="${esc(c.key)}" aria-label="${esc(statusAriaLabel(c.key, r.status === "resolved" ? "RESOLVED" : r.severity))}">
             ${r.status === "resolved" ? "RESOLVED" : r.severity}
           </span>
           <div class="incidentTitle">

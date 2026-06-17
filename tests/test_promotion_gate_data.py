@@ -82,6 +82,8 @@ def test_promotion_gate_response_shape_includes_comparison_checklist_and_safe_ac
     metrics = {row["key"]: row for row in gate["comparison_metrics"]}
     assert metrics["rmse"]["champion"] == 1.2
     assert metrics["rmse"]["challenger"] == 1.0
+    assert metrics["rmse"]["gate_threshold"]["operator"] == "<="
+    assert metrics["n_eval"]["gate_threshold"]["operator"] == ">="
     assert metrics["drawdown"]["champion"] == 0.12
     assert metrics["turnover"]["challenger"] == 0.2
 
@@ -138,6 +140,7 @@ def test_promotion_gate_ui_helpers_render_states_and_justification_payload():
     script = r"""
 import assert from "node:assert/strict";
 import {
+  buildPromotionComparisonBarViewModel,
   buildPromotionActionPayload,
   buildRollbackConsequencePreview,
   formatGateState,
@@ -173,6 +176,44 @@ const preview = buildRollbackConsequencePreview({
 });
 assert.match(preview, /Current champion: ridge_v2 @ 102/);
 assert.match(preview, /Rollback target: ridge_v1 @ 101/);
+
+const comparison = buildPromotionComparisonBarViewModel({
+  model_name: "embed_regressor",
+  regime: "global",
+  status: { enabled: true, allowed: false },
+  champion: { updated_ts_ms: 1_000 },
+  challenger: { updated_ts_ms: 1_000 },
+  comparison_metrics: [
+    {
+      key: "rmse",
+      label: "RMSE",
+      direction: "lower",
+      champion: 1.2,
+      challenger: 1.0,
+      delta: -0.2,
+      gate_threshold: { value: 1.1, operator: "<=", source: "unit" },
+      p_value: 0.01,
+    },
+    {
+      key: "turnover",
+      label: "Turnover",
+      direction: "lower",
+      champion: 0.2,
+      challenger: 0.5,
+      stale: true,
+    },
+  ],
+}, { nowMs: 10_000, staleAfterMs: 5_000 });
+
+assert.equal(comparison.summaryState, "fail");
+assert.equal(comparison.bars[0].decision.state, "pass");
+assert.equal(comparison.bars[0].thresholdLabel, "Gate <= 1.100");
+assert.equal(comparison.bars[0].significance.state, "pass");
+assert.equal(comparison.bars[0].championPct, 100);
+assert.equal(Math.round(comparison.bars[0].challengerPct), 83);
+assert.equal(Math.round(comparison.bars[0].thresholdPct), 92);
+assert.equal(comparison.bars[1].decision.state, "fail");
+assert.equal(comparison.bars[1].stale, true);
 """
     result = subprocess.run(
         ["node", "--input-type=module", "-e", script],

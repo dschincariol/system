@@ -31,10 +31,27 @@
       --chip:#0e1117;
       --btn:#161b22;
 
-      --ok:#2ea043;
-      --warn:#d29922;
-      --crit:#ff6b6b;
-      --info:#58a6ff;
+      --status-neutral:#A7B0BC;
+      --status-info:#56B4E9;
+      --status-ok:#009E73;
+      --status-warn:#E69F00;
+      --status-high:#CC79A7;
+      --status-crit:#D55E00;
+      --status-blocked:#73B7E6;
+      --status-unavailable:#8B949E;
+      --status-neutral-bg:rgba(167,176,188,.13);
+      --status-info-bg:rgba(86,180,233,.14);
+      --status-ok-bg:rgba(0,158,115,.14);
+      --status-warn-bg:rgba(230,159,0,.15);
+      --status-high-bg:rgba(204,121,167,.15);
+      --status-crit-bg:rgba(213,94,0,.16);
+      --status-blocked-bg:rgba(115,183,230,.16);
+      --status-unavailable-bg:rgba(139,148,158,.13);
+
+      --ok:var(--status-ok);
+      --warn:var(--status-warn);
+      --crit:var(--status-crit);
+      --info:var(--status-info);
 
       --r: 14px;
       --r2: 10px;
@@ -115,9 +132,13 @@
   border-radius: 12px;
   background: rgba(255,255,255,.025);
 }
-.healthScoreFactor.ok{ border-color: rgba(46,160,67,.55); }
-.healthScoreFactor.warn{ border-color: rgba(210,153,34,.65); }
-.healthScoreFactor.bad{ border-color: rgba(255,107,107,.65); }
+.healthScoreFactor.ok{ border-color: var(--status-ok); border-style: solid; }
+.healthScoreFactor.warn{ border-color: var(--status-warn); border-style: dashed; }
+.healthScoreFactor.high{ border-color: var(--status-high); border-style: dashed; }
+.healthScoreFactor.crit,
+.healthScoreFactor.bad{ border-color: var(--status-crit); border-style: double; }
+.healthScoreFactor.blocked{ border-color: var(--status-blocked); border-style: dashed; }
+.healthScoreFactor.unavailable{ border-color: var(--status-unavailable); border-style: dotted; }
 .healthScoreFactor.dim{ opacity:.92; }
 .healthScoreFactorName{
   font-size:11px;
@@ -565,27 +586,52 @@
     .pill.bad  { border-color: var(--crit); }
     .pill.dim  { opacity: .9; color: var(--muted); }
 .pill.warn {
-  background: linear-gradient(180deg, #f0b429, #d29922);
-  color:#000;
-  border-color: rgba(0,0,0,.35);
+  background: var(--status-warn-bg);
+  color:var(--status-warn);
+  border-color: var(--status-warn);
+  border-style: dashed;
   font-weight: 700;
 }
 
-.pill.crit {
-  background: linear-gradient(180deg, #ff7b7b, #ff4d4d);
-  color:#fff;
-  border-color: rgba(0,0,0,.35);
+.pill.high {
+  background: var(--status-high-bg);
+  color:var(--status-high);
+  border-color: var(--status-high);
+  border-style: dashed;
+  font-weight: 800;
+}
+
+.pill.crit,
+.pill.bad {
+  background: var(--status-crit-bg);
+  color:var(--status-crit);
+  border-color: var(--status-crit);
+  border-style: double;
   font-weight: 900;
-  box-shadow: 0 0 0 1px rgba(255,107,107,.35),
-              0 0 18px rgba(255,107,107,.25);
+  box-shadow: 0 0 0 1px var(--status-crit-bg);
+}
+.pill.blocked {
+  background:
+    repeating-linear-gradient(135deg, rgba(255,255,255,.08) 0 2px, transparent 2px 8px),
+    var(--status-blocked-bg);
+  color:var(--status-blocked);
+  border-color: var(--status-blocked);
+  border-style: dashed;
+  font-weight: 900;
+}
+.pill.unavailable {
+  background: var(--status-unavailable-bg);
+  color:var(--status-unavailable);
+  border-color: var(--status-unavailable);
+  border-style: dotted;
 }
     .pill.acked{ background:#6e7681; color:#fff; border-color: rgba(0,0,0,.25); }
     .pill.resolved { background:#444; color:#ddd; border-color: rgba(0,0,0,.25); }
 
     @keyframes critPulse {
-  0%   { box-shadow: 0 0 0 rgba(255,107,107,0); }
-  50%  { box-shadow: 0 0 18px rgba(255,107,107,.35); }
-  100% { box-shadow: 0 0 0 rgba(255,107,107,0); }
+  0%   { box-shadow: 0 0 0 rgba(213,94,0,0); }
+  50%  { box-shadow: 0 0 18px var(--status-crit-bg); }
+  100% { box-shadow: 0 0 0 rgba(213,94,0,0); }
 }
 
 .pill.crit {
@@ -783,11 +829,23 @@ body.mode-expert .operatorOnly { display:none !important; }
 
 .incidentItem[data-sev="CRIT"]::before{
   background: var(--crit);
-  box-shadow: 0 0 12px rgba(255,107,107,.6);
+  box-shadow: 0 0 12px var(--status-crit-bg);
+  width:6px;
 }
 
 .incidentItem[data-sev="WARN"]::before{
   background: var(--warn);
+  border-left: 2px dashed var(--warn);
+}
+
+.incidentItem[data-sev="HIGH"]::before{
+  background: var(--status-high);
+  border-left: 2px dashed var(--status-high);
+}
+
+.incidentItem[data-status="blocked"]::before{
+  background: var(--status-blocked);
+  border-left: 2px dashed var(--status-blocked);
 }
 
     .incidentTop{
@@ -917,12 +975,14 @@ body.mode-expert .operatorOnly { display:none !important; }
     }
     .opsBanner.is-visible{ display:block; }
     .opsBanner.warn{
-      border-color: rgba(210,153,34,.55);
-      background: rgba(210,153,34,.10);
+      border-color: var(--status-warn);
+      border-style: dashed;
+      background: var(--status-warn-bg);
     }
     .opsBanner.crit{
-      border-color: rgba(255,107,107,.55);
-      background: rgba(255,107,107,.10);
+      border-color: var(--status-crit);
+      border-style: double;
+      background: var(--status-crit-bg);
     }
     .opsBannerTitle{
       font-size: 13px;
@@ -988,6 +1048,199 @@ body.mode-expert .operatorOnly { display:none !important; }
     .opsNote {
       border-left: 2px solid rgba(88,166,255,.35);
       padding-left: 10px;
+    }
+    .bulletBarsMount,
+    .regimeRibbonMount {
+      margin-top: 10px;
+    }
+    .bulletBars {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 10px;
+    }
+    .bulletBar {
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 8px;
+      padding: 10px;
+      background: rgba(255,255,255,.025);
+      min-width: 0;
+    }
+    .bulletBarHeader,
+    .bulletBarMeta,
+    .regimeRibbonFoot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+    .bulletBarLabel,
+    .regimeRibbonLayer {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .bulletBarStatus {
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .bulletBar-ok .bulletBarStatus { color: var(--status-ok); }
+    .bulletBar-watch .bulletBarStatus { color: var(--status-warn); }
+    .bulletBar-over .bulletBarStatus { color: var(--status-crit); }
+    .bulletBar-blocked .bulletBarStatus { color: var(--status-blocked); }
+    .bulletBar-unavailable .bulletBarStatus { color: var(--status-unavailable); }
+    .bulletBarTrack {
+      position: relative;
+      overflow: hidden;
+      height: 16px;
+      margin: 8px 0;
+      border-radius: 5px;
+      border: 1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.035);
+    }
+    .bulletBarBands,
+    .bulletBarBand,
+    .bulletBarFill,
+    .bulletBarCap {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+    }
+    .bulletBarBands { left: 0; right: 0; }
+    .bulletBarBand-ok { background: rgba(0,158,115,.13); }
+    .bulletBarBand-watch { background: rgba(230,159,0,.16); }
+    .bulletBarBand-over { background: rgba(213,94,0,.18); }
+    .bulletBarFill {
+      left: 0;
+      max-width: 100%;
+      background: rgba(86,180,233,.74);
+      border-right: 2px solid rgba(230,237,243,.88);
+    }
+    .bulletBar-blocked .bulletBarFill { background: rgba(115,183,230,.72); }
+    .bulletBar-over .bulletBarFill { background: rgba(213,94,0,.76); }
+    .bulletBar-watch .bulletBarFill { background: rgba(230,159,0,.72); }
+    .bulletBar-unavailable .bulletBarFill { background: rgba(139,148,158,.38); }
+    .bulletBarCap {
+      width: 2px;
+      transform: translateX(-1px);
+      background: var(--text);
+      box-shadow: 0 0 0 1px rgba(0,0,0,.45);
+    }
+    .bulletBarMeta {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .bulletBarsFallback {
+      color: var(--muted);
+      font-size: 12px;
+      border: 1px dashed rgba(255,255,255,.14);
+      border-radius: 8px;
+      padding: 10px;
+    }
+    .regimeRibbon {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 8px;
+      padding: 10px;
+      background: rgba(255,255,255,.022);
+    }
+    .regimeRibbonItem {
+      min-width: 0;
+      border-left: 3px solid var(--status-info);
+      padding: 6px 8px;
+      background: rgba(255,255,255,.025);
+      border-radius: 6px;
+    }
+    .regimeRibbon-ok { border-left-color: var(--status-ok); }
+    .regimeRibbon-warn { border-left-color: var(--status-warn); }
+    .regimeRibbon-info { border-left-color: var(--status-info); }
+    .regimeRibbon-unavailable { border-left-color: var(--status-unavailable); }
+    .regimeRibbonLabel {
+      display: block;
+      margin-top: 4px;
+      font-weight: 900;
+      overflow-wrap: anywhere;
+    }
+    .regimeRibbonMeta {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .regimeRibbonFoot {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 11px;
+      border-top: 1px solid rgba(255,255,255,.08);
+      padding-top: 8px;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 720px) {
+      .regimeRibbon { grid-template-columns: 1fr; }
+    }
+    .killSwitchRows {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 8px 0 10px;
+    }
+    .killSwitchRow {
+      display: grid;
+      grid-template-columns: 14px minmax(120px, 1fr) auto minmax(140px, 2fr) auto;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,.025);
+      min-width: 0;
+    }
+    .killSwitchLight {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--status-unavailable);
+      box-shadow: 0 0 0 3px var(--status-unavailable-bg);
+    }
+    .killSwitchRow-ok .killSwitchLight {
+      background: var(--status-ok);
+      box-shadow: 0 0 0 3px var(--status-ok-bg);
+    }
+    .killSwitchRow-warn .killSwitchLight {
+      background: var(--status-warn);
+      box-shadow: 0 0 0 3px var(--status-warn-bg);
+    }
+    .killSwitchRow-crit .killSwitchLight {
+      background: var(--status-crit);
+      box-shadow: 0 0 0 3px var(--status-crit-bg);
+    }
+    .killSwitchName,
+    .killSwitchState {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+    .killSwitchReason {
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .killSwitchAction {
+      min-height: 34px;
+      white-space: nowrap;
+    }
+    @media (max-width: 820px) {
+      .killSwitchRow {
+        grid-template-columns: 14px 1fr auto;
+      }
+      .killSwitchReason,
+      .killSwitchAction {
+        grid-column: 2 / -1;
+      }
     }
     .operatorConsoleBridge {
       margin-top: 12px;
@@ -1122,6 +1375,47 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
       clip:rect(0,0,0,0);
       white-space:nowrap;
       border:0;
+    }
+    .chartA11y{
+      margin-top:8px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .chartA11ySummary{
+      margin-bottom:4px;
+    }
+    .chartA11yDetails{
+      margin-top:4px;
+    }
+    .chartA11yDetails summary{
+      cursor:pointer;
+      color:var(--info);
+      font-weight:700;
+      width:max-content;
+      max-width:100%;
+    }
+    .chartA11yDetails summary:focus-visible{
+      outline:2px solid rgba(88,166,255,.75);
+      outline-offset:3px;
+      border-radius:4px;
+    }
+    .chartA11yTableWrap{
+      margin-top:6px;
+      max-height:220px;
+      overflow:auto;
+      border:1px solid rgba(48,54,61,.75);
+      border-radius:var(--r2);
+    }
+    .chartA11yTable th,
+    .chartA11yTable td{
+      white-space:nowrap;
+    }
+    canvas:focus-visible,
+    .proChart:focus-visible,
+    #liveMarketChart:focus-visible{
+      outline:2px solid rgba(88,166,255,.75);
+      outline-offset:3px;
     }
     .tableControls{
       display:flex;
@@ -1307,10 +1601,11 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
       gap:10px;
       user-select:none;
     }
-    .postureBadge.monitor{ border-color: rgba(46,160,67,.75); }
-    .postureBadge.prepare{ border-color: rgba(210,153,34,.85); }
+    .postureBadge.monitor{ border-color: var(--status-ok); }
+    .postureBadge.prepare{ border-color: var(--status-warn); border-style: dashed; }
 .postureBadge.act{
-  border-color: rgba(255,107,107,.85);
+  border-color: var(--status-crit);
+  border-style: double;
   animation: softPulse 1.1s ease-in-out infinite;
 }
 
@@ -1319,9 +1614,9 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
       background: #6e7681;
       box-shadow: 0 0 0 3px rgba(110,118,129,.15);
     }
-    .postureBadge.monitor .postureDot{ background: var(--ok); box-shadow: 0 0 0 3px rgba(46,160,67,.16); }
-    .postureBadge.prepare .postureDot{ background: var(--warn); box-shadow: 0 0 0 3px rgba(210,153,34,.16); }
-    .postureBadge.act .postureDot{ background: var(--crit); box-shadow: 0 0 0 3px rgba(255,107,107,.16); }
+    .postureBadge.monitor .postureDot{ background: var(--status-ok); box-shadow: 0 0 0 3px var(--status-ok-bg); }
+    .postureBadge.prepare .postureDot{ background: var(--status-warn); box-shadow: 0 0 0 3px var(--status-warn-bg); }
+    .postureBadge.act .postureDot{ background: var(--status-crit); box-shadow: 0 0 0 3px var(--status-crit-bg); }
 
     @keyframes softPulse {
       0% { transform: scale(1); filter: brightness(1); }
@@ -1469,6 +1764,328 @@ tr.symbolContextMatch td{
   gap:6px 10px;
   font-size:12px;
 }
+.decisionDetailBlockWide{
+  grid-column:1 / -1;
+}
+.decisionAttribution{
+  display:grid;
+  gap:10px;
+}
+.decisionAttributionSummary{
+  display:flex;
+  gap:8px;
+  align-items:flex-start;
+  flex-wrap:wrap;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.45;
+}
+.decisionAttributionAxis{
+  display:grid;
+  grid-template-columns:1fr auto 1fr;
+  gap:8px;
+  color:var(--muted);
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+}
+.decisionAttributionAxis span:nth-child(2){
+  color:var(--text);
+}
+.decisionAttributionAxis span:last-child{
+  text-align:right;
+}
+.decisionAttributionRows{
+  display:grid;
+  gap:8px;
+}
+.decisionAttributionRow{
+  display:grid;
+  grid-template-columns:minmax(120px, 1fr) minmax(180px, 2fr) minmax(92px, auto);
+  gap:10px;
+  align-items:center;
+}
+.decisionAttributionFeature{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  min-width:0;
+  color:var(--text);
+  font-size:12px;
+}
+.decisionAttributionFeature span:last-child{
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.decisionAttributionRank{
+  flex:0 0 auto;
+  min-width:20px;
+  height:20px;
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:50%;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  font-size:11px;
+  color:var(--muted);
+}
+.decisionAttributionTrack{
+  position:relative;
+  height:20px;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(255,255,255,.035);
+  overflow:hidden;
+}
+.decisionAttributionZero{
+  position:absolute;
+  top:0;
+  bottom:0;
+  left:50%;
+  width:1px;
+  background:rgba(255,255,255,.36);
+}
+.decisionAttributionFill{
+  position:absolute;
+  top:3px;
+  bottom:3px;
+  max-width:50%;
+  border:1px solid currentColor;
+  background:repeating-linear-gradient(
+    45deg,
+    currentColor 0,
+    currentColor 2px,
+    transparent 2px,
+    transparent 5px
+  );
+  opacity:.82;
+}
+.decisionAttributionRow.is-positive .decisionAttributionFill{
+  left:50%;
+  color:var(--status-ok);
+}
+.decisionAttributionRow.is-negative .decisionAttributionFill{
+  right:50%;
+  color:var(--status-crit);
+}
+.decisionAttributionRow.is-neutral .decisionAttributionFill{
+  left:50%;
+  color:var(--muted);
+}
+.decisionAttributionValue{
+  display:flex;
+  gap:4px;
+  justify-content:flex-end;
+  color:var(--text);
+  font-size:12px;
+}
+.decisionAttributionTable{
+  width:100%;
+  border-collapse:collapse;
+  font-size:12px;
+}
+.decisionAttributionTable th,
+.decisionAttributionTable td{
+  border-bottom:1px solid rgba(255,255,255,.08);
+  padding:6px 8px;
+  text-align:left;
+}
+.decisionAttributionUnavailable{
+  display:grid;
+  gap:4px;
+  padding:10px;
+  border:1px dotted var(--status-unavailable);
+  background:var(--status-unavailable-bg);
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.45;
+}
+.decisionStepperMount{
+  margin-bottom:10px;
+}
+.decisionStepperWrap{
+  display:grid;
+  gap:10px;
+}
+.decisionStepperSummary{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  padding:9px 10px;
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:10px;
+  background:rgba(255,255,255,.025);
+  color:var(--text);
+  font-size:12px;
+  line-height:1.4;
+}
+.decisionStepperSummaryIcon{
+  flex:0 0 auto;
+  min-width:26px;
+  text-align:center;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight:900;
+}
+.decisionStepperSummary.is-ok{
+  border-color:var(--status-ok);
+  background:var(--status-ok-bg);
+}
+.decisionStepperSummary.is-warn{
+  border-color:var(--status-warn);
+  border-style:dashed;
+  background:var(--status-warn-bg);
+}
+.decisionStepperSummary.is-crit{
+  border-color:var(--status-crit);
+  border-style:double;
+  background:var(--status-crit-bg);
+}
+.decisionStepperSummary.is-unavailable,
+.decisionStepperSummary.is-neutral{
+  border-color:var(--status-unavailable);
+  border-style:dotted;
+  background:var(--status-unavailable-bg);
+}
+.decisionStepper{
+  list-style:none;
+  display:grid;
+  grid-template-columns:repeat(6, minmax(118px, 1fr));
+  gap:8px;
+  margin:0;
+  padding:0;
+  overflow-x:auto;
+}
+.decisionStepperItem{
+  position:relative;
+  min-width:0;
+}
+.decisionStepperItem:not(:last-child)::after{
+  content:"";
+  position:absolute;
+  top:25px;
+  right:-8px;
+  width:8px;
+  border-top:2px solid rgba(157,167,179,.38);
+}
+.decisionStep{
+  height:100%;
+  min-height:92px;
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:10px;
+  background:rgba(255,255,255,.018);
+}
+.decisionStep[open]{
+  background:rgba(255,255,255,.035);
+}
+.decisionStepSummary{
+  list-style:none;
+  cursor:pointer;
+  min-height:72px;
+  display:grid;
+  grid-template-columns:28px minmax(0, 1fr);
+  align-items:flex-start;
+  gap:8px;
+  padding:9px 8px;
+}
+.decisionStepSummary::-webkit-details-marker{
+  display:none;
+}
+.decisionStepSummary:focus-visible{
+  outline:2px solid rgba(88,166,255,.75);
+  outline-offset:3px;
+  border-radius:8px;
+}
+.decisionStepIcon{
+  width:26px;
+  height:26px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  border:1px solid rgba(255,255,255,.16);
+  border-radius:999px;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size:10px;
+  font-weight:900;
+  line-height:1;
+  color:var(--text);
+  background:rgba(255,255,255,.04);
+}
+.decisionStepText{
+  min-width:0;
+  display:grid;
+  gap:4px;
+}
+.decisionStepLabel{
+  font-size:11px;
+  font-weight:900;
+  line-height:1.25;
+}
+.decisionStepStatus{
+  color:var(--muted);
+  font-size:11px;
+  line-height:1.25;
+}
+.decisionStepDetail{
+  border-top:1px solid rgba(255,255,255,.08);
+  padding:8px;
+  color:var(--muted);
+  font-size:11px;
+  line-height:1.4;
+}
+.decisionStepTimestamp{
+  margin-top:5px;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size:10px;
+}
+.decisionStepperItem.is-ok .decisionStep{
+  border-color:var(--status-ok);
+  border-style:solid;
+}
+.decisionStepperItem.is-warn .decisionStep{
+  border-color:var(--status-warn);
+  border-style:dashed;
+}
+.decisionStepperItem.is-crit .decisionStep{
+  border-color:var(--status-crit);
+  border-style:double;
+}
+.decisionStepperItem.is-unavailable .decisionStep,
+.decisionStepperItem.is-neutral .decisionStep{
+  border-color:var(--status-unavailable);
+  border-style:dotted;
+}
+.decisionStepperItem.is-ok .decisionStepIcon{
+  color:var(--status-ok);
+  border-color:var(--status-ok);
+  background:var(--status-ok-bg);
+}
+.decisionStepperItem.is-warn .decisionStepIcon{
+  color:var(--status-warn);
+  border-color:var(--status-warn);
+  background:var(--status-warn-bg);
+}
+.decisionStepperItem.is-crit .decisionStepIcon{
+  color:var(--status-crit);
+  border-color:var(--status-crit);
+  background:var(--status-crit-bg);
+}
+.decisionStepperItem.is-unavailable .decisionStepIcon,
+.decisionStepperItem.is-neutral .decisionStepIcon{
+  color:var(--status-unavailable);
+  border-color:var(--status-unavailable);
+  background:var(--status-unavailable-bg);
+}
+.decisionStepperItem.is-emphasized .decisionStep{
+  box-shadow:0 0 0 2px rgba(255,255,255,.10), 0 12px 26px rgba(0,0,0,.28);
+}
+.decisionStepperItem.is-emphasized .decisionStepLabel{
+  color:#fff;
+}
+@media (max-width: 760px){
+  .decisionStepper{
+    grid-template-columns:repeat(6, minmax(132px, 1fr));
+  }
+}
 .decisionEmpty{
   color:var(--muted);
   font-size:12px;
@@ -1532,24 +2149,28 @@ tr.symbolContextMatch td{
   border:1px solid rgba(255,255,255,.12);
 }
 .panelStateBadge.is-fresh{
-  color:#2ea043;
-  border-color:rgba(46,160,67,.45);
-  background:rgba(46,160,67,.12);
+  color:var(--status-ok);
+  border-color:var(--status-ok);
+  border-style:solid;
+  background:var(--status-ok-bg);
 }
 .panelStateBadge.is-stale{
-  color:#d29922;
-  border-color:rgba(210,153,34,.45);
-  background:rgba(210,153,34,.12);
+  color:var(--status-warn);
+  border-color:var(--status-warn);
+  border-style:dashed;
+  background:var(--status-warn-bg);
 }
 .panelStateBadge.is-empty{
-  color:#9da7b3;
-  border-color:rgba(157,167,179,.28);
-  background:rgba(157,167,179,.08);
+  color:var(--status-unavailable);
+  border-color:var(--status-unavailable);
+  border-style:dotted;
+  background:var(--status-unavailable-bg);
 }
 .panelStateBadge.is-error{
-  color:#ff6b6b;
-  border-color:rgba(255,107,107,.45);
-  background:rgba(255,107,107,.12);
+  color:var(--status-crit);
+  border-color:var(--status-crit);
+  border-style:double;
+  background:var(--status-crit-bg);
 }
 .panelStateText{
   flex:1 1 220px;
@@ -1591,6 +2212,138 @@ tr.symbolContextMatch td{
   font-size:11px;
   color:var(--muted);
   line-height:1.4;
+}
+.promotionComparisonBars{
+  display:grid;
+  gap:10px;
+  margin-top:12px;
+}
+.promotionComparisonBar{
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:8px;
+  padding:10px;
+  background:rgba(255,255,255,.02);
+}
+.promotionComparisonBar[data-decision="pass"]{ border-color:rgba(0,158,115,.55); }
+.promotionComparisonBar[data-decision="warn"]{ border-color:rgba(230,159,0,.62); border-style:dashed; }
+.promotionComparisonBar[data-decision="fail"]{ border-color:rgba(213,94,0,.7); border-style:double; }
+.promotionComparisonBar[data-decision="unavailable"]{ border-color:rgba(139,148,158,.55); border-style:dotted; }
+.promotionComparisonTop{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+}
+.promotionComparisonTitle{
+  font-weight:900;
+  font-size:13px;
+}
+.promotionComparisonMeta{
+  display:flex;
+  gap:6px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+.promotionComparisonTrack{
+  position:relative;
+  display:grid;
+  gap:6px;
+  margin-top:9px;
+}
+.promotionComparisonLane{
+  display:grid;
+  grid-template-columns:84px minmax(120px,1fr) auto;
+  gap:8px;
+  align-items:center;
+}
+.promotionComparisonLaneLabel{
+  color:var(--muted);
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+}
+.promotionComparisonRail{
+  position:relative;
+  height:12px;
+  overflow:hidden;
+  border:1px solid rgba(48,54,61,.75);
+  border-radius:999px;
+  background:rgba(10,13,18,.9);
+}
+.promotionComparisonFill{
+  height:100%;
+  min-width:2px;
+  border-radius:999px;
+  background:var(--status-neutral);
+}
+.promotionComparisonFill.is-champion{ background:var(--status-info); }
+.promotionComparisonFill.is-challenger{ background:var(--status-warn); }
+.promotionComparisonThreshold{
+  position:absolute;
+  top:-3px;
+  bottom:-3px;
+  width:2px;
+  background:var(--status-high);
+  box-shadow:0 0 0 1px rgba(0,0,0,.4);
+}
+.promotionComparisonFooter{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  align-items:center;
+  margin-top:8px;
+  color:var(--muted);
+  font-size:11px;
+}
+.portfolioBtAnnotations{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  align-items:stretch;
+  margin-top:10px;
+}
+.portfolioBtAnnotation{
+  display:grid;
+  gap:3px;
+  min-width:112px;
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:8px;
+  padding:8px 10px;
+  background:rgba(255,255,255,.025);
+}
+.portfolioBtAnnotationLabel{
+  color:var(--muted);
+  font-size:10px;
+  font-weight:800;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+.portfolioBtAnnotationValue{
+  color:var(--text);
+  font-size:14px;
+  font-weight:900;
+}
+.portfolioBtAnnotationMeta{
+  color:var(--muted);
+  font-size:11px;
+  line-height:1.3;
+}
+.portfolioBtContext{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  align-items:center;
+  margin-top:10px;
+}
+.portfolioBtHover{
+  flex:1 1 320px;
+  min-height:30px;
+  border:1px solid rgba(48,54,61,.75);
+  border-radius:8px;
+  background:rgba(10,13,18,.72);
+  padding:7px 10px;
+  color:var(--muted);
 }
 .rawToggle{
   margin-top:10px;
@@ -1712,6 +2465,87 @@ tr.symbolContextMatch td{
     <div id="healthScoreFactors" class="healthScoreFactors" aria-label="Health score factor breakdown"></div>
   </div>
 
+  <div class="card operatorOverviewCard" id="operatorOverviewCard" data-screens="overview" aria-labelledby="operatorOverviewTitle">
+    <div class="operatorOverviewHeader">
+      <div>
+        <div class="section-kicker">Operator Overview</div>
+        <h2 id="operatorOverviewTitle">At-a-glance runtime state</h2>
+      </div>
+      <span class="pill dim">read-only</span>
+    </div>
+
+    <div class="operatorOverviewGrid">
+      <section id="overviewStatusTile" class="overviewTile overviewStatusTile" role="group" aria-label="System status unavailable.">
+        <div class="overviewTileTop">
+          <div>
+            <div class="overviewTileQuestion">Is the system OK?</div>
+            <div class="overviewTileTitle">System status</div>
+          </div>
+          <span id="overviewStatusFreshness" class="pill dim mono">Freshness unavailable</span>
+        </div>
+        <div class="overviewStatusHero" role="img" aria-label="System status word, icon, score, and freshness">
+          <span id="overviewStatusIcon" class="overviewStatusIcon" aria-hidden="true">?</span>
+          <span id="overviewStatusWord" class="overviewStatusWord">CAUTION</span>
+        </div>
+        <div id="overviewStatusScore" class="overviewStatusScore">Health score unavailable</div>
+        <div id="overviewStatusHeadline" class="overviewTileHeadline">System status unavailable</div>
+        <div id="overviewStatusMeaning" class="overviewTileCopy">Waiting for production runtime status.</div>
+        <div class="overviewNextStep">
+          <span class="overviewNextLabel">Next</span>
+          <span id="overviewStatusNext">Review detailed runtime panels before intervening.</span>
+        </div>
+        <div id="overviewStatusFallback" class="sr-only">System status unavailable.</div>
+      </section>
+
+      <section id="overviewDecisionTile" class="overviewTile overviewDecisionTile" role="group" aria-label="Current decision unavailable.">
+        <div class="overviewTileTop">
+          <div>
+            <div class="overviewTileQuestion">What is it doing right now?</div>
+            <div id="overviewDecisionTitle" class="overviewTileTitle">No recent decisions</div>
+          </div>
+          <span id="overviewDecisionMeta" class="pill dim mono">Decision freshness unavailable</span>
+        </div>
+        <div id="overviewDecisionStepper" class="overviewDecisionStepper" aria-live="polite">
+          <div class="overviewEmpty">No decision flow to display.</div>
+        </div>
+        <div id="overviewDecisionSummary" class="overviewTileCopy">Decision summary unavailable.</div>
+        <div id="overviewDecisionTimeline" class="overviewDecisionTimeline" role="img" aria-label="Recent decision timeline unavailable.">
+          <div class="overviewEmpty">No recent decision markers.</div>
+        </div>
+        <div id="overviewDecisionFallback" class="sr-only">Current decision unavailable.</div>
+      </section>
+
+      <section id="overviewTrustTile" class="overviewTile overviewTrustTile" role="group" aria-label="Risk headroom and trust state unavailable.">
+        <div class="overviewTileTop">
+          <div>
+            <div class="overviewTileQuestion">Should I trust it?</div>
+            <div class="overviewTileTitle">Trust and headroom</div>
+          </div>
+          <span class="pill dim">advisory</span>
+        </div>
+        <div id="overviewRiskBars" class="bulletBarsMount overviewRiskBars" aria-live="polite"></div>
+        <div id="overviewRiskUnavailable" class="overviewTileCopy"></div>
+        <div class="overviewTrustBottom">
+          <div>
+            <div class="overviewMiniLabel">PnL trend</div>
+            <div id="overviewPnlTrendText" class="overviewTileCopy">PnL trend unavailable.</div>
+            <div id="overviewPnlSparkline" class="overviewPnlSparkline" role="img" aria-label="PnL trend unavailable.">
+              <div class="overviewSparklineFallback">PnL sparkline unavailable</div>
+            </div>
+          </div>
+          <div>
+            <div class="overviewMiniLabel">Market stress driver</div>
+            <div id="overviewStressDriver" class="overviewStressDriver" role="img" aria-label="Market stress top driver unavailable.">
+              <span class="overviewStressScore">Stress unavailable</span>
+              <span class="overviewStressText">Top driver unavailable.</span>
+            </div>
+          </div>
+        </div>
+        <div id="overviewTrustFallback" class="sr-only">Risk headroom and trust state unavailable.</div>
+      </section>
+    </div>
+  </div>
+
   <div class="card" id="recommendedActionCard">
     <h2 class="card-header">🎯 Recommended Action <span id="recommendedActionStatePill" class="pill dim meta-pill-offset">loading</span></h2>
     <div class="recommendedActionGrid">
@@ -1762,7 +2596,7 @@ Calmar Ratio —
 <!-- ========================================================= -->
 <!-- OPERATOR SUMMARY (Human First View)                      -->
 <!-- ========================================================= -->
-<div class="card" id="operatorSummaryCard" data-screens="overview">
+<div class="card" id="operatorSummaryCard" data-screens="operate">
 
   <h2>🧭 What’s going on?</h2>
 
@@ -1936,7 +2770,7 @@ Trade Execution Integrity —
 <div class="card collapsible" id="proChartsCard" style="display:none;" data-screens="overview,analyze">
       <h2 class="card-header">📊 Live Market Chart <span id="proChartsMeta" class="pill dim meta-pill-offset">disabled</span></h2>
   <div class="small" style="margin:6px 0 10px;">
-    Uses /api/market/candles + /api/market/stream for price, /api/terminal/markers for trade markers, and /api/terminal/equity with /api/portfolio/backtest/latest fallback for portfolio overlay.
+    Uses /api/market/candles + /api/market/stream for price, /api/terminal/decision_overlays for automated decisions, and /api/terminal/equity with /api/portfolio/backtest/latest fallback for portfolio overlay.
   </div>
   <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:0 0 10px;">
     <span id="proChartsHealth" class="pill dim">boot</span>
@@ -1950,7 +2784,7 @@ Trade Execution Integrity —
     </label>
     <label class="pill dim" style="gap:8px;">
       <input id="proChartsOvTrades" type="checkbox" checked />
-      trade markers
+      decision overlays
     </label>
     <label class="pill dim" style="gap:8px;">
       <input id="proChartsOvPnL" type="checkbox" checked />
@@ -1961,6 +2795,8 @@ Trade Execution Integrity —
     <div id="liveMarketChart" style="width:100%; height:420px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
     <div id="proChartsSurfaceState" class="surfaceOverlayState" aria-live="polite"></div>
   </div>
+  <div id="proChartsOverlayLegend" class="overlayLegend" aria-live="polite"></div>
+  <div id="liveMarketChartA11y" class="chartA11y"></div>
   <div id="proChartsCrosshair" style="margin-top:8px; min-height:52px; border:1px solid #30363d; border-radius:10px; background:#0b0f15; padding:8px 10px; color:#e6edf3;" class="small mono">hover chart</div>
 </div>
 
@@ -1999,6 +2835,7 @@ Trade Execution Integrity —
     <span id="replayStats" style="display:flex; gap:8px; flex-wrap:wrap;"></span>
   </div>
   <canvas id="replayChart" width="1000" height="280"></canvas>
+  <div id="replayChartA11y" class="chartA11y"></div>
   <input id="replayTimeline" class="replayScrubber" type="range" min="0" max="0" value="0" disabled />
   <div id="replaySelected" class="replayStatGrid"></div>
   <div class="table-wrap" id="replayEvents" style="margin-top:10px;"></div>
@@ -2318,7 +3155,8 @@ loading
         </table>
       </div>
 
-      <canvas id="marketStressSparkline" height="48" style="margin-top:10px;"></canvas>
+      <canvas id="marketStressSparkline" width="900" height="48" style="width:100%; height:48px; margin-top:10px;"></canvas>
+      <div id="marketStressSparklineA11y" class="chartA11y"></div>
 
 <div style="margin-top:8px;">
   <span class="pill dim">Model confidence:</span>
@@ -2424,6 +3262,7 @@ loading
 
       <div class="small" style="margin:10px 0 6px;">Sentiment</div>
       <canvas id="newsSentimentCanvas" width="900" height="160" style="width:100%; height:160px;"></canvas>
+      <div id="newsSentimentCanvasA11y" class="chartA11y"></div>
     </div>
 
     <div class="card collapsible" id="weatherWidgetsCard" data-screens="analyze">
@@ -2477,6 +3316,7 @@ loading
           <div class="structuredSummaryMeta">Promotion gate data is loading.</div>
         </div>
       </div>
+      <div id="promotionGateBars" class="promotionComparisonBars" aria-live="polite"></div>
       <div class="small table-section-title">Champion vs challenger</div>
       <div class="table-wrap">
         <table id="promotionComparisonTable">
@@ -2783,6 +3623,7 @@ loading
   </div>
 
   <canvas id="calibCanvas" width="900" height="180" style="margin-top:10px;"></canvas>
+  <div id="calibCanvasA11y" class="chartA11y"></div>
   <pre id="calibRaw" class="small" style="white-space:pre-wrap; margin-top:8px;"></pre>
 </div>
 
@@ -2852,6 +3693,7 @@ loading
     <div id="equityDriftPanel" class="card collapsible" data-screens="explain,analyze">
       <h2 class="card-header">Equity Drift (Broker vs Backtest) <span id="equityDriftMeta" class="pill dim">—</span></h2>
       <canvas id="equityDriftCanvas" width="900" height="180"></canvas>
+      <div id="equityDriftCanvasA11y" class="chartA11y"></div>
     </div>
 
     <div id="driftExplainerPanel" class="card collapsible" data-screens="explain,analyze">
@@ -2906,6 +3748,7 @@ loading
         <span class="pill dim mono" id="performanceDivergenceUpdated">updated -</span>
       </div>
       <canvas id="performanceDivergenceChart" width="900" height="120" style="width:100%; height:120px; margin-top:8px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
+      <div id="performanceDivergenceChartA11y" class="chartA11y"></div>
       <div class="table-wrap table-wrap-spaced-sm">
         <table>
           <thead>
@@ -2983,6 +3826,67 @@ loading
       </div>
       <div id="eqReconDetail" class="small" style="margin-top:4px; opacity:.85;"></div>
       <pre id="brokerSnapshot" class="console" style="height:240px;">(loading...)</pre>
+    </div>
+
+    <div class="card collapsible" id="brokerConfigPanel" data-screens="operate,execution">
+      <h2 class="card-header">Broker Configuration <span id="brokerConfigMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Read-only configuration summary, masked credential status, connection testing, and guarded activation from <span class="mono">/api/broker/config</span>.</div>
+      <div class="pill-row">
+        <span id="brokerConfigModePill" class="pill dim">mode —</span>
+        <span id="brokerConfigCredentialPill" class="pill dim">credentials —</span>
+        <span id="brokerConfigTestPill" class="pill dim">test —</span>
+      </div>
+      <div id="brokerConfigGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">Broker</div><div class="opsStatValue">—</div><div class="opsStatMeta">loading</div></div>
+      </div>
+      <div class="brokerConfigControls">
+        <label class="metric-label" for="brokerConfigBroker">Broker</label>
+        <select id="brokerConfigBroker" aria-label="Broker to configure">
+          <option value="sim">Sim</option>
+          <option value="ibkr">IBKR</option>
+          <option value="alpaca">Alpaca</option>
+          <option value="other">Other</option>
+        </select>
+        <label class="metric-label" for="brokerConfigMode">Mode</label>
+        <select id="brokerConfigMode" aria-label="Broker execution mode">
+          <option value="safe">Safe</option>
+          <option value="paper">Paper</option>
+          <option value="live">Live</option>
+        </select>
+        <label class="metric-label" for="brokerConfigBaseUrl">Base URL</label>
+        <input id="brokerConfigBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://broker-api.example">
+        <label class="metric-label" for="brokerConfigHost">Host</label>
+        <input id="brokerConfigHost" type="text" autocomplete="off" spellcheck="false" placeholder="127.0.0.1">
+        <label class="metric-label" for="brokerConfigPort">Port</label>
+        <input id="brokerConfigPort" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="7497">
+        <label class="metric-label" for="brokerConfigClientId">Client ID</label>
+        <input id="brokerConfigClientId" type="text" autocomplete="off" spellcheck="false" placeholder="1">
+        <label class="metric-label" for="brokerConfigCredentials">Credentials JSON</label>
+        <textarea id="brokerConfigCredentials" rows="3" spellcheck="false" placeholder='{"api_key":"...","secret":"..."}'></textarea>
+        <button class="btn btnSmall" type="button" id="brokerConfigTestBtn">Test</button>
+        <button class="btn btnSmall danger" type="button" id="brokerConfigActivateBtn">Activate</button>
+        <button class="btn btnSmall" type="button" id="brokerConfigDisableBtn">Disable</button>
+      </div>
+      <div class="small section-note-title">Broker config audit</div>
+      <div class="table-wrap table-wrap-spaced-sm">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Action</th>
+              <th>Broker</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody id="brokerConfigAuditBody">
+            <tr class="table-row"><td colspan="4" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="small section-note-title">Notes</div>
+      <div id="brokerConfigNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
     </div>
 
     <!-- Execution Cost vs Confidence -->
@@ -3076,7 +3980,7 @@ loading
       </div>
     </div>
 
-    <div class="card collapsible" id="positionsExposureSummaryCard" data-screens="positions">
+    <div class="card collapsible" id="positionsExposureSummaryCard" data-screens="overview,positions">
       <h2>📐 Positions &amp; Exposure</h2>
       <div class="small">Current portfolio target book, live broker inventory, and risk-gate state from Python-served dashboard APIs.</div>
       <div class="pill-row">
@@ -3085,6 +3989,43 @@ loading
         <span class="pill dim" id="positionsDrawdownPill">drawdown —</span>
         <span class="pill dim" id="positionsBarrierPill">barrier —</span>
         <span class="pill dim mono" data-flash-on-change="true" id="positionsFreshnessPill">freshness —</span>
+      </div>
+      <div id="positionsRegimeRibbon" class="regimeRibbonMount" aria-live="polite"></div>
+      <div id="positionsRiskBars" class="bulletBarsMount" aria-live="polite"></div>
+      <div id="positionsRiskCharts" class="riskCharts" aria-live="polite">
+        <div class="riskChartBlock">
+          <div class="riskChartHeader">
+            <h3>Risk History</h3>
+            <span id="riskHistoryMeta" class="pill dim meta-pill-offset">loading</span>
+          </div>
+          <canvas id="riskHistoryChart" width="900" height="220"></canvas>
+          <div id="riskHistoryChartA11y" class="chartA11y"></div>
+        </div>
+        <div class="riskChartBlock">
+          <div class="riskChartHeader">
+            <h3>Monte-Carlo Risk</h3>
+            <span id="monteCarloRiskMeta" class="pill dim meta-pill-offset">loading</span>
+          </div>
+          <div id="monteCarloRiskBars"></div>
+          <canvas id="monteCarloFanChart" width="900" height="160"></canvas>
+          <div id="monteCarloFanChartA11y" class="chartA11y"></div>
+        </div>
+        <div class="riskChartBlock">
+          <div class="riskChartHeader">
+            <h3>Alpha Decay</h3>
+            <span id="alphaDecayMeta" class="pill dim meta-pill-offset">loading</span>
+          </div>
+          <canvas id="alphaDecayChart" width="900" height="220"></canvas>
+          <div id="alphaDecayChartA11y" class="chartA11y"></div>
+        </div>
+        <div class="riskChartBlock">
+          <div class="riskChartHeader">
+            <h3>Regime History</h3>
+            <span id="regimeHistoryMeta" class="pill dim meta-pill-offset">loading</span>
+          </div>
+          <div id="regimeHistoryRibbon"></div>
+        </div>
+        <div id="riskChartNotes" class="opsNotes small"></div>
       </div>
       <div id="positionsExposureGrid" class="opsStatGrid">
         <div class="opsStat"><div class="opsStatLabel">Exposure</div><div class="opsStatValue">—</div></div>
@@ -3316,12 +4257,21 @@ loading
           <div class="small" style="margin:0 0 6px;">Equity Curve</div>
           <canvas id="portfolioEquityCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
           <div id="portfolioEquityPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+          <div id="portfolioEquityCanvasA11y" class="chartA11y"></div>
         </div>
         <div style="flex:1 1 360px; min-width:320px;">
           <div class="small" style="margin:0 0 6px;">Drawdown</div>
           <canvas id="portfolioDdCanvas" width="900" height="220" style="width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
           <div id="portfolioDdPro" class="proChart" style="display:none; width:100%; height:220px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></div>
+          <div id="portfolioDdCanvasA11y" class="chartA11y"></div>
         </div>
+      </div>
+      <div id="portfolioBtAnnotations" class="portfolioBtAnnotations" aria-live="polite">
+        <span class="pill dim">run metrics loading</span>
+      </div>
+      <div class="portfolioBtContext">
+        <span id="portfolioBtBenchmarkState" class="pill dim">benchmark loading</span>
+        <div id="portfolioBtHover" class="portfolioBtHover small mono" aria-live="polite">hover portfolio charts</div>
       </div>
 
       <div class="small" style="margin:10px 0 6px;">Summary</div>
@@ -3445,6 +4395,7 @@ loading
         </div>
         <div class="decisionDetailBlock">
           <h3>Decision Path</h3>
+          <div id="decisionModalStepper" class="decisionStepperMount"></div>
           <div id="decisionModalStagesSummary" class="structuredSummary"></div>
           <details class="rawToggle">
             <summary>View Related Records</summary>
@@ -3462,6 +4413,10 @@ loading
             <summary>View Raw Inputs</summary>
             <pre id="decisionModalInputs" class="mono small" style="margin:0; white-space:pre-wrap;"></pre>
           </details>
+        </div>
+        <div class="decisionDetailBlock decisionDetailBlockWide">
+          <h3>Why This Decision</h3>
+          <div id="decisionModalAttribution" class="decisionAttributionMount"></div>
         </div>
         <div class="decisionDetailBlock">
           <h3>Risk Gates</h3>

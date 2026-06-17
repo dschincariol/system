@@ -17,6 +17,7 @@ export function renderKillSwitchPills(ks, lastRun, elId = "systemStateText") {
   if (!ks || typeof ks !== "object") return;
 
   const lines = [];
+  const controlRows = buildKillSwitchRows(ks, lastRun);
   const stateRows = Array.isArray(ks.state) ? ks.state : null;
 
   if (stateRows) {
@@ -38,8 +39,7 @@ export function renderKillSwitchPills(ks, lastRun, elId = "systemStateText") {
       : " last_run=—";
 
     lines.push(
-      `${k}: ${on ? "ENABLED" : "DISABLED"}${reason}${ts}` +
-      (!on ? `  [fix]` : "")
+      `${k}: ${on ? "ENABLED" : "DISABLED"}${reason}${ts}`
     );
   });
 
@@ -51,31 +51,123 @@ export function renderKillSwitchPills(ks, lastRun, elId = "systemStateText") {
   }
 
   el.textContent += "\n\n[automation]\n" + lines.join("\n");
+  renderKillSwitchControls(el, controlRows);
+}
 
-  el.onclick = (e) => {
-    // Determine clicked line from mouse Y offset (works for <pre> / monospace blocks)
-    try {
-      const txt = String(el.textContent || "");
-      if (!txt.includes("[fix]")) return;
+function esc(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
-      const cs = window.getComputedStyle(el);
-      const lh = parseFloat(cs.lineHeight) || 16;
-      const rect = el.getBoundingClientRect();
-      const y = (e && typeof e.clientY === "number") ? (e.clientY - rect.top) : -1;
-      if (y < 0) return;
+export function buildKillSwitchRows(ks, lastRun = null) {
+  const rows = [];
+  const root = ks && typeof ks === "object" ? ks : {};
+  const stateRows = Array.isArray(root.state) ? root.state : [];
 
-      const linesAll = txt.split("\n");
-      const idx = Math.max(0, Math.min(linesAll.length - 1, Math.floor(y / lh)));
-      const line = String(linesAll[idx] || "");
+  stateRows.forEach((row) => {
+    const scope = String((row && row.scope) || "global").trim() || "global";
+    const key = String((row && row.key) || "global").trim() || "global";
+    const enabled = Number((row && row.enabled) || 0) === 1;
+    const reason = String((row && row.reason) || "").trim();
+    const displayKey = `${scope}:${key}`;
+    rows.push({
+      id: displayKey,
+      key,
+      scope,
+      displayKey,
+      enabled,
+      reason,
+      status: enabled ? "ENABLED" : "DISABLED",
+      tone: enabled ? "crit" : "ok",
+      action: enabled ? "explain" : "hint",
+      actionLabel: enabled ? "Explain" : "Recovery hint",
+      ariaLabel: `${enabled ? "Explain" : "Recovery hint for"} kill switch ${displayKey} ${enabled ? "enabled" : "disabled"}`,
+    });
+  });
 
-      if (!line.includes("[fix]")) return;
+  Object.keys(root).forEach((key) => {
+    if (key === "state") return;
+    const value = root[key] || {};
+    if (!value || typeof value !== "object") return;
+    const enabled = !!value.enabled;
+    const reason = String(value.reason || "").trim();
+    const lastRunTs = lastRun && lastRun[key] ? Number(lastRun[key]) * 1000 : null;
+    rows.push({
+      id: String(key),
+      key: String(key),
+      scope: "automation",
+      displayKey: String(key),
+      enabled,
+      reason,
+      lastRunTs,
+      status: enabled ? "ENABLED" : "DISABLED",
+      tone: enabled ? "ok" : "warn",
+      action: enabled ? "explain" : "hint",
+      actionLabel: enabled ? "Explain" : "Recovery hint",
+      ariaLabel: `${enabled ? "Explain" : "Recovery hint for"} automation ${key} ${enabled ? "enabled" : "disabled"}`,
+    });
+  });
 
-      const key = line.split(":")[0].trim();
-      if (!key) return;
+  return rows;
+}
 
-      showKillSwitchFixHint(key);
-    } catch {}
-  };
+function renderKillSwitchControls(anchorEl, rows) {
+  if (!anchorEl || !anchorEl.parentNode) return;
+  const doc = anchorEl.ownerDocument || document;
+  const id = `${anchorEl.id || "systemStateText"}KillSwitchRows`;
+  let mount = doc.getElementById(id);
+  if (!mount) {
+    mount = doc.createElement("div");
+    mount.id = id;
+    mount.className = "killSwitchRows";
+    anchorEl.insertAdjacentElement("beforebegin", mount);
+  }
+
+  if (!Array.isArray(rows) || !rows.length) {
+    mount.innerHTML = '<div class="killSwitchEmpty small">Kill-switch state unavailable.</div>';
+    return;
+  }
+
+  mount.innerHTML = rows.map((row) => `
+    <div class="killSwitchRow killSwitchRow-${esc(row.tone)}">
+      <span class="killSwitchLight" aria-hidden="true"></span>
+      <span class="killSwitchName">${esc(row.displayKey)}</span>
+      <span class="killSwitchState">${esc(row.status)}</span>
+      <span class="killSwitchReason">${esc(row.reason || "no reason reported")}</span>
+      <button
+        type="button"
+        class="btn killSwitchAction"
+        data-ks-action="${esc(row.action)}"
+        data-ks-key="${esc(row.key)}"
+        data-ks-display-key="${esc(row.displayKey)}"
+        data-ks-reason="${esc(row.reason || "")}"
+        aria-label="${esc(row.ariaLabel)}"
+      >${esc(row.actionLabel)}</button>
+    </div>
+  `).join("");
+
+  if (!mount._boundKillSwitchRows) {
+    mount._boundKillSwitchRows = true;
+    mount.addEventListener("click", (event) => {
+      const target = event && event.target && event.target.closest
+        ? event.target.closest("[data-ks-action]")
+        : null;
+      if (!target) return;
+      const key = target.getAttribute("data-ks-key") || "";
+      const displayKey = target.getAttribute("data-ks-display-key") || key;
+      const reason = target.getAttribute("data-ks-reason") || "";
+      const action = target.getAttribute("data-ks-action") || "explain";
+      if (action === "hint") {
+        showKillSwitchFixHint(key || displayKey);
+      } else {
+        showKillSwitchExplanation(displayKey, reason);
+      }
+    });
+  }
 }
 
 export function showKillSwitchFixHint(key) {
@@ -92,10 +184,33 @@ export function showKillSwitchFixHint(key) {
   };
 
   title.textContent = "How to re-enable " + key;
+  body.textContent = envMap[key]
+    ? (
+      "This automation is disabled by configuration.\n\n" +
+      "Set the following environment variable and restart the server:\n\n" +
+      envMap[key]
+    )
+    : (
+      "This kill-switch row is disabled or has no configured automatic recovery hint.\n\n" +
+      "Review the reported reason and backend state before changing runtime configuration."
+    );
+
+  why.style.display = "block";
+}
+
+export function showKillSwitchExplanation(key, reason = "") {
+  const why = document.getElementById("whyModal");
+  const body = document.getElementById("whyBody");
+  const title = document.getElementById("whyTitle");
+
+  if (!why || !body || !title) return;
+
+  title.textContent = "Kill-switch state: " + key;
   body.textContent =
-    "This automation is disabled by configuration.\n\n" +
-    "Set the following environment variable and restart the server:\n\n" +
-    envMap[key];
+    "This is a read-only kill-switch status row.\n\n" +
+    "Status details:\n\n" +
+    (reason ? reason : "No reason was reported by the backend snapshot.") +
+    "\n\nThe dashboard does not grant mutation authority from this control.";
 
   why.style.display = "block";
 }

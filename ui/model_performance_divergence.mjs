@@ -62,6 +62,12 @@ function _sourceText(point) {
   return ts === "-" ? source || "-" : `${source || "source"} @ ${ts}`;
 }
 
+function _pointTime(point) {
+  if (!point || typeof point !== "object") return null;
+  const ts = _num(point.ts_ms ?? point.time ?? point.t);
+  return ts !== null && ts > 0 ? ts : null;
+}
+
 function _missingDetails(payload, rows) {
   const missing = Array.isArray(payload && payload.missing_sources)
     ? payload.missing_sources.map(String).filter(Boolean)
@@ -74,17 +80,21 @@ function _missingDetails(payload, rows) {
 
 function _chartSeries(rows) {
   for (const row of rows) {
-    const values = [row.expectedValue, row.shadowValue, row.realizedValue]
-      .filter((value) => Number.isFinite(value));
-    if (values.length >= 2) {
+    const points = [
+      { label: "Expected/backtest", value: row.expectedValue, source: row.expectedSource, time: row.expectedTime },
+      { label: "Shadow", value: row.shadowValue, source: row.shadowSource, time: row.shadowTime },
+      { label: "Live realized", value: row.realizedValue, source: row.realizedSource, time: row.realizedTime },
+    ].filter((point) => Number.isFinite(point.value));
+    if (points.length >= 2) {
       return {
         label: row.label,
         unit: row.unit,
-        values,
+        values: points.map((point) => point.value),
+        points,
       };
     }
   }
-  return { label: "Performance", unit: "", values: [] };
+  return { label: "Performance", unit: "", values: [], points: [] };
 }
 
 export function buildPerformanceDivergenceViewModel(payload = {}) {
@@ -110,6 +120,9 @@ export function buildPerformanceDivergenceViewModel(payload = {}) {
       expectedSource: _sourceText(expected),
       shadowSource: _sourceText(shadow),
       realizedSource: _sourceText(realized),
+      expectedTime: _pointTime(expected),
+      shadowTime: _pointTime(shadow),
+      realizedTime: _pointTime(realized),
       expectedValue: expected ? _num(expected.value) : null,
       shadowValue: shadow ? _num(shadow.value) : null,
       realizedValue: realized ? _num(realized.value) : null,
@@ -160,7 +173,35 @@ function _renderChart(root, vm, renderLineChart) {
 
   const values = Array.isArray(vm.chart.values) ? vm.chart.values : [];
   const opts = {
+    xValues: Array.isArray(vm.chart.points) ? vm.chart.points.map((point) => point.time ?? null) : [],
+    fmtX: (value, index) => {
+      const point = Array.isArray(vm.chart.points) ? vm.chart.points[index] : null;
+      return point && point.time ? _fmtTime(point.time) : String(point && point.label || index + 1);
+    },
     topLabel: `${vm.chart.label} expected to live`,
+    a11yTitle: "Model performance divergence",
+    a11ySeries: vm.chart.points,
+    a11yLabelKey: "label",
+    a11yTimeKey: "time",
+    valueLabel: vm.chart.label,
+    a11yValueFormatter: (value) => vm.chart.unit === "pct"
+      ? `${(Number(value) * 100).toFixed(1)}%`
+      : vm.chart.unit === "bps"
+        ? `${Number(value).toFixed(1)}bp`
+        : Number(value).toFixed(2),
+    a11yColumns: [
+      { label: "Series", value: (row) => row.raw && row.raw.label },
+      {
+        label: vm.chart.label,
+        value: (row) => vm.chart.unit === "pct"
+          ? `${(Number(row.value) * 100).toFixed(1)}%`
+          : vm.chart.unit === "bps"
+            ? `${Number(row.value).toFixed(1)}bp`
+            : Number(row.value).toFixed(2),
+      },
+      { label: "Source", value: (row) => row.raw && row.raw.source },
+    ],
+    emptyMessage: "No comparable performance data is available for the selected model.",
     stroke: vm.state === "diverged" ? "#ff6b6b" : vm.state === "watch" ? "#d29922" : "#58a6ff",
     fmtY: (value) => vm.chart.unit === "pct"
       ? `${(Number(value) * 100).toFixed(1)}%`

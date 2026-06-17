@@ -103,6 +103,188 @@ export function freshnessTone(ageMs, warnMs = 60_000, critMs = 300_000) {
   return "ok";
 }
 
+export const STATUS_TOKENS = Object.freeze({
+  neutral: Object.freeze({
+    key: "neutral",
+    className: "neutral",
+    label: "Neutral",
+    glyph: "-",
+    color: "#A7B0BC",
+    fill: "rgba(167,176,188,0.13)",
+  }),
+  info: Object.freeze({
+    key: "info",
+    className: "info",
+    label: "Info",
+    glyph: "i",
+    color: "#56B4E9",
+    fill: "rgba(86,180,233,0.14)",
+  }),
+  ok: Object.freeze({
+    key: "ok",
+    className: "ok",
+    label: "OK",
+    glyph: "OK",
+    color: "#009E73",
+    fill: "rgba(0,158,115,0.14)",
+  }),
+  warn: Object.freeze({
+    key: "warn",
+    className: "warn",
+    label: "Warning",
+    glyph: "!",
+    color: "#E69F00",
+    fill: "rgba(230,159,0,0.15)",
+  }),
+  high: Object.freeze({
+    key: "high",
+    className: "high",
+    label: "High",
+    glyph: "!!",
+    color: "#CC79A7",
+    fill: "rgba(204,121,167,0.15)",
+  }),
+  crit: Object.freeze({
+    key: "crit",
+    className: "crit",
+    label: "Critical",
+    glyph: "X",
+    color: "#D55E00",
+    fill: "rgba(213,94,0,0.16)",
+  }),
+  blocked: Object.freeze({
+    key: "blocked",
+    className: "blocked",
+    label: "Blocked",
+    glyph: "LOCK",
+    color: "#73B7E6",
+    fill: "rgba(115,183,230,0.16)",
+  }),
+  unavailable: Object.freeze({
+    key: "unavailable",
+    className: "unavailable",
+    label: "Unavailable",
+    glyph: "?",
+    color: "#8B949E",
+    fill: "rgba(139,148,158,0.13)",
+  }),
+});
+
+const STATUS_ALIASES = Object.freeze({
+  acked: "info",
+  active: "info",
+  allowed: "ok",
+  available: "ok",
+  bad: "crit",
+  critical: "crit",
+  danger: "crit",
+  degraded: "warn",
+  dim: "neutral",
+  disabled: "blocked",
+  disconnected: "crit",
+  err: "crit",
+  error: "crit",
+  fail: "crit",
+  failed: "crit",
+  halted: "blocked",
+  healthy: "ok",
+  kill: "crit",
+  kill_switch: "blocked",
+  missing: "unavailable",
+  muted: "neutral",
+  normal: "ok",
+  partial: "warn",
+  pending: "warn",
+  ready: "ok",
+  resolved: "ok",
+  stable: "ok",
+  stale: "warn",
+  success: "ok",
+  unknown: "unavailable",
+  waiting: "unavailable",
+  watch: "warn",
+});
+
+export function normalizeStatusTone(tone) {
+  const raw = String(tone ?? "neutral").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!raw) return "neutral";
+  if (Object.prototype.hasOwnProperty.call(STATUS_TOKENS, raw)) return raw;
+  return STATUS_ALIASES[raw] || "neutral";
+}
+
+export function statusToken(tone) {
+  return STATUS_TOKENS[normalizeStatusTone(tone)] || STATUS_TOKENS.neutral;
+}
+
+export function statusClassName(tone) {
+  return statusToken(tone).className;
+}
+
+export function statusGlyph(tone) {
+  return statusToken(tone).glyph;
+}
+
+export function statusLabel(tone) {
+  return statusToken(tone).label;
+}
+
+export function statusPillClasses(tone) {
+  const token = statusToken(tone);
+  const classes = ["pill", token.className, `status-${token.key}`];
+  if (token.key === "neutral") classes.push("dim");
+  if (token.key === "crit") classes.push("bad");
+  return Array.from(new Set(classes)).join(" ");
+}
+
+export function statusAriaLabel(tone, text = "") {
+  const token = statusToken(tone);
+  const detail = String(text || "").trim();
+  return detail ? `${token.label}: ${detail}` : token.label;
+}
+
+export function withStatusGlyph(text, tone) {
+  const token = statusToken(tone);
+  const label = String(text || "").trim();
+  if (!label) return token.glyph;
+  if (label.toUpperCase().startsWith(`${token.glyph} `)) return label;
+  return `${token.glyph} ${label}`;
+}
+
+export function tradeMarkerStatus(side, qty = 0) {
+  const rawSide = String(side || "").toUpperCase();
+  const nQty = Number(qty || 0);
+  if (rawSide.includes("SELL") || rawSide.includes("SHORT") || nQty < 0) return "crit";
+  if (rawSide.includes("BUY") || rawSide.includes("LONG") || nQty > 0) return "info";
+  return "neutral";
+}
+
+export function chartMarkerStyle(side, qty = 0) {
+  const token = statusToken(tradeMarkerStatus(side, qty));
+  const isSell = token.key === "crit";
+  return {
+    token,
+    isBuy: !isSell,
+    color: token.color,
+    position: isSell ? "aboveBar" : "belowBar",
+    shape: isSell ? "arrowDown" : "arrowUp",
+    label: isSell ? "SELL" : "BUY",
+    glyph: isSell ? "X" : "i",
+  };
+}
+
+export function chartVolumeColor(close, open, alpha = 0.45) {
+  const up = Number(close) >= Number(open);
+  const token = up ? STATUS_TOKENS.info : STATUS_TOKENS.crit;
+  const fallback = up ? "86,180,233" : "213,94,0";
+  const match = token.color.match(/^#([0-9a-f]{6})$/i);
+  if (!match) return `rgba(${fallback},${alpha})`;
+  const hex = match[1];
+  const r = Number.parseInt(hex.slice(0, 2), 16);
+  const g = Number.parseInt(hex.slice(2, 4), 16);
+  const b = Number.parseInt(hex.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
 export function formatSigned(value, digits = 2, suffix = "") {
   const n = numOrNull(value);
   if (n == null) return "—";

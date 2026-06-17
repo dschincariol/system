@@ -9,10 +9,16 @@ const NODE_RANGE = ">=20.17.0 <21";
 const NPM_RANGE = ">=10.0.0 <11";
 const PYTHON_RANGE = ">=3.11";
 const NODE_TESTS = [
+  "tests/test_canvas_line_chart_helpers.mjs",
   "tests/test_command_palette_helpers.mjs",
   "tests/test_symbol_context.mjs",
   "tests/test_mobile_ops_helpers.mjs",
   "tests/test_replay_ui_helpers.mjs",
+  "tests/test_terminal_decision_overlays.mjs",
+  "tests/test_pro_chart_core.mjs",
+  "tests/test_decision_stepper.mjs",
+  "tests/test_decision_attribution.mjs",
+  "tests/test_operator_overview.mjs",
   "tests/test_table_helpers.mjs",
 ];
 const PYTEST_UI_TESTS = [

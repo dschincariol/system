@@ -6,6 +6,8 @@
   editor backed by the `/api/data_sources/*` endpoints.
 */
 
+import { requestConfirmation } from "./confirmation_modal.mjs";
+
 const SESSION_STORAGE_KEY = "dataSourceControlPlaneSession";
 
 const state = {
@@ -996,10 +998,27 @@ async function testSource(sourceKey) {
 }
 
 async function deleteSource(sourceKey) {
-  if (!window.confirm(`Delete ${sourceKey}?`)) return;
+  const actor = state.session.actor.trim() || "operator";
+  const confirmed = await requestConfirmation({
+    title: "Delete data source",
+    action: "Delete data source",
+    target: sourceKey,
+    consequence: "This removes the source configuration and reconciles ingestion jobs. Built-in sources may be protected by the server.",
+    confirmText: "DELETE_SOURCE",
+    requireReason: true,
+    minReasonLength: 8,
+    submitLabel: "Delete source",
+    actor,
+    source: "data_sources_ui",
+  });
+  if (!confirmed.ok) return;
   await request("/api/data_sources/delete", {
     method: "POST",
-    body: JSON.stringify({ source_key: sourceKey, actor: state.session.actor.trim() || "operator" }),
+    body: JSON.stringify({
+      source_key: sourceKey,
+      actor,
+      ...confirmed.payload,
+    }),
   });
   state.selectedKey = "";
   flash("Source deleted.");
@@ -1020,16 +1039,29 @@ async function resetSourceCredentials(source, template) {
     flash("Missing source key.", true);
     return;
   }
-  const confirmed = window.confirm(
-    `Clear stored credentials for ${sourceKey}?\n\nFields: ${fields.join(", ")}${credentialError ? `\n\nCurrent decode error: ${credentialError}` : ""}`
-  );
-  if (!confirmed) return;
+  const actor = state.session.actor.trim() || "operator";
+  const confirmed = await requestConfirmation({
+    title: "Clear stored credentials",
+    action: "Clear stored credentials",
+    target: `${sourceKey}: ${fields.join(", ")}`,
+    consequence: credentialError
+      ? `Stored credentials will be cleared. Current decode error: ${credentialError}`
+      : "Stored credentials will be cleared and the source will require new credentials before protected provider access works.",
+    confirmText: "RESET_CREDENTIALS",
+    requireReason: true,
+    minReasonLength: 8,
+    submitLabel: "Clear credentials",
+    actor,
+    source: "data_sources_ui",
+  });
+  if (!confirmed.ok) return;
   await request("/api/data_sources/update", {
     method: "POST",
     body: JSON.stringify({
       source_key: sourceKey,
-      actor: state.session.actor.trim() || "operator",
+      actor,
       clear_credential_fields: fields,
+      ...confirmed.payload,
     }),
   });
   flash(`Stored credentials cleared for ${sourceKey}.`);

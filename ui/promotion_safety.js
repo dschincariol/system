@@ -6,6 +6,8 @@
   Extracted verbatim from dashboard.js
 */
 
+import { requestConfirmation } from "./confirmation_modal.mjs";
+
 const _PROMO_PAUSED_KEY = "promo_paused_due_to_exec_v1";
 
 let _isExecutionDegraded = () => false;
@@ -55,15 +57,29 @@ export async function maybeAutoResumePromotionsAfterRecovery({
     }
 
     if (!operatorMode) {
-      const ok = confirm(
-        "Execution has recovered.\n\nResume promotions automatically now?"
-      );
-      if (!ok) return;
+      const confirmation = await requestConfirmation({
+        title: "Resume promotions",
+        action: "Resume model promotions",
+        target: "promotion automation",
+        consequence: "Execution has recovered and promotions will be enabled again.",
+        confirmText: "PROMOTION",
+        submitLabel: "Resume promotions",
+        actor: "operator",
+        source: "dashboard_promotion",
+      });
+      if (!confirmation.ok) return;
     }
 
     const res = await _fetchJSON("/api/promotion/enable", {
       method: "POST",
-      body: JSON.stringify({ on: "1", confirm: "PROMOTION" }),
+      body: JSON.stringify({
+        on: "1",
+        confirm: "PROMOTION",
+        confirmation: "PROMOTION",
+        consequence_ack: true,
+        actor: "operator",
+        source: "dashboard_promotion",
+      }),
     });
     if (res && res.ok) {
       _toast("Promotions resumed after execution recovery", "ok", 3500);
@@ -96,9 +112,17 @@ export async function handlePromotionToggle({
   }
 
   if (!operatorMode) {
-    if (!confirm("Toggle promotions? This affects model promotion safety.")) {
-      return;
-    }
+    const confirmation = await requestConfirmation({
+      title: "Toggle promotions",
+      action: "Toggle model promotions",
+      target: "promotion automation",
+      consequence: "This changes model promotion safety automation state.",
+      confirmText: "PROMOTION",
+      submitLabel: "Toggle promotions",
+      actor: "operator",
+      source: "dashboard_promotion",
+    });
+    if (!confirmation.ok) return;
   }
 
   const st = await _fetchJSON("/api/promotion/status");
@@ -115,7 +139,14 @@ export async function handlePromotionToggle({
 
   const res = await _fetchJSON("/api/promotion/enable", {
     method: "POST",
-    body: JSON.stringify({ on: next, confirm: "PROMOTION" }),
+    body: JSON.stringify({
+      on: next,
+      confirm: "PROMOTION",
+      confirmation: "PROMOTION",
+      consequence_ack: true,
+      actor: "operator",
+      source: "dashboard_promotion",
+    }),
   });
   if (!res || !res.ok) {
     throw new Error((res && res.error) || "toggle failed");
@@ -131,14 +162,19 @@ export async function handleAutoFix({
   operatorMode
 }) {
   if (!operatorMode) {
-    const ok = confirm(
-      "This will automatically attempt to fix startup issues:\n" +
-      "- Initialize / migrate databases\n" +
-      "- Rebuild labels\n" +
-      "- Train size policy if missing\n\n" +
-      "Proceed?"
-    );
-    if (!ok) return;
+    const confirmation = await requestConfirmation({
+      title: "Run automatic fix",
+      action: "Run automatic fix",
+      target: "startup and runtime checks",
+      consequence: "This will attempt schema repair, label rebuilds, and size-policy training when needed.",
+      confirmText: "SYSTEM_FIX",
+      requireReason: true,
+      minReasonLength: 6,
+      submitLabel: "Run fix",
+      actor: "operator",
+      source: "dashboard_system_fix",
+    });
+    if (!confirmation.ok) return;
   }
 
   const el = document.getElementById("console");
@@ -146,7 +182,13 @@ export async function handleAutoFix({
 
   const res = await _fetchJSON("/api/system/fix", {
     method: "POST",
-    body: JSON.stringify({ confirm: "SYSTEM_FIX" }),
+    body: JSON.stringify({
+      confirm: "SYSTEM_FIX",
+      confirmation: "SYSTEM_FIX",
+      consequence_ack: true,
+      actor: "operator",
+      source: "dashboard_system_fix",
+    }),
   });
   if (!res || !res.ok) {
     throw new Error(res?.error || "fix failed");

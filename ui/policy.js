@@ -104,7 +104,7 @@ export function requireExpertUnlock(expertUnlocked, message) {
   if (_serverBlocksMutations()) return false;
   if (expertUnlocked) return true;
   if (!message) return false;
-  return confirm(message);
+  return false;
 }
 
 export function requireConfirmIfDegraded({
@@ -115,5 +115,5 @@ export function requireConfirmIfDegraded({
   if (_serverBlocksMutations()) return false;
   if (!executionDegraded) return true;
   if (operatorMode) return true;
-  return confirm(message);
+  return false;
 }
