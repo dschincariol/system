@@ -64,6 +64,7 @@ data/*.sqlite3.corrupt_*
 # --------------------------------------------------
 # Logs / runtime output
 # --------------------------------------------------
+var/
 logs/
 logs-*/
 logs-staging/
@@ -100,6 +101,7 @@ data/model_cache/
 data/models/
 data/processed/
 data/raw/
+.run-audit/
 tmp/
 .tmp/
 temp/
