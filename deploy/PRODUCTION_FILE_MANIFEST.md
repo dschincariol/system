@@ -1,7 +1,6 @@
 # Production File Manifest
 
-This is the copy policy for the Linux deployment bundle built by
-`tools/build_linux_deploy_bundle.ps1`.
+This is the copy policy for a Linux deployment mirror.
 
 ## Copy To Linux
 
@@ -17,12 +16,12 @@ This is the copy policy for the Linux deployment bundle built by
   `data/model_configs.json`, `data/sec_company_tickers_exchange.json`, and
   `sources_rss.json`.
 - Validation and smoke tooling: `tools/` and `tests/`, so Codex can verify the
-  server after install without needing the Windows workstation.
+  server after install from the Linux host.
 - Operator-facing docs needed during deployment, including this file,
   `deploy/LINUX_SERVER_CODEX_DEPLOY.md`, `ops/server/README.md`, and
   `docs/PRODUCTION_CHECKLIST.md`.
 
-## Keep Local On Windows
+## Keep Out Of The Linux Mirror
 
 - Secrets and machine-local configuration: `.env`, `.env.*`,
   `operator.secrets.json`, and generated credential files.

@@ -35,7 +35,7 @@ decision is reconstructable.
   extend its schema, not replace it.
 - `engine/model_registry.py` — champion / challenger / shadow lifecycle.
 - `engine/strategy/champion_manager.py` — actual promotion logic.
-- `ops/train_model_v2.py` — training entry point that produces the OOS
+- `engine/strategy/jobs/train_model_v2.py` — training entry point that produces the OOS
   metrics the new gates will consume.
 - `engine/runtime/storage.py` — schema versioning conventions; you will
   add a new table.
@@ -68,7 +68,7 @@ decision is reconstructable.
   `id INTEGER PK, ts INTEGER, model_id TEXT, feature_id TEXT NULL,
    test_name TEXT, t_stat REAL, p_value REAL, q_value REAL NULL,
    bootstrap_samples INTEGER NULL, decision TEXT, payload_json TEXT`.
-- `ops/train_model_v2.py` — emit the OOS-return series (not just
+- `engine/strategy/jobs/train_model_v2.py` — emit the OOS-return series (not just
   aggregate metrics) so Reality Check can bootstrap it.
 
 ## Implementation plan

@@ -126,7 +126,7 @@ flowchart TD
 Operational notes:
 
 - the DB kill-switch lookup order is global, then model, then regime, then symbol
-- `DISABLE_LIVE_EXECUTION` is evaluated before capital/data/job checks for live-mode execution; any non-empty value except `0`, `false`, `no`, or `off` blocks with `disable_live_execution_env`
+- `DISABLE_LIVE_EXECUTION` is evaluated before capital/data/job checks for live-mode execution; unset and any value except `0`, `false`, `no`, or `off` block with `disable_live_execution_env`
 - a global activation also forces lifecycle `KILL_SWITCH`
 - a global clear returns lifecycle to `DEGRADED`
 - `broker_apply_orders.py` does not rely on this cascade alone; it also checks the broader runtime barrier from `execution_gate_snapshot()`
@@ -207,7 +207,7 @@ This diagram follows the branch structure in `engine.strategy.champion_manager.e
 ```mermaid
 flowchart TD
     A[recompute rankings<br/>load replay validation<br/>run self critic] --> B{current champion exists?}
-    B -->|no| C{best candidate live-promotable<br/>eligible replay-approved not blocked?}
+    B -->|no| C{shared promotion eligibility passes?<br/>fresh replay approved not self-critic blocked}
     C -->|yes| C1[assign champion<br/>reason bootstrap_best]
     C -->|no| C2[leave unassigned<br/>reason no_bootstrap]
     B -->|yes| D{current blocked or hard demote?}
@@ -221,7 +221,7 @@ flowchart TD
     E -->|no| F{best blocked by self critic?}
     F -->|yes| F1[keep current<br/>reason best_blocked_self_critic]
     F -->|no| G{best live-promotable but replay not approved?}
-    G -->|yes| G1[keep current or no target<br/>reason replay_gate_blocked]
+    G -->|yes| G1[keep current or no target<br/>reason replay_gate_blocked or replay_stale]
     G -->|no| H[keep current<br/>reason keep_current]
     C1 --> I{statistical promotion gate passes?}
     D3 --> I
@@ -229,7 +229,9 @@ flowchart TD
     D5 --> I
     E1 --> I
     I -->|no| I1[revert to current or clear target<br/>append _stat_gate_blocked]
-    I -->|yes| J[write champion_assignments]
+    I -->|yes| I2{generated candidate<br/>experiment ledger passes?}
+    I2 -->|no| I1
+    I2 -->|yes| J[write champion_assignments]
     H --> J
     F1 --> J
     G1 --> J
@@ -237,7 +239,10 @@ flowchart TD
     I1 --> J
 ```
 
+The shared promotion eligibility check is used for both local symbol/horizon champion assignments and the aggregate `MODEL_COMPETITION_SCOPE` assignment. Its replay and self-critic block reasons are included in competition-cycle metadata so a global best model cannot be assigned through a lighter path than the local champion loop.
+
 The durable assignment table is `champion_assignments(scope, symbol, horizon_s, model_name, challenger_name, regime, state, assigned_ts_ms, updated_ts_ms, meta_json)`.
+Generated candidates also pass through `experiment_ledger`: `engine.strategy.champion_manager._evaluate_promotion_stat_gate()` and `engine.model_registry.promote_to_champion()` call the ledger gate before assignment/promotion. A generated candidate is blocked when the ledger row is missing, lacks a passing decision, omits trial budget/count, exceeds the configured trial budget, lacks evidence, or omits redundancy checks. LLM factor mining consumes `LLM_FACTOR_CANDIDATES` as a strict budget across propose, bounded-DSL validation, evaluation, critique, and revision. The loop records prompt hashes, model name, lineage, rejected candidates, statistical evidence, and a final decision; accepted LLM factors enter `feature_registry` as `shadow`, and `engine.strategy.discovery.registry.register_feature()` rejects direct `live` registration for `llm_factor` records without accepted evaluation and passing ledger evidence.
 
 ### Post-promotion watch and rollback
 
@@ -269,6 +274,7 @@ Promotion is also globally gated by `engine.strategy.promotion_guard.promotion_a
 - `equity_drift_crit`
 - `drift_ratio`
 - `negative_real_pnl_models`
+- generated-candidate `experiment_ledger` failures when `PROMOTION_EXPERIMENT_LEDGER_REQUIRED=1`
 
 ## 5. Operator Autofix And Patch Gating
 

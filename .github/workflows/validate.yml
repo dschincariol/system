@@ -6,12 +6,8 @@ on:
 
 jobs:
   validate:
-    name: Validate (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: SQLite contract validation (Linux)
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,23 +26,17 @@ jobs:
       - name: Install Python dependencies (including pytest)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: Install Windows dev extras
-        if: matrix.os == 'windows-latest'
-        run: python -m pip install -e ".[windows-dev]"
+          python -m pip install -r requirements-dev.txt
 
       - name: Install Node dependencies
         run: npm ci
 
-      - name: Run cross-platform contract tests
+      - name: Run Linux SQLite contract tests
         env:
           PYTHONPATH: .
-        # These tests do not need a running Postgres or Redis. They
-        # enforce the Windows-dev / Linux-prod application-code
-        # contract on both platforms. Suite tests that require
-        # Postgres / Redis are auto-skipped via the requires_postgres
-        # / requires_redis markers in tests/conftest.py.
+        # This job is intentionally not the production-backend gate.
+        # The separate production-backend job below provisions Postgres
+        # and Redis and fails if backend-required tests are skipped.
         run: |
           python -m pytest -q \
             tests/test_no_sqlite_in_runtime.py \
@@ -58,12 +48,205 @@ jobs:
             tests/test_audit_hashing.py \
             tests/test_secrets_loader.py \
             tests/test_secrets_provider_plaintext.py \
-            tests/test_secrets_provider_dpapi.py \
             tests/test_secrets_provider_systemd.py
         shell: bash
 
       - name: Run canonical repository validation
-        if: matrix.os == 'ubuntu-latest'
         env:
           PYTHONPATH: .
         run: python tools/validate_repo.py
+
+  production-backend:
+    name: Production backend gate (Postgres + Redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_DB: trading_ci
+          POSTGRES_USER: ts_app
+          POSTGRES_PASSWORD: test-app-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ts_app -d trading_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PYTHONPATH: .
+      TS_PRODUCTION_BACKEND_TESTS: "1"
+      TS_STORAGE_BACKEND: postgres
+      TS_PG_DSN: "host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password"
+      TS_PG_PASSWORD: test-app-password
+      TS_PG_SCHEMA_PER_DB_PATH: "1"
+      TS_PG_POOL_SIZE: "16"
+      TS_PG_POOL_MIN_SIZE: "1"
+      TS_PG_POOL_TIMEOUT: "15"
+      TS_PG_CONNECT_TIMEOUT: "5"
+      TRADING_UNIT_TEST_SCHEMA_FAST: "1"
+      TRADING_FAILURE_DIAGNOSTICS_PERSIST: "0"
+      TRADING_PG_AUTOINIT_ON_CONNECT: "1"
+      TS_REDIS_URL: redis://127.0.0.1:6379/0
+      TS_REDIS_CONNECT_TIMEOUT_S: "0.25"
+      TS_REDIS_SOCKET_TIMEOUT_S: "0.25"
+      TS_REDIS_CIRCUIT_COOLDOWN_S: "600"
+      TS_CACHE_REAL_INTEGRATION: "1"
+      LIVE_CACHE_BACKEND: redis
+      LIVE_CACHE_REDIS_URL: redis://127.0.0.1:6379/0
+      APP_ENV: test
+      ENGINE_MODE: safe
+      EXECUTION_MODE: safe
+      OPERATOR_MODE: safe
+      PROD_LOCK: "0"
+      KILL_SWITCH_GLOBAL: "0"
+      AUTO_BOOT_DAEMONS: "0"
+      AUTO_PIPELINE: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies (including pytest)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Verify provisioned Postgres and Redis
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+          import redis
+
+          with psycopg.connect(os.environ["TS_PG_DSN"], connect_timeout=5) as con:
+              print("postgres_select_1=", con.execute("SELECT 1").fetchone()[0])
+
+          client = redis.Redis.from_url(os.environ["TS_REDIS_URL"], socket_connect_timeout=2, socket_timeout=2)
+          print("redis_ping=", client.ping())
+          PY
+
+      - name: Run all marked production-backend tests without skips
+        run: |
+          python tools/run_required_backend_tests.py \
+            --label marked-production-backend-tests \
+            --junitxml "$RUNNER_TEMP/pytest-required-backends.xml" \
+            -- -q -m "requires_postgres or requires_redis" -rs
+
+      - name: Run targeted production-path backend tests without skips
+        run: |
+          python tools/run_required_backend_tests.py \
+            --label targeted-production-path-tests \
+            --junitxml "$RUNNER_TEMP/pytest-production-targeted.xml" \
+            -- -q -rs \
+              tests/test_storage_migrator.py \
+              tests/test_migrator_lock_release_on_rollback.py \
+              tests/test_storage_pg_runtime_regressions.py \
+              tests/test_storage_locks_pg.py \
+              tests/test_layer5_audit_chain_bypass_detected.py \
+              tests/test_live_trading_preflight.py::test_execution_mode_refuses_live_arming_before_initial_kill_switch_hold \
+              tests/test_live_trading_preflight.py::test_operator_execution_arm_writes_hash_chain_audit \
+              tests/test_runtime_reliability_regressions.py::RuntimeReliabilityRegressionTests::test_execution_mode_respects_caller_transaction_boundaries \
+              tests/test_runtime_reliability_regressions.py::RuntimeReliabilityRegressionTests::test_concurrent_order_claims_use_single_idempotency_row \
+              tests/test_promotion_guard_fdr.py \
+              tests/test_cpcv.py \
+              tests/test_model_competition_real_pnl.py \
+              tests/test_cache_wrappers_integration.py::test_real_redis_postgres_wrappers_integration \
+              tests/test_live_cache.py::LiveCacheTests::test_explicit_redis_live_cache_round_trip
+
+      - name: Run staging prod-preflight evidence harness
+        run: |
+          mkdir -p "$RUNNER_TEMP/trading-preflight-data" artifacts/preflight
+          {
+            echo "STAGING_PREFLIGHT_TARGET_ENV=staging"
+            echo "STAGING_PREFLIGHT_TARGET_ID=github-actions-postgres"
+            echo "TS_STORAGE_BACKEND=postgres"
+            echo "TS_PG_DSN=$TS_PG_DSN"
+            echo "TS_PG_PASSWORD=$TS_PG_PASSWORD"
+            echo "TS_PG_POOL_SIZE=$TS_PG_POOL_SIZE"
+            echo "TS_PG_POOL_MIN_SIZE=$TS_PG_POOL_MIN_SIZE"
+            echo "TS_PG_POOL_TIMEOUT=$TS_PG_POOL_TIMEOUT"
+            echo "TS_PG_CONNECT_TIMEOUT=$TS_PG_CONNECT_TIMEOUT"
+            echo "TS_REDIS_URL=$TS_REDIS_URL"
+            echo "LIVE_CACHE_BACKEND=redis"
+            echo "LIVE_CACHE_REDIS_URL=$LIVE_CACHE_REDIS_URL"
+            echo "APP_ENV=staging"
+            echo "ENGINE_MODE=safe"
+            echo "EXECUTION_MODE=safe"
+            echo "OPERATOR_MODE=safe"
+            echo "PROD_LOCK=1"
+            echo "ALLOW_TRAINING=0"
+            echo "DISABLE_LIVE_EXECUTION=1"
+            echo "KILL_SWITCH_GLOBAL=1"
+            echo "PREFLIGHT_REQUIRE_REDIS=1"
+            echo "PREFLIGHT_REQUIRE_TIMESCALE=0"
+            echo "PREFLIGHT_REQUIRE_OBJECT_STORAGE=0"
+            echo "PREFLIGHT_REQUIRE_BACKUP_EVIDENCE=0"
+            echo "PREFLIGHT_CHECK_OPERATOR_SIDECAR_HTTP=0"
+            echo "DASHBOARD_API_TOKEN=github-actions-dashboard-token-1234567890"
+            echo "OPERATOR_API_TOKEN=github-actions-operator-token-1234567890"
+            echo "DATA_SOURCE_MASTER_KEY=6cJ3aBXfO5ppbWiUmmwbBBuxJmloL9GkHW0gMvr/Xv0="
+            echo "DB_PATH=$RUNNER_TEMP/trading-preflight-data"
+          } > "$RUNNER_TEMP/staging-prod-preflight.env"
+
+          set +e
+          python -m engine.runtime.staging_prod_preflight \
+            --env-file "$RUNNER_TEMP/staging-prod-preflight.env" \
+            --target-env staging \
+            --evidence-dir artifacts/preflight \
+            --evidence-label github-actions \
+            --timeout-s 180
+          preflight_rc=$?
+          set -e
+
+          python - <<'PY'
+          import glob
+          import json
+          import sys
+
+          paths = sorted(glob.glob("artifacts/preflight/staging/prod_preflight_*.json"))
+          if not paths:
+              raise SystemExit("no staging prod-preflight evidence artifact was written")
+          path = paths[-1]
+          with open(path, encoding="utf-8") as fh:
+              payload = json.load(fh)
+          summary = {
+              "evidence_path": path,
+              "process": payload.get("process"),
+              "target": payload.get("target"),
+              "postgres_target": (payload.get("environment") or {}).get("postgres_target"),
+              "guardrails": payload.get("guardrails"),
+              "prod_preflight_status": (payload.get("prod_preflight") or {}).get("status"),
+              "prod_preflight_production_ready": (payload.get("prod_preflight") or {}).get("production_ready"),
+              "db_validation": (payload.get("prod_preflight") or {}).get("db_validation"),
+          }
+          rendered = json.dumps(summary, sort_keys=True)
+          for forbidden in ("test-app-password", "github-actions-dashboard-token", "github-actions-operator-token"):
+              if forbidden in rendered:
+                  raise SystemExit(f"unredacted secret leaked in evidence summary: {forbidden}")
+          print(rendered)
+          PY
+
+          if [ "$preflight_rc" -ne 0 ] && [ "$preflight_rc" -ne 2 ]; then
+            exit "$preflight_rc"
+          fi
+
+      - name: Upload staging prod-preflight evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-prod-preflight-evidence
+          path: artifacts/preflight/staging/*.json
+          if-no-files-found: error

@@ -11,15 +11,14 @@ The bar is institutional: any second of committed data must be
 recoverable, and the recovery procedure must be a single command an
 operator can run under stress.
 
-## Cross-platform note
+## Linux-only note
 
 This prompt is **Linux-only by design**. Backups are a
 staging/production concern and rely on bash scripts, systemd timers,
-`pg_basebackup`, and Postgres' `archive_command`. The user develops
-on Windows; for dev, occasional `pg_dump` of the dev database is
-sufficient and is documented in
+`pg_basebackup`, and Postgres' `archive_command`. For dev, occasional
+`pg_dump` of the dev database is sufficient and is documented in
 `docs/codex_prompts/database/CROSS_PLATFORM.md`. Do not produce
-cross-platform shell wrappers.
+platform shell wrappers.
 
 ## Goal
 

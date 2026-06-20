@@ -24,7 +24,7 @@ storage so trials accumulate across runs.
 
 ## Files to read first (read-only)
 
-- `ops/train_model_v2.py` — main training entrypoint.
+- `engine/strategy/jobs/train_model_v2.py` — main training entrypoint.
 - `engine/strategy/temporal_predictor.py` — current temporal model;
   contains hardcoded numeric defaults you will expose as search ranges.
 - `engine/strategy/embed_regressor.py` — current embed model; same.

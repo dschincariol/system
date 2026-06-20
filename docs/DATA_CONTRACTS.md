@@ -129,6 +129,161 @@ Failure if malformed:
 | `explain_json` | `JSON object` | Yes | Explainability payload. | JSON |
 | `extra_json` | `JSON object` | Yes | Auxiliary metadata. | JSON |
 
+## 3A. Point-In-Time Model Feature Snapshot
+
+Producer:
+- `engine.strategy.model_feature_snapshots.build_model_feature_snapshot(...)`
+
+Consumers:
+- `engine.strategy.feature_registry.build_feature_snapshot(...)`
+- training jobs that call the schema-driven feature registry
+- predictor serving cache reads in `engine.strategy.predictor`
+- replay/backfill and model-feature snapshot materialization
+
+Failure if malformed:
+- a delayed source can leak a value whose vendor availability was after the decision timestamp
+- a stale source can look valid because the numeric feature value is present
+- serving can use a latest cached feature snapshot that belongs to a later decision
+
+Production enforcement:
+- `build_model_feature_snapshot(...)` applies the PIT policy before returning or storing vectors.
+- `feature_registry` resolves schema-driven symbol snapshots through the same model-feature snapshot path and filters cached NLP rows with `b.ts <= decision_ts_ms`.
+- `predictor._latest_feature_snapshot_features(...)` rejects cached snapshots whose `ts_ms` or source availability is after the decision timestamp.
+- Shadow-only time-series foundation features such as `tsfm.chronos_v2.*` are produced through the same snapshot path. Live model serving and live preflight reject model feature contracts that contain shadow-stage feature ids.
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `symbol` | `TEXT` | Yes | Upper-cased asset symbol. | symbol |
+| `ts_ms` | `INTEGER` | Yes | Decision timestamp for the feature vector. | ms |
+| `feature_ids` | `JSON array[string]` | Yes | Ordered feature ids used for the vector. | feature ids |
+| `features` | `JSON object` | Yes | Feature-id to numeric value map after PIT enforcement. Ineligible or stale groups are zeroed. | feature payload |
+| `vector` | `JSON array[number]` | Yes | Numeric vector in `feature_ids` order after PIT enforcement. | numeric |
+| `availability` | `JSON object` | Yes | Group-level booleans after PIT and freshness enforcement. | boolean map |
+| `source_timestamps` | `JSON object` | Yes | Group-level source and availability timestamps used to validate PIT safety. | ms |
+| `source_timestamps._pit_controls` | `JSON object` | Yes | Per-group enforcement detail with `source_ts_ms`, `availability_ts_ms`, `reason_codes`, and `ok`. | JSON |
+| `source_timestamps._feature_metadata` | `JSON object` | Yes | Per-group metadata: `source_timestamp_field`, `availability_timestamp_field`, `freshness_ttl_ms`, `lag_policy`, `stale_behavior`, and `pit_eligible`. | JSON |
+| `feature_metadata` | `JSON object` | Yes | Top-level copy of the PIT metadata for live callers. Persisted rows recover it from `source_timestamps._feature_metadata`. | JSON |
+| `pit_controls` | `JSON object` | Yes | Top-level copy of PIT enforcement results. Persisted rows recover it from `source_timestamps._pit_controls`. | JSON |
+
+For the optional Chronos frozen encoder group, `source_timestamps.ts_foundation_chronos` includes `price_history_first_ts_ms`, `price_history_last_ts_ms`, `price_history_rows`, `encoder_artifact_created_ts_ms`, `artifact_alias`, `artifact_sha256`, `model_family`, `model_id`, `frozen_encoder=true`, and `direct_trading_authority=false`. PIT enforcement zeroes the group when price history or artifact availability is after the decision timestamp or stale under the group TTL.
+
+Optional graph/relational features use `graph.relational_v1.*` ids and are shadow-only. `engine.strategy.graph_relational.build_graph_relational_snapshot(...)` builds versioned snapshots from PIT-safe relationships: sector, industry, rolling correlation, ETF ownership, supply chain edges, 13F shared ownership, options co-movement, and news co-mentions when those source tables are available. The snapshot metadata includes `graph_id`, `snapshot_version`, `relationship_hash`, `max_source_ts_ms`, `max_availability_ts_ms`, `snapshot_available`, `pit_safe`, and `direct_trading_authority=false`. `build_model_feature_snapshot(...)` applies the `graph_relational_v1` PIT policy and zeroes graph features when availability/source timestamps are after the decision timestamp or stale. Live model serving rejects `graph.relational_v1.*` feature contracts through the shadow-feature registry, and `engine.model_registry` plus `engine.strategy.champion_manager` block graph candidate promotion when graph metadata, PIT safety, train/serve parity, or snapshot availability is missing. Fully valid graph metadata still remains non-promotable because the scaffold is shadow-only.
+
+### 3B. Structured Document Event Rows
+
+Producer:
+- `engine.runtime.storage_pg.put_normalized_event(...)` calls `engine.data.structured_document_events.extract_structured_document_events(...)` for normalized `news`, `filing`, and `transcript` rows. Transcript documents are also detected from `meta_json.transcript=true` or `source='fmp_transcript'`.
+
+Consumers:
+- `engine.data.structured_document_events.resolve_structured_document_event_features(...)`
+- `engine.strategy.model_feature_snapshots.build_model_feature_snapshot(...)`
+- `engine.strategy.feature_registry` via explicit `structured_doc_events_v1.*` feature ids
+
+Production enforcement:
+- durable rows live in `structured_document_events`, created by migration `0060_structured_document_events.py`
+- feature joins only use `availability_ts_ms <= decision ts_ms`
+- PIT metadata is attached to both raw rows (`pit_metadata_json`) and model snapshots (`source_timestamps.structured_doc_events`)
+- all `structured_doc_events_v1.*` features are registry stage `shadow` with `direct_trading_authority=false`; live model serving rejects them through `feature_registry.assert_no_shadow_features(...)`
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `source_document_id` | `TEXT` | Yes | Stable document key from `source_id`, `event_key`, artifact id, URL, or deterministic hash. | id |
+| `source_event_id` | `INTEGER` | No | Normalized `events.id` when available. | event id |
+| `symbol` | `TEXT` | Yes | Upper-cased asset symbol; empty string when document is market-wide. | symbol |
+| `document_type` | `TEXT` | Yes | `filing`, `transcript`, or `news`. | enum |
+| `event_type` | `TEXT` | Yes | Extracted event kind such as `guidance_raise`, `guidance_cut`, `margin_pressure`, `liquidity_stress`, `capex_increase`, `capex_cut`, `debt_refinancing_risk`, `regulatory_litigation_risk`, `customer_concentration`, or `management_uncertainty`. | enum |
+| `event_ts_ms` | `INTEGER` | Yes | Source document event timestamp. | ms |
+| `availability_ts_ms` | `INTEGER` | Yes | Earliest timestamp the extraction may be used by PIT features. | ms |
+| `extraction_confidence` | `REAL` | Yes | Deterministic extractor confidence for the matched evidence. | 0-1 score |
+| `feature_id` | `TEXT` | Yes | Registered `structured_doc_events_v1.*` feature receiving the event. | feature id |
+| `pit_metadata_json` | `JSON object` | Yes | Source timestamp, availability timestamp, extractor version, lag policy, and `direct_trading_authority=false`. | JSON |
+
+### 3C. Structured Document And Graph Feature Visibility API
+
+Producer:
+- `engine.api.feature_visibility.build_feature_visibility(...)`
+
+HTTP route:
+- `GET /api/data/feature_visibility`
+
+Consumers:
+- Data Health panels in [ui/dashboard.html](../ui/dashboard.html) and [ui/feature_visibility.js](../ui/feature_visibility.js)
+- `/api/ui/decision` attribution rows through `feature_visibility` metadata on structured-document and graph feature contributions
+
+Production enforcement:
+- This route is read-only and explanatory. It does not authorize feature use, promotion, allocation, or execution.
+- Structured-document and graph feature groups remain `stage=shadow` with `direct_trading_authority=false`.
+- Live model serving and promotion gates remain authoritative through `engine.strategy.feature_registry`, `engine.strategy.graph_relational`, model registry checks, champion competition, runtime gates, and execution controls.
+- Missing tables, stale PIT inputs, missing failure telemetry, and unavailable snapshots are serialized as explicit warnings or unavailable states rather than silent absence.
+
+Example:
+
+```json
+{
+  "ok": true,
+  "ts_ms": 1700000000000,
+  "structured_documents": {
+    "status": "available",
+    "shadow_only": true,
+    "direct_trading_authority": false,
+    "counts": {
+      "events": 12,
+      "source_documents": 7,
+      "symbols": 4,
+      "low_confidence": 2
+    },
+    "latest_extraction_ts_ms": 1699999900000,
+    "latest_availability_ts_ms": 1699999800000,
+    "confidence": {
+      "low_confidence_threshold": 0.6,
+      "low_confidence_count": 2,
+      "buckets": []
+    },
+    "coverage": {
+      "symbols": [],
+      "event_types": []
+    },
+    "lineage": {
+      "source_documents": []
+    },
+    "pit_status": {
+      "ok": true,
+      "reason_codes": []
+    },
+    "warnings": []
+  },
+  "graph_features": {
+    "status": "shadow_only",
+    "enabled": false,
+    "shadow_only": true,
+    "direct_trading_authority": false,
+    "feature_group": "graph_relational_v1",
+    "graph_id": "graph_relational_v1",
+    "snapshot_freshness": {
+      "latest_snapshot_ts_ms": 1699999900000,
+      "stale": false
+    },
+    "feature_availability": {
+      "expected_feature_count": 12,
+      "observed_feature_count": 12,
+      "missing_feature_ids": []
+    },
+    "pit_status": {
+      "ok": true,
+      "latest_snapshot_pit_safe": true
+    },
+    "snapshots": [],
+    "warnings": [
+      "USE_GRAPH_RELATIONAL_FEATURES is disabled; graph features are unavailable unless precomputed snapshots exist"
+    ]
+  },
+  "explanation_paths": {
+    "decision_detail_route": "/api/ui/decision",
+    "feature_prefixes": ["structured_doc_events_v1.", "graph.relational_v1."]
+  }
+}
+```
+
 ## 4. Execution Decision Result
 
 Producer:
@@ -381,7 +536,145 @@ Failure if malformed:
 | `raw_json` | `JSON object` | No | Raw broker payload. | JSON |
 | `extra_json` | `JSON object` | No | Additional normalized metadata. | JSON |
 
-## 9. Position Contracts
+## 8A. Execution Diagnostics API Payload
+
+Producer:
+- `engine.execution.execution_diagnostics.build_execution_diagnostics(...)`
+  exposed through `GET /api/execution/diagnostics`
+
+Consumers:
+- dashboard execution screen TCA, outcome, trace, LOB/DeepLOB, and learned
+  slicing panels
+- operator/debug tooling that needs a normalized read-only execution-quality
+  contract rather than raw table JSON
+
+Failure if malformed:
+- operators lose by-symbol execution-quality visibility
+- rejected, suppressed, stale L2, and partial-fill states can be hidden behind
+  raw API/table differences
+- UI may misrepresent advisory learned-slicing state as unavailable or active
+
+Authority:
+- explanatory only; it does not arm execution, mutate orders, bypass broker
+  controls, alter risk gates, or authorize learned slicing
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Whether the diagnostics serializer completed. | boolean |
+| `ts_ms` | `INTEGER` | Yes | Serialization timestamp. | ms |
+| `state` | `TEXT` | Yes | Overall read state such as `fresh`, `stale`, `partial`, or `unavailable`. | state |
+| `inventory.routes[]` | `ARRAY<object>` | Yes | Route/source availability for stats, rolling metrics, by-symbol metrics, advisories, terminal orders/fills, rejected/suppressed intents, LOB, DeepLOB, and learned slicing. | route metadata |
+| `tca.by_symbol[]` | `ARRAY<object>` | Yes | Symbol-level fills, filled quantity, slippage, latency, fill quality, costs, implementation shortfall, and VWAP fields where available. | mixed |
+| `tca.rolling[]` | `ARRAY<object>` | Yes | Rolling execution windows with fill count, slippage, latency, fees, and implementation-shortfall summaries. | mixed |
+| `tca.partial_fills[]` | `ARRAY<object>` | Yes | Parent-order fill aggregation with ordered, filled, remaining quantity, fill ratio, VWAP, and lineage ids. | mixed |
+| `order_flow.rejected_intents[]` | `ARRAY<object>` | Yes | Rejected terminal intents with `reason_code`, `reason`, side, quantity, source, and detail metadata. | mixed |
+| `order_flow.suppressed_intents[]` | `ARRAY<object>` | Yes | Suppressed portfolio/execution intents from attribution or policy audit rows with machine-readable and human-readable reasons. | mixed |
+| `lob.l2_feed` | `OBJECT` | Yes | L2 freshness state, latest timestamp, age, required/sample rows, and top-of-book depth summary. | mixed |
+| `lob.simulation` | `OBJECT` | Yes | LOB replay/simulation readiness and calibration evidence from recent simulated fills. | mixed |
+| `lob.deeplob` | `OBJECT` | Yes | Shadow-only DeepLOB enablement, readiness, blockers, and authority constraints. | mixed |
+| `learned_slicing` | `OBJECT` | Yes | Contextual-bandit policy state, selected action distribution, baseline comparison, recent non-application reasons, and explicit no-new-authority flags. | mixed |
+| `drilldowns[]` | `ARRAY<object>` | Yes | Intent-to-route-to-fill, rejection, or suppression trace rows with lineage identifiers where available. | mixed |
+
+## 9. Net-After-Cost Label Artifact
+
+Producers:
+- `engine/execution/jobs/compute_exec_labels.py` writes timestamp-safe market-data labels after the forward horizon has elapsed
+- `engine/execution/jobs/compute_exec_labels_from_fills.py` overwrites with realized broker-fill evidence when real fills are available
+
+Consumers:
+- training loaders that prefer realized `labels_exec.net_z` over gross `labels.impact_z`
+- PatchTST supervised fine-tuning, which first uses realized `net_after_cost_labels.net_return` for `net_edge` targets or `net_after_cost_labels.realized_forward_return` for `forward_return` targets before falling back to legacy labels
+- `engine.strategy.pipeline_train_and_eval._net_eval_metrics(...)`
+- `engine.strategy.model_marketplace` and `engine.strategy.champion_manager`
+- `engine.strategy.promotion_guard.metrics_have_net_cost_evidence(...)`
+
+Failure if malformed:
+- promotion can no longer prove whether edge survives slippage, spread, fees, and financing/borrow costs
+- training can silently optimize gross-only targets
+- order/fill attribution cannot be reconciled back to model intent, regime, or confidence
+
+Storage notes:
+
+- `net_after_cost_labels` is keyed by `(event_id, symbol, horizon_s, label_ts_ms)` so the label is tied to the original prediction timestamp and remains compatible with Timescale hypertable uniqueness.
+- `label_ts_ms` is the prediction timestamp, not the computation time. `computed_at_ts_ms` records when the label was materialized.
+- Rows from synthetic market-data execution have `realized=0`. Promotion-grade evidence requires realized fill-derived rows with cost fields populated.
+- Promotion gates fail closed when challenger metrics lack `net_cost_evidence.available=true` and a positive `net_cost_label_count`.
+- RL, bandit, sizing-policy, and execution-policy challengers also require doubly robust off-policy evaluation before moving beyond shadow. The raw inputs live in `policy_ope_observations` or compatible OPE payloads embedded in `shadow_predictions.extra_json`, `execution_policy_audit.decision_json`, or `challenger_shadow_orders.meta_json`. Each usable row must include behavior propensity, target propensity or target/logged actions, realized outcome, logged-action model estimate, and target-policy model estimate.
+- `policy_ope_evidence` stores the append-only DR estimate, effective sample size, support, confidence bounds, and pass/fail reason consumed by `engine.strategy.champion_manager`, `engine.model_registry`, `engine.strategy.size_policy`, `engine.execution.execution_policy_engine`, and `engine.strategy.jobs.strategy_governance_job`.
+- PatchTST masked pretraining does not consume labels. It reconstructs historical feature/price windows, persists a `model:patchtst:<model_name>:*:pretrained` artifact, and supervised fine-tuning records the pretraining artifact alias/SHA in the final shadow model config and registry metrics.
+- iTransformer supervised training consumes the same sequence rows and net-after-cost label preference as PatchTST, then writes OOS validation rows to `model_oos_predictions` with `family='itransformer'`. Its shadow marketplace row uses `score_source='model_oos_predictions'` only for champion-manager visibility; it is not realized execution evidence and cannot satisfy live-promotion gates by itself.
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `event_id` | `INTEGER` | Yes | Prediction/event lineage key. | event id |
+| `prediction_id` | `INTEGER` | No | Typed prediction row id when available. | row id |
+| `source_alert_id` | `INTEGER` | No | Alert or signal id that led to execution. | alert id |
+| `symbol` | `TEXT` | Yes | Asset symbol. | symbol |
+| `horizon_s` | `INTEGER` | Yes | Forward-return horizon. | seconds |
+| `label_ts_ms` | `INTEGER` | Yes | Original prediction timestamp used for the label. | ms |
+| `entry_ts_ms`, `exit_ts_ms` | `INTEGER` | No | Entry and exit price/fill timestamps used for realized return. | ms |
+| `computed_at_ts_ms` | `INTEGER` | Yes | Label materialization time. | ms |
+| `model_name`, `model_id`, `model_version` | `TEXT` | No | Model identity attached to the prediction/alert. | model identity |
+| `model_family` | `TEXT` | Yes | Normalized family such as `patchtst`, `itransformer`, `temporal`, or `gbm`. | family |
+| `regime` | `TEXT` | Yes | Regime label extracted from prediction, alert, or model intent metadata. | regime |
+| `confidence`, `confidence_raw` | `REAL` | No | Confidence values attached to the model intent. | dimensionless |
+| `confidence_metadata_json` | `JSON object` | No | Prediction score, confidence, raw confidence, and regime components. | JSON |
+| `side` | `INTEGER` | Yes | `1` for long-style label, `-1` for short-style label. | side |
+| `realized` | `INTEGER` | Yes | `1` when backed by real broker fills, else `0`. | 0/1 |
+| `gross_return` | `REAL` | Yes | Direction-adjusted forward return before execution costs. | return fraction |
+| `realized_forward_return` | `REAL` | Yes | Raw forward return from entry to exit before side adjustment. | return fraction |
+| `execution_cost_return` | `REAL` | Yes | Return drag from execution and carry costs. | return fraction |
+| `net_return` | `REAL` | Yes | Direction-adjusted return after all available costs. | return fraction |
+| `fees_bps`, `slippage_bps`, `spread_bps` | `REAL` | Yes | Execution cost decomposition. | basis points |
+| `borrow_bps`, `financing_bps` | `REAL` | Yes | Borrow/financing cost when available from broker or attribution metadata. | basis points |
+| `total_cost_bps` | `REAL` | Yes | Maximum known all-in cost basis points. | basis points |
+| `fees_cost`, `slippage_cost`, `spread_cost`, `borrow_cost`, `financing_cost`, `total_cost` | `REAL` | No | Currency-denominated cost evidence where available. | currency |
+| `source` | `TEXT` | Yes | Label source such as `synthetic_market_data` or `broker_fills_v2`. | source |
+| `order_count`, `fill_count` | `INTEGER` | Yes | Number of linked execution orders/fills found for the label. | count |
+| `label_metadata_json` | `JSON object` | No | Timestamp-safety flag, execution trace ids, carry availability, and source details. | JSON |
+
+## 10. Learned Alpha Decay, Capacity, And Crowding
+
+Producer:
+- `engine/strategy/jobs/train_learned_alpha_decay.py`
+
+Source evidence:
+- realized `net_after_cost_labels` rows first
+- legacy `labels_exec` rows only when richer net-after-cost rows are absent
+
+Consumers:
+- `engine.execution.execution_policy_engine.apply_execution_policy(...)` shortens TTL/half-life, blocks stale learned cohorts, blocks low-capacity/crowded risk-increasing orders, and records the learned gate in execution audit payloads
+- `engine.strategy.portfolio_execution_intents.load_latest_portfolio_execution_intents(...)` applies learned capacity/crowding multipliers before model/group/portfolio caps are enforced
+- `engine.strategy.position_sizing.position_from_signal(...)` accepts the learned estimate object and scales or blocks direct sizing calls
+- `engine.strategy.champion_manager.evaluate_competition_cycle(...)` treats learned low-capacity/crowded cohorts as candidate/current blockers during champion evaluation
+
+Failure if malformed:
+- stale signals can survive longer than realized edge supports
+- capacity-constrained alphas can receive full target weights
+- crowded model cohorts can be promoted even when realized net edge has decayed
+
+Storage notes:
+
+- `learned_alpha_decay_runs` records each training run and freshness metadata. Runtime lookups ignore stale runs beyond `LEARNED_ALPHA_MAX_LOOKUP_AGE_MS`.
+- `learned_alpha_decay_estimates` stores latest cohort estimates by model family, symbol, regime, liquidity bucket, spread bucket, volatility bucket, and factor group, with hierarchical fallback rows for sparse cohorts.
+- `learned_alpha_decay_age_edges` stores the realized edge curve by signal-age bucket so half-life and max useful age are auditable.
+- Runtime consumers fail open when no fresh matching estimate exists, but enforce the learned block/size multipliers when an estimate is present.
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `cohort_key` | `TEXT` | Yes | Pipe-delimited normalized cohort key. | key |
+| `cohort_level` | `TEXT` | Yes | Exact or fallback aggregation level. | label |
+| `model_family`, `symbol`, `regime` | `TEXT` | Yes | Core model and market context. | mixed |
+| `liquidity_bucket`, `spread_bucket`, `volatility_bucket`, `factor_group` | `TEXT` | Yes | Execution and factor-context cohort dimensions. | labels |
+| `n_obs` | `INTEGER` | Yes | Realized observations in the cohort. | count |
+| `mean_realized_edge`, `positive_rate` | `REAL` | Yes | Net-after-cost edge summary. | return fraction / ratio |
+| `half_life_ms`, `max_useful_age_ms` | `INTEGER` | Yes | Learned decay timing used by execution TTL/half-life policy. | ms |
+| `capacity_estimate` | `REAL` | Yes | Normalized useful capacity estimate. | portfolio fraction |
+| `crowding_penalty`, `size_multiplier` | `REAL` | Yes | Crowding penalty and final sizing multiplier. | 0..1 |
+| `block_signal` | `INTEGER` | Yes | Hard block flag for risk-increasing consumers. | 0/1 |
+| `detail_json` | `JSON object` | No | Estimator diagnostics and source counts. | JSON |
+
+## 11. Position Contracts
 
 ### Broker position row
 
@@ -432,7 +725,7 @@ Failure if malformed:
 | `realized_pnl` | `REAL` | Yes | Realized PnL for the model position. | currency |
 | `last_update_ts_ms` | `INTEGER` | Yes | Last update time. | ms |
 
-## 10. Runtime Execution Barrier Snapshot
+## 11. Runtime Execution Barrier Snapshot
 
 Producer:
 - `engine.runtime.gates.execution_gate_snapshot(...)`
@@ -451,7 +744,7 @@ Important semantic detail:
 
 - `allowed` is the same concept as `allow_execution_pipeline`.
 - `real_trading_allowed` is stricter and only becomes true in live mode when the runtime is armed and not otherwise blocked.
-- When `DISABLE_LIVE_EXECUTION` is truthy, live-mode snapshots return `reason=disable_live_execution_env`, `allowed=false`, and `real_trading_allowed=false` even if runtime state is `LIVE` and armed.
+- When `DISABLE_LIVE_EXECUTION` is unset or not explicitly false (`0`, `false`, `no`, or `off`), live-mode snapshots return `reason=disable_live_execution_env`, `allowed=false`, and `real_trading_allowed=false` even if runtime state is `LIVE` and armed.
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
@@ -476,7 +769,7 @@ Important semantic detail:
 | `conditional_allow` | `BOOLEAN` | No | Conditional allow flag when present. | boolean |
 | `disable_live_execution` | `BOOLEAN` | No | True when the `DISABLE_LIVE_EXECUTION` env emergency block is active. | boolean |
 
-## 11. Terminal Pre-Trade Rejection Row
+## 12. Terminal Pre-Trade Rejection Row
 
 Producer:
 - `engine.terminal.api.api_terminal_orders._record_terminal_rejection(...)`
@@ -501,7 +794,7 @@ Failure if malformed:
 | `source` | `TEXT` | Yes | Source surface. Current writer uses `terminal`. | source |
 | `detail_json` | `JSON object` | Yes | Price snapshot, cap, duplicate-window, or other rejection evidence. | JSON |
 
-## 12. Broker Configuration Control Plane
+## 13. Broker Configuration Control Plane
 
 Producers:
 - `engine.api.api_broker_config.api_post_broker_config(...)`
@@ -597,7 +890,7 @@ The test response includes:
 | `reasons` | `JSON array[string]` | Yes | Failure reasons. | reason codes |
 | `tested_ts_ms` | `INTEGER` | Yes | Test timestamp. | ms |
 
-## 13. Alert Lifecycle Rows
+## 14. Alert Lifecycle Rows
 
 Producers:
 - `engine.api.api_write.ack_alert(...)`
@@ -649,7 +942,7 @@ Failure if malformed:
 | `source` | `TEXT` | No | Source surface. | source |
 | `detail_json` | `JSON object` | Yes | Structured action detail. | JSON |
 
-## 14. Operator Emergency Stop Response
+## 15. Operator Emergency Stop Response
 
 Producer:
 - `engine.api.api_operator_handlers.api_post_operator_emergency_stop(...)`
@@ -670,7 +963,7 @@ Failure if malformed:
 | `operator_stop` | `JSON object` | Yes | Embedded response from `api_post_operator_stop(...)`. | JSON |
 | `safety_errors` | `JSON array[string]` | Yes | Errors from kill-switch activation or execution disarming. | errors |
 
-## 15. Engine Support Snapshot
+## 16. Engine Support Snapshot
 
 Producer:
 - `engine.api.api_system.api_get_support_snapshot(...)`
@@ -730,7 +1023,7 @@ Snapshot schema:
 | `job_restart_counters` | `JSON object` | Yes | Restart counters keyed by job name. | counts |
 | `job_summary` | `JSON object` | Yes | Aggregate job summary. | JSON |
 
-## 16. Operator Snapshot From `boot/operator_server.js`
+## 17. Operator Snapshot From `boot/operator_server.js`
 
 Producer:
 - `boot/operator_server.js` via `buildOperatorSnapshot(mode)`
@@ -767,7 +1060,7 @@ Snapshot schema:
 | `snapshot_meta` | `JSON object` | Yes | Snapshot metadata. | JSON |
 | `diagnostics` | `JSON object` | Yes | Operator-side diagnostics summary. | JSON |
 
-## 17. Diagnostics-Only Operator AI Result
+## 18. Diagnostics-Only Operator AI Result
 
 Producer:
 - `services/operator_ai/agent.js`
@@ -777,7 +1070,7 @@ Consumers:
 
 Failure if malformed:
 - operator automation can mistake a non-actionable diagnosis for an executable fix
-- postmortem logs in `data/ai_operator_log.jsonl` lose the normalized analysis shape
+- postmortem logs in `var/log/ai_operator_log.jsonl` lose the normalized analysis shape
 
 Current mutability constraint:
 
@@ -795,7 +1088,7 @@ Current mutability constraint:
 | `action` | `null` | Yes | Top-level action, also non-executable here. | null |
 | `executed` | `null` | Yes | Reserved execution result. | null |
 
-## 18. Data-Source Control-Plane Record
+## 19. Data-Source Control-Plane Record
 
 Producers:
 - `services.data_source_manager._materialize_source(...)`
@@ -844,7 +1137,7 @@ Failure if malformed:
 | `supports_test` | `BOOLEAN` | Yes | Whether the source exposes a test operation. | boolean |
 | `credentials` | `JSON object` | No | Only included when the manager is explicitly asked for full credentials. | JSON |
 
-## 19. Data-Source List, Lifecycle, And Test Responses
+## 20. Data-Source List, Lifecycle, And Test Responses
 
 Producer:
 - `routes/data_sources_routes.py`
@@ -912,3 +1205,142 @@ Failure shape:
 | `source_key` | `TEXT` | Yes | Source under test. | key |
 | `error` | `TEXT` | Yes | Failure detail. | text |
 | `...extra` | mixed | No | Provider-specific failure output. | mixed |
+
+## 21. Job Catalog API Contract
+
+Producer:
+- `engine.runtime.job_catalog.build_job_catalog(...)`
+- `engine.api.api_jobs.api_get_jobs(...)`
+- `engine.api.api_jobs.api_get_jobs_catalog(...)`
+
+Consumers:
+- dashboard Job Console and Job Catalog
+- command palette job actions
+- operator/support tooling that needs to discover registered jobs
+
+Failure if malformed:
+- operators cannot discover registered jobs or understand prerequisites
+- browser surfaces may mislabel dangerous job starts
+- execution-sensitive or destructive/admin jobs may appear unguarded
+
+`GET /api/jobs` remains backward-compatible and still returns `jobs`, `pipeline_order`, and `allowed`. Each job row now also carries the catalog fields below. `GET /api/jobs/catalog` returns the same row contract in both `jobs` and `catalog`; when the jobs manager is unavailable it returns the static registry catalog with `status = "static"`.
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `id` | `TEXT` | Yes | Stable job id; same value as `name`. | job name |
+| `name` | `TEXT` | Yes | Registered job name. | job name |
+| `label` | `TEXT` | Yes | Human-readable label derived from the registry name. | text |
+| `group` | `TEXT` | Yes | Registry group such as `price_feed`, or empty string. | group |
+| `workflow` | `TEXT` | Yes | Operator grouping used by the dashboard catalog. | group |
+| `script` | `TEXT` | Yes | Repository-relative Python entrypoint. | path |
+| `module` | `TEXT` | Yes | Python module path derived from `script`. | module |
+| `mode` | `TEXT` | Yes | `daemon` or `oneshot`. | mode |
+| `schedule` | `TEXT` | Yes | Registry schedule/cadence text when available. | text |
+| `cadence_seconds` | `INTEGER/null` | Yes | Numeric cadence when available. | seconds |
+| `stage` | `TEXT` | Yes | Pipeline/default stage when available. | stage |
+| `owner_subsystem` | `TEXT` | Yes | Owning subsystem derived from script path. | subsystem |
+| `dependencies` | `JSON array[string]` | Yes | Explicit registry dependencies or recovery jobs. | list |
+| `required_secrets` | `JSON array[string]` | Yes | Secret names that must all be configured. Values are never returned. | list |
+| `required_secret_any` | `JSON array[string]` | Yes | Secret alternatives where any one satisfies the prerequisite. | list |
+| `required_providers` | `JSON array[string]` | Yes | Provider names inferred from required secrets or job path/name. | list |
+| `missing_prerequisites` | `JSON array[object]` | Yes | Missing secret prerequisites. | list |
+| `prerequisites` | `JSON object` | Yes | Structured prerequisite summary with `ok`, required fields, providers, and missing entries. | JSON |
+| `safety` | `TEXT` | Yes | One of `read_only`, `data_refresh`, `training_research`, `execution_sensitive`, `destructive_admin`, or `unavailable`. | class |
+| `base_safety` | `TEXT` | Yes | Safety classification before prerequisite availability is applied. | class |
+| `execution_sensitivity` | `TEXT` | Yes | `live_execution`, `admin_destructive`, or `none`. | class |
+| `resource_class` | `TEXT` | Yes | Registry or derived runtime resource class. | class |
+| `purpose` | `TEXT` | Yes | Operator-facing explanation of what the job does. | text |
+| `latest_run` | `JSON object` | No | Merged live/history state when available. | JSON |
+| `log_url` | `TEXT` | Yes | Read API for recent job logs. | URL path |
+| `history_url` | `TEXT` | Yes | Read API for job history. | URL path |
+| `last_output_url` | `TEXT` | Yes | Current operator link for latest output/log inspection. | URL path |
+| `action_policy` | `JSON object` | Yes | Backend-owned start/stop enablement, confirmation, and disabled-reason policy. | JSON |
+
+Job starts for `execution_sensitive` or `destructive_admin` jobs require a backend confirmation payload with `confirmation = "JOB_ACTION"` and `consequence_ack = true`. Jobs whose `safety` is `unavailable` are rejected by the API handler even when a browser attempts to submit the action.
+
+## 22. Governance Evidence Center API
+
+Producer:
+- `engine.api.governance_evidence.build_governance_evidence_summary(...)`
+- route wrappers in `engine.api.api_governance` and `dashboard_server.py`
+
+Consumers:
+- dashboard Governance Evidence Center
+- operator/support tooling that needs current promotion, generated-candidate, model-risk, monitoring, and shadow-capital evidence without reading logs or raw files
+
+Routes:
+- `GET /api/governance/evidence`
+- `GET /api/governance/evidence/promotion_blockers`
+- `GET /api/governance/evidence/generated_candidates`
+- `GET /api/governance/evidence/shadow_capital`
+- `GET /api/governance/shadow_capital/scores`
+
+Production enforcement:
+- the evidence routes are read-only sensitive GET routes
+- they do not promote challengers, train models, recompute shadow-capital scores, allocate capital, or arm execution
+- promotion remains gated by `promotion_guard`, `champion_manager`, `strategy_promotion_governance`, OPE, experiment-ledger, replay, statistical, and audit controls
+- allocation and execution remain gated by the runtime allocator, execution barrier, risk, kill-switch, and broker controls
+
+### Evidence Summary Envelope
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Route success flag. | boolean |
+| `ts_ms` | `INTEGER` | Yes | Response time. | ms |
+| `state` | `TEXT` | Yes | Overall evidence state: `pass`, `block`, or `unknown`. | enum |
+| `authority` | `JSON object` | Yes | Read-only authority note and the backend control modules that remain authoritative. | JSON |
+| `evidence` | `JSON array[object]` | Yes | One row per evidence producer. | list |
+| `blockers` | `JSON array[object]` | Yes | Evidence rows whose state is `block`. | list |
+| `unknowns` | `JSON array[object]` | Yes | Evidence rows whose state is `unknown`. | list |
+| `promotion_blockers` | `JSON object` | Yes | Exact promotion guard and evidence blockers. | JSON |
+| `generated_candidates` | `JSON object` | Yes | Experiment-ledger provenance rows and candidate-level blockers. | JSON |
+| `production_monitoring` | `JSON object` | Yes | Latest production-monitoring payload used by the evidence rows. | JSON |
+| `shadow_capital` | `JSON object` | Yes | Masked shadow-capital score payload. | JSON |
+| `drilldowns` | `JSON object` | Yes | URL paths for the detail routes. | JSON |
+
+### Evidence Row
+
+Every row in `evidence`, `blockers`, and `unknowns` uses:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `key` | `TEXT` | Yes | Stable evidence id such as `ope_gate`, `experiment_ledger`, `net_after_cost_labels`, `learned_alpha_decay`, `alpha_shrinkage`, `production_monitoring`, `shadow_live_monitoring`, or `shadow_capital_scores`. | id |
+| `label` | `TEXT` | Yes | Operator-facing evidence label. | text |
+| `state` | `TEXT` | Yes | `pass`, `block`, or `unknown`. Missing, stale, failed, or insufficient required evidence is `block`. | enum |
+| `freshness` | `TEXT` | Yes | `fresh`, `stale`, `missing`, or `unknown`. | enum |
+| `sample_count` | `INTEGER` | Yes | Evidence-specific row/sample count. | count |
+| `last_update_ts_ms` | `INTEGER` | Yes | Latest source timestamp, or `0` when missing. | ms |
+| `source_artifact` | `TEXT` | Yes | Exact table/meta source, optionally with row id, such as `policy_ope_evidence#12` or `runtime_meta.last_alpha_shrinkage`. | source |
+| `remediation` | `TEXT` | Yes | Concrete operator/maintainer action to refresh or repair missing evidence. | text |
+| `details` | `JSON object` | Yes | Source-specific metrics, gate reasons, thresholds, or selected source rows. | JSON |
+
+### Generated-Candidate Provenance
+
+`GET /api/governance/evidence/generated_candidates` returns latest `experiment_ledger` rows with feature ids, prompt/model hashes when available, search-space metadata, trial budget/count, CPCV/PBO/DSR/FDR evidence, redundancy evidence, promotion decision, and `blockers`.
+
+Candidate rows are `block` when the latest ledger evidence is missing or has non-passing promotion decision, missing trial budget, missing trial count, exceeded trial budget, missing statistical evidence, or missing redundancy checks.
+
+### Promotion Blockers
+
+`GET /api/governance/evidence/promotion_blockers` returns:
+
+- `guard.allowed` and exact `promotion_guard` blockers
+- `guard.reason` from the backend guard
+- `evidence_blockers` derived from the evidence row contract
+
+This route explains blockers only. It does not change the promotion switch or override any guard.
+
+### Shadow-Capital Scores
+
+`GET /api/governance/evidence/shadow_capital` and `GET /api/governance/shadow_capital/scores` return:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Route success flag. | boolean |
+| `regime` | `TEXT` | Yes | Requested regime, default `global`. | regime |
+| `rows` | `JSON array[object]` | Yes | Whitelisted score rows from `shadow_capital_scores`. | list |
+| `masking` | `JSON object` | Yes | Masking metadata. Current policy is `score_fields_only`; sensitive component keys such as account, broker-account, credential, password, secret, and token are omitted. | JSON |
+| `evidence` | `JSON object/null` | Yes | Evidence row for shadow-capital freshness and sample sufficiency. | JSON |
+| `authority` | `TEXT` | Yes | `read_only_governance_evidence`. | enum |
+
+Per-row fields include `ts_ms`, `window_s`, `regime`, `model_name`, optional `model_kind`/`model_ts_ms`, `n`, `rmse`, `dir_acc`, `net_rmse`, slippage metrics, execution-latency metrics when the schema has them, `drawdown_proxy`, `cap_eff`, PnL fields, `score`, sanitized numeric/string `components`, and `source_artifact`.

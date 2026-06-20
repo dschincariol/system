@@ -1,0 +1,8 @@
+# Future AMD/ROCm profile marker.
+#
+# This repository does not enable AMD GPU/NPU acceleration by default because the
+# target AMD host has not validated ROCm/device access for PyTorch. Do not install
+# this profile directly for production. Supply TRADING_REQUIREMENTS_FILE with a
+# reviewed host-specific ROCm requirements file only after ROCm, container device
+# permissions, and PyTorch HIP support have been validated on the deployment host.
+-r requirements-base.txt

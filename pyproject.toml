@@ -11,8 +11,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-windows-dev = [
-  "pywin32>=306; sys_platform == 'win32'",
+cpu-runtime = [
+  "torch==2.4.1+cpu",
+]
+nvidia-cuda = [
+  "torch==2.4.1+cu121",
+  "nvidia-ml-py==13.595.45",
+  "pynvml==13.0.1",
+]
+amd-rocm = []
+ts-foundation = [
+  "chronos-forecasting>=2.1.0",
+  "pandas>=2.2",
 ]
 
 [tool.setuptools]

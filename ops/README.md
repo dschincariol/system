@@ -9,6 +9,17 @@ These scripts are generally not part of the hot runtime path, but they are impor
 - alerting
 - maintenance and reporting
 
+## Compatibility Wrappers
+
+Runtime jobs that have canonical engine ownership remain importable and
+launchable from `ops/` for older operator commands, but their implementation
+lives under `engine/*/jobs`:
+
+- `check_events.py`, `check_labels.py`, and `check_predictions.py` delegate to `engine.runtime.jobs.*`
+- `compute_drift.py` delegates to `engine.data.jobs.compute_drift`
+- `compute_exec_labels.py`, `compute_exec_labels_from_fills.py`, and `compute_exec_z.py` delegate to `engine.execution.jobs.*`
+- `train_model_v2.py`, `backtest_cpcv.py`, and `backtest_walk_forward.py` delegate to `engine.strategy.jobs.*`
+
 ## Examples
 
 - [check_events.py](check_events.py)

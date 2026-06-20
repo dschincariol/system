@@ -16,6 +16,7 @@ ENV_FILE="${ENV_FILE:-$ETC_DIR/trading.env}"
 TRADING_USER="${TRADING_USER:-trading}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_TEMPLATE=""
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -102,8 +103,19 @@ else
   exit 1
 fi
 
+if [[ -f "$REPO_DIR/deploy/env/trading.env" ]]; then
+  ENV_TEMPLATE="$REPO_DIR/deploy/env/trading.env"
+else
+  ENV_TEMPLATE="$REPO_DIR/deploy/env/trading.env.example"
+fi
+
+if [[ ! -f "$ENV_TEMPLATE" ]]; then
+  echo "env_template_not_found:$ENV_TEMPLATE" >&2
+  exit 1
+fi
+
 if [[ ! -f "$ENV_FILE" ]]; then
-  install -m 0600 "$REPO_DIR/deploy/env/trading.env" "$ENV_FILE"
+  install -m 0600 "$ENV_TEMPLATE" "$ENV_FILE"
 fi
 
 while IFS= read -r template_line; do
@@ -113,7 +125,7 @@ while IFS= read -r template_line; do
       printf '%s\n' "$template_line" >>"$ENV_FILE"
     fi
   fi
-done <"$REPO_DIR/deploy/env/trading.env"
+done <"$ENV_TEMPLATE"
 
 escape_sed_replacement() {
   printf '%s' "$1" | sed -e 's/[\/&#]/\\&/g'
@@ -156,25 +168,49 @@ ensure_generated_secret() {
   fi
 }
 
+ensure_generated_secret_file() {
+  local path="$1"
+  local current
+  install -d -m 0700 "$(dirname "$path")"
+  current=""
+  if [[ -f "$path" ]]; then
+    current="$(tr -d '\r\n' <"$path" || true)"
+  fi
+  case "$current" in
+    ""|"change-me"|"CHANGE_ME"|"__GENERATE_ON_INSTALL__"|"<generate-with-openssl-rand-base64-32>")
+      umask 077
+      openssl rand -base64 32 >"$path"
+      ;;
+  esac
+  chmod 0600 "$path"
+}
+
 set_env_value "TRADING_ROOT" "$INSTALL_ROOT"
 set_env_value "TRADING_REPO" "$REPO_DIR"
 set_env_value "TRADING_DATA" "$DATA_DIR"
 set_env_value "TRADING_LOGS" "$LOGS_DIR"
 set_env_value "TRADING_BACKUPS" "$BACKUPS_DIR"
 set_env_value "PYTHON_VENV" "$VENV_DIR"
-set_env_value "DB_PATH" "$DATA_DIR/trading.db"
+set_env_value "DB_PATH" "$DATA_DIR"
 set_env_value "HF_HOME" "$DATA_DIR/huggingface"
 set_env_value "SENTENCE_TRANSFORMERS_HOME" "$DATA_DIR/huggingface/sentence-transformers"
-set_env_value "DATA_SOURCE_MASTER_KEY_FILE" "$DATA_DIR/.data_source_master_key"
+DEPENDENCY_PROFILE="$(get_env_value "TRADING_DEPENDENCY_PROFILE")"
+DEPENDENCY_PROFILE="${TRADING_DEPENDENCY_PROFILE:-${DEPENDENCY_PROFILE:-cpu}}"
+set_env_value "TRADING_DEPENDENCY_PROFILE" "$DEPENDENCY_PROFILE"
+MASTER_KEY_FILE="$DATA_DIR/.data_source_master_key"
+set_env_value "DATA_SOURCE_MASTER_KEY_FILE" "$MASTER_KEY_FILE"
+if is_placeholder_secret "DATA_SOURCE_MASTER_KEY"; then
+  set_env_value "DATA_SOURCE_MASTER_KEY" ""
+fi
+ensure_generated_secret_file "$MASTER_KEY_FILE"
 set_env_value "DASHBOARD_BASE" "http://127.0.0.1:8000"
-ensure_generated_secret "DATA_SOURCE_MASTER_KEY"
 ensure_generated_secret "DASHBOARD_API_TOKEN"
 chmod 0600 "$ENV_FILE"
 
 rm -f "$REPO_DIR/.env"
 ln -s "$ENV_FILE" "$REPO_DIR/.env"
 
-TRADING_REPO="$REPO_DIR" PYTHON_VENV="$VENV_DIR" PYTHON_BIN="python3.11" \
+TRADING_REPO="$REPO_DIR" PYTHON_VENV="$VENV_DIR" PYTHON_BIN="python3.11" TRADING_DEPENDENCY_PROFILE="$DEPENDENCY_PROFILE" \
   bash "$REPO_DIR/deploy/bin/install_python_env.sh"
 
 cd "$REPO_DIR"
@@ -194,6 +230,7 @@ install -m 0644 "$REPO_DIR/deploy/systemd/trading-backup.service" /etc/systemd/s
 install -m 0644 "$REPO_DIR/deploy/systemd/trading-backup.timer" /etc/systemd/system/trading-backup.timer
 install -m 0644 "$REPO_DIR/deploy/systemd/trading-upgrade.service" /etc/systemd/system/trading-upgrade.service
 install -m 0644 "$REPO_DIR/deploy/logrotate/trading-system" /etc/logrotate.d/trading-system
+logrotate -d /etc/logrotate.d/trading-system >/dev/null
 
 cat >/etc/sudoers.d/trading-system <<'EOF'
 trading ALL=(root) NOPASSWD: /bin/systemctl start trading-engine.service
@@ -215,7 +252,6 @@ trading ALL=(root) NOPASSWD: /bin/journalctl -u trading-upgrade.service *
 EOF
 chmod 0440 /etc/sudoers.d/trading-system
 
-touch "$DATA_DIR/trading.db"
 chown -R "$TRADING_USER:$TRADING_USER" "$INSTALL_ROOT" "$ETC_DIR" "$REPO_DIR"
 
 TRADING_HOME="$(getent passwd "$TRADING_USER" | cut -d: -f6)"

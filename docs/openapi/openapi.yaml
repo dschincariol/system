@@ -21,6 +21,8 @@ tags:
   - name: jobs
   - name: data-sources
   - name: broker-config
+  - name: execution
+  - name: governance
   - name: terminal
 components:
   securitySchemes:
@@ -29,9 +31,11 @@ components:
       in: header
       name: X-API-Token
       description: |
-        When `DASHBOARD_API_TOKEN` is configured, mutating routes accept the
-        token in the `X-API-Token` header. The transport layer also accepts a
-        `token` query parameter.
+        Protected dashboard API routes accept the token in the `X-API-Token`
+        header. Sensitive GET routes require this header in production/live or
+        remote-bind deployments. Query-string `token` authentication is legacy
+        local-development compatibility only and is rejected for protected
+        routes in production/live.
   schemas:
     FreeformObject:
       type: object
@@ -103,6 +107,223 @@ components:
         severity:
           type: string
       additionalProperties: true
+    ExecutionDiagnosticsResponse:
+      type: object
+      required:
+        - ok
+        - ts_ms
+        - state
+        - inventory
+        - tca
+        - order_flow
+        - lob
+        - learned_slicing
+        - drilldowns
+      description: |
+        Read-only operator execution diagnostics. The payload aggregates
+        existing execution stats, TCA, order-flow outcomes, LOB/DeepLOB
+        readiness, and bounded learned-slicing audit evidence. It does not
+        grant execution authority; live actions remain governed by broker,
+        risk, and execution-barrier controls.
+      properties:
+        ok:
+          type: boolean
+        ts_ms:
+          type: integer
+        state:
+          type: string
+          enum: [fresh, available, stale, partial, unavailable]
+        symbol:
+          type:
+            - string
+            - "null"
+        inventory:
+          type: object
+          required: [routes, summary]
+          properties:
+            routes:
+              type: array
+              items:
+                type: object
+                required: [route, state, payload, description]
+                properties:
+                  route:
+                    type: string
+                  state:
+                    type: string
+                    enum: [fresh, available, stale, unavailable]
+                  payload:
+                    type: string
+                  description:
+                    type: string
+                  table:
+                    type: string
+                  rows:
+                    type: integer
+                  latest_ts_ms:
+                    type: integer
+                  age_ms:
+                    type: integer
+                  reason:
+                    type: string
+                additionalProperties: true
+            summary:
+              type: object
+              additionalProperties: true
+          additionalProperties: true
+        tca:
+          type: object
+          required: [state, by_symbol, rolling, partial_fills]
+          properties:
+            state:
+              type: string
+            reason:
+              type: string
+            latest_fill_ts_ms:
+              type:
+                - integer
+                - "null"
+            latest_fill_age_ms:
+              type:
+                - integer
+                - "null"
+            by_symbol:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            rolling:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            partial_fills:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            recent_fills:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+          additionalProperties: true
+        order_flow:
+          type: object
+          required: [state, partial_fills, rejected_intents, suppressed_intents]
+          properties:
+            state:
+              type: string
+            partial_fills:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            rejected_intents:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            suppressed_intents:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            outcome_counts:
+              type: object
+              additionalProperties: true
+          additionalProperties: true
+        lob:
+          type: object
+          required: [state, l2_feed, simulation, deeplob, warnings]
+          properties:
+            state:
+              type: string
+            l2_feed:
+              $ref: '#/components/schemas/FreeformObject'
+            simulation:
+              $ref: '#/components/schemas/FreeformObject'
+            latency:
+              $ref: '#/components/schemas/FreeformObject'
+            deeplob:
+              $ref: '#/components/schemas/FreeformObject'
+            warnings:
+              type: array
+              items:
+                type: string
+          additionalProperties: true
+        learned_slicing:
+          type: object
+          required: [state, reason, policy, authority]
+          properties:
+            state:
+              type: string
+            reason:
+              type: string
+            policy:
+              $ref: '#/components/schemas/FreeformObject'
+            authority:
+              type: object
+              properties:
+                live_authority_granted:
+                  type: boolean
+                execution_parameters_only:
+                  type: boolean
+              additionalProperties: true
+            exploration:
+              $ref: '#/components/schemas/FreeformObject'
+            shadow:
+              $ref: '#/components/schemas/FreeformObject'
+            selected_action_distribution:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            baseline_comparison:
+              $ref: '#/components/schemas/FreeformObject'
+            recent_suppression_reasons:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+            recent_decisions:
+              type: array
+              items:
+                $ref: '#/components/schemas/FreeformObject'
+          additionalProperties: true
+        drilldowns:
+          type: array
+          items:
+            type: object
+            required: [kind, intent, route, fill, outcome]
+            properties:
+              kind:
+                type: string
+              symbol:
+                type:
+                  - string
+                  - "null"
+              client_order_id:
+                type:
+                  - string
+                  - "null"
+              portfolio_orders_id:
+                type:
+                  - integer
+                  - "null"
+              source_alert_id:
+                type:
+                  - integer
+                  - "null"
+              intent:
+                type: string
+              route:
+                type: string
+              fill:
+                type: string
+              outcome:
+                type: string
+              reason_code:
+                type: string
+              reason:
+                type: string
+              ts_ms:
+                type:
+                  - integer
+                  - "null"
+            additionalProperties: true
+      additionalProperties: true
     SystemSnapshot:
       type: object
       required:
@@ -141,6 +362,98 @@ components:
           $ref: '#/components/schemas/FreeformObject'
         execution_barrier:
           $ref: '#/components/schemas/ExecutionBarrier'
+      additionalProperties: true
+    ReadinessEvidenceItem:
+      type: object
+      required:
+        - id
+        - title
+        - status
+        - severity
+        - blocking
+        - source_subsystem
+        - freshness
+        - detail
+        - remediation
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+          enum: [passing, warning, blocked, unavailable]
+        severity:
+          type: string
+          enum: [info, warning, critical]
+        blocking:
+          type: boolean
+        source_subsystem:
+          type: string
+        source_route:
+          type: string
+        source_config_key:
+          type: string
+        freshness:
+          type: object
+          properties:
+            last_update_ts_ms:
+              type: integer
+            age_ms:
+              type:
+                - integer
+                - "null"
+            max_age_ms:
+              type:
+                - integer
+                - "null"
+            stale:
+              type: boolean
+            label:
+              type: string
+          additionalProperties: true
+        detail:
+          type: string
+        remediation:
+          type: string
+        category:
+          type: string
+      additionalProperties: true
+    ReadinessEvidenceResponse:
+      type: object
+      required: [ok, status, mode, execution_mode, ts_ms, items]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          enum: [passing, warning, blocked, unavailable]
+        mode:
+          type: string
+        execution_mode:
+          type: string
+        critical_context:
+          type: boolean
+        ts_ms:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReadinessEvidenceItem'
+        blockers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReadinessEvidenceItem'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReadinessEvidenceItem'
+        unavailable:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReadinessEvidenceItem'
+        action_guards:
+          $ref: '#/components/schemas/FreeformObject'
       additionalProperties: true
     TerminalOrderRequest:
       type: object
@@ -307,6 +620,108 @@ components:
         tested_ts_ms:
           type: integer
       additionalProperties: true
+    GovernanceEvidenceRow:
+      type: object
+      required:
+        - key
+        - label
+        - state
+        - freshness
+        - sample_count
+        - last_update_ts_ms
+        - source_artifact
+        - remediation
+        - details
+      properties:
+        key:
+          type: string
+        label:
+          type: string
+        state:
+          type: string
+          enum: [pass, block, unknown]
+        freshness:
+          type: string
+          enum: [fresh, stale, missing, unknown]
+        sample_count:
+          type: integer
+        last_update_ts_ms:
+          type: integer
+        source_artifact:
+          type: string
+        remediation:
+          type: string
+        details:
+          $ref: '#/components/schemas/FreeformObject'
+      additionalProperties: true
+    GovernanceEvidenceResponse:
+      type: object
+      required: [ok, ts_ms, state, authority, evidence, blockers, unknowns]
+      properties:
+        ok:
+          type: boolean
+        ts_ms:
+          type: integer
+        state:
+          type: string
+          enum: [pass, block, unknown]
+        authority:
+          $ref: '#/components/schemas/FreeformObject'
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/GovernanceEvidenceRow'
+        blockers:
+          type: array
+          items:
+            $ref: '#/components/schemas/GovernanceEvidenceRow'
+        unknowns:
+          type: array
+          items:
+            $ref: '#/components/schemas/GovernanceEvidenceRow'
+      additionalProperties: true
+    ShadowCapitalScoresResponse:
+      type: object
+      required: [ok, regime, rows, masking, authority]
+      properties:
+        ok:
+          type: boolean
+        regime:
+          type: string
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/FreeformObject'
+        masking:
+          $ref: '#/components/schemas/FreeformObject'
+        evidence:
+          oneOf:
+            - $ref: '#/components/schemas/GovernanceEvidenceRow'
+            - type: "null"
+        authority:
+          type: string
+      additionalProperties: true
+    FeatureVisibilityResponse:
+      type: object
+      required: [ok, ts_ms, structured_documents, graph_features, meta]
+      description: |
+        Read-only operator visibility for structured-document extraction rows
+        and graph-relational snapshots. Shadow-only fields are labeled in the
+        payload and do not grant trading, promotion, or allocation authority.
+      properties:
+        ok:
+          type: boolean
+        ts_ms:
+          type: integer
+        structured_documents:
+          $ref: '#/components/schemas/FreeformObject'
+        graph_features:
+          $ref: '#/components/schemas/FreeformObject'
+        explanation_paths:
+          $ref: '#/components/schemas/FreeformObject'
+        meta:
+          $ref: '#/components/schemas/FreeformObject'
+      additionalProperties: true
 paths:
   /api/health:
     get:
@@ -344,6 +759,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SystemSnapshot'
+  /api/system/config:
+    get:
+      tags: [system]
+      summary: Return redacted runtime configuration and system state.
+      operationId: getSystemConfig
+      description: |
+        Sensitive GET. In production/live or remote-bind deployments the
+        transport requires `X-API-Token`, applies rate limiting and audit
+        logging, rejects query-string tokens in production/live, and redacts
+        DSNs, tokens, passwords, API keys, Authorization headers, and broker or
+        account identifiers in the response.
+      security:
+        - DashboardApiToken: []
+      responses:
+        '200':
+          description: Redacted runtime configuration payload from `api_get_runtime_config`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemSnapshot'
+        '401':
+          description: Missing, invalid, or disallowed query-string token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/readiness:
     get:
       tags: [system]
@@ -356,6 +797,213 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SystemSnapshot'
+  /api/data/feature_visibility:
+    get:
+      tags: [system]
+      summary: Return structured-document and graph-feature health visibility.
+      operationId: getDataFeatureVisibility
+      description: |
+        Sensitive GET. Returns counts, freshness, confidence buckets, source
+        lineage, symbol and event coverage, graph snapshot freshness, graph
+        feature availability, shadow-only labels, and PIT status for optional
+        structured-document and graph-relational feature groups. This route is
+        explanatory only; server-side feature registry, model serving,
+        promotion, and execution gates remain authoritative.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: low_confidence_threshold
+          in: query
+          required: false
+          schema:
+            type: number
+      responses:
+        '200':
+          description: Feature visibility payload for dashboard Data Health and decision-drilldown enrichment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeatureVisibilityResponse'
+  /api/operator/readiness_evidence:
+    get:
+      tags: [operator]
+      summary: Return normalized live/paper readiness evidence and guarded-action hints.
+      operationId: getOperatorReadinessEvidence
+      description: |
+        Sensitive GET. Aggregates readiness/preflight evidence from runtime
+        health, execution barrier, kill switches, broker config/test state,
+        live trading preflight, provider telemetry, data-source health,
+        governance OPE/experiment-ledger controls, production monitoring, and
+        health/liveness/readiness probes. Missing or stale critical evidence in
+        live/paper context is returned as `blocked` or `unavailable`, never as a
+        passing state. Aliases are `/api/readiness/evidence` and
+        `/api/system/readiness_evidence`.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: execution_mode
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: broker
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Normalized readiness evidence items grouped by owning subsystem.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessEvidenceResponse'
+  /api/governance/evidence:
+    get:
+      tags: [governance]
+      summary: Return read-only governance evidence for promotion and generated-candidate trust decisions.
+      operationId: getGovernanceEvidence
+      description: |
+        Sensitive GET. Aggregates persisted OPE, experiment-ledger,
+        net-after-cost label, learned-alpha, alpha-shrinkage, production
+        monitoring, shadow-live, and shadow-capital evidence. The route is
+        explanatory only and does not authorize promotion or allocation.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 500
+        - name: regime
+          in: query
+          required: false
+          schema:
+            type: string
+            default: global
+      responses:
+        '200':
+          description: Governance evidence summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GovernanceEvidenceResponse'
+  /api/governance/evidence/promotion_blockers:
+    get:
+      tags: [governance]
+      summary: Return exact promotion guard and evidence blockers.
+      operationId: getGovernanceEvidencePromotionBlockers
+      security:
+        - DashboardApiToken: []
+      responses:
+        '200':
+          description: Promotion blocker drilldown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/governance/evidence/generated_candidates:
+    get:
+      tags: [governance]
+      summary: Return generated-candidate experiment-ledger provenance and blockers.
+      operationId: getGovernanceEvidenceGeneratedCandidates
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 500
+      responses:
+        '200':
+          description: Generated-candidate provenance rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/governance/evidence/shadow_capital:
+    get:
+      tags: [governance]
+      summary: Return masked shadow-capital score evidence.
+      operationId: getGovernanceEvidenceShadowCapital
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 500
+        - name: regime
+          in: query
+          required: false
+          schema:
+            type: string
+            default: global
+      responses:
+        '200':
+          description: Shadow-capital score evidence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShadowCapitalScoresResponse'
+  /api/governance/shadow_capital/scores:
+    get:
+      tags: [governance]
+      summary: Return first-class masked shadow-capital score rows.
+      operationId: getGovernanceShadowCapitalScores
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 500
+        - name: regime
+          in: query
+          required: false
+          schema:
+            type: string
+            default: global
+      responses:
+        '200':
+          description: Shadow-capital score rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShadowCapitalScoresResponse'
   /api/execution/barrier:
     get:
       tags: [system]
@@ -377,6 +1025,36 @@ paths:
                         type: boolean
                       reason:
                         type: string
+  /api/execution/diagnostics:
+    get:
+      tags: [execution]
+      summary: Return read-only execution TCA, LOB, and learned slicing diagnostics.
+      operationId: getExecutionDiagnostics
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 500
+        - name: symbol
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: |
+            Aggregated execution diagnostics with explicit stale, unavailable,
+            shadow-only, rejected, suppressed, and partial-fill states.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionDiagnosticsResponse'
   /api/operator/service_status:
     get:
       tags: [operator]
@@ -418,6 +1096,13 @@ paths:
       tags: [operator]
       summary: Return the repair-oriented support snapshot.
       operationId: getOperatorSupportSnapshot
+      description: |
+        Sensitive GET. In production/live or remote-bind deployments the
+        transport requires `X-API-Token`, applies rate limiting and audit
+        logging, rejects query-string tokens in production/live, and redacts
+        secrets and broker/account identifiers in the response.
+      security:
+        - DashboardApiToken: []
       parameters:
         - name: mode
           in: query
@@ -433,14 +1118,76 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SystemSnapshot'
+        '401':
+          description: Missing, invalid, or disallowed query-string token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/operator/logs:
+    get:
+      tags: [operator]
+      summary: Return redacted operator log tail lines.
+      operationId: getOperatorLogs
+      description: |
+        Sensitive GET. In production/live or remote-bind deployments the
+        transport requires `X-API-Token`, applies rate limiting and audit
+        logging, rejects query-string tokens in production/live, and redacts
+        DSNs, tokens, passwords, API keys, Authorization headers, and broker or
+        account identifiers in log text.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: level
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 4000
+      responses:
+        '200':
+          description: Redacted log payload from `api_get_operator_logs`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '401':
+          description: Missing, invalid, or disallowed query-string token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/jobs:
     get:
       tags: [jobs]
-      summary: List allowed jobs with merged live and persisted state.
+      summary: List allowed jobs with catalog metadata plus merged live and persisted state.
       operationId: getJobs
       responses:
         '200':
-          description: Job inventory returned by `engine.api.api_jobs.api_get_jobs`.
+          description: Job inventory returned by `engine.api.api_jobs.api_get_jobs`. Each row includes registry-owned catalog fields such as `id`, `group`, `script`, `module`, `mode`, `schedule`, `cadence_seconds`, `stage`, `owner_subsystem`, `dependencies`, `required_secrets`, `required_secret_any`, `required_providers`, `safety`, `execution_sensitivity`, `resource_class`, `purpose`, `action_policy`, `log_url`, and `last_output_url`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+  /api/jobs/catalog:
+    get:
+      tags: [jobs]
+      summary: Return the first-class job catalog, even when the job manager is unavailable.
+      operationId: getJobsCatalog
+      responses:
+        '200':
+          description: Static catalog plus live state when available. The `catalog` and `jobs` arrays contain every registered job and backend-owned safety/prerequisite metadata.
           content:
             application/json:
               schema:
@@ -453,7 +1200,12 @@ paths:
       description: |
         The job name may be supplied in the request body or as a `name` query
         parameter. When `DASHBOARD_API_TOKEN` is configured, the transport layer
-        requires `X-API-Token` or `token` on this mutating route.
+        requires `X-API-Token` on this mutating route. Query-string `token` is
+        legacy local-development compatibility and is rejected in
+        production/live. The jobs API
+        also enforces backend confirmation for execution-sensitive and
+        destructive/admin job starts, and rejects unavailable jobs whose
+        catalog prerequisites are not satisfied.
       security:
         - DashboardApiToken: []
       parameters:
@@ -485,6 +1237,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: Backend confirmation is required for a guarded job start.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/jobs/stop:
     post:
       tags: [jobs]
@@ -493,7 +1251,9 @@ paths:
       description: |
         The job name may be supplied in the request body or as a `name` query
         parameter. When `DASHBOARD_API_TOKEN` is configured, the transport layer
-        requires `X-API-Token` or `token` on this mutating route.
+        requires `X-API-Token` on this mutating route. Query-string `token` is
+        legacy local-development compatibility and is rejected in
+        production/live.
       security:
         - DashboardApiToken: []
       parameters:
@@ -585,7 +1345,11 @@ paths:
       description: |
         When `include_execution` is false or omitted, execution-tagged jobs are
         skipped. When `DASHBOARD_API_TOKEN` is configured, the transport layer
-        requires `X-API-Token` or `token` on this mutating route.
+        requires `X-API-Token` on this mutating route. Query-string `token` is
+        legacy local-development compatibility and is rejected in
+        production/live. Direct
+        include-execution calls also require the `RUN_PIPELINE` confirmation
+        payload with `consequence_ack`.
       security:
         - DashboardApiToken: []
       parameters:
@@ -664,7 +1428,7 @@ paths:
       tags: [data-sources]
       summary: Create a new configurable data source.
       operationId: postDataSourceCreate
-      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` or `token` on this mutating route.
+      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` on this mutating route. Query-string `token` is legacy local-development compatibility and is rejected in production/live.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -691,7 +1455,7 @@ paths:
       tags: [data-sources]
       summary: Update an existing configurable data source.
       operationId: postDataSourceUpdate
-      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` or `token` on this mutating route.
+      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` on this mutating route. Query-string `token` is legacy local-development compatibility and is rejected in production/live.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -721,7 +1485,8 @@ paths:
       description: |
         `source_key` may be supplied in the request body or query string. When
         `DASHBOARD_API_TOKEN` is configured, the transport layer requires
-        `X-API-Token` or `token` on this mutating route.
+        `X-API-Token` on this mutating route. Query-string `token` is legacy
+        local-development compatibility and is rejected in production/live.
       security:
         - DashboardApiToken: []
       parameters:
@@ -757,7 +1522,8 @@ paths:
       description: |
         `source_key` may be supplied in the request body or query string. When
         `DASHBOARD_API_TOKEN` is configured, the transport layer requires
-        `X-API-Token` or `token` on this mutating route.
+        `X-API-Token` on this mutating route. Query-string `token` is legacy
+        local-development compatibility and is rejected in production/live.
       security:
         - DashboardApiToken: []
       parameters:
@@ -793,7 +1559,8 @@ paths:
       description: |
         `source_key` may be supplied in the request body or query string. When
         `DASHBOARD_API_TOKEN` is configured, the transport layer requires
-        `X-API-Token` or `token` on this mutating route.
+        `X-API-Token` on this mutating route. Query-string `token` is legacy
+        local-development compatibility and is rejected in production/live.
       security:
         - DashboardApiToken: []
       parameters:
@@ -830,7 +1597,9 @@ paths:
         `source_key` may be supplied in the request body or query string. The
         response shape is provider-specific but always includes `ok` and
         `source_key`. When `DASHBOARD_API_TOKEN` is configured, the transport
-        layer requires `X-API-Token` or `token` on this mutating route.
+        layer requires `X-API-Token` on this mutating route. Query-string
+        `token` is legacy local-development compatibility and is rejected in
+        production/live.
       security:
         - DashboardApiToken: []
       parameters:
@@ -879,7 +1648,8 @@ paths:
         supplied credentials, and writes `broker_config_audit`. Non-`sim`
         activation is blocked until a passing connection test exists for the
         selected broker. When `DASHBOARD_API_TOKEN` is configured, the
-        transport layer requires `X-API-Token` or `token`.
+        transport layer requires `X-API-Token`. Query-string `token` is legacy
+        local-development compatibility and is rejected in production/live.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -985,6 +1755,13 @@ paths:
       tags: [terminal]
       summary: Return current broker-position rows for the terminal.
       operationId: getTerminalPositions
+      description: |
+        Sensitive GET. In production/live or remote-bind deployments the
+        transport requires `X-API-Token`, applies rate limiting and audit
+        logging, rejects query-string tokens in production/live, and redacts
+        broker/account identifiers in the response.
+      security:
+        - DashboardApiToken: []
       responses:
         '200':
           description: Terminal positions payload.
@@ -992,6 +1769,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FreeformObject'
+        '401':
+          description: Missing, invalid, or disallowed query-string token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/terminal/orders:
     get:
       tags: [terminal]
@@ -1087,7 +1870,8 @@ paths:
         This route does not bypass broker logic. It writes a portfolio-order
         intent only when `execution_gate_snapshot()` reports that real trading
         is currently allowed. When `DASHBOARD_API_TOKEN` is configured, the
-        transport layer requires `X-API-Token` or `token`.
+        transport layer requires `X-API-Token`. Query-string `token` is legacy
+        local-development compatibility and is rejected in production/live.
 
         Manual quantity is not stored in `delta_weight`. Successful requests
         persist neutral weight fields and carry quantity under
@@ -1123,7 +1907,8 @@ paths:
         This route reads the current broker position, derives the flatten side
         and quantity, and writes a portfolio-order intent instead of mutating
         positions directly. When `DASHBOARD_API_TOKEN` is configured, the
-        transport layer requires `X-API-Token` or `token`.
+        transport layer requires `X-API-Token`. Query-string `token` is legacy
+        local-development compatibility and is rejected in production/live.
 
         Flatten uses the same terminal quantity contract as manual orders:
         neutral weight fields in `portfolio_orders`, positive absolute quantity

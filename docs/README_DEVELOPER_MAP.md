@@ -143,7 +143,7 @@ If the model has its own feature contract, also look in:
 - `engine/strategy/feature_registry.py`
 - `engine/strategy/feature_expansion.py`
 - the trainer for that model family
-- `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, or `engine/strategy/models/patchtst.py` for the current active model-family patterns
+- `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, or `engine/strategy/models/patchtst.py` for the current active model-family patterns. PatchTST owns both masked pretraining artifact validation and supervised fine-tuning in this module.
 - `engine/strategy/ensemble/ridge_meta.py` for meta-ensemble behavior
 - legacy/fallback paths such as `engine/strategy/embed_regressor.py` and `engine/strategy/temporal_predictor.py` only when maintaining those paths
 
@@ -288,7 +288,7 @@ For this functional area, do not add new operator-side `.env` feed-config flows.
 | Backup/restore evidence gate | `engine/runtime/backup_evidence.py`, `ops/backup/backup_restore_evidence.sh`, `ops/server/install_backup_evidence_gate.sh` |
 | Alert lifecycle shelving and expiry | `engine/api/api_write.py`, `engine/runtime/schema/migrations/0054_alert_lifecycle.py` |
 | Trade lifecycle and attribution audit | `engine/runtime/trade_lifecycle.py`, `engine/strategy/jobs/trade_lifecycle_audit_job.py`, `engine/execution/execution_ledger.py`, `engine/execution/trade_attribution_ledger.py`, `tests/test_trade_lifecycle_regressions.py` |
-| Current model families | `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, `engine/strategy/models/patchtst.py`, `engine/strategy/ensemble/ridge_meta.py` |
+| Current model families | `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, `engine/strategy/models/patchtst.py`, `engine/strategy/models/itransformer.py`, `engine/strategy/ensemble/ridge_meta.py` |
 | Promotion and statistical gates | `engine/strategy/promotion_guard.py`, `engine/strategy/statistical_gates.py`, `engine/strategy/champion_manager.py` |
 | CPCV and promotion-grade backtests | `engine/strategy/cpcv.py`, `engine/strategy/gated_backtest.py`, `engine/strategy/jobs/backtest_cpcv.py`, `engine/strategy/jobs/backtest_walk_forward.py` |
 | HPO and feature discovery | `engine/strategy/optuna_tuner.py`, `engine/strategy/tsfresh_features.py`, `engine/strategy/discovery/tsfresh_discoverer.py`, `engine/strategy/discovery/pysr_discoverer.py`, `engine/data/jobs/compute_tsfresh_snapshots.py` |
@@ -311,8 +311,8 @@ The main ownership points are:
   canonical record for the active model contract
 - `engine/strategy/feature_registry.py` and `engine/strategy/feature_expansion.py`
   canonical feature id ordering and vector assembly
-- `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, and `engine/strategy/models/patchtst.py`
-  current model-family schema persistence and load-time validation
+- `engine/strategy/models/lgbm_regressor.py`, `engine/strategy/models/xgb_regressor.py`, `engine/strategy/models/gbm_model.py`, `engine/strategy/models/patchtst.py`, and `engine/strategy/models/itransformer.py`
+  current model-family schema persistence and load-time validation. PatchTST additionally persists masked pretraining provenance and rejects served artifacts whose pretraining schema no longer matches the supervised model schema. iTransformer writes OOS rows and shadow marketplace visibility, and the predictor adapter refuses non-champion registry specs.
 - `engine/strategy/ensemble/ridge_meta.py`
   deterministic Ridge meta-ensemble behavior
 - `engine/strategy/embed_regressor.py`, `engine/strategy/train_temporal_predictor.py`, and `engine/strategy/temporal_predictor.py`

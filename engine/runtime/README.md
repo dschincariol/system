@@ -15,7 +15,7 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
 ## Core Files
 
 - [storage.py](storage.py)
-  Public runtime storage facade. Production and production-like runtimes route through [storage_pg.py](storage_pg.py); isolated Python tests may opt into [storage_sqlite.py](storage_sqlite.py) with `TS_STORAGE_BACKEND=sqlite`.
+  Public runtime storage facade. Production and production-like runtimes route through [storage_pg.py](storage_pg.py); isolated Python tests may opt into [storage_sqlite.py](storage_sqlite.py) with `TS_STORAGE_BACKEND=sqlite`, but that backend is rejected in real supervised/prod/live processes.
 - [storage_pg.py](storage_pg.py)
   Postgres-backed runtime storage implementation, connection-pool integration, SQLite-shaped compatibility cursor helpers, schema migration entrypoints, validation snapshots, and degraded-storage reporting.
 - [locks.py](locks.py)
@@ -24,6 +24,8 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
   Shared metadata store used for diagnostics and boot progress.
 - [job_registry.py](job_registry.py)
   Canonical registry of runnable jobs and pipeline order.
+- [job_catalog.py](job_catalog.py)
+  Operator-facing job catalog serializer and backend job-action safety policy derived from the canonical registry.
 - [jobs_manager.py](jobs_manager.py)
   Starts and stops jobs, owns their subprocesses, logs, heartbeats, and restart behavior.
 - [supervisor.py](supervisor.py)
@@ -36,6 +38,8 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
   Persistent runtime lifecycle state machine.
 - [health.py](health.py)
   Health snapshots and preflight checks used by UI and bootstrap.
+- [hardware.py](hardware.py)
+  CPU-first device/profile resolver, bounded torch/BLAS thread defaults, runtime hardware snapshots, and NVIDIA telemetry gating.
 - [live_trading_preflight.py](live_trading_preflight.py)
   Central fail-closed live deployment contract: execution mode, dashboard token, confirmation phrase, broker environment, startup broker preflight, initial kill-switch hold, backup evidence, pre-live reconciliation, and execution arming audit.
 - [live_execution_control.py](live_execution_control.py)
@@ -105,7 +109,9 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
 - When changing startup behavior, review:
   [start_system.py](../../start_system.py), [dashboard_server.py](../../dashboard_server.py), [startup_orchestrator.py](startup_orchestrator.py), and [ingestion_runtime.py](ingestion_runtime.py) together.
 - When changing job semantics, update:
-  [job_registry.py](job_registry.py), [jobs_manager.py](jobs_manager.py), and this README.
+  [job_registry.py](job_registry.py), [job_catalog.py](job_catalog.py), [jobs_manager.py](jobs_manager.py), and this README.
+- Keep job safety authoritative in runtime/API code.
+  Browser surfaces consume the catalog's `safety`, `prerequisites`, and `action_policy` fields; they do not decide whether an execution-sensitive, destructive/admin, or unavailable job may start.
 - Keep blocking DB work out of hot control-plane paths.
   Startup and job start behavior are sensitive to blocking Postgres acquisition, schema validation, and migration work. Hot append-heavy paths should use the buffered/router surfaces instead of doing ad hoc synchronous writes.
 - Keep lock naming consistent.
@@ -114,6 +120,10 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
   Async persistence, Timescale storage, and event-runtime helpers should fail open while still surfacing clear health snapshots to operators. The append-heavy market feature path now reports its explicit mode through `storage.get_timeseries_storage_snapshot()["market_feature_store"]`.
 - Treat Postgres runtime storage as required for production-like operation.
   `engine.runtime.storage_pool` records readiness and degraded state; `db_guard.ensure_db_ok()`, `runtime_bootstrap.bootstrap_runtime()`, production preflight, and startup gates fail closed when Postgres cannot be acquired or schema validation fails.
+- Keep runtime hardware CPU-first unless an accelerator profile is deliberately validated.
+  Production defaults are `TRADING_DEPENDENCY_PROFILE=cpu`, `RUNTIME_HARDWARE_PROFILE=cpu`, `TORCH_DEVICE=cpu`, `EMBED_DEVICE=cpu`, `NLP_DEVICE=cpu`, `FINBERT_DEVICE=cpu`, and `TS_FOUNDATION_DEVICE=cpu`, with `TORCH_CPU_THREADS=8` and `TORCH_INTEROP_THREADS=4`. `auto` only selects CUDA when both the NVIDIA dependency profile and NVIDIA runtime profile are active and PyTorch verifies CUDA availability; otherwise health/preflight report the dependency profile, resolved device, disabled accelerator reason, and any profile mismatch. CUDA-specific telemetry, pinned prefetch, TF32, and cuDNN benchmark flags default off and must be enabled explicitly in a validated accelerator profile.
+- Keep Postgres schema validation catalog-backed.
+  `storage_pg.get_db_validation_snapshot(strict=True)` must fail closed on introspection errors, stale `schema_migrations`, missing required tables/columns/indexes, owned live-ingestion primary-key drift, and unexpected owned columns or type drift.
 - Keep SQLite wording precise.
   SQLite remains in the repo for isolated Python tests, historical migration evidence, and compatibility shims such as `PRAGMA table_info`, `sqlite_master` lookups, and `last_insert_rowid()` translation inside `storage_pg.py`. It is not the production runtime fallback.
 
@@ -121,9 +131,9 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
 
 - Cold boot uses `bootstrap_first_run()`, `repair_schema()`, `storage.init_db()`, and the migration files under `engine/runtime/schema/migrations/` to create or upgrade the Postgres schema.
 - `DB_PATH` is retained as a local data-root/legacy compatibility hint for older callers and diagnostics. Connection targets come from `TS_PG_DSN` or platform defaults in `engine.runtime.platform`; `DB_PATH` is not a Postgres database location.
-- Strict or supervised runtimes require `DB_PATH` to be explicitly set and absolute, but file-shaped legacy values are normalized by `db_guard.resolve_db_path()` to their parent data directory.
+- Strict or supervised runtimes require `DB_PATH` to be explicitly set and absolute before normalization, but file-shaped legacy values are normalized by `db_guard.resolve_db_path()` to their parent data directory after that gate passes.
 - When Postgres is unavailable, acquisition failures are surfaced as storage readiness `degraded` or `unavailable`, API storage payloads return retryable 503-style metadata where possible, and startup/preflight gates block readiness instead of silently falling back to SQLite.
-- Python tests default to `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temporary `DB_PATH` through `engine/runtime/test_isolation.py` and `tests/conftest.py`. Tests that need real Postgres should opt into the `requires_postgres` marker and a reachable `TS_PG_DSN`.
+- Python tests default to `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temporary `DB_PATH` through `engine/runtime/test_isolation.py` and `tests/conftest.py`. Tests that need real Postgres should opt into the `requires_postgres` marker and a reachable `TS_PG_DSN`. The CI production-backend gate sets `TS_PRODUCTION_BACKEND_TESTS=1` so test isolation preserves the explicit Postgres/Redis targets instead of scrubbing them back to SQLite; local reproduction is documented in [../../docs/PRODUCTION_BACKEND_CI.md](../../docs/PRODUCTION_BACKEND_CI.md).
 
 ## Common Extension Points
 

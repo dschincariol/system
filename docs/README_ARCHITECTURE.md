@@ -262,16 +262,18 @@ In practical terms, training now writes a feature contract and serving reads tha
 
 ### Current feature inventory
 
-`engine/strategy/feature_registry.py` is the source of truth. The default serving set is about 111 feature ids. The full registered catalog is larger because optional and shadow groups include NLP embeddings, filings, transcripts, tsfresh, symbolic/discovered features, and other opt-in surfaces.
+`engine/strategy/feature_registry.py` is the source of truth. The default serving set is about 111 feature ids. The full registered catalog is larger because optional and shadow groups include NLP embeddings, filings, transcripts, tsfresh, symbolic/discovered features, time-series foundation-model embeddings, and other opt-in surfaces.
 
 Current groups visible in the registry include:
 
 - base, price, events, macro, HMM regime, tech, stress, social, weather, options-symbol, and availability
 - tsfresh and discovery-backed features
 - NLP/FinBERT/news, filings, and transcript feature groups
+- shadow-only `tsfm.chronos_v2.*` embeddings from the frozen Chronos encoder path when `USE_TS_FOUNDATION_FEATURES=1` and optional dependencies are installed
 - optional insider/Form 4, congressional, sentiment, and symbolic feature paths when their flags and dependencies are enabled
 
 Every new feature still needs an explicit feature id and must round-trip through the persisted feature schema.
+The Chronos foundation-model path is a feature generator only: it stores model-family provenance, artifact manifest hashes, and PIT source timestamps in the feature snapshot metadata, and live model serving rejects contracts that include shadow-stage feature ids.
 
 ### Current model families
 
@@ -281,6 +283,7 @@ The current code centers on:
 - XGBoost: `engine/strategy/models/xgb_regressor.py`, trained by `engine/strategy/jobs/train_xgb_models.py`
 - sklearn/GBM-style regressors: `engine/strategy/models/gbm_model.py`, `engine/strategy/gbm_regressor.py`, `engine/strategy/jobs/train_gbm_regressor.py`
 - PatchTST: `engine/strategy/models/patchtst.py`, trained by `engine/strategy/jobs/train_patchtst_models.py`
+- iTransformer: `engine/strategy/models/itransformer.py`, trained by `engine/strategy/jobs/train_itransformer_models.py` as a shadow-default modern time-series challenger
 - Ridge meta-ensemble: `engine/strategy/ensemble/ridge_meta.py`, `engine/strategy/jobs/train_ensemble_meta.py`, and `engine/strategy/jobs/train_ensemble.py`
 
 Legacy schema-aware paths for embed regressors, temporal predictors, and regime/statistical baselines still exist, but they are not the only or primary model description anymore.
@@ -301,7 +304,7 @@ The trading ML path in this repo is intentionally split into clear phases:
 1. data preparation
    ingestion jobs write prices, events, labels, embeddings, PIT universe rows, and related derived features into runtime storage
 2. training
-   model-family-specific jobs train artifacts such as LightGBM, XGBoost, sklearn GBM, PatchTST, Ridge ensemble, and legacy/fallback models
+   model-family-specific jobs train artifacts such as LightGBM, XGBoost, sklearn GBM, PatchTST, iTransformer, Ridge ensemble, and legacy/fallback models
 3. provenance capture
    training writes `feature_ids`, `feature_set_tag`, `feature_schema`, dataset snapshots, and version metadata into the registry/lifecycle surfaces
 4. live model selection

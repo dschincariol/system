@@ -14,11 +14,25 @@ TRADING_BACKUPS="${TRADING_BACKUPS:-$TRADING_ROOT/backups}"
 DB_PATH="${DB_PATH:-$TRADING_DATA/trading.db}"
 PYTHON_VENV="${PYTHON_VENV:-$TRADING_ROOT/venv}"
 
+profile="${ENV:-${APP_ENV:-${NODE_ENV:-}}}"
+mode="${ENGINE_MODE:-${EXECUTION_MODE:-}}"
+case "$(printf '%s:%s' "$profile" "$mode" | tr '[:upper:]' '[:lower:]')" in
+  *prod*|*production*|*live*)
+    echo "legacy_sqlite_backup_forbidden_in_production: use Postgres base backup/WAL evidence scripts" >&2
+    exit 1
+    ;;
+esac
+
 mkdir -p "$TRADING_BACKUPS"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 TMP_DB="$TRADING_BACKUPS/trading_${STAMP}.db"
 FINAL_GZ="$TRADING_BACKUPS/trading_${STAMP}.db.gz"
+
+if [[ -d "$DB_PATH" ]]; then
+  echo "db_path_is_data_root_not_sqlite_file:$DB_PATH" >&2
+  exit 1
+fi
 
 if [[ ! -f "$DB_PATH" ]]; then
   echo "missing_db:$DB_PATH" >&2

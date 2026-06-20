@@ -11,15 +11,13 @@ connection and Postgres, and stands up the observability stack
 (`pg_stat_statements`, slow-query log, key Grafana-friendly metrics)
 the operator needs to keep the system healthy.
 
-## Cross-platform note
+## Linux-only note
 
-PgBouncer is **Linux-only in this deployment**. The user develops on
-Windows; on the dev machine, the application talks directly to
-Postgres on TCP via `TS_PG_DSN` — at dev workload no pooler is
-needed. The Python storage layer (DB-02) handles both
-transports identically because the DSN is a single env var.
+PgBouncer is **Linux-only in this deployment**. Linux development,
+staging, and production hosts use `TS_PG_DSN` to select the target;
+production defaults route through the local PgBouncer Unix socket.
 
-The observability snapshotter is platform-aware: when
+The observability snapshotter is dependency-aware: when
 `pg_stat_statements` is not installed (e.g., on a dev Postgres the
 developer has not extended) it logs a single startup warning and
 becomes a no-op. See

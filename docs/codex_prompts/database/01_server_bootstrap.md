@@ -10,14 +10,11 @@ This is greenfield: there is no production data to preserve. Optimize
 for performance on a single host (Postgres + Redis + PgBouncer + the
 trading app all co-located, communicating via Unix sockets).
 
-## Cross-platform note
+## Linux-only note
 
-This prompt is **Linux-only by design**. The user develops on Windows
-and deploys on Linux; this script runs **only on the staging and
-production Linux servers**, never on the Windows dev machine. Do not
-attempt cross-platform shims for `apt`, `systemd`, `ufw`, or
-`systemd-creds`. The dev workflow uses WSL2 Ubuntu (which runs this
-script unchanged) or Docker Compose; see
+This prompt is **Linux-only by design**. This script runs only on
+Linux staging and production servers. Do not attempt platform shims
+for `apt`, `systemd`, `ufw`, or `systemd-creds`; see
 `docs/codex_prompts/database/CROSS_PLATFORM.md`.
 
 ## Goal
@@ -52,8 +49,8 @@ but the README and reference values target the canonical deployment:
   patterns the application expects.
 - `engine/runtime/job_registry.py` — to know which long-running
   processes will need systemd units.
-- `boot/start_operator.bat` — Windows-side launcher; reference for
-  what the equivalent Linux launcher must wire up.
+- `boot/start_operator.sh` — Linux launcher; reference for what the
+  equivalent systemd/operator path must wire up.
 - `engine/terminal/api/api_terminal.py` — UI process; will need its
   own systemd unit.
 - Whatever Polygon WS streamer module exists

@@ -16,4 +16,5 @@ PY
 
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel setuptools
-"$VENV_DIR/bin/pip" install -r requirements.txt
+REQ_FILE="$(bash "$REPO_DIR/deploy/bin/resolve_python_requirements.sh" "$REPO_DIR")"
+"$VENV_DIR/bin/pip" install -r "$REQ_FILE"

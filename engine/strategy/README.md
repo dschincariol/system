@@ -32,9 +32,17 @@ The repo uses a supervised competition model rather than blindly serving the lat
 
 1. challengers first accumulate shadow evidence through [challenger_runtime.py](challenger_runtime.py) and [model_marketplace.py](model_marketplace.py)
 2. replay validation and self-critic checks decide whether a challenger is even eligible
-3. [champion_manager.py](champion_manager.py) compares the current champion and best challenger by score, observation window, replay approval, cooldowns, and degradation rules
+3. [champion_manager.py](champion_manager.py) compares the current champion and best challenger by score, observation window, replay approval, cooldowns, deconfounded signal evidence, and degradation rules. The same promotion eligibility helper gates both symbol/horizon assignments and the aggregate `MODEL_COMPETITION_SCOPE` champion, so a global best model cannot bypass replay freshness, replay approval, or self-critic blocked keys.
 4. [engine/model_registry.py](../model_registry.py) and champion assignment tables hold the durable promotion state
 5. [predictor.py](predictor.py) asks those assignments which model should serve live
+
+Strategy-stage promotion follows the same governance principle. Portfolio shadow
+outperformance records a `strategy_promotion_candidates` row through
+[strategy_promotion_governance.py](strategy_promotion_governance.py); it does
+not set `strategy_registry.stage='live'`. The governance job may promote a
+candidate only after operator approval, positive realized PnL evidence, passing
+statistical evidence, fresh approved replay validation, passing OPE evidence,
+system promotion-guard/cooldown approval, and promotion audit persistence.
 
 ## Key Files For New Engineers
 
@@ -50,10 +58,14 @@ The repo uses a supervised competition model rather than blindly serving the lat
   Captures decision context for explainability and debugging.
 - [alpha_lifecycle_engine.py](alpha_lifecycle_engine.py)
   Alpha lifecycle and promotion/demotion logic.
+- [alpha_shrinkage.py](alpha_shrinkage.py)
+  Empirical-Bayes per-symbol alpha shrinkage. Portfolio rebalance applies it before expected-return blending, allocation optimization, and risk overlays so thin-history symbols are partially pooled toward sector, liquidity, volatility-regime, model-family, or neutral priors.
 - [allocation_risk_overlay.py](allocation_risk_overlay.py)
   Deterministic post-allocation guardrail layer for crowding, concentration, and execution-capacity limits.
 - [model_governance_ext.py](model_governance_ext.py)
   Additive governance snapshots and audit helpers shared by jobs, APIs, and research tooling.
+- [strategy_promotion_governance.py](strategy_promotion_governance.py)
+  Candidate, approval, evidence, and audit checks for shadow strategy promotion into live strategy-registry state.
 - [model_lifecycle.py](model_lifecycle.py)
   Version planning, retraining cadence, active-version tracking, and retirement logic for deployable models.
 - [learning_loop.py](learning_loop.py)
@@ -74,8 +86,12 @@ The repo uses a supervised competition model rather than blindly serving the lat
   HMM-based latent regime model and regime-aware ensemble weighting helpers.
 - [tsfresh_features.py](tsfresh_features.py)
   Deterministic TSFresh feature extraction and snapshot materialization for training and replay.
+- [ts_foundation_encoder.py](ts_foundation_encoder.py)
+  Shadow-only frozen time-series foundation encoder. The initial backend is Chronos and it emits `tsfm.chronos_v2.*` feature ids with PIT and artifact provenance metadata.
 - [statistical_gates.py](statistical_gates.py)
   Promotion-gate statistics such as bootstrap tests, SPA, and deflated Sharpe checks.
+- [deconfounded_promotion.py](deconfounded_promotion.py)
+  Residualized incremental signal validation for promotion gates after beta, sector, size, volatility, liquidity, regime, and existing-model exposure controls.
 - [cpcv.py](cpcv.py)
   Combinatorial purged cross-validation and probability-of-backtest-overfitting utilities.
 - [drift_retrain_controller.py](drift_retrain_controller.py)
@@ -98,6 +114,8 @@ The repo uses a supervised competition model rather than blindly serving the lat
 - Feature and validation expansion:
   [feature_store.py](feature_store.py),
   [tsfresh_features.py](tsfresh_features.py),
+  [ts_foundation_encoder.py](ts_foundation_encoder.py),
+  [deconfounded_promotion.py](deconfounded_promotion.py),
   [cpcv.py](cpcv.py), and
   [statistical_gates.py](statistical_gates.py).
 - Automated retraining controls:

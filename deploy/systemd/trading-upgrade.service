@@ -11,6 +11,8 @@ Environment=TRADING_UPGRADE_SERVICE_CONTROL=0
 ExecStartPre=+/bin/systemctl stop trading-operator.service
 ExecStartPre=+/bin/systemctl stop trading-engine.service
 ExecStart=/opt/trading-system/repo/deploy/bin/upgrade_trading_system.sh
+ExecStartPost=+/usr/bin/install -m 0644 /opt/trading-system/repo/deploy/logrotate/trading-system /etc/logrotate.d/trading-system
+ExecStartPost=+/usr/sbin/logrotate -d /etc/logrotate.d/trading-system
 ExecStartPost=+/bin/systemctl start trading-engine.service
 ExecStartPost=+/bin/systemctl restart trading-operator.service
 StandardOutput=append:/opt/trading-system/logs/upgrade.log

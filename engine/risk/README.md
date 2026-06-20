@@ -23,3 +23,7 @@ The execution barrier can incorporate portfolio-risk blocks, so risk changes can
 - `MC_*`
 
 These variables are consumed directly by the risk engines and should be documented in `.env.example` and `docs/REFERENCE_CONFIGURATION_GLOSSARY.md` when their operator-facing meaning changes.
+
+## Monte Carlo Live Gating
+
+`PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE=1` is the conservative default. In live/prod runtime, the portfolio-risk engine blocks approval when Monte Carlo risk state is missing, unreadable, unparseable, stale beyond `PORTFOLIO_RISK_MC_MAX_AGE_S`, explicitly disabled, or marked `ready=false`/`status=error`. Intentional advisory-only or disabled Monte Carlo behavior must be configured explicitly and is rejected by strict live config validation unless the audited live-risk acceptance override is present.

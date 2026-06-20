@@ -4,6 +4,24 @@ This is the single rotation reference for the trading server. Production secrets
 
 ## Master Key Rotation
 
+The active master key material must be canonical base64 text for exactly 32
+random bytes. Generate new key material with:
+
+```bash
+openssl rand -base64 32
+```
+
+For file-based deployments, create the file with restrictive permissions:
+
+```bash
+sudo install -o trading -g trading -m 0600 /dev/null /var/lib/trading/.data_source_master_key
+sudo -u trading sh -c 'openssl rand -base64 32 > /var/lib/trading/.data_source_master_key'
+```
+
+For systemd encrypted-credential deployments, use the scripted rotation below;
+it generates the same base64 32-byte material and installs it as
+`master_key.next`.
+
 1. Confirm the current host is healthy:
    ```bash
    sudo /opt/trading/app/ops/server/verify.sh
@@ -29,6 +47,24 @@ This is the single rotation reference for the trading server. Production secrets
      sudo TRADING_MASTER_KEY_ARCHIVE_RETENTION_HOURS=72 bash /opt/trading/app/ops/server/credstore/prune_archive.sh
      ```
    - A remaining `master_key.next.cred` means the rotation stopped before phase 3 and should be investigated before retrying.
+
+## File-Based Master Key Rotation
+
+Use this only for deployments that set `DATA_SOURCE_MASTER_KEY_FILE` directly
+instead of loading `master_key` from systemd credentials. Keep a copy of the old
+key until every encrypted data-source row is verified under the new key.
+
+```bash
+sudo install -o trading -g trading -m 0600 /dev/null /var/lib/trading/master_key.next
+sudo -u trading sh -c 'openssl rand -base64 32 > /var/lib/trading/master_key.next'
+sudo -u trading DATA_SOURCE_MASTER_KEY_FILE=/var/lib/trading/.data_source_master_key \
+  TS_SECRETS_PROVIDER=plaintext TS_DEV_SECRETS_DIR=/var/lib/trading \
+  python -c 'from services.secrets.rotation import re_encrypt_data_sources; print(re_encrypt_data_sources(old_key_name="master_key", new_key_name="master_key.next", final_key_version="master_key", delete_old_key=False))'
+sudo install -o trading -g trading -m 0600 /var/lib/trading/master_key.next /var/lib/trading/.data_source_master_key
+sudo -u trading DATA_SOURCE_MASTER_KEY_FILE=/var/lib/trading/.data_source_master_key \
+  python -c 'from services.secrets.rotation import verify_data_sources_key; print({"verified": verify_data_sources_key(new_key_name="master_key")})'
+sudo rm -f /var/lib/trading/master_key.next
+```
 
 ## Postgres Role Password Rotation
 

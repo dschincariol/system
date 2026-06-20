@@ -24,6 +24,11 @@ catalog and `model_best_params`.
 | `PATCHTST_SEQ_LEN` | `seq_len` | `patchtst` | int | 128 | 32-256 log | managed |
 | `PATCHTST_PATCH_LEN` | `patch_len` | `patchtst` | int | 16 | 4-32 log | managed |
 | `PATCHTST_D_MODEL` | `d_model` | `patchtst` | int | 64 | 16-256 log | managed |
+| `ITRANSFORMER_SEQ_LEN` | `seq_len` | `itransformer` | int | 128 | 32-256 log | managed |
+| `ITRANSFORMER_D_MODEL` | `d_model` | `itransformer` | int | 64 | 16-256 log | managed |
+| `ITRANSFORMER_LAYERS` | `n_layers` | `itransformer` | int | 2 | 1-6 | managed |
+| `ITRANSFORMER_HEADS` | `n_heads` | `itransformer` | int | 4 | 1-8 | managed |
+| `ITRANSFORMER_DROPOUT` | `dropout` | `itransformer` | float | 0.1 | 0.0-0.5 | managed |
 
 Environment variables not listed here are classified as runtime/platform
 controls, feature flags, credentials, provider settings, or job scheduling

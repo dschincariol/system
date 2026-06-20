@@ -12,14 +12,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+ARG TRADING_DEPENDENCY_PROFILE=cpu
+ENV TRADING_DEPENDENCY_PROFILE=${TRADING_DEPENDENCY_PROFILE}
+
+COPY requirements*.txt /app/
+COPY deploy/bin/resolve_python_requirements.sh /app/deploy/bin/resolve_python_requirements.sh
 
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install -r /app/requirements.txt
+    && REQ_FILE="$(bash /app/deploy/bin/resolve_python_requirements.sh /app)" \
+    && python -m pip install -r "$REQ_FILE"
 
 COPY . /app
 
 RUN mkdir -p /app/data /app/logs /app/artifact_mirror /app/training_datasets
 
 CMD ["python", "start_system.py"]
-

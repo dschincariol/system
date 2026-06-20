@@ -5,7 +5,7 @@ the automated `tools/audit_db_implementation.py` script. Run the
 script first; it covers structural, lint, file-existence, and (with
 `--run-tests`) functional checks. This document covers what scripts
 cannot — design correctness, performance under realistic load, and
-cross-platform behavior verified by running.
+Linux-only behavior verified by running.
 
 ## How to use
 
@@ -50,7 +50,7 @@ look at what passed and confirm it is **right**, not just present.
       steps for both master-key and Postgres-role rotation, and
       names the operator-facing commands.
 - [ ] `docs/codex_prompts/database/CROSS_PLATFORM.md` reflects the
-      env vars actually used by `engine/runtime/platform.py`. Open
+      Linux-only env vars actually used by `engine/runtime/platform.py`. Open
       both side-by-side and reconcile any drift.
 
 Operator: _________________________ Date: _____________
@@ -150,28 +150,25 @@ Record actual numbers below; the targets are not negotiable.
 
 Operator: _________________________ Date: _____________
 
-## Section D — Cross-platform parity
+## Section D — Linux platform contract
 
-The whole point of the cross-platform work is that the same Python
-code runs on your Windows dev machine and the Linux servers. Verify.
+The whole point of the platform work is that the same Python code runs
+on Linux development, staging, and production hosts. Verify.
 
 - [ ] On the Linux staging server, set `TS_PG_DSN`, `TS_REDIS_URL`,
       `TS_DATA_ROOT` to the platform defaults. Run `pytest -q`. All
       relevant tests pass.
-- [ ] On the Windows dev machine, set the env vars to your dev DB
-      DSN, dev Redis URL, and `%LOCALAPPDATA%\Trading`. Run
-      `pytest -q`. Same tests pass.
-- [ ] No `pytest.skip` markers fire because of platform on either
-      host that should have run.
+- [ ] On a Linux dev host, set the env vars to your dev DB DSN, dev
+      Redis URL, and `/var/lib/trading` or an explicit `TS_DATA_ROOT`.
+      Run `pytest -q`. Same tests pass.
+- [ ] No `pytest.skip` markers fire because of platform on Linux tests
+      that should have run.
 - [ ] `engine/runtime/platform.py::default_data_root()` returns
-      `/var/lib/trading` on Linux and a `Path` under `LOCALAPPDATA`
-      on Windows. Spot-check both.
+      `/var/lib/trading` unless `TS_DATA_ROOT` overrides it.
 - [ ] `engine/runtime/platform.py::default_pg_dsn()` returns the
-      Linux Unix-socket DSN on Linux and a TCP-localhost DSN on
-      Windows.
-- [ ] DPAPI provider (`services/secrets/providers/dpapi.py`)
-      round-trips a sample secret on Windows. The plaintext
-      provider refuses to import when `TS_ENV=production`.
+      Linux Unix-socket DSN.
+- [ ] systemd-creds round-trips a sample secret on Linux. The
+      plaintext provider refuses to import when `TS_ENV=production`.
 
 Operator: _________________________ Date: _____________
 

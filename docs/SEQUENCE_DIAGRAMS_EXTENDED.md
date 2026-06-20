@@ -175,7 +175,7 @@ sequenceDiagram
     Agent->>Op: GET /api/execution/barrier
     Op->>Dash: proxy support and runtime diagnostics where applicable
     Agent->>Agent: normalize into diagnostics-only result
-    Agent->>Agent: append data/ai_operator_log.jsonl
+    Agent->>Agent: append var/log/ai_operator_log.jsonl
     Agent-->>Operator: {analysis, action:null, executed:null}
 
     Operator->>Dash: POST /api/operator/autofix

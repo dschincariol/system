@@ -1,5 +1,5 @@
 [Unit]
-Description=Trading System Database Backup
+Description=Trading System Legacy SQLite Backup
 
 [Service]
 Type=oneshot

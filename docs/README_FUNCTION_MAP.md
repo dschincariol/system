@@ -76,7 +76,21 @@ This is the local operator control plane and repair proxy.
 
 ### `engine/runtime/job_registry.py`
 
-This file is the canonical job catalog.
+This file is the canonical runnable-job registry. `engine/runtime/job_catalog.py`
+serializes the operator-facing catalog and backend safety policy from it.
+
+The runtime boot set includes `kill_switch_cache_refresh`, a non-execution
+daemon that periodically reloads the DB-backed kill-switch snapshot into Redis.
+It keeps `loaded_ts_ms`/`source`/`max_age_ms` diagnostics fresh and prevents
+kill-switch cache freshness from depending only on activation or clear writes.
+
+The PatchTST path includes `pretrain_patchtst_models`, a shadow-default
+oneshot job that runs masked patch reconstruction before supervised
+`train_patchtst_models` fine-tuning when PatchTST is enabled in the pipeline.
+The iTransformer path includes `train_itransformer_models`, also a shadow-default
+oneshot training job. It writes feature-contract artifacts and OOS prediction
+rows for marketplace visibility, but those OOS rows are not live-promotion
+evidence without the normal realized-PnL, replay, and promotion-gate path.
 
 | Function | What it does |
 | --- | --- |
@@ -89,6 +103,18 @@ This file is the canonical job catalog.
 | `is_execution_job(job_name)` | identifies execution-sensitive jobs |
 | `is_price_feed_job(job_name)` | identifies price-feed jobs |
 | `is_market_data_job(job_name)` | identifies market-data jobs |
+
+### `engine/runtime/job_catalog.py`
+
+This file owns the first-class operator job catalog contract consumed by
+`/api/jobs`, `/api/jobs/catalog`, the dashboard Job Catalog, and command
+palette job actions.
+
+| Function | What it does |
+| --- | --- |
+| `build_job_catalog()` | serializes every registered job with purpose, prerequisites, safety, action policy, and log/history links |
+| `enrich_job_runtime_row(...)` | merges live/persisted job state with the catalog row shape |
+| `dangerous_job_start_confirmation_error(...)` | enforces backend confirmation for execution-sensitive or destructive/admin job starts and blocks unavailable jobs |
 
 ### `engine/runtime/jobs_manager.py`
 
@@ -116,7 +142,7 @@ This file owns startup sequencing.
 
 ### `engine/runtime/storage.py`, `engine/runtime/storage_pg.py`, and `engine/runtime/storage_sqlite.py`
 
-`engine/runtime/storage.py` is the public storage facade. In production-like operation it re-exports the Postgres implementation from `engine/runtime/storage_pg.py`; isolated Python tests can opt into `engine/runtime/storage_sqlite.py` through `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`.
+`engine/runtime/storage.py` is the public storage facade. In production-like operation it re-exports the Postgres implementation from `engine/runtime/storage_pg.py`; isolated Python tests can opt into `engine/runtime/storage_sqlite.py` through `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`, and real supervised/prod/live processes reject that SQLite backend.
 
 | Function or Class | What it does |
 | --- | --- |
@@ -192,6 +218,27 @@ This file shapes orders before they go further into the execution path.
 | `_decision_from_alpha(...)` | maps remaining alpha to policy stance |
 | `_alpha_remaining(...)` | estimates remaining alpha over time |
 
+### `engine/execution/contextual_bandit_slicer.py`
+
+This file implements the execution-only learned slicing prototype.
+
+| Function | What it does |
+| --- | --- |
+| `select_execution_adjustment(...)` | chooses bounded slice percentage, participation, interval, and entry-delay parameters |
+| `enforce_execution_only_decision(...)` | rejects learned decisions that emit forbidden fields or values outside EPE-provided bounds |
+| `validate_routed_learned_orders(...)` | broker-router guard that blocks direct learned-policy orders without EPE lock metadata |
+| `evaluate_against_baselines(...)` | compares learned slicing against TWAP/VWAP/POV/adaptive baselines on shortfall, slippage, fill risk, and adverse selection |
+
+### `engine/execution/lob_simulation.py`
+
+This file owns the first reactive LOB simulation and shadow DeepLOB readiness slice.
+
+| Function | What it does |
+| --- | --- |
+| `build_reactive_lob_simulation(...)` | computes queue position, spread crossing, queue-aware partial fills, adverse-selection bps, sweep bps, and L2-calibrated market impact for broker-sim fills |
+| `lob_deeplob_readiness_snapshot(...)` | blocks the shadow model path unless L2 depth, latency assumptions, and simulator calibration evidence are sufficient |
+| `shadow_deeplob_execution_signal(...)` | emits shadow-only execution-timing/adverse-selection diagnostics, never portfolio-selection or sizing directives |
+
 ### `engine/execution/broker_router.py`
 
 This file routes orders to broker adapters and failover logic.
@@ -213,7 +260,7 @@ This file owns live-broker failover validation and terminal broker-failure class
 | --- | --- |
 | `canonical_broker_name(...)` | normalizes broker aliases such as `alpaca_rest` and IBKR variants |
 | `configured_failover_chain(...)` | reads the configured broker failover chain from environment |
-| `validate_live_failover_chain(...)` | blocks unsafe live chains, including sim/paper fallback in live mode |
+| `validate_live_failover_chain(...)` | blocks unsafe live chains, including sim/paper fallback and mixed live brokers in live mode |
 | `live_broker_environment_contract(...)` | validates `BROKER`, `BROKER_NAME`, `LIVE_BROKER`, and failover consistency without touching broker APIs |
 | `broker_startup_preflight(...)` | runs broker credential/reachability preflight for live chains |
 | `terminal_broker_failure(...)` | builds a standard terminal broker-failure payload that stops unsafe retry/failover behavior |
@@ -311,6 +358,16 @@ This file owns governance-specific API handlers.
 | `get_promotion_explain()` | returns promotion state plus recent audit detail |
 | `get_governance_summary()` | returns governance dashboard summary |
 | `api_get_exec_conf_calib(...)` | returns execution confidence calibration |
+
+### `engine/strategy/production_monitoring.py`
+
+This file owns production drift, calibration, and shadow-vs-live monitoring.
+
+| Function | What it does |
+| --- | --- |
+| `compute_production_monitoring_metrics(...)` | computes latest feature drift, prediction drift, missing-feature, label, calibration, conformal, shadow/live, and net-PnL metrics |
+| `compute_and_store_production_monitoring(...)` | persists latest metrics and emits retrain or shadow-review signal rows without promotion side effects |
+| `get_latest_production_monitoring_snapshot(...)` | returns latest monitoring metrics for API/dashboard composition |
 
 ### `engine/api/api_system.py`
 

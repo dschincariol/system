@@ -107,7 +107,7 @@ If you are changing HTTP or operator surfaces:
 - Update [REFERENCE_CONFIGURATION_GLOSSARY.md](REFERENCE_CONFIGURATION_GLOSSARY.md) when environment or secret-management behavior changes.
 - Update [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md) when data-source routes, payloads, storage, or lifecycle behavior change.
 - Use [DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md) to decide whether a doc is canonical or supplementary before adding new prose.
-- Do not treat `docs/handoff/*` or [README_UI_REDESIGN_PLAN.md](README_UI_REDESIGN_PLAN.md) as canonical runtime truth.
+- Do not treat `docs/handoff/*`, `docs/archive/*`, or [archive/README_UI_REDESIGN_PLAN.md](archive/README_UI_REDESIGN_PLAN.md) as canonical runtime truth.
 
 ## Practical Rules
 

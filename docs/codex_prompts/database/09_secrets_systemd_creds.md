@@ -15,18 +15,15 @@ This prompt moves the master encryption key (and the Postgres role
 passwords from prompt 01) off raw disk and into systemd-managed
 encrypted credentials, with a documented rotation procedure.
 
-## Cross-platform note
+## Linux-only note
 
 The **systemd-creds backend is Linux-only** (correct: it is the
 production secret-management mechanism on the staging/prod servers).
-The **secrets loader API is cross-platform** via a pluggable
-provider model so the same Python code runs on the developer's
-Windows machine. Three providers ship:
+The **secrets loader API is Linux-only** via a pluggable provider
+model. Two providers ship:
 
 1. `systemd-creds` — Linux production (this prompt's primary subject).
-2. `dpapi` — Windows DPAPI (`win32crypt.CryptProtectData`),
-   production-grade for dev.
-3. `plaintext` — files with explicit warnings; refuses to start when
+2. `plaintext` — files with explicit warnings; refuses to start when
    `TS_ENV=production`.
 
 Provider selection is via the `TS_SECRETS_PROVIDER` env var. Read
@@ -67,18 +64,13 @@ Provider selection is via the `TS_SECRETS_PROVIDER` env var. Read
 - `services/secrets/__init__.py`
 - `services/secrets/loader.py` — `load_secret(name: str) -> bytes`.
   Dispatches to the provider selected by `TS_SECRETS_PROVIDER`
-  (default: `systemd-creds` on Linux, `dpapi` on Windows). Raises a
+  (default: `systemd-creds`). Raises a
   typed `SecretNotAvailable` on miss. Logs each successful read to
   `credential_access_log` with `(name, pid, service_name, ts,
   provider)`.
 - `services/secrets/providers/__init__.py`
 - `services/secrets/providers/systemd_creds.py` — Linux production.
   Reads from `${CREDENTIALS_DIRECTORY}/<name>`.
-- `services/secrets/providers/dpapi.py` — Windows. Reads
-  `%LOCALAPPDATA%\Trading\secrets\<name>.dpapi`, decrypts via
-  `win32crypt.CryptUnprotectData`. The `pywin32` dependency is
-  declared as a `windows-dev` extra so Linux installs do not pull
-  it.
 - `services/secrets/providers/plaintext.py` — Reads
   `${TS_DEV_SECRETS_DIR}/<name>` as raw bytes. Emits a loud
   `RuntimeWarning` at module import. Raises `RuntimeError` if
@@ -109,10 +101,7 @@ Provider selection is via the `TS_SECRETS_PROVIDER` env var. Read
   retention 1 year.
 - `tests/test_secrets_loader.py` — provider dispatch on each
   platform.
-- `tests/test_secrets_provider_systemd.py` — Linux-only marker;
-  skipped on Windows.
-- `tests/test_secrets_provider_dpapi.py` — Windows-only marker;
-  skipped on Linux.
+- `tests/test_secrets_provider_systemd.py` — Linux-only marker.
 - `tests/test_secrets_provider_plaintext.py` — refuses to load when
   `TS_ENV=production` regardless of platform.
 - `tests/test_secrets_rotation.py`
@@ -189,14 +178,10 @@ Provider selection is via the `TS_SECRETS_PROVIDER` env var. Read
       `credential_access_log`.
 - [ ] `docs/Secrets_Rotation_Runbook.md` exists and is the single
       reference for rotation.
-- [ ] On Windows, the `dpapi` provider round-trips a secret
-      end-to-end (encrypt → store → decrypt → verify) using only
-      `pywin32`, no Linux-only dependencies.
 - [ ] The `plaintext` provider refuses to import when
       `TS_ENV=production` is set, on any platform.
-- [ ] `pywin32` is declared as a `windows-dev` extras dependency,
-      not in the base requirements; `pip install` on Linux does not
-      attempt to build it.
+- [ ] No non-Linux secrets dependency is present in base
+      requirements or optional dependency profiles.
 
 ## Test plan
 

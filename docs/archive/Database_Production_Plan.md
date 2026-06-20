@@ -351,7 +351,52 @@ Connection strings carry the right role; no service uses superuser.
 - Replication lag alert on the read replica.
 - Object-storage upload-failure alert for WAL archive.
 
-### 6.5 Schema migrations at scale
+### 6.5 Timescale/Postgres tuning
+
+For the Docker deployment, `deploy/compose/.env` is the single source of truth
+for Timescale service limits and Postgres tuning. The Timescale service consumes
+the `TIMESCALE_*` settings directly as `postgres -c` arguments, and
+`engine/runtime/prod_preflight.py` validates those same settings before the
+production smoke cycle.
+
+Current 123 GiB host profile:
+
+- Docker resource envelope: runtime `48g`, Timescale `32g`, Redis `8g`, MinIO
+  `6g`, operator `2g`, with `TRADING_RESOURCE_MIN_HEADROOM_MEMORY=24g`.
+- Postgres memory: `shared_buffers=8GB`, `effective_cache_size=22GB`,
+  `work_mem=48MB`, `maintenance_work_mem=2GB`,
+  `autovacuum_work_mem=512MB`, `max_connections=100`.
+- Parallelism/autovacuum: `max_worker_processes=16`,
+  `max_parallel_workers=8`, `max_parallel_workers_per_gather=4`,
+  `max_parallel_maintenance_workers=4`,
+  `timescaledb.max_background_workers=8`, `autovacuum_max_workers=4`.
+- WAL/checkpoint: `wal_buffers=64MB`, `min_wal_size=4GB`,
+  `max_wal_size=16GB`, `wal_keep_size=1GB`,
+  `max_slot_wal_keep_size=8GB`, `checkpoint_timeout=15min`,
+  `checkpoint_completion_target=0.9`, `archive_timeout=60s`.
+- IO cost: `random_page_cost=1.1`, `effective_io_concurrency=200`,
+  `maintenance_io_concurrency=200`.
+
+The preflight memory budget treats the Timescale container limit as the hard
+budget when configured, not total host RAM. It fails if the configured memory
+estimate exceeds 85% of the service limit, if `effective_cache_size` is larger
+than the service limit, or if the Timescale limit plus host reserve does not fit
+inside `TRADING_RESOURCE_HOST_MEMORY`. It also checks that
+`max_wal_size + wal_keep_size + max_slot_wal_keep_size` stays under
+`TIMESCALE_WAL_DISK_BUDGET`. This provides ingestion checkpoint headroom while
+avoiding intentionally unbounded retained WAL. Backup evidence and WAL RPO
+checks remain mandatory because archive failures can still prevent PostgreSQL
+from recycling archived WAL.
+
+Smaller fallback hosts:
+
+| Host | Timescale limit | Recommended settings |
+| --- | ---: | --- |
+| 32 GiB | `12g` | `shared_buffers=3GB`, `effective_cache_size=9GB`, `work_mem=8MB`, `maintenance_work_mem=512MB`, `autovacuum_work_mem=256MB`, `max_wal_size=8GB`, `TIMESCALE_CPUS=4` |
+| 64 GiB | `20g` | `shared_buffers=5GB`, `effective_cache_size=15GB`, `work_mem=16MB`, `maintenance_work_mem=1GB`, `autovacuum_work_mem=384MB`, `max_wal_size=8GB`, `TIMESCALE_CPUS=6` |
+| 123 GiB | `32g` | committed compose defaults |
+
+### 6.6 Schema migrations at scale
 
 - Every migration goes through the file in
   `engine/runtime/schema/migrations.py` (created by prompt 04).
@@ -361,7 +406,7 @@ Connection strings carry the right role; no service uses superuser.
   `decompress_chunk → ALTER → recompress_chunk` pattern; never
   `ALTER TABLE` a multi-GB hot table directly.
 
-### 6.6 Tamper-evident audit
+### 6.7 Tamper-evident audit
 
 For the audit-class tables, add a `prev_hash TEXT` column and a
 `row_hash TEXT` column computed as

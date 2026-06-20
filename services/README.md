@@ -32,7 +32,7 @@ It currently:
 - collects operator evidence from runtime health, service status, logs, support snapshot, provider telemetry, watchdogs, and execution barrier endpoints
 - sends a strict JSON prompt to the configured LLM backend
 - normalizes the response into summary, root cause, failing component, file, patch hint, and `action: null`
-- logs decisions to `data/ai_operator_log.jsonl`
+- logs decisions to `var/log/ai_operator_log.jsonl` locally, or to `AI_OPERATOR_LOG_PATH` / `OPERATOR_AI_LOG_PATH` when configured
 - does not execute runtime-control actions directly
 
 It does not have direct trading authority. Guarded patch preview, apply, and rollback remain mediated by [../boot/operator_server.js](../boot/operator_server.js).

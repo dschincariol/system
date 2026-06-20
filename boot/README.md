@@ -2,12 +2,12 @@
 
 The `boot/` directory contains the local launch and operator surface for the system.
 
+Supported platform: Linux only.
+
 ## File Roles
 
-- [start_operator.bat](start_operator.bat)
-  Main Windows launcher used by local users.
 - [start_operator.sh](start_operator.sh)
-  Shell launcher for non-Windows environments.
+  Shell launcher for Linux environments.
 - [operator_server.js](operator_server.js)
   Local Node operator service on port `4001` that proxies dashboard/runtime reads, owns guided controls, and manages launcher/process workflows.
 - [operator_ui.html](operator_ui.html)
@@ -45,15 +45,36 @@ The boot/operator layer now also owns the guarded repair boundary for operator A
 - `/api/operator/ai/last_patch`
   returns the latest guarded operator patch metadata
 
+## Structured Operator Confirmations
+
+High-impact operator mutations must use structured confirmation payloads instead
+of native browser dialog flows. The operator console uses
+the shared [../ui/confirmation_modal.mjs](../ui/confirmation_modal.mjs) helper
+for live start, guided bootstrap, stop/restart, emergency stop, factory reset,
+repair/admin actions, secret changes, backups, updates, feed restarts, and
+operator-AI patch actions.
+
+The browser modal is advisory UI. `operator_server.js` remains the authoritative
+sidecar gate for its high-impact routes and rejects missing or invalid
+confirmation before the mutation runs. Confirmation payloads carry `action_id`,
+typed confirmation token, hold duration when required, `consequence_ack`,
+`actor`, `source`/`source_surface`, `reason`, `request_id`, and `target`.
+Sidecar audit records are appended to
+`var/tmp/operator/operator_confirmation_audit.jsonl` by default, with sensitive
+values redacted or hashed.
+
 ## Maintenance Guidance
 
 - Keep launcher semantics single-owner.
   Avoid hidden duplicate engine starts from both the operator and Python boot paths.
 - Reuse existing running operator instances where possible.
-- Treat process cleanup and stale launcher state as first-class concerns on Windows.
+- Treat process cleanup and stale launcher state as first-class Linux process-management concerns.
 - Keep the operator as a control/proxy layer, not a second business-logic runtime.
   Operator routes should delegate to dashboard/runtime APIs or process controls rather than reimplement trading logic locally.
 - Keep the operator out of provider credential ownership.
   Source credentials and source-specific settings should be managed through the Data Sources Control Center, not new `.env` edit paths.
 - Keep AI repair flows guarded.
   Patch apply and rollback must remain confirmation-gated and must not bypass live-mode safety rules.
+- Keep structured confirmations server-enforced.
+  Adding a modal is not enough for dangerous operator routes; add or update the
+  sidecar/API confirmation registry and mutation audit payload at the same time.

@@ -1,19 +1,13 @@
 # Linux Server Codex Deploy Prompt
 
-Use this after the Windows workstation has built and mirrored `dist/linux-server`
-to the Linux host.
+Use this from a Linux checkout or from a Linux-built deployment mirror.
+Non-Linux bundle creation and transfer workflows are not supported.
 
-## Windows Bundle Step
+## Prepare The Linux Source
 
-From the Windows repo root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools/build_linux_deploy_bundle.ps1
-```
-
-Mirror the resulting `dist/linux-server/` directory to the Linux server with the
-transfer method you normally use. Do not transfer `.env`, `.venv`, `node_modules`,
-logs, local databases, or `tmp`.
+Mirror a clean Linux checkout or filtered source directory to the Linux server
+with your normal Linux transfer tooling. Do not transfer `.env`, `.venv`,
+`node_modules`, logs, local databases, or `tmp`.
 
 ## Prompt To Give Codex On The Linux Server
 
@@ -34,7 +28,7 @@ Use this exact deployment path:
 6. Check sudo systemctl status trading.target --no-pager.
 7. Check sudo systemctl status trading-jobs.service trading-api.service trading-ingest.service --no-pager.
 8. Check recent logs with sudo journalctl -u trading-jobs.service -u trading-api.service -u trading-ingest.service -n 200 --no-pager.
-9. Probe http://127.0.0.1:8000/api/readiness and http://127.0.0.1:4001/api/operator/status from the server.
+9. Probe `http://127.0.0.1:8000/api/readiness` with `X-API-Token` and `http://127.0.0.1:4001/api/operator/status` with `X-Operator-Token` from the server.
 
 If any step fails, stop and fix the specific failing deployment asset or config.
 Report exactly what changed, the status of each service, and whether readiness

@@ -9,6 +9,10 @@ Production-grade supervised trading system repository with:
 
 This file is the canonical documentation entrypoint for the repository. For the full documentation map, use [docs/DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md).
 
+## Supported Platform
+
+This repository supports Linux only. Production and local development paths assume a Debian-family Linux host or container with bash, systemd-oriented service assets where applicable, POSIX process semantics, Postgres/Timescale, Redis, Node 20, and Python 3.11. Non-Linux launchers, deployment helpers, host-specific secret APIs, and CI runners are intentionally not supported.
+
 ## Start Here
 
 Engineer read path:
@@ -28,8 +32,9 @@ Operator read path:
 2. [docs/REFERENCE_CONFIGURATION_GLOSSARY.md](docs/REFERENCE_CONFIGURATION_GLOSSARY.md)
 3. [docs/REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](docs/REFERENCE_DATA_SOURCE_CONTROL_PLANE.md)
 4. [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md)
-5. [boot/README.md](boot/README.md)
-6. [ui/README.md](ui/README.md)
+5. [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md)
+6. [boot/README.md](boot/README.md)
+7. [ui/README.md](ui/README.md)
 
 ## Runtime Topology
 
@@ -82,25 +87,34 @@ Data-source configuration has one canonical contract:
   Explicit contract for the data-source UI, routes, storage, and runtime lifecycle behavior.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
   Grounded runtime architecture reference assembled from the current entrypoints, APIs, and subsystems.
+- [docs/README_SEQUENCE_DIAGRAMS.md](docs/README_SEQUENCE_DIAGRAMS.md) and [docs/STATE_MACHINES.md](docs/STATE_MACHINES.md)
+  Canonical workflow and state-transition references.
 - [docs/DATA_CONTRACTS.md](docs/DATA_CONTRACTS.md)
   Current payload and persistence contracts that cross module boundaries.
 - [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md), [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md), and [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md)
   Canonical operational references for telemetry, failure handling, and production readiness checks.
+- [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md)
+  CPU/default, NVIDIA CUDA, and reserved AMD/ROCm dependency profile selection, verification, and CPU rollback.
+- [docs/PRODUCTION_BACKEND_CI.md](docs/PRODUCTION_BACKEND_CI.md), [docs/LIVE_READINESS_CHECKLIST.md](docs/LIVE_READINESS_CHECKLIST.md), and [docs/STAGING_PROD_PREFLIGHT_EVIDENCE.md](docs/STAGING_PROD_PREFLIGHT_EVIDENCE.md)
+  Production-backend gate reproduction, live enablement readiness, and staging preflight evidence.
 - [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md), [docs/DOCSTRING_STYLE.md](docs/DOCSTRING_STYLE.md), [docs/adr/README.md](docs/adr/README.md), [docs/openapi/README.md](docs/openapi/README.md), and [docs/LICENSING_NOTE.md](docs/LICENSING_NOTE.md)
   Documentation governance, change tracking, docstring standards, decision records, API-spec location, and current licensing status.
-- [docs/README_DATABASE_MAP.md](docs/README_DATABASE_MAP.md)
-  Canonical database-family reference until a schema reference is generated directly from code.
-- Subsystem READMEs under `engine/`, plus [boot/README.md](boot/README.md), [services/README.md](services/README.md), [ui/README.md](ui/README.md), [ops/README.md](ops/README.md), and [deploy/README.md](deploy/README.md)
+- [docs/README_DATABASE_MAP.md](docs/README_DATABASE_MAP.md), [docs/Database_Schema.md](docs/Database_Schema.md), [docs/Audit_Chain_Spec.md](docs/Audit_Chain_Spec.md), and [docs/Secrets_Rotation_Runbook.md](docs/Secrets_Rotation_Runbook.md)
+  Canonical database-family, schema-classification, audit-chain, and secrets-rotation references.
+- Subsystem READMEs under `engine/`, plus [boot/README.md](boot/README.md), [services/README.md](services/README.md), and [ui/README.md](ui/README.md)
   Canonical local entrypoints for subsystem-level ownership.
+- [ops/README.md](ops/README.md) and [deploy/README.md](deploy/README.md)
+  Supplementary maps for ad hoc operational utilities and deployment automation.
 
 Supplementary but useful:
 
 - [docs/README_ARCHITECTURE.md](docs/README_ARCHITECTURE.md)
-- [docs/README_SEQUENCE_DIAGRAMS.md](docs/README_SEQUENCE_DIAGRAMS.md)
+- [docs/SEQUENCE_DIAGRAMS_EXTENDED.md](docs/SEQUENCE_DIAGRAMS_EXTENDED.md)
 - [docs/README_DEVELOPER_MAP.md](docs/README_DEVELOPER_MAP.md)
 - [docs/README_FUNCTION_MAP.md](docs/README_FUNCTION_MAP.md)
-- [docs/README_UI_REDESIGN_PLAN.md](docs/README_UI_REDESIGN_PLAN.md)
-- `docs/handoff/*`
+- [docs/archive/README.md](docs/archive/README.md)
+- [docs/handoff/README.md](docs/handoff/README.md)
+- [docs/codex_prompts/README.md](docs/codex_prompts/README.md)
 
 ## Repository Map
 
@@ -120,14 +134,15 @@ Supplementary but useful:
 ## Local Bootstrap And Validation
 
 - Copy [.env.example](.env.example) to `.env` for a new workstation.
-- On Linux/macOS development machines, run `bash tools/bootstrap_local_toolchain.sh` from the repo root. It creates or updates `.venv` with Python 3.11, installs `requirements.txt`, installs Node.js 20.19.4 with npm 10.8.2 inside `.venv` when needed, runs `npm ci`, and links the `python`, `python3`, `node`, `npm`, and `npx` command names into `$HOME/.local/bin` by default.
-- Install Python dependencies with `python -m pip install -r requirements.txt`.
+- On Linux/macOS development machines, run `bash tools/bootstrap_local_toolchain.sh` from the repo root. It creates or updates `.venv` with Python 3.11, installs the selected Python dependency profile (`TRADING_DEPENDENCY_PROFILE=cpu` by default), installs Node.js 20.19.4 with npm 10.8.2 inside `.venv` when needed, runs `npm ci`, and links the `python`, `python3`, `node`, `npm`, and `npx` command names into `$HOME/.local/bin` by default.
+- Install CPU/default Python dependencies with `TRADING_DEPENDENCY_PROFILE=cpu python -m pip install -r requirements.txt`. Use [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md) before selecting NVIDIA CUDA or AMD/ROCm profiles.
 - Use Node.js 20 LTS (`>=20.17.0 <21`) with npm 10.x for the operator UI. The checked-in `.npmrc` enforces this during `npm ci`.
 - Install Node dependencies reproducibly with `npm ci`; do not edit or vendor `node_modules/`.
 - Prefer `ENGINE_MODE=safe` and `EXECUTION_MODE=safe` until the environment, providers, and operator controls are verified.
 - Run `npm run check:ui` after `npm ci` to validate local asset references, dashboard JS syntax, and browser-helper tests before shipping UI changes.
-- Run `python tools/validate_repo.py` before merging.
-- Run `python tools/validate_repo.py --live` only when a running operator plus engine instance is available and a bounded live smoke test is intended.
+- Run `python tools/validate_repo.py` before merging. The default startup graph gate is hermetic and uses sqlite/memory backends even when local `.env` points at Postgres, Timescale, or Redis.
+- Reproduce the Postgres/Redis production-backend CI gate with [docs/PRODUCTION_BACKEND_CI.md](docs/PRODUCTION_BACKEND_CI.md) when changing runtime storage, Redis cache wrappers, migrations, audit-chain behavior, execution arming, or promotion evidence.
+- Run `python tools/validate_repo.py --live` only when a running operator plus engine instance is available and a bounded live smoke test is intended. This mode preserves production dependency requirements for Postgres/Timescale and Redis.
 
 Deterministic local gate commands after bootstrap:
 
@@ -160,9 +175,10 @@ Useful supporting checks:
 
 These paths are runtime state, not canonical documentation sources:
 
-- `data/`
-- `logs/`
+- `var/`
+- legacy local outputs such as `data/`, `logs/`, `tmp/`, `.run-audit/`, `artifacts/`, and `models/`
 - `__pycache__/`
 - `node_modules/`
 
-Use them for diagnostics, not for ownership or contract discovery.
+Use them for diagnostics, not for ownership or contract discovery. See
+[docs/RUNTIME_STATE.md](docs/RUNTIME_STATE.md) for the ignored local layout.

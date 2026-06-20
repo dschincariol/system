@@ -24,7 +24,7 @@ Terminal order-entry routes do not bypass the normal execution stack.
 
 - `POST /api/terminal/order` writes a row into `portfolio_orders` only when `execution_gate_snapshot()` reports that real trading is currently allowed.
 - `POST /api/terminal/flatten` derives the current broker position, then writes another `portfolio_orders` intent instead of mutating positions directly.
-- Both mutation routes also check `DISABLE_LIVE_EXECUTION` directly before storage writes. Any non-empty value except `0`, `false`, `no`, or `off` blocks terminal live order creation.
+- Both mutation routes also check `DISABLE_LIVE_EXECUTION` directly before storage writes. Unset and any value except `0`, `false`, `no`, or `off` block terminal live order creation.
 - Both mutation routes run backend pre-trade controls before writing an intent: positive quantity, fresh price, max quantity, max notional, optional per-symbol caps, and duplicate-recent-order detection.
 - Rejected terminal requests are persisted in `terminal_intent_rejections` with stable reason codes such as `missing_price`, `stale_price`, `max_qty_exceeded`, `max_notional_exceeded`, and `duplicate_recent_order`.
 

@@ -66,7 +66,7 @@ The observed startup order is:
 1. `start_system.py` bootstraps the environment.
    - Loads `.env`.
    - Clears the dead local proxy sentinel `http://127.0.0.1:9` if present.
-   - Creates default `logs/` and `data/`.
+   - Creates local defaults under `var/log/` and `var/db/`.
    - Sets `TRADING_LOGS`, `TRADING_DATA`, and `DB_PATH`. `DB_PATH` is a local data-root/legacy compatibility hint; Postgres connection targets come from `TS_PG_DSN` or platform defaults.
 2. `start_system.py` writes startup breadcrumbs into `runtime_meta`.
    - `startup_trace`
@@ -122,6 +122,12 @@ Important control-plane functions:
 - disables restart on fatal provider-auth failures
 - publishes heartbeat and channel state into `runtime_meta["ingestion_state"]`
 
+### Structured Document/Event Extraction
+
+Normalized SEC filing, transcript, and news writes flow through `engine.runtime.storage_pg.put_normalized_event(...)`. That write path calls `engine.data.structured_document_events.extract_structured_document_events(...)`, which stores source-document keyed rows in `structured_document_events` with event timestamp, availability timestamp, extraction confidence, and PIT metadata. The resolver `resolve_structured_document_event_features(...)` only reads rows whose `availability_ts_ms` is at or before the model snapshot timestamp.
+
+The feature group is registered as `structured_doc_events_v1.*` in `engine/strategy/feature_registry.py` and is wired into `engine/strategy/model_feature_snapshots.py` under the PIT group `structured_doc_events`. These features are shadow-stage with `direct_trading_authority=false`; live model serving rejects contracts containing them via `feature_registry.assert_no_shadow_features(...)`.
+
 The canonical ingestion children come from `engine/runtime/job_registry.py` and the source manager. In this repo that includes jobs such as:
 
 - `stream_prices_polygon_ws`
@@ -168,6 +174,12 @@ The orchestrator only marks the lifecycle `LIVE` when prices are present.
 
 The strategy stack uses auditable, table-backed transitions rather than passing an opaque execution blob from ingest directly to the broker.
 
+### Point-in-time feature controls
+
+Feature vectors are built through the schema-driven registry and canonical model-feature snapshot path. `engine/strategy/feature_pit.py` defines group-level metadata for source timestamp, availability timestamp, freshness TTL, lag policy, stale behavior, and PIT eligibility. `engine/strategy/model_feature_snapshots.py` applies that policy before returning or storing a vector: groups with future availability, future source timestamps, stale TTLs, or PIT-ineligible metadata are zeroed and marked unavailable in `availability` and `pit_controls`.
+
+Serving follows the same constraint. `engine/strategy/feature_registry.py` resolves symbol snapshots through `model_feature_snapshots`, filters cached NLP rows with `b.ts <= decision_ts_ms`, and suppresses LLM-discovered factors whose registry `created_ts` is after the decision timestamp. `engine/strategy/predictor.py` rejects latest cached feature snapshots that are newer than the decision timestamp before falling back to rebuilding from the PIT path.
+
 ### Prediction and intent path
 
 1. Prediction writers in `engine/strategy/validation.py` persist:
@@ -201,8 +213,15 @@ The competition cycle is not hypothetical. `evaluate_competition_cycle()` makes 
 - `demotion_fallback`
 - `challenger_outperformance`
 - `best_blocked_self_critic`
+- `replay_stale`
 - `replay_gate_blocked`
 - `*_stat_gate_blocked`
+
+Promotion evidence is fail-closed in the production path. `engine/strategy/champion_manager.py` first runs shared promotion eligibility for local symbol/horizon candidates and the aggregate `MODEL_COMPETITION_SCOPE` champion. That eligibility requires a fresh replay snapshot, replay approval for the candidate context, no matching self-critic blocked key, and the runtime observation/net-cost floor before the system, graph, OPE, and statistical gates can promote the target. The helper writes explicit block reasons such as `replay_stale`, `replay_missing`, `replay_not_approved`, and `self_critic_blocked` into assignment metadata and competition-cycle change output.
+
+After shared eligibility selects a promotable target, `engine/strategy/champion_manager.py` calls `engine/strategy/promotion_guard.py::assess_challenger(...)` before assigning a new champion. That assessment now includes `engine/strategy/deconfounded_promotion.py`, which residualizes the candidate signal and realized outcome against beta, sector, size, volatility, liquidity, regime, and existing-model exposure, then estimates the incremental residual effect. The same evidence attempt must contain passing `white_reality_check` and `deconfounded_signal_validation` rows before `engine/model_registry.py::promote_to_champion(...)` can change durable champion state.
+
+The deconfounded gate blocks weak, unstable, or confounder-explained signals. Its diagnostics are written to `promotion_statistical_evidence` as `deconfounded_signal_validation` and are surfaced in `/api/promotion/explain` through the "Deconfounded signal" checklist row.
 
 ## Execution Flow
 
@@ -230,7 +249,8 @@ Two execution gates coexist by design:
 
 - `execution_gate_snapshot()` is the broad runtime barrier. It blocks execution when lifecycle, execution mode, portfolio risk, or kill-switch state make the runtime unsafe.
 - `engine.execution.kill_switch.execution_allowed()` is the more detailed kill-switch cascade used inside broker paths and other jobs.
-- `DISABLE_LIVE_EXECUTION` is a process-environment emergency stop for live capital. Any non-empty value except `0`, `false`, `no`, or `off` blocks live mode even when the runtime is `LIVE` and armed.
+- `DISABLE_LIVE_EXECUTION` is a process-environment emergency stop for live capital. Unset and any value except `0`, `false`, `no`, or `off` block live mode even when the runtime is `LIVE` and armed.
+- `engine.runtime.live_ai_safety` is the live-only AI serving barrier. It fails live preflight or suppresses live risk-increasing orders when the decision gate is disabled, confidence or uncertainty thresholds are implicit, model resolution falls back, model artifacts are missing, online models would emit unfitted zero predictions, or RL placeholder policies appear in the live path.
 
 ### Post-submit path
 
@@ -280,16 +300,18 @@ Its operational responsibilities are:
 - runtime and stderr log access
 - AI patch preview/apply/rollback helpers
 
-Its persistent state lives under `data/operator/`:
+Its local persistent state defaults to the ignored runtime tree under
+`var/tmp/operator/`:
 
-- `data/operator/operator.secrets.json`
-- `data/operator/operator.state.json`
-- `data/operator/patches/`
+- `var/tmp/operator/operator.secrets.json`
+- `var/tmp/operator/operator.state.json`
+- `var/tmp/operator/patches/`
 
-It also uses repo-level log files:
+Existing `OPERATOR_DATA_DIR` deployments and legacy `data/operator/` checkouts
+remain supported. The default log files now live under:
 
-- `logs/runtime.log`
-- `boot/engine_stderr.log`
+- `var/log/runtime.log`
+- `var/log/engine_stderr.log`
 
 ### Diagnostics-only operator AI module
 
@@ -304,7 +326,7 @@ It also uses repo-level log files:
 - `/api/operator/runtime_watchdogs`
 - `/api/execution/barrier`
 
-It calls those endpoints against `http://127.0.0.1:4001`, which is the Node operator server.
+It calls those endpoints against the Node operator server. Direct `:4001` access requires `X-Operator-Token`; compose and production smoke checks should prefer the dashboard bridge at `/operator/api/...`.
 
 It builds a context object with:
 
@@ -317,7 +339,7 @@ It builds a context object with:
 - `barrier`
 - `allowed_actions`
 
-In the inspected code, `ALLOWED_ACTIONS = []`, so this module returns diagnostics but does not execute actions. It writes JSONL records to `data/ai_operator_log.jsonl`.
+In the inspected code, `ALLOWED_ACTIONS = []`, so this module returns diagnostics but does not execute actions. It writes JSONL records to `var/log/ai_operator_log.jsonl` locally, or to `AI_OPERATOR_LOG_PATH` / `OPERATOR_AI_LOG_PATH` when configured.
 
 One implementation detail matters for support work: `buildContext()` currently issues eight HTTP requests but destructures them into seven variables. As implemented:
 
@@ -346,7 +368,8 @@ Important gates in the Node operator server:
 - `confidence >= 0.85`
 - the `find` text matches exactly once in the target file
 
-Applied patches are backed up to `data/operator/patches/*.bak` with adjacent JSON metadata. `rollback_patch` requires `confirm === "ROLLBACK_PATCH"`.
+Applied patches are backed up to `var/tmp/operator/patches/*.bak` by default
+with adjacent JSON metadata. `rollback_patch` requires `confirm === "ROLLBACK_PATCH"`.
 
 ## UI And Control-Plane Flow
 
@@ -417,9 +440,9 @@ The terminal is intentionally risk-gated. It does not place broker orders direct
 | Postgres database selected by `TS_PG_DSN` or `engine.runtime.platform.default_pg_dsn()` | `engine/runtime/storage.py` -> `engine/runtime/storage_pg.py` | Primary runtime store. This is where `runtime_meta`, `predictions`, `prediction_history`, `decision_log`, `portfolio_orders`, `execution_orders`, `execution_fills`, `pnl_attribution`, `kill_switch_state`, `champion_assignments`, `data_sources`, schema migration state, and related tables live. |
 | `DB_PATH` / `TRADING_DATA` local data root | `start_system.py`, `start_ingestion.py`, `engine/runtime/db_guard.py` | Local data directory and legacy identity path for older callers, diagnostics, artifacts, and test backends. It is not the production database location. File-shaped legacy defaults such as `${TRADING_DATA}/trading.db` are tolerated and normalized to their parent directory by `db_guard`. |
 | temporary SQLite files under pytest temp roots | `engine/runtime/storage_sqlite.py`, `engine/runtime/test_isolation.py`, `tests/conftest.py` | Isolated unit-test storage when `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`. This path prevents tests from probing ambient Postgres/PgBouncer. |
-| `logs/` | `start_system.py` and `boot/operator_server.js` | `runtime.pid`, `ingestion.pid`, `runtime.log`, and ingestion stdout/stderr log files. |
-| `data/operator/` | `boot/operator_server.js` | Operator state, operator secrets, and AI patch backup metadata. |
-| `data/ai_operator_log.jsonl` | `services/operator_ai/agent.js` | Diagnostics-only operator AI analysis log. |
+| `var/log/` | `start_system.py` and `boot/operator_server.js` | `runtime.pid`, `ingestion.pid`, `runtime.log`, and ingestion stdout/stderr log files for local defaults. |
+| `var/tmp/operator/` | `boot/operator_server.js` | Local-default operator state, operator secrets, and AI patch backup metadata. Legacy `data/operator/` remains accepted when configured. |
+| `var/log/ai_operator_log.jsonl` | `services/operator_ai/agent.js` | Local-default diagnostics-only operator AI analysis log. Explicit operator-AI log path env vars and deployment log dirs take precedence. |
 | optional Timescale/price sidecars | `engine/runtime/storage_pg_prices.py`, `engine/runtime/timescale_client.py`, read routers | Append-heavy market-data and telemetry paths when enabled and validated. These sidecars complement the primary Postgres runtime storage and may be routed with fallback during migration windows. |
 
 Storage boot is fail closed in production-like modes. `db_guard.ensure_db_ok()` must acquire Postgres, `bootstrap_first_run()` and `storage.init_db()` apply migrations and repairs, `get_db_validation_snapshot(strict=True)` validates the schema, and startup gates expose blocking `database_reachable` and `schema_valid` checks. If Postgres is unavailable, the runtime reports degraded/unavailable storage and should not be considered ready for trading.
@@ -446,5 +469,5 @@ Storage boot is fail closed in production-like modes. `db_guard.ensure_db_ok()` 
 
 - If the dashboard is up but the system is not trading, inspect lifecycle and barrier state first. The primary blockers are exposed through `engine/runtime/lifecycle_state.py`, `engine/runtime/gates.py`, and `/api/execution/barrier`.
 - If the runtime is healthy but there are no fresh prices, inspect `start_ingestion.py`, `engine/runtime/ingestion_runtime.py`, `/api/operator/provider_telemetry`, `/api/operator/runtime_watchdogs`, and the data-source control plane.
-- If orders exist in `portfolio_orders` but never become real broker orders, the failure is usually in the execution gate, kill-switch cascade, competition policy, preflight, or broker watchdog inside `engine/execution/broker_apply_orders.py`.
+- If orders exist in `portfolio_orders` but never become real broker orders, the failure is usually in the execution gate, kill-switch cascade, live AI safety, competition policy, preflight, or broker watchdog inside `engine/execution/broker_apply_orders.py`.
 - If fills exist but attribution is missing, inspect `engine/execution/execution_poll_and_attrib.py`, `engine/execution/execution_ledger.py`, and `engine/runtime/trade_lifecycle.py`.

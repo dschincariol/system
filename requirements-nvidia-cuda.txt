@@ -1,0 +1,5 @@
+-r requirements-base.txt
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.4.1+cu121
+nvidia-ml-py==13.595.45
+pynvml==13.0.1

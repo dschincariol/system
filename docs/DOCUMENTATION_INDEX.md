@@ -45,6 +45,11 @@ Closest current substitutes:
 | --- | --- | --- |
 | [README_OPERATOR_GUIDE.md](README_OPERATOR_GUIDE.md) | Canonical | You need the operator mental model for daily supervision, incident triage, or dashboard interpretation. |
 | [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md) | Canonical | You are preparing a host, validating a deployment, or checking readiness before enabling higher-risk runtime modes. |
+| [PRODUCTION_BACKEND_CI.md](PRODUCTION_BACKEND_CI.md) | Canonical | You need to reproduce or audit the Postgres/Redis production-backend CI gate and staging preflight evidence. |
+| [LIVE_READINESS_CHECKLIST.md](LIVE_READINESS_CHECKLIST.md) | Canonical | You are moving from safe or paper operation toward live trading. |
+| [STAGING_PROD_PREFLIGHT_EVIDENCE.md](STAGING_PROD_PREFLIGHT_EVIDENCE.md) | Canonical | You need to run the staging prod-preflight harness or review redacted preflight evidence. |
+| [DISK_RETENTION_RUNBOOK.md](DISK_RETENTION_RUNBOOK.md) | Canonical | You need to inspect root/Docker disk pressure, backup accounting, or safe cleanup commands without deleting live state. |
+| [Secrets_Rotation_Runbook.md](Secrets_Rotation_Runbook.md) | Canonical | You need to rotate production secrets or credential-encryption key material. |
 | [boot/README.md](../boot/README.md) | Canonical | You are working on the local launcher, operator server, or guarded repair flow. |
 | [deploy/README.md](../deploy/README.md) | Supplementary | You need the current deployment directory layout and install entrypoint. |
 | [ops/README.md](../ops/README.md) | Supplementary | You need a quick orientation to ad hoc ops and offline maintenance scripts. |
@@ -57,9 +62,13 @@ Closest current substitutes:
 | [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md) | Canonical | Data-source UI, routes, storage tables, mutation payloads, and runtime lifecycle rules. |
 | [DATA_CONTRACTS.md](DATA_CONTRACTS.md) | Canonical | Current payload, row, and response contracts that cross subsystem boundaries. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | Canonical | Runtime observability signals, operator APIs, and telemetry ownership. |
+| [DEPENDENCY_PROFILES.md](DEPENDENCY_PROFILES.md) | Canonical | CPU/default, NVIDIA CUDA, and reserved AMD/ROCm dependency profile selection and rollback rules. |
 | [README_DATABASE_MAP.md](README_DATABASE_MAP.md) | Canonical | Runtime storage table families, key tables, and data-flow-oriented schema reference. |
+| [Database_Schema.md](Database_Schema.md) | Canonical | Production Postgres/Timescale schema classification and human review register. |
+| [Audit_Chain_Spec.md](Audit_Chain_Spec.md) | Canonical | Audit hash-chain serialization, ordering, and verification contract. |
 | [DOCSTRING_STYLE.md](DOCSTRING_STYLE.md) | Canonical | NumPy-style docstring contract for touched Python modules, classes, and functions. |
 | [openapi/README.md](openapi/README.md) | Canonical | Location and maintenance rule for the incremental OpenAPI source of truth. |
+| [hyperparameter_inventory.md](hyperparameter_inventory.md) | Canonical | Tunable model-training parameters managed by the Optuna tuning catalog. |
 | [README_FUNCTION_MAP.md](README_FUNCTION_MAP.md) | Supplementary | Function-level navigation for large Python entrypoints and major subsystems. |
 | [engine/README.md](../engine/README.md) | Canonical | Top-level engine package map. |
 | [engine/runtime/README.md](../engine/runtime/README.md) | Canonical | Runtime control plane ownership. |
@@ -94,12 +103,33 @@ Known reference gaps:
 | [FAILURE_MODES.md](FAILURE_MODES.md) | Canonical | You need the repo's current fail-closed behaviors and the first places to inspect for common runtime failures. |
 | [README_ARCHITECTURE.md](README_ARCHITECTURE.md) | Supplementary | You want a shorter architecture-oriented walkthrough alongside the canonical architecture reference. |
 | [README_SEQUENCE_DIAGRAMS.md](README_SEQUENCE_DIAGRAMS.md) | Canonical | You need startup, decision, governance, or dashboard flows in sequence form. |
+| [STATE_MACHINES.md](STATE_MACHINES.md) | Canonical | You need lifecycle, execution barrier, capital guard, promotion, or repair-gating state transitions. |
+| [SEQUENCE_DIAGRAMS_EXTENDED.md](SEQUENCE_DIAGRAMS_EXTENDED.md) | Supplementary | You want expanded sequence diagrams beyond the canonical short set. |
 | [README_DEVELOPER_MAP.md](README_DEVELOPER_MAP.md) | Supplementary | You want a narrative cross-repo navigation guide and common edit paths. |
-| [STORAGE_MIGRATION_BACKLOG.md](STORAGE_MIGRATION_BACKLOG.md) | Supplementary | You are executing or reviewing the phased SQLite to Postgres or Timescale migration backlog and need the phase gates, audits, and rollback rules. |
-| [README_UI_REDESIGN_PLAN.md](README_UI_REDESIGN_PLAN.md) | Supplementary | You are evaluating forward-looking UI restructuring work, not current runtime behavior. |
+| [System_Audit_Layer1.md](System_Audit_Layer1.md) and [System_Audit_Layer1.json](System_Audit_Layer1.json) | Supplementary | Generated static-audit outputs retained at the tool-owned path. |
+| [System_Audit_Layer3.md](System_Audit_Layer3.md) and [System_Audit_Layer3.json](System_Audit_Layer3.json) | Supplementary | Generated spec-compliance outputs retained at the tool-owned path. |
+
+## Archived And Handoff Material
+
+These documents are preserved for context and future work, but they are not canonical runtime truth.
+
+| Document | Status | Use When |
+| --- | --- | --- |
+| [archive/README.md](archive/README.md) | Supplementary | You need historical planning material, old audit triage, or binary planning artifacts. |
+| [archive/Database_Production_Plan.md](archive/Database_Production_Plan.md) | Supplementary | You need historical database production-planning context. |
+| [archive/STORAGE_MIGRATION_BACKLOG.md](archive/STORAGE_MIGRATION_BACKLOG.md) | Supplementary | You need the historical phased SQLite-to-Postgres or Timescale migration backlog. |
+| [archive/README_UI_REDESIGN_PLAN.md](archive/README_UI_REDESIGN_PLAN.md) | Supplementary | You are evaluating forward-looking UI restructuring work, not current runtime behavior. |
+| [archive/UI_CHARTING_BEST_IN_CLASS_RECOMMENDATIONS.md](archive/UI_CHARTING_BEST_IN_CLASS_RECOMMENDATIONS.md) | Supplementary | You need the advisory charting and decision-visualization roadmap. |
+| [archive/Quant_Architecture_Upgrade_Document.docx](archive/Quant_Architecture_Upgrade_Document.docx) | Supplementary | You need the legacy binary planning artifact. |
+| [archive/CANONICAL_REPOSITORY.md](archive/CANONICAL_REPOSITORY.md) | Supplementary | You need the one-time repository canonicalization note and removal plan. |
+| [archive/LEGACY_SALVAGE_REPORT.md](archive/LEGACY_SALVAGE_REPORT.md) | Supplementary | You need the historical legacy-tree salvage review. |
+| [archive/System_Audit_Layer1_P0P1_Triage.md](archive/System_Audit_Layer1_P0P1_Triage.md) | Supplementary | You need the dated static-audit triage record. |
+| [handoff/README.md](handoff/README.md) | Supplementary | You need AI-session handoff context or prompt collections. |
 | [handoff/TRADING_SYSTEM_HANDOFF.md](handoff/TRADING_SYSTEM_HANDOFF.md) | Supplementary | You need recent AI-session context or strategic roadmap material. |
 | [handoff/QUICK_WINS.md](handoff/QUICK_WINS.md) | Supplementary | You need implementation prompts for proposed future work, not current system contracts. |
-| [Quant_Architecture_Upgrade_Document.docx](Quant_Architecture_Upgrade_Document.docx) | Supplementary | Legacy binary planning artifact; do not treat as canonical source of truth. |
+| [handoff/deep_dive_prompts/README.md](handoff/deep_dive_prompts/README.md) | Supplementary | You need the moved go-live, hardware, prediction-market, or UI deep-dive prompt bundles. |
+| [handoff/codex_migration/README.md](handoff/codex_migration/README.md) | Supplementary | You need staged migration handoff records, slice prompts, or validation ledgers. |
+| [codex_prompts/README.md](codex_prompts/README.md) | Supplementary | You need older standalone Codex implementation prompt sets. |
 
 ## Canonical Vs Supplementary
 
@@ -113,16 +143,26 @@ Canonical documentation in this repository currently consists of:
 - [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md)
 - [DATA_CONTRACTS.md](DATA_CONTRACTS.md)
 - [OBSERVABILITY.md](OBSERVABILITY.md)
+- [DEPENDENCY_PROFILES.md](DEPENDENCY_PROFILES.md)
 - [DOCSTRING_STYLE.md](DOCSTRING_STYLE.md)
 - [openapi/README.md](openapi/README.md)
 - [LICENSING_NOTE.md](LICENSING_NOTE.md)
 - [adr/README.md](adr/README.md) and the ADR files under `docs/adr/`
 - [README_OPERATOR_GUIDE.md](README_OPERATOR_GUIDE.md)
 - [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md)
+- [PRODUCTION_BACKEND_CI.md](PRODUCTION_BACKEND_CI.md)
+- [LIVE_READINESS_CHECKLIST.md](LIVE_READINESS_CHECKLIST.md)
+- [STAGING_PROD_PREFLIGHT_EVIDENCE.md](STAGING_PROD_PREFLIGHT_EVIDENCE.md)
+- [DISK_RETENTION_RUNBOOK.md](DISK_RETENTION_RUNBOOK.md)
+- [Secrets_Rotation_Runbook.md](Secrets_Rotation_Runbook.md)
 - [README_DATABASE_MAP.md](README_DATABASE_MAP.md)
+- [Database_Schema.md](Database_Schema.md)
+- [Audit_Chain_Spec.md](Audit_Chain_Spec.md)
+- [hyperparameter_inventory.md](hyperparameter_inventory.md)
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [FAILURE_MODES.md](FAILURE_MODES.md)
 - [README_SEQUENCE_DIAGRAMS.md](README_SEQUENCE_DIAGRAMS.md)
+- [STATE_MACHINES.md](STATE_MACHINES.md)
 - Subsystem READMEs under `engine/`, plus [boot/README.md](../boot/README.md), [services/README.md](../services/README.md), and [ui/README.md](../ui/README.md)
 
 Supplementary documentation should not override the canonical set when there is a conflict.

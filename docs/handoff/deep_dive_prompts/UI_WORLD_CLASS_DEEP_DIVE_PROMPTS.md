@@ -4,7 +4,7 @@ Use these prompts as focused implementation briefs. Each prompt is intentionally
 
 ## Common Preamble
 
-You are working in `/home/david/gitsandbox/system/system`. First read `ui/README.md`, `docs/README_UI_REDESIGN_PLAN.md`, and the files named in the prompt. Preserve existing architecture and user changes. Prefer small modules over growing `ui/dashboard.js`. UI policy is advisory; server/API/runtime gates remain authoritative. Use current official/primary sources where standards are cited. Before finishing, run `npm run check:ui` plus focused Python/Node tests for changed behavior. Report any tests you could not run.
+You are working in `/home/david/gitsandbox/system/system`. First read `ui/README.md`, `docs/archive/README_UI_REDESIGN_PLAN.md`, and the files named in the prompt. Preserve existing architecture and user changes. Prefer small modules over growing `ui/dashboard.js`. UI policy is advisory; server/API/runtime gates remain authoritative. Use current official/primary sources where standards are cited. Before finishing, run `npm run check:ui` plus focused Python/Node tests for changed behavior. Report any tests you could not run.
 
 ## 1. Server-Side Confirmation Contract
 
@@ -265,7 +265,7 @@ Acceptance:
 
 # Charting & Decision-Visualization Deep Dive Prompts
 
-Use these prompts with `docs/UI_CHARTING_BEST_IN_CLASS_RECOMMENDATIONS.md`. Each prompt is scoped to
+Use these prompts with `docs/archive/UI_CHARTING_BEST_IN_CLASS_RECOMMENDATIONS.md`. Each prompt is scoped to
 one recommendation from that report. The implementation agent should copy one prompt at a time, keep
 changes narrow, and preserve the advisory UI boundary: charts visualize server/runtime decisions;
 they never become a control path for sizing, suppression, order placement, promotion, or kill-switch
@@ -277,8 +277,8 @@ You are working in `/home/david/gitsandbox/system/system`. First read:
 
 - `CLAUDE.md`
 - `ui/README.md`
-- `docs/README_UI_REDESIGN_PLAN.md`
-- `docs/UI_CHARTING_BEST_IN_CLASS_RECOMMENDATIONS.md`
+- `docs/archive/README_UI_REDESIGN_PLAN.md`
+- `docs/archive/UI_CHARTING_BEST_IN_CLASS_RECOMMENDATIONS.md`
 - The exact files named in the prompt
 
 Preserve existing architecture and user changes. Prefer small modules over growing

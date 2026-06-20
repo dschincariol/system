@@ -9,6 +9,7 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 - `0004_continuous_aggregates.py` creates dashboard rollups: `cagg_prices_5m`, `cagg_prices_1h`, `cagg_decision_volume`, and `cagg_runtime_metrics_5m`, with refresh and retention policies.
 - `0007_audit_chain.py` adds and backfills `prev_hash`/`row_hash` on audit-chain tables.
 - `0008_audit_findings.py` creates `audit_chain_findings` for verifier divergence reports.
+- `0063_model_scoring_indexes.py` adds the unresolved model-scoring indexes used to find the latest tracked prediction per prediction id and to anti-probe already scored rows in `model_performance`.
 - `0001_baseline.py` was not changed in this prompt. The baseline already uses JSONB for structured payloads and the runtime schema stores time as epoch-ms `BIGINT` columns, so `0002` uses Timescale integer hypertables instead of forcing a TIMESTAMPTZ rewrite.
 
 ## Classification Rules
@@ -37,6 +38,12 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 - Hypertables with non-symbol segment keys, such as `options_chain_v2.underlying` and `runtime_metrics.metric`, get matching `(segment, time DESC)` indexes.
 - JSONB columns on hypertables get `jsonb_path_ops` GIN indexes so `@>` and existence predicates stay bounded.
 - Targeted expression/index coverage includes `decision_log` reason/family predicates, `model_feature_snapshots(symbol, feature_set_tag, ts_ms DESC)`, model-promotion audit lookups, runtime metric dashboard lookups, and job-history latest-row reads.
+
+## Model Scoring Query Plan
+
+`engine/model_scoring.py` loads unresolved predictions in two bounded branches. In Postgres, the predictions-table branch first materializes at most `MODEL_SCORING_BATCH_LIMIT` unresolved `predictions` in `(ts_ms, id)` order, anti-probing `model_performance` through the non-null partial index `idx_model_performance_prediction_id`. It then uses `LEFT JOIN LATERAL` to resolve the newest tracking row through the non-null partial index `idx_tracked_predictions_prediction_id_ts_id` on `(prediction_id, ts_ms DESC, id DESC)`. The expected Postgres plan is a bounded ordered prediction scan with nested index probes; the latest-tracking lateral subquery should be an index scan with `LIMIT 1` and no sort.
+
+The tracked-only branch handles `tracked_predictions` rows that have no `prediction_id`. It anti-probes `model_performance` through `ux_model_performance_tracked_prediction_id`, which also backs the scorer's `ON CONFLICT(tracked_prediction_id)` retry path. Migration `0063` removes pre-existing duplicate non-null `tracked_prediction_id` performance rows before creating the unique index, so retries update the prior score instead of inserting duplicates.
 
 ## Continuous Aggregates
 
@@ -67,6 +74,9 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `alpha_decay_runtime_history` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `alpha_decay_strategy_metrics` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `alpha_lifecycle` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
+| `learned_alpha_decay_runs` | Regular | cleanup=n/a | low | latest run lookup and training audit | training-run metadata for learned alpha decay, capacity, and crowding estimates |
+| `learned_alpha_decay_estimates` | Regular | cleanup=n/a | low | latest cohort lookup from execution, portfolio, and champion paths | learned half-life, max useful age, capacity, crowding penalty, size multiplier, and block flag by cohort |
+| `learned_alpha_decay_age_edges` | Regular | cleanup=n/a | low | run/cohort drill-down and estimator audit | realized net edge by signal-age bucket behind learned-alpha estimates |
 | `alpha_preservation_kpis` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=symbol | medium | order, symbol, and time-range execution analysis | execution ledger; append-mostly financial evidence retained indefinitely |
 | `backtest_scores` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `broker_account` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
@@ -146,6 +156,7 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `factor_registry` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `feature_data` | Hypertable | time=timestamp; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | feature-store replay by (symbol, timestamp) | Timescale sidecar feature vectors; append-mostly and read by symbol/time |
 | `feature_distribution_drift` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
+| `production_monitoring_metrics` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded latest-state production monitoring for feature drift, missing features, prediction/label drift, calibration, conformal coverage, shadow disagreement, and net-PnL degradation |
 | `feature_store` | Hypertable | time=time; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | latest feature vector at or before time | versioned Timescale feature store; append/update-current bucket by symbol/time/version |
 | `finra_short_interest` | Regular | cleanup=n/a | low | source id upsert and symbol/availability-time feature snapshot reads | bi-monthly FINRA short-interest rows upserted by source record id |
 | `finra_short_sale_volume` | Regular | cleanup=n/a | low | source id upsert and symbol/availability-time feature snapshot reads | daily FINRA short-sale volume rows upserted by source record id |
@@ -154,6 +165,8 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `fundamentals_pit_symbol_features` | Hypertable | time=asof_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | low | latest fundamentals feature snapshot by symbol/time | materialized point-in-time fundamentals feature cache |
 | `gbm_models` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `gdelt_macro_features` | Hypertable | time=bucket_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | macro replay windows by bucket time | macro feature buckets; append-mostly and read by historical time windows |
+| `graph_relationship_edges` | Regular | cleanup=source-specific retention; preserve rows needed by retained graph snapshots and promotion evidence | medium | PIT graph snapshot construction by source or target symbol, relationship type, and availability time | point-in-time graph relationship edge catalog keyed by source/target symbol, relation type, and availability time |
+| `graph_relational_snapshots` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest graph snapshot by symbol/graph_id/time and historical replay windows | versioned point-in-time graph/relational feature snapshots for shadow-only train/serve parity and promotion evidence |
 | `gov_committee_sector_map` | Regular | cleanup=n/a | low | committee sector lookup for gov feature conditioning | static committee-to-sector conditioning map |
 | `gov_member_committee_map` | Regular | cleanup=n/a | low | member committee lookup for gov feature conditioning | static congressional member-to-committee conditioning map |
 | `gov_member_leadership_map` | Regular | cleanup=n/a | low | member leadership lookup for gov feature conditioning | static congressional leadership member map |
@@ -179,6 +192,8 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `kill_switch_state` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `labels` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `labels_exec` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
+| `labels_price` | Hypertable | time=ts_eval_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | calibration and validation scans by symbol, prediction time, evaluation time, and horizon | derived realized price labels keyed to prediction and evaluation time for confidence calibration and validation |
+| `net_after_cost_labels` | Hypertable | time=label_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | training, evaluation, and promotion scans by label time and model identity | timestamp-safe net-after-cost label artifacts keyed to prediction time and replayed by model/symbol/horizon |
 | `macro_series_vintages` | Regular | cleanup=n/a | low | series vintage upserts and point-in-time macro feature materialization | ALFRED/FRED macro observations keyed by series, observation date, and vintage date |
 | `macro_vintage_backfill_state` | Regular | cleanup=n/a | low | primary-key lookup by macro series id | resumable state for one-time macro vintage backfills |
 | `market_features` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest feature snapshot and historical replay by (symbol, time) | point-in-time feature series; append-mostly and replayed by symbol/time |
@@ -242,6 +257,8 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `portfolio_state` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `position_reconcile_audit` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
 | `position_reconcile_baseline` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
+| `policy_ope_observations` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | logged off-policy decisions, propensities, outcomes, and model estimates used by OPE promotion gates |
+| `policy_ope_evidence` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | append-only doubly robust OPE promotion evidence with uncertainty, support, and pass/fail decision |
 | `prediction_history` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `predictions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `price_anomalies` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest feature snapshot and historical replay by (symbol, time) | point-in-time feature series; append-mostly and replayed by symbol/time |
@@ -254,6 +271,7 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `price_ticks` | Hypertable | time=time; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
 | `prices` | Hypertable | time=ts_ms; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
 | `promotion_statistical_evidence` | Hypertable | time=ts; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
+| `strategy_promotion_candidates` | Regular | cleanup=n/a | low | pending candidate and operator approval lookup by strategy/status | governed shadow-strategy promotion candidates; live mutation requires approval, realized PnL, replay/OPE/statistical evidence, cooldown, and audit records |
 | `quiver_congressional_trades` | Regular | cleanup=n/a | low | source id upsert, dedupe-key lookup, and symbol/disclosure-time feature snapshot reads | Quiver congressional trade disclosures keyed by source record id and disclosure availability time |
 | `quiver_gov_contracts` | Regular | cleanup=n/a | low | source id upsert and symbol/sector availability-time feature snapshot reads | Quiver government contract award disclosures keyed by source record id |
 | `quiver_lobbying_filings` | Regular | cleanup=n/a | low | source id upsert and symbol/sector availability-time feature snapshot reads | Quiver lobbying spend disclosures keyed by source record id |
@@ -297,6 +315,7 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `strategy_promotion_log` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `strategy_registry` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `strategy_shadow_runs` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
+| `structured_document_events` | Regular | cleanup=n/a | medium | symbol availability-window PIT feature snapshots and source-document audits | structured extracted events from filings, transcripts, and news keyed by source document and extractor version |
 | `suppression_opportunity` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=symbol | medium | order, symbol, and time-range execution analysis | execution ledger; append-mostly financial evidence retained indefinitely |
 | `symbol_blacklist` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `symbol_universe` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
@@ -342,6 +361,7 @@ This document records the production Postgres 16 + TimescaleDB 2.x schema classi
 | `feature_candidates` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `feature_evaluation` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `feature_registry` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
+| `experiment_ledger` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | append-only generated-candidate ledger for lineage, trial budgets, false-discovery evidence, redundancy checks, and promotion decisions |
 | `finbert_sentiment_enrichments` | Hypertable | time=asof_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest sentiment enrichment by symbol/time/source | point-in-time FinBERT sentiment enrichments keyed by symbol/source availability |
 | `hypothesis_registry` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `model_best_params` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |

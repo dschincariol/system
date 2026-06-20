@@ -13,12 +13,11 @@ management**. Schema-as-code (hypertables, indexes, retention) is
 prompt 03. Concentrate here on getting the application talking to
 Postgres correctly and quickly.
 
-## Cross-platform note
+## Linux-only note
 
-This is **application code** that must run unchanged on the developer's
-Windows machine and on the Linux staging / production servers. Every
-path uses `pathlib.Path`. Every connection target comes from an
-environment variable with a platform-appropriate default. Read
+This is **Linux-only application code** for development, staging, and
+production hosts. Every path uses `pathlib.Path`. Every connection
+target comes from an environment variable with a Linux default. Read
 `docs/codex_prompts/database/CROSS_PLATFORM.md` before writing code.
 
 ## Goal
@@ -26,9 +25,8 @@ environment variable with a platform-appropriate default. Read
 1. `engine/runtime/storage.py` exposes the same public function names
    it does today, but the implementation talks to Postgres via
    `psycopg[binary,pool]` 3.x, using a DSN driven by the
-   `TS_PG_DSN` environment variable. On Linux the default is the
-   PgBouncer Unix socket; on Windows the default is TCP
-   `127.0.0.1:5432`. The same Python code runs on either platform.
+   `TS_PG_DSN` environment variable. The default is the PgBouncer Unix
+   socket on Linux.
 2. A connection-pool wrapper that gives every caller a fast,
    prepared-statement-friendly connection without managing pool
    lifecycle by hand.
@@ -103,11 +101,11 @@ environment variable with a platform-appropriate default. Read
 - `tests/test_no_sqlite_in_runtime.py` — fails the build if any
   module under `engine/` imports `sqlite3` or references `.db` paths.
 - `engine/runtime/platform.py` — single helper module:
-  `is_linux()`, `is_windows()`, `default_pg_dsn()`,
+  `is_linux()`, `default_pg_dsn()`,
   `default_admin_pg_dsn()`, `default_data_root() -> Path`.
-  The single source of truth for platform-conditional defaults.
-- `tests/test_platform_defaults.py` — defaults match the contract
-  in `CROSS_PLATFORM.md` for each platform.
+  The single source of truth for Linux defaults.
+- `tests/test_platform_defaults.py` — defaults match the Linux
+  contract in `CROSS_PLATFORM.md`.
 - `tests/test_no_string_paths.py` — AST scan of `engine/` and
   `services/`: no module body contains hardcoded path string
   literals like `/var/lib/`, `/etc/`, or `\\Trading\\`. All paths
@@ -138,10 +136,9 @@ environment variable with a platform-appropriate default. Read
 2. **Connection pool.** `psycopg_pool.ConnectionPool` with
    `min_size=2, max_size=<env>`. Connection string built from env
    `TS_PG_DSN`. Defaults computed by `engine/runtime/platform.py`:
-   on Linux, `host=/var/run/postgresql user=ts_app dbname=trading`;
-   on Windows, `host=127.0.0.1 port=5432 user=ts_app dbname=trading`
-   (developer supplies password via `TS_DEV_PG_PASSWORD` or via the
-   secrets loader from prompt 09). Connections request
+   `host=/var/run/postgresql user=ts_app dbname=trading`; the
+   developer supplies the password via the secrets loader from prompt
+   09. Connections request
    `autocommit=False` and apply `SET search_path = trading, public`
    on check-out.
 3. **Parameter rewrite.** `?` → `%s` happens once per SQL string at
@@ -193,9 +190,8 @@ environment variable with a platform-appropriate default. Read
 - [ ] Advisory-lock contention test demonstrates a second acquirer
       blocks until the first releases, and unblocks within 50 ms of
       release.
-- [ ] Full test suite runs to green on both Linux (Ubuntu 22.04 in
-      CI) and Windows (windows-latest runner in CI), pointed at a
-      Postgres reachable via the platform-default DSN.
+- [ ] Full test suite runs to green on Linux (Ubuntu 22.04 in CI),
+      pointed at a Postgres reachable via the Linux-default DSN.
 - [ ] No hardcoded `/var/`, `/etc/`, or `C:\` path literals in
       `engine/` or `services/` (enforced by
       `tests/test_no_string_paths.py`).

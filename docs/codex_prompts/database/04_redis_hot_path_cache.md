@@ -15,14 +15,12 @@ disk on the hot path.
 Redis runs on the same host (Unix socket from prompt 01). Target
 sub-millisecond reads.
 
-## Cross-platform note
+## Linux-only note
 
-This is **application code** that must run on the developer's Windows
-machine and on the Linux staging / production servers. The Redis
-client target comes from the `TS_REDIS_URL` environment variable.
-Linux default: `unix:///var/run/redis/trading.sock`. Windows default:
-`redis://127.0.0.1:6379/0` (assumes Memurai, Redis-in-Docker, or
-Redis-in-WSL2 listening on `localhost`). Read
+This is **Linux-only application code** for development, staging, and
+production hosts. The Redis client target comes from the
+`TS_REDIS_URL` environment variable. Linux default:
+`unix:///var/run/redis/trading.sock`. Read
 `docs/codex_prompts/database/CROSS_PLATFORM.md` first.
 
 ## Goal
@@ -78,8 +76,7 @@ Redis-in-WSL2 listening on `localhost`). Read
   The URL scheme (`unix://` or `redis://`) selects transport;
   `decode_responses=False`. Connection pool sized by env
   `TS_REDIS_POOL_SIZE` (default 16). Defaults computed by
-  `engine/runtime/platform.py` (`unix:///var/run/redis/trading.sock`
-  on Linux, `redis://127.0.0.1:6379/0` on Windows).
+  `engine/runtime/platform.py` (`unix:///var/run/redis/trading.sock`).
 - `engine/cache/circuit.py` — small circuit breaker. After N
   consecutive failures, open for `cooldown_s`; reads fall through to
   Postgres; periodic probe attempts re-close. Emits alerts on
@@ -203,9 +200,8 @@ Redis-in-WSL2 listening on `localhost`). Read
       raises a typed error rather than corrupting state.
 - [ ] No call to `r.set(` or `r.get(` in the codebase outside
       `engine/cache/store.py` (enforced by a guard test).
-- [ ] All tests pass on both Linux (Unix-socket transport) and
-      Windows (TCP transport) when `TS_REDIS_URL` is set
-      appropriately.
+- [ ] All tests pass on Linux with Unix-socket transport when
+      `TS_REDIS_URL` is set appropriately.
 - [ ] Switching `TS_REDIS_URL` from `unix://...` to `redis://...`
       requires zero source changes; the same Python code uses
       whichever transport the URL specifies.

@@ -28,6 +28,7 @@ It does not own:
 - general runtime bootstrap configuration such as bind host, DB path, or execution mode
 - trading authority
 - portfolio or execution policy
+- structured-document or graph-feature trading authority; Data Health only reads `/api/data/feature_visibility` for operator visibility into optional shadow feature groups
 
 ## Canonical Components
 
@@ -95,6 +96,19 @@ These templates are seeded automatically by [services/data_source_manager.py](..
 | `macro` | `macro_provider` | `poll_macro` | Yes | None |
 | `model_feature_snapshots` | `feature_snapshot` | `snapshot_model_features` | Yes | None |
 | `rss_feed` | `rss_feed` | `ingest_now` | Custom | None; user supplies `name` and `url` in settings |
+
+## Data Health Feature Visibility
+
+The dashboard Data Health screen includes structured-document and graph-feature panels backed by `GET /api/data/feature_visibility`. This is adjacent to the source control plane but does not mutate source configuration.
+
+The route reads existing `structured_document_events`, `graph_relational_snapshots`, and optional `event_log` failure rows to show:
+
+- extraction counts, latest extraction and availability timestamps, low-confidence counts, source lineage, symbol coverage, and event-type coverage
+- graph snapshot freshness, observed graph feature ids, relationship coverage, source artifact lineage, and PIT status
+- explicit unavailable or stale states when tables, snapshots, or failure telemetry are absent
+- shadow-only and `direct_trading_authority=false` labels for structured-document and graph feature groups
+
+Source setup, credential storage, and runtime lifecycle reconciliation remain owned by the data-source control plane. Feature usage remains owned by model-serving, feature-registry, promotion, runtime, and execution gates.
 
 ## Identity And Routing Rules
 

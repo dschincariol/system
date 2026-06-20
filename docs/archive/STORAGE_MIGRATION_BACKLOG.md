@@ -2,7 +2,7 @@
 
 This document is a historical execution backlog for moving hot, append-heavy data paths away from SQLite-era storage. The current production-like runtime uses the Postgres-backed storage facade in `engine/runtime/storage_pg.py`; SQLite is retained for isolated Python tests, compatibility shims, and historical contention-regression coverage.
 
-This is a supplementary planning document. It does not override the current storage contracts documented in [README_DATABASE_MAP.md](README_DATABASE_MAP.md), [ARCHITECTURE.md](ARCHITECTURE.md), or the runtime code.
+This is a supplementary planning document. It does not override the current storage contracts documented in [README_DATABASE_MAP.md](../README_DATABASE_MAP.md), [ARCHITECTURE.md](../ARCHITECTURE.md), or the runtime code.
 
 ## 1. Goals
 
@@ -65,14 +65,14 @@ These are the hot append-heavy paths that should stop depending on the main SQLi
 
 The codebase already has the primitives needed for staged cutover:
 
-- Async price writer: [engine/runtime/async_writer.py](../engine/runtime/async_writer.py)
-- Postgres or Timescale price storage: [engine/runtime/storage_pg_prices.py](../engine/runtime/storage_pg_prices.py)
-- Price parity validation: [engine/runtime/price_migration_validation.py](../engine/runtime/price_migration_validation.py)
-- Price read router: [engine/runtime/price_read_router.py](../engine/runtime/price_read_router.py)
-- Telemetry Timescale client: [engine/runtime/timescale_client.py](../engine/runtime/timescale_client.py)
-- Telemetry parity validation: [engine/runtime/telemetry_migration_validation.py](../engine/runtime/telemetry_migration_validation.py)
-- Telemetry read router: [engine/runtime/telemetry_read_router.py](../engine/runtime/telemetry_read_router.py)
-- Hybrid feature-store write mode: [engine/data/feature_store.py](../engine/data/feature_store.py)
+- Async price writer: [engine/runtime/async_writer.py](../../engine/runtime/async_writer.py)
+- Postgres or Timescale price storage: [engine/runtime/storage_pg_prices.py](../../engine/runtime/storage_pg_prices.py)
+- Price parity validation: [engine/runtime/price_migration_validation.py](../../engine/runtime/price_migration_validation.py)
+- Price read router: [engine/runtime/price_read_router.py](../../engine/runtime/price_read_router.py)
+- Telemetry Timescale client: [engine/runtime/timescale_client.py](../../engine/runtime/timescale_client.py)
+- Telemetry parity validation: [engine/runtime/telemetry_migration_validation.py](../../engine/runtime/telemetry_migration_validation.py)
+- Telemetry read router: [engine/runtime/telemetry_read_router.py](../../engine/runtime/telemetry_read_router.py)
+- Hybrid feature-store write mode: [engine/data/feature_store.py](../../engine/data/feature_store.py)
 
 ## 3. Phase Rules
 
@@ -88,7 +88,7 @@ Before starting a new phase:
 
 Minimum required commands:
 
-```powershell
+```bash
 python tools/runtime_graph_check.py --mode startup
 python -m pytest tests/test_db_repair.py -q -k repair_startup_fast_path_bootstraps_fresh_database
 python -m pytest tests/test_runtime_graph_check.py -q
@@ -155,7 +155,7 @@ The audit tool should run in CI before any read-cutover phase is allowed to star
 
 ### B. Runtime Contention Audit
 
-Capture SQLite trace snapshots before and after each phase using the counters already exposed from [engine/runtime/storage.py](../engine/runtime/storage.py).
+Capture SQLite trace snapshots before and after each phase using the counters already exposed from [engine/runtime/storage.py](../../engine/runtime/storage.py).
 
 Track at least:
 
@@ -175,8 +175,8 @@ No read cutover is allowed without parity validation.
 
 Current validators:
 
-- Prices: [engine/runtime/price_migration_validation.py](../engine/runtime/price_migration_validation.py)
-- Telemetry: [engine/runtime/telemetry_migration_validation.py](../engine/runtime/telemetry_migration_validation.py)
+- Prices: [engine/runtime/price_migration_validation.py](../../engine/runtime/price_migration_validation.py)
+- Telemetry: [engine/runtime/telemetry_migration_validation.py](../../engine/runtime/telemetry_migration_validation.py)
 
 Every new migrated dataset family must either:
 
@@ -203,7 +203,7 @@ Work items:
 
 Validation bundle:
 
-```powershell
+```bash
 python tools/runtime_graph_check.py --mode startup
 python -m pytest tests/test_db_repair.py -q
 python -m pytest tests/test_runtime_graph_check.py -q
@@ -232,14 +232,14 @@ Work items:
 
 Key files:
 
-- [engine/runtime/price_router.py](../engine/runtime/price_router.py)
-- [engine/runtime/telemetry_append_buffer.py](../engine/runtime/telemetry_append_buffer.py)
-- [engine/runtime/runtime_meta.py](../engine/runtime/runtime_meta.py)
-- [tests/test_sqlite_contention_relief.py](../tests/test_sqlite_contention_relief.py)
+- [engine/runtime/price_router.py](../../engine/runtime/price_router.py)
+- [engine/runtime/telemetry_append_buffer.py](../../engine/runtime/telemetry_append_buffer.py)
+- [engine/runtime/runtime_meta.py](../../engine/runtime/runtime_meta.py)
+- [tests/test_sqlite_contention_relief.py](../../tests/test_sqlite_contention_relief.py)
 
 Validation bundle:
 
-```powershell
+```bash
 python -m pytest tests/test_sqlite_contention_relief.py -q
 python -m pytest tests/test_async_price_writer.py -q
 python tools/runtime_graph_check.py --mode startup
@@ -267,7 +267,7 @@ Scope:
 
 Work items:
 
-- `SM-200` Enable and harden Timescale telemetry writes in [engine/runtime/timescale_client.py](../engine/runtime/timescale_client.py).
+- `SM-200` Enable and harden Timescale telemetry writes in [engine/runtime/timescale_client.py](../../engine/runtime/timescale_client.py).
   Owner: `engine/runtime/`
 - `SM-201` Verify after-commit hooks and buffer flush behavior for telemetry families.
   Owner: `engine/runtime/`, `tests/`
@@ -284,7 +284,7 @@ Suggested burn-in configuration:
 
 Validation bundle:
 
-```powershell
+```bash
 python -m pytest tests/test_timescale_client_storage_gates.py -q
 python -m pytest tests/test_telemetry_read_routing.py -q
 python tools/runtime_graph_check.py --mode startup
@@ -305,7 +305,7 @@ Objective:
 
 Work items:
 
-- `SM-300` Burn in telemetry parity validation using [engine/runtime/telemetry_migration_validation.py](../engine/runtime/telemetry_migration_validation.py).
+- `SM-300` Burn in telemetry parity validation using [engine/runtime/telemetry_migration_validation.py](../../engine/runtime/telemetry_migration_validation.py).
   Owner: `engine/runtime/`
 - `SM-301` Move telemetry consumers to router helpers where direct SQLite reads remain.
   Owner: `engine/runtime/`, `engine/api/`, `services/`
@@ -314,7 +314,7 @@ Work items:
 
 Validation bundle:
 
-```powershell
+```bash
 python -m pytest tests/test_telemetry_read_routing.py -q
 python tools/runtime_graph_check.py --mode startup
 ```
@@ -339,11 +339,11 @@ Scope:
 
 Work items:
 
-- `SM-400` Turn on [engine/runtime/async_writer.py](../engine/runtime/async_writer.py) in controlled environments.
+- `SM-400` Turn on [engine/runtime/async_writer.py](../../engine/runtime/async_writer.py) in controlled environments.
   Owner: `engine/runtime/`
-- `SM-401` Harden [engine/runtime/storage_pg_prices.py](../engine/runtime/storage_pg_prices.py) schema, retries, and observability.
+- `SM-401` Harden [engine/runtime/storage_pg_prices.py](../../engine/runtime/storage_pg_prices.py) schema, retries, and observability.
   Owner: `engine/runtime/`
-- `SM-402` Ensure all price ingress paths publish through [engine/runtime/price_router.py](../engine/runtime/price_router.py) and not ad hoc SQLite writes.
+- `SM-402` Ensure all price ingress paths publish through [engine/runtime/price_router.py](../../engine/runtime/price_router.py) and not ad hoc SQLite writes.
   Owner: `engine/runtime/`, `engine/data/`, `engine/jobs/`
 - `SM-403` Keep SQLite price writes enabled during historical burn-in to preserve fallback and parity checks.
   Owner: `ops/`, `deploy/`
@@ -360,7 +360,7 @@ Suggested burn-in configuration:
 
 Validation bundle:
 
-```powershell
+```bash
 python -m pytest tests/test_async_price_writer.py -q
 python -m pytest tests/test_timescale_integration_hooks.py -q
 python -m pytest tests/test_price_migration_validation.py -q
@@ -381,7 +381,7 @@ Objective:
 
 Work items:
 
-- `SM-500` Finish migrating dashboard and API readers to [engine/runtime/price_read_router.py](../engine/runtime/price_read_router.py).
+- `SM-500` Finish migrating dashboard and API readers to [engine/runtime/price_read_router.py](../../engine/runtime/price_read_router.py).
   Owner: `engine/api/`, `engine/runtime/`
 - `SM-501` Burn in `PRICE_READ_BACKEND=auto` with fallback still enabled.
   Owner: `ops/`, `deploy/`
@@ -390,7 +390,7 @@ Work items:
 
 Validation bundle:
 
-```powershell
+```bash
 python -m pytest tests/test_price_migration_validation.py -q
 python tools/runtime_graph_check.py --mode startup
 ```
@@ -426,7 +426,7 @@ Work items:
 
 Validation bundle:
 
-```powershell
+```bash
 python -m pytest tests/test_timescale_integration_hooks.py -q
 python tools/runtime_graph_check.py --mode startup
 ```
@@ -453,7 +453,7 @@ Work items:
 
 Validation bundle:
 
-```powershell
+```bash
 python tools/runtime_graph_check.py --mode startup
 python -m pytest tests/test_price_migration_validation.py -q
 python -m pytest tests/test_telemetry_read_routing.py -q

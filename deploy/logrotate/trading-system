@@ -1,6 +1,32 @@
-/opt/trading-system/logs/*.log {
+# Runtime log files include engine.log, runtime.log, ingestion.stdout.log,
+# ingestion.stderr.log, ingestion stdout/stderr,
+# job stdout/stderr/combined logs, operator.log, upgrade.log, JSONL diagnostics,
+# and process stderr. Local repo var/log is covered by
+# deploy/bin/rotate_local_logs.sh; installed repo var/log is covered here.
+/opt/trading-system/logs/*.log
+/opt/trading-system/logs/*.out
+/opt/trading-system/logs/*.err
+/opt/trading-system/logs/*.jsonl
+/opt/trading-system/repo/var/log/*.log
+/opt/trading-system/repo/var/log/*.out
+/opt/trading-system/repo/var/log/*.err
+/opt/trading-system/repo/var/log/*.jsonl
+/opt/trading/app/logs/*.log
+/opt/trading/app/logs/*.out
+/opt/trading/app/logs/*.err
+/opt/trading/app/logs/*.jsonl
+/opt/trading/app/var/log/*.log
+/opt/trading/app/var/log/*.out
+/opt/trading/app/var/log/*.err
+/opt/trading/app/var/log/*.jsonl
+/opt/trading-system/repo/boot/*.log
+/opt/trading/app/boot/*.log
+/opt/trading-system/repo/data/ai_operator_log.jsonl
+/opt/trading/app/data/ai_operator_log.jsonl {
     daily
-    rotate 14
+    maxsize 50M
+    rotate 10
+    maxage 21
     missingok
     notifempty
     compress
@@ -10,3 +36,19 @@
     su trading trading
 }
 
+/var/lib/docker/volumes/*trading-logs*/_data/*.log
+/var/lib/docker/volumes/*trading-logs*/_data/*.out
+/var/lib/docker/volumes/*trading-logs*/_data/*.err
+/var/lib/docker/volumes/*trading-logs*/_data/*.jsonl
+/var/lib/docker/volumes/*trading-data*/_data/ai_operator_log.jsonl {
+    daily
+    maxsize 50M
+    rotate 10
+    maxage 21
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}

@@ -35,6 +35,7 @@ Schema-driven train/serve parity through `engine/strategy/feature_registry.py`. 
 - **XGBoost** — `engine/strategy/models/xgb_regressor.py`
 - **sklearn/GBM-style regressors** — `engine/strategy/models/gbm_model.py`, `engine/strategy/gbm_regressor.py`
 - **PatchTST** — `engine/strategy/models/patchtst.py`
+- **iTransformer** — `engine/strategy/models/itransformer.py`
 - **Ridge meta-ensemble** — `engine/strategy/ensemble/ridge_meta.py`
 - **Legacy/fallback paths** — embed regressors, temporal predictors, and regime/statistical baselines still exist as schema-aware maintenance paths
 - **Shadow RL** — advisory/shadow only, no live execution authority
@@ -106,7 +107,7 @@ Comparison against Renaissance, Two Sigma, WorldQuant, Citadel, Jane Street, Man
 | Scale-out storage/streaming still incomplete | Current storage has a Postgres-backed facade, but Kafka-style event streaming and dedicated feature-store/hot-cache layers are not fully built. | `engine/runtime/`, ingestion runtime, Phase 3 infrastructure |
 | Universe and instrument coverage still narrower than the north star | More US equities, global ETFs, futures, FX, and direct options execution remain future expansion. | universe, data, execution |
 | More alternative data remains valuable | Form 4 and congressional paths exist, but satellite, credit-card proxies, deeper web data, and richer transcript workflows are not complete. | `engine/data/jobs/`, `engine/strategy/feature_registry.py` |
-| Graph/iTransformer/TabNet families not yet first-class | LightGBM/XGBoost/GBM/PatchTST landed, but broader deep tabular/graph sequence families are still open. | `engine/strategy/models/` |
+| Graph/TabNet families not yet first-class | LightGBM/XGBoost/GBM/PatchTST/iTransformer landed, but broader deep tabular/graph sequence families are still open. | `engine/strategy/models/` |
 | Closed-loop alpha discovery is partial | Discovery, evaluation, backtest, shadow, and promotion pieces exist, but the full auto-generate -> backtest -> shadow -> promote -> retire loop still needs orchestration hardening. | discovery, promotion, governance jobs |
 | Deep RL portfolio manager remains future work | Shadow RL exists, but no PPO/SAC live allocator has authority. | `engine/strategy/jobs/run_rl_shadow.py`, future RL modules |
 | L2 microstructure and direct options strategies remain future edge work | Current execution handles broker routing and cost/slippage realism, but L2 alpha and systematic options strategies are not fully built. | `engine/execution/`, future data sources |
@@ -121,8 +122,8 @@ Comparison against Renaissance, Two Sigma, WorldQuant, Citadel, Jane Street, Man
 - DONE/PARTIAL: Optuna tuning and parameter-surface robustness; broader config cleanup remains ongoing.
 
 ### Phase 2 (P1 HIGH — Months 3–6) — Intelligence
-- DONE/PARTIAL: LightGBM, XGBoost, sklearn GBM, PatchTST, FinBERT/NLP feature groups, causal diagnostics, Ridge meta-ensemble, and shadow RL are present.
-- FUTURE: iTransformer, graph models, TabNet, richer LLM transcript/filing workflows, and live-authority deep RL remain open.
+- DONE/PARTIAL: LightGBM, XGBoost, sklearn GBM, PatchTST, iTransformer, FinBERT/NLP feature groups, causal diagnostics, Ridge meta-ensemble, and shadow RL are present.
+- FUTURE: graph models, TabNet, richer LLM transcript/filing workflows, and live-authority deep RL remain open.
 
 ### Phase 3 (P1 — Months 6–9) — Scale
 - Data infrastructure: continue Postgres/runtime-storage hardening; add Kafka streaming, Feast feature store, and Redis caching
@@ -149,7 +150,7 @@ These were originally 1-2 week implementation prompts. They are now DONE in the 
 1. **DONE — Statistical promotion gates** — `engine/strategy/statistical_gates.py`, `engine/strategy/promotion_guard.py`, `engine/strategy/promotion_audit.py`
 2. **DONE — CPCV / PBO / gated promotion backtests** — `engine/strategy/cpcv.py`, `engine/strategy/gated_backtest.py`, `engine/strategy/jobs/backtest_cpcv.py`
 3. **DONE — tsfresh automated feature extraction** — `engine/strategy/tsfresh_features.py`, `engine/data/jobs/compute_tsfresh_snapshots.py`, `engine/strategy/feature_registry.py`
-4. **DONE — LightGBM/XGBoost/GBM/PatchTST families** — `engine/strategy/models/`, `engine/strategy/jobs/train_lgbm_models.py`, `engine/strategy/jobs/train_xgb_models.py`, `engine/strategy/jobs/train_patchtst_models.py`
+4. **DONE — LightGBM/XGBoost/GBM/PatchTST/iTransformer families** — `engine/strategy/models/`, `engine/strategy/jobs/train_lgbm_models.py`, `engine/strategy/jobs/train_xgb_models.py`, `engine/strategy/jobs/train_patchtst_models.py`, `engine/strategy/jobs/train_itransformer_models.py`
 5. **DONE — Ridge meta-ensemble blending** — `engine/strategy/ensemble/ridge_meta.py`, `engine/strategy/jobs/train_ensemble_meta.py`
 
 Historical execution order was 1 -> 2 -> 4 -> 3 -> 5.

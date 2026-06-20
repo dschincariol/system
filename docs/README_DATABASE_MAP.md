@@ -19,11 +19,23 @@ If you want the short version:
 
 The public storage facade is `engine/runtime/storage.py`. Current production-like storage is backed by `engine/runtime/storage_pg.py`; older SQLite-era file paths and constraints may still appear in tests, compatibility helpers, repair helpers, and historical docs.
 
-Runtime connection targets come from `TS_PG_DSN` or platform defaults. `DB_PATH` now means "local data root / legacy identity path" for diagnostics, artifacts, and test backends. In supervised or production-like modes it should be an absolute directory such as `/var/lib/trading`; file-shaped legacy values are tolerated by `db_guard.resolve_db_path()` and normalized to their parent directory.
+Runtime connection targets come from `TS_PG_DSN` or platform defaults. `DB_PATH` now means "local data root / legacy identity path" for diagnostics, artifacts, and test backends. In supervised or production-like modes it must be an absolute directory such as `/var/lib/trading`; relative values fail runtime config and production preflight. File-shaped legacy values are tolerated by `db_guard.resolve_db_path()` and normalized to their parent directory only after the raw path has passed the absolute-path gate.
+
+For the Docker Timescale/Postgres deployment, database tuning comes from the
+`TIMESCALE_*` variables in `deploy/compose/.env`. The compose service passes
+those values directly to Postgres, and production preflight records a
+`postgres_tuning` diagnostic with the configured values, container-memory
+derivation, bounded memory estimate, WAL retention budget, and reachable
+`pg_settings` values. `PREFLIGHT_REQUIRE_DOCKER_POSTGRES_TUNING=1` makes this a
+hard gate for the compose production path.
 
 In older local SQLite-oriented setups, and in the isolated SQLite test backend, the main file was usually:
 
 - `data/trading.db`
+
+New local defaults write compatibility SQLite files under `var/db/`, for
+example `var/db/trading.db`. Existing explicit `DB_PATH` values are still
+honored.
 
 Do not infer that new schema work is local-file-only. Treat the runtime storage facade and Postgres migrations as the primary persistence layer, and add migrations/tests for any schema or write-path change.
 
@@ -48,7 +60,7 @@ The easiest way to understand the schema is as a set of table families.
 | --- | --- |
 | Runtime and control | health, metadata, jobs, locks, audit state |
 | Market and ingestion | prices, quotes, options, provider health, raw event data |
-| Features and labels | model inputs, derived features, target labels |
+| Features and labels | model inputs, derived features, structured document events, target labels |
 | Models and governance | model registry, promotion audit, drift, governance snapshots |
 | Decisions and alerts | system decisions, alerts, acknowledgements, operator interactions |
 | Portfolio and risk | target weights, equity, risk snapshots, suppression state |
@@ -84,6 +96,7 @@ If you only learn ten tables, learn these first.
 | --- | --- |
 | `prices` | simple market price history by symbol and timestamp |
 | `events` | external or derived event records |
+| `structured_document_events` | timestamped filing/transcript/news event extractions with source document id, availability timestamp, confidence, and PIT metadata |
 | `predictions` | model output by symbol and horizon |
 | `decision_log` | the system's recorded trading decisions and explanations |
 | `alerts` | alert records emitted by rules or policy surfaces |
@@ -123,6 +136,10 @@ For the live-ingestion family, schema ownership lives in `engine/runtime/storage
 Repository validation now also blocks new DDL for that owned family outside the
 approved owner modules, and runtime validation treats unexpected columns, primary-key
 drift, or missing owned indexes on those tables as contract failures.
+For Postgres, the same validation also reads `schema_migrations`, required table
+columns, required indexes, and owned-table column types from the live catalog;
+production preflight fails closed when any expected migration ID or required
+owned schema element is missing.
 
 | Table | Role |
 | --- | --- |
@@ -134,7 +151,7 @@ drift, or missing owned indexes on those tables as contract failures.
 | `price_provider_health` | buffered provider freshness and health state; non-authoritative telemetry alongside canonical `prices` inputs |
 | `ingestion_pipeline_health` | per-pipeline liveness and ingest-volume snapshots for startup checks and operator diagnostics |
 | `options_symbol_ingestion_state` | options-ingestion retry, cooldown, and fallback state per underlying symbol |
-| `market_microstructure_signals` | spread, liquidity, and microstructure-derived signals |
+| `market_microstructure_signals` | spread, liquidity, top-of-book depth, order-book imbalance, and microstructure-derived signals used by execution realism and shadow LOB readiness |
 | `options_chain`, `options_chain_v2` | option chain snapshots |
 | `options_surface`, `options_surface_agg` | derived options surface data |
 | `options_symbol_features`, `options_event_features` | symbol-linked options summaries and event-linked options signals derived from chain snapshots |
@@ -153,7 +170,11 @@ These tables sit between raw data and trade decisions.
 | --- | --- |
 | `market_features` | feature rows derived from market data |
 | `labels` | training labels for strategy/model training |
-| `labels_exec` | execution-specific labels |
+| `labels_exec` | execution-specific gross/net labels used by evaluation and training loaders |
+| `net_after_cost_labels` | timestamp-safe model-intent-to-execution label artifact with gross return, costs, net return, model family, regime, and confidence metadata |
+| `learned_alpha_decay_runs` | training-run metadata for learned alpha decay, capacity, and crowding estimates |
+| `learned_alpha_decay_estimates` | latest learned half-life, max useful age, capacity, crowding, and size/block policy by cohort |
+| `learned_alpha_decay_age_edges` | realized net edge by signal-age bucket for learned-alpha cohorts |
 | `predictions` | model predictions used by downstream logic |
 | `temporal_predictions` | temporal-model outputs |
 | `event_embeddings` | stored embedding vectors or references for event content |
@@ -178,6 +199,7 @@ These tables answer:
 | `model_registry` | canonical registry of models |
 | `champion_assignments` | active champion selections |
 | `model_marketplace_scores` | model ranking or marketplace-style scoring |
+| `model_competition_rankings` | realized competition rankings; candidates without net-after-cost label evidence are excluded |
 | `model_promotion_audit` | promotion and rollback-style audit trail |
 | `model_promotion_cooldown` | cooldown gates after promotion activity |
 | `model_post_promo_watch` | models under watch after promotion |
@@ -186,12 +208,15 @@ These tables answer:
 | `model_governance_log` | governance snapshots and summary payloads |
 | `model_drift` | model drift data |
 | `feature_distribution_drift` | feature distribution drift |
+| `production_monitoring_metrics` | latest production drift, calibration, shadow-vs-live, and net-PnL monitoring metrics; alerts create signal-only `drift_retrain_events` |
 | `residual_distribution_drift` | residual drift |
 | `self_critic_alerts` | model self-critic warning records |
 | `shadow_predictions`, `shadow_metrics`, `shadow_training_runs` | shadow-model evaluation path |
 | `challenger_shadow_orders` | challenger shadow trading decisions or outcomes |
 | `hypothesis_registry` | legacy-compatible statistical promotion evidence |
 | `promotion_statistical_evidence` | current promotion-gate evidence for BH-FDR, Reality Check, pool, MPC, and era robustness payloads |
+| `strategy_promotion_candidates` | governed shadow-strategy promotion candidates and operator approval state; live mutation still requires realized PnL, replay/OPE/statistical evidence, cooldown, and audit records |
+| `experiment_ledger` | append-only generated-candidate ledger for lineage, trial budgets, false-discovery evidence, redundancy checks, and promotion decisions |
 
 ### Decisions And Alerts Tables
 
@@ -253,7 +278,7 @@ These tables track order handling and realized market interaction.
 | `execution_mode_audit` | changes to execution mode |
 | `execution_health_state` | summary execution health |
 | `execution_alerts` | execution-specific alerting |
-| `execution_order_idempotency` | duplicate-protection and order lifecycle safety |
+| `execution_order_idempotency` | durable live broker duplicate-protection and order lifecycle safety |
 | `terminal_intent_rejections` | terminal order/flatten pre-trade rejection audit rows |
 | `execution_divergence` | divergence between expected and actual execution state |
 | `broker_fills` | broker-specific fill records |
@@ -429,6 +454,53 @@ For the covered trading chain, `portfolio_orders_id`, `source_alert_id`, and `pr
 | `fees`, `commission` | execution cost |
 | `raw_json`, `extra_json` | extra broker/context payload; secondary audit context, not the primary lineage contract |
 
+### `model_performance` Scoring Indexes
+
+`engine/model_scoring.py` scores unresolved `predictions` and `tracked_predictions` into `model_performance`. Production migration `0063_model_scoring_indexes.py` keeps that path bounded with:
+
+| Index | Purpose |
+| --- | --- |
+| `idx_tracked_predictions_prediction_id_ts_id` | non-null partial index supporting the `LEFT JOIN LATERAL` latest-tracking lookup by `(prediction_id, ts_ms DESC, id DESC)` without a sort |
+| `idx_model_performance_prediction_id` | non-null partial index supporting the unresolved-prediction anti-probe so already scored predictions are skipped cheaply |
+| `ux_model_performance_tracked_prediction_id` | backs `ON CONFLICT(tracked_prediction_id)` so scoring retries update the existing row instead of inserting duplicates |
+
+### `net_after_cost_labels`
+
+This is the durable model-intent-to-realized-label artifact used by training, OOS evaluation, model marketplace scoring, and promotion gates.
+
+Rows are timestamp-safe: `label_ts_ms` is the original prediction timestamp, `exit_ts_ms` is the observed exit/fill timestamp, and `computed_at_ts_ms` is when the artifact was materialized. Promotion requires realized net-cost evidence; gross-only performance does not promote a model.
+
+| Column | Meaning |
+| --- | --- |
+| `event_id`, `prediction_id`, `source_alert_id` | prediction, alert, and execution lineage |
+| `symbol`, `horizon_s`, `label_ts_ms` | label key and original prediction time |
+| `entry_ts_ms`, `exit_ts_ms`, `computed_at_ts_ms` | entry, exit, and computation times |
+| `model_name`, `model_id`, `model_version`, `model_family` | model identity used for training/evaluation grouping |
+| `regime` | regime metadata attached to model intent |
+| `confidence`, `confidence_raw`, `confidence_metadata_json` | confidence and prediction score metadata |
+| `side`, `realized` | signed direction and whether real fills back the row |
+| `gross_return`, `realized_forward_return`, `execution_cost_return`, `net_return` | gross, raw forward, cost drag, and net returns |
+| `fees_bps`, `slippage_bps`, `spread_bps`, `borrow_bps`, `financing_bps`, `total_cost_bps` | execution and carry cost decomposition |
+| `order_count`, `fill_count` | linked execution evidence counts |
+| `label_metadata_json` | timestamp-safety, execution trace, carry availability, and source details |
+
+### `learned_alpha_decay_*`
+
+`engine/strategy/jobs/train_learned_alpha_decay.py` learns realized edge curves from `net_after_cost_labels` and falls back to `labels_exec` only when realized net-after-cost labels are absent. It writes:
+
+| Table | Meaning |
+| --- | --- |
+| `learned_alpha_decay_runs` | run timestamp, lookback, age bucket, and estimator parameters |
+| `learned_alpha_decay_estimates` | cohort-level learned half-life, max useful age, capacity estimate, crowding penalty, size multiplier, and block flag |
+| `learned_alpha_decay_age_edges` | per-age-bucket realized edge rows used to audit the estimate |
+
+Production enforcement:
+
+- execution policy uses the estimates to shorten TTL/half-life, block stale or low-capacity risk-increasing orders, and size crowded cohorts down
+- portfolio execution intents apply the size multiplier before model/group/portfolio caps
+- position sizing can consume the same estimate object for direct sizing calls
+- champion evaluation treats learned low-capacity/crowded cohorts as candidate/current blockers
+
 ### `execution_ai_advisory`
 
 This is an operator-facing advisory table.
@@ -559,7 +631,7 @@ If you change the schema, keep these rules:
 
 ## 10. Current Table Register
 
-Do not use a local `data/trading.db` snapshot as a production schema catalog. The current table register is maintained in:
+Do not use a local `data/trading.db` or `var/db/trading.db` snapshot as a production schema catalog. The current table register is maintained in:
 
 - [Database_Schema.md](Database_Schema.md)
 - [engine/runtime/schema/table_classification.py](../engine/runtime/schema/table_classification.py)

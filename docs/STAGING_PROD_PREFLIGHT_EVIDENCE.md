@@ -23,10 +23,12 @@ Equivalent direct command:
 python -m engine.runtime.staging_prod_preflight \
   --env-file deploy/env/staging-prod-preflight.env \
   --target-env staging \
-  --evidence-dir artifacts/preflight
+  --evidence-dir var/artifacts/preflight
 ```
 
-The command writes a redacted artifact under `artifacts/preflight/staging/`. The repository ignores `artifacts/`, so runtime evidence is preserved locally for review without being staged by default.
+The command writes a redacted artifact under `var/artifacts/preflight/staging/`. The repository ignores `var/`, so runtime evidence is preserved locally for review without being staged by default.
+
+The GitHub production-backend gate also runs this harness against its designated CI Postgres service and uploads the redacted `var/artifacts/preflight/staging/*.json` file for release-signoff evidence.
 
 ## Guardrails
 

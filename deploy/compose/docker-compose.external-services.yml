@@ -1,12 +1,24 @@
+x-trading-logging: &trading-logging
+  driver: "${DOCKER_LOG_DRIVER:-local}"
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-50m}"
+    max-file: "${DOCKER_LOG_MAX_FILE:-5}"
+
 services:
   timescaledb:
     image: ${TIMESCALE_IMAGE:?set TIMESCALE_IMAGE}
     container_name: trading-timescaledb
     restart: unless-stopped
+    cpus: ${TIMESCALE_CPUS:-8}
+    mem_limit: ${TIMESCALE_MEM_LIMIT:-32g}
+    memswap_limit: ${TIMESCALE_MEMSWAP_LIMIT:-32g}
+    shm_size: ${TIMESCALE_SHM_SIZE:-2g}
+    logging: *trading-logging
     environment:
       POSTGRES_DB: ${TIMESCALE_DB:-trading}
       POSTGRES_USER: ${TIMESCALE_USER:-trading}
       POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
     ports:
       - "${TIMESCALE_PORT:-5432}:5432"
     volumes:
@@ -15,13 +27,73 @@ services:
     command:
       - postgres
       - -c
+      - shared_preload_libraries=timescaledb,pg_stat_statements
+      - -c
+      - max_connections=${TIMESCALE_MAX_CONNECTIONS:-100}
+      - -c
+      - shared_buffers=${TIMESCALE_SHARED_BUFFERS:-8GB}
+      - -c
+      - effective_cache_size=${TIMESCALE_EFFECTIVE_CACHE_SIZE:-22GB}
+      - -c
+      - work_mem=${TIMESCALE_WORK_MEM:-48MB}
+      - -c
+      - maintenance_work_mem=${TIMESCALE_MAINTENANCE_WORK_MEM:-2GB}
+      - -c
+      - autovacuum_work_mem=${TIMESCALE_AUTOVACUUM_WORK_MEM:-512MB}
+      - -c
+      - wal_buffers=${TIMESCALE_WAL_BUFFERS:-64MB}
+      - -c
       - wal_level=replica
       - -c
-      - archive_mode=on
+      - wal_compression=on
       - -c
-      - archive_command=test ! -f /var/backups/trading/wal/%f && cp %p /var/backups/trading/wal/%f || test -f /var/backups/trading/wal/%f
+      - min_wal_size=${TIMESCALE_MIN_WAL_SIZE:-4GB}
       - -c
-      - archive_timeout=60s
+      - max_wal_size=${TIMESCALE_MAX_WAL_SIZE:-16GB}
+      - -c
+      - wal_keep_size=${TIMESCALE_WAL_KEEP_SIZE:-1GB}
+      - -c
+      - max_slot_wal_keep_size=${TIMESCALE_MAX_SLOT_WAL_KEEP_SIZE:-8GB}
+      - -c
+      - archive_mode=${TIMESCALE_ARCHIVE_MODE:-on}
+      - -c
+      - archive_command=mkdir -p /var/backups/trading/wal && test ! -f /var/backups/trading/wal/%f && cp %p /var/backups/trading/wal/%f || test -f /var/backups/trading/wal/%f
+      - -c
+      - archive_timeout=${TIMESCALE_ARCHIVE_TIMEOUT:-60s}
+      - -c
+      - checkpoint_timeout=${TIMESCALE_CHECKPOINT_TIMEOUT:-15min}
+      - -c
+      - checkpoint_completion_target=${TIMESCALE_CHECKPOINT_COMPLETION_TARGET:-0.9}
+      - -c
+      - max_worker_processes=${TIMESCALE_MAX_WORKER_PROCESSES:-16}
+      - -c
+      - max_parallel_workers=${TIMESCALE_MAX_PARALLEL_WORKERS:-8}
+      - -c
+      - max_parallel_workers_per_gather=${TIMESCALE_MAX_PARALLEL_WORKERS_PER_GATHER:-4}
+      - -c
+      - max_parallel_maintenance_workers=${TIMESCALE_MAX_PARALLEL_MAINTENANCE_WORKERS:-4}
+      - -c
+      - timescaledb.max_background_workers=${TIMESCALE_TIMESCALEDB_MAX_BACKGROUND_WORKERS:-8}
+      - -c
+      - autovacuum=${TIMESCALE_AUTOVACUUM:-on}
+      - -c
+      - autovacuum_max_workers=${TIMESCALE_AUTOVACUUM_MAX_WORKERS:-4}
+      - -c
+      - autovacuum_naptime=${TIMESCALE_AUTOVACUUM_NAPTIME:-10s}
+      - -c
+      - autovacuum_vacuum_cost_limit=${TIMESCALE_AUTOVACUUM_VACUUM_COST_LIMIT:-4000}
+      - -c
+      - autovacuum_vacuum_cost_delay=${TIMESCALE_AUTOVACUUM_VACUUM_COST_DELAY:-2ms}
+      - -c
+      - random_page_cost=${TIMESCALE_RANDOM_PAGE_COST:-1.1}
+      - -c
+      - effective_io_concurrency=${TIMESCALE_EFFECTIVE_IO_CONCURRENCY:-200}
+      - -c
+      - maintenance_io_concurrency=${TIMESCALE_MAINTENANCE_IO_CONCURRENCY:-200}
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_checkpoints=on
     healthcheck:
       test:
         - CMD-SHELL
@@ -37,12 +109,22 @@ services:
     image: ${REDIS_IMAGE:?set REDIS_IMAGE}
     container_name: trading-redis
     restart: unless-stopped
+    cpus: ${REDIS_CPUS:-2}
+    mem_limit: ${REDIS_MEM_LIMIT:-8g}
+    memswap_limit: ${REDIS_MEMSWAP_LIMIT:-8g}
+    logging: *trading-logging
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
     command:
       - redis-server
       - --appendonly
       - "yes"
       - --requirepass
       - ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-6gb}
+      - --maxmemory-policy
+      - ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
@@ -62,6 +144,10 @@ services:
     image: ${MINIO_IMAGE:?set MINIO_IMAGE}
     container_name: trading-minio
     restart: unless-stopped
+    cpus: ${MINIO_CPUS:-2}
+    mem_limit: ${MINIO_MEM_LIMIT:-6g}
+    memswap_limit: ${MINIO_MEMSWAP_LIMIT:-6g}
+    logging: *trading-logging
     command:
       - server
       - /data
@@ -82,6 +168,7 @@ services:
     image: ${MINIO_CLIENT_IMAGE:?set MINIO_CLIENT_IMAGE}
     container_name: trading-minio-init
     restart: "no"
+    logging: *trading-logging
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}

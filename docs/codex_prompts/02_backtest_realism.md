@@ -1,7 +1,7 @@
 # Codex Prompt 02 — Backtest Realism: Combinatorial Purged CV + Almgren-Chriss Costs
 
 You are working in a Python systematic trading system. The current
-backtester (`ops/backtest_walk_forward.py`) is, by its own docstring,
+backtester (`engine/strategy/jobs/backtest_walk_forward.py`) is, by its own docstring,
 "intentionally simple and honest" — fixed walk-forward folds and
 constant per-share commission. That simplicity is fine as a smoke test
 but it produces optimistic Sharpes because (a) it does not purge
@@ -28,18 +28,18 @@ default for any model whose holding horizon exceeds one bar.
 2. A transaction-cost model `AlmgrenChrissCost` returning expected
    slippage in bps as a function of trade size, ADV, volatility, and
    participation rate.
-3. A new entrypoint `ops/backtest_cpcv.py` that runs CPCV with the
+3. A new entrypoint `engine/strategy/jobs/backtest_cpcv.py` that runs CPCV with the
    cost model wired in, produces a distribution of OOS Sharpes (one
    per CPCV path), and emits a deflated Sharpe ratio per de Prado.
-4. Training pipelines that consume CV folds (`ops/train_model_v2.py`,
+4. Training pipelines that consume CV folds (`engine/strategy/jobs/train_model_v2.py`,
    `engine/strategy/jobs/train_temporal_predictor.py`) switch to the
    new splitter for any model with `holding_horizon_bars > 1`.
 
 ## Files to read first (read-only)
 
-- `ops/backtest_walk_forward.py` — current honest backtester; preserve
+- `engine/strategy/jobs/backtest_walk_forward.py` — current honest backtester; preserve
   it as a baseline.
-- `ops/train_model_v2.py` — main training entrypoint; this is where the
+- `engine/strategy/jobs/train_model_v2.py` — main training entrypoint; this is where the
   splitter is selected.
 - `engine/strategy/jobs/train_temporal_predictor.py` — multi-horizon
   trainer; this one *needs* purging because labels overlap.
@@ -64,7 +64,7 @@ default for any model whose holding horizon exceeds one bar.
 - `engine/execution/cost_models/almgren_chriss.py` — temporary +
   permanent impact, configurable participation, square-root market
   impact.
-- `ops/backtest_cpcv.py` — end-to-end CPCV runner with cost model
+- `engine/strategy/jobs/backtest_cpcv.py` — end-to-end CPCV runner with cost model
   injected; writes one row per path to a new audit table.
 - `tests/test_cpcv_splitter.py`
 - `tests/test_cpcv_purging.py` — verifies overlapping labels are
@@ -75,7 +75,7 @@ default for any model whose holding horizon exceeds one bar.
 
 ## Files to modify
 
-- `ops/train_model_v2.py` — when `cfg.holding_horizon_bars > 1`, use
+- `engine/strategy/jobs/train_model_v2.py` — when `cfg.holding_horizon_bars > 1`, use
   `CombinatorialPurgedKFold` instead of `TimeSeriesSplit`.
 - `engine/strategy/jobs/train_temporal_predictor.py` — same.
 - `engine/execution/broker_sim.py` — accept an optional `cost_model:
@@ -102,7 +102,7 @@ default for any model whose holding horizon exceeds one bar.
     gamma * (notional/adv)`, with `eta` and `gamma` calibrated to the
    defaults in Almgren et al. (2005) Table 4 (eta = 0.142, gamma =
    0.314 for US equities) and overrideable per asset class.
-4. **Backtest entrypoint.** `ops/backtest_cpcv.py` reads a config,
+4. **Backtest entrypoint.** `engine/strategy/jobs/backtest_cpcv.py` reads a config,
    loads the model, runs CPCV with the cost model in the loop (every
    simulated fill is shrunk by `cost_bps`), aggregates into one row per
    path, computes deflated Sharpe, writes to the new table.
@@ -125,7 +125,7 @@ default for any model whose holding horizon exceeds one bar.
       participation, and matches a hand-computed value to 1e-6 bps for
       a fixed set of inputs (recorded in the test).
 - [ ] Deflated Sharpe collapses to raw Sharpe when `n_trials=1`.
-- [ ] `ops/backtest_cpcv.py` runs to completion on
+- [ ] `engine/strategy/jobs/backtest_cpcv.py` runs to completion on
       `engine/strategy/temporal_predictor.py` against the last 18 months
       of cached prices (use whatever the existing walk-forward test
       uses) and writes ≥ 15 rows to `backtest_cpcv_runs`.
@@ -150,7 +150,7 @@ tests/test_backtest_cpcv_integration.py`
 
 ## Out of scope
 
-- Do not delete `ops/backtest_walk_forward.py`; it remains the simple
+- Do not delete `engine/strategy/jobs/backtest_walk_forward.py`; it remains the simple
   smoke-test backtester.
 - Do not change live execution costs. The Almgren-Chriss model is
   available to `broker_sim` but live paths keep their current cost

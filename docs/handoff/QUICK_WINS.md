@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_hypothesis_model ON hypothesis_registry(model_nam
 
 **Constraints.**
 - Do not bypass or remove existing promotion checks — this gate is additive.
-- Must be a no-op if `CHAMPION_PROMOTION_MIN_OBSERVATIONS` is not met (log "insufficient data", don't block).
+- Must fail closed in paper/live/production-like promotion paths when `CHAMPION_PROMOTION_MIN_OBSERVATIONS` is not met. Safe/shadow development paths may report an explicit advisory only when runtime strictness is off.
 - Respect the system's existing logging and storage patterns — do not introduce new DB connection logic.
 
 ---

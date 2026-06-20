@@ -11,10 +11,9 @@ the right thing the first time.
 - **Production / staging**: one Linux server, **Debian-family**
   (Ubuntu 22.04 LTS or Debian 12). RHEL-family adaptation is
   straightforward but not the default.
-- **Development**: Windows host with **WSL2 Ubuntu** (recommended) or
-  Docker Desktop dev container. The Python application code is fully
-  cross-platform; the deployment infrastructure (bash, systemd, ufw,
-  PgBouncer, systemd-creds) is Linux-only by design.
+- **Development**: Linux host or Linux dev container. The Python
+  application code, deployment infrastructure, and CI contract are
+  Linux-only by design.
 - Postgres 16 + TimescaleDB 2.x + Redis 7 + PgBouncer co-located on
   the same host. Communication via Unix sockets where possible for
   minimum latency.
@@ -26,10 +25,8 @@ the right thing the first time.
   reproduced from the bootstrap script on any equivalently-sized
   server.
 
-See **[CROSS_PLATFORM.md](CROSS_PLATFORM.md)** for the developer-side
-guide: what runs on Windows, what runs only on Linux, the
-recommended dev workflow, and the environment variables that route
-the application to the right DSN / paths on each platform.
+See **[CROSS_PLATFORM.md](CROSS_PLATFORM.md)** for the Linux-only
+platform policy and the remaining security-relevant path checks.
 
 ## Goals
 

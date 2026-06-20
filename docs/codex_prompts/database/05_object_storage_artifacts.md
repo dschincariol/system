@@ -17,15 +17,13 @@ metadata, the content hash, and the path / URI. The same API can be
 later swapped for MinIO or S3 without touching call sites — but for
 the single-server deployment, local filesystem is the right answer.
 
-## Cross-platform note
+## Linux-only note
 
-This is **application code** that must run on the developer's Windows
-machine and on the Linux staging / production servers. The artifact
-root is read from `TS_ARTIFACTS_ROOT` with a platform default
-(`/var/lib/trading/artifacts` on Linux,
-`%LOCALAPPDATA%\Trading\artifacts` on Windows) computed by
+This is **Linux-only application code** for development, staging, and
+production hosts. The artifact root is read from `TS_ARTIFACTS_ROOT`
+with a default of `/var/lib/trading/artifacts` computed by
 `engine/runtime/platform.py`. Every path uses `pathlib.Path`. Atomic
-writes use `os.replace()` (works on both platforms). Read
+writes use `os.replace()`. Read
 `docs/codex_prompts/database/CROSS_PLATFORM.md` first.
 
 ## Goal
@@ -199,9 +197,8 @@ writes use `os.replace()` (works on both platforms). Read
 - [ ] GC never deletes an object with `ref_count > 0`; never deletes
       an object younger than 30 days.
 - [ ] `tools/migrate_artifacts.py` is idempotent.
-- [ ] All tests pass on both Linux and Windows runners; the artifact
-      directory layout is identical on either platform under their
-      respective default roots.
+- [ ] All tests pass on Linux runners; the artifact directory layout
+      is identical across Linux dev, staging, and production hosts.
 - [ ] No hardcoded `/var/lib/trading` string literal anywhere in
       `engine/artifacts/` (lint-tested).
 
