@@ -7,7 +7,9 @@ single execution barrier used by live-order paths.
 
 import json
 import logging
+import math
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple, List
@@ -26,6 +28,8 @@ LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
 _KILL_SWITCH_SCHEMA_READY_LOCK = threading.Lock()
 _KILL_SWITCH_SCHEMA_READY_PATH = ""
+_ACTIVATION_FAILURE_STATE_FILE = "kill_switch_activation_failure_state.json"
+_ACTIVATION_FAILURE_EVIDENCE_FILE = "kill_switch_activation_failures.jsonl"
 
 
 def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
@@ -60,6 +64,274 @@ def _schema_path_key(con=None) -> str:
             db_path=str(db_path),
         )
         return str(db_path)
+
+
+def _activation_failure_dir() -> Path:
+    raw_dir = str(os.environ.get("KILL_SWITCH_FAILURE_DIR") or "").strip()
+    if raw_dir:
+        return Path(raw_dir).expanduser()
+    data_dir = str(os.environ.get("TRADING_DATA") or os.environ.get("DATA_DIR") or "").strip()
+    if data_dir:
+        return Path(data_dir).expanduser() / "runtime_evidence"
+    try:
+        return Path(DB_PATH).expanduser().resolve().parent / "runtime_evidence"
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_DIR_RESOLVE_FAILED",
+            e,
+            once_key="activation_failure_dir_resolve",
+            db_path=str(DB_PATH),
+        )
+        return Path(".").resolve() / "runtime_evidence"
+
+
+def _activation_failure_state_path() -> Path:
+    return _activation_failure_dir() / _ACTIVATION_FAILURE_STATE_FILE
+
+
+def _activation_failure_evidence_path() -> Path:
+    return _activation_failure_dir() / _ACTIVATION_FAILURE_EVIDENCE_FILE
+
+
+def _fsync_parent(path: Path) -> None:
+    try:
+        fd = os.open(str(path.parent), os.O_RDONLY)
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_PARENT_OPEN_FAILED",
+            e,
+            once_key=f"activation_failure_parent_open:{path.parent}",
+            path=str(path),
+        )
+        return
+    try:
+        os.fsync(fd)
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_PARENT_FSYNC_FAILED",
+            e,
+            once_key=f"activation_failure_parent_fsync:{path.parent}",
+            path=str(path),
+        )
+    finally:
+        try:
+            os.close(fd)
+        except Exception as e:
+            _warn_nonfatal(
+                "KILL_SWITCH_ACTIVATION_FAILURE_PARENT_CLOSE_FAILED",
+                e,
+                once_key=f"activation_failure_parent_close:{path.parent}",
+                path=str(path),
+            )
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{_now_ms()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"), sort_keys=True, default=str)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(str(tmp_path), str(path))
+    _fsync_parent(path)
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str))
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def activation_failure_snapshot() -> Dict[str, Any]:
+    """Return unresolved emergency activation failure evidence, if present."""
+    path = _activation_failure_state_path()
+    try:
+        if not path.exists():
+            return {"active": False}
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_SNAPSHOT_READ_FAILED",
+            e,
+            once_key=f"activation_failure_snapshot_read:{path}",
+            path=str(path),
+        )
+        return {
+            "active": True,
+            "reason": "kill_switch_activation_failure_snapshot_unreadable",
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "path": str(path),
+        }
+    if not isinstance(payload, dict):
+        return {"active": True, "reason": "kill_switch_activation_failure_snapshot_invalid", "path": str(path)}
+    payload.setdefault("active", True)
+    payload.setdefault("path", str(path))
+    return payload
+
+
+def _record_activation_failure(
+    *,
+    scope: str,
+    key: str,
+    reason: str,
+    actor: str,
+    meta: Dict[str, Any],
+    action: str,
+    trigger_kind: str,
+    error: BaseException,
+) -> Dict[str, Any]:
+    ts_ms = _now_ms()
+    payload: Dict[str, Any] = {
+        "active": True,
+        "status": "UNRESOLVED",
+        "ts_ms": int(ts_ms),
+        "scope": str(scope),
+        "key": str(key),
+        "reason": str(reason),
+        "actor": str(actor or "risk_engine"),
+        "action": str(action or "AUTO").upper(),
+        "trigger_kind": str(trigger_kind),
+        "reason_code": "kill_switch_activation_write_failed",
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "meta": dict(meta or {}),
+        "db_path": str(DB_PATH),
+        "evidence_path": str(_activation_failure_evidence_path()),
+        "state_path": str(_activation_failure_state_path()),
+    }
+    marker_error: BaseException | None = None
+    try:
+        _write_json_atomic(_activation_failure_state_path(), payload)
+        _append_jsonl(_activation_failure_evidence_path(), payload)
+    except Exception as e:
+        marker_error = e
+        payload["marker_write_failed"] = True
+        payload["marker_error_type"] = type(e).__name__
+        payload["marker_error"] = str(e)
+
+    log_failure(
+        LOGGER,
+        event="kill_switch_activation_failed",
+        code="KILL_SWITCH_ACTIVATION_WRITE_FAILED",
+        message="Automatic breach kill-switch activation could not be durably written.",
+        error=error,
+        level=logging.ERROR,
+        component="engine.execution.kill_switch",
+        extra=payload,
+        include_health=False,
+        persist=True,
+        flush=True,
+    )
+
+    if marker_error is not None:
+        log_failure(
+            LOGGER,
+            event="kill_switch_activation_failure_marker_failed",
+            code="KILL_SWITCH_ACTIVATION_FAILURE_MARKER_FAILED",
+            message="Kill-switch activation failure marker could not be written.",
+            error=marker_error,
+            level=logging.CRITICAL,
+            component="engine.execution.kill_switch",
+            extra=payload,
+            include_health=False,
+            persist=False,
+            flush=True,
+        )
+
+    try:
+        append_event(
+            event_type="kill_switch_activation_failed",
+            event_source="engine.execution.kill_switch",
+            event_version=1,
+            entity_type="kill_switch",
+            entity_id=f"{scope}:{key}",
+            correlation_id=f"{scope}:{key}:{trigger_kind}",
+            payload=payload,
+            ts_ms=int(ts_ms),
+            best_effort=False,
+        )
+        try:
+            from engine.runtime.event_log import flush_event_log_buffer
+
+            flush_event_log_buffer(max_batches=8, wait_inflight_s=1.0)
+        except Exception as e:
+            _warn_nonfatal(
+                "KILL_SWITCH_ACTIVATION_FAILURE_EVENT_FLUSH_FAILED",
+                e,
+                once_key="activation_failure_event_flush",
+            )
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_EVENT_WRITE_FAILED",
+            e,
+            once_key="activation_failure_event_write",
+        )
+
+    try:
+        from engine.runtime.risk_state import set_state as _risk_set_state
+
+        _risk_set_state(
+            "kill_switch_activation_failure",
+            json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str),
+        )
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_RISK_STATE_WRITE_FAILED",
+            e,
+            once_key="activation_failure_risk_state_write",
+        )
+
+    try:
+        from engine.runtime.lifecycle_state import DEGRADED as _DEGRADED, set_state as _lifecycle_set_state
+
+        _lifecycle_set_state(_DEGRADED, "kill_switch_activation_write_failed")
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_LIFECYCLE_DEGRADE_FAILED",
+            e,
+            once_key="activation_failure_lifecycle_degrade",
+        )
+
+    return payload
+
+
+def _clear_activation_failure_marker(scope: str, key: str) -> None:
+    path = _activation_failure_state_path()
+    payload = activation_failure_snapshot()
+    if not bool(payload.get("active")):
+        return
+    payload_scope = _s(payload.get("scope"))
+    payload_key = _s(payload.get("key"))
+    if payload_scope and payload_key and (payload_scope != _s(scope) or payload_key != _s(key)):
+        return
+    resolved = dict(payload)
+    resolved.update(
+        {
+            "active": False,
+            "status": "RESOLVED",
+            "resolved_ts_ms": int(_now_ms()),
+            "resolved_by": "kill_switch_activation_committed",
+        }
+    )
+    try:
+        _append_jsonl(_activation_failure_evidence_path(), resolved)
+        if path.exists():
+            path.unlink()
+        _fsync_parent(path)
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVATION_FAILURE_MARKER_CLEAR_FAILED",
+            e,
+            once_key=f"activation_failure_marker_clear:{scope}:{key}",
+            scope=str(scope),
+            key=str(key),
+        )
 
 
 def _mark_schema_ready(con=None) -> None:
@@ -131,6 +403,15 @@ KILL_SWITCH_ROLLING_DRAWDOWN_LOOKBACK_DAYS = int(os.environ.get("KILL_SWITCH_ROL
 KILL_SWITCH_VAR_LOOKBACK_POINTS = int(os.environ.get("KILL_SWITCH_VAR_LOOKBACK_POINTS", "250"))
 KILL_SWITCH_VAR_CONFIDENCE = float(os.environ.get("KILL_SWITCH_VAR_CONFIDENCE", "0.99"))
 KILL_SWITCH_VAR_MIN_HISTORY = int(os.environ.get("KILL_SWITCH_VAR_MIN_HISTORY", "30"))
+KILL_SWITCH_MAX_EQUITY_AGE_S = int(os.environ.get("KILL_SWITCH_MAX_EQUITY_AGE_S", "300"))
+KILL_SWITCH_DAILY_EQUITY_MIN_POINTS = int(os.environ.get("KILL_SWITCH_DAILY_EQUITY_MIN_POINTS", "2"))
+KILL_SWITCH_ROLLING_EQUITY_MIN_POINTS = int(os.environ.get("KILL_SWITCH_ROLLING_EQUITY_MIN_POINTS", "5"))
+KILL_SWITCH_VAR_EQUITY_MIN_POINTS = int(
+    os.environ.get(
+        "KILL_SWITCH_VAR_EQUITY_MIN_POINTS",
+        str(max(2, int(KILL_SWITCH_VAR_MIN_HISTORY) + 1)),
+    )
+)
 KILL_SWITCH_CONCENTRATION_MAX_SINGLE = float(os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_SINGLE", "0.35"))
 KILL_SWITCH_CONCENTRATION_MAX_TOP3 = float(os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_TOP3", "0.70"))
 KILL_SWITCH_CONCENTRATION_MAX_SINGLE = float(os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_SINGLE", "0.35"))
@@ -193,6 +474,9 @@ def _maybe_auto_expire(con, scope: str, key: str, st):
     if _now_ms() <= until_ms:
         return st
 
+    if _protected_manual_halt(st):
+        return st
+
     # expired → clear
     try:
         clear(
@@ -239,8 +523,6 @@ def _norm_key(scope: str, key: str) -> str:
     k = _s(key)
     if not k:
         raise ValueError("kill switch key required")
-    if scope == "global":
-        return "global"
     return k
 
 def _env_truthy(v: Optional[str]) -> bool:
@@ -360,6 +642,51 @@ def _read_state(con, scope: str, key: str) -> Optional[Tuple[int, str, str, str,
     )
 
 
+def _parse_meta_json(meta_json: Any) -> Dict[str, Any]:
+    if not meta_json:
+        return {}
+    try:
+        parsed = json.loads(str(meta_json))
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_META_JSON_PARSE_FAILED",
+            e,
+            once_key=f"meta_json_parse:{hash(str(meta_json))}",
+        )
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _state_owned_by(st: Optional[Tuple[int, str, str, str, int, int]], *, actor: str, trigger: str) -> bool:
+    if not st or int(st[0] or 0) != 1:
+        return False
+    if _s(st[2]) != _s(actor):
+        return False
+    meta = _parse_meta_json(st[3])
+    return _s(meta.get("trigger")) == _s(trigger)
+
+
+def _protected_manual_halt(st: Optional[Tuple[int, str, str, str, int, int]]) -> bool:
+    if not st or int(st[0] or 0) != 1:
+        return False
+    actor = _s(st[2]).lower()
+    reason = _s(st[1]).lower()
+    meta = _parse_meta_json(st[3])
+    meta_text = json.dumps(meta, separators=(",", ":"), sort_keys=True).lower() if meta else ""
+    protected_tokens = (
+        "operator",
+        "manual",
+        "emergency",
+        "startup",
+        "preflight",
+        "break_glass",
+        "break-glass",
+        "initial_hold",
+        "global_hold",
+    )
+    return any(token in actor or token in reason or token in meta_text for token in protected_tokens)
+
+
 def _read_state_hot(con, scope: str, key: str) -> Optional[Tuple[int, str, str, str, int, int]]:
     """Read persisted switch state from Redis on non-transactional hot paths."""
 
@@ -368,6 +695,31 @@ def _read_state_hot(con, scope: str, key: str) -> Optional[Tuple[int, str, str, 
             from engine.cache.wrappers.kill_switch import read_kill_switch
 
             snapshot_payload = read_kill_switch() or {}
+            for row in list(snapshot_payload.get("state") or []):
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    enabled = int(row.get("enabled") or 0) == 1
+                except Exception:
+                    enabled = False
+                if not enabled:
+                    continue
+                row_scope = _s(row.get("scope")).lower()
+                row_key = _s(row.get("key")).lower()
+                row_reason = _s(row.get("reason")).lower()
+                if row_scope == "global" and (
+                    row_key == "provider_unavailable"
+                    or row_reason == "kill_switch_provider_unavailable"
+                ):
+                    meta_json = json.dumps(dict(row.get("meta") or {}), separators=(",", ":"), sort_keys=True)
+                    return (
+                        1,
+                        _s(row.get("reason")) or "kill_switch_provider_unavailable",
+                        _s(row.get("actor")) or "engine.cache.wrappers.kill_switch",
+                        meta_json,
+                        int(row.get("created_ts_ms") or 0),
+                        int(row.get("updated_ts_ms") or _now_ms()),
+                    )
             for row in list(snapshot_payload.get("state") or []):
                 if not isinstance(row, dict):
                     continue
@@ -393,6 +745,108 @@ def _read_state_hot(con, scope: str, key: str) -> Optional[Tuple[int, str, str, 
                 key=str(key),
             )
     return _read_state(con, scope, key)
+
+
+def _snapshot_row_state(row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[int, str, str, str, int, int]]]:
+    if not isinstance(row, dict):
+        return None
+    if _s(row.get("scope")).lower() != "global":
+        return None
+    try:
+        enabled = 1 if int(row.get("enabled") or 0) else 0
+    except Exception:
+        enabled = 0
+    if enabled != 1:
+        return None
+    key = _s(row.get("key")) or "global"
+    meta_json = json.dumps(dict(row.get("meta") or {}), separators=(",", ":"), sort_keys=True)
+    return (
+        key,
+        (
+            1,
+            _s(row.get("reason")),
+            _s(row.get("actor")),
+            meta_json,
+            int(row.get("created_ts_ms") or 0),
+            int(row.get("updated_ts_ms") or 0),
+        ),
+    )
+
+
+def _active_global_state_hot(con) -> Optional[Tuple[str, Tuple[int, str, str, str, int, int]]]:
+    """Return the active global DB switch, preferring the manual/global row."""
+
+    if not bool(getattr(con, "in_transaction", False)):
+        try:
+            from engine.cache.wrappers.kill_switch import read_kill_switch
+
+            rows = []
+            for row in list((read_kill_switch() or {}).get("state") or []):
+                item = _snapshot_row_state(row)
+                if item is not None:
+                    rows.append(item)
+            rows.sort(key=lambda item: (0 if item[0] == "global" else 1, -int(item[1][5] or 0), item[0]))
+            for key, st in rows:
+                current = _maybe_auto_expire(con, "global", key, st)
+                if current and int(current[0] or 0) == 1:
+                    return key, current
+        except Exception as e:
+            _warn_nonfatal(
+                "KILL_SWITCH_ACTIVE_GLOBAL_CACHE_READ_FAILED",
+                e,
+                once_key="active_global_cache_read",
+            )
+
+    owns = False
+    db = con
+    if db is None:
+        try:
+            db = connect()
+            owns = True
+        except Exception as e:
+            _warn_nonfatal(
+                "KILL_SWITCH_ACTIVE_GLOBAL_CONNECT_FAILED",
+                e,
+                once_key="active_global_connect",
+            )
+            return None
+    try:
+        if not _schema_ready_for_reads(db):
+            return None
+        rows = db.execute(
+            """
+            SELECT key, enabled, reason, actor, meta_json, created_ts_ms, updated_ts_ms
+            FROM kill_switch_state
+            WHERE scope='global' AND enabled=1
+            ORDER BY CASE WHEN key='global' THEN 0 ELSE 1 END, updated_ts_ms DESC, key
+            """
+        ).fetchall()
+        for row in rows or []:
+            key = _s(row[0]) or "global"
+            st = (
+                1 if int(row[1] or 0) else 0,
+                _s(row[2]),
+                _s(row[3]),
+                _s(row[4]),
+                int(row[5] or 0),
+                int(row[6] or 0),
+            )
+            current = _maybe_auto_expire(db, "global", key, st)
+            if current and int(current[0] or 0) == 1:
+                return key, current
+    except Exception as e:
+        _warn_nonfatal(
+            "KILL_SWITCH_ACTIVE_GLOBAL_DB_READ_FAILED",
+            e,
+            once_key="active_global_db_read",
+        )
+    finally:
+        if owns and db is not None:
+            try:
+                db.close()
+            except Exception as e:
+                _warn_nonfatal("KILL_SWITCH_ACTIVE_GLOBAL_CLOSE_FAILED", e, once_key="active_global_close")
+    return None
 
 
 def _ensure_schema(con) -> None:
@@ -721,7 +1175,19 @@ def activate(scope: str, key: str, reason: str, actor: str = "system", meta: Opt
     con : storage connection, optional
         Existing write connection to reuse.
     """
+    scope_n = _norm_scope(scope)
+    key_n = _norm_key(scope_n, key)
     set_kill_switch(scope, key, 1, reason=reason, actor=actor, meta=meta, action=action, con=con)
+
+    def _clear_after_commit() -> None:
+        _clear_activation_failure_marker(scope_n, key_n)
+
+    if con is not None and bool(getattr(con, "in_transaction", False)):
+        register = getattr(con, "register_after_commit", None)
+        if callable(register):
+            register(_clear_after_commit)
+        return
+    _clear_after_commit()
 
 def clear(scope: str, key: str, reason: Optional[str] = None, actor: str = "system", meta: Optional[Dict[str, Any]] = None, con=None) -> None:
     """Clear a persisted kill switch using the standard audited workflow.
@@ -742,6 +1208,145 @@ def clear(scope: str, key: str, reason: Optional[str] = None, actor: str = "syst
         Existing write connection to reuse.
     """
     set_kill_switch(scope, key, 0, reason=reason, actor=actor, meta=meta, action="CLEAR", con=con)
+
+
+def activate_owned(
+    scope: str,
+    key: str,
+    reason: str,
+    *,
+    owner_actor: str,
+    trigger: str,
+    meta: Optional[Dict[str, Any]] = None,
+    action: str = "AUTO",
+    con=None,
+) -> bool:
+    """Activate a switch without overwriting an active row owned by another actor."""
+
+    scope_n = _norm_scope(scope)
+    key_n = _norm_key(scope_n, key)
+    owns = False
+    db = con
+    if db is None:
+        db = connect()
+        owns = True
+    try:
+        if not bool(getattr(db, "in_transaction", False)):
+            _ensure_schema(db)
+        st = _read_state(db, scope_n, key_n)
+        if st and int(st[0] or 0) == 1 and not _state_owned_by(st, actor=owner_actor, trigger=trigger):
+            return False
+        payload = dict(meta or {})
+        payload["actor"] = _s(owner_actor) or "system"
+        payload["trigger"] = _s(trigger)
+        activate(scope_n, key_n, reason=reason, actor=owner_actor, meta=payload, action=action, con=db)
+        return True
+    finally:
+        if owns:
+            db.close()
+
+
+def clear_owned(
+    scope: str,
+    key: str,
+    *,
+    owner_actor: str,
+    trigger: str,
+    reason: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    con=None,
+) -> bool:
+    """Clear only when the active DB row is owned by the expected actor/trigger."""
+
+    scope_n = _norm_scope(scope)
+    key_n = _norm_key(scope_n, key)
+    owns = False
+    db = con
+    if db is None:
+        db = connect()
+        owns = True
+    try:
+        if not bool(getattr(db, "in_transaction", False)):
+            _ensure_schema(db)
+        st = _read_state(db, scope_n, key_n)
+        if not _state_owned_by(st, actor=owner_actor, trigger=trigger):
+            return False
+        payload = dict(meta or {})
+        payload["actor"] = _s(owner_actor) or "system"
+        payload["trigger"] = _s(trigger)
+        payload["cleared_owned_halt"] = True
+        clear(scope_n, key_n, reason=reason, actor=owner_actor, meta=payload, con=db)
+        return True
+    finally:
+        if owns:
+            db.close()
+
+
+def clear_manual_halt(
+    scope: str = "global",
+    key: str = "global",
+    *,
+    reason: str,
+    actor: str = "operator",
+    meta: Optional[Dict[str, Any]] = None,
+    con=None,
+) -> Dict[str, Any]:
+    """Explicit operator workflow for clearing non-rules kill-switch holds."""
+
+    scope_n = _norm_scope(scope)
+    key_n = _norm_key(scope_n, key)
+    actor_s = _s(actor) or "operator"
+    reason_s = _s(reason) or "operator_manual_halt_clear"
+
+    owns = False
+    db = con
+    if db is None:
+        db = connect()
+        owns = True
+    try:
+        if not bool(getattr(db, "in_transaction", False)):
+            _ensure_schema(db)
+        st = _read_state(db, scope_n, key_n)
+        if not st or int(st[0] or 0) != 1:
+            return {
+                "ok": False,
+                "error": "manual_halt_not_active",
+                "scope": scope_n,
+                "key": key_n,
+            }
+        previous_meta = _parse_meta_json(st[3])
+        if _state_owned_by(st, actor="rules_engine", trigger=_s(previous_meta.get("trigger"))):
+            return {
+                "ok": False,
+                "error": "manual_clear_refused_rules_owned_halt",
+                "scope": scope_n,
+                "key": key_n,
+                "active_actor": st[2],
+                "active_trigger": _s(previous_meta.get("trigger")),
+            }
+        payload = dict(meta or {})
+        payload.update(
+            {
+                "manual_clear": True,
+                "cleared_by": actor_s,
+                "previous_actor": st[2],
+                "previous_reason": st[1],
+                "previous_meta": previous_meta,
+            }
+        )
+        clear(scope_n, key_n, reason=reason_s, actor=actor_s, meta=payload, con=db)
+        return {
+            "ok": True,
+            "scope": scope_n,
+            "key": key_n,
+            "actor": actor_s,
+            "reason": reason_s,
+            "previous_actor": st[2],
+            "previous_reason": st[1],
+        }
+    finally:
+        if owns:
+            db.close()
 
 def _latest_ts_ms(con, table: str, ts_col: str = "ts_ms") -> int:
     try:
@@ -804,26 +1409,78 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return fallback
 
 
-def _equity_series(con, lookback_ms: Optional[int] = None, limit: Optional[int] = None) -> List[Tuple[int, float]]:
+def _equity_window_status(
+    con,
+    *,
+    window: str,
+    now_ms: int,
+    min_points: int,
+    max_age_s: int,
+    lookback_ms: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    min_points_i = max(1, int(min_points))
+    max_age_i = max(0, int(max_age_s))
+    window_s = _s(window) or "equity"
+    base: Dict[str, Any] = {
+        "ok": False,
+        "window": window_s,
+        "source": "equity_history",
+        "table_present": None,
+        "query_available": False,
+        "points": 0,
+        "min_points": int(min_points_i),
+        "invalid_points": 0,
+        "latest_ts_ms": None,
+        "latest_age_s": None,
+        "max_equity_age_s": int(max_age_i),
+        "lookback_ms": (int(lookback_ms) if lookback_ms is not None else None),
+        "limit": (int(limit) if limit is not None else None),
+        "series": [],
+    }
+
     try:
         if not _table_exists(con, "equity_history"):
-            return []
+            base.update(
+                {
+                    "table_present": False,
+                    "reason_code": "KILL_SWITCH_EQUITY_HISTORY_MISSING",
+                    "reason": "equity_history table missing",
+                }
+            )
+            return base
     except Exception as e:
         _warn_nonfatal(
             "KILL_SWITCH_EQUITY_SERIES_TABLE_CHECK_FAILED",
             e,
             once_key="equity_series_table_check",
         )
-        return []
+        base.update(
+            {
+                "table_present": None,
+                "reason_code": "KILL_SWITCH_EQUITY_TABLE_CHECK_ERROR",
+                "reason": "equity_history table check failed",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+        )
+        return base
 
-    q = "SELECT ts_ms, equity FROM equity_history"
     args: List[Any] = []
+    where = ""
     if lookback_ms is not None and int(lookback_ms) > 0:
-        q += " WHERE ts_ms >= ?"
-        args.append(int(_now_ms() - int(lookback_ms)))
-    q += " ORDER BY ts_ms ASC"
+        where = " WHERE ts_ms >= ?"
+        args.append(int(now_ms) - int(lookback_ms))
+
+    q = f"SELECT ts_ms, equity FROM equity_history{where} ORDER BY ts_ms ASC"
     if limit is not None and int(limit) > 0:
-        q += f" LIMIT {int(limit)}"
+        q = (
+            "SELECT ts_ms, equity FROM ("
+            f"SELECT ts_ms, equity FROM equity_history{where} ORDER BY ts_ms DESC LIMIT ?"
+            ") AS recent_equity ORDER BY ts_ms ASC"
+        )
+        args.append(int(limit))
+
     try:
         rows = con.execute(q, tuple(args)).fetchall()
     except Exception as e:
@@ -832,19 +1489,199 @@ def _equity_series(con, lookback_ms: Optional[int] = None, limit: Optional[int] 
             e,
             once_key="equity_series_query",
         )
-        return []
+        base.update(
+            {
+                "table_present": True,
+                "reason_code": "KILL_SWITCH_EQUITY_QUERY_ERROR",
+                "reason": "equity_history query failed",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+        )
+        return base
+
     out: List[Tuple[int, float]] = []
+    invalid_points = 0
     for ts_ms, equity in rows or []:
         try:
-            out.append((int(ts_ms or 0), float(equity or 0.0)))
+            ts_i = int(ts_ms or 0)
+            eq_f = float(equity)
+            if ts_i <= 0 or not math.isfinite(eq_f) or eq_f <= 0.0:
+                invalid_points += 1
+                continue
+            out.append((ts_i, eq_f))
         except Exception as e:
+            invalid_points += 1
             _warn_nonfatal(
                 "KILL_SWITCH_EQUITY_SERIES_ROW_FAILED",
                 e,
                 once_key="equity_series_row_failed",
             )
             continue
+
+    base.update(
+        {
+            "table_present": True,
+            "query_available": True,
+            "points": int(len(out)),
+            "invalid_points": int(invalid_points),
+            "series": out,
+        }
+    )
+
+    if not out:
+        base.update(
+            {
+                "reason_code": "KILL_SWITCH_EQUITY_WINDOW_EMPTY",
+                "reason": f"equity_history window empty: {window_s}",
+            }
+        )
+        return base
+
+    latest_ts_ms = int(out[-1][0])
+    latest_age_s = max(0.0, (float(now_ms) - float(latest_ts_ms)) / 1000.0)
+    base.update({"latest_ts_ms": latest_ts_ms, "latest_age_s": latest_age_s})
+
+    if max_age_i > 0 and latest_age_s > float(max_age_i):
+        base.update(
+            {
+                "reason_code": "KILL_SWITCH_EQUITY_LATEST_STALE",
+                "reason": f"latest equity too stale: age_s={latest_age_s:.1f} max_age_s={max_age_i}",
+            }
+        )
+        return base
+
+    if len(out) < min_points_i:
+        base.update(
+            {
+                "reason_code": "KILL_SWITCH_EQUITY_WINDOW_INSUFFICIENT_POINTS",
+                "reason": f"equity_history insufficient points: {window_s} points={len(out)} min={min_points_i}",
+            }
+        )
+        return base
+
+    base.update({"ok": True, "reason_code": "KILL_SWITCH_EQUITY_WINDOW_OK", "reason": "ok"})
+    return base
+
+
+def _public_equity_window_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(status or {})
+    out.pop("series", None)
     return out
+
+
+def _equity_series(con, lookback_ms: Optional[int] = None, limit: Optional[int] = None) -> List[Tuple[int, float]]:
+    status = _equity_window_status(
+        con,
+        window="ad_hoc",
+        now_ms=_now_ms(),
+        min_points=1,
+        max_age_s=0,
+        lookback_ms=lookback_ms,
+        limit=limit,
+    )
+    out = list(status.get("series") or [])
+    return out
+
+
+def capital_equity_freshness_snapshot(
+    con=None,
+    *,
+    live_mode: Optional[bool] = None,
+    include_series: bool = False,
+) -> Dict[str, Any]:
+    owns = False
+    db = con
+    if db is None:
+        db = connect()
+        owns = True
+
+    try:
+        now_ms = _now_ms()
+        live_required = bool(_env_live_mode_requested() or _db_live_mode_requested(db)) if live_mode is None else bool(live_mode)
+        max_age_s = max(1, int(KILL_SWITCH_MAX_EQUITY_AGE_S))
+        rolling_lookback_ms = max(0, int(KILL_SWITCH_ROLLING_DRAWDOWN_LOOKBACK_DAYS)) * 86_400_000
+        var_min_points = max(
+            2,
+            int(KILL_SWITCH_VAR_EQUITY_MIN_POINTS),
+            int(KILL_SWITCH_VAR_MIN_HISTORY) + 1,
+        )
+
+        latest = _equity_window_status(
+            db,
+            window="latest",
+            now_ms=now_ms,
+            min_points=1,
+            max_age_s=max_age_s,
+            limit=1,
+        )
+        daily = _equity_window_status(
+            db,
+            window="daily",
+            now_ms=now_ms,
+            min_points=max(2, int(KILL_SWITCH_DAILY_EQUITY_MIN_POINTS)),
+            max_age_s=max_age_s,
+            lookback_ms=86_400_000,
+        )
+        rolling = _equity_window_status(
+            db,
+            window="rolling",
+            now_ms=now_ms,
+            min_points=max(2, int(KILL_SWITCH_ROLLING_EQUITY_MIN_POINTS)),
+            max_age_s=max_age_s,
+            lookback_ms=rolling_lookback_ms,
+        )
+        var = _equity_window_status(
+            db,
+            window="var",
+            now_ms=now_ms,
+            min_points=var_min_points,
+            max_age_s=max_age_s,
+            limit=max(1, int(KILL_SWITCH_VAR_LOOKBACK_POINTS)),
+        )
+
+        windows = {"latest": latest, "daily": daily, "rolling": rolling, "var": var}
+        blockers = [
+            f"{name}:{status.get('reason_code')}"
+            for name, status in windows.items()
+            if not bool(status.get("ok"))
+        ]
+        out: Dict[str, Any] = {
+            "ok": not blockers,
+            "required": bool(live_required),
+            "ts_ms": int(now_ms),
+            "source": "equity_history",
+            "max_equity_age_s": int(max_age_s),
+            "windows": {
+                name: (dict(status) if include_series else _public_equity_window_status(status))
+                for name, status in windows.items()
+            },
+            "blockers": blockers,
+            "reason_code": (str(windows[blockers[0].split(':', 1)[0]].get("reason_code")) if blockers else "KILL_SWITCH_EQUITY_FRESHNESS_OK"),
+        }
+        out["reason"] = "ok" if out["ok"] else "; ".join(blockers)
+        return out
+    finally:
+        if owns and db is not None:
+            db.close()
+
+
+def _capital_equity_availability_breach(con, *, now_ms: int, live_mode_requested: bool) -> Optional[Dict[str, Any]]:
+    if not live_mode_requested:
+        return None
+    snapshot = capital_equity_freshness_snapshot(con, live_mode=True, include_series=False)
+    if bool(snapshot.get("ok")):
+        return None
+    reason_code = str(snapshot.get("reason_code") or "KILL_SWITCH_EQUITY_FRESHNESS_UNAVAILABLE")
+    return {
+        "reason": f"capital_equity_unavailable reason={reason_code}",
+        "meta": {
+            "trigger": "equity_availability",
+            "reason_code": reason_code,
+            "equity_freshness": snapshot,
+            "ts_ms": int(now_ms),
+        },
+    }
 
 
 def _drawdown_pct(series: List[Tuple[int, float]]) -> float:
@@ -1192,6 +2029,14 @@ def _capital_risk_trigger(con) -> Optional[Dict[str, Any]]:
             },
         }
 
+    equity_availability = _capital_equity_availability_breach(
+        con,
+        now_ms=int(now_ms),
+        live_mode_requested=live_mode_requested,
+    )
+    if equity_availability is not None:
+        return equity_availability
+
     day_series = _equity_series(con, lookback_ms=86400000)
     if len(day_series) >= 2:
         day_dd = _drawdown_pct(day_series)
@@ -1376,6 +2221,15 @@ def execution_allowed(
     reg = _s(regime)
     mid = _norm_model_id(model_id) if model_id is not None else ""
 
+    activation_failure = activation_failure_snapshot()
+    if bool(activation_failure.get("active")):
+        return False, "kill_switch_activation_failed", {
+            "scope": _s(activation_failure.get("scope")) or "global",
+            "key": _s(activation_failure.get("key")) or "global",
+            "reason": _s(activation_failure.get("reason")) or "kill_switch_activation_write_failed",
+            "activation_failure": dict(activation_failure),
+        }
+
     # ------------------------------------------------------------------
     # Runtime lifecycle guard (STRICT runtime state enforcement)
     # Execution only allowed in LIVE state
@@ -1396,12 +2250,12 @@ def execution_allowed(
 
         if lifecycle_state == "KILL_SWITCH":
             try:
-                st = _read_state_hot(con, "global", "global")
-                st = _maybe_auto_expire(con, "global", "global", st)
-                if st and int(st[0]) == 1:
+                active_global = _active_global_state_hot(con)
+                if active_global is not None:
+                    active_key, st = active_global
                     return False, "kill_switch_db_global", {
                         "scope": "global",
-                        "key": "global",
+                        "key": active_key,
                         "reason": st[1],
                         "actor": st[2],
                     }
@@ -1460,7 +2314,26 @@ def execution_allowed(
         try:
             from engine.strategy.capital_guard import trading_allowed as _capital_trading_allowed
             if not _capital_trading_allowed(con=con):
-                return False, "capital_guard_block", {"scope": "global", "key": "global"}
+                meta = {"scope": "global", "key": "global"}
+                try:
+                    from engine.runtime.risk_state import get_state as _risk_get_state
+
+                    raw_diag = _s(_risk_get_state("capital_drawdown_diagnostic_json", ""))
+                    if raw_diag:
+                        drawdown_state = json.loads(raw_diag)
+                        if isinstance(drawdown_state, dict):
+                            meta["drawdown_state"] = drawdown_state
+                            meta["reason_code"] = _s(drawdown_state.get("reason_code"))
+                    stop_reason = _s(_risk_get_state("stop_reason", ""))
+                    if stop_reason:
+                        meta["stop_reason"] = stop_reason
+                except Exception as e:
+                    _warn_nonfatal(
+                        "KILL_SWITCH_CAPITAL_GUARD_DIAGNOSTIC_READ_FAILED",
+                        e,
+                        once_key="capital_guard_diagnostic_read",
+                    )
+                return False, "capital_guard_block", meta
         except Exception as e:
             _warn_nonfatal(
                 "KILL_SWITCH_CAPITAL_GUARD_CHECK_FAILED",
@@ -1543,6 +2416,7 @@ def execution_allowed(
                 )
             except Exception as e:
                 _warn_nonfatal("KILL_SWITCH_PERSIST_CAPITAL_RISK_EVENT_FAILED", e, once_key="persist_capital_risk_event")
+            activation_failure = None
             try:
                 activate(
                     "global",
@@ -1554,7 +2428,24 @@ def execution_allowed(
                     con=con,
                 )
             except Exception as e:
-                _warn_nonfatal("KILL_SWITCH_ACTIVATE_CAPITAL_BREACH_FAILED", e, once_key="activate_capital_breach")
+                activation_failure = _record_activation_failure(
+                    scope="global",
+                    key="global",
+                    reason=reason,
+                    actor="risk_engine",
+                    meta=meta,
+                    action="AUTO",
+                    trigger_kind="capital",
+                    error=e,
+                )
+            if activation_failure is not None:
+                return False, "capital_kill_switch_activation_failed", {
+                    "scope": "global",
+                    "key": "global",
+                    "reason": reason,
+                    "meta": meta,
+                    "activation_failure": activation_failure,
+                }
             return False, "capital_aware_kill_switch", {"scope": "global", "key": "global", "reason": reason, "meta": meta}
 
         model_breach = _model_risk_trigger(con, mid) if mid else None
@@ -1567,6 +2458,7 @@ def execution_allowed(
                 meta.setdefault("cooldown_minutes", float(KILL_SWITCH_COOLDOWN_MINUTES))
                 meta.setdefault("until_ts_ms", int(now_ms + cooldown_ms))
             meta.setdefault("trigger_type", _s(meta.get("trigger") or "model_risk"))
+            activation_failure = None
             try:
                 activate(
                     "model",
@@ -1578,19 +2470,38 @@ def execution_allowed(
                     con=con,
                 )
             except Exception as e:
-                _warn_nonfatal(
-                    "KILL_SWITCH_ACTIVATE_MODEL_BREACH_FAILED",
-                    e,
-                    once_key=f"activate_model_breach:{mid}",
-                    model_id=str(mid),
+                activation_failure = _record_activation_failure(
+                    scope="model",
+                    key=mid,
+                    reason=reason,
+                    actor="risk_engine",
+                    meta=meta,
+                    action="AUTO",
+                    trigger_kind="model",
+                    error=e,
                 )
+            if activation_failure is not None:
+                return False, "model_kill_switch_activation_failed", {
+                    "scope": "model",
+                    "key": mid,
+                    "reason": reason,
+                    "meta": meta,
+                    "activation_failure": activation_failure,
+                }
             return False, "model_aware_kill_switch", {"scope": "model", "key": mid, "reason": reason, "meta": meta}
 
         # DB switches
-        st = _read_state_hot(con, "global", "global")
-        st = _maybe_auto_expire(con, "global", "global", st)
-        if st and int(st[0]) == 1:
-            return False, "kill_switch_db_global", {"scope": "global", "key": "global", "reason": st[1], "actor": st[2]}
+        active_global = _active_global_state_hot(con)
+        if active_global is not None:
+            active_key, st = active_global
+            if _s(st[1]) == "kill_switch_provider_unavailable":
+                return False, "kill_switch_provider_unavailable", {
+                    "scope": "global",
+                    "key": active_key or "provider_unavailable",
+                    "reason": st[1],
+                    "actor": st[2],
+                }
+            return False, "kill_switch_db_global", {"scope": "global", "key": active_key, "reason": st[1], "actor": st[2]}
 
         if mid:
             st = _read_state_hot(con, "model", mid)
@@ -1636,11 +2547,18 @@ def snapshot(con=None) -> Dict[str, Any]:
     This snapshot only reflects database-backed switch rows. Environment-only
     overrides and implicit freshness gates are not materialized here.
     """
+    def _with_activation_failure(payload: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(payload or {"state": []})
+        failure = activation_failure_snapshot()
+        if bool(failure.get("active")):
+            out["activation_failure"] = dict(failure)
+        return out
+
     if con is None:
         try:
             from engine.cache.wrappers.kill_switch import read_kill_switch
 
-            return read_kill_switch()
+            return _with_activation_failure(read_kill_switch())
         except Exception as e:
             _warn_nonfatal(
                 "KILL_SWITCH_REDIS_CACHE_SNAPSHOT_FAILED",
@@ -1675,7 +2593,7 @@ def snapshot(con=None) -> Dict[str, Any]:
                     "updated_ts_ms": int(r[7] or 0),
                 }
             )
-        return {"state": out}
+        return _with_activation_failure({"state": out})
     finally:
         if owns:
             con.close()

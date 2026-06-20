@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.startup_write_gate import (
     noncritical_startup_write_wait_s,
     should_defer_noncritical_startup_write,
@@ -29,27 +30,13 @@ _METRICS_DB_READY = False
 _METRICS_DB_READY_PATH = ""
 LOG = logging.getLogger("engine.runtime.metrics_store")
 _WARNED_NONFATAL_KEYS: set[str] = set()
-_RUNTIME_METRICS_BUFFER_ENABLED = str(os.environ.get("RUNTIME_METRICS_BUFFER_ENABLED", "1")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_RUNTIME_METRICS_FLUSH_INTERVAL_S = max(
-    0.05,
-    float(os.environ.get("RUNTIME_METRICS_FLUSH_INTERVAL_S", "3.0") or 3.0),
-)
-_RUNTIME_METRICS_FLUSH_JITTER_RATIO = min(
-    1.0,
-    max(0.0, float(os.environ.get("RUNTIME_METRICS_FLUSH_JITTER_RATIO", "0.5") or 0.5)),
-)
-_RUNTIME_METRICS_BUFFER_MAX_BATCH = max(
-    1,
-    int(os.environ.get("RUNTIME_METRICS_BUFFER_MAX_BATCH", "256") or 256),
-)
+_RUNTIME_METRICS_BUFFER_ENABLED = env_bool("RUNTIME_METRICS_BUFFER_ENABLED", default=True)
+_RUNTIME_METRICS_FLUSH_INTERVAL_S = tuned_float("RUNTIME_METRICS_FLUSH_INTERVAL_S", 3.0, 0.05, 30.0)
+_RUNTIME_METRICS_FLUSH_JITTER_RATIO = tuned_float("RUNTIME_METRICS_FLUSH_JITTER_RATIO", 0.5, 0.0, 1.0)
+_RUNTIME_METRICS_BUFFER_MAX_BATCH = tuned_int("RUNTIME_METRICS_BUFFER_MAX_BATCH", 256, 1, 4096)
 _RUNTIME_METRICS_BUFFER_MAX_ROWS = max(
     _RUNTIME_METRICS_BUFFER_MAX_BATCH,
-    int(os.environ.get("RUNTIME_METRICS_BUFFER_MAX_ROWS", "4096") or 4096),
+    tuned_int("RUNTIME_METRICS_BUFFER_MAX_ROWS", 4096, 1, 65536),
 )
 MetricRow = tuple[int, str, float | None, str | None, str]
 

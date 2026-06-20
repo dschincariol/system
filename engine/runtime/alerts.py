@@ -246,6 +246,8 @@ def _resolve_prediction_id_for_alert(
     horizon_i = int(horizon_s or 0)
     if event_id_i <= 0 or not symbol_u or horizon_i <= 0:
         return None
+    model_id_s = str(model_id or "").strip()
+    model_name_s = str(model_name or "").strip()
     try:
         rows = con.execute(
             """
@@ -263,15 +265,12 @@ def _resolve_prediction_id_for_alert(
             event_id=int(event_id_i),
             symbol=str(symbol_u),
             horizon_s=int(horizon_i),
-            model_id=str(model_id_s if 'model_id_s' in locals() else model_id or ""),
-            model_name=str(model_name or ""),
+            model_id=str(model_id_s),
+            model_name=str(model_name_s),
         )
         rows = []
     if not rows:
         return None
-
-    model_id_s = str(model_id or "").strip()
-    model_name_s = str(model_name or "").strip()
 
     def _rank(row: Any) -> tuple[int, int, int]:
         row_model_name = str(row[1] or "").strip()

@@ -17,7 +17,7 @@ from engine.runtime import dbapi_compat as dbapi
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.startup_write_gate import should_defer_noncritical_startup_write
-from engine.runtime.storage import connect_ro, run_write_txn
+from engine.runtime.storage import connect_ro, init_db, run_write_txn
 from engine.runtime.metrics import emit_counter, emit_gauge
 from engine.runtime.tracing import trace_event
 

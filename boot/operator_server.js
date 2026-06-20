@@ -20,7 +20,8 @@ const os = require("os");
 
 function logAgentAction(entry) {
   try {
-    const p = path.join(__dirname, "../logs/agent_actions.jsonl");
+    const p = path.join(__dirname, "../var/log/agent_actions.jsonl");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.appendFileSync(p, JSON.stringify(entry) + "\n");
   } catch {}
 }
@@ -30,6 +31,7 @@ const http = require("http");
 const https = require("https");
 const net = require("net");
 const { spawn, spawnSync } = require("child_process");
+const { URL: NodeURL } = require("url");
 
 const app = express();
 const WebSocket = require("ws");
@@ -313,7 +315,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With"
+    "Content-Type, Authorization, X-Requested-With, X-Operator-Token, X-API-Token, X-Request-ID, X-Correlation-ID"
   );
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
@@ -335,6 +337,21 @@ app.use((err, _req, res, next) => {
 
 app.get("/api/operator/ping", (_req, res) => {
   return jsonOk(res, { ts: Date.now() });
+});
+
+app.use(["/api/operator", "/api/operator_summary", "/api/execution/barrier"], (req, res, next) => {
+  if (!operatorRouteRequiresAuth(req)) {
+    return next();
+  }
+  if (operatorMutationAuthorized(req)) {
+    return next();
+  }
+  return res.status(403).json({
+    ok: false,
+    error: "operator_forbidden",
+    auth_required: true,
+    meta: { status: 403 }
+  });
 });
 
 // system summary
@@ -441,11 +458,12 @@ app.get("/api/operator/stderr_tail", wrapOperatorRoute(async (req, res) => {
       }
     }
 
-    const lines = String(tail || "").split(/\r?\n/).filter(Boolean);
+    const redactedTail = redactOperatorSensitiveText(String(tail || ""));
+    const lines = redactedTail.split(/\r?\n/).filter(Boolean);
 
     return jsonOk(res, {
       ok:true,
-      tail: String(tail || ""),
+      tail: redactedTail,
       lines,
       currentAttemptOnly: true,
       attemptId: state.currentAttemptId || null,
@@ -475,18 +493,27 @@ app.get("/api/operator/proxy/health",
 );
 
 const ROOT = path.join(__dirname, "..");
+const VAR_DIR = path.join(ROOT, "var");
+const DEFAULT_LOCAL_DB_PATH = "./var/db/trading.db";
 
 // Python dashboard entrypoint (this repo ships start_system.py)
 const ENTRY = path.join(ROOT, "start_system.py");
 
 // Files
-const ENV_PATH = path.join(ROOT, ".env");
-const LOG_DIR = path.join(ROOT, "logs");
+const ENV_PATH = String(process.env.OPERATOR_ENV_PATH || "").trim()
+  ? path.resolve(String(process.env.OPERATOR_ENV_PATH || "").trim())
+  : path.join(ROOT, ".env");
+const LOG_DIR = String(process.env.TRADING_LOGS || process.env.LOG_DIR || "").trim()
+  ? path.resolve(String(process.env.TRADING_LOGS || process.env.LOG_DIR || "").trim())
+  : path.join(VAR_DIR, "log");
 const RUNTIME_LOG = path.join(LOG_DIR, "runtime.log");
-const ENGINE_STDERR_LOG = path.join(__dirname, "engine_stderr.log");
-const OPERATOR_DATA_DIR = path.join(ROOT, "data", "operator");
+const ENGINE_STDERR_LOG = path.join(LOG_DIR, "engine_stderr.log");
+const OPERATOR_DATA_DIR = String(process.env.OPERATOR_DATA_DIR || "").trim()
+  ? path.resolve(String(process.env.OPERATOR_DATA_DIR || "").trim())
+  : path.join(VAR_DIR, "tmp", "operator");
 const SECRETS_PATH = path.join(OPERATOR_DATA_DIR, "operator.secrets.json");
 const STATE_PATH = path.join(OPERATOR_DATA_DIR, "operator.state.json");
+const OPERATOR_CONFIRMATION_AUDIT_PATH = path.join(OPERATOR_DATA_DIR, "operator_confirmation_audit.jsonl");
 
 // Linux appliance deploy helpers
 const DEPLOY_DIR = path.join(ROOT, "deploy");
@@ -550,8 +577,14 @@ function normalizeAiPatchFile(file) {
 
   if (
     rel.startsWith("data/operator/patches/") ||
+    rel.startsWith("var/tmp/operator/patches/") ||
     rel === ".env" ||
-    rel.startsWith("logs/")
+    rel.startsWith("logs/") ||
+    rel.startsWith("var/log/") ||
+    rel.startsWith("var/db/") ||
+    rel.startsWith("var/artifacts/") ||
+    rel.startsWith("var/audit/") ||
+    rel.startsWith("var/tmp/")
   ) {
     throw new Error(`patch_target_forbidden:${rel}`);
   }
@@ -675,40 +708,490 @@ function isLoopbackRequest(req) {
   );
 }
 
-function operatorMutationAuthorized(req) {
-  if (isLoopbackRequest(req)) return true;
+function timingSafeTokenEquals(supplied, expected) {
+  const a = Buffer.from(String(supplied || ""), "utf8");
+  const b = Buffer.from(String(expected || ""), "utf8");
+  if (a.length === 0 || b.length === 0 || a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
 
-  const env = readEnv();
-  const token = String(
+function operatorApiTokenFromConfig() {
+  let env = {};
+  try {
+    env = readEnv();
+  } catch {}
+  return String(
     process.env.OPERATOR_API_TOKEN ||
     env.OPERATOR_API_TOKEN ||
     ""
   ).trim();
+}
+
+function dashboardApiTokenFromConfig() {
+  let env = {};
+  try {
+    env = readEnv();
+  } catch {}
+  return String(
+    process.env.DASHBOARD_API_TOKEN ||
+    env.DASHBOARD_API_TOKEN ||
+    ""
+  ).trim();
+}
+
+function normalizeUrlHostForCompare(host) {
+  return String(host || "").trim().replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+}
+
+function isLoopbackHost(host) {
+  const h = normalizeUrlHostForCompare(host);
+  return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "::ffff:127.0.0.1";
+}
+
+function isOperatorSidecarUrl(urlText) {
+  try {
+    const parsed = new URL(String(urlText || ""));
+    const parsedPort = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+    if (parsedPort !== Number(OPERATOR_PORT)) return false;
+    const host = normalizeUrlHostForCompare(parsed.hostname);
+    const bindHost = normalizeUrlHostForCompare(OPERATOR_BIND_HOST);
+    if (host && host === bindHost) return true;
+    if ((bindHost === "0.0.0.0" || bindHost === "::") && (isLoopbackHost(host) || host === "0.0.0.0")) return true;
+    return isLoopbackHost(host) && isLoopbackHost(bindHost);
+  } catch {
+    return false;
+  }
+}
+
+function trustedControlPlaneAuthHeaders(method, urlText) {
+  const upper = String(method || "GET").toUpperCase();
+  const headers = {};
+  if (isOperatorSidecarUrl(urlText)) {
+    const operatorToken = operatorApiTokenFromConfig();
+    if (operatorToken) headers["X-Operator-Token"] = operatorToken;
+    return headers;
+  }
+  if (upper === "GET" || upper === "HEAD" || upper === "OPTIONS") return {};
+  try {
+    const parsed = new URL(String(urlText || ""));
+    if (String(parsed.pathname || "").startsWith("/api/")) {
+      const dashboardToken = dashboardApiTokenFromConfig();
+      if (dashboardToken) headers["X-API-Token"] = dashboardToken;
+    }
+  } catch {}
+  return headers;
+}
+
+const OPERATOR_CONFIRMATION_REGISTRY = Object.freeze({
+  "operator.start": {
+    requiredToken: "START_OPERATOR",
+    severity: "high",
+    consequence: "Starts operator-controlled runtime processes and may start data or pipeline jobs.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.live_start": {
+    requiredToken: "TRADE",
+    severity: "emergency",
+    consequence: "Starts the runtime in TRADING mode, enabling live execution only if backend gates also allow it.",
+    requireReason: true,
+    minReasonLength: 10,
+    holdMs: 3000,
+  },
+  "operator.guided_bootstrap": {
+    requiredToken: "GUIDED_BOOTSTRAP",
+    severity: "high",
+    consequence: "Runs the guided startup workflow, including engine start, health wait, and bootstrap pipeline work.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.guided_bootstrap_live": {
+    requiredToken: "TRADE",
+    severity: "emergency",
+    consequence: "Runs guided startup in TRADING mode. Backend live execution gates remain authoritative.",
+    requireReason: true,
+    minReasonLength: 10,
+    holdMs: 3000,
+  },
+  "operator.stop": {
+    requiredToken: "STOP_OPERATOR",
+    severity: "high",
+    consequence: "Stops operator-controlled runtime processes.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.restart": {
+    requiredToken: "RESTART_OPERATOR",
+    severity: "high",
+    consequence: "Restarts operator-controlled runtime processes.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.emergency_stop": {
+    requiredToken: "KILL",
+    severity: "emergency",
+    consequence: "Forces SAFE mode, disarms execution, trips the global kill switch, and stops the engine.",
+    requireReason: true,
+    minReasonLength: 10,
+    holdMs: 3000,
+  },
+  "operator.config_write": {
+    requiredToken: "SAVE_CONFIG",
+    severity: "high",
+    consequence: "Writes normalized environment configuration used by future runtime starts.",
+    requireReason: true,
+    minReasonLength: 8,
+  },
+  "operator.set_mode": {
+    requiredToken: "SET_MODE",
+    severity: "high",
+    consequence: "Changes operator and execution mode values in environment configuration.",
+    requireReason: true,
+    minReasonLength: 8,
+  },
+  "operator.training_control": {
+    requiredToken: "TRAINING_CONTROL",
+    severity: "high",
+    consequence: "Changes automatic training pipeline configuration.",
+    requireReason: true,
+    minReasonLength: 8,
+  },
+  "operator.secrets_write": {
+    requiredToken: "SAVE_SECRET",
+    severity: "high",
+    consequence: "Writes encrypted operator-side secret values. Secret values are not stored in audit records.",
+    requireReason: true,
+    minReasonLength: 8,
+  },
+  "operator.factory_reset": {
+    requiredToken: "FACTORY_RESET",
+    severity: "emergency",
+    consequence: "Deletes .env and operator secrets, clears operator state, and emergency-stops the runtime first.",
+    requireReason: true,
+    minReasonLength: 12,
+    holdMs: 5000,
+  },
+  "operator.self_repair": {
+    requiredToken: "SYSTEM_FIX",
+    severity: "high",
+    consequence: "Runs automatic system repair actions through the dashboard/runtime repair surface.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.repair_schema": {
+    requiredToken: "REPAIR_SCHEMA",
+    severity: "high",
+    consequence: "Runs schema repair through the dashboard/runtime repair surface.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.restart_feeds": {
+    requiredToken: "RESTART_FEEDS",
+    severity: "high",
+    consequence: "Stops and starts market-data jobs and then requests a pipeline refresh.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.backup": {
+    requiredToken: "RUN_BACKUP",
+    severity: "high",
+    consequence: "Starts the appliance backup workflow.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.system_update": {
+    requiredToken: "SYSTEM_UPDATE",
+    severity: "high",
+    consequence: "Starts the appliance system update workflow.",
+    requireReason: true,
+    minReasonLength: 8,
+  },
+  "operator.restart_operator": {
+    requiredToken: "RESTART_OPERATOR_UI",
+    severity: "high",
+    consequence: "Restarts the operator UI service and may interrupt active operator sessions.",
+    requireReason: true,
+    minReasonLength: 6,
+  },
+  "operator.job_start": {
+    requiredToken: "JOB_ACTION",
+    severity: "high",
+    consequence: "Starts a runtime job through the dashboard job catalog.",
+    requireReason: true,
+    minReasonLength: 6,
+    requireTarget: true,
+  },
+  "operator.job_stop": {
+    requiredToken: "JOB_ACTION",
+    severity: "high",
+    consequence: "Stops a runtime job through the dashboard job catalog.",
+    requireReason: true,
+    minReasonLength: 6,
+    requireTarget: true,
+  },
+  "operator.promote_model": {
+    requiredToken: "PROMOTION",
+    severity: "high",
+    consequence: "Requests model promotion through the dashboard governance endpoint.",
+    requireReason: true,
+    minReasonLength: 10,
+  },
+  "operator.ai_apply_patch": {
+    requiredToken: "APPLY_PATCH",
+    severity: "high",
+    consequence: "Applies a guarded operator-AI patch to a repository file. Live mode remains blocked.",
+    requireReason: true,
+    minReasonLength: 10,
+    requireTarget: true,
+  },
+  "operator.ai_rollback_patch": {
+    requiredToken: "ROLLBACK_PATCH",
+    severity: "high",
+    consequence: "Restores a previously backed-up operator-AI patch target.",
+    requireReason: true,
+    minReasonLength: 10,
+    requireTarget: true,
+  },
+});
+
+function truthyConfirmationValue(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  return ["1", "true", "yes", "on", "ack", "confirmed"].includes(
+    String(value || "").trim().toLowerCase()
+  );
+}
+
+function operatorConfirmationHash(spec) {
+  const text = String((spec && spec.consequence) || "");
+  if (!text) return "";
+  return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+function operatorRequestId(req, body = {}) {
+  const fromBody = String(body.request_id || body.requestId || "").trim();
+  if (fromBody) return fromBody;
+  return String(
+    req.headers?.["x-request-id"] ||
+    req.headers?.["x-correlation-id"] ||
+    `operator-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  ).trim();
+}
+
+function operatorConfirmationTarget(req, spec, body = {}, fallbackTarget = "") {
+  const explicit = String(body.target || body.target_id || body.targetId || "").trim();
+  if (explicit) return explicit;
+  const fallback = String(fallbackTarget || spec?.target || "").trim();
+  if (fallback) return fallback;
+  const name = String(body.name || body.job || req.query?.name || "").trim();
+  if (name) return name;
+  const file = String(body.file || body.patchId || "").trim();
+  if (file) return file;
+  return "";
+}
+
+function appendOperatorConfirmationAudit(payload) {
+  try {
+    fs.mkdirSync(path.dirname(OPERATOR_CONFIRMATION_AUDIT_PATH), { recursive: true });
+    const sanitized = redactOperatorSecrets(payload);
+    fs.appendFileSync(OPERATOR_CONFIRMATION_AUDIT_PATH, JSON.stringify(sanitized) + "\n");
+  } catch {}
+}
+
+function operatorConfirmationAuditPayload(req, confirmation, outcome, statusCode = 0, extra = {}) {
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const spec = confirmation && confirmation.spec ? confirmation.spec : {};
+  return {
+    ts_ms: Date.now(),
+    request_id: String((confirmation && confirmation.request_id) || operatorRequestId(req, body)),
+    method: String(req.method || ""),
+    path: String(req.path || req.originalUrl || ""),
+    outcome: String(outcome || ""),
+    status: Number(statusCode || 0),
+    action_id: String((confirmation && confirmation.action_id) || spec.action_id || ""),
+    actor: String((confirmation && confirmation.actor) || ""),
+    source_surface: String((confirmation && confirmation.source_surface) || ""),
+    reason: String((confirmation && confirmation.reason) || ""),
+    target: String((confirmation && confirmation.target) || ""),
+    confirmation_method: String((confirmation && confirmation.confirmation_method) || ""),
+    confirmation_hold_ms: Number((confirmation && confirmation.confirmation_hold_ms) || 0),
+    consequence_hash: operatorConfirmationHash(spec),
+    client_ip: String(req.ip || req.socket?.remoteAddress || ""),
+    confirmed: outcome === "confirmation_accepted",
+    ...extra,
+  };
+}
+
+function requireOperatorConfirmation(req, res, actionId, overrides = {}) {
+  const baseSpec = OPERATOR_CONFIRMATION_REGISTRY[String(actionId || "")];
+  if (!baseSpec) {
+    throw new Error(`operator_confirmation_spec_missing:${actionId}`);
+  }
+  const spec = {
+    action_id: String(actionId || ""),
+    requireAck: true,
+    requireActor: true,
+    requireSource: true,
+    requireActionId: true,
+    holdMs: 0,
+    minReasonLength: 0,
+    requireTarget: false,
+    ...baseSpec,
+    ...overrides,
+  };
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const expected = String(spec.requiredToken || "").trim();
+  const actual = String(body.confirmation || body.confirm || body.confirmation_token || "").trim();
+  const suppliedActionId = String(body.action_id || body.actionId || "").trim();
+  const actor = String(body.actor || body.who || "").trim();
+  const sourceSurface = String(body.source_surface || body.source || "").trim();
+  const reason = String(body.reason || body.justification || body.note || "").trim();
+  const request_id = operatorRequestId(req, body);
+  const target = operatorConfirmationTarget(req, spec, body, overrides.target);
+  let holdMs = 0;
+  try {
+    holdMs = Math.max(0, Number(body.confirmation_hold_ms ?? body.hold_ms ?? 0));
+  } catch {
+    holdMs = 0;
+  }
+
+  const missing = [];
+  if (!expected || !timingSafeTokenEquals(actual, expected)) missing.push("confirmation");
+  if (spec.requireActionId && suppliedActionId !== spec.action_id) missing.push("action_id");
+  if (spec.requireAck && !truthyConfirmationValue(body.consequence_ack)) missing.push("consequence_ack");
+  if (spec.requireActor && !actor) missing.push("actor");
+  if (spec.requireSource && !sourceSurface) missing.push("source_surface");
+  if (spec.requireTarget && !target) missing.push("target");
+  if (spec.requireReason && reason.length < Number(spec.minReasonLength || 0)) missing.push("reason");
+  if (Number(spec.holdMs || 0) > 0 && holdMs < Number(spec.holdMs || 0)) missing.push("confirmation_hold_ms");
+
+  const confirmation = {
+    spec,
+    action_id: spec.action_id,
+    severity: String(spec.severity || ""),
+    actor,
+    source_surface: sourceSurface,
+    reason,
+    request_id,
+    target,
+    confirmation_method: String(body.confirmation_method || (holdMs > 0 ? "typed_phrase_hold" : "typed_phrase")),
+    confirmation_hold_ms: holdMs,
+  };
+
+  if (missing.length) {
+    appendOperatorConfirmationAudit(operatorConfirmationAuditPayload(req, confirmation, "confirmation_denied", 422, {
+      required_fields: missing,
+      required_token: expected,
+    }));
+    jsonFail(res, "confirmation_required", 422, {
+      required_confirm: expected,
+      required_token: expected,
+      required_fields: missing,
+      action_id: spec.action_id,
+      severity: String(spec.severity || ""),
+      consequence: String(spec.consequence || ""),
+      min_hold_ms: Number(spec.holdMs || 0),
+    });
+    return null;
+  }
+
+  req.operatorConfirmation = confirmation;
+  appendOperatorConfirmationAudit(operatorConfirmationAuditPayload(req, confirmation, "confirmation_accepted", 202));
+  return confirmation;
+}
+
+function operatorConfirmationBody(req, requiredToken, overrides = {}) {
+  const confirmation = req.operatorConfirmation || {};
+  const request_id = String(confirmation.request_id || `operator-${Date.now()}`);
+  return {
+    confirm: String(requiredToken || ""),
+    confirmation: String(requiredToken || ""),
+    confirmation_token: String(requiredToken || ""),
+    confirmation_method: String(confirmation.confirmation_method || "typed_phrase"),
+    confirmation_hold_ms: Number(overrides.holdMs ?? confirmation.confirmation_hold_ms ?? 0),
+    consequence_ack: true,
+    action_id: String(overrides.actionId || ""),
+    actor: String(confirmation.actor || "operator_server"),
+    source: String(overrides.source || confirmation.source_surface || "operator_sidecar"),
+    source_surface: String(overrides.source || confirmation.source_surface || "operator_sidecar"),
+    reason: String(overrides.reason || confirmation.reason || "operator sidecar confirmed downstream action"),
+    request_id,
+    target: String(overrides.target || confirmation.target || ""),
+  };
+}
+
+function stripConfirmationFields(body = {}) {
+  const out = {};
+  const confirmationKeys = new Set([
+    "confirm",
+    "confirmation",
+    "confirmation_token",
+    "confirmation_method",
+    "confirmation_hold_ms",
+    "hold_ms",
+    "consequence_ack",
+    "action_id",
+    "actionId",
+    "actor",
+    "who",
+    "source",
+    "source_surface",
+    "reason",
+    "justification",
+    "note",
+    "request_id",
+    "requestId",
+    "target",
+    "target_id",
+    "targetId",
+  ]);
+  for (const [key, value] of Object.entries(body || {})) {
+    if (!confirmationKeys.has(String(key))) out[key] = value;
+  }
+  return out;
+}
+
+function operatorRequestToken(req) {
+  const headerToken = String(req.headers?.["x-operator-token"] || "").trim();
+  if (headerToken) return headerToken;
+
+  const auth = String(req.headers?.authorization || "").trim();
+  if (auth.startsWith("Bearer ")) {
+    const bearer = auth.slice("Bearer ".length).trim();
+    if (bearer) return bearer;
+  }
+
+  try {
+    const rawUrl = String(req.url || "");
+    const parsed = new NodeURL(rawUrl, "http://127.0.0.1");
+    for (const name of ["operator_token", "operator_api_token", "token"]) {
+      const value = String(parsed.searchParams.get(name) || "").trim();
+      if (value) return value;
+    }
+  } catch {}
+
+  return "";
+}
+
+function operatorMutationAuthorized(req) {
+  const token = operatorApiTokenFromConfig();
 
   if (!token) return false;
 
-  const headerToken = String(req.headers["x-operator-token"] || "").trim();
-  if (headerToken && headerToken === token) return true;
-
-  const auth = String(req.headers.authorization || "").trim();
-  if (auth.startsWith("Bearer ")) {
-    const bearer = auth.slice("Bearer ".length).trim();
-    if (bearer === token) return true;
-  }
-
-  return false;
+  return timingSafeTokenEquals(operatorRequestToken(req), token);
 }
 
-app.use("/api/operator", (req, res, next) => {
+function operatorRouteRequiresAuth(req) {
+  const pathName = String(req.path || req.url || "");
   const method = String(req.method || "GET").toUpperCase();
-  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
-    return next();
-  }
-  if (operatorMutationAuthorized(req)) {
-    return next();
-  }
-  return res.status(403).json({ ok: false, error: "operator_forbidden" });
-});
+  if (method === "OPTIONS") return false;
+  if (pathName === "/ping" || pathName === "/api/operator/ping") return false;
+  return true;
+}
 
 // --------------------------------------------------
 // Persistent State
@@ -848,18 +1331,6 @@ function operatorPidIsRunning(pid) {
     return true;
   } catch {}
 
-  if (process.platform === "win32") {
-    try {
-      const probe = spawnSync(
-        "tasklist",
-        ["/FI", `PID eq ${n}`, "/FO", "CSV", "/NH"],
-        { encoding: "utf8", windowsHide: true }
-      );
-      const out = String((probe && probe.stdout) || "").trim();
-      return !!out && !/^INFO:/i.test(out) && !/No tasks are running/i.test(out);
-    } catch {}
-  }
-
   return false;
 }
 
@@ -893,18 +1364,7 @@ function validateOrClearPidFile(filePath, label) {
     return { pid, active: true, cleared: false, record };
   }
 
-  let pidStillBelongsToRecordedRuntime = true;
-  if (String(label || "").trim().toLowerCase() === "runtime" && process.platform === "win32") {
-    try {
-      const runtimeCandidates = _repoStartSystemCandidates();
-      pidStillBelongsToRecordedRuntime = runtimeCandidates.some((row) => Number(row && row.pid) === pid);
-    } catch (e) {
-      logOperatorCatch("validateOrClearPidFile.runtime_candidate_probe", e, { filePath, label, pid });
-      pidStillBelongsToRecordedRuntime = true;
-    }
-  }
-
-  if (operatorPidIsRunning(pid) && pidRecordBelongsHere(record, label) && pidStillBelongsToRecordedRuntime) {
+  if (operatorPidIsRunning(pid) && pidRecordBelongsHere(record, label)) {
     return { pid, active: true, cleared: false, record };
   }
 
@@ -1329,6 +1789,17 @@ function normalizeBool(v) {
   return null;
 }
 
+function liveExecutionEnvCleared(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "0" || s === "false" || s === "no" || s === "off";
+}
+
+function liveExecutionEnvBlocker(v) {
+  if (liveExecutionEnvCleared(v)) return null;
+  const raw = String(v ?? "").trim();
+  return raw ? `DISABLE_LIVE_EXECUTION=${raw}` : "DISABLE_LIVE_EXECUTION unset";
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -1337,7 +1808,6 @@ function _normalizeDashHostForLoopback(host) {
   const h = String(host || "").trim();
   // If dashboard binds to 0.0.0.0, callers should use loopback to reach it.
   if (h === "0.0.0.0") return "127.0.0.1";
-  // Avoid Windows/IPv6-only localhost resolution surprises.
   if (h.toLowerCase() === "localhost") return "127.0.0.1";
   return h || "127.0.0.1";
 }
@@ -1366,7 +1836,7 @@ const ENV_SPEC = [
   { key: "DASHBOARD_PORT", type: "int", required: false, min: 1, max: 65535, default: 8000 },
   { key: "DASHBOARD_API_TOKEN", type: "string", required: false, default: "" },
 
-  { key: "DB_PATH", type: "string", required: false, default: "./data/trading.db" },
+  { key: "DB_PATH", type: "string", required: false, default: DEFAULT_LOCAL_DB_PATH },
 
   // Boot behavior (deterministic)
   { key: "AUTO_BOOT_DAEMONS", type: "bool", required: false, default: true },
@@ -1531,7 +2001,6 @@ function spawnSyncSafe(cmd, args, options = {}) {
   const timeout = Number.isFinite(Number(options.timeout)) ? Number(options.timeout) : OPERATOR_SPAWN_SYNC_TIMEOUT_MS;
   const maxBuffer = Number.isFinite(Number(options.maxBuffer)) ? Number(options.maxBuffer) : 16 * 1024 * 1024;
   return spawnSync(cmd, args, {
-    windowsHide: true,
     encoding: "utf-8",
     ...options,
     timeout,
@@ -1548,8 +2017,7 @@ function runServiceCtl(args, { parseJson = true, timeout = 30000 } = {}) {
         cwd: ROOT,
         env: { ...process.env, TRADING_REPO: ROOT },
         encoding: "utf-8",
-        timeout,
-        windowsHide: true
+        timeout
       }
     );
 
@@ -1661,26 +2129,16 @@ function pickPythonCmd() {
     candidates.push(override);
   }
 
-  if (process.platform === "win32") {
-    candidates.push(
-      path.join(ROOT, ".venv", "Scripts", "python.exe"),
-      "python",
-      "py"
-    );
-  } else {
-    candidates.push("python3", "python");
-  }
+  candidates.push("python3", "python");
 
   for (const c of candidates) {
     try {
-      const args = c === "py" ? ["-3", "--version"] : ["--version"];
+      const args = ["--version"];
       const r = spawnSyncSafe(c, args, { stdio: "pipe" });
 
       if (r && !r.error && r.status === 0) {
         try {
-          const exeArgs = c === "py"
-            ? ["-3", "-c", "import sys; print(sys.executable)"]
-            : ["-c", "import sys; print(sys.executable)"];
+          const exeArgs = ["-c", "import sys; print(sys.executable)"];
           const exe = spawnSyncSafe(c, exeArgs, { stdio: "pipe" });
           const resolved = String(
             (exe && (exe.stdout || exe.text || "")) || ""
@@ -1694,15 +2152,11 @@ function pickPythonCmd() {
     } catch {}
   }
 
-  return process.platform === "win32"
-    ? path.join(ROOT, ".venv", "Scripts", "python.exe")
-    : "python3";
+  return "python3";
 }
 
 function spawnEngineProcess(python, sanitized, finalMode) {
-  const args = python === "py"
-    ? ["-3", ENTRY, finalMode]
-    : [ENTRY, finalMode];
+  const args = [ENTRY, finalMode];
 
   const spawnOptions = {
     cwd: ROOT,
@@ -1714,35 +2168,13 @@ function spawnEngineProcess(python, sanitized, finalMode) {
     stdio: ["ignore", "pipe", "pipe"]
   };
 
-  if (process.platform === "win32") {
-    spawnOptions.detached = false;
-    spawnOptions.windowsHide = true;
-  } else {
-    spawnOptions.detached = true;
-  }
+  spawnOptions.detached = true;
 
   return spawn(python, args, spawnOptions);
 }
 
 function killPidTree(pid, signalName = "SIGTERM") {
   if (!pid) return;
-
-  if (process.platform === "win32") {
-    if (signalName === "SIGKILL") {
-      try {
-        spawnSyncSafe("taskkill", ["/PID", String(pid), "/T", "/F"], {
-          stdio: "ignore",
-          timeout: 15000
-        });
-      } catch {}
-      return;
-    }
-
-    try {
-      process.kill(pid);
-    } catch {}
-    return;
-  }
 
   try {
     process.kill(-pid, signalName);
@@ -1754,55 +2186,10 @@ function killPidTree(pid, signalName = "SIGTERM") {
   } catch {}
 }
 
-function _pidSnapshotWindows() {
-  try {
-    const script = [
-      "$rows = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId",
-      "$rows | ConvertTo-Json -Compress"
-    ].join("; ");
-    const r = spawnSyncSafe("powershell", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      script
-    ], {
-      stdio: "pipe",
-      timeout: 5000
-    });
-    if (!r || r.error || r.status !== 0) return new Map();
-    const raw = String(r.stdout || r.text || "").trim();
-    if (!raw) return new Map();
-    const parsed = JSON.parse(raw);
-    const rows = Array.isArray(parsed) ? parsed : [parsed];
-    const out = new Map();
-    for (const row of rows) {
-      const pid = Number((row && row.ProcessId) || 0);
-      const ppid = Number((row && row.ParentProcessId) || 0);
-      if (pid > 0) out.set(pid, ppid > 0 ? ppid : 0);
-    }
-    return out;
-  } catch {
-    return new Map();
-  }
-}
-
 function _pidIsDescendantOf(pid, ancestorPid) {
   const targetPid = Number(pid || 0);
   const rootPid = Number(ancestorPid || 0);
   if (!(targetPid > 0) || !(rootPid > 0) || targetPid === rootPid) return false;
-
-  if (process.platform === "win32") {
-    const parents = _pidSnapshotWindows();
-    if (!parents.size) return false;
-    let cur = targetPid;
-    for (let depth = 0; depth < 32; depth += 1) {
-      cur = Number(parents.get(cur) || 0);
-      if (!(cur > 0)) return false;
-      if (cur === rootPid) return true;
-    }
-    return false;
-  }
 
   try {
     let cur = targetPid;
@@ -1823,27 +2210,6 @@ function _pidIsDescendantOf(pid, ancestorPid) {
 function _processCommandLine(pid) {
   const targetPid = Number(pid || 0);
   if (!(targetPid > 0)) return "";
-
-  if (process.platform === "win32") {
-    try {
-      const script = [
-        `$row = Get-CimInstance Win32_Process -Filter "ProcessId = ${targetPid}" | Select-Object -First 1 CommandLine`,
-        "if ($row) { $row.CommandLine }"
-      ].join("; ");
-      const r = spawnSyncSafe("powershell", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        script
-      ], {
-        stdio: "pipe",
-        timeout: 2500
-      });
-      if (r && !r.error && r.status === 0) return String(r.stdout || r.text || "").trim();
-    } catch {}
-    return "";
-  }
 
   try {
     const r = spawnSyncSafe("ps", ["-o", "args=", "-p", String(targetPid)], {
@@ -1903,54 +2269,20 @@ function _repoStartSystemCandidates() {
     });
   };
 
-  if (process.platform === "win32") {
-    try {
-      const script = [
-        "$rows = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate",
-        "$rows | ConvertTo-Json -Compress"
-      ].join("; ");
-      const r = spawnSyncSafe("powershell", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        script
-      ], {
-        stdio: "pipe",
-        timeout: 5000
-      });
-      if (r && !r.error && r.status === 0) {
-        const raw = String(r.stdout || r.text || "").trim();
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          const rows = Array.isArray(parsed) ? parsed : [parsed];
-          for (const row of rows) {
-            considerCandidate(
-              row && row.ProcessId,
-              row && row.ParentProcessId,
-              row && row.CommandLine,
-              row && row.CreationDate
-            );
-          }
-        }
+  try {
+    const r = spawnSyncSafe("ps", ["-eo", "pid=,ppid=,args="], {
+      stdio: "pipe",
+      timeout: 5000
+    });
+    if (r && !r.error && r.status === 0) {
+      const raw = String(r.stdout || r.text || "");
+      for (const line of raw.split(/\r?\n/)) {
+        const match = String(line || "").trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+        if (!match) continue;
+        considerCandidate(match[1], match[2], match[3]);
       }
-    } catch {}
-  } else {
-    try {
-      const r = spawnSyncSafe("ps", ["-eo", "pid=,ppid=,args="], {
-        stdio: "pipe",
-        timeout: 5000
-      });
-      if (r && !r.error && r.status === 0) {
-        const raw = String(r.stdout || r.text || "");
-        for (const line of raw.split(/\r?\n/)) {
-          const match = String(line || "").trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
-          if (!match) continue;
-          considerCandidate(match[1], match[2], match[3]);
-        }
-      }
-    } catch {}
-  }
+    }
+  } catch {}
 
   candidates.sort((a, b) => a.pid - b.pid);
   _repoStartSystemCandidatesCache = { tsMs: Date.now(), payload: cloneJsonValue(candidates) };
@@ -1961,16 +2293,6 @@ function stopEngineProcessTree(graceMs = 2500) {
   if (!child) return false;
 
   const pid = child.pid;
-
-  if (process.platform === "win32") {
-    try {
-      spawnSyncSafe("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        timeout: Math.max(5000, Math.min(30000, Number(graceMs || 0)))
-      });
-    } catch {}
-    return true;
-  }
 
   killPidTree(pid, "SIGTERM");
 
@@ -2120,16 +2442,8 @@ async function stopExternalRuntime(graceMs = 8000) {
     return { ok: true, active: false, stopped: true };
   }
 
-  try {
-    for (const targetPid of targetPids) {
-      if (process.platform === "win32") {
-        try {
-          spawnSyncSafe("taskkill", ["/PID", String(targetPid), "/T", "/F"], {
-            stdio: "ignore",
-            timeout: Math.max(5000, Math.min(30000, Number(graceMs || 0)))
-          });
-        } catch {}
-      } else {
+    try {
+      for (const targetPid of targetPids) {
         try {
           killPidTree(targetPid, "SIGTERM");
         } catch {}
@@ -2137,7 +2451,6 @@ async function stopExternalRuntime(graceMs = 8000) {
         if (!exited) {
           try { killPidTree(targetPid, "SIGKILL"); } catch {}
         }
-      }
     }
 
     let stopped = true;
@@ -2740,21 +3053,10 @@ function stopEngine() {
 
       try {
         const targetPids = Array.isArray(ext.pids) ? ext.pids.filter((value) => Number(value || 0) > 0) : [];
-        if (process.platform === "win32") {
-          stopped = true;
-          for (const targetPid of targetPids) {
-            const r = spawnSyncSafe("taskkill", ["/PID", String(targetPid), "/T", "/F"], {
-              stdio: "ignore",
-              timeout: 15000
-            });
-            if (r.error) stopped = false;
-          }
-        } else {
-          for (const targetPid of targetPids) {
-            killPidTree(targetPid, "SIGTERM");
-          }
-          stopped = targetPids.length > 0;
+        for (const targetPid of targetPids) {
+          killPidTree(targetPid, "SIGTERM");
         }
+        stopped = targetPids.length > 0;
       } catch {}
 
       validateOrClearPidFile(path.join(LOG_DIR, "runtime.pid"), "runtime");
@@ -2907,14 +3209,16 @@ function _httpJsonRequest(method, url, body = null, timeoutMs = 20000) {
     try {
       const payload = body === null ? "" : JSON.stringify(body || {});
       const lib = url.startsWith("https://") ? https : http;
+      const methodUpper = String(method || "GET").toUpperCase();
 
       const req = lib.request(
         url,
         {
-          method: String(method || "GET").toUpperCase(),
+          method: methodUpper,
           headers: {
             "Accept": "application/json",
             "Connection": "close",
+            ...trustedControlPlaneAuthHeaders(methodUpper, url),
             ...(body === null ? {} : {
               "Content-Type": "application/json",
               "Content-Length": Buffer.byteLength(payload)
@@ -3163,6 +3467,26 @@ async function verifyHealth(options = {}) {
   return { ...result };
 }
 
+async function verifyDashboardReadiness() {
+  const env = readEnv();
+  const port = Number(process.env.DASHBOARD_PORT || env.DASHBOARD_PORT || 8000);
+  const hostRaw = String(process.env.DASHBOARD_HOST || env.DASHBOARD_HOST || "127.0.0.1");
+  const host = _normalizeDashHostForLoopback(hostRaw);
+  const override = String(process.env.OPERATOR_READINESS_URL || env.OPERATOR_READINESS_URL || "").trim();
+  const url = override || `http://${host}:${port}/api/readiness`;
+  const r = await httpGetJson(url);
+  const body = (r && r.json && typeof r.json === "object") ? r.json : null;
+  const ready = !!(r && r.ok && body && body.ok === true && body.ready === true);
+  return {
+    ok: !!(r && r.ok && body),
+    ready,
+    url,
+    status: Number((r && r.status) || 0),
+    body,
+    error: ready ? null : String((body && (body.error || body.status || body.summary_reason)) || (r && r.error) || "readiness_not_ready")
+  };
+}
+
 async function checkPortAvailable(port, host = "127.0.0.1") {
   return new Promise((resolve) => {
     const srv = net.createServer();
@@ -3204,7 +3528,7 @@ function pythonAvailable() {
 }
 
 function resolveDbPathFromSanitized(sanitized) {
-  const dbPath = String(sanitized.DB_PATH || "./data/trading.db");
+  const dbPath = String(sanitized.DB_PATH || DEFAULT_LOCAL_DB_PATH);
   const resolvedDb = path.isAbsolute(dbPath) ? dbPath : path.join(ROOT, dbPath);
   return { dbPath, resolvedDb };
 }
@@ -3519,9 +3843,8 @@ async function getPreflight(mode = "safe", options = {}) {
 
   if (m === "live") {
     const liveBlockers = [];
-    if (String(sanitized.DISABLE_LIVE_EXECUTION || "").trim() === "1") {
-      liveBlockers.push("DISABLE_LIVE_EXECUTION=1");
-    }
+    const disableLiveBlocker = liveExecutionEnvBlocker(sanitized.DISABLE_LIVE_EXECUTION);
+    if (disableLiveBlocker) liveBlockers.push(disableLiveBlocker);
     if (String(sanitized.KILL_SWITCH_GLOBAL || "").trim() === "1") {
       liveBlockers.push("KILL_SWITCH_GLOBAL=1");
     }
@@ -3554,7 +3877,7 @@ async function getReadiness() {
   // Files
   if (!fs.existsSync(ENTRY)) issues.push({ level: "error", code: "ENTRY_MISSING", message: `Backend entrypoint missing (${path.basename(ENTRY)})` });
   if (!fs.existsSync(ENV_PATH)) issues.push({ level: "error", code: "ENV_MISSING", message: ".env missing" });
-  if (!fs.existsSync(LOG_DIR)) issues.push({ level: "warn", code: "LOGDIR_MISSING", message: "logs/ folder missing (will be created on start)" });
+  if (!fs.existsSync(LOG_DIR)) issues.push({ level: "warn", code: "LOGDIR_MISSING", message: "var/log folder missing (will be created on start)" });
 
   // Config validity
   const envObj = readEnv();
@@ -3577,11 +3900,15 @@ async function getReadiness() {
 
   // Health (if running)
   let health = null;
+  let dashboardReadiness = null;
   let backendHealthy = false;
+  let backendReady = false;
 
   if (engineStatus === "RUNNING") {
     health = await verifyHealth();
     backendHealthy = !!(health && health.ok && health.body && health.body.ok);
+    dashboardReadiness = await verifyDashboardReadiness();
+    backendReady = !!(backendHealthy && dashboardReadiness && dashboardReadiness.ready);
 
     if (!health || !health.ok) {
       issues.push({
@@ -3602,6 +3929,23 @@ async function getReadiness() {
           : "Backend reachable but not healthy yet"
       });
     }
+    if (!dashboardReadiness || !dashboardReadiness.ok) {
+      issues.push({
+        level: "error",
+        code: "READINESS_UNREACHABLE",
+        message: "Dashboard readiness endpoint is not reachable"
+      });
+    } else if (!dashboardReadiness.ready) {
+      const body = dashboardReadiness.body || {};
+      const reasons = Array.isArray(body.reasons) ? body.reasons.filter(Boolean) : [];
+      issues.push({
+        level: "warn",
+        code: "READINESS_NOT_READY",
+        message: reasons.length
+          ? `Readiness blocked: ${reasons.join(", ")}`
+          : `Readiness blocked: ${String(body.status || dashboardReadiness.error || "not ready")}`
+      });
+    }
   }
 
   // Current-attempt error persistence only
@@ -3615,13 +3959,18 @@ async function getReadiness() {
   }
 
   const hasError = issues.some((i) => i.level === "error");
-  const ready = !hasError && engineStatus === "RUNNING" && backendHealthy;
+  const ready = !hasError && engineStatus === "RUNNING" && backendReady;
+  const readinessStatus = ready
+    ? "RUNNING"
+    : (engineStatus === "RUNNING" ? "DEGRADED" : engineStatus);
   const degradedComponents = [];
 
   if (engineStatus !== "RUNNING") degradedComponents.push("engine_process");
   if (ext.active) degradedComponents.push("operator_supervision");
   if (engineStatus === "RUNNING" && (!health || !health.ok)) degradedComponents.push("dashboard_transport");
   if (engineStatus === "RUNNING" && health && health.ok && !backendHealthy) degradedComponents.push("runtime_health");
+  if (engineStatus === "RUNNING" && dashboardReadiness && dashboardReadiness.ok && !dashboardReadiness.ready) degradedComponents.push("runtime_readiness");
+  if (engineStatus === "RUNNING" && (!dashboardReadiness || !dashboardReadiness.ok)) degradedComponents.push("readiness_transport");
   if (activeAttemptError) degradedComponents.push("startup_attempt");
   if (state.restartBlocked === true || state.fatal === true) degradedComponents.push("restart_supervision");
 
@@ -3640,11 +3989,13 @@ async function getReadiness() {
     ok: ready,
     ready,
     degraded: !ready,
-    status: engineStatus,
+    status: readinessStatus,
+    engineStatus,
     productionMode: PRODUCTION_MODE,
     mode: state.lastMode || "safe",
     issues,
     health,
+    dashboardReadiness,
     lastHealthyAt: state.lastHealthyAt || null,
     restartAttempts: Number(state.restartAttempts || 0),
     restartBlocked: state.restartBlocked === true,
@@ -3737,14 +4088,52 @@ function tailLog(lines = 200) {
   return currentAttemptRuntimeTail(lines);
 }
 
-function safeEnvForSnapshot(envObj) {
-  const out = { ...envObj };
-  for (const k of Object.keys(out || {})) {
-    if (/(^|_)(TOKEN|SECRET|PASSWORD|PASS|API_KEY)(_|$)/i.test(String(k || ""))) {
-      out[k] = "***REDACTED***";
-    }
+const REDACTED_SECRET = "***REDACTED***";
+const OPERATOR_SENSITIVE_KEY_RE = /(?:^|[_\-.])(?:token|secret|password|passwd|passphrase|api[_\-.]?key|access[_\-.]?key|private[_\-.]?key|master[_\-.]?key|hmac[_\-.]?key|credential|credentials|dsn|database[_\-.]?url|redis[_\-.]?url|broker[_\-.]?key|provider[_\-.]?key)(?:$|[_\-.])/i;
+const OPERATOR_SENSITIVE_TEXT_KEY_RE = /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|ACCESS_KEY|PRIVATE_KEY|MASTER_KEY|HMAC_KEY|CREDENTIAL|CREDENTIALS|DSN|DATABASE_URL|REDIS_URL|BROKER_KEY|PROVIDER_KEY)[A-Z0-9_]*)\s*=\s*([^\s"'`]+)/gi;
+const OPERATOR_SENSITIVE_JSON_KEY_RE = /("([^"]*(?:token|secret|password|passwd|passphrase|api[_-]?key|access[_-]?key|private[_-]?key|master[_-]?key|hmac[_-]?key|credential|credentials|dsn|database[_-]?url|redis[_-]?url|broker[_-]?key|provider[_-]?key)[^"]*)"\s*:\s*)"([^"]*)"/gi;
+const URL_PASSWORD_RE = /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)([^@\s/]+)(@)/gi;
+
+function isOperatorSensitiveKey(keyName) {
+  return OPERATOR_SENSITIVE_KEY_RE.test(String(keyName || ""));
+}
+
+function redactOperatorSensitiveText(text) {
+  if (text === null || text === undefined) return text;
+  return String(text)
+    .replace(OPERATOR_SENSITIVE_TEXT_KEY_RE, (_match, key) => `${key}=${REDACTED_SECRET}`)
+    .replace(OPERATOR_SENSITIVE_JSON_KEY_RE, (_match, prefix) => `${prefix}"${REDACTED_SECRET}"`)
+    .replace(URL_PASSWORD_RE, `$1${REDACTED_SECRET}$3`);
+}
+
+function redactOperatorSecrets(value, keyName = "") {
+  if (value === null || value === undefined) return value;
+
+  if (isOperatorSensitiveKey(keyName)) {
+    return REDACTED_SECRET;
   }
-  return out;
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactOperatorSecrets(item, keyName));
+  }
+
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = redactOperatorSecrets(v, k);
+    }
+    return out;
+  }
+
+  if (typeof value === "string") {
+    return redactOperatorSensitiveText(value);
+  }
+
+  return value;
+}
+
+function safeEnvForSnapshot(envObj) {
+  return redactOperatorSecrets({ ...(envObj || {}) });
 }
 
 function readTailChars(filePath, maxChars = 12000) {
@@ -3838,13 +4227,12 @@ function snapshotModeConfig(mode) {
 function redactSnapshotSecrets(value, keyName = "") {
   if (value === null || value === undefined) return value;
 
-  const key = String(keyName || "");
-  if (/(token|secret|password|passphrase|api[_-]?key)/i.test(key)) {
-    return "***REDACTED***";
+  if (isOperatorSensitiveKey(keyName)) {
+    return REDACTED_SECRET;
   }
 
   if (Array.isArray(value)) {
-    return value.map((item) => redactSnapshotSecrets(item, key));
+    return value.map((item) => redactSnapshotSecrets(item, keyName));
   }
 
   if (typeof value === "object") {
@@ -3853,6 +4241,10 @@ function redactSnapshotSecrets(value, keyName = "") {
       out[k] = redactSnapshotSecrets(v, k);
     }
     return out;
+  }
+
+  if (typeof value === "string") {
+    return redactOperatorSensitiveText(value);
   }
 
   return value;
@@ -4331,6 +4723,10 @@ async function checkTelemetryFlow() {
 // Ensure Polygon stream job exists + running
 // --------------------------------------------
 app.post("/api/operator/ensure_polygon_stream", async (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.job_start", {
+    target: "polygon_stream",
+  });
+  if (!confirmation) return;
   try {
     const envObj = readEnv();
     const mode = state.lastMode || "safe";
@@ -4371,7 +4767,13 @@ app.post("/api/operator/ensure_polygon_stream", async (req, res) => {
     const targetName = ingestionJob ? "ingestion_runtime" : "stream_prices_polygon_ws";
 
     if (!targetJob.running) {
-      const started = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(targetName)}`, { name: targetName });
+      const started = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(targetName)}`, {
+        name: targetName,
+        ...operatorConfirmationBody(req, "JOB_ACTION", {
+          actionId: "jobs.start",
+          target: targetName,
+        }),
+      });
       const payload = {
         ok: !!(started && started.ok && (!started.json || started.json.ok !== false)),
         action: started && started.ok ? "started" : "start_failed",
@@ -4401,11 +4803,21 @@ app.post("/api/operator/jobs/stop", async (req, res) => {
   try {
     const name = String((req.body && req.body.name) || req.query.name || "").trim();
     if (!name) return jsonFail(res, "missing_name", 400);
+    const confirmation = requireOperatorConfirmation(req, res, "operator.job_stop", {
+      target: name,
+    });
+    if (!confirmation) return;
 
     const envObj = readEnv();
     const base = dashBaseUrlFromEnv(envObj);
 
-    const r = await httpPostJson(`${base}/api/jobs/stop?name=${encodeURIComponent(name)}`, { name });
+    const r = await httpPostJson(`${base}/api/jobs/stop?name=${encodeURIComponent(name)}`, {
+      name,
+      ...operatorConfirmationBody(req, "JOB_ACTION", {
+        actionId: "jobs.stop",
+        target: name,
+      }),
+    });
     if (!r.ok) {
       return sendOperatorPayload(
         res,
@@ -4543,7 +4955,7 @@ app.get("/api/operator/bootstrapStatus", wrapOperatorRoute(async (req, res) => {
 }));
 
 app.get("/api/operator/config", wrapOperatorRoute(async (req, res) => {
-  return jsonOk(res, readEnv());
+  return jsonOk(res, safeEnvForSnapshot(readEnv()));
 }));
 
 app.get("/api/operator/feed_configs", (req, res) => {
@@ -4574,11 +4986,15 @@ app.post("/api/operator/feed_configs/delete", (req, res) => {
 });
 
 app.post("/api/operator/config", wrapOperatorRoute(async (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.config_write", {
+    target: ".env",
+  });
+  if (!confirmation) return;
   if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
     return jsonFail(res, "invalid_config_payload", 400);
   }
 
-  const result = writeEnv(req.body || {});
+  const result = writeEnv(stripConfirmationFields(req.body || {}));
   invalidateOperatorHealthCache();
   invalidateOperatorDbCaches();
 
@@ -4598,16 +5014,21 @@ app.get("/api/operator/config/validate", wrapOperatorRoute(async (req, res) => {
   return jsonState(res, {
     ok: !issues.some((i) => i.level === "error"),
     issues,
-    sanitized
+    sanitized: safeEnvForSnapshot(sanitized)
   }, 200);
 }));
 
 app.post("/api/operator/secrets", wrapOperatorRoute(async (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.secrets_write", {
+    target: "operator.secrets.json",
+  });
+  if (!confirmation) return;
   if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
     return jsonFail(res, "invalid_secret_payload", 400);
   }
 
-  const entries = Object.entries(req.body)
+  const secretPayload = stripConfirmationFields(req.body || {});
+  const entries = Object.entries(secretPayload)
     .filter(([key]) => String(key || "").trim().length > 0);
   if (entries.length === 0) {
     return jsonFail(res, "missing_secret_entries", 400);
@@ -4654,7 +5075,7 @@ app.get("/api/operator/logs", wrapOperatorRoute(async (req, res) => {
         detail: String(r.error || "service_log_read_failed")
       });
     }
-    const logs = String(r.text || "");
+    const logs = redactOperatorSensitiveText(String(r.text || ""));
     return jsonOk(res, {
       service,
       logs,
@@ -4662,7 +5083,7 @@ app.get("/api/operator/logs", wrapOperatorRoute(async (req, res) => {
     });
   }
 
-  const logs = tailLog(n);
+  const logs = redactOperatorSensitiveText(tailLog(n));
   return jsonOk(res, {
     service: service || "runtime",
     logs,
@@ -4676,7 +5097,7 @@ app.get("/api/operator/logs", wrapOperatorRoute(async (req, res) => {
 
 app.get("/api/operator/runtime_logs", wrapOperatorRoute(async (req, res) => {
   const n = Math.max(50, Math.min(2000, Number(req.query.lines || 200)));
-  const logs = currentAttemptRuntimeTail(n);
+  const logs = redactOperatorSensitiveText(currentAttemptRuntimeTail(n));
   return jsonOk(res, {
     logs,
     lines: String(logs || "").split(/\r?\n/).filter(Boolean),
@@ -4686,7 +5107,7 @@ app.get("/api/operator/runtime_logs", wrapOperatorRoute(async (req, res) => {
 
 app.get("/api/operator/stderr_logs", wrapOperatorRoute(async (req, res) => {
   const n = Math.max(1024, Math.min(512000, Number(req.query.lines || 200) * 200));
-  const logs = currentAttemptStderrTail(n);
+  const logs = redactOperatorSensitiveText(currentAttemptStderrTail(n));
   return jsonOk(res, {
     logs,
     lines: String(logs || "").split(/\r?\n/).filter(Boolean),
@@ -4839,11 +5260,41 @@ const OPERATOR_BARRIER_PROXY_TIMEOUT_MS = clampNumber(
   300000
 );
 
-function operatorProxyGet(path, invalidError, timeout) {
+function operatorProxyGet(path, invalidError, timeoutOrOptions) {
   return wrapOperatorRoute(async (req, res) => {
+      const options = (timeoutOrOptions && typeof timeoutOrOptions === "object")
+        ? timeoutOrOptions
+        : {};
+      const timeout = (timeoutOrOptions && typeof timeoutOrOptions === "object")
+        ? options.timeout
+        : timeoutOrOptions;
       const envObj = readEnv();
       const base = dashBaseUrlFromEnv(envObj);
       const r = await httpGetJson(`${base}${path}`, timeout);
+      if (!r.ok) {
+        return sendOperatorPayload(
+          res,
+          buildOperatorProxyFailure(r, r.error || "dashboard_unreachable", {}, operatorErrorStatus(r.error || "dashboard_unreachable", 503)),
+          operatorErrorStatus(r.error || "dashboard_unreachable", 503)
+        );
+      }
+      if (!r.json || typeof r.json !== "object") {
+        return sendOperatorPayload(
+          res,
+          buildOperatorProxyFailure(r, invalidError, {}, 502),
+          502
+        );
+      }
+      const payload = options.redact ? redactOperatorSecrets(r.json) : r.json;
+      return jsonState(res, payload, Number(r.status || 200));
+  });
+}
+
+function operatorProxyPost(path, invalidError, timeout) {
+  return wrapOperatorRoute(async (req, res) => {
+      const envObj = readEnv();
+      const base = dashBaseUrlFromEnv(envObj);
+      const r = await httpPostJson(`${base}${path}`, req.body || {}, timeout);
       if (!r.ok) {
         return sendOperatorPayload(
           res,
@@ -4862,8 +5313,10 @@ function operatorProxyGet(path, invalidError, timeout) {
   });
 }
 
-function operatorProxyPost(path, invalidError, timeout) {
+function operatorConfirmedProxyPost(path, invalidError, actionId, timeout) {
   return wrapOperatorRoute(async (req, res) => {
+      const confirmation = requireOperatorConfirmation(req, res, actionId);
+      if (!confirmation) return;
       const envObj = readEnv();
       const base = dashBaseUrlFromEnv(envObj);
       const r = await httpPostJson(`${base}${path}`, req.body || {}, timeout);
@@ -4923,15 +5376,16 @@ app.get("/api/operator/supervisor_diagnostics",
 );
 
 app.get("/api/operator/support_snapshot",
-  operatorProxyGet("/api/operator/support_snapshot", "invalid_support_snapshot_response")
+  operatorProxyGet("/api/operator/support_snapshot", "invalid_support_snapshot_response", { redact: true })
 );
 
 app.get("/api/operator/runtime_log_tail", wrapOperatorRoute(async (req, res) => {
     const lines = Math.max(50, Math.min(2000, Number(req.query.lines || 250) || 250));
+    const tail = redactOperatorSensitiveText(tailLog(lines));
     return jsonOk(res, {
       ok: true,
       lines,
-      tail: tailLog(lines),
+      tail,
       currentAttemptOnly: true,
       attemptId: state.currentAttemptId || null,
       attemptStartedAt: state.currentAttemptStartedAt || state.lastStartAt || null,
@@ -4940,11 +5394,11 @@ app.get("/api/operator/runtime_log_tail", wrapOperatorRoute(async (req, res) => 
 }));
 
 app.post("/api/operator/self_repair",
-  operatorProxyPost("/api/operator/self_repair", "invalid_self_repair_response")
+  operatorConfirmedProxyPost("/api/operator/self_repair", "invalid_self_repair_response", "operator.self_repair")
 );
 
 app.post("/api/operator/bootstrap_pipeline",
-  operatorProxyPost("/api/operator/bootstrap_pipeline", "invalid_bootstrap_pipeline_response", 180000)
+  operatorConfirmedProxyPost("/api/operator/bootstrap_pipeline", "invalid_bootstrap_pipeline_response", "operator.guided_bootstrap", 180000)
 );
 
 // UI expects this endpoint
@@ -5009,15 +5463,29 @@ if (healthOk && health.body && Array.isArray(health.body.notes)) {
 }));
 
 app.post("/api/operator/repairSchema", async (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.repair_schema");
+  if (!confirmation) return;
   try {
     const envObj = readEnv();
     const base = dashBaseUrlFromEnv(envObj);
+    const repairPayload = operatorConfirmationBody(req, "REPAIR_SCHEMA", {
+      actionId: "operator.repair_schema",
+      target: "runtime_schema",
+    });
 
     const r = await new Promise((resolve) => {
       const lib = base.startsWith("https") ? https : http;
+      const body = JSON.stringify(repairPayload);
       const req2 = lib.request(
         `${base}/api/system/repair_schema`,
-        { method: "POST" },
+        {
+          method: "POST",
+          headers: {
+            ...trustedControlPlaneAuthHeaders("POST", `${base}/api/system/repair_schema`),
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
+        },
         (resp) => {
           let data = "";
           resp.on("data", (c) => (data += c));
@@ -5031,6 +5499,7 @@ app.post("/api/operator/repairSchema", async (req, res) => {
         }
       );
       req2.on("error", () => resolve({ ok: false }));
+      req2.write(body);
       req2.end();
     });
 
@@ -5050,6 +5519,10 @@ app.post("/api/operator/repairSchema", async (req, res) => {
 
 // UI calls this (AutoFix/Repair)
 app.post("/api/operator/autofix", async (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.self_repair", {
+    target: "autofix",
+  });
+  if (!confirmation) return;
   const steps = [];
   try {
     ensureEnvFile();
@@ -5098,14 +5571,14 @@ function isLiveModeBlocked() {
 }
 
 app.post("/api/operator/start", async (req, res) => {
-  const mode = String((req.body && req.body.mode) || "safe");
-
-    if (mode === "live") {
-    const confirm = String((req.body && req.body.confirm) || "");
-    if (confirm !== "TRADE") {
-      return jsonFail(res, "LIVE_CONFIRM_REQUIRED", 422);
-    }
-  }
+  const mode = String((req.body && req.body.mode) || "safe").trim().toLowerCase() || "safe";
+  const confirmation = requireOperatorConfirmation(
+    req,
+    res,
+    mode === "live" ? "operator.live_start" : "operator.start",
+    { target: `mode:${mode}` }
+  );
+  if (!confirmation) return;
 
   const steps = [];
 
@@ -5331,12 +5804,24 @@ try {
     if (shouldStartLegacyFeed) {
       await new Promise((resolve) => {
         const lib = base2.startsWith("https") ? https : http;
+        const body = JSON.stringify(operatorConfirmationBody(req, "JOB_ACTION", {
+          actionId: "jobs.start",
+          target: feedToStart,
+        }));
         const req2 = lib.request(
           `${base2}/api/jobs/start?name=${encodeURIComponent(feedToStart)}`,
-          { method: "POST" },
+          {
+            method: "POST",
+            headers: {
+              ...trustedControlPlaneAuthHeaders("POST", `${base2}/api/jobs/start?name=${encodeURIComponent(feedToStart)}`),
+              "Content-Type": "application/json",
+              "Content-Length": Buffer.byteLength(body),
+            },
+          },
           () => resolve()
         );
         req2.on("error", () => resolve());
+        req2.write(body);
         req2.end();
       });
 
@@ -5347,12 +5832,24 @@ try {
     // Trigger full pipeline (POST required)
     await new Promise((resolve) => {
       const lib = base2.startsWith("https") ? https : http;
+      const body = JSON.stringify(operatorConfirmationBody(req, "RUN_PIPELINE", {
+        actionId: "pipeline.run",
+        target: `mode:${mode}`,
+      }));
       const req2 = lib.request(
         `${base2}/api/pipeline/run`,
-        { method: "POST" },
+        {
+          method: "POST",
+          headers: {
+            ...trustedControlPlaneAuthHeaders("POST", `${base2}/api/pipeline/run`),
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
+        },
         () => resolve()
       );
       req2.on("error", () => resolve());
+      req2.write(body);
       req2.end();
     });
   }
@@ -5362,14 +5859,22 @@ return jsonOk(res, { status: "RUNNING", mode, steps });
 });
 
 app.post("/api/operator/stop", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.stop", {
+    target: "engine",
+  });
+  if (!confirmation) return;
   const r = stopEngine();
   return sendOperatorPayload(res, r, 200);
 });
 
 app.post("/api/operator/restart", async (req, res) => {
+  const mode = String((req.body && req.body.mode) || state.lastMode || "safe");
+  const confirmation = requireOperatorConfirmation(req, res, "operator.restart", {
+    target: `mode:${mode}`,
+  });
+  if (!confirmation) return;
   stopEngine();
   await sleep(1000);
-  const mode = String((req.body && req.body.mode) || state.lastMode || "safe");
   const r = startEngine(mode);
   return sendOperatorPayload(res, {
     ok: !!(r && r.ok),
@@ -5379,6 +5884,10 @@ app.post("/api/operator/restart", async (req, res) => {
 });
 
 app.post("/api/operator/emergencyStop", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.emergency_stop", {
+    target: "global",
+  });
+  if (!confirmation) return;
   const r = emergencyStop();
   return sendOperatorPayload(res, r, r && r.ok ? 200 : 500);
 });
@@ -5389,10 +5898,15 @@ app.post("/api/operator/clearLastError", (req, res) => {
 });
 
 app.post("/api/operator/set_mode", (req, res) => {
+  const requestedForTarget = String((req.body && req.body.mode) || "safe").trim().toLowerCase() || "safe";
+  const confirmation = requireOperatorConfirmation(req, res, "operator.set_mode", {
+    target: `mode:${requestedForTarget}`,
+  });
+  if (!confirmation) return;
   try {
     ensureEnvFile();
 
-    const requested = String((req.body && req.body.mode) || "safe").trim().toLowerCase();
+    const requested = requestedForTarget;
     const mode = (requested === "live" || requested === "shadow") ? requested : "safe";
 
     const envObj = readEnv();
@@ -5414,6 +5928,10 @@ app.post("/api/operator/set_mode", (req, res) => {
 });
 
 app.post("/api/operator/pause_training", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.training_control", {
+    target: "AUTO_PIPELINE:false",
+  });
+  if (!confirmation) return;
   try {
     ensureEnvFile();
 
@@ -5430,6 +5948,10 @@ app.post("/api/operator/pause_training", (req, res) => {
 });
 
 app.post("/api/operator/resume_training", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.training_control", {
+    target: "AUTO_PIPELINE:true",
+  });
+  if (!confirmation) return;
   try {
     ensureEnvFile();
 
@@ -5451,6 +5973,10 @@ app.post("/api/operator/run_job", async (req, res) => {
     if (!name) {
       return jsonFail(res, "missing_job_name", 400);
     }
+    const confirmation = requireOperatorConfirmation(req, res, "operator.job_start", {
+      target: name,
+    });
+    if (!confirmation) return;
 
     const guard = beginOperatorAction(`run_job:${name}`, 15000);
     if (!guard.ok) {
@@ -5460,7 +5986,13 @@ app.post("/api/operator/run_job", async (req, res) => {
     const envObj = readEnv();
     const base = dashBaseUrlFromEnv(envObj);
 
-    const r = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(name)}`, { name });
+    const r = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(name)}`, {
+      name,
+      ...operatorConfirmationBody(req, "JOB_ACTION", {
+        actionId: "jobs.start",
+        target: name,
+      }),
+    });
     const payload = {
       ok: !!(r && r.ok && (!r.json || r.json.ok !== false)),
       job: name,
@@ -5478,6 +6010,10 @@ app.post("/api/operator/run_job", async (req, res) => {
 
 app.post("/api/operator/promote_model", async (req, res) => {
   try {
+    const confirmation = requireOperatorConfirmation(req, res, "operator.promote_model", {
+      target: "model_promotion",
+    });
+    if (!confirmation) return;
     const guard = beginOperatorAction("promote_model", 60000);
     if (!guard.ok) {
       return jsonFail(res, guard.error, guard.statusCode, { retry_after_s: guard.retry_after_s || null });
@@ -5485,7 +6021,13 @@ app.post("/api/operator/promote_model", async (req, res) => {
     const envObj = readEnv();
     const base = dashBaseUrlFromEnv(envObj);
 
-    const r = await httpPostJson(`${base}/api/models/promote`, { confirm: "PROMOTION", on: "1" });
+    const r = await httpPostJson(`${base}/api/models/promote`, {
+      on: "1",
+      ...operatorConfirmationBody(req, "PROMOTION", {
+        actionId: "models.promote",
+        target: "model_promotion",
+      }),
+    });
     const payload = {
       ok: !!(r && r.ok && (!r.json || r.json.ok !== false)),
       result: r ? (r.json || null) : null,
@@ -5758,16 +6300,16 @@ app.post("/api/operator/ai/patch_preview", async (req, res) => {
 
 app.post("/api/operator/ai/apply_patch", async (req, res) => {
   try {
-    const confirm = String((req.body && req.body.confirm) || "").trim();
-    if (confirm !== "APPLY_PATCH") {
-      return jsonFail(res, "apply_patch_confirmation_required", 422);
-    }
+    const suppliedFile = String((req.body && req.body.file) || "").trim();
+    const confirmation = requireOperatorConfirmation(req, res, "operator.ai_apply_patch", {
+      target: suppliedFile,
+    });
+    if (!confirmation) return;
 
     if ((state.lastMode || "safe") === "live") {
       return jsonFail(res, "apply_patch_blocked_in_live_mode", 409);
     }
 
-    const suppliedFile = String((req.body && req.body.file) || "").trim();
     const suppliedPatch = req.body && req.body.patch ? req.body.patch : null;
     const suppliedConfidence = Number((req.body && req.body.confidence) || 0);
 
@@ -5824,7 +6366,17 @@ app.post("/api/operator/ai/apply_patch", async (req, res) => {
       summary: analysis.summary || null,
       root_cause: analysis.root_cause || null,
       failing_component: analysis.failing_component || null,
-      diff: applied.diff
+      diff: applied.diff,
+      confirmation: {
+        action_id: confirmation.action_id,
+        actor: confirmation.actor,
+        source_surface: confirmation.source_surface,
+        reason: confirmation.reason,
+        request_id: confirmation.request_id,
+        target: confirmation.target,
+        confirmation_method: confirmation.confirmation_method,
+        confirmation_hold_ms: confirmation.confirmation_hold_ms,
+      }
     });
 
     return jsonOk(res, {
@@ -5837,22 +6389,31 @@ app.post("/api/operator/ai/apply_patch", async (req, res) => {
 
 app.post("/api/operator/ai/rollback_patch", async (req, res) => {
   try {
-    const confirm = String((req.body && req.body.confirm) || "").trim();
-    if (confirm !== "ROLLBACK_PATCH") {
-      return jsonFail(res, "rollback_patch_confirmation_required", 422);
-    }
-
     const patchId = String((req.body && req.body.patchId) || "").trim();
     if (!patchId) {
       return jsonFail(res, "missing_patch_id", 400);
     }
+    const confirmation = requireOperatorConfirmation(req, res, "operator.ai_rollback_patch", {
+      target: patchId,
+    });
+    if (!confirmation) return;
     const rolledBack = rollbackAiPatch(patchId);
 
     logAgentAction({
       ts: new Date().toISOString(),
       actor: "operator_ai_rollback_patch",
       patchId: rolledBack.patchId,
-      file: rolledBack.file
+      file: rolledBack.file,
+      confirmation: {
+        action_id: confirmation.action_id,
+        actor: confirmation.actor,
+        source_surface: confirmation.source_surface,
+        reason: confirmation.reason,
+        request_id: confirmation.request_id,
+        target: confirmation.target,
+        confirmation_method: confirmation.confirmation_method,
+        confirmation_hold_ms: confirmation.confirmation_hold_ms,
+      }
     });
 
     return jsonOk(res, {
@@ -5921,6 +6482,10 @@ app.post("/api/operator/ai/explain", async (req, res) => {
 });
 
 app.post("/api/operator/backup", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.backup", {
+    target: "backup",
+  });
+  if (!confirmation) return;
   const guard = beginOperatorAction("backup", 60000);
   if (!guard.ok) {
     return jsonFail(res, guard.error, guard.statusCode, {
@@ -5959,6 +6524,10 @@ app.post("/api/operator/backup", (req, res) => {
 });
 
 app.post("/api/operator/update", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.system_update", {
+    target: "system_update",
+  });
+  if (!confirmation) return;
   const guard = beginOperatorAction("system_update", 300000);
   if (!guard.ok) {
     return jsonFail(res, guard.error, guard.statusCode, {
@@ -5997,6 +6566,10 @@ app.post("/api/operator/update", (req, res) => {
 });
 
 app.post("/api/operator/restart_operator", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.restart_operator", {
+    target: "operator_service",
+  });
+  if (!confirmation) return;
   const guard = beginOperatorAction("restart_operator", 60000);
   if (!guard.ok) {
     return jsonFail(res, guard.error, guard.statusCode, {
@@ -6049,10 +6622,10 @@ app.get("/api/operator/snapshot", wrapOperatorRoute(async (req, res) => {
 }));
 
 app.post("/api/operator/factoryReset", (req, res) => {
-  const confirm = String((req.body && req.body.confirm) || "").trim();
-  if (confirm !== "FACTORY_RESET") {
-    return jsonFail(res, "factory_reset_confirmation_required", 422);
-  }
+  const confirmation = requireOperatorConfirmation(req, res, "operator.factory_reset", {
+    target: "operator_state",
+  });
+  if (!confirmation) return;
   emergencyStop();
 
   const cleared = {
@@ -6438,12 +7011,13 @@ app.post("/api/operator/start_system", async (req, res) => {
     .toLowerCase();
 
   const finalMode = (mode === "live" || mode === "shadow") ? mode : "safe";
-  if (finalMode === "live") {
-    const confirm = String((req.body && req.body.confirm) || "");
-    if (confirm !== "TRADE") {
-      return jsonFail(res, "LIVE_CONFIRM_REQUIRED", 422);
-    }
-  }
+  const confirmation = requireOperatorConfirmation(
+    req,
+    res,
+    finalMode === "live" ? "operator.live_start" : "operator.start",
+    { target: `mode:${finalMode}` }
+  );
+  if (!confirmation) return;
   const result = startEngine(finalMode);
 
   SYSTEM_STATE.state = status();
@@ -6459,14 +7033,19 @@ app.post("/api/operator/start_system", async (req, res) => {
 });
 
 app.post("/api/operator/restart_engine", async (req, res) => {
+  const requestedMode = String((req.body && req.body.mode) || state.lastMode || "safe")
+    .trim()
+    .toLowerCase();
+  const confirmation = requireOperatorConfirmation(req, res, "operator.restart", {
+    target: `mode:${requestedMode || "safe"}`,
+  });
+  if (!confirmation) return;
   if (isLiveModeBlocked()) {
     return res.status(403).json({ ok: false, error: "blocked_in_live_mode" });
   }
 
   try {
-  const mode = String((req.body && req.body.mode) || state.lastMode || "safe")
-    .trim()
-    .toLowerCase();
+  const mode = requestedMode;
 
   const finalMode = (mode === "live" || mode === "shadow") ? mode : "safe";
 
@@ -6501,6 +7080,10 @@ return jsonOk(res, {
 });
 
 app.post("/api/operator/emergency_stop", (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.emergency_stop", {
+    target: "global",
+  });
+  if (!confirmation) return;
   const result = emergencyStop();
 
   SYSTEM_STATE.state = status();
@@ -6624,6 +7207,10 @@ app.get("/api/operator/trade_blotter", wrapOperatorRoute(async (req, res) => {
 }));
 
 app.post("/api/operator/restart_feeds", async (req, res) => {
+  const confirmation = requireOperatorConfirmation(req, res, "operator.restart_feeds", {
+    target: "market_data_jobs",
+  });
+  if (!confirmation) return;
   const guard = beginOperatorAction("restart_feeds", 30000);
   if (!guard.ok) {
     return jsonFail(res, guard.error, guard.statusCode, { retry_after_s: guard.retry_after_s || null });
@@ -6663,7 +7250,13 @@ app.post("/api/operator/restart_feeds", async (req, res) => {
     const stopped = [];
 
     for (const name of stopOrder) {
-      const r = await httpPostJson(`${base}/api/jobs/stop?name=${encodeURIComponent(name)}`, { name });
+      const r = await httpPostJson(`${base}/api/jobs/stop?name=${encodeURIComponent(name)}`, {
+        name,
+        ...operatorConfirmationBody(req, "JOB_ACTION", {
+          actionId: "jobs.stop",
+          target: name,
+        }),
+      });
       stopped.push({ name, ok: !!r.ok, result: r.json || null });
     }
 
@@ -6673,16 +7266,31 @@ app.post("/api/operator/restart_feeds", async (req, res) => {
 
     for (const name of supportDaemons) {
       if (!byName[name]) continue;
-      const r = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(name)}`, { name });
+      const r = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(name)}`, {
+        name,
+        ...operatorConfirmationBody(req, "JOB_ACTION", {
+          actionId: "jobs.start",
+          target: name,
+        }),
+      });
       started.push({ name, ok: !!r.ok, result: r.json || null });
     }
 
     if (targetPrimary) {
-      const r = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(targetPrimary)}`, { name: targetPrimary });
+      const r = await httpPostJson(`${base}/api/jobs/start?name=${encodeURIComponent(targetPrimary)}`, {
+        name: targetPrimary,
+        ...operatorConfirmationBody(req, "JOB_ACTION", {
+          actionId: "jobs.start",
+          target: targetPrimary,
+        }),
+      });
       started.push({ name: targetPrimary, ok: !!r.ok, result: r.json || null });
     }
 
-    const pipeline = await httpPostJson(`${base}/api/pipeline/run`, {});
+    const pipeline = await httpPostJson(`${base}/api/pipeline/run`, operatorConfirmationBody(req, "RUN_PIPELINE", {
+      actionId: "pipeline.run",
+      target: "market_data_pipeline",
+    }));
     const ok = started.some((x) => x && x.ok);
 
     const payload = {
@@ -7088,12 +7696,13 @@ app.post("/api/operator/guided_bootstrap", async (req, res) => {
     .toLowerCase();
 
   const finalMode = (mode === "live" || mode === "shadow") ? mode : "safe";
-  if (finalMode === "live") {
-    const confirm = String((req.body && req.body.confirm) || "").trim();
-    if (confirm !== "TRADE") {
-      return jsonFail(res, "LIVE_CONFIRM_REQUIRED", 422);
-    }
-  }
+  const confirmation = requireOperatorConfirmation(
+    req,
+    res,
+    finalMode === "live" ? "operator.guided_bootstrap_live" : "operator.guided_bootstrap",
+    { target: `mode:${finalMode}` }
+  );
+  if (!confirmation) return;
   const steps = [];
 
   try {
@@ -7136,7 +7745,13 @@ app.post("/api/operator/guided_bootstrap", async (req, res) => {
 
     const envObj = readEnv();
     const base = dashBaseUrlFromEnv(envObj);
-    const r = await httpPostJson(`${base}/api/operator/bootstrap_pipeline`, { mode: finalMode }, 180000);
+    const r = await httpPostJson(`${base}/api/operator/bootstrap_pipeline`, {
+      mode: finalMode,
+      ...operatorConfirmationBody(req, "GUIDED_BOOTSTRAP", {
+        actionId: "operator.guided_bootstrap",
+        target: `mode:${finalMode}`,
+      }),
+    }, 180000);
 
     if (!r || !r.ok) {
       steps.push({
@@ -7176,7 +7791,14 @@ function startTelemetryWebSocket(server){
 
   const wss = new WebSocket.Server({
     server,
-    path: "/ws/operator"
+    path: "/ws/operator",
+    verifyClient: (info, done) => {
+      if (operatorMutationAuthorized(info.req)) {
+        done(true);
+        return;
+      }
+      done(false, 403, "operator_forbidden");
+    }
   });
 
   _wsServer = wss;

@@ -20,6 +20,12 @@ import psycopg
 from psycopg.pq import TransactionStatus
 from psycopg_pool import ConnectionPool, PoolTimeout
 
+from engine.runtime.ingestion_tuning import (
+    active_profile,
+    ingestion_tuning_snapshot,
+    pg_pool_default_for_role,
+    tuned_int,
+)
 from engine.runtime.platform import default_pg_dsn, dsn_with_pg_password
 
 
@@ -163,6 +169,8 @@ def _pool_profile() -> str:
         or os.environ.get("ENGINE_PROCESS_ROLE")
         or ""
     ).strip().lower()
+    if raw in {"ingestion_child", "ingestion-child", "ingest_child", "ingest-child"}:
+        return "jobs"
     if raw in {"ingest", "ingestion", "market-data", "market_data"}:
         return "ingestion"
     if raw in {"job", "jobs", "worker"}:
@@ -179,13 +187,14 @@ def _pool_profile() -> str:
 def default_pool_size() -> int:
     explicit = str(os.environ.get("TS_PG_POOL_SIZE") or "").strip()
     if explicit:
-        return max(1, int(explicit))
+        return tuned_int("TS_PG_POOL_SIZE", 4, 1, 32)
     profile = _pool_profile()
-    if profile == "ingestion":
-        return 8
-    if profile == "jobs":
-        return 2
-    return 4
+    return tuned_int(
+        "TS_PG_POOL_SIZE",
+        pg_pool_default_for_role(profile),
+        1,
+        32,
+    )
 
 
 def _dsn() -> str:
@@ -421,7 +430,7 @@ def get_pool(timeout_s: float | None = None, *, bypass_failure_cooldown: bool = 
         _POOL_TRANSACTION_MODE = bool(transaction_mode)
 
     max_size = default_pool_size()
-    min_size = min(max_size, max(1, int(os.environ.get("TS_PG_POOL_MIN_SIZE", "2") or 2)))
+    min_size = min(max_size, tuned_int("TS_PG_POOL_MIN_SIZE", 2, 1, 16))
     pool = ConnectionPool(
         conninfo=conninfo,
         min_size=min_size,
@@ -583,13 +592,16 @@ def close_pooled_connections() -> None:
 
 def pool_snapshot() -> dict[str, Any]:
     pool = _POOL
+    profile = _pool_profile()
     return {
         "configured": bool(pool is not None),
         "dsn": _redact_dsn(_dsn()),
         "schema": schema_name(),
-        "profile": _pool_profile(),
+        "profile": profile,
+        "ingestion_tuning_profile": active_profile(),
         "max_size": int(default_pool_size()),
         "timeout_s": float(_pool_timeout_s()),
+        "ingestion_tuning": ingestion_tuning_snapshot(pg_pool_role=profile),
         "readiness": storage_readiness_snapshot(),
     }
 

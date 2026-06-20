@@ -877,6 +877,64 @@ const OPERATOR_DIRECT_ORIGIN = (() => {
   return "http://127.0.0.1:4001";
 })();
 
+const OPERATOR_AUTH_STORAGE_KEYS = {
+  dashboard: "trading_dashboard_api_token",
+  operator: "trading_operator_api_token"
+};
+
+function storageGet(key){
+  try{
+    return String(window.sessionStorage && window.sessionStorage.getItem(key) || "").trim()
+      || String(window.localStorage && window.localStorage.getItem(key) || "").trim();
+  }catch{
+    return "";
+  }
+}
+
+function storageSet(key, value){
+  const text = String(value || "").trim();
+  if(!text) return;
+  try{
+    if(window.sessionStorage) window.sessionStorage.setItem(key, text);
+  }catch{}
+}
+
+function rememberOperatorAuthTokensFromUrl(){
+  try{
+    const params = new URLSearchParams(String(location.search || ""));
+    const dashboardToken = String(
+      params.get("dashboard_token") ||
+      params.get("dashboard_api_token") ||
+      (OPERATOR_BRIDGE_PREFIX ? params.get("token") : "") ||
+      ""
+    ).trim();
+    const operatorToken = String(
+      params.get("operator_token") ||
+      params.get("operator_api_token") ||
+      (!OPERATOR_BRIDGE_PREFIX ? params.get("token") : "") ||
+      ""
+    ).trim();
+    storageSet(OPERATOR_AUTH_STORAGE_KEYS.dashboard, dashboardToken);
+    storageSet(OPERATOR_AUTH_STORAGE_KEYS.operator, operatorToken);
+  }catch{}
+}
+
+rememberOperatorAuthTokensFromUrl();
+
+function operatorAuthHeaders(method){
+  const upper = String(method || "GET").toUpperCase();
+  if(upper === "OPTIONS") return {};
+  const headers = {};
+  if(OPERATOR_BRIDGE_PREFIX){
+    const dashboardToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.dashboard);
+    if(dashboardToken) headers["X-API-Token"] = dashboardToken;
+  }else{
+    const operatorToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.operator);
+    if(operatorToken) headers["X-Operator-Token"] = operatorToken;
+  }
+  return headers;
+}
+
 function operatorBridgeUrl(url){
   const raw = String(url || "");
   if(!OPERATOR_BRIDGE_PREFIX) return raw;
@@ -891,12 +949,17 @@ function operatorTelemetryWsUrl(){
     direct.protocol = direct.protocol === "https:" ? "wss:" : "ws:";
     direct.pathname = "/ws/operator";
     direct.search = "";
+    const operatorToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.operator);
+    if(operatorToken) direct.searchParams.set("operator_token", operatorToken);
     direct.hash = "";
     return direct.toString();
   }
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/ws/operator`;
+  const direct = new URL(`${proto}://${location.host}/ws/operator`);
+  const operatorToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.operator);
+  if(operatorToken) direct.searchParams.set("operator_token", operatorToken);
+  return direct.toString();
 }
 
 let selectedMode = "safe"; // safe | shadow | live
@@ -1086,6 +1149,185 @@ async function jpost(url, body, timeoutMs = DEFAULT_POST_TIMEOUT_MS){
   });
 }
 
+let _confirmationModulePromise = null;
+function sharedConfirmationModule(){
+  if(!_confirmationModulePromise){
+    _confirmationModulePromise = import("/ui/confirmation_modal.mjs");
+  }
+  return _confirmationModulePromise;
+}
+
+const OPERATOR_CONFIRMATION_SPECS = {
+  "operator.start": {
+    title: "Start engine",
+    action: "Start operator-controlled runtime",
+    confirmText: "START_OPERATOR",
+    consequence: "Starts operator-controlled runtime processes and may start data or pipeline jobs.",
+    submitLabel: "Start engine",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.live_start": {
+    title: "Start TRADING mode",
+    action: "Start runtime in TRADING mode",
+    confirmText: "TRADE",
+    consequence: "TRADING mode can enable real execution only if backend execution gates also allow it.",
+    submitLabel: "Start TRADING",
+    requireReason: true,
+    minReasonLength: 10,
+    holdMs: 3000
+  },
+  "operator.guided_bootstrap": {
+    title: "Start system setup",
+    action: "Run guided startup workflow",
+    confirmText: "GUIDED_BOOTSTRAP",
+    consequence: "Runs engine start, health wait, and bootstrap pipeline work.",
+    submitLabel: "Start setup",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.guided_bootstrap_live": {
+    title: "Start TRADING setup",
+    action: "Run guided startup in TRADING mode",
+    confirmText: "TRADE",
+    consequence: "Runs guided startup in TRADING mode. Backend live execution gates remain authoritative.",
+    submitLabel: "Start TRADING setup",
+    requireReason: true,
+    minReasonLength: 10,
+    holdMs: 3000
+  },
+  "operator.stop": {
+    title: "Stop engine",
+    action: "Stop operator-controlled runtime",
+    confirmText: "STOP_OPERATOR",
+    consequence: "Stops operator-controlled runtime processes.",
+    submitLabel: "Stop engine",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.restart": {
+    title: "Restart engine",
+    action: "Restart operator-controlled runtime",
+    confirmText: "RESTART_OPERATOR",
+    consequence: "Stops and restarts operator-controlled runtime processes.",
+    submitLabel: "Restart engine",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.emergency_stop": {
+    title: "Emergency stop",
+    action: "Force SAFE mode and stop execution",
+    confirmText: "KILL",
+    consequence: "Forces SAFE mode, disarms execution, trips the global kill switch, and stops the engine.",
+    submitLabel: "Emergency stop",
+    requireReason: true,
+    minReasonLength: 10,
+    holdMs: 3000
+  },
+  "operator.config_write": {
+    title: "Save configuration",
+    action: "Write operator environment configuration",
+    confirmText: "SAVE_CONFIG",
+    consequence: "Writes normalized environment configuration used by future runtime starts.",
+    submitLabel: "Save config",
+    requireReason: true,
+    minReasonLength: 8
+  },
+  "operator.secrets_write": {
+    title: "Save secret",
+    action: "Write encrypted operator secret",
+    confirmText: "SAVE_SECRET",
+    consequence: "Writes encrypted operator-side secret values. Secret values are never shown or included in audit payloads.",
+    submitLabel: "Save secret",
+    requireReason: true,
+    minReasonLength: 8
+  },
+  "operator.factory_reset": {
+    title: "Factory reset",
+    action: "Delete operator configuration and state",
+    confirmText: "FACTORY_RESET",
+    consequence: "Deletes .env and operator secrets, clears operator state, and emergency-stops the runtime first.",
+    submitLabel: "Factory reset",
+    requireReason: true,
+    minReasonLength: 12,
+    holdMs: 5000
+  },
+  "operator.self_repair": {
+    title: "Run repair",
+    action: "Run automatic system repair",
+    confirmText: "SYSTEM_FIX",
+    consequence: "Runs automatic system repair actions through the dashboard/runtime repair surface.",
+    submitLabel: "Run repair",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.restart_feeds": {
+    title: "Restart feeds",
+    action: "Restart market-data jobs",
+    confirmText: "RESTART_FEEDS",
+    consequence: "Stops and starts market-data jobs and then requests a pipeline refresh.",
+    submitLabel: "Restart feeds",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.backup": {
+    title: "Run backup",
+    action: "Start appliance backup workflow",
+    confirmText: "RUN_BACKUP",
+    consequence: "Starts the appliance backup workflow.",
+    submitLabel: "Run backup",
+    requireReason: true,
+    minReasonLength: 6
+  },
+  "operator.system_update": {
+    title: "System update",
+    action: "Start appliance update workflow",
+    confirmText: "SYSTEM_UPDATE",
+    consequence: "Starts the appliance system update workflow.",
+    submitLabel: "Start update",
+    requireReason: true,
+    minReasonLength: 8
+  },
+  "operator.restart_operator": {
+    title: "Restart operator UI",
+    action: "Restart operator UI service",
+    confirmText: "RESTART_OPERATOR_UI",
+    consequence: "Restarts the operator UI service and may interrupt active operator sessions.",
+    submitLabel: "Restart operator UI",
+    requireReason: true,
+    minReasonLength: 6
+  }
+};
+
+async function requestOperatorConfirmation(actionId, overrides = {}){
+  try{
+    const mod = await sharedConfirmationModule();
+    const spec = OPERATOR_CONFIRMATION_SPECS[actionId] || {};
+    const confirmation = await mod.requestConfirmation({
+      ...spec,
+      ...overrides,
+      actionId,
+      actor: "operator_ui",
+      source: "operator_console"
+    });
+    return confirmation && confirmation.ok ? confirmation : null;
+  }catch(e){
+    console.error("confirmation modal failed", e);
+    renderWizard([{ ok:false, label:"Confirmation unavailable", detail:String(e) }], false);
+    return null;
+  }
+}
+
+async function operatorMutationConfirmation(actionId, body = {}, overrides = {}){
+  const confirmation = await requestOperatorConfirmation(actionId, overrides);
+  if(!confirmation) return null;
+  return {
+    ...(body || {}),
+    ...confirmation.payload,
+    reason: confirmation.reason
+  };
+}
+
 const DEFAULT_GET_TIMEOUT_MS = 8000;
 const DEFAULT_POST_TIMEOUT_MS = 15000;
 const CORE_REFRESH_MS = 5000;
@@ -1103,10 +1345,11 @@ async function fetchJson(url, options = {}){
     const init = {
       method,
       cache:"no-store",
+      headers: operatorAuthHeaders(method),
       signal: controller.signal
     };
     if(method !== "GET"){
-      init.headers = { "Content-Type":"application/json" };
+      init.headers = { ...init.headers, "Content-Type":"application/json" };
       init.body = JSON.stringify(options.body || {});
     }
 
@@ -1419,7 +1662,12 @@ async function saveConfig(){
     if(k) obj[k] = v;
   }
 
-  const r = await jpost("/api/operator/config", obj);
+  const payload = await operatorMutationConfirmation("operator.config_write", obj, {
+    target: ".env"
+  });
+  if(!payload) return;
+
+  const r = await jpost("/api/operator/config", payload);
 
   if(r.ok){
     document.getElementById("configMsg").innerText = "Saved OK.";
@@ -1467,7 +1715,12 @@ async function saveSecret(){
     return;
   }
 
-  const r = await jpost("/api/operator/secrets", { [key]: val });
+  const payload = await operatorMutationConfirmation("operator.secrets_write", { [key]: val }, {
+    target: key
+  });
+  if(!payload) return;
+
+  const r = await jpost("/api/operator/secrets", payload);
   document.getElementById("secretKey").value = "";
   document.getElementById("secretValue").value = "";
   document.getElementById("secretsMsg").innerText = (r && r.ok) ? "Saved." : "Failed.";
@@ -1501,12 +1754,11 @@ async function preflight(){
 }
 
 async function start(){
-  const request = { mode:selectedMode };
-  if(selectedMode === "live"){
-    const c = prompt("TRADING mode enables real execution.\nType TRADE to confirm:");
-    if(c !== "TRADE") return;
-    request.confirm = "TRADE";
-  }
+  const actionId = selectedMode === "live" ? "operator.live_start" : "operator.start";
+  const request = await operatorMutationConfirmation(actionId, { mode:selectedMode }, {
+    target: `mode:${selectedMode}`
+  });
+  if(!request) return;
 
   renderWizard([{ ok:false, label:"Starting…", detail:"sending start request" }], false);
 
@@ -1522,12 +1774,11 @@ async function start(){
 }
 
 async function guidedBootstrap(){
-  const request = { mode:selectedMode };
-  if(selectedMode === "live"){
-    const c = prompt("TRADING mode enables real execution.\nType TRADE to confirm:");
-    if(c !== "TRADE") return;
-    request.confirm = "TRADE";
-  }
+  const actionId = selectedMode === "live" ? "operator.guided_bootstrap_live" : "operator.guided_bootstrap";
+  const request = await operatorMutationConfirmation(actionId, { mode:selectedMode }, {
+    target: `mode:${selectedMode}`
+  });
+  if(!request) return;
 
   renderWizard([{ ok:false, label:"System setup…", detail:"starting automated operator workflow" }], false);
 
@@ -1882,13 +2133,24 @@ async function viewStrategy(){
 }
 
 async function restartFeeds(){
-  const r = await jpost("/api/operator/restart_feeds");
+  const payload = await operatorMutationConfirmation("operator.restart_feeds", {}, {
+    target: "market_data_jobs"
+  });
+  if(!payload) return;
+  const r = await jpost("/api/operator/restart_feeds", payload);
   document.getElementById("marketView").innerText = JSON.stringify(r, null, 2);
   await refreshAll();
 }
 
 async function restartEngine(){
-  const r = await jpost("/api/operator/restart_engine", { mode:selectedMode });
+  const payload = await operatorMutationConfirmation("operator.restart", { mode:selectedMode }, {
+    target: `mode:${selectedMode}`
+  });
+  if(!payload) return;
+  const r = await jpost(
+    "/api/operator/restart_engine",
+    payload
+  );
   if(r && r.ok){
     renderWizard([{ ok:true, label:"Restart Engine", detail:JSON.stringify(r, null, 2) }], true);
   }else{
@@ -1898,8 +2160,14 @@ async function restartEngine(){
 }
 
 async function emergencyStopHard(){
-  if(!confirm("Emergency stop will force SAFE mode and stop the engine. Continue?")) return;
-  const r = await jpost("/api/operator/emergency_stop");
+  const payload = await operatorMutationConfirmation("operator.emergency_stop", {}, {
+    target: "global"
+  });
+  if(!payload) return;
+  const r = await jpost(
+    "/api/operator/emergency_stop",
+    payload
+  );
   if(r && r.ok){
     renderWizard([{ ok:true, label:"Emergency Stop", detail:JSON.stringify(r, null, 2) }], true);
   }else{
@@ -1909,19 +2177,37 @@ async function emergencyStopHard(){
 }
 
 async function stop(){
-  await jpost("/api/operator/stop");
+  const payload = await operatorMutationConfirmation("operator.stop", {}, {
+    target: "engine"
+  });
+  if(!payload) return;
+  await jpost(
+    "/api/operator/stop",
+    payload
+  );
   renderWizard([], false);
   await refreshAll();
 }
 
 async function restart(){
-  await jpost("/api/operator/restart", { mode:selectedMode });
+  const payload = await operatorMutationConfirmation("operator.restart", { mode:selectedMode }, {
+    target: `mode:${selectedMode}`
+  });
+  if(!payload) return;
+  await jpost(
+    "/api/operator/restart",
+    payload
+  );
   renderWizard([{ ok:false, label:"Restarting…", detail:"backend restarting" }], false);
   await refreshAll();
 }
 
 async function repairSystem(){
-  const r = await jpost("/api/operator/self_repair");
+  const payload = await operatorMutationConfirmation("operator.self_repair", {}, {
+    target: "runtime_repair"
+  });
+  if(!payload) return;
+  const r = await jpost("/api/operator/self_repair", payload);
 
   if(r && Array.isArray(r.steps)){
     const steps = (r.steps || []).map((s) => ({
@@ -1948,8 +2234,11 @@ async function factoryReset(){
     document.getElementById("configMsg").innerText = "Monitoring mode: factory reset is disabled.";
     return;
   }
-  if(!confirm("Factory reset deletes .env and secrets and clears operator state. Continue?")) return;
-  await jpost("/api/operator/factoryReset", { confirm:"FACTORY_RESET" });
+  const payload = await operatorMutationConfirmation("operator.factory_reset", {}, {
+    target: "operator_state"
+  });
+  if(!payload) return;
+  await jpost("/api/operator/factoryReset", payload);
   await refreshAll();
   await loadConfig();
   await loadSecrets();
@@ -2068,9 +2357,13 @@ async function loadServiceStatus(){
 
 async function runBackup(){
   const msg = document.getElementById("serviceActionMsg");
+  const payload = await operatorMutationConfirmation("operator.backup", {}, {
+    target: "backup"
+  });
+  if(!payload) return;
   if(msg) msg.innerText = "Running backup…";
 
-  const r = await jpost("/api/operator/backup", {});
+  const r = await jpost("/api/operator/backup", payload);
   if(msg) msg.innerText = (r && r.ok) ? "Backup started." : `Backup failed: ${JSON.stringify(r || {}, null, 2)}`;
 
   await loadServiceStatus();
@@ -2079,9 +2372,13 @@ async function runBackup(){
 
 async function runSystemUpdate(){
   const msg = document.getElementById("serviceActionMsg");
+  const payload = await operatorMutationConfirmation("operator.system_update", {}, {
+    target: "system_update"
+  });
+  if(!payload) return;
   if(msg) msg.innerText = "Starting system update…";
 
-  const r = await jpost("/api/operator/update", {});
+  const r = await jpost("/api/operator/update", payload);
   if(msg) msg.innerText = (r && r.ok) ? "System update started." : `System update failed: ${JSON.stringify(r || {}, null, 2)}`;
 
   await loadServiceStatus();
@@ -2090,9 +2387,13 @@ async function runSystemUpdate(){
 
 async function restartOperatorService(){
   const msg = document.getElementById("serviceActionMsg");
+  const payload = await operatorMutationConfirmation("operator.restart_operator", {}, {
+    target: "operator_service"
+  });
+  if(!payload) return;
   if(msg) msg.innerText = "Restarting operator UI service…";
 
-  const r = await jpost("/api/operator/restart_operator", {});
+  const r = await jpost("/api/operator/restart_operator", payload);
   if(msg) msg.innerText = (r && r.ok) ? "Operator UI restart requested." : `Operator restart failed: ${JSON.stringify(r || {}, null, 2)}`;
 }
 

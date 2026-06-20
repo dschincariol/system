@@ -6,9 +6,11 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Sequence
+from typing import Any, Sequence
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
+from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.startup_write_gate import (
     noncritical_startup_write_wait_s,
     should_defer_noncritical_startup_write,
@@ -17,27 +19,13 @@ from engine.runtime.storage import connect_ro, run_write_txn
 
 LOG = logging.getLogger("engine.runtime.telemetry_append_buffer")
 
-_BUFFER_ENABLED = str(os.environ.get("TELEMETRY_APPEND_BUFFER_ENABLED", "1")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_BUFFER_FLUSH_INTERVAL_S = max(
-    0.05,
-    float(os.environ.get("TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S", "0.5") or 0.5),
-)
-_BUFFER_FLUSH_JITTER_RATIO = min(
-    1.0,
-    max(0.0, float(os.environ.get("TELEMETRY_APPEND_BUFFER_FLUSH_JITTER_RATIO", "0.25") or 0.25)),
-)
-_BUFFER_MAX_BATCH = max(
-    1,
-    int(os.environ.get("TELEMETRY_APPEND_BUFFER_MAX_BATCH", "128") or 128),
-)
+_BUFFER_ENABLED = env_bool("TELEMETRY_APPEND_BUFFER_ENABLED", default=True)
+_BUFFER_FLUSH_INTERVAL_S = tuned_float("TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0)
+_BUFFER_FLUSH_JITTER_RATIO = tuned_float("TELEMETRY_APPEND_BUFFER_FLUSH_JITTER_RATIO", 0.25, 0.0, 1.0)
+_BUFFER_MAX_BATCH = tuned_int("TELEMETRY_APPEND_BUFFER_MAX_BATCH", 128, 1, 4096)
 _BUFFER_MAX_ROWS = max(
     _BUFFER_MAX_BATCH,
-    int(os.environ.get("TELEMETRY_APPEND_BUFFER_MAX_ROWS", "4096") or 4096),
+    tuned_int("TELEMETRY_APPEND_BUFFER_MAX_ROWS", 4096, 1, 65536),
 )
 
 _TABLE_SPECS: dict[str, dict[str, str]] = {
@@ -175,7 +163,13 @@ _BUFFER_STATE: dict[str, Any] = {
     "buffered_rows": 0,
     "dropped_rows": 0,
     "flush_batches": 0,
+    "flush_failures": 0,
     "flushed_rows": 0,
+    "retry_count": 0,
+    "last_flush_latency_ms": 0,
+    "total_flush_latency_ms": 0,
+    "last_db_write_duration_ms": 0,
+    "total_db_write_duration_ms": 0,
     "last_enqueue_ts_ms": 0,
     "last_flush_ts_ms": 0,
     "last_error": "",
@@ -264,11 +258,26 @@ def _set_last_rejected_locked(*, table: str, reason: str, ts_ms: int) -> None:
     _BUFFER_STATE["last_rejected_ts_ms"] = int(ts_ms)
 
 
-def _record_flush_success_locked(*, table: str, flushed_rows: int, ts_ms: int) -> None:
+def _record_flush_success_locked(
+    *,
+    table: str,
+    flushed_rows: int,
+    ts_ms: int,
+    flush_latency_ms: float | int | None = None,
+    db_write_duration_ms: float | int | None = None,
+) -> None:
     _BUFFER_STATE["flush_batches"] = int(_BUFFER_STATE.get("flush_batches") or 0) + 1
     _BUFFER_STATE["flushed_rows"] = int(_BUFFER_STATE.get("flushed_rows") or 0) + int(flushed_rows)
     _BUFFER_STATE["last_flush_ts_ms"] = int(ts_ms)
     _BUFFER_STATE["last_error"] = ""
+    if flush_latency_ms is not None:
+        latency_i = int(round(float(flush_latency_ms)))
+        _BUFFER_STATE["last_flush_latency_ms"] = latency_i
+        _BUFFER_STATE["total_flush_latency_ms"] = int(_BUFFER_STATE.get("total_flush_latency_ms") or 0) + latency_i
+    if db_write_duration_ms is not None:
+        db_i = int(round(float(db_write_duration_ms)))
+        _BUFFER_STATE["last_db_write_duration_ms"] = db_i
+        _BUFFER_STATE["total_db_write_duration_ms"] = int(_BUFFER_STATE.get("total_db_write_duration_ms") or 0) + db_i
     _increment_table_counter_locked("flushed_by_table", str(table), int(flushed_rows))
 
 
@@ -279,6 +288,7 @@ def _snapshot_locked() -> dict[str, Any]:
     state["flushed_by_table"] = dict(_BUFFER_STATE.get("flushed_by_table") or {})
     state["enabled"] = bool(_BUFFER_ENABLED)
     state["thread_alive"] = bool(_BUFFER_THREAD is not None and _BUFFER_THREAD.is_alive())
+    state["queue_depth"] = int(state.get("buffered_rows") or 0)
     state["buffer_max_rows"] = int(_BUFFER_MAX_ROWS)
     state["batch_size"] = int(_BUFFER_MAX_BATCH)
     state["flush_interval_s"] = float(_BUFFER_EFFECTIVE_FLUSH_INTERVAL_S)
@@ -368,6 +378,7 @@ def _append_rows_direct_with_policy(
 ) -> int:
     if not rows:
         return 0
+    started = time.perf_counter()
     flushed = int(
         _write_rows(
             str(table),
@@ -377,13 +388,28 @@ def _append_rows_direct_with_policy(
             busy_timeout_ms=busy_timeout_ms,
         )
     )
+    latency_ms = float((time.perf_counter() - started) * 1000.0)
     now_ms = int(time.time() * 1000)
     with _BUFFER_LOCK:
         _record_flush_success_locked(
             table=str(table),
             flushed_rows=int(flushed),
             ts_ms=int(now_ms),
+            flush_latency_ms=float(latency_ms),
+            db_write_duration_ms=float(latency_ms),
         )
+    emit_timing(
+        "telemetry_append_buffer_flush_latency_ms",
+        float(latency_ms),
+        component="engine.runtime.telemetry_append_buffer",
+        extra_tags={"table": str(table), "path": "direct"},
+    )
+    emit_timing(
+        "telemetry_append_buffer_db_write_duration_ms",
+        float(latency_ms),
+        component="engine.runtime.telemetry_append_buffer",
+        extra_tags={"table": str(table), "path": "direct"},
+    )
     return int(flushed)
 
 
@@ -409,6 +435,7 @@ def _drain_rows_locked(
 def _requeue_rows(table: str, rows: Sequence[tuple[Any, ...]]) -> None:
     if not rows:
         return
+    dropped = 0
     with _BUFFER_LOCK:
         room = max(0, int(_BUFFER_MAX_ROWS) - int(_buffered_row_count_locked()))
         kept = list(rows[:room])
@@ -419,7 +446,15 @@ def _requeue_rows(table: str, rows: Sequence[tuple[Any, ...]]) -> None:
         _BUFFER_STATE["buffered_rows"] = int(_buffered_row_count_locked())
         if dropped > 0:
             _BUFFER_STATE["dropped_rows"] = int(_BUFFER_STATE.get("dropped_rows") or 0) + int(dropped)
+            _increment_table_counter_locked("dropped_by_table", str(table), int(dropped))
         _BUFFER_LOCK.notify_all()
+    if dropped > 0:
+        emit_counter(
+            "telemetry_append_buffer_dropped_rows",
+            int(dropped),
+            component="engine.runtime.telemetry_append_buffer",
+            extra_tags={"table": str(table), "reason": "requeue_overflow"},
+        )
 
 
 def _buffer_writer_loop() -> None:
@@ -457,17 +492,50 @@ def _buffer_writer_loop() -> None:
         if not table or not rows:
             continue
         try:
+            flush_started = time.perf_counter()
             flushed = _flush_rows(str(table), rows)
+            latency_ms = float((time.perf_counter() - flush_started) * 1000.0)
             consecutive_failures = 0
             now_ms = int(time.time() * 1000)
             with _BUFFER_LOCK:
-                _record_flush_success_locked(table=str(table), flushed_rows=int(flushed), ts_ms=int(now_ms))
+                _record_flush_success_locked(
+                    table=str(table),
+                    flushed_rows=int(flushed),
+                    ts_ms=int(now_ms),
+                    flush_latency_ms=float(latency_ms),
+                    db_write_duration_ms=float(latency_ms),
+                )
+            emit_timing(
+                "telemetry_append_buffer_flush_latency_ms",
+                float(latency_ms),
+                component="engine.runtime.telemetry_append_buffer",
+                extra_tags={"table": str(table), "path": "background"},
+            )
+            emit_timing(
+                "telemetry_append_buffer_db_write_duration_ms",
+                float(latency_ms),
+                component="engine.runtime.telemetry_append_buffer",
+                extra_tags={"table": str(table), "path": "background"},
+            )
+            emit_gauge(
+                "telemetry_append_buffer_queue_depth",
+                int(get_telemetry_append_buffer_snapshot().get("buffered_rows") or 0),
+                component="engine.runtime.telemetry_append_buffer",
+            )
         except Exception as e:
             consecutive_failures = min(consecutive_failures + 1, 5)
             _requeue_rows(str(table), rows)
             with _BUFFER_LOCK:
+                _BUFFER_STATE["flush_failures"] = int(_BUFFER_STATE.get("flush_failures") or 0) + 1
+                _BUFFER_STATE["retry_count"] = int(_BUFFER_STATE.get("retry_count") or 0) + 1
                 _BUFFER_STATE["last_error"] = f"{type(e).__name__}:{e}"
                 _BUFFER_STATE["last_error_ts_ms"] = int(time.time() * 1000)
+            emit_counter(
+                "telemetry_append_buffer_retries",
+                1,
+                component="engine.runtime.telemetry_append_buffer",
+                extra_tags={"table": str(table), "failure_count": int(consecutive_failures)},
+            )
             _warn_nonfatal(
                 "TELEMETRY_APPEND_BUFFER_FLUSH_FAILED",
                 e,
@@ -519,10 +587,14 @@ def _enqueue_rows(table: str, rows: Sequence[tuple[Any, ...]]) -> bool:
         return False
     _ensure_buffer_thread_started()
     now_ms = int(time.time() * 1000)
+    accepted_count = 0
+    dropped_count = 0
     with _BUFFER_LOCK:
         room = max(0, int(_BUFFER_MAX_ROWS) - int(_buffered_row_count_locked()))
         accepted = list(rows[:room])
         dropped = max(0, len(rows) - len(accepted))
+        accepted_count = int(len(accepted))
+        dropped_count = int(dropped)
         if accepted:
             _BUFFER_PENDING.setdefault(table_name, []).extend(accepted)
             _BUFFER_STATE["accepted_rows"] = int(_BUFFER_STATE.get("accepted_rows") or 0) + int(len(accepted))
@@ -551,6 +623,20 @@ def _enqueue_rows(table: str, rows: Sequence[tuple[Any, ...]]) -> bool:
                 reason="buffer_full",
                 ts_ms=int(now_ms),
             )
+    if accepted_count > 0:
+        emit_gauge(
+            "telemetry_append_buffer_queue_depth",
+            int(get_telemetry_append_buffer_snapshot().get("buffered_rows") or 0),
+            component="engine.runtime.telemetry_append_buffer",
+            extra_tags={"table": table_name},
+        )
+    if dropped_count > 0:
+        emit_counter(
+            "telemetry_append_buffer_dropped_rows",
+            int(dropped_count),
+            component="engine.runtime.telemetry_append_buffer",
+            extra_tags={"table": table_name, "reason": "buffer_overflow"},
+        )
     return bool(accepted)
 
 
@@ -767,7 +853,9 @@ def flush_telemetry_append_buffers(
             )
         if not table or not rows:
             break
+        started = time.perf_counter()
         flushed_now = int(_flush_rows(str(table), rows))
+        latency_ms = float((time.perf_counter() - started) * 1000.0)
         flushed += int(flushed_now)
         flush_batches += 1
         now_ms = int(time.time() * 1000)
@@ -776,7 +864,21 @@ def flush_telemetry_append_buffers(
                 table=str(table),
                 flushed_rows=int(flushed_now),
                 ts_ms=int(now_ms),
+                flush_latency_ms=float(latency_ms),
+                db_write_duration_ms=float(latency_ms),
             )
+        emit_timing(
+            "telemetry_append_buffer_flush_latency_ms",
+            float(latency_ms),
+            component="engine.runtime.telemetry_append_buffer",
+            extra_tags={"table": str(table), "path": "manual"},
+        )
+        emit_timing(
+            "telemetry_append_buffer_db_write_duration_ms",
+            float(latency_ms),
+            component="engine.runtime.telemetry_append_buffer",
+            extra_tags={"table": str(table), "path": "manual"},
+        )
     snapshot = get_telemetry_append_buffer_snapshot()
     snapshot["flushed"] = int(flushed)
     snapshot["manual_flush_batches"] = int(flush_batches)

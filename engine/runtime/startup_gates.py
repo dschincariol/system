@@ -15,7 +15,9 @@ from engine.runtime.logging import get_logger
 from engine.runtime.platform import (
     default_dashboard_host,
     default_data_root,
-    default_pg_dsn,
+    default_local_db_dir,
+    default_local_log_dir,
+    default_pg_dsn,  # noqa: F401 - compatibility patch target covered by tests/test_startup_health_validation.py.
     is_loopback_host as _platform_is_loopback_host,
     normalize_loopback_host,
 )
@@ -217,12 +219,12 @@ def _resolve_startup_paths(repo_root: str | Path | None = None) -> Dict[str, Pat
     log_dir = Path(
         os.environ.get("TRADING_LOGS")
         or os.environ.get("LOG_DIR")
-        or str((root / "logs").resolve())
+        or str(default_local_log_dir().resolve())
     ).expanduser().resolve()
     data_dir = Path(
         os.environ.get("TRADING_DATA")
         or os.environ.get("DATA_DIR")
-        or str((root / "data").resolve())
+        or str(default_local_db_dir().resolve())
     ).expanduser().resolve()
     db_path = Path(str(os.environ.get("DB_PATH") or default_data_root())).expanduser().resolve()
     log_file = Path(
@@ -718,6 +720,7 @@ def evaluate_runtime_startup_gates(
     ]
 
     db_health = dict(health.get("db") or {})
+    disk_pressure = dict(health.get("disk_pressure") or {})
     model_cache = dict(health.get("model_cache") or {})
     runtime_price_cache = dict(health.get("runtime_price_cache") or {})
     event_bus = dict(health.get("event_bus") or {})
@@ -819,6 +822,18 @@ def evaluate_runtime_startup_gates(
         and bool(schema_version_ok)
         and (quick_check_value == "ok" or quick_check_skipped)
     )
+    disk_pressure_reported = bool(disk_pressure)
+    disk_critical = [str(item) for item in list(disk_pressure.get("critical") or []) if str(item).strip()]
+    disk_warnings = [str(item) for item in list(disk_pressure.get("warnings") or []) if str(item).strip()]
+    disk_ok = (not disk_pressure_reported) or (bool(disk_pressure.get("ok", True)) and not disk_critical)
+    disk_detail = "unreported"
+    if disk_pressure_reported:
+        if disk_critical:
+            disk_detail = "disk_pressure_critical:" + "; ".join(disk_critical[:5])
+        elif disk_warnings:
+            disk_detail = "disk_pressure_warning:" + "; ".join(disk_warnings[:5])
+        else:
+            disk_detail = "ok"
 
     gates = {
         "config_valid": _gate(
@@ -889,6 +904,20 @@ def evaluate_runtime_startup_gates(
             detail="ok" if not missing_dirs else f"missing_directories:{','.join(missing_dirs)}",
             config_keys=["TRADING_LOGS", "LOG_DIR", "TRADING_DATA", "DATA_DIR", "DB_PATH"],
             extra={"paths": {key: str(value) for key, value in paths.items() if key in {"log_dir", "data_dir", "db_parent"}}},
+        ),
+        "disk_headroom_available": _gate(
+            "disk_headroom_available",
+            disk_ok,
+            blocking=not disk_ok,
+            component="filesystem",
+            detail=disk_detail,
+            config_keys=[
+                "DISK_PRESSURE_WARN_FREE_PCT",
+                "DISK_PRESSURE_WARN_FREE_BYTES",
+                "DISK_PRESSURE_CRITICAL_FREE_PCT",
+                "DISK_PRESSURE_CRITICAL_FREE_BYTES",
+            ],
+            extra={"disk_pressure": disk_pressure},
         ),
         "core_services_initialized": _gate(
             "core_services_initialized",

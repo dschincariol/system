@@ -279,11 +279,20 @@ def get_realized_trade(
 
         if px_in is None:
             return None
+        entry_qty = sum(abs(float(qty or 0.0)) for _price, qty in entry_rows)
+        exit_qty = sum(abs(float(qty or 0.0)) for _price, qty in exit_rows)
+        entry_notional = sum(abs(float(qty or 0.0)) * float(price or 0.0) for price, qty in entry_rows)
+        exit_notional = sum(abs(float(qty or 0.0)) * float(price or 0.0) for price, qty in exit_rows)
 
         return {
             "side": 1 if str(side).upper().startswith("B") else -1,
             "px_in": float(px_in),
             "px_out": float(px_out) if px_out is not None else None,
+            "qty": float(entry_qty),
+            "entry_qty": float(entry_qty),
+            "exit_qty": float(exit_qty),
+            "entry_notional": float(entry_notional),
+            "exit_notional": float(exit_notional),
             "fees_total": float(fees_total),
         }
 

@@ -250,6 +250,28 @@ def _check_state(blockers: set[str], blocker_key: str, available: bool = True) -
     return "fail" if blocker_key in blockers else "pass"
 
 
+def _promotion_test_payload(reason: dict, test_name: str) -> dict:
+    direct = reason.get(test_name)
+    if isinstance(direct, dict):
+        return dict(direct)
+    statistical_gate = reason.get("statistical_gate")
+    if isinstance(statistical_gate, dict):
+        tests = statistical_gate.get("tests")
+        if isinstance(tests, dict) and isinstance(tests.get(test_name), dict):
+            return dict(tests.get(test_name) or {})
+        if test_name in statistical_gate and isinstance(statistical_gate.get(test_name), dict):
+            return dict(statistical_gate.get(test_name) or {})
+    return {}
+
+
+def _promotion_payload_state(payload: dict) -> str:
+    if not isinstance(payload, dict) or not payload:
+        return "unavailable"
+    if "passed" in payload:
+        return "pass" if bool(payload.get("passed")) else "fail"
+    return "unavailable"
+
+
 def _gate_checklist(status: dict, reason: dict, replay_status: dict, shadow_scores: list) -> list[dict]:
     raw_blockers = reason.get("blockers") or []
     if not isinstance(raw_blockers, list):
@@ -269,8 +291,11 @@ def _gate_checklist(status: dict, reason: dict, replay_status: dict, shadow_scor
             replay_pass = bool(replay_status.get("fresh"))
         elif str(replay_status.get("status") or "").lower() in {"pass", "passed", "fresh", "ok", "approved"}:
             replay_pass = True
-        elif str(replay_status.get("status") or "").lower() in {"fail", "failed", "stale", "blocked", "rejected"}:
-            replay_pass = False
+    elif str(replay_status.get("status") or "").lower() in {"fail", "failed", "stale", "blocked", "rejected"}:
+        replay_pass = False
+
+    statistical_observed = reason.get("statistical_gate") if isinstance(reason.get("statistical_gate"), dict) else {}
+    deconfounded_observed = _promotion_test_payload(reason, "deconfounded_signal_validation")
 
     return [
         {
@@ -336,9 +361,16 @@ def _gate_checklist(status: dict, reason: dict, replay_status: dict, shadow_scor
         {
             "key": "statistical_gate",
             "label": "Statistical gate",
-            "state": "unavailable",
-            "observed": reason.get("statistical_gate"),
+            "state": _promotion_payload_state(statistical_observed),
+            "observed": statistical_observed or reason.get("statistical_gate"),
             "expected": "latest persisted statistical evidence must pass",
+        },
+        {
+            "key": "deconfounded_signal_validation",
+            "label": "Deconfounded signal",
+            "state": _promotion_payload_state(deconfounded_observed),
+            "observed": deconfounded_observed or None,
+            "expected": "positive stable residual signal effect after beta, sector, size, volatility, liquidity, regime, and existing-model exposure controls",
         },
         {
             "key": "cpcv_gate",
@@ -691,6 +723,62 @@ def get_governance_summary():
             "audit": [],
             "logs": [],
         }
+
+
+def get_governance_evidence(*, limit: int = 20, regime: str = "global") -> dict:
+    try:
+        from engine.api.governance_evidence import build_governance_evidence_summary
+
+        return build_governance_evidence_summary(limit=limit, regime=regime)
+    except Exception as e:
+        _warn_nonfatal(
+            "API_GOVERNANCE_EVIDENCE_FAILED",
+            e,
+            once_key="api_governance_evidence_failed",
+        )
+        return {"ok": False, "error": str(e), "state": "unknown", "evidence": []}
+
+
+def get_governance_evidence_promotion_blockers(*, limit: int = 20, regime: str = "global") -> dict:
+    try:
+        from engine.api.governance_evidence import build_promotion_blockers
+
+        return build_promotion_blockers(limit=limit, regime=regime)
+    except Exception as e:
+        _warn_nonfatal(
+            "API_GOVERNANCE_EVIDENCE_BLOCKERS_FAILED",
+            e,
+            once_key="api_governance_evidence_blockers_failed",
+        )
+        return {"ok": False, "error": str(e), "state": "unknown", "evidence_blockers": []}
+
+
+def get_governance_evidence_generated_candidates(*, limit: int = 50) -> dict:
+    try:
+        from engine.api.governance_evidence import build_generated_candidate_provenance
+
+        return build_generated_candidate_provenance(limit=limit)
+    except Exception as e:
+        _warn_nonfatal(
+            "API_GOVERNANCE_EVIDENCE_GENERATED_FAILED",
+            e,
+            once_key="api_governance_evidence_generated_failed",
+        )
+        return {"ok": False, "error": str(e), "state": "unknown", "rows": []}
+
+
+def get_governance_evidence_shadow_capital(*, limit: int = 50, regime: str = "global") -> dict:
+    try:
+        from engine.api.governance_evidence import build_shadow_capital_evidence
+
+        return build_shadow_capital_evidence(limit=limit, regime=regime)
+    except Exception as e:
+        _warn_nonfatal(
+            "API_GOVERNANCE_EVIDENCE_SHADOW_CAPITAL_FAILED",
+            e,
+            once_key="api_governance_evidence_shadow_capital_failed",
+        )
+        return {"ok": False, "error": str(e), "rows": [], "masking": {"applied": True}}
 
 
 # --------------------------------------------------

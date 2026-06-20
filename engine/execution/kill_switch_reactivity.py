@@ -68,7 +68,7 @@ def _latest_active_kill_ts_ms(*, con=None, symbol: Optional[str] = None, model_i
         con = connect(readonly=True)
         own = True
     try:
-        clauses = [("global", "global")]
+        clauses = []
         sym = str(symbol or "").strip().upper()
         if sym:
             clauses.append(("symbol", sym))
@@ -77,6 +77,21 @@ def _latest_active_kill_ts_ms(*, con=None, symbol: Optional[str] = None, model_i
             clauses.append(("model", mid))
 
         latest = int(_LAST_KILL_EVENT_TS_MS or 0)
+        try:
+            row = con.execute(
+                """
+                SELECT updated_ts_ms
+                FROM kill_switch_state
+                WHERE scope='global' AND enabled=1
+                ORDER BY updated_ts_ms DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except Exception:
+            row = None
+        if row and row[0] is not None:
+            latest = max(int(latest), int(row[0] or 0))
+
         for scope, key in clauses:
             try:
                 row = con.execute(

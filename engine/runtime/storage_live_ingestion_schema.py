@@ -321,6 +321,46 @@ def _table_column_specs(con, table: str) -> Dict[str, Dict[str, object]]:
     }
 
 
+def _type_matches(con, *, expected: str, actual: str) -> bool:
+    expected_type = str(expected or "").strip().upper()
+    actual_type = str(actual or "").strip().upper()
+    if _is_sqlite_connection(con):
+        return expected_type == actual_type
+    if expected_type == "INTEGER":
+        return actual_type in {"SMALLINT", "INTEGER", "BIGINT"}
+    if expected_type == "REAL":
+        return actual_type in {"REAL", "DOUBLE PRECISION", "NUMERIC"}
+    if expected_type == "TEXT":
+        return actual_type in {"TEXT", "CHARACTER", "CHARACTER VARYING"}
+    return expected_type == actual_type
+
+
+def _table_matches_owned_contract(con, table: str) -> bool:
+    expected_specs = OWNED_LIVE_TABLE_COLUMN_SPECS[str(table)]
+    actual_specs = _table_column_specs(con, str(table))
+    if set(actual_specs) != set(expected_specs):
+        return False
+    return all(
+        _type_matches(
+            con,
+            expected=str((expected_spec or {}).get("type") or ""),
+            actual=str((actual_specs.get(column_name) or {}).get("type") or ""),
+        )
+        and int((actual_specs.get(column_name) or {}).get("pk") or 0)
+        == int((expected_spec or {}).get("pk") or 0)
+        for column_name, expected_spec in expected_specs.items()
+    )
+
+
+def _next_legacy_table_name(con, base: str) -> str:
+    if not _table_exists(con, base):
+        return base
+    idx = 2
+    while _table_exists(con, f"{base}_{idx}"):
+        idx += 1
+    return f"{base}_{idx}"
+
+
 def _has_column(con, table: str, col: str) -> bool:
     return str(col).strip().lower() in _table_column_specs(con, str(table))
 
@@ -340,25 +380,9 @@ def ensure_prices_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
     needs_rebuild = False
     legacy_table = ""
     if _table_exists(con, "prices"):
-        expected_specs = OWNED_LIVE_TABLE_COLUMN_SPECS["prices"]
-        actual_specs = _table_column_specs(con, "prices")
-        needs_rebuild = bool(
-            set(actual_specs) != set(expected_specs)
-            or any(
-                str((actual_specs.get(column_name) or {}).get("type") or "").strip().upper()
-                != str((expected_spec or {}).get("type") or "").strip().upper()
-                or int((actual_specs.get(column_name) or {}).get("pk") or 0)
-                != int((expected_spec or {}).get("pk") or 0)
-                for column_name, expected_spec in expected_specs.items()
-            )
-        )
+        needs_rebuild = not _table_matches_owned_contract(con, "prices")
     if needs_rebuild and _table_exists(con, "prices"):
-        legacy_table = "prices_legacy_exact_once"
-        if _table_exists(con, legacy_table):
-            idx = 2
-            while _table_exists(con, f"prices_legacy_exact_once_{idx}"):
-                idx += 1
-            legacy_table = f"prices_legacy_exact_once_{idx}"
+        legacy_table = _next_legacy_table_name(con, "prices_legacy_exact_once")
         con.execute(f"ALTER TABLE prices RENAME TO {legacy_table}")
     con.execute(
         """
@@ -378,8 +402,6 @@ def ensure_prices_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
           ON prices(symbol, ts_ms)
         """
     )
-    if not _is_sqlite_connection(con):
-        con.execute("ALTER TABLE prices ADD COLUMN IF NOT EXISTS extra_json JSONB")
     if not legacy_table and _table_exists(con, "prices_legacy_exact_once"):
         legacy_table = "prices_legacy_exact_once"
     if legacy_table and _table_exists(con, legacy_table):
@@ -459,25 +481,13 @@ def ensure_price_quotes_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
 
 def ensure_price_quotes_raw_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
     needs_rebuild = False
+    legacy_table = ""
     if _table_exists(con, "price_quotes_raw"):
-        required_cols = {
-            "event_key",
-            "event_type",
-            "event_ts_ms",
-            "trade_ts_ms",
-            "quote_ts_ms",
-            "ingest_ts_ms",
-            "source",
-        }
-        cols = {
-            str(name).strip().lower()
-            for name in _table_column_specs(con, "price_quotes_raw")
-        }
-        if not required_cols.issubset(cols):
-            needs_rebuild = True
+        needs_rebuild = not _table_matches_owned_contract(con, "price_quotes_raw")
 
-    if needs_rebuild and _table_exists(con, "price_quotes_raw") and not _table_exists(con, "price_quotes_raw_legacy_exact_once"):
-        con.execute("ALTER TABLE price_quotes_raw RENAME TO price_quotes_raw_legacy_exact_once")
+    if needs_rebuild and _table_exists(con, "price_quotes_raw"):
+        legacy_table = _next_legacy_table_name(con, "price_quotes_raw_legacy_exact_once")
+        con.execute(f"ALTER TABLE price_quotes_raw RENAME TO {legacy_table}")
 
     con.executescript(
         """
@@ -513,35 +523,58 @@ def ensure_price_quotes_raw_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
           ON price_quotes_raw(provider, event_ts_ms);
         """
     )
-    if _table_exists(con, "price_quotes_raw_legacy_exact_once"):
+    if not legacy_table and _table_exists(con, "price_quotes_raw_legacy_exact_once"):
+        legacy_table = "price_quotes_raw_legacy_exact_once"
+    if legacy_table and _table_exists(con, legacy_table):
+        legacy_specs = _table_column_specs(con, legacy_table)
+        legacy_columns = set(legacy_specs)
+        symbol_expr = "symbol" if "symbol" in legacy_columns else "''"
+        provider_expr = "provider" if "provider" in legacy_columns else "''"
+        ts_expr = "ts_ms" if "ts_ms" in legacy_columns else "0"
+        event_key_expr = (
+            "COALESCE(CAST(event_key AS TEXT), "
+            f"'legacy:' || {symbol_expr} || ':' || {provider_expr} || ':' || {ts_expr} || ':' || "
+            f"COALESCE(CAST({'last' if 'last' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
+            f"COALESCE(CAST({'bid' if 'bid' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
+            f"COALESCE(CAST({'ask' if 'ask' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
+            f"COALESCE(CAST({'volume' if 'volume' in legacy_columns else 'NULL'} AS TEXT), ''))"
+            if "event_key" in legacy_columns
+            else (
+                f"'legacy:' || {symbol_expr} || ':' || {provider_expr} || ':' || {ts_expr} || ':' || "
+                f"COALESCE(CAST({'last' if 'last' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
+                f"COALESCE(CAST({'bid' if 'bid' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
+                f"COALESCE(CAST({'ask' if 'ask' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
+                f"COALESCE(CAST({'volume' if 'volume' in legacy_columns else 'NULL'} AS TEXT), '')"
+            )
+        )
+
+        def col(name: str, default: str) -> str:
+            return name if name in legacy_columns else default
+
         con.execute(
-            """
+            f"""
             INSERT OR IGNORE INTO price_quotes_raw(
               ts_ms, symbol, provider, event_key, event_type, event_ts_ms,
               last, bid, ask, spread, volume,
               trade_ts_ms, quote_ts_ms, ingest_ts_ms, source
             )
             SELECT
-              ts_ms,
-              symbol,
-              provider,
-              'legacy:' || symbol || ':' || provider || ':' || ts_ms || ':' ||
-                COALESCE(CAST(last AS TEXT), '') || ':' ||
-                COALESCE(CAST(bid AS TEXT), '') || ':' ||
-                COALESCE(CAST(ask AS TEXT), '') || ':' ||
-                COALESCE(CAST(volume AS TEXT), ''),
-              'legacy',
-              ts_ms,
-              last,
-              bid,
-              ask,
-              spread,
-              volume,
-              ts_ms,
-              ts_ms,
-              ts_ms,
-              provider
-            FROM price_quotes_raw_legacy_exact_once
+              {col('ts_ms', '0')},
+              {col('symbol', "''")},
+              {col('provider', "''")},
+              {event_key_expr},
+              {col('event_type', "'legacy'")},
+              {col('event_ts_ms', col('ts_ms', '0'))},
+              {col('last', 'NULL')},
+              {col('bid', 'NULL')},
+              {col('ask', 'NULL')},
+              {col('spread', 'NULL')},
+              {col('volume', 'NULL')},
+              {col('trade_ts_ms', col('ts_ms', '0'))},
+              {col('quote_ts_ms', col('ts_ms', '0'))},
+              {col('ingest_ts_ms', col('ts_ms', '0'))},
+              {col('source', col('provider', "''"))}
+            FROM {legacy_table}
             """
         )
 

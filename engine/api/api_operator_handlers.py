@@ -41,6 +41,10 @@ def _str_list(value: Any) -> list[str]:
     return []
 
 
+def _truthy_confirmation_value(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "ack", "confirmed"}
+
+
 def _api_handler(ctx: JsonDict, name: str) -> Optional[ApiHandler]:
     handlers = (_ctx_dict(ctx).get("API_HANDLERS") or {})
     fn = handlers.get(name)
@@ -473,6 +477,120 @@ def api_post_operator_emergency_stop(_parsed=None, _body=None, ctx=None):
         "operator_stop": stop,
         "safety_errors": safety_errors,
     }
+
+
+def api_post_operator_execution_arm(_parsed=None, body=None, ctx=None):
+    """Arm or disarm audited live execution through the DB execution-mode row."""
+
+    ctx = _ctx_dict(ctx)
+    payload = body if isinstance(body, dict) else {}
+    requested = payload.get("armed", payload.get("arm", 1))
+    arm = str(requested).strip().lower() not in {"0", "false", "no", "off", "disarm"}
+    actor = str(payload.get("actor") or "operator").strip() or "operator"
+    reason = str(payload.get("reason") or ("operator_live_arm" if arm else "operator_live_disarm")).strip()
+
+    try:
+        from engine.execution.execution_mode import get_execution_mode, set_execution_armed
+
+        before = get_execution_mode()
+        if arm and str(before.get("mode") or "").strip().lower() != "live":
+            return {
+                "ok": False,
+                "error": "execution_mode_not_live",
+                "execution_mode": before,
+            }
+        after = set_execution_armed(1 if arm else 0, actor=actor, reason=reason)
+    except Exception as e:
+        return failure_response(
+            LOG,
+            event="api_operator_handlers_execution_arm_failed",
+            code="API_OPERATOR_HANDLERS_EXECUTION_ARM_FAILED",
+            message=str(e),
+            error=e,
+            component="engine.api.api_operator_handlers",
+            ctx=ctx,
+            extra={"armed": int(bool(arm)), "actor": actor, "reason": reason},
+        )
+
+    barrier_handler = _api_handler(ctx, "api_get_execution_barrier")
+    barrier = _dict_or_empty(barrier_handler(None, ctx)) if callable(barrier_handler) else {}
+    target_armed = 1 if arm else 0
+    return {
+        "ok": bool(int((after or {}).get("armed") or 0) == target_armed and ((not arm) or (after or {}).get("mode") == "live")),
+        "armed": int((after or {}).get("armed") or 0),
+        "execution_mode": after,
+        "previous_execution_mode": before,
+        "execution_barrier": barrier,
+    }
+
+
+def api_post_operator_clear_manual_halt(_parsed=None, body=None, ctx=None):
+    """Clear a non-rules kill-switch hold through an explicit operator workflow."""
+
+    ctx = _ctx_dict(ctx)
+    payload = body if isinstance(body, dict) else {}
+    expected = "CLEAR_MANUAL_HALT"
+    confirmation = str(payload.get("confirmation") or payload.get("confirm") or "").strip()
+    actor = str(payload.get("actor") or payload.get("who") or "").strip()
+    source = str(payload.get("source") or payload.get("source_surface") or "").strip()
+    reason = str(payload.get("reason") or payload.get("note") or "").strip()
+    missing = []
+    if confirmation != expected:
+        missing.append("confirmation")
+    if not _truthy_confirmation_value(payload.get("consequence_ack")):
+        missing.append("consequence_ack")
+    if not actor:
+        missing.append("actor")
+    if not source:
+        missing.append("source")
+    if not reason:
+        missing.append("reason")
+    if missing:
+        return {
+            "ok": False,
+            "error": "confirmation_required",
+            "required_confirm": expected,
+            "required_token": expected,
+            "action_id": "operator.clear_manual_halt",
+            "missing": missing,
+            "meta": {"status": 422},
+        }
+
+    scope = str(payload.get("scope") or "global").strip() or "global"
+    key = str(payload.get("key") or "global").strip() or "global"
+    try:
+        from engine.execution.kill_switch import clear_manual_halt
+
+        result = clear_manual_halt(
+            scope,
+            key,
+            reason=reason,
+            actor=actor,
+            meta={
+                "source": source,
+                "operator_endpoint": "api_post_operator_clear_manual_halt",
+                "confirmation": expected,
+            },
+        )
+    except Exception as e:
+        return failure_response(
+            LOG,
+            event="api_operator_handlers_clear_manual_halt_failed",
+            code="API_OPERATOR_HANDLERS_CLEAR_MANUAL_HALT_FAILED",
+            message=str(e),
+            error=e,
+            component="engine.api.api_operator_handlers",
+            ctx=ctx,
+            extra={"scope": scope, "key": key, "actor": actor, "source": source},
+        )
+
+    if not bool(result.get("ok")):
+        status = 403 if str(result.get("error") or "") == "manual_clear_refused_rules_owned_halt" else 409
+        result = dict(result)
+        result.setdefault("meta", {})
+        if isinstance(result["meta"], dict):
+            result["meta"].setdefault("status", status)
+    return result
 
 
 def api_post_operator_autofix(_parsed=None, _body=None, ctx=None):

@@ -57,6 +57,21 @@ def env_truthy(
     return raw.lower() in TRUTHY_VALUES
 
 
+def dashboard_api_token_from_env(*, environ: Mapping[str, Any] | None = None) -> str:
+    env = _env(environ)
+    token = env_text("DASHBOARD_API_TOKEN", environ=env)
+    if token:
+        return token
+    secret_name = env_text("DASHBOARD_API_TOKEN_SECRET", environ=env)
+    if not secret_name:
+        return ""
+    if env is not os.environ:
+        return ""
+    from services.secrets.loader import load_secret
+
+    return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+
+
 def _env_int(
     name: str,
     default: int,
@@ -128,7 +143,7 @@ def validate_mutation_auth_config(
 ) -> dict[str, Any]:
     env = _env(environ)
     token = (
-        env_text("DASHBOARD_API_TOKEN", environ=env)
+        dashboard_api_token_from_env(environ=env)
         if dashboard_api_token is None
         else str(dashboard_api_token or "").strip()
     )
@@ -200,6 +215,7 @@ __all__ = [
     "DEFAULT_PRODUCTION_TOKEN_MIN_LENGTH",
     "PLACEHOLDER_DASHBOARD_API_TOKENS",
     "dashboard_api_token_issue",
+    "dashboard_api_token_from_env",
     "env_flag",
     "env_text",
     "env_truthy",

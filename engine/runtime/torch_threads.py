@@ -5,6 +5,8 @@ import sys
 import threading
 from typing import Any, Dict
 
+from engine.runtime.hardware import DEFAULT_CPU_THREADS, DEFAULT_INTEROP_THREADS
+
 _CONFIG_LOCK = threading.Lock()
 _CONFIG_STATE: Dict[str, Any] = {
     "attempted": False,
@@ -16,14 +18,22 @@ _CONFIG_STATE: Dict[str, Any] = {
 }
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(str(name))
+    try:
+        return int(str(default if raw is None or str(raw).strip() == "" else raw).strip())
+    except Exception:
+        return int(default)
+
+
 def configure_torch_thread_pools(
     torch_module: Any,
     *,
-    default_cpu_threads: int = 8,
-    default_interop_threads: int = 4,
+    default_cpu_threads: int = DEFAULT_CPU_THREADS,
+    default_interop_threads: int = DEFAULT_INTEROP_THREADS,
 ) -> Dict[str, Any]:
-    cpu_threads = max(1, int(os.environ.get("TORCH_CPU_THREADS", str(default_cpu_threads))))
-    interop_threads = max(1, int(os.environ.get("TORCH_INTEROP_THREADS", str(default_interop_threads))))
+    cpu_threads = max(1, _env_int("TORCH_CPU_THREADS", int(default_cpu_threads)))
+    interop_threads = max(1, _env_int("TORCH_INTEROP_THREADS", int(default_interop_threads)))
 
     with _CONFIG_LOCK:
         if _CONFIG_STATE["attempted"]:

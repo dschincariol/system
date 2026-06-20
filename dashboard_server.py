@@ -17,6 +17,7 @@ UI:
 
 APIs:
   /api/jobs
+  /api/jobs/catalog
   /api/embed_model_eval
   /api/embed_conf_calib
   /api/jobs/start?name=<job>
@@ -38,8 +39,11 @@ import threading
 import time
 import traceback
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Optional, cast
 from urllib import error as urllib_error, request as urllib_request
+
+from engine.runtime.platform import default_local_log_dir
 
 # ------------------------------------------------------------------
 # Ensure imports work no matter what the working directory is.
@@ -59,7 +63,7 @@ except Exception as e:
         traceback.print_exc()
 
 try:
-    from dashboard_config import (
+    from engine.runtime.dashboard_config import (
         COPILOT_LLM_ENDPOINT,
         COPILOT_LLM_MODEL,
         COPILOT_LLM_TIMEOUT_S,
@@ -193,7 +197,7 @@ except Exception as e:
     )
 
 from engine.api.http_transport import build_handler, run_http_server
-from engine.api.http_parsing import qs as _qs
+from engine.api.http_parsing import deny_if_shutdown, qs as _qs
 from engine.runtime.shutdown import runtime_shutdown
 
 
@@ -397,6 +401,7 @@ except Exception as e:
 # ------------------------------------------------------------------
 from engine.api.api_jobs import (
     api_get_jobs,
+    api_get_jobs_catalog,
     api_post_pipeline_run as _api_jobs_post_pipeline_run,
     api_post_job_start,
     api_post_job_stop,
@@ -625,10 +630,13 @@ SERVER_SHUTDOWN_TOKEN = os.environ.get("SERVER_SHUTDOWN_TOKEN", "").strip()
 # Optional in explicit safe local dev only; required for production/live
 # mutation routes. The transport enforces generated-token requirements and
 # gates any localhost no-token fallback behind explicit safe dev/test env.
-DASHBOARD_API_TOKEN = os.environ.get("DASHBOARD_API_TOKEN", "").strip()
+from engine.api.auth_config import dashboard_api_token_from_env
+
+DASHBOARD_API_TOKEN = dashboard_api_token_from_env()
 
 SERVER_STARTED_AT_MS = int(time.time() * 1000)
-_default_crash_path = os.path.join(_BASE_DIR, "logs", "crash_analytics.jsonl")
+_DEFAULT_LOG_DIR = str(default_local_log_dir().resolve())
+_default_crash_path = os.path.join(_DEFAULT_LOG_DIR, "crash_analytics.jsonl")
 CRASH_LOG_PATH = os.environ.get("CRASH_LOG_PATH", _default_crash_path)
 _SERVER_STOP_EVENT = threading.Event()
 _SERVER_BACKGROUND_THREADS = []
@@ -725,7 +733,16 @@ def _require_env(key: str) -> str:
 
 
 _db_path_env = _require_env("DB_PATH")
-if not os.path.isabs(os.path.abspath(_db_path_env)):
+_db_path_raw = Path(_db_path_env).expanduser()
+try:
+    from engine.runtime.config_schema import get_runtime_safety_context
+
+    _strict_db_path_runtime = bool(get_runtime_safety_context().get("strict_runtime"))
+except Exception:
+    _strict_db_path_runtime = False
+if _strict_db_path_runtime and not _db_path_raw.is_absolute():
+    raise RuntimeError(f"DB_PATH must be absolute in supervised/prod/live runtime: {_db_path_env}")
+if not _db_path_raw.is_absolute():
     os.environ["DB_PATH"] = os.path.abspath(_db_path_env)
 
 host = str(os.environ.get("DASHBOARD_HOST", "127.0.0.1") or "").strip() or "127.0.0.1"
@@ -784,12 +801,12 @@ _OPERATOR_PRICE_JOB_CANDIDATES = tuple(
 
 _OPERATOR_LOG_PATH = os.environ.get(
     "OPERATOR_LOG_PATH",
-    os.path.join(_BASE_DIR, "logs", "runtime.log"),
+    os.path.join(_DEFAULT_LOG_DIR, "runtime.log"),
 )
 
 _OPERATOR_STDERR_LOG_PATH = os.environ.get(
     "OPERATOR_STDERR_LOG_PATH",
-    os.path.join(_BASE_DIR, "boot", "engine_stderr.log"),
+    os.path.join(_DEFAULT_LOG_DIR, "engine_stderr.log"),
 )
 
 _OPERATOR_CONSOLE_PREFIX = "/operator"
@@ -804,7 +821,11 @@ _OPERATOR_PROXY_MAX_BODY_BYTES = _env_int(
 
 
 def _operator_sidecar_host_port() -> tuple[str, int]:
-    host = str(os.environ.get("OPERATOR_BIND_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    host = str(
+        os.environ.get("OPERATOR_SIDECAR_HOST")
+        or os.environ.get("OPERATOR_BIND_HOST", "127.0.0.1")
+        or "127.0.0.1"
+    ).strip()
     if host in ("", "0.0.0.0", "::", "[::]"):
         host = "127.0.0.1"
     port = _env_int("OPERATOR_PORT", 4001, minimum=1, maximum=65535)
@@ -816,6 +837,28 @@ def _operator_sidecar_base_url() -> str:
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     return f"http://{host}:{int(port)}"
+
+
+def _operator_sidecar_api_token() -> str:
+    token = str(os.environ.get("OPERATOR_API_TOKEN", "") or "").strip()
+    if token:
+        return token
+
+    secret_name = str(os.environ.get("OPERATOR_API_TOKEN_SECRET", "") or "").strip()
+    if not secret_name:
+        return ""
+
+    try:
+        from services.secrets.loader import load_secret
+
+        return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+    except Exception as e:
+        _warn_nonfatal(
+            "DASHBOARD_SERVER_OPERATOR_TOKEN_SECRET_LOAD_FAILED",
+            e,
+            secret_name=secret_name,
+        )
+        return ""
 
 
 def _operator_sidecar_ws_url() -> str:
@@ -954,12 +997,259 @@ def _wrap_operator_console_routes(BaseHandler):
                 target += "?" + str(parsed.query)
             return target
 
+        def _operator_payload_status(self, payload: dict, default: int = 500) -> int:
+            if isinstance(payload, dict):
+                meta = payload.get("meta")
+                if isinstance(meta, dict):
+                    try:
+                        status = int(meta.get("status") or meta.get("http_status") or 0)
+                        if 100 <= status <= 599:
+                            return status
+                    except Exception as e:
+                        _warn_nonfatal(
+                            "DASHBOARD_SERVER_OPERATOR_PAYLOAD_STATUS_PARSE_FAILED",
+                            e,
+                            endpoint="operator_console",
+                        )
+            return int(default)
+
+        def _operator_proxy_audit_path(self, parsed) -> str:
+            path = str(parsed.path or "")
+            if path == "/operator/api/operator_summary":
+                return "/api/operator_summary"
+            if path.startswith("/operator/api/"):
+                return path[len("/operator"):]
+            return path
+
+        def _operator_send_bridge_denial(self, status: int, error: str, **extra) -> None:
+            payload = {
+                "ok": False,
+                "error": str(error or "operator_bridge_denied"),
+                "meta": {"status": int(status)},
+            }
+            payload.update(extra or {})
+            self._operator_send_json(int(status), payload)
+
+        def _operator_require_bridge_mutation_gate(self, audit_path: str) -> bool:
+            required_methods = (
+                "_require_mutation_auth",
+                "_rate_limit_mutation",
+                "_audit_mutation",
+                "_warn_if_token_unset",
+            )
+            missing = [name for name in required_methods if not hasattr(self, name)]
+            if missing:
+                self._operator_send_bridge_denial(
+                    500,
+                    "operator_bridge_auth_unavailable",
+                    missing=missing,
+                )
+                return False
+
+            self._mutation_confirmation = None
+            self._mutation_auth_kind = ""
+            handler_name = "operator_console_bridge"
+            method = str(self.command or "POST").upper()
+
+            try:
+                self._warn_if_token_unset(method, audit_path)
+            except Exception as e:
+                _warn_nonfatal(
+                    "DASHBOARD_SERVER_OPERATOR_TOKEN_WARNING_FAILED",
+                    e,
+                    endpoint=audit_path,
+                )
+
+            denied = deny_if_shutdown()
+            if denied:
+                status = self._operator_payload_status(denied, 503)
+                self._audit_mutation(
+                    method=method,
+                    path=audit_path,
+                    handler_name=handler_name,
+                    outcome="shutdown_denied",
+                    status=status,
+                    error=str((denied or {}).get("error") or "shutdown"),
+                )
+                self._operator_send_json(status, denied)
+                return False
+
+            auth = self._require_mutation_auth()
+            if auth:
+                status = self._operator_payload_status(auth, 403)
+                limited = self._rate_limit_mutation(audit_path, token_for_bucket="")
+                if limited:
+                    payload, headers = limited
+                    self._audit_mutation(
+                        method=method,
+                        path=audit_path,
+                        handler_name=handler_name,
+                        outcome="rate_limited_auth_denied",
+                        status=429,
+                        error=str(payload.get("error") or "rate_limit_exceeded"),
+                        rate_limited=True,
+                    )
+                    self._operator_send_json(429, payload, headers=headers)
+                    return False
+                self._audit_mutation(
+                    method=method,
+                    path=audit_path,
+                    handler_name=handler_name,
+                    outcome="auth_denied",
+                    status=status,
+                    error=str(auth.get("error") or "auth_denied"),
+                )
+                self._operator_send_json(status, auth)
+                return False
+
+            limited = self._rate_limit_mutation(audit_path)
+            if limited:
+                payload, headers = limited
+                self._audit_mutation(
+                    method=method,
+                    path=audit_path,
+                    handler_name=handler_name,
+                    outcome="rate_limited",
+                    status=429,
+                    error=str(payload.get("error") or "rate_limit_exceeded"),
+                    rate_limited=True,
+                )
+                self._operator_send_json(429, payload, headers=headers)
+                return False
+
+            return True
+
+        def _operator_require_bridge_read_gate(self, audit_path: str) -> bool:
+            if not hasattr(self, "_require_mutation_auth"):
+                return True
+
+            self._mutation_confirmation = None
+            self._mutation_auth_kind = ""
+            method = str(self.command or "GET").upper()
+
+            try:
+                if hasattr(self, "_warn_if_token_unset"):
+                    self._warn_if_token_unset(method, audit_path)
+            except Exception as e:
+                _warn_nonfatal(
+                    "DASHBOARD_SERVER_OPERATOR_READ_TOKEN_WARNING_FAILED",
+                    e,
+                    endpoint=audit_path,
+                )
+
+            auth = self._require_mutation_auth()
+            if not auth:
+                return True
+
+            status = self._operator_payload_status(auth, 403)
+            self._operator_send_json(status, auth)
+            return False
+
+        def _operator_parse_bridge_body(self, data: bytes, audit_path: str):
+            if not data:
+                return {}
+            try:
+                decoded = data.decode("utf-8", errors="strict")
+                return json.loads(decoded or "{}")
+            except Exception as e:
+                _warn_nonfatal(
+                    "DASHBOARD_SERVER_OPERATOR_BRIDGE_INVALID_JSON",
+                    e,
+                    endpoint=audit_path,
+                )
+                self._audit_mutation(
+                    method=str(self.command or "POST").upper(),
+                    path=audit_path,
+                    handler_name="operator_console_bridge",
+                    outcome="invalid_body",
+                    status=400,
+                    error="invalid_json",
+                    body_valid=False,
+                )
+                self._operator_send_bridge_denial(400, "invalid_json")
+                return None
+
+        def _operator_require_bridge_confirmation(self, audit_path: str, body_payload) -> bool:
+            if not hasattr(self, "_require_mutation_confirmation") or not hasattr(self, "_audit_mutation"):
+                return True
+            confirmation = self._require_mutation_confirmation(audit_path, body_payload)
+            if not confirmation:
+                return True
+            status = self._operator_payload_status(confirmation, 422)
+            self._audit_mutation(
+                method=str(self.command or "POST").upper(),
+                path=audit_path,
+                handler_name="operator_console_bridge",
+                outcome="confirmation_denied",
+                status=status,
+                error=str(confirmation.get("error") or "confirmation_required"),
+                confirmed=False,
+            )
+            self._operator_send_json(status, confirmation)
+            return False
+
+        def _operator_audit_bridge_completion(self, audit_path: str, status: int, body: bytes) -> None:
+            if not hasattr(self, "_audit_mutation"):
+                return
+            error = ""
+            ok = 200 <= int(status or 0) < 400
+            try:
+                payload = json.loads((body or b"{}").decode("utf-8", errors="replace") or "{}")
+                if isinstance(payload, dict):
+                    if payload.get("ok") is False:
+                        ok = False
+                    error = str(payload.get("error") or "")
+            except Exception as e:
+                _warn_nonfatal(
+                    "DASHBOARD_SERVER_OPERATOR_SIDECAR_RESPONSE_PARSE_FAILED",
+                    e,
+                    endpoint=audit_path,
+                    status=int(status or 0),
+                )
+            self._audit_mutation(
+                method=str(self.command or "POST").upper(),
+                path=audit_path,
+                handler_name="operator_console_bridge",
+                outcome="completed" if ok else "sidecar_rejected",
+                status=int(status or 0),
+                error=error,
+                confirmed=True if getattr(self, "_mutation_confirmation", None) is not None else None,
+            )
+
         def _operator_proxy_http(self, parsed):
             target = self._operator_proxy_target(parsed)
             if not target:
                 return False
 
             method = str(self.command or "GET").upper()
+            mutation = method != "GET"
+            audit_path = self._operator_proxy_audit_path(parsed)
+            if mutation and not self._operator_require_bridge_mutation_gate(audit_path):
+                return True
+            if not mutation and not self._operator_require_bridge_read_gate(audit_path):
+                return True
+
+            sidecar_token = ""
+            sidecar_token_required = audit_path not in {"/api/operator/ping"}
+            if sidecar_token_required:
+                sidecar_token = _operator_sidecar_api_token()
+                if not sidecar_token:
+                    if mutation and hasattr(self, "_audit_mutation"):
+                        self._audit_mutation(
+                            method=method,
+                            path=audit_path,
+                            handler_name="operator_console_bridge",
+                            outcome="sidecar_token_unconfigured",
+                            status=503,
+                            error="operator_sidecar_token_unconfigured",
+                        )
+                    self._operator_send_bridge_denial(
+                        503,
+                        "operator_sidecar_token_unconfigured",
+                        detail="OPERATOR_API_TOKEN is required for bridged operator requests.",
+                    )
+                    return True
+
             data = None
             if method not in ("GET", "HEAD"):
                 try:
@@ -967,6 +1257,16 @@ def _wrap_operator_console_routes(BaseHandler):
                 except Exception:
                     content_length = 0
                 if content_length > _OPERATOR_PROXY_MAX_BODY_BYTES:
+                    if mutation and hasattr(self, "_audit_mutation"):
+                        self._audit_mutation(
+                            method=method,
+                            path=audit_path,
+                            handler_name="operator_console_bridge",
+                            outcome="invalid_body",
+                            status=413,
+                            error="body_too_large",
+                            body_valid=False,
+                        )
                     self._operator_send_json(413, {
                         "ok": False,
                         "error": "operator_proxy_body_too_large",
@@ -974,11 +1274,18 @@ def _wrap_operator_console_routes(BaseHandler):
                     })
                     return True
                 data = self.rfile.read(max(0, content_length)) if content_length > 0 else b""
+                body_payload = self._operator_parse_bridge_body(data, audit_path)
+                if body_payload is None:
+                    return True
+                if not self._operator_require_bridge_confirmation(audit_path, body_payload):
+                    return True
 
             headers = {"Accept": self.headers.get("Accept") or "application/json"}
             content_type = self.headers.get("Content-Type")
             if content_type:
                 headers["Content-Type"] = content_type
+            if sidecar_token:
+                headers["X-Operator-Token"] = sidecar_token
 
             try:
                 req = urllib_request.Request(target, data=data, headers=headers, method=method)
@@ -992,6 +1299,15 @@ def _wrap_operator_console_routes(BaseHandler):
                 response_headers = dict(e.headers.items()) if getattr(e, "headers", None) else {}
             except Exception as e:
                 _warn_nonfatal("DASHBOARD_SERVER_OPERATOR_SIDECAR_PROXY_FAILED", e, endpoint=str(target))
+                if mutation and hasattr(self, "_audit_mutation"):
+                    self._audit_mutation(
+                        method=method,
+                        path=audit_path,
+                        handler_name="operator_console_bridge",
+                        outcome="sidecar_unavailable",
+                        status=503,
+                        error=f"{type(e).__name__}: {e}",
+                    )
                 self._operator_send_json(503, {
                     "ok": False,
                     "error": "operator_sidecar_unavailable",
@@ -1004,6 +1320,8 @@ def _wrap_operator_console_routes(BaseHandler):
                 })
                 return True
 
+            if mutation:
+                self._operator_audit_bridge_completion(audit_path, status, body or b"")
             content_type = response_headers.pop("Content-Type", "application/json; charset=utf-8")
             self._operator_send_bytes(status, body or b"", content_type, response_headers)
             return True
@@ -2470,6 +2788,8 @@ _FALLBACK_ROUTE_SPECS = [
     {"method": "POST", "path": "/api/operator/restart_engine",    "handler": "api_post_operator_restart"},
     {"method": "POST", "path": "/api/operator/restart_feeds",     "handler": "api_post_operator_restart_feeds"},
     {"method": "POST", "path": "/api/operator/emergency_stop",    "handler": "api_post_operator_emergency_stop"},
+    {"method": "POST", "path": "/api/operator/execution_arm",     "handler": "api_post_operator_execution_arm"},
+    {"method": "POST", "path": "/api/operator/clear_manual_halt", "handler": "api_post_operator_clear_manual_halt"},
     {"method": "POST", "path": "/api/operator/autofix",           "handler": "api_post_operator_autofix"},
     {"method": "POST", "path": "/api/operator/clearLastError",    "handler": "api_post_operator_clear_last_error"},
     {"method": "GET",  "path": "/api/operator/institutionalCheck","handler": "api_get_operator_institutional_check"},
@@ -2492,6 +2812,7 @@ _FALLBACK_ROUTE_SPECS = [
 
     # JOBS
     {"method": "GET",  "path": "/api/jobs",               "handler": "api_get_jobs"},
+    {"method": "GET",  "path": "/api/jobs/catalog",       "handler": "api_get_jobs_catalog"},
     {"method": "POST", "path": "/api/jobs/start",         "handler": "api_post_job_start"},
     {"method": "POST", "path": "/api/jobs/stop",          "handler": "api_post_job_stop"},
     {"method": "GET",  "path": "/api/jobs/log",           "handler": "api_get_job_log"},
@@ -2563,6 +2884,7 @@ _FALLBACK_ROUTE_SPECS = [
     {"method": "POST", "path": "/api/alerts/{id}/resolve",            "handler": "api_post_alert_resolve"},
     {"method": "GET",  "path": "/api/ui/decisions",                   "handler": "api_get_recent_decisions"},
     {"method": "GET",  "path": "/api/ui/decision",                    "handler": "api_get_decision_detail"},
+    {"method": "GET",  "path": "/api/data/feature_visibility",        "handler": "api_get_feature_visibility"},
     {"method": "GET",  "path": "/api/audit/records",                  "handler": "api_get_audit_records"},
     {"method": "POST", "path": "/api/ui/interaction",                 "handler": "api_post_ui_interaction"},
     {"method": "POST", "path": "/api/copilot/ask",                    "handler": "api_post_copilot_ask"},
@@ -2812,6 +3134,7 @@ _OPS_HANDLER_NAMES = [
     "api_get_execution_metrics_rolling",
     "api_get_execution_metrics_by_symbol",
     "api_get_execution_cost_by_confidence",
+    "api_get_execution_diagnostics",
     "api_get_execution_advisories",
     "api_get_social_features",
     "api_get_social_regimes",
@@ -2855,6 +3178,7 @@ api_get_execution_stats = _unavailable("api_get_execution_stats")
 api_get_execution_metrics_rolling = _unavailable("api_get_execution_metrics_rolling")
 api_get_execution_metrics_by_symbol = _unavailable("api_get_execution_metrics_by_symbol")
 api_get_execution_cost_by_confidence = _unavailable("api_get_execution_cost_by_confidence")
+api_get_execution_diagnostics = _unavailable("api_get_execution_diagnostics")
 api_get_execution_advisories = _unavailable("api_get_execution_advisories")
 api_get_social_features = _unavailable("api_get_social_features")
 api_get_social_regimes = _unavailable("api_get_social_regimes")
@@ -2897,6 +3221,7 @@ try:
         api_get_latest_portfolio_backtest as _impl_api_get_latest_portfolio_backtest,
         api_get_recent_decisions as _impl_api_get_recent_decisions,
         api_get_decision_detail as _impl_api_get_decision_detail,
+        api_get_feature_visibility as _impl_api_get_feature_visibility,
         api_get_audit_records as _impl_api_get_audit_records,
     )
 except Exception:
@@ -2904,6 +3229,7 @@ except Exception:
     _impl_api_get_latest_portfolio_backtest = None
     _impl_api_get_recent_decisions = None
     _impl_api_get_decision_detail = None
+    _impl_api_get_feature_visibility = None
     _impl_api_get_audit_records = None
 
 def api_get_portfolio(parsed, _ctx=None):
@@ -2962,6 +3288,24 @@ def api_get_decision_detail(parsed, _ctx=None):
             tuple(),
         )
     return {"ok": False, "error": "decision_handler_unavailable", "decision": None}
+
+
+def api_get_feature_visibility(parsed, _ctx=None):
+    if _impl_api_get_feature_visibility:
+        return _call_with_typeerror_fallbacks(
+            "api_get_feature_visibility",
+            _impl_api_get_feature_visibility,
+            (parsed, {}),
+            (parsed,),
+            tuple(),
+        )
+    return {
+        "ok": False,
+        "error": "feature_visibility_handler_unavailable",
+        "structured_documents": {"available": False, "status": "unavailable", "warnings": ["handler unavailable"]},
+        "graph_features": {"available": False, "status": "unavailable", "warnings": ["handler unavailable"]},
+        "meta": {"ready": False, "status": "unavailable"},
+    }
 
 
 def api_get_audit_records(parsed, _ctx=None):
@@ -4169,6 +4513,7 @@ from engine.api.api_system import (
     api_get_replay_freshness,
     api_get_attribution_quality,
     api_get_readiness,
+    api_get_readiness_evidence,
     api_get_runtime_health,
     api_get_trading_readiness,
     api_get_preflight_report,
@@ -4203,6 +4548,8 @@ from engine.api.api_operator_handlers import (
     api_post_operator_restart,
     api_post_operator_restart_feeds,
     api_post_operator_emergency_stop,
+    api_post_operator_execution_arm,
+    api_post_operator_clear_manual_halt,
     api_post_operator_autofix,
     api_post_operator_clear_last_error,
     api_get_operator_logs,
@@ -4733,6 +5080,64 @@ def api_get_governance_summary(_parsed=None, _ctx=None):
         return {"ok": False, "error": f"governance_summary_unavailable:{e}"}
 
 
+def _governance_evidence_query(parsed):
+    q = _qs_dict(parsed)
+    try:
+        limit = max(1, min(500, int(q.get("limit") or "20")))
+    except Exception:
+        limit = 20
+    regime = str(q.get("regime") or "global").strip() or "global"
+    return int(limit), regime
+
+
+def api_get_governance_evidence(parsed=None, _ctx=None):
+    try:
+        from engine.api.api_governance import get_governance_evidence as _impl
+
+        limit, regime = _governance_evidence_query(parsed)
+        return _impl(limit=limit, regime=regime)
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_GOVERNANCE_EVIDENCE_FAILED", e)
+        return {"ok": False, "error": f"governance_evidence_unavailable:{e}", "state": "unknown", "evidence": []}
+
+
+def api_get_governance_evidence_promotion_blockers(parsed=None, _ctx=None):
+    try:
+        from engine.api.api_governance import get_governance_evidence_promotion_blockers as _impl
+
+        limit, regime = _governance_evidence_query(parsed)
+        return _impl(limit=limit, regime=regime)
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_GOVERNANCE_EVIDENCE_BLOCKERS_FAILED", e)
+        return {"ok": False, "error": f"governance_evidence_blockers_unavailable:{e}", "state": "unknown"}
+
+
+def api_get_governance_evidence_generated_candidates(parsed=None, _ctx=None):
+    try:
+        from engine.api.api_governance import get_governance_evidence_generated_candidates as _impl
+
+        limit, _regime = _governance_evidence_query(parsed)
+        return _impl(limit=limit)
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_GOVERNANCE_EVIDENCE_GENERATED_FAILED", e)
+        return {"ok": False, "error": f"governance_evidence_generated_unavailable:{e}", "state": "unknown", "rows": []}
+
+
+def api_get_governance_evidence_shadow_capital(parsed=None, _ctx=None):
+    try:
+        from engine.api.api_governance import get_governance_evidence_shadow_capital as _impl
+
+        limit, regime = _governance_evidence_query(parsed)
+        return _impl(limit=limit, regime=regime)
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_GOVERNANCE_EVIDENCE_SHADOW_FAILED", e)
+        return {"ok": False, "error": f"governance_evidence_shadow_unavailable:{e}", "rows": [], "masking": {"applied": True}}
+
+
+def api_get_shadow_capital_scores(parsed=None, _ctx=None):
+    return api_get_governance_evidence_shadow_capital(parsed, _ctx)
+
+
 def _confirmation_error(body: Any, expected: str) -> Optional[dict[str, Any]]:
     payload = _json_dict(body)
     actual = str(payload.get("confirm") or "").strip()
@@ -5185,6 +5590,7 @@ API_HANDLERS = {
     "api_get_replay_freshness": api_get_replay_freshness,
     "api_get_attribution_quality": api_get_attribution_quality,
     "api_get_readiness": api_get_readiness,
+    "api_get_readiness_evidence": api_get_readiness_evidence,
     "api_get_runtime_health": api_get_runtime_health,
     "api_get_trading_readiness": api_get_trading_readiness,
     "api_get_preflight_report": api_get_preflight_report,
@@ -5229,6 +5635,8 @@ API_HANDLERS = {
     "api_post_operator_restart": api_post_operator_restart,
     "api_post_operator_restart_feeds": api_post_operator_restart_feeds,
     "api_post_operator_emergency_stop": api_post_operator_emergency_stop,
+    "api_post_operator_execution_arm": api_post_operator_execution_arm,
+    "api_post_operator_clear_manual_halt": api_post_operator_clear_manual_halt,
     "api_post_operator_autofix": api_post_operator_autofix,
     "api_post_operator_clear_last_error": api_post_operator_clear_last_error,
     "api_get_server_status": api_get_server_status,
@@ -5237,6 +5645,7 @@ API_HANDLERS = {
 
     # JOBS
     "api_get_jobs": api_get_jobs,
+    "api_get_jobs_catalog": api_get_jobs_catalog,
     "api_post_job_start": api_post_job_start,
     "api_post_job_stop": api_post_job_stop,
     "api_post_pipeline_run": api_post_pipeline_run,
@@ -5277,6 +5686,7 @@ API_HANDLERS = {
     "api_get_execution_metrics_rolling": api_get_execution_metrics_rolling,
     "api_get_execution_metrics_by_symbol": api_get_execution_metrics_by_symbol,
     "api_get_execution_cost_by_confidence": api_get_execution_cost_by_confidence,
+    "api_get_execution_diagnostics": api_get_execution_diagnostics,
     "api_get_execution_advisories": api_get_execution_advisories,
     "api_get_social_features": api_get_social_features,
     "api_get_social_regimes": api_get_social_regimes,
@@ -5300,10 +5710,16 @@ API_HANDLERS = {
     "api_post_alert_resolve": api_post_alert_resolve,
     "api_get_recent_decisions": api_get_recent_decisions,
     "api_get_decision_detail": api_get_decision_detail,
+    "api_get_feature_visibility": api_get_feature_visibility,
     "api_get_audit_records": api_get_audit_records,
     "api_post_ui_interaction": api_post_ui_interaction,
     "api_post_copilot_ask": api_post_copilot_ask,
     "api_get_governance_summary": api_get_governance_summary,
+    "api_get_governance_evidence": api_get_governance_evidence,
+    "api_get_governance_evidence_promotion_blockers": api_get_governance_evidence_promotion_blockers,
+    "api_get_governance_evidence_generated_candidates": api_get_governance_evidence_generated_candidates,
+    "api_get_governance_evidence_shadow_capital": api_get_governance_evidence_shadow_capital,
+    "api_get_shadow_capital_scores": api_get_shadow_capital_scores,
     "api_get_promotion_status": api_get_promotion_status,
     "api_get_promotion_explain": api_get_promotion_explain,
     "api_post_promotion_enable": api_post_promotion_enable,

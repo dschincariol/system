@@ -25,7 +25,7 @@ from engine.runtime.runtime_meta import meta_get
 from engine.runtime.system_state import compute_system_state
 from engine.runtime.gates import execution_gate_snapshot
 from engine.runtime.ipc import market_data_status
-from engine.runtime.storage import connect as _db_connect, connect_ro_direct, DB_PATH, run_write_txn, get_db_debug_snapshot
+from engine.runtime.storage import connect as _db_connect, connect_ro_direct, DB_PATH, run_write_txn, get_db_debug_snapshot, table_exists
 from engine.runtime.telemetry_read_router import fetch_recent_runtime_failure_events
 from engine.runtime.jobs.repair_schema import run as repair_schema
 from engine.runtime.job_registry import validate_runtime_architecture
@@ -84,6 +84,17 @@ def _failure_out(event: str, code: str, error: BaseException, **extra) -> dict:
     return payload
 
 
+def _telemetry_fills_table(con) -> str | None:
+    try:
+        if table_exists(con, "broker_fills_v2"):
+            return require_allowed_table_name("broker_fills_v2")
+        if table_exists(con, "broker_fills"):
+            return require_allowed_table_name("broker_fills")
+    except Exception as e:
+        _warn("api_system.telemetry.fills_table_probe", e)
+    return None
+
+
 # ----------------------------------------------------------------------
 # ROUTE DEFINITIONS
 # ----------------------------------------------------------------------
@@ -106,7 +117,10 @@ ROUTE_SPECS_SYSTEM = [
     ("GET",  "/api/liveness",                      "api_get_liveness"),
     ("GET",  "/api/status",                        "api_get_status"),
     ("GET",  "/api/readiness",                     "api_get_readiness"),
+    ("GET",  "/api/readiness/evidence",            "api_get_readiness_evidence"),
+    ("GET",  "/api/system/readiness_evidence",     "api_get_readiness_evidence"),
     ("GET",  "/api/system/trading_readiness",      "api_get_trading_readiness"),
+    ("GET",  "/api/operator/readiness_evidence",   "api_get_readiness_evidence"),
     ("GET",  "/api/operator/trading_readiness",    "api_get_trading_readiness"),
     ("GET",  "/api/operator/preflight_report",     "api_get_preflight_report"),
     ("GET",  "/api/operator/runtime_watchdogs",    "api_get_runtime_watchdogs"),
@@ -284,7 +298,18 @@ def _refresh_health_cache_sync() -> dict:
             fresh = dict(get_health_snapshot() or {})
     except Exception as e:
         _warn("api_system.health_cache.refresh", e)
-        fresh = {"ok": False, "error": str(e), "reasons": [f"health_snapshot_error:{e}"]}
+        fresh = {
+            "ok": False,
+            "status": "DEGRADED",
+            "error": str(e),
+            "reasons": [f"health_snapshot_error:{e}"],
+            "ts_ms": _ts_ms(),
+            "db": {
+                "ok": False,
+                "status": "UNKNOWN",
+                "detail": f"health_snapshot_error:{e}",
+            },
+        }
 
     try:
         with _HEALTH_CACHE_LOCK:
@@ -391,7 +416,7 @@ def _build_readiness_snapshot(_parsed, ctx=None) -> dict:
         _store_cached_system_snapshot(snapshot)
 
     snapshot.setdefault("graph", dict(snapshot.get("graph") or {}))
-    return snapshot
+    return _align_snapshot_to_operational_readiness(snapshot)
 
 
 def _dedupe_reasons(*groups):
@@ -545,6 +570,7 @@ _PRODUCTION_GATE_ORDER = [
     "order_state_consistent",
     "position_state_consistent",
     "pnl_calculation_valid",
+    "live_trading_preflight",
     "api_layer_healthy",
     "operator_server_healthy",
     "critical_ui_dependencies_available",
@@ -564,6 +590,7 @@ _PRODUCTION_CRITICAL_GATES = {
     "order_state_consistent",
     "position_state_consistent",
     "pnl_calculation_valid",
+    "live_trading_preflight",
 }
 
 _SAFE_NO_CREDENTIAL_SERVICE_READY_GATES = {
@@ -800,6 +827,93 @@ def _execution_gate_to_production(name: str, execution_supervisor: dict, *, snap
     )
 
 
+def _live_trading_preflight_to_production(
+    *,
+    mode_name: str,
+    execution_mode: str,
+    snapshot_ts_ms: int,
+    snapshot: dict,
+    health: dict,
+) -> tuple[dict, dict]:
+    required = str(mode_name or "").strip().lower() == "live"
+    if not required:
+        state = {
+            "ok": True,
+            "required": False,
+            "mode": str(mode_name or "safe"),
+            "execution_mode": str(execution_mode or mode_name or "safe"),
+            "reason": "not_required",
+            "blockers": [],
+        }
+        return (
+            _make_production_gate(
+                "live_trading_preflight",
+                True,
+                reason="not_required",
+                subsystem="live_trading",
+                ts_ms=snapshot_ts_ms,
+                critical=True,
+                source="live_trading_preflight",
+                extra={"required": False, "blockers": []},
+            ),
+            state,
+        )
+
+    execution_barrier = dict(
+        (snapshot.get("execution_barrier") if isinstance(snapshot.get("execution_barrier"), dict) else {})
+        or (health.get("execution_barrier") if isinstance(health.get("execution_barrier"), dict) else {})
+    )
+    state = dict(execution_barrier.get("live_trading_preflight") or {})
+    if not state or "ok" not in state:
+        try:
+            from engine.runtime.live_trading_preflight import live_trading_preflight
+
+            state = dict(
+                live_trading_preflight(
+                    engine_mode=mode_name,
+                    execution_mode=execution_mode,
+                )
+                or {}
+            )
+        except Exception as e:
+            _warn("api_system.live_trading_preflight", e)
+            state = {
+                "ok": False,
+                "required": True,
+                "mode": str(mode_name or "live"),
+                "execution_mode": str(execution_mode or mode_name or "live"),
+                "reason": f"live_trading_preflight_error:{type(e).__name__}",
+                "blockers": [f"live_trading_preflight_error:{type(e).__name__}:{e}"],
+            }
+
+    blockers = _dedupe_reasons(
+        list(state.get("blockers") or []),
+        [state.get("reason") if not bool(state.get("ok")) else None],
+    )
+    ok = bool(state.get("ok"))
+    return (
+        _make_production_gate(
+            "live_trading_preflight",
+            ok,
+            reason="ok" if ok else _first_text(blockers[0] if blockers else "", state.get("reason"), "live_trading_preflight_failed"),
+            subsystem="live_trading",
+            ts_ms=state.get("ts_ms") or snapshot_ts_ms,
+            critical=True,
+            source="live_trading_preflight",
+            extra={
+                "required": True,
+                "blockers": blockers,
+                "broker": str((state.get("broker_contract") or {}).get("broker") or ""),
+            },
+        ),
+        {
+            **state,
+            "required": True,
+            "blockers": blockers,
+        },
+    )
+
+
 def _ctx_handlers(ctx=None) -> dict:
     handlers = {}
     if isinstance(ctx, dict):
@@ -1000,7 +1114,6 @@ def _build_production_validation(snapshot, *, ctx=None, runtime_watchdogs=None) 
     lifecycle = dict(health.get("lifecycle") or {})
     database_debug = dict(snapshot.get("database_debug") or {})
     db_validation = dict(snapshot.get("db_validation") or (database_debug.get("db_validation") or {}) or {})
-    services = dict(snapshot.get("services") or {})
 
     runtime_state = str(
         system_state_detail.get("state")
@@ -1010,6 +1123,20 @@ def _build_production_validation(snapshot, *, ctx=None, runtime_watchdogs=None) 
         or "UNKNOWN"
     ).strip().upper()
     runtime_detail = _first_text(system_state_detail.get("detail"), lifecycle.get("detail"))
+    mode_name = str(
+        snapshot.get("mode")
+        or snapshot.get("execution_mode")
+        or (health.get("startup") or {}).get("mode")
+        or os.environ.get("ENGINE_MODE")
+        or "safe"
+    ).strip().lower() or "safe"
+    execution_mode = str(
+        snapshot.get("execution_mode")
+        or snapshot.get("mode")
+        or (health.get("execution_barrier") or {}).get("mode")
+        or os.environ.get("EXECUTION_MODE")
+        or mode_name
+    ).strip().lower() or mode_name
 
     gates = {
         "config_valid": _startup_gate_to_production(
@@ -1085,6 +1212,15 @@ def _build_production_validation(snapshot, *, ctx=None, runtime_watchdogs=None) 
             critical=True,
         ),
     }
+
+    live_preflight_gate, live_preflight_state = _live_trading_preflight_to_production(
+        mode_name=mode_name,
+        execution_mode=execution_mode,
+        snapshot_ts_ms=snapshot_ts_ms,
+        snapshot=snapshot,
+        health=health,
+    )
+    gates["live_trading_preflight"] = live_preflight_gate
 
     startup_complete_ok = (
         bool((startup_gates.get("core_services_initialized") or {}).get("ok"))
@@ -1294,6 +1430,7 @@ def _build_production_validation(snapshot, *, ctx=None, runtime_watchdogs=None) 
         "restart_retry_loop_indicators": restart_retry_loop_indicators,
         "stale_data_indicators": stale_data_indicators,
         "ui_critical_endpoint_status": ui_critical_endpoint_status,
+        "live_trading_preflight": dict(live_preflight_state or {}),
         "summary_reason": _first_text(
             (gates.get(critical_failures[0] if critical_failures else "") or {}).get("reason"),
             (gates.get(warning_failures[0] if warning_failures else "") or {}).get("reason"),
@@ -1842,10 +1979,108 @@ def _compute_status_name(state_name, health_ok, services_ok, ingestion_ok, execu
     return "STOPPED"
 
 
+def _snapshot_mode(snapshot: dict) -> str:
+    snapshot = dict(snapshot or {})
+    health = _normalized_health_from_snapshot(snapshot)
+    execution_barrier = dict(snapshot.get("execution_barrier") or health.get("execution_barrier") or {})
+    startup = dict(health.get("startup") or {})
+    mode = str(
+        snapshot.get("mode")
+        or snapshot.get("execution_mode")
+        or execution_barrier.get("mode")
+        or startup.get("mode")
+        or os.environ.get("ENGINE_MODE")
+        or "safe"
+    ).strip().lower() or "safe"
+    return mode
+
+
+def _production_validation_ready(production_validation: dict) -> bool:
+    if not isinstance(production_validation, dict) or not production_validation:
+        return False
+    status = str(production_validation.get("status") or "").strip().lower()
+    return bool(status == "healthy" and production_validation.get("safe_to_operate"))
+
+
+def _readiness_ready(readiness: dict) -> bool:
+    if not isinstance(readiness, dict) or not readiness:
+        return False
+    return bool(readiness.get("ready", readiness.get("ok")))
+
+
+def _runtime_lifecycle_payload(snapshot: dict, *, raw_state: str) -> dict:
+    health = _normalized_health_from_snapshot(snapshot)
+    lifecycle = dict(health.get("lifecycle") or {})
+    system_state_detail = dict(snapshot.get("system_state_detail") or {})
+    if lifecycle:
+        payload = dict(lifecycle)
+    else:
+        payload = dict(system_state_detail)
+    payload.setdefault("state", raw_state or "UNKNOWN")
+    payload.setdefault("detail", str(system_state_detail.get("detail") or ""))
+    return payload
+
+
+def _align_snapshot_to_operational_readiness(snapshot: dict) -> dict:
+    """Downgrade top-level state/status when lifecycle LIVE is not live-ready."""
+
+    if not isinstance(snapshot, dict):
+        return snapshot
+
+    raw_state = str(snapshot.get("state") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    mode = _snapshot_mode(snapshot)
+    readiness = dict(snapshot.get("readiness") or {})
+    production_validation = dict(snapshot.get("production_validation") or {})
+    production_ready = _production_validation_ready(production_validation)
+    readiness_ok = _readiness_ready(readiness) if readiness else production_ready
+
+    runtime_lifecycle = _runtime_lifecycle_payload(snapshot, raw_state=raw_state)
+    snapshot["runtime_lifecycle_state"] = runtime_lifecycle
+    snapshot["lifecycle_state"] = runtime_lifecycle
+
+    degrade_reason = ""
+    if raw_state == "LIVE":
+        if mode != "live":
+            degrade_reason = f"mode_{mode}_not_live"
+        elif not production_ready:
+            degrade_reason = str(production_validation.get("summary_reason") or "production_validation_not_ready")
+        elif not readiness_ok:
+            degrade_reason = "readiness_not_ready"
+
+    if degrade_reason:
+        snapshot["state"] = "DEGRADED"
+        snapshot["ok"] = False
+        if str(snapshot.get("status") or "").strip().upper() == "RUNNING":
+            snapshot["status"] = "DEGRADED"
+        snapshot["readiness_state_aligned"] = True
+        snapshot["readiness_state_reason"] = degrade_reason
+        snapshot["reasons"] = _dedupe_reasons(snapshot.get("reasons") or [], [degrade_reason])
+        if isinstance(snapshot.get("health"), dict):
+            snapshot["health"] = dict(snapshot.get("health") or {})
+            snapshot["health"]["state"] = "DEGRADED"
+            if str(snapshot["health"].get("status") or "").strip().upper() == "RUNNING":
+                snapshot["health"]["status"] = "DEGRADED"
+    else:
+        snapshot.setdefault("readiness_state_aligned", False)
+
+    if str(snapshot.get("status") or "").strip().upper() == "RUNNING":
+        if mode != "live" or not production_ready or not readiness_ok:
+            snapshot["status"] = "DEGRADED"
+            snapshot["ok"] = False
+            snapshot["readiness_state_reason"] = _first_text(
+                snapshot.get("readiness_state_reason"),
+                f"mode_{mode}_not_live" if mode != "live" else "",
+                str(production_validation.get("summary_reason") or ""),
+                "readiness_not_ready",
+            )
+
+    return snapshot
+
+
 def _build_system_snapshot(_parsed, ctx=None):
     cached = _get_cached_system_snapshot()
     if isinstance(cached, dict):
-        return cached
+        return _align_snapshot_to_operational_readiness(dict(cached))
 
     ts_ms = _ts_ms()
     timestamps = {"ts_ms": ts_ms, "snapshot_ts_ms": ts_ms}
@@ -1916,6 +2151,7 @@ def _build_system_snapshot(_parsed, ctx=None):
             kill_switches=kill_switches,
             execution_degraded=dict((health_raw or {}).get("execution_degraded") or {}),
             portfolio_risk_gate=None,
+            readiness=dict(readiness_seed or {}),
         )
     except Exception as e:
         _warn("api_system.build_system_snapshot.execution_barrier", e)
@@ -2117,6 +2353,7 @@ def _build_system_snapshot(_parsed, ctx=None):
         runtime_watchdogs=runtime_watchdogs,
     )
     payload["production_validation"] = production_validation
+    _align_snapshot_to_operational_readiness(payload)
     _store_cached_system_snapshot(payload)
     return payload
 
@@ -2235,7 +2472,7 @@ def _build_system_state_snapshot(_parsed, ctx=None):
         kill_switches=kill_switches,
     )
 
-    return {
+    payload = {
         "ok": bool((system_state_detail or {}).get("ok")),
         "status": status,
         "state": state_name,
@@ -2254,6 +2491,7 @@ def _build_system_state_snapshot(_parsed, ctx=None):
         "execution_barrier": dict(execution_barrier or {}),
         "system_state_detail": dict(system_state_detail or {}),
     }
+    return _align_snapshot_to_operational_readiness(payload)
 
 
 def api_get_runtime_config(_parsed, ctx=None):
@@ -2914,7 +3152,7 @@ def api_get_status(_parsed, ctx=None):
         Aggregated system snapshot from ``_build_system_snapshot`` wrapped by
         ``_snapshot_response``.
     """
-    snapshot = _build_readiness_snapshot(_parsed, ctx)
+    snapshot = _align_snapshot_to_operational_readiness(_build_readiness_snapshot(_parsed, ctx))
     return _snapshot_response(snapshot)
 
 
@@ -3008,7 +3246,7 @@ def api_get_readiness(_parsed, ctx=None):
             "system_state_detail": {"state": "DEGRADED" if reason == "storage_unavailable" else "STARTING", "reason": reason},
         }
 
-    snapshot = _build_readiness_snapshot(_parsed, ctx)
+    snapshot = _align_snapshot_to_operational_readiness(_build_readiness_snapshot(_parsed, ctx))
     production_validation = dict(snapshot.get("production_validation") or {})
     storage_degraded = bool(storage.get("checked") and storage.get("ok") is False)
     if storage:
@@ -3020,18 +3258,31 @@ def api_get_readiness(_parsed, ctx=None):
         [production_validation.get("summary_reason")],
         ["storage_unavailable"] if storage_degraded else [],
     )
+    mode_name = str(snapshot.get("mode") or "unknown").strip().lower() or "unknown"
+    state_name = str(snapshot.get("state") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    live_ready = bool(
+        production_status == "healthy"
+        and production_validation.get("safe_to_operate")
+        and mode_name == "live"
+        and state_name == "LIVE"
+        and not storage_degraded
+    )
+    response_status = production_status.upper()
+    if not live_ready and response_status == "HEALTHY":
+        response_status = "DEGRADED"
     return {
-        "ok": production_status == "healthy",
-        "ready": bool(production_validation.get("safe_to_operate")),
-        "degraded": production_status == "degraded" or storage_degraded,
+        "ok": live_ready,
+        "ready": live_ready,
+        "degraded": (not live_ready) and production_status != "failed",
         "failed": production_status == "failed",
-        "safe_to_operate": bool(production_validation.get("safe_to_operate")),
-        "unsafe_to_operate": bool(production_validation.get("unsafe_to_operate")),
-        "status": production_status.upper(),
+        "safe_to_operate": live_ready,
+        "unsafe_to_operate": not live_ready,
+        "status": response_status,
         "storage": storage,
         "storage_degraded": storage_degraded,
-        "state": str(snapshot.get("state") or "UNKNOWN"),
-        "mode": str(snapshot.get("mode") or "unknown"),
+        "state": state_name,
+        "runtime_lifecycle_state": dict(snapshot.get("runtime_lifecycle_state") or snapshot.get("lifecycle_state") or {}),
+        "mode": mode_name,
         "execution_mode": str(snapshot.get("execution_mode") or snapshot.get("mode") or "unknown"),
         "execution_allowed": bool(snapshot.get("execution_allowed")),
         "reasons": reasons,
@@ -3081,6 +3332,145 @@ def api_get_trading_readiness(_parsed, ctx=None):
             "reasons": reasons,
             "status": "READY" if trading_ready else "BLOCKED",
         }
+    )
+    return payload
+
+
+def api_get_readiness_evidence(_parsed, ctx=None):
+    """Return normalized readiness evidence for live/paper operation."""
+
+    mode = str(_qs(_parsed, "mode", "") or "").strip().lower()
+    execution_mode = str(_qs(_parsed, "execution_mode", "") or "").strip().lower()
+    broker = str(_qs(_parsed, "broker", "") or "").strip().lower()
+    if mode in {"sim-paper", "sim_paper"}:
+        mode = "paper"
+    if execution_mode in {"sim-paper", "sim_paper"}:
+        execution_mode = "paper"
+
+    try:
+        readiness_payload = api_get_readiness(_parsed, ctx)
+    except Exception as e:
+        _warn("api_system.readiness_evidence.readiness", e)
+        readiness_payload = {
+            "ok": False,
+            "ready": False,
+            "mode": mode or os.environ.get("ENGINE_MODE") or "safe",
+            "execution_mode": execution_mode or os.environ.get("EXECUTION_MODE") or "safe",
+            "reason": f"readiness_unavailable:{type(e).__name__}",
+            "reasons": [f"readiness_unavailable:{type(e).__name__}:{e}"],
+            "ts_ms": _ts_ms(),
+        }
+
+    try:
+        health_payload = _cached_health_snapshot(allow_sync_on_miss=False)
+    except Exception as e:
+        _warn("api_system.readiness_evidence.health", e)
+        health_payload = {"ok": False, "reason": f"health_unavailable:{type(e).__name__}", "ts_ms": _ts_ms()}
+
+    try:
+        liveness_payload = api_get_liveness(_parsed, ctx)
+    except Exception as e:
+        _warn("api_system.readiness_evidence.liveness", e)
+        liveness_payload = {"ok": False, "alive": False, "reason": f"liveness_unavailable:{type(e).__name__}", "ts_ms": _ts_ms()}
+
+    try:
+        execution_barrier_payload = api_get_execution_barrier(_parsed, ctx)
+        execution_barrier = dict(execution_barrier_payload.get("execution_barrier") or execution_barrier_payload or {})
+        execution_barrier.setdefault("ts_ms", execution_barrier_payload.get("ts_ms") or _ts_ms())
+    except Exception as e:
+        _warn("api_system.readiness_evidence.execution_barrier", e)
+        execution_barrier = {"ok": False, "allowed": False, "reason": f"execution_barrier_unavailable:{type(e).__name__}", "ts_ms": _ts_ms()}
+
+    try:
+        from engine.runtime.health import get_kill_switch_snapshot_readonly
+
+        kill_switches = dict(get_kill_switch_snapshot_readonly() or {})
+    except Exception as e:
+        _warn("api_system.readiness_evidence.kill_switches", e)
+        kill_switches = {"enabled": True, "reason": f"kill_switch_evidence_unavailable:{type(e).__name__}"}
+
+    target_mode = mode or str(readiness_payload.get("mode") or os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+    target_execution_mode = execution_mode or str(
+        readiness_payload.get("execution_mode") or os.environ.get("EXECUTION_MODE") or target_mode
+    ).strip().lower()
+    target_broker = broker or str(os.environ.get("BROKER") or os.environ.get("BROKER_NAME") or "sim").strip().lower()
+
+    try:
+        from engine.runtime.live_trading_preflight import live_trading_preflight
+
+        live_preflight = dict(
+            live_trading_preflight(
+                engine_mode=target_mode,
+                execution_mode=target_execution_mode,
+            )
+            or {}
+        )
+    except Exception as e:
+        _warn("api_system.readiness_evidence.live_preflight", e)
+        live_preflight = {
+            "ok": False,
+            "required": target_mode == "live" or target_execution_mode == "live",
+            "reason": f"live_preflight_unavailable:{type(e).__name__}",
+            "blockers": [f"live_preflight_unavailable:{type(e).__name__}:{e}"],
+        }
+
+    try:
+        from engine.api.api_broker_config import api_get_broker_config
+
+        broker_config = dict(api_get_broker_config(_parsed, {}, ctx) or {})
+    except Exception as e:
+        _warn("api_system.readiness_evidence.broker_config", e)
+        broker_config = {"ok": False, "reason": f"broker_config_unavailable:{type(e).__name__}", "ts_ms": _ts_ms()}
+
+    try:
+        status = dict(market_data_status() or {})
+        provider_telemetry = {
+            "ok": bool(status.get("ok")),
+            "running": bool(status.get("running")),
+            "healthy_providers": int(status.get("healthy_providers") or 0),
+            "fresh_rows": int(status.get("fresh_rows") or 0),
+            "fresh_symbols": int(status.get("fresh_symbols") or 0),
+            "last_price_ts_ms": int(status.get("last_price_ts_ms") or 0),
+            "price_age_ms": int(status.get("price_age_ms") or 0),
+            "providers": status.get("providers") or {},
+            "updated_ts_ms": int(status.get("updated_ts_ms") or 0),
+        }
+    except Exception as e:
+        _warn("api_system.readiness_evidence.provider_telemetry", e)
+        provider_telemetry = {
+            "ok": False,
+            "reason": f"provider_telemetry_unavailable:{type(e).__name__}",
+            "ts_ms": _ts_ms(),
+        }
+
+    try:
+        from engine.api.governance_evidence import build_governance_evidence_summary
+
+        governance_evidence = dict(build_governance_evidence_summary(limit=20) or {})
+    except Exception as e:
+        _warn("api_system.readiness_evidence.governance", e)
+        governance_evidence = {
+            "ok": False,
+            "state": "unknown",
+            "reason": f"governance_evidence_unavailable:{type(e).__name__}",
+            "ts_ms": _ts_ms(),
+        }
+
+    from engine.api.readiness_evidence import build_readiness_evidence
+
+    payload = build_readiness_evidence(
+        readiness_payload=readiness_payload,
+        health_payload=health_payload,
+        liveness_payload=liveness_payload,
+        execution_barrier=execution_barrier,
+        kill_switches=kill_switches,
+        live_preflight=live_preflight,
+        broker_config=broker_config,
+        provider_telemetry=provider_telemetry,
+        governance_evidence=governance_evidence,
+        mode=target_mode,
+        execution_mode=target_execution_mode,
+        target_broker=target_broker,
     )
     return payload
 
@@ -3505,6 +3895,7 @@ def api_get_provider_telemetry(_parsed, ctx=None):
             "last_seq": int(status.get("last_seq") or 0),
             "lifecycle": lifecycle,
             "runtime_health_providers": (((snapshot.get("health") or {}).get("health") or {}).get("providers") or {}),
+            "provider_readiness": (((snapshot.get("health") or {}).get("health") or {}).get("provider_readiness") or {}),
             "ingestion_pipelines": pipeline_health_summary(),
         }
         return _snapshot_response(snapshot, ok=bool(provider_telemetry.get("ok")), provider_telemetry=provider_telemetry)
@@ -3661,22 +4052,7 @@ def api_get_telemetry(_parsed, ctx=None):
         except Exception as e:
             _warn("api_system.telemetry.alert_counts.critical_open", e)
 
-        fills_table = None
-        try:
-            row = con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='broker_fills_v2' LIMIT 1"
-            ).fetchone()
-            if row:
-                fills_table = require_allowed_table_name("broker_fills_v2")
-            else:
-                row = con.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='broker_fills' LIMIT 1"
-                ).fetchone()
-                if row:
-                    fills_table = require_allowed_table_name("broker_fills")
-        except Exception as e:
-            _warn("api_system.telemetry.fills_table_probe", e)
-            fills_table = None
+        fills_table = _telemetry_fills_table(con)
 
         if fills_table:
             try:

@@ -22,6 +22,7 @@ from engine.runtime.storage import connect as _connect
 from engine.runtime.storage import connect_ro as _connect_ro
 from engine.runtime.storage import init_db as _init_db
 from engine.runtime.storage import run_write_txn
+from engine.strategy.ope_gate import evaluate_policy_ope_gate
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -89,6 +90,8 @@ def _infer_model_family_name(model_name: str) -> str:
         return "xgb_regressor"
     if name == "patchtst" or name.startswith("patchtst"):
         return "patchtst"
+    if name == "itransformer" or name.startswith("itransformer"):
+        return "itransformer"
     if name == "gbm_regressor" or name.startswith("gbm_regressor"):
         return "gbm_regressor"
     if name == "temporal_predictor" or name.startswith("temporal_predictor"):
@@ -649,6 +652,11 @@ for _family_name, _training_entrypoint, _inference_entrypoint in (
         "engine.strategy.jobs.train_patchtst_models",
         "engine.strategy.models.patchtst.PatchTSTRegressor",
     ),
+    (
+        "itransformer",
+        "engine.strategy.jobs.train_itransformer_models",
+        "engine.strategy.models.itransformer.ITransformerRegressor",
+    ),
 ):
     register_model_family(
         _family_name,
@@ -936,12 +944,13 @@ def init_model_registry(con=None) -> None:
                 END)
                 """
             )
-            con.execute(
-                """
-                UPDATE model_registry
-                SET created_ts_ms=COALESCE(created_ts_ms, created_ts, updated_ts, 0)
-                """
-            )
+            created_ts_sources = ["created_ts_ms"]
+            if "created_ts" in cols:
+                created_ts_sources.append("created_ts")
+            if "updated_ts" in cols:
+                created_ts_sources.append("updated_ts")
+            created_ts_expr = "COALESCE(" + ", ".join(created_ts_sources + ["0"]) + ")"
+            con.execute(f"UPDATE model_registry SET created_ts_ms={created_ts_expr}")
             con.execute(
                 """
                 UPDATE model_registry
@@ -1184,7 +1193,53 @@ def _require_latest_statistical_evidence_pass(con, *, model_id: str) -> Dict[str
         raise RuntimeError(
             f"cannot promote model={model_key}: latest statistical evidence decision={decision.get('decision') or 'missing'}"
         )
+    latest_rows = [dict(row or {}) for row in list(decision.get("rows") or [])]
+    present_tests = {str(row.get("test_name") or "").strip() for row in latest_rows}
+    required_tests = {"white_reality_check", "deconfounded_signal_validation"}
+    missing_tests = sorted(required_tests.difference(present_tests))
+    if missing_tests:
+        raise RuntimeError(
+            f"cannot promote model={model_key}: latest statistical evidence missing required tests={missing_tests}"
+        )
     return dict(decision)
+
+
+def _require_experiment_ledger_pass(
+    con,
+    *,
+    model_id: str,
+    candidate_version: Optional[str] = None,
+) -> Dict[str, Any]:
+    from engine.strategy.experiment_ledger import evaluate_experiment_ledger_promotion_gate
+
+    model_key = str(model_id or "").strip()
+    passed, diagnostics = evaluate_experiment_ledger_promotion_gate(
+        model_name=str(model_key),
+        candidate_version=(None if candidate_version is None else str(candidate_version)),
+        con=con,
+    )
+    if not bool(passed):
+        blockers = list(dict(diagnostics or {}).get("blockers") or [])
+        raise RuntimeError(
+            f"cannot promote model={model_key}: experiment ledger blocked "
+            f"status={dict(diagnostics or {}).get('status') or 'missing'} blockers={blockers}"
+        )
+    return dict(diagnostics or {})
+
+
+def _require_graph_relational_promotion_gate_pass(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    from engine.strategy.graph_relational import evaluate_graph_promotion_gate
+
+    passed, diagnostics = evaluate_graph_promotion_gate(dict(candidate or {}))
+    if not bool(passed):
+        if bool((diagnostics or {}).get("applied")):
+            blockers = list(dict(diagnostics or {}).get("blockers") or [])
+            raise RuntimeError(
+                f"graph relational promotion gate blocked: "
+                f"status={dict(diagnostics or {}).get('status') or 'failed'} blockers={blockers}"
+            )
+        return dict(diagnostics or {})
+    return dict(diagnostics or {})
 
 
 def _candidate_replay_models(snapshot: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
@@ -1299,10 +1354,20 @@ def _ensure_model_promotion_audit_schema(con) -> None:
         ("prev_hash", "BLOB"),
         ("row_hash", "BLOB"),
         ("reason_json", "TEXT"),
+        ("details_json", "TEXT"),
         ("regime", "TEXT"),
     ):
         if column_name not in cols:
             con.execute(f"ALTER TABLE model_promotion_audit ADD COLUMN {column_name} {column_type}")
+    try:
+        con.execute(
+            "ALTER TABLE model_promotion_audit ALTER COLUMN ts_ms "
+            "SET DEFAULT ((EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)"
+        )
+        con.execute("ALTER TABLE model_promotion_audit ALTER COLUMN action SET DEFAULT 'audit_chain_append'")
+        con.execute("ALTER TABLE model_promotion_audit ALTER COLUMN model_name SET DEFAULT ''")
+    except Exception:
+        logging.getLogger(__name__).debug("model_promotion_audit_default_repair_skipped", exc_info=True)
     con.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_model_promo_audit_name_regime_ts
@@ -1349,6 +1414,54 @@ def _append_model_promotion_audit_row(
         },
         con,
     )
+    if str(action or "").strip().lower() == "promote":
+        try:
+            from engine.strategy.experiment_ledger import fetch_experiment_ledger, record_experiment_ledger
+
+            rows = fetch_experiment_ledger(
+                candidate_name=str(model_name),
+                candidate_version=(None if to_ts_ms is None else str(to_ts_ms)),
+                model_name=str(model_name),
+                limit=1,
+                con=con,
+            )
+            if rows:
+                latest = dict(rows[0])
+                record_experiment_ledger(
+                    con=con,
+                    candidate_key=str(latest.get("candidate_key") or ""),
+                    candidate_name=str(latest.get("candidate_name") or model_name),
+                    candidate_version=str(latest.get("candidate_version") or (to_ts_ms or "")),
+                    candidate_type=str(latest.get("candidate_type") or "model_challenger"),
+                    source=str(latest.get("source") or "model_registry"),
+                    parent_candidate_key=str(latest.get("parent_candidate_key") or ""),
+                    model_name=str(model_name),
+                    model_family=str(latest.get("model_family") or ""),
+                    feature_ids=list(latest.get("feature_ids_json") or []),
+                    prompt_hash=str(latest.get("prompt_hash") or ""),
+                    model_hash=str(latest.get("model_hash") or ""),
+                    search_space=dict(latest.get("search_space_json") or {}),
+                    trial_budget=int(latest.get("trial_budget") or 0),
+                    trial_count=int(latest.get("trial_count") or 0),
+                    cpcv=dict(latest.get("cpcv_json") or {}),
+                    pbo=latest.get("pbo"),
+                    dsr=latest.get("dsr"),
+                    fdr=dict(latest.get("fdr_json") or {}),
+                    redundancy=dict(latest.get("redundancy_json") or {}),
+                    evidence={**dict(latest.get("evidence_json") or {}), "promotion_audit_reason": dict(reason or {})},
+                    promotion_decision="promoted",
+                    status="promoted",
+                    diagnostics={"promotion_actor": str(actor), "to_kind": str(to_kind or ""), "to_ts_ms": to_ts_ms},
+                )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_registry_experiment_ledger_promotion_append_failed",
+                "MODEL_REGISTRY_EXPERIMENT_LEDGER_PROMOTION_APPEND_FAILED",
+                exc,
+                warn_key=f"experiment_ledger_promote:{model_name}:{regime}",
+                model_name=str(model_name),
+                regime=str(regime),
+            )
 
 
 def _audit_blocked_promotion(
@@ -1392,17 +1505,23 @@ def _audit_blocked_promotion(
 def _promotion_gate_reason(
     *,
     statistical: Dict[str, Any],
+    experiment_ledger: Dict[str, Any],
     replay: Dict[str, Any],
+    ope: Dict[str, Any],
     guard: Dict[str, Any],
+    graph_relational: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "registry_gate_version": 1,
+        "graph_relational": dict(graph_relational or {}),
         "statistical_evidence": {
             "decision": str(statistical.get("decision") or ""),
             "rows": len(list(statistical.get("rows") or [])),
         },
+        "experiment_ledger": dict(experiment_ledger or {}),
         "replay_validation": dict(replay or {}),
+        "off_policy_evaluation": dict(ope or {}),
         "promotion_guard": dict(guard or {}),
         "extra": dict(extra or {}),
     }
@@ -1434,13 +1553,13 @@ def promote_to_champion(
     # the durable champion handoff that serving code later reads.
     if b is None and isinstance(a, str) and (regime is None) and (key is None):
         reg = str(a or "global")
-        promoted: dict[str, Any] = {"kind": None, "ts": None, "gate_reason": {}}
+        promoted: dict[str, Any] = {"kind": None, "ts": None, "gate_reason": {}, "metrics": {}, "graph_gate": {}}
         try:
             con = _connect_ro()
             try:
                 row = con.execute(
                     """
-                    SELECT model_kind, model_ts_ms
+                    SELECT model_kind, model_ts_ms, metrics_json
                     FROM model_registry
                     WHERE model_name=? AND regime=? AND stage='challenger'
                     ORDER BY created_ts_ms DESC
@@ -1452,7 +1571,22 @@ def promote_to_champion(
                     raise RuntimeError(f"cannot promote missing challenger model={model_name} regime={reg}")
                 promoted["kind"] = str(row[0])
                 promoted["ts"] = int(row[1])
+                promoted["metrics"] = _json_load_dict(row[2] if len(row) > 2 else None)
+                promoted["graph_gate"] = _require_graph_relational_promotion_gate_pass(
+                    {
+                        "model_name": str(model_name),
+                        "model_kind": str(promoted["kind"]),
+                        "model_ts_ms": int(promoted["ts"]),
+                        "regime": str(reg),
+                        "metrics": dict(promoted.get("metrics") or {}),
+                    }
+                )
                 statistical = _require_latest_statistical_evidence_pass(con, model_id=str(model_name))
+                experiment_ledger = _require_experiment_ledger_pass(
+                    con,
+                    model_id=str(model_name),
+                    candidate_version=str(promoted["ts"]),
+                )
             finally:
                 con.close()
 
@@ -1462,11 +1596,26 @@ def promote_to_champion(
                 model_ts_ms=int(promoted["ts"]),
                 regime=str(reg),
             )
+            ope_passed, ope_reason = evaluate_policy_ope_gate(
+                model_id=str(model_name),
+                model_name=str(model_name),
+                candidate_type=str(promoted["kind"]),
+                model_kind=str(promoted["kind"]),
+                candidate_version=str(promoted["ts"]),
+                regime=str(reg),
+            )
+            if not bool(ope_passed):
+                raise RuntimeError(
+                    f"OPE gate blocked promotion: {str((ope_reason or {}).get('status') or 'failed')}"
+                )
             guard_reason = _require_system_promotion_guard_pass()
             promoted["gate_reason"] = _promotion_gate_reason(
                 statistical=statistical,
+                experiment_ledger=experiment_ledger,
                 replay=replay,
+                ope=ope_reason,
                 guard=guard_reason,
+                graph_relational=dict(promoted.get("graph_gate") or {}),
                 extra=reason,
             )
         except Exception as e:
@@ -1571,12 +1720,13 @@ def promote_to_champion(
     reg = str(regime if regime is not None else (key if key is not None else "global"))
 
     prev_state: dict[str, Any] = {"kind": None, "ts": None}
+    graph_gate: Dict[str, Any] = {}
     try:
         con = _connect_ro()
         try:
             exists = con.execute(
                 """
-                SELECT 1
+                SELECT metrics_json
                 FROM model_registry
                 WHERE model_name=? AND model_kind=? AND model_ts_ms=? AND regime=?
                 LIMIT 1
@@ -1587,7 +1737,22 @@ def promote_to_champion(
                 raise RuntimeError(
                     f"cannot promote missing model record model={model_name} regime={reg} kind={to_kind} ts={to_ts_ms}"
                 )
+            candidate_metrics = _json_load_dict(exists[0] if len(exists) > 0 else None)
+            graph_gate = _require_graph_relational_promotion_gate_pass(
+                {
+                    "model_name": str(model_name),
+                    "model_kind": str(to_kind),
+                    "model_ts_ms": int(to_ts_ms),
+                    "regime": str(reg),
+                    "metrics": dict(candidate_metrics or {}),
+                }
+            )
             statistical = _require_latest_statistical_evidence_pass(con, model_id=str(model_name))
+            experiment_ledger = _require_experiment_ledger_pass(
+                con,
+                model_id=str(model_name),
+                candidate_version=str(to_ts_ms),
+            )
         finally:
             con.close()
 
@@ -1597,11 +1762,26 @@ def promote_to_champion(
             model_ts_ms=int(to_ts_ms),
             regime=str(reg),
         )
+        ope_passed, ope_reason = evaluate_policy_ope_gate(
+            model_id=str(model_name),
+            model_name=str(model_name),
+            candidate_type=str(to_kind),
+            model_kind=str(to_kind),
+            candidate_version=str(to_ts_ms),
+            regime=str(reg),
+        )
+        if not bool(ope_passed):
+            raise RuntimeError(
+                f"OPE gate blocked promotion: {str((ope_reason or {}).get('status') or 'failed')}"
+            )
         guard_reason = _require_system_promotion_guard_pass()
         gate_reason = _promotion_gate_reason(
             statistical=statistical,
+            experiment_ledger=experiment_ledger,
             replay=replay,
+            ope=ope_reason,
             guard=guard_reason,
+            graph_relational=dict(graph_gate or {}),
             extra=reason,
         )
     except Exception as e:

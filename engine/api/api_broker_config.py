@@ -33,6 +33,7 @@ _CREDENTIALS_KEY = "broker.credentials_enc"
 _CREDENTIALS_VERSION_KEY = "broker.credentials_key_version"
 _LAST_TEST_KEY = "broker.last_test"
 _AUDIT_LIMIT = 200
+_DEFAULT_TEST_MAX_AGE_S = 24 * 60 * 60
 
 
 def _now_ms() -> int:
@@ -45,6 +46,24 @@ def _json_loads(raw: Any, default: Any) -> Any:
         return parsed if parsed is not None else default
     except Exception:
         return default
+
+
+def _broker_test_max_age_ms() -> int:
+    raw = str(os.environ.get("BROKER_CONNECTION_TEST_MAX_AGE_S") or "").strip()
+    if not raw:
+        return int(_DEFAULT_TEST_MAX_AGE_S * 1000)
+    try:
+        value = float(raw)
+    except Exception:
+        return int(_DEFAULT_TEST_MAX_AGE_S * 1000)
+    return int(max(0.0, value) * 1000.0)
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except Exception:
+        return 0
 
 
 def _default_config() -> Dict[str, Any]:
@@ -287,12 +306,22 @@ def api_post_broker_config(_parsed=None, body=None, _ctx=None):
     wants_activation = bool(next_config.get("active")) and not bool(next_config.get("disabled"))
     last_test = _json_loads(_read_meta_value(_LAST_TEST_KEY), {})
     if wants_activation and str(next_config.get("active_broker") or "sim") != "sim":
-        if not (isinstance(last_test, dict) and bool(last_test.get("ok")) and str(last_test.get("broker") or "") == str(next_config.get("active_broker") or "")):
-            _audit("activation_blocked", actor=actor, success=False, message="broker_test_required", detail=next_config)
+        tested_ts_ms = _int_or_zero((last_test or {}).get("tested_ts_ms")) if isinstance(last_test, dict) else 0
+        max_age_ms = _broker_test_max_age_ms()
+        test_stale = tested_ts_ms <= 0 or (_now_ms() - int(tested_ts_ms)) > int(max_age_ms)
+        test_matches = bool(
+            isinstance(last_test, dict)
+            and bool(last_test.get("ok"))
+            and str(last_test.get("broker") or "") == str(next_config.get("active_broker") or "")
+        )
+        if not test_matches or test_stale:
+            message = "broker_test_stale" if test_matches and test_stale else "broker_test_required"
+            _audit("activation_blocked", actor=actor, success=False, message=message, detail=next_config)
             return {
                 "ok": False,
-                "error": "broker_test_required",
-                "message": "Run a passing broker connection test before live activation.",
+                "error": message,
+                "message": "Run a fresh passing broker connection test before broker activation.",
+                "test_max_age_ms": int(max_age_ms),
                 "meta": {"status": 422},
             }
 

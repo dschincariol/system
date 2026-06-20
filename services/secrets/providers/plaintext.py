@@ -46,9 +46,6 @@ def _secrets_dir() -> Path:
     configured = str(os.environ.get("TS_DEV_SECRETS_DIR") or "").strip()
     if configured:
         return Path(configured).expanduser()
-    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
-    if local_app_data:
-        return Path(local_app_data) / "Trading" / "secrets"
     return Path.home() / ".trading" / "secrets"
 
 

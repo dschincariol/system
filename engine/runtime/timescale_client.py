@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
+from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
+
 try:
     import asyncpg
 except Exception:  # pragma: no cover - optional dependency at runtime
@@ -150,30 +153,15 @@ class TimescaleBackpressureError(TimescaleError):
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = str(os.environ.get(name, "")).strip().lower()
-    if raw == "":
-        return bool(default)
-    return raw in {"1", "true", "yes", "on"}
+    return env_bool(name, default=default)
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = str(os.environ.get(name, "")).strip()
-    if raw == "":
-        return float(default)
-    try:
-        return float(raw)
-    except Exception:
-        return float(default)
+    return tuned_float(name, default, 0.0, float("inf"))
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = str(os.environ.get(name, "")).strip()
-    if raw == "":
-        return int(default)
-    try:
-        return int(raw)
-    except Exception:
-        return int(default)
+    return tuned_int(name, default, 0, 2**31 - 1)
 
 
 def _now_ms() -> int:
@@ -292,24 +280,26 @@ class TimescaleConfig:
             or ""
         ).strip()
         enabled = _env_bool("TIMESCALE_ENABLED", default=bool(dsn))
+        pool_min_size = tuned_int("TIMESCALE_POOL_MIN_SIZE", 1, 1, 16)
+        pool_max_size = max(pool_min_size, tuned_int("TIMESCALE_POOL_MAX_SIZE", 4, 1, 16))
         return cls(
             enabled=bool(enabled),
             dsn=dsn,
             schema_name=str(os.environ.get("TIMESCALE_SCHEMA", "public")).strip() or "public",
-            pool_min_size=max(1, _env_int("TIMESCALE_POOL_MIN_SIZE", 1)),
-            pool_max_size=max(1, _env_int("TIMESCALE_POOL_MAX_SIZE", 4)),
-            batch_size=max(1, _env_int("TIMESCALE_BATCH_SIZE", 500)),
-            flush_interval_s=max(0.05, _env_float("TIMESCALE_FLUSH_INTERVAL_S", 1.0)),
-            queue_maxsize=max(1, _env_int("TIMESCALE_QUEUE_MAXSIZE", 1024)),
-            retry_attempts=max(1, _env_int("TIMESCALE_RETRY_ATTEMPTS", 5)),
-            retry_base_s=max(0.05, _env_float("TIMESCALE_RETRY_BASE_S", 0.25)),
-            retry_max_s=max(0.1, _env_float("TIMESCALE_RETRY_MAX_S", 5.0)),
-            backpressure_timeout_s=max(0.05, _env_float("TIMESCALE_BACKPRESSURE_TIMEOUT_S", 5.0)),
-            start_timeout_s=max(0.1, _env_float("TIMESCALE_START_TIMEOUT_S", 5.0)),
-            connect_timeout_s=max(0.1, _env_float("TIMESCALE_CONNECT_TIMEOUT_S", 5.0)),
-            lock_timeout_s=max(0.05, _env_float("TIMESCALE_LOCK_TIMEOUT_S", 5.0)),
-            command_timeout_s=max(1.0, _env_float("TIMESCALE_COMMAND_TIMEOUT_S", 30.0)),
-            idle_in_txn_timeout_s=max(1.0, _env_float("TIMESCALE_IDLE_IN_TXN_TIMEOUT_S", 60.0)),
+            pool_min_size=int(pool_min_size),
+            pool_max_size=int(pool_max_size),
+            batch_size=tuned_int("TIMESCALE_BATCH_SIZE", 500, 1, 5000),
+            flush_interval_s=tuned_float("TIMESCALE_FLUSH_INTERVAL_S", 1.0, 0.05, 10.0),
+            queue_maxsize=tuned_int("TIMESCALE_QUEUE_MAXSIZE", 1024, 1, 32768),
+            retry_attempts=tuned_int("TIMESCALE_RETRY_ATTEMPTS", 5, 1, 10),
+            retry_base_s=tuned_float("TIMESCALE_RETRY_BASE_S", 0.25, 0.01, 5.0),
+            retry_max_s=tuned_float("TIMESCALE_RETRY_MAX_S", 5.0, 0.1, 30.0),
+            backpressure_timeout_s=tuned_float("TIMESCALE_BACKPRESSURE_TIMEOUT_S", 5.0, 0.05, 30.0),
+            start_timeout_s=tuned_float("TIMESCALE_START_TIMEOUT_S", 5.0, 0.1, 30.0),
+            connect_timeout_s=tuned_float("TIMESCALE_CONNECT_TIMEOUT_S", 5.0, 0.1, 30.0),
+            lock_timeout_s=tuned_float("TIMESCALE_LOCK_TIMEOUT_S", 5.0, 0.05, 30.0),
+            command_timeout_s=tuned_float("TIMESCALE_COMMAND_TIMEOUT_S", 30.0, 1.0, 120.0),
+            idle_in_txn_timeout_s=tuned_float("TIMESCALE_IDLE_IN_TXN_TIMEOUT_S", 60.0, 1.0, 300.0),
             application_name=str(os.environ.get("TIMESCALE_APPLICATION_NAME", "trading-system")).strip()
             or "trading-system",
             retention_days=max(0, _env_int("TIMESCALE_RETENTION_DAYS", 0)),
@@ -370,9 +360,13 @@ class TimescaleClient:
             "flushed_rows": 0,
             "inflight_rows": 0,
             "last_backpressure_ts_ms": 0,
+            "last_db_write_duration_ms": 0,
             "last_flush_failure_ts_ms": 0,
+            "last_flush_latency_ms": 0,
             "last_flush_ts_ms": 0,
             "retry_count": 0,
+            "total_db_write_duration_ms": 0,
+            "total_flush_latency_ms": 0,
             "table_stats": {
                 "data_source_logs": {"enqueued_rows": 0, "flushed_rows": 0},
                 "event_log": {"enqueued_rows": 0, "flushed_rows": 0},
@@ -535,6 +529,10 @@ class TimescaleClient:
             "driver_available": _asyncpg_pool_available(),
             "queue_depth": int(queue_depth),
             "queue_maxsize": int(self._config.queue_maxsize),
+            "pool_min_size": int(self._config.pool_min_size),
+            "pool_max_size": int(self._config.pool_max_size),
+            "batch_size": int(self._config.batch_size),
+            "flush_interval_s": float(self._config.flush_interval_s),
             "backpressure_timeout_s": float(self._config.backpressure_timeout_s),
             "schema_name": str(self._config.schema_name),
             "schema_ready": bool(self._schema_ready),
@@ -1291,19 +1289,51 @@ class TimescaleClient:
             return True
         sql = self._insert_sql(table_name)
         self._set_inflight(len(rows))
+        flush_started = time.perf_counter()
         try:
             for attempt in range(1, int(self._config.retry_attempts) + 1):
                 try:
                     await self._ensure_schema()
+                    db_started = time.perf_counter()
                     pool = await self._ensure_pool()
                     async with pool.acquire() as conn:
                         async with conn.transaction():
                             await conn.executemany(sql, rows)
-                    self._note_flush_success(table_name, len(rows))
+                    db_write_duration_ms = float((time.perf_counter() - db_started) * 1000.0)
+                    flush_latency_ms = float((time.perf_counter() - flush_started) * 1000.0)
+                    self._note_flush_success(
+                        table_name,
+                        len(rows),
+                        flush_latency_ms=flush_latency_ms,
+                        db_write_duration_ms=db_write_duration_ms,
+                    )
+                    emit_timing(
+                        "timescale_flush_latency_ms",
+                        float(flush_latency_ms),
+                        component="engine.runtime.timescale_client",
+                        extra_tags={"table": str(table_name)},
+                    )
+                    emit_timing(
+                        "timescale_db_write_duration_ms",
+                        float(db_write_duration_ms),
+                        component="engine.runtime.timescale_client",
+                        extra_tags={"table": str(table_name)},
+                    )
+                    emit_gauge(
+                        "timescale_queue_depth",
+                        int(self._queue.qsize()) if self._queue is not None else 0,
+                        component="engine.runtime.timescale_client",
+                    )
                     return True
                 except Exception as exc:
                     self._record_error(exc)
                     self._note_retry()
+                    emit_counter(
+                        "timescale_retries",
+                        1,
+                        component="engine.runtime.timescale_client",
+                        extra_tags={"table": str(table_name), "attempt": int(attempt)},
+                    )
                     if attempt >= int(self._config.retry_attempts):
                         self._note_flush_failure(table_name, len(rows))
                         LOGGER.warning(
@@ -1681,11 +1711,27 @@ class TimescaleClient:
             except concurrent.futures.TimeoutError as exc:
                 future.cancel()
                 self._note_backpressure()
+                emit_counter(
+                    "timescale_enqueue_failures",
+                    1,
+                    component="engine.runtime.timescale_client",
+                    extra_tags={"table": str(table_name), "reason": "backpressure_timeout"},
+                )
+                emit_gauge(
+                    "timescale_queue_depth",
+                    int(self._queue.qsize()) if self._queue is not None else 0,
+                    component="engine.runtime.timescale_client",
+                )
                 raise TimescaleBackpressureError(
                     f"timescale_queue_backpressure_timeout:{table_name}:{deadline_s}s"
                 ) from exc
             total_rows += len(chunk)
             self._note_enqueued(table_name, len(chunk))
+            emit_gauge(
+                "timescale_queue_depth",
+                int(self._queue.qsize()) if self._queue is not None else 0,
+                component="engine.runtime.timescale_client",
+            )
         return total_rows
 
     async def _async_enqueue(self, envelope: _WriteEnvelope) -> None:
@@ -1703,7 +1749,14 @@ class TimescaleClient:
             table_stats[table_name] = table
             self._metrics["table_stats"] = table_stats
 
-    def _note_flush_success(self, table_name: str, row_count: int) -> None:
+    def _note_flush_success(
+        self,
+        table_name: str,
+        row_count: int,
+        *,
+        flush_latency_ms: float | int | None = None,
+        db_write_duration_ms: float | int | None = None,
+    ) -> None:
         with self._metrics_lock:
             self._metrics["backpressure_active"] = False
             self._metrics["buffered_rows"] = max(0, int(self._metrics.get("buffered_rows") or 0) - int(row_count))
@@ -1711,9 +1764,21 @@ class TimescaleClient:
             self._metrics["flushed_batches"] = int(self._metrics.get("flushed_batches") or 0) + 1
             self._metrics["flushed_rows"] = int(self._metrics.get("flushed_rows") or 0) + int(row_count)
             self._metrics["last_flush_ts_ms"] = _now_ms()
+            if flush_latency_ms is not None:
+                latency_i = int(round(float(flush_latency_ms)))
+                self._metrics["last_flush_latency_ms"] = latency_i
+                self._metrics["total_flush_latency_ms"] = int(self._metrics.get("total_flush_latency_ms") or 0) + latency_i
+            if db_write_duration_ms is not None:
+                db_i = int(round(float(db_write_duration_ms)))
+                self._metrics["last_db_write_duration_ms"] = db_i
+                self._metrics["total_db_write_duration_ms"] = int(self._metrics.get("total_db_write_duration_ms") or 0) + db_i
             table_stats = dict(self._metrics.get("table_stats") or {})
             table = dict(table_stats.get(table_name) or {})
             table["flushed_rows"] = int(table.get("flushed_rows") or 0) + int(row_count)
+            if flush_latency_ms is not None:
+                table["last_flush_latency_ms"] = int(round(float(flush_latency_ms)))
+            if db_write_duration_ms is not None:
+                table["last_db_write_duration_ms"] = int(round(float(db_write_duration_ms)))
             table_stats[table_name] = table
             self._metrics["table_stats"] = table_stats
 

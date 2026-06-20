@@ -240,8 +240,17 @@ const path = require("path");
 
 const decision = normalized.decision;
 
+function operatorAiLogPath() {
+  const configured = String(process.env.AI_OPERATOR_LOG_PATH || process.env.OPERATOR_AI_LOG_PATH || "").trim();
+  if (configured) return path.resolve(configured);
+  const configuredLogDir = String(process.env.TRADING_LOGS || process.env.LOG_DIR || "").trim();
+  const logDir = configuredLogDir ? path.resolve(configuredLogDir) : path.join(process.cwd(), "var", "log");
+  return path.join(logDir, "ai_operator_log.jsonl");
+}
+
 try {
-  const logPath = path.join(process.cwd(), "data", "ai_operator_log.jsonl");
+  const logPath = operatorAiLogPath();
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
   fs.appendFileSync(
     logPath,
     JSON.stringify({

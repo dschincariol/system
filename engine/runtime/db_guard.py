@@ -118,16 +118,25 @@ def _attach_schema_contract_summary(out: dict) -> dict:
     return out
 
 
+def _explicit_sqlite_storage_backend() -> bool:
+    backend = str(os.environ.get("TS_STORAGE_BACKEND") or "").strip().lower()
+    return backend in {"sqlite", "sqlite-test", "test"}
+
+
 def ensure_db_ok(*, include_quick_check: bool = True) -> dict:
     del include_quick_check
-    out = {"ok": True, "db_path": None, "action": "none", "error": None, "storage": "postgres"}
+    storage_name = "sqlite" if _explicit_sqlite_storage_backend() else "postgres"
+    out = {"ok": True, "db_path": None, "action": "none", "error": None, "storage": storage_name}
     data_root = resolve_db_path()
     out["db_path"] = str(data_root)
 
     try:
         from engine.runtime.storage import connect_rw_direct
 
-        conn = connect_rw_direct(timeout_s=30.0, busy_timeout_ms=60000)
+        if storage_name == "sqlite":
+            conn = connect_rw_direct()
+        else:
+            conn = connect_rw_direct(timeout_s=30.0, busy_timeout_ms=60000)
         try:
             conn.execute("SELECT 1").fetchone()
             conn.commit()
@@ -135,13 +144,14 @@ def ensure_db_ok(*, include_quick_check: bool = True) -> dict:
             conn.close()
     except Exception as exc:
         _warn_nonfatal(
-            "DB_GUARD_POSTGRES_CONNECT_FAILED",
+            "DB_GUARD_STORAGE_CONNECT_FAILED",
             exc,
-            once_key="ensure_db_ok_postgres_connect",
+            once_key=f"ensure_db_ok_{storage_name}_connect",
             data_root=str(data_root),
+            storage=storage_name,
         )
         out["ok"] = False
-        out["error"] = f"postgres_connect_failed:{type(exc).__name__}:{exc}"
+        out["error"] = f"{storage_name}_connect_failed:{type(exc).__name__}:{exc}"
         return out
 
     return _attach_schema_contract_summary(out)

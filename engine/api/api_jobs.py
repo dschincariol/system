@@ -15,6 +15,11 @@ import logging
 import threading
 from engine.api.http_parsing import qs as _qs
 from engine.runtime.failure_diagnostics import failure_response, log_failure, normalize_root_cause_code
+from engine.runtime.job_catalog import (
+    build_job_catalog,
+    dangerous_job_start_confirmation_error,
+    enrich_job_runtime_row,
+)
 from engine.runtime.job_registry import ALLOWED_JOBS, PIPELINE_ORDER, JOB_ORDER
 from engine.runtime.storage import connect as _db_connect, _pid_is_running
 
@@ -28,6 +33,7 @@ log = logging.getLogger(__name__)
 ROUTE_SPECS = [
     ("GET",  "/api/jobs/log",     "api_get_job_log"),
     ("GET",  "/api/jobs/history", "api_get_job_history"),
+    ("GET",  "/api/jobs/catalog", "api_get_jobs_catalog"),
     ("GET",  "/api/jobs",         "api_get_jobs"),
     ("POST", "/api/jobs/start",   "api_post_job_start"),
     ("POST", "/api/jobs/stop",    "api_post_job_stop"),
@@ -162,9 +168,78 @@ def _clear_jobs_cache() -> None:
         _warn("cache_clear", e)
 
 
+def _truthy_confirmation_value(value) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "ack", "confirmed"}
+
+
+def _pipeline_execution_confirmation_error(body) -> dict | None:
+    payload = dict(body or {}) if isinstance(body, dict) else {}
+    actual = str(payload.get("confirmation") or payload.get("confirm") or "").strip()
+    missing = []
+    if actual != "RUN_PIPELINE":
+        missing.append("confirmation")
+    if not _truthy_confirmation_value(payload.get("consequence_ack")):
+        missing.append("consequence_ack")
+    if not missing:
+        return None
+    return {
+        "ok": False,
+        "error": "confirmation_required",
+        "required_confirm": "RUN_PIPELINE",
+        "required_token": "RUN_PIPELINE",
+        "required_fields": missing,
+        "action_id": "pipeline.run",
+        "severity": "high",
+        "consequence": "Runs a pipeline that includes execution-sensitive jobs.",
+        "meta": {"status": 422},
+    }
+
+
 # ----------------------------------------------------------------------
 # Endpoints
 # ----------------------------------------------------------------------
+
+def api_get_jobs_catalog(parsed, _body=None, ctx=None):
+    del parsed
+    now_ms = int(time.time() * 1000)
+    jobs_payload = None
+    JOBS = _jobs_from(ctx)
+    if JOBS:
+        try:
+            jobs_payload = api_get_jobs({}, None, ctx)
+        except Exception as e:
+            _warn("catalog_jobs_merge", e)
+            jobs_payload = None
+
+    if isinstance(jobs_payload, dict) and isinstance(jobs_payload.get("jobs"), list):
+        rows = list(jobs_payload.get("jobs") or [])
+        status = "ok" if jobs_payload.get("ok", True) else str(jobs_payload.get("status") or "degraded")
+        reasons = list(jobs_payload.get("reasons") or [])
+        live_list_available = bool(jobs_payload.get("live_list_available"))
+    else:
+        rows = build_job_catalog(environ=os.environ)
+        status = "static"
+        reasons = ["jobs_manager_unavailable"] if not JOBS else []
+        live_list_available = False
+
+    return {
+        "ok": True,
+        "status": status,
+        "degraded": status not in {"ok", "static"},
+        "reasons": reasons,
+        "live_list_available": live_list_available,
+        "ts_ms": now_ms,
+        "catalog_schema_version": 1,
+        "jobs": rows,
+        "catalog": rows,
+        "pipeline_order": list(PIPELINE_ORDER or []),
+        "allowed": [str(row.get("name") or row.get("id") or "") for row in rows],
+    }
+
 
 def api_get_jobs(parsed, _body=None, ctx=None):
     JOBS = _jobs_from(ctx)
@@ -332,7 +407,7 @@ def api_get_jobs(parsed, _body=None, ctx=None):
         row["last_exit_code"] = hist.get("last_exit_code")
         row["last_event_ts_ms"] = hist.get("last_event_ts_ms")
 
-        out.append(row)
+        out.append(enrich_job_runtime_row(row, environ=os.environ, now_ms=now_ms))
 
     payload = {
         "ok": len(list_errors) == 0,
@@ -341,7 +416,9 @@ def api_get_jobs(parsed, _body=None, ctx=None):
         "reasons": list(list_errors),
         "live_list_available": not bool(list_errors),
         "ts_ms": now_ms,
+        "catalog_schema_version": 1,
         "jobs": out,
+        "catalog": out,
         "pipeline_order": list(PIPELINE_ORDER or []),
         "allowed": names,
     }
@@ -366,6 +443,10 @@ def api_post_job_start(parsed, body=None, ctx=None):
 
     if name not in ALLOWED_JOBS:
         return {"ok": False, "error": "job_not_registered", "job": name}
+
+    confirmation_error = dangerous_job_start_confirmation_error(name, body, environ=os.environ)
+    if confirmation_error:
+        return confirmation_error
 
     try:
         res = JOBS.start(name)
@@ -523,6 +604,10 @@ def api_post_pipeline_run(parsed, body=None, ctx=None):
     include_execution = str(q.get("include_execution") or "").strip().lower() in ("1", "true", "yes", "y", "on")
     if not include_execution and isinstance(body, dict):
         include_execution = str(body.get("include_execution") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    if include_execution:
+        confirmation_error = _pipeline_execution_confirmation_error(body)
+        if confirmation_error:
+            return confirmation_error
     pipeline_names, skipped = _pipeline_names_from(body, include_execution=include_execution)
     supervisor = _supervisor_from(ctx)
 
@@ -579,6 +664,7 @@ __all__ = [
     "ROUTE_SPECS",
     "ROUTE_SPECS_JOBS",
     "api_get_jobs",
+    "api_get_jobs_catalog",
     "api_post_job_start",
     "api_post_job_stop",
     "api_get_job_log",

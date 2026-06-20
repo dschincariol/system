@@ -9,11 +9,14 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.observability import backoff_delay_s, record_component_health
+from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
+from engine.runtime.platform import default_local_log_dir
 from engine.runtime.storage_pg_prices import get_price_storage
 
 LOG = get_logger("runtime.async_writer")
@@ -22,30 +25,15 @@ _WRITER: "AsyncPriceWriter | None" = None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = str(os.environ.get(name, "")).strip().lower()
-    if raw == "":
-        return bool(default)
-    return raw in {"1", "true", "yes", "on"}
+    return env_bool(name, default=default)
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = str(os.environ.get(name, "")).strip()
-    if raw == "":
-        return float(default)
-    try:
-        return float(raw)
-    except Exception:
-        return float(default)
+    return tuned_float(name, default, 0.0, float("inf"))
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = str(os.environ.get(name, "")).strip()
-    if raw == "":
-        return int(default)
-    try:
-        return int(raw)
-    except Exception:
-        return int(default)
+    return tuned_int(name, default, 0, 2**31 - 1)
 
 
 def _json_default(value: Any) -> Any:
@@ -89,17 +77,17 @@ class AsyncPriceWriterConfig:
         enabled_default = bool(getattr(get_price_storage(), "enabled", False))
         dead_letter_path = str(
             os.environ.get("ASYNC_PRICE_WRITER_DEAD_LETTER_PATH")
-            or os.path.join(os.getcwd(), "logs", "async_price_writer_dead_letter.jsonl")
+            or os.path.join(str(default_local_log_dir().resolve()), "async_price_writer_dead_letter.jsonl")
         ).strip()
         return cls(
             enabled=_env_bool("ASYNC_PRICE_WRITER_ENABLED", default=enabled_default),
-            queue_maxsize=max(32, _env_int("ASYNC_PRICE_WRITER_QUEUE_MAXSIZE", 2048)),
-            batch_size=max(1, _env_int("ASYNC_PRICE_WRITER_BATCH_SIZE", 256)),
-            flush_interval_s=max(0.05, _env_float("ASYNC_PRICE_WRITER_FLUSH_INTERVAL_S", 0.5)),
-            retry_attempts=max(1, _env_int("ASYNC_PRICE_WRITER_RETRY_ATTEMPTS", 4)),
-            retry_base_s=max(0.05, _env_float("ASYNC_PRICE_WRITER_RETRY_BASE_S", 0.25)),
-            retry_max_s=max(0.10, _env_float("ASYNC_PRICE_WRITER_RETRY_MAX_S", 5.0)),
-            enqueue_timeout_s=max(0.0, _env_float("ASYNC_PRICE_WRITER_ENQUEUE_TIMEOUT_S", 0.05)),
+            queue_maxsize=tuned_int("ASYNC_PRICE_WRITER_QUEUE_MAXSIZE", 2048, 32, 32768),
+            batch_size=tuned_int("ASYNC_PRICE_WRITER_BATCH_SIZE", 256, 1, 4096),
+            flush_interval_s=tuned_float("ASYNC_PRICE_WRITER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0),
+            retry_attempts=tuned_int("ASYNC_PRICE_WRITER_RETRY_ATTEMPTS", 4, 1, 10),
+            retry_base_s=tuned_float("ASYNC_PRICE_WRITER_RETRY_BASE_S", 0.25, 0.01, 5.0),
+            retry_max_s=tuned_float("ASYNC_PRICE_WRITER_RETRY_MAX_S", 5.0, 0.10, 30.0),
+            enqueue_timeout_s=tuned_float("ASYNC_PRICE_WRITER_ENQUEUE_TIMEOUT_S", 0.05, 0.0, 5.0),
             dead_letter_path=dead_letter_path,
         )
 
@@ -132,6 +120,11 @@ class AsyncPriceWriter:
             "dead_letters": 0,
             "retry_count": 0,
             "dropped_batches": 0,
+            "dropped_rows": 0,
+            "last_flush_latency_ms": 0,
+            "total_flush_latency_ms": 0,
+            "last_db_write_duration_ms": 0,
+            "total_db_write_duration_ms": 0,
             "last_enqueue_ts_ms": 0,
             "last_flush_ts_ms": 0,
             "last_error": "",
@@ -200,12 +193,29 @@ class AsyncPriceWriter:
                 self._metrics["enqueued_batches"] = int(self._metrics.get("enqueued_batches") or 0) + 1
                 self._metrics["enqueued_rows"] = int(self._metrics.get("enqueued_rows") or 0) + int(row_count)
                 self._metrics["last_enqueue_ts_ms"] = int(envelope.created_ts_ms)
+            emit_gauge(
+                "async_price_writer_queue_depth",
+                int(self._queue.qsize()),
+                component="engine.runtime.async_writer",
+            )
             return True
         except queue.Full as exc:
             with self._state_lock:
                 self._metrics["dropped_batches"] = int(self._metrics.get("dropped_batches") or 0) + 1
+                self._metrics["dropped_rows"] = int(self._metrics.get("dropped_rows") or 0) + int(row_count)
                 self._metrics["last_error"] = f"{type(exc).__name__}:{exc}"
                 self._metrics["last_error_ts_ms"] = int(time.time() * 1000)
+            emit_counter(
+                "async_price_writer_dropped_rows",
+                int(row_count),
+                component="engine.runtime.async_writer",
+                extra_tags={"reason": "queue_full"},
+            )
+            emit_gauge(
+                "async_price_writer_queue_depth",
+                int(self._queue.qsize()),
+                component="engine.runtime.async_writer",
+            )
             self._dead_letter("queue_full", [envelope], error=exc)
             record_component_health(
                 "async_price_writer",
@@ -255,27 +265,60 @@ class AsyncPriceWriter:
 
         total_rows = int(len(combined_prices) + len(combined_quotes) + len(combined_raw))
         last_error: BaseException | None = None
+        flush_started = time.perf_counter()
         for attempt in range(1, int(self._config.retry_attempts) + 1):
             try:
                 storage = get_price_storage()
-                storage.write_batch(
+                write_started = time.perf_counter()
+                write_result = storage.write_batch(
                     prices=tuple(combined_prices),
                     quotes=tuple(combined_quotes),
                     raw=tuple(combined_raw),
                 )
+                write_result_dict = dict(write_result) if isinstance(write_result, dict) else {}
+                db_write_duration_ms = float(
+                    (write_result_dict.get("write_duration_ms"))
+                    or ((time.perf_counter() - write_started) * 1000.0)
+                )
+                flush_latency_ms = float((time.perf_counter() - flush_started) * 1000.0)
                 now_ts_ms = int(time.time() * 1000)
                 with self._state_lock:
                     self._metrics["flushed_batches"] = int(self._metrics.get("flushed_batches") or 0) + 1
                     self._metrics["flushed_rows"] = int(self._metrics.get("flushed_rows") or 0) + int(total_rows)
                     self._metrics["last_flush_ts_ms"] = int(now_ts_ms)
+                    self._metrics["last_flush_latency_ms"] = int(round(flush_latency_ms))
+                    self._metrics["total_flush_latency_ms"] = int(self._metrics.get("total_flush_latency_ms") or 0) + int(round(flush_latency_ms))
+                    self._metrics["last_db_write_duration_ms"] = int(round(db_write_duration_ms))
+                    self._metrics["total_db_write_duration_ms"] = int(self._metrics.get("total_db_write_duration_ms") or 0) + int(round(db_write_duration_ms))
                     self._metrics["last_error"] = ""
+                emit_timing(
+                    "async_price_writer_flush_latency_ms",
+                    float(flush_latency_ms),
+                    component="engine.runtime.async_writer",
+                )
+                emit_timing(
+                    "async_price_writer_db_write_duration_ms",
+                    float(db_write_duration_ms),
+                    component="engine.runtime.async_writer",
+                )
+                emit_gauge(
+                    "async_price_writer_queue_depth",
+                    int(self._queue.qsize()),
+                    component="engine.runtime.async_writer",
+                )
                 record_component_health(
                     "async_price_writer",
                     ok=True,
                     status="ok",
                     detail="flush_ok",
                     observed_ts_ms=int(now_ts_ms),
-                    extra={"enabled": bool(self.enabled), "rows": int(total_rows)},
+                    latency_ms=float(flush_latency_ms),
+                    extra={
+                        "enabled": bool(self.enabled),
+                        "rows": int(total_rows),
+                        "db_write_duration_ms": int(round(db_write_duration_ms)),
+                        "queue_depth": int(self._queue.qsize()),
+                    },
                 )
                 return
             except Exception as exc:
@@ -284,6 +327,12 @@ class AsyncPriceWriter:
                     self._metrics["retry_count"] = int(self._metrics.get("retry_count") or 0) + 1
                     self._metrics["last_error"] = f"{type(exc).__name__}:{exc}"
                     self._metrics["last_error_ts_ms"] = int(time.time() * 1000)
+                emit_counter(
+                    "async_price_writer_retries",
+                    1,
+                    component="engine.runtime.async_writer",
+                    extra_tags={"attempt": int(attempt)},
+                )
                 if attempt >= int(self._config.retry_attempts):
                     break
                 time.sleep(
@@ -357,6 +406,11 @@ class AsyncPriceWriter:
             "dead_letters": int(metrics.get("dead_letters") or 0),
             "retry_count": int(metrics.get("retry_count") or 0),
             "dropped_batches": int(metrics.get("dropped_batches") or 0),
+            "dropped_rows": int(metrics.get("dropped_rows") or 0),
+            "last_flush_latency_ms": int(metrics.get("last_flush_latency_ms") or 0),
+            "total_flush_latency_ms": int(metrics.get("total_flush_latency_ms") or 0),
+            "last_db_write_duration_ms": int(metrics.get("last_db_write_duration_ms") or 0),
+            "total_db_write_duration_ms": int(metrics.get("total_db_write_duration_ms") or 0),
             "last_enqueue_ts_ms": (int(metrics.get("last_enqueue_ts_ms") or 0) or None),
             "last_flush_ts_ms": (int(metrics.get("last_flush_ts_ms") or 0) or None),
             "last_error": str(metrics.get("last_error") or ""),

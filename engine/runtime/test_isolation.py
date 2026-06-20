@@ -25,6 +25,21 @@ _DEFAULT_ENV_KEYS = {
     "TS_PG_POOL_TIMEOUT": "0.1",
     "TS_PG_CONNECT_TIMEOUT": "1",
 }
+_PRODUCTION_BACKEND_TEST_FLAGS = (
+    "TS_PRODUCTION_BACKEND_TESTS",
+    "TRADING_PRODUCTION_BACKEND_TESTS",
+)
+_PRODUCTION_BACKEND_ENV_PRESERVE = {
+    "LIVE_CACHE_BACKEND",
+    "LIVE_CACHE_REDIS_URL",
+    "REDIS_URL",
+    "TS_PG_DSN",
+    "TS_PG_PASSWORD",
+    "TS_PG_PASSWORD_APP",
+    "TS_PG_APP_PASSWORD",
+    "TS_REDIS_URL",
+    "TS_STORAGE_BACKEND",
+}
 _SCRUB_ENV_NAMES = {
     "ALLOW_TRAINING",
     "ASYNC_PRICE_WRITER_ENABLED",
@@ -72,7 +87,6 @@ _SCRUB_ENV_NAMES = {
     "TRADING_LOGS",
     "TS_API_ALLOW_LOCALHOST_MUTATIONS_WITHOUT_TOKEN",
     "TS_DEV_SECRETS_DIR",
-    "TS_DPAPI_SECRETS_DIR",
     "TS_ENV",
     "TS_PG_DSN",
     "TS_PG_PASSWORD",
@@ -128,6 +142,7 @@ def _write_default_test_secrets(root: Path) -> Path:
     secrets = root / "secrets"
     secrets.mkdir(parents=True, exist_ok=True)
     for name, value in {
+        "data_source_master_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
         "master_key": "test-master-key",
         "pg_password_app": "test-app-password",
         "pg_password_ingest": "test-ingest-password",
@@ -142,10 +157,30 @@ def _should_scrub_env_key(key: str) -> bool:
     return bool(key_s in _SCRUB_ENV_NAMES or any(key_s.startswith(prefix) for prefix in _SCRUB_ENV_PREFIXES))
 
 
+def _env_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _production_backend_tests_enabled() -> bool:
+    return any(_env_truthy(os.environ.get(name)) for name in _PRODUCTION_BACKEND_TEST_FLAGS)
+
+
 def _build_base_test_env() -> dict[str, str]:
     root = _test_root()
-    env = {key: value for key, value in os.environ.items() if not _should_scrub_env_key(key)}
-    env.update(_DEFAULT_ENV_KEYS)
+    production_backend_tests = _production_backend_tests_enabled()
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if (production_backend_tests and key in _PRODUCTION_BACKEND_ENV_PRESERVE)
+        or not _should_scrub_env_key(key)
+    }
+    defaults = dict(_DEFAULT_ENV_KEYS)
+    if production_backend_tests:
+        defaults["TS_STORAGE_BACKEND"] = "postgres"
+        for key in ("TS_PG_POOL_TIMEOUT", "TS_PG_CONNECT_TIMEOUT"):
+            if os.environ.get(key):
+                defaults[key] = str(os.environ[key])
+    env.update(defaults)
     env["DB_PATH"] = str(root / "runtime-test.sqlite")
     env["TS_SECRETS_PROVIDER"] = "plaintext"
     env["TS_DEV_SECRETS_DIR"] = str(_write_default_test_secrets(root))

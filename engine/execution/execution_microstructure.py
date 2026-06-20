@@ -264,13 +264,36 @@ def _next_action_ms(now_ms: int, meta: Optional[Dict[str, Any]]) -> int:
 
 
 def _remaining_qty(open_qty: float, oinfo: Dict[str, Any]) -> float:
+    def _parse_float(value: Any, default: float = 0.0) -> float:
+        if value in (None, ""):
+            return float(default)
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _signed_remaining(abs_qty: float) -> float:
+        side = str(oinfo.get("side") or oinfo.get("action") or "").lower().strip()
+        if side in {"sell", "sell_short", "short", "sellshort"}:
+            return -float(abs_qty)
+        if side in {"buy", "bot"}:
+            return float(abs_qty)
+        return float(abs_qty) if float(open_qty) >= 0.0 else -float(abs_qty)
+
+    broker_remaining = _parse_float(oinfo.get("remaining"), default=-1.0)
+    if broker_remaining >= 0.0:
+        rem_abs = abs(float(broker_remaining))
+        if rem_abs <= float(EPS_QTY):
+            return 0.0
+        return _signed_remaining(rem_abs)
+
     try:
-        broker_qty = float(oinfo.get("qty") or 0.0)
+        broker_qty = float(oinfo.get("qty") or oinfo.get("totalQuantity") or 0.0)
     except Exception:
         broker_qty = 0.0
 
     try:
-        filled_qty = float(oinfo.get("filled_qty") or 0.0)
+        filled_qty = float(oinfo.get("filled_qty") or oinfo.get("filled") or 0.0)
     except Exception:
         filled_qty = 0.0
 
@@ -279,12 +302,7 @@ def _remaining_qty(open_qty: float, oinfo: Dict[str, Any]) -> float:
     if rem_abs <= float(EPS_QTY):
         return 0.0
 
-    side = str(oinfo.get("side") or "").lower().strip()
-    if side == "sell":
-        return -float(rem_abs)
-    if side == "buy":
-        return float(rem_abs)
-    return float(rem_abs) if float(open_qty) >= 0.0 else -float(rem_abs)
+    return _signed_remaining(rem_abs)
 
 
 def _is_open_like_status(status: str) -> bool:
@@ -299,6 +317,568 @@ def _is_open_like_status(status: str) -> bool:
         "done_for_day",
         "calculated",
         "open",
+    }
+
+
+def _truthy_env(name: str, default: str = "1") -> bool:
+    raw = str(os.environ.get(name, default) or default).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+_TERMINAL_CANCEL_STATUSES = {"canceled", "cancelled", "api_cancelled"}
+
+
+def _normalize_order_status(status: Any) -> str:
+    s = str(status or "").lower().strip()
+    aliases = {
+        "cancelled": "canceled",
+        "api_cancelled": "canceled",
+        "partial_fill": "partially_filled",
+        "fill": "filled",
+    }
+    return aliases.get(s, s)
+
+
+def _order_status(oinfo: Dict[str, Any]) -> str:
+    for key in ("broker_status", "order_status", "status"):
+        value = (oinfo or {}).get(key)
+        if value not in (None, ""):
+            return _normalize_order_status(value)
+    return ""
+
+
+def _is_terminal_cancel_status(status: Any) -> bool:
+    return _normalize_order_status(status) in {_normalize_order_status(s) for s in _TERMINAL_CANCEL_STATUSES}
+
+
+def _cancel_result_order(cancel_result: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(cancel_result or {})
+    for key in ("order", "broker_order", "latest_order", "verified_order", "post_cancel_order"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
+def _cancel_result_verified(cancel_result: Dict[str, Any]) -> bool:
+    result = dict(cancel_result or {})
+    return bool(
+        result.get("cancel_verified")
+        or result.get("terminal_cancel_verified")
+        or result.get("verified_terminal_cancel")
+        or result.get("zero_remaining_verified")
+    )
+
+
+def _cancel_result_remaining_qty(open_qty: float, cancel_result: Dict[str, Any]) -> Optional[float]:
+    result = dict(cancel_result or {})
+    for key in ("remaining_qty", "remaining"):
+        if result.get(key) not in (None, ""):
+            try:
+                value = float(result.get(key) or 0.0)
+                if abs(value) <= float(EPS_QTY):
+                    return 0.0
+                if key == "remaining" and float(value) >= 0.0:
+                    return float(value) if float(open_qty) >= 0.0 else -float(value)
+                return float(value)
+            except Exception:
+                return None
+    order = _cancel_result_order(result)
+    if order:
+        return _remaining_qty(float(open_qty), order)
+    return None
+
+
+def _ensure_execution_alerts(con) -> None:
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS execution_alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          severity TEXT NOT NULL,
+          alert_type TEXT NOT NULL,
+          state TEXT NOT NULL,
+          details_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_execution_alerts_ts
+          ON execution_alerts(ts_ms);
+
+        CREATE INDEX IF NOT EXISTS idx_execution_alerts_type_ts
+          ON execution_alerts(alert_type, ts_ms);
+        """
+    )
+
+
+def _emit_execution_alert(con, *, severity: str, alert_type: str, state: str, details: Dict[str, Any]) -> None:
+    try:
+        _ensure_execution_alerts(con)
+        con.execute(
+            """
+            INSERT INTO execution_alerts(ts_ms, severity, alert_type, state, details_json)
+            VALUES(?,?,?,?,?)
+            """,
+            (
+                _now_ms(),
+                str(severity),
+                str(alert_type),
+                str(state),
+                json.dumps(details or {}, separators=(",", ":"), sort_keys=True, default=str),
+            ),
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "execution_microstructure_emit_execution_alert_failed",
+            "EXECUTION_MICROSTRUCTURE_EMIT_EXECUTION_ALERT_FAILED",
+            exc,
+            alert_type=str(alert_type),
+            state=str(state),
+        )
+
+
+def mark_cancel_replace_needs_reconcile(
+    con,
+    *,
+    open_id: int,
+    now_ms: int,
+    broker: str,
+    symbol: str,
+    qty: float,
+    client_order_id: str,
+    broker_order_id: str,
+    reason: str,
+    details: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    detail = {
+        "reason": str(reason or "cancel_replace_ambiguous"),
+        "broker": str(broker),
+        "symbol": str(symbol),
+        "open_order_id": int(open_id),
+        "client_order_id": str(client_order_id or ""),
+        "broker_order_id": str(broker_order_id or ""),
+        "remaining_qty": float(qty),
+        **dict(details or {}),
+    }
+    meta_obj = dict(meta or {})
+    meta_obj["cancel_replace_block"] = detail
+    con.execute(
+        """
+        UPDATE exec_open_orders
+        SET updated_ts_ms=?, qty=?, status='needs_reconcile',
+            next_action_ts_ms=0, meta_json=?
+        WHERE id=?
+        """,
+        (
+            int(now_ms),
+            float(qty),
+            json.dumps(meta_obj, separators=(",", ":"), sort_keys=True, default=str),
+            int(open_id),
+        ),
+    )
+    _log_event(con, int(open_id), "cancel_replace_needs_reconcile", detail)
+    _emit_execution_alert(
+        con,
+        severity="critical",
+        alert_type="limit_cancel_replace_needs_reconcile",
+        state="needs_reconcile",
+        details=detail,
+    )
+    return {"ok": False, "status": "needs_reconcile", "reason": str(reason or "cancel_replace_ambiguous"), **detail}
+
+
+def verify_cancel_before_replace(
+    con,
+    *,
+    open_id: int,
+    now_ms: int,
+    broker: str,
+    symbol: str,
+    open_qty: float,
+    client_order_id: str,
+    broker_order_id: str,
+    get_order_fn,
+    cancel_order_fn,
+    current_order: Optional[Dict[str, Any]] = None,
+    attempts: int = 0,
+    max_attempts: int = 0,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Cancel a fillable order and prove it is no longer fillable before replacement."""
+    prior = dict(current_order or {})
+    prior_remaining_qty = _remaining_qty(float(open_qty), prior) if prior else float(open_qty)
+    base_details = {
+        "attempts": int(attempts),
+        "max_attempts": int(max_attempts),
+        "prior_order": prior,
+        "prior_status": _order_status(prior),
+    }
+
+    if not callable(cancel_order_fn):
+        return mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(prior_remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="cancel_unavailable",
+            details=base_details,
+            meta=meta,
+        )
+
+    try:
+        cancel_result = cancel_order_fn(str(broker_order_id)) or {}
+    except Exception as exc:
+        return mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(prior_remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="cancel_exception",
+            details={**base_details, "error": f"{type(exc).__name__}: {exc}"},
+            meta=meta,
+        )
+
+    if not isinstance(cancel_result, dict):
+        cancel_result = {"raw_cancel_result": str(cancel_result)}
+    verified_from_cancel = _cancel_result_verified(cancel_result)
+    cancel_remaining_qty = _cancel_result_remaining_qty(float(open_qty), cancel_result)
+    if cancel_remaining_qty is None:
+        cancel_remaining_qty = float(prior_remaining_qty)
+
+    if not bool(cancel_result.get("ok", verified_from_cancel)) and not verified_from_cancel:
+        return mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(cancel_remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="cancel_not_verified",
+            details={**base_details, "cancel_result": dict(cancel_result or {})},
+            meta=meta,
+        )
+
+    post_cancel_order: Dict[str, Any] = {}
+    post_query_error = ""
+    if callable(get_order_fn):
+        try:
+            post_cancel_order = dict(get_order_fn(str(broker_order_id)) or {})
+        except Exception as exc:
+            post_query_error = f"{type(exc).__name__}: {exc}"
+
+    if post_query_error and not verified_from_cancel:
+        return mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(cancel_remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="post_cancel_query_failed",
+            details={
+                **base_details,
+                "cancel_result": dict(cancel_result or {}),
+                "post_cancel_query_error": str(post_query_error),
+            },
+            meta=meta,
+        )
+
+    if post_cancel_order:
+        post_status = _order_status(post_cancel_order)
+        post_remaining_qty = _remaining_qty(float(open_qty), post_cancel_order)
+        if _is_open_like_status(post_status) and abs(float(post_remaining_qty)) > float(EPS_QTY):
+            return mark_cancel_replace_needs_reconcile(
+                con,
+                open_id=open_id,
+                now_ms=now_ms,
+                broker=broker,
+                symbol=symbol,
+                qty=float(post_remaining_qty),
+                client_order_id=client_order_id,
+                broker_order_id=broker_order_id,
+                reason="broker_order_still_open_after_cancel",
+                details={
+                    **base_details,
+                    "cancel_result": dict(cancel_result or {}),
+                    "post_cancel_order": post_cancel_order,
+                    "post_cancel_status": str(post_status),
+                },
+                meta=meta,
+            )
+        if post_status == "filled" or abs(float(post_remaining_qty)) <= float(EPS_QTY):
+            con.execute(
+                """
+                UPDATE exec_open_orders
+                SET updated_ts_ms=?, qty=?, status='filled', next_action_ts_ms=0
+                WHERE id=?
+                """,
+                (int(now_ms), 0.0, int(open_id)),
+            )
+            _log_event(
+                con,
+                int(open_id),
+                "cancel_replace_zero_remaining",
+                {
+                    **base_details,
+                    "cancel_result": dict(cancel_result or {}),
+                    "post_cancel_order": post_cancel_order,
+                    "post_cancel_status": str(post_status),
+                },
+            )
+            return {
+                "ok": True,
+                "replace_allowed": False,
+                "zero_remaining": True,
+                "remaining_qty": 0.0,
+                "status": str(post_status or "zero_remaining"),
+                "post_cancel_order": post_cancel_order,
+            }
+        if _is_terminal_cancel_status(post_status):
+            return {
+                "ok": True,
+                "replace_allowed": True,
+                "remaining_qty": float(post_remaining_qty),
+                "status": str(post_status),
+                "cancel_result": dict(cancel_result or {}),
+                "post_cancel_order": post_cancel_order,
+            }
+        return mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(post_remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="post_cancel_status_not_terminal",
+            details={
+                **base_details,
+                "cancel_result": dict(cancel_result or {}),
+                "post_cancel_order": post_cancel_order,
+                "post_cancel_status": str(post_status),
+            },
+            meta=meta,
+        )
+
+    if not verified_from_cancel:
+        return mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(cancel_remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="cancel_no_terminal_verification",
+            details={
+                **base_details,
+                "cancel_result": dict(cancel_result or {}),
+                "post_cancel_order": post_cancel_order,
+                "post_cancel_query_error": str(post_query_error),
+            },
+            meta=meta,
+        )
+
+    cancel_order_info = _cancel_result_order(cancel_result)
+    cancel_status = _order_status(cancel_order_info) or _normalize_order_status(
+        cancel_result.get("broker_status") or cancel_result.get("order_status")
+    )
+    if bool(cancel_result.get("zero_remaining_verified")) or abs(float(cancel_remaining_qty)) <= float(EPS_QTY):
+        con.execute(
+            """
+            UPDATE exec_open_orders
+            SET updated_ts_ms=?, qty=?, status='filled', next_action_ts_ms=0
+            WHERE id=?
+            """,
+            (int(now_ms), 0.0, int(open_id)),
+        )
+        _log_event(
+            con,
+            int(open_id),
+            "cancel_replace_zero_remaining",
+            {
+                **base_details,
+                "cancel_result": dict(cancel_result or {}),
+                "post_cancel_query_error": str(post_query_error),
+            },
+        )
+        return {
+            "ok": True,
+            "replace_allowed": False,
+            "zero_remaining": True,
+            "remaining_qty": 0.0,
+            "status": str(cancel_status or "zero_remaining"),
+            "cancel_result": dict(cancel_result or {}),
+        }
+    if _is_terminal_cancel_status(cancel_status) or bool(cancel_result.get("terminal_cancel_verified")):
+        return {
+            "ok": True,
+            "replace_allowed": True,
+            "remaining_qty": float(cancel_remaining_qty),
+            "status": str(cancel_status or "canceled"),
+            "cancel_result": dict(cancel_result or {}),
+            "post_cancel_query_error": str(post_query_error),
+        }
+    return mark_cancel_replace_needs_reconcile(
+        con,
+        open_id=open_id,
+        now_ms=now_ms,
+        broker=broker,
+        symbol=symbol,
+        qty=float(cancel_remaining_qty),
+        client_order_id=client_order_id,
+        broker_order_id=broker_order_id,
+        reason="cancel_verified_without_terminal_cancel",
+        details={
+            **base_details,
+            "cancel_result": dict(cancel_result or {}),
+            "cancel_status": str(cancel_status),
+            "post_cancel_query_error": str(post_query_error),
+        },
+        meta=meta,
+    )
+
+
+def try_native_limit_replace(
+    con,
+    *,
+    open_id: int,
+    now_ms: int,
+    broker: str,
+    symbol: str,
+    current_qty: float,
+    remaining_qty: float,
+    limit_px: float,
+    client_order_id: str,
+    broker_order_id: str,
+    attempts: int,
+    max_attempts: int,
+    aggressiveness: str,
+    next_action_ts_ms: int,
+    replace_limit_fn,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Use a broker-native in-place limit replace when it cannot create a second order."""
+    if not _truthy_env("EXEC_NATIVE_LIMIT_REPLACE_ENABLED", "1"):
+        return {"attempted": False, "reason": "native_replace_disabled"}
+    if not callable(replace_limit_fn):
+        return {"attempted": False, "reason": "native_replace_unavailable"}
+    if abs(abs(float(current_qty)) - abs(float(remaining_qty))) > float(EPS_QTY):
+        return {"attempted": False, "reason": "partial_fill_requires_cancel_verify"}
+
+    next_attempt = int(attempts) + 1
+    next_aggr = _next_aggressiveness(str(aggressiveness or ""), int(next_attempt), int(max_attempts))
+    if str(next_aggr).upper().strip() == "MARKET" or (int(max_attempts) > 0 and int(attempts) >= int(max_attempts)):
+        return {"attempted": False, "reason": "market_escalation_requires_cancel_verify"}
+
+    next_limit = _adjust_limit_px(float(limit_px), float(remaining_qty), int(next_attempt))
+    try:
+        result = replace_limit_fn(
+            order_id=str(broker_order_id),
+            symbol=str(symbol),
+            qty=float(remaining_qty),
+            limit_price=float(next_limit),
+            client_oid=str(client_order_id or ""),
+        ) or {}
+    except Exception as exc:
+        blocked = mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="native_replace_exception",
+            details={
+                "attempts": int(attempts),
+                "max_attempts": int(max_attempts),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            meta=meta,
+        )
+        blocked["attempted"] = True
+        return blocked
+
+    if not isinstance(result, dict):
+        result = {"raw_replace_result": str(result)}
+    if not bool(result.get("ok")) or not bool(result.get("replace_verified")):
+        blocked = mark_cancel_replace_needs_reconcile(
+            con,
+            open_id=open_id,
+            now_ms=now_ms,
+            broker=broker,
+            symbol=symbol,
+            qty=float(remaining_qty),
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            reason="native_replace_not_verified",
+            details={
+                "attempts": int(attempts),
+                "max_attempts": int(max_attempts),
+                "replace_result": dict(result or {}),
+            },
+            meta=meta,
+        )
+        blocked["attempted"] = True
+        return blocked
+
+    new_broker_order_id = str(result.get("broker_order_id") or result.get("order_id") or result.get("id") or broker_order_id)
+    con.execute(
+        """
+        UPDATE exec_open_orders
+        SET updated_ts_ms=?, qty=?, broker_order_id=?, attempts=?,
+            aggressiveness=?, limit_px=?, next_action_ts_ms=?
+        WHERE id=?
+        """,
+        (
+            int(now_ms),
+            float(remaining_qty),
+            str(new_broker_order_id),
+            int(next_attempt),
+            str(next_aggr),
+            float(next_limit),
+            int(next_action_ts_ms),
+            int(open_id),
+        ),
+    )
+    _log_event(
+        con,
+        int(open_id),
+        "native_replaced",
+        {
+            "attempt": int(next_attempt),
+            "limit_px": float(next_limit),
+            "aggressiveness": str(next_aggr),
+            "broker_order_id": str(new_broker_order_id),
+            "remaining_qty": float(remaining_qty),
+            "replace_result": dict(result or {}),
+        },
+    )
+    return {
+        "ok": True,
+        "attempted": True,
+        "replace_done": True,
+        "remaining_qty": float(remaining_qty),
+        "limit_px": float(next_limit),
+        "broker_order_id": str(new_broker_order_id),
+        "attempt": int(next_attempt),
+        "aggressiveness": str(next_aggr),
     }
 
 
@@ -409,6 +989,7 @@ def manage_open_orders() -> Dict[str, Any]:
         try:
             from engine.execution.broker_alpaca_rest import get_order as alpaca_get_order
             from engine.execution.broker_alpaca_rest import cancel_order as alpaca_cancel_order
+            from engine.execution.broker_alpaca_rest import replace_limit_order as alpaca_replace_limit_order
             from engine.execution.broker_alpaca_rest import submit_limit_order as alpaca_submit_limit_order
             from engine.execution.broker_alpaca_rest import submit_market_order as alpaca_submit_market_order
         except Exception as exc:
@@ -420,6 +1001,7 @@ def manage_open_orders() -> Dict[str, Any]:
             )
             alpaca_get_order = None
             alpaca_cancel_order = None
+            alpaca_replace_limit_order = None
             alpaca_submit_limit_order = None
             alpaca_submit_market_order = None
 
@@ -471,120 +1053,26 @@ def manage_open_orders() -> Dict[str, Any]:
                     continue
 
                 if not broker_oid:
-                    new_client_oid = f"{client_oid}_retry{attempts + 1}"
-                    new_broker_oid = None
-                    submit_ok = False
-
-                    try:
-                        if order_type == "LIMIT" and limit_px is not None:
-                            res = alpaca_submit_limit_order(
-                                symbol=symbol,
-                                qty=float(qty),
-                                limit_price=float(limit_px),
-                                client_oid=new_client_oid,
-                            ) or {}
-                            new_broker_oid = str(res.get("id") or "") or None
-                            submit_ok = bool(new_broker_oid)
-                        elif order_type == "MARKET" and alpaca_submit_market_order:
-                            res = alpaca_submit_market_order(
-                                symbol=symbol,
-                                qty=float(qty),
-                                client_oid=new_client_oid,
-                            ) or {}
-                            new_broker_oid = str(res.get("id") or "") or None
-                            submit_ok = bool(new_broker_oid)
-                    except Exception as exc:
-                        _warn_nonfatal(
-                            "execution_microstructure_missing_broker_order_resubmit_failed",
-                            "EXECUTION_MICROSTRUCTURE_MISSING_BROKER_ORDER_RESUBMIT_FAILED",
-                            exc,
-                            symbol=symbol,
-                            client_order_id=client_oid,
-                            order_type=order_type,
-                        )
-                        submit_ok = False
-
-                    if submit_ok:
-                        submit_ts_ms = int(_now_ms())
-                        retry_payload = {
-                            "timeout_escalation": True,
-                            "retry_missing_broker_order_id": True,
-                            "prev_client_order_id": client_oid,
-                            "meta": meta,
-                        }
-                        try:
-                            log_submit(
-                                client_order_id=new_client_oid,
-                                broker="alpaca",
-                                symbol=symbol,
-                                qty=float(qty),
-                                submit_ts_ms=int(submit_ts_ms),
-                                ref_px=float(limit_px) if limit_px is not None else 0.0,
-                                broker_order_id=str(new_broker_oid) if new_broker_oid else None,
-                                portfolio_orders_id=int(portfolio_orders_id) if portfolio_orders_id is not None else None,
-                                source_alert_id=int(source_alert_id) if source_alert_id is not None else None,
-                                extra=retry_payload,
-                            )
-                        except Exception as exc:
-                            _warn_nonfatal(
-                                "execution_microstructure_resubmit_log_submit_failed",
-                                "EXECUTION_MICROSTRUCTURE_RESUBMIT_LOG_SUBMIT_FAILED",
-                                exc,
-                                symbol=symbol,
-                                client_order_id=new_client_oid,
-                                broker_order_id=new_broker_oid,
-                            )
-                            _raise_submission_unrecorded(
-                                open_id=open_id,
-                                symbol=symbol,
-                                qty=float(qty),
-                                client_order_id=new_client_oid,
-                                broker_order_id=new_broker_oid,
-                                submit_ts_ms=int(submit_ts_ms),
-                                attempts=int(attempts + 1),
-                                portfolio_orders_id=portfolio_orders_id,
-                                source_alert_id=source_alert_id,
-                                payload=retry_payload,
-                                error=exc,
-                                stage="log_submit",
-                            )
-
-                        con.execute(
-                            """
-                            UPDATE exec_open_orders
-                            SET updated_ts_ms=?,
-                                client_order_id=?,
-                                broker_order_id=?,
-                                attempts=?,
-                                next_action_ts_ms=?
-                            WHERE id=?
-                            """,
-                            (
-                                int(now),
-                                str(new_client_oid),
-                                str(new_broker_oid),
-                                int(attempts + 1),
-                                int(next_action_ts_ms),
-                                int(open_id),
-                            ),
-                        )
-                        _log_event(
-                            con,
-                            open_id,
-                            "resubmitted_missing_broker_order_id",
-                            {"client_order_id": new_client_oid, "broker_order_id": new_broker_oid},
-                        )
-                    else:
-                        con.execute(
-                            """
-                            UPDATE exec_open_orders
-                            SET updated_ts_ms=?, next_action_ts_ms=?
-                            WHERE id=?
-                            """,
-                            (int(now), int(next_action_ts_ms), int(open_id)),
-                        )
-                        _log_event(con, open_id, "missing_broker_order_id", {"client_order_id": client_oid})
-
+                    mark_cancel_replace_needs_reconcile(
+                        con,
+                        open_id=open_id,
+                        now_ms=int(now),
+                        broker=broker,
+                        symbol=symbol,
+                        qty=float(qty),
+                        client_order_id=client_oid,
+                        broker_order_id=broker_oid,
+                        reason="missing_broker_order_id_unverified",
+                        details={
+                            "attempts": int(attempts),
+                            "max_attempts": int(max_attempts),
+                            "portfolio_orders_id": portfolio_orders_id,
+                            "source_alert_id": source_alert_id,
+                            "order_type": str(order_type),
+                        },
+                        meta=meta,
+                    )
+                    out["errors"] += 1
                     out["updated"] += 1
                     continue
 
@@ -674,18 +1162,59 @@ def manage_open_orders() -> Dict[str, Any]:
                 next_attempt = attempts + 1
                 next_aggr = _next_aggressiveness(str(r[5] or ""), next_attempt, max_attempts)
 
-                try:
-                    alpaca_cancel_order(str(broker_oid))
-                except Exception as exc:
-                    _warn_nonfatal(
-                        "execution_microstructure_cancel_failed",
-                        "EXECUTION_MICROSTRUCTURE_CANCEL_FAILED",
-                        exc,
-                        symbol=symbol,
-                        broker_order_id=broker_oid,
-                        open_order_id=int(open_id),
-                    )
-                    _log_event(con, open_id, "cancel_failed", {"broker_order_id": broker_oid})
+                native_replace = try_native_limit_replace(
+                    con,
+                    open_id=open_id,
+                    now_ms=int(now),
+                    broker=broker,
+                    symbol=symbol,
+                    current_qty=float(qty),
+                    remaining_qty=float(remaining_qty),
+                    limit_px=float(limit_px),
+                    client_order_id=client_oid,
+                    broker_order_id=broker_oid,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                    aggressiveness=str(r[5] or ""),
+                    next_action_ts_ms=int(next_action_ts_ms),
+                    replace_limit_fn=alpaca_replace_limit_order,
+                    meta=meta,
+                )
+                if bool(native_replace.get("replace_done")):
+                    out["updated"] += 1
+                    continue
+                if bool(native_replace.get("attempted")) and not bool(native_replace.get("ok")):
+                    out["errors"] += 1
+                    out["updated"] += 1
+                    continue
+
+                cancel_gate = verify_cancel_before_replace(
+                    con,
+                    open_id=open_id,
+                    now_ms=int(now),
+                    broker=broker,
+                    symbol=symbol,
+                    open_qty=float(qty),
+                    client_order_id=client_oid,
+                    broker_order_id=broker_oid,
+                    get_order_fn=alpaca_get_order,
+                    cancel_order_fn=alpaca_cancel_order,
+                    current_order=oinfo,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                    meta=meta,
+                )
+                if not bool(cancel_gate.get("ok")):
+                    out["errors"] += 1
+                    out["updated"] += 1
+                    continue
+                if not bool(cancel_gate.get("replace_allowed")):
+                    out["updated"] += 1
+                    continue
+                remaining_qty = float(cancel_gate.get("remaining_qty") or 0.0)
+                if abs(float(remaining_qty)) <= float(EPS_QTY):
+                    out["updated"] += 1
+                    continue
 
                 if max_attempts > 0 and attempts >= max_attempts:
                     if not alpaca_submit_market_order:

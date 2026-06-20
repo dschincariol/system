@@ -39,6 +39,10 @@ from engine.api.api_read_advanced import (
     run_shadow_capital_scores,
     get_size_policy,
 )
+from engine.api.feature_visibility import (
+    LOW_CONFIDENCE_THRESHOLD,
+    build_feature_visibility,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -156,6 +160,32 @@ def api_get_decision_detail(parsed, _ctx=None):
             LOG,
             event="api_dashboard_reads_decision_detail_failed",
             code="API_DASHBOARD_DECISION_DETAIL_FAILED",
+            message=str(e),
+            error=e,
+            component="engine.api.api_dashboard_reads",
+            ctx=_ctx,
+        )
+
+
+def api_get_feature_visibility(parsed, _ctx=None):
+    try:
+        qs = _qs(parsed)
+        symbol = str(qs.get("symbol", "") or "").strip().upper()
+        limit = _parse_int(qs.get("limit", "12") or "12", 12, 1, 100)
+        try:
+            threshold = float(qs.get("low_confidence_threshold", "") or LOW_CONFIDENCE_THRESHOLD)
+        except Exception:
+            threshold = LOW_CONFIDENCE_THRESHOLD
+        return build_feature_visibility(
+            symbol=symbol,
+            low_confidence_threshold=float(threshold),
+            lineage_limit=limit,
+        )
+    except Exception as e:
+        return failure_response(
+            LOG,
+            event="api_dashboard_reads_feature_visibility_failed",
+            code="API_DASHBOARD_FEATURE_VISIBILITY_FAILED",
             message=str(e),
             error=e,
             component="engine.api.api_dashboard_reads",

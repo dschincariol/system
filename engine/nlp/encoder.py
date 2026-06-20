@@ -11,8 +11,13 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 
+from engine.runtime.hardware import resolve_torch_device
+from engine.runtime.platform import default_local_models_dir
 
-DEFAULT_MODEL_CACHE_DIR = Path(os.environ.get("NLP_MODEL_CACHE_DIR", "models/nlp"))
+
+DEFAULT_MODEL_CACHE_DIR = Path(
+    os.environ.get("NLP_MODEL_CACHE_DIR", str((default_local_models_dir() / "nlp").resolve()))
+)
 FINBERT_LABEL_ORDER = ("positive", "negative", "neutral")
 
 
@@ -142,16 +147,13 @@ class FinBertSentimentEncoder(Encoder):
 
     def _resolve_device(self):
         torch = importlib.import_module("torch")
-        requested = self.device or os.environ.get("NLP_DEVICE") or os.environ.get("TORCH_DEVICE") or ""
-        device = str(requested or "").strip().lower()
-        if not device:
-            cuda = getattr(torch, "cuda", None)
-            device = "cuda" if cuda is not None and cuda.is_available() else "cpu"
-        if device.startswith("cuda"):
-            cuda = getattr(torch, "cuda", None)
-            if cuda is None or not cuda.is_available():
-                device = "cpu"
-        return torch, device
+        resolution = resolve_torch_device(
+            torch,
+            requested=self.device or None,
+            env_var="FINBERT_DEVICE",
+            fallback_envs=("NLP_DEVICE", "TORCH_DEVICE"),
+        )
+        return torch, resolution.resolved
 
     def _load_bundle(self) -> dict[str, object]:
         if self._bundle is not None:
@@ -285,8 +287,14 @@ class SentenceTransformerEncoder(Encoder):
         if self._model is not None:
             return self._model
         module = importlib.import_module("sentence_transformers")
+        torch = importlib.import_module("torch")
+        resolution = resolve_torch_device(
+            torch,
+            requested=self.device or None,
+            env_var="NLP_DEVICE",
+            fallback_envs=("EMBED_DEVICE", "TORCH_DEVICE"),
+        )
         kwargs = {"cache_folder": self.cache_dir}
-        if self.device:
-            kwargs["device"] = self.device
+        kwargs["device"] = resolution.resolved
         self._model = module.SentenceTransformer(self.model_name, **kwargs)
         return self._model

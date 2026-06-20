@@ -36,12 +36,14 @@ import os
 import time
 import json
 import logging
+import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine.execution.broker_failover_policy import terminal_broker_failure
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
+from engine.execution.options_readiness import live_options_order_block
 from engine.execution.broker_submission_recovery import (
     record_submission_unrecorded,
     unrecorded_submission_gate,
@@ -64,9 +66,11 @@ from engine.execution.execution_analytics_engine import (
     get_execution_degradation_snapshot,
 )
 from engine.execution.order_idempotency import (
-    claim_order_submission,
-    mark_order_submission_submitted,
-    mark_order_submission_unknown,
+    claim_order_submission_durable,
+    compute_order_uid,
+    make_client_order_id,
+    mark_order_submission_submitted_durable,
+    mark_order_submission_unknown_durable,
 )
 from engine.execution.broker_action_audit import record_broker_action_audit
 from engine.execution.execution_liquidity_model import (
@@ -74,10 +78,10 @@ from engine.execution.execution_liquidity_model import (
     get_execution_liquidity_snapshot,
 )
 
-# Execution gate providers are fail-closed here to keep adapter import from
-# blocking when runtime registry services are unavailable.
-_execution_gate_snapshot = None  # type: ignore
-_ALLOWED_JOBS = {}  # type: ignore
+try:
+    from engine.runtime.gates import execution_gate_snapshot as _execution_gate_snapshot  # type: ignore
+except Exception:
+    _execution_gate_snapshot = None  # type: ignore
 
 try:
     from engine.cache.wrappers.kill_switch import read_kill_switch as _kill_switch_snapshot  # type: ignore
@@ -151,6 +155,17 @@ def _safe_i(value: Any, default: int = 0) -> int:
             value_type=type(value).__name__,
         )
         return int(default)
+
+
+def _is_multi_slice_override(orders: Optional[List[Dict[str, Any]]]) -> bool:
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        has_index = order.get("slice_index") not in (None, "") or order.get("adaptive_slice_index") not in (None, "")
+        slice_count = _safe_i(order.get("slice_count") or order.get("adaptive_slice_count"), 0)
+        if bool(has_index) and int(slice_count) > 1:
+            return True
+    return False
 
 
 def _explicit_ibkr_config_required() -> bool:
@@ -247,6 +262,107 @@ def _consume_next_order_id(app: Any) -> int:
     oid = _safe_i(next_order_id)
     setattr(app, "_next_order_id", int(oid) + 1)
     return int(oid)
+
+
+IBKR_ORDER_REF_MAX_LEN = 255
+_IBKR_ORDER_REF_SAFE_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def _ibkr_order_ref_limit() -> int:
+    raw = os.environ.get("IBKR_ORDER_REF_MAX_LEN", str(IBKR_ORDER_REF_MAX_LEN))
+    try:
+        value = int(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_ORDER_REF_LIMIT_PARSE_FAILED",
+            e,
+            once_key=f"order_ref_limit:{str(raw)[:32]}",
+        )
+        value = IBKR_ORDER_REF_MAX_LEN
+    return max(1, min(int(value), IBKR_ORDER_REF_MAX_LEN))
+
+
+def sanitize_ibkr_order_ref(client_order_id: Any) -> str:
+    """Return the canonical IBKR-safe orderRef candidate for a local client id."""
+
+    raw = str(client_order_id or "").strip()
+    safe_chars = []
+    for ch in raw:
+        if ch in {"_", ".", ":", "-"} or ch.isascii() and ch.isalnum():
+            safe_chars.append(ch)
+        else:
+            safe_chars.append("_")
+    return "".join(safe_chars)[: _ibkr_order_ref_limit()]
+
+
+def validate_ibkr_order_ref(client_order_id: Any) -> str:
+    """Validate that the local client id can be sent unchanged as IBKR orderRef."""
+
+    raw_input = str(client_order_id or "")
+    raw = raw_input.strip()
+    limit = _ibkr_order_ref_limit()
+    if not raw:
+        raise ValueError("ibkr_order_ref_empty")
+    if raw_input != raw:
+        raise ValueError("ibkr_order_ref_unsafe_whitespace")
+    if len(raw) > limit:
+        raise ValueError(f"ibkr_order_ref_too_long:{len(raw)}>{limit}")
+    candidate = sanitize_ibkr_order_ref(raw)
+    if candidate != raw or _IBKR_ORDER_REF_SAFE_RE.fullmatch(raw) is None:
+        raise ValueError("ibkr_order_ref_unsafe_characters")
+    return raw
+
+
+def _ibkr_invalid_order_ref_failure(*, client_order_id: Any, error: BaseException, symbol: str = "") -> Dict[str, Any]:
+    return _ibkr_terminal_failure(
+        status="invalid_order_ref",
+        failure_kind="configuration",
+        detail="ibkr_order_ref_must_match_safe_client_order_id",
+        error=error,
+        extra={
+            "client_order_id": str(client_order_id or ""),
+            "sanitized_candidate": sanitize_ibkr_order_ref(client_order_id),
+            "symbol": str(symbol or "").upper().strip(),
+            "max_len": int(_ibkr_order_ref_limit()),
+        },
+    )
+
+
+def _client_order_identity_for_ibkr_order(
+    *,
+    portfolio_orders_id: Optional[int],
+    portfolio_ts_ms: Optional[int],
+    order: Dict[str, Any],
+) -> Tuple[str, str]:
+    order_uid = compute_order_uid(
+        broker="ibkr",
+        portfolio_orders_id=portfolio_orders_id,
+        portfolio_ts_ms=portfolio_ts_ms,
+        order=order,
+    )
+    return str(order_uid), make_client_order_id(order_uid, broker="ibkr")
+
+
+def _set_and_validate_order_ref(order: Any, client_order_id: Any) -> str:
+    order_ref = validate_ibkr_order_ref(client_order_id)
+    setattr(order, "orderRef", order_ref)
+    observed = str(getattr(order, "orderRef", "") or "").strip()
+    if observed != order_ref:
+        raise RuntimeError("ibkr_order_ref_assignment_failed")
+    return order_ref
+
+
+def _place_order_with_order_ref(
+    app: Any,
+    order_id: int,
+    contract: Any,
+    order: Any,
+    *,
+    client_order_id: Any,
+) -> str:
+    order_ref = _set_and_validate_order_ref(order, client_order_id)
+    app.placeOrder(int(order_id), contract, order)
+    return order_ref
 
 
 def _real_trading_gate() -> Dict[str, Any]:
@@ -605,6 +721,7 @@ def _connect_ib():
                 "shares": getattr(execution, "shares", None),
                 "price": getattr(execution, "price", None),
                 "side": getattr(execution, "side", None),
+                "orderRef": getattr(execution, "orderRef", None),
             }
             with self._exec_lock:
                 self._exec.append(rec)
@@ -638,6 +755,7 @@ def _connect_ib():
                     "orderType": getattr(order, "orderType", None),
                     "totalQuantity": getattr(order, "totalQuantity", None),
                     "lmtPrice": getattr(order, "lmtPrice", None),
+                    "orderRef": getattr(order, "orderRef", None),
                     "status": getattr(orderState, "status", None),
                 }
                 with self._open_orders_lock:
@@ -912,9 +1030,21 @@ def apply_latest_portfolio_orders_live(
             portfolio_ts_ms=int(ts_ms),
             orders=orders,
         )
+        multi_slice_override = bool(override_orders is not None and _is_multi_slice_override(orders_ale))
+
+        if not bool(dry_run):
+            options_block = live_options_order_block(
+                orders_ale,
+                broker="ibkr",
+                dry_run=False,
+                engine_mode=os.environ.get("ENGINE_MODE", ""),
+                execution_mode=os.environ.get("EXECUTION_MODE", ""),
+            )
+            if options_block is not None:
+                return options_block
 
         last_applied = get_state("ibkr_last_portfolio_orders_id", "0")
-        if order_id is not None:
+        if order_id is not None and not bool(multi_slice_override):
             try:
                 if int(last_applied) >= int(order_id):
                     return {"ok": True, "status": "already_applied", "broker": "ibkr"}
@@ -1012,12 +1142,40 @@ def apply_latest_portfolio_orders_live(
                     else "close"
                 )
 
+                expected_order_uid, expected_client_order_id = _client_order_identity_for_ibkr_order(
+                    portfolio_orders_id=order_id,
+                    portfolio_ts_ms=int(ts_ms),
+                    order=o,
+                )
+                failure = None
+                try:
+                    ibkr_order_ref = validate_ibkr_order_ref(expected_client_order_id)
+                except ValueError as e:
+                    failure = _ibkr_invalid_order_ref_failure(
+                        client_order_id=expected_client_order_id,
+                        error=e,
+                        symbol=str(symbol),
+                    )
+                    failure.update(
+                        {
+                            "order_uid": str(expected_order_uid),
+                            "submitted_n": int(n),
+                        }
+                    )
+                if failure is not None:
+                    return failure
+                order_meta["order_uid"] = str(expected_order_uid)
+                order_meta["client_order_id"] = str(expected_client_order_id)
+                order_meta["ibkr_order_ref"] = str(ibkr_order_ref)
+                order_meta["broker_native_client_order_ref"] = str(ibkr_order_ref)
+
                 audit = record_broker_action_audit(
                     broker="ibkr",
                     action="order_submit_attempt",
                     status="attempted",
                     symbol=str(symbol),
                     qty=float(delta),
+                    client_order_id=str(expected_client_order_id),
                     portfolio_orders_id=(int(order_id) if order_id is not None else None),
                     mode=str(order_meta.get("execution_mode") or ""),
                     payload={
@@ -1026,6 +1184,9 @@ def apply_latest_portfolio_orders_live(
                         "source_order_id": o.get("source_order_id"),
                         "source_alert_id": o.get("source_alert_id"),
                         "estimated_notional": float(order_meta.get("estimated_notional") or 0.0),
+                        "order_uid": str(expected_order_uid),
+                        "ibkr_order_ref": str(ibkr_order_ref),
+                        "broker_native_client_order_ref": str(ibkr_order_ref),
                     },
                 )
                 if not bool(audit.get("ok")):
@@ -1057,12 +1218,12 @@ def apply_latest_portfolio_orders_live(
                 else:
                     order = _mk_market_order(delta)
 
-                guard = claim_order_submission(
-                    con=con,
+                guard = claim_order_submission_durable(
                     broker="ibkr",
                     portfolio_orders_id=order_id,
                     portfolio_ts_ms=int(ts_ms),
                     order=o,
+                    connect_fn=connect,
                 )
                 if not bool(guard.get("ok")):
                     return {
@@ -1081,6 +1242,20 @@ def apply_latest_portfolio_orders_live(
 
                 order_uid = str(guard.get("order_uid") or "")
                 client_order_id = str(guard.get("client_order_id") or "")
+                if order_uid != str(expected_order_uid) or client_order_id != str(expected_client_order_id):
+                    return {
+                        "ok": False,
+                        "status": "order_idempotency_claim_mismatch",
+                        "broker": "ibkr",
+                        "stop_failover": True,
+                        "detail": "claimed_client_order_id_did_not_match_pre_submit_reference",
+                        "order_uid": str(order_uid),
+                        "client_order_id": str(client_order_id),
+                        "expected_order_uid": str(expected_order_uid),
+                        "expected_client_order_id": str(expected_client_order_id),
+                        "symbol": str(symbol),
+                        "submitted_n": int(n),
+                    }
 
                 oid = _consume_next_order_id(app)
 
@@ -1093,13 +1268,19 @@ def apply_latest_portfolio_orders_live(
                 ask_px = _safe_f(order_meta.get("ask_px")) if order_meta.get("ask_px") is not None else None
 
                 try:
-                    app.placeOrder(oid, contract, order)
+                    ibkr_order_ref = _place_order_with_order_ref(
+                        app,
+                        oid,
+                        contract,
+                        order,
+                        client_order_id=str(client_order_id),
+                    )
                 except Exception as e:
                     try:
-                        mark_order_submission_unknown(
-                            con=con,
+                        mark_order_submission_unknown_durable(
                             order_uid=order_uid,
                             last_error=str(e),
+                            connect_fn=connect,
                         )
                     except Exception as mark_err:
                         _warn_nonfatal("BROKER_IBKR_GATEWAY_MARK_UNKNOWN_FAILED", mark_err, once_key="mark_submission_unknown", order_uid=str(order_uid), broker_order_id=str(oid))
@@ -1112,6 +1293,7 @@ def apply_latest_portfolio_orders_live(
                         "order_uid": str(order_uid),
                         "client_order_id": str(client_order_id),
                         "broker_order_id": str(oid),
+                        "ibkr_order_ref": str(getattr(order, "orderRef", "") or ""),
                         "symbol": str(symbol),
                         "error": str(e),
                         "submitted_n": int(n),
@@ -1120,6 +1302,9 @@ def apply_latest_portfolio_orders_live(
                 submit_ts_ms = int(time.time() * 1000)
 
                 order_meta["order_uid"] = str(order_uid)
+                order_meta["client_order_id"] = str(client_order_id)
+                order_meta["ibkr_order_ref"] = str(ibkr_order_ref)
+                order_meta["broker_native_client_order_ref"] = str(ibkr_order_ref)
                 order_meta["idempotency_status"] = "submitted"
 
                 try:
@@ -1173,15 +1358,17 @@ def apply_latest_portfolio_orders_live(
                         error=e,
                         stage="log_submit",
                         submitted_n=int(n),
+                        durable_idempotency=True,
+                        connect_fn=connect,
                     )
 
                 try:
-                    mark_order_submission_submitted(
-                        con=con,
+                    mark_order_submission_submitted_durable(
                         order_uid=str(order_uid),
                         client_order_id=str(client_order_id),
                         broker_order_id=str(oid),
                         submit_ts_ms=int(submit_ts_ms),
+                        connect_fn=connect,
                     )
                 except Exception as e:
                     _warn_nonfatal(
@@ -1214,6 +1401,8 @@ def apply_latest_portfolio_orders_live(
                         error=e,
                         stage="mark_order_submission_submitted",
                         submitted_n=int(n),
+                        durable_idempotency=True,
+                        connect_fn=connect,
                     )
 
                 if str(order_type).upper().strip() == "LIMIT":
@@ -1273,10 +1462,16 @@ def apply_latest_portfolio_orders_live(
                         "submitted_n": int(n),
                     }
 
-            if order_id is not None:
+            if order_id is not None and not bool(multi_slice_override):
                 set_state("ibkr_last_portfolio_orders_id", str(int(order_id)))
 
-            return {"ok": True, "status": "applied", "submitted_n": n, "broker": "ibkr"}
+            return {
+                "ok": True,
+                "status": "applied",
+                "submitted_n": n,
+                "broker": "ibkr",
+                "parent_cursor_deferred": bool(multi_slice_override),
+            }
         finally:
             try:
                 app.disconnect()
@@ -1460,6 +1655,25 @@ def get_order(order_id: str, timeout_s: float = 8.0) -> Dict[str, Any]:
     return {}
 
 
+def _ibkr_remaining_qty(order: Dict[str, Any]) -> float:
+    try:
+        remaining = order.get("remaining")
+        if remaining not in (None, ""):
+            return float(remaining or 0.0)
+    except Exception:
+        # no-op-guard: allow fallback to total-minus-filled when IBKR omits or mangles remaining.
+        pass
+    try:
+        total = float(order.get("totalQuantity") or 0.0)
+    except Exception:
+        total = 0.0
+    try:
+        filled = float(order.get("filled") or 0.0)
+    except Exception:
+        filled = 0.0
+    return max(0.0, abs(float(total)) - abs(float(filled)))
+
+
 def cancel_order(order_id: str, timeout_s: float = 8.0) -> Dict[str, Any]:
     oid = int(order_id)
     audit = record_broker_action_audit(
@@ -1472,10 +1686,82 @@ def cancel_order(order_id: str, timeout_s: float = 8.0) -> Dict[str, Any]:
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
     app = _connect_ib()
+    last_order: Dict[str, Any] = {}
+    last_error = ""
     try:
         app.cancelOrder(int(oid))
-        time.sleep(min(max(float(timeout_s), 0.1), 2.0))
-        return {"ok": True, "orderId": int(oid)}
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        time.sleep(min(max(float(timeout_s), 0.1), 0.25))
+        while True:
+            try:
+                last_order = get_order(str(oid), timeout_s=min(1.0, max(0.1, float(deadline - time.monotonic())))) or {}
+                last_error = ""
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                last_order = {}
+
+            if not last_order:
+                return {
+                    "ok": True,
+                    "broker": "ibkr",
+                    "status": "cancel_verified",
+                    "orderId": int(oid),
+                    "broker_order_id": str(oid),
+                    "cancel_requested": True,
+                    "cancel_verified": True,
+                    "terminal_cancel_verified": True,
+                    "verification_source": "open_orders_absent",
+                }
+
+            broker_status = str(last_order.get("status") or "").lower().strip()
+            remaining_qty = _ibkr_remaining_qty(last_order)
+            if broker_status in {"cancelled", "canceled", "api_cancelled"}:
+                return {
+                    "ok": True,
+                    "broker": "ibkr",
+                    "status": "cancel_verified",
+                    "orderId": int(oid),
+                    "broker_order_id": str(oid),
+                    "broker_status": str(broker_status),
+                    "cancel_requested": True,
+                    "cancel_verified": True,
+                    "terminal_cancel_verified": True,
+                    "zero_remaining_verified": abs(float(remaining_qty)) <= 1e-9,
+                    "remaining_qty": float(remaining_qty),
+                    "order": dict(last_order),
+                }
+            if remaining_qty <= 1e-9:
+                return {
+                    "ok": True,
+                    "broker": "ibkr",
+                    "status": "zero_remaining_verified",
+                    "orderId": int(oid),
+                    "broker_order_id": str(oid),
+                    "broker_status": str(broker_status),
+                    "cancel_requested": True,
+                    "cancel_verified": True,
+                    "zero_remaining_verified": True,
+                    "remaining_qty": 0.0,
+                    "order": dict(last_order),
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "ok": False,
+                    "broker": "ibkr",
+                    "status": "cancel_not_verified",
+                    "orderId": int(oid),
+                    "broker_order_id": str(oid),
+                    "broker_status": str(broker_status),
+                    "cancel_requested": True,
+                    "cancel_verified": False,
+                    "terminal_cancel_verified": False,
+                    "zero_remaining_verified": False,
+                    "remaining_qty": float(remaining_qty),
+                    "order": dict(last_order),
+                    "last_error": str(last_error),
+                    "timeout_s": float(timeout_s),
+                }
+            time.sleep(min(0.25, max(0.01, float(deadline - time.monotonic()))))
     finally:
         try:
             app.disconnect()
@@ -1493,14 +1779,30 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     credentials_block = _ibkr_credentials_block(require_explicit=True)
     if credentials_block is not None:
         return credentials_block
+    failure = None
+    try:
+        ibkr_order_ref = validate_ibkr_order_ref(client_oid)
+    except ValueError as e:
+        failure = _ibkr_invalid_order_ref_failure(
+            client_order_id=client_oid,
+            error=e,
+            symbol=str(symbol),
+        )
+    if failure is not None:
+        return failure
     audit = record_broker_action_audit(
         broker="ibkr",
         action="order_submit_attempt",
         status="attempted",
         symbol=str(symbol),
         qty=float(qty),
-        client_order_id=str(client_oid),
-        payload={"order_type": "LIMIT", "limit_price": float(limit_price)},
+        client_order_id=str(ibkr_order_ref),
+        payload={
+            "order_type": "LIMIT",
+            "limit_price": float(limit_price),
+            "ibkr_order_ref": str(ibkr_order_ref),
+            "broker_native_client_order_ref": str(ibkr_order_ref),
+        },
     )
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
@@ -1509,8 +1811,21 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
         oid = _consume_next_order_id(app)
         contract = _mk_stock_contract(symbol)
         order = _mk_limit_order(qty, limit_price)
-        app.placeOrder(oid, contract, order)
-        return {"id": str(oid), "client_order_id": str(client_oid), "orderType": "LMT", "limit_price": float(limit_price)}
+        ibkr_order_ref = _place_order_with_order_ref(
+            app,
+            oid,
+            contract,
+            order,
+            client_order_id=str(ibkr_order_ref),
+        )
+        return {
+            "id": str(oid),
+            "client_order_id": str(ibkr_order_ref),
+            "orderRef": str(ibkr_order_ref),
+            "ibkr_order_ref": str(ibkr_order_ref),
+            "orderType": "LMT",
+            "limit_price": float(limit_price),
+        }
     finally:
         try:
             app.disconnect()
@@ -1528,14 +1843,29 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     credentials_block = _ibkr_credentials_block(require_explicit=True)
     if credentials_block is not None:
         return credentials_block
+    failure = None
+    try:
+        ibkr_order_ref = validate_ibkr_order_ref(client_oid)
+    except ValueError as e:
+        failure = _ibkr_invalid_order_ref_failure(
+            client_order_id=client_oid,
+            error=e,
+            symbol=str(symbol),
+        )
+    if failure is not None:
+        return failure
     audit = record_broker_action_audit(
         broker="ibkr",
         action="order_submit_attempt",
         status="attempted",
         symbol=str(symbol),
         qty=float(qty),
-        client_order_id=str(client_oid),
-        payload={"order_type": "MARKET"},
+        client_order_id=str(ibkr_order_ref),
+        payload={
+            "order_type": "MARKET",
+            "ibkr_order_ref": str(ibkr_order_ref),
+            "broker_native_client_order_ref": str(ibkr_order_ref),
+        },
     )
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
@@ -1544,8 +1874,20 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
         oid = _consume_next_order_id(app)
         contract = _mk_stock_contract(symbol)
         order = _mk_market_order(qty)
-        app.placeOrder(oid, contract, order)
-        return {"id": str(oid), "client_order_id": str(client_oid), "orderType": "MKT"}
+        ibkr_order_ref = _place_order_with_order_ref(
+            app,
+            oid,
+            contract,
+            order,
+            client_order_id=str(ibkr_order_ref),
+        )
+        return {
+            "id": str(oid),
+            "client_order_id": str(ibkr_order_ref),
+            "orderRef": str(ibkr_order_ref),
+            "ibkr_order_ref": str(ibkr_order_ref),
+            "orderType": "MKT",
+        }
     finally:
         try:
             app.disconnect()
@@ -1609,7 +1951,8 @@ def poll_and_log_fills(after_ts_ms: int) -> Dict[str, Any]:
         for r in rows:
             try:
                 broker_order_id = str(r.get("orderId") or "").strip()
-                client_order_id = broker_order_id
+                ibkr_order_ref = str(r.get("orderRef") or "").strip()
+                client_order_id = ibkr_order_ref or broker_order_id
                 submit_ts_ms = None
                 expected_px = None
                 mid_px = None
@@ -1667,6 +2010,8 @@ def poll_and_log_fills(after_ts_ms: int) -> Dict[str, Any]:
                         **submit_extra,
                         **dict(r or {}),
                         "broker_order_id": broker_order_id,
+                        "ibkr_order_ref": ibkr_order_ref,
+                        "broker_native_client_order_ref": ibkr_order_ref,
                         "submit_ts_ms": submit_ts_ms,
                         "expected_px": expected_px,
                         "mid_px": mid_px,
@@ -1722,7 +2067,8 @@ def run_execution_stream_daemon(poll_sleep_s: float = 1.0) -> None:
                 for r in rows:
                     try:
                         broker_order_id = str(r.get("orderId") or "").strip()
-                        client_order_id = broker_order_id
+                        ibkr_order_ref = str(r.get("orderRef") or "").strip()
+                        client_order_id = ibkr_order_ref or broker_order_id
 
                         if broker_order_id:
                             row = con.execute(
@@ -1791,6 +2137,8 @@ def run_execution_stream_daemon(poll_sleep_s: float = 1.0) -> None:
                                 **submit_extra,
                                 **dict(r or {}),
                                 "broker_order_id": broker_order_id,
+                                "ibkr_order_ref": ibkr_order_ref,
+                                "broker_native_client_order_ref": ibkr_order_ref,
                                 "submit_ts_ms": submit_ts_ms,
                                 "expected_px": expected_px,
                                 "mid_px": mid_px,

@@ -43,6 +43,16 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _optional_int(v: Any) -> int | None:
+    try:
+        if v in (None, ""):
+            return None
+        return int(v)
+    except Exception as e:
+        _warn_nonfatal("EXECUTION_SLICING_ENGINE_OPTIONAL_INT_FAILED", e, value=repr(v))
+        return None
+
+
 def _style_from_order(order: Dict[str, Any]) -> str:
     # Allow several upstream aliases so intent producers can evolve without
     # breaking the slicer contract.
@@ -267,6 +277,7 @@ def build_order_slices(order: Dict[str, Any], broker_name: str = "") -> List[Dic
 
     slices: List[Dict[str, Any]] = []
     parent_id = str(src.get("client_order_id") or src.get("portfolio_orders_id") or f"{symbol}_{int(time.time() * 1000)}")
+    parent_order_id = _optional_int(src.get("parent_order_id") or src.get("portfolio_orders_id"))
     base_qty = _base_slice_qty(remaining, style, liquidity, src)
     weights = _slice_weights(
         style=style,
@@ -278,6 +289,7 @@ def build_order_slices(order: Dict[str, Any], broker_name: str = "") -> List[Dic
         order=src,
     )
 
+    slice_count = len(list(weights or [1.0]))
     for idx, weight in enumerate(list(weights or [1.0])):
         if remaining <= 1e-9:
             break
@@ -290,9 +302,15 @@ def build_order_slices(order: Dict[str, Any], broker_name: str = "") -> List[Dic
         so["qty"] = float(qty) * float(side_sign)
         so["slice_style"] = str(style)
         so["slice_index"] = int(idx)
+        so["adaptive_slice_index"] = int(idx)
+        so["slice_count"] = int(slice_count)
+        so["adaptive_slice_count"] = int(slice_count)
         so["slice_parent_qty"] = float(qty0)
         so["slice_interval_ms"] = int(interval_ms)
         so["slice_parent_id"] = str(parent_id)
+        if parent_order_id is not None:
+            so["parent_order_id"] = int(parent_order_id)
+            so["adaptive_parent_order_id"] = int(parent_order_id)
         so["slice_weight"] = float(weight)
         so["liquidity_snapshot"] = liquidity
         so["rolling_adv"] = float(liquidity.get("rolling_adv") or 0.0)

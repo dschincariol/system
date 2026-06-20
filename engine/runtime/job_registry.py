@@ -366,6 +366,13 @@ ALLOWED_JOBS = {
     {"execution": False, "schedule": "manual one-shot", "pipeline_stage": "macro_backfill"},
 ),
 
+"backfill_features": (
+    "engine/data/jobs/backfill_features.py",
+    "oneshot",
+    None,
+    {"execution": False, "schedule": "manual one-shot", "pipeline_stage": "feature_backfill"},
+),
+
 "snapshot_model_features": (
     "engine/data/jobs/snapshot_model_features.py",
     "daemon",
@@ -392,6 +399,18 @@ ALLOWED_JOBS = {
     "daemon",
     None,
     {"execution": False},
+),
+
+"kill_switch_cache_refresh": (
+    "engine/runtime/jobs/kill_switch_cache_refresh.py",
+    "daemon",
+    None,
+    {
+        "execution": False,
+        "schedule": "every 10s",
+        "cadence_seconds": 10,
+        "resource_class": "control_plane",
+    },
 ),
 
 "observability_snapshot": (
@@ -452,7 +471,13 @@ ALLOWED_JOBS = {
     "engine/data/jobs/compute_tsfresh_snapshots.py",
     "daemon",
     None,
-    {"execution": False},
+    {
+        "execution": False,
+        "pipeline_stage": "feature_snapshot_training",
+        "resource_class": "training",
+        "resource_priority": 25,
+        "slot_cost": 1,
+    },
 ),
 
 "poll_weather_alerts": (
@@ -730,6 +755,34 @@ ALLOWED_JOBS = {
         "resource_class": "training",
         "resource_priority": 40,
         "slot_cost": 1,
+    },
+),
+
+"train_itransformer_models": (
+    "engine/strategy/jobs/train_itransformer_models.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "itransformer_train",
+        "resource_class": "training",
+        "resource_priority": 40,
+        "slot_cost": 1,
+        "default_stage": "shadow",
+    },
+),
+
+"pretrain_patchtst_models": (
+    "engine/strategy/jobs/pretrain_patchtst_models.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "patchtst_pretrain",
+        "resource_class": "training",
+        "resource_priority": 40,
+        "slot_cost": 1,
+        "default_stage": "shadow",
     },
 ),
 
@@ -1261,6 +1314,19 @@ ALLOWED_JOBS = {
     {"execution": False},
 ),
 
+"train_learned_alpha_decay": (
+    "engine/strategy/jobs/train_learned_alpha_decay.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "learned_alpha_decay",
+        "resource_class": "training",
+        "resource_priority": 24,
+        "slot_cost": 1,
+    },
+),
+
 "train_drawdown_policy": (
     "engine/strategy/jobs/train_drawdown_policy.py",
     "oneshot",
@@ -1547,7 +1613,10 @@ def _build_pipeline_order() -> List[str]:
     if _model_family_pipeline_enabled("xgb_regressor", "USE_XGB_REGRESSOR"):
         order.append("train_xgb_models")
     if _model_family_pipeline_enabled("patchtst", "USE_PATCHTST"):
+        order.append("pretrain_patchtst_models")
         order.append("train_patchtst_models")
+    if _model_family_pipeline_enabled("itransformer", "USE_ITRANSFORMER"):
+        order.append("train_itransformer_models")
     if _env_flag("TUNE_MODELS_ENABLED", False):
         order.append("tune_models")
     order.extend(
@@ -1588,6 +1657,7 @@ JOB_ORDER = [
     # Monitoring
     "provider_monitor",
     "metrics_collector",
+    "kill_switch_cache_refresh",
     "inference_health_probe",
     "observability_snapshot",
     "snapshot_equity",
@@ -1799,6 +1869,32 @@ def is_price_feed_job(job_name: str) -> bool:
 
 def is_market_data_job(job_name: str) -> bool:
     return str(job_name or "").strip() == "ingestion_runtime" or is_price_feed_job(job_name)
+
+
+def is_offline_workload_job(job_name: str) -> bool:
+    name = str(job_name or "").strip().lower()
+    meta = get_job_meta(str(job_name))
+    resource_class = str(meta.get("resource_class") or "").strip().lower()
+    stage = str(meta.get("pipeline_stage") or "").strip().lower()
+    if resource_class in {"training", "replay"}:
+        return True
+    if stage and any(token in stage for token in ("train", "tune", "backtest", "discovery", "replay")):
+        return True
+    if name.startswith(("train_", "pretrain_", "tune_")):
+        return True
+    if name in {
+        "pipeline_train_and_eval",
+        "shadow_train",
+        "drift_triggered_retrain",
+        "alpha_discovery_loop",
+        "discover_features",
+        "llm_factor_discovery",
+        "backtest_cpcv",
+        "backtest_walk_forward",
+        "portfolio_backtest",
+    }:
+        return True
+    return False
 
 
 def get_price_feed_jobs() -> List[str]:

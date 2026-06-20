@@ -352,6 +352,85 @@ def _comparison(
     }
 
 
+def _monitor_status(severity: str, state: str) -> str:
+    sev = str(severity or "").upper()
+    st = str(state or "").lower()
+    if sev == "CRIT" or st == "crit":
+        return "diverged"
+    if sev == "WARN" or st == "warn":
+        return "watch"
+    if st in {"ok", "normal"} or sev == "OK":
+        return "ok"
+    return "incomplete"
+
+
+def _monitor_unit(metric_name: str) -> str:
+    name = str(metric_name or "").lower()
+    if any(token in name for token in ("rate", "coverage", "ece", "pnl")):
+        return "pct"
+    return ""
+
+
+def _monitor_label(metric_name: str) -> str:
+    labels = {
+        "feature_drift": "Feature Drift",
+        "missing_feature_rate": "Missing Features",
+        "prediction_drift": "Prediction Drift",
+        "target_label_drift": "Target/Label Drift",
+        "calibration_ece": "Calibration ECE",
+        "conformal_coverage": "Conformal Coverage",
+        "shadow_live_disagreement": "Shadow/Live Disagreement",
+        "net_pnl_degradation": "Net PnL Degradation",
+    }
+    return labels.get(str(metric_name or ""), str(metric_name or "Production Monitor").replace("_", " ").title())
+
+
+def _monitor_explanation(row: dict[str, Any], status: str) -> str:
+    action = str(row.get("action_signal") or "").replace("_", " ").strip()
+    state = str(row.get("state") or "unavailable").replace("_", " ")
+    if status == "diverged":
+        return f"Production monitor is critical; {action or 'review'} signal is recorded."
+    if status == "watch":
+        return f"Production monitor is warning; {action or 'review'} signal is recorded."
+    if status == "ok":
+        return "Production monitor is within the configured threshold."
+    return f"Production monitor is {state}; no threshold signal is emitted."
+
+
+def _production_monitoring_comparisons(payload: Any) -> list[dict[str, Any]]:
+    data = _as_dict(payload)
+    rows = data.get("metrics") if isinstance(data.get("metrics"), list) else []
+    comparisons: list[dict[str, Any]] = []
+    for item in rows:
+        row = _as_dict(item)
+        metric_name = str(row.get("metric_name") or "").strip()
+        if not metric_name:
+            continue
+        value = _safe_float(row.get("value"))
+        baseline = _safe_float(row.get("baseline_value"))
+        threshold = _safe_float(row.get("threshold_value"))
+        unit = _monitor_unit(metric_name)
+        status = _monitor_status(str(row.get("severity") or ""), str(row.get("state") or ""))
+        expected_value = threshold
+        if metric_name == "conformal_coverage" and baseline is not None:
+            expected_value = baseline
+        comparisons.append(
+            {
+                "key": metric_name,
+                "label": _monitor_label(metric_name),
+                "unit": unit,
+                "expected": _value(expected_value, source="production_monitoring_threshold", ts_ms=_safe_int(row.get("ts_ms")), unit=unit),
+                "shadow": None,
+                "realized": _value(value, source="production_monitoring", ts_ms=_safe_int(row.get("ts_ms")), unit=unit),
+                "delta": (None if value is None or baseline is None else float(value) - float(baseline)),
+                "status": status,
+                "explanation": _monitor_explanation(row, status),
+                "details": dict(row.get("details") or {}),
+            }
+        )
+    return comparisons
+
+
 def build_model_performance_divergence(
     *,
     model_id: str = "",
@@ -364,6 +443,7 @@ def build_model_performance_divergence(
     execution_stats_payload: Any = None,
     execution_advisories_payload: Any = None,
     model_registry_payload: Any = None,
+    production_monitoring_payload: Any = None,
     now_ms: int | None = None,
 ) -> dict[str, Any]:
     now = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -439,6 +519,8 @@ def build_model_performance_divergence(
             realized=(realized_fill, realized_fill_ts, "execution_stats"),
         ),
     ]
+    monitoring_comparisons = _production_monitoring_comparisons(production_monitoring_payload)
+    comparisons.extend(monitoring_comparisons)
 
     sources = {
         "model_registry": _source(
@@ -481,6 +563,12 @@ def build_model_performance_divergence(
             count=len(_rows_from_payload(execution_advisories_payload)),
             reason="" if _rows_from_payload(execution_advisories_payload) else "execution advisories returned no rows",
         ),
+        "production_monitoring": _source(
+            bool(_rows_from_payload(production_monitoring_payload) or _as_dict(production_monitoring_payload).get("metrics")),
+            ts_ms=_safe_int(_as_dict(production_monitoring_payload).get("updated_ts_ms")),
+            count=len(_as_dict(production_monitoring_payload).get("metrics") or []),
+            reason="" if _as_dict(production_monitoring_payload).get("metrics") else "production monitoring metrics unavailable",
+        ),
     }
 
     missing_sources = [
@@ -521,6 +609,7 @@ def build_model_performance_divergence(
             "ts_ms": now,
         },
         "comparisons": comparisons,
+        "production_monitoring": _as_dict(production_monitoring_payload),
         "sources": sources,
         "missing_sources": missing_sources,
         "updated_ts_ms": now,
@@ -536,6 +625,7 @@ def get_model_performance_divergence(*, model_id: str = "", strategy: str = "") 
     from engine.api.api_read_advanced import get_latest_portfolio_backtest, get_temporal_shadow_eval
     from engine.execution.execution_ai_advisor import list_execution_advisories
     from engine.runtime.position_store import get_pnl_snapshot
+    from engine.strategy.production_monitoring import get_latest_production_monitoring_snapshot
 
     def _call_source(fn, fallback):
         try:
@@ -596,6 +686,10 @@ def get_model_performance_divergence(*, model_id: str = "", strategy: str = "") 
         model_registry_payload=_call_source(
             lambda: get_model_registry(limit=50),
             {"ok": False, "error": "model_registry_unavailable", "rows": []},
+        ),
+        production_monitoring_payload=_call_source(
+            lambda: get_latest_production_monitoring_snapshot(limit=50),
+            {"ok": False, "error": "production_monitoring_unavailable", "metrics": []},
         ),
         now_ms=now_ms,
     )

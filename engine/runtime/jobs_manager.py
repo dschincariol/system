@@ -14,7 +14,13 @@ import subprocess
 from collections import deque
 from typing import Deque, Dict, Optional
 
-from engine.runtime.job_registry import ALLOWED_JOBS, JOB_ORDER, enforce_registered_job_path, is_market_data_job
+from engine.runtime.job_registry import (
+    ALLOWED_JOBS,
+    JOB_ORDER,
+    enforce_registered_job_path,
+    is_market_data_job,
+    is_offline_workload_job,
+)
 
 from engine.runtime.config import (
     AUTO_RESTART_DAEMONS,
@@ -33,6 +39,7 @@ from engine.runtime.config import (
     RESOURCE_SCHEDULER_REPLAY_MAX,
     RESOURCE_SCHEDULER_TRAINING_MAX,
 )
+from engine.runtime.platform import default_local_log_dir
 
 _DAEMON_STALL_AFTER_MS = int(os.environ.get("DAEMON_STALL_AFTER_MS", "120000"))
 _ALLOW_DAEMON_PERMANENT_FAILURE = str(
@@ -43,6 +50,7 @@ from engine.runtime.gates import execution_gate_snapshot
 from engine.runtime.job_registry import validate_job_registry_paths
 from engine.runtime.lifecycle_state import set_state, WARMING_UP, DEGRADED
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.log_retention import rotate_log_if_needed
 from engine.runtime.logging import get_logger, log_event
 from engine.runtime.runtime_meta import meta_get
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
@@ -95,7 +103,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_ENGINE_DIR, ".."))
 _LOG_DIR = os.path.abspath(
     os.environ.get("TRADING_LOGS")
     or os.environ.get("LOG_DIR")
-    or os.path.join(_PROJECT_ROOT, "logs")
+    or str(default_local_log_dir())
 )
 os.makedirs(_LOG_DIR, exist_ok=True)
 
@@ -357,7 +365,9 @@ class JobState:
         with self._lock:
             self.log.append(text)
         try:
-            with open(_job_log_path(self.name), "a", encoding="utf-8", errors="replace") as fh:
+            log_path = _job_log_path(self.name)
+            rotate_log_if_needed(log_path)
+            with open(log_path, "a", encoding="utf-8", errors="replace") as fh:
                 fh.write(text + "\n")
         except Exception as e:
             log_event(
@@ -925,6 +935,63 @@ class JobManager:
                         "job": str(name),
                         "gate": gate,
                     }
+
+        if is_offline_workload_job(job.name):
+            blocked_workload_result = None
+            try:
+                from engine.runtime.workload_profiles import assert_offline_work_allowed
+
+                profile_ack = assert_offline_work_allowed(job_name=str(job.name))
+            except RuntimeError as e:
+                detail = str(e)
+                _write_job_history(job.name, "start_blocked_workload_profile", detail, None)
+                _job_launch_trace_append({
+                    "job": str(job.name),
+                    "attempted": True,
+                    "spawned": False,
+                    "failed": True,
+                    "entry_valid": True,
+                    "workload_profile_denied": True,
+                    "error": detail,
+                    "ts_ms": int(time.time() * 1000),
+                })
+                log_event(
+                    LOG,
+                    30,
+                    "job_start_blocked_workload_profile",
+                    component="engine.runtime.jobs_manager",
+                    extra={"job": str(job.name), "error": detail},
+                )
+                blocked_workload_result = {
+                    "ok": False,
+                    "error": "offline_training_live_profile_ack_required",
+                    "job": str(job.name),
+                    "detail": detail,
+                }
+            except Exception as e:
+                detail = f"{type(e).__name__}: {e}"
+                _write_job_history(job.name, "start_blocked_workload_profile_error", detail, None)
+                blocked_workload_result = {
+                    "ok": False,
+                    "error": "workload_profile_guard_failed",
+                    "job": str(job.name),
+                    "detail": detail,
+                }
+            else:
+                if bool(profile_ack.get("required")):
+                    log_event(
+                        LOG,
+                        30,
+                        "job_start_offline_work_acknowledged_in_live_profile",
+                        component="engine.runtime.jobs_manager",
+                        extra={
+                            "job": str(job.name),
+                            "audit": dict(profile_ack.get("audit") or {}),
+                            "enabled_settings": list(profile_ack.get("enabled_settings") or []),
+                        },
+                    )
+            if blocked_workload_result is not None:
+                return blocked_workload_result
 
         admission = self._resource_admission(job)
         if not admission.get("ok"):

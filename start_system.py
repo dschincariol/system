@@ -23,6 +23,8 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from engine.runtime.platform import default_local_db_dir, default_local_db_path, default_local_log_dir
+
 warnings.filterwarnings(
     "ignore",
     message=r"The pynvml package is deprecated\.",
@@ -53,7 +55,7 @@ except Exception as e:
     _early_log_nonfatal("START_SYSTEM_PSUTIL_IMPORT_FAILED", e)
 
 # ------------------------------------------------------------------
-# Absolute base directory (works under systemd + Windows)
+# Absolute base directory for systemd-managed Linux execution.
 # ------------------------------------------------------------------
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -89,6 +91,31 @@ def _append_env_line(env_path: Path, line: str) -> None:
         if existing and not existing.endswith(("\n", "\r")):
             fh.write("\n")
         fh.write(str(line).rstrip("\r\n") + "\n")
+
+
+def _strict_runtime_requires_explicit_db_path() -> bool:
+    try:
+        from engine.runtime.config_schema import get_runtime_safety_context
+
+        requires_explicit = bool(get_runtime_safety_context().get("strict_runtime"))
+    except Exception:
+        env_raw = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
+        env = "prod" if env_raw in {"prod", "production"} else env_raw
+        engine_mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+        supervised = str(os.environ.get("ENGINE_SUPERVISED") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        explicit_dev_env = bool(str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "").strip()) and env in {
+            "dev",
+            "test",
+        }
+        requires_explicit = bool(
+            supervised or env == "prod" or (engine_mode in {"live", "shadow", "paper"} and not explicit_dev_env)
+        )
+    return bool(requires_explicit)
 
 
 def _ensure_local_env_file() -> None:
@@ -142,12 +169,12 @@ def _env_bool(name: str, default: bool) -> bool:
 _LOG_DIR = os.path.abspath(
     os.environ.get("TRADING_LOGS") or
     os.environ.get("LOG_DIR") or
-    os.path.join(_BASE_DIR, "logs")
+    str(default_local_log_dir())
 )
 _DATA_DIR = os.path.abspath(
     os.environ.get("TRADING_DATA") or
     os.environ.get("DATA_DIR") or
-    os.path.join(_BASE_DIR, "data")
+    str(default_local_db_dir())
 )
 _PID_PATH = os.path.join(_LOG_DIR, "runtime.pid")
 _INGESTION_PID_PATH = os.path.join(_LOG_DIR, "ingestion.pid")
@@ -224,19 +251,27 @@ def _bootstrap_start_system_env() -> None:
     resolved_log_dir = os.path.abspath(
         os.environ.get("TRADING_LOGS")
         or os.environ.get("LOG_DIR")
-        or os.path.join(_BASE_DIR, "logs")
+        or str(default_local_log_dir())
     )
     resolved_data_dir = os.path.abspath(
         os.environ.get("TRADING_DATA")
         or os.environ.get("DATA_DIR")
-        or os.path.join(_BASE_DIR, "data")
+        or str(default_local_db_dir())
     )
 
     os.makedirs(resolved_log_dir, exist_ok=True)
     os.makedirs(resolved_data_dir, exist_ok=True)
     os.environ.setdefault("TRADING_LOGS", resolved_log_dir)
     os.environ.setdefault("TRADING_DATA", resolved_data_dir)
-    os.environ.setdefault("DB_PATH", str((Path(resolved_data_dir) / "trading.db").resolve()))
+    if not _strict_runtime_requires_explicit_db_path():
+        os.environ.setdefault("DB_PATH", str(default_local_db_path().resolve()))
+    try:
+        from engine.runtime.hardware import apply_cpu_first_runtime_defaults
+
+        apply_cpu_first_runtime_defaults()
+    except Exception as e:
+        sys.stderr.write(f"[start_system] hardware_defaults_failed: {type(e).__name__}: {e}\n")
+        sys.stderr.flush()
     os.environ["PYTHONPATH"] = _BASE_DIR + os.pathsep + str(os.environ.get("PYTHONPATH", ""))
 
 
@@ -265,12 +300,12 @@ def _refresh_startup_settings() -> None:
     _LOG_DIR = os.path.abspath(
         os.environ.get("TRADING_LOGS")
         or os.environ.get("LOG_DIR")
-        or os.path.join(_BASE_DIR, "logs")
+        or str(default_local_log_dir())
     )
     _DATA_DIR = os.path.abspath(
         os.environ.get("TRADING_DATA")
         or os.environ.get("DATA_DIR")
-        or os.path.join(_BASE_DIR, "data")
+        or str(default_local_db_dir())
     )
     _PID_PATH = os.path.join(_LOG_DIR, "runtime.pid")
     _INGESTION_PID_PATH = os.path.join(_LOG_DIR, "ingestion.pid")
@@ -318,6 +353,7 @@ def _refresh_startup_settings() -> None:
 _bootstrap_start_system_env()
 _refresh_startup_settings()
 
+from engine.runtime.log_retention import rotate_log_if_needed
 from engine.runtime.logging import get_logger, flush_logging_handlers
 from engine.runtime.failure_diagnostics import log_failure, normalize_root_cause_code
 from engine.runtime.shutdown import runtime_shutdown
@@ -943,6 +979,25 @@ def _log_swallowed(event: str, **extra) -> None:
             extra_keys=sorted(str(key) for key in list((extra or {}).keys())[:20]) if isinstance(extra, dict) else [],
         )
 
+
+def _log_runtime_hardware_bootstrap() -> None:
+    try:
+        from engine.runtime.hardware import log_runtime_hardware_diagnostics
+
+        snapshot = log_runtime_hardware_diagnostics(LOG, component="start_system")
+        _STARTUP_TRACE["runtime_hardware"] = {
+            "profile": str(snapshot.get("profile") or ""),
+            "dependency_profile": str(snapshot.get("dependency_profile") or ""),
+            "disabled_accelerator_reason": str(snapshot.get("disabled_accelerator_reason") or ""),
+            "accelerator_profile_error": str(snapshot.get("accelerator_profile_error") or ""),
+            "nvidia_telemetry_enabled": bool(snapshot.get("nvidia_telemetry_enabled")),
+            "amd_profile_selected": bool(snapshot.get("amd_profile_selected")),
+            "ok": bool(snapshot.get("ok")),
+        }
+        _persist_startup_trace()
+    except Exception as e:
+        _log_swallowed("START_SYSTEM_RUNTIME_HARDWARE_DIAGNOSTICS_FAILED", error=str(e))
+
 try:
     from engine.runtime.event_log import append_event
 except Exception:
@@ -1217,15 +1272,6 @@ def _pid_is_running_cross_platform(pid: int) -> bool:
         return False
 
     try:
-        if os.name == "nt":
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, 0, int(pid))
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            return False
-
         os.kill(int(pid), 0)
         return True
     except Exception as e:
@@ -1246,17 +1292,6 @@ def _terminate_pid_tree_cross_platform(pid: int, *, timeout_s: float = 15.0) -> 
         return False
 
     try:
-        if os.name == "nt":
-            timeout_s = max(1.0, min(15.0, float(timeout_s or 15.0)))
-            result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return int(result.returncode or 0) == 0
-
         os.kill(int(pid), signal.SIGTERM)
         return True
     except Exception as e:
@@ -1764,6 +1799,8 @@ def _spawn_ingestion_if_enabled() -> None:
     env["ENGINE_SUPERVISED"] = "1"
     env["ENGINE_LAUNCHED_BY_SUPERVISOR"] = "1"
     env["ENGINE_JOB_NAME"] = "ingestion_runtime"
+    env.setdefault("ENGINE_PROCESS_ROLE", "ingestion")
+    env.setdefault("TS_PG_POOL_PROFILE", "ingestion")
     env["PYTHONPATH"] = _BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     try:
         from services.data_source_manager import (
@@ -1785,6 +1822,8 @@ def _spawn_ingestion_if_enabled() -> None:
 
     os.makedirs(_LOG_DIR, exist_ok=True)
 
+    rotate_log_if_needed(_INGESTION_STDOUT_PATH)
+    rotate_log_if_needed(_INGESTION_STDERR_PATH)
     with open(_INGESTION_STDOUT_PATH, "ab") as stdout_fh, open(_INGESTION_STDERR_PATH, "ab") as stderr_fh:
         _INGESTION_PROC = subprocess.Popen(
             [sys.executable, "-u", _INGESTION_ENTRY],
@@ -2245,6 +2284,7 @@ def main():
     mode = _pick_mode_from_argv_or_env()
     os.environ["ENGINE_MODE"] = mode
     os.environ["ENGINE_PRIMARY_BOOTSTRAP_DONE"] = "1"
+    _log_runtime_hardware_bootstrap()
     _record_phase("BOOT", status="ok", detail=f"mode={mode}", extra={"pid": int(os.getpid()), "db_path": str(os.environ.get("DB_PATH") or "")})
 
     _record_phase("CONFIG", status="started", detail="startup_prebind_gates")

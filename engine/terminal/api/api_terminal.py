@@ -19,6 +19,16 @@ from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.gates import execution_gate_snapshot
 from engine.runtime.storage import connect_ro
 
+try:
+    from engine.cache.wrappers.execution_mode import read_execution_mode as _get_execution_mode
+except Exception:
+    _get_execution_mode = None  # type: ignore
+
+try:
+    from engine.cache.wrappers.kill_switch import read_kill_switch as _kill_switch_snapshot
+except Exception:
+    _kill_switch_snapshot = None  # type: ignore
+
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
 
@@ -334,7 +344,12 @@ def _dedupe_strings(values: List[Any]) -> List[str]:
 def _terminal_execution_barrier_snapshot() -> Dict[str, Any]:
     now_ms = int(time.time() * 1000)
     try:
-        gate = execution_gate_snapshot()
+        if _get_execution_mode is None or _kill_switch_snapshot is None:
+            raise RuntimeError("execution_gate_providers_missing")
+        gate = execution_gate_snapshot(
+            get_execution_mode_fn=_get_execution_mode,
+            kill_switches=(_kill_switch_snapshot() or {}),
+        )
         if not isinstance(gate, dict):
             raise TypeError(f"execution_gate_snapshot returned {type(gate).__name__}")
     except Exception as e:

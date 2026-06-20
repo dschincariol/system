@@ -208,6 +208,11 @@ TABLE_CLASS["news_flow_features"] = _h(
     write_rate="medium",
     read_pattern="latest news-flow feature snapshot by symbol/time/backend",
 )
+TABLE_CLASS["structured_document_events"] = _r(
+    "structured extracted events from filings, transcripts, and news keyed by source document and extractor version",
+    write_rate="medium",
+    read_pattern="symbol availability-window PIT feature snapshots and source-document audits",
+)
 TABLE_CLASS["options_symbol_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
 TABLE_CLASS["social_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
 TABLE_CLASS["social_regimes"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
@@ -220,6 +225,21 @@ TABLE_CLASS["gdelt_macro_features"] = _h(
     rationale="macro feature buckets; append-mostly and read by historical time windows",
     write_rate="medium",
     read_pattern="macro replay windows by bucket time",
+)
+TABLE_CLASS["graph_relationship_edges"] = _r(
+    "point-in-time graph relationship edge catalog keyed by source/target symbol, relation type, and availability time",
+    write_rate="medium",
+    read_pattern="PIT graph snapshot construction by source or target symbol, relationship type, and availability time",
+    cleanup="source-specific retention; preserve rows needed by retained graph snapshots and promotion evidence",
+)
+TABLE_CLASS["graph_relational_snapshots"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    rationale="versioned point-in-time graph/relational feature snapshots for shadow-only train/serve parity and promotion evidence",
+    write_rate="medium",
+    read_pattern="latest graph snapshot by symbol/graph_id/time and historical replay windows",
 )
 TABLE_CLASS["feature_data"] = _h(
     chunk="1 week",
@@ -512,6 +532,7 @@ _add(
         "prediction_explanations",
         "triple_barrier_labels",
         "rl_shadow_decisions",
+        "policy_ope_observations",
     ),
     DECISION_SERIES,
 )
@@ -582,6 +603,10 @@ _add(
 TABLE_CLASS["alert_acks"] = _h(**{**AUDIT_SERIES.__dict__, "time_column": "acked_ts_ms"})
 TABLE_CLASS["alert_resolutions"] = _h(**{**AUDIT_SERIES.__dict__, "time_column": "resolved_ts_ms"})
 TABLE_CLASS["promotion_statistical_evidence"] = _h(**{**AUDIT_SERIES.__dict__, "time_column": "ts"})
+TABLE_CLASS["strategy_promotion_candidates"] = _r(
+    "mutable governed promotion candidate state; immutable decisions are mirrored to model_promotion_audit",
+    read_pattern="pending candidate and operator approval lookup by strategy/status",
+)
 
 _add(
     (
@@ -621,6 +646,25 @@ _add(
         "alerts_archive",
     ),
     GLOBAL_FEATURE_SERIES,
+)
+TABLE_CLASS["net_after_cost_labels"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    time_column="label_ts_ms",
+    rationale="timestamp-safe net-after-cost label artifacts keyed to prediction time and replayed by model/symbol/horizon",
+    write_rate="medium",
+    read_pattern="training, evaluation, and promotion scans by label time and model identity",
+)
+TABLE_CLASS["labels_price"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    time_column="ts_eval_ms",
+    rationale="derived realized price labels keyed to prediction and evaluation time for confidence calibration and validation",
+    write_rate="medium",
+    read_pattern="calibration and validation scans by symbol, prediction time, evaluation time, and horizon",
 )
 TABLE_CLASS["model_version_performance"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "recorded_ts_ms"})
 TABLE_CLASS["shadow_metrics"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "window_end_ms"})
@@ -732,6 +776,7 @@ _add(
         "alpha_decay_strategy_metrics",
         "alpha_decay_runtime_history",
         "feature_distribution_drift",
+        "production_monitoring_metrics",
         "model_competition_rankings",
         "model_marketplace_scores",
         "model_promotion_guard",
@@ -806,6 +851,8 @@ _add(
         "model_hyperparameter_registry",
         "model_best_params",
         "model_performance",
+        "experiment_ledger",
+        "policy_ope_evidence",
         "rl_training_runs",
     ),
     _r(_TRAINING_RATIONALE, write_rate="low to medium", read_pattern="model/run keyed lookup and latest status reads"),
@@ -847,6 +894,9 @@ AUDIT_CHAIN_TABLES = frozenset(
         "kill_switch_audit",
         "model_promotion_audit",
         "position_reconcile_audit",
+        "experiment_ledger",
+        "policy_ope_observations",
+        "policy_ope_evidence",
         "promotion_statistical_evidence",
         "trade_attribution_ledger",
     }

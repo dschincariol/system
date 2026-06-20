@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from engine.execution.broker_failover_policy import terminal_broker_failure
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
+from engine.execution.options_readiness import live_options_order_block
 from engine.execution.execution_ledger import init_execution_ledger, log_submit, log_fill
 from engine.execution.broker_submission_recovery import (
     record_submission_unrecorded,
@@ -55,15 +56,26 @@ from engine.execution.kill_switch import execution_allowed
 from engine.runtime.risk_state import get_state, set_state
 from engine.execution.deployable_capital import compute_deployable_equity
 from engine.execution.order_idempotency import (
-    claim_order_submission,
-    mark_order_submission_submitted,
-    mark_order_submission_unknown,
+    claim_order_submission_durable,
+    mark_order_submission_submitted_durable,
+    mark_order_submission_unknown_durable,
 )
 from engine.execution.broker_action_audit import record_broker_action_audit
-from engine.cache.wrappers.kill_switch import read_kill_switch as kill_switch_snapshot
-from engine.cache.wrappers.execution_mode import read_execution_mode as get_execution_mode
 
-execution_gate_snapshot = None
+try:
+    from engine.runtime.gates import execution_gate_snapshot  # type: ignore
+except Exception:
+    execution_gate_snapshot = None  # type: ignore
+
+try:
+    from engine.cache.wrappers.kill_switch import read_kill_switch as kill_switch_snapshot  # type: ignore
+except Exception:
+    kill_switch_snapshot = None  # type: ignore
+
+try:
+    from engine.cache.wrappers.execution_mode import read_execution_mode as get_execution_mode  # type: ignore
+except Exception:
+    get_execution_mode = None  # type: ignore
 
 try:
     from engine.execution.position_reconcile import pre_live_position_reconcile as _prelive_reconcile
@@ -270,6 +282,17 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
             value_type=type(value).__name__,
         )
         return float(default)
+
+
+def _is_multi_slice_override(orders: Optional[List[Dict[str, Any]]]) -> bool:
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        has_index = order.get("slice_index") not in (None, "") or order.get("adaptive_slice_index") not in (None, "")
+        slice_count = _safe_int(order.get("slice_count") or order.get("adaptive_slice_count"), 0)
+        if bool(has_index) and int(slice_count) > 1:
+            return True
+    return False
 
 
 def _alpaca_stream_url() -> str:
@@ -563,10 +586,10 @@ def _req(method: str, path: str, payload: Optional[dict] = None) -> Any:
 def _real_trading_gate() -> Dict[str, Any]:
     if live_execution_disabled():
         return disabled_live_execution_gate(source="engine.execution.broker_alpaca_rest")
-    if execution_gate_snapshot is None:
+    if execution_gate_snapshot is None or kill_switch_snapshot is None or get_execution_mode is None:
         return {
             "ok": False,
-            "reason": "execution_gate_provider_missing",
+            "reason": "execution_gate_providers_missing",
             "real_trading_allowed": False,
             "allowed": False,
         }
@@ -641,17 +664,143 @@ def get_order(order_id: str) -> Dict[str, Any]:
     return _req("GET", f"/v2/orders/{str(order_id)}")
 
 
-def cancel_order(order_id: str) -> Dict[str, Any]:
+def _alpaca_cancel_remaining_qty(order: Dict[str, Any]) -> float:
+    qty = _safe_float((order or {}).get("qty"), 0.0)
+    filled_qty = _safe_float((order or {}).get("filled_qty"), 0.0)
+    remaining_abs = max(0.0, abs(float(qty)) - abs(float(filled_qty)))
+    if remaining_abs <= 1e-9:
+        return 0.0
+    return _signed_alpaca_qty(float(remaining_abs), (order or {}).get("side"))
+
+
+def _alpaca_cancel_status(order: Dict[str, Any]) -> str:
+    return _alpaca_terminal_status(str((order or {}).get("status") or ""), dict(order or {}))
+
+
+def cancel_order(order_id: str, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+    verify_timeout_s = float(
+        timeout_s
+        if timeout_s is not None
+        else os.environ.get("ALPACA_CANCEL_VERIFY_TIMEOUT_S", "5.0")
+    )
+    poll_interval_s = float(os.environ.get("ALPACA_CANCEL_VERIFY_POLL_INTERVAL_S", "0.25"))
     audit = record_broker_action_audit(
         broker="alpaca",
         action="order_cancel_attempt",
         status="attempted",
         broker_order_id=str(order_id),
-        payload={"order_id": str(order_id)},
+        payload={"order_id": str(order_id), "timeout_s": float(verify_timeout_s)},
     )
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
-    return _req("DELETE", f"/v2/orders/{str(order_id)}")
+    cancel_response = _req("DELETE", f"/v2/orders/{str(order_id)}")
+    deadline = time.monotonic() + max(0.0, float(verify_timeout_s))
+    last_order: Dict[str, Any] = dict(cancel_response or {}) if isinstance(cancel_response, dict) else {}
+    last_error = ""
+    while True:
+        try:
+            last_order = dict(get_order(str(order_id)) or {})
+            last_error = ""
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            last_order = {}
+
+        status = _alpaca_cancel_status(last_order) if last_order else ""
+        remaining_qty = _alpaca_cancel_remaining_qty(last_order) if last_order else 0.0
+        if status in {"canceled", "cancelled", "api_cancelled"}:
+            return {
+                "ok": True,
+                "broker": "alpaca",
+                "status": "cancel_verified",
+                "order_id": str(order_id),
+                "broker_status": str(status),
+                "cancel_requested": True,
+                "cancel_verified": True,
+                "terminal_cancel_verified": True,
+                "zero_remaining_verified": abs(float(remaining_qty)) <= 1e-9,
+                "remaining_qty": float(remaining_qty),
+                "order": last_order,
+                "cancel_response": cancel_response,
+            }
+        if last_order and abs(float(remaining_qty)) <= 1e-9:
+            return {
+                "ok": True,
+                "broker": "alpaca",
+                "status": "zero_remaining_verified",
+                "order_id": str(order_id),
+                "broker_status": str(status),
+                "cancel_requested": True,
+                "cancel_verified": True,
+                "zero_remaining_verified": True,
+                "remaining_qty": 0.0,
+                "order": last_order,
+                "cancel_response": cancel_response,
+            }
+
+        if time.monotonic() >= deadline:
+            return {
+                "ok": False,
+                "broker": "alpaca",
+                "status": "cancel_not_verified",
+                "order_id": str(order_id),
+                "broker_status": str(status),
+                "cancel_requested": True,
+                "cancel_verified": False,
+                "terminal_cancel_verified": False,
+                "zero_remaining_verified": False,
+                "remaining_qty": float(remaining_qty),
+                "order": last_order,
+                "cancel_response": cancel_response,
+                "last_error": str(last_error),
+                "timeout_s": float(verify_timeout_s),
+            }
+
+        wait_s = min(max(0.01, float(poll_interval_s)), max(0.01, float(deadline - time.monotonic())))
+        wait_with_kill_interrupt(wait_s)
+
+
+def replace_limit_order(
+    *,
+    order_id: str,
+    symbol: str,
+    qty: float,
+    limit_price: float,
+    client_oid: Optional[str] = None,
+) -> Dict[str, Any]:
+    gate = _real_trading_gate()
+    if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
+        return {"ok": False, "status": "real_trading_blocked", "gate": gate, "broker": "alpaca"}
+    reconcile_block = _prelive_reconcile_or_block("alpaca")
+    if reconcile_block is not None:
+        return reconcile_block
+    credentials_block = _alpaca_credentials_block()
+    if credentials_block is not None:
+        return credentials_block
+    audit = record_broker_action_audit(
+        broker="alpaca",
+        action="order_replace_attempt",
+        status="attempted",
+        symbol=str(symbol),
+        qty=float(qty),
+        client_order_id=str(client_oid or ""),
+        broker_order_id=str(order_id),
+        payload={"order_type": "LIMIT", "limit_price": float(limit_price)},
+    )
+    if not bool(audit.get("ok")):
+        return {"ok": False, **audit}
+    raw = _req("PATCH", f"/v2/orders/{str(order_id)}", {"limit_price": str(float(limit_price))})
+    order = dict(raw or {}) if isinstance(raw, dict) else {}
+    return {
+        **order,
+        "ok": True,
+        "broker": "alpaca",
+        "status": "native_replace_verified",
+        "broker_status": str(order.get("status") or ""),
+        "replace_verified": True,
+        "broker_order_id": str(order.get("id") or order_id),
+        "order_id": str(order.get("id") or order_id),
+        "order": order,
+    }
 
 
 def list_orders(status: str = "all", limit: int = 500, after_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1065,9 +1214,21 @@ def apply_latest_portfolio_orders_live(
             )
         except Exception:
             orders_ale, ale_meta = list(orders or []), {"ok": False, "error": "ale_failed"}
+        multi_slice_override = bool(override_orders is not None and _is_multi_slice_override(orders_ale))
+
+        if not bool(dry_run):
+            options_block = live_options_order_block(
+                orders_ale,
+                broker="alpaca",
+                dry_run=False,
+                engine_mode=os.environ.get("ENGINE_MODE", ""),
+                execution_mode=os.environ.get("EXECUTION_MODE", ""),
+            )
+            if options_block is not None:
+                return options_block
 
         # idempotency
-        if order_id is not None:
+        if order_id is not None and not bool(multi_slice_override):
             last_applied = get_state("alpaca_last_portfolio_orders_id", "0")
             try:
                 if int(last_applied) >= int(order_id):
@@ -1205,12 +1366,12 @@ def apply_latest_portfolio_orders_live(
                     "audit": dict(audit or {}),
                 }
 
-            guard = claim_order_submission(
-                con=con,
+            guard = claim_order_submission_durable(
                 broker="alpaca",
                 portfolio_orders_id=order_id,
                 portfolio_ts_ms=int(ts_ms),
                 order=o,
+                connect_fn=connect,
             )
             if not bool(guard.get("ok")):
                 return {
@@ -1265,10 +1426,10 @@ def apply_latest_portfolio_orders_live(
                 raise
             except Exception as e:
                 try:
-                    mark_order_submission_unknown(
-                        con=con,
+                    mark_order_submission_unknown_durable(
                         order_uid=order_uid,
                         last_error=str(e),
+                        connect_fn=connect,
                     )
                 except Exception as mark_err:
                     _warn_nonfatal(
@@ -1344,15 +1505,17 @@ def apply_latest_portfolio_orders_live(
                     error=e,
                     stage="log_submit",
                     submitted_n=int(n),
+                    durable_idempotency=True,
+                    connect_fn=connect,
                 )
 
             try:
-                mark_order_submission_submitted(
-                    con=con,
+                mark_order_submission_submitted_durable(
                     order_uid=str(order_uid),
                     client_order_id=str(client_oid),
                     broker_order_id=broker_order_id,
                     submit_ts_ms=int(submit_ts_ms),
+                    connect_fn=connect,
                 )
             except Exception as e:
                 _warn_nonfatal(
@@ -1384,6 +1547,8 @@ def apply_latest_portfolio_orders_live(
                     error=e,
                     stage="mark_order_submission_submitted",
                     submitted_n=int(n),
+                    durable_idempotency=True,
+                    connect_fn=connect,
                 )
 
             try:
@@ -1452,10 +1617,15 @@ def apply_latest_portfolio_orders_live(
                     "submitted_n": int(n),
                 }
 
-        if order_id is not None:
+        if order_id is not None and not bool(multi_slice_override):
             set_state("alpaca_last_portfolio_orders_id", str(int(order_id)))
 
-        return {"ok": True, "broker": "alpaca", "submitted_n": n}
+        return {
+            "ok": True,
+            "broker": "alpaca",
+            "submitted_n": n,
+            "parent_cursor_deferred": bool(multi_slice_override),
+        }
 
     finally:
         con.close()

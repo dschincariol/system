@@ -52,6 +52,7 @@ from engine.runtime.logging import get_logger, log_event
 from engine.runtime.metrics import emit_counter, emit_timing
 from engine.runtime.observability import backoff_delay_s, record_component_health
 from engine.strategy.model_config import get_model_config
+from engine.strategy.uncertainty_sizing import ensemble_epistemic_uncertainty
 from engine.strategy.validation import store_prediction
 
 LOG = get_logger("engine.inference_engine")
@@ -825,9 +826,10 @@ def _predict_from_mapping_artifact(artifact: Mapping[str, Any], vector: np.ndarr
     raise TypeError("unsupported_mapping_model_artifact")
 
 
-def _parse_prediction_result(result: Any, *, record: Mapping[str, Any]) -> tuple[float, float]:
+def _parse_prediction_payload(result: Any, *, record: Mapping[str, Any]) -> Dict[str, Any]:
     prediction: float | None = None
     confidence: float | None = None
+    meta: Dict[str, Any] = {}
 
     if isinstance(result, Mapping):
         for key in ("prediction", "predicted_z", "value", "score"):
@@ -838,10 +840,26 @@ def _parse_prediction_result(result: Any, *, record: Mapping[str, Any]) -> tuple
             if key in result:
                 confidence = _clip_confidence(result.get(key), default=SAFE_CONFIDENCE)
                 break
+        for key in (
+            "uncertainty",
+            "predictive_uncertainty",
+            "epistemic_uncertainty",
+            "aleatoric_uncertainty",
+            "mc_dropout_samples",
+            "uncertainty_ts_ms",
+            "prediction_vector",
+            "epistemic_uncertainty_vector",
+            "aleatoric_uncertainty_vector",
+            "uncertainty_detail",
+        ):
+            if key in result:
+                meta[key] = result.get(key)
     elif isinstance(result, (tuple, list)):
         if len(result) >= 2:
             prediction = _safe_float(_first_scalar(result[0]), 0.0)
             confidence = _clip_confidence(_first_scalar(result[1]), default=SAFE_CONFIDENCE)
+            if len(result) >= 3 and isinstance(result[2], Mapping):
+                meta.update(dict(result[2]))
         elif len(result) == 1:
             prediction = _safe_float(_first_scalar(result[0]), 0.0)
     else:
@@ -851,10 +869,17 @@ def _parse_prediction_result(result: Any, *, record: Mapping[str, Any]) -> tuple
         raise ValueError("prediction_unavailable")
     if confidence is None:
         confidence = _pick_metric_confidence(record, prediction)
-    return float(prediction), float(confidence)
+    meta["prediction"] = float(prediction)
+    meta["confidence"] = float(confidence)
+    return meta
 
 
-def _predict_with_artifact(artifact: Any, vector: np.ndarray, *, record: Mapping[str, Any]) -> tuple[float, float]:
+def _parse_prediction_result(result: Any, *, record: Mapping[str, Any]) -> tuple[float, float]:
+    payload = _parse_prediction_payload(result, record=record)
+    return float(payload.get("prediction") or 0.0), float(payload.get("confidence") or SAFE_CONFIDENCE)
+
+
+def _predict_with_artifact_detail(artifact: Any, vector: np.ndarray, *, record: Mapping[str, Any]) -> Dict[str, Any]:
     expected_features = _safe_int(getattr(artifact, "n_features_in_", 0), 0)
     if expected_features > 0 and int(expected_features) != int(vector.size):
         raise ValueError(f"artifact_feature_count_mismatch:{expected_features}:{vector.size}")
@@ -863,12 +888,18 @@ def _predict_with_artifact(artifact: Any, vector: np.ndarray, *, record: Mapping
         prediction, confidence = _predict_from_mapping_artifact(artifact, vector)
         if confidence is None:
             confidence = _pick_metric_confidence(record, prediction)
-        return float(prediction), float(_clip_confidence(confidence, default=SAFE_CONFIDENCE))
+        return {
+            "prediction": float(prediction),
+            "confidence": float(_clip_confidence(confidence, default=SAFE_CONFIDENCE)),
+        }
 
     matrix = vector.reshape(1, -1).astype(np.float32, copy=False)
 
+    if hasattr(artifact, "predict_with_uncertainty") and callable(getattr(artifact, "predict_with_uncertainty")):
+        return _parse_prediction_payload(artifact.predict_with_uncertainty(matrix), record=record)
+
     if hasattr(artifact, "predict_with_confidence") and callable(getattr(artifact, "predict_with_confidence")):
-        return _parse_prediction_result(artifact.predict_with_confidence(matrix), record=record)
+        return _parse_prediction_payload(artifact.predict_with_confidence(matrix), record=record)
 
     if hasattr(artifact, "predict_proba") and callable(getattr(artifact, "predict_proba")):
         predicted = artifact.predict(matrix)
@@ -880,7 +911,7 @@ def _predict_with_artifact(artifact: Any, vector: np.ndarray, *, record: Mapping
             "prediction": _first_scalar(predicted),
             "confidence": confidence,
         }
-        return _parse_prediction_result(payload, record=record)
+        return _parse_prediction_payload(payload, record=record)
 
     if hasattr(artifact, "decision_function") and callable(getattr(artifact, "decision_function")):
         decision = _safe_float(_first_scalar(artifact.decision_function(matrix)), 0.0)
@@ -891,18 +922,23 @@ def _predict_with_artifact(artifact: Any, vector: np.ndarray, *, record: Mapping
             except Exception:
                 predicted = decision
         confidence = 1.0 / (1.0 + math.exp(-abs(decision)))
-        return _parse_prediction_result({"prediction": predicted, "confidence": confidence}, record=record)
+        return _parse_prediction_payload({"prediction": predicted, "confidence": confidence}, record=record)
 
     if hasattr(artifact, "predict") and callable(getattr(artifact, "predict")):
-        return _parse_prediction_result(artifact.predict(matrix), record=record)
+        return _parse_prediction_payload(artifact.predict(matrix), record=record)
 
     if callable(artifact):
         try:
-            return _parse_prediction_result(artifact(matrix), record=record)
+            return _parse_prediction_payload(artifact(matrix), record=record)
         except TypeError:
-            return _parse_prediction_result(artifact(vector), record=record)
+            return _parse_prediction_payload(artifact(vector), record=record)
 
     raise TypeError(f"unsupported_model_artifact:{type(artifact).__name__}")
+
+
+def _predict_with_artifact(artifact: Any, vector: np.ndarray, *, record: Mapping[str, Any]) -> tuple[float, float]:
+    payload = _predict_with_artifact_detail(artifact, vector, record=record)
+    return float(payload.get("prediction") or 0.0), float(payload.get("confidence") or SAFE_CONFIDENCE)
 
 
 def _safe_output(
@@ -1160,9 +1196,11 @@ def _build_prediction_output(
     coverage: float,
     requested_model_name: str | None = None,
     regime: Mapping[str, Any] | None = None,
+    prediction_meta: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     metadata = dict(record.get("metadata") or {})
     resolved_model_name = str(record.get("model_name") or requested_model_name or "safe_default")
+    meta = dict(prediction_meta or {})
     output = {
         "symbol": str(symbol),
         "prediction": float(prediction),
@@ -1185,6 +1223,20 @@ def _build_prediction_output(
         "model_loaded": True,
         "config_variant": str(resolved_model_name),
     }
+    for key in (
+        "uncertainty",
+        "predictive_uncertainty",
+        "epistemic_uncertainty",
+        "aleatoric_uncertainty",
+        "mc_dropout_samples",
+        "prediction_vector",
+        "epistemic_uncertainty_vector",
+        "aleatoric_uncertainty_vector",
+        "uncertainty_detail",
+    ):
+        if key in meta:
+            output[key] = meta.get(key)
+    output["uncertainty_ts_ms"] = int(meta.get("uncertainty_ts_ms") or output["ts_ms"])
     output["ensemble_output"] = _build_ensemble_decision_output(
         final_prediction=float(prediction),
         aggregated_confidence=float(confidence),
@@ -1239,11 +1291,14 @@ def _predict_record_output(
     if not bool(input_validation.get("ok")):
         raise ValueError(str(input_validation.get("detail") or "model_input_invalid"))
     artifact = preloaded_artifact if preloaded_artifact is not None else _load_model_artifact(record)
-    prediction, confidence = _predict_with_artifact(artifact, vector, record=record)
+    prediction_payload = _predict_with_artifact_detail(artifact, vector, record=record)
+    prediction = float(prediction_payload.get("prediction") or 0.0)
+    confidence = float(prediction_payload.get("confidence") or SAFE_CONFIDENCE)
     adjusted_confidence = _clip_confidence(
         float(confidence) * float(max(0.0, min(1.0, coverage))),
         default=SAFE_CONFIDENCE,
     )
+    prediction_payload["confidence"] = float(adjusted_confidence)
     output = _build_prediction_output(
         symbol=symbol,
         record=record,
@@ -1255,6 +1310,7 @@ def _predict_record_output(
         coverage=float(coverage),
         requested_model_name=requested_model_name,
         regime=regime,
+        prediction_meta=prediction_payload,
     )
     prediction_validation = _validate_prediction_output(output, record=record)
     if not bool(prediction_validation.get("ok")):
@@ -1320,6 +1376,7 @@ def _build_ensemble_output(
         payload["regime_key"] = str(output.get("regime_key") or regime_signature(normalized_regime))
         ensemble_members.append(payload)
 
+    epistemic = ensemble_epistemic_uncertainty({"ensemble_members": ensemble_members})
     resolved_horizon_s = int(horizon_s or member_outputs[0].get("horizon_s") or DEFAULT_HORIZON_S)
     ensemble_method = str(combined.get("method") or method or DEFAULT_ENSEMBLE_METHOD)
     feature_ids = list(member_outputs[0].get("feature_ids") or [])
@@ -1351,7 +1408,12 @@ def _build_ensemble_output(
         "ensemble_size": int(len(ensemble_members)),
         "ensemble_members": ensemble_members,
         "component_vector": component_vector,
+        "uncertainty_ts_ms": _now_ms(),
     }
+    if bool(epistemic.get("available")):
+        output["epistemic_uncertainty"] = float(epistemic.get("epistemic_uncertainty") or 0.0)
+        output["ensemble_epistemic_uncertainty"] = float(epistemic.get("epistemic_uncertainty") or 0.0)
+        output["uncertainty_detail"] = dict(epistemic)
     output["ensemble_output"] = _build_ensemble_decision_output(
         final_prediction=float(final_prediction),
         aggregated_confidence=float(aggregated_confidence),
@@ -1365,6 +1427,9 @@ def _build_ensemble_output(
             else None
         ),
     )
+    if bool(epistemic.get("available")):
+        output["ensemble_output"]["epistemic_uncertainty"] = float(epistemic.get("epistemic_uncertainty") or 0.0)
+        output["ensemble_output"]["uncertainty_detail"] = dict(epistemic)
     _track_prediction_output(
         output,
         feature_snapshot=feature_snapshot,

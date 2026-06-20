@@ -16,17 +16,18 @@ from pathlib import Path
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import default_local_db_dir, default_local_db_path, default_local_log_dir
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG_DIR = os.path.abspath(
     os.environ.get("TRADING_LOGS") or
     os.environ.get("LOG_DIR") or
-    os.path.join(_BASE_DIR, "logs")
+    str(default_local_log_dir())
 )
 _DATA_DIR = os.path.abspath(
     os.environ.get("TRADING_DATA") or
     os.environ.get("DATA_DIR") or
-    os.path.join(_BASE_DIR, "data")
+    str(default_local_db_dir())
 )
 _PID_PATH = os.path.join(_LOG_DIR, "ingestion.pid")
 LOG = get_logger("start_ingestion")
@@ -47,6 +48,28 @@ def _warn_nonfatal(event: str, error: BaseException, **extra) -> None:
     )
 
 
+def _strict_runtime_requires_explicit_db_path() -> bool:
+    try:
+        from engine.runtime.config_schema import get_runtime_safety_context
+
+        return bool(get_runtime_safety_context().get("strict_runtime"))
+    except Exception:
+        env_raw = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
+        env = "prod" if env_raw in {"prod", "production"} else env_raw
+        engine_mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+        supervised = str(os.environ.get("ENGINE_SUPERVISED") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        explicit_dev_env = bool(str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "").strip()) and env in {
+            "dev",
+            "test",
+        }
+        return bool(supervised or env == "prod" or (engine_mode in {"live", "shadow", "paper"} and not explicit_dev_env))
+
+
 def _bootstrap_ingestion_env() -> None:
     sys.dont_write_bytecode = True
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
@@ -56,6 +79,8 @@ def _bootstrap_ingestion_env() -> None:
     # This entrypoint is always treated as supervisor-owned ingestion, even when
     # launched directly, so downstream jobs inherit consistent runtime identity.
     os.environ.setdefault("ENGINE_JOB_NAME", "ingestion_runtime")
+    os.environ.setdefault("ENGINE_PROCESS_ROLE", "ingestion")
+    os.environ.setdefault("TS_PG_POOL_PROFILE", "ingestion")
 
     try:
         from dotenv import load_dotenv
@@ -84,7 +109,14 @@ def _bootstrap_ingestion_env() -> None:
     os.makedirs(_DATA_DIR, exist_ok=True)
     os.environ.setdefault("TRADING_LOGS", _LOG_DIR)
     os.environ.setdefault("TRADING_DATA", _DATA_DIR)
-    os.environ.setdefault("DB_PATH", str((Path(_DATA_DIR) / "trading.db").resolve()))
+    if not _strict_runtime_requires_explicit_db_path():
+        os.environ.setdefault("DB_PATH", str(default_local_db_path().resolve()))
+    try:
+        from engine.runtime.hardware import apply_cpu_first_runtime_defaults
+
+        apply_cpu_first_runtime_defaults()
+    except Exception as e:
+        _warn_nonfatal("START_INGESTION_HARDWARE_DEFAULTS_FAILED", e)
 
     try:
         from services.data_source_manager import (
@@ -237,6 +269,36 @@ def _write_ingestion_state(payload: dict) -> None:
             extra={"payload": dict(payload or {})},
         )
 
+
+def _assert_ingestion_tuning_safe() -> dict:
+    try:
+        from engine.runtime.ingestion_tuning import assert_ingestion_tuning_safe
+
+        return assert_ingestion_tuning_safe(pg_pool_role="ingestion")
+    except Exception as e:
+        log_failure(
+            LOG,
+            event="start_ingestion_tuning_unsafe",
+            code="START_INGESTION_TUNING_UNSAFE",
+            message=str(e),
+            error=e,
+            level=logging.ERROR,
+            component="start_ingestion",
+            include_health=True,
+            persist=True,
+        )
+        raise
+
+
+def _log_runtime_hardware_bootstrap() -> None:
+    try:
+        from engine.runtime.hardware import log_runtime_hardware_diagnostics
+
+        log_runtime_hardware_diagnostics(LOG, component="start_ingestion")
+    except Exception as e:
+        _warn_nonfatal("START_INGESTION_RUNTIME_HARDWARE_DIAGNOSTICS_FAILED", e)
+
+
 def main():
     """Bootstrap supervised ingestion and transfer control to the runtime.
 
@@ -262,6 +324,8 @@ def main():
     file, persists a boot-state snapshot, and registers process-exit cleanup.
     """
     _bootstrap_ingestion_env()
+    _log_runtime_hardware_bootstrap()
+    _assert_ingestion_tuning_safe()
     atexit.register(_cleanup_pid_file)
     _write_pid_file()
 

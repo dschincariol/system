@@ -501,12 +501,6 @@ def trace_trade_lifecycle(
 
         report["steps"]["portfolio_orders"] = portfolio_orders
 
-        client_order_ids = [
-            str(item.get("client_order_id"))
-            for item in execution_orders
-            if item.get("client_order_id") not in (None, "")
-        ]
-
         fills: List[Dict[str, Any]] = list(projection.get("fills") or [])
         report["steps"]["fills"] = fills
 

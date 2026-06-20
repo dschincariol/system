@@ -17,15 +17,17 @@ import webbrowser
 from pathlib import Path
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.log_retention import rotate_log_if_needed
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import default_local_db_dir, default_local_log_dir, default_local_tmp_dir
 
 
 ROOT = Path(__file__).resolve().parent
 OPERATOR_URL = os.environ.get("OPERATOR_URL", "http://127.0.0.1:4001/")
 NODE_ENTRY = ROOT / "boot" / "operator_server.js"
 EXPRESS_PKG = ROOT / "node_modules" / "express" / "package.json"
-OPERATOR_STDOUT_LOG = ROOT / "logs" / "operator.stdout.log"
-OPERATOR_STDERR_LOG = ROOT / "logs" / "operator.stderr.log"
+OPERATOR_STDOUT_LOG = default_local_log_dir() / "operator.stdout.log"
+OPERATOR_STDERR_LOG = default_local_log_dir() / "operator.stderr.log"
 LOG = get_logger("engine.start_all")
 
 
@@ -33,8 +35,6 @@ def _pick_python() -> str:
     override = str(os.environ.get("OPERATOR_PYTHON", "")).strip()
     candidates = [override] if override else []
     candidates.extend(["python3", "python"])
-    if os.name == "nt":
-        candidates.insert(0, "py")
     seen = set()
     for cmd in candidates:
         if not cmd or cmd in seen:
@@ -54,9 +54,9 @@ def _pick_required(name: str) -> str:
 
 
 def _ensure_dirs() -> None:
-    (ROOT / "data").mkdir(parents=True, exist_ok=True)
-    (ROOT / "logs").mkdir(parents=True, exist_ok=True)
-    (ROOT / "data" / "operator").mkdir(parents=True, exist_ok=True)
+    default_local_db_dir().mkdir(parents=True, exist_ok=True)
+    default_local_log_dir().mkdir(parents=True, exist_ok=True)
+    (default_local_tmp_dir() / "operator").mkdir(parents=True, exist_ok=True)
 
 
 def _ensure_node_modules(npm_exe: str) -> None:
@@ -98,10 +98,6 @@ def _warn_nonfatal(event: str, code: str, error: BaseException, **extra: object)
 
 
 def _spawn_operator(node_exe: str) -> subprocess.Popen:
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -113,6 +109,8 @@ def _spawn_operator(node_exe: str) -> subprocess.Popen:
 
     OPERATOR_STDOUT_LOG.parent.mkdir(parents=True, exist_ok=True)
 
+    rotate_log_if_needed(OPERATOR_STDOUT_LOG)
+    rotate_log_if_needed(OPERATOR_STDERR_LOG)
     stdout_fh = open(OPERATOR_STDOUT_LOG, "ab")
     stderr_fh = open(OPERATOR_STDERR_LOG, "ab")
 
@@ -121,7 +119,6 @@ def _spawn_operator(node_exe: str) -> subprocess.Popen:
             [node_exe, str(NODE_ENTRY)],
             cwd=str(ROOT),
             env=env,
-            creationflags=creationflags,
             stdout=stdout_fh,
             stderr=stderr_fh,
         )
@@ -136,10 +133,7 @@ def _terminate_operator(proc: subprocess.Popen) -> None:
         return
 
     try:
-        if os.name == "nt":
-            proc.terminate()
-        else:
-            proc.send_signal(signal.SIGTERM)
+        proc.send_signal(signal.SIGTERM)
     except Exception as e:
         print(f"[startup] operator_terminate_failed: {e}", flush=True)
 
@@ -184,23 +178,13 @@ def main() -> int:
         if _port_in_use(4001):
             print("[startup] port 4001 already in use, attempting cleanup...", flush=True)
 
-            if os.name == "nt":
-                subprocess.run(
-                    'for /f "tokens=5" %a in (\'netstat -aon ^| find ":4001" ^| find "LISTENING"\') do taskkill /F /PID %a',
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=15,
-                    check=False,
-                )
-            else:
-                subprocess.run(
-                    ["pkill", "-f", "operator_server.js"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=15,
-                    check=False,
-                )
+            subprocess.run(
+                ["pkill", "-f", "operator_server.js"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
 
             time.sleep(1)
 

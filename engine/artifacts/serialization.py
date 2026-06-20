@@ -1,7 +1,6 @@
 """Serialization helpers owned by the artifact layer.
 
-All ``joblib.dump`` / ``torch.save`` / ``pickle.dump`` calls in the
-codebase live here so blob production stays single-sourced. Callers
+Blob serializer calls are centralized behind this facade so callers
 elsewhere ask for bytes, write them through the artifact store, or
 feed them to ``Path.write_bytes`` for legacy file targets.
 
@@ -14,21 +13,19 @@ from __future__ import annotations
 
 import io
 import pickle
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
-try:
-    import joblib
-except Exception:  # pragma: no cover - optional dependency
-    joblib = None  # type: ignore[assignment]
-
 
 def dumps_pickle_artifact(value: Any, *, prefer_joblib: bool = False) -> bytes:
-    if prefer_joblib and joblib is not None:
-        buffer = io.BytesIO()
-        joblib.dump(value, buffer)
-        return buffer.getvalue()
-    return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    if prefer_joblib and find_spec("joblib") is not None:
+        from engine.artifacts.store import dumps_joblib_artifact
+
+        return dumps_joblib_artifact(value)
+    from engine.artifacts.store import dumps_pickle_artifact_payload
+
+    return dumps_pickle_artifact_payload(value)
 
 
 def dump_pickle_artifact(value: Any, path: str | Path, *, prefer_joblib: bool = False) -> Path:
@@ -40,7 +37,9 @@ def dump_pickle_artifact(value: Any, path: str | Path, *, prefer_joblib: bool = 
 
 
 def loads_pickle_artifact(payload: bytes, *, prefer_joblib: bool = False) -> Any:
-    if prefer_joblib and joblib is not None:
+    if prefer_joblib and find_spec("joblib") is not None:
+        import joblib
+
         buffer = io.BytesIO(bytes(payload or b""))
         return joblib.load(buffer)
     return pickle.loads(bytes(payload or b""))
@@ -51,11 +50,9 @@ def load_pickle_artifact(path: str | Path, *, prefer_joblib: bool = False) -> An
 
 
 def dumps_torch_payload(payload: Any) -> bytes:
-    import torch
+    from engine.artifacts.store import dumps_torch_artifact_payload
 
-    buffer = io.BytesIO()
-    torch.save(payload, buffer)
-    return buffer.getvalue()
+    return dumps_torch_artifact_payload(payload)
 
 
 def loads_torch_payload(payload: bytes, *, map_location: str = "cpu", weights_only: bool = True) -> Any:

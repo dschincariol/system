@@ -11,6 +11,7 @@ from engine.execution.broker_action_audit import record_broker_action_audit
 from engine.execution.order_idempotency import (
     SUBMISSION_UNRECORDED_STATUS,
     mark_order_submission_unrecorded,
+    mark_order_submission_unrecorded_durable,
 )
 from engine.runtime import storage
 from engine.runtime.failure_diagnostics import log_failure
@@ -232,27 +233,38 @@ def record_submission_unrecorded(
     error: BaseException,
     stage: str,
     submitted_n: int = 0,
+    durable_idempotency: bool = False,
+    connect_fn: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
     broker_name = str(broker or "").strip().lower() or "unknown"
     symbol_norm = str(symbol or "").strip().upper()
     error_text = f"{str(stage or 'bookkeeping')}:{type(error).__name__}:{error}"
     marker: Dict[str, Any]
     try:
-        marker = mark_order_submission_unrecorded(
-            con=con,
-            broker=broker_name,
-            order_uid=str(order_uid or ""),
-            client_order_id=str(client_order_id or ""),
-            broker_order_id=broker_order_id,
-            submit_ts_ms=int(submit_ts_ms or _now_ms()),
-            last_error=error_text,
-            symbol=symbol_norm,
-            portfolio_orders_id=portfolio_orders_id,
-            portfolio_ts_ms=portfolio_ts_ms,
-            source_order_id=source_order_id,
-            source_alert_id=source_alert_id,
-            payload=dict(payload or {}),
-        )
+        marker_kwargs = {
+            "broker": broker_name,
+            "order_uid": str(order_uid or ""),
+            "client_order_id": str(client_order_id or ""),
+            "broker_order_id": broker_order_id,
+            "submit_ts_ms": int(submit_ts_ms or _now_ms()),
+            "last_error": error_text,
+            "symbol": symbol_norm,
+            "portfolio_orders_id": portfolio_orders_id,
+            "portfolio_ts_ms": portfolio_ts_ms,
+            "source_order_id": source_order_id,
+            "source_alert_id": source_alert_id,
+            "payload": dict(payload or {}),
+        }
+        if durable_idempotency:
+            marker = mark_order_submission_unrecorded_durable(
+                **marker_kwargs,
+                connect_fn=connect_fn,
+            )
+        else:
+            marker = mark_order_submission_unrecorded(
+                con=con,
+                **marker_kwargs,
+            )
     except Exception as marker_exc:
         log_failure(
             LOG,

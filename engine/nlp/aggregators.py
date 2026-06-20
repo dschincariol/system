@@ -55,8 +55,6 @@ def aggregate_symbol_day_documents(
 
     out: list[dict[str, Any]] = []
     for (symbol, bucket_ts_ms), rows in sorted(grouped.items()):
-        ts_values = [int(row.get(ts_key) or 0) for row in rows]
-        weights = recency_weights(ts_values, half_life_hours=half_life_hours)
         result: dict[str, Any] = {
             "symbol": symbol,
             "day_ts_ms": int(bucket_ts_ms),

@@ -11,6 +11,14 @@ from pathlib import Path
 from dataclasses import dataclass
 import math
 
+from engine.runtime.workload_profiles import (
+    LIVE_PROFILE_OFFLINE_TRAINING_ACK_PHRASE,
+    normalize_workload_profile,
+    offline_training_ack_snapshot,
+    workload_profile_defaults,
+    workload_profile_from_env,
+)
+
 
 class ConfigError(RuntimeError):
     pass
@@ -37,6 +45,7 @@ _PLACEHOLDER_VALUES = {
 _LIVE_RISK_REQUIRED_ENABLED_FLAGS = (
     "PORTFOLIO_USE_RISK_ENGINE",
     "PORTFOLIO_RISK_USE_MONTE_CARLO",
+    "PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE",
     "MODEL_AWARE_KILL_SWITCH",
 )
 _LIVE_RISK_REQUIRED_FLOAT_THRESHOLDS = (
@@ -58,6 +67,15 @@ _LIVE_RISK_ACCEPTANCE_AUDIT_FIELDS = (
     "LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER",
     "LIVE_RISK_THRESHOLD_ACCEPTANCE_REASON",
 )
+_CPU_FIRST_DEVICE_ENV_KEYS = (
+    "TORCH_DEVICE",
+    "EMBED_DEVICE",
+    "NLP_DEVICE",
+    "FINBERT_DEVICE",
+    "TS_FOUNDATION_DEVICE",
+)
+_DEVICE_VALUE_PREFIXES = ("cuda:",)
+_DEVICE_VALUE_EXACT = {"cpu", "cuda", "auto"}
 
 
 def _req(name: str) -> str:
@@ -90,6 +108,17 @@ def _opt_float(name: str, default: float) -> float:
         return float(str(v).strip())
     except Exception as e:
         raise ConfigError(f"Invalid float for {name}: {v}") from e
+
+
+def _validate_device_value(name: str, default: str = "cpu") -> None:
+    value = _opt(name, default).lower()
+    if not value:
+        raise ConfigError(f"{name} must be non-empty")
+    if value in _DEVICE_VALUE_EXACT:
+        return
+    if any(value.startswith(prefix) for prefix in _DEVICE_VALUE_PREFIXES):
+        return
+    raise ConfigError(f"Invalid device for {name}: {value}")
 
 
 def _opt_bool(name: str, default: bool = False) -> bool:
@@ -269,6 +298,52 @@ def validate_live_trading_confirmation(safety: dict[str, object] | None = None) 
     return snapshot
 
 
+def validate_options_instrument_config(safety: dict[str, object] | None = None) -> dict[str, object]:
+    """Validate the options-as-instruments rollout mode.
+
+    Options market data/features are available today, but broker adapters do
+    not yet implement live options order submission. Live/prod attempts to
+    enable options instruments must therefore fail closed until the execution
+    gate reports a complete readiness contract.
+    """
+
+    from engine.execution.options_readiness import (
+        live_options_readiness_snapshot,
+        options_instruments_mode,
+    )
+
+    mode = options_instruments_mode()
+    if mode == "invalid":
+        raw = os.environ.get("OPTIONS_INSTRUMENTS_MODE") or os.environ.get("OPTIONS_AS_INSTRUMENTS_MODE") or ""
+        raise ConfigError(f"Invalid OPTIONS_INSTRUMENTS_MODE: {raw}")
+
+    ctx = safety if safety is not None else get_runtime_safety_context()
+    required_context = bool(str(ctx.get("engine_mode") or "").lower() == "live" and bool(ctx.get("strict_runtime")))
+    snapshot = live_options_readiness_snapshot(
+        engine_mode=str(ctx.get("engine_mode") or ""),
+        execution_mode=os.environ.get("EXECUTION_MODE", ""),
+        broker=os.environ.get("BROKER") or os.environ.get("BROKER_NAME") or os.environ.get("LIVE_BROKER") or "",
+    )
+    if required_context and bool(snapshot.get("required")) and not bool(snapshot.get("ok")):
+        blockers = "; ".join(str(item) for item in list(snapshot.get("blockers") or []))
+        raise ConfigError(f"live options instruments invalid: {blockers or snapshot.get('reason')}")
+    return snapshot
+
+
+def validate_data_source_master_key_config(safety: dict[str, object] | None = None) -> dict[str, object]:
+    ctx = safety if safety is not None else get_runtime_safety_context()
+    required = bool(ctx.get("strict_runtime"))
+    try:
+        from services.credential_encryption import validate_data_source_master_key
+
+        return validate_data_source_master_key(
+            production=required,
+            require_present=required,
+        )
+    except Exception as exc:
+        raise ConfigError(f"data source master key invalid: {exc}") from exc
+
+
 def _normalize_env_name(raw: str) -> str:
     env = str(raw or "").strip().lower()
     if env == "production":
@@ -293,6 +368,10 @@ def get_runtime_safety_context() -> dict[str, object]:
     env_raw = _opt("ENV", os.environ.get("NODE_ENV", "dev"))
     env = _normalize_env_name(env_raw)
     engine_mode = _normalize_engine_mode(_opt("ENGINE_MODE", "safe"))
+    try:
+        workload_profile = workload_profile_from_env()
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     env_explicit = bool(str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "").strip())
     explicit_dev_env = bool(env_explicit and env in {"dev", "test"})
     supervised = _opt_bool("ENGINE_SUPERVISED", default=False)
@@ -302,6 +381,7 @@ def get_runtime_safety_context() -> dict[str, object]:
     return {
         "env": env,
         "engine_mode": engine_mode,
+        "workload_profile": workload_profile,
         "supervised": bool(supervised),
         "strict_runtime": strict_runtime,
         "explicit_dev_env": explicit_dev_env,
@@ -310,7 +390,25 @@ def get_runtime_safety_context() -> dict[str, object]:
     }
 
 
+def validate_workload_profile_guardrails(safety: dict[str, object] | None = None) -> dict[str, object]:
+    ctx = safety if safety is not None else get_runtime_safety_context()
+    profile = normalize_workload_profile(str(ctx.get("workload_profile") or workload_profile_from_env()))
+    snapshot = offline_training_ack_snapshot(profile=profile)
+    if bool(ctx.get("strict_runtime")) and bool(snapshot.get("required")) and not bool(snapshot.get("ok")):
+        blockers = "; ".join(str(item) for item in list(snapshot.get("blockers") or []))
+        enabled = ",".join(str(item) for item in list(snapshot.get("enabled_settings") or []))
+        raise ConfigError(
+            "offline training in live workload profile requires explicit acknowledgement: "
+            f"enabled_settings={enabled}; blockers={blockers}; "
+            f"expected OFFLINE_TRAINING_LIVE_PROFILE_ACK={LIVE_PROFILE_OFFLINE_TRAINING_ACK_PHRASE}"
+        )
+    return snapshot
+
+
 def _validate_new_subsystem_flags() -> None:
+    for device_key in _CPU_FIRST_DEVICE_ENV_KEYS:
+        _validate_device_value(device_key, "cpu")
+
     hmm_num_states = _opt_int("HMM_NUM_STATES", 3)
     if hmm_num_states < 3 or hmm_num_states > 5:
         raise ConfigError("HMM_NUM_STATES must be between 3 and 5")
@@ -376,8 +474,74 @@ def _validate_new_subsystem_flags() -> None:
         raise ConfigError("TSFRESH_MAX_FEATURES must be >= 1")
     if _opt_int("TSFRESH_SNAPSHOT_BUCKET_SEC", _opt_int("MODEL_FEATURE_SNAPSHOT_BUCKET_SEC", 300)) < 60:
         raise ConfigError("TSFRESH_SNAPSHOT_BUCKET_SEC must be >= 60")
-    if _opt_int("TSFRESH_SNAPSHOT_SYMBOL_LIMIT", 1500) < 1:
+    profile_defaults = workload_profile_defaults()
+    tsfresh_symbol_default = int(profile_defaults.get("tsfresh_snapshot_symbol_limit") or 1)
+    tsfresh_batch_default = int(profile_defaults.get("tsfresh_snapshot_batch_size") or 1)
+    tune_trials_default = int(profile_defaults.get("tune_n_trials") or 1)
+    tune_max_trials_default = int(profile_defaults.get("tune_max_n_trials") or tune_trials_default)
+    tsfresh_symbol_limit = _opt_int("TSFRESH_SNAPSHOT_SYMBOL_LIMIT", tsfresh_symbol_default)
+    tsfresh_max_symbols = _opt_int("TSFRESH_SNAPSHOT_MAX_SYMBOLS", tsfresh_symbol_default)
+    tsfresh_batch_size = _opt_int("TSFRESH_SNAPSHOT_BATCH_SIZE", tsfresh_batch_default)
+    tsfresh_max_batch_size = _opt_int("TSFRESH_SNAPSHOT_MAX_BATCH_SIZE", tsfresh_batch_default)
+    if tsfresh_symbol_limit < 1:
         raise ConfigError("TSFRESH_SNAPSHOT_SYMBOL_LIMIT must be >= 1")
+    if tsfresh_max_symbols < 1:
+        raise ConfigError("TSFRESH_SNAPSHOT_MAX_SYMBOLS must be >= 1")
+    if tsfresh_symbol_limit > tsfresh_max_symbols:
+        raise ConfigError("TSFRESH_SNAPSHOT_SYMBOL_LIMIT must be <= TSFRESH_SNAPSHOT_MAX_SYMBOLS")
+    if tsfresh_batch_size < 1:
+        raise ConfigError("TSFRESH_SNAPSHOT_BATCH_SIZE must be >= 1")
+    if tsfresh_max_batch_size < 1:
+        raise ConfigError("TSFRESH_SNAPSHOT_MAX_BATCH_SIZE must be >= 1")
+    if tsfresh_batch_size > tsfresh_max_batch_size:
+        raise ConfigError("TSFRESH_SNAPSHOT_BATCH_SIZE must be <= TSFRESH_SNAPSHOT_MAX_BATCH_SIZE")
+    if _opt_int("TSFRESH_N_JOBS", int(profile_defaults.get("tsfresh_n_jobs") or 0)) < 0:
+        raise ConfigError("TSFRESH_N_JOBS must be >= 0")
+    if _opt_int("TSFRESH_MAX_N_JOBS", int(profile_defaults.get("tsfresh_max_n_jobs") or 1)) < 1:
+        raise ConfigError("TSFRESH_MAX_N_JOBS must be >= 1")
+    if _opt_int("MODEL_TRAIN_N_JOBS", int(profile_defaults.get("model_n_jobs") or 1)) < 1:
+        raise ConfigError("MODEL_TRAIN_N_JOBS must be >= 1")
+    if _opt_int("MODEL_TRAIN_MAX_N_JOBS", int(profile_defaults.get("model_max_n_jobs") or 1)) < 1:
+        raise ConfigError("MODEL_TRAIN_MAX_N_JOBS must be >= 1")
+    tune_n_trials = _opt_int("TUNE_N_TRIALS", tune_trials_default)
+    tune_max_n_trials = _opt_int("TUNE_MAX_N_TRIALS", tune_max_trials_default)
+    if tune_n_trials < 1:
+        raise ConfigError("TUNE_N_TRIALS must be >= 1")
+    if tune_max_n_trials < 1:
+        raise ConfigError("TUNE_MAX_N_TRIALS must be >= 1")
+    if tune_n_trials > tune_max_n_trials:
+        raise ConfigError("TUNE_N_TRIALS must be <= TUNE_MAX_N_TRIALS")
+    for n_jobs_key in ("LGBM_N_JOBS", "LGBM_RANKER_N_JOBS", "XGB_N_JOBS", "META_LABEL_N_JOBS"):
+        if _opt_int(n_jobs_key, int(profile_defaults.get("model_n_jobs") or 1)) < 1:
+            raise ConfigError(f"{n_jobs_key} must be >= 1")
+
+    ts_foundation_backend = _opt("TS_FOUNDATION_BACKEND", "chronos").lower() or "chronos"
+    if ts_foundation_backend not in {"chronos"}:
+        raise ConfigError(f"Invalid TS_FOUNDATION_BACKEND: {ts_foundation_backend}")
+    if not _opt("TS_FOUNDATION_CHRONOS_MODEL_ID", _opt("TS_FOUNDATION_MODEL_ID", "amazon/chronos-2")).strip():
+        raise ConfigError("TS_FOUNDATION_CHRONOS_MODEL_ID must be non-empty")
+    ts_foundation_dim = _opt_int("TS_FOUNDATION_EMBEDDING_DIM", 16)
+    if ts_foundation_dim < 1 or ts_foundation_dim > 512:
+        raise ConfigError("TS_FOUNDATION_EMBEDDING_DIM must be between 1 and 512")
+    ts_foundation_context_rows = _opt_int("TS_FOUNDATION_CONTEXT_ROWS", 256)
+    ts_foundation_min_context_rows = _opt_int("TS_FOUNDATION_MIN_CONTEXT_ROWS", 32)
+    if ts_foundation_context_rows < 16:
+        raise ConfigError("TS_FOUNDATION_CONTEXT_ROWS must be >= 16")
+    if ts_foundation_min_context_rows < 4:
+        raise ConfigError("TS_FOUNDATION_MIN_CONTEXT_ROWS must be >= 4")
+    if ts_foundation_min_context_rows > ts_foundation_context_rows:
+        raise ConfigError("TS_FOUNDATION_MIN_CONTEXT_ROWS must be <= TS_FOUNDATION_CONTEXT_ROWS")
+    graph_max_neighbors = _opt_int("GRAPH_RELATIONAL_MAX_NEIGHBORS", 24)
+    if graph_max_neighbors < 1 or graph_max_neighbors > 512:
+        raise ConfigError("GRAPH_RELATIONAL_MAX_NEIGHBORS must be between 1 and 512")
+    graph_corr_lookback_rows = _opt_int("GRAPH_RELATIONAL_CORR_LOOKBACK_ROWS", 96)
+    if graph_corr_lookback_rows < 8:
+        raise ConfigError("GRAPH_RELATIONAL_CORR_LOOKBACK_ROWS must be >= 8")
+    graph_corr_min_abs = _opt_float("GRAPH_RELATIONAL_CORR_MIN_ABS", 0.35)
+    if not (0.0 <= graph_corr_min_abs <= 1.0):
+        raise ConfigError("GRAPH_RELATIONAL_CORR_MIN_ABS must be between 0 and 1")
+    if _opt_int("GRAPH_RELATIONAL_NEWS_LOOKBACK_HOURS", 72) < 1:
+        raise ConfigError("GRAPH_RELATIONAL_NEWS_LOOKBACK_HOURS must be >= 1")
 
     if not _opt("FINBERT_MODEL_NAME", "ProsusAI/finbert").strip():
         raise ConfigError("FINBERT_MODEL_NAME must be non-empty")
@@ -429,6 +593,10 @@ def _validate_new_subsystem_flags() -> None:
     _opt_bool("USE_TSFRESH_FEATURES", default=False)
     _opt_bool("TSFRESH_USE_PERSISTED_SNAPSHOTS", default=True)
     _opt_bool("TSFRESH_LIVE_COMPUTE_ENABLED", default=False)
+    _opt_bool("USE_TS_FOUNDATION_FEATURES", default=False)
+    _opt_bool("TS_FOUNDATION_LOCAL_FILES_ONLY", default=True)
+    _opt_bool("TS_FOUNDATION_REQUIRE_ARTIFACT_PERSISTENCE", default=True)
+    _opt_bool("USE_GRAPH_RELATIONAL_FEATURES", default=False)
     _opt_bool("USE_FINBERT_SENTIMENT", default=False)
     _opt_bool("FINBERT_USE_PERSISTED_ENRICHMENT", default=True)
     _opt_bool("FINBERT_LIVE_INFERENCE_ENABLED", default=False)
@@ -453,6 +621,8 @@ class RuntimeConfig:
         Normalized runtime environment name.
     db_path : str
         Absolute path to the active SQLite database.
+    runtime_workload_profile : str
+        Workload profile controlling live/offline defaults and guardrails.
     prod_lock : bool
         Whether production safety locking is enabled.
     allow_training : bool
@@ -497,6 +667,7 @@ class RuntimeConfig:
 
     env: str
     db_path: str
+    runtime_workload_profile: str
 
     # production lock
     prod_lock: bool
@@ -554,17 +725,17 @@ def load_runtime_config() -> RuntimeConfig:
     safety = get_runtime_safety_context()
     env = str(safety["env"])
     engine_mode = str(safety["engine_mode"])
-    supervised = bool(safety["supervised"])
-    explicit_dev_env = bool(safety["explicit_dev_env"])
+    workload_profile = normalize_workload_profile(str(safety["workload_profile"]))
+    profile_defaults = workload_profile_defaults(workload_profile)
     strict_runtime = bool(safety["strict_runtime"])
     require_explicit_training = bool(safety["require_explicit_training"])
 
-    from engine.runtime.platform import default_data_root
+    from engine.runtime.platform import default_data_root, default_local_db_path
 
-    if engine_mode == "live" and explicit_dev_env and not supervised:
-        default_db_path = str(Path.cwd() / "data" / ("trading" + "." + "db"))
-    else:
+    if strict_runtime:
         default_db_path = str(default_data_root())
+    else:
+        default_db_path = str(default_local_db_path())
     db_path_raw = _opt("DB_PATH", "")
     if strict_runtime and not db_path_raw:
         raise ConfigError(
@@ -572,7 +743,19 @@ def load_runtime_config() -> RuntimeConfig:
         )
     if not db_path_raw:
         db_path_raw = default_db_path
-    db_path = str(Path(db_path_raw).expanduser().resolve())
+    db_path_expanded = Path(db_path_raw).expanduser()
+    if strict_runtime and not db_path_expanded.is_absolute():
+        raise ConfigError(
+            "DB_PATH must be absolute when "
+            f"env={env} engine_mode={engine_mode} strict_runtime=1: {db_path_raw}"
+        )
+    data_root_raw = _opt("TS_DATA_ROOT", "")
+    if strict_runtime and data_root_raw and not Path(data_root_raw).expanduser().is_absolute():
+        raise ConfigError(
+            "TS_DATA_ROOT must be absolute when "
+            f"env={env} engine_mode={engine_mode} strict_runtime=1: {data_root_raw}"
+        )
+    db_path = str(db_path_expanded.resolve())
 
     prod_lock = _opt_bool("PROD_LOCK", default=(env == "prod"))
     allow_training_raw = str(os.environ.get("ALLOW_TRAINING") or "").strip()
@@ -580,7 +763,10 @@ def load_runtime_config() -> RuntimeConfig:
         raise ConfigError(
             f"ALLOW_TRAINING must be explicitly set when env={env} engine_mode={engine_mode}"
         )
-    allow_training = _opt_bool("ALLOW_TRAINING", default=(env != "prod" and not require_explicit_training))
+    allow_training = _opt_bool(
+        "ALLOW_TRAINING",
+        default=bool(profile_defaults.get("allow_training")) and env != "prod",
+    )
 
     supervisor_enabled = _opt_bool("SUPERVISOR_ENABLED", default=True)
     supervisor_tick_s = _opt_int("SUPERVISOR_TICK_S", 2)
@@ -603,12 +789,12 @@ def load_runtime_config() -> RuntimeConfig:
     ingest_congressional_enabled = _opt_bool("INGEST_CONGRESSIONAL_ENABLED", default=False)
     use_pit_universe = _opt_bool("USE_PIT_UNIVERSE", default=False)
     pit_universe_backfill_enabled = _opt_bool("PIT_UNIVERSE_BACKFILL_ENABLED", default=False)
+    validate_workload_profile_guardrails(safety)
     _validate_new_subsystem_flags()
+    validate_data_source_master_key_config(safety)
+    validate_options_instrument_config(safety)
     validate_live_risk_thresholds(safety)
     validate_live_trading_confirmation(safety)
-
-    if strict_runtime and not Path(db_path).is_absolute():
-        raise ConfigError(f"DB_PATH must resolve to an absolute path in supervised/prod mode: {db_path_raw}")
 
     # Hard production safety: do not allow training when prod_lock enabled.
     if prod_lock and allow_training:
@@ -624,6 +810,7 @@ def load_runtime_config() -> RuntimeConfig:
     return RuntimeConfig(
         env=env,
         db_path=db_path,
+        runtime_workload_profile=workload_profile,
         prod_lock=prod_lock,
         allow_training=allow_training,
         supervisor_enabled=supervisor_enabled,

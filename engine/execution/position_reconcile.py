@@ -77,6 +77,19 @@ def _safe_f(x, d: float = 0.0) -> float:
     return float(d)
 
 
+def _safe_int(x: Any, d: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception as e:
+        _warn_nonfatal(
+            "POSITION_RECONCILE_INT_PARSE_FAILED",
+            e,
+            once_key=f"safe_int:{repr(x)[:80]}",
+            value_repr=repr(x),
+        )
+    return int(d)
+
+
 def _safe_int_env(name: str, default: int, *, minimum: int = 0) -> int:
     raw = os.environ.get(str(name))
     try:
@@ -92,6 +105,23 @@ def _safe_int_env(name: str, default: int, *, minimum: int = 0) -> int:
         )
         value = int(default)
     return max(int(minimum), int(value))
+
+
+def _safe_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.environ.get(str(name))
+    try:
+        value = float(str(raw if raw is not None else default).strip())
+    except Exception as e:
+        _warn_nonfatal(
+            "POSITION_RECONCILE_FLOAT_ENV_PARSE_FAILED",
+            e,
+            once_key=f"float_env:{name}",
+            env_name=str(name),
+            value_repr=repr(raw),
+            default=float(default),
+        )
+        value = float(default)
+    return max(float(minimum), float(value))
 
 
 def _fetch_failure_halt_config() -> Tuple[int, int]:
@@ -125,6 +155,61 @@ def _norm_positions(positions: List[Dict[str, Any]], ignore_lt: float) -> Dict[s
             )
             continue
     return out
+
+
+def _normalize_mode(value: Any = None) -> str:
+    return str(value if value is not None else os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+
+
+def configured_position_reconcile_broker(*, engine_mode: Any = None, broker: Optional[str] = None) -> str:
+    if broker is not None and str(broker).strip():
+        raw = str(broker).strip()
+    else:
+        mode = _normalize_mode(engine_mode)
+        raw = ""
+        try:
+            from engine.execution.broker_failover_policy import configured_failover_chain
+
+            chain = [str(item or "").strip() for item in list(configured_failover_chain() or []) if str(item or "").strip()]
+        except Exception as e:
+            _warn_nonfatal(
+                "POSITION_RECONCILE_BROKER_CHAIN_FAILED",
+                e,
+                once_key="broker_chain",
+            )
+            chain = []
+        if mode == "live":
+            raw = (
+                str(os.environ.get("LIVE_BROKER", "") or "").strip()
+                or str(os.environ.get("BROKER", "") or "").strip()
+                or str(os.environ.get("BROKER_NAME", "") or "").strip()
+                or next((item for item in chain if item not in {"sim", "paper", "sandbox"}), "")
+            )
+        elif mode == "paper":
+            raw = (
+                str(os.environ.get("BROKER", "") or "").strip()
+                or str(os.environ.get("BROKER_NAME", "") or "").strip()
+                or (chain[0] if chain else "")
+                or "paper"
+            )
+        else:
+            raw = (
+                str(os.environ.get("BROKER", "") or "").strip()
+                or str(os.environ.get("BROKER_NAME", "") or "").strip()
+                or (chain[0] if chain else "")
+            )
+    try:
+        from engine.execution.broker_failover_policy import canonical_broker_name
+
+        return canonical_broker_name(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "POSITION_RECONCILE_BROKER_CANONICALIZE_FAILED",
+            e,
+            once_key=f"broker_canonical:{raw}",
+            broker=str(raw),
+        )
+        return str(raw or "").strip().lower()
 
 
 def _ensure_schema(con) -> None:
@@ -251,6 +336,56 @@ def _has_column(con, table_name: str, column_name: str) -> bool:
         return False
     target = str(column_name or "").strip().lower()
     return any(str(row[1] or "").strip().lower() == target for row in rows if row and len(row) > 1)
+
+
+def _json_dict_or_empty(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except Exception as e:
+        _warn_nonfatal(
+            "POSITION_RECONCILE_JSON_DICT_PARSE_FAILED",
+            e,
+            once_key=f"json_dict:{text[:80]}",
+            raw_preview=text[:120],
+        )
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _json_list_or_empty(raw: Any) -> List[Any]:
+    if isinstance(raw, list):
+        return list(raw)
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except Exception as e:
+        _warn_nonfatal(
+            "POSITION_RECONCILE_JSON_LIST_PARSE_FAILED",
+            e,
+            once_key=f"json_list:{text[:80]}",
+            raw_preview=text[:120],
+        )
+        return []
+    return list(payload) if isinstance(payload, list) else []
+
+
+def _dedupe_strs(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values or []:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 def _append_reconcile_audit(
@@ -507,17 +642,272 @@ def _compare_position_maps(
     total_abs = 0.0
     max_abs = 0.0
     for sym in sorted(keys):
+        broker_has = sym in (broker_map or {})
+        expected_has = sym in (baseline_map or {})
         bq = _safe_f((broker_map or {}).get(sym), 0.0)
         eq = _safe_f((baseline_map or {}).get(sym), 0.0)
         d = float(bq - eq)
         ad = abs(d)
         if ad <= float(qty_tol):
             continue
-        mismatched.append({"symbol": str(sym), "broker_qty": bq, "expected_qty": eq, "diff_qty": d})
+        if broker_has and not expected_has:
+            mismatch_type = "broker_orphan"
+        elif expected_has and not broker_has:
+            mismatch_type = "expected_orphan"
+        else:
+            mismatch_type = "quantity_mismatch"
+        mismatched.append(
+            {
+                "symbol": str(sym),
+                "broker_qty": bq,
+                "expected_qty": eq,
+                "diff_qty": d,
+                "mismatch_type": mismatch_type,
+            }
+        )
         total_abs += float(ad)
         if ad > max_abs:
             max_abs = float(ad)
     return mismatched, float(total_abs), float(max_abs)
+
+
+def _mismatch_summary(mismatched: List[Dict[str, Any]]) -> Dict[str, int]:
+    broker_orphan_n = 0
+    expected_orphan_n = 0
+    quantity_mismatch_n = 0
+    for item in list(mismatched or []):
+        row = dict(item or {})
+        kind = str(row.get("mismatch_type") or "").strip().lower()
+        if not kind:
+            broker_qty = _safe_f(row.get("broker_qty"), 0.0)
+            expected_qty = _safe_f(row.get("expected_qty"), 0.0)
+            if abs(broker_qty) > 0 and abs(expected_qty) <= 0:
+                kind = "broker_orphan"
+            elif abs(expected_qty) > 0 and abs(broker_qty) <= 0:
+                kind = "expected_orphan"
+            else:
+                kind = "quantity_mismatch"
+        if kind == "broker_orphan":
+            broker_orphan_n += 1
+        elif kind == "expected_orphan":
+            expected_orphan_n += 1
+        else:
+            quantity_mismatch_n += 1
+    return {
+        "broker_orphan_n": int(broker_orphan_n),
+        "expected_orphan_n": int(expected_orphan_n),
+        "quantity_mismatch_n": int(quantity_mismatch_n),
+        "orphan_position_n": int(broker_orphan_n + expected_orphan_n),
+    }
+
+
+def _reconcile_required_for_mode(mode: Any) -> bool:
+    return _normalize_mode(mode) in {"paper", "live"}
+
+
+def _position_reconcile_max_age_s() -> float:
+    return _safe_float_env("POSITION_RECONCILE_EVIDENCE_MAX_AGE_S", 900.0, minimum=0.0)
+
+
+def position_reconcile_evidence_snapshot(
+    *,
+    engine_mode: Any = None,
+    broker: Optional[str] = None,
+    con=None,
+    now_ms: Optional[int] = None,
+    max_age_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Return the latest persisted broker-position reconcile evidence.
+
+    This function intentionally does not call broker APIs or write rows. It is
+    the read-only contract used by startup/readiness/preflight gates.
+    """
+
+    mode = _normalize_mode(engine_mode)
+    required = _reconcile_required_for_mode(mode)
+    resolved_broker = (
+        configured_position_reconcile_broker(engine_mode=mode, broker=broker)
+        if (required or (broker is not None and str(broker).strip()))
+        else ""
+    )
+    ts_ms = int(now_ms if now_ms is not None else _now_ms())
+    max_age = float(max_age_s if max_age_s is not None else _position_reconcile_max_age_s())
+    owns = False
+    if con is None:
+        try:
+            con = connect(readonly=True)
+        except TypeError:
+            con = connect()
+        owns = True
+
+    out: Dict[str, Any] = {
+        "ok": not required,
+        "required": bool(required),
+        "mode": mode,
+        "broker": resolved_broker,
+        "available": False,
+        "exercised": False,
+        "fresh": False,
+        "stale": False,
+        "fatal_reconcile": False,
+        "status": "unavailable",
+        "reason": "ok" if not required else "position_reconcile_not_exercised",
+        "blockers": ([] if not required else ["position_reconcile_not_exercised"]),
+        "updated_ts_ms": None,
+        "age_s": None,
+        "max_age_s": float(max_age),
+        "mismatched_n": 0,
+        "max_abs_qty_diff": 0.0,
+        "total_abs_qty_diff": 0.0,
+        "broker_orphan_n": 0,
+        "expected_orphan_n": 0,
+        "orphan_position_n": 0,
+        "quantity_mismatch_n": 0,
+        "detail": "not_required" if not required else "position_reconcile_audit_missing",
+        "detail_json": {},
+    }
+
+    if required and not resolved_broker:
+        out["reason"] = "position_reconcile_broker_unknown"
+        out["blockers"] = ["position_reconcile_broker_unknown"]
+        out["detail"] = "position_reconcile_broker_unknown"
+        if owns:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "POSITION_RECONCILE_EVIDENCE_CLOSE_FAILED",
+                    e,
+                    once_key="evidence_close_unknown_broker",
+                )
+        return out
+
+    query_failed = False
+    try:
+        params: Tuple[Any, ...]
+        where = ""
+        if resolved_broker:
+            where = "WHERE broker=?"
+            params = (str(resolved_broker),)
+        else:
+            params = ()
+        row = con.execute(
+            f"""
+            SELECT ts_ms, broker, ok, status, mismatched_n, max_abs_qty_diff, total_abs_qty_diff, detail_json
+            FROM position_reconcile_audit
+            {where}
+            ORDER BY ts_ms DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+    except Exception as e:
+        detail = f"position_reconcile_query_failed:{type(e).__name__}:{e}"
+        out.update(
+            {
+                "ok": not required,
+                "available": False,
+                "exercised": False,
+                "fresh": False,
+                "stale": False,
+                "fatal_reconcile": bool(required),
+                "status": "query_failed",
+                "reason": "ok" if not required else "position_reconcile_not_exercised",
+                "blockers": ([] if not required else ["position_reconcile_not_exercised"]),
+                "detail": detail,
+            }
+        )
+        query_failed = True
+    finally:
+        if owns:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "POSITION_RECONCILE_EVIDENCE_CLOSE_FAILED",
+                    e,
+                    once_key="evidence_close",
+                )
+
+    if query_failed:
+        return out
+
+    out["available"] = True
+    if not row:
+        out.update(
+            {
+                "ok": not required,
+                "exercised": False,
+                "fresh": False,
+                "stale": False,
+                "fatal_reconcile": bool(required),
+                "status": "empty",
+                "reason": "ok" if not required else "position_reconcile_not_exercised",
+                "blockers": ([] if not required else ["position_reconcile_not_exercised"]),
+                "detail": "position_reconcile_audit_empty",
+            }
+        )
+        return out
+
+    updated_ts_ms = _safe_int(row[0])
+    row_broker = str(row[1] or "").strip()
+    row_ok = bool(row[2])
+    status = str(row[3] or "").strip() or ("ok" if row_ok else "unknown")
+    detail_json = _json_dict_or_empty(row[7])
+    mismatched_raw = detail_json.get("mismatched")
+    mismatched = [dict(item or {}) for item in _json_list_or_empty(mismatched_raw) if isinstance(item, dict)]
+    if not mismatched and isinstance(mismatched_raw, list):
+        mismatched = [dict(item or {}) for item in mismatched_raw if isinstance(item, dict)]
+    summary = _mismatch_summary(mismatched)
+    mismatched_n = _safe_int(row[4])
+    age_s = round(max(0, ts_ms - int(updated_ts_ms)) / 1000.0, 1) if updated_ts_ms > 0 else None
+    stale = bool(required and (updated_ts_ms <= 0 or (age_s is not None and float(age_s) > float(max_age))))
+    pending = bool(
+        detail_json.get("re_reconcile_pending")
+        or status.endswith("_re_reconcile_pending")
+        or status in {"baseline_bootstrapped_re_reconcile_pending", "baseline_created_re_reconcile_pending"}
+    )
+    fatal = bool((not row_ok) or detail_json.get("fatal_reconcile"))
+    blockers: List[str] = []
+    if required:
+        if stale:
+            blockers.append("position_reconcile_stale")
+        if pending:
+            blockers.append("position_reconcile_recheck_pending")
+        if fatal:
+            if int(summary.get("orphan_position_n") or 0) > 0:
+                blockers.append("position_reconcile_orphan_positions")
+            if mismatched_n > 0:
+                blockers.append("position_reconcile_mismatched_positions")
+            blockers.append("position_reconcile_unhealthy")
+
+    blockers = _dedupe_strs(blockers)
+    out.update(
+        {
+            "ok": not blockers,
+            "available": True,
+            "exercised": True,
+            "fresh": bool(not stale),
+            "stale": bool(stale),
+            "fatal_reconcile": bool(fatal),
+            "status": status,
+            "reason": "ok" if not blockers else blockers[0],
+            "blockers": blockers,
+            "broker": row_broker or resolved_broker,
+            "updated_ts_ms": (int(updated_ts_ms) if updated_ts_ms > 0 else None),
+            "age_s": age_s,
+            "mismatched_n": int(mismatched_n),
+            "max_abs_qty_diff": _safe_f(row[5], 0.0),
+            "total_abs_qty_diff": _safe_f(row[6], 0.0),
+            "broker_orphan_n": int(summary.get("broker_orphan_n") or 0),
+            "expected_orphan_n": int(summary.get("expected_orphan_n") or 0),
+            "orphan_position_n": int(summary.get("orphan_position_n") or 0),
+            "quantity_mismatch_n": int(summary.get("quantity_mismatch_n") or 0),
+            "detail": "ok" if not blockers else blockers[0],
+            "detail_json": detail_json,
+        }
+    )
+    return out
 
 
 def _load_baseline(con, broker: str) -> Optional[Dict[str, float]]:
@@ -999,6 +1389,7 @@ def pre_live_position_reconcile(
                 "mismatched_n": int(len(mismatched)),
                 "qty_tol": float(qty_tol),
                 "ignore_lt": float(ignore_lt),
+                **_mismatch_summary(mismatched),
             }
             _set_re_reconcile_pending(
                 con,
@@ -1055,6 +1446,7 @@ def pre_live_position_reconcile(
             "qty_tol": float(qty_tol),
             "ignore_lt": float(ignore_lt),
             "max_mismatched": int(max_mismatched),
+            **_mismatch_summary(mismatched),
         }
 
         if not owns_txn:

@@ -39,9 +39,10 @@ from engine.runtime import dbapi_compat as dbapi
 from engine.runtime.failure_diagnostics import log_failure
 from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
 from engine.runtime.storage import connect, connect_rw_direct, run_write_txn
-from engine.execution.almgren_chriss import estimate_almgren_chriss_costs  # legacy patch target
+from engine.execution.almgren_chriss import estimate_almgren_chriss_costs  # noqa: F401 - compatibility patch target covered by tests/test_broker_order_idempotency_regressions.py.
 from engine.execution.deployable_capital import compute_deployable_equity
 from engine.execution.execution_liquidity_model import get_execution_liquidity_snapshot
+from engine.execution.lob_simulation import build_reactive_lob_simulation
 from engine.execution.order_idempotency import (
     claim_order_submission,
     mark_order_submission_submitted,
@@ -1868,6 +1869,7 @@ def apply_new_portfolio_orders(
 
         wrote_fills = False
         fills_written = 0
+        submitted_count = min(len(orders or []), int(max_rows))
 
         for o in (orders or [])[: int(max_rows)]:
             symbol = str(o.get("symbol") or "").strip()
@@ -2072,7 +2074,7 @@ def apply_new_portfolio_orders(
                     "order_uid": str(guard.get("order_uid") or ""),
                     "client_order_id": str(guard.get("client_order_id") or ""),
                     "symbol": str(symbol),
-                    "submitted_n": int(n),
+                    "submitted_n": int(submitted_count),
                 }
             if bool(guard.get("duplicate")):
                 continue
@@ -2316,6 +2318,36 @@ def apply_new_portfolio_orders(
                         symbol=str(symbol),
                     )
 
+                lob_simulation = build_reactive_lob_simulation(
+                    con,
+                    symbol=str(symbol),
+                    side=str(chunk_side),
+                    qty=float(abs(qty_cap)),
+                    mid_px=float(px_mid_use),
+                    order_type=str(order_type_eff),
+                    aggressiveness=str(aggressiveness),
+                    ts_ms=int(fill_ts),
+                    latency_ms=int(local_latency_ms),
+                    liquidity_snapshot=liquidity_snapshot,
+                )
+                lob_applied = bool(lob_simulation.get("applied"))
+                lob_adverse_bps = (
+                    max(0.0, _safe_f(lob_simulation.get("adverse_selection_bps"), 0.0))
+                    if lob_applied
+                    else 0.0
+                )
+                lob_impact_bps = (
+                    max(0.0, _safe_f(lob_simulation.get("market_impact_bps"), 0.0))
+                    if lob_applied
+                    else 0.0
+                )
+                lob_sweep_bps = (
+                    max(0.0, _safe_f(lob_simulation.get("sweep_bps"), 0.0))
+                    if lob_applied
+                    else 0.0
+                )
+                chunk_lob_slip_bps = float(local_slip_bps) + float(lob_adverse_bps) + float(lob_impact_bps) + float(lob_sweep_bps)
+
                 # Choose effective order type for this chunk
                 if order_type_eff == "LIMIT":
                     # LIMIT improves price relative to market baseline.
@@ -2352,6 +2384,17 @@ def apply_new_portfolio_orders(
                     u = _u01(f"{order_id}|{symbol}|{chunk_idx}|{fill_ts}|{order_type_eff}|{aggressiveness}")
                     jitter = float(_clamp((u - 0.5) * 0.10, -0.05, 0.05))
                     fill_frac = float(_clamp(fill_frac + jitter, 0.20, 1.0))
+                    if lob_applied:
+                        fill_frac = float(fill_frac) * float(
+                            _clamp(_safe_f(lob_simulation.get("fill_probability_mult"), 1.0), 0.05, 1.0)
+                        )
+                        fill_frac = min(
+                            float(fill_frac),
+                            float(_clamp(_safe_f(lob_simulation.get("partial_fill_cap"), 1.0), 0.05, 1.0)),
+                        )
+                        if bool(lob_simulation.get("spread_crossed")):
+                            fill_frac = max(float(fill_frac), 0.95)
+                        fill_frac = float(_clamp(fill_frac, 0.05, 1.0))
 
                     # apply partial fill
                     qty_cap = float(qty_cap) * float(fill_frac)
@@ -2391,7 +2434,7 @@ def apply_new_portfolio_orders(
                         chunk_side,
                         trade_notional=notional_est,
                         equity=equity,
-                        slip_bps_override=float(local_slip_bps) + float(ac_exec_bps),
+                        slip_bps_override=float(chunk_lob_slip_bps) + float(ac_exec_bps),
                         spread_bps_override=float(exec_spread_bps),
                     )
                 if order_type_eff == "LIMIT":
@@ -2404,7 +2447,10 @@ def apply_new_portfolio_orders(
                         liquidity_snapshot=liquidity_snapshot,
                     )
                     ac_exec_bps = float(almgren_chriss.get("execution_cost_bps") or 0.0)
-                    impact_px = _impact_px_from_bps(float(px_mid_use), float(ac_exec_bps))
+                    impact_px = _impact_px_from_bps(
+                        float(px_mid_use),
+                        float(ac_exec_bps) + float(lob_adverse_bps) + float(lob_impact_bps),
+                    )
                     if chunk_side == "BUY":
                         px_exec = max(0.0, float(px_exec) + float(impact_px))
                     else:
@@ -2484,7 +2530,9 @@ def apply_new_portfolio_orders(
                     },
 
                     "spread_bps": float(exec_spread_bps),
-                    "slippage_bps": float(local_slip_bps),
+                    "slippage_bps": float(chunk_lob_slip_bps),
+                    "base_slippage_bps": float(local_slip_bps),
+                    "lob_simulation": dict(lob_simulation or {}),
                     "almgren_chriss": dict(almgren_chriss or {}),
                     "almgren_chriss_execution_cost_bps": float(almgren_chriss.get("execution_cost_bps") or 0.0),
                     "expected_price": float(px_mid_use),
@@ -2522,7 +2570,9 @@ def apply_new_portfolio_orders(
                     fees=float(fee),
                     note=(
                         f"spread_bps={float(exec_spread_bps):.4f} "
-                        f"slippage_bps={float(local_slip_bps):.4f} "
+                        f"slippage_bps={float(chunk_lob_slip_bps):.4f} "
+                        f"lob_adv_bps={float(lob_adverse_bps):.4f} "
+                        f"lob_impact_bps={float(lob_impact_bps):.4f} "
                         f"ac_bps={float(almgren_chriss.get('execution_cost_bps') or 0.0):.4f} "
                         f"fee_bps={BROKER_FEE_BPS}"
                     ),
@@ -2575,11 +2625,11 @@ def apply_new_portfolio_orders(
                                 float(px_exec),
                                 float(exec_spread_bps),
                                 float(BROKER_FEE_BPS),
-                                float(local_slip_bps),
+                                float(chunk_lob_slip_bps),
                                 float(exec_spread_bps),
                                 float(
                                     BROKER_FEE_BPS
-                                    + float(local_slip_bps)
+                                    + float(chunk_lob_slip_bps)
                                     + float(exec_spread_bps)
                                     + float(almgren_chriss.get("execution_cost_bps") or 0.0)
                                 ),

@@ -13,7 +13,6 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 import psycopg
@@ -25,21 +24,26 @@ import sqlparse
 from engine.runtime.platform import default_data_root
 from engine.runtime.storage_dialect import to_pg_params
 from engine.runtime.storage_pool import (
-    StoragePoolTimeout,
     acquire,
-    assert_storage_ready,
     close_pool,
-    is_storage_acquisition_error,
     pool_snapshot,
-    probe_storage_readiness,
     release,
     storage_readiness_snapshot,
-    storage_unavailable_payload,
 )
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+def _load_expected_schema_version() -> int:
+    try:
+        from engine.runtime.schema.migrator import expected_schema_version
+
+        return int(expected_schema_version())
+    except Exception:
+        LOGGER.debug("postgres_expected_schema_version_load_failed", exc_info=True)
+        return 1
+
+
+SCHEMA_VERSION = _load_expected_schema_version()
 DB_PATH = default_data_root()
 
 PG_LIVENESS_DB_ENABLED = False
@@ -287,6 +291,9 @@ class StorageConnection:
     def begin_managed_write(self) -> None:
         if self.readonly:
             raise psycopg.OperationalError("write_transaction_not_allowed_on_readonly_connection")
+        if not self.in_transaction:
+            with self._raw.cursor() as cur:
+                cur.execute("BEGIN")
 
     def execute(self, sql: str, params: Any = None):
         synthetic = _synthetic_cursor(self, sql, params)
@@ -824,7 +831,9 @@ def _ensure_autoinit_schema() -> None:
 
 
 def connect(readonly: bool = False, **_: Any) -> StorageConnection:
-    _ensure_autoinit_schema()
+    skip_autoinit = bool(_.pop("_skip_autoinit", False))
+    if not skip_autoinit:
+        _ensure_autoinit_schema()
     timeout_s = _.get("timeout_s")
     return StorageConnection(acquire(timeout_s=timeout_s), readonly=bool(readonly), timeout_s=timeout_s)
 
@@ -838,6 +847,7 @@ def connect_ro_direct(**kwargs: Any) -> StorageConnection:
 
 
 def connect_rw_direct(**kwargs: Any) -> StorageConnection:
+    kwargs.setdefault("_skip_autoinit", True)
     return connect(readonly=False, **kwargs)
 
 
@@ -1039,6 +1049,7 @@ def apply_migrations() -> list[int]:
     applied = _apply()
     _ensure_sqlite_compat_bigints()
     _ensure_walk_forward_registry_columns()
+    _ensure_backend_compat_schema()
     _PK_CACHE.clear()
     return applied
 
@@ -1108,6 +1119,62 @@ def _ensure_walk_forward_registry_columns() -> None:
         con.commit()
 
 
+def _ensure_backend_compat_schema() -> None:
+    with connection(readonly=False) as con:
+        def _ensure_index(table: str, index: str, columns: Sequence[str]) -> None:
+            if not _compat_table_exists(con, table):
+                return
+            available = _table_columns(con, table)
+            if not set(columns).issubset(available):
+                return
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                f"{_ident(index)} ON {_ident(table)} ({_identifier_csv(tuple(columns))})"
+            )
+
+        con.execute("ALTER TABLE labels ADD COLUMN IF NOT EXISTS impact_z DOUBLE PRECISION")
+        con.execute("ALTER TABLE labels ADD COLUMN IF NOT EXISTS created_at_ms BIGINT")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS labels_price (
+              ts_pred_ms BIGINT NOT NULL,
+              ts_eval_ms BIGINT NOT NULL,
+              symbol TEXT NOT NULL,
+              horizon_s BIGINT NOT NULL,
+              entry_price DOUBLE PRECISION NOT NULL,
+              exit_price DOUBLE PRECISION NOT NULL,
+              ret DOUBLE PRECISION NOT NULL,
+              ret_z DOUBLE PRECISION,
+              dir BIGINT,
+              PRIMARY KEY(ts_pred_ms, symbol, horizon_s)
+            )
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_labels_price_eval ON labels_price(ts_eval_ms)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_labels_price_symbol_eval ON labels_price(symbol, ts_eval_ms)")
+
+        if _compat_table_exists(con, "model_promotion_audit"):
+            con.execute("ALTER TABLE model_promotion_audit ADD COLUMN IF NOT EXISTS details_json JSONB")
+            con.execute("ALTER TABLE model_promotion_audit ADD COLUMN IF NOT EXISTS prev_hash BYTEA")
+            con.execute("ALTER TABLE model_promotion_audit ADD COLUMN IF NOT EXISTS row_hash BYTEA")
+            con.execute(
+                "ALTER TABLE model_promotion_audit ALTER COLUMN ts_ms "
+                "SET DEFAULT ((EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)"
+            )
+            con.execute("ALTER TABLE model_promotion_audit ALTER COLUMN action SET DEFAULT 'audit_chain_append'")
+            con.execute("ALTER TABLE model_promotion_audit ALTER COLUMN model_name SET DEFAULT ''")
+
+        if _compat_table_exists(con, "model_hyperparameter_registry"):
+            con.execute("ALTER TABLE model_hyperparameter_registry ADD COLUMN IF NOT EXISTS symbol TEXT")
+            con.execute("ALTER TABLE model_hyperparameter_registry ADD COLUMN IF NOT EXISTS seed BIGINT")
+
+        _ensure_index("execution_orders", "idx_execution_orders_submit_ts", ("submit_ts_ms",))
+        _ensure_index("execution_orders", "idx_execution_orders_source_alert", ("source_alert_id",))
+        _ensure_index("execution_fills", "idx_execution_fills_ts", ("fill_ts_ms",))
+        _ensure_index("execution_fills", "idx_execution_fills_client", ("client_order_id",))
+        con.commit()
+
+
 def _ensure_alert_prediction_schema() -> None:
     with connection(readonly=False) as con:
         if _compat_table_exists(con, "alerts"):
@@ -1121,38 +1188,319 @@ def _ensure_alert_prediction_schema() -> None:
         con.commit()
 
 
+_PG_REQUIRED_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "schema_migrations": ("id", "description", "applied_at"),
+    "alert_acks": ("alert_id", "acked_ts_ms", "acked_by", "source", "expires_ts_ms", "reason"),
+    "alert_shelves": (
+        "alert_id",
+        "shelved_ts_ms",
+        "expires_ts_ms",
+        "shelved_by",
+        "reason",
+        "source",
+        "severity",
+        "detail_json",
+    ),
+    "alert_lifecycle_events": (
+        "id",
+        "alert_id",
+        "ts_ms",
+        "lifecycle_state",
+        "actor",
+        "reason",
+        "source",
+        "detail_json",
+    ),
+}
+
+_PG_REQUIRED_INDEXES: tuple[str, ...] = ("idx_alert_lifecycle_events_alert_ts",)
+
+
+def _current_expected_schema_version() -> int:
+    try:
+        from engine.runtime.schema.migrator import expected_schema_version
+
+        return int(expected_schema_version())
+    except Exception:
+        LOGGER.debug("postgres_expected_schema_version_refresh_failed", exc_info=True)
+        return int(SCHEMA_VERSION)
+
+
+def _expected_migration_ids() -> tuple[int, ...]:
+    try:
+        from engine.runtime.schema.migrator import expected_migration_ids
+
+        return tuple(int(item) for item in expected_migration_ids())
+    except Exception:
+        LOGGER.debug("postgres_expected_migration_ids_load_failed", exc_info=True)
+        return (int(SCHEMA_VERSION),)
+
+
+def _validation_contract() -> tuple[dict[str, tuple[str, ...]], tuple[str, ...]]:
+    from engine.runtime.storage_sqlite import _REQUIRED_INDEXES, _REQUIRED_TABLE_COLUMNS
+
+    required_columns = {str(table): tuple(str(col) for col in cols) for table, cols in _REQUIRED_TABLE_COLUMNS.items()}
+    for table, cols in _PG_REQUIRED_TABLE_COLUMNS.items():
+        existing = tuple(required_columns.get(str(table), ()))
+        required_columns[str(table)] = tuple(dict.fromkeys((*existing, *(str(col) for col in cols))))
+    required_indexes = tuple(dict.fromkeys((*_REQUIRED_INDEXES, *_PG_REQUIRED_INDEXES)))
+    return required_columns, required_indexes
+
+
+def _validation_table_columns(con: StorageConnection, table: str) -> dict[str, dict[str, Any]]:
+    rows = con.execute(
+        """
+        SELECT
+          c.column_name,
+          UPPER(c.data_type) AS data_type,
+          c.udt_name,
+          CASE WHEN c.is_nullable = 'NO' THEN 1 ELSE 0 END AS notnull,
+          c.column_default,
+          COALESCE(pk.ordinal_position, 0) AS pk
+        FROM information_schema.columns c
+        LEFT JOIN (
+          SELECT
+            k.table_schema,
+            k.table_name,
+            k.column_name,
+            k.ordinal_position
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage k
+            ON k.table_schema = tc.table_schema
+           AND k.table_name = tc.table_name
+           AND k.constraint_name = tc.constraint_name
+          WHERE tc.constraint_type = 'PRIMARY KEY'
+        ) pk
+          ON pk.table_schema = c.table_schema
+         AND pk.table_name = c.table_name
+         AND pk.column_name = c.column_name
+        WHERE c.table_schema = current_schema()
+          AND c.table_name = ?
+        ORDER BY c.ordinal_position
+        """,
+        (str(table),),
+    ).fetchall() or []
+    return {
+        str(row[0]): {
+            "type": str(row[1] or "").upper(),
+            "udt_name": str(row[2] or "").lower(),
+            "notnull": bool(row[3]),
+            "default": None if row[4] is None else str(row[4]),
+            "pk": int(row[5] or 0),
+        }
+        for row in rows
+    }
+
+
+def _validation_index_names(con: StorageConnection) -> set[str]:
+    rows = con.execute(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+        UNION
+        SELECT c.relname
+        FROM pg_class c
+        JOIN pg_namespace n
+          ON n.oid = c.relnamespace
+        WHERE n.nspname = current_schema()
+          AND c.relkind IN ('i', 'I')
+        """
+    ).fetchall() or []
+    return {str(row[0]) for row in rows}
+
+
+def _expected_type_matches_pg(*, expected: str, actual: str, udt_name: str, column_name: str) -> bool:
+    expected_type = str(expected or "").strip().upper()
+    actual_type = str(actual or "").strip().upper()
+    actual_udt = str(udt_name or "").strip().lower()
+    column = str(column_name or "").strip().lower()
+    if expected_type == "INTEGER":
+        return actual_type in {"SMALLINT", "INTEGER", "BIGINT"} or actual_udt in {"int2", "int4", "int8"}
+    if expected_type == "REAL":
+        return actual_type in {"REAL", "DOUBLE PRECISION", "NUMERIC"} or actual_udt in {"float4", "float8", "numeric"}
+    if expected_type == "TEXT":
+        if actual_type in {"TEXT", "CHARACTER VARYING", "CHARACTER"} or actual_udt in {"text", "varchar", "bpchar"}:
+            return True
+        return column.endswith("_json") and actual_type in {"JSON", "JSONB"} and actual_udt in {"json", "jsonb"}
+    if expected_type == "BLOB":
+        return actual_type == "BYTEA" or actual_udt == "bytea"
+    return expected_type == actual_type or expected_type == actual_udt.upper()
+
+
 def get_db_validation_snapshot(*, include_quick_check: bool = True, strict: bool = False) -> dict[str, Any]:
     del include_quick_check
+    have_tables: list[str] = []
+    missing_tables: list[str] = []
+    missing_columns: dict[str, list[str]] = {}
+    missing_indexes: list[str] = []
+    owned_missing_tables: list[str] = []
+    owned_missing_columns: dict[str, list[str]] = {}
+    owned_unexpected_columns: dict[str, list[str]] = {}
+    owned_type_mismatches: dict[str, dict[str, dict[str, str]]] = {}
+    owned_pk_mismatches: dict[str, dict[str, dict[str, int]]] = {}
+    owned_missing_indexes: dict[str, list[str]] = {}
+    schema_migration_ids: list[int] = []
+    missing_migration_ids: list[int] = []
+    unexpected_migration_ids: list[int] = []
+    schema_version: int | None = None
+    schema_status = "missing"
+    expected_version = _current_expected_schema_version()
+    expected_ids = _expected_migration_ids()
     try:
         with connection(readonly=True) as con:
-            tables = [
+            required_columns, required_indexes = _validation_contract()
+            have_tables = [
                 str(row[0])
                 for row in con.execute(
                     """
                     SELECT table_name
                     FROM information_schema.tables
-            WHERE table_schema = current_schema()
+                    WHERE table_schema = current_schema()
+                      AND table_type = 'BASE TABLE'
                     ORDER BY table_name
                     """
                 ).fetchall()
             ]
-            row = con.execute("SELECT MAX(id) FROM schema_migrations").fetchone() if "schema_migrations" in tables else None
-            version = int(row[0] or 0) if row else 0
+            have_set = set(have_tables)
+            for table, columns in required_columns.items():
+                if table not in have_set:
+                    missing_tables.append(table)
+                    continue
+                actual = _validation_table_columns(con, table)
+                missing = [col for col in columns if col not in actual]
+                if missing:
+                    missing_columns[table] = missing
+
+            index_names = _validation_index_names(con)
+            missing_indexes = sorted(name for name in required_indexes if name not in index_names)
+
+            if "schema_migrations" in have_set:
+                schema_migration_ids = [
+                    int(row[0])
+                    for row in con.execute("SELECT id FROM schema_migrations ORDER BY id").fetchall()
+                    if row and row[0] is not None
+                ]
+                schema_version = max(schema_migration_ids) if schema_migration_ids else None
+                actual_ids = set(schema_migration_ids)
+                expected_id_set = set(expected_ids)
+                missing_migration_ids = [item for item in expected_ids if item not in actual_ids]
+                unexpected_migration_ids = sorted(item for item in actual_ids if item not in expected_id_set)
+                if schema_migration_ids and not missing_migration_ids and not unexpected_migration_ids:
+                    schema_status = "applied"
+                elif missing_migration_ids:
+                    schema_status = "stale"
+                elif unexpected_migration_ids:
+                    schema_status = "unexpected"
+                else:
+                    schema_status = "empty"
+            else:
+                missing_migration_ids = list(expected_ids)
+                schema_status = "missing_schema_migrations"
+
+            from engine.runtime.storage_live_ingestion_schema import (
+                OWNED_LIVE_TABLE_COLUMN_SPECS,
+                OWNED_LIVE_TABLE_REQUIRED_INDEXES,
+            )
+
+            for table, expected_specs in OWNED_LIVE_TABLE_COLUMN_SPECS.items():
+                if table not in have_set:
+                    owned_missing_tables.append(table)
+                    continue
+                actual = _validation_table_columns(con, table)
+                expected_cols = set(expected_specs)
+                actual_cols = set(actual)
+                missing = sorted(expected_cols - actual_cols)
+                unexpected = sorted(actual_cols - expected_cols)
+                if missing:
+                    owned_missing_columns[table] = missing
+                if unexpected:
+                    owned_unexpected_columns[table] = unexpected
+                type_diff: dict[str, dict[str, str]] = {}
+                pk_diff: dict[str, dict[str, int]] = {}
+                for column_name, expected_spec in expected_specs.items():
+                    if column_name not in actual:
+                        continue
+                    expected_type = str((expected_spec or {}).get("type") or "")
+                    actual_spec = actual[column_name]
+                    if not _expected_type_matches_pg(
+                        expected=expected_type,
+                        actual=str(actual_spec.get("type") or ""),
+                        udt_name=str(actual_spec.get("udt_name") or ""),
+                        column_name=str(column_name),
+                    ):
+                        type_diff[column_name] = {
+                            "expected": expected_type,
+                            "actual": str(actual_spec.get("type") or ""),
+                        }
+                    actual_pk = int(actual_spec.get("pk") or 0)
+                    expected_pk = int((expected_spec or {}).get("pk") or 0)
+                    if actual_pk != expected_pk:
+                        pk_diff[column_name] = {"expected": expected_pk, "actual": actual_pk}
+                if type_diff:
+                    owned_type_mismatches[table] = type_diff
+                if pk_diff:
+                    owned_pk_mismatches[table] = pk_diff
+                missing_owned_indexes = [
+                    name
+                    for name in OWNED_LIVE_TABLE_REQUIRED_INDEXES.get(table, ())
+                    if name not in index_names
+                ]
+                if missing_owned_indexes:
+                    owned_missing_indexes[table] = sorted(missing_owned_indexes)
+
+            schema_version_ok = (
+                schema_version is not None
+                and int(schema_version) == int(expected_version)
+                and not missing_migration_ids
+                and not unexpected_migration_ids
+                and schema_status == "applied"
+            )
+            owned_drift_tables = sorted(
+                set(owned_missing_tables)
+                | set(owned_missing_columns)
+                | set(owned_unexpected_columns)
+                | set(owned_type_mismatches)
+                | set(owned_pk_mismatches)
+                | set(owned_missing_indexes)
+            )
+            owned_schema_ok = not owned_drift_tables
+            ok = (
+                not missing_tables
+                and not missing_columns
+                and not missing_indexes
+                and bool(schema_version_ok)
+                and bool(owned_schema_ok)
+            )
         return {
-            "ok": True,
+            "ok": bool(ok),
             "storage": "postgres",
-            "have_tables": tables,
-            "schema_version": version,
-            "expected_schema_version": SCHEMA_VERSION,
-            "schema_version_ok": version >= SCHEMA_VERSION,
-            "owned_schema_ok": True,
-            "owned_drift_tables": [],
-            "owned_missing_tables": [],
-            "owned_missing_columns": {},
-            "owned_unexpected_columns": {},
-            "owned_type_mismatches": {},
-            "owned_pk_mismatches": {},
-            "owned_missing_indexes": {},
+            "backend": "postgres",
+            "have_tables": list(have_tables),
+            "required_tables": list(required_columns.keys()),
+            "required_columns": {table: list(cols) for table, cols in required_columns.items()},
+            "required_indexes": list(required_indexes),
+            "missing_tables": list(missing_tables),
+            "missing_columns": dict(missing_columns),
+            "missing_cols": dict(missing_columns),
+            "missing_indexes": list(missing_indexes),
+            "schema_version": (int(schema_version) if schema_version is not None else None),
+            "expected_schema_version": int(expected_version),
+            "expected_migration_ids": list(expected_ids),
+            "schema_migration_ids": list(schema_migration_ids),
+            "schema_migration_missing_ids": list(missing_migration_ids),
+            "schema_migration_unexpected_ids": list(unexpected_migration_ids),
+            "schema_version_ok": bool(schema_version_ok),
+            "schema_status": str(schema_status),
+            "owned_tables": list(OWNED_LIVE_TABLE_COLUMN_SPECS.keys()),
+            "owned_schema_ok": bool(owned_schema_ok),
+            "owned_drift_tables": list(owned_drift_tables),
+            "owned_missing_tables": list(owned_missing_tables),
+            "owned_missing_columns": dict(owned_missing_columns),
+            "owned_unexpected_columns": dict(owned_unexpected_columns),
+            "owned_type_mismatches": dict(owned_type_mismatches),
+            "owned_pk_mismatches": dict(owned_pk_mismatches),
+            "owned_missing_indexes": dict(owned_missing_indexes),
             "quick_check": "not_applicable",
             "ts_ms": int(time.time() * 1000),
         }
@@ -1163,17 +1511,26 @@ def get_db_validation_snapshot(*, include_quick_check: bool = True, strict: bool
             "ok": False,
             "storage": "postgres",
             "error": f"{type(exc).__name__}: {exc}",
-            "schema_version": None,
-            "expected_schema_version": SCHEMA_VERSION,
+            "schema_version": schema_version,
+            "expected_schema_version": int(expected_version),
+            "expected_migration_ids": list(expected_ids),
+            "schema_migration_ids": list(schema_migration_ids),
+            "schema_migration_missing_ids": list(missing_migration_ids),
+            "schema_migration_unexpected_ids": list(unexpected_migration_ids),
             "schema_version_ok": False,
+            "schema_status": str(schema_status),
+            "missing_tables": list(missing_tables),
+            "missing_columns": dict(missing_columns),
+            "missing_cols": dict(missing_columns),
+            "missing_indexes": list(missing_indexes),
             "owned_schema_ok": False,
             "owned_drift_tables": [],
-            "owned_missing_tables": [],
-            "owned_missing_columns": {},
-            "owned_unexpected_columns": {},
-            "owned_type_mismatches": {},
-            "owned_pk_mismatches": {},
-            "owned_missing_indexes": {},
+            "owned_missing_tables": list(owned_missing_tables),
+            "owned_missing_columns": dict(owned_missing_columns),
+            "owned_unexpected_columns": dict(owned_unexpected_columns),
+            "owned_type_mismatches": dict(owned_type_mismatches),
+            "owned_pk_mismatches": dict(owned_pk_mismatches),
+            "owned_missing_indexes": dict(owned_missing_indexes),
             "ts_ms": int(time.time() * 1000),
         }
 
@@ -1323,6 +1680,18 @@ def _insert_dict(table: str, row: dict[str, Any], *, returning_id: bool = False,
     return run_write_txn(_write)
 
 
+def _table_columns(con: StorageConnection, table: str) -> set[str]:
+    try:
+        return {
+            str(row[1] or "")
+            for row in (con.execute(f"PRAGMA table_info({_ident(table)})").fetchall() or [])
+            if row and len(row) > 1
+        }
+    except Exception:
+        logging.getLogger(__name__).debug("postgres_table_columns_probe_failed", exc_info=True)
+        return set()
+
+
 def _upsert_dict(
     table: str,
     row: dict[str, Any],
@@ -1333,7 +1702,6 @@ def _upsert_dict(
     con: StorageConnection | None = None,
 ) -> int:
     table_name = _ident(table)
-    conflict = _ident(conflict_column)
     conflict_names = tuple(
         str(col)
         for col in (conflict_columns or (conflict_column,))
@@ -1434,16 +1802,58 @@ def put_normalized_event(event: dict[str, Any], con: StorageConnection | None = 
         "dedupe_hash": payload.get("dedupe_hash"),
         "meta_json": meta,
     }
-    if row.get("event_key"):
-        return _upsert_dict(
-            "events",
-            row,
-            conflict_column="event_key",
-            conflict_columns=("event_key", "ts_ms"),
-            returning_id=True,
-            con=con,
+    def _write(db: StorageConnection) -> int:
+        if row.get("event_key"):
+            event_id = int(
+                _upsert_dict(
+                    "events",
+                    row,
+                    conflict_column="event_key",
+                    conflict_columns=("event_key", "ts_ms"),
+                    returning_id=True,
+                    con=db,
+                )
+                or 0
+            )
+        else:
+            event_id = int(_insert_dict("events", row, returning_id=True, con=db) or 0)
+        _put_structured_document_events_for_normalized_event(db, row=row, event_id=event_id)
+        return int(event_id)
+
+    if con is not None:
+        return _write(con)
+    return run_write_txn(_write)
+
+
+def _put_structured_document_events_for_normalized_event(
+    con: StorageConnection,
+    *,
+    row: dict[str, Any],
+    event_id: int,
+) -> None:
+    event_type = str((row or {}).get("event_type") or "").strip().lower()
+    if event_type not in {"news", "filing", "transcript"}:
+        return
+    try:
+        from engine.data.structured_document_events import (
+            extract_structured_document_events,
+            put_structured_document_events,
         )
-    return _insert_dict("events", row, returning_id=True, con=con)
+
+        payload = dict(row or {})
+        payload["event_id"] = int(event_id or 0)
+        records = extract_structured_document_events(payload)
+        if records:
+            put_structured_document_events(con, records)
+    except Exception as exc:
+        _warn_nonfatal(
+            "STRUCTURED_DOCUMENT_EVENT_EXTRACTION_FAILED",
+            exc,
+            event_type=event_type,
+            event_id=int(event_id or 0),
+            source=str((row or {}).get("source") or ""),
+            symbol=str((row or {}).get("symbol") or ""),
+        )
 
 
 def put_price(ts_ms, symbol, price, source: str = "runtime", con: StorageConnection | None = None):
@@ -2091,12 +2501,13 @@ def record_drift_retrain_event(**kwargs: Any) -> int:
 
 
 def record_model_hyperparameter_registry(con: StorageConnection | None = None, **kwargs: Any) -> int:
-    row = dict(kwargs or {})
-    row.setdefault("ts", int(time.time() * 1000))
+    row = _normalise_model_hparam_row(dict(kwargs or {}))
 
     def _write(db: StorageConnection) -> int:
-        registry_id = int(_insert_dict("model_hyperparameter_registry", row, returning_id=True, con=db) or 0)
-        params = row.get("params") or {}
+        available = _table_columns(db, "model_hyperparameter_registry")
+        registry_row = {key: value for key, value in row.items() if key in available}
+        registry_id = int(_insert_dict("model_hyperparameter_registry", registry_row, returning_id=True, con=db) or 0)
+        params = _json_payload(row.get("params")) or _json_payload(row.get("params_json")) or {}
         if isinstance(params, dict) and row.get("model_family"):
             upsert_model_best_params(
                 model_family=str(row.get("model_family") or ""),
@@ -2186,6 +2597,24 @@ def _format_plain_row(row: Any, columns: Sequence[str], *, json_columns: Sequenc
         else:
             out[key] = _json_safe_value(out[key])
     return out
+
+
+def _normalise_model_hparam_row(row: dict[str, Any]) -> dict[str, Any]:
+    clean = dict(row or {})
+    clean.setdefault("ts", int(time.time() * 1000))
+    clean.setdefault("symbol", "GLOBAL")
+    clean.setdefault("study_name", "")
+    clean.setdefault("tuner", "")
+    clean.setdefault("objective", "")
+    clean.setdefault("trial_count", 0)
+    clean.setdefault("best_trial_number", 0)
+    params = clean.get("params")
+    params_json = clean.get("params_json")
+    if params_json in (None, "") and params not in (None, ""):
+        clean["params_json"] = params
+    if params in (None, "") and params_json not in (None, ""):
+        clean["params"] = params_json
+    return clean
 
 
 def _bounded_limit(limit: int | None, *, default: int = 20, maximum: int = 500) -> int:
@@ -2575,13 +3004,17 @@ def fetch_recent_promotion_statistical_evidence(
     if model_id:
         extra_where.append("model_id=?")
         extra_params.append(str(model_id))
-    return _fetch_audit_records(
+    rows = _fetch_audit_records(
         "promotion_statistical_evidence",
         limit=limit,
         con=con,
         extra_where=extra_where,
         extra_params=extra_params,
     )
+    for row in rows:
+        if "payload" not in row and "payload_json" in row:
+            row["payload"] = _json_read_value(row.get("payload_json"))
+    return rows
 
 
 def fetch_recent_decisions(
@@ -2618,13 +3051,76 @@ def fetch_latest_model_hyperparameters(*args: Any, **kwargs: Any):
     if args:
         kwargs.setdefault("model_family", args[0])
     model_family = str(kwargs.get("model_family") or "").strip()
+    model_name = str(kwargs.get("model_name") or "").strip()
     if not model_family:
-        model_name = str(kwargs.get("model_name") or "").strip()
         model_family = model_name.split(":", 1)[0] if model_name else ""
     if not model_family:
         return None
-    symbol = str(kwargs.get("symbol") or "GLOBAL")
-    return fetch_model_best_params(model_family=model_family, symbol=symbol, con=kwargs.get("con"))
+
+    owns = kwargs.get("con") is None
+    db = kwargs.get("con") or connect(readonly=True)
+    try:
+        if _table_exists(db, "model_hyperparameter_registry"):
+            available = _table_columns(db, "model_hyperparameter_registry")
+            desired = (
+                "id",
+                "ts",
+                "model_family",
+                "model_name",
+                "symbol",
+                "tuner",
+                "objective",
+                "study_name",
+                "params",
+                "params_json",
+                "metric_value",
+                "trial_count",
+                "best_trial_number",
+                "seed",
+                "cpcv_mean_sharpe",
+                "cpcv_median_sharpe",
+                "cpcv_pbo",
+                "diagnostics",
+            )
+            columns = tuple(column for column in desired if column in available)
+            if columns:
+                filters = ["model_family=?"]
+                params: list[Any] = [model_family]
+                if model_name and "model_name" in available:
+                    filters.append("model_name=?")
+                    params.append(model_name)
+                tuner = kwargs.get("tuner")
+                if tuner not in (None, "") and "tuner" in available:
+                    filters.append("tuner=?")
+                    params.append(str(tuner))
+                symbol_filter = kwargs.get("symbol")
+                if symbol_filter not in (None, "") and "symbol" in available:
+                    filters.append("symbol=?")
+                    params.append(str(symbol_filter).strip().upper() or "GLOBAL")
+                row = db.execute(
+                    f"""
+                    SELECT {', '.join(_ident(column) for column in columns)}
+                    FROM model_hyperparameter_registry
+                    WHERE {' AND '.join(filters)}
+                    ORDER BY ts DESC, id DESC
+                    LIMIT 1
+                    """,
+                    tuple(params),
+                ).fetchone()
+                if row:
+                    out = _format_plain_row(row, columns, json_columns=("params", "params_json", "diagnostics"))
+                    params_value = out.get("params")
+                    if not isinstance(params_value, dict):
+                        params_value = out.get("params_json")
+                    out["params"] = dict(params_value or {})
+                    if "params_json" in out and not isinstance(out.get("params_json"), dict):
+                        out["params_json"] = dict(out.get("params") or {})
+                    return out
+        symbol = str(kwargs.get("symbol") or "GLOBAL")
+        return fetch_model_best_params(model_family=model_family, symbol=symbol, con=db)
+    finally:
+        if owns:
+            db.close()
 
 
 def fetch_decision_detail(decision_id: int, *, con: StorageConnection | None = None):

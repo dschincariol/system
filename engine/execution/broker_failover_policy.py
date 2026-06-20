@@ -36,6 +36,7 @@ NON_RETRYABLE_BROKER_STATUSES = {
     "alpaca_auth_failed",
     "broker_auth_failed",
     "ibkr_configuration_invalid",
+    "invalid_order_ref",
     "needs_reconcile",
     "prelive_reconcile_exception",
     "prelive_reconcile_unavailable",
@@ -85,20 +86,23 @@ def validate_live_failover_chain(
     live_broker = ""
 
     if mode == "live" and not bool(dry_run):
-        live_seen = False
+        live_entries: list[str] = []
         if not normalized:
             blockers.append("live_broker_required")
         for broker in normalized:
             if broker in LIVE_BROKERS:
-                live_seen = True
-                live_broker = broker
-            elif broker == "sim" and live_seen:
+                live_entries.append(broker)
+                if not live_broker:
+                    live_broker = broker
+            elif broker == "sim" and live_entries:
                 blockers.append("sim_after_live_broker_forbidden")
-                break
             elif broker == "sim":
                 blockers.append("sim_broker_forbidden_in_live")
-                break
-        if not live_seen:
+            else:
+                blockers.append("unknown_broker_forbidden_in_live")
+        if len(set(live_entries)) > 1:
+            blockers.append("mixed_live_broker_chain_forbidden")
+        if not live_entries:
             blockers.append("live_broker_required")
 
     return {
@@ -126,9 +130,10 @@ def live_broker_environment_contract(
     required = mode == "live"
     raw_broker = str(source.get("BROKER", "") or "").strip()
     raw_broker_name = str(source.get("BROKER_NAME", "") or "").strip()
-    raw_expected = str(
-        source.get("LIVE_BROKER", source.get("INTENDED_LIVE_BROKER", "")) or ""
-    ).strip()
+    raw_live_broker = str(source.get("LIVE_BROKER", "") or "").strip()
+    raw_intended = str(source.get("INTENDED_LIVE_BROKER", "") or "").strip()
+    raw_expected = raw_live_broker or raw_intended
+    raw_failover = str(source.get("BROKER_FAILOVER", "") or "").strip()
     broker = canonical_broker_name(raw_broker)
     broker_name = canonical_broker_name(raw_broker_name)
     expected = canonical_broker_name(raw_expected)
@@ -149,20 +154,38 @@ def live_broker_environment_contract(
         elif broker not in LIVE_BROKERS:
             blockers.append("broker_must_be_live")
 
-        if raw_expected:
-            if expected not in LIVE_BROKERS:
-                blockers.append("live_broker_expected_invalid")
-            elif broker and broker != expected:
-                blockers.append("broker_mismatch_expected_live_broker")
+        if not raw_live_broker:
+            blockers.append("live_broker_required_for_live")
+        elif expected not in LIVE_BROKERS:
+            blockers.append("live_broker_expected_invalid")
+        elif broker and broker != expected:
+            blockers.append("broker_mismatch_expected_live_broker")
+        if raw_intended:
+            intended = canonical_broker_name(raw_intended)
+            if intended != expected:
+                blockers.append("intended_live_broker_mismatch_live_broker")
 
-        if raw_broker_name and broker_name != broker:
+        if not raw_broker_name:
+            blockers.append("broker_name_required_for_live")
+        elif broker_name not in LIVE_BROKERS:
+            blockers.append("broker_name_must_be_live")
+        elif broker and broker_name != broker:
             blockers.append("broker_name_mismatch_broker")
+        elif expected in LIVE_BROKERS and broker_name != expected:
+            blockers.append("broker_name_mismatch_expected_live_broker")
+
+        if not raw_failover:
+            blockers.append("broker_failover_required_for_live")
 
         if not bool(chain_state.get("ok")):
             blockers.extend(str(item) for item in list(chain_state.get("blockers") or []))
 
         if normalized_chain and broker in LIVE_BROKERS and normalized_chain[0] != broker:
             blockers.append("broker_failover_primary_mismatch")
+        if normalized_chain and broker in LIVE_BROKERS and any(item != broker for item in normalized_chain):
+            blockers.append("broker_failover_chain_mismatch")
+        if normalized_chain and expected in LIVE_BROKERS and any(item != expected for item in normalized_chain):
+            blockers.append("broker_failover_chain_mismatch_expected_live_broker")
 
     blockers = list(dict.fromkeys(blockers))
     return {
@@ -180,8 +203,9 @@ def live_broker_environment_contract(
         "env": {
             "BROKER": raw_broker,
             "BROKER_NAME": raw_broker_name,
-            "LIVE_BROKER": raw_expected,
-            "BROKER_FAILOVER": str(source.get("BROKER_FAILOVER", "") or "").strip(),
+            "LIVE_BROKER": raw_live_broker,
+            "INTENDED_LIVE_BROKER": raw_intended,
+            "BROKER_FAILOVER": raw_failover,
         },
     }
 
@@ -269,8 +293,25 @@ def broker_startup_preflight(
     chain_state = validate_live_failover_chain(normalized, engine_mode=mode, dry_run=False)
     checks: list[Dict[str, Any]] = []
     blockers: list[str] = list(chain_state.get("blockers") or [])
+    environment_contract: Dict[str, Any] = {}
 
     if mode == "live":
+        environment_contract = live_broker_environment_contract(engine_mode=mode, chain=normalized)
+        if not bool(environment_contract.get("ok")):
+            blockers.extend(str(item) for item in list(environment_contract.get("blockers") or []))
+            blockers = list(dict.fromkeys(blockers))
+            return {
+                "ok": False,
+                "status": "broker_startup_preflight_failed",
+                "reason": blockers[0] if blockers else "live_broker_contract_invalid",
+                "engine_mode": mode,
+                "chain": normalized,
+                "chain_policy": chain_state,
+                "environment_contract": environment_contract,
+                "checks": checks,
+                "blockers": blockers,
+            }
+
         if "alpaca" in normalized:
             try:
                 from engine.execution.broker_alpaca_rest import alpaca_credentials_status
@@ -318,6 +359,7 @@ def broker_startup_preflight(
         "engine_mode": mode,
         "chain": normalized,
         "chain_policy": chain_state,
+        "environment_contract": environment_contract,
         "checks": checks,
         "blockers": list(dict.fromkeys(blockers)),
     }

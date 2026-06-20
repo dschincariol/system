@@ -17,6 +17,7 @@ from typing import Any
 from engine.api.api_read import _table_exists
 from engine.api.internal_access import db_connect
 from engine.api.sql_identifiers import require_allowed_table_name, sql_identifier
+from engine.api.feature_visibility import annotate_attribution_feature_visibility
 from engine.runtime.state_cache import cache_get_or_load
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import (
@@ -1735,14 +1736,14 @@ def _build_decision_attribution(
     for source, raw in _attribution_candidate_payloads(decision, related):
         payload = _normalize_decision_attribution_payload(raw, source=source, feature_ids=feature_ids)
         if list(payload.get("top_features") or []):
-            return payload
+            return annotate_attribution_feature_visibility(payload, con=con, decision=decision)
 
     table_payload = _prediction_explanation_from_table(con, decision)
     if table_payload is not None:
         source, raw = table_payload
         payload = _normalize_decision_attribution_payload(raw, source=source, feature_ids=feature_ids)
         if list(payload.get("top_features") or []):
-            return payload
+            return annotate_attribution_feature_visibility(payload, con=con, decision=decision)
 
     model_family = str((decision or {}).get("model_kind") or (decision or {}).get("model_name") or "").strip()
     return {

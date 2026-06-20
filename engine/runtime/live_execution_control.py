@@ -18,7 +18,7 @@ PRELIVE_RECONCILE_BREAK_GLASS_ACCEPTED_REASON = "prelive_reconcile_break_glass_a
 PRELIVE_RECONCILE_BREAK_GLASS_AUDIT_FAILED_REASON = "prelive_reconcile_break_glass_audit_failed"
 
 _TRUTHY_VALUES = {"1", "true", "t", "yes", "y", "on"}
-_FALSEY_VALUES = {"0", "false", "f", "no", "n", "off", "none", "null"}
+_FALSEY_VALUES = {"0", "false", "no", "off"}
 _PLACEHOLDER_VALUES = {
     "changeme",
     "change-me",
@@ -84,7 +84,7 @@ def _prelive_reconcile_enabled() -> bool:
 
 
 def live_execution_disabled() -> bool:
-    return env_flag_truthy(DISABLE_LIVE_EXECUTION_ENV, False)
+    return env_flag_truthy(DISABLE_LIVE_EXECUTION_ENV, True)
 
 
 def disabled_live_execution_gate(

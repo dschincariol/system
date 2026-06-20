@@ -82,7 +82,19 @@ def _import_nonfatal(code: str, error: BaseException) -> None:
 
 
 def _execution_gate_snapshot() -> Dict[str, Any]:
-    return execution_gate_snapshot(get_execution_mode_fn=get_execution_mode)
+    return execution_gate_snapshot(
+        get_execution_mode_fn=get_execution_mode,
+        kill_switches=(kill_switch_snapshot() or {}),
+    )
+
+
+class LivePayloadLoadError(RuntimeError):
+    """Raised when live mode cannot load audited execution intents."""
+
+    def __init__(self, reason: str, error: BaseException) -> None:
+        super().__init__(str(reason))
+        self.reason = str(reason)
+        self.error = error
 
 
 def _defer_initial_capital_block(reason: Any, meta: Optional[Dict[str, Any]]) -> bool:
@@ -94,6 +106,39 @@ def _defer_initial_capital_block(reason: Any, meta: Optional[Dict[str, Any]]) ->
     if isinstance(nested_meta, dict) and str(nested_meta.get("trigger") or "").strip() == "drawdown_state_unavailable":
         return True
     return str(meta_obj.get("trigger") or "").strip() == "drawdown_state_unavailable"
+
+
+def _execution_gate_blocks(gate: Dict[str, Any]) -> bool:
+    return (not bool((gate or {}).get("ok"))) or (not bool((gate or {}).get("allow_execution_pipeline")))
+
+
+def _execution_gate_block_layer(gate: Dict[str, Any]) -> str:
+    reason = str((gate or {}).get("reason") or "").strip()
+    if reason.startswith("kill_switch") or reason in {
+        "disable_live_execution_env",
+        "runtime_state_kill_switch",
+    }:
+        return "kill_switch"
+    return "execution_gate"
+
+
+def _kill_switch_cascade_preserves_layer(reason: Any) -> bool:
+    reason_s = str(reason or "").strip()
+    if reason_s.startswith("kill_switch"):
+        return True
+    return reason_s in {
+        "capital_guard_block",
+        "capital_guard_error",
+        "capital_aware_kill_switch",
+        "capital_kill_switch_activation_failed",
+        "disable_live_execution_env",
+        "model_aware_kill_switch",
+        "model_kill_switch_activation_failed",
+        "stale_events",
+        "stale_job_heartbeat",
+        "stale_predictions",
+        "stale_prices",
+    }
 
 # Newer path (preferred)
 try:
@@ -829,7 +874,7 @@ def _apply_epe_compat(
         return list(shaped or [])
 
 
-def _load_latest_payload() -> Tuple[Optional[int], Optional[int], List[dict], str]:
+def _load_latest_payload(*, live_strict: bool = False) -> Tuple[Optional[int], Optional[int], List[dict], str]:
     """
     Returns: (batch_or_order_id, ts_ms, payload_list, source)
     payload_list is either intents or orders; broker router receives as override_orders.
@@ -853,8 +898,14 @@ def _load_latest_payload() -> Tuple[Optional[int], Optional[int], List[dict], st
                     intents,
                     "execution_intents",
                 )
-        except Exception:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_APPEND_EVENT_FAILED", Exception("append_event failed"), once_key="append_order_submit_result")
+        except Exception as e:
+            _warn_nonfatal(
+                "BROKER_APPLY_ORDERS_EXECUTION_INTENTS_LOAD_FAILED",
+                e,
+                once_key="execution_intents_load_failed",
+            )
+            if bool(live_strict):
+                raise LivePayloadLoadError("execution_intents_load_failed", e) from e
 
     # Fallback: legacy broker_router dry_run preview
     preview = apply_new_portfolio_orders(dry_run=True)
@@ -1161,6 +1212,10 @@ def main() -> int:
 # ------------------------------------------------------------
 
     try:
+        mode_state = get_execution_mode() or {}
+        gate = _execution_gate_snapshot()
+        gate_blocks = _execution_gate_blocks(gate)
+        gate_layer = _execution_gate_block_layer(gate)
         con = connect()
         try:
             allow, ks_reason, ks_meta = execution_allowed(con=con, symbol=None, regime=None)
@@ -1173,6 +1228,21 @@ def main() -> int:
                 "meta": dict(ks_meta or {}),
             }
         elif not allow:
+            if gate_blocks and gate_layer == "execution_gate" and not _kill_switch_cascade_preserves_layer(ks_reason):
+                return _blocked(
+                    started_ms=int(started_ms),
+                    layer="execution_gate",
+                    mode=str(gate.get("mode") or mode_state.get("mode") or "unknown"),
+                    broker=str(BROKER_NAME),
+                    reason=str(gate.get("reason") or "execution_gate_blocked"),
+                    payload={
+                        "gate": gate,
+                        "kill_switch_cascade": {
+                            "reason": str(ks_reason or ""),
+                            "meta": dict(ks_meta or {}),
+                        },
+                    },
+                )
             blocked_ts_ms = _now_ms()
             _record_execution_event_boundary(
                 event_type="execution_block",
@@ -1260,15 +1330,10 @@ def main() -> int:
             )
             return 0
 
-        mode_state = get_execution_mode() or {}
-        gate = execution_gate_snapshot(
-            get_execution_mode_fn=get_execution_mode,
-            kill_switches=(kill_switch_snapshot() or {}),
-        )
-        if (not bool(gate.get("ok"))) or (not bool(gate.get("allow_execution_pipeline"))):
+        if gate_blocks:
             return _blocked(
                 started_ms=int(started_ms),
-                layer="execution_gate",
+                layer=gate_layer,
                 mode=str(gate.get("mode") or mode_state.get("mode") or "unknown"),
                 broker=str(BROKER_NAME),
                 reason=str(gate.get("reason") or "execution_gate_blocked"),
@@ -1278,7 +1343,30 @@ def main() -> int:
         mode = str(gate.get("mode") or mode_state.get("mode") or "").lower().strip()
 
         # Load latest payload
-        batch_or_oid, payload_ts_ms, raw_payload, payload_source = _load_latest_payload()
+        try:
+            batch_or_oid, payload_ts_ms, raw_payload, payload_source = _load_latest_payload(
+                live_strict=(mode == "live")
+            )
+        except LivePayloadLoadError as e:
+            _warn_nonfatal(
+                "BROKER_APPLY_ORDERS_LIVE_PAYLOAD_LOAD_BLOCK",
+                e.error,
+                once_key="live_payload_load_block",
+                mode=str(mode or "live"),
+                broker=str(BROKER_NAME),
+                reason=str(e.reason or "execution_intents_load_failed"),
+            )
+            return _blocked(
+                started_ms=int(started_ms),
+                layer="payload_load",
+                mode=str(mode or "live"),
+                broker=str(BROKER_NAME),
+                reason=str(e.reason or "execution_intents_load_failed"),
+                payload={
+                    "error": f"{type(e.error).__name__}: {e.error}",
+                    "source": "execution_intents",
+                },
+            )
 
         # Shape via EPE (TTL hard wall / ALE registration when supported)
         con = connect()

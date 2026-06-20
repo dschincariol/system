@@ -28,6 +28,7 @@ else:
 from engine.data.provider_registry import get_enabled_market_data_job_names
 from engine.runtime.ipc import publish_channel_state, publish_message
 from engine.runtime.job_registry import ALLOWED_JOBS, INGESTION_DAEMON_JOBS
+from engine.runtime.platform import default_local_log_dir
 from engine.runtime.runtime_meta import meta_get
 from engine.runtime.storage import (
     acquire_job_lock,
@@ -42,6 +43,7 @@ from services.data_source_manager import desired_ingestion_jobs, get_manager
 from engine.runtime.alerts import emit_alert
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.lifecycle_state import set_state, WARMING_UP, DEGRADED
+from engine.runtime.log_retention import rotate_log_if_needed
 from engine.runtime.logging import get_logger, log_event
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.observability import backoff_delay_s, record_component_health
@@ -198,14 +200,6 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-if _PSUTIL_IMPORT_ERROR is not None:
-    _warn_failure(
-        "INGESTION_RUNTIME_PSUTIL_IMPORT_FAILED",
-        _PSUTIL_IMPORT_ERROR,
-        degradation="process_tree_checks_fall_back_to_pid_signals",
-    )
-
-
 def _child_proc(info: Dict[str, object]) -> Optional[subprocess.Popen]:
     proc = info.get("proc")
     return proc if isinstance(proc, subprocess.Popen) else None
@@ -221,16 +215,6 @@ def _pid_is_running(pid: int) -> bool:
         return False
 
     try:
-        if os.name == "nt":
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, 0, int(pid))
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            return False
-
         os.kill(int(pid), 0)
         return True
     except Exception as e:
@@ -251,16 +235,6 @@ def _terminate_pid_tree(pid: int) -> bool:
         return False
 
     try:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return int(result.returncode or 0) == 0
-
         os.kill(int(pid), signal.SIGTERM)
         return True
     except Exception as e:
@@ -433,10 +407,12 @@ def _children_snapshot(children: Optional[Dict[str, Dict[str, object]]]) -> Dict
 def _emit_ingestion_heartbeat(children: Optional[Dict[str, Dict[str, object]]]) -> None:
     # Ingestion runtime owns a dedicated heartbeat because health/lifecycle code
     # depends on it even when the main supervision loop is busy.
+    writer_diagnostics = _ingestion_writer_diagnostics()
     extra_json = json.dumps(
         {
             "children": _children_snapshot(children),
             "market_state": dict(_INGESTION_STATE),
+            "writer_diagnostics": writer_diagnostics,
             "heartbeat_every_s": float(HEARTBEAT_EVERY_S),
         },
         separators=(",", ":"),
@@ -470,6 +446,123 @@ def _emit_ingestion_heartbeat(children: Optional[Dict[str, Dict[str, object]]]) 
     )
 
 
+def _queue_pressure(snapshot: Dict[str, object], *, depth_key: str = "queue_depth", max_key: str = "queue_maxsize") -> bool:
+    depth = _safe_int(snapshot.get(depth_key), 0)
+    maximum = _safe_int(snapshot.get(max_key), 0)
+    return bool(maximum > 0 and depth >= int(maximum * 0.80))
+
+
+def _ingestion_writer_diagnostics() -> Dict[str, object]:
+    diagnostics: Dict[str, object] = {
+        "ok": True,
+        "degraded": False,
+        "degraded_reasons": [],
+    }
+    reasons: list[str] = []
+    try:
+        from engine.runtime.ingestion_tuning import ingestion_tuning_snapshot
+
+        tuning = dict(ingestion_tuning_snapshot(pg_pool_role="ingestion") or {})
+        tuning.pop("bounds", None)
+        diagnostics["tuning"] = tuning
+        if not bool(tuning.get("ok", True)):
+            reasons.append("unsafe_tuning")
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_TUNING_SNAPSHOT_FAILED", e)
+        diagnostics["tuning"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+        reasons.append("tuning_snapshot_failed")
+
+    try:
+        from engine.runtime.async_writer import get_async_writer
+
+        async_snapshot = dict(get_async_writer().get_snapshot() or {})
+        diagnostics["async_price_writer"] = async_snapshot
+        if bool(async_snapshot.get("enabled")):
+            emit_gauge(
+                "ingestion_async_price_writer_queue_depth",
+                _safe_int(async_snapshot.get("queue_depth"), 0),
+                component="engine.runtime.ingestion_runtime",
+                job=JOB_NAME,
+            )
+            if _queue_pressure(async_snapshot):
+                reasons.append("async_price_writer_queue_pressure")
+            if _safe_int(async_snapshot.get("dropped_rows"), 0) > 0:
+                reasons.append("async_price_writer_dropped_rows")
+            if _safe_int(async_snapshot.get("dead_letters"), 0) > 0:
+                reasons.append("async_price_writer_dead_letters")
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_ASYNC_WRITER_SNAPSHOT_FAILED", e)
+        diagnostics["async_price_writer"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+
+    try:
+        from engine.runtime.storage_pg_prices import get_price_storage
+
+        price_storage = dict(get_price_storage().get_snapshot() or {})
+        diagnostics["price_storage"] = price_storage
+        if bool(price_storage.get("enabled")) and not bool(price_storage.get("ok", True)):
+            reasons.append("price_storage_not_ok")
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_PRICE_STORAGE_SNAPSHOT_FAILED", e)
+        diagnostics["price_storage"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+
+    try:
+        from engine.runtime.telemetry_append_buffer import get_telemetry_append_buffer_snapshot
+
+        telemetry = dict(get_telemetry_append_buffer_snapshot() or {})
+        diagnostics["telemetry_append_buffer"] = telemetry
+        if bool(telemetry.get("enabled")):
+            emit_gauge(
+                "ingestion_telemetry_append_buffer_queue_depth",
+                _safe_int(telemetry.get("buffered_rows"), 0),
+                component="engine.runtime.ingestion_runtime",
+                job=JOB_NAME,
+            )
+            if _queue_pressure(telemetry, depth_key="buffered_rows", max_key="buffer_max_rows"):
+                reasons.append("telemetry_append_buffer_pressure")
+            if _safe_int(telemetry.get("dropped_rows"), 0) > 0:
+                reasons.append("telemetry_append_buffer_dropped_rows")
+            if _safe_int(telemetry.get("flush_failures"), 0) > 0:
+                reasons.append("telemetry_append_buffer_flush_failures")
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_TELEMETRY_BUFFER_SNAPSHOT_FAILED", e)
+        diagnostics["telemetry_append_buffer"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+
+    try:
+        from engine.runtime.timescale_client import get_timescale_snapshot
+
+        timescale = dict(get_timescale_snapshot() or {})
+        diagnostics["timescale"] = timescale
+        if bool(timescale.get("enabled")):
+            emit_gauge(
+                "ingestion_timescale_queue_depth",
+                _safe_int(timescale.get("queue_depth"), 0),
+                component="engine.runtime.ingestion_runtime",
+                job=JOB_NAME,
+            )
+            if _queue_pressure(timescale):
+                reasons.append("timescale_queue_pressure")
+            metrics = _dict_or_empty(timescale.get("metrics"))
+            if bool(metrics.get("backpressure_active")):
+                reasons.append("timescale_backpressure")
+            if _safe_int(metrics.get("flush_failure_count"), 0) > 0:
+                reasons.append("timescale_flush_failures")
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_TIMESCALE_SNAPSHOT_FAILED", e)
+        diagnostics["timescale"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+
+    unique_reasons = sorted(set(str(reason) for reason in reasons if str(reason).strip()))
+    diagnostics["ok"] = not bool(unique_reasons)
+    diagnostics["degraded"] = bool(unique_reasons)
+    diagnostics["degraded_reasons"] = unique_reasons
+    emit_gauge(
+        "ingestion_writer_backpressure_degraded",
+        1.0 if unique_reasons else 0.0,
+        component="engine.runtime.ingestion_runtime",
+        job=JOB_NAME,
+    )
+    return diagnostics
+
+
 def _warn_failure(event: str, error: Exception, **extra) -> None:
     log_failure(
         log,
@@ -482,6 +575,14 @@ def _warn_failure(event: str, error: Exception, **extra) -> None:
         extra=extra or None,
         include_health=False,
         persist=True,
+    )
+
+
+if _PSUTIL_IMPORT_ERROR is not None:
+    _warn_failure(
+        "INGESTION_RUNTIME_PSUTIL_IMPORT_FAILED",
+        _PSUTIL_IMPORT_ERROR,
+        degradation="process_tree_checks_fall_back_to_pid_signals",
     )
 
 
@@ -588,11 +689,10 @@ def _repo_root() -> Path:
 
 
 def _job_log_dir() -> Path:
-    root = _repo_root()
     log_dir = Path(
         os.environ.get("TRADING_LOGS")
         or os.environ.get("LOG_DIR")
-        or str((root / "logs").resolve())
+        or str(default_local_log_dir().resolve())
     )
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
@@ -762,6 +862,50 @@ def _script_module_name(script_path: Path) -> str:
     return ".".join(str(part) for part in parts)
 
 
+def _child_pg_pool_env() -> Dict[str, str]:
+    try:
+        from engine.runtime.ingestion_tuning import env_bool, pg_pool_default_for_role, tuned_int
+
+        if env_bool("INGESTION_CHILD_INHERIT_TS_PG_POOL_PROFILE", default=False):
+            return {}
+        pool_size = tuned_int(
+            "INGESTION_CHILD_TS_PG_POOL_SIZE",
+            pg_pool_default_for_role("jobs"),
+            1,
+            8,
+        )
+        pool_min_size = min(
+            int(pool_size),
+            tuned_int("INGESTION_CHILD_TS_PG_POOL_MIN_SIZE", 1, 1, 8),
+        )
+        timescale_pool_max = tuned_int("INGESTION_CHILD_TIMESCALE_POOL_MAX_SIZE", 2, 1, 8)
+        price_pool_max = tuned_int("INGESTION_CHILD_TIMESCALE_PRICES_POOL_MAX_SIZE", 2, 1, 8)
+        return {
+            "ENGINE_PROCESS_ROLE": "ingestion_child",
+            "TS_PROCESS_ROLE": "jobs",
+            "TS_PG_POOL_PROFILE": "jobs",
+            "TS_PG_POOL_SIZE": str(int(pool_size)),
+            "TS_PG_POOL_MIN_SIZE": str(int(pool_min_size)),
+            "TIMESCALE_POOL_MIN_SIZE": "1",
+            "TIMESCALE_POOL_MAX_SIZE": str(int(timescale_pool_max)),
+            "TIMESCALE_PRICES_POOL_MIN_SIZE": "1",
+            "TIMESCALE_PRICES_POOL_MAX_SIZE": str(int(price_pool_max)),
+        }
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_CHILD_POOL_ENV_FAILED", e)
+        return {
+            "ENGINE_PROCESS_ROLE": "ingestion_child",
+            "TS_PROCESS_ROLE": "jobs",
+            "TS_PG_POOL_PROFILE": "jobs",
+            "TS_PG_POOL_SIZE": "2",
+            "TS_PG_POOL_MIN_SIZE": "1",
+            "TIMESCALE_POOL_MIN_SIZE": "1",
+            "TIMESCALE_POOL_MAX_SIZE": "2",
+            "TIMESCALE_PRICES_POOL_MIN_SIZE": "1",
+            "TIMESCALE_PRICES_POOL_MAX_SIZE": "2",
+        }
+
+
 def _spawn_child_once(job_name: str) -> subprocess.Popen:
     script_path = _resolve_child_script(job_name)
     env = dict(os.environ)
@@ -793,6 +937,8 @@ def _spawn_child_once(job_name: str) -> subprocess.Popen:
     except Exception as e:
         _warn_failure("INGESTION_RUNTIME_SAFE_ENV_SANITIZE_FAILED", e, job=str(job_name))
 
+    env.update(_child_pg_pool_env())
+
     module_name = _script_module_name(script_path)
     if module_name:
         args = [sys.executable, "-u", "-m", module_name]
@@ -800,6 +946,8 @@ def _spawn_child_once(job_name: str) -> subprocess.Popen:
         args = [sys.executable, "-u", str(script_path)]
 
     stdout_path, stderr_path = _child_log_paths(job_name)
+    rotate_log_if_needed(stdout_path)
+    rotate_log_if_needed(stderr_path)
     stdout_fh = open(stdout_path, "ab")
     stderr_fh = open(stderr_path, "ab")
     log_event(
@@ -1497,6 +1645,7 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
         now_ms = int(time.time() * 1000)
         market_state = _dict_or_empty(_latest_prices_state() or {})
         source_health = _source_health_snapshot(market_state)
+        writer_diagnostics = _ingestion_writer_diagnostics()
         payload = {
             "running": bool(_INGESTION_STATE.get("running")),
             "pid": int(PID),
@@ -1505,6 +1654,7 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
             "lag_ms": max(0, now_ms - _safe_int(market_state.get("last_ts_ms"), now_ms)),
             "market_state": market_state,
             "source_health": source_health,
+            "writer_diagnostics": writer_diagnostics,
             "children": {
                 name: {
                     "pid": _safe_int(info.get("pid"), 0),
@@ -1525,12 +1675,14 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
             best_effort=True,
         )
         critical_ok = bool(source_health.get("critical_ok"))
+        writer_ok = bool(writer_diagnostics.get("ok", True))
         running = bool(_INGESTION_STATE.get("running"))
         healthy_providers = _safe_int(market_state.get("healthy_providers"), 0)
         status_name = str(provider_status or market_state.get("status") or ("running" if running else "stopped"))
         detail = (
             str(last_error or "")
             or ("critical_sources_stale" if not critical_ok else "")
+            or ("ingestion_writer_backpressure" if not writer_ok else "")
             or ("no_healthy_providers" if running and healthy_providers <= 0 else "")
             or "ok"
         )
@@ -1542,7 +1694,7 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
         )
         record_component_health(
             "ingestion",
-            ok=bool(running and critical_ok and healthy_providers > 0 and not str(last_error or "").strip()),
+            ok=bool(running and critical_ok and writer_ok and healthy_providers > 0 and not str(last_error or "").strip()),
             status=str(status_name),
             detail=str(detail),
             observed_ts_ms=int(now_ms),
@@ -1551,6 +1703,7 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
                 "healthy_providers": int(healthy_providers),
                 "stale_critical_sources": _list_or_empty(source_health.get("stale_critical_sources")),
                 "stale_sources": _list_or_empty(source_health.get("stale_sources")),
+                "writer_degraded_reasons": _list_or_empty(writer_diagnostics.get("degraded_reasons")),
                 "last_publish_ts_ms": int(_INGESTION_STATE.get("last_publish_ts_ms") or 0),
                 "children_running": int(
                     sum(

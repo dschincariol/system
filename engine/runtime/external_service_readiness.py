@@ -46,6 +46,19 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _secret_text_from_env(*env_names: str) -> str:
+    secret_name = ""
+    for env_name in env_names:
+        secret_name = _clean_text(os.environ.get(env_name))
+        if secret_name:
+            break
+    if not secret_name:
+        return ""
+    from services.secrets.loader import load_secret
+
+    return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+
+
 def _object_scheme(value: Any) -> str:
     text = _clean_text(value)
     if "://" not in text:
@@ -85,6 +98,27 @@ def _probe_postgres(dsn: str, *, timeout_s: float) -> tuple[bool, str | None]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def _postgres_probe_dsn(dsn: str) -> str:
+    """Return a probe DSN with the configured runtime credential attached."""
+
+    raw = str(dsn or "").strip()
+    parsed = urlparse(raw)
+    scheme = str(parsed.scheme or "").strip().lower()
+    if scheme in _TIMESCALE_SCHEMES and parsed.hostname:
+        if parsed.password:
+            return raw
+        password = _clean_text(
+            os.environ.get("TIMESCALE_PASSWORD")
+            or os.environ.get("TS_PG_PASSWORD")
+            or os.environ.get("PGPASSWORD")
+        )
+        return _url_with_password(raw, password) if password else raw
+
+    from engine.runtime.platform import dsn_with_pg_password
+
+    return dsn_with_pg_password(raw)
+
+
 def _redis_command(*parts: str) -> bytes:
     encoded = [str(part).encode("utf-8") for part in parts]
     payload = [f"*{len(encoded)}\r\n".encode("ascii")]
@@ -93,6 +127,34 @@ def _redis_command(*parts: str) -> bytes:
         payload.append(part)
         payload.append(b"\r\n")
     return b"".join(payload)
+
+
+def _url_with_password(url: str, password: str) -> str:
+    text = _clean_text(url)
+    if not text or not password:
+        return text
+    parsed = urlparse(text)
+    if parsed.password:
+        return text
+    if not parsed.scheme or not parsed.hostname:
+        return text
+    user = quote(str(parsed.username or ""), safe="")
+    host = str(parsed.hostname or "")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    auth = f"{user}:{quote(password, safe='')}@" if user else f":{quote(password, safe='')}@"
+    return urlunparse((parsed.scheme, auth + host, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
+def _redis_probe_url(redis_url: str) -> str:
+    password = _secret_text_from_env(
+        "LIVE_CACHE_REDIS_PASSWORD_SECRET",
+        "TS_REDIS_PASSWORD_SECRET",
+        "REDIS_PASSWORD_SECRET",
+    )
+    return _url_with_password(redis_url, password)
 
 
 def _redis_ok(response: bytes, expected: bytes) -> bool:
@@ -284,7 +346,18 @@ def _check_timescale_service(*, name: str, dsn: Any, required: bool, timeout_s: 
     if not host or not port:
         status["errors"].append(f"{name} DSN missing host or port")
         return status
-    reachable, error = _probe_postgres(dsn_text, timeout_s=timeout_s)
+    try:
+        probe_dsn = _postgres_probe_dsn(dsn_text)
+    except Exception as exc:
+        status["reachable"] = False
+        message = f"{name} credential resolution failed target={target} error={type(exc).__name__}: {exc}"
+        if required:
+            status["errors"].append(message)
+        else:
+            status["warnings"].append(message)
+        return status
+
+    reachable, error = _probe_postgres(probe_dsn, timeout_s=timeout_s)
     status["reachable"] = bool(reachable)
     if reachable:
         status["ok"] = True
@@ -321,7 +394,18 @@ def _check_redis_service(*, required: bool, timeout_s: float) -> dict[str, Any] 
     if not host or not port:
         status["errors"].append("live_cache_redis URL missing host or port")
         return status
-    reachable, error = _probe_redis(redis_url, timeout_s=timeout_s)
+    try:
+        probe_url = _redis_probe_url(redis_url)
+    except Exception as exc:
+        status["reachable"] = False
+        message = f"live_cache_redis credential resolution failed target={target} error={type(exc).__name__}: {exc}"
+        if status["required"]:
+            status["errors"].append(message)
+        else:
+            status["warnings"].append(message)
+        return status
+
+    reachable, error = _probe_redis(probe_url, timeout_s=timeout_s)
     status["reachable"] = bool(reachable)
     if reachable:
         status["ok"] = True
@@ -353,16 +437,31 @@ def _check_object_storage_service(*, required: bool, timeout_s: float) -> dict[s
         or os.environ.get("MINIO_ACCESS_KEY")
         or os.environ.get("AWS_ACCESS_KEY_ID")
     )
-    secret_key = _clean_text(
-        os.environ.get("OBJECT_STORE_SECRET_KEY")
-        or os.environ.get("MINIO_SECRET_KEY")
-        or os.environ.get("AWS_SECRET_ACCESS_KEY")
-    )
     dataset_prefix = _clean_text(os.environ.get("TRAINING_DATASET_URI_PREFIX"))
     object_scheme = _object_scheme(dataset_prefix)
     active = required or object_scheme in OBJECT_STORAGE_SCHEMES
     if not active:
         return None
+
+    secret_key = _clean_text(
+        os.environ.get("OBJECT_STORE_SECRET_KEY")
+        or os.environ.get("MINIO_SECRET_KEY")
+        or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    )
+    if not secret_key:
+        try:
+            secret_key = _secret_text_from_env(
+                "OBJECT_STORE_SECRET_KEY_SECRET",
+                "MINIO_SECRET_KEY_SECRET",
+                "AWS_SECRET_ACCESS_KEY_SECRET",
+            )
+        except Exception as exc:
+            secret_key = ""
+            secret_key_error = f"{type(exc).__name__}: {exc}"
+        else:
+            secret_key_error = ""
+    else:
+        secret_key_error = ""
 
     host, port, target = _network_target(endpoint, default_scheme="http", default_port=9000)
     status = _service_status(
@@ -382,7 +481,10 @@ def _check_object_storage_service(*, required: bool, timeout_s: float) -> dict[s
     if not access_key:
         status["errors"].append("object_storage access key is missing")
     if not secret_key:
-        status["errors"].append("object_storage secret key is missing")
+        if secret_key_error:
+            status["errors"].append(f"object_storage secret key credential resolution failed: {secret_key_error}")
+        else:
+            status["errors"].append("object_storage secret key is missing")
     if not host or not port:
         status["errors"].append("object_storage endpoint missing host or port")
     if status["errors"]:

@@ -10,7 +10,7 @@ Supports:
 - ibkr
 
 Failover:
-  BROKER_FAILOVER="ibkr,alpaca"
+  BROKER_FAILOVER="ibkr"
   Retries on exception OR ok=False
   Returns structured failover_attempts
 
@@ -30,11 +30,14 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.execution.execution_slicing_engine import build_order_slices
+from engine.execution.contextual_bandit_slicer import validate_routed_learned_orders
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
+from engine.execution.options_readiness import live_options_order_block
 from engine.execution.broker_failover_policy import (
     broker_exception_terminal_failure,
     configured_failover_chain,
     is_non_retryable_broker_result,
+    live_broker_environment_contract,
     validate_live_failover_chain,
 )
 from engine.runtime.failure_diagnostics import log_failure
@@ -48,11 +51,6 @@ from engine.runtime.metrics import emit_counter, emit_timing
 from engine.runtime.observability import backoff_delay_s, record_component_health, record_rolling_rate
 from engine.runtime.tracing import trace_event
 
-# Execution gate providers are intentionally resolved by callers/tests or fail
-# closed. Eager imports can block router import if the runtime registry is
-# unavailable during execution-path safety checks.
-_execution_gate_snapshot = None  # type: ignore
-_ALLOWED_JOBS = {}  # type: ignore
 _IMPORT_LOG = logging.getLogger("execution.broker_router")
 
 
@@ -67,6 +65,19 @@ def _import_nonfatal(code: str, error: BaseException) -> None:
         component="engine.execution.broker_router",
         persist=False,
     )
+
+
+try:
+    from engine.runtime.gates import execution_gate_snapshot as _execution_gate_snapshot  # type: ignore
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_EXECUTION_GATE_IMPORT_FAILED", e)
+    _execution_gate_snapshot = None  # type: ignore
+
+try:
+    from engine.runtime.job_registry import ALLOWED_JOBS as _ALLOWED_JOBS  # type: ignore
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_JOB_REGISTRY_IMPORT_FAILED", e)
+    _ALLOWED_JOBS = {}  # type: ignore
 
 
 try:
@@ -196,6 +207,45 @@ def _safe_int(value: Any, default: int = 0) -> int:
             value_type=type(value).__name__,
         )
         return int(default)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_OPTIONAL_INT_FAILED",
+            e,
+            once_key=f"optional_int:{type(value).__name__}:{str(value)[:64]}",
+            value_type=type(value).__name__,
+        )
+        return None
+
+
+def _stamp_parent_slice_identity(
+    order: Dict[str, Any],
+    *,
+    parent_order_id: Optional[int],
+    parent_ts_ms: Optional[int],
+    order_index: int,
+    slice_index: int,
+    slice_count: int,
+) -> Dict[str, Any]:
+    out = dict(order or {})
+    out["slice_index"] = int(slice_index)
+    out["adaptive_slice_index"] = int(slice_index)
+    out["slice_count"] = int(slice_count)
+    out["adaptive_slice_count"] = int(slice_count)
+    out["parent_order_index"] = int(order_index)
+    if parent_order_id is not None:
+        out["parent_order_id"] = int(parent_order_id)
+        out["adaptive_parent_order_id"] = int(parent_order_id)
+    if parent_ts_ms is not None:
+        out["parent_ts_ms"] = int(parent_ts_ms)
+        out["adaptive_parent_ts_ms"] = int(parent_ts_ms)
+    return out
 
 
 def _lineage_summary(orders: Optional[List[dict]]) -> Dict[str, Any]:
@@ -776,7 +826,22 @@ def _adaptive_execute_orders(
                 }
                 break
 
-            for sidx, so in enumerate(list(sliced_orders or [dict(order)])):
+            slice_batch = list(sliced_orders or [dict(order)])
+            slice_count = len(slice_batch)
+            parent_order_id = _optional_int(override_order_id)
+            parent_ts_ms = _optional_int(override_ts_ms)
+
+            for sidx, raw_slice in enumerate(slice_batch):
+                so = dict(raw_slice or {})
+                if slice_count > 1:
+                    so = _stamp_parent_slice_identity(
+                        so,
+                        parent_order_id=parent_order_id,
+                        parent_ts_ms=parent_ts_ms,
+                        order_index=int(oidx),
+                        slice_index=int(sidx),
+                        slice_count=int(slice_count),
+                    )
                 interval_ms = int(so.get("slice_interval_ms") or 0)
                 style = str(so.get("slice_style") or "single").strip().lower()
                 gate_ok, gate_reason, gate_meta = wait_with_kill_interrupt(
@@ -801,6 +866,8 @@ def _adaptive_execute_orders(
                             "symbol": symbol,
                             "order_index": int(oidx),
                             "slice_index": int(sidx),
+                            "slice_count": int(slice_count),
+                            "parent_order_id": parent_order_id,
                             "slice_qty": float(so.get("qty") or 0.0),
                             "delay_ms": int(interval_ms),
                             "style": str(style),
@@ -827,6 +894,8 @@ def _adaptive_execute_orders(
                         "symbol": symbol,
                         "order_index": int(oidx),
                         "slice_index": int(sidx),
+                        "slice_count": int(slice_count),
+                        "parent_order_id": parent_order_id,
                         "slice_qty": float(so.get("qty") or 0.0),
                         "delay_ms": int(interval_ms),
                         "style": str(style),
@@ -839,7 +908,7 @@ def _adaptive_execute_orders(
                     all_ok = False
                     break
 
-                if interval_ms > 0 and sidx < (len(sliced_orders) - 1) and (not bool(dry_run)):
+                if interval_ms > 0 and sidx < (len(slice_batch) - 1) and (not bool(dry_run)):
                     wait_ok, wait_reason, wait_meta = wait_with_kill_interrupt(
                         delay_s=float(interval_ms) / 1000.0,
                         symbol=str(so.get("symbol") or symbol).upper().strip(),
@@ -862,6 +931,8 @@ def _adaptive_execute_orders(
                                 "symbol": symbol,
                                 "order_index": int(oidx),
                                 "slice_index": int(sidx),
+                                "slice_count": int(slice_count),
+                                "parent_order_id": parent_order_id,
                                 "slice_qty": float(so.get("qty") or 0.0),
                                 "delay_ms": int(interval_ms),
                                 "style": str(style),
@@ -917,6 +988,7 @@ def _is_retryable_result(res: Optional[Dict[str, Any]]) -> bool:
         "invalid_credentials",
         "credentials_invalid",
         "ibkr_configuration_invalid",
+        "invalid_order_ref",
     }
 
 
@@ -1048,6 +1120,15 @@ def _apply_one(
         gate_block = _real_trading_gate_or_block(broker_name=name, dry_run=bool(dry_run))
         if gate_block is not None:
             return gate_block
+        options_block = live_options_order_block(
+            override_orders,
+            broker=name,
+            dry_run=bool(dry_run),
+            engine_mode=os.environ.get("ENGINE_MODE", ""),
+            execution_mode=os.environ.get("EXECUTION_MODE", ""),
+        )
+        if options_block is not None:
+            return options_block
 
     # Pre-live reconcile gate (never blocks dry_run)
     if is_live and (not bool(dry_run)):
@@ -1194,15 +1275,20 @@ def apply_new_portfolio_orders_router(
     if rl_block is not None:
         return rl_block
 
+    learned_policy_block = validate_routed_learned_orders(override_orders)
+    if learned_policy_block is not None:
+        return learned_policy_block
+
     lineage = _lineage_summary(override_orders)
 
     chain = _parse_failover_chain()
     if not chain:
         chain = ["sim"]
 
+    engine_mode = os.environ.get("ENGINE_MODE", "safe")
     chain_policy = validate_live_failover_chain(
         chain,
-        engine_mode=os.environ.get("ENGINE_MODE", "safe"),
+        engine_mode=engine_mode,
         dry_run=bool(dry_run),
     )
     if not bool(chain_policy.get("ok")):
@@ -1217,9 +1303,34 @@ def apply_new_portfolio_orders_router(
             "failover_policy": chain_policy,
         }
 
+    if str(engine_mode or "").strip().lower() == "live" and not bool(dry_run):
+        broker_contract = live_broker_environment_contract(engine_mode=engine_mode, chain=chain)
+        if not bool(broker_contract.get("ok")):
+            return {
+                "ok": False,
+                "status": "live_broker_contract_invalid",
+                "reason": str(broker_contract.get("reason") or "live_broker_contract_invalid"),
+                "broker": "failover_chain",
+                "stop_failover": True,
+                "retryable": False,
+                "failover_attempts": [],
+                "broker_contract": broker_contract,
+                "failover_policy": dict(broker_contract.get("chain_policy") or chain_policy),
+            }
+
     blocked = _execution_gate_or_block(dry_run=bool(dry_run))
     if blocked is not None:
         return blocked
+
+    options_block = live_options_order_block(
+        override_orders,
+        broker=",".join(chain),
+        dry_run=bool(dry_run),
+        engine_mode=engine_mode,
+        execution_mode=os.environ.get("EXECUTION_MODE", ""),
+    )
+    if options_block is not None:
+        return options_block
 
     attempts: List[Dict[str, Any]] = []
 

@@ -521,6 +521,120 @@ def _read_residual_distribution_drift(
     )
 
 
+def _production_monitor_label(metric_name: str) -> str:
+    labels = {
+        "feature_drift": "Feature drift",
+        "missing_feature_rate": "Missing feature rate",
+        "prediction_drift": "Prediction drift",
+        "target_label_drift": "Target/label drift",
+        "calibration_ece": "Calibration drift",
+        "conformal_coverage": "Conformal coverage drift",
+        "shadow_live_disagreement": "Shadow-vs-live disagreement",
+        "net_pnl_degradation": "Net PnL degradation",
+    }
+    return labels.get(str(metric_name or ""), str(metric_name or "production monitor").replace("_", " ").title())
+
+
+def _read_production_monitoring(
+    con,
+    *,
+    top_n: int,
+    now_ms: int,
+    stale_after_ms: int,
+    contributors: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not _table_exists(con, "production_monitoring_metrics"):
+        return (
+            _source_state(
+                available=False,
+                now_ms=now_ms,
+                stale_after_ms=stale_after_ms,
+                reason="production_monitoring_metrics table unavailable",
+                endpoint="/api/model/performance_divergence",
+            ),
+            {},
+        )
+
+    rows = _query(
+        con,
+        """
+        SELECT metric_name, scope, dimension, ts_ms, value, baseline_value,
+               threshold_value, severity, state, action_signal, labels_available,
+               sample_n, details_json
+        FROM production_monitoring_metrics
+        ORDER BY
+          CASE severity WHEN 'CRIT' THEN 4 WHEN 'WARN' THEN 3 WHEN 'STALE' THEN 2 WHEN 'UNKNOWN' THEN 1 ELSE 0 END DESC,
+          ts_ms DESC,
+          metric_name ASC
+        LIMIT ?
+        """,
+        (int(top_n),),
+    )
+    latest_ts_ms = max((_safe_int(row[3]) for row in rows), default=0)
+    metrics: list[dict[str, Any]] = []
+    for row in rows:
+        metric_name = str(row[0] or "")
+        severity = _normalize_severity(str(row[7] or "UNKNOWN"))
+        value = _safe_float(row[4])
+        baseline = _safe_float(row[5])
+        threshold = _safe_float(row[6])
+        details = _safe_json_obj(row[12])
+        metrics.append(
+            {
+                "metric_name": metric_name,
+                "scope": str(row[1] or "global"),
+                "dimension": str(row[2] or ""),
+                "ts_ms": _safe_int(row[3]),
+                "value": value,
+                "baseline_value": baseline,
+                "threshold_value": threshold,
+                "severity": severity,
+                "state": str(row[8] or ""),
+                "action_signal": str(row[9] or ""),
+                "labels_available": bool(_safe_int(row[10])),
+                "sample_n": _safe_int(row[11]),
+                "details": details,
+            }
+        )
+        contributors.append(
+            _contributor(
+                kind="production_monitor",
+                label=_production_monitor_label(metric_name),
+                dimension=str(row[2] or row[1] or "global"),
+                source="production_monitoring_metrics",
+                severity=severity,
+                current_value=value,
+                baseline_value=baseline,
+                delta_value=(None if value is None or baseline is None else float(value) - float(baseline)),
+                metric=metric_name,
+                metric_value=value,
+                ts_ms=_safe_int(row[3]),
+                stale=_is_stale(_safe_int(row[3]), now_ms, stale_after_ms),
+                details={
+                    **details,
+                    "threshold_value": threshold,
+                    "state": str(row[8] or ""),
+                    "action_signal": str(row[9] or ""),
+                    "labels_available": bool(_safe_int(row[10])),
+                    "sample_n": _safe_int(row[11]),
+                },
+            )
+        )
+
+    return (
+        _source_state(
+            available=True,
+            rows=len(rows),
+            ts_ms=latest_ts_ms,
+            now_ms=now_ms,
+            stale_after_ms=stale_after_ms,
+            reason=("ok" if rows else "no production monitoring rows"),
+            endpoint="/api/model/performance_divergence",
+        ),
+        {"metrics": metrics},
+    )
+
+
 def _read_distribution_state(con) -> dict[str, Any] | None:
     try:
         from engine.strategy.distribution_drift import get_latest_distribution_drift_snapshot
@@ -723,6 +837,13 @@ def build_drift_explainer_snapshot(
             stale_after_ms=stale_after_ms,
             contributors=contributors,
             affected=affected,
+        )
+        sources["production_monitoring"], current["production_monitoring"] = _read_production_monitoring(
+            con,
+            top_n=top_n,
+            now_ms=now,
+            stale_after_ms=stale_after_ms,
+            contributors=contributors,
         )
         current["distribution_drift"] = _read_distribution_state(con) or {}
         sources["monte_carlo_risk"], current["monte_carlo_risk"] = _read_risk_state(

@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import threading
 from typing import Any
+from urllib.parse import quote, urlparse, urlunparse
 
 from engine.cache.circuit import cache_circuit
+from engine.runtime.ingestion_tuning import tuned_float, tuned_int
 from engine.runtime.platform import default_redis_url
 
 try:  # pragma: no cover - dependency availability is environment-specific.
@@ -20,19 +22,48 @@ _PINGED_KEY: tuple[str, int] | None = None
 _LOCK = threading.Lock()
 
 
+def _secret_text_from_env(*env_names: str) -> str:
+    secret_name = ""
+    for env_name in env_names:
+        secret_name = str(os.environ.get(env_name) or "").strip()
+        if secret_name:
+            break
+    if not secret_name:
+        return ""
+    from services.secrets.loader import load_secret
+
+    return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+
+
+def _url_with_password(url: str, password: str) -> str:
+    text = str(url or "").strip()
+    if not text or not password:
+        return text
+    parsed = urlparse(text)
+    if parsed.password or not parsed.scheme or not parsed.hostname:
+        return text
+    user = quote(str(parsed.username or ""), safe="")
+    host = str(parsed.hostname or "")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    auth = f"{user}:{quote(password, safe='')}@" if user else f":{quote(password, safe='')}@"
+    return urlunparse((parsed.scheme, auth + host, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
 def redis_url() -> str:
-    return str(os.environ.get("TS_REDIS_URL") or os.environ.get("REDIS_URL") or default_redis_url()).strip()
+    raw = str(os.environ.get("TS_REDIS_URL") or os.environ.get("REDIS_URL") or default_redis_url()).strip()
+    password = _secret_text_from_env("TS_REDIS_PASSWORD_SECRET", "REDIS_PASSWORD_SECRET")
+    return _url_with_password(raw, password)
 
 
 def redis_pool_size() -> int:
-    return max(1, int(os.environ.get("TS_REDIS_POOL_SIZE", "16")))
+    return tuned_int("TS_REDIS_POOL_SIZE", 16, 1, 64)
 
 
 def _redis_timeout_s(name: str, default: float) -> float:
-    try:
-        return max(0.05, float(os.environ.get(name, str(default))))
-    except Exception:
-        return float(default)
+    return tuned_float(name, float(default), 0.05, 5.0)
 
 
 def reset_redis_pool() -> None:

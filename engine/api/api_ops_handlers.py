@@ -313,6 +313,29 @@ def api_get_execution_cost_by_confidence(parsed, ctx):
         return payload
 
 
+def api_get_execution_diagnostics(parsed, ctx):
+    try:
+        from engine.execution.execution_diagnostics import build_execution_diagnostics
+
+        qs = _qs(parsed)
+        limit = _parse_int(qs.get("limit", "50") or "50", 50, 1, 500)
+        symbol = str(qs.get("symbol", "") or "").strip().upper()
+        return build_execution_diagnostics(limit=limit, symbol=symbol or None)
+    except Exception as e:
+        payload = _failure_out(
+            "api_ops_handlers_execution_diagnostics_failed",
+            "API_OPS_HANDLERS_EXECUTION_DIAGNOSTICS_FAILED",
+            e,
+            inventory={"routes": [], "summary": {}},
+            tca={"state": "unavailable", "reason": str(e), "by_symbol": [], "rolling": [], "partial_fills": []},
+            order_flow={"state": "unavailable", "partial_fills": [], "rejected_intents": [], "suppressed_intents": []},
+            lob={"state": "unavailable", "warnings": [str(e)]},
+            learned_slicing={"state": "unavailable", "reason": str(e)},
+            drilldowns=[],
+        )
+        return payload
+
+
 def api_get_execution_advisories(parsed, ctx):
     try:
         from engine.execution.execution_ai_advisor import list_execution_advisories
@@ -597,6 +620,7 @@ __all__ = [
     "api_get_execution_metrics_rolling",
     "api_get_execution_metrics_by_symbol",
     "api_get_execution_cost_by_confidence",
+    "api_get_execution_diagnostics",
     "api_get_execution_advisories",
     "api_get_social_features",
     "api_get_social_regimes",

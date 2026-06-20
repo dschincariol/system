@@ -9,6 +9,7 @@ import threading
 from typing import Any, Optional
 
 from engine.runtime import dbapi_compat as dbapi
+from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.startup_write_gate import (
     noncritical_startup_write_wait_s,
     should_defer_noncritical_startup_write,
@@ -31,31 +32,26 @@ def _stderr_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
             str(code),
             f"{type(stderr_err).__name__}: {stderr_err}",
         )
-_BEST_EFFORT_SAME_VALUE_MIN_INTERVAL_MS = max(
-    0,
-    int(float(os.environ.get("RUNTIME_META_BEST_EFFORT_MIN_INTERVAL_S", "2.0") or 2.0) * 1000.0),
+_BEST_EFFORT_SAME_VALUE_MIN_INTERVAL_MS = int(
+    tuned_float("RUNTIME_META_BEST_EFFORT_MIN_INTERVAL_S", 2.0, 0.0, 60.0) * 1000.0
 )
-_BEST_EFFORT_BUFFER_ENABLED = str(os.environ.get("RUNTIME_META_BEST_EFFORT_BUFFER_ENABLED", "1")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_BEST_EFFORT_BUFFER_FLUSH_INTERVAL_S = max(
+_BEST_EFFORT_BUFFER_ENABLED = env_bool("RUNTIME_META_BEST_EFFORT_BUFFER_ENABLED", default=True)
+_BEST_EFFORT_BUFFER_FLUSH_INTERVAL_S = tuned_float(
+    "RUNTIME_META_BEST_EFFORT_BUFFER_FLUSH_INTERVAL_S",
+    2.0,
     0.05,
-    float(os.environ.get("RUNTIME_META_BEST_EFFORT_BUFFER_FLUSH_INTERVAL_S", "2.0") or 2.0),
+    30.0,
 )
-_BEST_EFFORT_BUFFER_FLUSH_JITTER_RATIO = min(
+_BEST_EFFORT_BUFFER_FLUSH_JITTER_RATIO = tuned_float(
+    "RUNTIME_META_BEST_EFFORT_BUFFER_FLUSH_JITTER_RATIO",
+    0.5,
+    0.0,
     1.0,
-    max(0.0, float(os.environ.get("RUNTIME_META_BEST_EFFORT_BUFFER_FLUSH_JITTER_RATIO", "0.5") or 0.5)),
 )
-_BEST_EFFORT_BUFFER_MAX_BATCH = max(
-    1,
-    int(os.environ.get("RUNTIME_META_BEST_EFFORT_BUFFER_MAX_BATCH", "64") or 64),
-)
+_BEST_EFFORT_BUFFER_MAX_BATCH = tuned_int("RUNTIME_META_BEST_EFFORT_BUFFER_MAX_BATCH", 64, 1, 4096)
 _BEST_EFFORT_BUFFER_MAX_KEYS = max(
     _BEST_EFFORT_BUFFER_MAX_BATCH,
-    int(os.environ.get("RUNTIME_META_BEST_EFFORT_BUFFER_MAX_KEYS", "512") or 512),
+    tuned_int("RUNTIME_META_BEST_EFFORT_BUFFER_MAX_KEYS", 512, 1, 65536),
 )
 _PREVIOUS_RUNTIME_META_DB_PATH = str(globals().get("_RUNTIME_META_DB_PATH") or "").strip()
 _RUNTIME_META_DB_PATH = str(os.environ.get("DB_PATH") or "").strip()

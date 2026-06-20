@@ -42,17 +42,12 @@ PRODUCTION_TARGETS = frozenset({"live", "prd", "prod", "production"})
 PRODUCTION_MARKERS = frozenset({"live", "prd", "prod", "production"})
 NON_PROD_MARKERS = NON_PROD_TARGETS | frozenset({"nonproduction", "nonprd"})
 SAFE_BASE_ENV_KEYS = frozenset(
-    {
-        "COMSPEC",
+        {
         "HOME",
         "LANG",
         "LC_ALL",
-        "LOCALAPPDATA",
         "PATH",
-        "PATHEXT",
         "PYTHONPATH",
-        "SYSTEMDRIVE",
-        "SYSTEMROOT",
         "TEMP",
         "TMP",
         "TMPDIR",
@@ -89,7 +84,9 @@ ENV_SNAPSHOT_KEYS = (
     "APP_ENV",
     "BACKUP_EVIDENCE_HMAC_KEY_FILE",
     "BACKUP_EVIDENCE_PATH",
+    "BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S",
     "CREDENTIALS_DIRECTORY",
+    "DATA_SOURCE_MASTER_KEY",
     "DASHBOARD_API_TOKEN",
     "DB_PATH",
     "DEPLOYMENT_ENV",
@@ -488,7 +485,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--env-file", action="append", default=[], help="Env file to load; may be supplied more than once.")
     parser.add_argument("--target-env", default="", help="Explicit target environment, usually 'staging'.")
-    parser.add_argument("--evidence-dir", default=str(REPO_ROOT / "artifacts" / "preflight"))
+    parser.add_argument("--evidence-dir", default=str(REPO_ROOT / "var" / "artifacts" / "preflight"))
     parser.add_argument("--evidence-label", default="")
     parser.add_argument("--timeout-s", type=int, default=int(os.environ.get("PREFLIGHT_SMOKE_TIMEOUT_S", "900")))
     parser.add_argument("--python", default=sys.executable)

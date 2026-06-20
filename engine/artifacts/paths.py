@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from engine.runtime.platform import default_data_root
+from engine.runtime.platform import default_data_root, default_local_artifacts_dir, use_local_runtime_defaults
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -36,6 +36,8 @@ def artifacts_root() -> Path:
     if _running_python_tests():
         root = Path(tempfile.gettempdir()) / f"trading-system-tests-{os.getpid()}"
         return (root / "artifacts").resolve()
+    if use_local_runtime_defaults():
+        return default_local_artifacts_dir().resolve()
     return (default_data_root() / "artifacts").resolve()
 
 

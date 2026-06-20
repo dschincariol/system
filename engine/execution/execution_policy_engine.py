@@ -25,7 +25,6 @@ Adds:
 - Unified compatibility for both qty-orders and to_weight intents
 """
 
-import json
 import logging
 import math
 import os
@@ -48,6 +47,10 @@ from engine.execution.execution_decision_engine import (
     decide_execution_strategy,
     load_execution_feedback_snapshot,
 )
+from engine.execution.lob_simulation import (
+    deeplob_shadow_enabled,
+    shadow_deeplob_execution_signal,
+)
 from engine.strategy.regime_stack import (
     compute_regime_vector,
     regime_compatibility,
@@ -56,6 +59,18 @@ from engine.strategy.regime_stack import (
 from engine.strategy.meta_labeling import score_order_meta_label
 from engine.strategy.conformal import conformal_gate_from_payload
 from engine.strategy.ood import ood_gate_from_payload
+from engine.strategy.uncertainty_sizing import uncertainty_gate_from_payload
+from engine.runtime.live_ai_safety import live_ai_order_guard
+from engine.strategy.learned_alpha_decay import execution_adjustment_for_order
+from engine.strategy.ope_gate import evaluate_policy_ope_gate
+from engine.execution.contextual_bandit_slicer import (
+    LearnedExecutionPolicyViolation,
+    build_constraints as build_learned_execution_constraints,
+    build_context as build_learned_execution_context,
+    learned_execution_enabled,
+    metadata_for_order as learned_execution_metadata_for_order,
+    select_execution_adjustment as select_learned_execution_adjustment,
+)
 
 
 LOG = logging.getLogger("engine.execution.execution_policy_engine")
@@ -382,6 +397,140 @@ def _signed_qty_or_weight(o: Dict[str, Any], side: str) -> float:
     return 0.0
 
 
+def _first_present(o: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in o:
+            return o.get(key)
+    return None
+
+
+def _ope_payload_from_order(
+    original_order: Dict[str, Any],
+    shaped_order: Dict[str, Any],
+    *,
+    side: str,
+    signed_qty: float,
+) -> Dict[str, Any]:
+    payload = {
+        "policy_type": _first_present(original_order, "policy_type", "candidate_type"),
+        "candidate_key": _first_present(original_order, "candidate_key", "policy_id"),
+        "candidate_version": _first_present(original_order, "candidate_version", "policy_version", "model_version"),
+        "logged_action": _first_present(original_order, "logged_action", "behavior_action", "side", "to_side"),
+        "target_action": _first_present(original_order, "target_action", "candidate_action", "policy_action"),
+        "behavior_propensity": _first_present(
+            original_order,
+            "behavior_propensity",
+            "logging_propensity",
+            "logged_propensity",
+            "decision_propensity",
+            "propensity",
+        ),
+        "target_propensity": _first_present(
+            original_order,
+            "target_propensity",
+            "candidate_propensity",
+            "evaluation_propensity",
+            "policy_propensity",
+        ),
+        "outcome": _first_present(
+            original_order,
+            "outcome",
+            "reward",
+            "net_return",
+            "net_ret",
+            "realized_return",
+            "realized_ret",
+        ),
+        "logged_model_estimate": _first_present(
+            original_order,
+            "logged_model_estimate",
+            "behavior_model_estimate",
+            "q_logged",
+            "model_estimate",
+        ),
+        "target_model_estimate": _first_present(
+            original_order,
+            "target_model_estimate",
+            "candidate_model_estimate",
+            "q_target",
+            "policy_model_estimate",
+        ),
+        "target_qty_or_weight": float(signed_qty),
+        "target_side": str(side),
+        "target_to_weight": shaped_order.get("to_weight"),
+        "target_qty": shaped_order.get("qty"),
+    }
+    if not payload.get("logged_action"):
+        payload["logged_action"] = str(side)
+    if not payload.get("target_action"):
+        payload["target_action"] = str(side)
+    return {str(key): value for key, value in payload.items() if value is not None and value != ""}
+
+
+def _learned_execution_ope_gate(con, order: Dict[str, Any], *, symbol: str) -> tuple[bool, Dict[str, Any]]:
+    policy_name = str(
+        order.get("learned_execution_policy")
+        or order.get("execution_policy_model_name")
+        or order.get("policy_name")
+        or "contextual_bandit_execution_slicer_v1"
+    )
+    policy_id = str(
+        order.get("learned_execution_policy_id")
+        or order.get("execution_policy_model_id")
+        or order.get("policy_id")
+        or policy_name
+    )
+    policy_version = str(
+        order.get("learned_execution_policy_version")
+        or order.get("execution_policy_model_version")
+        or order.get("policy_version")
+        or ""
+    )
+    candidate_type = str(
+        order.get("learned_execution_candidate_type")
+        or order.get("policy_type")
+        or order.get("candidate_type")
+        or "bandit"
+    )
+    return evaluate_policy_ope_gate(
+        model_id=policy_id,
+        model_name=policy_name,
+        candidate_type=candidate_type,
+        model_kind="contextual_bandit",
+        candidate_version=policy_version,
+        symbol=str(symbol or "").upper().strip(),
+        regime=str(order.get("regime") or "global"),
+        metadata={
+            "candidate_key": str(order.get("learned_execution_candidate_key") or policy_id),
+            "policy_id": policy_id,
+            "policy_type": candidate_type,
+            "source": "learned_execution.contextual_bandit",
+        },
+        con=con,
+    )
+
+
+def _is_risk_increasing_order(o: Dict[str, Any], side: str) -> bool:
+    action = str(o.get("action") or "").strip().upper()
+    if bool(o.get("reduce_only")) or action in {"CLOSE", "EXIT", "REDUCE", "FLATTEN", "LIQUIDATE"}:
+        return False
+
+    if "to_weight" in o and o.get("to_weight") is not None:
+        from_weight = _safe_float(o.get("from_weight"), 0.0)
+        to_weight = _safe_float(o.get("to_weight"), 0.0)
+        if abs(float(to_weight)) <= abs(float(from_weight)) + float(TSE_MIN_ABS_QTY):
+            return False
+        return True
+
+    qty = _safe_float(o.get("qty"), 0.0)
+    if abs(float(qty)) <= float(TSE_MIN_ABS_QTY):
+        return False
+
+    if side == "SHORT" and qty > 0.0 and action in {"COVER", "BUY_TO_COVER"}:
+        return False
+    return True
+
+
 def _build_slice_qtys(total_qty: float, slice_pct: float, max_slices: int) -> List[float]:
     signed_total = float(total_qty)
     abs_total = abs(float(signed_total))
@@ -643,8 +792,32 @@ def apply_execution_policy(
                 )
                 continue
 
+            risk_increasing_order = bool(_is_risk_increasing_order(o, side))
+            live_ai_gate = live_ai_order_guard(
+                o,
+                execution_mode=str(mode or ""),
+                broker=str(broker or ""),
+                risk_increasing=bool(risk_increasing_order),
+                now_ms=int(now_ms),
+            )
+            if not bool(live_ai_gate.get("ok")):
+                reason_code = str(live_ai_gate.get("reason") or "failed").strip() or "failed"
+                _log_suppression_event(
+                    o=o,
+                    reason=f"live_ai_safety_{reason_code}",
+                    decision_json={
+                        "blocked_by": "live_ai_safety",
+                        "live_ai_safety": dict(live_ai_gate),
+                    },
+                    execution_policy_json={
+                        "live_ai_safety": dict(live_ai_gate),
+                    },
+                )
+                continue
+
             signal_ts = _normalize_signal_ts(o, default_signal_ts_ms)
             ttl_ms = max(1, _safe_int(o.get("alpha_ttl_ms"), DEFAULT_TTL_MS))
+            half_life_ms = max(1, _safe_int(o.get("alpha_half_life_ms"), DEFAULT_HALF_LIFE_MS))
 
             if signal_ts <= 0 and STRICT_SIGNAL_TS:
                 signal_ts = int(now_ms)
@@ -665,6 +838,57 @@ def apply_execution_policy(
                 continue
 
             age_ms = max(0, now_ms - signal_ts) if signal_ts > 0 else 0
+            try:
+                learned_alpha_gate = execution_adjustment_for_order(
+                    con,
+                    o,
+                    age_ms=int(age_ms),
+                    ttl_ms=int(ttl_ms),
+                    half_life_ms=int(half_life_ms),
+                    now_ms=int(now_ms),
+                )
+            except Exception as e:
+                _warn_nonfatal(
+                    "EXECUTION_POLICY_ENGINE_LEARNED_ALPHA_FAILED",
+                    e,
+                    once_key=f"learned_alpha:{symbol}",
+                    symbol=str(symbol),
+                )
+                learned_alpha_gate = {
+                    "available": False,
+                    "blocked": False,
+                    "reason": f"lookup_failed:{type(e).__name__}",
+                    "ttl_ms": int(ttl_ms),
+                    "half_life_ms": int(half_life_ms),
+                    "size_multiplier": 1.0,
+                    "estimate": {},
+                }
+
+            if bool(learned_alpha_gate.get("blocked")) and bool(risk_increasing_order):
+                _log_suppression_event(
+                    o=o,
+                    reason=str(learned_alpha_gate.get("reason") or "learned_alpha_blocked"),
+                    decision_json={
+                        "blocked_by": "learned_alpha_decay",
+                        "age_ms": int(age_ms),
+                        "learned_alpha": dict(learned_alpha_gate),
+                    },
+                    execution_policy_json={
+                        "learned_alpha": dict(learned_alpha_gate),
+                    },
+                )
+                continue
+            if bool(learned_alpha_gate.get("blocked")) and not bool(risk_increasing_order):
+                learned_alpha_gate = {
+                    **dict(learned_alpha_gate),
+                    "blocked": False,
+                    "risk_reduction_bypass": True,
+                    "size_multiplier": 1.0,
+                }
+
+            ttl_ms = max(1, _safe_int(learned_alpha_gate.get("ttl_ms"), ttl_ms))
+            half_life_ms = max(1, _safe_int(learned_alpha_gate.get("half_life_ms"), half_life_ms))
+
             if ttl_ms > 0 and age_ms > ttl_ms:
                 _log_suppression_event(
                     o=o,
@@ -674,7 +898,6 @@ def apply_execution_policy(
                 )
                 continue
 
-            half_life_ms = max(1, _safe_int(o.get("alpha_half_life_ms"), DEFAULT_HALF_LIFE_MS))
             alpha_rem = _alpha_remaining(age_ms, half_life_ms, ttl_ms)
 
             if alpha_rem <= 0.0:
@@ -712,6 +935,10 @@ def apply_execution_policy(
             regime_comp, regime_vec = resolved_regime_compatibility(con, symbol, signal_ts, o)
 
             size_scale = max(float(EPE_MIN_REGIME_COMPAT_SCALE), float(regime_comp))
+            size_scale = max(0.0, min(1.0, float(size_scale)))
+
+            learned_alpha_size_mult = max(0.0, min(1.0, _safe_float(learned_alpha_gate.get("size_multiplier"), 1.0)))
+            size_scale *= float(learned_alpha_size_mult)
             size_scale = max(0.0, min(1.0, float(size_scale)))
 
             if capital_mode == "preserve":
@@ -808,6 +1035,34 @@ def apply_execution_policy(
             )
             size_scale = max(0.0, min(1.0, float(size_scale)))
 
+            lob_deeplob_shadow = {
+                "enabled": False,
+                "shadow_only": True,
+                "reason": "disabled",
+            }
+            if deeplob_shadow_enabled():
+                try:
+                    lob_deeplob_shadow = shadow_deeplob_execution_signal(
+                        con,
+                        symbol=str(symbol),
+                        side=("BUY" if side == "LONG" else "SELL"),
+                        ts_ms=int(signal_ts or now_ms),
+                        latency_ms=int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms),
+                    )
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_DEEPLOB_SHADOW_FAILED",
+                        e,
+                        once_key=f"deeplob_shadow:{symbol}",
+                        symbol=str(symbol),
+                    )
+                    lob_deeplob_shadow = {
+                        "ok": False,
+                        "blocked": True,
+                        "shadow_only": True,
+                        "reason": f"shadow_signal_failed:{type(e).__name__}",
+                    }
+
             try:
                 meta_label_gate = score_order_meta_label(con, o, regime_vec=regime_vec)
             except Exception as e:
@@ -881,6 +1136,74 @@ def apply_execution_policy(
                     "hard_block": False,
                     "reason": f"score_failed:{type(e).__name__}",
                 }
+            try:
+                uncertainty_gate = uncertainty_gate_from_payload(
+                    o,
+                    conformal_gate=conformal_gate,
+                    ood_gate=ood_gate,
+                    execution_mode=str(mode or ""),
+                    broker=str(broker or ""),
+                    risk_increasing=bool(risk_increasing_order),
+                    now_ms=int(now_ms),
+                )
+            except Exception as e:
+                if bool(live_ai_gate.get("required")):
+                    _log_suppression_event(
+                        o=o,
+                        reason=f"live_ai_safety_uncertainty_gate_failed:{type(e).__name__}",
+                        decision_json={
+                            "blocked_by": "live_ai_safety",
+                            "reason": "uncertainty_gate_failed",
+                            "error": f"{type(e).__name__}: {e}",
+                            "conformal_gate": dict(conformal_gate),
+                            "ood_gate": dict(ood_gate),
+                        },
+                        execution_policy_json={
+                            "live_ai_safety": dict(live_ai_gate),
+                            "conformal_gate": dict(conformal_gate),
+                            "ood_gate": dict(ood_gate),
+                        },
+                    )
+                    continue
+                _warn_nonfatal(
+                    "EXECUTION_POLICY_ENGINE_UNCERTAINTY_GATE_FAILED",
+                    e,
+                    once_key=f"uncertainty_gate:{symbol}",
+                    symbol=str(symbol),
+                )
+                uncertainty_gate = {
+                    "enabled": True,
+                    "applied": False,
+                    "mode": str(os.environ.get("UNCERTAINTY_SIZING_MODE", "log_only") or "log_only"),
+                    "multiplier": 1.0,
+                    "hard_block": False,
+                    "reason": f"score_failed:{type(e).__name__}",
+                }
+            uncertainty_mult = max(0.0, min(1.0, _safe_float(uncertainty_gate.get("multiplier"), 1.0)))
+            if bool(uncertainty_gate.get("hard_block")):
+                reason_code = str(uncertainty_gate.get("reason") or "hard_block").strip() or "hard_block"
+                _log_suppression_event(
+                    o=o,
+                    reason=f"uncertainty_{reason_code}",
+                    decision_json={
+                        "blocked_by": "uncertainty",
+                        "scale": 0.0,
+                        "uncertainty_gate": dict(uncertainty_gate),
+                        "conformal_gate": dict(conformal_gate),
+                        "ood_gate": dict(ood_gate),
+                        "meta_label": dict(meta_label_gate),
+                        "tse": tse,
+                    },
+                    execution_policy_json={
+                        "uncertainty_gate": dict(uncertainty_gate),
+                        "conformal_gate": dict(conformal_gate),
+                        "ood_gate": dict(ood_gate),
+                        "meta_label": dict(meta_label_gate),
+                        "tse": tse,
+                        "scale": 0.0,
+                    },
+                )
+                continue
             ood_mult = max(0.0, min(1.0, _safe_float(ood_gate.get("multiplier"), 1.0)))
             if bool(ood_gate.get("hard_block")):
                 _log_suppression_event(
@@ -901,6 +1224,8 @@ def apply_execution_policy(
                     },
                 )
                 continue
+            size_scale *= float(uncertainty_mult)
+            size_scale = max(0.0, min(1.0, float(size_scale)))
             size_scale *= float(ood_mult)
             size_scale = max(0.0, min(1.0, float(size_scale)))
 
@@ -959,6 +1284,37 @@ def apply_execution_policy(
                             "meta": meta,
                         },
                         execution_policy_json={"ood_gate": dict(ood_gate), "scale": size_scale, "meta": meta},
+                    )
+                    continue
+                if bool(uncertainty_gate.get("applied")) and float(uncertainty_mult) <= 0.0:
+                    original_qty = (
+                        _safe_float(o.get("qty"), 0.0)
+                        if "qty" in o and o.get("qty") is not None
+                        else _safe_float(o.get("to_weight"), 0.0)
+                    )
+                    compressed_qty = (
+                        _safe_float(shaped_order.get("qty"), 0.0)
+                        if "qty" in shaped_order and shaped_order.get("qty") is not None
+                        else _safe_float(shaped_order.get("to_weight"), 0.0)
+                    )
+                    meta = {
+                        "original_qty": float(original_qty),
+                        "compressed_qty": float(compressed_qty),
+                    }
+                    _log_suppression_event(
+                        o=o,
+                        reason="uncertainty_size_compression_scaled_to_zero",
+                        decision_json={
+                            "blocked_by": "uncertainty_size_compression",
+                            "scale": size_scale,
+                            "uncertainty_gate": dict(uncertainty_gate),
+                            "meta": meta,
+                        },
+                        execution_policy_json={
+                            "uncertainty_gate": dict(uncertainty_gate),
+                            "scale": size_scale,
+                            "meta": meta,
+                        },
                     )
                     continue
                 if tse_action == "SIZE_COMPRESSION":
@@ -1022,22 +1378,162 @@ def apply_execution_policy(
                 "broker": str(broker or "unknown"),
                 "portfolio_orders_batch_id": portfolio_orders_batch_id,
                 "portfolio_orders_id": portfolio_orders_id,
+                "learned_alpha": dict(learned_alpha_gate),
                 "alpha_intent": dict(alpha_intent),
                 "execution_decision": dict(execution_decision),
                 "execution_feedback": dict(feedback_snapshot or {}),
+                "lob_deeplob_shadow": dict(lob_deeplob_shadow or {}),
                 "meta_label": dict(meta_label_gate),
                 "conformal_gate": dict(conformal_gate),
                 "ood_gate": dict(ood_gate),
+                "uncertainty_gate": dict(uncertainty_gate),
             }
+            ope_payload = _ope_payload_from_order(
+                o,
+                shaped_order,
+                side=str(side),
+                signed_qty=float(signed_qty),
+            )
+            if ope_payload:
+                decision_blob["ope"] = dict(ope_payload)
 
             if "qty" in shaped_order and shaped_order.get("qty") is not None:
                 slice_pct = 0.15 if volatility > 0.03 else 0.25
                 if capital_mode == "preserve":
                     slice_pct = min(slice_pct, float(EPE_CAPITAL_PRESERVE_CHUNK_PCT))
 
+                learned_execution = {
+                    "enabled": False,
+                    "applied": False,
+                    "reason": "disabled",
+                }
+                learned_decision = None
+                learned_constraints = None
+                parent_id = str(
+                    shaped_order.get("client_order_id")
+                    or shaped_order.get("portfolio_orders_id")
+                    or shaped_order.get("source_order_id")
+                    or f"{symbol}:{portfolio_orders_batch_id or portfolio_orders_id or 'policy'}:{now_ms}"
+                )
+                base_entry_delay_ms = int(execution_decision.get("entry_delay_ms") or 0)
+                base_slice_interval_ms = _safe_int(
+                    o.get("slice_interval_ms") or o.get("interval_ms") or os.environ.get("EXEC_SLICE_INTERVAL_MS", "250"),
+                    250,
+                )
+                base_participation = _safe_float(
+                    o.get("target_participation")
+                    or o.get("pov_participation")
+                    or o.get("participation_rate")
+                    or os.environ.get("EXEC_POV_PARTICIPATION", "0.03"),
+                    0.03,
+                )
+                learned_slice_pct = float(slice_pct)
+                learned_entry_delay_ms = int(base_entry_delay_ms)
+                learned_slice_interval_ms = int(max(0, base_slice_interval_ms))
+                learned_target_participation = float(base_participation)
+                learned_requested = bool(learned_execution_enabled(o))
+                learned_ope_gate: Dict[str, Any] = {}
+                if learned_requested:
+                    try:
+                        learned_ope_ok, learned_ope_gate = _learned_execution_ope_gate(
+                            con,
+                            o,
+                            symbol=str(symbol),
+                        )
+                    except Exception as e:
+                        _warn_nonfatal(
+                            "EXECUTION_POLICY_ENGINE_LEARNED_EXECUTION_OPE_FAILED",
+                            e,
+                            once_key=f"learned_execution_ope:{symbol}",
+                            symbol=str(symbol),
+                        )
+                        learned_ope_ok = False
+                        learned_ope_gate = {
+                            "applied": True,
+                            "passed": False,
+                            "status": f"ope_gate_error:{type(e).__name__}",
+                        }
+                    if not bool(learned_ope_ok):
+                        learned_execution = {
+                            "enabled": True,
+                            "applied": False,
+                            "reason": "ope_gate_blocked",
+                            "ope_gate": dict(learned_ope_gate or {}),
+                        }
+
+                if learned_requested and bool(learned_ope_gate.get("passed")):
+                    try:
+                        learned_constraints = build_learned_execution_constraints(
+                            order=o,
+                            symbol=str(symbol),
+                            side=str(side),
+                            parent_qty=float(shaped_order.get("qty") or 0.0),
+                            parent_id=str(parent_id),
+                            base_slice_pct=float(slice_pct),
+                            base_participation=float(base_participation),
+                            base_slice_interval_ms=int(base_slice_interval_ms),
+                            base_entry_delay_ms=int(base_entry_delay_ms),
+                            max_slices=int(TSE_MAX_SLICES),
+                        )
+                        learned_context = build_learned_execution_context(
+                            order={
+                                **dict(o),
+                                "epe_alpha_remaining": float(alpha_rem),
+                                "true_spread_bps": o.get("true_spread_bps", shaped_order.get("true_spread_bps")),
+                                "intraday_vol_bps": o.get("intraday_vol_bps", shaped_order.get("intraday_vol_bps")),
+                            },
+                            feedback=feedback_snapshot,
+                            execution_decision=execution_decision,
+                            extra={
+                                "alpha_remaining": float(alpha_rem),
+                                "capital_mode": 1.0 if capital_mode == "preserve" else 0.0,
+                            },
+                        )
+                        learned_decision = select_learned_execution_adjustment(
+                            context=learned_context,
+                            constraints=learned_constraints,
+                        )
+                        learned_slice_pct = float(learned_decision.parameters["slice_pct"])
+                        learned_entry_delay_ms = int(learned_decision.parameters["entry_delay_ms"])
+                        learned_slice_interval_ms = int(learned_decision.parameters["slice_interval_ms"])
+                        learned_target_participation = float(learned_decision.parameters["target_participation"])
+                        learned_execution = {
+                            "enabled": True,
+                            "applied": True,
+                            "policy": str(learned_decision.policy_name),
+                            "action_id": str(learned_decision.action_id),
+                            "parameters": dict(learned_decision.parameters),
+                            "constraints": learned_constraints.as_guard(),
+                            "context": dict(learned_context),
+                            "ope_gate": dict(learned_ope_gate or {}),
+                        }
+                    except LearnedExecutionPolicyViolation as e:
+                        _log_suppression_event(
+                            o=o,
+                            reason="learned_execution_policy_violation",
+                            decision_json={
+                                "blocked_by": "learned_execution_policy",
+                                "reason": str(e),
+                            },
+                            execution_policy_json={"learned_execution": {"enabled": True, "error": str(e)}},
+                        )
+                        continue
+                    except Exception as e:
+                        _warn_nonfatal(
+                            "EXECUTION_POLICY_ENGINE_LEARNED_EXECUTION_FAILED",
+                            e,
+                            once_key=f"learned_execution:{symbol}",
+                            symbol=str(symbol),
+                        )
+                        learned_execution = {
+                            "enabled": True,
+                            "applied": False,
+                            "reason": f"fallback_baseline:{type(e).__name__}",
+                        }
+
                 slice_qtys = _build_slice_qtys(
                     float(shaped_order.get("qty") or 0.0),
-                    float(slice_pct),
+                    float(learned_slice_pct),
                     int(TSE_MAX_SLICES),
                 )
                 if not slice_qtys:
@@ -1045,7 +1541,7 @@ def apply_execution_policy(
                 slices = len(slice_qtys)
                 slice_qty = abs(float(slice_qtys[0] or 0.0))
 
-                for slice_signed_qty in slice_qtys:
+                for slice_index, slice_signed_qty in enumerate(slice_qtys):
                     row = dict(shaped_order)
                     row["qty"] = float(slice_signed_qty)
                     row["order_type"] = str(order_type)
@@ -1060,11 +1556,15 @@ def apply_execution_policy(
                     row["tse_reason"] = str(tse.get("reason") or "")
                     row["capital_mode"] = str(capital_mode)
                     row["capital_preservation_snapshot"] = dict(cpm_snapshot or {})
+                    row["learned_alpha_decay"] = dict(learned_alpha_gate)
+                    row["learned_alpha_size_mult"] = float(learned_alpha_size_mult)
                     row["alpha_intent"] = dict(alpha_intent)
                     row["execution_policy"] = str(execution_decision.get("execution_policy") or "balanced")
                     row["execution_policy_locked"] = 1
                     row["entry_strategy"] = str(execution_decision.get("entry_strategy") or "working_limit")
-                    row["entry_delay_ms"] = int(execution_decision.get("entry_delay_ms") or 0)
+                    row["entry_delay_ms"] = int(learned_entry_delay_ms)
+                    row["slice_interval_ms"] = int(learned_slice_interval_ms)
+                    row["target_participation"] = float(learned_target_participation)
                     row["expected_slippage_bps"] = float(execution_decision.get("expected_slippage_bps") or 0.0)
                     row["expected_fill_latency_ms"] = int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms)
                     row["slippage_size_mult"] = float(execution_decision.get("size_mult") or 1.0)
@@ -1077,22 +1577,37 @@ def apply_execution_policy(
                     row["ood_score"] = ood_gate.get("ood_score")
                     row["ood_size_mult"] = float(ood_mult)
                     row["ood_gate"] = dict(ood_gate)
+                    row["uncertainty_size_mult"] = float(uncertainty_mult)
+                    row["uncertainty_action"] = str(uncertainty_gate.get("action") or "NONE")
+                    row["uncertainty_gate"] = dict(uncertainty_gate)
                     row["execution_feedback_snapshot"] = dict(feedback_snapshot or {})
+                    row["lob_deeplob_shadow"] = dict(lob_deeplob_shadow or {})
                     row["entry_limit_offset_bps"] = float(execution_decision.get("limit_offset_bps") or 0.0)
                     row["epe_broker_sim_overrides"] = {
                         "latency_ms": int(sim_lat_ms),
                         "chunk_pct": float(sim_chunk_pct),
                         "extra_slippage_bps": float(sim_extra_slip),
                     }
+                    row["learned_execution"] = dict(learned_execution)
+                    if learned_decision is not None and learned_constraints is not None:
+                        row.update(
+                            learned_execution_metadata_for_order(
+                                decision=learned_decision,
+                                constraints=learned_constraints,
+                                slice_index=int(slice_index),
+                                slice_count=int(slices),
+                            )
+                        )
                     shaped.append(row)
 
                 policy_json = dict(decision_blob)
                 policy_json.update(
                     {
-                        "slice_pct": float(slice_pct),
+                        "slice_pct": float(learned_slice_pct),
                         "slice_qty": float(slice_qty),
                         "slices": int(slices),
                         "regime_vector": regime_vec,
+                        "learned_execution": dict(learned_execution),
                     }
                 )
 
@@ -1137,6 +1652,8 @@ def apply_execution_policy(
             row["tse_reason"] = str(tse.get("reason") or "")
             row["capital_mode"] = str(capital_mode)
             row["capital_preservation_snapshot"] = dict(cpm_snapshot or {})
+            row["learned_alpha_decay"] = dict(learned_alpha_gate)
+            row["learned_alpha_size_mult"] = float(learned_alpha_size_mult)
             row["alpha_intent"] = dict(alpha_intent)
             row["execution_policy"] = str(execution_decision.get("execution_policy") or "balanced")
             row["execution_policy_locked"] = 1
@@ -1154,7 +1671,11 @@ def apply_execution_policy(
             row["ood_score"] = ood_gate.get("ood_score")
             row["ood_size_mult"] = float(ood_mult)
             row["ood_gate"] = dict(ood_gate)
+            row["uncertainty_size_mult"] = float(uncertainty_mult)
+            row["uncertainty_action"] = str(uncertainty_gate.get("action") or "NONE")
+            row["uncertainty_gate"] = dict(uncertainty_gate)
             row["execution_feedback_snapshot"] = dict(feedback_snapshot or {})
+            row["lob_deeplob_shadow"] = dict(lob_deeplob_shadow or {})
             row["entry_limit_offset_bps"] = float(execution_decision.get("limit_offset_bps") or 0.0)
             row["epe_broker_sim_overrides"] = {
                 "latency_ms": int(sim_lat_ms),

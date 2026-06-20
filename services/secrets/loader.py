@@ -24,7 +24,6 @@ LOG = logging.getLogger(__name__)
 _PROVIDER_MODULES = {
     "systemd-creds": "services.secrets.providers.systemd_creds",
     "systemd_creds": "services.secrets.providers.systemd_creds",
-    "dpapi": "services.secrets.providers.dpapi",
     "plaintext": "services.secrets.providers.plaintext",
 }
 _AUDIT_LOCAL = threading.local()
@@ -59,8 +58,6 @@ def validate_secret_name(name: str) -> str:
 
 
 def _default_provider_name() -> str:
-    if sys.platform.startswith("win"):
-        return "dpapi"
     return "systemd-creds"
 
 

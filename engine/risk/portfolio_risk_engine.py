@@ -46,6 +46,13 @@ LOG = logging.getLogger("engine.risk.portfolio_risk_engine")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
     key = str(once_key or "")
     if key:
@@ -91,7 +98,8 @@ PORTFOLIO_VOL_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_VOL_HARD_BLOCK",
 PORTFOLIO_VOL_FLOOR = float(os.environ.get("PORTFOLIO_RISK_VOL_FLOOR", "0.005"))
 PORTFOLIO_VOL_CEIL = float(os.environ.get("PORTFOLIO_RISK_VOL_CEIL", "0.080"))
 USE_GEX_VOL_MODIFIER = os.environ.get("PORTFOLIO_RISK_USE_GEX_VOL_MODIFIER", os.environ.get("USE_OPTIONS_FEATURES", "0")) == "1"
-PORTFOLIO_RISK_USE_MONTE_CARLO = os.environ.get("PORTFOLIO_RISK_USE_MONTE_CARLO", "1") == "1"
+PORTFOLIO_RISK_USE_MONTE_CARLO = _env_bool("PORTFOLIO_RISK_USE_MONTE_CARLO", True)
+PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE = _env_bool("PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE", True)
 PORTFOLIO_RISK_MC_MAX_AGE_S = int(os.environ.get("PORTFOLIO_RISK_MC_MAX_AGE_S", "900"))
 PORTFOLIO_RISK_MC_VAR_95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_VAR_95_BLOCK", "0.0"))
 PORTFOLIO_RISK_MC_VAR_99_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_VAR_99_BLOCK", "0.0"))
@@ -179,9 +187,70 @@ def _optional_float(x: Any) -> Optional[float]:
         return None
 
 
+def _is_live_risk_runtime() -> bool:
+    engine_mode = str(os.environ.get("ENGINE_MODE", "") or "").strip().lower()
+    execution_mode = str(os.environ.get("EXECUTION_MODE", "") or "").strip().lower()
+    env = str(os.environ.get("ENV", "") or "").strip().lower()
+    prod_lock = _env_bool("PROD_LOCK", env == "prod")
+    return bool(engine_mode == "live" or execution_mode == "live" or (env == "prod" and prod_lock))
+
+
+def _monte_carlo_required_in_current_runtime() -> bool:
+    return bool(PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE and _is_live_risk_runtime())
+
+
+def _monte_carlo_failure_summary(
+    reason_code: str,
+    *,
+    now_ms: int,
+    ts_ms: int = 0,
+    status: str = "",
+    ready: bool = False,
+    stale: bool = False,
+    error_type: str | None = None,
+    error: str | None = None,
+) -> Dict[str, Any]:
+    required = _monte_carlo_required_in_current_runtime()
+    age_ms = int(max(0, int(now_ms) - int(ts_ms or 0))) if ts_ms else 0
+    reason: Dict[str, Any] = {"type": str(reason_code)}
+    if error_type:
+        reason["error_type"] = str(error_type)
+    if error:
+        reason["error"] = str(error)
+
+    out: Dict[str, Any] = {
+        "enabled": bool(PORTFOLIO_RISK_USE_MONTE_CARLO),
+        "required": bool(required),
+        "ready": bool(ready),
+        "status": str(status or reason_code),
+        "ts_ms": int(ts_ms or 0),
+        "age_s": float(age_ms) / 1000.0,
+        "blocked": bool(required),
+        "reasons": [reason],
+    }
+    if stale:
+        out["stale"] = True
+    return out
+
+
 def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
     if not PORTFOLIO_RISK_USE_MONTE_CARLO:
-        return {}
+        if _monte_carlo_required_in_current_runtime():
+            return _monte_carlo_failure_summary(
+                "monte_carlo_risk_disabled_while_required",
+                now_ms=int(now_ms),
+                status="disabled",
+            )
+        return {
+            "enabled": False,
+            "required": False,
+            "ready": False,
+            "status": "disabled",
+            "ts_ms": 0,
+            "age_s": 0.0,
+            "blocked": False,
+            "reasons": [{"type": "monte_carlo_risk_disabled"}],
+        }
 
     try:
         raw, ts_ms = get_state_row("monte_carlo_risk_info", "")
@@ -191,11 +260,20 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
             e,
             once_key="monte_carlo_state_read",
         )
-        monte_carlo_info: Dict[str, Any] = {}
-        return monte_carlo_info
+        return _monte_carlo_failure_summary(
+            "monte_carlo_risk_state_read_error",
+            now_ms=int(now_ms),
+            error_type=type(e).__name__,
+            error=str(e),
+        )
 
     if not raw:
-        return {}
+        return _monte_carlo_failure_summary(
+            "monte_carlo_risk_state_missing",
+            now_ms=int(now_ms),
+            ts_ms=int(ts_ms or 0),
+            status="missing",
+        )
 
     try:
         info = json.loads(raw or "{}")
@@ -205,14 +283,29 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
             e,
             once_key="monte_carlo_json_parse",
         )
-        monte_carlo_info = {}
-        return monte_carlo_info
+        return _monte_carlo_failure_summary(
+            "monte_carlo_risk_state_parse_error",
+            now_ms=int(now_ms),
+            ts_ms=int(ts_ms or 0),
+            status="parse_error",
+            error_type=type(e).__name__,
+            error=str(e),
+        )
 
     if not isinstance(info, dict):
-        return {}
+        return _monte_carlo_failure_summary(
+            "monte_carlo_risk_state_invalid",
+            now_ms=int(now_ms),
+            ts_ms=int(ts_ms or 0),
+            status="invalid",
+            error_type=type(info).__name__,
+        )
 
     age_ms = int(max(0, int(now_ms) - int(ts_ms or 0)))
+    drawdown_percentiles = info.get("drawdown_percentiles") if isinstance(info.get("drawdown_percentiles"), dict) else {}
     out: Dict[str, Any] = {
+        "enabled": bool(info.get("enabled", True)),
+        "required": bool(_monte_carlo_required_in_current_runtime()),
         "ready": bool(info.get("ready", False)),
         "status": str(info.get("status") or ""),
         "ts_ms": int(ts_ms or 0),
@@ -222,14 +315,36 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
         "cvar_95": float(_safe_float(info.get("cvar_95"), 0.0)),
         "cvar_99": float(_safe_float(info.get("cvar_99"), 0.0)),
         "worst_simulated_drawdown": float(_safe_float(info.get("worst_simulated_drawdown"), 0.0)),
-        "drawdown_p95": float(_safe_float((info.get("drawdown_percentiles") or {}).get("p95"), 0.0)),
-        "drawdown_p99": float(_safe_float((info.get("drawdown_percentiles") or {}).get("p99"), 0.0)),
+        "drawdown_p95": float(_safe_float(drawdown_percentiles.get("p95"), 0.0)),
+        "drawdown_p99": float(_safe_float(drawdown_percentiles.get("p99"), 0.0)),
     }
+
+    status = str(out.get("status") or "").strip().lower()
+    if not bool(out["enabled"]):
+        out["blocked"] = bool(out["required"])
+        out["reasons"] = [{"type": "monte_carlo_risk_disabled_while_required", "status": str(out.get("status") or "")}]
+        return out
+
+    if not bool(out["ready"]) or status in {"disabled", "error", "failed", "unavailable"}:
+        reason_code = "monte_carlo_risk_simulation_error" if status == "error" else "monte_carlo_risk_not_ready"
+        out["blocked"] = bool(out["required"])
+        out["reasons"] = [{"type": reason_code, "status": str(out.get("status") or ""), "ready": bool(out["ready"])}]
+        if info.get("error"):
+            out["reasons"][0]["error"] = str(info.get("error"))
+        return out
 
     # Monte Carlo results are advisory only while fresh. Stale simulations are
     # surfaced as stale rather than silently trusted for hard blocking decisions.
     if int(PORTFOLIO_RISK_MC_MAX_AGE_S) > 0 and float(out["age_s"]) > float(PORTFOLIO_RISK_MC_MAX_AGE_S):
         out["stale"] = True
+        out["blocked"] = bool(out["required"])
+        out["reasons"] = [
+            {
+                "type": "monte_carlo_risk_state_stale",
+                "age_s": float(out["age_s"]),
+                "max_age_s": int(PORTFOLIO_RISK_MC_MAX_AGE_S),
+            }
+        ]
         return out
 
     var_95_loss = max(0.0, -float(out["var_95"]))

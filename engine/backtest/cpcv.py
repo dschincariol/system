@@ -12,7 +12,7 @@ import logging
 import itertools
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 

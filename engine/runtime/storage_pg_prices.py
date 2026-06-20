@@ -23,7 +23,9 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     execute_values = None  # type: ignore[assignment]
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.logging import get_logger
+from engine.runtime.metrics import emit_counter, emit_timing
 from engine.runtime.observability import record_component_health
 
 LOG = get_logger("runtime.storage_pg_prices")
@@ -87,30 +89,15 @@ _PG_PRICE_SCHEMA_INDEXES: tuple[str, ...] = (
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = str(os.environ.get(name, "")).strip().lower()
-    if raw == "":
-        return bool(default)
-    return raw in {"1", "true", "yes", "on"}
+    return env_bool(name, default=default)
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = str(os.environ.get(name, "")).strip()
-    if raw == "":
-        return float(default)
-    try:
-        return float(raw)
-    except Exception:
-        return float(default)
+    return tuned_float(name, default, 0.0, float("inf"))
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = str(os.environ.get(name, "")).strip()
-    if raw == "":
-        return int(default)
-    try:
-        return int(raw)
-    except Exception:
-        return int(default)
+    return tuned_int(name, default, 0, 2**31 - 1)
 
 
 def _quote_ident(value: str) -> str:
@@ -211,19 +198,21 @@ class PostgresPriceStorageConfig:
             or ""
         ).strip()
         enabled = _env_bool("TIMESCALE_PRICES_ENABLED", default=bool(dsn))
+        pool_min_size = tuned_int("TIMESCALE_PRICES_POOL_MIN_SIZE", 1, 1, 16)
+        pool_max_size = max(pool_min_size, tuned_int("TIMESCALE_PRICES_POOL_MAX_SIZE", 4, 1, 16))
         return cls(
             enabled=bool(enabled),
             dsn=dsn,
             schema_name=str(os.environ.get("TIMESCALE_PRICES_SCHEMA") or os.environ.get("TIMESCALE_SCHEMA") or "public").strip() or "public",
-            pool_min_size=max(1, _env_int("TIMESCALE_PRICES_POOL_MIN_SIZE", 1)),
-            pool_max_size=max(1, _env_int("TIMESCALE_PRICES_POOL_MAX_SIZE", 4)),
-            connect_timeout_s=max(0.1, _env_float("TIMESCALE_PRICES_CONNECT_TIMEOUT_S", 5.0)),
-            lock_timeout_s=max(0.05, _env_float("TIMESCALE_PRICES_LOCK_TIMEOUT_S", 5.0)),
-            command_timeout_s=max(1.0, _env_float("TIMESCALE_PRICES_COMMAND_TIMEOUT_S", 30.0)),
-            idle_in_txn_timeout_s=max(1.0, _env_float("TIMESCALE_PRICES_IDLE_IN_TXN_TIMEOUT_S", 60.0)),
-            retry_attempts=max(1, _env_int("TIMESCALE_PRICES_RETRY_ATTEMPTS", 3)),
-            retry_base_s=max(0.05, _env_float("TIMESCALE_PRICES_RETRY_BASE_S", 0.25)),
-            retry_max_s=max(0.1, _env_float("TIMESCALE_PRICES_RETRY_MAX_S", 5.0)),
+            pool_min_size=int(pool_min_size),
+            pool_max_size=int(pool_max_size),
+            connect_timeout_s=tuned_float("TIMESCALE_PRICES_CONNECT_TIMEOUT_S", 5.0, 0.1, 30.0),
+            lock_timeout_s=tuned_float("TIMESCALE_PRICES_LOCK_TIMEOUT_S", 5.0, 0.05, 30.0),
+            command_timeout_s=tuned_float("TIMESCALE_PRICES_COMMAND_TIMEOUT_S", 30.0, 1.0, 120.0),
+            idle_in_txn_timeout_s=tuned_float("TIMESCALE_PRICES_IDLE_IN_TXN_TIMEOUT_S", 60.0, 1.0, 300.0),
+            retry_attempts=tuned_int("TIMESCALE_PRICES_RETRY_ATTEMPTS", 3, 1, 10),
+            retry_base_s=tuned_float("TIMESCALE_PRICES_RETRY_BASE_S", 0.25, 0.01, 5.0),
+            retry_max_s=tuned_float("TIMESCALE_PRICES_RETRY_MAX_S", 5.0, 0.1, 30.0),
             application_name=str(os.environ.get("TIMESCALE_PRICES_APPLICATION_NAME") or "trading-system-price-storage").strip() or "trading-system-price-storage",
             retention_days=max(0, _env_int("TIMESCALE_PRICES_RETENTION_DAYS", _env_int("TIMESCALE_RETENTION_DAYS", 0))),
             compression_after_days=max(
@@ -264,6 +253,9 @@ class PostgresPriceStorage:
             "written_prices": 0,
             "written_quotes": 0,
             "written_raw": 0,
+            "dropped_rows": 0,
+            "last_write_duration_ms": 0,
+            "total_write_duration_ms": 0,
             "last_write_ts_ms": 0,
         }
 
@@ -713,6 +705,15 @@ class PostgresPriceStorage:
             "raw": max(0, len(input_raw) - len(raw_rows)),
         }
         if any(int(value) > 0 for value in dropped_rows.values()):
+            dropped_total = int(sum(int(value) for value in dropped_rows.values()))
+            with self._state_lock:
+                self._metrics["dropped_rows"] = int(self._metrics.get("dropped_rows") or 0) + int(dropped_total)
+            emit_counter(
+                "storage_pg_prices_dropped_rows",
+                int(dropped_total),
+                component="engine.runtime.storage_pg_prices",
+                extra_tags={"reason": "invalid_rows"},
+            )
             _warn_nonfatal(
                 "STORAGE_PG_PRICES_INVALID_ROWS_DROPPED",
                 ValueError(f"invalid_rows_dropped:{dropped_rows}"),
@@ -798,27 +799,38 @@ class PostgresPriceStorage:
                         )
                 con.commit()
 
+        write_started = time.perf_counter()
         self._run_with_retry(_write, operation="write_batch")
+        write_duration_ms = float((time.perf_counter() - write_started) * 1000.0)
         now_ts_ms = int(time.time() * 1000)
         with self._state_lock:
             self._metrics["write_batches"] = int(self._metrics.get("write_batches") or 0) + 1
             self._metrics["written_prices"] = int(self._metrics.get("written_prices") or 0) + int(len(price_rows))
             self._metrics["written_quotes"] = int(self._metrics.get("written_quotes") or 0) + int(len(quote_rows))
             self._metrics["written_raw"] = int(self._metrics.get("written_raw") or 0) + int(len(raw_rows))
+            self._metrics["last_write_duration_ms"] = int(round(write_duration_ms))
+            self._metrics["total_write_duration_ms"] = int(self._metrics.get("total_write_duration_ms") or 0) + int(round(write_duration_ms))
             self._metrics["last_write_ts_ms"] = int(now_ts_ms)
             self._last_error = None
+        emit_timing(
+            "storage_pg_prices_db_write_duration_ms",
+            float(write_duration_ms),
+            component="engine.runtime.storage_pg_prices",
+        )
         record_component_health(
             "storage_pg_prices",
             ok=True,
             status="ok",
             detail="write_batch_ok",
             observed_ts_ms=int(now_ts_ms),
+            latency_ms=float(write_duration_ms),
             extra={
                 "enabled": bool(self.enabled),
                 "price_rows": int(len(price_rows)),
                 "quote_rows": int(len(quote_rows)),
                 "raw_rows": int(len(raw_rows)),
                 "dropped_rows": dict(dropped_rows),
+                "write_duration_ms": int(round(write_duration_ms)),
             },
         )
         return {
@@ -828,6 +840,7 @@ class PostgresPriceStorage:
             "quotes": int(len(quote_rows)),
             "raw": int(len(raw_rows)),
             "dropped_rows": dict(dropped_rows),
+            "write_duration_ms": float(write_duration_ms),
         }
 
     def get_snapshot(self) -> dict[str, Any]:
@@ -853,6 +866,8 @@ class PostgresPriceStorage:
             "enabled": bool(self.enabled),
             "dsn_configured": bool(self._config.dsn),
             "pool_ready": bool(pool_ready),
+            "pool_min_size": int(self._config.pool_min_size),
+            "pool_max_size": int(self._config.pool_max_size),
             "schema_ready": bool(schema_ready),
             "schema_ok": bool(schema_ok),
             "schema_error": schema_error,
@@ -870,6 +885,9 @@ class PostgresPriceStorage:
             "written_prices": int(metrics.get("written_prices") or 0),
             "written_quotes": int(metrics.get("written_quotes") or 0),
             "written_raw": int(metrics.get("written_raw") or 0),
+            "dropped_rows": int(metrics.get("dropped_rows") or 0),
+            "last_write_duration_ms": int(metrics.get("last_write_duration_ms") or 0),
+            "total_write_duration_ms": int(metrics.get("total_write_duration_ms") or 0),
             "last_write_ts_ms": (int(last_write_ts_ms) if last_write_ts_ms > 0 else None),
             "age_s": age_s,
             "ts_ms": int(time.time() * 1000),

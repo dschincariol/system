@@ -27,6 +27,17 @@ def _migration_modules(package: str) -> list[ModuleType]:
     return sorted(modules, key=lambda module: int(getattr(module, "id")))
 
 
+def expected_migration_ids(package: str = "engine.runtime.schema.migrations") -> tuple[int, ...]:
+    """Return the ordered migration IDs that define the current Postgres contract."""
+
+    return tuple(int(getattr(module, "id")) for module in _migration_modules(package))
+
+
+def expected_schema_version(package: str = "engine.runtime.schema.migrations") -> int:
+    ids = expected_migration_ids(package)
+    return max(ids) if ids else 0
+
+
 def _ensure_schema_table(conn) -> None:
     from engine.runtime.storage_pool import quote_ident, schema_name
 

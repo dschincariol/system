@@ -1,16 +1,11 @@
-"""
-FILE: dashboard_config.py
+"""Dashboard and scheduler configuration constants."""
 
-Top-level entrypoint or configuration module for `dashboard_config`.
-"""
-
-# dashboard_config.py
 import os
 import time
 
- # `dashboard_config.py` is a flat env->constant translation layer shared by the
- # dashboard and related orchestration code. Keep policy/defaults centralized here
- # rather than scattering ad hoc `os.environ.get(...)` calls across handlers.
+# This is a flat env-to-constant translation layer shared by the dashboard and
+# related orchestration code. Keep policy/defaults centralized here rather than
+# scattering ad hoc ``os.environ.get(...)`` calls across handlers.
 # ------------------------------
 # Restart + scheduler controls
 # ------------------------------

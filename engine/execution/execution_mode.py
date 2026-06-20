@@ -34,7 +34,7 @@ from engine.runtime.logging import get_logger
 from engine.runtime.storage import DB_PATH, _table_exists, connect, init_db, run_write_txn
 from engine.runtime.state_cache import cache_get, cache_set, cache_invalidate_namespace
 from engine.runtime.event_log import append_event
-from engine.runtime.live_trading_preflight import assert_live_trading_confirmation, live_trading_preflight
+from engine.runtime.live_trading_preflight import assert_live_execution_arming_preflight, live_trading_preflight
 from engine.execution.execution_costs import (
     DEFAULT_FEES_BPS,
     DEFAULT_SLIPPAGE_BPS,
@@ -226,9 +226,9 @@ def _begin_owned_write(con) -> bool:
     raise RuntimeError("managed_write_begin_unavailable")
 
 
-def _assert_live_arming_confirmation(mode: str, armed: int) -> None:
+def _assert_live_arming_preflight(mode: str, armed: int) -> None:
     if str(mode or "").strip().lower() == "live" and int(armed or 0) == 1:
-        assert_live_trading_confirmation(engine_mode="live")
+        assert_live_execution_arming_preflight(engine_mode="live")
 
 
 # ============================================================
@@ -310,7 +310,7 @@ def set_execution_mode(
                 new_armed = 0
             if mode == "live":
                 new_armed = 0
-        _assert_live_arming_confirmation(mode, new_armed)
+        _assert_live_arming_preflight(mode, new_armed)
 
         db.execute(
             "UPDATE execution_mode SET mode=?, armed=?, updated_ts_ms=?, actor=?, reason=? WHERE id=1",
@@ -452,7 +452,7 @@ def set_execution_armed(
         new_armed = 1 if int(armed) == 1 else 0
         if mode != "live":
             new_armed = 0
-        _assert_live_arming_confirmation(mode, new_armed)
+        _assert_live_arming_preflight(mode, new_armed)
 
         db.execute(
             "UPDATE execution_mode SET armed=?, updated_ts_ms=?, actor=?, reason=? WHERE id=1",

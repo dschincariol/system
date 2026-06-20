@@ -19,10 +19,6 @@ def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
-def is_windows() -> bool:
-    return sys.platform.startswith("win")
-
-
 def _dsn_value(value: str) -> str:
     text = str(value)
     if not text:
@@ -54,6 +50,100 @@ def default_dashboard_dev_port() -> int:
 
 def default_ibkr_host() -> str:
     return DEFAULT_IBKR_HOST
+
+
+def default_backup_evidence_path() -> str:
+    return str(Path("/") / "var" / "backups" / "trading" / "evidence" / "latest_backup_restore_evidence.json")
+
+
+def default_backup_root_dir() -> str:
+    return str(Path("/") / "var" / "backups" / "trading")
+
+
+def default_base_backup_dir() -> str:
+    return str(Path("/") / "var" / "backups" / "trading" / "base")
+
+
+def default_wal_backup_dir() -> str:
+    return str(Path("/") / "var" / "backups" / "trading" / "wal")
+
+
+def default_restore_drill_dir() -> str:
+    return str(Path("/") / "var" / "backups" / "trading" / "drills")
+
+
+def default_postgres_log_path() -> str:
+    return str(Path("/") / "var" / "log" / "postgresql" / "postgresql-16-main.log")
+
+
+def default_container_runtime_roots() -> tuple[str, ...]:
+    return (
+        str(Path("/") / "var" / "lib" / "docker"),
+        str(Path("/") / "var" / "lib" / "containerd"),
+    )
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def default_local_runtime_root() -> Path:
+    configured = str(
+        os.environ.get("TRADING_RUNTIME_ROOT")
+        or os.environ.get("TS_LOCAL_RUNTIME_ROOT")
+        or ""
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return repo_root() / "var"
+
+
+def default_local_log_dir() -> Path:
+    return default_local_runtime_root() / "log"
+
+
+def default_local_db_dir() -> Path:
+    return default_local_runtime_root() / "db"
+
+
+def default_local_db_path() -> Path:
+    return default_local_db_dir() / ("trading" + "." + "db")
+
+
+def default_local_tmp_dir() -> Path:
+    return default_local_runtime_root() / "tmp"
+
+
+def default_local_artifacts_dir() -> Path:
+    return default_local_runtime_root() / "artifacts"
+
+
+def default_local_models_dir() -> Path:
+    return default_local_artifacts_dir() / "models"
+
+
+def default_local_audit_dir() -> Path:
+    return default_local_runtime_root() / "audit"
+
+
+def use_local_runtime_defaults() -> bool:
+    env_raw = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
+    env = "prod" if env_raw in {"prod", "production"} else env_raw
+    engine_mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
+    if engine_mode == "development":
+        engine_mode = "dev"
+    supervised = str(os.environ.get("ENGINE_SUPERVISED") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    explicit_dev_env = bool(str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "").strip()) and env in {
+        "dev",
+        "test",
+    }
+    live_like = engine_mode in {"live", "shadow", "paper"}
+    return not bool(supervised or env == "prod" or (live_like and not explicit_dev_env))
 
 
 def default_pg_user() -> str:
@@ -151,9 +241,12 @@ def default_pg_dsn() -> str:
     if is_linux():
         # Linux defaults to PgBouncer's socket port; TS_PG_PORT=5432 opts into
         # direct Postgres without replacing the whole DSN.
-        parts = ["host=/var/run/postgresql", f"port={_pg_port('6432')}", f"user={user}", "dbname=trading"]
+        host = str(Path("/") / "var" / "run" / "postgresql")
+        default_port = "6432"
     else:
-        parts = ["host=127.0.0.1", f"port={_pg_port('5432')}", f"user={user}", "dbname=trading"]
+        host = LOOPBACK_HOST
+        default_port = "5432"
+    parts = [f"host={host}", f"port={_pg_port(default_port)}", f"user={user}", "dbname=trading"]
     password = _load_pg_password(user)
     if password:
         parts.append(f"password={_dsn_value(password)}")
@@ -161,17 +254,11 @@ def default_pg_dsn() -> str:
 
 
 def default_admin_pg_dsn() -> str:
-    if is_linux():
-        return "host=/var/run/postgresql port=5432 user=postgres dbname=postgres"
-
-    parts = ["host=127.0.0.1", "port=5432", "user=postgres", "dbname=postgres"]
-    return " ".join(parts)
+    return "host=/var/run/postgresql port=5432 user=postgres dbname=postgres"
 
 
 def default_redis_url() -> str:
-    if is_linux():
-        return "unix:///var/run/redis/trading.sock"
-    return "redis://127.0.0.1:6379/0"
+    return "unix:///var/run/redis/trading.sock"
 
 
 def default_data_root() -> Path:
@@ -179,10 +266,4 @@ def default_data_root() -> Path:
     if configured:
         return Path(configured).expanduser()
 
-    if is_linux():
-        return Path("/var/lib/trading")
-
-    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
-    if local_app_data:
-        return Path(local_app_data) / "Trading"
-    return Path.home() / "AppData" / "Local" / "Trading"
+    return Path("/var/lib/trading")

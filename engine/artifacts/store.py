@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import pickle
 import shutil
 import tempfile
 from contextlib import contextmanager, suppress
@@ -131,6 +132,26 @@ def _connect_default():
     from engine.runtime.storage import connect
 
     return connect()
+
+
+def dumps_joblib_artifact(value: Any) -> bytes:
+    import joblib
+
+    buffer = io.BytesIO()
+    joblib.dump(value, buffer)
+    return buffer.getvalue()
+
+
+def dumps_pickle_artifact_payload(value: Any) -> bytes:
+    return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def dumps_torch_artifact_payload(payload: Any) -> bytes:
+    import torch
+
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    return buffer.getvalue()
 
 
 class ArtifactCorruption(IOError):

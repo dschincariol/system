@@ -17,13 +17,16 @@ import time
 import json
 import copy
 import logging
+import shutil
 import threading
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Iterable, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.hardware import runtime_hardware_snapshot
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import default_backup_root_dir, default_local_log_dir
 from engine.runtime.data_quality import (
     build_data_pipeline_gate_snapshot,
     get_feature_validation_snapshot,
@@ -68,6 +71,16 @@ HEALTH_MODEL_SERVING_MAX_FALLBACK_RATE = float(os.environ.get("HEALTH_MODEL_SERV
 HEALTH_MODEL_SERVING_MAX_ROWS = int(os.environ.get("HEALTH_MODEL_SERVING_MAX_ROWS", "500"))
 HEALTH_ALERT_LIFECYCLE_WINDOW_S = float(os.environ.get("HEALTH_ALERT_LIFECYCLE_WINDOW_S", "86400"))
 PROVIDER_CIRCUIT_BREAKER_ERRORS = int(os.environ.get("PROVIDER_CIRCUIT_BREAKER_ERRORS", "3"))
+PROVIDER_READINESS_DEFAULT_MAX_AGE_S = float(
+    os.environ.get("PROVIDER_READINESS_MAX_AGE_S", str(HEALTH_PRICES_MAX_AGE_S))
+)
+
+_PROVIDER_CREDENTIAL_SECRET_NAMES: Dict[str, tuple[str, ...]] = {
+    "polygon": ("POLYGON_API_KEY",),
+    "polygon_ws": ("POLYGON_API_KEY",),
+    "tradier": ("TRADIER_API_TOKEN",),
+}
+_PROVIDER_READINESS_ENFORCED_MODES = {"paper", "live"}
 
 HEALTH_MIN_LABELS = int(os.environ.get("HEALTH_MIN_LABELS", "10"))
 HEALTH_MIN_MODEL_SUPPORT = int(os.environ.get("HEALTH_MIN_MODEL_SUPPORT", "10"))
@@ -77,6 +90,10 @@ PREFLIGHT_PRICES_MAX_AGE_S = float(os.environ.get("PREFLIGHT_PRICES_MAX_AGE_S", 
 HEALTH_RUN_QUICK_CHECK = os.environ.get("HEALTH_RUN_QUICK_CHECK", "0") == "1"
 HEALTH_INCLUDE_EXECUTION_BARRIER = os.environ.get("HEALTH_INCLUDE_EXECUTION_BARRIER", "0") == "1"
 HEALTH_EMIT_METRICS = os.environ.get("HEALTH_EMIT_METRICS", "0") == "1"
+DISK_PRESSURE_WARN_FREE_PCT = float(os.environ.get("DISK_PRESSURE_WARN_FREE_PCT", "15"))
+DISK_PRESSURE_CRITICAL_FREE_PCT = float(os.environ.get("DISK_PRESSURE_CRITICAL_FREE_PCT", "5"))
+DISK_PRESSURE_WARN_FREE_BYTES = int(float(os.environ.get("DISK_PRESSURE_WARN_FREE_BYTES", str(20 * 1024 * 1024 * 1024))))
+DISK_PRESSURE_CRITICAL_FREE_BYTES = int(float(os.environ.get("DISK_PRESSURE_CRITICAL_FREE_BYTES", str(5 * 1024 * 1024 * 1024))))
 
 _PREFLIGHT_CACHE: Dict = {
     "ok": False,
@@ -179,6 +196,143 @@ def _csv_env_set(name: str, default: str) -> set[str]:
         str(part or "").strip().lower()
         for part in raw.split(",")
         if str(part or "").strip()
+    }
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name), "")
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _nearest_existing_path(path: Path) -> Path:
+    candidate = path.expanduser()
+    for item in (candidate, *candidate.parents):
+        try:
+            if item.exists():
+                return item
+        except Exception as exc:
+            _warn("health.disk_path_exists", exc, path=str(item))
+    return Path("/")
+
+
+def _disk_path_snapshot(label: str, path: Path) -> Dict[str, Any]:
+    requested = path.expanduser()
+    check_path = _nearest_existing_path(requested)
+    out: Dict[str, Any] = {
+        "label": str(label),
+        "path": str(requested),
+        "exists": bool(requested.exists()),
+        "checked_path": str(check_path),
+        "ok": False,
+        "status": "unknown",
+        "warning": False,
+        "critical": False,
+        "detail": "",
+    }
+    try:
+        usage = shutil.disk_usage(str(check_path))
+        total = int(usage.total)
+        free = int(usage.free)
+        used = int(usage.used)
+        free_pct = (float(free) / float(total) * 100.0) if total > 0 else 0.0
+        critical = free <= DISK_PRESSURE_CRITICAL_FREE_BYTES or free_pct <= DISK_PRESSURE_CRITICAL_FREE_PCT
+        warning = (
+            not critical
+            and (free <= DISK_PRESSURE_WARN_FREE_BYTES or free_pct <= DISK_PRESSURE_WARN_FREE_PCT)
+        )
+        status = "critical" if critical else ("warning" if warning else "ok")
+        out.update(
+            {
+                "ok": not critical,
+                "status": status,
+                "warning": bool(warning),
+                "critical": bool(critical),
+                "total_bytes": total,
+                "used_bytes": used,
+                "free_bytes": free,
+                "free_pct": round(free_pct, 2),
+                "used_pct": round(100.0 - free_pct, 2),
+                "detail": (
+                    "ok"
+                    if status == "ok"
+                    else f"disk_{status}:free_bytes={free}:free_pct={free_pct:.2f}"
+                ),
+            }
+        )
+    except Exception as e:
+        out.update(
+            {
+                "ok": False,
+                "status": "error",
+                "critical": True,
+                "detail": f"disk_usage_error:{type(e).__name__}:{e}",
+            }
+        )
+    return out
+
+
+def _default_disk_pressure_paths() -> list[tuple[str, Path]]:
+    log_root = Path(
+        os.environ.get("TRADING_LOGS")
+        or os.environ.get("LOG_DIR")
+        or str(default_local_log_dir().resolve())
+    ).expanduser()
+    backup_root = Path(
+        os.environ.get("TRADING_BACKUP_ROOT")
+        or os.environ.get("TS_BACKUP_ROOT")
+        or default_backup_root_dir()
+    ).expanduser()
+    paths: list[tuple[str, Path]] = [
+        ("root", Path("/")),
+        ("runtime_data", Path(DB_PATH).expanduser().parent if Path(DB_PATH).suffix else Path(DB_PATH).expanduser()),
+        ("runtime_logs", log_root),
+        ("backup_root", backup_root),
+    ]
+    extra_raw = str(os.environ.get("DISK_PRESSURE_EXTRA_PATHS") or "").strip()
+    for idx, raw in enumerate(part.strip() for part in extra_raw.split(",") if part.strip()):
+        paths.append((f"extra_{idx}", Path(raw).expanduser()))
+    return paths
+
+
+def get_disk_pressure_snapshot(
+    paths: Optional[Iterable[tuple[str, str | Path]]] = None,
+) -> Dict[str, Any]:
+    requested_paths = list(paths) if paths is not None else _default_disk_pressure_paths()
+    snapshots: list[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for label, raw_path in requested_paths:
+        path = Path(raw_path).expanduser()
+        key = (str(label), str(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        snapshots.append(_disk_path_snapshot(str(label), path))
+
+    critical = [
+        f"{item.get('label')}:{item.get('detail')}"
+        for item in snapshots
+        if bool(item.get("critical"))
+    ]
+    warnings = [
+        f"{item.get('label')}:{item.get('detail')}"
+        for item in snapshots
+        if bool(item.get("warning"))
+    ]
+    return {
+        "ok": not critical,
+        "degraded": bool(warnings),
+        "status": "critical" if critical else ("warning" if warnings else "ok"),
+        "warnings": warnings,
+        "critical": critical,
+        "paths": snapshots,
+        "thresholds": {
+            "warn_free_pct": DISK_PRESSURE_WARN_FREE_PCT,
+            "critical_free_pct": DISK_PRESSURE_CRITICAL_FREE_PCT,
+            "warn_free_bytes": DISK_PRESSURE_WARN_FREE_BYTES,
+            "critical_free_bytes": DISK_PRESSURE_CRITICAL_FREE_BYTES,
+        },
     }
 
 
@@ -340,12 +494,56 @@ def _read_kill_switch_snapshot_readonly(con=None) -> Dict[str, Any]:
     owns_con = con is None
     db = con or _db_connect()
     try:
+        cache_meta: Dict[str, Any] = {}
+        cache_diag_allowed = owns_con
+        if not cache_diag_allowed:
+            try:
+                db_path = getattr(db, "_db_path", None)
+                cache_diag_allowed = bool(db_path and Path(db_path).resolve() == Path(DB_PATH).resolve())
+            except Exception:
+                cache_diag_allowed = False
+        if cache_diag_allowed:
+            try:
+                from engine.cache.wrappers.kill_switch import kill_switch_cache_diagnostics  # type: ignore
+
+                cached = dict(kill_switch_cache_diagnostics() or {})
+                for field in (
+                    "loaded_ts_ms",
+                    "source",
+                    "max_age_ms",
+                    "cache_age_ms",
+                    "cache_fresh",
+                    "read_source",
+                    "cache_status",
+                ):
+                    if field in cached:
+                        cache_meta[field] = cached.get(field)
+            except Exception as e:
+                _warn("health.kill_switch_cache_diagnostics", e)
+                cache_meta = {
+                    "source": "engine.runtime.health:cache_diagnostics_error",
+                    "cache_fresh": False,
+                    "cache_status": "diagnostics_error",
+                    "error": f"{type(e).__name__}: {e}",
+                }
+
+        activation_failure = {"active": False}
+        try:
+            from engine.execution.kill_switch import activation_failure_snapshot  # type: ignore
+
+            activation_failure = dict(activation_failure_snapshot() or {"active": False})
+        except Exception as e:
+            _warn("health.kill_switch_activation_failure_snapshot", e)
+
         row = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
             ("kill_switch_state",),
         ).fetchone()
         if not row:
-            return {"state": []}
+            payload = {"state": [], **dict(cache_meta)}
+            if bool(activation_failure.get("active")):
+                payload["activation_failure"] = dict(activation_failure)
+            return payload
 
         rows = db.execute(
             """
@@ -374,7 +572,10 @@ def _read_kill_switch_snapshot_readonly(con=None) -> Dict[str, Any]:
                     "updated_ts_ms": int(row[7] or 0),
                 }
             )
-        return {"state": out}
+        payload = {"state": out, **dict(cache_meta)}
+        if bool(activation_failure.get("active")):
+            payload["activation_failure"] = dict(activation_failure)
+        return payload
     finally:
         if owns_con:
             db.close()
@@ -686,65 +887,28 @@ def _pnl_attribution_orphan_snapshot(con) -> Dict[str, Any]:
 
 
 def _latest_position_reconcile_snapshot(con, now_ms: int) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "available": False,
-        "ok": True,
-        "fatal_reconcile": False,
-        "status": "unavailable",
-        "broker": None,
-        "updated_ts_ms": None,
-        "age_s": None,
-        "mismatched_n": 0,
-        "max_abs_qty_diff": 0.0,
-        "total_abs_qty_diff": 0.0,
-        "detail": "position_reconcile_audit_table_missing",
-        "detail_json": {},
-    }
-    if not _table_exists(con, "position_reconcile_audit"):
-        return out
-    cols = {str(col).strip().lower() for col in (_get_table_cols(con, "position_reconcile_audit") or [])}
-    required = {"ts_ms", "broker", "ok", "status", "mismatched_n", "max_abs_qty_diff", "total_abs_qty_diff", "detail_json"}
-    if not required.issubset(cols):
-        out["detail"] = "position_reconcile_audit_columns_missing"
-        return out
     try:
-        row = con.execute(
-            """
-            SELECT ts_ms, broker, ok, status, mismatched_n, max_abs_qty_diff, total_abs_qty_diff, detail_json
-            FROM position_reconcile_audit
-            ORDER BY ts_ms DESC
-            LIMIT 1
-            """
-        ).fetchone()
+        from engine.execution.position_reconcile import position_reconcile_evidence_snapshot
+
+        return position_reconcile_evidence_snapshot(
+            engine_mode=os.environ.get("ENGINE_MODE", "safe"),
+            con=con,
+            now_ms=int(now_ms),
+        )
     except Exception as e:
         _warn("health.position_reconcile.query", e)
-        out["detail"] = f"position_reconcile_query_failed:{type(e).__name__}:{e}"
-        return out
-    out["available"] = True
-    if not row:
-        out["detail"] = "position_reconcile_audit_empty"
-        out["status"] = "empty"
-        return out
-    updated_ts_ms = _int_or(row[0])
-    ok = bool(row[2])
-    status = str(row[3] or "").strip() or ("ok" if ok else "unknown")
-    detail_json = _json_dict_or_empty(row[7])
-    out.update(
-        {
-            "ok": ok,
-            "fatal_reconcile": not ok,
-            "status": status,
-            "broker": (str(row[1]) if row[1] not in (None, "") else None),
-            "updated_ts_ms": (int(updated_ts_ms) if updated_ts_ms > 0 else None),
-            "age_s": (round(max(0, now_ms - int(updated_ts_ms)) / 1000.0, 1) if updated_ts_ms > 0 else None),
-            "mismatched_n": _int_or(row[4]),
-            "max_abs_qty_diff": _float_or(row[5]),
-            "total_abs_qty_diff": _float_or(row[6]),
-            "detail": ("ok" if ok else status),
-            "detail_json": detail_json,
+        mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+        required = mode_name in ("paper", "live")
+        return {
+            "available": False,
+            "ok": not required,
+            "required": bool(required),
+            "fatal_reconcile": bool(required),
+            "status": "error",
+            "reason": "ok" if not required else "position_reconcile_not_exercised",
+            "blockers": ([] if not required else ["position_reconcile_not_exercised"]),
+            "detail": f"position_reconcile_error:{type(e).__name__}:{e}",
         }
-    )
-    return out
 
 
 def _attribution_health_snapshot(con, now_ms: int) -> Dict[str, Any]:
@@ -1056,6 +1220,336 @@ def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
         "critical_symbols": critical_symbols,
         "critical_unavailable_symbols": critical_unavailable,
         "symbol_status": symbol_status,
+    }
+
+
+def _provider_readiness_enforced(mode: str) -> bool:
+    return str(mode or "").strip().lower() in _PROVIDER_READINESS_ENFORCED_MODES
+
+
+def _provider_readiness_max_age_s(provider_name: str) -> float:
+    provider = str(provider_name or "").strip().lower()
+    if provider == "tradier":
+        return float(HEALTH_OPTIONS_MAX_AGE_S)
+    return float(PROVIDER_READINESS_DEFAULT_MAX_AGE_S)
+
+
+def _explicit_required_provider_names() -> Optional[List[str]]:
+    for env_name in (
+        "PROVIDER_READINESS_REQUIRED_PROVIDERS",
+        "LIVE_PROVIDER_READINESS_REQUIRED_PROVIDERS",
+    ):
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        lowered = str(raw or "").strip().lower()
+        if lowered in {"", "none", "off", "disabled"}:
+            return []
+        return _dedupe_strs(
+            [
+                str(part or "").strip().lower()
+                for part in str(raw or "").split(",")
+                if str(part or "").strip()
+            ]
+        )
+    return None
+
+
+def _required_providers_from_env() -> List[str]:
+    out: List[str] = []
+    price_chain = [
+        str(part or "").strip().lower()
+        for part in str(os.environ.get("LIVE_PRICE_PROVIDER_CHAIN", "") or "").split(",")
+        if str(part or "").strip()
+    ]
+    options_chain = [
+        str(part or "").strip().lower()
+        for part in str(os.environ.get("OPTIONS_PROVIDER_CHAIN", "") or "").split(",")
+        if str(part or "").strip()
+    ]
+    out.extend(price_chain)
+    out.extend(options_chain)
+    if _env_flag("POLYGON_WS_ENABLED", False):
+        out.append("polygon_ws")
+    if _env_flag("POLYGON_REST_ENABLED", False):
+        out.append("polygon")
+    if _env_flag("IBKR_ENABLED", False):
+        out.append("ibkr")
+    if _env_flag("TRADIER_ENABLED", False):
+        out.append("tradier")
+    if _env_flag("YFINANCE_ENABLED", False):
+        out.append("yfinance")
+    if _env_flag("CCXT_ENABLED", False):
+        out.append("ccxt")
+    return _dedupe_strs(out)
+
+
+def _manager_provider_sources() -> tuple[Dict[str, Dict[str, Any]], List[str], str]:
+    """Return enabled managed provider sources without exposing credentials."""
+    sources_by_provider: Dict[str, Dict[str, Any]] = {}
+    required: List[str] = []
+    error = ""
+    try:
+        from services.data_source_manager import load_sources_from_db
+
+        for row in load_sources_from_db(include_credentials=False) or []:
+            if not isinstance(row, dict) or not bool(row.get("enabled")):
+                continue
+            source_type = str(row.get("source_type") or "").strip()
+            if source_type not in {"price_provider", "options_provider"}:
+                continue
+            provider_name = str(row.get("provider_name") or row.get("source_key") or "").strip().lower()
+            if not provider_name:
+                continue
+            required.append(provider_name)
+            current = dict(sources_by_provider.get(provider_name) or {})
+            fields = _dedupe_strs(
+                list(current.get("credential_fields") or [])
+                + [str(field) for field in list(row.get("credential_fields") or []) if str(field).strip()]
+            )
+            sources_by_provider[provider_name] = {
+                "source_key": str(row.get("source_key") or provider_name),
+                "source_type": source_type,
+                "job_name": str(row.get("job_name") or ""),
+                "credential_fields": fields,
+                "credentials_configured": bool(row.get("credentials_configured")),
+                "credentials_stored": bool(row.get("credentials_stored")),
+                "credential_error": str(row.get("credential_error") or ""),
+                "status": str(row.get("status") or ""),
+                "last_error": str(row.get("last_error") or ""),
+                "last_success_ts_ms": int(row.get("last_success_ts_ms") or 0),
+                "error_count": int(row.get("error_count") or 0),
+                "config_hash": str(row.get("config_hash") or ""),
+            }
+    except Exception as exc:
+        error = f"{type(exc).__name__}:{exc}"
+        _warn("health.provider_readiness.manager_sources", exc)
+    return sources_by_provider, _dedupe_strs(required), error
+
+
+def _provider_credential_available(provider_name: str, source: Dict[str, Any]) -> tuple[bool, str, List[str]]:
+    provider = str(provider_name or "").strip().lower()
+    credential_fields = [str(field) for field in list(source.get("credential_fields") or []) if str(field).strip()]
+    secret_names = [str(name) for name in _PROVIDER_CREDENTIAL_SECRET_NAMES.get(provider, tuple()) if str(name).strip()]
+    if not credential_fields and not secret_names:
+        return True, "not_required", []
+    if str(source.get("credential_error") or "").strip():
+        return False, "data_source_manager_error", secret_names
+    if bool(source.get("credentials_configured")):
+        return True, "data_source_manager", secret_names
+    try:
+        from engine.data._credentials import get_data_credential
+
+        for secret_name in secret_names:
+            if str(get_data_credential(secret_name) or "").strip():
+                return True, "secret_loader", secret_names
+    except Exception as exc:
+        _warn("health.provider_readiness.secret_loader", exc, provider=provider)
+    return False, "missing", secret_names
+
+
+def _provider_auth_error(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "401",
+            "403",
+            "unauthorized",
+            "forbidden",
+            "auth",
+            "credential",
+            "token_missing",
+            "api_key",
+            "api token",
+            "not set",
+        )
+    )
+
+
+def _provider_telemetry_from_health(health: Optional[Dict[str, Any]], now_ms: int) -> Dict[str, Dict[str, Any]]:
+    providers = _dict_or_empty((health or {}).get("providers") if isinstance(health, dict) else {})
+    by_provider = _dict_or_empty(providers.get("by_provider"))
+    out: Dict[str, Dict[str, Any]] = {}
+    for provider_name, raw in by_provider.items():
+        if not isinstance(raw, dict):
+            continue
+        provider = str(provider_name or "").strip().lower()
+        if not provider:
+            continue
+        row = dict(raw)
+        last_ts_ms = _int_or(row.get("last_ts_ms") or row.get("ts_ms"))
+        age_s = row.get("age_s")
+        if age_s is None and row.get("age_ms") is not None:
+            age_s = round(_int_or(row.get("age_ms")) / 1000.0, 1)
+        if age_s is None and last_ts_ms > 0:
+            age_s = round(max(0, int(now_ms) - int(last_ts_ms)) / 1000.0, 1)
+        row["provider"] = provider
+        row["last_ts_ms"] = last_ts_ms or None
+        row["age_s"] = (float(age_s) if age_s is not None else None)
+        row["ok"] = bool(row.get("ok"))
+        row["error_count"] = _int_or(row.get("error_count"))
+        row["circuit_open"] = bool(row.get("circuit_open"))
+        out[provider] = row
+    return out
+
+
+def _provider_telemetry_from_rows(now_ms: int) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in fetch_provider_health_rows():
+        provider = str(row.get("provider") or "").strip().lower()
+        if not provider:
+            continue
+        ts_ms = _int_or(row.get("ts_ms"))
+        age_s = None if ts_ms <= 0 else round(max(0, int(now_ms) - int(ts_ms)) / 1000.0, 1)
+        last_success_ts_ms = _int_or(row.get("last_success_ts_ms"))
+        error_count = _int_or(row.get("error_count"))
+        latest_row_ok = bool(row.get("ok"))
+        circuit_open = bool(
+            int(PROVIDER_CIRCUIT_BREAKER_ERRORS) > 0
+            and error_count >= int(PROVIDER_CIRCUIT_BREAKER_ERRORS)
+            and not latest_row_ok
+        )
+        out[provider] = {
+            "provider": provider,
+            "ok": latest_row_ok,
+            "age_s": age_s,
+            "last_ts_ms": ts_ms or None,
+            "last_success_ts_ms": (last_success_ts_ms if last_success_ts_ms > 0 else None),
+            "last_success_age_s": (
+                round(max(0, int(now_ms) - int(last_success_ts_ms)) / 1000.0, 1)
+                if last_success_ts_ms > 0
+                else None
+            ),
+            "error_count": error_count,
+            "circuit_open": circuit_open,
+            "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
+            "latency_ms": row.get("latency_ms"),
+            "n_symbols": row.get("n_symbols"),
+            "error": row.get("error"),
+        }
+    return out
+
+
+def provider_readiness_snapshot(
+    *,
+    mode: Optional[str] = None,
+    health: Optional[Dict[str, Any]] = None,
+    required_providers: Optional[Iterable[str]] = None,
+    now_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Assess required market-data providers without exposing credential values."""
+
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    mode_name = str(mode if mode is not None else os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+    enforced = _provider_readiness_enforced(mode_name)
+    sources_by_provider, manager_required, manager_error = _manager_provider_sources()
+
+    if required_providers is not None:
+        required = _dedupe_strs(
+            [
+                str(provider or "").strip().lower()
+                for provider in required_providers
+                if str(provider or "").strip()
+            ]
+        )
+    else:
+        explicit = _explicit_required_provider_names()
+        required = list(explicit) if explicit is not None else list(manager_required or _required_providers_from_env())
+
+    telemetry = _provider_telemetry_from_health(health, now)
+    if not telemetry:
+        telemetry = _provider_telemetry_from_rows(now)
+
+    by_provider: Dict[str, Dict[str, Any]] = {}
+    blockers: List[str] = []
+
+    if enforced and not required:
+        blockers.append("provider_readiness_required_providers_empty")
+
+    for provider in required:
+        provider_name = str(provider or "").strip().lower()
+        if not provider_name:
+            continue
+        source = dict(sources_by_provider.get(provider_name) or {})
+        telem = dict(telemetry.get(provider_name) or {})
+        provider_blockers: List[str] = []
+        max_age_s = _provider_readiness_max_age_s(provider_name)
+        credential_ok, credential_source, credential_secret_names = _provider_credential_available(provider_name, source)
+        credential_error = str(source.get("credential_error") or "").strip()
+        if not credential_ok:
+            provider_blockers.append(f"provider_unauthenticated:{provider_name}")
+        if credential_error:
+            provider_blockers.append(f"provider_credential_error:{provider_name}")
+
+        age_s = telem.get("age_s")
+        age_value = None if age_s is None else float(age_s)
+        has_telemetry = bool(telem)
+        telemetry_ok = bool(telem.get("ok")) if has_telemetry else False
+        telemetry_error = str(telem.get("error") or source.get("last_error") or "").strip()
+        stale = bool((not has_telemetry) or age_value is None or age_value > float(max_age_s))
+        circuit_open = bool(telem.get("circuit_open"))
+
+        if not has_telemetry:
+            provider_blockers.append(f"provider_telemetry_missing:{provider_name}")
+        elif stale:
+            provider_blockers.append(f"provider_stale:{provider_name}")
+        if circuit_open:
+            provider_blockers.append(f"provider_circuit_open:{provider_name}")
+        if has_telemetry and not telemetry_ok:
+            if _provider_auth_error(telemetry_error):
+                provider_blockers.append(f"provider_unauthenticated:{provider_name}")
+            else:
+                provider_blockers.append(f"provider_unhealthy:{provider_name}")
+
+        provider_blockers = _dedupe_strs(provider_blockers)
+        provider_ok = not provider_blockers
+        blockers.extend(provider_blockers)
+        by_provider[provider_name] = {
+            "ok": provider_ok,
+            "required": True,
+            "mode": mode_name,
+            "source_key": str(source.get("source_key") or ""),
+            "source_type": str(source.get("source_type") or ""),
+            "job_name": str(source.get("job_name") or ""),
+            "credential_required": bool(
+                source.get("credential_fields")
+                or provider_name in _PROVIDER_CREDENTIAL_SECRET_NAMES
+            ),
+            "credential_configured": bool(credential_ok),
+            "credential_source": credential_source,
+            "credential_secret_names": list(credential_secret_names),
+            "credential_error": credential_error,
+            "telemetry_present": has_telemetry,
+            "telemetry_ok": telemetry_ok,
+            "age_s": age_value,
+            "max_age_s": float(max_age_s),
+            "last_ts_ms": telem.get("last_ts_ms"),
+            "last_success_ts_ms": telem.get("last_success_ts_ms"),
+            "last_success_age_s": telem.get("last_success_age_s"),
+            "error_count": _int_or(telem.get("error_count") or source.get("error_count")),
+            "circuit_open": circuit_open,
+            "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
+            "error": telemetry_error,
+            "blockers": provider_blockers,
+        }
+
+    blockers = _dedupe_strs(blockers)
+    ok = bool(not blockers)
+    return {
+        "ok": ok,
+        "required": bool(enforced),
+        "mode": mode_name,
+        "reason": "ok" if ok else blockers[0],
+        "blockers": blockers,
+        "required_providers": list(required),
+        "healthy_required": sum(1 for row in by_provider.values() if bool(row.get("ok"))),
+        "total_required": len(required),
+        "by_provider": by_provider,
+        "manager_error": manager_error,
+        "ts_ms": int(now),
     }
 
 
@@ -2025,172 +2519,49 @@ def get_schema_audit():
     # Schema audit is stricter than ordinary health checks because it is used to
     # decide whether the runtime is structurally safe to operate.
     ts_ms = int(time.time() * 1000)
-    con = _db_connect()
-
     try:
-        try:
-            rows = con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-            have = {r[0] for r in rows}
-        except Exception:
-            have = set()
-
-        missing_tables = []
-        missing_cols = {}
-        missing_indexes: list[str] = []
-
-        SCHEMA_EXPECTATIONS = {
-            "prices": {"required": True, "cols": ["ts_ms", "symbol", "price"]},
-            "events": {"required": True, "cols": ["id", "ts_ms"]},
-            "labels": {
-                "required": True,
-                "cols": ["event_id", "symbol", "horizon_s", "impact_z", "created_at_ms"],
-            },
-            "alerts": {"required": True, "cols": ["id", "ts_ms"]},
-            "job_history": {"required": True, "cols": ["id", "ts_ms"]},
-            "portfolio_state": {
-                "required": True,
-                "cols": ["symbol", "side", "weight", "opened_ts_ms", "updated_ts_ms"],
-            },
-            "broker_account": {"required": True, "cols": ["ts_ms"]},
-            "job_locks": {
-                "required": True,
-                "cols": ["job_name", "owner", "heartbeat_ts_ms"],
-            },
-            "pnl_attribution": {
-                "required": True,
-                "cols": [
-                    "ts_ms",
-                    "source_alert_id",
-                    "prediction_id",
-                    "model_id",
-                    "model_version",
-                    "symbol",
-                    "pnl",
-                    "fees",
-                    "slippage_bps",
-                    "position_size",
-                    "avg_price",
-                    "realized_pnl",
-                    "unrealized_pnl",
-                    "extra_json",
-                ],
-            },
-            "shadow_capital_scores": {
-                "required": False,
-                "cols": ["ts_ms", "window_s", "regime", "model_name", "score"],
-            },
-        }
-        REQUIRED_INDEXES = {
-            "idx_prices_symbol_ts",
-            "idx_event_log_ts",
-            "idx_event_log_type_ts",
-            "idx_event_log_entity",
-            "idx_event_log_corr",
-            "idx_job_checkpoints_updated",
-            "idx_decision_log_ts",
-            "idx_decision_log_symbol_ts",
-            "idx_decision_log_model_ts",
-            "idx_predictions_ts",
-            "idx_predictions_symbol_ts",
-            "idx_predictions_model_ts",
-            "idx_alerts_ts",
-            "idx_alerts_event_id",
-            "idx_alerts_prediction_id",
-            "idx_alerts_severity_ts",
-            "idx_alerts_symbol_ts",
-            "idx_portfolio_state_updated_ts",
-            "idx_execution_orders_submit_ts",
-            "idx_execution_orders_source_alert",
-            "idx_execution_orders_prediction_submit_ts",
-            "idx_execution_orders_model_submit_ts",
-            "idx_execution_orders_symbol_submit_ts",
-            "idx_execution_orders_order_uid",
-            "idx_pnl_attribution_prediction_ts",
-            "idx_pnl_attribution_ts",
-            "idx_pnl_attribution_model_ts",
-            "uq_exec_open_orders_client",
-            "uq_execution_order_idempotency_client",
-        }
-
-        for table, spec in SCHEMA_EXPECTATIONS.items():
-            if table not in have:
-                if spec.get("required"):
-                    missing_tables.append(table)
-                continue
-
-            cols_have = _get_table_cols(con, table)
-            missing = [c for c in spec.get("cols", []) if c not in cols_have]
-            if missing and spec.get("required"):
-                missing_cols[table] = missing
-
-        index_names = _get_index_names(con)
-        missing_indexes = sorted(REQUIRED_INDEXES - index_names)
-
-        expected_schema_version = None
-        schema_version = None
-        schema_version_status = "unknown"
-        schema_version_notes = ""
-
-        try:
-            expected_schema_version = int(STORAGE_SCHEMA_VERSION)
-        except Exception:
-            try:
-                from engine.runtime.jobs.repair_schema import SCHEMA_VERSION as _EXPECTED_SCHEMA_VERSION
-                expected_schema_version = int(_EXPECTED_SCHEMA_VERSION)
-            except Exception:
-                expected_schema_version = None
-
-        try:
-            row = con.execute(
-                """
-                SELECT version, status, notes
-                FROM schema_version
-                ORDER BY version DESC
-                LIMIT 1
-                """
-            ).fetchone()
-            if row and row[0] is not None:
-                schema_version = int(row[0])
-                schema_version_status = str(row[1] or "unknown")
-                schema_version_notes = str(row[2] or "")
-            else:
-                row = con.execute(
-                    "SELECT value FROM runtime_meta WHERE key = 'schema_version'"
-                ).fetchone()
-                if row and row[0] is not None:
-                    schema_version = int(str(row[0]).strip())
-                    schema_version_status = "legacy"
-        except Exception as e:
-            _warn("health.db_validation.schema_version", e)
-
-        schema_version_ok = True
-        if expected_schema_version is not None:
-            schema_version_ok = (
-                schema_version is not None
-                and int(schema_version) == int(expected_schema_version)
-                and str(schema_version_status) in ("applied", "verified", "legacy")
-            )
-
-        ok = (not missing_tables) and (not missing_cols) and (not missing_indexes) and bool(schema_version_ok)
-
+        validation = dict(get_db_validation_snapshot(include_quick_check=False) or {})
+    except Exception as e:
+        _warn("health.db_validation.snapshot", e)
         return {
-            "ok": ok,
+            "ok": False,
             "ts_ms": ts_ms,
-            "missing_tables": missing_tables,
-            "missing_cols": missing_cols,
-            "missing_indexes": missing_indexes,
-            "have_tables": sorted(list(have)),
-            "schema_version": schema_version,
-            "expected_schema_version": expected_schema_version,
-            "schema_version_status": schema_version_status,
-            "schema_version_notes": schema_version_notes,
-            "schema_version_ok": bool(schema_version_ok),
+            "missing_tables": [],
+            "missing_cols": {},
+            "missing_columns": {},
+            "missing_indexes": [],
+            "have_tables": [],
+            "schema_version": None,
+            "expected_schema_version": STORAGE_SCHEMA_VERSION,
+            "schema_version_status": "unavailable",
+            "schema_status": "unavailable",
+            "schema_version_notes": f"{type(e).__name__}: {e}",
+            "schema_version_ok": False,
+            "error": f"{type(e).__name__}: {e}",
         }
 
-    finally:
-        con.close()
+    missing_cols = dict(validation.get("missing_columns") or validation.get("missing_cols") or {})
+    schema_status = str(validation.get("schema_status") or "")
+    return {
+        "ok": bool(validation.get("ok")),
+        "ts_ms": ts_ms,
+        "missing_tables": list(validation.get("missing_tables") or []),
+        "missing_cols": missing_cols,
+        "missing_columns": missing_cols,
+        "missing_indexes": list(validation.get("missing_indexes") or []),
+        "have_tables": list(validation.get("have_tables") or []),
+        "schema_version": validation.get("schema_version"),
+        "expected_schema_version": validation.get("expected_schema_version", STORAGE_SCHEMA_VERSION),
+        "schema_version_status": schema_status,
+        "schema_status": schema_status,
+        "schema_version_notes": str(validation.get("schema_version_notes") or validation.get("error") or ""),
+        "schema_version_ok": bool(validation.get("schema_version_ok", True)),
+        "backend": str(validation.get("backend") or validation.get("storage") or ""),
+        "storage": str(validation.get("storage") or validation.get("backend") or ""),
+        "quick_check": str(validation.get("quick_check") or ""),
+        "owned_schema_ok": bool(validation.get("owned_schema_ok", True)),
+        "owned_drift_tables": list(validation.get("owned_drift_tables") or []),
+    }
 
 
 # ---------------------------------------------------
@@ -2284,7 +2655,8 @@ def get_health_snapshot():
         except Exception as e:
             _warn("health.snapshot_cache.read", e)
 
-    refresh_lock_acquired = _HEALTH_SNAPSHOT_REFRESH_LOCK.acquire(blocking=False)
+    refresh_lock = _HEALTH_SNAPSHOT_REFRESH_LOCK
+    refresh_lock_acquired = refresh_lock.acquire(blocking=False)
     if not refresh_lock_acquired:
         if isinstance(cached_payload, dict) and cached_ts_ms > 0:
             return _stale_health_snapshot_payload(
@@ -2326,6 +2698,29 @@ def get_health_snapshot():
                 "age_s": None,
             },
         }
+        try:
+            out["runtime_hardware"] = runtime_hardware_snapshot()
+        except Exception as e:
+            _warn("health.runtime_hardware", e)
+            out["runtime_hardware"] = {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+            }
+
+        section_started = time.perf_counter()
+        try:
+            out["disk_pressure"] = get_disk_pressure_snapshot()
+        except Exception as e:
+            _warn("health.disk_pressure", e)
+            out["disk_pressure"] = {
+                "ok": False,
+                "status": "error",
+                "critical": [f"disk_pressure_error:{type(e).__name__}:{e}"],
+                "warnings": [],
+                "paths": [],
+            }
+        _trace_section("disk_pressure", section_started, ok=bool((out.get("disk_pressure") or {}).get("ok")))
+
         def _table_exists(table: str) -> bool:
             try:
                 row = con.execute(
@@ -2735,7 +3130,7 @@ def get_health_snapshot():
             healthy_n = 0
             ingestion_runtime = dict(out.get("ingestion_runtime") or {})
             runtime_mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
-            strict_provider_telemetry = runtime_mode_name in ("shadow", "live")
+            strict_provider_telemetry = runtime_mode_name in ("paper", "shadow", "live")
 
             for row in fetch_provider_health_rows():
                 ts_ms = row.get("ts_ms")
@@ -2884,6 +3279,37 @@ def get_health_snapshot():
             healthy=int((out.get("providers") or {}).get("healthy") or 0),
         )
 
+        section_started = time.perf_counter()
+        try:
+            out["provider_readiness"] = provider_readiness_snapshot(
+                mode=os.environ.get("ENGINE_MODE", "safe"),
+                health=out,
+                now_ms=now_ms,
+            )
+        except Exception as e:
+            _warn("health.provider_readiness", e)
+            mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+            required = _provider_readiness_enforced(mode_name)
+            out["provider_readiness"] = {
+                "ok": not required,
+                "required": bool(required),
+                "mode": mode_name,
+                "reason": "provider_readiness_error" if required else "not_required",
+                "blockers": (["provider_readiness_error"] if required else []),
+                "required_providers": [],
+                "healthy_required": 0,
+                "total_required": 0,
+                "by_provider": {},
+                "error": f"{type(e).__name__}:{e}",
+                "ts_ms": int(now_ms),
+            }
+        _trace_section(
+            "provider_readiness",
+            section_started,
+            ok=bool((out.get("provider_readiness") or {}).get("ok")),
+            required=bool((out.get("provider_readiness") or {}).get("required")),
+        )
+
         # ---------------------------
         # Portfolio presence
         # ---------------------------
@@ -2964,9 +3390,11 @@ def get_health_snapshot():
                 from engine.runtime.gates import execution_gate_snapshot
                 from engine.api.internal_access import get_execution_mode as _get_execution_mode
 
+                kill_switches = _read_kill_switch_snapshot_readonly(con=con)
+                out["kill_switches"] = dict(kill_switches)
                 snap = execution_gate_snapshot(
                     get_execution_mode_fn=_get_execution_mode,
-                    kill_switches=_read_kill_switch_snapshot_readonly(con=con),
+                    kill_switches=kill_switches,
                     risk_state_getter=lambda key, default="": _risk_state_value_readonly(con, str(key), str(default)),
                 )
                 if isinstance(snap, dict):
@@ -3301,13 +3729,16 @@ def get_health_snapshot():
         try:
             timeseries_storage = dict(get_timeseries_storage_snapshot() or {})
             feature_store_snapshot = dict(timeseries_storage.get("feature_store") or {})
+            telemetry_append_buffer_snapshot = dict(timeseries_storage.get("telemetry_append_buffer") or {})
             telemetry_mirror_snapshot = dict(timeseries_storage.get("telemetry_mirror") or {})
             timescale_snapshot = dict(timeseries_storage)
             timescale_snapshot.pop("feature_store", None)
+            timescale_snapshot.pop("telemetry_append_buffer", None)
             timescale_snapshot.pop("telemetry_mirror", None)
             out["timeseries_storage"] = timeseries_storage
             out["timescale"] = timescale_snapshot
             out["feature_store"] = feature_store_snapshot
+            out["telemetry_append_buffer"] = telemetry_append_buffer_snapshot
             out["telemetry_mirror"] = telemetry_mirror_snapshot
         except Exception as e:
             _warn("health.timeseries_storage", e)
@@ -3331,6 +3762,13 @@ def get_health_snapshot():
                 "enabled": False,
                 "degraded": True,
                 "degraded_reasons": ["feature_store_error"],
+                "detail": error_detail,
+            }
+            out["telemetry_append_buffer"] = {
+                "ok": False,
+                "enabled": False,
+                "degraded": True,
+                "degraded_reasons": ["telemetry_append_buffer_error"],
                 "detail": error_detail,
             }
             out["telemetry_mirror"] = {
@@ -3652,6 +4090,9 @@ def get_health_snapshot():
         events_ok = bool((out.get("events") or {}).get("ok"))
         jobs_ok = bool((out.get("job_summary") or {}).get("ok"))
         providers_ok = bool((out.get("providers") or {}).get("ok"))
+        provider_readiness = dict(out.get("provider_readiness") or {})
+        provider_readiness_required = bool(provider_readiness.get("required"))
+        provider_readiness_ok = bool((not provider_readiness_required) or provider_readiness.get("ok"))
         competition_ok = bool((out.get("competition") or {}).get("ok"))
         attribution_ok = bool((out.get("attribution") or {}).get("ok"))
         options_ingestion_ok = bool((out.get("options_ingestion") or {}).get("ok"))
@@ -3664,12 +4105,9 @@ def get_health_snapshot():
         execution_degraded_snapshot = dict(out.get("execution_degraded") or {})
         timeseries_ok = bool(timeseries_storage_snapshot.get("ok", True))
         portfolio_runtime_ok = not bool(portfolio_runtime_snapshot.get("degraded"))
-        position_reconcile_blocking = bool(
-            mode_name == "live"
-            and position_reconcile_snapshot.get("available")
-            and position_reconcile_snapshot.get("fatal_reconcile")
-        )
-        position_reconcile_ok = not position_reconcile_blocking
+        position_reconcile_required = mode_name in ("paper", "live")
+        position_reconcile_ok = bool((not position_reconcile_required) or position_reconcile_snapshot.get("ok"))
+        position_reconcile_blocking = bool(position_reconcile_required and not position_reconcile_ok)
         execution_degraded_active = bool(execution_degraded_snapshot.get("active"))
         execution_degraded_critical = bool(
             execution_degraded_active
@@ -3731,6 +4169,7 @@ def get_health_snapshot():
             "events_ok": events_ok,
             "jobs_ok": jobs_ok,
             "providers_ok": providers_ok,
+            "provider_readiness_ok": provider_readiness_ok,
             "competition_ok": competition_ok,
             "attribution_ok": attribution_ok,
             "critical_ingestion_ok": critical_ingestion_ok,
@@ -3765,6 +4204,9 @@ def get_health_snapshot():
 
         if not providers_ok:
             out["reasons"].append("providers_not_ok")
+        if not provider_readiness_ok:
+            out["reasons"].append("provider_readiness_not_ok")
+            out["reasons"].extend(list(provider_readiness.get("blockers") or []))
 
         if not competition_ok and mode_name in ("shadow", "live"):
             out["reasons"].append("competition_not_ok")
@@ -3800,6 +4242,7 @@ def get_health_snapshot():
             out["reasons"].append(
                 f"position_reconcile:{position_reconcile_snapshot.get('status') or 'failed'}"
             )
+            out["reasons"].extend(list(position_reconcile_snapshot.get("blockers") or []))
         if not startup_validation_ok:
             out["reasons"].extend(list((out.get("startup_validation") or {}).get("reasons") or []))
         if not barrier_ok and mode_name in ("shadow", "live"):
@@ -3834,7 +4277,15 @@ def get_health_snapshot():
         if not broker_ok and mode_name == "live":
             out["reasons"].append("broker_connection_unavailable")
 
-        startup_ok = db_ok and event_log_ok and prices_ok and jobs_ok and providers_ok and critical_ingestion_ok
+        startup_ok = (
+            db_ok
+            and event_log_ok
+            and prices_ok
+            and jobs_ok
+            and providers_ok
+            and provider_readiness_ok
+            and critical_ingestion_ok
+        )
         if mode_name == "live":
             out["ok"] = (
                 startup_ok
@@ -3924,6 +4375,11 @@ def get_health_snapshot():
             critical_blockers.append("prices_not_ok")
         if not bool(out.get("providers", {}).get("ok")):
             critical_blockers.append("providers_not_ok")
+        if not bool((out.get("provider_readiness") or {}).get("ok")) and bool(
+            (out.get("provider_readiness") or {}).get("required")
+        ):
+            critical_blockers.append("provider_readiness_not_ok")
+            critical_blockers.extend(list((out.get("provider_readiness") or {}).get("blockers") or []))
         if not bool(out.get("job_summary", {}).get("ok")):
             critical_blockers.append("jobs_not_ok")
         if not bool(out.get("competition", {}).get("ok")) and mode_name in ("shadow", "live"):
@@ -3968,6 +4424,10 @@ def get_health_snapshot():
             out.get("db", {}).get("ok")
             and out.get("prices", {}).get("ok")
             and out.get("providers", {}).get("ok")
+            and (
+                (not bool((out.get("provider_readiness") or {}).get("required")))
+                or bool((out.get("provider_readiness") or {}).get("ok"))
+            )
             and out.get("job_summary", {}).get("ok")
             and not bool((out.get("ingestion_runtime") or {}).get("stale"))
             and bool(critical_ingestion_ok)
@@ -4008,7 +4468,7 @@ def get_health_snapshot():
             if con is not None:
                 con.close()
         finally:
-            _HEALTH_SNAPSHOT_REFRESH_LOCK.release()
+            refresh_lock.release()
 
 
 def get_readiness_snapshot(
@@ -4026,6 +4486,7 @@ def get_readiness_snapshot(
 
     prices = health.get("prices") or {}
     providers = health.get("providers") or {}
+    provider_readiness = dict(health.get("provider_readiness") or {}) if isinstance(health.get("provider_readiness"), dict) else {}
     labels = health.get("labels") or {}
     model = health.get("model") or {}
     execution_barrier = health.get("execution_barrier") or {}
@@ -4048,7 +4509,9 @@ def get_readiness_snapshot(
     require_risk = mode_name in ("shadow", "live")
     require_broker = mode_name == "live"
 
-    data_feed_ok = bool(prices.get("ok")) and bool(providers.get("ok"))
+    provider_readiness_required = bool(provider_readiness.get("required"))
+    provider_readiness_ok = bool((not provider_readiness_required) or provider_readiness.get("ok"))
+    data_feed_ok = bool(prices.get("ok")) and bool(providers.get("ok")) and provider_readiness_ok
     models_ok = bool(labels.get("ok")) and bool(model.get("ok"))
     risk_ok = bool(execution_barrier.get("allowed"))
     db_ok = bool(db.get("ok"))
@@ -4058,12 +4521,9 @@ def get_readiness_snapshot(
     require_timeseries = bool(timeseries_storage.get("enabled")) or bool(feature_store.get("enabled"))
     timeseries_ok = (not require_timeseries) or bool(timeseries_storage.get("ok"))
     portfolio_runtime_ok = not bool(portfolio_runtime.get("degraded"))
-    position_reconcile_blocking = bool(
-        mode_name == "live"
-        and position_reconcile.get("available")
-        and position_reconcile.get("fatal_reconcile")
-    )
-    position_reconcile_ok = not position_reconcile_blocking
+    position_reconcile_required = mode_name in ("paper", "live")
+    position_reconcile_ok = bool((not position_reconcile_required) or position_reconcile.get("ok"))
+    position_reconcile_blocking = bool(position_reconcile_required and not position_reconcile_ok)
     execution_degraded_active = bool(execution_degraded.get("active"))
     execution_degraded_severity = str(execution_degraded.get("severity") or "WARNING").strip().upper() or "WARNING"
     execution_degraded_critical = bool(execution_degraded_active and execution_degraded_severity == "CRITICAL")
@@ -4126,7 +4586,22 @@ def get_readiness_snapshot(
             "code": "data_feed_not_ready",
             "level": "error",
             "message": "Data feed readiness failed.",
-            "detail": f"prices_ok={bool(prices.get('ok'))} providers_ok={bool(providers.get('ok'))} age_s={prices.get('age_s')} healthy={providers.get('healthy')}/{providers.get('total')}",
+            "detail": (
+                f"prices_ok={bool(prices.get('ok'))} providers_ok={bool(providers.get('ok'))} "
+                f"provider_readiness_ok={provider_readiness_ok} age_s={prices.get('age_s')} "
+                f"healthy={providers.get('healthy')}/{providers.get('total')}"
+            ),
+        })
+
+    if provider_readiness_required and not provider_readiness_ok:
+        issues.append({
+            "code": "provider_readiness_failed",
+            "level": "error",
+            "message": "Required provider readiness failed.",
+            "detail": (
+                f"required_providers={list(provider_readiness.get('required_providers') or [])} "
+                f"blockers={list(provider_readiness.get('blockers') or [])}"
+            ),
         })
 
     if require_models and not models_ok:
@@ -4184,6 +4659,7 @@ def get_readiness_snapshot(
                 f"status={position_reconcile.get('status') or 'failed'} "
                 f"broker={position_reconcile.get('broker') or 'unknown'} "
                 f"mismatched_n={position_reconcile.get('mismatched_n')} "
+                f"blockers={list(position_reconcile.get('blockers') or [])} "
                 f"detail={position_reconcile.get('detail') or 'position_reconcile_failed'}"
             ),
         })
@@ -4279,7 +4755,21 @@ def get_readiness_snapshot(
             "label": "Verify Data Feed",
             "ok": data_feed_ok,
             "blocked": not data_feed_ok,
-            "detail": f"prices_ok={bool(prices.get('ok'))} providers={providers.get('healthy')}/{providers.get('total')} age_s={prices.get('age_s')}",
+            "detail": (
+                f"prices_ok={bool(prices.get('ok'))} providers={providers.get('healthy')}/{providers.get('total')} "
+                f"provider_readiness_ok={provider_readiness_ok} age_s={prices.get('age_s')}"
+            ),
+        },
+        {
+            "id": "provider_readiness",
+            "label": "Verify Providers",
+            "ok": provider_readiness_ok,
+            "blocked": bool(provider_readiness_required and not provider_readiness_ok),
+            "detail": (
+                "not_required"
+                if not provider_readiness_required
+                else f"required={list(provider_readiness.get('required_providers') or [])} blockers={list(provider_readiness.get('blockers') or [])}"
+            ),
         },
         {
             "id": "jobs",
@@ -4388,6 +4878,8 @@ def get_readiness_snapshot(
         waiting_on.append("database")
     if not data_feed_ok:
         waiting_on.append("data_feed")
+    if provider_readiness_required and not provider_readiness_ok:
+        waiting_on.append("provider_readiness")
     if not jobs_ok:
         waiting_on.append("jobs")
     if require_models and not models_ok:
@@ -4443,6 +4935,7 @@ def get_readiness_snapshot(
         "ts_ms": ts_ms,
         "mode": mode_name,
         "data_feed_ok": data_feed_ok,
+        "provider_readiness_ok": provider_readiness_ok,
         "models_ok": models_ok,
         "risk_ok": risk_ok,
         "broker_ok": broker_ok,
@@ -4455,6 +4948,7 @@ def get_readiness_snapshot(
         "system_live": system_live,
         "system_state": state_name or "UNKNOWN",
         "position_reconcile": dict(position_reconcile or {}),
+        "provider_readiness": provider_readiness,
         "execution_degraded": dict(execution_degraded or {}),
         "startup_validation": startup_validation,
         "waiting_on": waiting_on,
@@ -4549,11 +5043,33 @@ def run_preflight() -> Dict:
         if not _mode:
             _mode = "safe"
 
+        try:
+            from engine.execution.kill_switch import capital_equity_freshness_snapshot
+
+            live_equity_required = any(
+                str(os.environ.get(name) or "").strip().lower() == "live"
+                for name in ("ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE", "MODE")
+            )
+            equity_freshness = dict(capital_equity_freshness_snapshot(live_mode=live_equity_required) or {})
+        except Exception as e:
+            _warn("health.capital_equity_freshness", e)
+            equity_freshness = {
+                "ok": False,
+                "required": any(
+                    str(os.environ.get(name) or "").strip().lower() == "live"
+                    for name in ("ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE", "MODE")
+                ),
+                "reason_code": "capital_equity_freshness_error",
+                "reason": f"{type(e).__name__}: {e}",
+            }
+        out["capital_equity_freshness"] = equity_freshness
+
         if _mode in ("live", "shadow"):
             barrier_ok = bool(barrier.get("allowed"))
         else:
             barrier_ok = not str(barrier.get("reason") or "").startswith("execution_barrier_error")
-        out["health_ok"] = prices_ok and barrier_ok and startup_validation_ok
+        equity_ok = (not bool(equity_freshness.get("required"))) or bool(equity_freshness.get("ok"))
+        out["health_ok"] = prices_ok and barrier_ok and startup_validation_ok and equity_ok
 
         if age_s > PREFLIGHT_PRICES_MAX_AGE_S:
             out["ok"] = False
@@ -4574,6 +5090,14 @@ def run_preflight() -> Dict:
             if critical_missing:
                 out["notes"].append(f"startup_validation_missing={','.join(critical_missing)}")
             out["notes"].extend(notes[:8])
+
+        if not equity_ok:
+            out["ok"] = False
+            out["health_ok"] = False
+            out["notes"].append(
+                "capital_equity_freshness="
+                f"{equity_freshness.get('reason_code') or equity_freshness.get('reason') or 'unavailable'}"
+            )
 
     except Exception as e:
         out["ok"] = False

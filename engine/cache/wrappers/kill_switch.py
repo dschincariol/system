@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 from engine.audit.chain import append_chain_row
@@ -14,9 +16,35 @@ from engine.cache.wrappers._common import (
     reload_after_codec_version_mismatch,
 )
 from engine.runtime import storage
+from engine.runtime.metrics import emit_counter, emit_gauge
 
 KILL_SWITCH_CODEC_VERSION = 1
-KILL_SWITCH_TTL_S: int | None = None
+KILL_SWITCH_CACHE_TTL_ENV = "KILL_SWITCH_CACHE_TTL_S"
+KILL_SWITCH_TTL_S = 30
+KILL_SWITCH_MAX_TTL_S = 300
+
+LOG = logging.getLogger(__name__)
+
+
+def _configured_ttl_s() -> int:
+    fallback = int(KILL_SWITCH_TTL_S or 30)
+    raw = str(os.environ.get(KILL_SWITCH_CACHE_TTL_ENV, "") or "").strip()
+    try:
+        value = int(float(raw)) if raw else fallback
+    except Exception:
+        value = fallback
+    return max(1, min(int(KILL_SWITCH_MAX_TTL_S), int(value)))
+
+
+def _max_age_ms() -> int:
+    return int(_configured_ttl_s() * 1000)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
 
 
 def _normalize_scope(scope: str) -> str:
@@ -30,7 +58,7 @@ def _normalize_key(scope: str, key: str) -> str:
     value = str(key or "").strip()
     if not value:
         raise ValueError("kill_switch_key_required")
-    return "global" if scope == "global" else value
+    return value
 
 
 def _row_to_state(row: Any) -> dict[str, Any]:
@@ -46,6 +74,174 @@ def _row_to_state(row: Any) -> dict[str, Any]:
     }
 
 
+def _provider_unavailable_snapshot(error: BaseException | str | None = None) -> dict[str, Any]:
+    error_text = "" if error is None else str(error)
+    return _snapshot_for_cache(
+        {
+            "state": [
+                {
+                    "scope": "global",
+                    "key": "provider_unavailable",
+                    "enabled": 1,
+                    "reason": "kill_switch_provider_unavailable",
+                    "actor": "engine.cache.wrappers.kill_switch",
+                    "meta": {"error": error_text} if error_text else {},
+                    "created_ts_ms": 0,
+                    "updated_ts_ms": now_ms(),
+                }
+            ],
+            "source": "engine.cache.wrappers.kill_switch:provider_unavailable",
+        }
+    )
+
+
+def _snapshot_for_cache(snapshot: dict[str, Any] | None, *, source: str = "engine.cache.wrappers.kill_switch:db") -> dict[str, Any]:
+    out = dict(snapshot or {})
+    state = out.get("state")
+    out["state"] = list(state) if isinstance(state, list) else []
+    out["loaded_ts_ms"] = int(now_ms())
+    out["source"] = str(out.get("source") or source)
+    out["max_age_ms"] = int(_max_age_ms())
+    return out
+
+
+def _snapshot_age_ms(snapshot: dict[str, Any], *, now: int | None = None) -> int | None:
+    loaded_ts_ms = _safe_int(snapshot.get("loaded_ts_ms"), 0)
+    if loaded_ts_ms <= 0:
+        return None
+    return max(0, int(now_ms() if now is None else now) - int(loaded_ts_ms))
+
+
+def _freshness_budget_ms(snapshot: dict[str, Any]) -> int:
+    stored = _safe_int(snapshot.get("max_age_ms"), 0)
+    current = int(_max_age_ms())
+    if stored <= 0:
+        return 0
+    return max(1, min(int(stored), int(current)))
+
+
+def _is_fresh_snapshot(snapshot: dict[str, Any], *, now: int | None = None) -> bool:
+    age_ms = _snapshot_age_ms(snapshot, now=now)
+    if age_ms is None:
+        return False
+    return int(age_ms) <= int(_freshness_budget_ms(snapshot))
+
+
+def _snapshot_is_provider_unavailable(snapshot: dict[str, Any] | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    if "provider_unavailable" in str(snapshot.get("source") or ""):
+        return True
+    for row in list(snapshot.get("state") or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            enabled = int(row.get("enabled") or 0) == 1
+        except Exception:
+            enabled = False
+        if not enabled:
+            continue
+        scope = str(row.get("scope") or "").strip().lower()
+        key = str(row.get("key") or "").strip().lower()
+        reason = str(row.get("reason") or "").strip().lower()
+        if scope == "global" and (key == "provider_unavailable" or reason == "kill_switch_provider_unavailable"):
+            return True
+    return False
+
+
+def _finalize_return_snapshot(
+    snapshot: dict[str, Any] | None,
+    *,
+    read_source: str,
+    cache_status: str,
+) -> dict[str, Any]:
+    out = dict(snapshot or {"state": []})
+    state = out.get("state")
+    out["state"] = list(state) if isinstance(state, list) else []
+    if _snapshot_is_provider_unavailable(out):
+        out["source"] = "engine.cache.wrappers.kill_switch:provider_unavailable"
+    out["max_age_ms"] = int(_freshness_budget_ms(out) or _max_age_ms())
+    age_ms = _snapshot_age_ms(out)
+    out["cache_age_ms"] = age_ms
+    out["cache_fresh"] = bool(age_ms is not None and int(age_ms) <= int(out["max_age_ms"]))
+    out["read_source"] = str(read_source)
+    out["cache_status"] = str(cache_status)
+
+    source = str(out.get("source") or "unknown")
+    try:
+        emit_gauge(
+            "kill_switch_cache_age_ms",
+            int(age_ms) if age_ms is not None else -1,
+            component="engine.cache.wrappers.kill_switch",
+            extra_tags={
+                "source": source,
+                "read_source": str(read_source),
+                "cache_status": str(cache_status),
+                "fresh": str(bool(out["cache_fresh"])).lower(),
+            },
+        )
+        emit_counter(
+            "kill_switch_cache_read_total",
+            1,
+            component="engine.cache.wrappers.kill_switch",
+            extra_tags={
+                "source": source,
+                "read_source": str(read_source),
+                "cache_status": str(cache_status),
+            },
+        )
+    except Exception as exc:
+        LOG.debug("KILL_SWITCH_CACHE_METRIC_EMIT_FAILED: %s", exc, exc_info=True)
+    return out
+
+
+def _encode_loaded_snapshot() -> bytes:
+    return codec.encode(_snapshot_for_cache(_load_snapshot()), version=KILL_SWITCH_CODEC_VERSION)
+
+
+def _reload_stale_snapshot(key: str, *, reason: str) -> dict[str, Any]:
+    emit_counter(
+        "kill_switch_cache_stale_reload_total",
+        1,
+        component="engine.cache.wrappers.kill_switch",
+        extra_tags={"reason": str(reason)},
+    )
+    LOG.warning("KILL_SWITCH_CACHE_STALE: reloading key=%s reason=%s", key, reason)
+    store.invalidate(key)
+    snapshot = _snapshot_for_cache(_load_snapshot())
+    try:
+        store.prime(
+            key,
+            codec.encode(snapshot, version=KILL_SWITCH_CODEC_VERSION),
+            ttl_s=_configured_ttl_s(),
+        )
+    except Exception as exc:
+        LOG.warning("KILL_SWITCH_CACHE_PRIME_FAILED: key=%s reason=%s error=%s", key, reason, exc, exc_info=True)
+    status = "stale_fail_closed" if _snapshot_is_provider_unavailable(snapshot) else "stale_reloaded"
+    return _finalize_return_snapshot(snapshot, read_source="db_reload", cache_status=status)
+
+
+def fail_closed_snapshot(error: BaseException | str | None = None) -> dict[str, Any]:
+    """Public helper for callers that must materialize an unavailable provider block."""
+    return _provider_unavailable_snapshot(error)
+
+
+def kill_switch_cache_diagnostics() -> dict[str, Any]:
+    """Return the current cached kill-switch snapshot with freshness metadata."""
+    return read_kill_switch()
+
+
+def refresh_kill_switch_cache() -> dict[str, Any]:
+    """Reload the kill-switch snapshot from storage and re-prime Redis."""
+    snapshot = _snapshot_for_cache(_load_snapshot())
+    prime_kill_switch(snapshot)
+    return _finalize_return_snapshot(
+        snapshot,
+        read_source="db_refresh",
+        cache_status=("refresh_fail_closed" if _snapshot_is_provider_unavailable(snapshot) else "refreshed"),
+    )
+
+
 def _load_snapshot() -> dict[str, Any]:
     con = None
     try:
@@ -57,9 +253,9 @@ def _load_snapshot() -> dict[str, Any]:
             ORDER BY scope, key
             """
         ).fetchall()
-        return {"state": [_row_to_state(row) for row in rows or []]}
-    except Exception:
-        return {"state": []}
+        return {"state": [_row_to_state(row) for row in rows or []], "source": "engine.cache.wrappers.kill_switch:db"}
+    except Exception as exc:
+        return _provider_unavailable_snapshot(exc)
     finally:
         if con is not None:
             con.close()
@@ -67,42 +263,63 @@ def _load_snapshot() -> dict[str, Any]:
 
 def read_kill_switch() -> dict[str, Any]:
     key = keys.kill_switch("snapshot")
+    loaded_from_loader = False
 
     def _loader() -> bytes:
-        return codec.encode(_load_snapshot(), version=KILL_SWITCH_CODEC_VERSION)
+        nonlocal loaded_from_loader
+        loaded_from_loader = True
+        return _encode_loaded_snapshot()
 
-    raw = store.read(key, _loader, ttl_s=KILL_SWITCH_TTL_S)
+    ttl_s = _configured_ttl_s()
+    raw = store.read(key, _loader, ttl_s=ttl_s)
     if raw is None:
-        return {"state": []}
+        return _finalize_return_snapshot(
+            _provider_unavailable_snapshot("kill_switch_cache_loader_unavailable"),
+            read_source="loader_unavailable",
+            cache_status="fail_closed",
+        )
     try:
         data = codec.decode(raw, expected_version=KILL_SWITCH_CODEC_VERSION)
     except codec.UnsupportedCacheVersion as exc:
         raw = reload_after_codec_version_mismatch(
             key,
             _loader,
-            ttl_s=KILL_SWITCH_TTL_S,
+            ttl_s=ttl_s,
             wrapper=__name__,
             expected_version=KILL_SWITCH_CODEC_VERSION,
             error=exc,
         )
         if raw is None:
-            return {"state": []}
+            return _finalize_return_snapshot(
+                _provider_unavailable_snapshot("kill_switch_cache_reload_unavailable"),
+                read_source="codec_reload_unavailable",
+                cache_status="fail_closed",
+            )
         try:
             data = codec.decode(raw, expected_version=KILL_SWITCH_CODEC_VERSION)
         except codec.CacheCodecError:
             store.invalidate(key)
-            return _load_snapshot()
+            return _reload_stale_snapshot(key, reason="codec_reload_decode_failed")
     except codec.CacheCodecError:
         store.invalidate(key)
-        return _load_snapshot()
-    return dict(data or {"state": []})
+        return _reload_stale_snapshot(key, reason="codec_decode_failed")
+
+    snapshot = dict(data or {"state": []})
+    if not _is_fresh_snapshot(snapshot):
+        reason = "missing_loaded_ts_ms" if _snapshot_age_ms(snapshot) is None else "expired_loaded_ts_ms"
+        return _reload_stale_snapshot(key, reason=reason)
+    return _finalize_return_snapshot(
+        snapshot,
+        read_source=("db_load" if loaded_from_loader else "redis"),
+        cache_status=("loaded" if loaded_from_loader else "fresh"),
+    )
 
 
 def prime_kill_switch(snapshot: dict[str, Any] | None = None) -> None:
     store.prime(
         keys.kill_switch("snapshot"),
-        codec.encode(snapshot or _load_snapshot(), version=KILL_SWITCH_CODEC_VERSION),
-        ttl_s=KILL_SWITCH_TTL_S,
+        codec.encode(_snapshot_for_cache(snapshot or _load_snapshot()), version=KILL_SWITCH_CODEC_VERSION),
+        ttl_s=_configured_ttl_s(),
     )
 
 
@@ -215,8 +432,8 @@ def set_kill_switch(
     else:
         store.write_through(
             keys.kill_switch("snapshot"),
-            lambda: codec.encode(_load_snapshot(), version=KILL_SWITCH_CODEC_VERSION),
+            _encode_loaded_snapshot,
             persist=_persist,
-            ttl_s=KILL_SWITCH_TTL_S,
+            ttl_s=_configured_ttl_s(),
         )
     return row

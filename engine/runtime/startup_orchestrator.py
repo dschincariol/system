@@ -10,10 +10,12 @@ import os
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import default_local_db_dir, default_local_log_dir, use_local_runtime_defaults
 from engine.runtime.storage import connect
 from engine.runtime.health import run_preflight
 from engine.runtime.db_repair import repair as repair_db
@@ -491,10 +493,25 @@ class StartupOrchestrator:
     def run(self, mode: str = "safe") -> Dict:
         # This sequence is intentionally linear and fail-closed so source jobs
         # come up before downstream event/label/model stages.
-        # ensure required directories exist
+        # Ensure required runtime directories exist. Explicit deployment paths
+        # still win; local defaults live under the ignored var/ tree.
         try:
-            os.makedirs("data", exist_ok=True)
-            os.makedirs("logs", exist_ok=True)
+            dirs: list[Path] = []
+            data_dir = os.environ.get("TRADING_DATA") or os.environ.get("DATA_DIR")
+            log_dir = os.environ.get("TRADING_LOGS") or os.environ.get("LOG_DIR")
+            if not data_dir and use_local_runtime_defaults():
+                data_dir = str(default_local_db_dir())
+            if not log_dir and use_local_runtime_defaults():
+                log_dir = str(default_local_log_dir())
+            if data_dir:
+                dirs.append(Path(data_dir).expanduser())
+            if log_dir:
+                dirs.append(Path(log_dir).expanduser())
+            db_path = os.environ.get("DB_PATH")
+            if db_path:
+                dirs.append(Path(db_path).expanduser().parent)
+            for directory in dirs:
+                directory.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self._warn_nonfatal("STARTUP_ORCHESTRATOR_MAKEDIRS_FAILED", e, once_key="makedirs")
 

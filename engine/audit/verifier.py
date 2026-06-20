@@ -52,7 +52,7 @@ class VerifyResult:
 
 def verify_table(
     table: str,
-    conn,
+    conn=None,
     *,
     from_id: int | None = None,
     to_id: int | None = None,
@@ -67,6 +67,10 @@ def verify_table(
     two contiguous rows: the requested first row and its predecessor.
     """
 
+    if not isinstance(table, str) and isinstance(conn, str):
+        table, conn = conn, table
+    if conn is None:
+        raise TypeError("verify_table() missing required connection argument")
     table_name = _ident(table)
     columns = table_columns(conn, table_name)
     names = {col.name for col in columns}

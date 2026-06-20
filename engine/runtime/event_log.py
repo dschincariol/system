@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.logging import get_logger
 from engine.runtime.startup_write_gate import (
     noncritical_startup_write_wait_s,
@@ -18,27 +19,13 @@ from engine.runtime.storage import connect, init_db, run_write_txn
 LOG = get_logger("runtime.event_log")
 
 SCHEMA = ""
-_EVENT_LOG_BUFFER_ENABLED = str(os.environ.get("EVENT_LOG_BUFFER_ENABLED", "1")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_EVENT_LOG_BUFFER_FLUSH_INTERVAL_S = max(
-    0.05,
-    float(os.environ.get("EVENT_LOG_BUFFER_FLUSH_INTERVAL_S", "0.5") or 0.5),
-)
-_EVENT_LOG_BUFFER_FLUSH_JITTER_RATIO = min(
-    1.0,
-    max(0.0, float(os.environ.get("EVENT_LOG_BUFFER_FLUSH_JITTER_RATIO", "0.25") or 0.25)),
-)
-_EVENT_LOG_BUFFER_MAX_BATCH = max(
-    1,
-    int(os.environ.get("EVENT_LOG_BUFFER_MAX_BATCH", "128") or 128),
-)
+_EVENT_LOG_BUFFER_ENABLED = env_bool("EVENT_LOG_BUFFER_ENABLED", default=True)
+_EVENT_LOG_BUFFER_FLUSH_INTERVAL_S = tuned_float("EVENT_LOG_BUFFER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0)
+_EVENT_LOG_BUFFER_FLUSH_JITTER_RATIO = tuned_float("EVENT_LOG_BUFFER_FLUSH_JITTER_RATIO", 0.25, 0.0, 1.0)
+_EVENT_LOG_BUFFER_MAX_BATCH = tuned_int("EVENT_LOG_BUFFER_MAX_BATCH", 128, 1, 4096)
 _EVENT_LOG_BUFFER_MAX_ROWS = max(
     _EVENT_LOG_BUFFER_MAX_BATCH,
-    int(os.environ.get("EVENT_LOG_BUFFER_MAX_ROWS", "2048") or 2048),
+    tuned_int("EVENT_LOG_BUFFER_MAX_ROWS", 2048, 1, 65536),
 )
 _EVENT_LOG_BUFFER_LOCK = threading.Condition()
 _EVENT_LOG_BUFFER_PENDING: List[tuple[int, str, str, int, str | None, str | None, str | None, str]] = []

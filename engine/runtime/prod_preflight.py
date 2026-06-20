@@ -22,6 +22,7 @@ Runtime subsystem module for `prod_preflight`.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import py_compile
@@ -32,6 +33,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -55,17 +59,18 @@ KEY_FILES = [
     os.path.join(REPO_ROOT, "dashboard_server.py"),
     os.path.join(REPO_ROOT, "engine", "runtime", "alerts.py"),
     os.path.join(REPO_ROOT, "engine", "execution", "broker_sim.py"),
+    os.path.join(REPO_ROOT, "engine", "execution", "lob_simulation.py"),
     os.path.join(REPO_ROOT, "engine", "execution", "broker_alpaca_rest.py"),
     os.path.join(REPO_ROOT, "engine", "runtime", "storage.py"),
     os.path.join(REPO_ROOT, "engine", "strategy", "edge_filter.py"),
     os.path.join(REPO_ROOT, "engine", "strategy", "portfolio_backtest.py"),
     os.path.join(REPO_ROOT, "engine", "strategy", "portfolio_rebalance.py"),
-    os.path.join(REPO_ROOT, "ops", "compute_exec_labels.py"),
+    os.path.join(REPO_ROOT, "engine", "execution", "jobs", "compute_exec_labels.py"),
     os.path.join(REPO_ROOT, "engine", "execution", "train_size_policy.py"),
 ]
 
 SMOKE_CMDS = [
-    ("ops.compute_exec_labels", [sys.executable, "-u", "-m", "ops.compute_exec_labels"]),
+    ("engine.execution.jobs.compute_exec_labels", [sys.executable, "-u", "-m", "engine.execution.jobs.compute_exec_labels"]),
     ("engine.strategy.jobs.train_size_policy", [sys.executable, "-u", "-m", "engine.strategy.jobs.train_size_policy"]),
     ("engine.strategy.portfolio_backtest", [sys.executable, "-u", "-m", "engine.strategy.portfolio_backtest"]),
     ("engine.execution.jobs.portfolio_rebalance", [sys.executable, "-u", "-m", "engine.execution.jobs.portfolio_rebalance"]),
@@ -341,11 +346,14 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
 
 def _compile_files(files: List[str]) -> List[str]:
     errs: List[str] = []
-    for f in files:
-        try:
-            py_compile.compile(f, doraise=True)
-        except Exception as e:
-            errs.append(f"{f}: {e}")
+    with tempfile.TemporaryDirectory(prefix="prod_preflight_pycompile_") as tmp_dir:
+        for f in files:
+            try:
+                digest = hashlib.sha256(os.path.abspath(f).encode("utf-8", "surrogatepass")).hexdigest()
+                cfile = os.path.join(tmp_dir, f"{digest}.pyc")
+                py_compile.compile(f, cfile=cfile, doraise=True)
+            except Exception as e:
+                errs.append(f"{f}: {e}")
     return errs
 
 
@@ -359,22 +367,59 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             get_runtime_safety_context,
             live_risk_threshold_validation_snapshot,
             load_runtime_config,
+            validate_workload_profile_guardrails,
         )
+        from engine.runtime.hardware import runtime_hardware_snapshot
         from engine.runtime.live_trading_preflight import live_trading_preflight
 
         ConfigError = RuntimeConfigError
 
         safety = get_runtime_safety_context()
         cfg = load_runtime_config()
+        workload_ack = validate_workload_profile_guardrails(safety)
+        hardware = runtime_hardware_snapshot()
+        hardware_devices = dict(hardware.get("devices") or {})
+        hardware_threads = dict(hardware.get("threads") or {})
         live_risk = live_risk_threshold_validation_snapshot(safety)
         notes.append(
             "runtime config ok "
             f"env={safety.get('env')} "
             f"engine_mode={safety.get('engine_mode')} "
+            f"workload_profile={getattr(cfg, 'runtime_workload_profile', safety.get('workload_profile', 'live'))} "
             f"strict_runtime={int(bool(safety.get('strict_runtime')))} "
             f"db_path={getattr(cfg, 'db_path', '')} "
-            f"allow_training={int(bool(getattr(cfg, 'allow_training', False)))}"
+            f"allow_training={int(bool(getattr(cfg, 'allow_training', False)))} "
+            f"offline_ack={int(bool(workload_ack.get('acknowledged')))}"
         )
+        notes.append(
+            "runtime hardware ok "
+            f"profile={hardware.get('profile')} "
+            f"dependency_profile={hardware.get('dependency_profile')} "
+            f"torch_device={dict(hardware_devices.get('TORCH_DEVICE') or {}).get('resolved')} "
+            f"embed_device={dict(hardware_devices.get('EMBED_DEVICE') or {}).get('resolved')} "
+            f"nlp_device={dict(hardware_devices.get('NLP_DEVICE') or {}).get('resolved')} "
+            f"finbert_device={dict(hardware_devices.get('FINBERT_DEVICE') or {}).get('resolved')} "
+            f"ts_foundation_device={dict(hardware_devices.get('TS_FOUNDATION_DEVICE') or {}).get('resolved')} "
+            f"cpu_threads={hardware_threads.get('cpu_threads')} "
+            f"interop_threads={hardware_threads.get('interop_threads')} "
+            f"nvidia_telemetry={int(bool(hardware.get('nvidia_telemetry_enabled')))} "
+            f"disabled_accelerator_reason={hardware.get('disabled_accelerator_reason') or 'none'}"
+        )
+        accelerator_profile_error = str(hardware.get("accelerator_profile_error") or "").strip()
+        if not bool(hardware.get("ok", False)):
+            errors.append(
+                "runtime hardware dependency profile invalid "
+                f"profile={hardware.get('profile')} "
+                f"dependency_profile={hardware.get('dependency_profile')} "
+                f"reason={hardware.get('disabled_accelerator_reason') or hardware.get('error') or 'snapshot_unavailable'}"
+            )
+        if accelerator_profile_error:
+            errors.append(
+                "runtime hardware dependency profile invalid "
+                f"profile={hardware.get('profile')} "
+                f"dependency_profile={hardware.get('dependency_profile')} "
+                f"reason={accelerator_profile_error}"
+            )
         if bool(live_risk.get("required")):
             if bool(live_risk.get("override")):
                 audit = dict(live_risk.get("audit") or {})
@@ -390,6 +435,14 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
                     f"thresholds={len(list(live_risk.get('required_thresholds') or []))} "
                     f"enabled_flags={len(list(live_risk.get('required_enabled_flags') or []))}"
                 )
+        promotion_min_observations = int(os.environ.get("CHAMPION_PROMOTION_MIN_OBSERVATIONS") or 50)
+        notes.append(
+            "promotion observation governance ok "
+            f"min_observations={promotion_min_observations} "
+            "non_bypassable=1 "
+            f"legacy_stat_gate={int(_env_truthy('CHAMPION_PROMOTION_USE_STAT_GATE', default=False))} "
+            f"cpcv={int(_env_truthy('CPCV_ENABLED', default=False))}"
+        )
         live_preflight = live_trading_preflight(
             engine_mode=safety.get("engine_mode"),
             execution_mode=os.environ.get("EXECUTION_MODE", ""),
@@ -399,6 +452,9 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             prelive_reconcile = dict(live_preflight.get("prelive_reconcile") or {})
             backup_restore_evidence = dict(live_preflight.get("backup_restore_evidence") or {})
             execution_arming_audit = dict(live_preflight.get("execution_arming_audit") or {})
+            live_ai_safety = dict(live_preflight.get("live_ai_safety") or {})
+            lob_deeplob_shadow = dict(live_preflight.get("lob_deeplob_shadow") or {})
+            options_instruments = dict(live_preflight.get("options_instruments") or {})
             classified_blockers: set[str] = set()
 
             if not bool(live_env.get("ok")):
@@ -433,6 +489,24 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
                 issues = "; ".join(arming_blockers)
                 errors.append(f"execution arming audit invalid: {issues or execution_arming_audit.get('reason')}")
 
+            if bool(live_ai_safety.get("required")) and not bool(live_ai_safety.get("ok")):
+                ai_blockers = [str(item) for item in list(live_ai_safety.get("blockers") or [])]
+                classified_blockers.update(ai_blockers)
+                issues = "; ".join(ai_blockers)
+                errors.append(f"live AI safety invalid: {issues or live_ai_safety.get('reason')}")
+
+            if bool(lob_deeplob_shadow.get("enabled")) and not bool(lob_deeplob_shadow.get("ok")):
+                lob_blockers = [str(item) for item in list(lob_deeplob_shadow.get("blockers") or [])]
+                classified_blockers.update(lob_blockers)
+                issues = "; ".join(lob_blockers)
+                errors.append(f"LOB DeepLOB shadow readiness invalid: {issues or lob_deeplob_shadow.get('reason')}")
+
+            if bool(options_instruments.get("required")) and not bool(options_instruments.get("ok")):
+                options_blockers = [str(item) for item in list(options_instruments.get("blockers") or [])]
+                classified_blockers.update(options_blockers)
+                issues = "; ".join(options_blockers)
+                errors.append(f"options instrument readiness invalid: {issues or options_instruments.get('reason')}")
+
             other_blockers = [
                 str(item)
                 for item in list(live_preflight.get("blockers") or [])
@@ -451,7 +525,8 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
                     f"broker={broker_contract.get('broker')} "
                     f"chain={','.join(str(item) for item in list(broker_contract.get('chain') or []))} "
                     f"initial_kill_switch_armed={int(bool(initial_hold.get('armed')))} "
-                    f"execution_arming_audited={int(bool(arming_audit.get('ok')))}"
+                    f"execution_arming_audited={int(bool(arming_audit.get('ok')))} "
+                    f"live_ai_safety={int(bool(live_ai_safety.get('ok')))}"
                 )
     except ConfigError as e:
         errors.append(f"runtime config invalid: {e}")
@@ -494,6 +569,325 @@ def _api_mutation_auth_gate() -> Tuple[List[str], List[str]]:
         )
         errors.append(f"api mutation auth validation failed: {type(e).__name__}: {e}")
     return notes, errors
+
+
+def _postgres_tuning_required() -> bool:
+    if _env_truthy("PREFLIGHT_REQUIRE_DOCKER_POSTGRES_TUNING"):
+        return True
+    return bool(str(os.environ.get("TIMESCALE_MEMORY_LIMIT") or os.environ.get("TIMESCALE_MEM_LIMIT") or "").strip())
+
+
+def _postgres_tuning_effective_settings(names: List[str]) -> Dict[str, Dict[str, Any]]:
+    import psycopg
+
+    from engine.runtime.platform import default_pg_dsn, dsn_with_pg_password
+
+    configured = str(os.environ.get("TS_PG_DSN") or "").strip()
+    conninfo = dsn_with_pg_password(configured or default_pg_dsn())
+    timeout_s = 2.0
+    try:
+        timeout_s = max(
+            0.1,
+            float(
+                os.environ.get("PREFLIGHT_POSTGRES_TUNING_TIMEOUT_S")
+                or os.environ.get("PREFLIGHT_EXTERNAL_TIMEOUT_S")
+                or "2.0"
+            ),
+        )
+    except Exception:
+        timeout_s = 2.0
+    connect_timeout = max(1, int(math.ceil(timeout_s)))
+    rows: list[tuple[Any, ...]]
+    with psycopg.connect(conninfo, autocommit=True, connect_timeout=connect_timeout) as con:
+        rows = con.execute(
+            """
+            SELECT name, setting, unit
+            FROM pg_catalog.pg_settings
+            WHERE name = ANY(%s)
+            """,
+            (list(names),),
+        ).fetchall()
+    return {
+        str(row[0]): {
+            "setting": row[1],
+            "unit": row[2],
+        }
+        for row in rows
+    }
+
+
+def _postgres_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    required = _postgres_tuning_required()
+    if not required:
+        return notes, warnings, errors, {"required": False, "skipped": True}
+
+    effective_settings: Dict[str, Dict[str, Any]] = {}
+    effective_query: Dict[str, Any] = {"attempted": False, "ok": None}
+    if str(os.environ.get("PREFLIGHT_POSTGRES_TUNING_QUERY_EFFECTIVE", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        try:
+            from engine.runtime.postgres_tuning import PG_SETTING_SPECS
+
+            names = [str(spec.pg_name) for spec in PG_SETTING_SPECS]
+            effective_settings = _postgres_tuning_effective_settings(names)
+            effective_query = {
+                "attempted": True,
+                "ok": True,
+                "settings": len(effective_settings),
+            }
+        except Exception as exc:
+            _warn_nonfatal(
+                "PROD_PREFLIGHT_POSTGRES_TUNING_EFFECTIVE_SETTINGS_FAILED",
+                exc,
+                once_key="postgres_tuning_effective_settings",
+            )
+            effective_query = {
+                "attempted": True,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            warnings.append(f"postgres tuning effective settings unavailable: {type(exc).__name__}: {exc}")
+
+    try:
+        from engine.runtime.postgres_tuning import docker_postgres_tuning_snapshot, format_bytes
+
+        snapshot = dict(
+            docker_postgres_tuning_snapshot(
+                os.environ,
+                required=required,
+                effective_settings=effective_settings,
+            )
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_POSTGRES_TUNING_VALIDATION_FAILED",
+            exc,
+            once_key="postgres_tuning_validation",
+        )
+        return notes, warnings, [f"postgres tuning validation failed: {type(exc).__name__}: {exc}"], {
+            "required": required,
+            "effective_query": effective_query,
+        }
+
+    snapshot["effective_query"] = effective_query
+    warnings.extend(str(item) for item in list(snapshot.get("warnings") or []))
+    errors.extend(str(item) for item in list(snapshot.get("errors") or []))
+    if not errors:
+        derivation = dict(snapshot.get("derivation") or {})
+        memory_budget = dict(snapshot.get("memory_budget") or {})
+        wal_budget = dict(snapshot.get("wal_budget") or {})
+        notes.append(
+            "postgres tuning ok "
+            f"memory_limit={derivation.get('memory_limit_human')} "
+            f"memory_source={derivation.get('memory_source')} "
+            f"cpus={derivation.get('cpus')} "
+            f"estimated_peak={format_bytes(memory_budget.get('estimated_peak_bytes'))} "
+            f"wal_ceiling={format_bytes(wal_budget.get('configured_retained_wal_ceiling_bytes'))}"
+        )
+        if effective_settings:
+            notes.append(f"postgres effective settings ok count={len(effective_settings)}")
+    return notes, warnings, errors, snapshot
+
+
+def _ingestion_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.ingestion_tuning import ingestion_tuning_snapshot
+
+        snapshot = dict(ingestion_tuning_snapshot(pg_pool_role="ingestion") or {})
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_INGESTION_TUNING_FAILED",
+            exc,
+            once_key="ingestion_tuning",
+        )
+        return notes, warnings, [f"ingestion tuning validation failed: {type(exc).__name__}: {exc}"], {}
+
+    warnings.extend(str(item) for item in list(snapshot.get("warnings") or []) if str(item).strip())
+    errors.extend(str(item) for item in list(snapshot.get("errors") or []) if str(item).strip())
+    if not errors:
+        capacity = dict(snapshot.get("capacity") or {})
+        notes.append(
+            "ingestion tuning ok "
+            f"profile={snapshot.get('profile')} "
+            f"db_pool_total={capacity.get('total_db_pool_connections')}/{capacity.get('max_total_db_connections')} "
+            f"buffered_row_risk={capacity.get('buffered_row_risk_estimate')}/{capacity.get('max_buffered_rows')}"
+        )
+    return notes, warnings, errors, snapshot
+
+
+def _compose_operator_service_block() -> str:
+    compose_path = Path(REPO_ROOT) / "deploy" / "compose" / "docker-compose.stack.yml"
+    try:
+        lines = compose_path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_OPERATOR_COMPOSE_READ_FAILED",
+            exc,
+            once_key="operator_compose_read",
+            path=str(compose_path),
+        )
+        lines = []
+
+    block: list[str] = []
+    in_block = False
+    for line in lines:
+        if re.match(r"^\s{2}operator:\s*$", line):
+            in_block = True
+            block.append(line)
+            continue
+        if in_block and line and not line.startswith(" "):
+            break
+        if in_block and re.match(r"^\s{2}[A-Za-z0-9_.-]+:\s*$", line):
+            break
+        if in_block:
+            block.append(line)
+    return "\n".join(block)
+
+
+def _operator_sidecar_probe_base() -> str:
+    raw = str(
+        os.environ.get("OPERATOR_PREFLIGHT_BASE")
+        or os.environ.get("OPERATOR_SIDECAR_BASE")
+        or ""
+    ).strip()
+    if raw:
+        return raw.rstrip("/")
+    host = str(
+        os.environ.get("OPERATOR_SIDECAR_HOST")
+        or os.environ.get("OPERATOR_BIND_HOST")
+        or "127.0.0.1"
+    ).strip()
+    if host in {"", "0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = str(os.environ.get("OPERATOR_PORT") or "4001").strip() or "4001"
+    return f"http://{host}:{port}"
+
+
+def _operator_sensitive_get_denied(base_url: str, timeout_s: float) -> Tuple[bool | None, int, str]:
+    url = str(base_url).rstrip("/") + "/api/operator/config"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    denied: bool | None
+    status = 0
+    detail = ""
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
+            denied = False
+            detail = "sensitive_get_allowed_without_operator_token"
+    except urllib.error.HTTPError as exc:
+        status = int(getattr(exc, "code", 0) or 0)
+        if status in {401, 403}:
+            denied = True
+            detail = "denied"
+        else:
+            _warn_nonfatal(
+                "PROD_PREFLIGHT_OPERATOR_SENSITIVE_GET_UNEXPECTED_HTTP",
+                exc,
+                once_key=f"operator_sensitive_get_http:{status}",
+                status=int(status),
+                url=url,
+            )
+            denied = False
+            detail = f"unexpected_http_{status}"
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_OPERATOR_SENSITIVE_GET_PROBE_FAILED",
+            exc,
+            once_key="operator_sensitive_get_probe",
+            url=url,
+        )
+        denied = None
+        status = 0
+        detail = f"{type(exc).__name__}: {exc}"
+    return denied, status, detail
+
+
+def _operator_sidecar_security_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    snapshot: Dict[str, Any] = {}
+
+    try:
+        from engine.api.auth_config import strict_mutation_auth_reasons
+        from engine.runtime.live_trading_preflight import operator_sidecar_security_snapshot
+
+        strict_reasons = list(strict_mutation_auth_reasons())
+        snapshot = dict(operator_sidecar_security_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe")) or {})
+        snapshot["strict_reasons"] = strict_reasons
+        strict = bool(strict_reasons or str(os.environ.get("ENGINE_MODE", "")).strip().lower() == "live")
+        if strict and not bool(snapshot.get("ok")):
+            errors.append(
+                "operator sidecar security invalid: "
+                + ",".join(str(item) for item in list(snapshot.get("blockers") or []))
+            )
+        elif bool(snapshot.get("ok")):
+            notes.append(
+                "operator sidecar token ok "
+                f"internal_only={int(bool(snapshot.get('internal_only')))} "
+                f"token_configured={int(bool(snapshot.get('operator_api_token_configured')))}"
+            )
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_OPERATOR_SIDECAR_SECURITY_FAILED",
+            exc,
+            once_key="operator_sidecar_security",
+        )
+        errors.append(f"operator sidecar security validation failed: {type(exc).__name__}: {exc}")
+        return notes, warnings, errors, snapshot
+
+    block = _compose_operator_service_block()
+    compose_state = {
+        "operator_service_found": bool(block),
+        "operator_ports_declared": bool(re.search(r"(?m)^\s{4}ports:\s*$", block)),
+        "operator_expose_declared": bool(re.search(r"(?m)^\s{4}expose:\s*$", block)),
+    }
+    snapshot["compose"] = compose_state
+    if compose_state["operator_ports_declared"]:
+        errors.append("operator sidecar compose service must not publish ports by default")
+    elif compose_state["operator_service_found"]:
+        notes.append(
+            "operator sidecar compose exposure ok "
+            f"expose={int(bool(compose_state['operator_expose_declared']))}"
+        )
+
+    if str(os.environ.get("PREFLIGHT_CHECK_OPERATOR_SIDECAR_HTTP", "1")).strip().lower() not in {"0", "false", "no", "off"}:
+        base_url = _operator_sidecar_probe_base()
+        timeout_s = 1.0
+        try:
+            timeout_s = max(0.1, float(os.environ.get("PREFLIGHT_OPERATOR_SIDECAR_TIMEOUT_S", "1.0")))
+        except Exception:
+            timeout_s = 1.0
+        denied, status, reason = _operator_sensitive_get_denied(base_url, timeout_s)
+        snapshot["unauthenticated_sensitive_get"] = {
+            "checked": True,
+            "base_url": base_url,
+            "denied": denied,
+            "status": int(status),
+            "reason": str(reason),
+        }
+        if denied is False:
+            errors.append(f"operator sidecar sensitive GET is not fail-closed: status={status} reason={reason}")
+        elif denied is True:
+            notes.append(f"operator sidecar sensitive GET denied without token status={status}")
+        else:
+            warnings.append(f"operator sidecar sensitive GET probe skipped/unreachable: {reason}")
+    else:
+        snapshot["unauthenticated_sensitive_get"] = {"checked": False, "reason": "disabled"}
+
+    return notes, warnings, errors, snapshot
 
 
 def _ensure_schemas() -> List[str]:
@@ -554,6 +948,44 @@ def _verify_postgres_contract() -> Tuple[List[str], List[str], Dict[str, Any]]:
     expected_schema_version = validation.get("expected_schema_version")
     schema_version_ok = bool(validation.get("schema_version_ok", False))
     schema_status = str(validation.get("schema_status") or "")
+    missing_migration_ids = [
+        int(item)
+        for item in list(validation.get("schema_migration_missing_ids") or [])
+        if str(item).strip()
+    ]
+    unexpected_migration_ids = [
+        int(item)
+        for item in list(validation.get("schema_migration_unexpected_ids") or [])
+        if str(item).strip()
+    ]
+    owned_missing_tables = [
+        str(item) for item in list(validation.get("owned_missing_tables") or []) if str(item).strip()
+    ]
+    owned_missing_columns = {
+        str(table): [str(column) for column in list(columns or []) if str(column).strip()]
+        for table, columns in dict(validation.get("owned_missing_columns") or {}).items()
+        if str(table).strip()
+    }
+    owned_unexpected_columns = {
+        str(table): [str(column) for column in list(columns or []) if str(column).strip()]
+        for table, columns in dict(validation.get("owned_unexpected_columns") or {}).items()
+        if str(table).strip()
+    }
+    owned_type_mismatches = {
+        str(table): dict(columns or {})
+        for table, columns in dict(validation.get("owned_type_mismatches") or {}).items()
+        if str(table).strip()
+    }
+    owned_pk_mismatches = {
+        str(table): dict(columns or {})
+        for table, columns in dict(validation.get("owned_pk_mismatches") or {}).items()
+        if str(table).strip()
+    }
+    owned_missing_indexes = {
+        str(table): [str(index_name) for index_name in list(indexes or []) if str(index_name).strip()]
+        for table, indexes in dict(validation.get("owned_missing_indexes") or {}).items()
+        if str(table).strip()
+    }
     quick_check = str(validation.get("quick_check") or "")
 
     if missing_tables:
@@ -571,6 +1003,42 @@ def _verify_postgres_contract() -> Tuple[List[str], List[str], Dict[str, Any]]:
             "postgres contract invalid schema version: "
             f"actual={schema_version} expected={expected_schema_version} status={schema_status}"
         )
+    if missing_migration_ids:
+        errors.append(
+            "postgres contract invalid missing migrations: "
+            + ",".join(str(item) for item in sorted(missing_migration_ids))
+        )
+    if unexpected_migration_ids:
+        errors.append(
+            "postgres contract invalid unexpected migrations: "
+            + ",".join(str(item) for item in sorted(unexpected_migration_ids))
+        )
+    if owned_missing_tables:
+        errors.append("postgres contract invalid owned missing tables: " + ",".join(sorted(owned_missing_tables)))
+    if owned_missing_columns:
+        rendered = "; ".join(
+            f"{table}({','.join(sorted(columns))})"
+            for table, columns in sorted(owned_missing_columns.items())
+        )
+        errors.append(f"postgres contract invalid owned missing columns: {rendered}")
+    if owned_unexpected_columns:
+        rendered = "; ".join(
+            f"{table}({','.join(sorted(columns))})"
+            for table, columns in sorted(owned_unexpected_columns.items())
+        )
+        errors.append(f"postgres contract invalid owned unexpected columns: {rendered}")
+    if owned_type_mismatches:
+        rendered = "; ".join(f"{table}({sorted(columns)})" for table, columns in sorted(owned_type_mismatches.items()))
+        errors.append(f"postgres contract invalid owned type mismatches: {rendered}")
+    if owned_pk_mismatches:
+        rendered = "; ".join(f"{table}({sorted(columns)})" for table, columns in sorted(owned_pk_mismatches.items()))
+        errors.append(f"postgres contract invalid owned primary keys: {rendered}")
+    if owned_missing_indexes:
+        rendered = "; ".join(
+            f"{table}({','.join(sorted(indexes))})"
+            for table, indexes in sorted(owned_missing_indexes.items())
+        )
+        errors.append(f"postgres contract invalid owned missing indexes: {rendered}")
     if quick_check.lower() not in {"ok", "not_applicable"}:
         errors.append(f"postgres contract invalid quick_check={quick_check or 'unknown'}")
     if not errors:
@@ -604,6 +1072,26 @@ def _check_external_services() -> Tuple[List[str], List[str], List[str], List[Di
     )
 
 
+def _resource_isolation_gate() -> Tuple[List[str], List[str], Dict[str, Any]]:
+    try:
+        from engine.runtime.resource_isolation import check_resource_isolation
+
+        summary = dict(check_resource_isolation() or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_RESOURCE_ISOLATION_FAILED",
+            e,
+            once_key="resource_isolation_gate",
+        )
+        return [], [f"resource isolation validation failed: {type(e).__name__}: {e}"], {}
+
+    return (
+        list(summary.get("notes") or []),
+        list(summary.get("warnings") or []),
+        summary,
+    )
+
+
 def _backup_restore_evidence_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
     notes: List[str] = []
     warnings: List[str] = []
@@ -624,6 +1112,42 @@ def _backup_restore_evidence_gate() -> Tuple[List[str], List[str], List[str], Di
     base = dict(state.get("base_backup") or {})
     wal = dict(state.get("wal_archive") or {})
     drill = dict(state.get("restore_drill") or {})
+    accounting: Dict[str, Any] = {}
+    if bool(state.get("fresh")) or not bool(state.get("required")):
+        try:
+            from engine.runtime.backup_evidence import backup_accounting_snapshot
+
+            accounting = dict(backup_accounting_snapshot() or {})
+            state["accounting"] = accounting
+            root_size = dict(accounting.get("root_size") or {})
+            retention = dict(accounting.get("retention") or {})
+            container_mount_source = (
+                str(accounting.get("container_mount_source") or "").strip()
+                or str(dict(accounting.get("container_mount") or {}).get("mount_source") or "").strip()
+                or "unknown"
+            )
+            notes.append(
+                "backup accounting "
+                f"host_path={accounting.get('host_path')} "
+                f"container_path={accounting.get('container_path')} "
+                f"container_mount_source={container_mount_source} "
+                f"apparent_bytes={root_size.get('apparent_bytes')} "
+                f"allocated_bytes={root_size.get('allocated_bytes')} "
+                f"retention_status={accounting.get('retention_status') or retention.get('status')} "
+                f"keep_daily_days={retention.get('keep_daily_days')} "
+                f"keep_weekly_days={retention.get('keep_weekly_days')}"
+            )
+            if not bool(accounting.get("ok")):
+                warnings.append("backup accounting unavailable or incomplete")
+            warnings.extend(str(item) for item in list(accounting.get("warnings") or []))
+        except Exception as e:
+            _warn_nonfatal(
+                "PROD_PREFLIGHT_BACKUP_ACCOUNTING_FAILED",
+                e,
+                once_key="backup_accounting_gate",
+            )
+            warnings.append(f"backup accounting failed: {type(e).__name__}: {e}")
+    warnings.extend(str(item) for item in list(state.get("warnings") or []))
     if bool(state.get("fresh")):
         notes.append(
             "backup restore evidence ok "
@@ -641,6 +1165,102 @@ def _backup_restore_evidence_gate() -> Tuple[List[str], List[str], List[str], Di
             f"blockers={len(list(state.get('blockers') or []))} "
             f"path={state.get('evidence_path')}"
         )
+    return notes, warnings, errors, state
+
+
+def _disk_pressure_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    state: Dict[str, Any] = {}
+
+    try:
+        from engine.runtime.health import get_disk_pressure_snapshot
+        from engine.runtime.platform import (
+            default_backup_root_dir,
+            default_container_runtime_roots,
+        )
+
+        candidate_paths: list[tuple[str, Path]] = [
+            ("root", Path("/")),
+            ("runtime_data", _runtime_data_root()),
+            (
+                "runtime_logs",
+                Path(os.environ.get("TRADING_LOGS") or os.environ.get("LOG_DIR") or "/app/logs"),
+            ),
+            (
+                "backup_root",
+                Path(
+                    os.environ.get("TRADING_BACKUP_ROOT")
+                    or os.environ.get("TS_BACKUP_ROOT")
+                    or default_backup_root_dir()
+                ),
+            ),
+        ]
+        docker_paths_raw = str(
+            os.environ.get("DISK_PRESSURE_DOCKER_PATHS")
+            or ",".join(default_container_runtime_roots())
+        )
+        for raw in [part.strip() for part in docker_paths_raw.split(",") if part.strip()]:
+            path = Path(raw)
+            if path.exists():
+                candidate_paths.append((f"docker:{path.name}", path))
+
+        state = dict(get_disk_pressure_snapshot(candidate_paths) or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_DISK_PRESSURE_FAILED",
+            e,
+            once_key="disk_pressure_gate",
+        )
+        return [], [], [f"disk pressure validation failed: {type(e).__name__}: {e}"], {}
+
+    disk_warnings = [str(item) for item in list(state.get("warnings") or []) if str(item).strip()]
+    disk_critical = [str(item) for item in list(state.get("critical") or []) if str(item).strip()]
+    warnings.extend(f"disk pressure warning: {item}" for item in disk_warnings)
+    errors.extend(f"disk pressure critical: {item}" for item in disk_critical)
+
+    paths = [dict(item) for item in list(state.get("paths") or []) if isinstance(item, dict)]
+    root = next((item for item in paths if item.get("label") == "root"), paths[0] if paths else {})
+    notes.append(
+        "disk pressure "
+        f"status={state.get('status')} "
+        f"root_free_bytes={root.get('free_bytes')} "
+        f"root_free_pct={root.get('free_pct')}"
+    )
+    return notes, warnings, errors, state
+
+
+def _lob_deeplob_shadow_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.live_trading_preflight import lob_deeplob_shadow_readiness_snapshot
+
+        state = dict(lob_deeplob_shadow_readiness_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe")) or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_LOB_DEEPLOB_READINESS_FAILED",
+            e,
+            once_key="lob_deeplob_readiness_gate",
+        )
+        return [], [], [f"LOB DeepLOB shadow readiness validation failed: {type(e).__name__}: {e}"], {}
+
+    if not bool(state.get("enabled")):
+        notes.append("LOB DeepLOB shadow readiness not required enabled=0")
+    elif bool(state.get("ok")):
+        l2 = dict(state.get("l2_data") or {})
+        calibration = dict(state.get("simulator_calibration") or {})
+        notes.append(
+            "LOB DeepLOB shadow readiness ok "
+            f"l2_rows={l2.get('sample_n')} "
+            f"calibration_fills={calibration.get('sample_n')} "
+            f"shadow_only={int(bool(state.get('shadow_only')))}"
+        )
+    else:
+        blockers = ",".join(str(item) for item in list(state.get("blockers") or []))
+        errors.append(f"LOB DeepLOB shadow readiness invalid: {blockers or state.get('reason') or 'unknown'}")
     return notes, warnings, errors, state
 
 
@@ -858,6 +1478,54 @@ def _capital_reconciliation_sanity() -> Tuple[List[str], List[str], List[str]]:
     return notes, warnings, errors
 
 
+def _capital_equity_freshness_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    state: Dict[str, Any] = {}
+
+    live_mode = any(
+        str(os.environ.get(name) or "").strip().lower() == "live"
+        for name in ("ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE", "MODE")
+    )
+    try:
+        from engine.execution.kill_switch import capital_equity_freshness_snapshot
+
+        state = dict(capital_equity_freshness_snapshot(live_mode=live_mode) or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_CAPITAL_EQUITY_FRESHNESS_FAILED",
+            e,
+            once_key="capital_equity_freshness_gate",
+        )
+        return [], [], [f"capital equity freshness validation failed: {type(e).__name__}: {e}"], {}
+
+    if bool(state.get("required")) and not bool(state.get("ok")):
+        blockers = ",".join(str(item) for item in list(state.get("blockers") or []))
+        errors.append(
+            "capital equity freshness invalid: "
+            f"{state.get('reason_code') or state.get('reason') or 'unknown'}"
+            + (f" blockers={blockers}" if blockers else "")
+        )
+    elif bool(state.get("required")):
+        windows = dict(state.get("windows") or {})
+        latest = dict(windows.get("latest") or {})
+        daily = dict(windows.get("daily") or {})
+        rolling = dict(windows.get("rolling") or {})
+        var = dict(windows.get("var") or {})
+        notes.append(
+            "capital equity freshness ok "
+            f"latest_age_s={latest.get('latest_age_s')} "
+            f"daily_points={daily.get('points')} "
+            f"rolling_points={rolling.get('points')} "
+            f"var_points={var.get('points')}"
+        )
+    else:
+        notes.append("capital equity freshness not required live_mode=0")
+
+    return notes, warnings, errors, state
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
@@ -877,7 +1545,14 @@ def main() -> int:
         "db_validation": {},
         "external_services": [],
         "backup_restore_evidence": {},
+        "disk_pressure": {},
+        "lob_deeplob_shadow": {},
+        "resource_isolation": {},
         "provisioning": {},
+        "postgres_tuning": {},
+        "ingestion_tuning": {},
+        "operator_sidecar_security": {},
+        "capital_equity_freshness": {},
     }
 
     # Fail fast in dependency order: source integrity first, then schema,
@@ -892,6 +1567,45 @@ def main() -> int:
         else:
             for error in provisioning_errors:
                 print("[provisioning]", error)
+        return 3
+
+    disk_notes, disk_warnings, disk_errors, disk_pressure = _disk_pressure_gate()
+    result["steps"].extend(disk_notes)
+    result["warnings"].extend(disk_warnings)
+    result["disk_pressure"] = dict(disk_pressure or {})
+    if disk_errors:
+        result["errors"].extend(disk_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in disk_errors:
+                print("[disk]", error)
+        return 3
+
+    tuning_notes, tuning_warnings, tuning_errors, postgres_tuning = _postgres_tuning_gate()
+    result["steps"].extend(tuning_notes)
+    result["warnings"].extend(tuning_warnings)
+    result["postgres_tuning"] = dict(postgres_tuning or {})
+    if tuning_errors:
+        result["errors"].extend(tuning_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in tuning_errors:
+                print("[postgres-tuning]", error)
+        return 3
+
+    ingestion_tuning_notes, ingestion_tuning_warnings, ingestion_tuning_errors, ingestion_tuning = _ingestion_tuning_gate()
+    result["steps"].extend(ingestion_tuning_notes)
+    result["warnings"].extend(ingestion_tuning_warnings)
+    result["ingestion_tuning"] = dict(ingestion_tuning or {})
+    if ingestion_tuning_errors:
+        result["errors"].extend(ingestion_tuning_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in ingestion_tuning_errors:
+                print("[ingestion-tuning]", error)
         return 3
 
     config_notes, config_errors = _runtime_config_gate()
@@ -915,6 +1629,24 @@ def main() -> int:
             for error in auth_errors:
                 print("[api-auth]", error)
         return 3
+
+    sidecar_notes, sidecar_warnings, sidecar_errors, sidecar_security = _operator_sidecar_security_gate()
+    result["steps"].extend(sidecar_notes)
+    result["warnings"].extend(sidecar_warnings)
+    result["operator_sidecar_security"] = dict(sidecar_security or {})
+    if sidecar_errors:
+        result["errors"].extend(sidecar_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in sidecar_errors:
+                print("[operator-sidecar]", error)
+        return 3
+
+    resource_notes, resource_warnings, resource_isolation = _resource_isolation_gate()
+    result["steps"].extend(resource_notes)
+    result["warnings"].extend(resource_warnings)
+    result["resource_isolation"] = dict(resource_isolation or {})
 
     comp_errs = _compile_files(KEY_FILES)
     if comp_errs:
@@ -950,6 +1682,19 @@ def main() -> int:
                 print("[postgres]", error)
         return 3
 
+    equity_notes, equity_warnings, equity_errors, equity_state = _capital_equity_freshness_gate()
+    result["steps"].extend(equity_notes)
+    result["warnings"].extend(equity_warnings)
+    result["capital_equity_freshness"] = dict(equity_state or {})
+    if equity_errors:
+        result["errors"].extend(equity_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in equity_errors:
+                print("[capital-equity]", error)
+        return 3
+
     external_notes, external_warnings, external_errors, external_services = _check_external_services()
     result["steps"].extend(external_notes)
     result["warnings"].extend(external_warnings)
@@ -974,6 +1719,19 @@ def main() -> int:
         else:
             for error in backup_errors:
                 print("[backup]", error)
+        return 3
+
+    lob_notes, lob_warnings, lob_errors, lob_state = _lob_deeplob_shadow_gate()
+    result["steps"].extend(lob_notes)
+    result["warnings"].extend(lob_warnings)
+    result["lob_deeplob_shadow"] = dict(lob_state or {})
+    if lob_errors:
+        result["errors"].extend(lob_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in lob_errors:
+                print("[lob-deeplob]", error)
         return 3
 
     smoke_db_notes, smoke_db_warnings, smoke_db_errors, smoke_db_path, smoke_db_temp_dir = _prepare_isolated_smoke_db()

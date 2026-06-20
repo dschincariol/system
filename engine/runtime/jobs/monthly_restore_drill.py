@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from engine.runtime.platform import default_restore_drill_dir
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
@@ -50,7 +52,7 @@ def _latest_drill_age_days(drill_dir: Path) -> float | None:
 def main() -> int:
     root = _repo_root()
     script = Path(os.environ.get("TS_RESTORE_DRILL_SCRIPT") or root / "ops" / "backup" / "restore_drill.sh")
-    drill_dir = Path(os.environ.get("TS_RESTORE_DRILL_DIR") or "/var/backups/trading/drills")
+    drill_dir = Path(os.environ.get("TS_RESTORE_DRILL_DIR") or default_restore_drill_dir())
     started = time.monotonic()
 
     if not script.exists():

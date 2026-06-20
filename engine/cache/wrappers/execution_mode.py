@@ -110,9 +110,9 @@ def _ensure_schema(con: Any) -> None:
 
 def _assert_live_arming_confirmation(mode: str, armed: int) -> None:
     if str(mode or "").strip().lower() == "live" and int(armed or 0) == 1:
-        from engine.runtime.live_trading_preflight import assert_live_trading_confirmation
+        from engine.runtime.live_trading_preflight import assert_live_execution_arming_preflight
 
-        assert_live_trading_confirmation(engine_mode="live")
+        assert_live_execution_arming_preflight(engine_mode="live")
 
 
 def set_execution_mode(

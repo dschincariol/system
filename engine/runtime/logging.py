@@ -17,11 +17,12 @@ import socket
 import sys
 import threading
 import time
-import traceback
 from logging import FileHandler
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from engine.runtime.platform import default_local_log_dir
 
 LOG_LEVEL = os.environ.get("ENGINE_LOG_LEVEL", os.environ.get("LOG_LEVEL", "INFO")).upper().strip()
 LOG_JSON = os.environ.get("ENGINE_LOG_JSON", "1") == "1"
@@ -32,7 +33,7 @@ LOG_FILE = os.environ.get(
             Path(
                 os.environ.get("TRADING_LOGS")
                 or os.environ.get("LOG_DIR")
-                or str((Path(__file__).resolve().parents[2] / "logs").resolve())
+                or str(default_local_log_dir().resolve())
             )
             / "engine.log"
         ).resolve()
@@ -88,12 +89,11 @@ def _stderr_nonfatal(event: str, error: BaseException, *, warn_key: str | None =
 
 class SafeRotatingFileHandler(RotatingFileHandler):
     """
-    Windows-safe rollover wrapper.
+    Rollover wrapper that fails closed on shared-file contention.
 
-    Multiple engine processes may share the same log path. On Windows, rename
-    during rollover can fail with WinError 32 if another process still has the
-    file open. In that case, skip rollover for this emit instead of surfacing
-    noisy logging tracebacks into child stderr.
+    Multiple engine processes may share the same log path. If rollover cannot
+    rename a file because another process still has it open, skip rollover for
+    this emit instead of surfacing noisy logging tracebacks into child stderr.
     """
 
     def doRollover(self) -> None:
@@ -305,8 +305,8 @@ if not _root_logger.handlers:
                 encoding="utf-8",
             )
         else:
-            # On Windows multiple runtime processes share engine.log; append-only
-            # writes are stable, while in-process rollover is not.
+            # Multiple runtime processes may share engine.log; append-only
+            # writes are stable when in-process rollover is disabled.
             _file_handler = FileHandler(LOG_FILE, encoding="utf-8")
         _file_handler.setFormatter(_formatter)
         _root_logger.addHandler(_file_handler)

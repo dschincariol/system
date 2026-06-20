@@ -32,6 +32,25 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _truthy_env(name: str, default: str = "0") -> bool:
+    raw = str(os.environ.get(name, default) or default).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _broker_required_for_execution() -> bool:
+    execution_mode = str(os.environ.get("EXECUTION_MODE") or "").strip().lower()
+    engine_mode = str(os.environ.get("ENGINE_MODE") or "").strip().lower()
+    mode = execution_mode or engine_mode
+
+    if execution_mode in ("live", "paper") or engine_mode in ("live", "paper", "shadow"):
+        return True
+    if mode == "shadow":
+        return True
+    if mode in ("safe", "sim", "dev", "test", "local", "") and _truthy_env("DISABLE_LIVE_EXECUTION", "1"):
+        return False
+    return True
+
+
 def _warn_nonfatal(code: str, error: BaseException, **extra: Any) -> None:
     log_failure(
         LOG,
@@ -121,7 +140,7 @@ def _has_execution_activity(con) -> bool:
     return False
 
 
-def _account_state_snapshot(con, broker_conn: Dict[str, Any]) -> Dict[str, Any]:
+def _account_state_snapshot(con, broker_conn: Dict[str, Any], *, broker_required: bool = True) -> Dict[str, Any]:
     broker_name = str((broker_conn or {}).get("broker") or os.environ.get("BROKER_NAME", os.environ.get("BROKER", "sim")) or "sim").lower().strip()
     if broker_name in ("sim", "paper", "sandbox", ""):
         has_activity = _has_execution_activity(con)
@@ -181,6 +200,13 @@ def _account_state_snapshot(con, broker_conn: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     broker_ok = bool((broker_conn or {}).get("ok"))
+    if not broker_required and not broker_ok:
+        return {
+            "ok": True,
+            "broker": broker_name or "unknown",
+            "state": str((broker_conn or {}).get("state") or "unknown"),
+            "detail": "broker_not_required_for_safe_execution_mode",
+        }
     return {
         "ok": bool(broker_ok),
         "broker": broker_name or "unknown",
@@ -318,8 +344,9 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
         last_fill_age_ms = _last_fills_age_ms(con)
         oldest_open_order_age_ms = _oldest_open_order_age_ms(con)
 
+        broker_required = _broker_required_for_execution()
         try:
-            broker_conn = get_broker_connection_health()
+            broker_conn = get_broker_connection_health(readonly=not broker_required)
         except Exception:
             broker_conn = {"ok": False, "state": "unknown"}
         broker_state = str((broker_conn or {}).get("state") or "").lower().strip()
@@ -330,6 +357,7 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
             "unsupported_broker",
             "unknown",
         )
+        broker_gate_ok = bool(broker_conn_valid or not broker_required)
 
         execution_tables = _execution_table_state(con)
         integrity = _default_integrity_snapshot(
@@ -351,7 +379,7 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
                     missing_tables=list(execution_tables.get("missing_tables") or []),
                 )
 
-        account_state = _account_state_snapshot(con, dict(broker_conn or {}))
+        account_state = _account_state_snapshot(con, dict(broker_conn or {}), broker_required=broker_required)
         duplicate_order_count = int(integrity.get("duplicate_order_count") or 0)
         duplicate_fill_count = int(integrity.get("duplicate_fill_count") or 0)
         stale_missing_fill_count = int(integrity.get("stale_missing_fill_count") or 0)
@@ -371,11 +399,12 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
                 ),
             },
             "broker_or_sim_connection_valid": {
-                "ok": bool(broker_conn_valid),
+                "ok": bool(broker_gate_ok),
                 "detail": (
                     f"broker={broker_conn.get('broker') or 'unknown'} "
                     f"state={broker_conn.get('state') or 'unknown'} "
-                    f"detail={broker_conn.get('detail') or 'ok'}"
+                    f"detail={broker_conn.get('detail') or 'ok'} "
+                    f"required={broker_required}"
                 ),
             },
             "order_state_consistent": {
@@ -450,10 +479,10 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
             score += 1.5
             alerts.append({"severity": "warn", "alert_type": "execution_timeout", "value": oldest_open_order_age_ms})
 
-        if broker_state in ("disconnected", "connect_failed", "reconnect_failed"):
+        if broker_required and broker_state in ("disconnected", "connect_failed", "reconnect_failed"):
             score += 3.0
             alerts.append({"severity": "critical", "alert_type": "broker_connection_failure", "value": broker_state})
-        elif broker_state in ("reconnecting", "unknown", "degraded"):
+        elif broker_required and broker_state in ("reconnecting", "unknown", "degraded"):
             score += 1.5
             alerts.append({"severity": "warn", "alert_type": "broker_connection_warning", "value": broker_state})
 
@@ -564,7 +593,7 @@ def refresh_execution_quality_supervisor(lookback_n: int = 500) -> Dict[str, Any
             "alerts": alerts,
         }
 
-        broker_failures = 0 if bool(broker_conn_valid) else 1
+        broker_failures = 0 if bool(broker_gate_ok) else 1
 
         con.execute(
             """

@@ -8,8 +8,6 @@ so they do not accidentally probe ambient PgBouncer/Postgres.
 from __future__ import annotations
 
 import os
-import json
-import time
 import importlib
 import logging
 
@@ -40,9 +38,31 @@ def _use_sqlite_test_backend() -> bool:
     backend = str(os.environ.get("TS_STORAGE_BACKEND") or "").strip().lower()
     if backend in {"postgres", "pg"}:
         return False
+    explicit_sqlite = backend in {"sqlite", "sqlite-test", "test"}
+    explicit_test_mode = str(os.environ.get("TS_TESTING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    validation_harness = (
+        str(os.environ.get("TRADING_VALIDATION_MODE") or "").strip().lower() == "startup"
+        and str(os.environ.get("DATA_SOURCE_MANAGER_READ_ONLY") or "").strip().lower() in {"1", "true", "yes", "on"}
+        and str(os.environ.get("ENGINE_PRIMARY_BOOTSTRAP_DONE") or "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    if explicit_sqlite or explicit_test_mode:
+        try:
+            from engine.runtime.config_schema import get_runtime_safety_context
+
+            safety = get_runtime_safety_context()
+        except Exception:
+            safety = {}
+        if bool((safety or {}).get("strict_runtime")) and not running_python_tests() and not validation_harness:
+            mode = "TS_STORAGE_BACKEND=" + (backend or "<unset>")
+            if explicit_test_mode and not explicit_sqlite:
+                mode = "TS_TESTING=1"
+            raise RuntimeError(
+                "SQLite runtime storage backend is forbidden in supervised/prod/live runtime; "
+                f"{mode} is test-only and production control-plane state requires Postgres"
+            )
     if backend in {"sqlite", "sqlite-test", "test"}:
         return True
-    return str(os.environ.get("TS_TESTING") or "").strip().lower() in {"1", "true", "yes", "on"} or running_python_tests()
+    return explicit_test_mode or running_python_tests()
 
 
 _SQLITE_TEST_BACKEND = _use_sqlite_test_backend()
@@ -184,6 +204,15 @@ def init_db(schema: str | None = None):
         globals()["_SQLITE_LIVENESS_DB_ENABLED"] = _sqlite_backend._SQLITE_LIVENESS_DB_ENABLED
         globals()["_SQLITE_LIVENESS_DB_PATH"] = _sqlite_backend._SQLITE_LIVENESS_DB_PATH
     return result
+
+
+def table_exists(con, table_name: str) -> bool:
+    """Return whether a runtime storage table exists for the active backend."""
+
+    helper = globals().get("_table_exists")
+    if not callable(helper):
+        raise RuntimeError("runtime storage backend does not expose table existence checks")
+    return bool(helper(con, str(table_name)))
 
 
 if _SQLITE_TEST_BACKEND and _sqlite_backend is not None:

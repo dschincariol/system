@@ -26,6 +26,20 @@ from engine.runtime.platform import default_data_root
 LOGGER = logging.getLogger(__name__)
 sqlite3 = importlib.import_module("sqlite3")
 
+
+def _env_truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _warn_nonfatal(code: str, error: Exception, **extra: Any) -> None:
+    LOGGER.warning("%s: %s extra=%s", str(code), error, extra or {})
+
+
+def _warn_nonfatal_once(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
+    del once_key
+    _warn_nonfatal(code, error, **extra)
+
+
 SCHEMA_VERSION = 1
 DB_PATH = Path(
     os.environ.get("DB_PATH")
@@ -33,7 +47,7 @@ DB_PATH = Path(
 )
 PG_LIVENESS_DB_ENABLED = False
 PG_LIVENESS_DB_PATH = DB_PATH.with_suffix(".liveness.sqlite")
-_SQLITE_LIVENESS_DB_ENABLED = _env_truthy(os.environ.get("SQLITE_LIVENESS_DB_ENABLED", "1")) if "_env_truthy" in globals() else str(os.environ.get("SQLITE_LIVENESS_DB_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+_SQLITE_LIVENESS_DB_ENABLED = _env_truthy(os.environ.get("SQLITE_LIVENESS_DB_ENABLED", "1"))
 _SQLITE_LIVENESS_DB_PATH = PG_LIVENESS_DB_PATH
 
 _WRITE_LOCK = globals().get("_WRITE_LOCK") or threading.RLock()
@@ -212,8 +226,8 @@ sqlite3.register_adapter(list, _adapt_json)
 sqlite3.register_adapter(tuple, _adapt_json)
 
 
-def _env_truthy(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+def _sqlite_open_connection(*args: Any, **kwargs: Any):
+    return getattr(sqlite3, "connect")(*args, **kwargs)
 
 
 def _liveness_db_enabled() -> bool:
@@ -550,6 +564,7 @@ _INIT_SENTINEL_TABLES = (
     "model_stats_regime",
     "realized_outcomes",
     "model_performance",
+    "production_monitoring_metrics",
     "model_hyperparameter_registry",
     "model_best_params",
     "data_sources",
@@ -563,6 +578,7 @@ _INIT_SENTINEL_TABLES = (
     "job_heartbeats",
     "price_feed_lock",
     "price_provider_health",
+    "net_after_cost_labels",
 )
 
 _INIT_SENTINEL_INDEXES = (
@@ -572,6 +588,7 @@ _INIT_SENTINEL_INDEXES = (
     "idx_alerts_prediction_id",
     "idx_regime_state_symbol_time_desc",
     "idx_tracked_predictions_prediction_id",
+    "idx_tracked_predictions_prediction_id_ts_id",
     "idx_execution_orders_prediction_submit_ts",
     "idx_execution_fills_model_ts",
     "idx_pnl_attribution_prediction_ts",
@@ -582,9 +599,11 @@ _INIT_SENTINEL_INDEXES = (
     "ux_model_best_params_model_family_symbol",
     "idx_realized_outcomes_symbol_ts",
     "ux_model_performance_tracked_prediction_id",
+    "idx_model_performance_prediction_id",
     "idx_model_performance_identity_time",
     "idx_model_performance_model_id_time",
     "idx_model_performance_regime_time",
+    "idx_production_monitoring_metrics_ts",
 )
 
 _INIT_SENTINEL_COLUMNS = {
@@ -641,6 +660,14 @@ _INIT_SENTINEL_COLUMNS = {
     "model_best_params": ("model_family", "symbol", "params_json", "value", "trial_number", "seed"),
     "data_sources": ("source_key", "display_name", "source_type", "job_name", "key_version"),
     "strategy_metrics": ("strategy_name", "window_days", "ts_ms", "metrics_json", "is_active"),
+    "strategy_promotion_candidates": (
+        "strategy_name",
+        "candidate_version",
+        "candidate_model_id",
+        "status",
+        "operator_approved_ts_ms",
+        "evidence_json",
+    ),
     "size_policy": ("ts_ms", "lookback_days", "buckets", "method", "metrics_json"),
     "walk_forward_runs": ("run_id", "params_json", "metrics_json", "ts_ms", "model_selection_json"),
     "walk_forward_scores": ("run_id", "symbol", "horizon_s", "model_name", "model_version", "model_kind"),
@@ -653,13 +680,25 @@ _INIT_SENTINEL_COLUMNS = {
     "model_marketplace_scores": ("regime", "stage", "trades", "net_pnl", "updated_ts_ms", "meta_json"),
     "model_metrics": ("model_name", "symbol", "horizon_s", "metrics_json"),
     "labels_exec": ("event_id", "symbol", "horizon_s", "net_z", "total_cost_bps"),
+    "net_after_cost_labels": (
+        "event_id",
+        "symbol",
+        "horizon_s",
+        "label_ts_ms",
+        "gross_return",
+        "execution_cost_return",
+        "net_return",
+        "model_family",
+        "regime",
+        "confidence_metadata_json",
+    ),
 }
 
 
 def _sqlite_schema_sentinels_ready(path: Path) -> bool:
     if not Path(path).exists():
         return False
-    con = sqlite3.connect(str(path), timeout=0.05, isolation_level=None)
+    con = _sqlite_open_connection(str(path), timeout=0.05, isolation_level=None)
     try:
         rows = sqlite3.Connection.execute(
             con,
@@ -1321,7 +1360,7 @@ def _connect_raw(
     path = Path(path_override).expanduser() if path_override is not None else _current_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     timeout = max(0.05, float(timeout_s if timeout_s is not None else os.environ.get("SQLITE_TIMEOUT_S", "30") or 30.0))
-    con = sqlite3.connect(
+    con = _sqlite_open_connection(
         str(path),
         timeout=timeout,
         isolation_level=None,
@@ -2381,6 +2420,23 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
           diagnostics TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS production_monitoring_metrics (
+          metric_name TEXT NOT NULL,
+          scope TEXT NOT NULL DEFAULT 'global',
+          dimension TEXT NOT NULL DEFAULT '',
+          ts_ms INTEGER NOT NULL,
+          value REAL,
+          baseline_value REAL,
+          threshold_value REAL,
+          severity TEXT NOT NULL DEFAULT 'UNKNOWN',
+          state TEXT NOT NULL DEFAULT 'unavailable',
+          action_signal TEXT NOT NULL DEFAULT '',
+          labels_available INTEGER NOT NULL DEFAULT 0,
+          sample_n INTEGER NOT NULL DEFAULT 0,
+          details_json TEXT NOT NULL DEFAULT '{}',
+          PRIMARY KEY(metric_name, scope, dimension)
+        );
+
         CREATE TABLE IF NOT EXISTS promotion_statistical_evidence (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts INTEGER,
@@ -2396,6 +2452,103 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
           payload_json TEXT,
           prev_hash TEXT,
           row_hash TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS policy_ope_observations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          candidate_key TEXT,
+          model_id TEXT,
+          model_name TEXT NOT NULL,
+          candidate_type TEXT NOT NULL,
+          candidate_version TEXT,
+          symbol TEXT,
+          horizon_s INTEGER NOT NULL DEFAULT 0,
+          regime TEXT NOT NULL DEFAULT 'global',
+          logged_action TEXT,
+          target_action TEXT,
+          behavior_propensity REAL,
+          target_propensity REAL,
+          outcome REAL,
+          logged_model_estimate REAL,
+          target_model_estimate REAL,
+          source_table TEXT,
+          source_id TEXT,
+          meta_json TEXT NOT NULL DEFAULT '{}',
+          prev_hash TEXT,
+          row_hash TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_policy_ope_obs_candidate_ts
+          ON policy_ope_observations(candidate_key, ts_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_policy_ope_obs_model_ts
+          ON policy_ope_observations(model_id, model_name, ts_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_policy_ope_obs_scope_ts
+          ON policy_ope_observations(symbol, horizon_s, regime, ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS policy_ope_evidence (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          candidate_key TEXT,
+          model_id TEXT,
+          model_name TEXT NOT NULL,
+          candidate_type TEXT NOT NULL,
+          candidate_version TEXT,
+          symbol TEXT,
+          horizon_s INTEGER NOT NULL DEFAULT 0,
+          regime TEXT NOT NULL DEFAULT 'global',
+          policy_value REAL,
+          standard_error REAL,
+          ci_lower REAL,
+          ci_upper REAL,
+          n_obs INTEGER NOT NULL DEFAULT 0,
+          effective_n REAL NOT NULL DEFAULT 0.0,
+          support REAL NOT NULL DEFAULT 0.0,
+          max_importance_weight REAL NOT NULL DEFAULT 0.0,
+          confidence_z REAL NOT NULL DEFAULT 0.0,
+          decision TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          config_json TEXT NOT NULL DEFAULT '{}',
+          diagnostics_json TEXT NOT NULL DEFAULT '{}',
+          prev_hash TEXT,
+          row_hash TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_policy_ope_evidence_candidate_ts
+          ON policy_ope_evidence(candidate_key, ts_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_policy_ope_evidence_model_ts
+          ON policy_ope_evidence(model_id, model_name, ts_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_policy_ope_evidence_decision_ts
+          ON policy_ope_evidence(decision, ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS experiment_ledger (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          candidate_key TEXT NOT NULL,
+          candidate_name TEXT,
+          candidate_version TEXT,
+          candidate_type TEXT NOT NULL,
+          source TEXT NOT NULL,
+          parent_candidate_key TEXT,
+          model_name TEXT,
+          model_family TEXT,
+          feature_ids_json TEXT NOT NULL DEFAULT '[]',
+          prompt_hash TEXT,
+          model_hash TEXT,
+          search_space_json TEXT NOT NULL DEFAULT '{}',
+          trial_budget INTEGER NOT NULL DEFAULT 0,
+          trial_count INTEGER NOT NULL DEFAULT 0,
+          cpcv_json TEXT NOT NULL DEFAULT '{}',
+          pbo REAL,
+          dsr REAL,
+          fdr_json TEXT NOT NULL DEFAULT '{}',
+          redundancy_json TEXT NOT NULL DEFAULT '{}',
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          promotion_decision TEXT NOT NULL DEFAULT 'pending',
+          status TEXT NOT NULL DEFAULT 'recorded',
+          diagnostics_json TEXT NOT NULL DEFAULT '{}',
+          prev_hash BLOB,
+          row_hash BLOB
         );
 
         CREATE TABLE IF NOT EXISTS temporal_model_eval (
@@ -2417,11 +2570,17 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_event_key_ts_ms ON events(event_key, ts_ms)")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_model_best_params_model_family_symbol ON model_best_params(model_family, symbol)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_model_hparam_registry_family_ts ON model_hyperparameter_registry(model_family, ts DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_experiment_ledger_candidate_ts ON experiment_ledger(candidate_key, ts DESC, id DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_experiment_ledger_model_version_ts ON experiment_ledger(candidate_name, candidate_version, ts DESC, id DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_experiment_ledger_source_status_ts ON experiment_ledger(source, status, ts DESC, id DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_realized_outcomes_symbol_ts ON realized_outcomes(symbol, ts_ms)")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_model_performance_tracked_prediction_id ON model_performance(tracked_prediction_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_model_performance_prediction_id ON model_performance(prediction_id)")
     con.execute('CREATE INDEX IF NOT EXISTS idx_model_performance_identity_time ON model_performance(model_name, model_version, symbol, "time" DESC, id DESC)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_model_performance_model_id_time ON model_performance(model_id, symbol, "time" DESC, id DESC)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_model_performance_regime_time ON model_performance(model_name, model_version, symbol, volatility_regime, trend_regime, liquidity_regime, "time" DESC, id DESC)')
+    con.execute("CREATE INDEX IF NOT EXISTS idx_production_monitoring_metrics_ts ON production_monitoring_metrics(ts_ms DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_production_monitoring_metrics_state ON production_monitoring_metrics(severity, state, ts_ms DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_job_checkpoints_updated ON job_checkpoints(updated_ts_ms)")
     _ensure_regime_state_schema(con)
     con.execute("CREATE INDEX IF NOT EXISTS idx_tracked_model_registry_updated ON tracked_model_registry(updated_ts_ms DESC)")
@@ -2436,6 +2595,7 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_tracked_predictions_ts ON tracked_predictions(ts_ms DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_tracked_predictions_symbol_ts ON tracked_predictions(symbol, ts_ms DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_tracked_predictions_prediction_id ON tracked_predictions(prediction_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_tracked_predictions_prediction_id_ts_id ON tracked_predictions(prediction_id, ts_ms DESC, id DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_prediction_explanations_symbol_ts ON prediction_explanations(symbol, ts DESC)")
     for column_name, ddl in (
         ("confidence_raw", "REAL"),
@@ -2527,6 +2687,9 @@ def _ensure_labels_price_schema(con: sqlite3.Connection) -> None:
         )
         """
     )
+    from engine.strategy.net_after_cost_labels import ensure_net_after_cost_labels_schema
+
+    ensure_net_after_cost_labels_schema(con)
 
 
 def _ensure_model_marketplace_scores_schema(con: sqlite3.Connection) -> None:
@@ -2837,6 +3000,21 @@ _EXACT_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "disabled_until_ts_ms",
         "updated_ts_ms",
     ),
+    "production_monitoring_metrics": (
+        "metric_name",
+        "scope",
+        "dimension",
+        "ts_ms",
+        "value",
+        "baseline_value",
+        "threshold_value",
+        "severity",
+        "state",
+        "action_signal",
+        "labels_available",
+        "sample_n",
+        "details_json",
+    ),
     "predictions": (
         "id",
         "ts_ms",
@@ -2954,6 +3132,24 @@ _EXACT_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "status",
         "extra_json",
     ),
+    "execution_order_idempotency": (
+        "order_uid",
+        "broker",
+        "portfolio_orders_id",
+        "portfolio_ts_ms",
+        "source_order_id",
+        "source_alert_id",
+        "symbol",
+        "client_order_id",
+        "broker_order_id",
+        "status",
+        "first_seen_ts_ms",
+        "claimed_ts_ms",
+        "updated_ts_ms",
+        "submit_ts_ms",
+        "last_error",
+        "payload_json",
+    ),
     "execution_fills": (
         "id",
         "client_order_id",
@@ -3018,6 +3214,7 @@ _EXACT_TABLE_PK: dict[str, dict[str, int]] = {
     "portfolio_state": {"model_id": 1, "symbol": 2},
     "portfolio_orders": {"id": 1},
     "execution_orders": {"client_order_id": 1},
+    "execution_order_idempotency": {"order_uid": 1},
     "execution_fills": {"id": 1},
     "pnl_attribution": {"ts_ms": 1, "source_alert_id": 2, "model_id": 3, "symbol": 4},
 }
@@ -3207,6 +3404,26 @@ def _contract_create_sql(table: str) -> str:
           FOREIGN KEY(prediction_id) REFERENCES predictions(id) ON DELETE SET NULL,
           FOREIGN KEY(source_alert_id, prediction_id) REFERENCES alerts(id, prediction_id) ON DELETE SET NULL,
           FOREIGN KEY(portfolio_orders_id, source_alert_id, prediction_id) REFERENCES portfolio_orders(id, source_alert_id, prediction_id) ON DELETE SET NULL
+        )
+        """,
+        "execution_order_idempotency": """
+        CREATE TABLE IF NOT EXISTS execution_order_idempotency (
+          order_uid TEXT PRIMARY KEY,
+          broker TEXT NOT NULL,
+          portfolio_orders_id INTEGER,
+          portfolio_ts_ms INTEGER,
+          source_order_id INTEGER,
+          source_alert_id INTEGER,
+          symbol TEXT NOT NULL,
+          client_order_id TEXT NOT NULL,
+          broker_order_id TEXT,
+          status TEXT NOT NULL,
+          first_seen_ts_ms INTEGER NOT NULL,
+          claimed_ts_ms INTEGER NOT NULL,
+          updated_ts_ms INTEGER NOT NULL,
+          submit_ts_ms INTEGER,
+          last_error TEXT,
+          payload_json TEXT NOT NULL
         )
         """,
         "execution_fills": """
@@ -3581,7 +3798,7 @@ def _ensure_contract_tables(con: sqlite3.Connection) -> None:
     ):
         _connection_execute_raw(con, _contract_create_sql(table))
 
-    for table in ("alerts", "portfolio_orders", "execution_orders", "execution_fills"):
+    for table in ("alerts", "portfolio_orders", "execution_orders", "execution_order_idempotency", "execution_fills"):
         if _needs_exact_rebuild(
             con,
             table,
@@ -3655,6 +3872,13 @@ def _ensure_contract_indexes(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_execution_orders_model_submit_ts ON execution_orders(model_id, submit_ts_ms);
         CREATE INDEX IF NOT EXISTS idx_execution_orders_symbol_submit_ts ON execution_orders(symbol, submit_ts_ms);
         CREATE INDEX IF NOT EXISTS idx_execution_orders_order_uid ON execution_orders(order_uid);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_order_idempotency_client
+          ON execution_order_idempotency(client_order_id);
+        CREATE INDEX IF NOT EXISTS idx_execution_order_idempotency_status
+          ON execution_order_idempotency(status);
+        CREATE INDEX IF NOT EXISTS idx_execution_order_idempotency_symbol_ts
+          ON execution_order_idempotency(symbol, updated_ts_ms);
 
         CREATE INDEX IF NOT EXISTS idx_execution_fills_ts ON execution_fills(fill_ts_ms);
         CREATE INDEX IF NOT EXISTS idx_execution_fills_client ON execution_fills(client_order_id);
@@ -3981,6 +4205,31 @@ def _ensure_runtime_baseline_schema(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_strategy_metrics_ts
           ON strategy_metrics(ts_ms);
 
+        CREATE TABLE IF NOT EXISTS strategy_promotion_candidates (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_ts_ms INTEGER NOT NULL,
+          updated_ts_ms INTEGER NOT NULL,
+          strategy_name TEXT NOT NULL,
+          candidate_version TEXT NOT NULL,
+          candidate_model_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          source TEXT NOT NULL,
+          shadow_score REAL,
+          best_live_score REAL,
+          observed_shadow_runs INTEGER NOT NULL DEFAULT 0,
+          min_shadow_runs INTEGER NOT NULL DEFAULT 0,
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          operator_approved_ts_ms INTEGER,
+          operator_approved_by TEXT,
+          operator_approval_reason TEXT,
+          promoted_ts_ms INTEGER,
+          blocked_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_strategy_promotion_candidates_strategy_status
+          ON strategy_promotion_candidates(strategy_name, status, updated_ts_ms);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_strategy_promotion_candidates_model_id
+          ON strategy_promotion_candidates(candidate_model_id);
+
         CREATE TABLE IF NOT EXISTS size_policy (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts_ms INTEGER NOT NULL,
@@ -4076,8 +4325,66 @@ def _base_schema(con: sqlite3.Connection) -> None:
     _ensure_options_chain_v2_schema(con)
     _ensure_insider_transactions_schema(con)
     _ensure_congressional_trades_schema(con)
-    _create_table(con, "news_event_features", ("id", "event_id", "ts_ms", "symbol", "payload_json", "sentiment_score", "embedding_novelty_score", "novelty_score", "stale_flag", "is_duplicate", "finbert_label", "finbert_score", "finbert_confidence", "finbert_pos", "finbert_neg", "finbert_neu"), (("event_id",),))
+    _create_table(
+        con,
+        "news_event_features",
+        (
+            "id",
+            "event_id",
+            "ts_ms",
+            "symbol",
+            "cluster_key",
+            "headline_key",
+            "sentiment_score",
+            "novelty_score",
+            "is_duplicate",
+            "duplicate_count",
+            "company_match_method",
+            "company_match_conf",
+            "source_count",
+            "payload_json",
+            "meta_json",
+            "embedding_backend",
+            "embedding_model_name",
+            "embedding_novelty_score",
+            "embedding_max_similarity",
+            "stale_flag",
+            "novelty_computed_ts_ms",
+            "finbert_label",
+            "finbert_score",
+            "finbert_confidence",
+            "finbert_pos",
+            "finbert_neg",
+            "finbert_neu",
+        ),
+        (("event_id",),),
+    )
     _create_table(con, "news_symbol_features", ("id", "event_id", "ts_ms", "symbol", "payload_json"))
+    _create_table(
+        con,
+        "structured_document_events",
+        (
+            "id",
+            "source_document_id",
+            "source_event_id",
+            "symbol",
+            "document_type",
+            "source",
+            "event_type",
+            "event_ts_ms",
+            "availability_ts_ms",
+            "extraction_confidence",
+            "polarity",
+            "feature_id",
+            "evidence",
+            "extractor_name",
+            "extractor_version",
+            "created_ts_ms",
+            "payload_json",
+            "pit_metadata_json",
+        ),
+        (("source_document_id", "symbol", "event_type", "event_ts_ms", "extractor_version"),),
+    )
     _create_table(con, "options_event_features", ("id", "event_id", "ts_ms", "symbol", "payload_json"))
     _create_table(con, "finbert_sentiment_enrichments", ("id", "ts_ms", "symbol", "event_id", "source_identifier", "model_name", "payload_json"))
     _create_table(con, "finra_short_sale_volume", ("id", *_FINRA_SHORT_SALE_VOLUME_COLUMNS), (("source_record_id",),))
@@ -4132,7 +4439,7 @@ def _base_schema(con: sqlite3.Connection) -> None:
         "shadow_predictions": (("id", "event_id", "symbol", "horizon_s", "model_name", "prediction", "confidence", "ts_ms", "payload_json"), ()),
         "insider_transactions": (("id", *_INSIDER_TRANSACTION_COLUMNS), (("source_transaction_id",),)),
         "congressional_trades": (("id", *_CONGRESSIONAL_TRADE_COLUMNS), (("source_trade_id",),)),
-        "news_event_features": (("id", "event_id", "ts_ms", "symbol", "payload_json", "sentiment_score", "embedding_novelty_score", "novelty_score", "stale_flag", "is_duplicate", "finbert_label", "finbert_score", "finbert_confidence", "finbert_pos", "finbert_neg", "finbert_neu"), (("event_id",),)),
+        "news_event_features": (("id", "event_id", "ts_ms", "symbol", "cluster_key", "headline_key", "sentiment_score", "novelty_score", "is_duplicate", "duplicate_count", "company_match_method", "company_match_conf", "source_count", "payload_json", "meta_json", "embedding_backend", "embedding_model_name", "embedding_novelty_score", "embedding_max_similarity", "stale_flag", "novelty_computed_ts_ms", "finbert_label", "finbert_score", "finbert_confidence", "finbert_pos", "finbert_neg", "finbert_neu"), (("event_id",),)),
         "news_symbol_features": (("id", "event_id", "ts_ms", "symbol", "payload_json"), ()),
         "options_event_features": (("id", "event_id", "ts_ms", "symbol", "payload_json"), ()),
         "finbert_sentiment_enrichments": (("id", "ts_ms", "symbol", "event_id", "source_identifier", "model_name", "payload_json"), ()),
@@ -4165,6 +4472,38 @@ def _base_schema(con: sqlite3.Connection) -> None:
                 "cpcv_median_sharpe",
                 "cpcv_pbo",
                 "diagnostics",
+            ),
+            (),
+        ),
+        "experiment_ledger": (
+            (
+                "id",
+                "ts",
+                "candidate_key",
+                "candidate_name",
+                "candidate_version",
+                "candidate_type",
+                "source",
+                "parent_candidate_key",
+                "model_name",
+                "model_family",
+                "feature_ids_json",
+                "prompt_hash",
+                "model_hash",
+                "search_space_json",
+                "trial_budget",
+                "trial_count",
+                "cpcv_json",
+                "pbo",
+                "dsr",
+                "fdr_json",
+                "redundancy_json",
+                "evidence_json",
+                "promotion_decision",
+                "status",
+                "diagnostics_json",
+                "prev_hash",
+                "row_hash",
             ),
             (),
         ),
@@ -4303,6 +4642,24 @@ def _base_schema(con: sqlite3.Connection) -> None:
             ),
             (("tracked_prediction_id",),),
         ),
+        "production_monitoring_metrics": (
+            (
+                "metric_name",
+                "scope",
+                "dimension",
+                "ts_ms",
+                "value",
+                "baseline_value",
+                "threshold_value",
+                "severity",
+                "state",
+                "action_signal",
+                "labels_available",
+                "sample_n",
+                "details_json",
+            ),
+            (("metric_name", "scope", "dimension"),),
+        ),
         "job_locks": (("id", "job_name", "owner", "pid", "acquired_ts_ms", "heartbeat_ts_ms", "expires_ms"), (("job_name",),)),
         "job_heartbeats": (("id", "job_name", "owner", "pid", "ts_ms", "extra_json"), (("job_name",),)),
         "job_checkpoints": (("id", "job_name", "last_event_id", "last_event_ts_ms", "updated_ts_ms"), (("job_name",),)),
@@ -4364,6 +4721,63 @@ def _base_schema(con: sqlite3.Connection) -> None:
                 "row_hash",
             ),
             (("model_id", "evidence_kind", "ts"),),
+        ),
+        "policy_ope_observations": (
+            (
+                "id",
+                "ts_ms",
+                "candidate_key",
+                "model_id",
+                "model_name",
+                "candidate_type",
+                "candidate_version",
+                "symbol",
+                "horizon_s",
+                "regime",
+                "logged_action",
+                "target_action",
+                "behavior_propensity",
+                "target_propensity",
+                "outcome",
+                "logged_model_estimate",
+                "target_model_estimate",
+                "source_table",
+                "source_id",
+                "meta_json",
+                "prev_hash",
+                "row_hash",
+            ),
+            (("candidate_key", "ts_ms"),),
+        ),
+        "policy_ope_evidence": (
+            (
+                "id",
+                "ts_ms",
+                "candidate_key",
+                "model_id",
+                "model_name",
+                "candidate_type",
+                "candidate_version",
+                "symbol",
+                "horizon_s",
+                "regime",
+                "policy_value",
+                "standard_error",
+                "ci_lower",
+                "ci_upper",
+                "n_obs",
+                "effective_n",
+                "support",
+                "max_importance_weight",
+                "confidence_z",
+                "decision",
+                "reason",
+                "config_json",
+                "diagnostics_json",
+                "prev_hash",
+                "row_hash",
+            ),
+            (("candidate_key", "ts_ms"),),
         ),
     }
     for table, (columns, uniques) in core_tables.items():
@@ -4801,6 +5215,21 @@ def get_connection_debug_snapshot() -> dict[str, Any]:
 
 _REQUIRED_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "runtime_meta": ("key", "value", "updated_ts_ms"),
+    "production_monitoring_metrics": (
+        "metric_name",
+        "scope",
+        "dimension",
+        "ts_ms",
+        "value",
+        "baseline_value",
+        "threshold_value",
+        "severity",
+        "state",
+        "action_signal",
+        "labels_available",
+        "sample_n",
+        "details_json",
+    ),
     "schema_version": ("version", "applied_ts_ms", "status", "notes"),
     "market_features": ("ts_ms", "symbol", "v", "features_json"),
     "regime_state": ("time", "symbol", "volatility_regime", "trend_regime", "liquidity_regime", "created_ts_ms"),
@@ -4889,6 +5318,26 @@ _REQUIRED_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "updated_ts_ms",
     ),
     "strategy_metrics": ("strategy_name", "window_days", "ts_ms", "metrics_json", "is_active"),
+    "strategy_promotion_candidates": (
+        "id",
+        "created_ts_ms",
+        "updated_ts_ms",
+        "strategy_name",
+        "candidate_version",
+        "candidate_model_id",
+        "status",
+        "source",
+        "shadow_score",
+        "best_live_score",
+        "observed_shadow_runs",
+        "min_shadow_runs",
+        "evidence_json",
+        "operator_approved_ts_ms",
+        "operator_approved_by",
+        "operator_approval_reason",
+        "promoted_ts_ms",
+        "blocked_reason",
+    ),
     "size_policy": ("id", "ts_ms", "lookback_days", "buckets", "method", "params_json", "metrics_json"),
     "walk_forward_runs": ("run_id", "params_json", "metrics_json", "ts_ms", "model_selection_json"),
     "walk_forward_scores": (
@@ -4948,6 +5397,7 @@ _REQUIRED_INDEXES: tuple[str, ...] = (
     "idx_predictions_symbol_ts",
     "idx_predictions_model_ts",
     "idx_regime_state_symbol_time_desc",
+    "idx_tracked_predictions_prediction_id_ts_id",
     "idx_alerts_ts",
     "idx_alerts_event_id",
     "idx_alerts_prediction_id",
@@ -4971,6 +5421,9 @@ _REQUIRED_INDEXES: tuple[str, ...] = (
     "idx_execution_orders_model_submit_ts",
     "idx_execution_orders_symbol_submit_ts",
     "idx_execution_orders_order_uid",
+    "uq_execution_order_idempotency_client",
+    "idx_execution_order_idempotency_status",
+    "idx_execution_order_idempotency_symbol_ts",
     "idx_execution_fills_ts",
     "idx_execution_fills_client",
     "idx_execution_fills_model_ts",
@@ -4985,6 +5438,8 @@ _REQUIRED_INDEXES: tuple[str, ...] = (
     "idx_pnl_attribution_prediction_ts",
     "idx_pnl_attribution_ts",
     "idx_pnl_attribution_model_ts",
+    "ux_model_performance_tracked_prediction_id",
+    "idx_model_performance_prediction_id",
 )
 
 
@@ -5574,10 +6029,12 @@ _CLONE_NAMES = [
     "_upsert_dict",
     "put_event",
     "put_normalized_event",
+    "_put_structured_document_events_for_normalized_event",
     "put_price",
     "_payload_writer",
     "_alt_data_row",
     "_alt_data_upsert",
+    "_news_event_feature_row",
     "put_news_event_feature",
     "_payload_dict",
     "put_finbert_sentiment_enrichment",
@@ -5665,6 +6122,7 @@ def _clone_pg_helpers() -> bool:
             "_FINRA_SHORT_SALE_VOLUME_COLUMNS",
             "_FINRA_SHORT_INTEREST_COLUMNS",
             "_CRYPTO_FUNDING_RATE_COLUMNS",
+            "_NEWS_EVENT_FEATURE_COLUMNS",
         ):
             globals()[name] = getattr(_pg, name)
 

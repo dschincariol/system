@@ -27,6 +27,108 @@ _SERVICE_LOCK = threading.Lock()
 _SERVICE: "ModelScoringService | None" = None
 
 
+def _is_postgres_connection(con: Any) -> bool:
+    module_name = str(type(con).__module__)
+    return module_name.endswith("storage_pg") or ".storage_pg" in module_name
+
+
+def _unresolved_predictions_sql(*, postgres: bool) -> str:
+    if not postgres:
+        return """
+                SELECT
+                  p.id,
+                  p.ts_ms,
+                  p.symbol,
+                  p.model_name,
+                  p.model_version,
+                  p.predicted_z,
+                  p.confidence,
+                  p.event_id,
+                  p.horizon_s,
+                  p.model_id,
+                  tp.id,
+                  tp.features_version,
+                  tp.source_alert_id,
+                  tp.tracking_source,
+                  tp.metadata_json
+                FROM predictions p
+                LEFT JOIN tracked_predictions tp
+                  ON tp.id = (
+                    SELECT tp2.id
+                    FROM tracked_predictions tp2
+                    WHERE tp2.prediction_id = p.id
+                    ORDER BY tp2.ts_ms DESC, tp2.id DESC
+                    LIMIT 1
+                  )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM model_performance mp
+                  WHERE mp.prediction_id = p.id
+                )
+                ORDER BY p.ts_ms ASC, p.id ASC
+                LIMIT ?
+                """
+
+    # Expected Postgres plan: materialize at most MODEL_SCORING_BATCH_LIMIT
+    # unresolved prediction rows, anti-probe model_performance by
+    # idx_model_performance_prediction_id, then nested-loop into
+    # idx_tracked_predictions_prediction_id_ts_id for a LIMIT 1 latest tracker
+    # lookup with no sort.
+    return """
+                WITH unresolved_predictions AS MATERIALIZED (
+                  SELECT
+                    p.id,
+                    p.ts_ms,
+                    p.symbol,
+                    p.model_name,
+                    p.model_version,
+                    p.predicted_z,
+                    p.confidence,
+                    p.event_id,
+                    p.horizon_s,
+                    p.model_id
+                  FROM predictions p
+                  WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM model_performance mp
+                    WHERE mp.prediction_id = p.id
+                  )
+                  ORDER BY p.ts_ms ASC, p.id ASC
+                  LIMIT ?
+                )
+                SELECT
+                  p.id,
+                  p.ts_ms,
+                  p.symbol,
+                  p.model_name,
+                  p.model_version,
+                  p.predicted_z,
+                  p.confidence,
+                  p.event_id,
+                  p.horizon_s,
+                  p.model_id,
+                  tp.id,
+                  tp.features_version,
+                  tp.source_alert_id,
+                  tp.tracking_source,
+                  tp.metadata_json
+                FROM unresolved_predictions p
+                LEFT JOIN LATERAL (
+                  SELECT
+                    tp2.id,
+                    tp2.features_version,
+                    tp2.source_alert_id,
+                    tp2.tracking_source,
+                    tp2.metadata_json
+                  FROM tracked_predictions tp2
+                  WHERE tp2.prediction_id = p.id
+                  ORDER BY tp2.ts_ms DESC, tp2.id DESC
+                  LIMIT 1
+                ) tp ON TRUE
+                ORDER BY p.ts_ms ASC, p.id ASC
+                """
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = str(os.environ.get(name, "")).strip().lower()
     if raw == "":
@@ -365,38 +467,7 @@ class ModelScorer:
         con = connect(readonly=True)
         try:
             prediction_rows = con.execute(
-                """
-                SELECT
-                  p.id,
-                  p.ts_ms,
-                  p.symbol,
-                  p.model_name,
-                  p.model_version,
-                  p.predicted_z,
-                  p.confidence,
-                  p.event_id,
-                  p.horizon_s,
-                  p.model_id,
-                  tp.id,
-                  tp.features_version,
-                  tp.source_alert_id,
-                  tp.tracking_source,
-                  tp.metadata_json
-                FROM predictions p
-                LEFT JOIN tracked_predictions tp
-                  ON tp.id = (
-                    SELECT tp2.id
-                    FROM tracked_predictions tp2
-                    WHERE tp2.prediction_id = p.id
-                    ORDER BY tp2.ts_ms DESC, tp2.id DESC
-                    LIMIT 1
-                  )
-                LEFT JOIN model_performance mp
-                  ON mp.prediction_id = p.id
-                WHERE mp.prediction_id IS NULL
-                ORDER BY p.ts_ms ASC, p.id ASC
-                LIMIT ?
-                """,
+                _unresolved_predictions_sql(postgres=_is_postgres_connection(con)),
                 (int(limit),),
             ).fetchall()
             tracked_only_rows = con.execute(
@@ -418,10 +489,12 @@ class ModelScorer:
                   tp.tracking_source,
                   tp.metadata_json
                 FROM tracked_predictions tp
-                LEFT JOIN model_performance mp
-                  ON mp.tracked_prediction_id = tp.id
                 WHERE tp.prediction_id IS NULL
-                  AND mp.tracked_prediction_id IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM model_performance mp
+                    WHERE mp.tracked_prediction_id = tp.id
+                  )
                 ORDER BY tp.ts_ms ASC, tp.id ASC
                 LIMIT ?
                 """,

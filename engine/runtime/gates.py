@@ -187,17 +187,146 @@ def _normalize_severity(value: Any, default: str = "WARNING") -> str:
     return str(default or "WARNING").strip().upper() or "WARNING"
 
 
-def _env_mode() -> str:
+def _env_mode_snapshot() -> tuple[str, bool]:
     # Operator intent comes from env first; later reconciliation with DB state
     # chooses the most restrictive result rather than trusting one source blindly.
-    m = (
-        os.environ.get("EXECUTION_MODE")
-        or os.environ.get("ENGINE_MODE")
-        or os.environ.get("OPERATOR_MODE")
-        or os.environ.get("MODE")
-        or "safe"
+    for name in ("EXECUTION_MODE", "ENGINE_MODE", "OPERATOR_MODE", "MODE"):
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        return str(raw).strip().lower() or "safe", True
+    return "safe", False
+
+
+def _env_mode() -> str:
+    return _env_mode_snapshot()[0]
+
+
+def _default_execution_mode_state() -> Dict[str, Any]:
+    try:
+        from engine.cache.wrappers.execution_mode import read_execution_mode
+
+        state = dict(read_execution_mode() or {})
+        state.setdefault("source", "engine.cache.wrappers.execution_mode")
+        return state
+    except Exception as e:
+        _warn_nonfatal(
+            "RUNTIME_GATES_DEFAULT_EXECUTION_MODE_LOAD_FAILED",
+            e,
+            once_key="runtime_gates_default_execution_mode_load_failed",
+        )
+        return {
+            "mode": "safe",
+            "armed": None,
+            "source": "default_execution_mode_db:error",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def _default_kill_switch_state() -> Dict[str, Any]:
+    try:
+        from engine.cache.wrappers.kill_switch import read_kill_switch
+
+        state = dict(read_kill_switch() or {"state": []})
+        state.setdefault("source", "engine.cache.wrappers.kill_switch")
+        return state
+    except Exception as e:
+        _warn_nonfatal(
+            "RUNTIME_GATES_DEFAULT_KILL_SWITCH_LOAD_FAILED",
+            e,
+            once_key="runtime_gates_default_kill_switch_load_failed",
+        )
+        return {
+            "state": [
+                {
+                    "scope": "global",
+                    "key": "provider_unavailable",
+                    "enabled": 1,
+                    "reason": "kill_switch_provider_unavailable",
+                    "actor": "runtime_gates",
+                }
+            ],
+            "source": "default_kill_switch_db:error",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def _kill_switch_cache_meta(snapshot: Any, *, now_ms_value: int | None = None) -> Dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+    fields = (
+        "loaded_ts_ms",
+        "source",
+        "max_age_ms",
+        "cache_age_ms",
+        "cache_fresh",
+        "read_source",
+        "cache_status",
     )
-    return str(m).strip().lower() or "safe"
+    out = {field: snapshot.get(field) for field in fields if field in snapshot}
+    try:
+        loaded_ts_ms = int(snapshot.get("loaded_ts_ms") or 0)
+        max_age_ms = int(snapshot.get("max_age_ms") or 0)
+        if loaded_ts_ms > 0 and max_age_ms > 0:
+            age_ms = max(0, int(now_ms_value if now_ms_value is not None else _now_ms()) - int(loaded_ts_ms))
+            out["cache_age_ms"] = int(age_ms)
+            out["cache_fresh"] = bool(age_ms <= max_age_ms)
+    except Exception as e:
+        _warn_nonfatal(
+            "RUNTIME_GATES_KILL_SWITCH_CACHE_META_FAILED",
+            e,
+            once_key="runtime_gates_kill_switch_cache_meta_failed",
+        )
+    return out
+
+
+def _kill_switch_cache_stale_reason(cache_meta: Dict[str, Any]) -> str:
+    if not cache_meta:
+        return ""
+    if cache_meta.get("cache_fresh") is False:
+        return "kill_switch_cache_stale"
+    status = str(cache_meta.get("cache_status") or "").strip().lower()
+    if status in {"stale", "expired"}:
+        return "kill_switch_cache_stale"
+    return ""
+
+
+def _armed_source_is_audited_db(value: Any) -> bool:
+    text = str(value or "")
+    return "get_execution_mode_fn" in text or "default_execution_mode_db" in text
+
+
+def _live_readiness_blockers(readiness: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(readiness, dict) or not readiness:
+        return []
+    if bool(readiness.get("ok")) and bool(readiness.get("ready", readiness.get("ok"))):
+        return []
+
+    # `risk` and `system_state` are circular with this barrier while it is being
+    # built. Other readiness gates are independent prerequisites for live capital.
+    ignored = {
+        "risk",
+        "enable_trading",
+        "system_state",
+        "risk_not_ready",
+        "system_state_not_live",
+    }
+    blockers: List[str] = []
+    for item in list(readiness.get("waiting_on") or []):
+        value = str(item or "").strip()
+        if value and value not in ignored:
+            blockers.append(value)
+
+    for item in list(readiness.get("issues") or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("level") or "error").strip().lower() not in {"", "error", "critical"}:
+            continue
+        code = str(item.get("code") or "").strip()
+        if code and code not in ignored:
+            blockers.append(code)
+
+    return _dedupe_strs(blockers)
 
 
 def is_execution_job(job_name: str) -> bool:
@@ -333,6 +462,55 @@ def _portfolio_execution_degraded_snapshot(risk_state_getter=None) -> Dict[str, 
         }
 
 
+def _kill_switch_activation_failure_degraded_snapshot() -> Dict[str, Any]:
+    try:
+        from engine.execution.kill_switch import activation_failure_snapshot  # type: ignore
+
+        payload = dict(activation_failure_snapshot() or {"active": False})
+    except Exception as e:
+        _warn_nonfatal(
+            "RUNTIME_GATES_KILL_SWITCH_ACTIVATION_FAILURE_LOAD_FAILED",
+            e,
+            once_key="runtime_gates_kill_switch_activation_failure_load_failed",
+        )
+        return {
+            "source": "kill_switch_activation_failure",
+            "active": True,
+            "severity": "CRITICAL",
+            "reason": "kill_switch_activation_failure_unreadable",
+            "reason_codes": ["kill_switch_activation_failure_unreadable"],
+            "detail": {"error_type": type(e).__name__, "error": str(e)},
+        }
+
+    if not bool(payload.get("active")):
+        return {
+            "source": "kill_switch_activation_failure",
+            "active": False,
+            "severity": "WARNING",
+            "reason": "",
+            "reason_codes": [],
+            "detail": {},
+        }
+
+    scope = str(payload.get("scope") or "global")
+    key = str(payload.get("key") or "global")
+    trigger_kind = str(payload.get("trigger_kind") or "unknown")
+    return {
+        "source": "kill_switch_activation_failure",
+        "active": True,
+        "severity": "CRITICAL",
+        "reason": "kill_switch_activation_failed",
+        "reason_codes": _dedupe_strs(
+            [
+                "kill_switch_activation_write_failed",
+                f"kill_switch_activation_failed:{trigger_kind}",
+                f"kill_switch_activation_failed:{scope}:{key}",
+            ]
+        ),
+        "detail": dict(payload),
+    }
+
+
 def _event_bus_execution_degraded_snapshot() -> Dict[str, Any]:
     if not _EXECUTION_BLOCK_EVENT_BUS_CRITICAL_BACKPRESSURE:
         return {"source": "event_bus", "active": False, "severity": "WARNING", "reason": "", "reason_codes": [], "detail": {}}
@@ -387,6 +565,7 @@ def _event_bus_execution_degraded_snapshot() -> Dict[str, Any]:
 def get_execution_degraded_snapshot(execution_degraded: Any = False, *, risk_state_getter=None) -> Dict[str, Any]:
     sources = [
         _explicit_execution_degraded_snapshot(execution_degraded),
+        _kill_switch_activation_failure_degraded_snapshot(),
         _portfolio_execution_degraded_snapshot(risk_state_getter=risk_state_getter),
         _event_bus_execution_degraded_snapshot(),
     ]
@@ -437,6 +616,7 @@ def execution_gate_snapshot(
     execution_degraded: bool = False,
     portfolio_risk_gate: Optional[Dict[str, Any]] = None,
     risk_state_getter=None,
+    readiness: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the current execution barrier snapshot.
 
@@ -478,12 +658,12 @@ def execution_gate_snapshot(
 
     ts = _now_ms()
 
-    mode: str = _env_mode()
-    env_mode: str = mode
+    env_mode, env_mode_explicit = _env_mode_snapshot()
+    mode: str = env_mode
     db_mode: Optional[str] = None
     armed: Optional[int] = None
     armed_source = ""
-    source = "env"
+    source = "env" if env_mode_explicit else "default"
     reason = "ok"
     allow_execution_pipeline = False
     allow_simulation = False
@@ -725,6 +905,11 @@ def execution_gate_snapshot(
             runtime_detail = str(lifecycle.get("detail") or "")
             runtime_source = source_name + ".lifecycle"
 
+    system_state_has_mode = bool(
+        isinstance(system_state, dict)
+        and any(key in system_state for key in ("mode", "execution_mode", "armed"))
+    )
+
     if isinstance(system_state, dict):
         _apply_runtime_state(system_state, "system_state")
         _apply_mode_state(system_state, "system_state")
@@ -754,6 +939,8 @@ def execution_gate_snapshot(
                 "runtime_detail": runtime_detail,
                 "runtime_source": runtime_source,
             }
+    elif not system_state_has_mode:
+        _apply_mode_state(_default_execution_mode_state(), "default_execution_mode_db")
 
     if runtime_state == "UNKNOWN" and callable(_get_lifecycle_state):
         try:
@@ -779,7 +966,7 @@ def execution_gate_snapshot(
         "live": 1,
     }
     if db_mode:
-        if order.get(env_mode, 3) >= order.get(db_mode, 3):
+        if env_mode_explicit and order.get(env_mode, 3) >= order.get(db_mode, 3):
             mode = _normalize_mode(env_mode, "safe")
             source = f"{source}+env_restrictive"
         else:
@@ -937,13 +1124,16 @@ def execution_gate_snapshot(
             "severity_reasons": _dedupe_strs(severity_reasons + ["portfolio_risk_block"]),
         }
 
-    ks = kill_switches
+    ks = _default_kill_switch_state() if kill_switches is None else kill_switches
     if isinstance(ks, dict) and isinstance(ks.get("data"), dict):
         ks = ks.get("data")
+    kill_switch_cache = _kill_switch_cache_meta(ks, now_ms_value=ts)
 
     active_kill = []
 
     if isinstance(ks, dict):
+        if "provider_unavailable" in str(ks.get("source") or ""):
+            active_kill.append("global:provider_unavailable")
         if isinstance(ks.get("state"), list):
             for row in ks.get("state") or []:
                 try:
@@ -960,12 +1150,44 @@ def execution_gate_snapshot(
                     continue
 
         for k, v in ks.items():
-            if k == "state":
+            if k in {
+                "state",
+                "loaded_ts_ms",
+                "source",
+                "max_age_ms",
+                "cache_age_ms",
+                "cache_fresh",
+                "read_source",
+                "cache_status",
+            }:
                 continue
             if isinstance(v, dict) and (v.get("enabled") is True or v.get("active") is True):
                 active_kill.append(str(k))
             elif v is True:
                 active_kill.append(str(k))
+
+    stale_cache_reason = _kill_switch_cache_stale_reason(kill_switch_cache)
+    if stale_cache_reason:
+        return {
+            "ok": True,
+            "ts_ms": ts,
+            "mode": mode,
+            "armed": armed,
+            "armed_source": armed_source,
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "allow_simulation": False,
+            "real_trading_allowed": False,
+            "allowed": False,
+            "reason": stale_cache_reason,
+            "source": source,
+            "runtime_state": runtime_state,
+            "runtime_detail": runtime_detail,
+            "runtime_source": runtime_source,
+            "severity": "CRITICAL",
+            "severity_reasons": _dedupe_strs(severity_reasons + [stale_cache_reason]),
+            "kill_switch_cache": dict(kill_switch_cache),
+        }
 
     if active_kill:
         return {
@@ -987,6 +1209,7 @@ def execution_gate_snapshot(
             "runtime_source": runtime_source,
             "severity": "CRITICAL",
             "severity_reasons": _dedupe_strs(severity_reasons + ["kill_switch_active"]),
+            "kill_switch_cache": dict(kill_switch_cache),
         }
 
     if mode == "live" and live_execution_disabled():
@@ -1064,7 +1287,7 @@ def execution_gate_snapshot(
             reason = "mode_live_unarmed_unknown"
         elif armed != 1:
             reason = "mode_live_unarmed"
-        elif "get_execution_mode_fn" not in str(armed_source or ""):
+        elif not _armed_source_is_audited_db(armed_source):
             reason = "mode_live_armed_not_from_audited_db"
         elif runtime_state != "LIVE":
             reason = {
@@ -1077,14 +1300,23 @@ def execution_gate_snapshot(
                 "UNKNOWN": "runtime_state_unknown",
             }.get(runtime_state, f"runtime_state_{str(runtime_state or 'unknown').lower()}")
         else:
-            live_preflight_state = live_trading_preflight(engine_mode=mode)
-            if not bool(live_preflight_state.get("ok")):
-                reason = str(live_preflight_state.get("reason") or "live_trading_preflight_failed")
+            readiness_blockers = _live_readiness_blockers(readiness)
+            if readiness_blockers:
+                reason = "readiness_not_ready"
+                live_preflight_state = {
+                    "ok": False,
+                    "reason": "readiness_not_ready",
+                    "readiness_blockers": list(readiness_blockers),
+                }
             else:
-                real_trading_allowed = True
-                allow_execution_pipeline = True
-                allow_simulation = True
-                reason = "mode_live_armed"
+                live_preflight_state = live_trading_preflight(engine_mode=mode)
+                if not bool(live_preflight_state.get("ok")):
+                    reason = str(live_preflight_state.get("reason") or "live_trading_preflight_failed")
+                else:
+                    real_trading_allowed = True
+                    allow_execution_pipeline = True
+                    allow_simulation = True
+                    reason = "mode_live_armed"
     else:
         reason = f"mode_unknown:{mode}"
 
@@ -1111,4 +1343,5 @@ def execution_gate_snapshot(
         "conditional_allow": bool(runtime_state == "DEGRADED" and gate_severity == "DEGRADED"),
         "execution_degraded": dict(execution_degraded_state),
         "live_trading_preflight": dict(live_preflight_state or {}),
+        "kill_switch_cache": dict(kill_switch_cache),
     }

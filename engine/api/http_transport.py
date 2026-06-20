@@ -37,6 +37,7 @@ from engine.api.auth_config import (
 )
 from engine.api.http_parsing import deny_if_shutdown
 from engine.api.rate_limit import build_default_rate_limiter
+from engine.api.redaction import redact_api_payload
 from engine.runtime.failure_diagnostics import log_failure, normalize_root_cause_code
 from engine.runtime.metrics import emit_counter, emit_timing
 from engine.runtime.platform import (
@@ -291,14 +292,42 @@ class StreamingResponse:
         self.stream_fn = stream_fn
 
 
+ROUTE_SENSITIVITY_PUBLIC = "public"
+ROUTE_SENSITIVITY_SENSITIVE = "sensitive"
+
+_PUBLIC_GET_ENDPOINT_PATHS = frozenset(
+    {
+        "/api/health",
+        "/api/operator/health",
+        "/api/system/health",
+        "/api/liveness",
+        "/api/system/liveness",
+        "/api/readiness",
+    }
+)
+
+_SENSITIVE_GET_ENDPOINT_PATHS = frozenset(
+    {
+        "/api/system/config",
+        "/api/operator/logs",
+        "/api/operator/stderr_tail",
+        "/api/operator/support_snapshot",
+        "/api/operator/snapshot",
+        "/api/terminal/positions",
+    }
+)
+
 _DESTRUCTIVE_ENDPOINT_PATHS = frozenset(
     {
         "/api/operator/emergency_stop",
+        "/api/operator/clear_manual_halt",
         "/api/operator/stop",
         "/api/operator/restart",
         "/api/operator/restart_engine",
         "/api/operator/autofix",
         "/api/operator/restart_feeds",
+        "/api/operator/self_repair",
+        "/api/operator/bootstrap_pipeline",
         "/api/system/repair_schema",
         "/api/repair_schema",
         "/api/jobs/start",
@@ -318,6 +347,15 @@ _CONFIRMATION_REGISTRY = {
         "severity": "emergency",
         "consequence": "Immediately stops operator jobs, trips the global kill switch, and disarms execution.",
         "hold_ms": 3000,
+        "require_ack": True,
+        "require_actor": True,
+        "require_source": True,
+    },
+    "/api/operator/clear_manual_halt": {
+        "action_id": "operator.clear_manual_halt",
+        "required_token": "CLEAR_MANUAL_HALT",
+        "severity": "high",
+        "consequence": "Clears an operator/manual kill-switch hold after confirming the current active row is not rules-owned.",
         "require_ack": True,
         "require_actor": True,
         "require_source": True,
@@ -348,6 +386,41 @@ _CONFIRMATION_REGISTRY = {
         "required_token": "SYSTEM_FIX",
         "severity": "high",
         "consequence": "Runs automatic repair steps against startup/runtime issues.",
+        "require_ack": True,
+    },
+    "/api/operator/restart_feeds": {
+        "action_id": "operator.restart_feeds",
+        "required_token": "RESTART_FEEDS",
+        "severity": "high",
+        "consequence": "Restarts market-data feed jobs and may run a pipeline refresh.",
+        "require_ack": True,
+    },
+    "/api/operator/self_repair": {
+        "action_id": "operator.self_repair",
+        "required_token": "SYSTEM_FIX",
+        "severity": "high",
+        "consequence": "Runs automatic runtime repair actions.",
+        "require_ack": True,
+    },
+    "/api/operator/bootstrap_pipeline": {
+        "action_id": "operator.guided_bootstrap",
+        "required_token": "GUIDED_BOOTSTRAP",
+        "severity": "high",
+        "consequence": "Runs guided bootstrap pipeline work.",
+        "require_ack": True,
+    },
+    "/api/system/repair_schema": {
+        "action_id": "operator.repair_schema",
+        "required_token": "REPAIR_SCHEMA",
+        "severity": "high",
+        "consequence": "Runs schema repair against runtime storage.",
+        "require_ack": True,
+    },
+    "/api/repair_schema": {
+        "action_id": "operator.repair_schema",
+        "required_token": "REPAIR_SCHEMA",
+        "severity": "high",
+        "consequence": "Runs schema repair against runtime storage.",
         "require_ack": True,
     },
     "/api/jobs/start": {
@@ -517,6 +590,46 @@ def _route_specs_include_mutation(route_specs) -> bool:
     return False
 
 
+def _normalize_route_sensitivity(method: str, path: str, route=None) -> str:
+    raw = ""
+    if isinstance(route, dict):
+        raw = str(
+            route.get("sensitivity")
+            or route.get("route_sensitivity")
+            or route.get("auth")
+            or ""
+        ).strip().lower()
+    if raw in {"public", "unauthenticated", "anonymous", "health", "readiness"}:
+        return ROUTE_SENSITIVITY_PUBLIC
+    if raw in {"sensitive", "protected", "private", "operator", "authenticated"}:
+        return ROUTE_SENSITIVITY_SENSITIVE
+
+    method = str(method or "").upper().strip()
+    path = str(path or "").strip()
+    if method and method != "GET" and path.startswith("/api/"):
+        return ROUTE_SENSITIVITY_SENSITIVE
+    if method == "GET" and path in _PUBLIC_GET_ENDPOINT_PATHS:
+        return ROUTE_SENSITIVITY_PUBLIC
+    if method == "GET" and (path in _SENSITIVE_GET_ENDPOINT_PATHS or path.startswith("/api/")):
+        return ROUTE_SENSITIVITY_SENSITIVE
+    return ROUTE_SENSITIVITY_PUBLIC
+
+
+def _route_specs_include_sensitive_get(route_specs) -> bool:
+    for route in route_specs or []:
+        method = ""
+        path = ""
+        if isinstance(route, dict):
+            method = str(route.get("method", "") or "").upper().strip()
+            path = str(route.get("path", "") or "").strip()
+        elif isinstance(route, tuple) and len(route) >= 2:
+            method = str(route[0] or "").upper().strip()
+            path = str(route[1] or "").strip()
+        if method == "GET" and _normalize_route_sensitivity(method, path, route) == ROUTE_SENSITIVITY_SENSITIVE:
+            return True
+    return False
+
+
 def _parse_trusted_proxy_networks(raw: str | None):
     networks = []
     for item in str(raw or "").split(","):
@@ -562,7 +675,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
     )
 
     dashboard_token = (dashboard_api_token or "").strip()
-    if _route_specs_include_mutation(ROUTE_SPECS):
+    if _route_specs_include_mutation(ROUTE_SPECS) or _route_specs_include_sensitive_get(ROUTE_SPECS):
         auth_config = validate_mutation_auth_config(dashboard_token)
         if not bool(auth_config.get("ok")):
             raise InsecureConfiguration(format_mutation_auth_config_error(auth_config))
@@ -597,6 +710,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
     # Route normalization happens once at handler construction so request
     # dispatch stays cheap and business handlers receive a stable map.
     routes = {}
+    route_meta = {}
     template_routes = {}
 
     def _compile_route_template(path):
@@ -621,22 +735,26 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             path = str(r.get("path", ""))
             handler = r.get("handler")
             if method and path and handler:
+                meta = {"sensitivity": _normalize_route_sensitivity(method, path, r)}
                 if "{" in path and "}" in path:
                     regex, names = _compile_route_template(path)
-                    template_routes.setdefault(method, []).append((path, regex, names, handler))
+                    template_routes.setdefault(method, []).append((path, regex, names, handler, meta))
                 else:
                     routes[(method, path)] = handler
+                    route_meta[(method, path)] = meta
             continue
 
         if isinstance(r, tuple) and len(r) >= 3:
             method = str(r[0]).upper()
             path = str(r[1])
             handler = r[2]
+            meta = {"sensitivity": _normalize_route_sensitivity(method, path, r)}
             if "{" in path and "}" in path:
                 regex, names = _compile_route_template(path)
-                template_routes.setdefault(method, []).append((path, regex, names, handler))
+                template_routes.setdefault(method, []).append((path, regex, names, handler, meta))
             else:
                 routes[(method, path)] = handler
+                route_meta[(method, path)] = meta
             continue
 
     _STATIC_DIR = os.path.abspath(static_dir or os.getcwd())
@@ -686,6 +804,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
     class Handler(SimpleHTTPRequestHandler):
 
         ROUTES = routes
+        ROUTE_META = route_meta
         TEMPLATE_ROUTES = template_routes
 
         def __init__(self, *args, **kwargs):
@@ -696,6 +815,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             self._response_streaming = False
             self._request_body_valid = True
             self._mutation_auth_kind = ""
+            self._route_sensitivity = ROUTE_SENSITIVITY_PUBLIC
+            self._response_redaction_enabled = False
             try:
                 super().__init__(*args, directory=_STATIC_DIR, **kwargs)
             except TypeError:
@@ -825,6 +946,12 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             meta.setdefault("status", int(status))
             obj["meta"] = meta
 
+            if bool(getattr(self, "_response_redaction_enabled", False)):
+                try:
+                    obj = redact_api_payload(obj)
+                except Exception as e:
+                    _warn("response_redaction", e, status=status)
+
             try:
                 data = json.dumps(
                     obj,
@@ -923,14 +1050,14 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 _warn("localhost_client_check", e)
                 return False
 
-        def _request_api_token(self):
+        def _request_api_token_parts(self):
             try:
                 hdr = (self.headers.get("X-API-Token") or "").strip()
             except Exception as e:
                 _warn("auth_header_read", e)
                 hdr = ""
             if hdr:
-                return hdr
+                return hdr, "header"
 
             try:
                 parsed = urlparse(self.path)
@@ -939,17 +1066,75 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             except Exception as e:
                 _warn("auth_query_parse", e, path=getattr(self, "path", ""))
                 qtok = ""
-            return str(qtok or "").strip()
+            qtok = str(qtok or "").strip()
+            if qtok:
+                return qtok, "query"
+            return "", ""
+
+        def _request_api_token(self):
+            token_value, _source = self._request_api_token_parts()
+            return str(token_value or "")
+
+        def _server_bind_host_candidates(self):
+            candidates = []
+            try:
+                ctx_host = str((self._ctx or {}).get("DASHBOARD_HOST") or "").strip()
+                if ctx_host:
+                    candidates.append(("ctx.dashboard_host", ctx_host))
+            except Exception as e:
+                _warn("ctx_dashboard_host_read", e)
+            env_host = str(os.environ.get("DASHBOARD_HOST", "") or "").strip()
+            if env_host:
+                candidates.append(("env.dashboard_host", env_host))
+            try:
+                server_address = getattr(self.server, "server_address", None) or ()
+                server_host = str(server_address[0] or "").strip()
+                if server_host:
+                    candidates.append(("server.bind_host", server_host))
+            except Exception as e:
+                _warn("server_bind_host_read", e)
+            return candidates
+
+        def _is_loopback_bind_host(self, host):
+            text = str(host or "").strip()
+            if not text:
+                return True
+            if text in LOOPBACK_HOSTS or text.lower() in {"localhost", "[::1]"}:
+                return True
+            try:
+                return bool(ipaddress.ip_address(text.strip("[]")).is_loopback)
+            except Exception as e:
+                _log_nonfatal("loopback_bind_host_parse", e, host=text)
+                return False
+
+        def _remote_bind_reasons(self):
+            reasons = []
+            for source, host in self._server_bind_host_candidates():
+                if not self._is_loopback_bind_host(host):
+                    reasons.append(f"{source}={host}")
+            return tuple(reasons)
 
         def _require_mutation_auth(self):
+            return self._require_protected_route_auth(
+                allow_safe_dev_localhost_fallback=True,
+                protection_reasons=(),
+            )
+
+        def _require_protected_route_auth(
+            self,
+            *,
+            allow_safe_dev_localhost_fallback,
+            protection_reasons,
+        ):
             self._mutation_auth_kind = ""
+            strict_reasons = strict_mutation_auth_reasons()
+            all_reasons = tuple(str(item) for item in list(strict_reasons) + list(protection_reasons or ()))
 
             if dashboard_token:
-                strict_reasons = strict_mutation_auth_reasons()
                 token_issue = dashboard_api_token_issue(
                     dashboard_token,
                     strict=bool(strict_reasons),
-                ) if strict_reasons else ""
+                ) if all_reasons else ""
                 if token_issue:
                     return {
                         "ok": False,
@@ -958,23 +1143,34 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                         "meta": {"status": 403},
                     }
 
-                supplied = self._request_api_token()
+                supplied, source = self._request_api_token_parts()
+                if source == "query" and strict_reasons:
+                    return {
+                        "ok": False,
+                        "error": "query_token_forbidden",
+                        "reason": "query_string_token_authentication_disabled_in_production_live",
+                        "meta": {"status": 401},
+                    }
                 if hmac.compare_digest(supplied, dashboard_token):
                     self._mutation_auth_kind = "dashboard_api_token"
                     return None
 
                 return {"ok": False, "error": "unauthorized", "meta": {"status": 401}}
 
-            strict_reasons = strict_mutation_auth_reasons()
-            if strict_reasons:
+            if all_reasons:
                 return {
                     "ok": False,
                     "error": "forbidden_dashboard_api_token_required",
                     "strict_reasons": list(strict_reasons),
+                    "protection_reasons": list(protection_reasons or ()),
                     "meta": {"status": 403},
                 }
 
-            if safe_dev_localhost_fallback_enabled() and self._is_localhost_client():
+            if (
+                allow_safe_dev_localhost_fallback
+                and safe_dev_localhost_fallback_enabled()
+                and self._is_localhost_client()
+            ):
                 self._mutation_auth_kind = "safe_dev_localhost_fallback"
                 return None
 
@@ -1009,7 +1205,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             except Exception as e:
                 _warn("token_unset_warning", e, method=method, path=path)
 
-        def _rate_limit_mutation(self, parsed_path, *, token_for_bucket=None):
+        def _rate_limit_protected_request(self, parsed_path, *, token_for_bucket=None):
             if token_for_bucket is None:
                 token_for_bucket = self._request_api_token() if dashboard_token else ""
             destructive = str(parsed_path or "") in _DESTRUCTIVE_ENDPOINT_PATHS
@@ -1038,6 +1234,12 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 {"Retry-After": str(retry_after)},
             )
 
+        def _rate_limit_mutation(self, parsed_path, *, token_for_bucket=None):
+            return self._rate_limit_protected_request(
+                parsed_path,
+                token_for_bucket=token_for_bucket,
+            )
+
         def _require_mutation_confirmation(self, parsed_path, body):
             spec = _route_confirmation_spec(str(parsed_path or ""), body)
             self._mutation_confirmation = None
@@ -1049,6 +1251,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             method = "typed_phrase" if payload.get("confirmation") is not None else "legacy_confirm"
             actor = str(payload.get("actor") or payload.get("who") or "").strip()
             source = str(payload.get("source") or payload.get("source_surface") or "").strip()
+            reason = str(payload.get("reason") or payload.get("justification") or payload.get("note") or "").strip()
+            target = str(payload.get("target") or payload.get("target_id") or payload.get("name") or payload.get("source_key") or "").strip()
             hold_ms = 0
             try:
                 hold_ms = int(float(payload.get("confirmation_hold_ms") or payload.get("hold_ms") or 0))
@@ -1074,6 +1278,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     "confirmation_method": method,
                     "actor": actor,
                     "source_surface": source,
+                    "reason": reason,
+                    "target": target,
                     "confirmation_hold_ms": int(hold_ms),
                     "consequence_hash": _confirmation_hash(spec),
                     "threshold_policy": dict(spec.get("threshold_policy") or {}),
@@ -1123,6 +1329,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     "method": str(method or ""),
                     "path": str(path or ""),
                     "handler": str(handler_name or ""),
+                    "route_sensitivity": str(getattr(self, "_route_sensitivity", "") or ""),
                     "outcome": str(outcome or ""),
                     "status": int(status or 0),
                     "error": str(error or ""),
@@ -1148,6 +1355,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                         "confirmation_method": confirmation.get("confirmation_method", ""),
                         "actor": confirmation.get("actor", ""),
                         "source_surface": confirmation.get("source_surface", ""),
+                        "reason": confirmation.get("reason", ""),
+                        "target": confirmation.get("target", ""),
                         "confirmation_severity": confirmation.get("severity", ""),
                         "consequence_hash": confirmation.get("consequence_hash", ""),
                         "threshold_policy": confirmation.get("threshold_policy", {}),
@@ -1183,6 +1392,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             self._response_streaming = False
             self._request_body_valid = True
             self._mutation_confirmation = None
+            self._route_sensitivity = ROUTE_SENSITIVITY_PUBLIC
+            self._response_redaction_enabled = False
 
             self._normalize_ui_legacy_path()
 
@@ -1190,6 +1401,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             key = (method, parsed.path)
             handler_name = self.ROUTES.get(key)
             parsed_for_handler = parsed
+            route_meta = dict(self.ROUTE_META.get(key) or {})
 
             # tolerate trailing slash mismatches
             if not handler_name and parsed.path.endswith("/"):
@@ -1198,9 +1410,10 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 if handler_name:
                     parsed = urlparse(parsed._replace(path=parsed.path.rstrip("/")).geturl())
                     parsed_for_handler = parsed
+                    route_meta = dict(self.ROUTE_META.get(key) or {})
 
             if not handler_name:
-                for route_path, route_regex, route_names, route_handler in self.TEMPLATE_ROUTES.get(method, []):
+                for route_path, route_regex, route_names, route_handler, template_meta in self.TEMPLATE_ROUTES.get(method, []):
                     match = route_regex.match(parsed.path)
                     if not match:
                         continue
@@ -1218,6 +1431,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     parsed_for_handler["_route_path"] = str(route_path)
                     parsed_for_handler["_path"] = str(parsed.path or "")
                     handler_name = route_handler
+                    route_meta = dict(template_meta or {})
                     break
 
             # no route → static or 404
@@ -1238,10 +1452,28 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     404,
                 )
 
+            self._route_sensitivity = str(
+                route_meta.get("sensitivity")
+                or _normalize_route_sensitivity(method, parsed.path)
+            )
+            self._response_redaction_enabled = bool(
+                method == "GET"
+                and self._route_sensitivity == ROUTE_SENSITIVITY_SENSITIVE
+            )
+            protected_get_reasons = (
+                self._remote_bind_reasons()
+                if method == "GET" and self._route_sensitivity == ROUTE_SENSITIVITY_SENSITIVE
+                else ()
+            )
+            protected_access = bool(
+                method != "GET"
+                or (method == "GET" and self._route_sensitivity == ROUTE_SENSITIVITY_SENSITIVE and (strict_mutation_auth_reasons() or protected_get_reasons))
+            )
+
             fn = API_HANDLERS.get(handler_name)
 
             if not fn:
-                if method != "GET":
+                if protected_access:
                     self._audit_mutation(
                         method=method,
                         path=parsed.path,
@@ -1260,48 +1492,32 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
 
             self._warn_if_token_unset(method, parsed.path)
 
-            if method == "GET" and parsed.path in _storage_required_paths(self._ctx):
-                try:
-                    from engine.runtime.storage_pool import probe_storage_readiness
-
-                    readiness = probe_storage_readiness(
-                        timeout_s=_request_storage_timeout_s(self._ctx),
-                        max_age_s=_storage_readiness_cache_s(self._ctx),
-                    )
-                except Exception as e:
-                    _warn("storage_readiness_probe_failed", e, path=str(parsed.path))
-                    return self.respond_json(
-                        _storage_unavailable_response(endpoint=parsed.path, error=e),
-                        503,
-                    )
-                if not bool((readiness or {}).get("ok")):
-                    return self.respond_json(
-                        _storage_unavailable_response(endpoint=parsed.path, readiness=readiness),
-                        503,
-                    )
-
             # ----------------------------------------------------
-            # mutation protection
+            # protected route auth/rate-limit/audit gate
             # ----------------------------------------------------
 
-            if method != "GET":
+            if protected_access:
 
-                denied = deny_if_shutdown()
-                if denied:
-                    self._audit_mutation(
-                        method=method,
-                        path=parsed.path,
-                        handler_name=handler_name,
-                        outcome="shutdown_denied",
-                        status=503,
-                        error=str((denied or {}).get("error") or "shutdown"),
-                    )
-                    return self.respond_json(denied, 503)
+                if method != "GET":
+                    denied = deny_if_shutdown()
+                    if denied:
+                        self._audit_mutation(
+                            method=method,
+                            path=parsed.path,
+                            handler_name=handler_name,
+                            outcome="shutdown_denied",
+                            status=503,
+                            error=str((denied or {}).get("error") or "shutdown"),
+                        )
+                        return self.respond_json(denied, 503)
 
-                auth = self._require_mutation_auth()
+                auth = self._require_protected_route_auth(
+                    allow_safe_dev_localhost_fallback=method != "GET",
+                    protection_reasons=protected_get_reasons,
+                )
                 if auth:
                     auth_status = _derive_response_status(auth, default_status=403)
-                    limited = self._rate_limit_mutation(parsed.path, token_for_bucket="")
+                    limited = self._rate_limit_protected_request(parsed.path, token_for_bucket="")
                     if limited:
                         payload, headers = limited
                         self._audit_mutation(
@@ -1324,7 +1540,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     )
                     return self.respond_json(auth, auth_status)
 
-                limited = self._rate_limit_mutation(parsed.path)
+                limited = self._rate_limit_protected_request(parsed.path)
                 if limited:
                     payload, headers = limited
                     self._audit_mutation(
@@ -1337,6 +1553,26 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                         rate_limited=True,
                     )
                     return self.respond_json(payload, 429, headers=headers)
+
+            if method == "GET" and parsed.path in _storage_required_paths(self._ctx):
+                try:
+                    from engine.runtime.storage_pool import probe_storage_readiness
+
+                    readiness = probe_storage_readiness(
+                        timeout_s=_request_storage_timeout_s(self._ctx),
+                        max_age_s=_storage_readiness_cache_s(self._ctx),
+                    )
+                except Exception as e:
+                    _warn("storage_readiness_probe_failed", e, path=str(parsed.path))
+                    return self.respond_json(
+                        _storage_unavailable_response(endpoint=parsed.path, error=e),
+                        503,
+                    )
+                if not bool((readiness or {}).get("ok")):
+                    return self.respond_json(
+                        _storage_unavailable_response(endpoint=parsed.path, readiness=readiness),
+                        503,
+                    )
 
             try:
 
@@ -1441,7 +1677,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     }
 
                 if isinstance(result, StreamingResponse):
-                    if method != "GET":
+                    if protected_access:
                         self._audit_mutation(
                             method=method,
                             path=parsed.path,
@@ -1479,7 +1715,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                         return
                     return
 
-                if method != "GET":
+                if protected_access:
                     result_status = _derive_response_status(result, default_status=200)
                     result_dict = result if isinstance(result, dict) else {}
                     self._audit_mutation(
@@ -1498,7 +1734,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 return self.respond_json(result)
 
             except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as e:
-                if method != "GET":
+                if protected_access:
                     self._audit_mutation(
                         method=method,
                         path=parsed.path,
@@ -1528,7 +1764,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                         include_health=False,
                         persist=False,
                     )
-                    if method != "GET":
+                    if protected_access:
                         self._audit_mutation(
                             method=method,
                             path=parsed.path,
@@ -1550,7 +1786,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     path=getattr(self, "path", ""),
                 )
 
-                if method != "GET":
+                if protected_access:
                     self._audit_mutation(
                         method=method,
                         path=parsed.path,

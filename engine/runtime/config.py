@@ -14,6 +14,15 @@ from pathlib import Path
 from engine.runtime.config_schema import ConfigError, get_runtime_safety_context, load_runtime_config
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.workload_profiles import (
+    model_family_n_jobs,
+    tsfresh_snapshot_batch_size,
+    tsfresh_snapshot_symbol_limit,
+    tsfresh_n_jobs,
+    tuning_n_trials,
+    workload_profile_defaults,
+    workload_profile_from_env,
+)
 
 
 # ---------------------------------------------------------
@@ -113,14 +122,19 @@ def _env_float(key: str, default: float) -> float:
 # ---------------------------------------------------------
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-from engine.runtime.platform import default_data_root
+from engine.runtime.platform import default_local_db_path
 
-_DEFAULT_DB_PATH = str(default_data_root())
+_DEFAULT_DB_PATH = str(default_local_db_path())
 
 ENV = _schema_attr("env", os.environ.get("ENV", "dev"))
 DB_PATH = _schema_attr("db_path", os.environ.get("DB_PATH", _DEFAULT_DB_PATH))
+RUNTIME_WORKLOAD_PROFILE = _schema_attr("runtime_workload_profile", workload_profile_from_env())
+_WORKLOAD_DEFAULTS = workload_profile_defaults(str(RUNTIME_WORKLOAD_PROFILE))
 PROD_LOCK = _schema_attr("prod_lock", _env_bool("PROD_LOCK", ENV == "prod"))
-ALLOW_TRAINING = _schema_attr("allow_training", _env_bool("ALLOW_TRAINING", ENV != "prod"))
+ALLOW_TRAINING = _schema_attr(
+    "allow_training",
+    _env_bool("ALLOW_TRAINING", bool(_WORKLOAD_DEFAULTS.get("allow_training")) and ENV != "prod"),
+)
 SUPERVISOR_ENABLED = _schema_attr("supervisor_enabled", _env_bool("SUPERVISOR_ENABLED", True))
 SUPERVISOR_TICK_S = _schema_attr("supervisor_tick_s", _env_int("SUPERVISOR_TICK_S", 2))
 EXEC_DEGRADE_BLOCK = _schema_attr("exec_degrade_block", _env_bool("EXEC_DEGRADE_BLOCK", True))
@@ -218,12 +232,39 @@ EXECUTION_DISABLED_IN_SAFE = _env_bool("EXECUTION_DISABLED_IN_SAFE", True)
 # ---------------------------------------------------------
 
 RESOURCE_SCHEDULER_ENABLE = _env_bool("RESOURCE_SCHEDULER_ENABLE", True)
-RESOURCE_SCHEDULER_GLOBAL_MAX = _env_int("RESOURCE_SCHEDULER_GLOBAL_MAX", 2)
-RESOURCE_SCHEDULER_EXECUTION_MAX = _env_int("RESOURCE_SCHEDULER_EXECUTION_MAX", 1)
-RESOURCE_SCHEDULER_INFERENCE_MAX = _env_int("RESOURCE_SCHEDULER_INFERENCE_MAX", 1)
-RESOURCE_SCHEDULER_TRAINING_MAX = _env_int("RESOURCE_SCHEDULER_TRAINING_MAX", 1)
-RESOURCE_SCHEDULER_REPLAY_MAX = _env_int("RESOURCE_SCHEDULER_REPLAY_MAX", 1)
-RESOURCE_SCHEDULER_BACKGROUND_MAX = _env_int("RESOURCE_SCHEDULER_BACKGROUND_MAX", 1)
+RESOURCE_SCHEDULER_GLOBAL_MAX = _env_int(
+    "RESOURCE_SCHEDULER_GLOBAL_MAX",
+    int(_WORKLOAD_DEFAULTS.get("resource_scheduler_global_max") or 2),
+)
+RESOURCE_SCHEDULER_EXECUTION_MAX = _env_int(
+    "RESOURCE_SCHEDULER_EXECUTION_MAX",
+    int(_WORKLOAD_DEFAULTS.get("resource_scheduler_execution_max") or 1),
+)
+RESOURCE_SCHEDULER_INFERENCE_MAX = _env_int(
+    "RESOURCE_SCHEDULER_INFERENCE_MAX",
+    int(_WORKLOAD_DEFAULTS.get("resource_scheduler_inference_max") or 1),
+)
+RESOURCE_SCHEDULER_TRAINING_MAX = _env_int(
+    "RESOURCE_SCHEDULER_TRAINING_MAX",
+    int(_WORKLOAD_DEFAULTS.get("resource_scheduler_training_max") or 1),
+)
+RESOURCE_SCHEDULER_REPLAY_MAX = _env_int(
+    "RESOURCE_SCHEDULER_REPLAY_MAX",
+    int(_WORKLOAD_DEFAULTS.get("resource_scheduler_replay_max") or 1),
+)
+RESOURCE_SCHEDULER_BACKGROUND_MAX = _env_int(
+    "RESOURCE_SCHEDULER_BACKGROUND_MAX",
+    int(_WORKLOAD_DEFAULTS.get("resource_scheduler_background_max") or 1),
+)
+MODEL_TRAIN_N_JOBS = model_family_n_jobs("MODEL_TRAIN_N_JOBS", fallback_keys=())
+LGBM_N_JOBS = model_family_n_jobs("LGBM_N_JOBS")
+LGBM_RANKER_N_JOBS = model_family_n_jobs("LGBM_RANKER_N_JOBS", fallback_keys=("LGBM_N_JOBS", "MODEL_TRAIN_N_JOBS"))
+XGB_N_JOBS = model_family_n_jobs("XGB_N_JOBS")
+META_LABEL_N_JOBS = model_family_n_jobs("META_LABEL_N_JOBS")
+TSFRESH_N_JOBS = tsfresh_n_jobs()
+TSFRESH_SNAPSHOT_SYMBOL_LIMIT = tsfresh_snapshot_symbol_limit()
+TSFRESH_SNAPSHOT_BATCH_SIZE = tsfresh_snapshot_batch_size()
+TUNE_N_TRIALS = tuning_n_trials()
 
 
 # ---------------------------------------------------------

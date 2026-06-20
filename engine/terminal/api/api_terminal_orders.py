@@ -23,6 +23,16 @@ from engine.runtime.gates import execution_gate_snapshot
 from engine.runtime.state_cache import cache_invalidate_namespace
 from engine.terminal.api.api_terminal import _table_exists
 
+try:
+    from engine.cache.wrappers.execution_mode import read_execution_mode as _get_execution_mode
+except Exception:
+    _get_execution_mode = None  # type: ignore
+
+try:
+    from engine.cache.wrappers.kill_switch import read_kill_switch as _kill_switch_snapshot
+except Exception:
+    _kill_switch_snapshot = None  # type: ignore
+
 
 ROUTE_SPECS_TERMINAL_ORDERS = [
     ("POST", "/api/terminal/order",   "api_post_terminal_order"),
@@ -81,6 +91,22 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     except Exception:
         value = int(default)
     return max(int(minimum), int(value))
+
+
+def _execution_gate_for_terminal_order() -> Dict[str, Any]:
+    if _get_execution_mode is None or _kill_switch_snapshot is None:
+        return {
+            "ok": False,
+            "reason": "execution_gate_providers_missing",
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "real_trading_allowed": False,
+            "allowed": False,
+        }
+    return execution_gate_snapshot(
+        get_execution_mode_fn=_get_execution_mode,
+        kill_switches=(_kill_switch_snapshot() or {}),
+    )
 
 
 def _table_columns(con, table: str) -> set[str]:
@@ -400,7 +426,7 @@ def api_post_terminal_order(_parsed=None, body=None, _ctx=None):
 
     # Terminal order entry is intentionally just an intent write behind the same
     # execution gate as the rest of the system. The route does not bypass policy.
-    gate = execution_gate_snapshot()
+    gate = _execution_gate_for_terminal_order()
     if not _terminal_intent_allowed(gate):
         return {"ok": False, "error": "execution_blocked", "gate": gate}
 
@@ -497,7 +523,7 @@ def api_post_terminal_flatten(_parsed=None, body=None, _ctx=None):
     if prelive_policy is not None:
         return prelive_policy
 
-    gate = execution_gate_snapshot()
+    gate = _execution_gate_for_terminal_order()
     if not _terminal_intent_allowed(gate):
         return {"ok": False, "error": "execution_blocked", "gate": gate}
 

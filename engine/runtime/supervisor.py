@@ -54,7 +54,9 @@ from engine.runtime.job_registry import (
     PIPELINE_ORDER,
     validate_runtime_architecture,
 )
+from engine.runtime.log_retention import rotate_log_if_needed
 from engine.runtime.logging import get_logger
+from engine.runtime.platform import default_local_log_dir
 
 LOG = get_logger("runtime_supervisor")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -177,11 +179,10 @@ def _repo_root() -> Path:
 
 
 def _job_log_dir() -> Path:
-    root = _repo_root()
     log_dir = Path(
         os.environ.get("TRADING_LOGS")
         or os.environ.get("LOG_DIR")
-        or str((root / "logs").resolve())
+        or str(default_local_log_dir().resolve())
     )
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
@@ -407,6 +408,8 @@ class RuntimeSupervisor:
             script_path = str((_repo_root() / state.spec.script).resolve())
             stdout_path, stderr_path = _job_log_paths(name)
 
+            rotate_log_if_needed(stdout_path)
+            rotate_log_if_needed(stderr_path)
             stdout_fh = open(stdout_path, "ab")
             stderr_fh = open(stderr_path, "ab")
 
@@ -857,6 +860,8 @@ class RuntimeSupervisor:
                                 script_path = str((_repo_root() / st.spec.script).resolve())
                                 stdout_path, stderr_path = _job_log_paths(job_name)
 
+                                rotate_log_if_needed(stdout_path)
+                                rotate_log_if_needed(stderr_path)
                                 stdout_fh = open(stdout_path, "ab")
                                 stderr_fh = open(stderr_path, "ab")
 
