@@ -1,3 +1,15 @@
+x-trading-logging: &trading-logging
+  driver: local
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-50m}"
+    max-file: "${DOCKER_LOG_MAX_FILE:-5}"
+
+x-trading-restart-policy: &trading-restart-policy
+  condition: on-failure
+  delay: "${DOCKER_RESTART_DELAY:-10s}"
+  max_attempts: ${DOCKER_RESTART_MAX_ATTEMPTS:-5}
+  window: "${DOCKER_RESTART_WINDOW:-120s}"
+
 services:
   runtime:
     build:
@@ -7,7 +19,10 @@ services:
         PYTHON_RUNTIME_IMAGE: ${PYTHON_RUNTIME_IMAGE:?set PYTHON_RUNTIME_IMAGE}
     image: ${APP_RUNTIME_IMAGE:?set APP_RUNTIME_IMAGE}
     container_name: trading-runtime
-    restart: unless-stopped
+    restart: "on-failure:${DOCKER_RESTART_MAX_ATTEMPTS:-5}"
+    logging: *trading-logging
+    deploy:
+      restart_policy: *trading-restart-policy
     environment:
       ENV: ${APP_ENV:-prod}
       ENGINE_SUPERVISED: "1"
@@ -20,6 +35,7 @@ services:
       TRADING_IMPORT_SMOKE_TIMEOUT_S: ${TRADING_IMPORT_SMOKE_TIMEOUT_S:-12.0}
       TRADING_STARTUP_HEALTH_FAIL_OPEN: ${TRADING_STARTUP_HEALTH_FAIL_OPEN:-0}
       TRADING_STARTUP_HEALTH_ASYNC_BIND: ${TRADING_STARTUP_HEALTH_ASYNC_BIND:-1}
+      TRADING_SCHEMA_VALIDATION_BACKOFF_S: ${TRADING_SCHEMA_VALIDATION_BACKOFF_S:-30}
       DASHBOARD_HOST: 0.0.0.0
       DASHBOARD_PORT: 8000
       DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:?set DASHBOARD_API_TOKEN}
@@ -140,7 +156,10 @@ services:
         NODE_RUNTIME_IMAGE: ${NODE_RUNTIME_IMAGE:?set NODE_RUNTIME_IMAGE}
     image: ${APP_OPERATOR_IMAGE:?set APP_OPERATOR_IMAGE}
     container_name: trading-operator
-    restart: unless-stopped
+    restart: "on-failure:${DOCKER_RESTART_MAX_ATTEMPTS:-5}"
+    logging: *trading-logging
+    deploy:
+      restart_policy: *trading-restart-policy
     environment:
       OPERATOR_BIND_HOST: 0.0.0.0
       OPERATOR_PORT: 4001

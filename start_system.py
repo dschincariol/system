@@ -157,6 +157,7 @@ _INGESTION_ENTRY = os.path.join(_BASE_DIR, "start_ingestion.py")
 _VALIDATION_TIMEOUT_S = _env_int("TRADING_VALIDATION_TIMEOUT_S", 180, minimum=30, maximum=3600)
 _STARTUP_HEALTH_TIMEOUT_S = _env_int("TRADING_STARTUP_HEALTH_TIMEOUT_S", 180, minimum=15, maximum=3600)
 _STARTUP_HEALTH_POLL_S = _env_float("TRADING_STARTUP_HEALTH_POLL_S", 2.0, minimum=0.5, maximum=30.0)
+_SCHEMA_VALIDATION_BACKOFF_S = _env_float("TRADING_SCHEMA_VALIDATION_BACKOFF_S", 30.0, minimum=0.0, maximum=600.0)
 _STALE_INGESTION_CLEANUP_TIMEOUT_S = _env_float(
     "TRADING_STALE_INGESTION_CLEANUP_TIMEOUT_S",
     5.0,
@@ -251,6 +252,7 @@ def _refresh_startup_settings() -> None:
     global _VALIDATION_TIMEOUT_S
     global _STARTUP_HEALTH_TIMEOUT_S
     global _STARTUP_HEALTH_POLL_S
+    global _SCHEMA_VALIDATION_BACKOFF_S
     global _STALE_INGESTION_CLEANUP_TIMEOUT_S
     global _CHALLENGER_RUNTIME_START_TIMEOUT_S
     global _STARTUP_DB_REPAIR_LOCK_RETRIES
@@ -280,6 +282,7 @@ def _refresh_startup_settings() -> None:
     _VALIDATION_TIMEOUT_S = _env_int("TRADING_VALIDATION_TIMEOUT_S", 180, minimum=30, maximum=3600)
     _STARTUP_HEALTH_TIMEOUT_S = _env_int("TRADING_STARTUP_HEALTH_TIMEOUT_S", 180, minimum=15, maximum=3600)
     _STARTUP_HEALTH_POLL_S = _env_float("TRADING_STARTUP_HEALTH_POLL_S", 2.0, minimum=0.5, maximum=30.0)
+    _SCHEMA_VALIDATION_BACKOFF_S = _env_float("TRADING_SCHEMA_VALIDATION_BACKOFF_S", 30.0, minimum=0.0, maximum=600.0)
     _STALE_INGESTION_CLEANUP_TIMEOUT_S = _env_float(
         "TRADING_STALE_INGESTION_CLEANUP_TIMEOUT_S",
         5.0,
@@ -473,6 +476,114 @@ def _redact_for_log(value: Any, *, key: str = "") -> Any:
     return value
 
 
+def _short_log_list(values: List[str], *, limit: int = 6) -> str:
+    items = [str(item) for item in values if str(item).strip()]
+    if len(items) <= limit:
+        return ",".join(items)
+    return ",".join(items[:limit]) + f",+{len(items) - limit}_more"
+
+
+def _short_log_mapping(values: Dict[str, Any], *, table_limit: int = 4, value_limit: int = 4) -> str:
+    rendered: List[str] = []
+    for idx, (table, raw_columns) in enumerate(sorted(values.items())):
+        if idx >= table_limit:
+            rendered.append(f"+{len(values) - table_limit}_more_tables")
+            break
+        columns = [str(column) for column in list(raw_columns or []) if str(column).strip()]
+        if len(columns) > value_limit:
+            column_text = ",".join(columns[:value_limit]) + f",+{len(columns) - value_limit}_more"
+        else:
+            column_text = ",".join(columns)
+        rendered.append(f"{table}({column_text})")
+    return ";".join(rendered)
+
+
+def _schema_validation_failure_summary(validation: Dict[str, Any]) -> str:
+    missing_tables = [str(item) for item in list(validation.get("missing_tables") or []) if str(item).strip()]
+    missing_columns = {
+        str(table): [str(column) for column in list(columns or []) if str(column).strip()]
+        for table, columns in dict(validation.get("missing_columns") or validation.get("missing_cols") or {}).items()
+        if str(table).strip()
+    }
+    missing_indexes = [str(item) for item in list(validation.get("missing_indexes") or []) if str(item).strip()]
+    missing_migrations = [
+        str(item)
+        for item in list(validation.get("schema_migration_missing_ids") or [])
+        if str(item).strip()
+    ]
+    unexpected_migrations = [
+        str(item)
+        for item in list(validation.get("schema_migration_unexpected_ids") or [])
+        if str(item).strip()
+    ]
+    samples: List[str] = []
+    if missing_tables:
+        samples.append(f"missing_tables={_short_log_list(sorted(missing_tables))}")
+    if missing_columns:
+        samples.append(f"missing_columns={_short_log_mapping(missing_columns)}")
+    if missing_indexes:
+        samples.append(f"missing_indexes={_short_log_list(sorted(missing_indexes))}")
+    if missing_migrations:
+        samples.append(f"missing_migrations={_short_log_list(sorted(missing_migrations))}")
+    if unexpected_migrations:
+        samples.append(f"unexpected_migrations={_short_log_list(sorted(unexpected_migrations))}")
+    return (
+        "postgres_schema_validation_failed "
+        "migration_required=1 "
+        f"actual_schema_version={validation.get('schema_version')} "
+        f"expected_schema_version={validation.get('expected_schema_version')} "
+        f"schema_status={validation.get('schema_status') or 'unknown'} "
+        f"schema_version_ok={int(bool(validation.get('schema_version_ok', False)))} "
+        f"quick_check={validation.get('quick_check') or 'unknown'} "
+        f"missing_tables_count={len(missing_tables)} "
+        f"missing_columns_count={sum(len(values) for values in missing_columns.values())} "
+        f"missing_indexes_count={len(missing_indexes)} "
+        f"missing_migrations_count={len(missing_migrations)} "
+        f"unexpected_migrations_count={len(unexpected_migrations)} "
+        f"backoff_s={float(_SCHEMA_VALIDATION_BACKOFF_S)} "
+        f"samples={('|'.join(samples) if samples else 'none')}"
+    )
+
+
+def _startup_schema_validation_failed(snapshot: Optional[Dict[str, Any]]) -> bool:
+    snap = dict(snapshot or {})
+    blocking = {str(item) for item in list(snap.get("blocking_gates") or snap.get("blocking_checks") or [])}
+    db_validation = dict(snap.get("db_validation") or {})
+    if "schema_valid" in blocking and db_validation and not bool(db_validation.get("ok", True)):
+        return True
+    gates = dict(snap.get("gates") or snap.get("checks") or {})
+    schema_gate = dict(gates.get("schema_valid") or {}) if isinstance(gates.get("schema_valid"), dict) else {}
+    if schema_gate and not bool(schema_gate.get("ok", True)):
+        return True
+    return False
+
+
+def _condense_startup_validation_for_log(payload: Dict[str, Any]) -> Dict[str, Any]:
+    condensed = dict(payload or {})
+    db_validation = dict(condensed.get("db_validation") or {})
+    if db_validation and not bool(db_validation.get("ok", True)):
+        condensed["db_validation"] = {
+            "ok": False,
+            "summary": _schema_validation_failure_summary(db_validation),
+        }
+    gates = dict(condensed.get("gates") or {})
+    schema_gate = dict(gates.get("schema_valid") or {}) if isinstance(gates.get("schema_valid"), dict) else {}
+    if schema_gate and not bool(schema_gate.get("ok", True)):
+        gates["schema_valid"] = {
+            "ok": False,
+            "component": str(schema_gate.get("component") or "database"),
+            "detail": "postgres_schema_validation_failed",
+        }
+        condensed["gates"] = gates
+        condensed["checks"] = gates
+    return condensed
+
+
+def _sleep_schema_validation_backoff() -> None:
+    if _SCHEMA_VALIDATION_BACKOFF_S > 0:
+        time.sleep(float(_SCHEMA_VALIDATION_BACKOFF_S))
+
+
 def _persist_startup_validation(snapshot: Optional[Dict[str, Any]], *, stage: str, attempt: int, timeout_s: float) -> None:
     payload = _startup_validation_summary(snapshot)
     payload["stage"] = str(stage)
@@ -488,7 +599,7 @@ def _log_startup_validation(stage: str, snapshot: Optional[Dict[str, Any]], *, l
     payload["stage"] = str(stage)
     payload["attempt"] = int(attempt)
     payload["timeout_s"] = float(timeout_s)
-    safe_payload = _redact_for_log(payload)
+    safe_payload = _redact_for_log(_condense_startup_validation_for_log(payload))
     message = "STARTUP_HEALTH_VALIDATION " + json.dumps(safe_payload, default=_json_default, separators=(",", ":"), sort_keys=True)
     log_fn = getattr(LOG, str(level).lower(), LOG.warning)
     log_fn(message)
@@ -553,7 +664,10 @@ def _await_startup_health(*, mode: str, timeout_s: float) -> Dict[str, Any]:
             default=_json_default,
             sort_keys=True,
         )
-        if attempt == 1 or signature != last_signature:
+        schema_validation_failed = _startup_schema_validation_failed(validation)
+        if schema_validation_failed:
+            last_signature = signature
+        elif attempt == 1 or signature != last_signature:
             _log_startup_validation("poll", validation, level="warning", attempt=attempt, timeout_s=timeout_s)
             last_signature = signature
 
@@ -563,6 +677,20 @@ def _await_startup_health(*, mode: str, timeout_s: float) -> Dict[str, Any]:
             return validation
 
         last_validation = validation
+        if schema_validation_failed:
+            _persist_startup_validation(last_validation, stage="failed", attempt=attempt, timeout_s=timeout_s)
+            schema_summary = _schema_validation_failure_summary(dict(last_validation.get("db_validation") or {}))
+            LOG.error("POSTGRES_SCHEMA_VALIDATION_FAILED %s", schema_summary)
+            try:
+                flush_logging_handlers()
+            except Exception as e:
+                _log_swallowed(
+                    "POSTGRES_SCHEMA_VALIDATION_FAILURE_FLUSH_FAILED",
+                    error=str(e),
+                    attempt=int(attempt),
+                )
+            _sleep_schema_validation_backoff()
+            raise RuntimeError("migration_required:" + schema_summary)
         if time.time() >= deadline:
             break
         time.sleep(float(_STARTUP_HEALTH_POLL_S))
@@ -1865,10 +1993,11 @@ def _perform_startup_health_validation(*, mode: str) -> None:
             detail=str(e),
             extra=dict(_STARTUP_TRACE.get("startup_health_validation") or {}),
         )
-        LOG.exception(
-            "STARTUP_HEALTH_VALIDATION_FAILED",
-            extra={"mode": str(mode), "entry": str(_INGESTION_ENTRY)},
-        )
+        if not str(e).startswith("migration_required:postgres_schema_validation_failed"):
+            LOG.exception(
+                "STARTUP_HEALTH_VALIDATION_FAILED",
+                extra={"mode": str(mode), "entry": str(_INGESTION_ENTRY)},
+            )
         raise
 
 
@@ -1953,7 +2082,8 @@ def _start_startup_health_validation_async(*, mode: str) -> threading.Thread:
         try:
             _perform_startup_health_validation(mode=str(mode))
         except Exception as e:
-            _log_swallowed("STARTUP_HEALTH_ASYNC_FATAL", mode=str(mode), error=str(e))
+            if not str(e).startswith("migration_required:postgres_schema_validation_failed"):
+                _log_swallowed("STARTUP_HEALTH_ASYNC_FATAL", mode=str(mode), error=str(e))
             _handle_late_startup_health_validation_failure(
                 e,
                 mode=str(mode),

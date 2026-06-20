@@ -44,6 +44,8 @@ keep_data="${TS_RESTORE_DRILL_KEEP_DATA:-0}"
 allow_direct="${TS_RESTORE_DRILL_ALLOW_DIRECT:-0}"
 start_epoch="$(date +%s)"
 pgbouncer_pidfile="${work_dir}/pgbouncer.pid"
+drill_pidfile="${work_dir}/restore_drill.pid"
+cleanup_done=0
 
 if [ -n "${TS_RESTORE_DOCKER_IMAGE:-}" ] && [ "${TS_RESTORE_DRILL_IN_DOCKER:-0}" != "1" ]; then
   command -v docker >/dev/null 2>&1 || die docker_missing "image=${TS_RESTORE_DOCKER_IMAGE}"
@@ -80,8 +82,13 @@ if [ -n "${TS_RESTORE_DOCKER_IMAGE:-}" ] && [ "${TS_RESTORE_DRILL_IN_DOCKER:-0}"
 fi
 
 mkdir -p "$drill_dir" "$work_dir"
+printf '%s\n' "$$" > "$drill_pidfile"
 
 cleanup() {
+  if [ "$cleanup_done" = "1" ]; then
+    return 0
+  fi
+  cleanup_done=1
   if [ -f "$pgbouncer_pidfile" ]; then
     pid="$(cat "$pgbouncer_pidfile" 2>/dev/null || true)"
     if [ -n "${pid:-}" ]; then
@@ -89,6 +96,7 @@ cleanup() {
       rm -f "$pgbouncer_pidfile"
     fi
   fi
+  rm -f "$drill_pidfile"
   if [ -f "${datadir}/PG_VERSION" ]; then
     "${PGCTL_BIN:-pg_ctl}" -D "$datadir" -m fast stop >/dev/null 2>&1 || true
   fi
@@ -96,6 +104,19 @@ cleanup() {
     rm -rf "$work_dir"
   fi
 }
+
+interrupt_cleanup() {
+  local signal_name="$1"
+  local rc="$2"
+  log warn drill_interrupted "signal=${signal_name} work_dir=${work_dir}"
+  cleanup
+  trap - EXIT INT TERM
+  exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'interrupt_cleanup INT 130' INT
+trap 'interrupt_cleanup TERM 143' TERM
 
 write_report() {
   local rc="$1"
@@ -193,5 +214,4 @@ set -e
 elapsed_s="$(($(date +%s) - start_epoch))"
 write_report "$rc" "$elapsed_s"
 log info drill_report_written "report=${report} exit_code=${rc} elapsed_s=${elapsed_s}"
-cleanup
 exit "$rc"

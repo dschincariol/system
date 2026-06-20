@@ -996,6 +996,7 @@ install_backup_scripts() {
     base_backup.sh \
     state_snapshot.sh \
     artifact_snapshot.sh \
+    accounting.sh \
     prune.sh \
     restore.sh \
     restore_drill.sh \

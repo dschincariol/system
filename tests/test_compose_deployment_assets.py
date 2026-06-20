@@ -25,6 +25,28 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:?set OPERATOR_API_TOKEN}", text)
         self.assertIn("docker-compose.external-services.yml", (REPO_ROOT / "deploy" / "compose" / "README.md").read_text(encoding="utf-8"))
 
+    def test_compose_services_use_capped_logs_and_bounded_restarts(self) -> None:
+        stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
+        external_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.external-services.yml").read_text(encoding="utf-8")
+        env_text = (REPO_ROOT / "deploy" / "compose" / ".env.example").read_text(encoding="utf-8")
+
+        combined = stack_text + "\n" + external_text
+        self.assertNotIn("restart: unless-stopped", combined)
+        self.assertIn("driver: local", stack_text)
+        self.assertIn("driver: local", external_text)
+        self.assertIn('max-size: "${DOCKER_LOG_MAX_SIZE:-50m}"', combined)
+        self.assertIn('max-file: "${DOCKER_LOG_MAX_FILE:-5}"', combined)
+        self.assertEqual(stack_text.count("logging: *trading-logging"), 2)
+        self.assertEqual(external_text.count("logging: *trading-logging"), 4)
+        self.assertIn('restart: "on-failure:${DOCKER_RESTART_MAX_ATTEMPTS:-5}"', combined)
+        self.assertIn("restart_policy: *trading-restart-policy", combined)
+        self.assertIn("max_attempts: ${DOCKER_RESTART_MAX_ATTEMPTS:-5}", combined)
+
+        self.assertIn("DOCKER_LOG_MAX_SIZE=50m", env_text)
+        self.assertIn("DOCKER_LOG_MAX_FILE=5", env_text)
+        self.assertIn("DOCKER_RESTART_MAX_ATTEMPTS=5", env_text)
+        self.assertIn("TRADING_SCHEMA_VALIDATION_BACKOFF_S=30", env_text)
+
     def test_compose_dockerfiles_and_ignore_exist(self) -> None:
         runtime_dockerfile = REPO_ROOT / "deploy" / "compose" / "Dockerfile.runtime"
         operator_dockerfile = REPO_ROOT / "deploy" / "compose" / "Dockerfile.operator"
@@ -97,12 +119,17 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         base_backup = (REPO_ROOT / "ops" / "backup" / "base_backup.sh").read_text(encoding="utf-8")
         restore_drill = (REPO_ROOT / "ops" / "backup" / "restore_drill.sh").read_text(encoding="utf-8")
         installer = (REPO_ROOT / "ops" / "server" / "install_backup_evidence_gate.sh").read_text(encoding="utf-8")
+        bootstrap = (REPO_ROOT / "ops" / "server" / "bootstrap.sh").read_text(encoding="utf-8")
+        verify = (REPO_ROOT / "ops" / "server" / "verify.sh").read_text(encoding="utf-8")
 
         self.assertIn("TS_BACKUP_DOCKER_IMAGE", base_backup)
         self.assertIn("TS_BACKUP_DOCKER_EXEC_CONTAINER", base_backup)
         self.assertIn("TS_RESTORE_DOCKER_IMAGE", restore_drill)
         self.assertIn("--compose", installer)
         self.assertIn("install_compose_systemd_overrides", installer)
+        self.assertIn("accounting.sh", installer)
+        self.assertIn("accounting.sh", bootstrap)
+        self.assertIn("accounting.sh", verify)
 
     def test_runtime_compose_exposes_provider_and_broker_contract(self) -> None:
         stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")

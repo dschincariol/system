@@ -80,6 +80,16 @@ class StartupHealthValidationTests(unittest.TestCase):
         os.environ["TRADING_STARTUP_HEALTH_ASYNC_BIND"] = "1"
         os.environ["TRADING_STARTUP_HEALTH_FAIL_OPEN"] = "0"
         os.environ["TS_PG_SCHEMA_PER_DB_PATH"] = "1"
+        os.environ["KILL_SWITCH_MODEL_MAX_DRAWDOWN"] = "0"
+        os.environ["KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES"] = "0"
+        os.environ["KILL_SWITCH_MODEL_LOOKBACK_ROWS"] = "250"
+        os.environ["PORTFOLIO_RISK_VOL_HARD_BLOCK"] = "0"
+        os.environ["PORTFOLIO_RISK_MC_VAR_95_BLOCK"] = "0"
+        os.environ["PORTFOLIO_RISK_MC_VAR_99_BLOCK"] = "0"
+        os.environ["PORTFOLIO_RISK_MC_CVAR_95_BLOCK"] = "0"
+        os.environ["PORTFOLIO_RISK_MC_CVAR_99_BLOCK"] = "0"
+        os.environ["PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK"] = "0"
+        os.environ["PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK"] = "0"
         _reload_modules("engine.runtime.db_guard", "engine.runtime.storage")
 
     def test_startup_db_repair_retries_transient_sqlite_lock(self) -> None:
@@ -1510,6 +1520,72 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertFalse(bool(schema_gate["ok"]))
         self.assertIn("missing_columns={'prices': ['source']}", str(schema_gate.get("detail") or ""))
         self.assertIn("missing_indexes=['idx_prices_symbol_ts']", str(schema_gate.get("detail") or ""))
+
+    def test_startup_schema_validation_failure_logs_condensed_backoff_and_exits(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+        start_system._SCHEMA_VALIDATION_BACKOFF_S = 0.25
+        missing_indexes = [f"idx_schema_{idx}" for idx in range(20)]
+        validation = {
+            "ok": False,
+            "mode": "safe",
+            "blocking_checks": ["schema_valid"],
+            "blocking_gates": ["schema_valid"],
+            "critical_systems_missing": ["database"],
+            "reasons": ["startup_schema_invalid"],
+            "checks": {
+                "schema_valid": {
+                    "ok": False,
+                    "component": "database",
+                    "detail": "postgres_schema_validation_failed",
+                }
+            },
+            "gates": {
+                "schema_valid": {
+                    "ok": False,
+                    "component": "database",
+                    "detail": "postgres_schema_validation_failed",
+                }
+            },
+            "db_validation": {
+                "ok": False,
+                "missing_tables": [],
+                "missing_columns": {},
+                "missing_indexes": missing_indexes,
+                "schema_version": 63,
+                "expected_schema_version": 20,
+                "schema_version_ok": False,
+                "schema_status": "unexpected_migrations",
+                "schema_migration_unexpected_ids": list(range(21, 64)),
+                "quick_check": "not_applicable",
+            },
+            "ts_ms": int(time.time() * 1000),
+        }
+        health_snapshot = {
+            "ok": False,
+            "startup_validation": validation,
+            "reasons": ["startup_schema_invalid"],
+            "ts_ms": int(time.time() * 1000),
+        }
+
+        with patch("engine.runtime.health.get_health_snapshot", return_value=health_snapshot):
+            with patch.object(start_system.LOG, "error") as log_error:
+                with patch.object(start_system, "flush_logging_handlers", return_value=None):
+                    with patch.object(start_system.time, "sleep") as sleep:
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "migration_required:postgres_schema_validation_failed",
+                        ):
+                            start_system._await_startup_health(mode="safe", timeout_s=60.0)
+
+        log_error.assert_called_once()
+        rendered = " ".join(str(arg) for arg in log_error.call_args[0])
+        self.assertIn("POSTGRES_SCHEMA_VALIDATION_FAILED", rendered)
+        self.assertIn("actual_schema_version=63", rendered)
+        self.assertIn("expected_schema_version=20", rendered)
+        self.assertIn("unexpected_migrations_count=43", rendered)
+        self.assertIn("+14_more", rendered)
+        self.assertNotIn("idx_schema_19", rendered)
+        sleep.assert_called_once_with(0.25)
 
     def test_startup_config_rejects_fail_open_and_requires_async_bind(self) -> None:
         (startup_gates,) = _reload_modules("engine.runtime.startup_gates")

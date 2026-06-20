@@ -1,8 +1,23 @@
+x-trading-logging: &trading-logging
+  driver: local
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-50m}"
+    max-file: "${DOCKER_LOG_MAX_FILE:-5}"
+
+x-trading-restart-policy: &trading-restart-policy
+  condition: on-failure
+  delay: "${DOCKER_RESTART_DELAY:-10s}"
+  max_attempts: ${DOCKER_RESTART_MAX_ATTEMPTS:-5}
+  window: "${DOCKER_RESTART_WINDOW:-120s}"
+
 services:
   timescaledb:
     image: ${TIMESCALE_IMAGE:?set TIMESCALE_IMAGE}
     container_name: trading-timescaledb
-    restart: unless-stopped
+    restart: "on-failure:${DOCKER_RESTART_MAX_ATTEMPTS:-5}"
+    logging: *trading-logging
+    deploy:
+      restart_policy: *trading-restart-policy
     environment:
       POSTGRES_DB: ${TIMESCALE_DB:-trading}
       POSTGRES_USER: ${TIMESCALE_USER:-trading}
@@ -36,7 +51,10 @@ services:
   redis:
     image: ${REDIS_IMAGE:?set REDIS_IMAGE}
     container_name: trading-redis
-    restart: unless-stopped
+    restart: "on-failure:${DOCKER_RESTART_MAX_ATTEMPTS:-5}"
+    logging: *trading-logging
+    deploy:
+      restart_policy: *trading-restart-policy
     command:
       - redis-server
       - --appendonly
@@ -61,7 +79,10 @@ services:
   minio:
     image: ${MINIO_IMAGE:?set MINIO_IMAGE}
     container_name: trading-minio
-    restart: unless-stopped
+    restart: "on-failure:${DOCKER_RESTART_MAX_ATTEMPTS:-5}"
+    logging: *trading-logging
+    deploy:
+      restart_policy: *trading-restart-policy
     command:
       - server
       - /data
@@ -82,6 +103,7 @@ services:
     image: ${MINIO_CLIENT_IMAGE:?set MINIO_CLIENT_IMAGE}
     container_name: trading-minio-init
     restart: "no"
+    logging: *trading-logging
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}

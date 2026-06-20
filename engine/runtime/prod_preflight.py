@@ -91,6 +91,93 @@ def _split_names(raw: str) -> List[str]:
     return [part.strip() for part in re.split(r"[\s,]+", str(raw or "")) if part.strip()]
 
 
+def _short_list(values: List[str], *, limit: int = 6) -> str:
+    items = [str(item) for item in values if str(item).strip()]
+    if len(items) <= limit:
+        return ",".join(items)
+    return ",".join(items[:limit]) + f",+{len(items) - limit}_more"
+
+
+def _short_mapping(values: Dict[str, List[str]], *, table_limit: int = 4, value_limit: int = 4) -> str:
+    rendered: List[str] = []
+    for idx, (table, columns) in enumerate(sorted(values.items())):
+        if idx >= table_limit:
+            rendered.append(f"+{len(values) - table_limit}_more_tables")
+            break
+        column_values = [str(column) for column in list(columns or []) if str(column).strip()]
+        if len(column_values) > value_limit:
+            column_text = ",".join(column_values[:value_limit]) + f",+{len(column_values) - value_limit}_more"
+        else:
+            column_text = ",".join(column_values)
+        rendered.append(f"{table}({column_text})")
+    return ";".join(rendered)
+
+
+def _schema_validation_failure_summary(validation: Dict[str, Any]) -> str:
+    missing_tables = [str(item) for item in list(validation.get("missing_tables") or []) if str(item).strip()]
+    missing_columns = {
+        str(table): [str(column) for column in list(columns or []) if str(column).strip()]
+        for table, columns in dict(validation.get("missing_columns") or validation.get("missing_cols") or {}).items()
+        if str(table).strip()
+    }
+    missing_indexes = [str(item) for item in list(validation.get("missing_indexes") or []) if str(item).strip()]
+    missing_migration_ids = [
+        str(item)
+        for item in list(validation.get("schema_migration_missing_ids") or [])
+        if str(item).strip()
+    ]
+    unexpected_migration_ids = [
+        str(item)
+        for item in list(validation.get("schema_migration_unexpected_ids") or [])
+        if str(item).strip()
+    ]
+    samples: List[str] = []
+    if missing_tables:
+        samples.append(f"missing_tables={_short_list(sorted(missing_tables))}")
+    if missing_columns:
+        samples.append(f"missing_columns={_short_mapping(missing_columns)}")
+    if missing_indexes:
+        samples.append(f"missing_indexes={_short_list(sorted(missing_indexes))}")
+    if missing_migration_ids:
+        samples.append(f"missing_migrations={_short_list(sorted(missing_migration_ids))}")
+    if unexpected_migration_ids:
+        samples.append(f"unexpected_migrations={_short_list(sorted(unexpected_migration_ids))}")
+
+    return (
+        "postgres_schema_validation_failed "
+        "migration_required=1 "
+        f"actual_schema_version={validation.get('schema_version')} "
+        f"expected_schema_version={validation.get('expected_schema_version')} "
+        f"schema_status={validation.get('schema_status') or 'unknown'} "
+        f"schema_version_ok={int(bool(validation.get('schema_version_ok', False)))} "
+        f"quick_check={validation.get('quick_check') or 'unknown'} "
+        f"missing_tables_count={len(missing_tables)} "
+        f"missing_columns_count={sum(len(v) for v in missing_columns.values())} "
+        f"missing_indexes_count={len(missing_indexes)} "
+        f"missing_migrations_count={len(missing_migration_ids)} "
+        f"unexpected_migrations_count={len(unexpected_migration_ids)} "
+        f"samples={('|'.join(samples) if samples else 'none')}"
+    )
+
+
+def _schema_validation_backoff_s() -> float:
+    raw = str(
+        os.environ.get("PROD_PREFLIGHT_SCHEMA_FAILURE_BACKOFF_S")
+        or os.environ.get("TRADING_SCHEMA_VALIDATION_BACKOFF_S")
+        or "0"
+    ).strip()
+    try:
+        return max(0.0, min(600.0, float(raw)))
+    except Exception:
+        return 0.0
+
+
+def _sleep_schema_validation_backoff() -> None:
+    backoff_s = _schema_validation_backoff_s()
+    if backoff_s > 0:
+        time.sleep(backoff_s)
+
+
 def _dsn_user(conninfo: str) -> str:
     match = _DSN_USER_RE.search(str(conninfo or ""))
     if not match:
@@ -543,38 +630,7 @@ def _verify_postgres_contract() -> Tuple[List[str], List[str], Dict[str, Any]]:
         )
         return notes, errors, validation
 
-    missing_tables = [str(item) for item in list(validation.get("missing_tables") or []) if str(item).strip()]
-    missing_columns = {
-        str(table): [str(column) for column in list(columns or []) if str(column).strip()]
-        for table, columns in dict(validation.get("missing_columns") or validation.get("missing_cols") or {}).items()
-        if str(table).strip()
-    }
-    missing_indexes = [str(item) for item in list(validation.get("missing_indexes") or []) if str(item).strip()]
-    schema_version = validation.get("schema_version")
-    expected_schema_version = validation.get("expected_schema_version")
-    schema_version_ok = bool(validation.get("schema_version_ok", False))
-    schema_status = str(validation.get("schema_status") or "")
-    quick_check = str(validation.get("quick_check") or "")
-
-    if missing_tables:
-        errors.append("postgres contract invalid missing tables: " + ",".join(sorted(missing_tables)))
-    if missing_columns:
-        rendered_missing_columns = "; ".join(
-            f"{table}({','.join(sorted(columns))})"
-            for table, columns in sorted(missing_columns.items())
-        )
-        errors.append(f"postgres contract invalid missing columns: {rendered_missing_columns}")
-    if missing_indexes:
-        errors.append("postgres contract invalid missing indexes: " + ",".join(sorted(missing_indexes)))
-    if not schema_version_ok:
-        errors.append(
-            "postgres contract invalid schema version: "
-            f"actual={schema_version} expected={expected_schema_version} status={schema_status}"
-        )
-    if quick_check.lower() not in {"ok", "not_applicable"}:
-        errors.append(f"postgres contract invalid quick_check={quick_check or 'unknown'}")
-    if not errors:
-        errors.append("postgres contract invalid")
+    errors.append(_schema_validation_failure_summary(validation))
 
     return notes, errors, validation
 
@@ -602,6 +658,120 @@ def _check_external_services() -> Tuple[List[str], List[str], List[str], List[Di
         list(summary.get("errors") or []),
         [dict(item) for item in list(summary.get("services") or []) if isinstance(item, dict)],
     )
+
+
+def _docker_log_cap_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    state: Dict[str, Any] = {"checked": False, "containers": []}
+
+    explicit_check = str(os.environ.get("PREFLIGHT_CHECK_DOCKER_LOG_CAPS") or "").strip()
+    strict_runtime = str(os.environ.get("ENV") or "").strip().lower() in {"prod", "production"} or str(
+        os.environ.get("ENGINE_MODE") or ""
+    ).strip().lower() == "live"
+    if explicit_check:
+        check_enabled = _env_truthy("PREFLIGHT_CHECK_DOCKER_LOG_CAPS", True)
+    else:
+        check_enabled = bool(strict_runtime)
+    if not check_enabled:
+        notes.append("docker log cap check skipped")
+        state["reason"] = "disabled"
+        return notes, warnings, errors, state
+
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        warnings.append("docker log cap check skipped: docker CLI unavailable")
+        state["reason"] = "docker_cli_unavailable"
+        return notes, warnings, errors, state
+
+    try:
+        timeout_s = max(0.5, min(30.0, float(os.environ.get("PREFLIGHT_DOCKER_LOG_CAP_TIMEOUT_S", "5") or "5")))
+    except Exception:
+        timeout_s = 5.0
+    try:
+        ps = subprocess.run(
+            [docker_bin, "ps", "-q"],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except Exception as exc:
+        warnings.append(f"docker log cap check skipped: docker ps failed: {type(exc).__name__}: {exc}")
+        state["reason"] = "docker_ps_failed"
+        return notes, warnings, errors, state
+
+    if int(ps.returncode or 0) != 0:
+        warnings.append(f"docker log cap check skipped: docker ps rc={ps.returncode}")
+        state["reason"] = "docker_ps_nonzero"
+        state["stderr"] = str(ps.stderr or "")[-1000:]
+        return notes, warnings, errors, state
+
+    container_ids = [line.strip() for line in str(ps.stdout or "").splitlines() if line.strip()]
+    state["checked"] = True
+    if not container_ids:
+        notes.append("docker log caps ok running_containers=0")
+        return notes, warnings, errors, state
+
+    try:
+        inspected = subprocess.run(
+            [docker_bin, "inspect", *container_ids],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except Exception as exc:
+        errors.append(f"docker log cap validation failed: docker inspect failed: {type(exc).__name__}: {exc}")
+        state["reason"] = "docker_inspect_failed"
+        return notes, warnings, errors, state
+
+    if int(inspected.returncode or 0) != 0:
+        errors.append(f"docker log cap validation failed: docker inspect rc={inspected.returncode}")
+        state["reason"] = "docker_inspect_nonzero"
+        state["stderr"] = str(inspected.stderr or "")[-1000:]
+        return notes, warnings, errors, state
+
+    try:
+        objects = list(json.loads(inspected.stdout or "[]") or [])
+    except Exception as exc:
+        errors.append(f"docker log cap validation failed: inspect JSON invalid: {type(exc).__name__}: {exc}")
+        state["reason"] = "docker_inspect_invalid_json"
+        return notes, warnings, errors, state
+
+    uncapped: List[str] = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        name = str(obj.get("Name") or obj.get("Id") or "unknown").lstrip("/")
+        log_config = dict(dict(obj.get("HostConfig") or {}).get("LogConfig") or {})
+        driver = str(log_config.get("Type") or "").strip()
+        config = dict(log_config.get("Config") or {})
+        max_size = str(config.get("max-size") or "").strip()
+        max_file = str(config.get("max-file") or "").strip()
+        capped = bool(driver in {"local", "json-file"} and max_size and max_file)
+        state["containers"].append(
+            {
+                "name": name,
+                "driver": driver,
+                "max_size": max_size,
+                "max_file": max_file,
+                "capped": capped,
+            }
+        )
+        if not capped:
+            uncapped.append(f"{name}:driver={driver or 'unknown'}")
+
+    if uncapped:
+        errors.append("docker log caps invalid uncapped_containers=" + ",".join(uncapped))
+    else:
+        notes.append(f"docker log caps ok running_containers={len(state['containers'])}")
+    return notes, warnings, errors, state
 
 
 def _backup_restore_evidence_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
@@ -877,6 +1047,7 @@ def main() -> int:
         "db_validation": {},
         "external_services": [],
         "backup_restore_evidence": {},
+        "docker_log_caps": {},
         "provisioning": {},
     }
 
@@ -916,6 +1087,19 @@ def main() -> int:
                 print("[api-auth]", error)
         return 3
 
+    docker_notes, docker_warnings, docker_errors, docker_state = _docker_log_cap_gate()
+    result["steps"].extend(docker_notes)
+    result["warnings"].extend(docker_warnings)
+    result["docker_log_caps"] = dict(docker_state or {})
+    if docker_errors:
+        result["errors"].extend(docker_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in docker_errors:
+                print("[docker-log]", error)
+        return 3
+
     comp_errs = _compile_files(KEY_FILES)
     if comp_errs:
         result["errors"] = list(result["errors"]) + comp_errs
@@ -943,6 +1127,7 @@ def main() -> int:
     result["db_validation"] = dict(validation or {})
     if validation_errors:
         result["errors"].extend(validation_errors)
+        _sleep_schema_validation_backoff()
         if args.json:
             print(json.dumps(result, separators=(",", ":"), sort_keys=True))
         else:

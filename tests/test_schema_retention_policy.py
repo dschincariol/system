@@ -50,3 +50,19 @@ def test_compliance_ledger_has_no_retention_policy() -> None:
             """
         ).fetchall()
         assert rows == []
+
+
+def test_backup_retention_scripts_are_capacity_aware() -> None:
+    prune = (ROOT / "ops" / "backup" / "prune.sh").read_text(encoding="utf-8")
+    accounting = (ROOT / "ops" / "backup" / "accounting.sh").read_text(encoding="utf-8")
+    runbook = (ROOT / "docs" / "DISK_RETENTION_RUNBOOK.md").read_text(encoding="utf-8")
+
+    for text in (prune, accounting, runbook):
+        assert "TS_BACKUP_MAX_BYTES" in text
+        assert "observed_wal_bytes_per_day" in text
+
+    assert "backup_over_budget" in prune
+    assert "backup_capacity_preflight_failed" in prune
+    assert "TS_BACKUP_ENFORCE_BUDGET" in prune
+    assert "TS_RESTORE_DRILL_WORK_TTL_DAYS" in prune
+    assert "projected_days_to_full" in accounting
