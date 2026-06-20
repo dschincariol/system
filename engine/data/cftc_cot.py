@@ -24,7 +24,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import requests

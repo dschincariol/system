@@ -388,6 +388,8 @@ def persist_symbolic_alpha_candidate(
     inserted: Dict[str, Any] = {"id": 0}
 
     def _write(con) -> int:
+        from engine.strategy.experiment_ledger import record_experiment_ledger
+
         _ensure_symbolic_alpha_schema(con)
         cur = con.execute(
             """
@@ -408,6 +410,32 @@ def persist_symbolic_alpha_candidate(
             ),
         )
         inserted["id"] = int(cur.lastrowid or 0)
+        record_experiment_ledger(
+            con=con,
+            ts=int(now_ms),
+            candidate_key=str(feature_id),
+            candidate_name=str(feature_id),
+            candidate_version=str(inserted["id"] or 0),
+            candidate_type="symbolic_factor",
+            source="symbolic_alpha",
+            feature_ids=[str(feature_id), *[str(fid) for fid in list(validated["source_feature_ids"] or [])]],
+            search_space={
+                "allowed_operators": list(validated["allowed_operators"]),
+                "max_complexity": int(symbolic_alpha_max_complexity()),
+                "max_expressions": int(symbolic_alpha_max_expressions()),
+                "expression_text": str(validated["expression_text"]),
+            },
+            trial_budget=int(symbolic_alpha_max_expressions()),
+            trial_count=1,
+            redundancy={"checked": True, "method": "feature_id_dedup"},
+            evidence={
+                "score": (_safe_float(score) if score is not None else None),
+                "diagnostics": dict(diag),
+            },
+            promotion_decision=("accepted" if str(status or "accepted") == "accepted" else str(status or "pending")),
+            status=str(status or "accepted"),
+            diagnostics={"symbolic_alpha_candidate_id": int(inserted["id"] or 0), **dict(diag)},
+        )
         return int(inserted["id"])
 
     run_write_txn(_write, table="symbolic_alpha_candidates", operation="persist_symbolic_alpha_candidate")

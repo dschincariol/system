@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from engine.execution.deployable_capital import compute_deployable_equity
+from engine.execution.options_readiness import force_options_shadow_intent
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.metrics import emit_timing
 from engine.runtime.state_cache import cache_get_or_load
@@ -765,6 +766,7 @@ def _load_pending_shadow_execution_intents(
                 continue
             intent["qty"] = float(signed_qty)
 
+        intent = force_options_shadow_intent(intent)
         intents.append(intent)
 
     return intents
@@ -1561,6 +1563,26 @@ def _apply_decision_gate(
     *,
     exposure_context: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    live_decision_state: Dict[str, Any] = {}
+    try:
+        from engine.runtime.live_ai_safety import live_decision_gate_snapshot
+
+        live_decision_state = live_decision_gate_snapshot(
+            execution_mode=os.environ.get("EXECUTION_MODE", ""),
+            broker=os.environ.get("BROKER") or os.environ.get("BROKER_NAME") or os.environ.get("LIVE_BROKER") or "",
+            decision_engine=DEFAULT_DECISION_ENGINE,
+        )
+        if bool(live_decision_state.get("required")) and not bool(live_decision_state.get("ok")):
+            blockers = ",".join(str(item) for item in list(live_decision_state.get("blockers") or []))
+            raise RuntimeError(f"live_decision_gate_failed:{blockers}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        live_context = str(os.environ.get("EXECUTION_MODE") or os.environ.get("ENGINE_MODE") or "").strip().lower() == "live"
+        if live_context:
+            raise RuntimeError(f"live_decision_gate_check_failed:{type(e).__name__}:{e}") from e
+        live_decision_state = {"required": False, "ok": True, "reason": "check_unavailable_non_live"}
+
     if DEFAULT_DECISION_ENGINE is None:
         return list(intents or []), [], {"enabled": False, "reason": "decision_engine_unavailable"}
     if not bool(getattr(DEFAULT_DECISION_ENGINE, "enabled", False)):
@@ -1603,6 +1625,10 @@ def _apply_decision_gate(
                 or {}
             )
         except Exception as e:
+            if bool(live_decision_state.get("required")):
+                raise RuntimeError(
+                    f"live_decision_gate_evaluation_failed:{type(e).__name__}:{e}"
+                ) from e
             _warn_nonfatal(
                 "portfolio_execution_intents_decision_gate_failed",
                 "PORTFOLIO_EXECUTION_INTENTS_DECISION_GATE_FAILED",
@@ -1642,6 +1668,7 @@ def _apply_decision_gate(
         "allowed": int(max(0, evaluated - len(shadowed))),
         "open_positions_start": int(max(0, int((exposure_context.get("open_positions") or 0)))),
         "open_positions_end": int(max(0, int(projected_open_positions))),
+        "live_decision_gate": dict(live_decision_state or {}),
     }
 
 
@@ -1859,6 +1886,8 @@ def load_latest_execution_intents(
             if execution_target != "shadow" and bool((competition_policy or {}).get("blocked")):
                 execution_target = "shadow"
             intent["execution_target"] = str(execution_target)
+            intent = force_options_shadow_intent(intent)
+            execution_target = str(intent.get("execution_target") or "real").strip().lower()
 
             skew_z = _factor_value("options.skew_25d_z", int(ts_ref))
             flow_z = _factor_value("flows.index_constituent_imbalance_z", int(ts_ref))
@@ -1902,6 +1931,54 @@ def load_latest_execution_intents(
                     or (competition_policy or {}).get("model_weight")
                     or 1.0
                 )
+            try:
+                from_w0 = float(intent.get("from_weight") or 0.0)
+            except Exception:
+                from_w0 = 0.0
+
+            learned_alpha_adjustment: Dict[str, Any] = {
+                "available": False,
+                "blocked": False,
+                "size_multiplier": 1.0,
+                "reason": "not_evaluated",
+            }
+            if execution_target == "real":
+                try:
+                    from engine.strategy.learned_alpha_decay import portfolio_adjustment_for_intent
+
+                    signal_age_ms = max(0, int(ts_ref) - int(intent.get("signal_ts_ms") or ts_ref))
+                    learned_alpha_adjustment = portfolio_adjustment_for_intent(
+                        con,
+                        intent,
+                        signal_age_ms=int(signal_age_ms),
+                        now_ms=int(ts_ref),
+                    )
+                    learned_size_raw = learned_alpha_adjustment.get("size_multiplier")
+                    learned_size_mult = max(
+                        0.0,
+                        min(1.0, float(1.0 if learned_size_raw is None else learned_size_raw)),
+                    )
+                    risk_increasing_intent = abs(float(base_to_w)) > abs(float(from_w0)) + 1e-12
+                    if bool(learned_alpha_adjustment.get("blocked")) and bool(risk_increasing_intent):
+                        final_mult = 0.0
+                        intent["learned_alpha_block_reason"] = str(
+                            learned_alpha_adjustment.get("reason") or "learned_alpha_blocked"
+                        )
+                        intent["competition"]["blocked"] = True
+                        intent["competition"]["allowed"] = False
+                        intent["competition"]["reason"] = str(intent["learned_alpha_block_reason"])
+                    elif bool(risk_increasing_intent):
+                        final_mult *= float(learned_size_mult)
+                    intent["learned_alpha_decay"] = dict(learned_alpha_adjustment)
+                except Exception as e:
+                    _warn_nonfatal(
+                        "portfolio_execution_intents_learned_alpha_failed",
+                        "PORTFOLIO_EXECUTION_INTENTS_LEARNED_ALPHA_FAILED",
+                        e,
+                        warn_key=f"portfolio_execution_intents_learned_alpha_failed:{intent.get('source_order_id')}",
+                        source_order_id=int(intent.get("source_order_id") or 0),
+                        symbol=str(sym),
+                    )
             final_to_w = float(base_to_w) * float(final_mult)
 
             if execution_target == "real" and bool((competition_policy or {}).get("blocked")):
@@ -1914,10 +1991,6 @@ def load_latest_execution_intents(
                 risk_limit_mult = float((competition_policy or {}).get("risk_limit_multiplier") or 1.0)
                 max_abs_weight = max(0.01, abs(float(base_to_w)) * max(0.25, risk_limit_mult))
                 final_to_w = _clamp(final_to_w, -max_abs_weight, max_abs_weight)
-            try:
-                from_w0 = float(intent.get("from_weight") or 0.0)
-            except Exception:
-                from_w0 = 0.0
 
             # ------------------------------------------------------------
             # Hard capital enforcement: clamp/zero intents when the current
@@ -2074,6 +2147,7 @@ def load_latest_execution_intents(
                 "earnings_decay": float(earnings_decay),
                 "earnings_mult": float(earnings_mult),
                 "final_mult": float(final_mult),
+                "learned_alpha": dict(learned_alpha_adjustment),
             }
 
             intents.append(intent)

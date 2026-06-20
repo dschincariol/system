@@ -18,6 +18,13 @@ import torch
 import torch.nn as nn
 from engine.artifacts.store import LocalArtifactStore
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.hardware import (
+    apply_cpu_first_runtime_defaults,
+    log_runtime_hardware_diagnostics,
+    resolve_torch_device,
+    torch_device_is_cuda,
+)
+from engine.runtime.torch_threads import configure_torch_thread_pools
 
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -42,21 +49,40 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
         persist=False,
     )
 
-# Prediction also defaults to CPU to avoid surprising resource contention in the
-# live runtime.
-if os.environ.get("TEMPORAL_USE_CUDA", "0") != "1":
-    try:
-        torch.set_default_device("cpu")
-    except Exception as e:
-        _warn_nonfatal("TEMPORAL_PREDICTOR_SET_DEFAULT_DEVICE_FAILED", e, once_key="set_default_device_cpu")
+# Prediction uses the same CPU-first device resolver as live event processing.
+# TEMPORAL_USE_CUDA remains a legacy request flag, but it cannot select CUDA
+# unless the explicit runtime/dependency profiles and torch support validate it.
+apply_cpu_first_runtime_defaults()
+_TEMPORAL_DEVICE_RESOLUTION = resolve_torch_device(
+    torch,
+    env_var="TEMPORAL_DEVICE",
+    fallback_envs=("TORCH_DEVICE",),
+    legacy_cuda_flag="TEMPORAL_USE_CUDA",
+)
+_CUDA_RUNTIME_ENABLED = torch_device_is_cuda(torch, _TEMPORAL_DEVICE_RESOLUTION)
+try:
+    torch.set_default_device(_TEMPORAL_DEVICE_RESOLUTION.resolved)
+except Exception as e:
+    _warn_nonfatal(
+        "TEMPORAL_PREDICTOR_SET_DEFAULT_DEVICE_FAILED",
+        e,
+        once_key="set_default_device",
+        requested=_TEMPORAL_DEVICE_RESOLUTION.requested,
+        resolved=_TEMPORAL_DEVICE_RESOLUTION.resolved,
+        disabled_accelerator_reason=_TEMPORAL_DEVICE_RESOLUTION.disabled_accelerator_reason,
+    )
 
 # Optional: cap CPU threads (helps overall system stability under load)
-try:
-    _threads = int(os.environ.get("TORCH_NUM_THREADS", "0"))
-    if _threads > 0:
-        torch.set_num_threads(_threads)
-except Exception as e:
-    _warn_nonfatal("TEMPORAL_PREDICTOR_SET_NUM_THREADS_FAILED", e, once_key="set_num_threads")
+_thread_config = configure_torch_thread_pools(torch)
+if _thread_config.get("reason") == "failed":
+    _warn_nonfatal(
+        "TEMPORAL_PREDICTOR_TORCH_THREAD_CONFIG_FAILED",
+        _thread_config["error"],
+        once_key="torch_thread_config",
+        cpu_threads=int(_thread_config.get("cpu_threads") or 0),
+        interop_threads=int(_thread_config.get("interop_threads") or 0),
+    )
+log_runtime_hardware_diagnostics(LOGGER, torch_module=torch, component="engine.strategy.temporal_predictor")
 
 from engine.runtime.storage import connect
 from engine.data.asset_map import asset_class_for_symbol
@@ -92,7 +118,11 @@ except Exception as e:
 
 try:
     torch.backends.cudnn.deterministic = _DET
-    torch.backends.cudnn.benchmark = (not _DET) and (os.environ.get("CUDNN_BENCHMARK", "1") == "1")
+    torch.backends.cudnn.benchmark = (
+        _CUDA_RUNTIME_ENABLED
+        and (not _DET)
+        and (os.environ.get("CUDNN_BENCHMARK", "0") == "1")
+    )
 except Exception as e:
     _warn_nonfatal("TEMPORAL_PREDICTOR_CUDNN_CONFIG_FAILED", e, once_key="cudnn_config")
 
@@ -101,14 +131,15 @@ try:
     torch.set_float32_matmul_precision(os.environ.get("TORCH_MATMUL_PRECISION", "high"))
 except Exception as e:
     _warn_nonfatal("TEMPORAL_PREDICTOR_MATMUL_PRECISION_FAILED", e, once_key="matmul_precision")
-try:
-    torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "1") == "1"
-except Exception as e:
-    _warn_nonfatal("TEMPORAL_PREDICTOR_CUDA_TF32_CONFIG_FAILED", e, once_key="cuda_tf32")
-try:
-    torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "1") == "1"
-except Exception as e:
-    _warn_nonfatal("TEMPORAL_PREDICTOR_CUDNN_TF32_CONFIG_FAILED", e, once_key="cudnn_tf32")
+if _CUDA_RUNTIME_ENABLED:
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "0") == "1"
+    except Exception as e:
+        _warn_nonfatal("TEMPORAL_PREDICTOR_CUDA_TF32_CONFIG_FAILED", e, once_key="cuda_tf32")
+    try:
+        torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "0") == "1"
+    except Exception as e:
+        _warn_nonfatal("TEMPORAL_PREDICTOR_CUDNN_TF32_CONFIG_FAILED", e, once_key="cudnn_tf32")
 
 
 # -------------            -- ------------------------------------------------------

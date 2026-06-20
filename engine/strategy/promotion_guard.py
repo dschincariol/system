@@ -20,12 +20,14 @@ from engine.runtime.storage import (
     fetch_latest_backtest_cpcv_run,
     init_db,
     record_hypothesis_result,
+    table_exists,
 )
 from engine.strategy.cpcv import cpcv_config_from_env
 from engine.strategy.statistical_gates import (
     passes_promotion_gate,
     promotion_gate_config_from_env,
 )
+from engine.strategy.deconfounded_promotion import validate_deconfounded_signal
 from engine.strategy.promotion_audit import record_statistical_evidence
 from engine.strategy.feature_neutralization import (
     extract_feature_rows,
@@ -111,15 +113,7 @@ def _warn_nonfatal(event: str, error: BaseException, **extra: Any) -> None:
 
 
 def _table_exists(con, table_name: str) -> bool:
-    try:
-        row = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-            (str(table_name),),
-        ).fetchone()
-        return bool(row)
-    except Exception as e:
-        _warn_nonfatal("promotion_guard_table_exists_failed", e, table_name=str(table_name))
-        return False
+    return bool(table_exists(con, str(table_name)))
 
 
 def _warn_state(event: str, message: str, **extra: Any) -> None:
@@ -683,6 +677,145 @@ def _pool_contribution_gates(
     return corr_payload, mpc_payload, bool(corr_passed and bool(mpc_payload.get("passed")))
 
 
+def _payload_value(payload: Any, *keys: str) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        if key in payload and payload.get(key) is not None:
+            return payload.get(key)
+    return None
+
+
+def _first_non_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _mean_aligned_series(*series_values: Any) -> list[float]:
+    series = [_clean_numeric_series(values) for values in series_values]
+    series = [values for values in series if values]
+    if not series:
+        return []
+    n = min(len(values) for values in series)
+    if n <= 0:
+        return []
+    return [
+        sum(float(values[idx]) for values in series) / float(len(series))
+        for idx in range(n)
+    ]
+
+
+def _existing_model_exposure_for_deconfounded(
+    *,
+    payload: Dict[str, Any],
+    champion_returns: Any,
+    models_returns: Any,
+    model_id: str,
+    model_name: str,
+    candidate_version: str,
+) -> Any:
+    explicit = _payload_value(
+        payload,
+        "existing_model_exposure",
+        "model_exposure",
+        "champion_exposure",
+        "champion_signal",
+        "champion_prediction",
+        "pool_signal",
+        "pool_exposure",
+    )
+    if explicit is not None:
+        return explicit
+    excluded = {
+        str(model_id or "").strip(),
+        str(model_name or "").strip(),
+        str(candidate_version or "").strip(),
+        "challenger",
+    }
+    pool_series, _labels = _equally_weighted_pool_series(models_returns, exclude_labels=excluded)
+    return _mean_aligned_series(champion_returns, pool_series) or _clean_numeric_series(champion_returns) or pool_series
+
+
+def _deconfounded_signal_payload(
+    *,
+    deconfounded_validation: Any = None,
+    challenger_returns: Any = None,
+    champion_returns: Any = None,
+    models_returns: Any = None,
+    evaluation_timestamps: Any = None,
+    era_labels: Any = None,
+    regime_labels: Any = None,
+    challenger_predictions: Any = None,
+    realized_returns: Any = None,
+    neutralization_features: Any = None,
+    candidate_features: Any = None,
+    model_id: str = "",
+    model_name: str = "",
+    candidate_version: str = "",
+    config: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    payload = dict(deconfounded_validation or {}) if isinstance(deconfounded_validation, dict) else {}
+    controls = _payload_value(payload, "controls", "confounders", "control_rows", "rows", "features")
+    if controls is None:
+        controls = neutralization_features
+    if controls is None:
+        controls = candidate_features
+    signal = _payload_value(
+        payload,
+        "candidate_signal",
+        "signal",
+        "challenger_signal",
+        "challenger_predictions",
+        "predictions",
+        "net_predictions",
+    )
+    if signal is None:
+        signal = challenger_predictions
+    if signal is None:
+        signal = challenger_returns
+    outcome = _payload_value(
+        payload,
+        "outcome",
+        "realized_returns",
+        "realized",
+        "target",
+        "y",
+        "forward_returns",
+    )
+    if outcome is None:
+        outcome = realized_returns
+    if outcome is None:
+        outcome = challenger_returns
+
+    stability_labels = _payload_value(payload, "stability_labels", "era_labels", "regime_labels")
+    if stability_labels is None:
+        stability_labels = _first_non_none(regime_labels, era_labels, evaluation_timestamps)
+
+    return validate_deconfounded_signal(
+        candidate_signal=signal,
+        outcome=outcome,
+        controls=controls,
+        beta=_payload_value(payload, "beta", "market_beta", "capm_beta"),
+        sector=_payload_value(payload, "sector", "gics_sector"),
+        size=_payload_value(payload, "size", "market_cap", "log_market_cap"),
+        volatility=_payload_value(payload, "volatility", "vol", "realized_volatility", "rv_20"),
+        liquidity=_payload_value(payload, "liquidity", "adv", "dollar_volume", "volume"),
+        regime=_first_non_none(_payload_value(payload, "regime", "market_regime", "hmm_regime"), regime_labels),
+        existing_model_exposure=_existing_model_exposure_for_deconfounded(
+            payload=payload,
+            champion_returns=champion_returns,
+            models_returns=models_returns,
+            model_id=str(model_id),
+            model_name=str(model_name),
+            candidate_version=str(candidate_version),
+        ),
+        stability_labels=stability_labels,
+        config=config,
+    )
+
+
 def _two_sided_normal_p_value(t_stat: float) -> float:
     if not math.isfinite(float(t_stat)):
         return 0.0 if float(t_stat) > 0.0 else 1.0
@@ -792,6 +925,8 @@ def assess_challenger(
     realized_returns: Any = None,
     neutralization_features: Any = None,
     candidate_features: Any = None,
+    deconfounded_validation: Any = None,
+    deconfounded_config: Dict[str, Any] | None = None,
     new_features: Any = None,
     current_feature_ids: Any = None,
     challenger_feature_ids: Any = None,
@@ -1037,6 +1172,38 @@ def assess_challenger(
             payload=dict(fnc_payload),
         )
 
+    deconfounded_payload = _deconfounded_signal_payload(
+        deconfounded_validation=deconfounded_validation,
+        challenger_returns=challenger_series,
+        champion_returns=champion_series,
+        models_returns=models_returns,
+        evaluation_timestamps=evaluation_timestamps,
+        era_labels=era_labels,
+        regime_labels=regime_labels,
+        challenger_predictions=challenger_predictions,
+        realized_returns=realized_returns,
+        neutralization_features=neutralization_features,
+        candidate_features=candidate_features,
+        model_id=str(model_key),
+        model_name=str(model_name or ""),
+        candidate_version=str(candidate_version or ""),
+        config=deconfounded_config,
+    )
+    deconfounded_passed = bool(deconfounded_payload.get("passed"))
+    diagnostics["tests"]["deconfounded_signal_validation"] = dict(deconfounded_payload)
+    diagnostics["deconfounded_signal_validation"] = dict(deconfounded_payload)
+    if persist and bool(deconfounded_payload.get("applied", deconfounded_payload.get("enabled", True))):
+        record_statistical_evidence(
+            con=con,
+            ts=int(evidence_ts),
+            model_id=str(model_key),
+            test_name="deconfounded_signal_validation",
+            t_stat=float(deconfounded_payload.get("t_stat") or 0.0),
+            p_value=float(deconfounded_payload.get("p_value") or 1.0),
+            decision=("pass" if deconfounded_passed else "fail"),
+            payload=dict(deconfounded_payload),
+        )
+
     era_payload, era_gate_passed = _era_regime_robustness_gate(
         challenger_series=challenger_series,
         champion_series=champion_series,
@@ -1057,7 +1224,13 @@ def assess_challenger(
             payload=dict(era_payload),
         )
 
-    diagnostics["passed"] = bool(reality.passed and feature_gate_passed and pool_gates_passed and era_gate_passed)
+    diagnostics["passed"] = bool(
+        reality.passed
+        and feature_gate_passed
+        and pool_gates_passed
+        and deconfounded_passed
+        and era_gate_passed
+    )
     diagnostics["status"] = "pass" if bool(diagnostics["passed"]) else "fail"
     return bool(diagnostics["passed"]), diagnostics
 
@@ -1409,6 +1582,14 @@ def promotion_allowed_by_metrics(
     Returns True if challenger is statistically better.
     """
     try:
+        if not metrics_have_net_cost_evidence(challenger_metrics):
+            _warn_state(
+                "PROMOTE_BLOCKED_MISSING_NET_COST_EVIDENCE",
+                "Promotion blocked because challenger metrics lack net-after-cost evidence.",
+                metrics=dict(challenger_metrics or {}),
+            )
+            return False
+
         # ---- coverage ----
         n_eval = int(challenger_metrics.get("n_eval", 0))
         if n_eval < MIN_EVAL_ROWS:
@@ -1465,9 +1646,338 @@ def promotion_allowed_by_metrics(
         )
         return False
 
+
+def metrics_have_net_cost_evidence(metrics: Dict[str, Any] | None) -> bool:
+    """Return whether evaluation metrics contain realized net-after-cost evidence."""
+
+    payload = dict(metrics or {})
+    evidence = payload.get("net_cost_evidence")
+    if isinstance(evidence, dict):
+        if bool(evidence.get("available")) and int(evidence.get("n") or 0) > 0:
+            return True
+    if bool(payload.get("net_cost_evidence_available") or payload.get("has_net_cost_evidence")):
+        if int(payload.get("net_cost_label_count") or payload.get("n_eval_net") or payload.get("n_eval") or 0) > 0:
+            return True
+    required_metric_present = any(
+        key in payload
+        for key in (
+            "net_edge",
+            "avg_net_return",
+            "mean_net_return",
+            "rmse_net",
+            "directional_acc_net",
+        )
+    )
+    cost_metric_present = any(
+        key in payload
+        for key in (
+            "avg_total_cost_bps",
+            "avg_execution_cost_return",
+            "cost_drag",
+            "mean_execution_cost",
+        )
+    )
+    return bool(
+        int(payload.get("net_cost_label_count") or 0) > 0
+        and required_metric_present
+        and cost_metric_present
+    )
+
 # ------            -- ------------------------------------------------------
 # B) System-state promotion guard (public API)
 # ------            -- ------------------------------------------------------
+
+def _promotion_engine_mode() -> str:
+    return str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+
+
+def _position_reconcile_required_for_promotion(mode: str) -> bool:
+    return str(mode or "").strip().lower() in {"paper", "live"}
+
+
+def _promotion_runtime_safety_context(mode_name: str | None = None) -> Dict[str, Any]:
+    try:
+        from engine.runtime.config_schema import get_runtime_safety_context
+
+        context = dict(get_runtime_safety_context() or {})
+    except Exception as e:
+        _warn_nonfatal("promotion_guard_runtime_safety_context_failed", e)
+        env = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
+        supervised = str(os.environ.get("ENGINE_SUPERVISED") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        mode = str(mode_name or _promotion_engine_mode()).strip().lower() or "safe"
+        context = {
+            "env": env,
+            "engine_mode": mode,
+            "supervised": bool(supervised),
+            "strict_runtime": bool(supervised or env in {"prod", "production"} or mode == "live"),
+            "live_like_mode": bool(mode in {"live", "shadow", "paper"}),
+        }
+    if mode_name is not None:
+        context.setdefault("engine_mode", str(mode_name or "").strip().lower() or "safe")
+    return context
+
+
+def _promotion_governance_strict(mode_name: str, safety_context: Dict[str, Any] | None = None) -> bool:
+    context = dict(safety_context or _promotion_runtime_safety_context(mode_name))
+    mode = str(context.get("engine_mode") or mode_name or "").strip().lower()
+    return bool(context.get("strict_runtime")) or mode == "live"
+
+
+def _exception_detail(error: BaseException) -> str:
+    return f"{type(error).__name__}:{error}"
+
+
+def _append_unique_blocker(reason: Dict[str, Any], blocker: str) -> None:
+    blockers = reason.setdefault("blockers", [])
+    if str(blocker) not in {str(item) for item in blockers}:
+        blockers.append(str(blocker))
+
+
+def _mark_governance_unavailable(
+    reason: Dict[str, Any],
+    *,
+    signal: str,
+    table_name: str,
+    blocker: str,
+    strict: bool,
+    error: str,
+) -> None:
+    reason.setdefault("governance_unavailable", []).append(
+        {
+            "signal": str(signal),
+            "table": str(table_name),
+            "blocker": str(blocker),
+            "strict": bool(strict),
+            "error": str(error),
+        }
+    )
+    reason[f"{signal}_error"] = str(error)
+    if strict:
+        _append_unique_blocker(reason, str(blocker))
+
+
+def _governance_table_available(
+    con,
+    reason: Dict[str, Any],
+    *,
+    signal: str,
+    table_name: str,
+    blocker: str,
+    strict: bool,
+) -> bool:
+    try:
+        available = bool(_table_exists(con, str(table_name)))
+    except Exception as e:
+        _warn_nonfatal(
+            "promotion_guard_table_exists_failed",
+            e,
+            table_name=str(table_name),
+            signal=str(signal),
+        )
+        reason[f"{signal}_available"] = False
+        _mark_governance_unavailable(
+            reason,
+            signal=str(signal),
+            table_name=str(table_name),
+            blocker=str(blocker),
+            strict=bool(strict),
+            error=f"table_probe_failed:{_exception_detail(e)}",
+        )
+        return False
+
+    reason[f"{signal}_available"] = bool(available)
+    if not available:
+        _mark_governance_unavailable(
+            reason,
+            signal=str(signal),
+            table_name=str(table_name),
+            blocker=str(blocker),
+            strict=bool(strict),
+            error="missing_table",
+        )
+        return False
+    return True
+
+
+def _governance_count(
+    con,
+    reason: Dict[str, Any],
+    *,
+    signal: str,
+    table_name: str,
+    value_key: str,
+    blocker: str,
+    strict: bool,
+    sql: str,
+    params: tuple[Any, ...],
+) -> int:
+    if not _governance_table_available(
+        con,
+        reason,
+        signal=str(signal),
+        table_name=str(table_name),
+        blocker=str(blocker),
+        strict=bool(strict),
+    ):
+        reason[value_key] = None if strict else 0
+        return 0
+
+    try:
+        row = con.execute(sql, params).fetchone()
+        value = int((row or [0])[0] or 0)
+    except Exception as e:
+        _warn_nonfatal(
+            "promotion_guard_governance_count_failed",
+            e,
+            signal=str(signal),
+            table_name=str(table_name),
+        )
+        reason[value_key] = None if strict else 0
+        _mark_governance_unavailable(
+            reason,
+            signal=str(signal),
+            table_name=str(table_name),
+            blocker=str(blocker),
+            strict=bool(strict),
+            error=f"query_failed:{_exception_detail(e)}",
+        )
+        return 0
+
+    reason[value_key] = int(value)
+    reason.pop(f"{signal}_error", None)
+    return int(value)
+
+
+def _governance_float_scalar(
+    con,
+    reason: Dict[str, Any],
+    *,
+    signal: str,
+    table_name: str,
+    value_key: str,
+    blocker: str,
+    strict: bool,
+    sql: str,
+    params: tuple[Any, ...] = (),
+    default: float = 0.0,
+) -> float:
+    if not _governance_table_available(
+        con,
+        reason,
+        signal=str(signal),
+        table_name=str(table_name),
+        blocker=str(blocker),
+        strict=bool(strict),
+    ):
+        reason[value_key] = None if strict else float(default)
+        return float(default)
+
+    try:
+        row = con.execute(sql, params).fetchone()
+        value = float((row or [default])[0] or default)
+    except Exception as e:
+        _warn_nonfatal(
+            "promotion_guard_governance_scalar_failed",
+            e,
+            signal=str(signal),
+            table_name=str(table_name),
+        )
+        reason[value_key] = None if strict else float(default)
+        _mark_governance_unavailable(
+            reason,
+            signal=str(signal),
+            table_name=str(table_name),
+            blocker=str(blocker),
+            strict=bool(strict),
+            error=f"query_failed:{_exception_detail(e)}",
+        )
+        return float(default)
+
+    reason[value_key] = float(value)
+    reason.pop(f"{signal}_error", None)
+    return float(value)
+
+
+def run_position_reconcile_before_promotion(
+    *,
+    engine_mode: Any = None,
+    broker: Any = None,
+) -> Dict[str, Any]:
+    """Run broker position reconciliation before a paper/live promotion attempt."""
+
+    mode = str(engine_mode if engine_mode is not None else _promotion_engine_mode()).strip().lower() or "safe"
+    required = _position_reconcile_required_for_promotion(mode)
+    if not required:
+        return {
+            "ok": True,
+            "required": False,
+            "mode": mode,
+            "reason": "not_required",
+            "blockers": [],
+        }
+
+    try:
+        from engine.execution.position_reconcile import (
+            configured_position_reconcile_broker,
+            position_reconcile_evidence_snapshot,
+            pre_live_position_reconcile,
+        )
+        from engine.runtime.live_execution_control import PRELIVE_RECONCILE_ENV
+
+        resolved_broker = configured_position_reconcile_broker(engine_mode=mode, broker=(str(broker) if broker else None))
+        raw_enabled = str(os.environ.get(PRELIVE_RECONCILE_ENV, "1") or "").strip().lower()
+        enabled = raw_enabled in {"", "1", "true", "yes", "y", "on"}
+        blockers: list[str] = []
+        if not enabled:
+            blockers.append("promotion_position_reconcile_disabled")
+            evidence = position_reconcile_evidence_snapshot(engine_mode=mode, broker=resolved_broker)
+            blockers.extend(str(item) for item in list(evidence.get("blockers") or []))
+            blockers = list(dict.fromkeys(blockers))
+            return {
+                "ok": False,
+                "required": True,
+                "mode": mode,
+                "broker": resolved_broker,
+                "reason": blockers[0],
+                "blockers": blockers,
+                "evidence": dict(evidence or {}),
+            }
+
+        run_result = pre_live_position_reconcile(resolved_broker)
+        evidence = position_reconcile_evidence_snapshot(engine_mode=mode, broker=resolved_broker)
+        if not bool(run_result.get("ok")):
+            blockers.append(str(run_result.get("status") or "position_reconcile_unhealthy"))
+        if not bool(evidence.get("ok")):
+            blockers.extend(str(item) for item in list(evidence.get("blockers") or []))
+        blockers = list(dict.fromkeys(blockers))
+        return {
+            "ok": not blockers,
+            "required": True,
+            "mode": mode,
+            "broker": resolved_broker,
+            "reason": "ok" if not blockers else blockers[0],
+            "blockers": blockers,
+            "run": dict(run_result or {}),
+            "evidence": dict(evidence or {}),
+        }
+    except Exception as e:
+        _warn_nonfatal("promotion_position_reconcile_failed", e)
+        return {
+            "ok": False,
+            "required": True,
+            "mode": mode,
+            "broker": str(broker or ""),
+            "reason": "position_reconcile_unavailable",
+            "blockers": ["position_reconcile_unavailable"],
+            "error": f"{type(e).__name__}:{e}",
+        }
+
 
 def promotion_allowed() -> Tuple[bool, Dict[str, Any]]:
     """
@@ -1491,10 +2001,29 @@ def promotion_allowed() -> Tuple[bool, Dict[str, Any]]:
         reason["blockers"].append("disabled")
         return (False, reason)
 
+    mode_name = _promotion_engine_mode()
+    safety_context = _promotion_runtime_safety_context(mode_name)
+    governance_strict = _promotion_governance_strict(mode_name, safety_context)
+    reason["engine_mode"] = str(mode_name)
+    reason["runtime_safety"] = dict(safety_context)
+    reason["promotion_governance_strict"] = bool(governance_strict)
+
+    try:
+        from engine.execution.position_reconcile import position_reconcile_evidence_snapshot
+
+        position_reconcile_evidence = position_reconcile_evidence_snapshot(engine_mode=mode_name)
+        reason["position_reconcile_evidence"] = dict(position_reconcile_evidence or {})
+        if bool(position_reconcile_evidence.get("required")) and not bool(position_reconcile_evidence.get("ok")):
+            reason["blockers"].extend(str(item) for item in list(position_reconcile_evidence.get("blockers") or []))
+    except Exception as e:
+        _warn_nonfatal("promotion_guard_position_reconcile_evidence_failed", e)
+        if _position_reconcile_required_for_promotion(mode_name):
+            reason["blockers"].append("position_reconcile_unavailable")
+
     try:
         from engine.runtime.backup_evidence import backup_restore_evidence_snapshot
 
-        backup_evidence = backup_restore_evidence_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe"))
+        backup_evidence = backup_restore_evidence_snapshot(engine_mode=mode_name)
         reason["backup_restore_evidence"] = dict(backup_evidence or {})
         if bool(backup_evidence.get("required")) and not bool(backup_evidence.get("ok")):
             reason["blockers"].extend(str(item) for item in list(backup_evidence.get("blockers") or []))
@@ -1504,6 +2033,18 @@ def promotion_allowed() -> Tuple[bool, Dict[str, Any]]:
             "PREFLIGHT_REQUIRE_BACKUP_EVIDENCE", "0"
         ) == "1":
             reason["blockers"].append("backup_evidence_unavailable")
+
+    try:
+        from engine.runtime.health import provider_readiness_snapshot
+
+        provider_readiness = provider_readiness_snapshot(mode=mode_name)
+        reason["provider_readiness"] = dict(provider_readiness or {})
+        if bool(provider_readiness.get("required")) and not bool(provider_readiness.get("ok")):
+            reason["blockers"].extend(str(item) for item in list(provider_readiness.get("blockers") or []))
+    except Exception as e:
+        _warn_nonfatal("promotion_guard_provider_readiness_failed", e)
+        if mode_name in {"paper", "live"}:
+            reason["blockers"].append("provider_readiness_unavailable")
 
     con = connect()
     try:
@@ -1530,57 +2071,59 @@ def promotion_allowed() -> Tuple[bool, Dict[str, Any]]:
             reason["blockers"].append("cooldown")
 
         # ---- CRIT alerts guard ----
-        try:
-            lookback_ms = PROMOTION_CRIT_ALERT_LOOKBACK_S * 1000
-            n_crit = con.execute(
-                """
+        lookback_ms = PROMOTION_CRIT_ALERT_LOOKBACK_S * 1000
+        n_crit = _governance_count(
+            con,
+            reason,
+            signal="crit_alerts",
+            table_name="alerts",
+            value_key="crit_alerts",
+            blocker="crit_alerts_unavailable",
+            strict=bool(governance_strict),
+            sql="""
                 SELECT COUNT(1) FROM alerts
                 WHERE severity='CRIT' AND ts_ms >= ?
                 """,
-                (now - lookback_ms,),
-            ).fetchone()[0]
-            n_crit = int(n_crit or 0)
-        except Exception:
-            n_crit = 0
-
-        reason["crit_alerts"] = n_crit
+            params=(now - lookback_ms,),
+        )
         if n_crit > PROMOTION_MAX_CRIT_ALERTS:
             reason["blockers"].append("crit_alerts")
 
         # ---- equity drift CRIT ----
         if PROMOTION_BLOCK_IF_EQUITY_CRIT:
-            reason["equity_drift_available"] = _table_exists(con, "equity_drift")
-            if reason["equity_drift_available"]:
-                try:
-                    ed_ms = PROMOTION_EQUITY_DRIFT_LOOKBACK_S * 1000
-                    ed = con.execute(
-                        """
+            ed_ms = PROMOTION_EQUITY_DRIFT_LOOKBACK_S * 1000
+            ed = _governance_count(
+                con,
+                reason,
+                signal="equity_drift",
+                table_name="equity_drift",
+                value_key="equity_drift_crit_points",
+                blocker="equity_drift_unavailable",
+                strict=bool(governance_strict),
+                sql="""
                         SELECT COUNT(1) FROM equity_drift
                         WHERE level='CRIT' AND ts_ms >= ?
                         """,
-                        (now - ed_ms,),
-                    ).fetchone()[0]
-                    ed = int(ed or 0)
-                except Exception:
-                    ed = 0
-            else:
-                ed = 0
-            reason["equity_drift_crit_points"] = ed
+                params=(now - ed_ms,),
+            )
             if ed > 0:
                 reason["blockers"].append("equity_drift_crit")
 
         # ---- model drift ratio ----
-        if PROMOTION_MAX_DRIFT_RATIO > 0.0:
-            try:
-                md = con.execute(
-                    "SELECT MAX(drift_ratio) FROM model_drift"
-                ).fetchone()[0]
-                md = float(md or 0.0)
-            except Exception:
-                md = 0.0
-
-            reason["max_drift_ratio"] = md
-            if md > PROMOTION_MAX_DRIFT_RATIO:
+        model_drift_check_enabled = bool(governance_strict or PROMOTION_MAX_DRIFT_RATIO > 0.0)
+        reason["model_drift_check_enabled"] = bool(model_drift_check_enabled)
+        if model_drift_check_enabled:
+            md = _governance_float_scalar(
+                con,
+                reason,
+                signal="model_drift",
+                table_name="model_drift",
+                value_key="max_drift_ratio",
+                blocker="model_drift_unavailable",
+                strict=bool(governance_strict),
+                sql="SELECT MAX(drift_ratio) FROM model_drift",
+            )
+            if PROMOTION_MAX_DRIFT_RATIO > 0.0 and md > PROMOTION_MAX_DRIFT_RATIO:
                 reason["blockers"].append("drift_ratio")
 
         # ------------------------------------------------------------
@@ -1593,11 +2136,11 @@ def promotion_allowed() -> Tuple[bool, Dict[str, Any]]:
                   json_extract(model_json, '$.model_name') AS model_name,
                   SUM(
                     COALESCE(
-                      json_extract(signal_json, '$.pnl_attribution.total_pnl'),
-                      COALESCE(json_extract(signal_json, '$.pnl_attribution.realized_pnl'), 0.0)
-                      + COALESCE(json_extract(signal_json, '$.pnl_attribution.unrealized_pnl'), 0.0)
+                      CAST(json_extract(signal_json, '$.pnl_attribution.total_pnl') AS DOUBLE PRECISION),
+                      COALESCE(CAST(json_extract(signal_json, '$.pnl_attribution.realized_pnl') AS DOUBLE PRECISION), 0.0)
+                      + COALESCE(CAST(json_extract(signal_json, '$.pnl_attribution.unrealized_pnl') AS DOUBLE PRECISION), 0.0)
                       - COALESCE(fees, 0.0)
-                      - COALESCE(json_extract(signal_json, '$.pnl_attribution.extra.slippage_cost'), 0.0)
+                      - COALESCE(CAST(json_extract(signal_json, '$.pnl_attribution.extra.slippage_cost') AS DOUBLE PRECISION), 0.0)
                     )
                   ) AS total_pnl
                 FROM trade_attribution_ledger

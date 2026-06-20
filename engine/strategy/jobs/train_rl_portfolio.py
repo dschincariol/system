@@ -13,6 +13,7 @@ import numpy as np
 from engine.rl.agents import policy_hash32, train_agent
 from engine.rl.portfolio_env import PortfolioEnv, PortfolioEnvConfig
 from engine.runtime import storage
+from engine.runtime.platform import default_local_models_dir
 
 
 def _csv(value: str, default: Sequence[str]) -> list[str]:
@@ -85,7 +86,10 @@ def main(argv: Sequence[str] | None = None) -> Dict[str, Any]:
     parser.add_argument("--steps", type=int, default=int(os.environ.get("RL_PORTFOLIO_TOTAL_STEPS", "1000000")))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("RL_PORTFOLIO_SEED", "7")))
     parser.add_argument("--symbols", default=os.environ.get("RL_PORTFOLIO_SYMBOLS", "SPY,AAPL,MSFT"))
-    parser.add_argument("--model-root", default=os.environ.get("RL_PORTFOLIO_MODEL_ROOT", "models/rl"))
+    parser.add_argument(
+        "--model-root",
+        default=os.environ.get("RL_PORTFOLIO_MODEL_ROOT", str((default_local_models_dir() / "rl").resolve())),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     universe = _csv(args.symbols, ["SPY", "AAPL", "MSFT"])

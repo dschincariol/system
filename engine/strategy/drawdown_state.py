@@ -22,6 +22,12 @@ LOG = get_logger("strategy.drawdown_state")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 DRAWDOWN_MIN_HISTORY_POINTS = int(os.environ.get("DRAWDOWN_MIN_HISTORY_POINTS", "5"))
 DRAWDOWN_BOOTSTRAP_MAX_AGE_S = int(os.environ.get("DRAWDOWN_BOOTSTRAP_MAX_AGE_S", "86400"))
+DRAWDOWN_MAX_EQUITY_AGE_S = int(
+    os.environ.get(
+        "DRAWDOWN_MAX_EQUITY_AGE_S",
+        os.environ.get("KILL_SWITCH_MAX_EQUITY_AGE_S", "300"),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,8 @@ class DrawdownDiagnostic:
     bootstrap_reason: str | None = None
     bootstrap_expires_ts_ms: int | None = None
     table_present: bool | None = None
+    latest_age_s: float | None = None
+    max_equity_age_s: int | None = None
     error_type: str | None = None
     error: str | None = None
 
@@ -238,6 +246,7 @@ def evaluate_current_drawdown(
     con=None,
     *,
     min_history_points: int | None = None,
+    max_equity_age_s: int | None = None,
     allow_bootstrap: bool = True,
     now_ms: int | None = None,
 ) -> DrawdownDiagnostic:
@@ -249,6 +258,7 @@ def evaluate_current_drawdown(
     audited bootstrap baseline is present.
     """
     min_points = max(1, int(min_history_points or DRAWDOWN_MIN_HISTORY_POINTS))
+    max_age_s = int(DRAWDOWN_MAX_EQUITY_AGE_S if max_equity_age_s is None else max_equity_age_s)
     ts_now = int(now_ms or _now_ms())
     owns = False
     if con is None:
@@ -406,6 +416,26 @@ def evaluate_current_drawdown(
                 table_present=True,
             )
 
+        latest_age_s = None
+        if latest_ts_ms > 0:
+            latest_age_s = max(0.0, (float(ts_now) - float(latest_ts_ms)) / 1000.0)
+        if max_age_s > 0 and (latest_ts_ms <= 0 or latest_age_s is None or latest_age_s > float(max_age_s)):
+            return DrawdownDiagnostic(
+                ok=False,
+                drawdown=None,
+                reason_code="DRAWDOWN_EQUITY_HISTORY_STALE_LATEST",
+                source="equity_history",
+                history_points=int(valid_points),
+                min_history_points=int(min_points),
+                latest_equity=float(cur),
+                peak_equity=float(peak),
+                latest_ts_ms=int(latest_ts_ms or 0),
+                invalid_points=int(invalid_points),
+                table_present=True,
+                latest_age_s=latest_age_s,
+                max_equity_age_s=int(max_age_s),
+            )
+
         dd = 1.0 - (cur / peak)
         if dd < 0.0:
             dd = 0.0
@@ -423,6 +453,8 @@ def evaluate_current_drawdown(
             latest_ts_ms=int(latest_ts_ms or 0),
             invalid_points=int(invalid_points),
             table_present=True,
+            latest_age_s=latest_age_s,
+            max_equity_age_s=int(max_age_s),
         )
     finally:
         if owns:

@@ -26,13 +26,13 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Protocol, Sequence, Tuple
 
 import requests
 
 from engine.data._credentials import get_data_credential
 from engine.runtime.logging import get_logger
-from engine.runtime.storage import connect, run_write_txn
+from engine.runtime.storage import run_write_txn
 
 LOG = get_logger("engine.data.fundamentals_pit")
 

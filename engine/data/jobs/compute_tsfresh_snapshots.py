@@ -9,7 +9,6 @@ import logging
 import os
 import time
 
-from engine.data.default_symbols import parse_symbol_limit
 from engine.data.universe import get_active_symbols
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.ingestion_status import record_pipeline_status
@@ -21,6 +20,11 @@ from engine.runtime.storage import (
     put_job_heartbeat,
     release_job_lock,
     touch_job_lock,
+)
+from engine.runtime.workload_profiles import (
+    assert_offline_work_allowed,
+    tsfresh_snapshot_batch_size,
+    tsfresh_snapshot_symbol_limit,
 )
 from engine.strategy.tsfresh_features import (
     TSFRESH_WINDOW_S,
@@ -53,7 +57,8 @@ SNAPSHOT_BUCKET_SEC = max(
         )
     ),
 )
-SNAPSHOT_SYMBOL_LIMIT = parse_symbol_limit(os.environ.get("TSFRESH_SNAPSHOT_SYMBOL_LIMIT"), 1500)
+SNAPSHOT_SYMBOL_LIMIT = tsfresh_snapshot_symbol_limit()
+SNAPSHOT_BATCH_SIZE = tsfresh_snapshot_batch_size()
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -112,6 +117,8 @@ def _sleep_with_heartbeat(manager, status: dict) -> bool:
         payload["sleep_s"] = float(SNAPSHOT_SLEEP_S)
         payload["heartbeat_every_s"] = float(HEARTBEAT_EVERY_S)
         payload["window_s"] = int(TSFRESH_WINDOW_S)
+        payload["symbol_limit"] = int(SNAPSHOT_SYMBOL_LIMIT)
+        payload["batch_size"] = int(SNAPSHOT_BATCH_SIZE)
         _emit_heartbeat(payload)
         time.sleep(min(float(HEARTBEAT_EVERY_S), max(1.0, remaining)))
 
@@ -164,6 +171,19 @@ def main() -> None:
         manager.record_job_status(JOB_NAME, ok=True, message="compute_tsfresh_snapshots disabled by data source control plane")
         raise SystemExit(0)
 
+    try:
+        assert_offline_work_allowed(job_name=JOB_NAME)
+    except RuntimeError as exc:
+        detail = str(exc)
+        manager.record_job_status(
+            JOB_NAME,
+            ok=False,
+            message="compute_tsfresh_snapshots blocked by workload profile",
+            error=detail,
+        )
+        print(f"[workload_profile] {detail}")
+        raise SystemExit(3)
+
     if not acquire_job_lock(JOB_NAME, OWNER, PID, ttl_s=LOCK_STALE_AFTER_S):
         raise SystemExit(2)
 
@@ -202,6 +222,8 @@ def main() -> None:
                         symbols=symbols,
                         ts_ms=int(anchor_ts_ms),
                         window_s=int(TSFRESH_WINDOW_S),
+                        symbol_limit=int(SNAPSHOT_SYMBOL_LIMIT),
+                        batch_size=int(SNAPSHOT_BATCH_SIZE),
                         con=con,
                     )
                     con.commit()
@@ -240,15 +262,19 @@ def main() -> None:
                         "feature_dim": int(snapshot_stats.get("feature_dim") or len(get_tsfresh_feature_ids())),
                         "window_s": int(snapshot_stats.get("window_s") or TSFRESH_WINDOW_S),
                         "bucket_sec": int(SNAPSHOT_BUCKET_SEC),
+                        "symbol_limit": int(SNAPSHOT_SYMBOL_LIMIT),
+                        "batch_size": int(SNAPSHOT_BATCH_SIZE),
                     },
                 )
                 logging.info(
-                    "anchor_ts_ms=%s symbols=%s snapshots=%s feature_dim=%s window_s=%s",
+                    "anchor_ts_ms=%s symbols=%s snapshots=%s feature_dim=%s window_s=%s symbol_limit=%s batch_size=%s",
                     int(anchor_ts_ms),
                     int(snapshot_stats.get("symbols") or 0),
                     int(snapshot_stats.get("snapshots") or 0),
                     int(snapshot_stats.get("feature_dim") or len(get_tsfresh_feature_ids())),
                     int(snapshot_stats.get("window_s") or TSFRESH_WINDOW_S),
+                    int(SNAPSHOT_SYMBOL_LIMIT),
+                    int(SNAPSHOT_BATCH_SIZE),
                 )
             except Exception as exc:
                 status = record_pipeline_status(

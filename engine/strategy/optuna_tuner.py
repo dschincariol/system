@@ -17,6 +17,7 @@ from engine.runtime.logging import get_logger
 from engine.runtime.storage import connect, init_db, record_model_hyperparameter_registry
 from engine.strategy import gbm_regressor as gbm
 from engine.strategy.cpcv import cpcv_backtest, cpcv_config_from_env
+from engine.strategy.experiment_ledger import record_experiment_ledger
 
 
 LOG = get_logger("engine.strategy.optuna_tuner")
@@ -539,15 +540,39 @@ def run_gbm_optuna_tuning_job(
         cpcv_pbo=float(best_cpcv.get("pbo") or 1.0),
         diagnostics=diagnostics,
     )
+    study_name = str(getattr(study, "study_name", "") or _study_name_for_model(resolved_model_name))
+    trial_count = int(len(list(getattr(study, "trials", []) or [])))
+    record_experiment_ledger(
+        candidate_key=f"{str(resolved_model_name)}:{study_name}",
+        candidate_name=str(resolved_model_name),
+        candidate_version=str(study_name),
+        candidate_type="optuna_run",
+        source=_TUNER_NAME,
+        model_name=str(resolved_model_name),
+        model_family=str(train_cfg.get("family") or gbm._GBM_FAMILY),
+        feature_ids=list(feature_ids),
+        search_space=dict(_GBM_TUNED_PARAM_SPACE),
+        trial_budget=max(1, int(_DEFAULT_TRIALS)),
+        trial_count=max(1, int(trial_count)),
+        cpcv=dict(best_cpcv),
+        pbo=float(best_cpcv.get("pbo") or 0.0),
+        dsr=float(best_cpcv.get("deflated_sharpe") or best_cpcv.get("median_sharpe") or 0.0),
+        fdr={"n_competing_trials": int(trial_count), "objective": "median_sharpe_minus_pbo_penalty"},
+        redundancy={"checked": True, "method": "parameter_surface_robustness", "surface": dict(surface_summary)},
+        evidence={"registry_id": int(registry_id or 0), "best_params": dict(best_params), "diagnostics": diagnostics},
+        promotion_decision=("pass" if float(best_cpcv.get("pbo") or 1.0) <= 1.0 else "fail"),
+        status="completed",
+        diagnostics={"best_trial_number": int(best_trial_number), "objective_value": float(objective_value)},
+    )
 
     return {
         "ok": True,
         "status": "completed",
         "model_name": str(resolved_model_name),
         "model_family": str(train_cfg.get("family") or gbm._GBM_FAMILY),
-        "study_name": str(getattr(study, "study_name", "") or _study_name_for_model(resolved_model_name)),
+        "study_name": str(study_name),
         "registry_id": int(registry_id or 0),
-        "trial_count": int(len(list(getattr(study, "trials", []) or []))),
+        "trial_count": int(trial_count),
         "best_trial_number": int(best_trial_number),
         "objective_value": float(objective_value),
         "best_params": dict(best_params),

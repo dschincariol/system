@@ -537,7 +537,6 @@ def _load_latest_stacked_weights(regime: Optional[str]) -> Tuple[Dict[str, float
         if str(key or "").strip()
     }
     intercept = 0.0
-    row_count = 0
     blob_bytes = bytes(meta_blob or b"")
     if not blob_bytes and (meta_artifact_alias or meta_artifact_sha256):
         try:
@@ -566,7 +565,6 @@ def _load_latest_stacked_weights(regime: Optional[str]) -> Tuple[Dict[str, float
             payload = {}
         if isinstance(payload, Mapping):
             intercept = float(_safe_float(payload.get("intercept"), 0.0))
-            row_count = int(_safe_int(payload.get("row_count"), 0))
             blob_weights = payload.get("weights")
             if isinstance(blob_weights, Mapping):
                 parsed_weights = {

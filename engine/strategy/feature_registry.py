@@ -31,11 +31,27 @@ from engine.data.finbert_sentiment import (
     USE_FINBERT_SENTIMENT,
     resolve_finbert_sentiment_snapshot,
 )
+from engine.data.structured_document_events import STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS
 from engine.strategy.tsfresh_features import (
     TSFRESH_FEATURE_PREFIX,
     get_default_tsfresh_feature_ids,
     get_tsfresh_feature_ids,
     resolve_tsfresh_features,
+)
+from engine.strategy.feature_pit import FEATURE_PIT_POLICIES, policy_metadata_for_groups
+from engine.strategy.graph_relational import (
+    GRAPH_RELATIONSHIP_TYPES,
+    GRAPH_RELATIONAL_FEATURE_IDS,
+    GRAPH_RELATIONAL_GROUP,
+    GRAPH_RELATIONAL_PREFIX,
+    GRAPH_RELATIONAL_SNAPSHOT_VERSION,
+    graph_max_neighbors,
+)
+from engine.strategy.ts_foundation_encoder import (
+    TS_FOUNDATION_CHRONOS_FEATURE_IDS,
+    TS_FOUNDATION_CHRONOS_GROUP,
+    TS_FOUNDATION_CHRONOS_PREFIX,
+    chronos_model_id,
 )
 
 USE_TECH_FEATURES = os.environ.get("USE_TECH_FEATURES", "0") == "1"
@@ -457,6 +473,9 @@ FEATURE_GROUPS = {
     "nlp_finbert_news_v1": list(NLP_FINBERT_NEWS_FEATURE_IDS),
     "nlp_filings_v1": list(NLP_FILINGS_FEATURE_IDS),
     "nlp_transcripts_v1": list(NLP_TRANSCRIPTS_FEATURE_IDS),
+    "structured_doc_events_v1": list(STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS),
+    TS_FOUNDATION_CHRONOS_GROUP: list(TS_FOUNDATION_CHRONOS_FEATURE_IDS),
+    GRAPH_RELATIONAL_GROUP: list(GRAPH_RELATIONAL_FEATURE_IDS),
 }
 if FINBERT_FEATURE_IDS:
     FEATURE_GROUPS["sentiment"] = list(FINBERT_FEATURE_IDS)
@@ -489,6 +508,12 @@ FEATURE_STAGES: Dict[str, str] = {
     for fid in list(ids or [])
     if str(fid or "").strip()
 }
+for _fid in TS_FOUNDATION_CHRONOS_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
+for _fid in GRAPH_RELATIONAL_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
+for _fid in STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
 
 FEATURE_GROUP_METADATA: Dict[str, Dict[str, Any]] = {
     name: {
@@ -503,6 +528,50 @@ FEATURE_GROUP_METADATA["lexical_sentiment_v0"] = {
     "deprecated_after": LEXICAL_SENTIMENT_DEPRECATED_AFTER,
     "serving_path": "news_event_features.sentiment_score",
 }
+FEATURE_GROUP_METADATA[TS_FOUNDATION_CHRONOS_GROUP].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "encoder_mode": "frozen",
+        "model_family": "chronos",
+        "model_family_provenance": {
+            "backend": "chronos",
+            "direct_trading_authority": False,
+            "frozen_encoder": True,
+            "model_id": chronos_model_id(),
+            "package": "chronos-forecasting",
+            "source": "pretrained_time_series_foundation_model",
+        },
+        "stage": FEATURE_STAGE_SHADOW,
+    }
+)
+FEATURE_GROUP_METADATA[GRAPH_RELATIONAL_GROUP].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "feature_prefix": GRAPH_RELATIONAL_PREFIX,
+        "graph_id": GRAPH_RELATIONAL_GROUP,
+        "relationship_sources": sorted(GRAPH_RELATIONSHIP_TYPES),
+        "max_neighbors": int(graph_max_neighbors()),
+        "snapshot_version": int(GRAPH_RELATIONAL_SNAPSHOT_VERSION),
+        "stage": FEATURE_STAGE_SHADOW,
+        **FEATURE_PIT_POLICIES[GRAPH_RELATIONAL_GROUP].to_metadata(),
+    }
+)
+FEATURE_GROUP_METADATA["structured_doc_events_v1"].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "extractor_name": "structured_document_events",
+        "extractor_version": "structured_document_events_v1",
+        "source_documents": ["filing", "transcript", "news"],
+        "stage": FEATURE_STAGE_SHADOW,
+        **FEATURE_PIT_POLICIES["structured_doc_events"].to_metadata(),
+    }
+)
+for _group_name, _pit_meta in policy_metadata_for_groups(FEATURE_GROUP_METADATA.keys()).items():
+    FEATURE_GROUP_METADATA.setdefault(str(_group_name), {})
+    FEATURE_GROUP_METADATA[str(_group_name)].update(_pit_meta)
 
 
 def list_groups() -> Dict[str, Dict[str, Any]]:
@@ -520,6 +589,7 @@ def list_groups() -> Dict[str, Dict[str, Any]]:
         "schema_version": "experimental",
         "default_enabled": False,
         "stage": FEATURE_STAGE_SHADOW,
+        **FEATURE_PIT_POLICIES["discovered_llm"].to_metadata(),
     }
     return out
 
@@ -547,6 +617,7 @@ _SNAPSHOT_PREFIXES = (
     "basis_",
     "news_",
     "fresh_neg_news_",
+    "structured_doc_events_v1.",
     "etf_",
     "cot_",
     "13f_",
@@ -563,6 +634,8 @@ _SNAPSHOT_PREFIXES = (
     "availability.",
     "meta_label.",
     "bocpd_",
+    TS_FOUNDATION_CHRONOS_PREFIX,
+    GRAPH_RELATIONAL_PREFIX,
 )
 LOG = get_logger("engine.strategy.feature_registry")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -646,6 +719,36 @@ def feature_stage(feature_id: str) -> str | None:
     return None
 
 
+def shadow_feature_ids(feature_ids: List[str] | tuple[str, ...] | None) -> List[str]:
+    """Return feature ids that are registered for shadow use only."""
+
+    out: List[str] = []
+    seen = set()
+    for fid in _parse_feature_ids(feature_ids):
+        if fid in seen:
+            continue
+        if feature_stage(str(fid)) == FEATURE_STAGE_SHADOW:
+            seen.add(fid)
+            out.append(str(fid))
+    return out
+
+
+def assert_no_shadow_features(
+    feature_ids: List[str] | tuple[str, ...] | None,
+    *,
+    context: str = "live_model_serving",
+    model_name: str = "",
+) -> None:
+    """Raise when a live-sensitive path tries to use shadow-only features."""
+
+    shadow_ids = shadow_feature_ids(feature_ids)
+    if not shadow_ids:
+        return
+    prefix = str(context or "live_model_serving").strip() or "live_model_serving"
+    model_part = f":{str(model_name).strip()}" if str(model_name or "").strip() else ""
+    raise ValueError(f"{prefix}_shadow_features_forbidden{model_part}:{','.join(shadow_ids)}")
+
+
 def _feature_uses_symbol_snapshot(fid: str) -> bool:
     text = str(fid or "").strip()
     if not text:
@@ -711,7 +814,7 @@ def _factor_feature_has_passing_evidence(fid: str) -> bool:
         return False
 
 
-def _load_symbol_snapshot(symbol: str, ts_ms: int) -> Dict[str, float]:
+def _load_symbol_snapshot(symbol: str, ts_ms: int, feature_ids: Optional[List[str]] = None) -> Dict[str, float]:
     try:
         from engine.strategy.model_feature_snapshots import (
             FEATURE_SET_TAG as _SNAP_TAG,
@@ -719,14 +822,24 @@ def _load_symbol_snapshot(symbol: str, ts_ms: int) -> Dict[str, float]:
             load_model_feature_snapshot,
             store_model_feature_snapshots,
         )
+        requested_ids = [
+            str(fid)
+            for fid in list(feature_ids or [])
+            if str(fid or "").strip() and _feature_uses_symbol_snapshot(str(fid))
+        ]
+        feature_set_tag = str(feature_set_tag_from_ids(requested_ids) if requested_ids else _SNAP_TAG)
         snap = load_model_feature_snapshot(
             symbol=str(symbol),
             ts_ms=int(ts_ms),
-            feature_set_tag=str(_SNAP_TAG),
+            feature_set_tag=str(feature_set_tag),
             exact=True,
         )
         if not isinstance(snap, dict):
-            snap = build_model_feature_snapshot(symbol=str(symbol), ts_ms=int(ts_ms))
+            snap = build_model_feature_snapshot(
+                symbol=str(symbol),
+                ts_ms=int(ts_ms),
+                feature_ids=(list(requested_ids) if requested_ids else None),
+            )
             if isinstance(snap, dict) and snap:
                 try:
                     store_model_feature_snapshots([snap])
@@ -983,6 +1096,8 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
         parts.append("crypto_positioning")
     if any(fid in NEWS_FLOW_FEATURE_IDS or fid.startswith(("news_", "fresh_neg_news_")) for fid in ids):
         parts.append("news_flow")
+    if any(fid.startswith("structured_doc_events_v1.") for fid in ids):
+        parts.append("structured_doc_events_v1_shadow")
     if any(fid in ETF_FLOW_FEATURE_IDS or fid.startswith("etf_") for fid in ids):
         parts.append("etf_flow")
     if any(fid in COT_FEATURE_IDS or fid.startswith("cot_") for fid in ids):
@@ -1005,6 +1120,10 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
         parts.append("finbert")
     if any(fid.startswith("nlp.") for fid in ids):
         parts.append("nlp_v1")
+    if any(fid.startswith(TS_FOUNDATION_CHRONOS_PREFIX) for fid in ids):
+        parts.append("tsfm_chronos_v2_shadow")
+    if any(fid.startswith(GRAPH_RELATIONAL_PREFIX) for fid in ids):
+        parts.append("graph_relational_v1_shadow")
     if any(fid.startswith(TSFRESH_FEATURE_PREFIX) for fid in ids):
         parts.append("tsfresh")
     if any(fid.startswith("factor.") for fid in ids):
@@ -1302,9 +1421,10 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.source = 'news'
                   AND b.ts >= ?
                   AND b.ts < ?
+                  AND b.ts <= ?
                   AND e.model_name = ?
                 """,
-                (symbol_key, int(day_start), int(day_end), NLP_FINBERT_MODEL_NAME),
+                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_FINBERT_MODEL_NAME),
             ).fetchall()
             if rows:
                 ts_values = [int(row[0] or 0) for row in rows]
@@ -1335,9 +1455,10 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.source = 'filing'
                   AND b.ts >= ?
                   AND b.ts < ?
+                  AND b.ts <= ?
                   AND e.model_name = ?
                 """,
-                (symbol_key, int(day_start), int(day_end), NLP_SENTENCE_MODEL_NAME),
+                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_SENTENCE_MODEL_NAME),
             ).fetchall()
             if rows:
                 matrix = np.vstack([_vector_from_blob(row[2], row[1]) for row in rows]).astype(np.float32)
@@ -1359,9 +1480,10 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.source = 'transcript'
                   AND b.ts >= ?
                   AND b.ts < ?
+                  AND b.ts <= ?
                   AND e.model_name = ?
                 """,
-                (symbol_key, int(day_start), int(day_end), NLP_SENTENCE_MODEL_NAME),
+                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_SENTENCE_MODEL_NAME),
             ).fetchall()
             if rows:
                 matrix = np.vstack([_vector_from_blob(row[2], row[1]) for row in rows]).astype(np.float32)
@@ -1382,9 +1504,10 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.source = 'transcript_qa'
                   AND b.ts >= ?
                   AND b.ts < ?
+                  AND b.ts <= ?
                   AND s.model_name = ?
                 """,
-                (symbol_key, int(day_start), int(day_end), NLP_FINBERT_MODEL_NAME),
+                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_FINBERT_MODEL_NAME),
             ).fetchall()
             if qa_rows:
                 scores = np.asarray([float(row[1] or 0.0) for row in qa_rows], dtype=np.float64)
@@ -1447,6 +1570,7 @@ def _load_discovered_feature_definition(fid: str) -> Dict[str, Any] | None:
             "expression": str(getattr(record, "expression", "") or ""),
             "params": dict(getattr(record, "params", {}) or {}),
             "hash": str(getattr(record, "hash", "") or ""),
+            "created_ts": int(getattr(record, "created_ts", 0) or 0),
         }
     return None
 
@@ -1457,6 +1581,10 @@ def _evaluate_discovered_feature(fid: str, *, event: Dict[str, Any], symbol: str
         return 0.0
     source = str(definition.get("source") or "").strip().lower()
     params = dict(definition.get("params") or {})
+    decision_ts_ms = int((event or {}).get("ts_ms", 0) or 0)
+    created_ts_ms = int(definition.get("created_ts") or 0)
+    if source == "llm_factor" and decision_ts_ms > 0 and created_ts_ms > int(decision_ts_ms):
+        return 0.0
 
     if source in {"pysr", "llm_factor"}:
         try:
@@ -1537,6 +1665,8 @@ def _schedule_feature_store_write(*, symbol: str, ts_ms: int, snap: Dict[str, fl
 def _load_feature_store_snapshot(*, symbol: str, ts_ms: int, feature_ids: List[str]) -> Dict[str, float] | None:
     if not FEATURE_STORE_READS_ENABLED or int(ts_ms or 0) <= 0:
         return None
+    if _features_require_fresh_resolution(feature_ids):
+        return None
     try:
         from engine.strategy.feature_store import get_feature_store
 
@@ -1564,14 +1694,36 @@ def _load_feature_store_snapshot(*, symbol: str, ts_ms: int, feature_ids: List[s
     return {str(fid): float(feature_map.get(fid, 0.0) or 0.0) for fid in list(feature_ids or [])}
 
 
+def _features_require_fresh_resolution(feature_ids: List[str]) -> bool:
+    late_arriving_prefixes = (
+        "sentiment.finbert.",
+        "structured_doc_events_v1.",
+    )
+    return any(str(fid or "").startswith(late_arriving_prefixes) for fid in list(feature_ids or []))
+
+
+def _requires_event_scoped_resolution(*, event: Dict[str, Any], feature_ids: List[str]) -> bool:
+    event_id = str((event or {}).get("event_id") or "").strip()
+    if not event_id:
+        return False
+    return any(str(fid or "").startswith("sentiment.finbert.") for fid in list(feature_ids or []))
+
+
 def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids: Optional[List[str]] = None) -> Dict[str, float]:
     ids = resolve_feature_ids(feature_ids)
     ctx = _build_context(event=event, symbol=str(symbol))
     snap: Dict[str, float] = {}
     tech = stress = macro = social = weather = options = social_regime = hmm_regime = bocpd_regime = tsfresh = factors = finbert = nlp = None
     snapshot = None
-    if int(ctx["ts_ms"] or 0) > 0 and any(_feature_uses_symbol_snapshot(fid) for fid in ids):
-        snapshot = _load_symbol_snapshot(str(symbol), int(ctx["ts_ms"]))
+    event_scoped_resolution = _requires_event_scoped_resolution(event=dict(event or {}), feature_ids=list(ids))
+    snapshot_ids = [
+        fid
+        for fid in ids
+        if _feature_uses_symbol_snapshot(fid)
+        and not (event_scoped_resolution and str(fid).startswith("sentiment.finbert."))
+    ]
+    if int(ctx["ts_ms"] or 0) > 0 and snapshot_ids:
+        snapshot = _load_symbol_snapshot(str(symbol), int(ctx["ts_ms"]), feature_ids=list(snapshot_ids))
 
     for fid in ids:
         if isinstance(snapshot, dict) and fid in snapshot:
@@ -1718,9 +1870,10 @@ def build_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids: O
         ts_ms = int((event or {}).get("ts_ms", 0) or 0)
     except Exception:
         ts_ms = 0
-    snap = _load_feature_store_snapshot(symbol=str(symbol), ts_ms=int(ts_ms), feature_ids=list(ids))
-    if snap is not None:
-        return snap
+    if not _requires_event_scoped_resolution(event=dict(event or {}), feature_ids=list(ids)):
+        snap = _load_feature_store_snapshot(symbol=str(symbol), ts_ms=int(ts_ms), feature_ids=list(ids))
+        if snap is not None:
+            return snap
     snap = compute_feature_snapshot(event=event, symbol=str(symbol), feature_ids=ids)
     _schedule_feature_store_write(symbol=str(symbol), ts_ms=int(ts_ms), snap=snap)
     return snap

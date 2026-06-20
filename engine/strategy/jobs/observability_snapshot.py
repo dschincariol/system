@@ -12,7 +12,7 @@ from typing import Any
 from engine.runtime.observability import record_component_health
 from engine.runtime.observability.pg_stats import snapshot_pg_observability
 from engine.runtime.observability.slow_log import start_slow_log_tail_thread
-from engine.runtime.platform import is_linux
+from engine.runtime.platform import default_postgres_log_path
 from engine.runtime.storage import (
     acquire_job_lock,
     init_db,
@@ -39,9 +39,7 @@ def _default_slow_log_path() -> str:
     configured = str(os.environ.get("OBSERVABILITY_POSTGRES_LOG") or "").strip()
     if configured:
         return configured
-    if is_linux():
-        return "/var/log/postgresql/postgresql-16-main.log"
-    return ""
+    return default_postgres_log_path()
 
 
 def _ensure_slow_log_tail() -> None:

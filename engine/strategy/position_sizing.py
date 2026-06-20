@@ -121,6 +121,7 @@ def position_from_signal(
     confidence: float,
     alpha_remaining: Optional[float] = None,
     allocation_multiplier: float = 1.0,
+    learned_alpha_estimate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Returns sizing decision dict.
@@ -132,6 +133,7 @@ def position_from_signal(
       - capital-preserve compression
       - regime compatibility multiplier / suppression
       - allocation multiplier
+      - learned alpha capacity/crowding multiplier
     """
     z = float(expected_z)
     c = float(confidence)
@@ -159,6 +161,34 @@ def position_from_signal(
             size = max(0.0, min(float(MAX_POS), float(size) * float(decay_mult)))
         except Exception as e:
             _warn_nonfatal("POSITION_SIZING_ALPHA_DECAY_FAILED", e, alpha_remaining=alpha_remaining)
+
+    learned_alpha_blob = None
+    if isinstance(learned_alpha_estimate, dict) and bool(learned_alpha_estimate.get("available")):
+        try:
+            if bool(learned_alpha_estimate.get("block_signal")):
+                return {
+                    "direction": "FLAT",
+                    "size": 0.0,
+                    "notional_frac": 0.0,
+                    "reason": "learned_alpha_blocked",
+                    "alpha_remaining": (float(alpha_remaining) if alpha_remaining is not None else None),
+                    "learned_alpha": dict(learned_alpha_estimate),
+                }
+            learned_raw = learned_alpha_estimate.get("size_multiplier")
+            learned_mult = max(0.0, min(1.0, float(1.0 if learned_raw is None else learned_raw)))
+            size = max(0.0, min(float(MAX_POS), float(size) * float(learned_mult)))
+            learned_alpha_blob = {
+                "run_id": learned_alpha_estimate.get("run_id"),
+                "cohort_key": learned_alpha_estimate.get("cohort_key"),
+                "cohort_level": learned_alpha_estimate.get("cohort_level"),
+                "half_life_ms": learned_alpha_estimate.get("half_life_ms"),
+                "max_useful_age_ms": learned_alpha_estimate.get("max_useful_age_ms"),
+                "capacity_estimate": learned_alpha_estimate.get("capacity_estimate"),
+                "crowding_penalty": learned_alpha_estimate.get("crowding_penalty"),
+                "size_multiplier": float(learned_mult),
+            }
+        except Exception as e:
+            _warn_nonfatal("POSITION_SIZING_LEARNED_ALPHA_FAILED", e, learned_alpha=learned_alpha_estimate)
 
     # Learned size policy reflects realized net returns, so it is the main knob
     # for shrinking exposure when execution quality degrades.
@@ -246,6 +276,8 @@ def position_from_signal(
 
     if size_policy_blob is not None:
         out["size_policy"] = size_policy_blob
+    if learned_alpha_blob is not None:
+        out["learned_alpha"] = learned_alpha_blob
 
     if cap_mode == "preserve":
         out["capital_mode"] = "preserve"

@@ -6,12 +6,12 @@ and execution quality. This is the fail-closed guardrail layer above normal
 portfolio/risk logic.
 """
 
+import logging
 import os
 import time
-import logging
 from typing import Any, Dict
 
-from engine.execution.kill_switch import activate, clear
+from engine.execution.kill_switch import activate_owned, clear_owned
 from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.execution.exec_stats import get_exec_winrate_global, get_exec_stats_by_symbol
 from engine.strategy.drift_utils import get_max_drift_ratio, get_symbol_max_drift_ratio
@@ -50,7 +50,14 @@ SYM_MIN_WINRATE = float(os.environ.get("RULES_SYMBOL_MIN_WINRATE", "0.40"))
 SYM_MIN_AVG_NET_Z = float(os.environ.get("RULES_SYMBOL_MIN_AVG_NET_Z", "-0.05"))
 SYM_MAX_DRIFT = float(os.environ.get("RULES_SYMBOL_MAX_DRIFT_RATIO", "3.0"))
 
-AUTO_RESUME = os.environ.get("RULES_AUTO_RESUME", "1") == "1"
+RULES_ACTOR = "rules_engine"
+RULES_GLOBAL_KEYS = {
+    "cost_spike": "rules:cost_spike",
+    "drawdown": "rules:drawdown",
+    "drift": "rules:drift",
+    "exec_winrate": "rules:exec_winrate",
+}
+RULES_SYMBOL_TRIGGER = "symbol"
 
 
 def _now_ms() -> int:
@@ -85,6 +92,100 @@ def _live_mode_requested(con=None) -> bool | None:
     except Exception as e:
         _warn_nonfatal("rules_engine_live_mode_check_failed", e)
         return None
+
+
+def _env_truthy(name: str) -> bool:
+    return str(os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _production_like_requested() -> bool:
+    env = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or os.environ.get("APP_ENV") or "").strip().lower()
+    return bool(env in {"prod", "production"} or _env_truthy("PROD_LOCK") or _env_truthy("ENGINE_SUPERVISED"))
+
+
+def _rules_auto_resume_enabled(con=None) -> bool:
+    return _env_truthy("RULES_AUTO_RESUME")
+
+
+def _rules_meta(trigger: str, payload: Dict[str, Any] | None = None, *, con=None) -> Dict[str, Any]:
+    meta = dict(payload or {})
+    meta["actor"] = RULES_ACTOR
+    meta["trigger"] = str(trigger)
+    return meta
+
+
+def _rules_clear_meta(trigger: str, payload: Dict[str, Any] | None = None, *, con=None) -> Dict[str, Any]:
+    meta = _rules_meta(trigger, payload, con=con)
+    meta["rules_auto_resume_opt_in"] = True
+    meta["rules_auto_resume_env"] = "RULES_AUTO_RESUME=1"
+    meta["live_mode_requested"] = bool(_live_mode_requested(con))
+    meta["production_like_requested"] = bool(_production_like_requested())
+    return meta
+
+
+def _activate_rule_halt(
+    con,
+    out: Dict[str, Any],
+    *,
+    scope: str,
+    key: str,
+    trigger: str,
+    reason: str,
+    meta: Dict[str, Any] | None = None,
+    action_reason: Any = None,
+) -> None:
+    activated = activate_owned(
+        scope,
+        key,
+        reason=reason,
+        owner_actor=RULES_ACTOR,
+        trigger=trigger,
+        meta=_rules_meta(trigger, meta, con=con),
+        action="AUTO",
+        con=con,
+    )
+    if activated:
+        out["actions"].append(
+            {
+                "scope": scope,
+                "key": key,
+                "enabled": 1,
+                "reason": trigger if action_reason is None else action_reason,
+            }
+        )
+
+
+def _clear_rule_halt(
+    con,
+    out: Dict[str, Any],
+    *,
+    scope: str,
+    key: str,
+    trigger: str,
+    reason: str,
+    meta: Dict[str, Any] | None = None,
+    auto_resume: bool,
+) -> None:
+    if not auto_resume:
+        return
+    cleared = clear_owned(
+        scope,
+        key,
+        owner_actor=RULES_ACTOR,
+        trigger=trigger,
+        reason=reason,
+        meta=_rules_clear_meta(trigger, meta, con=con),
+        con=con,
+    )
+    if cleared:
+        out["actions"].append(
+            {
+                "scope": scope,
+                "key": key,
+                "enabled": 0,
+                "reason": reason,
+            }
+        )
 
 def _detect_realized_exec_cost_spike(con) -> Dict[str, Any]:
     """
@@ -192,6 +293,11 @@ def evaluate_rules() -> Dict[str, Any]:
     try:
         now_ms = _now_ms()
         out: Dict[str, Any] = {"enabled": True, "ts_ms": now_ms, "actions": []}
+        auto_resume = _rules_auto_resume_enabled(con)
+        out["rules_auto_resume_enabled"] = bool(auto_resume)
+        out["rules_auto_resume_requested"] = _env_truthy("RULES_AUTO_RESUME")
+        out["rules_auto_resume_live_mode"] = bool(_live_mode_requested(con))
+        out["rules_auto_resume_production_like"] = bool(_production_like_requested())
 
         # ---            -- ------------------------------------------------------
         # Execution cost spike → GLOBAL kill switch
@@ -205,26 +311,26 @@ def evaluate_rules() -> Dict[str, Any]:
                 meta = dict(spike)
                 meta["until_ts_ms"] = int(until_ms)
 
-                activate(
-                    "global",
-                    "global",
-                    f"rules_exec_cost_spike avg_spread_bps={float(spike.get('avg_spread_bps', 0.0)):.2f}",
+                _activate_rule_halt(
+                    con,
+                    out,
+                    scope="global",
+                    key=RULES_GLOBAL_KEYS["cost_spike"],
+                    trigger="cost_spike",
+                    reason=f"rules_exec_cost_spike avg_spread_bps={float(spike.get('avg_spread_bps', 0.0)):.2f}",
                     meta=meta,
-                    action="AUTO",
-                    con=con,
-                )
-                out["actions"].append(
-                    {"scope": "global", "key": "global", "enabled": 1, "reason": "exec_cost_spike"}
                 )
             else:
-                if AUTO_RESUME:
-                    clear(
-                        "global",
-                        "global",
-                        reason="rules_exec_cost_spike_clear",
-                        meta=spike,
-                        con=con,
-                    )
+                _clear_rule_halt(
+                    con,
+                    out,
+                    scope="global",
+                    key=RULES_GLOBAL_KEYS["cost_spike"],
+                    trigger="cost_spike",
+                    reason="rules_exec_cost_spike_clear",
+                    meta=spike,
+                    auto_resume=auto_resume,
+                )
         except Exception as e:
             _warn_nonfatal("rules_engine_exec_cost_spike_evaluation_failed", e)
 
@@ -239,27 +345,41 @@ def evaluate_rules() -> Dict[str, Any]:
                     "reason_code": str(drawdown_state.reason_code),
                     "drawdown_state": drawdown_state.to_dict(),
                 }
-                activate(
-                    "global",
-                    "global",
-                    f"rules_drawdown_state_unavailable reason={drawdown_state.reason_code}",
+                _activate_rule_halt(
+                    con,
+                    out,
+                    scope="global",
+                    key=RULES_GLOBAL_KEYS["drawdown"],
+                    trigger="drawdown",
+                    reason=f"rules_drawdown_state_unavailable reason={drawdown_state.reason_code}",
                     meta=meta,
-                    action="AUTO",
-                    con=con,
-                )
-                out["actions"].append(
-                    {"scope": "global", "key": "global", "enabled": 1, "reason": "drawdown_state_unavailable"}
+                    action_reason="drawdown_state_unavailable",
                 )
         else:
             dd = float(drawdown_state.drawdown or 0.0)
             out["drawdown"] = float(dd)
 
         if drawdown_state.ok and dd >= MAX_DD:
-            activate("global", "global", f"rules_drawdown dd={dd:.3f}", meta={"dd": dd}, action="AUTO", con=con)
-            out["actions"].append({"scope": "global", "key": "global", "enabled": 1, "reason": "drawdown"})
+            _activate_rule_halt(
+                con,
+                out,
+                scope="global",
+                key=RULES_GLOBAL_KEYS["drawdown"],
+                trigger="drawdown",
+                reason=f"rules_drawdown dd={dd:.3f}",
+                meta={"dd": dd},
+            )
         elif drawdown_state.ok:
-            if AUTO_RESUME:
-                clear("global", "global", reason="rules_drawdown_clear", meta={"dd": dd}, con=con)
+            _clear_rule_halt(
+                con,
+                out,
+                scope="global",
+                key=RULES_GLOBAL_KEYS["drawdown"],
+                trigger="drawdown",
+                reason="rules_drawdown_clear",
+                meta={"dd": dd},
+                auto_resume=auto_resume,
+            )
 
         # Global drift
         drift = 0.0
@@ -270,22 +390,53 @@ def evaluate_rules() -> Dict[str, Any]:
         out["max_drift_ratio"] = float(drift)
 
         if MAX_DRIFT > 0.0 and drift >= MAX_DRIFT:
-            activate("global", "global", f"rules_drift drift={drift:.2f}", meta={"drift": drift}, action="AUTO", con=con)
-            out["actions"].append({"scope": "global", "key": "global", "enabled": 1, "reason": "drift"})
+            _activate_rule_halt(
+                con,
+                out,
+                scope="global",
+                key=RULES_GLOBAL_KEYS["drift"],
+                trigger="drift",
+                reason=f"rules_drift drift={drift:.2f}",
+                meta={"drift": drift},
+            )
         else:
-            if AUTO_RESUME:
-                clear("global", "global", reason="rules_drift_clear", meta={"drift": drift}, con=con)
+            _clear_rule_halt(
+                con,
+                out,
+                scope="global",
+                key=RULES_GLOBAL_KEYS["drift"],
+                trigger="drift",
+                reason="rules_drift_clear",
+                meta={"drift": drift},
+                auto_resume=auto_resume,
+            )
 
         # Global execution winrate
         gw = get_exec_winrate_global(con=con, lookback_days=EXEC_LOOKBACK_DAYS)
         out["exec_winrate_global"] = gw
 
         if gw is not None and gw < MIN_GLOBAL_WINRATE:
-            activate("global", "global", f"rules_exec_winrate winrate={gw:.2f}", meta={"winrate": gw}, action="AUTO", con=con)
-            out["actions"].append({"scope": "global", "key": "global", "enabled": 1, "reason": "global_winrate"})
+            _activate_rule_halt(
+                con,
+                out,
+                scope="global",
+                key=RULES_GLOBAL_KEYS["exec_winrate"],
+                trigger="exec_winrate",
+                reason=f"rules_exec_winrate winrate={gw:.2f}",
+                meta={"winrate": gw},
+                action_reason="global_winrate",
+            )
         else:
-            if AUTO_RESUME:
-                clear("global", "global", reason="rules_exec_winrate_clear", meta={"winrate": gw}, con=con)
+            _clear_rule_halt(
+                con,
+                out,
+                scope="global",
+                key=RULES_GLOBAL_KEYS["exec_winrate"],
+                trigger="exec_winrate",
+                reason="rules_exec_winrate_clear",
+                meta={"winrate": gw},
+                auto_resume=auto_resume,
+            )
 
         # Per-symbol halts
         sym_stats = get_exec_stats_by_symbol(con=con, lookback_days=EXEC_LOOKBACK_DAYS) or {}
@@ -320,11 +471,27 @@ def evaluate_rules() -> Dict[str, Any]:
                 why["drift_ratio"] = sdr
 
             if bad:
-                activate("symbol", sym, f"rules_symbol_halt {sym}", meta=why, action="AUTO", con=con)
-                out["actions"].append({"scope": "symbol", "key": sym, "enabled": 1, "reason": why})
+                _activate_rule_halt(
+                    con,
+                    out,
+                    scope="symbol",
+                    key=sym,
+                    trigger=RULES_SYMBOL_TRIGGER,
+                    reason=f"rules_symbol_halt {sym}",
+                    meta=why,
+                    action_reason=why,
+                )
             else:
-                if AUTO_RESUME:
-                    clear("symbol", sym, reason="rules_symbol_clear", meta={"n": n, "winrate": wr, "avg_net_z": avg_z, "drift_ratio": sdr}, con=con)
+                _clear_rule_halt(
+                    con,
+                    out,
+                    scope="symbol",
+                    key=sym,
+                    trigger=RULES_SYMBOL_TRIGGER,
+                    reason="rules_symbol_clear",
+                    meta={"n": n, "winrate": wr, "avg_net_z": avg_z, "drift_ratio": sdr},
+                    auto_resume=auto_resume,
+                )
 
         return out
     finally:

@@ -47,8 +47,14 @@ from engine.strategy.model_config import (
     load_model_configs,
 )
 from engine.strategy.promotion_hardening import promote_with_snapshot_and_db_watch
-from engine.strategy.promotion_guard import promotion_allowed
+from engine.strategy.promotion_guard import (
+    metrics_have_net_cost_evidence,
+    promotion_allowed,
+    run_position_reconcile_before_promotion,
+)
 from engine.strategy.promotion_audit import audit
+from engine.strategy.net_after_cost_labels import net_cost_evidence_summary
+from engine.runtime.workload_profiles import assert_offline_work_allowed
 from engine.training_guard import training_allowed
 
 
@@ -228,7 +234,7 @@ def _net_eval_metrics(con, lookback_days: int = 90) -> Optional[Dict[str, Any]]:
 
     rows = con.execute(
         """
-        SELECT p.predicted_z, le.net_z
+        SELECT p.predicted_z, le.net_z, le.gross_ret, le.net_ret, le.total_cost_bps, le.realized
         FROM predictions p
         JOIN labels_exec le
           ON le.event_id=p.event_id
@@ -247,10 +253,15 @@ def _net_eval_metrics(con, lookback_days: int = 90) -> Optional[Dict[str, Any]]:
         return None
 
     n = 0
+    realized_n = 0
     se = 0.0
     hit = 0
+    gross_sum = 0.0
+    net_sum = 0.0
+    cost_sum = 0.0
+    cost_bps_sum = 0.0
 
-    for pred, netz in rows:
+    for pred, netz, gross_ret, net_ret, total_cost_bps, realized in rows:
         try:
             pr = float(pred)
             nz = float(netz)
@@ -263,9 +274,21 @@ def _net_eval_metrics(con, lookback_days: int = 90) -> Optional[Dict[str, Any]]:
             )
             continue
         n += 1
+        realized_n += 1 if int(realized or 0) == 1 else 0
         se += (pr - nz) ** 2
         if (pr >= 0 and nz >= 0) or (pr < 0 and nz < 0):
             hit += 1
+        g = _as_float(gross_ret)
+        nr = _as_float(net_ret)
+        cbps = _as_float(total_cost_bps)
+        if g is not None:
+            gross_sum += float(g)
+        if nr is not None:
+            net_sum += float(nr)
+        if g is not None and nr is not None:
+            cost_sum += max(0.0, float(g) - float(nr))
+        if cbps is not None:
+            cost_bps_sum += max(0.0, float(cbps))
 
     if n <= 0:
         return None
@@ -273,10 +296,19 @@ def _net_eval_metrics(con, lookback_days: int = 90) -> Optional[Dict[str, Any]]:
     rmse = math.sqrt(se / n)
     diracc = float(hit) / float(n)
 
+    artifact_evidence = net_cost_evidence_summary(con, lookback_days=int(lookback_days))
     return {
         "n_eval_net": n,
+        "n_eval_net_realized": int(realized_n),
         "rmse_net": rmse,
         "directional_acc_net": diracc,
+        "gross_edge": float(gross_sum / float(n)),
+        "net_edge": float(net_sum / float(n)),
+        "cost_drag": float(cost_sum / float(n)),
+        "avg_total_cost_bps": float(cost_bps_sum / float(n)),
+        "net_cost_label_count": int(artifact_evidence.get("n") or 0),
+        "net_cost_evidence_available": bool(artifact_evidence.get("available")),
+        "net_cost_evidence": dict(artifact_evidence),
     }
 
 
@@ -348,6 +380,11 @@ def _aggregate(rows) -> Tuple[str, Dict[str, Any]]:
 # Challenger vs champion comparison
 # ------            -- ------------------------------------------------------
 def _beats_champion(candidate: Dict[str, Any], champion: Optional[Dict[str, Any]]):
+    if not metrics_have_net_cost_evidence(candidate):
+        return False, {
+            "missing_net_cost_evidence": True,
+            "net_cost_label_count": int(candidate.get("net_cost_label_count") or 0),
+        }
     if champion is None:
         return True, {"no_champion": True}
 
@@ -496,6 +533,11 @@ def main() -> int:
     if not training_allowed():
         print("[training_guard] training disabled")
         raise SystemExit(0)
+    try:
+        assert_offline_work_allowed(job_name=JOB_NAME)
+    except RuntimeError as exc:
+        print(f"[workload_profile] {exc}")
+        return 3
 
     init_db()
 
@@ -643,6 +685,23 @@ def main() -> int:
                     },
                 )
                 print(f"[SHADOW] model={variant_name} retained as shadow-only candidate")
+                trained_variants += 1
+                continue
+
+            position_reconcile_gate = run_position_reconcile_before_promotion()
+            if bool(position_reconcile_gate.get("required")) and not bool(position_reconcile_gate.get("ok")):
+                audit(
+                    actor="auto",
+                    action="block",
+                    model_name=variant_name,
+                    to_kind=kind,
+                    to_ts_ms=int(snap),
+                    reason={"position_reconcile": position_reconcile_gate, "metrics": metrics},
+                )
+                print(
+                    f"[BLOCKED] model={variant_name} position reconcile gate: "
+                    f"{position_reconcile_gate.get('reason')}"
+                )
                 trained_variants += 1
                 continue
 

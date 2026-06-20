@@ -28,7 +28,7 @@ LOG = logging.getLogger(__name__)
 from engine.runtime.storage import connect as _db_connect
 from engine.runtime.ipc import market_data_status
 
-from dashboard_config import (
+from engine.runtime.dashboard_config import (
     AUTO_PIPELINE_INCLUDE_EXECUTION,
     AUTO_PIPELINE_START_DELAY_S,
     AUTO_PIPELINE_INTERVAL_S,

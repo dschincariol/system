@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 
 import json
-import math
 import os
 import time
 import uuid
@@ -19,8 +18,8 @@ from engine.artifacts.serialization import dumps_torch_payload, loads_torch_payl
 from engine.artifacts.store import LocalArtifactStore
 from engine.model_registry import register_model, register_model_family
 from engine.runtime.failure_diagnostics import log_failure
-from engine.runtime.storage import connect, init_db
-from engine.strategy import feature_registry
+from engine.runtime.hardware import resolve_torch_device, torch_device_is_cuda
+from engine.runtime.storage import connect, init_db, table_exists
 from engine.strategy.feature_registry import build_feature_snapshot, feature_set_tag_from_ids
 from engine.strategy.model_lifecycle import (
     load_lifecycle_plan,
@@ -48,9 +47,16 @@ DEFAULT_LAYERS = int(os.environ.get("PATCHTST_LAYERS", "3"))
 DEFAULT_HEADS = int(os.environ.get("PATCHTST_HEADS", "4"))
 DEFAULT_D_MODEL = int(os.environ.get("PATCHTST_D_MODEL", "64"))
 DEFAULT_DROPOUT = float(os.environ.get("PATCHTST_DROPOUT", "0.1"))
+DEFAULT_MC_DROPOUT_SAMPLES = int(os.environ.get("PATCHTST_MC_DROPOUT_SAMPLES", "0"))
 DEFAULT_MIN_SAMPLES = int(os.environ.get("PATCHTST_MIN_SAMPLES", "20"))
 DEFAULT_LOOKBACK_DAYS = int(os.environ.get("PATCHTST_LOOKBACK_DAYS", "365"))
 DEFAULT_HORIZON_S = int(os.environ.get("PATCHTST_HORIZON_S", os.environ.get("MODEL_HORIZON_MEDIUM_S", "3600")))
+DEFAULT_PRETRAIN_MASK_RATIO = float(os.environ.get("PATCHTST_PRETRAIN_MASK_RATIO", "0.35"))
+DEFAULT_PRETRAIN_EPOCHS = int(os.environ.get("PATCHTST_PRETRAIN_EPOCHS", "20"))
+DEFAULT_PRETRAIN_LR = float(os.environ.get("PATCHTST_PRETRAIN_LR", "0.001"))
+DEFAULT_PRETRAIN_MIN_SAMPLES = int(os.environ.get("PATCHTST_PRETRAIN_MIN_SAMPLES", str(DEFAULT_MIN_SAMPLES)))
+DEFAULT_PRETRAIN_MAX_SAMPLES = int(os.environ.get("PATCHTST_PRETRAIN_MAX_SAMPLES", "2048"))
+PRETRAIN_ARTIFACT_KIND = "patchtst_masked_pretraining"
 
 
 def _register_family() -> None:
@@ -68,10 +74,17 @@ def _register_family() -> None:
 
 _register_family()
 
-if os.environ.get("PATCHTST_USE_CUDA", "0") == "1" and torch.cuda.is_available():
-    DEFAULT_DEVICE = torch.device("cuda")
-else:
-    DEFAULT_DEVICE = torch.device("cpu")
+def _default_device() -> torch.device:
+    resolution = resolve_torch_device(
+        torch,
+        env_var="PATCHTST_DEVICE",
+        fallback_envs=("TORCH_DEVICE",),
+        legacy_cuda_flag="PATCHTST_USE_CUDA",
+    )
+    return torch.device(resolution.resolved)
+
+
+DEFAULT_DEVICE = _default_device()
 
 
 def _set_seed(seed: int) -> None:
@@ -236,8 +249,14 @@ def _assert_config_feature_schema_current(config: Mapping[str, Any]) -> list[str
 
 def _resolve_load_device(config: Mapping[str, Any]) -> torch.device:
     trained_device = str(config.get("device_at_train") or "cpu").strip().lower()
-    if trained_device.startswith("cuda") and torch.cuda.is_available():
-        return torch.device("cuda")
+    resolution = resolve_torch_device(
+        torch,
+        env_var="PATCHTST_DEVICE",
+        fallback_envs=("TORCH_DEVICE",),
+        legacy_cuda_flag="PATCHTST_USE_CUDA",
+    )
+    if torch_device_is_cuda(torch, resolution):
+        return torch.device(resolution.resolved)
     if trained_device.startswith("cuda"):
         logging.getLogger(__name__).warning(
             "patchtst_cuda_trained_loaded_on_cpu model_name=%s device_at_train=%s",
@@ -301,6 +320,91 @@ def _preprocess_sequence_array(
     return flat.reshape(int(n_samples), int(seq_len), int(n_features)).astype(np.float32), preprocessing, accounting
 
 
+def _table_columns(con: Any, table_name: str) -> set[str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({str(table_name)})").fetchall() or []
+        return {str(row[1] or "").strip() for row in rows if len(row) > 1 and str(row[1] or "").strip()}
+    except Exception:
+        return set()
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return int(default)
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _feature_schema_core(schema: Mapping[str, Any] | None) -> dict[str, Any]:
+    raw = dict(schema or {})
+    return {
+        "feature_ids": [str(item) for item in list(raw.get("feature_ids") or [])],
+        "feature_set_tag": str(raw.get("feature_set_tag") or ""),
+        "feature_count": _safe_int(raw.get("feature_count"), 0),
+        "sequence_schema": dict(raw.get("sequence_schema") or {}),
+    }
+
+
+def _assert_pretraining_schema_compatible(
+    pretraining: Mapping[str, Any] | None,
+    *,
+    model_config: Mapping[str, Any] | None = None,
+    model_schema: Mapping[str, Any] | None = None,
+) -> None:
+    meta = dict(pretraining or {})
+    if not meta:
+        return
+    pre_schema = dict(meta.get("feature_schema") or {})
+    if not pre_schema and isinstance(meta.get("config"), Mapping):
+        pre_schema = dict((meta.get("config") or {}).get("feature_schema") or {})
+    expected_schema = dict(model_schema or {})
+    if not expected_schema and isinstance(model_config, Mapping):
+        expected_schema = dict((model_config or {}).get("feature_schema") or {})
+    pre_core = _feature_schema_core(pre_schema)
+    expected_core = _feature_schema_core(expected_schema)
+    if pre_core.get("feature_ids") != expected_core.get("feature_ids"):
+        raise ValueError(
+            "patchtst_pretraining_schema_drift:"
+            f" pretraining_feature_ids={pre_core.get('feature_ids')}"
+            f" model_feature_ids={expected_core.get('feature_ids')}"
+        )
+    if str(pre_core.get("feature_set_tag") or "") != str(expected_core.get("feature_set_tag") or ""):
+        raise ValueError(
+            "patchtst_pretraining_schema_drift:"
+            f" pretraining_feature_set_tag={pre_core.get('feature_set_tag') or '<missing>'}"
+            f" model_feature_set_tag={expected_core.get('feature_set_tag') or '<missing>'}"
+        )
+    pre_seq = dict(pre_core.get("sequence_schema") or {})
+    expected_seq = dict(expected_core.get("sequence_schema") or {})
+    for key in ("seq_len",):
+        if _safe_int(pre_seq.get(key), 0) != _safe_int(expected_seq.get(key), 0):
+            raise ValueError(
+                "patchtst_pretraining_sequence_drift:"
+                f" {key}={_safe_int(pre_seq.get(key), 0)}"
+                f" model_{key}={_safe_int(expected_seq.get(key), 0)}"
+            )
+    if isinstance(model_config, Mapping):
+        for key in ("patch_len", "stride", "d_model", "n_layers", "n_heads"):
+            pre_value = meta.get(key)
+            if pre_value is None and isinstance(meta.get("config"), Mapping):
+                pre_value = (meta.get("config") or {}).get(key)
+            model_value = model_config.get(key)
+            if pre_value is None or model_value is None:
+                continue
+            if _safe_int(pre_value, 0) != _safe_int(model_value, 0):
+                raise ValueError(
+                    "patchtst_pretraining_architecture_drift:"
+                    f" {key}={_safe_int(pre_value, 0)}"
+                    f" model_{key}={_safe_int(model_value, 0)}"
+                )
+
+
+def _pretraining_alias(model_name: str, symbol: str = "*") -> str:
+    return f"model:{FAMILY}:{str(model_name or FAMILY)}:{str(symbol or '*').upper()}:pretrained"
+
+
 class PatchTST(nn.Module):
     """Compact PatchTST encoder using patch tokens and a Transformer encoder."""
 
@@ -347,16 +451,80 @@ class PatchTST(nn.Module):
         self.norm = nn.LayerNorm(self.d_model)
         self.head = nn.Linear(self.d_model, self.n_horizons)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def patchify(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError("patchtst_forward_requires_3d")
         patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
         patches = patches.permute(0, 1, 3, 2).contiguous()
-        patches = patches.reshape(x.shape[0], self.n_patches, self.patch_len * self.n_features)
-        tokens = self.patch_projection(patches) + self.position
+        return patches.reshape(x.shape[0], self.n_patches, self.patch_len * self.n_features)
+
+    def encode(
+        self,
+        x: torch.Tensor,
+        *,
+        patch_mask: torch.Tensor | None = None,
+        mask_token: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        patches = self.patchify(x)
+        projected = self.patch_projection(patches)
+        if patch_mask is not None:
+            if mask_token is None:
+                raise ValueError("patchtst_mask_token_required")
+            mask = patch_mask.to(device=projected.device, dtype=torch.bool)
+            if tuple(mask.shape) != tuple(projected.shape[:2]):
+                raise ValueError("patchtst_patch_mask_shape_mismatch")
+            replacement = mask_token.to(device=projected.device, dtype=projected.dtype).reshape(1, 1, -1)
+            projected = torch.where(mask.unsqueeze(-1), replacement.expand_as(projected), projected)
+        tokens = projected + self.position
         encoded = self.encoder(tokens)
+        return encoded
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        encoded = self.encode(x)
         pooled = self.norm(encoded.mean(dim=1))
         return self.head(pooled)
+
+
+class MaskedPatchTSTPretrainer(nn.Module):
+    """PatchTST encoder trained to reconstruct intentionally masked patches."""
+
+    def __init__(
+        self,
+        *,
+        seq_len: int,
+        n_features: int,
+        patch_len: int = DEFAULT_PATCH_LEN,
+        stride: int = DEFAULT_STRIDE,
+        d_model: int = DEFAULT_D_MODEL,
+        n_layers: int = DEFAULT_LAYERS,
+        n_heads: int = DEFAULT_HEADS,
+        dropout: float = DEFAULT_DROPOUT,
+    ) -> None:
+        super().__init__()
+        self.encoder = PatchTST(
+            seq_len=int(seq_len),
+            n_features=int(n_features),
+            n_horizons=1,
+            patch_len=int(patch_len),
+            stride=int(stride),
+            d_model=int(d_model),
+            n_layers=int(n_layers),
+            n_heads=int(n_heads),
+            dropout=float(dropout),
+        )
+        self.mask_token = nn.Parameter(torch.zeros(int(d_model)))
+        self.reconstruction_head = nn.Linear(int(d_model), int(patch_len) * int(n_features))
+
+    @property
+    def n_patches(self) -> int:
+        return int(self.encoder.n_patches)
+
+    def forward(self, x: torch.Tensor, patch_mask: torch.Tensor) -> torch.Tensor:
+        encoded = self.encoder.encode(x, patch_mask=patch_mask, mask_token=self.mask_token)
+        return self.reconstruction_head(encoded)
+
+    def target_patches(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder.patchify(x)
 
 
 class PatchTSTRegressor:
@@ -401,6 +569,7 @@ class PatchTSTRegressor:
         self.feature_preprocessing: dict[str, Any] = {}
         self.training_metrics: dict[str, Any] = {}
         self.ood_profile: dict[str, Any] = {}
+        self.pretraining_metadata: dict[str, Any] = {}
         if self.feature_ids:
             self._build_model(n_features=len(self.feature_ids))
 
@@ -437,6 +606,7 @@ class PatchTSTRegressor:
         weight_decay: float = 1e-4,
         grad_clip: float = 1.0,
         return_losses: bool = False,
+        pretraining_artifact: Mapping[str, Any] | None = None,
     ) -> list[float] | "PatchTSTRegressor":
         columns = _expected_columns(self.feature_ids, model_name=self.model_name, model_spec=self.feature_schema)
         X_raw = _sequence_array_from_features(X, columns, seq_len=self.seq_len)
@@ -458,6 +628,7 @@ class PatchTSTRegressor:
         self.feature_preprocessing = dict(preprocessing or {})
         self._build_model(n_features=int(X_arr.shape[2]))
         assert self.model is not None
+        pretraining_applied = self._apply_pretraining_artifact(pretraining_artifact)
 
         self.x_mean = X_arr.mean(axis=(0, 1)).astype(np.float32)
         self.x_std = X_arr.std(axis=(0, 1)).astype(np.float32)
@@ -503,8 +674,68 @@ class PatchTSTRegressor:
             "model_kind": self.model_kind,
             "feature_schema": dict(self.feature_schema),
             "ood_profile_summary": summarize_ood_profile(self.ood_profile),
+            "pretraining": dict(self.pretraining_metadata or {}),
+            "pretraining_applied": bool(pretraining_applied),
         }
         return losses if return_losses else self
+
+    def _apply_pretraining_artifact(self, pretraining_artifact: Mapping[str, Any] | None) -> bool:
+        if not pretraining_artifact:
+            self.pretraining_metadata = {}
+            return False
+        if self.model is None:
+            raise RuntimeError("patchtst_model_not_initialized")
+        raw = dict(pretraining_artifact or {})
+        if str(raw.get("artifact_kind") or raw.get("kind") or "") != PRETRAIN_ARTIFACT_KIND:
+            raise ValueError("patchtst_invalid_pretraining_artifact_kind")
+        config = dict(raw.get("config") or {})
+        artifact_schema = dict(config.get("feature_schema") or raw.get("feature_schema") or {})
+        artifact_meta = {
+            "artifact_kind": PRETRAIN_ARTIFACT_KIND,
+            "model_name": str(config.get("model_name") or raw.get("model_name") or ""),
+            "feature_schema": dict(artifact_schema),
+            "seq_len": int(config.get("seq_len") or self.seq_len),
+            "patch_len": int(config.get("patch_len") or self.patch_len),
+            "stride": int(config.get("stride") or self.stride),
+            "d_model": int(config.get("d_model") or self.d_model),
+            "n_layers": int(config.get("n_layers") or self.n_layers),
+            "n_heads": int(config.get("n_heads") or self.n_heads),
+            "mask_ratio": float((raw.get("metrics") or {}).get("mask_ratio") or config.get("mask_ratio") or 0.0),
+            "artifact_alias": str(raw.get("artifact_alias") or ""),
+            "artifact_sha256": str(raw.get("artifact_sha256") or ""),
+        }
+        _assert_pretraining_schema_compatible(
+            artifact_meta,
+            model_config=self._config_payload(),
+            model_schema=self.feature_schema,
+        )
+        state = dict(raw.get("encoder_state_dict") or {})
+        if not state and isinstance(raw.get("pretraining_state_dict"), Mapping):
+            prefix = "encoder."
+            state = {
+                str(key)[len(prefix):]: value
+                for key, value in dict(raw.get("pretraining_state_dict") or {}).items()
+                if str(key).startswith(prefix)
+            }
+        if not state:
+            raise ValueError("patchtst_pretraining_encoder_state_missing")
+        current_state = self.model.state_dict()
+        compatible_state = {
+            str(key): value
+            for key, value in state.items()
+            if str(key) in current_state
+            and not str(key).startswith("head.")
+            and tuple(getattr(value, "shape", ())) == tuple(current_state[str(key)].shape)
+        }
+        if not compatible_state:
+            raise ValueError("patchtst_pretraining_encoder_state_incompatible")
+        self.model.load_state_dict(compatible_state, strict=False)
+        self.pretraining_metadata = {
+            **artifact_meta,
+            "loaded_encoder_tensors": int(len(compatible_state)),
+            "metrics": dict(raw.get("metrics") or {}),
+        }
+        return True
 
     def predict(self, X: Any) -> np.ndarray:
         if self.model is None or self.x_mean is None or self.x_std is None or self.y_mean is None or self.y_std is None:
@@ -524,6 +755,68 @@ class PatchTSTRegressor:
             pred_n = self.model(torch.from_numpy(Xn).to(self.device)).detach().cpu().numpy().astype(np.float32)
         return pred_n * self.y_std.reshape(1, -1) + self.y_mean.reshape(1, -1)
 
+    def predict_with_uncertainty(self, X: Any, *, samples: int | None = None) -> dict[str, Any]:
+        """Return first-horizon prediction plus optional MC-dropout uncertainty."""
+
+        if self.model is None or self.x_mean is None or self.x_std is None or self.y_mean is None or self.y_std is None:
+            raise RuntimeError("patchtst_model_not_fitted")
+        columns = _expected_columns(self.feature_ids, model_name=self.model_name, model_spec=self.feature_schema)
+        X_raw = _sequence_array_from_features(X, columns, seq_len=self.seq_len)
+        X_arr, _preprocessing, _accounting = _preprocess_sequence_array(
+            X_raw,
+            columns,
+            feature_schema=self.feature_schema,
+            phase="serve",
+            model_name=self.model_name,
+        )
+        Xn = ((X_arr - self.x_mean.reshape(1, 1, -1)) / self.x_std.reshape(1, 1, -1)).astype(np.float32)
+        xt = torch.from_numpy(Xn).to(self.device)
+        sample_count = max(0, int(samples if samples is not None else DEFAULT_MC_DROPOUT_SAMPLES))
+
+        if sample_count <= 1 or float(self.dropout) <= 0.0:
+            self.model.eval()
+            with torch.no_grad():
+                pred_n = self.model(xt).detach().cpu().numpy().astype(np.float32)
+            pred = pred_n * self.y_std.reshape(1, -1) + self.y_mean.reshape(1, -1)
+            return {
+                "prediction": float(pred.reshape(-1)[0]) if pred.size else 0.0,
+                "prediction_vector": pred.astype(float).tolist(),
+                "epistemic_uncertainty": 0.0,
+                "mc_dropout_samples": int(sample_count),
+                "uncertainty_ts_ms": int(time.time() * 1000),
+            }
+
+        was_training = bool(self.model.training)
+        preds: list[np.ndarray] = []
+        try:
+            self.model.train()
+            with torch.no_grad():
+                for _idx in range(int(sample_count)):
+                    pred_n = self.model(xt).detach().cpu().numpy().astype(np.float32)
+                    preds.append(pred_n * self.y_std.reshape(1, -1) + self.y_mean.reshape(1, -1))
+        finally:
+            if was_training:
+                self.model.train()
+            else:
+                self.model.eval()
+
+        stacked = np.stack(preds, axis=0).astype(np.float32)
+        mean_pred = stacked.mean(axis=0)
+        std_pred = stacked.std(axis=0)
+        return {
+            "prediction": float(mean_pred.reshape(-1)[0]) if mean_pred.size else 0.0,
+            "prediction_vector": mean_pred.astype(float).tolist(),
+            "epistemic_uncertainty": float(std_pred.reshape(-1)[0]) if std_pred.size else 0.0,
+            "epistemic_uncertainty_vector": std_pred.astype(float).tolist(),
+            "mc_dropout_samples": int(sample_count),
+            "uncertainty_ts_ms": int(time.time() * 1000),
+            "uncertainty_detail": {
+                "method": "mc_dropout",
+                "samples": int(sample_count),
+                "dropout": float(self.dropout),
+            },
+        }
+
     def save(self, directory: str | Path) -> Path:
         target = Path(directory)
         target.mkdir(parents=True, exist_ok=True)
@@ -539,6 +832,11 @@ class PatchTSTRegressor:
         target = Path(directory)
         config = json.loads((target / "config.json").read_text(encoding="utf-8"))
         feature_ids = _assert_config_feature_schema_current(config)
+        _assert_pretraining_schema_compatible(
+            dict(config.get("pretraining") or {}),
+            model_config=config,
+            model_schema=dict(config.get("feature_schema") or {}),
+        )
         load_device = _resolve_load_device(config)
         obj = cls(
             model_name=str(config.get("model_name") or FAMILY),
@@ -566,6 +864,7 @@ class PatchTSTRegressor:
         )
         obj.training_metrics = dict(config.get("training_metrics") or {})
         obj.ood_profile = dict(config.get("ood_profile") or {})
+        obj.pretraining_metadata = dict(config.get("pretraining") or {})
         if obj.model is None:
             obj._build_model(n_features=len(obj.feature_ids))
         payload = loads_torch_payload((target / "state.pt").read_bytes(), map_location=str(load_device))
@@ -594,6 +893,7 @@ class PatchTSTRegressor:
             "y_std": [] if self.y_std is None else self.y_std.astype(float).tolist(),
             "training_metrics": dict(self.training_metrics or {}),
             "ood_profile": dict(getattr(self, "ood_profile", {}) or {}),
+            "pretraining": dict(getattr(self, "pretraining_metadata", {}) or {}),
         }
 
     def to_bytes(self) -> bytes:
@@ -608,6 +908,11 @@ class PatchTSTRegressor:
         raw = loads_torch_payload(payload)
         config = dict(raw.get("config") or {})
         feature_ids = _assert_config_feature_schema_current(config)
+        _assert_pretraining_schema_compatible(
+            dict(config.get("pretraining") or {}),
+            model_config=config,
+            model_schema=dict(config.get("feature_schema") or {}),
+        )
         load_device = _resolve_load_device(config)
         obj = cls(
             model_name=str(config.get("model_name") or FAMILY),
@@ -635,6 +940,7 @@ class PatchTSTRegressor:
         )
         obj.training_metrics = dict(config.get("training_metrics") or {})
         obj.ood_profile = dict(config.get("ood_profile") or {})
+        obj.pretraining_metadata = dict(config.get("pretraining") or {})
         if obj.model is None:
             obj._build_model(n_features=len(obj.feature_ids))
         obj.model.load_state_dict(dict(raw.get("state_dict") or {}))
@@ -659,6 +965,7 @@ def persist_model_artifact(model: PatchTSTRegressor, *, symbol: str = "*", versi
             "version": str(version),
             "feature_schema": dict(model.feature_schema),
             "ood_profile_summary": summarize_ood_profile(getattr(model, "ood_profile", None)),
+            "pretraining": dict(getattr(model, "pretraining_metadata", {}) or {}),
         },
     )
     return {"alias": str(alias), "sha256": str(ref.sha256), "size_bytes": int(ref.size), "content_type": ref.content_type}
@@ -683,6 +990,7 @@ def register_shadow_model(
         "feature_ids": list(model.feature_ids),
         "feature_set_tag": str(model.feature_schema.get("feature_set_tag") or ""),
         "feature_schema": dict(model.feature_schema),
+        "pretraining": dict(getattr(model, "pretraining_metadata", {}) or {}),
         "artifact_alias": str(manifest.get("alias") or ""),
         "artifact_sha256": str(manifest.get("sha256") or ""),
     }
@@ -724,6 +1032,233 @@ def load_model_from_artifact(alias: str = "", sha256: str = "", path: str | Path
     return PatchTSTRegressor.from_bytes(payload)
 
 
+def _patch_mask(
+    *,
+    n_samples: int,
+    n_patches: int,
+    mask_ratio: float,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    ratio = min(0.95, max(0.05, float(mask_ratio)))
+    generator = torch.Generator(device=str(device))
+    generator.manual_seed(int(seed))
+    mask = torch.rand((int(n_samples), int(n_patches)), generator=generator, device=device) < float(ratio)
+    if int(n_patches) <= 1:
+        return torch.ones((int(n_samples), int(n_patches)), dtype=torch.bool, device=device)
+    for row_idx in range(int(n_samples)):
+        if not bool(mask[row_idx].any()):
+            mask[row_idx, row_idx % int(n_patches)] = True
+        if bool(mask[row_idx].all()):
+            mask[row_idx, (row_idx + 1) % int(n_patches)] = False
+    return mask.to(dtype=torch.bool)
+
+
+def train_masked_pretraining_artifact(
+    X: Any,
+    *,
+    model_name: str = FAMILY,
+    feature_ids: Sequence[Any] | None = None,
+    seq_len: int = DEFAULT_SEQ_LEN,
+    n_horizons: int = DEFAULT_N_HORIZONS,
+    patch_len: int = DEFAULT_PATCH_LEN,
+    stride: int = DEFAULT_STRIDE,
+    n_layers: int = DEFAULT_LAYERS,
+    n_heads: int = DEFAULT_HEADS,
+    d_model: int = DEFAULT_D_MODEL,
+    dropout: float = DEFAULT_DROPOUT,
+    seed: int = 42,
+    epochs: int = DEFAULT_PRETRAIN_EPOCHS,
+    lr: float = DEFAULT_PRETRAIN_LR,
+    weight_decay: float = 1e-4,
+    grad_clip: float = 1.0,
+    mask_ratio: float = DEFAULT_PRETRAIN_MASK_RATIO,
+    device: str | torch.device | None = None,
+) -> dict[str, Any]:
+    columns = _expected_columns(feature_ids, model_name=str(model_name), model_spec={"feature_ids": list(feature_ids or [])})
+    X_raw = _sequence_array_from_features(X, columns, seq_len=int(seq_len))
+    X_arr, preprocessing, _accounting = _preprocess_sequence_array(
+        X_raw,
+        columns,
+        phase="pretrain",
+        model_name=str(model_name),
+        fit_preprocessing=True,
+    )
+    x_mean = X_arr.mean(axis=(0, 1)).astype(np.float32)
+    x_std = X_arr.std(axis=(0, 1)).astype(np.float32)
+    x_std = np.where(x_std < 1e-6, 1.0, x_std).astype(np.float32)
+    Xn = ((X_arr - x_mean.reshape(1, 1, -1)) / x_std.reshape(1, 1, -1)).astype(np.float32)
+    train_device = torch.device(device) if device is not None else DEFAULT_DEVICE
+    _set_seed(int(seed))
+    pretrainer = MaskedPatchTSTPretrainer(
+        seq_len=int(seq_len),
+        n_features=int(X_arr.shape[2]),
+        patch_len=int(patch_len),
+        stride=int(stride),
+        d_model=int(d_model),
+        n_layers=int(n_layers),
+        n_heads=int(n_heads),
+        dropout=float(dropout),
+    ).to(train_device)
+    xt = torch.from_numpy(Xn).to(train_device)
+    opt = torch.optim.AdamW(pretrainer.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, int(epochs)))
+    losses: list[float] = []
+    pretrainer.train()
+    for epoch in range(int(epochs)):
+        mask = _patch_mask(
+            n_samples=int(xt.shape[0]),
+            n_patches=int(pretrainer.n_patches),
+            mask_ratio=float(mask_ratio),
+            device=train_device,
+            seed=int(seed) + int(epoch) + 17,
+        )
+        opt.zero_grad(set_to_none=True)
+        pred = pretrainer(xt, mask)
+        target = pretrainer.target_patches(xt)
+        diff = (pred - target) ** 2
+        loss = diff[mask].mean()
+        loss.backward()
+        if float(grad_clip) > 0.0:
+            torch.nn.utils.clip_grad_norm_(pretrainer.parameters(), float(grad_clip))
+        opt.step()
+        sched.step()
+        losses.append(float(loss.detach().cpu().item()))
+    pretrainer.eval()
+    feature_schema = _feature_schema(
+        columns,
+        seq_len=int(seq_len),
+        n_horizons=int(n_horizons),
+        preprocessing=dict(preprocessing or {}),
+    )
+    metrics = {
+        "model_family": FAMILY,
+        "model_kind": "patchtst_pretraining",
+        "pretraining_task": "masked_patch_reconstruction",
+        "n_train": int(X_arr.shape[0]),
+        "mask_ratio": float(mask_ratio),
+        "n_patches": int(pretrainer.n_patches),
+        "loss_initial": float(losses[0] if losses else 0.0),
+        "loss_final": float(losses[-1] if losses else 0.0),
+        "reconstruction_rmse": float(np.sqrt(float(losses[-1] if losses else 0.0))),
+        "feature_schema": dict(feature_schema),
+    }
+    config = {
+        "model_name": str(model_name),
+        "feature_ids": list(columns),
+        "feature_schema": dict(feature_schema),
+        "seq_len": int(seq_len),
+        "n_horizons": int(n_horizons),
+        "patch_len": int(patch_len),
+        "stride": int(stride),
+        "n_layers": int(n_layers),
+        "n_heads": int(n_heads),
+        "d_model": int(d_model),
+        "dropout": float(dropout),
+        "seed": int(seed),
+        "device_at_train": str(train_device.type),
+        "mask_ratio": float(mask_ratio),
+        "x_mean": x_mean.astype(float).tolist(),
+        "x_std": x_std.astype(float).tolist(),
+    }
+    return {
+        "artifact_kind": PRETRAIN_ARTIFACT_KIND,
+        "config": config,
+        "feature_schema": dict(feature_schema),
+        "encoder_state_dict": pretrainer.encoder.state_dict(),
+        "pretraining_state_dict": pretrainer.state_dict(),
+        "metrics": metrics,
+    }
+
+
+def persist_pretraining_artifact(
+    payload: Mapping[str, Any],
+    *,
+    model_name: str,
+    symbol: str = "*",
+    version: str,
+) -> dict[str, Any]:
+    raw = dict(payload or {})
+    if str(raw.get("artifact_kind") or "") != PRETRAIN_ARTIFACT_KIND:
+        raise ValueError("patchtst_invalid_pretraining_artifact_kind")
+    alias = _pretraining_alias(str(model_name or FAMILY), str(symbol or "*"))
+    ref = LocalArtifactStore().put(
+        dumps_torch_payload(raw),
+        content_type="application/vnd.pytorch",
+        kind="model",
+        alias=alias,
+        metadata={
+            "model_name": str(model_name or FAMILY),
+            "family": FAMILY,
+            "artifact_kind": PRETRAIN_ARTIFACT_KIND,
+            "symbol": str(symbol or "*").upper(),
+            "version": str(version),
+            "feature_schema": dict(raw.get("feature_schema") or (raw.get("config") or {}).get("feature_schema") or {}),
+            "metrics": dict(raw.get("metrics") or {}),
+        },
+    )
+    return {"alias": str(alias), "sha256": str(ref.sha256), "size_bytes": int(ref.size), "content_type": ref.content_type}
+
+
+def load_pretraining_artifact_from_artifact(alias: str = "", sha256: str = "") -> dict[str, Any]:
+    alias_s = str(alias or "").strip()
+    sha_s = str(sha256 or "").strip()
+    store = LocalArtifactStore()
+    ref = store.resolve(alias_s) if alias_s else None
+    if ref is None and sha_s:
+        from datetime import datetime, timezone
+
+        from engine.artifacts.refs import ArtifactRef
+
+        ref = ArtifactRef(
+            sha256=sha_s,
+            size=0,
+            content_type="application/vnd.pytorch",
+            kind="model",
+            created_ts=datetime.now(timezone.utc),
+            metadata={},
+        )
+    if ref is None:
+        raise FileNotFoundError("patchtst_pretraining_artifact_not_found")
+    raw = dict(loads_torch_payload(store.get_bytes(ref)))
+    if str(raw.get("artifact_kind") or "") != PRETRAIN_ARTIFACT_KIND:
+        raise ValueError("patchtst_invalid_pretraining_artifact_kind")
+    raw["artifact_alias"] = alias_s
+    raw["artifact_sha256"] = str(ref.sha256)
+    return raw
+
+
+def _resolve_pretraining_artifact_for_finetune(
+    cfg: Mapping[str, Any],
+    manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if isinstance(manifest, Mapping) and (manifest.get("alias") or manifest.get("sha256")):
+        return load_pretraining_artifact_from_artifact(
+            alias=str(manifest.get("alias") or ""),
+            sha256=str(manifest.get("sha256") or ""),
+        )
+    explicit_alias = str(
+        os.environ.get("PATCHTST_PRETRAIN_ARTIFACT_ALIAS")
+        or cfg.get("pretraining_artifact_alias")
+        or ""
+    ).strip()
+    explicit_sha = str(
+        os.environ.get("PATCHTST_PRETRAIN_ARTIFACT_SHA256")
+        or cfg.get("pretraining_artifact_sha256")
+        or ""
+    ).strip()
+    if explicit_alias or explicit_sha:
+        return load_pretraining_artifact_from_artifact(alias=explicit_alias, sha256=explicit_sha)
+    default_alias = _pretraining_alias(str(cfg.get("model_name") or FAMILY), "*")
+    try:
+        store = LocalArtifactStore()
+        if store.resolve(default_alias) is None:
+            return None
+        return load_pretraining_artifact_from_artifact(alias=default_alias)
+    except FileNotFoundError:
+        return None
+
+
 def _resolve_training_config(plan: Mapping[str, Any] | None = None) -> dict[str, Any]:
     from engine.strategy.model_config import get_model_config, load_model_configs
 
@@ -737,6 +1272,11 @@ def _resolve_training_config(plan: Mapping[str, Any] | None = None) -> dict[str,
     feature_ids = _expected_columns(cfg.get("feature_ids"), model_name=model_name, model_spec=cfg)
     seq_len = int(cfg.get("seq_len") or DEFAULT_SEQ_LEN)
     n_horizons = int(cfg.get("n_horizons") or DEFAULT_N_HORIZONS)
+    raw_horizons = cfg.get("horizons_s") or cfg.get("horizons") or []
+    if not isinstance(raw_horizons, (list, tuple, set)):
+        raw_horizons = [raw_horizons]
+    first_horizon = next((_safe_int(item, 0) for item in list(raw_horizons or []) if _safe_int(item, 0) > 0), 0)
+    horizon_s = _safe_int(cfg.get("horizon_s"), first_horizon or DEFAULT_HORIZON_S)
     schema_guard = _resolve_retrain_schema_guard(
         family=FAMILY,
         model_name=str(model_name),
@@ -751,9 +1291,102 @@ def _resolve_training_config(plan: Mapping[str, Any] | None = None) -> dict[str,
         "feature_ids": list(feature_ids),
         "symbol_universe": list(cfg.get("symbol_universe") or cfg.get("symbols") or ["*"]),
         "training_window_days": int(cfg.get("training_window_days") or cfg.get("lookback_days") or DEFAULT_LOOKBACK_DAYS),
+        "horizon_s": int(horizon_s),
         "seq_len": int(seq_len),
         "n_horizons": int(n_horizons),
+        "supervised_target": str(cfg.get("supervised_target") or os.environ.get("PATCHTST_SUPERVISED_TARGET", "net_edge")),
     }
+
+
+def _supervised_target_expression(target_kind: str) -> tuple[str, str]:
+    normalized = str(target_kind or "net_edge").strip().lower().replace("-", "_")
+    if normalized in {"forward_return", "realized_forward_return", "raw_forward_return"}:
+        return "realized_forward_return", "net_after_cost_labels.realized_forward_return"
+    if normalized in {"net_edge", "net_return", "edge"}:
+        return "net_return", "net_after_cost_labels.net_return"
+    return "", "legacy.labels_exec_net_z_or_impact_z"
+
+
+def _load_supervised_label_points(
+    cfg: Mapping[str, Any],
+    *,
+    cutoff_ms: int,
+) -> list[tuple[str, int, float, int, str, str, str, str]]:
+    horizon_s = int(cfg.get("horizon_s") or DEFAULT_HORIZON_S)
+    target_expr, target_source = _supervised_target_expression(str(cfg.get("supervised_target") or "net_edge"))
+    con = connect()
+    try:
+        if target_expr:
+            try:
+                net_labels_available = bool(table_exists(con, "net_after_cost_labels"))
+            except Exception:
+                net_labels_available = False
+            if net_labels_available:
+                rows = con.execute(
+                    f"""
+                    SELECT n.symbol, n.horizon_s, n.{target_expr} AS target_value,
+                           COALESCE(n.label_ts_ms, e.ts_ms, n.computed_at_ts_ms) AS ts_ms,
+                           COALESCE(e.title, '') AS title,
+                           COALESCE(e.body, '') AS body,
+                           COALESCE(e.source, n.source, 'net_after_cost_labels') AS source
+                    FROM net_after_cost_labels n
+                    LEFT JOIN events e ON e.id = n.event_id
+                    WHERE COALESCE(n.label_ts_ms, e.ts_ms, n.computed_at_ts_ms) >= ?
+                      AND n.horizon_s = ?
+                      AND n.realized = 1
+                      AND n.{target_expr} IS NOT NULL
+                    ORDER BY n.symbol ASC, COALESCE(n.label_ts_ms, e.ts_ms, n.computed_at_ts_ms) ASC
+                    """,
+                    (int(cutoff_ms), int(horizon_s)),
+                ).fetchall()
+                if rows:
+                    return [
+                        (
+                            str(symbol or ""),
+                            int(row_horizon_s or 0),
+                            _safe_float(target_value, 0.0),
+                            int(ts_ms or 0),
+                            str(title or ""),
+                            str(body or ""),
+                            str(source or ""),
+                            str(target_source),
+                        )
+                        for symbol, row_horizon_s, target_value, ts_ms, title, body, source in rows
+                    ]
+
+        rows = con.execute(
+            """
+            SELECT l.symbol, l.horizon_s, COALESCE(le.net_z, l.impact_z) AS impact_z,
+                   e.ts_ms, e.title, e.body, e.source
+            FROM labels l
+            JOIN events e ON e.id = l.event_id
+            LEFT JOIN labels_exec le
+              ON le.event_id = l.event_id
+             AND le.symbol = l.symbol
+             AND le.horizon_s = l.horizon_s
+             AND le.realized = 1
+            WHERE e.ts_ms >= ?
+              AND l.horizon_s = ?
+              AND COALESCE(le.net_z, l.impact_z) IS NOT NULL
+            ORDER BY l.symbol ASC, e.ts_ms ASC
+            """,
+            (int(cutoff_ms), int(horizon_s)),
+        ).fetchall()
+        return [
+            (
+                str(symbol or ""),
+                int(row_horizon_s or 0),
+                _safe_float(impact_z, 0.0),
+                int(ts_ms or 0),
+                str(title or ""),
+                str(body or ""),
+                str(source or ""),
+                "legacy.labels_exec_net_z_or_impact_z",
+            )
+            for symbol, row_horizon_s, impact_z, ts_ms, title, body, source in rows or []
+        ]
+    finally:
+        con.close()
 
 
 def _load_sequence_training_rows(cfg: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, list[dict[str, int | str]]] | None:
@@ -762,23 +1395,9 @@ def _load_sequence_training_rows(cfg: Mapping[str, Any]) -> tuple[np.ndarray, np
     n_horizons = int(cfg.get("n_horizons") or DEFAULT_N_HORIZONS)
     cutoff_ms = int(time.time() * 1000) - int(cfg.get("training_window_days") or DEFAULT_LOOKBACK_DAYS) * 86_400_000
     symbols_filter = {str(s).upper().strip() for s in list(cfg.get("symbol_universe") or []) if str(s or "").strip() and str(s) != "*"}
-    con = connect()
-    try:
-        rows = con.execute(
-            """
-            SELECT l.symbol, l.horizon_s, l.impact_z, e.ts_ms, e.title, e.body, e.source
-            FROM labels l
-            JOIN events e ON e.id = l.event_id
-            WHERE e.ts_ms >= ?
-              AND l.impact_z IS NOT NULL
-            ORDER BY l.symbol ASC, e.ts_ms ASC
-            """,
-            (int(cutoff_ms),),
-        ).fetchall()
-    finally:
-        con.close()
-    by_symbol: dict[str, list[tuple[int, dict[str, float], float]]] = {}
-    for symbol, _horizon_s, impact_z, ts_ms, title, body, source in rows or []:
+    rows = _load_supervised_label_points(cfg, cutoff_ms=int(cutoff_ms))
+    by_symbol: dict[str, list[tuple[int, dict[str, float], float, str]]] = {}
+    for symbol, _horizon_s, target_value, ts_ms, title, body, source, target_source in rows or []:
         sym = str(symbol or "").upper().strip()
         if not sym or (symbols_filter and sym not in symbols_filter):
             continue
@@ -787,7 +1406,7 @@ def _load_sequence_training_rows(cfg: Mapping[str, Any]) -> tuple[np.ndarray, np
             symbol=str(sym),
             feature_ids=list(feature_ids),
         )
-        by_symbol.setdefault(sym, []).append((int(ts_ms or 0), dict(snapshot), _safe_float(impact_z, 0.0)))
+        by_symbol.setdefault(sym, []).append((int(ts_ms or 0), dict(snapshot), _safe_float(target_value, 0.0), str(target_source)))
     X_rows: list[np.ndarray] = []
     y_rows: list[np.ndarray] = []
     meta_rows: list[dict[str, int | str]] = []
@@ -804,13 +1423,107 @@ def _load_sequence_training_rows(cfg: Mapping[str, Any]) -> tuple[np.ndarray, np
                 )
             )
             y_rows.append(np.full((n_horizons,), float(ordered[idx][2]), dtype=np.float32))
-            meta_rows.append({"symbol": str(sym), "ts": int(ordered[idx][0])})
+            meta_rows.append({"symbol": str(sym), "ts": int(ordered[idx][0]), "target_source": str(ordered[idx][3])})
     if not X_rows:
         return None
     return np.stack(X_rows).astype(np.float32), np.stack(y_rows).astype(np.float32), meta_rows
 
 
-def main() -> int:
+def _load_pretraining_feature_points(cfg: Mapping[str, Any], *, cutoff_ms: int) -> dict[str, list[tuple[int, dict[str, float], str]]]:
+    feature_ids = list(cfg.get("feature_ids") or [])
+    symbols_filter = {str(s).upper().strip() for s in list(cfg.get("symbol_universe") or []) if str(s or "").strip() and str(s) != "*"}
+    by_symbol: dict[str, list[tuple[int, dict[str, float], str]]] = {}
+    con = connect()
+    try:
+        try:
+            if table_exists(con, "events") and table_exists(con, "labels"):
+                rows = con.execute(
+                    """
+                    SELECT DISTINCT l.symbol, e.ts_ms, e.title, e.body, e.source
+                    FROM labels l
+                    JOIN events e ON e.id = l.event_id
+                    WHERE e.ts_ms >= ?
+                    ORDER BY l.symbol ASC, e.ts_ms ASC
+                    """,
+                    (int(cutoff_ms),),
+                ).fetchall()
+            else:
+                rows = []
+        except Exception:
+            rows = []
+        for symbol, ts_ms, title, body, source in rows or []:
+            sym = str(symbol or "").upper().strip()
+            if not sym or (symbols_filter and sym not in symbols_filter):
+                continue
+            event = {"ts_ms": int(ts_ms or 0), "title": str(title or ""), "body": str(body or ""), "source": str(source or "")}
+            snapshot = build_feature_snapshot(event=event, symbol=str(sym), feature_ids=list(feature_ids))
+            by_symbol.setdefault(sym, []).append((int(ts_ms or 0), dict(snapshot), "events"))
+
+        try:
+            prices_available = bool(table_exists(con, "prices"))
+        except Exception:
+            prices_available = False
+        if prices_available:
+            cols = _table_columns(con, "prices")
+            price_col = next((col for col in ("price", "px", "last", "close") if col in cols), "")
+            volume_col = next((col for col in ("volume", "vol", "size") if col in cols), "")
+            if {"symbol", "ts_ms"}.issubset(cols) and price_col:
+                volume_sql = str(volume_col) if volume_col else "NULL"
+                price_rows = con.execute(
+                    f"""
+                    SELECT symbol, ts_ms, {price_col} AS price_value, {volume_sql} AS volume_value
+                    FROM prices
+                    WHERE ts_ms >= ?
+                    ORDER BY symbol ASC, ts_ms ASC
+                    """,
+                    (int(cutoff_ms),),
+                ).fetchall()
+                for symbol, ts_ms, price_value, volume_value in price_rows or []:
+                    sym = str(symbol or "").upper().strip()
+                    if not sym or (symbols_filter and sym not in symbols_filter):
+                        continue
+                    event = {"ts_ms": int(ts_ms or 0), "title": "", "body": "", "source": "prices"}
+                    snapshot = build_feature_snapshot(event=event, symbol=str(sym), feature_ids=list(feature_ids))
+                    if "price.last" in feature_ids:
+                        snapshot["price.last"] = _safe_float(price_value, 0.0)
+                    if "price.volume" in feature_ids:
+                        snapshot["price.volume"] = _safe_float(volume_value, 0.0)
+                    by_symbol.setdefault(sym, []).append((int(ts_ms or 0), dict(snapshot), "prices"))
+    finally:
+        con.close()
+    return by_symbol
+
+
+def _load_pretraining_rows(cfg: Mapping[str, Any]) -> tuple[np.ndarray, list[dict[str, int | str]]] | None:
+    feature_ids = list(cfg.get("feature_ids") or [])
+    seq_len = int(cfg.get("seq_len") or DEFAULT_SEQ_LEN)
+    cutoff_ms = int(time.time() * 1000) - int(cfg.get("training_window_days") or DEFAULT_LOOKBACK_DAYS) * 86_400_000
+    max_samples = int(cfg.get("pretraining_max_samples") or DEFAULT_PRETRAIN_MAX_SAMPLES)
+    by_symbol = _load_pretraining_feature_points(cfg, cutoff_ms=int(cutoff_ms))
+    X_rows: list[np.ndarray] = []
+    meta_rows: list[dict[str, int | str]] = []
+    for sym, items in by_symbol.items():
+        ordered = sorted(items, key=lambda row: row[0])
+        if len(ordered) < seq_len:
+            continue
+        for idx in range(seq_len - 1, len(ordered)):
+            window = ordered[idx - seq_len + 1 : idx + 1]
+            X_rows.append(
+                np.asarray(
+                    [[_safe_float(step[1].get(feature_id), float("nan")) for feature_id in feature_ids] for step in window],
+                    dtype=np.float32,
+                )
+            )
+            meta_rows.append({"symbol": str(sym), "ts": int(ordered[idx][0]), "source": str(ordered[idx][2])})
+    if not X_rows:
+        return None
+    if max_samples > 0 and len(X_rows) > max_samples:
+        X_rows = X_rows[-max_samples:]
+        meta_rows = meta_rows[-max_samples:]
+    return np.stack(X_rows).astype(np.float32), meta_rows
+
+
+def main(pretraining_manifest: Mapping[str, Any] | None = None) -> int:
     init_db()
     plan = load_lifecycle_plan(FAMILY)
     cfg = _resolve_training_config(plan)
@@ -845,12 +1558,18 @@ def main() -> int:
         seq_len=int(cfg.get("seq_len") or DEFAULT_SEQ_LEN),
         n_horizons=int(cfg.get("n_horizons") or DEFAULT_N_HORIZONS),
     )
+    pretraining_artifact = _resolve_pretraining_artifact_for_finetune(cfg, pretraining_manifest)
     model.fit(
         X[:split],
         y[:split],
         epochs=int(os.environ.get("PATCHTST_EPOCHS", "20")),
         lr=float(os.environ.get("PATCHTST_LR", "0.001")),
+        pretraining_artifact=pretraining_artifact,
     )
+    target_sources = sorted({str(row.get("target_source") or "") for row in meta_rows if str(row.get("target_source") or "")})
+    model.training_metrics["supervised_target"] = str(cfg.get("supervised_target") or "net_edge")
+    model.training_metrics["supervised_target_sources"] = list(target_sources)
+    model.training_metrics["horizon_s"] = int(cfg.get("horizon_s") or DEFAULT_HORIZON_S)
     try:
         pred_eval = model.predict(X[split:])
         horizon_s = int(cfg.get("horizon_s") or DEFAULT_HORIZON_S)
@@ -898,14 +1617,98 @@ def main() -> int:
     return 0
 
 
+def pretrain_main() -> int:
+    init_db()
+    plan = load_lifecycle_plan(FAMILY)
+    cfg = _resolve_training_config(plan)
+    built = _load_pretraining_rows(cfg)
+    min_samples = int(os.environ.get("PATCHTST_PRETRAIN_MIN_SAMPLES", str(DEFAULT_PRETRAIN_MIN_SAMPLES)))
+    if built is None or int(built[0].shape[0]) < max(2, min_samples):
+        n = 0 if built is None else int(built[0].shape[0])
+        print(f"{FAMILY}: insufficient_pretraining_samples n={n} min_required={max(2, min_samples)}")
+        return 0
+    X_pre, meta_rows = built
+    version = str(
+        cfg.get("pretraining_version_id")
+        or version_from_ts(str(cfg.get("model_name") or FAMILY), int(time.time() * 1000), prefix=f"{FAMILY}-pretrain")
+    )
+    payload = train_masked_pretraining_artifact(
+        X_pre,
+        model_name=str(cfg.get("model_name") or FAMILY),
+        feature_ids=list(cfg.get("feature_ids") or []),
+        seq_len=int(cfg.get("seq_len") or DEFAULT_SEQ_LEN),
+        n_horizons=int(cfg.get("n_horizons") or DEFAULT_N_HORIZONS),
+        patch_len=int(cfg.get("patch_len") or DEFAULT_PATCH_LEN),
+        stride=int(cfg.get("stride") or DEFAULT_STRIDE),
+        n_layers=int(cfg.get("n_layers") or DEFAULT_LAYERS),
+        n_heads=int(cfg.get("n_heads") or DEFAULT_HEADS),
+        d_model=int(cfg.get("d_model") or DEFAULT_D_MODEL),
+        dropout=float(cfg.get("dropout") or DEFAULT_DROPOUT),
+        seed=int(cfg.get("seed") or 42),
+        epochs=int(os.environ.get("PATCHTST_PRETRAIN_EPOCHS", str(DEFAULT_PRETRAIN_EPOCHS))),
+        lr=float(os.environ.get("PATCHTST_PRETRAIN_LR", str(DEFAULT_PRETRAIN_LR))),
+        mask_ratio=float(os.environ.get("PATCHTST_PRETRAIN_MASK_RATIO", str(DEFAULT_PRETRAIN_MASK_RATIO))),
+    )
+    sources = sorted({str(row.get("source") or "") for row in meta_rows if str(row.get("source") or "")})
+    payload["metrics"] = {
+        **dict(payload.get("metrics") or {}),
+        "pretraining_sources": list(sources),
+        "pretraining_window_count": int(X_pre.shape[0]),
+    }
+    manifest = persist_pretraining_artifact(
+        payload,
+        model_name=str(cfg.get("model_name") or FAMILY),
+        symbol="*",
+        version=str(version),
+    )
+    register_model_version(
+        model_name=str(cfg.get("model_name") or FAMILY),
+        model_version=str(version),
+        model_kind="patchtst_pretraining",
+        stage="shadow",
+        status="pretrained",
+        live_ready=False,
+        training_job_name="pretrain_patchtst_models",
+        train_scope={
+            "symbol": "*",
+            "feature_ids": list(cfg.get("feature_ids") or []),
+            "feature_schema": dict(payload.get("feature_schema") or {}),
+            "seq_len": int(cfg.get("seq_len") or DEFAULT_SEQ_LEN),
+            "mask_ratio": float((payload.get("metrics") or {}).get("mask_ratio") or 0.0),
+        },
+        meta={**dict(payload.get("metrics") or {}), "artifact_manifest": dict(manifest)},
+    )
+    record_version_performance(
+        model_name=str(cfg.get("model_name") or FAMILY),
+        model_version=str(version),
+        metric_scope="pretraining",
+        metrics={
+            "reconstruction_rmse": float((payload.get("metrics") or {}).get("reconstruction_rmse") or 0.0),
+            "loss_final": float((payload.get("metrics") or {}).get("loss_final") or 0.0),
+            "trained_models": 1,
+        },
+        sample_n=int(X_pre.shape[0]),
+        meta={"job_name": "pretrain_patchtst_models", "artifact_manifest": dict(manifest)},
+    )
+    if str(os.environ.get("PATCHTST_PRETRAIN_FINE_TUNE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}:
+        return int(main(pretraining_manifest=manifest) or 0)
+    print(json.dumps({"ok": True, "family": FAMILY, "version": str(version), "stage": "shadow", "pretraining": dict(manifest)}))
+    return 0
+
+
 __all__ = [
     "FAMILY",
+    "MaskedPatchTSTPretrainer",
     "PatchTST",
     "PatchTSTRegressor",
     "load_model_from_artifact",
+    "load_pretraining_artifact_from_artifact",
     "main",
     "persist_model_artifact",
+    "persist_pretraining_artifact",
+    "pretrain_main",
     "register_shadow_model",
+    "train_masked_pretraining_artifact",
 ]
 
 

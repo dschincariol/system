@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from engine.strategy.discovery.base import CandidateFeature, EvaluationResult, now_ms, stable_json
+from engine.strategy.experiment_ledger import PASS_DECISIONS, fetch_experiment_ledger, record_experiment_ledger
 
 FEATURE_STAGE_SHADOW = "shadow"
 FEATURE_STAGE_LIVE = "live"
@@ -127,11 +128,13 @@ def record_candidate(candidate: CandidateFeature, *, con=None, ts: int | None = 
             """,
             (str(candidate.hash),),
         ).fetchone()
-        if owns:
-            db.commit()
         if not row:
             raise RuntimeError("feature_candidate_insert_failed")
-        return _candidate_record(row)
+        record = _candidate_record(row)
+        _record_feature_candidate_ledger(candidate, record, con=db, ts=int(record.ts or ts or now_ms()))
+        if owns:
+            db.commit()
+        return record
     finally:
         if owns:
             db.close()
@@ -202,6 +205,17 @@ def record_evaluation(
                 str(result.decision or "pending"),
             ),
         )
+        record = _candidate_record(
+            db.execute(
+                """
+                SELECT id, ts, source, symbol, expression, params_json, hash
+                FROM feature_candidates
+                WHERE id=?
+                """,
+                (int(candidate_id),),
+            ).fetchone()
+        )
+        _record_feature_evaluation_ledger(record, result, con=db, ts=int(ts if ts is not None else now_ms()))
         if owns:
             db.commit()
     finally:
@@ -259,6 +273,12 @@ def register_feature(
     owns, db = _connection(con, readonly=False)
     try:
         ensure_discovery_schema(db)
+        if stage_text == FEATURE_STAGE_LIVE and str(candidate.source or "").strip().lower() == "llm_factor":
+            _assert_llm_feature_live_promotion_evidence(
+                candidate,
+                candidate_id=int(candidate_id),
+                con=db,
+            )
         db.execute(
             """
             INSERT INTO feature_registry(
@@ -352,6 +372,148 @@ def _candidate_record(row) -> CandidateRecord:
     )
 
 
+def _feature_candidate_type(source: str) -> str:
+    source_key = str(source or "").strip().lower()
+    if source_key == "llm_factor":
+        return "llm_factor"
+    if source_key == "tsfresh":
+        return "tsfresh_feature"
+    if source_key == "pysr":
+        return "search_feature"
+    return "search_feature"
+
+
+def _record_feature_candidate_ledger(
+    candidate: CandidateFeature,
+    record: CandidateRecord,
+    *,
+    con,
+    ts: int,
+) -> None:
+    params = dict(candidate.params or {})
+    model_name = str(params.get("model_name") or params.get("model_id") or candidate.feature_id)
+    record_experiment_ledger(
+        con=con,
+        ts=int(ts),
+        candidate_key=str(record.hash),
+        candidate_name=str(candidate.feature_id),
+        candidate_version=str(record.hash)[:16],
+        candidate_type=_feature_candidate_type(str(candidate.source)),
+        source=str(candidate.source),
+        model_name=model_name,
+        feature_ids=[str(candidate.feature_id), *[str(fid) for fid in list(params.get("source_feature_ids") or [])]],
+        prompt_hash=str(params.get("prompt_hash") or ""),
+        model_hash=str(params.get("model_id") or model_name),
+        search_space={
+            "expression": str(candidate.expression),
+            "params": dict(params),
+            "symbol": str(candidate.symbol).upper(),
+        },
+        trial_budget=int(params.get("max_candidates") or params.get("trial_budget") or 1),
+        trial_count=max(1, _safe_int(params.get("trial_count") or params.get("trial_index"), 1)),
+        promotion_decision="pending",
+        status="generated",
+        diagnostics={"feature_candidate_id": int(record.id)},
+    )
+
+
+def _record_feature_evaluation_ledger(
+    record: CandidateRecord,
+    result: EvaluationResult,
+    *,
+    con,
+    ts: int,
+) -> None:
+    params = dict(record.params or {})
+    model_name = str(params.get("model_name") or params.get("model_id") or result.feature_id or "")
+    decision = str(result.decision or "pending").strip().lower()
+    redundancy = dict(result.diagnostics or {}) if decision == "redundant" else {"checked": True, "decision": decision}
+    record_experiment_ledger(
+        con=con,
+        ts=int(ts),
+        candidate_key=str(record.hash),
+        candidate_name=str(result.feature_id or ""),
+        candidate_version=str(record.hash)[:16],
+        candidate_type=_feature_candidate_type(str(record.source)),
+        source=str(record.source),
+        model_name=model_name,
+        feature_ids=[str(result.feature_id or ""), *[str(fid) for fid in list(params.get("source_feature_ids") or [])]],
+        prompt_hash=str(params.get("prompt_hash") or ""),
+        model_hash=str(params.get("model_id") or model_name),
+        search_space={
+            "expression": str(record.expression),
+            "params": dict(params),
+            "symbol": str(record.symbol).upper(),
+        },
+        trial_budget=int(params.get("max_candidates") or params.get("trial_budget") or 1),
+        trial_count=max(1, _safe_int(params.get("trial_count") or params.get("trial_index"), 1)),
+        fdr={
+            "p_value": result.p_value,
+            "q_value": result.q_value,
+            "t_stat": result.t_stat,
+            "decision": str(decision),
+            "n_obs": int(result.n_obs or 0),
+        },
+        redundancy=redundancy,
+        evidence={
+            "oos_ic": result.oos_ic,
+            "diagnostics": dict(result.diagnostics or {}),
+        },
+        promotion_decision=("accepted" if decision == ACCEPTED_DECISION else "rejected"),
+        status=str(decision or "evaluated"),
+        diagnostics={"feature_candidate_id": int(record.id)},
+    )
+
+
+def _assert_llm_feature_live_promotion_evidence(
+    candidate: CandidateFeature,
+    *,
+    candidate_id: int,
+    con,
+) -> None:
+    row = con.execute(
+        """
+        SELECT decision, t_stat, p_value, q_value
+        FROM feature_evaluation
+        WHERE candidate_id=?
+        ORDER BY ts DESC
+        LIMIT 1
+        """,
+        (int(candidate_id),),
+    ).fetchone()
+    if not row:
+        raise ValueError("llm_feature_live_promotion_blocked:evaluation_missing")
+    decision = str(row[0] or "").strip().lower()
+    if decision != ACCEPTED_DECISION:
+        raise ValueError(f"llm_feature_live_promotion_blocked:evaluation_not_accepted:{decision or 'missing'}")
+    rows = fetch_experiment_ledger(candidate_key=str(candidate.hash), limit=5, con=con)
+    if not rows:
+        raise ValueError("llm_feature_live_promotion_blocked:ledger_missing")
+    latest = dict(rows[0] or {})
+    ledger_decision = str(latest.get("promotion_decision") or "").strip().lower()
+    trial_budget = _safe_int(latest.get("trial_budget"), 0)
+    trial_count = _safe_int(latest.get("trial_count"), 0)
+    fdr = dict(latest.get("fdr_json") or {})
+    evidence = dict(latest.get("evidence_json") or {})
+    blockers: list[str] = []
+    if ledger_decision not in PASS_DECISIONS:
+        blockers.append("ledger_decision_not_passing")
+    if trial_budget <= 0:
+        blockers.append("trial_budget_missing")
+    if trial_count <= 0:
+        blockers.append("trial_count_missing")
+    if trial_budget > 0 and trial_count > trial_budget:
+        blockers.append("trial_budget_exceeded")
+    if not fdr:
+        blockers.append("statistical_gate_missing")
+    if fdr and str(fdr.get("decision") or "").strip().lower() != ACCEPTED_DECISION:
+        blockers.append("statistical_gate_not_accepted")
+    if not evidence:
+        blockers.append("ledger_evidence_missing")
+    if blockers:
+        raise ValueError(f"llm_feature_live_promotion_blocked:{','.join(blockers)}")
+
+
 def _feature_registry_record(row) -> FeatureRegistryRecord:
     return FeatureRegistryRecord(
         feature_id=str(row[0] or ""),
@@ -376,6 +538,13 @@ def _parse_json_dict(value: Any) -> dict[str, Any]:
     except Exception:
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
 
 
 def _finite_or_none(value: Any) -> float | None:

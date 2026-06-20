@@ -30,7 +30,7 @@ import time
 import json
 import random
 import logging
-from typing import Dict, Any, List, Optional, Tuple, cast
+from typing import Dict, Any, List, Optional, cast
 
 import numpy as np
 import torch
@@ -48,6 +48,13 @@ except Exception as _sentence_transformers_import_error:
 from pathlib import Path
 from engine.data.default_symbols import load_default_symbols
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.hardware import (
+    apply_cpu_first_runtime_defaults,
+    log_runtime_hardware_diagnostics,
+    nvidia_telemetry_enabled,
+    resolve_torch_device,
+    torch_device_is_cuda,
+)
 from engine.runtime.torch_threads import configure_torch_thread_pools
 
 LOGGER = logging.getLogger(__name__)
@@ -86,13 +93,10 @@ def _is_expected_nvml_unavailable(error: Exception) -> bool:
 # -----------------------------------------------------------------------------
 # ENV defaults (safe)
 # -----------------------------------------------------------------------------
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("TORCH_DEVICE", "cuda")
-
-os.environ.setdefault("OMP_NUM_THREADS", "8")
-os.environ.setdefault("MKL_NUM_THREADS", "8")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "8")
+apply_cpu_first_runtime_defaults()
+_TORCH_DEVICE_RESOLUTION = resolve_torch_device(torch, env_var="TORCH_DEVICE")
+_CUDA_RUNTIME_ENABLED = torch_device_is_cuda(torch, _TORCH_DEVICE_RESOLUTION)
+_NVIDIA_TELEMETRY_ENABLED = nvidia_telemetry_enabled(torch)
 
 _thread_config = configure_torch_thread_pools(torch)
 if _thread_config.get("reason") == "failed":
@@ -102,6 +106,7 @@ if _thread_config.get("reason") == "failed":
         cpu_threads=int(_thread_config.get("cpu_threads") or 0),
         interop_threads=int(_thread_config.get("interop_threads") or 0),
     )
+log_runtime_hardware_diagnostics(LOGGER, torch_module=torch, component="engine.data.jobs.process_events_live")
 
 # -----------------------------------------------------------------------------
 # CUDA streams (live vs shadow reserved)
@@ -109,7 +114,7 @@ if _thread_config.get("reason") == "failed":
 _LIVE_STREAM = None
 _SHADOW_STREAM = None
 
-if torch.cuda.is_available():
+if _CUDA_RUNTIME_ENABLED:
     try:
         _LIVE_STREAM = torch.cuda.default_stream()
         # lower priority stream for optional background work
@@ -194,27 +199,27 @@ _model: Any = None
 def _get_model() -> Any:
     global _model
     if _model is None:
-        dev = os.environ.get("EMBED_DEVICE", "").strip().lower()
-        if not dev:
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        resolution = resolve_torch_device(torch, env_var="EMBED_DEVICE", fallback_envs=("TORCH_DEVICE",))
+        dev = resolution.resolved
 
         # Safe perf flags
         try:
             torch.set_float32_matmul_precision(os.environ.get("TORCH_MATMUL_PRECISION", "high"))
         except Exception as e:
             _warn_nonfatal("PROCESS_EVENTS_LIVE_TORCH_MATMUL_PRECISION_FAILED", e, once_key="torch_matmul_precision")
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_LIVE_TORCH_CUDA_TF32_FAILED", e, once_key="torch_cuda_tf32")
-        try:
-            torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_LIVE_TORCH_CUDNN_TF32_FAILED", e, once_key="torch_cudnn_tf32")
-        try:
-            torch.backends.cudnn.benchmark = os.environ.get("CUDNN_BENCHMARK", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_LIVE_TORCH_CUDNN_BENCHMARK_FAILED", e, once_key="torch_cudnn_benchmark")
+        if _CUDA_RUNTIME_ENABLED:
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_LIVE_TORCH_CUDA_TF32_FAILED", e, once_key="torch_cuda_tf32")
+            try:
+                torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_LIVE_TORCH_CUDNN_TF32_FAILED", e, once_key="torch_cudnn_tf32")
+            try:
+                torch.backends.cudnn.benchmark = os.environ.get("CUDNN_BENCHMARK", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_LIVE_TORCH_CUDNN_BENCHMARK_FAILED", e, once_key="torch_cudnn_benchmark")
 
         for _k in ("HF_HOME", "TRANSFORMERS_CACHE", "SENTENCE_TRANSFORMERS_HOME"):
             if _k in os.environ:
@@ -314,6 +319,9 @@ class _GpuUtilProbe:
         self._mode = "none"
         self._nvml = None
         self._handle = None
+        if not _NVIDIA_TELEMETRY_ENABLED:
+            self._mode = "disabled"
+            return
         try:
             import pynvml  # type: ignore
 
@@ -328,7 +336,7 @@ class _GpuUtilProbe:
             self._mode = "fallback"
 
     def utilization(self) -> Optional[float]:
-        if not torch.cuda.is_available():
+        if not _NVIDIA_TELEMETRY_ENABLED:
             return None
         if self._mode == "nvml" and self._nvml and self._handle:
             try:
@@ -538,7 +546,7 @@ def main() -> None:
         titles = [(r[3] or "") for r in rows]
 
         # Embed on live stream
-        if _LIVE_STREAM is not None and torch.cuda.is_available():
+        if _LIVE_STREAM is not None and _CUDA_RUNTIME_ENABLED:
             with torch.cuda.stream(cast(Any, _LIVE_STREAM)):
                 embeddings = _get_model().encode(
                     titles,

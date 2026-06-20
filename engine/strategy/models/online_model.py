@@ -16,12 +16,27 @@ ONLINE_MODEL_MAX_ABS_PREDICTION = max(
     1.0,
     float(os.environ.get("ONLINE_MODEL_MAX_ABS_PREDICTION", os.environ.get("INFERENCE_MAX_ABS_PREDICTION", "20.0"))),
 )
+_LIVE_BROKERS = {"alpaca", "ibkr", "interactive_brokers"}
+_SAFE_BROKERS = {"", "unknown", "sim", "paper", "sandbox", "test", "mock"}
 
 
 def _clip_prediction(value: Any) -> float:
     bounded = _safe_float(value, 0.0)
     limit = float(ONLINE_MODEL_MAX_ABS_PREDICTION)
     return float(max(-limit, min(limit, bounded)))
+
+
+def _live_context_active() -> bool:
+    modes = {
+        str(os.environ.get("ENGINE_MODE", "") or "").strip().lower(),
+        str(os.environ.get("EXECUTION_MODE", "") or "").strip().lower(),
+    }
+    if "live" in modes:
+        return True
+    broker = str(os.environ.get("BROKER") or os.environ.get("BROKER_NAME") or os.environ.get("LIVE_BROKER") or "").strip().lower()
+    if broker in _LIVE_BROKERS:
+        return True
+    return bool(broker and broker not in _SAFE_BROKERS)
 
 
 class OnlineModel(BaseModel):
@@ -81,6 +96,8 @@ class OnlineModel(BaseModel):
     def _predict_vector(self, vector: np.ndarray, *, context: Mapping[str, Any] | None = None) -> float:
         del context
         if not self._model_fitted:
+            if _live_context_active():
+                raise RuntimeError("live_online_model_unfitted_dummy_prediction")
             return 0.0
         matrix = self._transform(vector)
         raw = self.model.predict(matrix)

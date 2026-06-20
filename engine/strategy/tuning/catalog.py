@@ -67,6 +67,11 @@ CATALOG: tuple[Hyperparam, ...] = (
     Hyperparam("seq_len", "patchtst", "int", 128, low=32, high=256, log=True, env_name="PATCHTST_SEQ_LEN"),
     Hyperparam("patch_len", "patchtst", "int", 16, low=4, high=32, log=True, env_name="PATCHTST_PATCH_LEN"),
     Hyperparam("d_model", "patchtst", "int", 64, low=16, high=256, log=True, env_name="PATCHTST_D_MODEL"),
+    Hyperparam("seq_len", "itransformer", "int", 128, low=32, high=256, log=True, env_name="ITRANSFORMER_SEQ_LEN"),
+    Hyperparam("d_model", "itransformer", "int", 64, low=16, high=256, log=True, env_name="ITRANSFORMER_D_MODEL"),
+    Hyperparam("n_layers", "itransformer", "int", 2, low=1, high=6, env_name="ITRANSFORMER_LAYERS"),
+    Hyperparam("n_heads", "itransformer", "int", 4, low=1, high=8, env_name="ITRANSFORMER_HEADS"),
+    Hyperparam("dropout", "itransformer", "float", 0.1, low=0.0, high=0.5, env_name="ITRANSFORMER_DROPOUT"),
 )
 
 

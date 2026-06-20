@@ -28,12 +28,20 @@ import numpy as np
 import torch
 from engine.data.default_symbols import load_default_symbols
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.hardware import (
+    apply_cpu_first_runtime_defaults,
+    log_runtime_hardware_diagnostics,
+    resolve_torch_device,
+    torch_device_is_cuda,
+)
+from engine.runtime.torch_threads import configure_torch_thread_pools
 
 # -----------------------------------------------------------------------------
 # ENV defaults
 # -----------------------------------------------------------------------------
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("TORCH_DEVICE", "cuda")
+apply_cpu_first_runtime_defaults()
+_TORCH_DEVICE_RESOLUTION = resolve_torch_device(torch, env_var="TORCH_DEVICE")
+_CUDA_RUNTIME_ENABLED = torch_device_is_cuda(torch, _TORCH_DEVICE_RESOLUTION)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -63,12 +71,23 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
         persist=False,
     )
 
+_thread_config = configure_torch_thread_pools(torch)
+if _thread_config.get("reason") == "failed":
+    _warn_nonfatal(
+        "PROCESS_EVENTS_SHADOW_TORCH_THREAD_CONFIG_FAILED",
+        _thread_config["error"],
+        once_key="torch_thread_config",
+        cpu_threads=int(_thread_config.get("cpu_threads") or 0),
+        interop_threads=int(_thread_config.get("interop_threads") or 0),
+    )
+log_runtime_hardware_diagnostics(LOGGER, torch_module=torch, component="engine.data.jobs.process_events_shadow")
+
 # -----------------------------------------------------------------------------
 # CUDA streams (shadow-focused)
 # -----------------------------------------------------------------------------
 _LIVE_STREAM = None
 _SHADOW_STREAM = None
-if torch.cuda.is_available():
+if _CUDA_RUNTIME_ENABLED:
     try:
         _LIVE_STREAM = torch.cuda.default_stream()
         _SHADOW_STREAM = torch.cuda.Stream(priority=1)
@@ -316,7 +335,7 @@ def main() -> None:
                 # Optional clustering (shadow)
                 if assign_cluster and vec is not None:
                     try:
-                        if _SHADOW_STREAM is not None and torch.cuda.is_available():
+                        if _SHADOW_STREAM is not None and _CUDA_RUNTIME_ENABLED:
                             with torch.cuda.stream(cast(Any, _SHADOW_STREAM)):
                                 _ = assign_cluster(event_id=int(eid), ts_ms=int(ts_ms or 0), title=(title or ""), vec=vec)
                         else:
@@ -327,7 +346,7 @@ def main() -> None:
                 # Temporal shadow predictor (shadow stream)
                 if predict_temporal_shadow_for_event:
                     try:
-                        if _SHADOW_STREAM is not None and torch.cuda.is_available():
+                        if _SHADOW_STREAM is not None and _CUDA_RUNTIME_ENABLED:
                             with torch.cuda.stream(cast(Any, _SHADOW_STREAM)):
                                 _ = predict_temporal_shadow_for_event(
                                     conw,

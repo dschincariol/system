@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Sequence
+import os
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
 
+from engine.runtime.workload_profiles import bounded_n_jobs, tsfresh_n_jobs
 from engine.strategy.discovery.base import (
     CandidateFeature,
     EvaluationResult,
@@ -28,13 +30,26 @@ class TsfreshDiscoverer:
         window: int = 180,
         max_candidates: int | None = None,
         min_periods: int | None = None,
-        n_jobs: int = 0,
+        n_jobs: int | None = None,
         value_columns: Sequence[str] | None = None,
     ) -> None:
         self.window = max(2, int(window))
         self.max_candidates = None if max_candidates is None else max(1, int(max_candidates))
         self.min_periods = max(2, int(min_periods or window))
-        self.n_jobs = int(n_jobs)
+        if n_jobs is None:
+            self.n_jobs = tsfresh_n_jobs()
+        else:
+            scoped_env = dict(os.environ)
+            scoped_env["TSFRESH_N_JOBS"] = str(int(n_jobs))
+            self.n_jobs = bounded_n_jobs(
+                "TSFRESH_N_JOBS",
+                fallback_keys=("TSFRESH_WORKERS",),
+                max_key="TSFRESH_MAX_N_JOBS",
+                default_key="tsfresh_n_jobs",
+                max_default_key="tsfresh_max_n_jobs",
+                allow_zero=True,
+                env=scoped_env,
+            )
         self.value_columns = tuple(str(col).strip() for col in list(value_columns or []) if str(col).strip())
 
     def propose(self, symbol: str, train_df: pd.DataFrame) -> list[CandidateFeature]:
@@ -101,6 +116,8 @@ class TsfreshDiscoverer:
             "feature_column": str(feature_column),
             "window": int(self.window),
             "parameter_set": "comprehensive",
+            "max_candidates": int(self.max_candidates or 0),
+            "trial_budget": int(self.max_candidates or 1),
         }
         expression = f"tsfresh({value_column}__{feature_column},window={int(self.window)})"
         digest = candidate_hash(

@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from typing import Any
 
+from engine.runtime.workload_profiles import assert_offline_work_allowed, tuning_n_trials
 from engine.runtime.storage import (
     acquire_job_lock,
     init_db,
@@ -68,9 +69,20 @@ def run_tuning_job(
     objective_factory: ObjectiveFactory | None = None,
     allow_smoke_objective: bool | None = None,
 ) -> dict[str, Any]:
+    try:
+        assert_offline_work_allowed(job_name=JOB_NAME)
+    except RuntimeError as exc:
+        return {
+            "ok": False,
+            "job": JOB_NAME,
+            "error": "offline_training_live_profile_ack_required",
+            "detail": str(exc),
+            "results": [],
+        }
+
     families = [str(f).strip() for f in (model_families or _csv(os.environ.get("TUNE_MODEL_FAMILIES"), ("temporal_predictor", "embed_regressor"))) if str(f).strip()]
     syms = [str(s).strip().upper() for s in (symbols or _csv(os.environ.get("TUNE_SYMBOLS"), ("GLOBAL",))) if str(s).strip()]
-    trials = max(1, int(n_trials if n_trials is not None else _env_int("TUNE_N_TRIALS", 50)))
+    trials = max(1, int(n_trials if n_trials is not None else tuning_n_trials()))
     timeout = timeout_s if timeout_s is not None else _env_int("TUNE_TIMEOUT_S", 0)
     resolved_seed = int(seed if seed is not None else _env_int("TUNE_SEED", 7))
     smoke = bool(allow_smoke_objective) if allow_smoke_objective is not None else str(os.environ.get("TUNE_MODE", "")).strip().lower() == "smoke"
@@ -118,7 +130,9 @@ def run_tuning_job(
 def main() -> int:
     result = run_tuning_job()
     print(json.dumps(result, separators=(",", ":"), sort_keys=True))
-    return 0 if result.get("ok") else 1
+    if result.get("ok"):
+        return 0
+    return 3 if str(result.get("error") or "") == "offline_training_live_profile_ack_required" else 1
 
 
 if __name__ == "__main__":

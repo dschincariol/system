@@ -17,6 +17,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import connect
+from engine.runtime.workload_profiles import (
+    tsfresh_n_jobs,
+    tsfresh_snapshot_batch_size,
+    tsfresh_snapshot_symbol_limit,
+)
 
 LOG = get_logger("engine.strategy.tsfresh_features")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -25,6 +30,9 @@ TSFRESH_FEATURE_PREFIX = "tsfresh."
 TSFRESH_WINDOW_S = max(60, int(os.environ.get("TSFRESH_WINDOW_S", "3600")))
 TSFRESH_FC_PROFILE = str(os.environ.get("TSFRESH_FC_PROFILE", "minimal") or "minimal").strip().lower() or "minimal"
 TSFRESH_MAX_FEATURES = max(1, int(os.environ.get("TSFRESH_MAX_FEATURES", "200")))
+TSFRESH_N_JOBS = tsfresh_n_jobs()
+TSFRESH_SNAPSHOT_SYMBOL_LIMIT = tsfresh_snapshot_symbol_limit()
+TSFRESH_SNAPSHOT_BATCH_SIZE = tsfresh_snapshot_batch_size()
 TSFRESH_USE_PERSISTED_SNAPSHOTS = os.environ.get("TSFRESH_USE_PERSISTED_SNAPSHOTS", "1") == "1"
 TSFRESH_LIVE_COMPUTE_ENABLED = os.environ.get("TSFRESH_LIVE_COMPUTE_ENABLED", "0") == "1"
 TSFRESH_SNAPSHOT_BUCKET_SEC = max(
@@ -126,6 +134,33 @@ def _json_dumps(value: Any) -> str:
 
 def _normalize_symbol(symbol: str) -> str:
     return str(symbol or "").upper().strip()
+
+
+def _bounded_symbols(symbols: Sequence[str], *, symbol_limit: Optional[int] = None) -> List[str]:
+    limit = max(1, int(symbol_limit if symbol_limit is not None else TSFRESH_SNAPSHOT_SYMBOL_LIMIT))
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in symbols or []:
+        symbol = _normalize_symbol(str(raw))
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        out.append(symbol)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def _chunks(values: Sequence[str], size: int) -> Iterable[List[str]]:
+    batch_size = max(1, int(size))
+    current: List[str] = []
+    for value in values:
+        current.append(str(value))
+        if len(current) >= batch_size:
+            yield list(current)
+            current = []
+    if current:
+        yield list(current)
 
 
 def _profile_feature_names(profile: str | None = None) -> List[str]:
@@ -268,7 +303,7 @@ def compute_tsfresh_features(window_df) -> Dict[str, float]:
             column_value="value",
             default_fc_parameters=_fc_parameters_for_extract(),
             disable_progressbar=True,
-            n_jobs=0,
+            n_jobs=int(TSFRESH_N_JOBS),
         )
     except Exception as exc:
         _warn_nonfatal(
@@ -517,26 +552,35 @@ def materialize_tsfresh_feature_snapshots(
     symbols: Sequence[str],
     ts_ms: int,
     window_s: Optional[int] = None,
+    symbol_limit: Optional[int] = None,
+    batch_size: Optional[int] = None,
     con=None,
 ) -> Dict[str, Any]:
     """Compute and persist TSFresh snapshots for a batch of symbols."""
     anchor_ts_ms = _bucket_start(int(ts_ms), int(TSFRESH_SNAPSHOT_BUCKET_SEC))
     window_seconds = max(60, int(window_s or TSFRESH_WINDOW_S))
-    snapshot_list = [
-        build_tsfresh_feature_snapshot(
-            symbol=str(symbol),
-            ts_ms=int(anchor_ts_ms),
-            window_s=int(window_seconds),
-            con=con,
-        )
-        for symbol in (symbols or [])
-        if _normalize_symbol(str(symbol))
-    ]
-    written = store_tsfresh_feature_snapshots(snapshot_list, con=con)
+    bounded_symbols = _bounded_symbols(list(symbols or []), symbol_limit=symbol_limit)
+    effective_batch_size = max(1, int(batch_size if batch_size is not None else TSFRESH_SNAPSHOT_BATCH_SIZE))
+    written = 0
+    built = 0
+    for chunk in _chunks(bounded_symbols, effective_batch_size):
+        snapshot_list = [
+            build_tsfresh_feature_snapshot(
+                symbol=str(symbol),
+                ts_ms=int(anchor_ts_ms),
+                window_s=int(window_seconds),
+                con=con,
+            )
+            for symbol in chunk
+        ]
+        built += int(len(snapshot_list))
+        written += int(store_tsfresh_feature_snapshots(snapshot_list, con=con))
     return {
         "snapshots": int(written),
-        "symbols": int(len(snapshot_list)),
+        "symbols": int(built),
         "feature_dim": int(len(get_tsfresh_feature_ids())),
+        "symbol_limit": int(TSFRESH_SNAPSHOT_SYMBOL_LIMIT if symbol_limit is None else max(1, int(symbol_limit))),
+        "batch_size": int(effective_batch_size),
         "window_s": int(window_seconds),
         "ts_ms": int(anchor_ts_ms),
     }

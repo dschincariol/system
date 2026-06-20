@@ -23,6 +23,7 @@ from engine.artifacts.serialization import dumps_pickle_artifact, loads_pickle_a
 from engine.artifacts.store import LocalArtifactStore
 from engine.model_registry import get_stage_latest, register_model, register_model_family
 from engine.runtime.storage import connect, init_db
+from engine.runtime.workload_profiles import model_family_n_jobs
 from engine.strategy.model_lifecycle import register_model_version
 from engine.strategy.ood import extract_ood_payload
 
@@ -761,7 +762,7 @@ def _new_classifier() -> tuple[Any, str]:
                 num_leaves=int(os.environ.get("META_LABEL_LGBM_NUM_LEAVES", "15")),
                 min_child_samples=max(2, int(os.environ.get("META_LABEL_LGBM_MIN_CHILD_SAMPLES", "5"))),
                 random_state=42,
-                n_jobs=1,
+                n_jobs=model_family_n_jobs("META_LABEL_N_JOBS"),
                 verbosity=-1,
                 deterministic=True,
                 force_col_wise=True,

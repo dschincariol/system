@@ -7,11 +7,13 @@ never executes code or interacts with the order path.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import math
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -40,12 +42,12 @@ from engine.strategy.discovery.registry import (
     ACCEPTED_DECISION,
     FEATURE_STAGE_SHADOW,
     ensure_discovery_schema,
-    list_evaluations,
     list_registered_features,
     record_candidate,
     record_evaluation,
     register_feature,
 )
+from engine.strategy.experiment_ledger import record_experiment_ledger
 from engine.strategy.jobs.discover_features import (
     _resolve_feature_ids_for_discovery,
     _resolve_frames,
@@ -66,6 +68,52 @@ DEFAULT_Q_THRESHOLD = 0.10
 DEFAULT_T_THRESHOLD = 3.0
 DEFAULT_MIN_OBS = 24
 STAT_TEST_DECISIONS = frozenset({ACCEPTED_DECISION, "fdr_failed", "tstat_failed", "degenerate", "leakage_failed"})
+
+
+def _llm_factor_helpers_need_reload() -> list[str]:
+    required = (
+        "_record_llm_parse_rejections",
+        "_record_llm_loop_final_decision",
+        "_validate_candidates",
+    )
+    missing = [name for name in required if not callable(globals().get(name))]
+    validator = globals().get("_validate_candidates")
+    if callable(validator):
+        try:
+            probe = validator(
+                [],
+                con=None,
+                batch_ts=0,
+                frame=pd.DataFrame(),
+                target="target",
+                q_threshold=DEFAULT_Q_THRESHOLD,
+                t_threshold=DEFAULT_T_THRESHOLD,
+                redundancy_max=DEFAULT_REDUNDANCY_MAX,
+                eval_min_ts=0,
+                summary={},
+                symbol_stats={},
+            )
+        except Exception as exc:
+            missing.append(f"_validate_candidates_probe_failed:{type(exc).__name__}")
+        else:
+            if probe is None:
+                missing.append("_validate_candidates_returned_none")
+    return missing
+
+
+def _reload_llm_factor_module_for_helpers(missing: Sequence[str]) -> Callable[..., dict[str, Any]] | None:
+    try:
+        module = importlib.reload(sys.modules[__name__])
+    except Exception as exc:
+        _warn_nonfatal(
+            "LLM_FACTOR_HELPER_RELOAD_FAILED",
+            exc,
+            once_key="llm_factor_helper_reload_failed",
+            missing_helpers=list(missing or []),
+        )
+        return None
+    fresh = getattr(module, "run_llm_factor_discovery", None)
+    return fresh if callable(fresh) and fresh is not run_llm_factor_discovery else None
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -90,6 +138,8 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
 class ParsedLLMCandidate:
     expression: str
     hypothesis: str
+    raw_idx: int = 0
+    complexity: int = 0
 
 
 class LLMFactorDiscoverer:
@@ -125,37 +175,83 @@ class LLMFactorDiscoverer:
         self.last_prompt_hash = ""
         self.last_prompt = ""
         self.last_model_id = self.model
+        self.last_trial_count = 0
+        self.last_raw_candidate_count = 0
         self.last_parse_rejected = 0
         self.last_parse_errors: list[dict[str, Any]] = []
 
     def propose(self, symbol: str, train_df: pd.DataFrame) -> list[CandidateFeature]:
+        return self.propose_revision(
+            symbol,
+            train_df,
+            remaining_budget=int(self.max_candidates),
+            total_trial_budget=int(self.max_candidates),
+            attempt_idx=0,
+            trial_start_index=0,
+            critique=None,
+            parent_hash="",
+        )
+
+    def propose_revision(
+        self,
+        symbol: str,
+        train_df: pd.DataFrame,
+        *,
+        remaining_budget: int,
+        total_trial_budget: int,
+        attempt_idx: int,
+        trial_start_index: int,
+        critique: Mapping[str, Any] | None = None,
+        parent_hash: str = "",
+    ) -> list[CandidateFeature]:
         frame = pd.DataFrame(train_df).copy()
         feature_columns = _feature_columns(frame, allowed=self.primitive_columns)
         if not feature_columns:
             return []
         feature_columns = feature_columns[: _bounded_int(os.environ.get("LLM_FACTOR_MAX_PRIMITIVES"), 64, low=2, high=256)]
+        remaining = max(0, min(int(remaining_budget), int(total_trial_budget), int(self.max_candidates)))
+        if remaining <= 0:
+            self.last_parse_rejected = 0
+            self.last_parse_errors = []
+            self.last_trial_count = 0
+            return []
         safe_names = [f"x{i}" for i in range(len(feature_columns))]
         feature_map = {safe: original for safe, original in zip(safe_names, feature_columns)}
         prompt = build_factor_prompt(
             symbol=str(symbol),
             train_df=frame,
             feature_map=feature_map,
-            max_candidates=int(self.max_candidates),
+            max_candidates=int(remaining),
             max_complexity=int(self.max_complexity),
             prior_experiments=self.prior_experiments,
+            revision_context=critique,
         )
         prompt_hash = content_hash({"source": self.source, "prompt": prompt, "model": self.model})
         self.last_prompt = str(prompt)
         self.last_prompt_hash = str(prompt_hash)
+        self.last_model_id = str(self.model)
         raw = self._complete(prompt)
         parsed = parse_llm_candidates(
             raw,
             allowed_names=set(safe_names),
             max_complexity=int(self.max_complexity),
-            max_candidates=int(self.max_candidates),
+            max_candidates=int(remaining),
         )
+        self.last_trial_count = int(parsed.get("raw_count") or 0)
+        self.last_raw_candidate_count = int(parsed.get("raw_candidate_count") or 0)
         self.last_parse_rejected = int(parsed["rejected"])
-        self.last_parse_errors = [dict(item) for item in list(parsed.get("errors") or [])]
+        self.last_parse_errors = [
+            {
+                **dict(item),
+                "prompt_hash": str(prompt_hash),
+                "model_name": str(self.model),
+                "attempt_idx": int(attempt_idx),
+                "trial_index": int(trial_start_index) + int(dict(item).get("idx", 0) or 0) + 1,
+                "trial_budget": int(total_trial_budget),
+                "parent_hash": str(parent_hash or ""),
+            }
+            for item in list(parsed.get("errors") or [])
+        ]
         out: list[CandidateFeature] = []
         seen: set[str] = set()
         for item in list(parsed.get("candidates") or []):
@@ -167,7 +263,6 @@ class LLMFactorDiscoverer:
                     "symbol": str(symbol).upper(),
                     "expression": expression,
                     "feature_map": dict(feature_map),
-                    "hypothesis": hypothesis,
                 }
             )
             if digest in seen:
@@ -175,6 +270,17 @@ class LLMFactorDiscoverer:
             seen.add(str(digest))
             names = sorted(_expression_names(expression))
             source_feature_ids = [str(feature_map[name]) for name in names if name in feature_map]
+            trial_index = int(trial_start_index) + int(item.raw_idx) + 1
+            lineage = {
+                "attempt_idx": int(attempt_idx),
+                "trial_index": int(trial_index),
+                "trial_budget": int(total_trial_budget),
+                "prompt_hash": str(prompt_hash),
+                "parent_hash": str(parent_hash or ""),
+                "revision_context_hash": (
+                    "" if not critique else str(content_hash({"source": self.source, "critique": dict(critique or {})}))
+                ),
+            }
             out.append(
                 CandidateFeature(
                     source=self.source,
@@ -189,6 +295,14 @@ class LLMFactorDiscoverer:
                         "hypothesis": hypothesis,
                         "prompt_hash": str(prompt_hash),
                         "model_id": str(self.model),
+                        "model_name": str(self.model),
+                        "max_candidates": int(total_trial_budget),
+                        "trial_budget": int(total_trial_budget),
+                        "trial_count": int(trial_index),
+                        "attempt_idx": int(attempt_idx),
+                        "trial_index": int(trial_index),
+                        "candidate_lineage": lineage,
+                        "shadow_only": True,
                     },
                     hash=str(digest),
                     feature_id=f"discovered.llm.{str(digest)[:16]}",
@@ -232,6 +346,23 @@ def run_llm_factor_discovery(
     q_threshold: float = DEFAULT_Q_THRESHOLD,
     t_threshold: float = DEFAULT_T_THRESHOLD,
 ) -> dict[str, Any]:
+    missing_helpers = _llm_factor_helpers_need_reload()
+    if missing_helpers:
+        fresh_runner = _reload_llm_factor_module_for_helpers(missing_helpers)
+        if callable(fresh_runner):
+            return fresh_runner(
+                symbols=symbols,
+                train_frames=train_frames,
+                test_frames=test_frames,
+                target=target,
+                con=con,
+                feature_ids=feature_ids,
+                llm_client=llm_client,
+                q_threshold=q_threshold,
+                t_threshold=t_threshold,
+            )
+        raise RuntimeError(f"llm_factor_discovery_helpers_unavailable:{','.join(missing_helpers)}")
+
     if not _env_bool("LLM_FACTOR_DISCOVERY", False) and llm_client is None:
         return {"ok": True, "enabled": False, "reason": "LLM_FACTOR_DISCOVERY_disabled"}
 
@@ -274,6 +405,9 @@ def run_llm_factor_discovery(
             "rejected": 0,
             "degenerate": 0,
             "leakage_failed": 0,
+            "trials_used": 0,
+            "trial_budget": 0,
+            "duplicate_rejected": 0,
             "batch_ts": int(batch_ts),
             "cumulative_n_tests": cumulative_trial_count(con=con),
             "by_symbol": {},
@@ -294,6 +428,9 @@ def run_llm_factor_discovery(
                 "redundant": 0,
                 "rejected": 0,
                 "degenerate": 0,
+                "trials_used": 0,
+                "trial_budget": 0,
+                "duplicate_rejected": 0,
             }
             if train_df.empty or test_df.empty:
                 summary["by_symbol"][str(symbol)] = {**symbol_stats, "skipped_reason": "empty_dataset"}
@@ -304,33 +441,160 @@ def run_llm_factor_discovery(
                 api_key=api_key,
                 prior_experiments=prior,
             )
-            try:
-                candidates = list(discoverer.propose(str(symbol), train_df) or [])
-            except Exception as exc:
-                LOG.info("llm_factor_discovery_noop symbol=%s reason=%s", str(symbol), type(exc).__name__)
-                summary["by_symbol"][str(symbol)] = {
-                    **symbol_stats,
-                    "skipped_reason": f"proposal_failed:{type(exc).__name__}",
-                }
-                continue
-            summary["proposed"] += len(candidates)
-            summary["parse_rejected"] += int(discoverer.last_parse_rejected)
-            symbol_stats["proposed"] += len(candidates)
-            symbol_stats["parse_rejected"] += int(discoverer.last_parse_rejected)
-
             full_df = pd.concat([pd.DataFrame(train_df), pd.DataFrame(test_df)], ignore_index=True)
-            _validate_candidates(
-                candidates,
+            trial_budget = int(discoverer.max_candidates)
+            remaining_budget = int(trial_budget)
+            symbol_stats["trial_budget"] = int(trial_budget)
+            summary["trial_budget"] = int(summary.get("trial_budget", 0) or 0) + int(trial_budget)
+            critique: dict[str, Any] | None = None
+            parent_hash = ""
+            seen_hashes: set[str] = set()
+            prompt_hashes: list[str] = []
+            evaluation_history: list[dict[str, Any]] = []
+            parse_history: list[dict[str, Any]] = []
+            attempt_idx = 0
+            final_decision = "budget_exhausted"
+            while remaining_budget > 0:
+                trial_start = int(trial_budget - remaining_budget)
+                try:
+                    candidates = list(
+                        discoverer.propose_revision(
+                            str(symbol),
+                            train_df,
+                            remaining_budget=int(remaining_budget),
+                            total_trial_budget=int(trial_budget),
+                            attempt_idx=int(attempt_idx),
+                            trial_start_index=int(trial_start),
+                            critique=critique,
+                            parent_hash=str(parent_hash),
+                        )
+                        or []
+                    )
+                except Exception as exc:
+                    LOG.info("llm_factor_discovery_noop symbol=%s reason=%s", str(symbol), type(exc).__name__)
+                    summary["by_symbol"][str(symbol)] = {
+                        **symbol_stats,
+                        "skipped_reason": f"proposal_failed:{type(exc).__name__}",
+                    }
+                    break
+
+                consumed = max(1 if int(discoverer.last_parse_rejected or 0) else 0, int(discoverer.last_trial_count or 0))
+                consumed = min(int(consumed), int(remaining_budget))
+                remaining_budget -= int(consumed)
+                summary["trials_used"] = int(summary.get("trials_used", 0) or 0) + int(consumed)
+                symbol_stats["trials_used"] = int(symbol_stats.get("trials_used", 0) or 0) + int(consumed)
+                if str(discoverer.last_prompt_hash or ""):
+                    prompt_hashes.append(str(discoverer.last_prompt_hash))
+
+                parse_errors = [dict(item) for item in list(discoverer.last_parse_errors or [])]
+                parse_history.extend(parse_errors)
+                if parse_errors:
+                    _record_llm_parse_rejections(
+                        parse_errors,
+                        con=con,
+                        batch_ts=int(batch_ts),
+                        symbol=str(symbol),
+                        trial_budget=int(trial_budget),
+                    )
+                summary["parse_rejected"] += int(discoverer.last_parse_rejected)
+                symbol_stats["parse_rejected"] += int(discoverer.last_parse_rejected)
+
+                novel_candidates: list[CandidateFeature] = []
+                duplicate_errors: list[dict[str, Any]] = []
+                for candidate in candidates:
+                    if str(candidate.hash) in seen_hashes:
+                        duplicate_errors.append(
+                            {
+                                "idx": int(dict(candidate.params or {}).get("trial_index", 0) or 0),
+                                "expression": str(candidate.expression),
+                                "reason": "duplicate_candidate",
+                                "candidate_hash": str(candidate.hash),
+                                "feature_id": str(candidate.feature_id),
+                                "prompt_hash": str(dict(candidate.params or {}).get("prompt_hash") or discoverer.last_prompt_hash),
+                                "model_name": str(dict(candidate.params or {}).get("model_name") or discoverer.model),
+                                "trial_index": int(dict(candidate.params or {}).get("trial_index", 0) or 0),
+                                "trial_budget": int(trial_budget),
+                                "parent_hash": str(parent_hash),
+                            }
+                        )
+                        continue
+                    seen_hashes.add(str(candidate.hash))
+                    novel_candidates.append(candidate)
+                if duplicate_errors:
+                    parse_history.extend(duplicate_errors)
+                    _record_llm_parse_rejections(
+                        duplicate_errors,
+                        con=con,
+                        batch_ts=int(batch_ts),
+                        symbol=str(symbol),
+                        trial_budget=int(trial_budget),
+                    )
+                    summary["duplicate_rejected"] += int(len(duplicate_errors))
+                    symbol_stats["duplicate_rejected"] += int(len(duplicate_errors))
+
+                summary["proposed"] += len(novel_candidates)
+                symbol_stats["proposed"] += len(novel_candidates)
+                outcomes = _validate_candidates(
+                    novel_candidates,
+                    con=con,
+                    batch_ts=int(batch_ts),
+                    frame=full_df,
+                    target=target,
+                    q_threshold=float(q_threshold),
+                    t_threshold=float(t_threshold),
+                    redundancy_max=_safe_float(os.environ.get("FACTOR_REDUNDANCY_MAX"), DEFAULT_REDUNDANCY_MAX),
+                    eval_min_ts=parse_ts_ms(os.environ.get("LLM_EVAL_MIN_TS"), default=0),
+                    summary=summary,
+                    symbol_stats=symbol_stats,
+                )
+                evaluation_history.extend(outcomes)
+                if any(str(item.get("decision") or "") == ACCEPTED_DECISION for item in outcomes):
+                    final_decision = ACCEPTED_DECISION
+                    break
+                if not novel_candidates and (parse_errors or duplicate_errors):
+                    final_decision = "no_novel_candidates"
+                    break
+                if remaining_budget <= 0:
+                    final_decision = "budget_exhausted"
+                    break
+                critique = critique_llm_failure_modes(
+                    parse_errors=[*parse_errors, *duplicate_errors],
+                    evaluation_outcomes=outcomes,
+                    remaining_budget=int(remaining_budget),
+                )
+                parent_hash = str(
+                    content_hash(
+                        {
+                            "source": SOURCE,
+                            "symbol": str(symbol).upper(),
+                            "attempt_idx": int(attempt_idx),
+                            "prompt_hash": str(discoverer.last_prompt_hash),
+                            "critique": dict(critique or {}),
+                        }
+                    )
+                )
+                if not outcomes and not parse_errors and not duplicate_errors:
+                    final_decision = "no_candidates"
+                    break
+                attempt_idx += 1
+
+            if final_decision == "budget_exhausted" and int(symbol_stats.get("accepted") or 0) <= 0:
+                final_decision = "rejected_budget_exhausted"
+            elif int(symbol_stats.get("accepted") or 0) > 0:
+                final_decision = ACCEPTED_DECISION
+            symbol_stats["final_decision"] = str(final_decision)
+            symbol_stats["prompt_hashes"] = list(prompt_hashes)
+            _record_llm_loop_final_decision(
                 con=con,
                 batch_ts=int(batch_ts),
-                frame=full_df,
-                target=target,
-                q_threshold=float(q_threshold),
-                t_threshold=float(t_threshold),
-                redundancy_max=_safe_float(os.environ.get("FACTOR_REDUNDANCY_MAX"), DEFAULT_REDUNDANCY_MAX),
-                eval_min_ts=parse_ts_ms(os.environ.get("LLM_EVAL_MIN_TS"), default=0),
-                summary=summary,
-                symbol_stats=symbol_stats,
+                symbol=str(symbol),
+                model_name=str(discoverer.model),
+                prompt_hashes=list(prompt_hashes),
+                trial_budget=int(trial_budget),
+                trials_used=int(symbol_stats.get("trials_used") or 0),
+                final_decision=str(final_decision),
+                evaluation_history=list(evaluation_history),
+                parse_history=list(parse_history),
             )
             summary["by_symbol"][str(symbol)] = dict(symbol_stats)
         summary["cumulative_n_tests"] = cumulative_trial_count(con=con)
@@ -350,6 +614,7 @@ def build_factor_prompt(
     max_candidates: int,
     max_complexity: int,
     prior_experiments: Sequence[Mapping[str, Any]] | None = None,
+    revision_context: Mapping[str, Any] | None = None,
 ) -> str:
     frame = pd.DataFrame(train_df).copy()
     ic_summary = _recent_ic_summary(frame, feature_map=dict(feature_map))
@@ -381,6 +646,7 @@ def build_factor_prompt(
             "factor_pool_ic_matrix": corr,
         },
         "prior_experiment_log": [dict(item) for item in list(prior_experiments or [])[:50]],
+        "revision_context": dict(revision_context or {}),
         "output_schema": {"candidates": [{"expression": "(x0-x1)", "hypothesis": "economic rationale"}]},
     }
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
@@ -396,41 +662,96 @@ def parse_llm_candidates(
     payload = _json_object_from_text(raw_text)
     raw_candidates = payload.get("candidates")
     if not isinstance(raw_candidates, list):
-        return {"candidates": [], "rejected": 1, "errors": [{"reason": "missing_candidates_array"}]}
+        return {
+            "candidates": [],
+            "rejected": 1,
+            "raw_count": 1,
+            "raw_candidate_count": 0,
+            "errors": [{"idx": 0, "reason": "missing_candidates_array"}],
+        }
     candidates: list[ParsedLLMCandidate] = []
     errors: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for idx, item in enumerate(raw_candidates[: max(1, int(max_candidates)) * 2]):
+    budget = max(1, int(max_candidates))
+    raw_slice = list(raw_candidates[:budget])
+    for idx, item in enumerate(raw_slice):
         if not isinstance(item, Mapping):
             errors.append({"idx": int(idx), "reason": "candidate_not_object"})
             continue
         expression = _simplify_expression(str(item.get("expression") or ""))
         hypothesis = str(item.get("hypothesis") or "").strip()
-        if not expression:
-            errors.append({"idx": int(idx), "reason": "expression_missing"})
-            continue
-        names = _expression_names(expression)
-        complexity = expression_complexity(expression)
-        if complexity > int(max_complexity):
-            errors.append({"idx": int(idx), "expression": expression, "reason": "complexity_exceeded"})
-            continue
-        if not names or not names.issubset(set(allowed_names)):
-            errors.append({"idx": int(idx), "expression": expression, "reason": "unknown_variable"})
-            continue
-        try:
-            dummy = pd.DataFrame({name: [1.0, 2.0, 3.0] for name in sorted(allowed_names)})
-            evaluate_pysr_expression(expression, dummy, feature_map={name: name for name in sorted(allowed_names)})
-        except Exception as exc:
-            errors.append({"idx": int(idx), "expression": expression, "reason": f"parse_failed:{type(exc).__name__}"})
+        validation = validate_llm_candidate_expression(
+            expression,
+            allowed_names=set(allowed_names),
+            max_complexity=int(max_complexity),
+        )
+        if not bool(validation.get("ok")):
+            errors.append(
+                {
+                    "idx": int(idx),
+                    "raw_expression": str(item.get("expression") or ""),
+                    "expression": expression,
+                    "reason": str(validation.get("reason") or "invalid_dsl"),
+                    "complexity": validation.get("complexity"),
+                }
+            )
             continue
         key = str(expression)
         if key in seen:
+            errors.append({"idx": int(idx), "expression": expression, "reason": "duplicate_expression"})
             continue
         seen.add(key)
-        candidates.append(ParsedLLMCandidate(expression=expression, hypothesis=hypothesis))
-        if len(candidates) >= int(max_candidates):
-            break
-    return {"candidates": candidates, "rejected": len(errors), "errors": errors}
+        candidates.append(
+            ParsedLLMCandidate(
+                expression=expression,
+                hypothesis=hypothesis,
+                raw_idx=int(idx),
+                complexity=int(validation.get("complexity") or 0),
+            )
+        )
+    return {
+        "candidates": candidates,
+        "rejected": len(errors),
+        "errors": errors,
+        "raw_count": int(len(raw_slice)),
+        "raw_candidate_count": int(len(raw_candidates)),
+    }
+
+
+def validate_llm_candidate_expression(
+    expression: str,
+    *,
+    allowed_names: set[str],
+    max_complexity: int,
+) -> dict[str, Any]:
+    """Validate an LLM expression against the bounded PySR-compatible DSL."""
+
+    expr = _simplify_expression(str(expression or ""))
+    if not expr:
+        return {"ok": False, "reason": "expression_missing", "expression": "", "complexity": 0}
+    names = _expression_names(expr)
+    complexity = int(expression_complexity(expr))
+    if complexity > int(max_complexity):
+        return {"ok": False, "reason": "complexity_exceeded", "expression": expr, "complexity": int(complexity)}
+    if not names or not names.issubset(set(allowed_names)):
+        return {
+            "ok": False,
+            "reason": "unknown_variable",
+            "expression": expr,
+            "complexity": int(complexity),
+            "names": sorted(names),
+        }
+    try:
+        dummy = pd.DataFrame({name: [1.0, 2.0, 3.0] for name in sorted(allowed_names)})
+        evaluate_pysr_expression(expr, dummy, feature_map={name: name for name in sorted(allowed_names)})
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": f"parse_failed:{type(exc).__name__}",
+            "expression": expr,
+            "complexity": int(complexity),
+        }
+    return {"ok": True, "reason": "ok", "expression": expr, "complexity": int(complexity), "names": sorted(names)}
 
 
 def evaluate_llm_candidate(
@@ -589,9 +910,10 @@ def _validate_candidates(
     eval_min_ts: int,
     summary: dict[str, Any],
     symbol_stats: dict[str, int],
-) -> None:
+) -> list[dict[str, Any]]:
+    outcomes: list[dict[str, Any]] = []
     if not candidates:
-        return
+        return outcomes
     full_frame = pd.DataFrame(frame).copy()
     eval_frame = _post_cutoff_frame(full_frame, int(eval_min_ts))
     existing_series = _existing_feature_series(full_frame, con=con)
@@ -614,6 +936,7 @@ def _validate_candidates(
             record_evaluation(int(record.id), result, con=con, ts=batch_ts)
             summary["degenerate"] += 1
             symbol_stats["degenerate"] += 1
+            outcomes.append(_evaluation_outcome(candidate, result, decision="degenerate"))
             continue
         redundant_with = _redundant_with(values_full, existing_series + pending_series, max_abs_corr=float(redundancy_max))
         if redundant_with:
@@ -631,6 +954,7 @@ def _validate_candidates(
             record_evaluation(int(record.id), result, con=con, ts=batch_ts)
             summary["redundant"] += 1
             symbol_stats["redundant"] += 1
+            outcomes.append(_evaluation_outcome(candidate, result, decision="redundant"))
             continue
         pending_series.append((str(candidate.feature_id), np.asarray(values_full, dtype=float).reshape(-1)))
         result = evaluate_llm_candidate(candidate, eval_frame, target=target, min_obs=DEFAULT_MIN_OBS)
@@ -639,11 +963,12 @@ def _validate_candidates(
             record_evaluation(int(record.id), result, con=con, ts=batch_ts)
             summary["degenerate"] += 1
             symbol_stats["degenerate"] += 1
+            outcomes.append(_evaluation_outcome(candidate, result, decision="degenerate"))
             continue
         statistical_pending.append((candidate, int(record.id), result))
 
     if not statistical_pending:
-        return
+        return outcomes
     past_p, past_labels = _past_statistical_trials(con=con)
     current_p = [float(result.p_value if math.isfinite(float(result.p_value)) else 1.0) for _candidate, _id, result in statistical_pending]
     labels = list(past_labels) + [str(candidate.hash) for candidate, _id, _result in statistical_pending]
@@ -678,6 +1003,7 @@ def _validate_candidates(
         record_evaluation(int(candidate_id), gated, con=con, ts=batch_ts)
         summary["evaluated"] += 1
         symbol_stats["evaluated"] += 1
+        outcomes.append(_evaluation_outcome(candidate, gated, decision=str(decision)))
         if decision == ACCEPTED_DECISION:
             metadata = {
                 "experimental": True,
@@ -712,6 +1038,210 @@ def _validate_candidates(
         else:
             summary["rejected"] += 1
             symbol_stats["rejected"] += 1
+    return outcomes
+
+
+def _evaluation_outcome(
+    candidate: CandidateFeature,
+    result: EvaluationResult,
+    *,
+    decision: str,
+) -> dict[str, Any]:
+    return {
+        "candidate_hash": str(candidate.hash),
+        "feature_id": str(candidate.feature_id),
+        "expression": str(candidate.expression),
+        "decision": str(decision),
+        "t_stat": float(result.t_stat),
+        "p_value": float(result.p_value),
+        "q_value": _finite_or_none(result.q_value),
+        "oos_ic": _finite_or_none(result.oos_ic),
+        "n_obs": int(result.n_obs or 0),
+        "diagnostics": dict(result.diagnostics or {}),
+        "lineage": dict((candidate.params or {}).get("candidate_lineage") or {}),
+    }
+
+
+def critique_llm_failure_modes(
+    *,
+    parse_errors: Sequence[Mapping[str, Any]] | None = None,
+    evaluation_outcomes: Sequence[Mapping[str, Any]] | None = None,
+    remaining_budget: int,
+) -> dict[str, Any]:
+    """Build deterministic critique context for the next bounded LLM revision."""
+
+    failure_modes: dict[str, int] = {}
+    rejected: list[dict[str, Any]] = []
+    for error in list(parse_errors or []):
+        reason = str(dict(error or {}).get("reason") or "parse_rejected")
+        failure_modes[reason] = int(failure_modes.get(reason, 0) or 0) + 1
+        rejected.append(
+            {
+                "expression": str(dict(error or {}).get("expression") or dict(error or {}).get("raw_expression") or ""),
+                "decision": str(reason),
+                "trial_index": int(dict(error or {}).get("trial_index") or 0),
+            }
+        )
+    for item in list(evaluation_outcomes or []):
+        decision = str(dict(item or {}).get("decision") or "rejected")
+        if decision == ACCEPTED_DECISION:
+            continue
+        failure_modes[decision] = int(failure_modes.get(decision, 0) or 0) + 1
+        rejected.append(
+            {
+                "expression": str(dict(item or {}).get("expression") or ""),
+                "decision": str(decision),
+                "t_stat": _finite_or_none(dict(item or {}).get("t_stat")),
+                "p_value": _finite_or_none(dict(item or {}).get("p_value")),
+                "q_value": _finite_or_none(dict(item or {}).get("q_value")),
+                "oos_ic": _finite_or_none(dict(item or {}).get("oos_ic")),
+                "n_obs": int(dict(item or {}).get("n_obs") or 0),
+            }
+        )
+    guidance: list[str] = []
+    if failure_modes.get("unknown_variable") or failure_modes.get("parse_failed:ValueError"):
+        guidance.append("Use only variables listed in bounds.variables and the allowed arithmetic/unary operators.")
+    if failure_modes.get("complexity_exceeded"):
+        guidance.append("Lower expression complexity; prefer one interaction or transform.")
+    if failure_modes.get("redundant") or failure_modes.get("duplicate_candidate") or failure_modes.get("duplicate_expression"):
+        guidance.append("Avoid expressions equivalent to existing features or earlier candidates.")
+    if failure_modes.get("fdr_failed") or failure_modes.get("tstat_failed"):
+        guidance.append("Revise toward stronger post-cutoff signal and lower multiple-testing burden.")
+    if failure_modes.get("degenerate"):
+        guidance.append("Avoid constants and transforms that collapse to non-finite or near-constant vectors.")
+    return {
+        "task": "critique_and_revise_failed_factor_candidates",
+        "remaining_trial_budget": int(max(0, remaining_budget)),
+        "failure_modes": dict(sorted(failure_modes.items())),
+        "rejected_candidates": rejected[-20:],
+        "revision_guidance": guidance,
+        "return_only_new_non_duplicate_candidates": True,
+    }
+
+
+def _record_llm_parse_rejections(
+    errors: Sequence[Mapping[str, Any]],
+    *,
+    con,
+    batch_ts: int,
+    symbol: str,
+    trial_budget: int,
+) -> None:
+    for error in list(errors or []):
+        item = dict(error or {})
+        reason = str(item.get("reason") or "parse_rejected")
+        prompt_hash = str(item.get("prompt_hash") or "")
+        model_name = str(item.get("model_name") or DEFAULT_MODEL)
+        trial_index = max(1, int(item.get("trial_index") or item.get("idx") or 1))
+        key = content_hash(
+            {
+                "source": SOURCE,
+                "symbol": str(symbol).upper(),
+                "prompt_hash": prompt_hash,
+                "trial_index": int(trial_index),
+                "expression": str(item.get("expression") or item.get("raw_expression") or ""),
+                "reason": reason,
+            }
+        )
+        record_experiment_ledger(
+            con=con,
+            ts=int(batch_ts),
+            candidate_key=str(key),
+            candidate_name=f"rejected.llm.{str(key)[:16]}",
+            candidate_version=str(key)[:16],
+            candidate_type="llm_factor",
+            source=SOURCE,
+            parent_candidate_key=str(item.get("parent_hash") or ""),
+            model_name=model_name,
+            feature_ids=[],
+            prompt_hash=prompt_hash,
+            model_hash=model_name,
+            search_space={
+                "symbol": str(symbol).upper(),
+                "raw_expression": str(item.get("raw_expression") or ""),
+                "expression": str(item.get("expression") or ""),
+                "reason": reason,
+                "attempt_idx": int(item.get("attempt_idx") or 0),
+            },
+            trial_budget=max(1, int(trial_budget or 1)),
+            trial_count=min(max(1, int(trial_index)), max(1, int(trial_budget or trial_index or 1))),
+            fdr={"decision": reason},
+            redundancy={"checked": reason in {"duplicate_candidate", "duplicate_expression"}, "decision": reason},
+            evidence={"reason": reason, "error": dict(item)},
+            promotion_decision="rejected",
+            status="parse_rejected",
+            diagnostics={"final_decision": "rejected", "failure_mode": reason},
+        )
+
+
+def _record_llm_loop_final_decision(
+    *,
+    con,
+    batch_ts: int,
+    symbol: str,
+    model_name: str,
+    prompt_hashes: Sequence[str],
+    trial_budget: int,
+    trials_used: int,
+    final_decision: str,
+    evaluation_history: Sequence[Mapping[str, Any]],
+    parse_history: Sequence[Mapping[str, Any]],
+) -> None:
+    accepted = [dict(item) for item in list(evaluation_history or []) if str(dict(item).get("decision") or "") == ACCEPTED_DECISION]
+    rejected = [dict(item) for item in list(evaluation_history or []) if str(dict(item).get("decision") or "") != ACCEPTED_DECISION]
+    key = content_hash(
+        {
+            "source": SOURCE,
+            "symbol": str(symbol).upper(),
+            "batch_ts": int(batch_ts),
+            "prompt_hashes": list(prompt_hashes or []),
+            "final_decision": str(final_decision),
+        }
+    )
+    best = accepted[0] if accepted else {}
+    record_experiment_ledger(
+        con=con,
+        ts=int(batch_ts),
+        candidate_key=str(key),
+        candidate_name=f"llm_factor_loop.{str(symbol).upper()}",
+        candidate_version=str(batch_ts),
+        candidate_type="llm_factor",
+        source=SOURCE,
+        model_name=str(model_name),
+        feature_ids=[str(item.get("feature_id") or "") for item in accepted if str(item.get("feature_id") or "")],
+        prompt_hash=(str(list(prompt_hashes or [])[-1]) if list(prompt_hashes or []) else ""),
+        model_hash=str(model_name),
+        search_space={
+            "symbol": str(symbol).upper(),
+            "prompt_hashes": list(prompt_hashes or []),
+            "trial_budget": int(trial_budget),
+            "bounded_dsl": True,
+            "shadow_only": True,
+        },
+        trial_budget=max(1, int(trial_budget or 1)),
+        trial_count=max(0, min(int(trials_used or 0), max(1, int(trial_budget or 1)))),
+        fdr={
+            "decision": str(final_decision),
+            "accepted": int(len(accepted)),
+            "rejected": int(len(rejected)),
+            "parse_rejected": int(len(list(parse_history or []))),
+            "best": {
+                "t_stat": _finite_or_none(best.get("t_stat")) if best else None,
+                "p_value": _finite_or_none(best.get("p_value")) if best else None,
+                "q_value": _finite_or_none(best.get("q_value")) if best else None,
+                "oos_ic": _finite_or_none(best.get("oos_ic")) if best else None,
+            },
+        },
+        redundancy={"checked": True, "method": "within_loop_candidate_hash"},
+        evidence={
+            "final_decision": str(final_decision),
+            "evaluation_history": [dict(item) for item in list(evaluation_history or [])],
+            "parse_history": [dict(item) for item in list(parse_history or [])],
+        },
+        promotion_decision=("accepted" if str(final_decision) == ACCEPTED_DECISION else "rejected"),
+        status=str(final_decision),
+        diagnostics={"shadow_only": True, "model_name": str(model_name)},
+    )
 
 
 def _past_statistical_trials(*, con) -> tuple[list[float], list[str]]:
@@ -973,10 +1503,12 @@ __all__ = [
     "build_factor_prompt",
     "call_anthropic_messages_api",
     "cumulative_trial_count",
+    "critique_llm_failure_modes",
     "evaluate_llm_candidate",
     "load_anthropic_api_key",
     "load_prior_experiment_log",
     "parse_llm_candidates",
     "parse_ts_ms",
     "run_llm_factor_discovery",
+    "validate_llm_candidate_expression",
 ]

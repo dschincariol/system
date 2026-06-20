@@ -842,6 +842,33 @@ CREATE TABLE IF NOT EXISTS strategy_promotion_log (
   reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS strategy_promotion_candidates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_ts_ms INTEGER NOT NULL,
+  updated_ts_ms INTEGER NOT NULL,
+  strategy_name TEXT NOT NULL,
+  candidate_version TEXT NOT NULL,
+  candidate_model_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  source TEXT NOT NULL,
+  shadow_score REAL,
+  best_live_score REAL,
+  observed_shadow_runs INTEGER NOT NULL DEFAULT 0,
+  min_shadow_runs INTEGER NOT NULL DEFAULT 0,
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  operator_approved_ts_ms INTEGER,
+  operator_approved_by TEXT,
+  operator_approval_reason TEXT,
+  promoted_ts_ms INTEGER,
+  blocked_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_promotion_candidates_strategy_status
+  ON strategy_promotion_candidates(strategy_name, status, updated_ts_ms);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_strategy_promotion_candidates_model_id
+  ON strategy_promotion_candidates(candidate_model_id);
+
 CREATE TABLE IF NOT EXISTS strategy_shadow_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts_ms INTEGER NOT NULL,
@@ -4400,7 +4427,11 @@ def _load_shadow_strategies(con) -> List[str]:
 
 def _auto_promote_shadow_strategies(con):
     """
-    Promote shadow strategies if they outperform live strategies.
+    Record governed promotion candidates for shadow strategies that outperform.
+
+    This function intentionally does not mutate strategy_registry.stage to live.
+    Shadow-only performance is evidence for the governance workflow; the
+    strategy_governance_job promotion guard owns any live-stage mutation.
     """
 
     shadow_perf = _load_shadow_performance(con)
@@ -4425,33 +4456,24 @@ def _auto_promote_shadow_strategies(con):
             (strat,),
         ).fetchone()
 
-        if not row or int(row[0]) < SHADOW_PROMOTION_MIN_RUNS:
+        observed_runs = int((row or [0])[0] or 0)
+        if observed_runs < SHADOW_PROMOTION_MIN_RUNS:
             continue
 
-        con.execute(
-            """
-            UPDATE strategy_registry
-            SET stage='live'
-            WHERE strategy_name=?
-              AND COALESCE(stage,'') <> 'live'
-            """,
-            (strat,),
-        )
+        from engine.strategy.strategy_promotion_governance import record_shadow_promotion_candidate
 
-        con.execute(
-            """
-            INSERT INTO strategy_promotion_log(ts_ms,strategy_name,reason)
-            VALUES(?,?,?)
-            """,
-            (
-                _now_ms(),
-                strat,
-                json.dumps({
-                    "reason":"shadow_outperformance",
-                    "shadow_score":score,
-                    "best_live":best_live
-                })
-            )
+        record_shadow_promotion_candidate(
+            con,
+            strategy_name=str(strat),
+            shadow_score=float(score),
+            best_live_score=float(best_live),
+            observed_shadow_runs=int(observed_runs),
+            min_shadow_runs=int(SHADOW_PROMOTION_MIN_RUNS),
+            evidence={
+                "reason": "shadow_outperformance",
+                "promotion_threshold": float(SHADOW_PROMOTION_THRESHOLD),
+                "lookback_s": int(SHADOW_PROMOTION_LOOKBACK),
+            },
         )
 
 
@@ -5664,6 +5686,49 @@ def compute_rebalance() -> Dict:  # pyright: ignore[reportGeneralTypeIssues]
                         _warn_nonfatal("PORTFOLIO_EXPLORE_CAP_REASON_FAILED", e, once_key="explore_cap_reason")
         except Exception as e:
             _warn_nonfatal("PORTFOLIO_EXPLORE_CAP_FAILED", e, once_key="explore_cap")
+
+        # Empirical-Bayes alpha shrinkage is applied before expected-return
+        # blending and allocation optimization so thin-history estimates cannot
+        # feed full-size risk downstream.
+        try:
+            from engine.strategy.alpha_shrinkage import apply_alpha_shrinkage_to_desired
+
+            desired, _alpha_shrinkage = apply_alpha_shrinkage_to_desired(
+                con,
+                desired,
+                now_ms=int(now_ms),
+            )
+            try:
+                _put_meta(
+                    con,
+                    "last_alpha_shrinkage",
+                    json.dumps(_alpha_shrinkage or {}, separators=(",", ":"), sort_keys=True),
+                )
+            except Exception as e:
+                _warn_nonfatal("PORTFOLIO_ALPHA_SHRINKAGE_META_FAILED", e, once_key="alpha_shrinkage_meta")
+        except Exception as e:
+            _record_degraded_phase("alpha_shrinkage", "PORTFOLIO_ALPHA_SHRINKAGE_FAILED", e)
+            _warn_nonfatal("PORTFOLIO_ALPHA_SHRINKAGE_FAILED", e, once_key="alpha_shrinkage")
+            mode = str(os.environ.get("ENGINE_MODE") or os.environ.get("APP_ENV") or "").strip().lower()
+            execution_mode = str(os.environ.get("EXECUTION_MODE") or "").strip().lower()
+            fail_closed_raw = os.environ.get("ALPHA_SHRINKAGE_FAIL_CLOSED")
+            fail_closed = (
+                str(fail_closed_raw).strip().lower() in {"1", "true", "yes", "on"}
+                if fail_closed_raw is not None
+                else mode in {"live", "prod", "production"} or execution_mode == "live"
+            )
+            if fail_closed:
+                for desired_key in list(desired.keys()):
+                    desired[desired_key]["weight"] = 0.0
+                    desired[desired_key]["side"] = "FLAT"
+                    desired[desired_key].setdefault("reason", {})
+                    if isinstance(desired[desired_key]["reason"], dict):
+                        desired[desired_key]["reason"]["alpha_shrinkage"] = {
+                            "enabled": True,
+                            "applied": False,
+                            "failed_closed": True,
+                            "error": f"{type(e).__name__}: {e}",
+                        }
 
         # ---            -- ------------------------------------------------------
         # Optional expected-return blending (Black-Litterman)

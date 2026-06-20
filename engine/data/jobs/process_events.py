@@ -44,6 +44,13 @@ import torch
 from pathlib import Path
 from engine.data.default_symbols import load_default_symbols
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.hardware import (
+    apply_cpu_first_runtime_defaults,
+    log_runtime_hardware_diagnostics,
+    nvidia_telemetry_enabled,
+    resolve_torch_device,
+    torch_device_is_cuda,
+)
 from engine.runtime.torch_threads import configure_torch_thread_pools
 from engine.strategy.model_config import configured_model_horizons, experimental_models_enabled
 from engine.strategy.microstructure_signals import (
@@ -75,7 +82,7 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
     )
 
 # -----------------------------
-# CUDA stream separation + pinned async H->D
+# Optional accelerator stream separation + pinned async H->D
 # -----------------------------
 # This file is the canonical enriched event-processing path. The live/shadow
 # variants split out narrower workflows, but this module carries the richest
@@ -83,27 +90,23 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
 _LIVE_STREAM = None
 _SHADOW_STREAM = None
 
+# CPU-first runtime defaults. CUDA/NVIDIA behavior is opt-in via explicit env.
+apply_cpu_first_runtime_defaults()
+_TORCH_DEVICE_RESOLUTION = resolve_torch_device(torch, env_var="TORCH_DEVICE")
+_CUDA_RUNTIME_ENABLED = torch_device_is_cuda(torch, _TORCH_DEVICE_RESOLUTION)
+_NVIDIA_TELEMETRY_ENABLED = nvidia_telemetry_enabled(torch)
+
 # GPU feedback throttling config
-GPU_THROTTLE_ENABLE = os.environ.get("GPU_THROTTLE_ENABLE", "1") == "1"
+GPU_THROTTLE_ENABLE = os.environ.get("GPU_THROTTLE_ENABLE", "0") == "1" and _NVIDIA_TELEMETRY_ENABLED
 GPU_UTIL_MAX = float(os.environ.get("GPU_UTIL_MAX", "92"))          # %
 GPU_MEM_MAX = float(os.environ.get("GPU_MEM_MAX", "92"))            # %
 GPU_THROTTLE_SLEEP_S = float(os.environ.get("GPU_THROTTLE_SLEEP_S", "0.05"))
 
 # Pinned H->D config
-PINNED_ENABLE = os.environ.get("PINNED_ENABLE", "1") == "1"
-PINNED_PREFETCH = os.environ.get("PINNED_PREFETCH", "1") == "1"
-PINNED_DEVICE = os.environ.get("PINNED_DEVICE", "cuda").strip()     # usually cuda:0
+PINNED_ENABLE = os.environ.get("PINNED_ENABLE", "0") == "1" and _CUDA_RUNTIME_ENABLED
+PINNED_PREFETCH = os.environ.get("PINNED_PREFETCH", "0") == "1" and _CUDA_RUNTIME_ENABLED
+PINNED_DEVICE = os.environ.get("PINNED_DEVICE", _TORCH_DEVICE_RESOLUTION.resolved).strip()
 PINNED_DTYPE = torch.float32
-
-# Prevent iGPU/NPU from being used implicitly (opt-in later)
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("TORCH_DEVICE", "cuda")
-
-# Prevent CPU oversubscription (keeps GPU fed)
-os.environ.setdefault("OMP_NUM_THREADS", "8")
-os.environ.setdefault("MKL_NUM_THREADS", "8")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "8")
 
 _thread_config = configure_torch_thread_pools(torch)
 if _thread_config.get("reason") == "failed":
@@ -114,9 +117,10 @@ if _thread_config.get("reason") == "failed":
         cpu_threads=int(_thread_config.get("cpu_threads") or 0),
         interop_threads=int(_thread_config.get("interop_threads") or 0),
     )
+log_runtime_hardware_diagnostics(LOGGER, torch_module=torch, component="engine.data.jobs.process_events")
 
-# Initialize CUDA streams (live = default, shadow = low priority)
-if torch.cuda.is_available():
+# Initialize CUDA streams only when an explicit runtime device resolved to CUDA.
+if _CUDA_RUNTIME_ENABLED:
     try:
         _LIVE_STREAM = torch.cuda.default_stream()
         _SHADOW_STREAM = torch.cuda.Stream(priority=1)
@@ -134,7 +138,7 @@ def _gpu_stats() -> Dict[str, float]:
       2) nvidia-smi
       3) torch memory only (no util)
     """
-    if not torch.cuda.is_available():
+    if not _NVIDIA_TELEMETRY_ENABLED:
         return {"util": 0.0, "mem": 0.0, "mem_used_mb": 0.0, "mem_total_mb": 0.0}
 
     # 1) NVML
@@ -185,7 +189,7 @@ def _gpu_stats() -> Dict[str, float]:
 
 
 def _gpu_throttle_if_needed() -> None:
-    if not GPU_THROTTLE_ENABLE or not torch.cuda.is_available():
+    if not GPU_THROTTLE_ENABLE or not _NVIDIA_TELEMETRY_ENABLED:
         return
     try:
         s = _gpu_stats()
@@ -204,7 +208,7 @@ def _pinned_prefetch_to_device(vec_np: np.ndarray) -> Optional["torch.Tensor"]:
     This is intentionally optional: it improves overlap if your predictor can accept
     a torch.Tensor directly (recommended patch), otherwise it still warms the copy path.
     """
-    if not PINNED_ENABLE or not torch.cuda.is_available():
+    if not PINNED_ENABLE or not _CUDA_RUNTIME_ENABLED:
         return None
     try:
         # Ensure contiguous float32 CPU buffer
@@ -1133,28 +1137,27 @@ _model: Any = None
 def _get_model() -> Any:
     global _model
     if _model is None:
-        # Prefer GPU when available (RTX PRO 2000), allow override.
-        dev = os.environ.get("EMBED_DEVICE", "").strip().lower()
-        if not dev:
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        resolution = resolve_torch_device(torch, env_var="EMBED_DEVICE", fallback_envs=("TORCH_DEVICE",))
+        dev = resolution.resolved
 
-        # Performance flags (safe to apply even if CPU-only)
+        # Performance flags. CUDA-specific flags are gated by the resolved device.
         try:
             torch.set_float32_matmul_precision(os.environ.get("TORCH_MATMUL_PRECISION", "high"))
         except Exception as e:
             _warn_nonfatal("PROCESS_EVENTS_TORCH_MATMUL_PRECISION_FAILED", e, once_key="torch_matmul_precision")
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_TORCH_CUDA_TF32_FAILED", e, once_key="torch_cuda_tf32")
-        try:
-            torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_TORCH_CUDNN_TF32_FAILED", e, once_key="torch_cudnn_tf32")
-        try:
-            torch.backends.cudnn.benchmark = os.environ.get("CUDNN_BENCHMARK", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_TORCH_CUDNN_BENCHMARK_FAILED", e, once_key="torch_cudnn_benchmark")
+        if _CUDA_RUNTIME_ENABLED:
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_TORCH_CUDA_TF32_FAILED", e, once_key="torch_cuda_tf32")
+            try:
+                torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_TORCH_CUDNN_TF32_FAILED", e, once_key="torch_cudnn_tf32")
+            try:
+                torch.backends.cudnn.benchmark = os.environ.get("CUDNN_BENCHMARK", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_TORCH_CUDNN_BENCHMARK_FAILED", e, once_key="torch_cudnn_benchmark")
 
         # Allow separate disks via env (avoid OS drive fallback)
         for _k in ("HF_HOME", "TRANSFORMERS_CACHE", "SENTENCE_TRANSFORMERS_HOME"):
@@ -1412,7 +1415,7 @@ def main() -> None:
         # Embed outside write transaction
         titles = [(r[3] or "") for r in rows]
         _trace_main("embedding_begin", n=len(titles))
-        if _LIVE_STREAM is not None and torch.cuda.is_available():
+        if _LIVE_STREAM is not None and _CUDA_RUNTIME_ENABLED:
             with torch.cuda.stream(cast(Any, _LIVE_STREAM)):
                 embeddings = _get_model().encode(
 
@@ -1551,7 +1554,7 @@ def main() -> None:
                 temporal_shadow = None
                 if ENABLE_EXPERIMENTAL_MODELS and predict_temporal_shadow_for_event:
                     try:
-                        if _SHADOW_STREAM is not None:
+                        if _SHADOW_STREAM is not None and _CUDA_RUNTIME_ENABLED:
                             with torch.cuda.stream(cast(Any, _SHADOW_STREAM)):
                                 temporal_shadow = predict_temporal_shadow_for_event(
                                     conw,

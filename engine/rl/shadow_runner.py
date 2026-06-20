@@ -6,17 +6,17 @@ policy, computes target-weight deltas, and writes them to storage.
 
 from __future__ import annotations
 
-import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
 from engine.rl.agents import PortfolioAgent, latest_checkpoint, load_agent
 from engine.rl.portfolio_env import PortfolioEnv, PortfolioEnvConfig, observation_hash
 from engine.rl.wrappers import clip_and_normalize_action
+from engine.runtime.platform import default_local_models_dir
 from engine.runtime import storage
 
 
@@ -25,11 +25,17 @@ ObservationFn = Callable[[Sequence[str], Mapping[str, float], int], Any]
 KillSwitchFn = Callable[[Optional[Any]], tuple[bool, str, Dict[str, Any]]]
 
 
+def _default_rl_model_root() -> str:
+    return str((default_local_models_dir() / "rl").resolve())
+
+
 @dataclass
 class ShadowRunnerConfig:
     universe: Sequence[str]
     algo: str = "ppo"
-    model_root: str = "models/rl"
+    model_root: str = field(default_factory=_default_rl_model_root)
+    model_name: str = "rl_portfolio_shadow"
+    candidate_type: str = "rl"
     checkpoint_path: Optional[str] = None
     max_w: float = 0.35
     leverage_cap: float = 1.0
@@ -42,11 +48,19 @@ class ShadowRunnerConfig:
 RL_SHADOW_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rl_shadow_decisions(
   ts INTEGER NOT NULL,
+  model_name TEXT NOT NULL DEFAULT 'rl_portfolio_shadow',
+  candidate_type TEXT NOT NULL DEFAULT 'rl',
   symbol TEXT NOT NULL,
   live_weight REAL NOT NULL,
   rl_weight REAL NOT NULL,
   delta REAL NOT NULL,
   obs_hash TEXT NOT NULL,
+  behavior_propensity REAL,
+  target_propensity REAL,
+  outcome REAL,
+  logged_model_estimate REAL,
+  target_model_estimate REAL,
+  meta_json TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY(ts, symbol)
 );
 """
@@ -54,13 +68,67 @@ CREATE TABLE IF NOT EXISTS rl_shadow_decisions(
 
 def ensure_shadow_schema(con: Any) -> None:
     con.executescript(RL_SHADOW_SCHEMA)
+    cols = _table_columns(con, "rl_shadow_decisions")
+    for column_name, definition in (
+        ("model_name", "TEXT NOT NULL DEFAULT 'rl_portfolio_shadow'"),
+        ("candidate_type", "TEXT NOT NULL DEFAULT 'rl'"),
+        ("behavior_propensity", "REAL"),
+        ("target_propensity", "REAL"),
+        ("outcome", "REAL"),
+        ("logged_model_estimate", "REAL"),
+        ("target_model_estimate", "REAL"),
+        ("meta_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ):
+        if column_name not in cols:
+            con.execute(f"ALTER TABLE rl_shadow_decisions ADD COLUMN {column_name} {definition}")
+
+
+def _table_columns(con: Any, table_name: str) -> set[str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table_name})").fetchall() or []
+    except Exception:
+        return set()
+    return {str(row[1] or "").strip() for row in rows if row and len(row) > 1 and str(row[1] or "").strip()}
+
+
+def _safe_json_dumps(value: Mapping[str, Any]) -> str:
+    import json
+
+    return json.dumps(dict(value or {}), separators=(",", ":"), sort_keys=True, default=str)
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(out):
+        return None
+    return float(out)
 
 
 def normalize_live_decisions(decisions: Any) -> Dict[str, float]:
     if decisions is None:
         return {}
     if isinstance(decisions, Mapping):
-        return {str(k).upper().strip(): float(v or 0.0) for k, v in decisions.items() if str(k).strip()}
+        out: Dict[str, float] = {}
+        for key, value in decisions.items():
+            sym = str(key).upper().strip()
+            if not sym:
+                continue
+            if isinstance(value, Mapping):
+                if value.get("weight") is not None:
+                    weight = float(value.get("weight") or 0.0)
+                elif value.get("to_weight") is not None:
+                    weight = float(value.get("to_weight") or 0.0)
+                else:
+                    weight = 0.0
+            else:
+                weight = float(value or 0.0)
+            out[sym] = float(weight)
+        return out
     out: Dict[str, float] = {}
     for item in list(decisions or []):
         if not isinstance(item, Mapping):
@@ -81,6 +149,63 @@ def normalize_live_decisions(decisions: Any) -> Dict[str, float]:
             weight = 0.0
         out[sym] = float(weight)
     return out
+
+
+def normalize_live_decision_metadata(decisions: Any) -> Dict[str, Dict[str, Any]]:
+    if decisions is None:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(decisions, Mapping):
+        for key, value in decisions.items():
+            sym = str(key).upper().strip()
+            if sym and isinstance(value, Mapping):
+                out[sym] = dict(value)
+        return out
+    for item in list(decisions or []):
+        if not isinstance(item, Mapping):
+            continue
+        sym = str(item.get("symbol") or "").upper().strip()
+        if sym:
+            out[sym] = dict(item)
+    return out
+
+
+def _first_detail_value(details: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in details:
+            return details.get(key)
+    return None
+
+
+def _insert_shadow_decision(con: Any, row: Mapping[str, Any]) -> None:
+    cols = _table_columns(con, "rl_shadow_decisions")
+    ordered = [
+        "ts",
+        "model_name",
+        "candidate_type",
+        "symbol",
+        "live_weight",
+        "rl_weight",
+        "delta",
+        "obs_hash",
+        "behavior_propensity",
+        "target_propensity",
+        "outcome",
+        "logged_model_estimate",
+        "target_model_estimate",
+        "meta_json",
+    ]
+    insert_cols = [col for col in ordered if col in cols]
+    placeholders = ",".join(["?"] * len(insert_cols))
+    con.execute(
+        f"""
+        INSERT OR REPLACE INTO rl_shadow_decisions(
+          {", ".join(insert_cols)}
+        )
+        VALUES ({placeholders})
+        """,
+        tuple(row.get(col) for col in insert_cols),
+    )
 
 
 class RLShadowRunner:
@@ -107,6 +232,7 @@ class RLShadowRunner:
             if live_raw is None and self.config.live_decision_fn is not None:
                 live_raw = self.config.live_decision_fn()
             live_weights = normalize_live_decisions(live_raw)
+            live_details = normalize_live_decision_metadata(live_raw)
             universe = self._resolved_universe(live_weights)
 
             agent = self._load_agent()
@@ -126,18 +252,82 @@ class RLShadowRunner:
             for idx, sym in enumerate(universe):
                 live_w = float(live_weights.get(sym, 0.0))
                 rl_w = float(rl_action[idx]) if idx < len(rl_action) else 0.0
-                rows.append((int(ts), str(sym), float(live_w), float(rl_w), float(rl_w - live_w), str(obs_h)))
+                details = dict(live_details.get(sym) or {})
+                behavior_propensity = _float_or_none(
+                    _first_detail_value(
+                        details,
+                        "behavior_propensity",
+                        "logging_propensity",
+                        "logged_propensity",
+                        "decision_propensity",
+                        "propensity",
+                    )
+                )
+                target_propensity = _float_or_none(
+                    _first_detail_value(
+                        details,
+                        "target_propensity",
+                        "candidate_propensity",
+                        "evaluation_propensity",
+                        "policy_propensity",
+                    )
+                )
+                logged_model_estimate = _float_or_none(
+                    _first_detail_value(
+                        details,
+                        "logged_model_estimate",
+                        "behavior_model_estimate",
+                        "q_logged",
+                        "model_estimate",
+                    )
+                )
+                target_model_estimate = _float_or_none(
+                    _first_detail_value(
+                        details,
+                        "target_model_estimate",
+                        "candidate_model_estimate",
+                        "q_target",
+                        "policy_model_estimate",
+                    )
+                )
+                outcome = _float_or_none(
+                    _first_detail_value(details, "outcome", "reward", "net_return", "net_ret", "realized_return")
+                )
+                rows.append(
+                    {
+                        "ts": int(ts),
+                        "model_name": str(self.config.model_name or "rl_portfolio_shadow"),
+                        "candidate_type": str(self.config.candidate_type or "rl"),
+                        "symbol": str(sym),
+                        "live_weight": float(live_w),
+                        "rl_weight": float(rl_w),
+                        "delta": float(rl_w - live_w),
+                        "obs_hash": str(obs_h),
+                        "behavior_propensity": behavior_propensity,
+                        "target_propensity": target_propensity,
+                        "outcome": outcome,
+                        "logged_model_estimate": logged_model_estimate,
+                        "target_model_estimate": target_model_estimate,
+                        "meta_json": _safe_json_dumps(
+                            {
+                                "live_weight": float(live_w),
+                                "rl_weight": float(rl_w),
+                                "logged_action": f"weight:{live_w:.8f}",
+                                "target_action": f"weight:{rl_w:.8f}",
+                                "ope": {
+                                    "behavior_propensity": behavior_propensity,
+                                    "target_propensity": target_propensity,
+                                    "outcome": outcome,
+                                    "logged_model_estimate": logged_model_estimate,
+                                    "target_model_estimate": target_model_estimate,
+                                },
+                            }
+                        ),
+                    }
+                )
 
             for row in rows:
-                con.execute(
-                    """
-                    INSERT OR REPLACE INTO rl_shadow_decisions(
-                      ts, symbol, live_weight, rl_weight, delta, obs_hash
-                    )
-                    VALUES (?,?,?,?,?,?)
-                    """,
-                    row,
-                )
+                _insert_shadow_decision(con, row)
             con.commit()
             return {
                 "ok": True,
@@ -152,8 +342,7 @@ class RLShadowRunner:
     def _ensure_schema(self, con: Any) -> None:
         if hasattr(storage, "init_rl_portfolio_tables"):
             storage.init_rl_portfolio_tables(con=con)
-        else:
-            ensure_shadow_schema(con)
+        ensure_shadow_schema(con)
 
     def _kill_switch_allowed(self, con: Any) -> tuple[bool, str, Dict[str, Any]]:
         if self.config.kill_switch_fn is not None:

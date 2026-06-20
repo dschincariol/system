@@ -46,6 +46,12 @@ except Exception as _sentence_transformers_import_error:
 from pathlib import Path
 from engine.data.default_symbols import load_default_symbols
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.hardware import (
+    apply_cpu_first_runtime_defaults,
+    log_runtime_hardware_diagnostics,
+    resolve_torch_device,
+    torch_device_is_cuda,
+)
 from engine.runtime.torch_threads import configure_torch_thread_pools
 from engine.strategy.model_config import configured_model_horizons, experimental_models_enabled
 
@@ -75,13 +81,9 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
 # -----------------------------------------------------------------------------
 # ENV defaults
 # -----------------------------------------------------------------------------
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("TORCH_DEVICE", "cuda")
-
-os.environ.setdefault("OMP_NUM_THREADS", "8")
-os.environ.setdefault("MKL_NUM_THREADS", "8")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "8")
+apply_cpu_first_runtime_defaults()
+_TORCH_DEVICE_RESOLUTION = resolve_torch_device(torch, env_var="TORCH_DEVICE")
+_CUDA_RUNTIME_ENABLED = torch_device_is_cuda(torch, _TORCH_DEVICE_RESOLUTION)
 
 _thread_config = configure_torch_thread_pools(torch)
 if _thread_config.get("reason") == "failed":
@@ -92,6 +94,7 @@ if _thread_config.get("reason") == "failed":
         cpu_threads=int(_thread_config.get("cpu_threads") or 0),
         interop_threads=int(_thread_config.get("interop_threads") or 0),
     )
+log_runtime_hardware_diagnostics(LOGGER, torch_module=torch, component="engine.data.jobs.process_events_enriched")
 
 # -----------------------------------------------------------------------------
 # CUDA streams
@@ -99,7 +102,7 @@ if _thread_config.get("reason") == "failed":
 _LIVE_STREAM = None
 _SHADOW_STREAM = None
 
-if torch.cuda.is_available():
+if _CUDA_RUNTIME_ENABLED:
     try:
         _LIVE_STREAM = torch.cuda.default_stream()
         _SHADOW_STREAM = torch.cuda.Stream(priority=1)
@@ -211,26 +214,26 @@ def _get_model() -> Any:
         # Delay model allocation until the enriched worker actually needs it.
         # That keeps health checks/import smoke lightweight and avoids paying
         # GPU initialization cost in processes that only inspect the module.
-        dev = os.environ.get("EMBED_DEVICE", "").strip().lower()
-        if not dev:
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        resolution = resolve_torch_device(torch, env_var="EMBED_DEVICE", fallback_envs=("TORCH_DEVICE",))
+        dev = resolution.resolved
 
         try:
             torch.set_float32_matmul_precision(os.environ.get("TORCH_MATMUL_PRECISION", "high"))
         except Exception as e:
             _warn_nonfatal("PROCESS_EVENTS_ENRICHED_TORCH_MATMUL_PRECISION_FAILED", e, once_key="torch_matmul_precision")
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_ENRICHED_TORCH_CUDA_TF32_FAILED", e, once_key="torch_cuda_tf32")
-        try:
-            torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_ENRICHED_TORCH_CUDNN_TF32_FAILED", e, once_key="torch_cudnn_tf32")
-        try:
-            torch.backends.cudnn.benchmark = os.environ.get("CUDNN_BENCHMARK", "1") == "1"
-        except Exception as e:
-            _warn_nonfatal("PROCESS_EVENTS_ENRICHED_TORCH_CUDNN_BENCHMARK_FAILED", e, once_key="torch_cudnn_benchmark")
+        if _CUDA_RUNTIME_ENABLED:
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = os.environ.get("TORCH_ALLOW_TF32", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_ENRICHED_TORCH_CUDA_TF32_FAILED", e, once_key="torch_cuda_tf32")
+            try:
+                torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_ALLOW_TF32", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_ENRICHED_TORCH_CUDNN_TF32_FAILED", e, once_key="torch_cudnn_tf32")
+            try:
+                torch.backends.cudnn.benchmark = os.environ.get("CUDNN_BENCHMARK", "1") == "1"
+            except Exception as e:
+                _warn_nonfatal("PROCESS_EVENTS_ENRICHED_TORCH_CUDNN_BENCHMARK_FAILED", e, once_key="torch_cudnn_benchmark")
 
         for _k in ("HF_HOME", "TRANSFORMERS_CACHE", "SENTENCE_TRANSFORMERS_HOME"):
             if _k in os.environ:
@@ -1152,7 +1155,7 @@ def main() -> None:
         titles = [(r[3] or "") for r in rows]
 
         # Embed (live stream)
-        if _LIVE_STREAM is not None and torch.cuda.is_available():
+        if _LIVE_STREAM is not None and _CUDA_RUNTIME_ENABLED:
             with torch.cuda.stream(cast(Any, _LIVE_STREAM)):
                 embeddings = _get_model().encode(
                     titles,
@@ -1303,7 +1306,7 @@ def main() -> None:
                 temporal_shadow = None
                 if ENABLE_EXPERIMENTAL_MODELS and predict_temporal_shadow_for_event:
                     try:
-                        if _SHADOW_STREAM is not None and torch.cuda.is_available():
+                        if _SHADOW_STREAM is not None and _CUDA_RUNTIME_ENABLED:
                             with torch.cuda.stream(cast(Any, _SHADOW_STREAM)):
                                 temporal_shadow = predict_temporal_shadow_for_event(
                                     conw,

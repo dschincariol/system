@@ -11,6 +11,7 @@ from typing import Any
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect
+from engine.runtime.workload_profiles import assert_offline_work_allowed
 
 LOG = logging.getLogger(__name__)
 
@@ -393,6 +394,15 @@ def fit_and_persist_group(
 
 
 def run(*, con=None) -> dict[str, Any]:
+    try:
+        assert_offline_work_allowed(job_name="train_ensemble")
+    except RuntimeError as exc:
+        return {
+            "ok": False,
+            "error": "offline_training_live_profile_ack_required",
+            "detail": str(exc),
+        }
+
     own = con is None
     con = connect() if con is None else con
     try:
@@ -417,6 +427,7 @@ def run(*, con=None) -> dict[str, Any]:
             if not symbol or int(horizon) <= 0:
                 skipped += 1
                 continue
+            families: set[str] = set()
             try:
                 alpha = resolve_ridge_alpha(
                     symbol=str(symbol),
@@ -461,7 +472,7 @@ def run(*, con=None) -> dict[str, Any]:
                     e,
                     symbol=str(symbol),
                     horizon=int(horizon),
-                    families=sorted(str(family) for family in weights),
+                    families=sorted(str(family) for family in families),
                 )
                 skipped += 1
                 continue
@@ -493,9 +504,11 @@ def run(*, con=None) -> dict[str, Any]:
                 logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
 
 
-def main() -> None:
-    LOG.info("train_ensemble_result result=%s", run())
+def main() -> int:
+    result = run()
+    LOG.info("train_ensemble_result result=%s", result)
+    return 0 if bool(result.get("ok")) else 3
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

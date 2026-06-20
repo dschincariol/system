@@ -22,6 +22,7 @@ from engine.execution.execution_ledger import compute_capital_efficiency_snapsho
 
 
 _MIN_N = int(os.environ.get("TEMPORAL_PROMOTE_MIN_N", "200"))
+_MIN_NET_LABELS = int(os.environ.get("TEMPORAL_PROMOTE_MIN_NET_LABELS", str(_MIN_N)))
 _MIN_IMPROVE = float(os.environ.get("TEMPORAL_PROMOTE_MIN_IMPROVEMENT", os.environ.get("PROMOTE_MIN_IMPROVEMENT", "0.01")))
 _DIR_TOL = float(os.environ.get("TEMPORAL_PROMOTE_DIRACC_TOL", os.environ.get("PROMOTE_DIRACC_TOL", "0.00")))
 
@@ -276,28 +277,34 @@ def main() -> int:
               tp.horizon_s,
               tp.event_id,
               {temporal_pred_expr} AS temporal_pred,
-              l.impact_z AS y_true,
+              COALESCE(le.net_z, l.impact_z) AS y_true,
               p.predicted_z AS baseline_pred,
               {model_ts_expr} AS model_ts_ms,
-              {model_kind_expr} AS model_kind
+              {model_kind_expr} AS model_kind,
+              CASE WHEN le.net_z IS NOT NULL THEN 1 ELSE 0 END AS net_label_available
             FROM temporal_predictions tp
             JOIN labels l
               ON l.event_id = tp.event_id
              AND l.symbol = tp.symbol
              AND l.horizon_s = tp.horizon_s
+            LEFT JOIN labels_exec le
+              ON le.event_id = l.event_id
+             AND le.symbol = l.symbol
+             AND le.horizon_s = l.horizon_s
+             AND le.realized = 1
             LEFT JOIN predictions p
               ON p.event_id = tp.event_id
              AND p.symbol = tp.symbol
              AND p.horizon_s = tp.horizon_s
             WHERE tp.ts_ms >= ?
-              AND l.impact_z IS NOT NULL
+              AND COALESCE(le.net_z, l.impact_z) IS NOT NULL
             """,
             (int(min_ts),),
         ).fetchall()
 
         by: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
-        for sym, h, eid, tpred, y, bpred, model_ts_ms, model_kind in rows or []:
+        for sym, h, eid, tpred, y, bpred, model_ts_ms, model_kind, net_label_available in rows or []:
 
             sym_u = str(sym or "").upper().strip()
             hi = int(h or 0)
@@ -348,11 +355,13 @@ def main() -> int:
                     "signed_alpha": 0.0,
                     "latest_model_ts_ms": int(model_ts_ms or 0),
                     "latest_model_kind": str(model_kind or "temporal_mlp"),
+                    "net_label_count": 0,
                 }
                 by[k] = g
 
             g["y"].append(yt)
             g["t"].append(tpv)
+            g["net_label_count"] = int(g.get("net_label_count") or 0) + (1 if int(net_label_available or 0) else 0)
 
             side = 1.0 if tpv >= 0 else -1.0
             pnl = side * yt
@@ -446,10 +455,15 @@ def main() -> int:
 
             reasons = []
             pass_all = True
+            net_label_count = int(g.get("net_label_count") or 0)
+            net_label_coverage = float(net_label_count) / float(max(1, n))
 
             if n < _MIN_N:
                 pass_all = False
                 reasons.append(f"n<{_MIN_N}")
+            if net_label_count < int(_MIN_NET_LABELS):
+                pass_all = False
+                reasons.append("net_cost_labels_unavailable")
 
             if not np.isfinite(brmse) or brmse <= 0:
                 pass_all = False
@@ -481,6 +495,11 @@ def main() -> int:
                 "drawdown_contribution": float(drawdown),
                 "avg_slippage_impact": float(avg_slippage),
                 "signed_alpha": float(signed_alpha),
+                "net_edge": float(signed_alpha / float(max(1, n))),
+                "gross_only_eval_blocked": bool(net_label_count < int(_MIN_NET_LABELS)),
+                "net_label_count": int(net_label_count),
+                "net_label_coverage": float(net_label_coverage),
+                "min_net_labels": int(_MIN_NET_LABELS),
                 "capital_hours": float(exec_metrics.get("capital_hours") or 0.0),
                 "safety_score": float(safety_score),
                 "latest_model_ts_ms": int(g.get("latest_model_ts_ms") or 0),

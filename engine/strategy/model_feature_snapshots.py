@@ -10,7 +10,7 @@ import math
 import os
 import logging
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -58,13 +58,31 @@ from engine.strategy.feature_registry import (
     OPTIONS_FEATURE_IDS,
     PRICE_FEATURE_IDS,
     SHORT_FEATURE_IDS,
+    STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS,
     TECH_FEATURE_IDS,
+    TS_FOUNDATION_CHRONOS_FEATURE_IDS,
     UNIFIED_MACRO_FEATURE_IDS as MACRO_FEATURE_IDS,
     UNIFIED_SOCIAL_FEATURE_IDS as SOCIAL_FEATURE_IDS,
     UNIFIED_SYMBOL_FEATURE_IDS,
     WEATHER_FEATURE_IDS,
 )
+from engine.strategy.feature_pit import (
+    enforce_feature_pit_controls,
+    evaluate_group_policy,
+    policy_metadata_for_groups,
+)
+from engine.strategy.graph_relational import (
+    GRAPH_RELATIONAL_FEATURE_IDS,
+    GRAPH_RELATIONAL_GROUP,
+    GRAPH_RELATIONAL_PREFIX,
+    build_graph_relational_snapshot,
+    graph_metadata_from_snapshot,
+)
 from engine.strategy.social_regime import classify_regime_from_features
+from engine.strategy.ts_foundation_encoder import (
+    TS_FOUNDATION_CHRONOS_GROUP,
+    resolve_chronos_foundation_features,
+)
 
 FEATURE_SET_TAG = "unified_symbol_v1"
 SNAPSHOT_VERSION = 1
@@ -148,6 +166,8 @@ def _json_dumps(value: Any) -> str:
 def _feature_set_tag(feature_ids: Sequence[str]) -> str:
     if list(feature_ids) == list(UNIFIED_SYMBOL_FEATURE_IDS):
         return FEATURE_SET_TAG
+    if any(str(fid or "").startswith(GRAPH_RELATIONAL_PREFIX) for fid in list(feature_ids or [])):
+        return f"{FEATURE_SET_TAG}+graph_relational_v1_shadow"
     return f"{FEATURE_SET_TAG}+custom"
 
 
@@ -170,6 +190,8 @@ def _register_timescale_feature_rows_after_commit(con, snapshots: Sequence[Dict[
                     "feature_ids": list(snap.get("feature_ids") or []),
                     "feature_set_tag": str(snap.get("feature_set_tag") or FEATURE_SET_TAG),
                     "features": dict(snap.get("features") or {}),
+                    "feature_metadata": dict(snap.get("feature_metadata") or {}),
+                    "pit_controls": dict(snap.get("pit_controls") or {}),
                     "snapshot_version": int(snap.get("snapshot_version") or SNAPSHOT_VERSION),
                     "source_timestamps": dict(snap.get("source_timestamps") or {}),
                     "vector": list(snap.get("vector") or []),
@@ -243,17 +265,24 @@ def summarize_model_feature_snapshots(
         "short",
         "crypto_positioning",
         "news_flow",
+        "structured_doc_events",
         "etf_flow",
         "cot",
         "inst_13f",
         "gov",
         "fundamentals",
+        "congressional",
         "social",
+        "sentiment",
         "weather",
+        "bocpd_regime",
+        TS_FOUNDATION_CHRONOS_GROUP,
+        GRAPH_RELATIONAL_GROUP,
     )
     availability_counts = {group: 0 for group in groups}
     violations: List[Dict[str, Any]] = []
     lookahead_violations = 0
+    pit_policy_violations = 0
 
     for snap in snapshots or []:
         symbol = str((snap or {}).get("symbol") or "").upper().strip()
@@ -286,6 +315,12 @@ def summarize_model_feature_snapshots(
             "news_flow.latest_availability_ts_ms": (
                 (source_timestamps.get("news_flow") or {}).get("latest_availability_ts_ms")
             ),
+            "structured_doc_events.latest_availability_ts_ms": (
+                (source_timestamps.get("structured_doc_events") or {}).get("latest_availability_ts_ms")
+            ),
+            "structured_doc_events.latest_event_ts_ms": (
+                (source_timestamps.get("structured_doc_events") or {}).get("latest_event_ts_ms")
+            ),
             "etf_flow.latest_availability_ts_ms": (
                 (source_timestamps.get("etf_flow") or {}).get("latest_availability_ts_ms")
             ),
@@ -301,10 +336,31 @@ def summarize_model_feature_snapshots(
             "fundamentals.latest_publish_ts_ms": (
                 (source_timestamps.get("fundamentals") or {}).get("latest_publish_ts_ms")
             ),
+            "congressional.latest_availability_ts_ms": (
+                (source_timestamps.get("congressional") or {}).get("latest_availability_ts_ms")
+            ),
+            "congressional.latest_trade_ts_ms": (
+                (source_timestamps.get("congressional") or {}).get("latest_trade_ts_ms")
+            ),
+            "congressional.latest_transaction_ts_ms": (
+                (source_timestamps.get("congressional") or {}).get("latest_transaction_ts_ms")
+            ),
             "social.bucket_ts_ms": ((source_timestamps.get("social") or {}).get("bucket_ts_ms")),
             "sentiment.ts_ms": ((source_timestamps.get("sentiment") or {}).get("ts_ms")),
             "weather.forecast_run_ts_ms": ((source_timestamps.get("weather") or {}).get("forecast_run_ts_ms")),
             "weather.alert_issued_ts_ms": ((source_timestamps.get("weather") or {}).get("alert_issued_ts_ms")),
+            f"{TS_FOUNDATION_CHRONOS_GROUP}.price_history_last_ts_ms": (
+                (source_timestamps.get(TS_FOUNDATION_CHRONOS_GROUP) or {}).get("price_history_last_ts_ms")
+            ),
+            f"{TS_FOUNDATION_CHRONOS_GROUP}.encoder_artifact_created_ts_ms": (
+                (source_timestamps.get(TS_FOUNDATION_CHRONOS_GROUP) or {}).get("encoder_artifact_created_ts_ms")
+            ),
+            f"{GRAPH_RELATIONAL_GROUP}.max_source_ts_ms": (
+                (source_timestamps.get(GRAPH_RELATIONAL_GROUP) or {}).get("max_source_ts_ms")
+            ),
+            f"{GRAPH_RELATIONAL_GROUP}.max_availability_ts_ms": (
+                (source_timestamps.get(GRAPH_RELATIONAL_GROUP) or {}).get("max_availability_ts_ms")
+            ),
         }
         for key, value in checks.items():
             if not _is_lookahead(value, int(anchor_ts_ms)):
@@ -321,6 +377,26 @@ def summarize_model_feature_snapshots(
                 max_examples=int(max_examples),
             )
 
+        for group in groups:
+            detail = evaluate_group_policy(
+                group=str(group),
+                source_meta=dict(source_timestamps.get(str(group)) or {}),
+                anchor_ts_ms=int(anchor_ts_ms),
+                available=bool(availability.get(str(group))),
+            )
+            if bool(detail.get("ok", True)):
+                continue
+            pit_policy_violations += 1
+            _record_validation_violation(
+                violations,
+                symbol=symbol,
+                anchor_ts_ms=int(anchor_ts_ms),
+                group=str(group),
+                field="pit_policy:" + ",".join(str(code) for code in list(detail.get("reason_codes") or [])),
+                value=detail.get("availability_ts_ms") or detail.get("source_ts_ms"),
+                max_examples=int(max_examples),
+            )
+
     total = int(len(list(snapshots or [])))
     return {
         "snapshots": int(total),
@@ -330,7 +406,8 @@ def summarize_model_feature_snapshots(
             for k, v in availability_counts.items()
         },
         "lookahead_violations": int(lookahead_violations),
-        "ok": bool(lookahead_violations == 0),
+        "pit_policy_violations": int(pit_policy_violations),
+        "ok": bool(lookahead_violations == 0 and pit_policy_violations == 0),
         "violations": list(violations),
     }
 
@@ -822,7 +899,11 @@ def _load_event_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
         float(sum(importance_24h) / len(importance_24h)) if importance_24h else 0.0
     )
     features["events.hours_since_last"] = float(max(0, int(ts_ms) - int(latest_event_ts_ms)) / 3_600_000.0)
-    return features, {"latest_event_ts_ms": int(latest_event_ts_ms), "window_start_ts_ms": int(cutoff_24h)}, True
+    return features, {
+        "latest_event_ts_ms": int(latest_event_ts_ms),
+        "latest_event_availability_ts_ms": int(latest_event_ts_ms),
+        "window_start_ts_ms": int(cutoff_24h),
+    }, True
 
 
 def _storage_row_dict(row: Any) -> Dict[str, Any]:
@@ -955,6 +1036,7 @@ def _load_insider_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, floa
     cluster_buyers_5d: set[str] = set()
     officer_buy_weight = 0.0
     latest_availability = max([int(_insider_availability_ts_ms(row) or 0) for row in row_dicts] or [0])
+    latest_transaction_ts = max([_safe_int(row.get("transaction_ts_ms"), 0) for row in row_dicts] or [0])
     adv_dollars = _adv_dollar_volume(con, symbol=str(symbol), ts_ms=int(ts_ms))
 
     for row, label in classified_rows:
@@ -987,6 +1069,7 @@ def _load_insider_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, floa
         features,
         {
             "latest_availability_ts_ms": int(latest_availability) if latest_availability > 0 else None,
+            "latest_transaction_ts_ms": int(latest_transaction_ts) if latest_transaction_ts > 0 else None,
             "window_start_ts_ms": int(query_start),
             "normalizer": "adv_dollar_volume_30d",
             "normalizer_value": float(adv_dollars),
@@ -1064,6 +1147,7 @@ def _load_short_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
     volume_dicts = [row for row in volume_dicts if row]
     features["short_vol_ratio_z20"] = float(_short_volume_ratio_z(volume_dicts, lookback=20))
     latest_volume_availability = max([_safe_int(row.get("availability_ts_ms"), 0) for row in volume_dicts] or [0])
+    latest_volume_trade_ts = max([_safe_int(row.get("trade_ts_ms"), 0) for row in volume_dicts] or [0])
     latest_volume_trade_date = None
     if volume_dicts:
         latest_volume_trade_date = str(
@@ -1107,6 +1191,7 @@ def _load_short_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
     earnings_window = _earnings_window_proximity(con, symbol=str(symbol), ts_ms=int(ts_ms))
     features["si_surprise_x_earnings_window"] = float(features["si_surprise"] * float(earnings_window))
     latest_si_availability = max([_safe_int(row.get("availability_ts_ms"), 0) for row in si_dicts] or [0])
+    latest_si_settlement_ts = max([_safe_int(row.get("settlement_ts_ms"), 0) for row in si_dicts] or [0])
     latest_si_settlement_date = None
     if si_dicts:
         latest_si_settlement_date = str(
@@ -1121,8 +1206,10 @@ def _load_short_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
         features,
         {
             "latest_short_volume_availability_ts_ms": int(latest_volume_availability) if latest_volume_availability > 0 else None,
+            "latest_short_volume_trade_ts_ms": int(latest_volume_trade_ts) if latest_volume_trade_ts > 0 else None,
             "latest_short_volume_trade_date": latest_volume_trade_date or None,
             "latest_short_interest_availability_ts_ms": int(latest_si_availability) if latest_si_availability > 0 else None,
+            "latest_short_interest_settlement_ts_ms": int(latest_si_settlement_ts) if latest_si_settlement_ts > 0 else None,
             "latest_short_interest_settlement_date": latest_si_settlement_date or None,
             "short_volume_window_start_ts_ms": int(volume_start),
             "short_interest_readings": int(len(si_dicts)),
@@ -1215,6 +1302,33 @@ def _load_news_flow_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, fl
         )
         return features, {"latest_availability_ts_ms": None}, False
     for fid in NEWS_FLOW_FEATURE_IDS:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_structured_doc_events_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS}
+    if not STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS:
+        return features, {"latest_availability_ts_ms": None, "latest_event_ts_ms": None}, False
+    try:
+        from engine.data.structured_document_events import resolve_structured_document_event_features
+
+        resolved, meta, available = resolve_structured_document_event_features(
+            con,
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_structured_doc_events_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_STRUCTURED_DOC_EVENTS_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_structured_doc_events_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_availability_ts_ms": None, "latest_event_ts_ms": None}, False
+    for fid in STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS:
         features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
     return features, dict(meta or {}), bool(available)
 
@@ -1345,13 +1459,14 @@ def _load_congressional_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str
         rows = con.execute(
             """
             SELECT
-              COALESCE(transaction_ts_ms, disclosure_ts_ms, ingested_ts_ms) AS event_ts_ms,
+              COALESCE(disclosure_ts_ms, ingested_ts_ms, created_ts_ms, transaction_ts_ms) AS availability_ts_ms,
+              transaction_ts_ms,
               direction
             FROM congressional_trades
             WHERE symbol = ?
-              AND COALESCE(transaction_ts_ms, disclosure_ts_ms, ingested_ts_ms) <= ?
-              AND COALESCE(transaction_ts_ms, disclosure_ts_ms, ingested_ts_ms) >= ?
-            ORDER BY COALESCE(transaction_ts_ms, disclosure_ts_ms, ingested_ts_ms) DESC, id DESC
+              AND COALESCE(disclosure_ts_ms, ingested_ts_ms, created_ts_ms, transaction_ts_ms) <= ?
+              AND COALESCE(disclosure_ts_ms, ingested_ts_ms, created_ts_ms, transaction_ts_ms) >= ?
+            ORDER BY COALESCE(disclosure_ts_ms, ingested_ts_ms, created_ts_ms, transaction_ts_ms) DESC, id DESC
             """,
             (str(symbol), int(ts_ms), int(query_start)),
         ).fetchall()
@@ -1363,10 +1478,11 @@ def _load_congressional_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str
 
     buy_count_30d = 0
     sell_count_30d = 0
-    latest_trade_ts_ms = _safe_int(rows[0][0], 0)
-    for event_ts_ms, direction in rows or []:
-        event_ts_ms = _safe_int(event_ts_ms, 0)
-        if event_ts_ms < int(window_30d_start):
+    latest_availability_ts_ms = _safe_int(rows[0][0], 0)
+    latest_transaction_ts_ms = max([_safe_int(row[1], 0) for row in rows or []] or [0])
+    for availability_ts_ms, _transaction_ts_ms, direction in rows or []:
+        availability_ts_ms = _safe_int(availability_ts_ms, 0)
+        if availability_ts_ms < int(window_30d_start):
             continue
         direction_key = str(direction or "").strip().lower()
         if direction_key == "buy":
@@ -1377,7 +1493,12 @@ def _load_congressional_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str
     features["congressional.buy_count_30d"] = float(buy_count_30d)
     features["congressional.sell_count_30d"] = float(sell_count_30d)
     features["congressional.net_signal_30d"] = float(buy_count_30d - sell_count_30d)
-    return features, {"latest_trade_ts_ms": int(latest_trade_ts_ms), "window_start_ts_ms": int(query_start)}, True
+    return features, {
+        "latest_availability_ts_ms": int(latest_availability_ts_ms),
+        "latest_trade_ts_ms": int(latest_availability_ts_ms),
+        "latest_transaction_ts_ms": int(latest_transaction_ts_ms) if latest_transaction_ts_ms > 0 else None,
+        "window_start_ts_ms": int(query_start),
+    }, True
 
 
 def _load_finbert_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
@@ -1685,6 +1806,87 @@ def _load_bocpd_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float]
         return features, {"summary_ts_ms": None, "series_key": None, "series_type": None}, False
 
 
+def _load_ts_foundation_chronos_group(
+    con,
+    *,
+    symbol: str,
+    ts_ms: int,
+    feature_ids: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    features = {fid: 0.0 for fid in TS_FOUNDATION_CHRONOS_FEATURE_IDS}
+    requested = [
+        str(fid)
+        for fid in list(feature_ids or TS_FOUNDATION_CHRONOS_FEATURE_IDS)
+        if str(fid or "").strip()
+    ]
+    if requested:
+        features = {fid: 0.0 for fid in requested}
+    try:
+        resolved, meta, available = resolve_chronos_foundation_features(
+            con,
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+            feature_ids=list(requested or TS_FOUNDATION_CHRONOS_FEATURE_IDS),
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_ts_foundation_chronos_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_TS_FOUNDATION_CHRONOS_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_ts_foundation_chronos_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"status": "error", "price_history_last_ts_ms": None}, False
+    for fid in features:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_graph_relational_group(
+    con,
+    *,
+    symbol: str,
+    ts_ms: int,
+    feature_ids: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    requested = [
+        str(fid)
+        for fid in list(feature_ids or GRAPH_RELATIONAL_FEATURE_IDS)
+        if str(fid or "").startswith(GRAPH_RELATIONAL_PREFIX)
+    ]
+    features = {fid: 0.0 for fid in list(requested or GRAPH_RELATIONAL_FEATURE_IDS)}
+    try:
+        snapshot = build_graph_relational_snapshot(
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+            feature_ids=list(requested or GRAPH_RELATIONAL_FEATURE_IDS),
+            con=con,
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_graph_relational_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_GRAPH_RELATIONAL_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_graph_relational_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"status": "error", "max_source_ts_ms": None, "max_availability_ts_ms": None}, False
+
+    resolved = dict((snapshot or {}).get("features") or {})
+    for fid in features:
+        features[fid] = float(_safe_float(resolved.get(fid), 0.0))
+    graph_meta = graph_metadata_from_snapshot(snapshot or {})
+    source_meta = {
+        **dict((snapshot or {}).get("source_timestamps") or {}),
+        **dict(graph_meta or {}),
+        "edge_counts": dict((snapshot or {}).get("edge_counts") or {}),
+        "graph_metadata": dict(graph_meta or {}),
+    }
+    return features, source_meta, bool((snapshot or {}).get("availability", {}).get(GRAPH_RELATIONAL_GROUP))
+
+
 def build_model_feature_snapshot(
     *,
     symbol: str,
@@ -1695,6 +1897,11 @@ def build_model_feature_snapshot(
     symbol_key = str(symbol or "").upper().strip()
     anchor_ts_ms = int(ts_ms)
     ids = list(feature_ids or UNIFIED_SYMBOL_FEATURE_IDS)
+    graph_feature_ids = [
+        str(fid)
+        for fid in ids
+        if str(fid or "").startswith(GRAPH_RELATIONAL_PREFIX)
+    ]
 
     group_features: Dict[str, float] = {}
     source_timestamps: Dict[str, Any] = {"anchor_ts_ms": int(anchor_ts_ms)}
@@ -1843,6 +2050,28 @@ def build_model_feature_snapshot(
                 False,
             )
         try:
+            structured_doc_events_features, structured_doc_events_meta, structured_doc_events_available = (
+                _load_structured_doc_events_group(
+                    con,
+                    symbol=symbol_key,
+                    ts_ms=anchor_ts_ms,
+                )
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_structured_doc_events_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_STRUCTURED_DOC_EVENTS_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_structured_doc_events_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            structured_doc_events_features, structured_doc_events_meta, structured_doc_events_available = (
+                {fid: 0.0 for fid in STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "latest_event_ts_ms": None},
+                False,
+            )
+        try:
             etf_flow_features, etf_flow_meta, etf_flow_available = _load_etf_flow_group(
                 con,
                 symbol=symbol_key,
@@ -1943,7 +2172,7 @@ def build_model_feature_snapshot(
                 False,
             )
         try:
-            congressional_features, congressional_meta, _congressional_available = _load_congressional_group(
+            congressional_features, congressional_meta, congressional_available = _load_congressional_group(
                 con,
                 symbol=symbol_key,
                 ts_ms=anchor_ts_ms,
@@ -1957,7 +2186,11 @@ def build_model_feature_snapshot(
                 symbol=symbol_key,
                 ts_ms=int(anchor_ts_ms),
             )
-            congressional_features, congressional_meta = ({fid: 0.0 for fid in CONGRESSIONAL_FEATURE_IDS}, {"latest_trade_ts_ms": None})
+            congressional_features, congressional_meta, congressional_available = (
+                {fid: 0.0 for fid in CONGRESSIONAL_FEATURE_IDS},
+                {"latest_trade_ts_ms": None},
+                False,
+            )
         try:
             social_features, social_meta, social_available = _load_social_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
         except Exception as exc:
@@ -1971,7 +2204,7 @@ def build_model_feature_snapshot(
             )
             social_features, social_meta, social_available = ({fid: 0.0 for fid in SOCIAL_FEATURE_IDS}, {"bucket_ts_ms": None}, False)
         try:
-            finbert_features, finbert_meta, _finbert_available = _load_finbert_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
+            finbert_features, finbert_meta, finbert_available = _load_finbert_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
         except Exception as exc:
             _warn_nonfatal(
                 "model_feature_snapshots_finbert_group_failed",
@@ -1981,7 +2214,7 @@ def build_model_feature_snapshot(
                 symbol=symbol_key,
                 ts_ms=int(anchor_ts_ms),
             )
-            finbert_features, finbert_meta = ({fid: 0.0 for fid in FINBERT_FEATURE_IDS}, {"ts_ms": None})
+            finbert_features, finbert_meta, finbert_available = ({fid: 0.0 for fid in FINBERT_FEATURE_IDS}, {"ts_ms": None}, False)
         try:
             weather_features, weather_meta, weather_available = _load_weather_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
         except Exception as exc:
@@ -2010,6 +2243,57 @@ def build_model_feature_snapshot(
                 {"summary_ts_ms": None, "series_key": None, "series_type": None},
                 False,
             )
+        try:
+            ts_foundation_feature_ids = [
+                fid
+                for fid in ids
+                if str(fid or "").startswith("tsfm.chronos_v2.")
+            ]
+            ts_foundation_features, ts_foundation_meta, ts_foundation_available = _load_ts_foundation_chronos_group(
+                con,
+                symbol=symbol_key,
+                ts_ms=anchor_ts_ms,
+                feature_ids=list(ts_foundation_feature_ids or TS_FOUNDATION_CHRONOS_FEATURE_IDS),
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_ts_foundation_chronos_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_TS_FOUNDATION_CHRONOS_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_ts_foundation_chronos_group_failed_outer",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            ts_foundation_features, ts_foundation_meta, ts_foundation_available = (
+                {fid: 0.0 for fid in TS_FOUNDATION_CHRONOS_FEATURE_IDS},
+                {"status": "error", "price_history_last_ts_ms": None},
+                False,
+            )
+        graph_features: Dict[str, float] = {}
+        graph_meta: Dict[str, Any] = {"status": "not_requested"}
+        graph_available = False
+        if graph_feature_ids:
+            try:
+                graph_features, graph_meta, graph_available = _load_graph_relational_group(
+                    con,
+                    symbol=symbol_key,
+                    ts_ms=anchor_ts_ms,
+                    feature_ids=list(graph_feature_ids),
+                )
+            except Exception as exc:
+                _warn_nonfatal(
+                    "model_feature_snapshots_graph_relational_group_failed",
+                    "MODEL_FEATURE_SNAPSHOTS_GRAPH_RELATIONAL_GROUP_FAILED",
+                    exc,
+                    warn_key="model_feature_snapshots_graph_relational_group_failed_outer",
+                    symbol=symbol_key,
+                    ts_ms=int(anchor_ts_ms),
+                )
+                graph_features, graph_meta, graph_available = (
+                    {fid: 0.0 for fid in graph_feature_ids},
+                    {"status": "error", "max_source_ts_ms": None, "max_availability_ts_ms": None},
+                    False,
+                )
 
         for mapping in (
             price_features,
@@ -2021,6 +2305,7 @@ def build_model_feature_snapshot(
             short_features,
             crypto_positioning_features,
             news_flow_features,
+            structured_doc_events_features,
             etf_flow_features,
             cot_features,
             inst_13f_features,
@@ -2031,6 +2316,8 @@ def build_model_feature_snapshot(
             finbert_features,
             weather_features,
             bocpd_features,
+            ts_foundation_features,
+            graph_features,
         ):
             group_features.update(mapping)
 
@@ -2044,22 +2331,21 @@ def build_model_feature_snapshot(
             "short": bool(short_available),
             "crypto_positioning": bool(crypto_positioning_available),
             "news_flow": bool(news_flow_available),
+            "structured_doc_events": bool(structured_doc_events_available),
             "etf_flow": bool(etf_flow_available),
             "cot": bool(cot_available),
             "inst_13f": bool(inst_13f_available),
             "gov": bool(gov_available),
             "fundamentals": bool(fundamentals_available),
+            "congressional": bool(congressional_available),
             "social": bool(social_available),
+            "sentiment": bool(finbert_available),
             "weather": bool(weather_available),
             "bocpd_regime": bool(bocpd_available),
+            TS_FOUNDATION_CHRONOS_GROUP: bool(ts_foundation_available),
         }
-        group_features["availability.price"] = 1.0 if availability["price"] else 0.0
-        group_features["availability.events"] = 1.0 if availability["events"] else 0.0
-        group_features["availability.macro"] = 1.0 if availability["macro"] else 0.0
-        group_features["availability.options"] = 1.0 if availability["options"] else 0.0
-        group_features["availability.social"] = 1.0 if availability["social"] else 0.0
-        group_features["availability.weather"] = 1.0 if availability["weather"] else 0.0
-
+        if graph_feature_ids:
+            availability[GRAPH_RELATIONAL_GROUP] = bool(graph_available)
         source_timestamps.update(
             {
                 "price": price_meta,
@@ -2071,6 +2357,7 @@ def build_model_feature_snapshot(
                 "short": short_meta,
                 "crypto_positioning": crypto_positioning_meta,
                 "news_flow": news_flow_meta,
+                "structured_doc_events": structured_doc_events_meta,
                 "etf_flow": etf_flow_meta,
                 "cot": cot_meta,
                 "inst_13f": inst_13f_meta,
@@ -2081,8 +2368,29 @@ def build_model_feature_snapshot(
                 "sentiment": finbert_meta,
                 "weather": weather_meta,
                 "bocpd_regime": bocpd_meta,
+                TS_FOUNDATION_CHRONOS_GROUP: ts_foundation_meta,
             }
         )
+        if graph_feature_ids:
+            source_timestamps[GRAPH_RELATIONAL_GROUP] = dict(graph_meta or {})
+
+        group_features, availability, pit_controls = enforce_feature_pit_controls(
+            features=group_features,
+            availability=availability,
+            source_timestamps=source_timestamps,
+            anchor_ts_ms=int(anchor_ts_ms),
+            feature_ids=list(ids),
+        )
+        feature_metadata = policy_metadata_for_groups(sorted(set(pit_controls.keys()) | set(availability.keys())))
+        source_timestamps["_pit_controls"] = dict(pit_controls)
+        source_timestamps["_feature_metadata"] = dict(feature_metadata)
+
+        group_features["availability.price"] = 1.0 if availability.get("price") else 0.0
+        group_features["availability.events"] = 1.0 if availability.get("events") else 0.0
+        group_features["availability.macro"] = 1.0 if availability.get("macro") else 0.0
+        group_features["availability.options"] = 1.0 if availability.get("options") else 0.0
+        group_features["availability.social"] = 1.0 if availability.get("social") else 0.0
+        group_features["availability.weather"] = 1.0 if availability.get("weather") else 0.0
 
         features = {fid: float(_safe_float(group_features.get(fid), 0.0)) for fid in ids}
         vector = [float(features[fid]) for fid in ids]
@@ -2096,6 +2404,8 @@ def build_model_feature_snapshot(
             "features": dict(features),
             "source_timestamps": dict(source_timestamps),
             "availability": dict(availability),
+            "feature_metadata": dict(feature_metadata),
+            "pit_controls": dict(pit_controls),
         }
     finally:
         if owns:
@@ -2299,6 +2609,14 @@ def backfill_model_feature_snapshots(
                 )
 
 
+def _attach_snapshot_pit_metadata(payload: Mapping[str, Any] | None) -> Dict[str, Any]:
+    out = dict(payload or {})
+    source_timestamps = dict(out.get("source_timestamps") or {})
+    out.setdefault("feature_metadata", dict(source_timestamps.get("_feature_metadata") or {}))
+    out.setdefault("pit_controls", dict(source_timestamps.get("_pit_controls") or {}))
+    return out
+
+
 def load_model_feature_snapshot(
     *,
     symbol: str,
@@ -2315,7 +2633,7 @@ def load_model_feature_snapshot(
 
                 cached = latest(str(symbol), str(feature_set_tag))
                 if isinstance(cached, dict) and cached:
-                    return cached
+                    return _attach_snapshot_pit_metadata(cached)
         except Exception:
             logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
     owns = False
@@ -2351,7 +2669,7 @@ def load_model_feature_snapshot(
         ).fetchone()
         if not row:
             return None
-        return {
+        payload = {
             "symbol": str(row[0] or ""),
             "ts_ms": _safe_int(row[1], 0),
             "feature_set_tag": str(row[2] or ""),
@@ -2363,6 +2681,7 @@ def load_model_feature_snapshot(
             "availability": json.loads(str(row[8] or "{}")),
             "created_ts_ms": _safe_int(row[9], 0),
         }
+        return _attach_snapshot_pit_metadata(payload)
     finally:
         if owns:
             try:

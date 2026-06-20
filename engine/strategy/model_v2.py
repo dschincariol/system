@@ -388,11 +388,16 @@ def train_regime_stats(
         try:
             rows = con.execute(
                 """
-                SELECT l.symbol, l.horizon_s, l.impact_z
+                SELECT l.symbol, l.horizon_s, COALESCE(le.net_z, l.impact_z) AS impact_z
                 FROM labels l
                 JOIN events e ON e.id = l.event_id
+                LEFT JOIN labels_exec le
+                  ON le.event_id = l.event_id
+                 AND le.symbol = l.symbol
+                 AND le.horizon_s = l.horizon_s
+                 AND le.realized = 1
                 WHERE e.ts_ms >= ?
-                  AND l.impact_z IS NOT NULL
+                  AND COALESCE(le.net_z, l.impact_z) IS NOT NULL
                 """,
                 (int(cutoff_ms),),
             ).fetchall()

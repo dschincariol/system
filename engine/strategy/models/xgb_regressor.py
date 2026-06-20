@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 
 from engine.model_registry import register_model_family
+from engine.runtime.workload_profiles import model_family_n_jobs
 from engine.strategy.models.lgbm_regressor import (
     LGBMRegressorModel,
     _assert_loaded_feature_schema_current,
@@ -79,7 +80,7 @@ class XGBRegressorModel(LGBMRegressorModel):
             "subsample": 1.0,
             "colsample_bytree": 1.0,
             "random_state": 42,
-            "n_jobs": 1,
+            "n_jobs": model_family_n_jobs("XGB_N_JOBS"),
             "verbosity": 0,
         }
 

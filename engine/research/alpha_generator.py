@@ -40,6 +40,7 @@ from engine.strategy.model_lifecycle import (
 )
 from engine.strategy.model_marketplace import refresh_replay_validation_snapshot, upsert_marketplace_candidate
 from engine.strategy.promotion_guard import evaluate_statistical_promotion_gate
+from engine.strategy.experiment_ledger import record_experiment_ledger
 from engine.model_registry import register_model
 
 
@@ -758,6 +759,31 @@ def _reject_candidate(
         diagnostics={"reason": str(reason), **dict(merged_diagnostics or {})},
     )
     if str(candidate_name or "").strip() and str(candidate_version or "").strip():
+        record_experiment_ledger(
+            candidate_key=f"{str(candidate_name)}:{str(candidate_version)}",
+            candidate_name=str(candidate_name),
+            candidate_version=str(candidate_version),
+            candidate_type="model_challenger",
+            source=str((candidate_spec or {}).get("generation_method") or "alpha_discovery"),
+            model_name=str(candidate_name),
+            model_family=str((candidate_spec or {}).get("model_family") or ""),
+            feature_ids=list((candidate_spec or {}).get("feature_ids") or []),
+            search_space={
+                "generation_method": str((candidate_spec or {}).get("generation_method") or ""),
+                "group_names": list((candidate_spec or {}).get("group_names") or []),
+            },
+            trial_budget=max(1, _safe_int(os.environ.get("ALPHA_DISCOVERY_MAX_CANDIDATES"), 1)),
+            trial_count=max(1, _safe_int(dict(merged_diagnostics).get("n_competing_trials"), 1)),
+            cpcv=dict(merged_diagnostics.get("cpcv") or {}),
+            pbo=_safe_float(dict(merged_diagnostics.get("cpcv") or {}).get("latest_run", {}).get("pbo"), 0.0),
+            dsr=_safe_float(merged_diagnostics.get("deflated_sharpe"), 0.0),
+            fdr=dict(merged_diagnostics.get("statistical_gate") or {}),
+            redundancy={"checked": True, "method": "feature_set_signature"},
+            evidence=dict(merged_diagnostics or {}),
+            promotion_decision="rejected",
+            status="rejected",
+            diagnostics={"reason": str(reason), "symbolic_candidate": dict(symbolic_candidate or {})},
+        )
         update_model_version_status(
             str(candidate_name),
             str(candidate_version),
@@ -947,6 +973,30 @@ def _process_candidate(
             created_ts=int(created_ts),
         )
         or 0
+    )
+    record_experiment_ledger(
+        candidate_key=f"{str(candidate_name)}:{str(candidate_version)}",
+        candidate_name=str(candidate_name),
+        candidate_version=str(candidate_version),
+        candidate_type="model_challenger",
+        source=str(candidate_spec.get("generation_method") or "alpha_discovery"),
+        parent_candidate_key=str(symbolic_candidate.get("feature_id") or ""),
+        model_name=str(candidate_name),
+        model_family=str(candidate_spec.get("model_family") or ""),
+        feature_ids=list(feature_ids),
+        search_space={
+            "generation_method": str(candidate_spec.get("generation_method") or ""),
+            "group_names": list(candidate_spec.get("group_names") or []),
+            "feature_set_tag": str(candidate_spec.get("feature_set_tag") or ""),
+            "loop_config": dict(loop_cfg or {}),
+        },
+        trial_budget=max(1, _safe_int(loop_cfg.get("max_candidates"), 1)),
+        trial_count=max(1, int(n_competing_trials or 1)),
+        redundancy={"checked": True, "method": "feature_set_signature", "feature_set_tag": str(candidate_spec.get("feature_set_tag") or "")},
+        evidence={"stage": "generated", "alpha_candidate_id": int(candidate_id)},
+        promotion_decision="pending",
+        status="generated",
+        diagnostics={"symbolic_candidate": dict(symbolic_candidate or {})},
     )
     record_alpha_lifecycle(
         candidate_id=int(candidate_id),
@@ -1164,6 +1214,37 @@ def _process_candidate(
         persist=True,
     )
     full_validation = {**dict(validation_diagnostics or {}), "replay_rows": list(replay_rows or []), "replay_refresh": dict(replay_summary or {})}
+    cpcv_diag = dict(full_validation.get("cpcv") or {})
+    cpcv_run = dict(cpcv_diag.get("latest_run") or {})
+    stat_diag = dict(full_validation.get("statistical_gate") or full_validation)
+    record_experiment_ledger(
+        candidate_key=f"{str(candidate_name)}:{str(candidate_version)}",
+        candidate_name=str(candidate_name),
+        candidate_version=str(candidate_version),
+        candidate_type="model_challenger",
+        source=str(candidate_spec.get("generation_method") or "alpha_discovery"),
+        parent_candidate_key=str(symbolic_candidate.get("feature_id") or ""),
+        model_name=str(candidate_name),
+        model_family=str(candidate_spec.get("model_family") or ""),
+        feature_ids=list(feature_ids),
+        search_space={
+            "generation_method": str(candidate_spec.get("generation_method") or ""),
+            "group_names": list(candidate_spec.get("group_names") or []),
+            "feature_set_tag": str(candidate_spec.get("feature_set_tag") or ""),
+            "loop_config": dict(loop_cfg or {}),
+        },
+        trial_budget=max(1, _safe_int(loop_cfg.get("max_candidates"), 1)),
+        trial_count=max(1, int(n_competing_trials or 1)),
+        cpcv=cpcv_diag,
+        pbo=_safe_float(cpcv_run.get("pbo"), 0.0),
+        dsr=_safe_float(full_validation.get("deflated_sharpe") or stat_diag.get("deflated_sharpe"), 0.0),
+        fdr=stat_diag,
+        redundancy={"checked": True, "method": "feature_set_signature", "feature_set_tag": str(candidate_spec.get("feature_set_tag") or "")},
+        evidence=full_validation,
+        promotion_decision=("pass" if bool(validation_passed) else "fail"),
+        status=("validated" if bool(validation_passed) else "rejected"),
+        diagnostics={"alpha_candidate_id": int(candidate_id), "symbolic_candidate": dict(symbolic_candidate or {})},
+    )
     if not replay_rows or not any(bool(row.get("approved")) for row in replay_rows):
         return _reject_candidate(
             candidate_id=int(candidate_id),

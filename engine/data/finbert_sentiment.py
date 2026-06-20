@@ -14,6 +14,7 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.hardware import resolve_torch_device
 from engine.runtime.logging import get_logger
 
 LOG = get_logger("engine.data.finbert_sentiment")
@@ -175,17 +176,13 @@ def _source_identifier(payload: Dict[str, Any]) -> str:
 
 def _resolved_device(requested: Any = None) -> Tuple[Any, str]:
     torch = importlib.import_module("torch")
-    device = str(
-        requested
-        or os.environ.get("FINBERT_DEVICE")
-        or os.environ.get("TORCH_DEVICE")
-        or ""
-    ).strip().lower()
-    if not device:
-        device = "cuda" if bool(getattr(torch, "cuda", None)) and torch.cuda.is_available() else "cpu"
-    if device.startswith("cuda") and (not bool(getattr(torch, "cuda", None)) or not torch.cuda.is_available()):
-        device = "cpu"
-    return torch, device
+    resolution = resolve_torch_device(
+        torch,
+        requested=requested,
+        env_var="FINBERT_DEVICE",
+        fallback_envs=("NLP_DEVICE", "TORCH_DEVICE"),
+    )
+    return torch, resolution.resolved
 
 
 def load_finbert_model(
@@ -419,6 +416,35 @@ def resolve_finbert_sentiment_snapshot(
 
     symbol_key = _normalize_symbol(symbol)
     anchor_ts_ms = _safe_int(ts_ms, _safe_int((event or {}).get("ts_ms"), 0))
+    event_id = _safe_int_or_none((event or {}).get("event_id") if isinstance(event, dict) else None)
+    if FINBERT_USE_PERSISTED_ENRICHMENT and event_id is not None:
+        try:
+            from engine.runtime.storage import load_finbert_sentiment_enrichment_for_event
+
+            row = load_finbert_sentiment_enrichment_for_event(
+                event_id=int(event_id),
+                model_name=str(FINBERT_MODEL_NAME),
+                con=con,
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "FINBERT_PERSISTED_EVENT_LOOKUP_FAILED",
+                exc,
+                once_key="finbert_persisted_event_lookup_failed",
+                event_id=int(event_id),
+            )
+            row = None
+        if isinstance(row, dict):
+            meta = {
+                "event_id": _safe_int_or_none(row.get("event_id")),
+                "label": str(row.get("label") or ""),
+                "model_name": str(row.get("model_name") or FINBERT_MODEL_NAME),
+                "model_version": str(row.get("model_version") or ""),
+                "source": "persisted_event",
+                "ts_ms": _safe_int(row.get("ts_ms"), 0),
+            }
+            return finbert_feature_map_from_row(row), meta, True
+
     if FINBERT_USE_PERSISTED_ENRICHMENT and symbol_key and anchor_ts_ms > 0:
         try:
             from engine.runtime.storage import load_latest_finbert_sentiment_enrichment

@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from engine.runtime.platform import default_local_models_dir
 from engine.rl.wrappers import clip_and_normalize_action
 
 try:  # pragma: no cover - optional dependency path
@@ -26,12 +27,16 @@ except Exception:  # pragma: no cover - exercised in this checkout
     STABLE_BASELINES3_AVAILABLE = False
 
 
+def _default_rl_model_root() -> str:
+    return str((default_local_models_dir() / "rl").resolve())
+
+
 @dataclass
 class AgentConfig:
     algo: str = "ppo"
     seed: int = 7
     total_timesteps: int = 1_000_000
-    model_root: str = "models/rl"
+    model_root: str = field(default_factory=_default_rl_model_root)
     policy: str = "MlpPolicy"
     device: str = "cpu"
     learning_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -308,8 +313,13 @@ def make_agent(algo: str = "ppo", **kwargs: Any) -> PortfolioAgent:
     return PPOPortfolioAgent(config)
 
 
-def train_agent(env: Any, *, algo: str = "ppo", total_timesteps: int = 1_000_000, seed: int = 7, model_root: str = "models/rl"):
-    agent = make_agent(algo=algo, total_timesteps=int(total_timesteps), seed=int(seed), model_root=str(model_root))
+def train_agent(env: Any, *, algo: str = "ppo", total_timesteps: int = 1_000_000, seed: int = 7, model_root: str | None = None):
+    agent = make_agent(
+        algo=algo,
+        total_timesteps=int(total_timesteps),
+        seed=int(seed),
+        model_root=str(model_root or _default_rl_model_root()),
+    )
     agent.learn(env, total_timesteps=int(total_timesteps))
     out_dir = checkpoint_dir(agent.config)
     agent.save(out_dir)
@@ -320,8 +330,8 @@ def load_agent(path: str | Path, *, env: Any = None, algo: str = "ppo", seed: in
     return PortfolioAgent.load(path, env=env, algo=algo, seed=seed)
 
 
-def latest_checkpoint(*, algo: str = "ppo", model_root: str = "models/rl") -> Optional[Path]:
-    root = Path(model_root) / str(algo).lower()
+def latest_checkpoint(*, algo: str = "ppo", model_root: str | None = None) -> Optional[Path]:
+    root = Path(model_root or _default_rl_model_root()) / str(algo).lower()
     if not root.exists():
         return None
     candidates = [p for p in root.iterdir() if p.is_dir() and ((p / "model.json").exists() or (p / "model.zip").exists())]

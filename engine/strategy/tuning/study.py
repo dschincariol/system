@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from engine.runtime.platform import default_data_root
+from engine.runtime.platform import default_data_root, default_local_db_dir, use_local_runtime_defaults
 from engine.strategy.tuning.catalog import catalog_defaults
 
 _OPTUNA_STUDY_DB_FILENAME = ".".join(("optuna_studies", "db"))
@@ -31,7 +31,8 @@ def study_storage_url(db_path: str | os.PathLike[str] | None = None) -> str:
     explicit = str(os.environ.get("TS_OPTUNA_STORAGE_URL", "") or "").strip()
     if explicit:
         return explicit
-    path = Path(db_path or os.environ.get("OPTUNA_DB_PATH", "") or (default_data_root() / _OPTUNA_STUDY_DB_FILENAME))
+    default_root = default_local_db_dir() if use_local_runtime_defaults() else default_data_root()
+    path = Path(db_path or os.environ.get("OPTUNA_DB_PATH", "") or (default_root / _OPTUNA_STUDY_DB_FILENAME))
     path.parent.mkdir(parents=True, exist_ok=True)
     return f"sqlite:///{path.as_posix()}"
 

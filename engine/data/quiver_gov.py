@@ -25,7 +25,7 @@ import os
 import re
 import time
 from datetime import date, datetime, time as dt_time, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -33,7 +33,7 @@ import requests
 from engine.data._credentials import get_data_credential
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.storage import connect, run_write_txn
+from engine.runtime.storage import run_write_txn
 
 GOV_FEATURE_IDS = [
     "congress_committee_buy_30d",

@@ -6,6 +6,7 @@ champion should stay live, be replaced by a challenger, or be demoted because
 its live behavior has degraded.
 """
 import json
+import math
 import os
 import logging
 import threading
@@ -21,13 +22,16 @@ from engine.runtime.storage import connect, init_db, record_hypothesis_result, r
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.runtime_meta import meta_get, meta_set
 from engine.strategy.promotion_audit import audit
-from engine.strategy.promotion_guard import assess_challenger, evaluate_statistical_promotion_gate
+from engine.strategy.promotion_guard import assess_challenger, evaluate_statistical_promotion_gate, promotion_allowed
+from engine.strategy.experiment_ledger import evaluate_experiment_ledger_promotion_gate
 from engine.strategy.model_marketplace import (
     compute_capital_plan,
     get_cached_replay_validation_snapshot,
     recompute_marketplace_scores,
     run_self_critic,
 )
+from engine.strategy.ope_gate import evaluate_policy_ope_gate
+from engine.strategy.learned_alpha_decay import champion_gate_for_candidate
 
 PROMOTION_MIN_SCORE = float(os.environ.get("CHAMPION_PROMOTION_MIN_SCORE", "0.0"))
 PROMOTION_MIN_TRADES = int(os.environ.get("CHAMPION_PROMOTION_MIN_TRADES", "3"))
@@ -156,7 +160,17 @@ def _safe_json_dict(v: Any) -> Dict[str, Any]:
 
 
 def _json_dumps(v: Any) -> str:
-    return json.dumps(v, separators=(",", ":"), sort_keys=True)
+    return json.dumps(_json_sanitize(v), separators=(",", ":"), sort_keys=True, allow_nan=False)
+
+
+def _json_sanitize(v: Any) -> Any:
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {str(key): _json_sanitize(value) for key, value in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [_json_sanitize(value) for value in v]
+    return v
 
 
 def _safe_json_value(v: Any, default: Any) -> Any:
@@ -272,6 +286,339 @@ def _candidate_block_key(model_name: str, symbol: str, horizon_s: int, regime: s
     )
 
 
+def _candidate_model_id(row: Optional[Dict[str, Any]]) -> str:
+    candidate = dict(row or {})
+    meta = dict(candidate.get("meta") or {})
+    metrics = dict(candidate.get("metrics") or {})
+    value = candidate.get("model_id") or metrics.get("model_id") or meta.get("model_id")
+    text = str(value or "").strip()
+    return text or "baseline"
+
+
+def _as_nonempty_strings(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+    elif value is None:
+        values = []
+    else:
+        values = [value]
+    out: List[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _as_positive_ints(value: Any) -> List[int]:
+    values = list(value) if isinstance(value, (list, tuple, set)) else ([] if value is None else [value])
+    out: List[int] = []
+    for item in values:
+        number = _safe_int(item, 0)
+        if number > 0:
+            out.append(int(number))
+    return out
+
+
+def _candidate_contexts(row: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    candidate = dict(row or {})
+    if not candidate:
+        return []
+    meta = dict(candidate.get("meta") or {})
+    metrics = dict(candidate.get("metrics") or {})
+    model_name = str(candidate.get("model_name") or metrics.get("model_name") or meta.get("model_name") or "").strip()
+    model_id = _candidate_model_id(candidate)
+    contexts: List[Dict[str, Any]] = []
+    raw_contexts = candidate.get("contexts") or metrics.get("contexts") or meta.get("contexts")
+    if isinstance(raw_contexts, list):
+        for raw in raw_contexts:
+            if not isinstance(raw, dict):
+                continue
+            symbol = str(raw.get("symbol") or "").upper().strip()
+            horizon_s = _safe_int(raw.get("horizon_s"), 0)
+            regime = str(raw.get("regime") or "global").strip() or "global"
+            if model_name and symbol and horizon_s > 0:
+                contexts.append(
+                    {
+                        "model_name": model_name,
+                        "model_id": model_id,
+                        "symbol": symbol,
+                        "horizon_s": int(horizon_s),
+                        "regime": regime,
+                    }
+                )
+    if not contexts:
+        symbols = _as_nonempty_strings(
+            candidate.get("symbols") or metrics.get("symbols") or meta.get("symbols")
+        )
+        horizons = _as_positive_ints(
+            candidate.get("horizons") or metrics.get("horizons") or meta.get("horizons")
+        )
+        regimes = _as_nonempty_strings(
+            candidate.get("regimes") or metrics.get("regimes") or meta.get("regimes")
+        ) or ["global"]
+        if model_name and symbols and horizons:
+            for symbol in symbols:
+                for horizon_s in horizons:
+                    for regime in regimes:
+                        contexts.append(
+                            {
+                                "model_name": model_name,
+                                "model_id": model_id,
+                                "symbol": str(symbol).upper().strip(),
+                                "horizon_s": int(horizon_s),
+                                "regime": str(regime or "global").strip() or "global",
+                            }
+                        )
+    if not contexts:
+        symbol = str(candidate.get("symbol") or metrics.get("symbol") or meta.get("symbol") or "").upper().strip()
+        horizon_s = _safe_int(candidate.get("horizon_s") or metrics.get("horizon_s") or meta.get("horizon_s"), 0)
+        regime = str(candidate.get("regime") or metrics.get("regime") or meta.get("regime") or "global").strip() or "global"
+        if model_name and symbol and horizon_s > 0:
+            contexts.append(
+                {
+                    "model_name": model_name,
+                    "model_id": model_id,
+                    "symbol": symbol,
+                    "horizon_s": int(horizon_s),
+                    "regime": regime,
+                }
+            )
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, int, str]] = set()
+    for context in contexts:
+        key = (
+            str(context.get("model_name") or ""),
+            str(context.get("symbol") or "").upper().strip(),
+            _safe_int(context.get("horizon_s"), 0),
+            str(context.get("regime") or "global"),
+        )
+        if not key[0] or not key[1] or key[2] <= 0 or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(context)
+    return deduped
+
+
+def _candidate_replay_lookup_keys(context: Dict[str, Any]) -> List[str]:
+    model_name = str(context.get("model_name") or "").strip()
+    model_id = str(context.get("model_id") or "baseline").strip() or "baseline"
+    symbol = str(context.get("symbol") or "").upper().strip()
+    horizon_s = _safe_int(context.get("horizon_s"), 0)
+    regime = str(context.get("regime") or "global").strip() or "global"
+    raw_keys = [
+        "|".join([model_name, model_id, symbol, str(horizon_s), regime]),
+        "|".join([model_name, model_id, "*", str(horizon_s), regime]),
+        "|".join([model_name, "baseline", symbol, str(horizon_s), regime]),
+        "|".join([model_name, "baseline", "*", str(horizon_s), regime]),
+        "|".join([model_name, symbol, str(horizon_s), regime]),
+        "|".join([model_name, "*", str(horizon_s), regime]),
+        "|".join([model_id, symbol, str(horizon_s), regime]),
+        "|".join([model_id, "*", str(horizon_s), regime]),
+    ]
+    out: List[str] = []
+    for key in raw_keys:
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _candidate_self_critic_lookup_keys(context: Dict[str, Any]) -> List[str]:
+    model_name = str(context.get("model_name") or "").strip()
+    model_id = str(context.get("model_id") or "baseline").strip() or "baseline"
+    symbol = str(context.get("symbol") or "").upper().strip()
+    horizon_s = _safe_int(context.get("horizon_s"), 0)
+    regime = str(context.get("regime") or "global").strip() or "global"
+    raw_keys = [
+        _candidate_block_key(model_name, symbol, horizon_s, regime),
+        "|".join([model_name, model_id, symbol, str(horizon_s), regime]),
+        "|".join([model_name, "baseline", symbol, str(horizon_s), regime]),
+        "|".join([model_id, symbol, str(horizon_s), regime]),
+    ]
+    out: List[str] = []
+    for key in raw_keys:
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _candidate_replay_checks(
+    row: Optional[Dict[str, Any]],
+    replay_models: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    models = dict(replay_models or {})
+    checks: List[Dict[str, Any]] = []
+    for context in _candidate_contexts(row):
+        lookup_keys = _candidate_replay_lookup_keys(context)
+        replay_row: Dict[str, Any] = {}
+        matched_key = ""
+        for lookup_key in lookup_keys:
+            value = models.get(lookup_key)
+            if isinstance(value, dict) and value:
+                replay_row = dict(value)
+                matched_key = str(lookup_key)
+                break
+        checks.append(
+            {
+                "context": dict(context),
+                "lookup_keys": list(lookup_keys),
+                "matched_key": matched_key,
+                "replay": replay_row,
+                "approved": bool(replay_row.get("approved")) if replay_row else False,
+                "missing": not bool(replay_row),
+            }
+        )
+    return checks
+
+
+def _promotion_replay_check_provenance(checks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for check in checks:
+        replay_row = dict(check.get("replay") or {})
+        context = dict(check.get("context") or {})
+        payload = {
+            "context": {
+                "model_name": str(context.get("model_name") or ""),
+                "model_id": str(context.get("model_id") or ""),
+                "symbol": str(context.get("symbol") or ""),
+                "horizon_s": _safe_int(context.get("horizon_s"), 0),
+                "regime": str(context.get("regime") or "global"),
+            },
+            "matched_key": str(check.get("matched_key") or ""),
+            "approved": bool(check.get("approved")),
+            "missing": bool(check.get("missing")),
+        }
+        if replay_row:
+            payload.update(
+                {
+                    "model_name": str(replay_row.get("model_name") or ""),
+                    "symbol": str(replay_row.get("symbol") or ""),
+                    "horizon_s": _safe_int(replay_row.get("horizon_s"), 0),
+                    "regime": str(replay_row.get("regime") or "global"),
+                    "model_kind": str(replay_row.get("model_kind") or ""),
+                    "model_ts_ms": _safe_int(replay_row.get("model_ts_ms"), 0),
+                    "source": str(replay_row.get("source") or ""),
+                    "n": _safe_int(replay_row.get("n"), 0),
+                    "baseline_n": _safe_int(replay_row.get("baseline_n"), 0),
+                    "dir_acc": _safe_float(replay_row.get("dir_acc"), 0.0),
+                    "baseline_dir_acc": replay_row.get("baseline_dir_acc"),
+                    "dir_acc_delta": replay_row.get("dir_acc_delta"),
+                    "net_rmse": _safe_float(replay_row.get("net_rmse"), 0.0),
+                    "baseline_net_rmse": replay_row.get("baseline_net_rmse"),
+                    "net_rmse_delta": replay_row.get("net_rmse_delta"),
+                    "last_event_id": _safe_int(replay_row.get("last_event_id"), 0),
+                    "window_end_ms": _safe_int(replay_row.get("window_end_ms"), 0),
+                }
+            )
+        out.append(payload)
+    return out
+
+
+def _candidate_promotion_eligibility(
+    row: Optional[Dict[str, Any]],
+    *,
+    replay_models: Optional[Dict[str, Any]],
+    replay_fresh: bool,
+    blocked_keys: set[str],
+    runtime_eligible_fn,
+    live_promotable_fn=None,
+    learned_alpha_gate: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    candidate = dict(row or {})
+    block_reasons: List[str] = []
+    if not candidate:
+        block_reasons.append("missing_candidate")
+
+    live_promotable = True
+    if candidate and live_promotable_fn is not None:
+        live_promotable = bool(live_promotable_fn(candidate))
+        if not live_promotable:
+            if not _candidate_has_net_cost_evidence(candidate):
+                block_reasons.append("net_cost_evidence_missing")
+            else:
+                block_reasons.append("not_live_promotable")
+
+    runtime_eligible = bool(runtime_eligible_fn(candidate)) if candidate else False
+    if candidate and not runtime_eligible:
+        if not _candidate_has_net_cost_evidence(candidate):
+            block_reasons.append("net_cost_evidence_missing")
+        else:
+            block_reasons.append("runtime_eligibility_failed")
+
+    replay_checks = _candidate_replay_checks(candidate, replay_models)
+    replay_missing = bool(not replay_checks or any(bool(check.get("missing")) for check in replay_checks))
+    replay_approved = bool(replay_checks and all(bool(check.get("approved")) for check in replay_checks))
+    if not bool(replay_fresh):
+        block_reasons.append("replay_stale")
+    elif replay_missing:
+        block_reasons.append("replay_missing")
+    elif not replay_approved:
+        block_reasons.append("replay_not_approved")
+
+    critic_keys: List[str] = []
+    for context in _candidate_contexts(candidate):
+        for lookup_key in _candidate_self_critic_lookup_keys(context):
+            if str(lookup_key) in blocked_keys and str(lookup_key) not in critic_keys:
+                critic_keys.append(str(lookup_key))
+    self_critic_blocked = bool(critic_keys)
+    if self_critic_blocked:
+        block_reasons.append("self_critic_blocked")
+
+    learned_alpha = dict(learned_alpha_gate or {})
+    learned_alpha_allowed = bool(learned_alpha.get("allowed", True))
+    if learned_alpha and not learned_alpha_allowed:
+        block_reasons.append("learned_alpha_blocked")
+
+    deduped_reasons: List[str] = []
+    for reason in block_reasons:
+        if reason not in deduped_reasons:
+            deduped_reasons.append(reason)
+
+    eligible = bool(
+        candidate
+        and live_promotable
+        and runtime_eligible
+        and bool(replay_fresh)
+        and replay_approved
+        and not self_critic_blocked
+        and learned_alpha_allowed
+    )
+    return {
+        "eligible": bool(eligible),
+        "status": "eligible" if eligible else (deduped_reasons[0] if deduped_reasons else "blocked"),
+        "block_reasons": deduped_reasons,
+        "replay_fresh": bool(replay_fresh),
+        "replay_approved": bool(replay_approved),
+        "replay_missing": bool(replay_missing),
+        "replay_checks": _promotion_replay_check_provenance(replay_checks),
+        "self_critic_blocked": bool(self_critic_blocked),
+        "self_critic_blocked_keys": list(critic_keys),
+        "runtime_eligible": bool(runtime_eligible),
+        "live_promotable": bool(live_promotable),
+        "learned_alpha": learned_alpha,
+    }
+
+
+def _promotion_assignment_block_reason(prefix: str, eligibility: Optional[Dict[str, Any]]) -> str:
+    reasons = list((eligibility or {}).get("block_reasons") or [])
+    if "learned_alpha_blocked" in reasons:
+        return "best_blocked_learned_alpha"
+    if "self_critic_blocked" in reasons:
+        return "best_blocked_self_critic"
+    if "replay_stale" in reasons:
+        return "replay_stale"
+    if "replay_missing" in reasons or "replay_not_approved" in reasons:
+        return "replay_gate_blocked"
+    if "net_cost_evidence_missing" in reasons:
+        return "net_cost_evidence_missing"
+    if "not_live_promotable" in reasons:
+        return "shadow_candidate_only"
+    if "runtime_eligibility_failed" in reasons:
+        return f"{prefix}_eligibility_blocked"
+    return str(prefix)
+
+
 def _candidate_is_deployable(row: Optional[Dict[str, Any]]) -> bool:
     meta = dict((row or {}).get("meta") or {})
     score_source = str(meta.get("score_source") or "").strip().lower()
@@ -291,33 +638,39 @@ def _score_source_is_realized_pnl(meta: Optional[Dict[str, Any]]) -> bool:
 
 def _score_source_is_competition_candidate(meta: Optional[Dict[str, Any]]) -> bool:
     source = str((meta or {}).get("score_source") or "").strip().lower()
-    return bool(_score_source_is_realized_pnl(meta) or source == "shadow_predictions")
+    return bool(_score_source_is_realized_pnl(meta) or source in {"shadow_predictions", "model_oos_predictions"})
 
 
 def _candidate_is_live_promotable(row: Optional[Dict[str, Any]]) -> bool:
     candidate = dict(row or {})
     meta = dict(candidate.get("meta") or {})
-    return bool(_score_source_is_realized_pnl(meta) and _candidate_is_deployable(candidate))
+    return bool(
+        _score_source_is_realized_pnl(meta)
+        and _candidate_is_deployable(candidate)
+        and _candidate_has_net_cost_evidence(candidate)
+    )
+
+
+def _candidate_has_net_cost_evidence(row: Optional[Dict[str, Any]]) -> bool:
+    candidate = dict(row or {})
+    meta = dict(candidate.get("meta") or {})
+    evidence = meta.get("net_cost_evidence")
+    if isinstance(evidence, dict) and bool(evidence.get("available")) and _safe_int(evidence.get("n"), 0) > 0:
+        return True
+    return bool(
+        bool(meta.get("net_cost_evidence_available"))
+        and _safe_int(meta.get("net_cost_label_count"), 0) > 0
+    )
 
 
 def _candidate_replay_row(
     row: Optional[Dict[str, Any]],
     replay_models: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    candidate = dict(row or {})
-    models = dict(replay_models or {})
-    if not candidate or not models:
-        return {}
-    model_name = str(candidate.get("model_name") or "").strip()
-    symbol = str(candidate.get("symbol") or "").upper().strip()
-    horizon_s = _safe_int(candidate.get("horizon_s"), 0)
-    regime = str(candidate.get("regime") or "global").strip() or "global"
-    specific = models.get("|".join([model_name, symbol, str(horizon_s), regime]))
-    if isinstance(specific, dict) and specific:
-        return dict(specific)
-    aggregate = models.get("|".join([model_name, "*", str(horizon_s), regime]))
-    if isinstance(aggregate, dict) and aggregate:
-        return dict(aggregate)
+    for check in _candidate_replay_checks(row, replay_models):
+        replay_row = dict(check.get("replay") or {})
+        if replay_row:
+            return replay_row
     return {}
 
 
@@ -785,6 +1138,12 @@ def _rank_models(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _serialize_ranking_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     rec = dict(row or {})
+    contexts = rec.get("contexts")
+    if isinstance(contexts, set):
+        rec["contexts"] = [
+            {"symbol": str(symbol), "horizon_s": int(horizon_s), "regime": str(regime)}
+            for symbol, horizon_s, regime in sorted(contexts)
+        ]
     for key in ("symbols", "horizons", "regimes"):
         value = rec.get(key)
         if isinstance(value, set):
@@ -871,6 +1230,8 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
                 meta = _safe_json_dict(meta_json)
                 if not _score_source_is_realized_pnl(meta):
                     continue
+                if not _candidate_has_net_cost_evidence({"meta": meta}):
+                    continue
                 key = f"{mid}|{name}"
                 rec = ranking_rows.setdefault(
                     key,
@@ -895,11 +1256,33 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
                         "symbols": set(),
                         "horizons": set(),
                         "regimes": set(),
+                        "contexts": set(),
                         "rolling_window_ms": int(meta.get("rolling_window_ms") or (MODEL_COMPETITION_WINDOW_S * 1000)),
                         "observation_ms": 0,
                         "recent_total_pnl": 0.0,
                         "prior_total_pnl": 0.0,
+                        "net_cost_label_count": 0,
                     },
+                )
+                for meta_key in (
+                    "feature_ids",
+                    "feature_schema",
+                    "feature_set_tag",
+                    "graph_relational",
+                    "graph_relational_v1",
+                    "graph_metadata",
+                    "model_family",
+                    "model_kind",
+                    "model_ts_ms",
+                    "model_version",
+                ):
+                    value = meta.get(meta_key)
+                    if value is not None and value != "":
+                        rec[meta_key] = value
+                evidence = meta.get("net_cost_evidence") if isinstance(meta.get("net_cost_evidence"), dict) else {}
+                rec["net_cost_label_count"] = _safe_int(rec.get("net_cost_label_count"), 0) + _safe_int(
+                    meta.get("net_cost_label_count") or evidence.get("n"),
+                    0,
                 )
                 realized_pnl = _safe_float(meta.get("rolling_realized_pnl"), _safe_float(meta.get("realized_pnl"), 0.0))
                 unrealized_pnl = _safe_float(meta.get("rolling_unrealized_pnl"), _safe_float(meta.get("unrealized_pnl"), 0.0))
@@ -963,6 +1346,13 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
                 rec["symbols"].add(str(symbol or "").upper().strip())
                 rec["horizons"].add(_safe_int(horizon_s, 0))
                 rec["regimes"].add(str(regime or "global"))
+                rec["contexts"].add(
+                    (
+                        str(symbol or "").upper().strip(),
+                        _safe_int(horizon_s, 0),
+                        str(regime or "global"),
+                    )
+                )
 
             prepared_rows: List[Dict[str, Any]] = list(ranking_rows.values())
             for row in prepared_rows:
@@ -1001,13 +1391,31 @@ def recompute_model_rankings(ranking_scope: str = "global") -> Dict[str, Any]:
                     "symbols": sorted(str(x) for x in (row.get("symbols") or set()) if str(x).strip()),
                     "horizons": sorted(int(x) for x in (row.get("horizons") or set())),
                     "regimes": sorted(str(x) for x in (row.get("regimes") or set()) if str(x).strip()),
+                    "contexts": list(row.get("contexts") or []),
                     "evaluation_timestamps": list(row.get("evaluation_timestamps") or []),
                     "regime_labels": list(row.get("regime_labels") or []),
                     "challenger_predictions": list(row.get("challenger_predictions") or []),
                     "realized_returns": list(row.get("realized_returns") or []),
                     "event_pnls": list(row.get("event_pnls") or []),
+                    "net_cost_label_count": int(row.get("net_cost_label_count") or 0),
+                    "net_cost_evidence_available": bool(_safe_int(row.get("net_cost_label_count"), 0) > 0),
                     "source": str(row.get("source") or ""),
                 }
+                for meta_key in (
+                    "feature_ids",
+                    "feature_schema",
+                    "feature_set_tag",
+                    "graph_relational",
+                    "graph_relational_v1",
+                    "graph_metadata",
+                    "model_family",
+                    "model_kind",
+                    "model_ts_ms",
+                    "model_version",
+                ):
+                    value = row.get(meta_key)
+                    if value is not None and value != "":
+                        metrics[meta_key] = value
                 con.execute(
                     """
                     INSERT INTO model_competition_rankings(
@@ -1348,6 +1756,8 @@ def _candidate_runtime_metrics(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _candidate_is_eligible(row: Optional[Dict[str, Any]]) -> bool:
+    if not _candidate_has_net_cost_evidence(row):
+        return False
     metrics = _candidate_runtime_metrics(row)
     if _safe_int(metrics.get("trade_count"), 0) < int(PROMOTION_MIN_TRADES):
         return False
@@ -1359,6 +1769,92 @@ def _candidate_is_eligible(row: Optional[Dict[str, Any]]) -> bool:
     if _safe_float(metrics.get("rolling_total_pnl"), 0.0) <= 0.0:
         return False
     return True
+
+
+def _promotion_mode_name() -> str:
+    return str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+
+
+def _promotion_strict_runtime(mode_name: str) -> bool:
+    env = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
+    supervised = str(os.environ.get("ENGINE_SUPERVISED") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    return bool(supervised or env in {"prod", "production"} or str(mode_name).strip().lower() in {"live", "paper"})
+
+
+def _promotion_insufficient_observation_payload(
+    *,
+    model_id: str,
+    model_name: str,
+    candidate_version: str,
+    challenger_observations: int,
+    champion_observations: int,
+    aligned_observations: int,
+    min_observations: int,
+    legacy_gate_enabled: bool,
+) -> Dict[str, Any]:
+    mode_name = _promotion_mode_name()
+    fail_closed = bool(_promotion_strict_runtime(mode_name) or legacy_gate_enabled)
+    status = "insufficient_observations" if fail_closed else "insufficient_observations_advisory"
+    payload: Dict[str, Any] = {
+        "enabled": True,
+        "applied": bool(fail_closed),
+        "status": status,
+        "passed": not fail_closed,
+        "model_id": str(model_id),
+        "model_name": str(model_name),
+        "candidate_version": str(candidate_version),
+        "n_observations": int(aligned_observations),
+        "current_observations": int(aligned_observations),
+        "min_observations": int(min_observations),
+        "required_observations": int(min_observations),
+        "challenger_observations": int(challenger_observations),
+        "champion_observations": int(champion_observations),
+        "promotion_mode": str(mode_name),
+        "strict_runtime": bool(_promotion_strict_runtime(mode_name)),
+        "fail_closed": bool(fail_closed),
+        "advisory": not fail_closed,
+        "legacy_gate_enabled": bool(legacy_gate_enabled),
+        "insufficient_observations": True,
+        "non_bypassable_observation_gate": {
+            "enabled": True,
+            "applied": bool(fail_closed),
+            "status": status,
+            "passed": not fail_closed,
+            "current_observations": int(aligned_observations),
+            "required_observations": int(min_observations),
+            "min_observations": int(min_observations),
+        },
+        "legacy_stat_gate": {
+            "enabled": bool(legacy_gate_enabled),
+            "applied": False,
+            "status": "not_evaluated_insufficient_observations" if legacy_gate_enabled else "disabled",
+            "passed": not legacy_gate_enabled,
+        },
+        "record_legacy_hypothesis": False,
+        "validation_enabled": True,
+    }
+    if fail_closed:
+        payload["blockers"] = ["insufficient_observations"]
+    return payload
+
+
+def _learned_alpha_candidate_gate(con, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    try:
+        return dict(champion_gate_for_candidate(con, dict(row or {})) or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "CHAMPION_MANAGER_LEARNED_ALPHA_GATE_FAILED",
+            e,
+            once_key=f"learned_alpha_gate:{str((row or {}).get('model_name') or '')}",
+            model_name=str((row or {}).get("model_name") or ""),
+        )
+        return {"allowed": True, "available": False, "reason": f"gate_failed:{type(e).__name__}"}
 
 
 def _promotion_return_series(row: Optional[Dict[str, Any]]) -> List[float]:
@@ -1442,6 +1938,19 @@ def _promotion_stat_gate_cache_key(row: Optional[Dict[str, Any]]) -> Tuple[str, 
     return str(model_id), str(_promotion_candidate_version(candidate))
 
 
+def _promotion_ope_gate_cache_key(row: Optional[Dict[str, Any]]) -> Tuple[str, str, str, int, str]:
+    candidate = dict(row or {})
+    metrics = dict(candidate.get("metrics") or {})
+    model_id = str(candidate.get("model_id") or metrics.get("model_id") or "").strip()
+    return (
+        str(model_id or candidate.get("model_name") or ""),
+        str(_promotion_candidate_version(candidate)),
+        str(candidate.get("symbol") or "").upper().strip(),
+        _safe_int(candidate.get("horizon_s"), 0),
+        str(candidate.get("regime") or "global"),
+    )
+
+
 def _promotion_feature_ids(row: Optional[Dict[str, Any]]) -> List[str]:
     contract = _extract_feature_contract(row)
     ids = contract.get("feature_ids")
@@ -1451,6 +1960,13 @@ def _promotion_feature_ids(row: Optional[Dict[str, Any]]) -> List[str]:
     if isinstance(schema, dict) and isinstance(schema.get("feature_ids"), list):
         return [str(fid) for fid in schema.get("feature_ids") if str(fid or "").strip()]
     return []
+
+
+def _first_non_none_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _promotion_feature_gate_payload(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1468,6 +1984,15 @@ def _promotion_feature_gate_payload(row: Optional[Dict[str, Any]]) -> Dict[str, 
         "feature_snapshots",
         "feature_values",
         "features_matrix",
+        "deconfounded_validation",
+        "confounders",
+        "control_rows",
+        "beta",
+        "sector",
+        "size",
+        "volatility",
+        "liquidity",
+        "existing_model_exposure",
     ):
         value = meta.get(key, metrics.get(key))
         if value is not None:
@@ -1566,6 +2091,90 @@ def _promotion_gate_overrides(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return overrides
 
 
+def _candidate_has_generated_lineage(row: Optional[Dict[str, Any]]) -> bool:
+    candidate = dict(row or {})
+    meta = dict(candidate.get("meta") or {})
+    metrics = dict(candidate.get("metrics") or {})
+    for source in (candidate, meta, metrics):
+        generation_method = str(source.get("generation_method") or "").strip()
+        mutation_kind = str(source.get("mutation_kind") or "").strip()
+        if generation_method or mutation_kind in {"alpha_discovery", "symbolic_alpha_discovery", "llm_alpha_discovery"}:
+            return True
+        if source.get("alpha_candidate_id") is not None:
+            return True
+        symbolic_candidate = source.get("symbolic_candidate")
+        if isinstance(symbolic_candidate, dict) and symbolic_candidate:
+            return True
+    return False
+
+
+def _evaluate_candidate_experiment_ledger(
+    row: Optional[Dict[str, Any]],
+    *,
+    con=None,
+) -> tuple[bool, Dict[str, Any]]:
+    candidate = dict(row or {})
+    model_name = str(candidate.get("model_name") or "").strip()
+    if not model_name:
+        return False, {"enabled": True, "required": False, "status": "missing_model_name", "passed": False}
+    version = _promotion_candidate_version(candidate)
+    return evaluate_experiment_ledger_promotion_gate(
+        model_name=str(model_name),
+        candidate_version=str(version),
+        generated_hint=_candidate_has_generated_lineage(candidate),
+        con=con,
+    )
+
+
+def _evaluate_candidate_ope_gate(
+    row: Optional[Dict[str, Any]],
+    *,
+    con=None,
+) -> tuple[bool, Dict[str, Any]]:
+    candidate = dict(row or {})
+    meta = dict(candidate.get("meta") or {})
+    metrics = dict(candidate.get("metrics") or {})
+    model_name = str(candidate.get("model_name") or "").strip()
+    if not model_name:
+        return False, {"enabled": True, "applied": True, "status": "missing_model_name", "passed": False}
+    return evaluate_policy_ope_gate(
+        model_id=str(candidate.get("model_id") or metrics.get("model_id") or meta.get("model_id") or ""),
+        model_name=str(model_name),
+        candidate_type=(
+            str(meta.get("policy_type") or meta.get("candidate_type") or metrics.get("policy_type") or "")
+            or None
+        ),
+        model_kind=(str(meta.get("model_kind") or metrics.get("model_kind") or "").strip() or None),
+        candidate_version=_promotion_candidate_version(candidate),
+        symbol=str(candidate.get("symbol") or metrics.get("symbol") or "").upper().strip(),
+        horizon_s=_safe_int(candidate.get("horizon_s") or metrics.get("horizon_s"), 0),
+        regime=str(candidate.get("regime") or metrics.get("regime") or "global"),
+        metadata={**metrics, **meta},
+        con=con,
+    )
+
+
+def _evaluate_candidate_graph_gate(row: Optional[Dict[str, Any]]) -> tuple[bool, Dict[str, Any]]:
+    try:
+        from engine.strategy.graph_relational import evaluate_graph_promotion_gate
+
+        passed, diagnostics = evaluate_graph_promotion_gate(dict(row or {}))
+        return bool(passed), dict(diagnostics or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "CHAMPION_MANAGER_GRAPH_RELATIONAL_GATE_FAILED",
+            e,
+            once_key=f"graph_relational_gate:{str((row or {}).get('model_name') or '')}",
+            model_name=str((row or {}).get("model_name") or ""),
+        )
+        return False, {
+            "enabled": True,
+            "applied": True,
+            "status": f"gate_failed:{type(e).__name__}",
+            "passed": False,
+        }
+
+
 def _evaluate_promotion_stat_gate(
     row: Optional[Dict[str, Any]],
     n_competing_trials: int,
@@ -1627,14 +2236,18 @@ def _evaluate_promotion_stat_gate(
             payload["record_legacy_hypothesis"] = bool(statistical_gate.get("enabled"))
             payload["required_by_candidate"] = True
             payload["validation_enabled"] = True
-            payload["passed"] = bool(configured_passed)
+            ledger_passed, ledger_diagnostics = _evaluate_candidate_experiment_ledger(candidate, con=con)
+            payload["experiment_ledger"] = dict(ledger_diagnostics or {})
+            payload["passed"] = bool(configured_passed and ledger_passed)
             payload["status"] = (
                 str((configured_diagnostics or {}).get("status") or "configured_gate_failed")
                 if not bool(configured_passed)
+                else "experiment_ledger_failed"
+                if not bool(ledger_passed)
                 else str((configured_diagnostics or {}).get("status") or "evaluated")
             )
             payload["missing_model_id_advisory"] = True
-            return bool(configured_passed), payload
+            return bool(configured_passed and ledger_passed), payload
         return False, {
             "enabled": True,
             "applied": True,
@@ -1647,35 +2260,29 @@ def _evaluate_promotion_stat_gate(
     era_payload = _promotion_era_gate_payload(candidate)
     challenger_returns = _promotion_return_series(candidate)
     champion_returns = _promotion_return_series(champion_row)
+    challenger_observations = len(challenger_returns)
+    champion_observations = len(champion_returns)
     aligned_observations = (
-        min(len(challenger_returns), len(champion_returns))
+        min(challenger_observations, champion_observations)
         if champion_returns
-        else len(challenger_returns)
+        else challenger_observations
     )
     min_assessment_observations = max(
         2,
         _safe_int(os.environ.get("CHAMPION_PROMOTION_MIN_OBSERVATIONS"), 50),
     )
-    if not legacy_gate_enabled and int(aligned_observations) < int(min_assessment_observations):
-        return True, {
-            "enabled": True,
-            "applied": False,
-            "status": "insufficient_observations_advisory",
-            "passed": True,
-            "model_id": str(evidence_model_id),
-            "model_name": str(model_name),
-            "candidate_version": _promotion_candidate_version(candidate),
-            "n_observations": int(aligned_observations),
-            "min_observations": int(min_assessment_observations),
-            "legacy_stat_gate": {
-                "enabled": False,
-                "applied": False,
-                "status": "disabled",
-                "passed": True,
-            },
-            "record_legacy_hypothesis": False,
-            "validation_enabled": False,
-        }
+    if int(aligned_observations) < int(min_assessment_observations):
+        observation_payload = _promotion_insufficient_observation_payload(
+            model_id=str(evidence_model_id),
+            model_name=str(model_name),
+            candidate_version=_promotion_candidate_version(candidate),
+            challenger_observations=int(challenger_observations),
+            champion_observations=int(champion_observations),
+            aligned_observations=int(aligned_observations),
+            min_observations=int(min_assessment_observations),
+            legacy_gate_enabled=bool(legacy_gate_enabled),
+        )
+        return bool(observation_payload.get("passed")), observation_payload
     passed, diagnostics = assess_challenger(
         model_id=str(evidence_model_id),
         model_name=model_name,
@@ -1688,15 +2295,42 @@ def _evaluate_promotion_stat_gate(
         regime_labels=era_payload.get("regime_labels"),
         challenger_predictions=era_payload.get("challenger_predictions"),
         realized_returns=era_payload.get("realized_returns"),
-        neutralization_features=(
-            feature_payload.get("neutralization_features")
-            or feature_payload.get("feature_snapshots")
-            or feature_payload.get("feature_values")
-            or feature_payload.get("features_matrix")
+        neutralization_features=_first_non_none_value(
+            feature_payload.get("neutralization_features"),
+            feature_payload.get("feature_snapshots"),
+            feature_payload.get("feature_values"),
+            feature_payload.get("features_matrix"),
         ),
         current_feature_ids=_promotion_feature_ids(champion_row),
         challenger_feature_ids=_promotion_feature_ids(candidate),
         candidate_features=feature_payload.get("candidate_features"),
+        deconfounded_validation=(
+            feature_payload.get("deconfounded_validation")
+            or {
+                key: value
+                for key, value in {
+                    "controls": _first_non_none_value(
+                        feature_payload.get("confounders"),
+                        feature_payload.get("control_rows"),
+                        feature_payload.get("neutralization_features"),
+                        feature_payload.get("feature_snapshots"),
+                        feature_payload.get("feature_values"),
+                        feature_payload.get("features_matrix"),
+                    ),
+                    "beta": feature_payload.get("beta"),
+                    "sector": feature_payload.get("sector"),
+                    "size": feature_payload.get("size"),
+                    "volatility": feature_payload.get("volatility"),
+                    "liquidity": feature_payload.get("liquidity"),
+                    "existing_model_exposure": feature_payload.get("existing_model_exposure"),
+                    "candidate_signal": era_payload.get("challenger_predictions"),
+                    "outcome": era_payload.get("realized_returns"),
+                    "regime": era_payload.get("regime_labels"),
+                    "stability_labels": _first_non_none_value(era_payload.get("era_labels"), era_payload.get("regime_labels")),
+                }.items()
+                if value is not None
+            }
+        ),
         new_features=feature_payload.get("new_features"),
         feature_returns=feature_payload.get("feature_returns"),
         feature_p_values=feature_payload.get("feature_p_values"),
@@ -1733,11 +2367,21 @@ def _evaluate_promotion_stat_gate(
         payload["requested_gate_config"] = dict(legacy_config)
         payload["required_by_candidate"] = bool(config_gate_enabled)
         payload["validation_enabled"] = True
-        return bool(passed and configured_passed), payload
+        ledger_passed, ledger_diagnostics = _evaluate_candidate_experiment_ledger(candidate, con=con)
+        payload["experiment_ledger"] = dict(ledger_diagnostics or {})
+        if not bool(ledger_passed):
+            payload["passed"] = False
+            payload["status"] = "experiment_ledger_failed"
+        return bool(passed and configured_passed and ledger_passed), payload
     payload["legacy_stat_gate"] = {"enabled": False, "applied": False, "status": "disabled", "passed": True}
     payload["record_legacy_hypothesis"] = False
     payload["validation_enabled"] = True
-    return bool(passed), payload
+    ledger_passed, ledger_diagnostics = _evaluate_candidate_experiment_ledger(candidate, con=con)
+    payload["experiment_ledger"] = dict(ledger_diagnostics or {})
+    if not bool(ledger_passed):
+        payload["passed"] = False
+        payload["status"] = "experiment_ledger_failed"
+    return bool(passed and ledger_passed), payload
 
 
 def _sync_registry_runtime(row: Optional[Dict[str, Any]], *, status: str, last_promotion_ts_ms: Optional[int] = None) -> None:
@@ -1785,20 +2429,31 @@ def _ranking_runtime_metrics(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "rolling_score": _safe_float(metrics.get("score"), _safe_float(ranking.get("score"), 0.0)),
         "rolling_total_pnl": rolling_total_pnl,
-        "rolling_window_ms": _safe_int(metrics.get("rolling_window_ms"), MODEL_COMPETITION_WINDOW_S * 1000),
+        "rolling_window_ms": _safe_int(
+            metrics.get("rolling_window_ms"),
+            _safe_int(ranking.get("rolling_window_ms"), MODEL_COMPETITION_WINDOW_S * 1000),
+        ),
         "max_drawdown": _safe_float(ranking.get("max_drawdown"), 0.0),
-        "recent_total_pnl": _safe_float(metrics.get("recent_total_pnl"), 0.0),
-        "prior_total_pnl": _safe_float(metrics.get("prior_total_pnl"), 0.0),
+        "recent_total_pnl": _safe_float(metrics.get("recent_total_pnl"), _safe_float(ranking.get("recent_total_pnl"), 0.0)),
+        "prior_total_pnl": _safe_float(metrics.get("prior_total_pnl"), _safe_float(ranking.get("prior_total_pnl"), 0.0)),
         "capital_base": float(capital_base),
         "return_pct": _capital_adjusted_return_pct(rolling_total_pnl, capital_base),
         "trade_count": trade_count,
         "win_rate": (None if win_rate is None else float(win_rate)),
-        "observation_ms": _safe_int(metrics.get("observation_ms"), 0),
+        "observation_ms": _safe_int(metrics.get("observation_ms"), _safe_int(ranking.get("observation_ms"), 0)),
+        "net_cost_label_count": _safe_int(metrics.get("net_cost_label_count"), _safe_int(ranking.get("net_cost_label_count"), 0)),
+        "net_cost_evidence_available": bool(
+            metrics.get("net_cost_evidence_available")
+            or ranking.get("net_cost_evidence_available")
+            or _safe_int(metrics.get("net_cost_label_count"), _safe_int(ranking.get("net_cost_label_count"), 0)) > 0
+        ),
     }
 
 
 def _ranking_is_eligible(row: Optional[Dict[str, Any]]) -> bool:
     metrics = _ranking_runtime_metrics(row)
+    if not bool(metrics.get("net_cost_evidence_available")) or _safe_int(metrics.get("net_cost_label_count"), 0) <= 0:
+        return False
     if _safe_int(metrics.get("trade_count"), 0) < int(PROMOTION_MIN_TRADES):
         return False
     if _safe_int(metrics.get("observation_ms"), 0) < int(PROMOTION_MIN_OBSERVATION_S * 1000):
@@ -2077,9 +2732,35 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
         try:
             _ensure_post_commit_schema(con)
             stat_gate_cache: Dict[Tuple[str, str], Tuple[bool, Dict[str, Any]]] = {}
+            ope_gate_cache: Dict[Tuple[str, str, str, int, str], Tuple[bool, Dict[str, Any]]] = {}
+            graph_gate_cache: Dict[Tuple[str, str], Tuple[bool, Dict[str, Any]]] = {}
 
             def _enqueue_post_commit(fn_name: str, *args, **kwargs) -> None:
                 _queue_post_commit_action(con, str(fn_name), *args, **kwargs)
+
+            def _cached_ope_gate(target_row: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
+                cache_key = _promotion_ope_gate_cache_key(target_row)
+                if cache_key[0] and cache_key in ope_gate_cache:
+                    cached_ok, cached_payload = ope_gate_cache[cache_key]
+                    payload = dict(cached_payload or {})
+                    payload["cache_hit"] = True
+                    return bool(cached_ok), payload
+                ok, payload = _evaluate_candidate_ope_gate(target_row, con=con)
+                if cache_key[0]:
+                    ope_gate_cache[cache_key] = (bool(ok), dict(payload or {}))
+                return bool(ok), dict(payload or {})
+
+            def _cached_graph_gate(target_row: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
+                cache_key = _promotion_stat_gate_cache_key(target_row)
+                if cache_key[0] and cache_key in graph_gate_cache:
+                    cached_ok, cached_payload = graph_gate_cache[cache_key]
+                    payload = dict(cached_payload or {})
+                    payload["cache_hit"] = True
+                    return bool(cached_ok), payload
+                ok, payload = _evaluate_candidate_graph_gate(target_row)
+                if cache_key[0]:
+                    graph_gate_cache[cache_key] = (bool(ok), dict(payload or {}))
+                return bool(ok), dict(payload or {})
 
             def _cached_promotion_stat_gate(
                 target_row: Optional[Dict[str, Any]],
@@ -2139,10 +2820,61 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
 
             changes: List[Dict[str, Any]] = []
             if not replay_fresh:
+                global_rows = list(rankings.get("rows") or [])
+                global_best = dict(global_rows[0]) if global_rows else {}
+                global_current = get_champion_assignment(
+                    MODEL_COMPETITION_SCOPE,
+                    MODEL_COMPETITION_SYMBOL,
+                    MODEL_COMPETITION_HORIZON_S,
+                )
+                global_current_name = str((global_current or {}).get("model_name") or "").strip()
+                global_current_row = next(
+                    (row for row in global_rows if str((row or {}).get("model_name") or "").strip() == global_current_name),
+                    None,
+                )
+                global_best_metrics = _ranking_runtime_metrics(global_best)
+                global_current_metrics = _ranking_runtime_metrics(global_current_row)
+                global_promotion_delta = _promotion_delta(global_best_metrics, global_current_metrics)
+                global_best_eligibility = _candidate_promotion_eligibility(
+                    global_best,
+                    replay_models=replay_models,
+                    replay_fresh=False,
+                    blocked_keys=blocked_keys,
+                    runtime_eligible_fn=_ranking_is_eligible,
+                )
+                global_current_eligibility = (
+                    _candidate_promotion_eligibility(
+                        global_current_row,
+                        replay_models=replay_models,
+                        replay_fresh=False,
+                        blocked_keys=blocked_keys,
+                        runtime_eligible_fn=_ranking_is_eligible,
+                    )
+                    if global_current_row
+                    else {}
+                )
+                if global_best and global_best_eligibility.get("block_reasons"):
+                    changes.append(
+                        {
+                            "scope": MODEL_COMPETITION_SCOPE,
+                            "symbol": MODEL_COMPETITION_SYMBOL,
+                            "horizon_s": MODEL_COMPETITION_HORIZON_S,
+                            "from_model_name": str(global_current_name),
+                            "to_model_name": str(global_current_name if global_current_row else ""),
+                            "reason": _promotion_assignment_block_reason("replay_stale", global_best_eligibility),
+                            "comparison_metric": str(global_promotion_delta.get("metric") or "net_pnl"),
+                            "challenger_delta": float(global_promotion_delta.get("delta") or 0.0),
+                            "cooldown_active": False,
+                            "promotion_eligibility": dict(global_current_eligibility or {}),
+                            "best_promotion_eligibility": dict(global_best_eligibility or {}),
+                            "current_promotion_eligibility": dict(global_current_eligibility or {}),
+                            "system_guard": {"allowed": False, "status": "not_evaluated_replay_stale"},
+                        }
+                    )
                 capital_plan = compute_capital_plan()
                 out = {
                     "ok": True,
-                    "changes": [],
+                    "changes": changes,
                     "replay_validation": replay_validation,
                     "replay_cache": replay_cache,
                     "self_critic": self_critic,
@@ -2163,6 +2895,10 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                     )
                 out["snapshot"] = current_competition_snapshot()
                 return out
+
+            promotion_system_allowed, promotion_system_guard = promotion_allowed()
+            promotion_system_guard = dict(promotion_system_guard or {})
+            promotion_system_guard["allowed"] = bool(promotion_system_allowed)
 
             _begin_owned_write(con)
 
@@ -2203,24 +2939,45 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                 )
                 current_metrics = _candidate_runtime_metrics(current_row)
 
-                best_blocked = _candidate_block_key(
-                    str(best.get("model_name") or ""),
-                    str(best.get("symbol") or ""),
-                    _safe_int(best.get("horizon_s"), 0),
-                    str(best.get("regime") or "global"),
-                ) in blocked_keys
-                best_replay = _candidate_replay_row(best, replay_models)
-                best_replay_approved = bool(best_replay.get("approved")) if best_replay else False
-                current_blocked = False
                 current_replay = _candidate_replay_row(current_row, replay_models) if current_row else {}
                 current_replay_approved = bool(current_replay.get("approved")) if current_replay else False
-                if current_row:
-                    current_blocked = _candidate_block_key(
-                        str(current_row.get("model_name") or ""),
-                        str(current_row.get("symbol") or ""),
-                        _safe_int(current_row.get("horizon_s"), 0),
-                        str(current_row.get("regime") or "global"),
-                    ) in blocked_keys
+                best_learned_alpha_gate = _learned_alpha_candidate_gate(con, best)
+                current_learned_alpha_gate = _learned_alpha_candidate_gate(con, current_row) if current_row else {
+                    "allowed": True,
+                    "available": False,
+                    "reason": "no_current_row",
+                }
+                best_eligibility = _candidate_promotion_eligibility(
+                    best,
+                    replay_models=replay_models,
+                    replay_fresh=bool(replay_fresh),
+                    blocked_keys=blocked_keys,
+                    runtime_eligible_fn=_candidate_is_eligible,
+                    live_promotable_fn=_candidate_is_live_promotable,
+                    learned_alpha_gate=best_learned_alpha_gate,
+                )
+                current_eligibility = (
+                    _candidate_promotion_eligibility(
+                        current_row,
+                        replay_models=replay_models,
+                        replay_fresh=bool(replay_fresh),
+                        blocked_keys=blocked_keys,
+                        runtime_eligible_fn=_candidate_is_eligible,
+                        live_promotable_fn=_candidate_is_live_promotable,
+                        learned_alpha_gate=current_learned_alpha_gate,
+                    )
+                    if current_row
+                    else {}
+                )
+                best_blocked = bool(
+                    best_eligibility.get("self_critic_blocked")
+                    or "learned_alpha_blocked" in list(best_eligibility.get("block_reasons") or [])
+                )
+                best_replay_approved = bool(best_eligibility.get("replay_approved"))
+                current_blocked = bool(
+                    (current_eligibility or {}).get("self_critic_blocked")
+                    or "learned_alpha_blocked" in list((current_eligibility or {}).get("block_reasons") or [])
+                )
                 current_meta = dict((current or {}).get("meta") or {})
                 last_promotion_ts_ms = _safe_int(
                     current_meta.get("last_promotion_ts_ms")
@@ -2262,31 +3019,27 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                 target = current_row or {}
                 reason = "keep_current" if current_row else "no_bootstrap"
                 if not current_row:
-                    if (
-                        _candidate_is_live_promotable(best)
-                        and
-                        not best_blocked
-                        and best_replay_approved
-                        and _candidate_is_eligible(best)
-                    ):
+                    if bool(best_eligibility.get("eligible")):
                         target = best
                         reason = "bootstrap_best"
+                    elif best_eligibility.get("block_reasons"):
+                        reason = _promotion_assignment_block_reason("no_bootstrap", best_eligibility)
                 elif current_blocked or hard_demote:
                     fallback = next(
                         (
                             row
                             for row in candidates
                             if str(row.get("model_name") or "") != str(current_name)
-                            if _candidate_is_live_promotable(row)
-                            and bool(_candidate_replay_row(row, replay_models).get("approved"))
-                            and _candidate_is_eligible(row)
-                            and _candidate_block_key(
-                                str(row.get("model_name") or ""),
-                                str(row.get("symbol") or ""),
-                                _safe_int(row.get("horizon_s"), 0),
-                                str(row.get("regime") or "global"),
+                            if bool(
+                                _candidate_promotion_eligibility(
+                                    row,
+                                    replay_models=replay_models,
+                                    replay_fresh=bool(replay_fresh),
+                                    blocked_keys=blocked_keys,
+                                    runtime_eligible_fn=_candidate_is_eligible,
+                                    live_promotable_fn=_candidate_is_live_promotable,
+                                ).get("eligible")
                             )
-                            not in blocked_keys
                         ),
                         {},
                     )
@@ -2299,10 +3052,7 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                         reason = "demotion_fallback"
                 elif (
                     str(best.get("model_name") or "") != str(current_name)
-                    and _candidate_is_live_promotable(best)
-                    and not best_blocked
-                    and best_replay_approved
-                    and _candidate_is_eligible(best)
+                    and bool(best_eligibility.get("eligible"))
                     and float(promotion_delta.get("delta") or 0.0) >= float(promotion_delta.get("threshold") or 0.0)
                     and (not cooldown_active)
                 ):
@@ -2310,26 +3060,52 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                     reason = "challenger_outperformance"
                 elif best_blocked and current_row:
                     target = current_row
-                    reason = "best_blocked_self_critic"
+                    reason = _promotion_assignment_block_reason("keep_current", best_eligibility)
                 elif current_row and (
-                    _candidate_is_live_promotable(best)
-                    and best_replay_approved
-                    and _candidate_is_eligible(best)
+                    bool(best_eligibility.get("eligible"))
                     and float(promotion_delta.get("delta") or 0.0) >= float(
                         max(float(promotion_delta.get("threshold") or 0.0), 0.0)
                     )
-                ) and not best_blocked:
+                ):
                     target = best
                     reason = "demotion_replace"
-                elif not _candidate_is_live_promotable(best):
-                    target = current_row or target
-                    reason = "shadow_candidate_only"
-                elif _candidate_is_live_promotable(best) and not best_replay_approved:
+                elif best_eligibility.get("block_reasons"):
                     target = current_row or {}
-                    reason = "replay_gate_blocked"
+                    reason = _promotion_assignment_block_reason("keep_current", best_eligibility)
 
                 stat_gate: Dict[str, Any] = {}
+                ope_gate: Dict[str, Any] = {}
+                graph_gate: Dict[str, Any] = {}
                 target_name = str((target or {}).get("model_name") or "")
+                if target_name and target_name != str(current_name):
+                    if not bool(promotion_system_allowed):
+                        reason = f"{reason}_system_guard_blocked"
+                        if current_row and not (current_blocked or hard_demote):
+                            target = current_row
+                        else:
+                            target = {}
+                        target_name = str((target or {}).get("model_name") or "")
+
+                if target_name and target_name != str(current_name):
+                    graph_gate_ok, graph_gate = _cached_graph_gate(target)
+                    if not bool(graph_gate_ok):
+                        reason = f"{reason}_graph_gate_blocked"
+                        if current_row and not (current_blocked or hard_demote):
+                            target = current_row
+                        else:
+                            target = {}
+                        target_name = str((target or {}).get("model_name") or "")
+
+                if target_name and target_name != str(current_name):
+                    ope_gate_ok, ope_gate = _cached_ope_gate(target)
+                    if not bool(ope_gate_ok):
+                        reason = f"{reason}_ope_gate_blocked"
+                        if current_row and not (current_blocked or hard_demote):
+                            target = current_row
+                        else:
+                            target = {}
+                        target_name = str((target or {}).get("model_name") or "")
+
                 if target_name and target_name != str(current_name):
                     stat_gate_ok, stat_gate = _cached_promotion_stat_gate(
                         target,
@@ -2360,7 +3136,16 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                 previous_meta = dict((current or {}).get("meta") or {})
                 previous_name = str((current or {}).get("model_name") or "")
                 target_name = str((target or {}).get("model_name") or "")
+                ope_gate_meta = dict(ope_gate or {}) if bool((ope_gate or {}).get("applied")) else {}
                 stat_gate_meta = dict(stat_gate or {}) if bool((stat_gate or {}).get("validation_enabled", (stat_gate or {}).get("enabled"))) else {}
+                graph_gate_meta = dict(graph_gate or {}) if bool((graph_gate or {}).get("applied")) else {}
+                target_eligibility = (
+                    best_eligibility
+                    if target_name and target_name == str(best.get("model_name") or "")
+                    else current_eligibility
+                    if target_name and target_name == str(current_name)
+                    else {}
+                )
                 change = {
                     "symbol": str(best.get("symbol") or ""),
                     "horizon_s": _safe_int(best.get("horizon_s"), 0),
@@ -2381,7 +3166,17 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                     "champion_drawdown": float(champion_drawdown),
                     "champion_decay": float(champion_decay),
                     "cooldown_active": bool(cooldown_active),
+                    "ope_gate": ope_gate_meta,
                     "stat_gate": stat_gate_meta,
+                    "graph_gate": graph_gate_meta,
+                    "promotion_eligibility": dict(target_eligibility or {}),
+                    "best_promotion_eligibility": dict(best_eligibility or {}),
+                    "current_promotion_eligibility": dict(current_eligibility or {}),
+                    "system_guard": dict(promotion_system_guard or {}),
+                    "learned_alpha": {
+                        "best": dict(best_learned_alpha_gate),
+                        "current": dict(current_learned_alpha_gate),
+                    },
                 }
 
                 if not target_name:
@@ -2399,6 +3194,8 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                             status="challenger",
                             last_promotion_ts_ms=int(last_promotion_ts_ms or 0),
                         )
+                        changes.append(change)
+                    elif stat_gate_meta or best_eligibility.get("block_reasons"):
                         changes.append(change)
                     for row in candidates:
                         _enqueue_post_commit(
@@ -2419,9 +3216,14 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                         "last_promotion_ts_ms": int(promotion_ts_ms),
                         "promotion_ts_ms": int(promotion_ts_ms),
                         "rolling_metrics": _candidate_runtime_metrics(target),
+                        "promotion_eligibility": dict(target_eligibility or {}),
                     }
                     if stat_gate_meta:
                         meta["stat_gate"] = dict(stat_gate_meta)
+                    if ope_gate_meta:
+                        meta["ope_gate"] = dict(ope_gate_meta)
+                    if graph_gate_meta:
+                        meta["graph_gate"] = dict(graph_gate_meta)
                     set_champion_assignment(
                         con=con,
                         scope="global",
@@ -2487,11 +3289,17 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                             "current_trades": _safe_int((current_row or {}).get("trades"), 0),
                             "target_replay": _promotion_replay_provenance(target, replay_models),
                             "current_replay": _promotion_replay_provenance(current_row, replay_models),
+                            "ope_gate": ope_gate_meta,
                             "stat_gate": stat_gate_meta,
+                            "graph_gate": graph_gate_meta,
                         },
                     )
                     changes.append(change)
                 else:
+                    if stat_gate_meta and str(reason).endswith("_stat_gate_blocked"):
+                        changes.append(change)
+                    elif best_eligibility.get("block_reasons"):
+                        changes.append(change)
                     _enqueue_post_commit(
                         "sync_registry_runtime",
                         _copy_candidate_row(target),
@@ -2533,6 +3341,25 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
             )
             global_best_metrics = _ranking_runtime_metrics(global_best)
             global_current_metrics = _ranking_runtime_metrics(global_current_row)
+            global_best_eligibility = _candidate_promotion_eligibility(
+                global_best,
+                replay_models=replay_models,
+                replay_fresh=bool(replay_fresh),
+                blocked_keys=blocked_keys,
+                runtime_eligible_fn=_ranking_is_eligible,
+            )
+            global_current_eligibility = (
+                _candidate_promotion_eligibility(
+                    global_current_row,
+                    replay_models=replay_models,
+                    replay_fresh=bool(replay_fresh),
+                    blocked_keys=blocked_keys,
+                    runtime_eligible_fn=_ranking_is_eligible,
+                )
+                if global_current_row
+                else {}
+            )
+            global_current_blocked = bool((global_current_eligibility or {}).get("self_critic_blocked"))
             global_score_delta = (
                 _safe_float(global_best_metrics.get("rolling_score"), 0.0)
                 - _safe_float(global_current_metrics.get("rolling_score"), 0.0)
@@ -2554,6 +3381,8 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
             global_current_invalid = bool(
                 global_current_row
                 and (
+                    global_current_blocked
+                    or
                     global_drawdown >= float(DEMOTION_MAX_DRAWDOWN)
                     or global_decay <= float(DEMOTION_DECAY_THRESHOLD)
                     or _safe_float(global_current_row.get("net_pnl"), 0.0) <= float(DEMOTION_MIN_NET_PNL)
@@ -2562,20 +3391,32 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
             global_target = global_current_row or {}
             global_reason = "keep_current" if global_current_row else "no_bootstrap"
             if not global_current_row:
-                if global_best_name and _ranking_is_eligible(global_best):
+                if global_best_name and bool(global_best_eligibility.get("eligible")):
                     global_target = global_best
                     global_reason = "bootstrap_best"
+                elif global_best_name and global_best_eligibility.get("block_reasons"):
+                    global_reason = _promotion_assignment_block_reason("no_bootstrap", global_best_eligibility)
             elif global_current_invalid:
                 fallback = next(
                     (
                         row for row in global_rows
                         if str((row or {}).get("model_name") or "").strip() != str(global_current_name)
-                        and _ranking_is_eligible(row)
+                        and bool(
+                            _candidate_promotion_eligibility(
+                                row,
+                                replay_models=replay_models,
+                                replay_fresh=bool(replay_fresh),
+                                blocked_keys=blocked_keys,
+                                runtime_eligible_fn=_ranking_is_eligible,
+                            ).get("eligible")
+                        )
                     ),
                     {},
                 )
                 global_target = fallback
-                if global_drawdown >= float(DEMOTION_MAX_DRAWDOWN):
+                if global_current_blocked:
+                    global_reason = "demotion_self_critic"
+                elif global_drawdown >= float(DEMOTION_MAX_DRAWDOWN):
                     global_reason = "demotion_drawdown"
                 elif global_decay <= float(DEMOTION_DECAY_THRESHOLD):
                     global_reason = "demotion_decay"
@@ -2584,15 +3425,49 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
             elif (
                 global_best_name
                 and global_best_name != global_current_name
-                and _ranking_is_eligible(global_best)
+                and bool(global_best_eligibility.get("eligible"))
                 and float(global_promotion_delta.get("delta") or 0.0) >= float(global_promotion_delta.get("threshold") or 0.0)
                 and not global_cooldown_active
             ):
                 global_target = global_best
                 global_reason = "challenger_outperformance"
+            elif global_best_name and global_best_name != global_current_name and global_best_eligibility.get("block_reasons"):
+                global_target = global_current_row or {}
+                global_reason = _promotion_assignment_block_reason("keep_current", global_best_eligibility)
 
             global_stat_gate: Dict[str, Any] = {}
+            global_ope_gate: Dict[str, Any] = {}
+            global_graph_gate: Dict[str, Any] = {}
             global_target_name = str((global_target or {}).get("model_name") or "").strip()
+            if global_target_name and global_target_name != str(global_current_name):
+                if not bool(promotion_system_allowed):
+                    global_reason = f"{global_reason}_system_guard_blocked"
+                    if global_current_row and not global_current_invalid:
+                        global_target = global_current_row
+                    else:
+                        global_target = {}
+                    global_target_name = str((global_target or {}).get("model_name") or "").strip()
+
+            if global_target_name and global_target_name != str(global_current_name):
+                global_graph_gate_ok, global_graph_gate = _cached_graph_gate(global_target)
+                if not bool(global_graph_gate_ok):
+                    global_reason = f"{global_reason}_graph_gate_blocked"
+                    if global_current_row and not global_current_invalid:
+                        global_target = global_current_row
+                    else:
+                        global_target = {}
+                    global_target_name = str((global_target or {}).get("model_name") or "").strip()
+
+            if global_target_name and global_target_name != str(global_current_name):
+                global_ope_gate_ok, global_ope_gate = _cached_ope_gate(global_target)
+                if not bool(global_ope_gate_ok):
+                    global_reason = f"{global_reason}_ope_gate_blocked"
+                    if global_current_row and not global_current_invalid:
+                        global_target = global_current_row
+                    else:
+                        global_target = {}
+                    global_target_name = str((global_target or {}).get("model_name") or "").strip()
+
             if global_target_name and global_target_name != str(global_current_name):
                 global_stat_gate_ok, global_stat_gate = _cached_promotion_stat_gate(
                     global_target,
@@ -2622,6 +3497,17 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                     global_target_name = str((global_target or {}).get("model_name") or "").strip()
 
             if global_target_name:
+                global_target_eligibility = (
+                    global_best_eligibility
+                    if global_target_name == str(global_best_name)
+                    else global_current_eligibility
+                    if global_target_name == str(global_current_name)
+                    else {}
+                )
+                global_ope_gate_meta = dict(global_ope_gate or {}) if bool((global_ope_gate or {}).get("applied")) else {}
+                global_graph_gate_meta = (
+                    dict(global_graph_gate or {}) if bool((global_graph_gate or {}).get("applied")) else {}
+                )
                 global_stat_gate_meta = (
                     dict(global_stat_gate or {})
                     if bool((global_stat_gate or {}).get("validation_enabled", (global_stat_gate or {}).get("enabled")))
@@ -2637,9 +3523,35 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                     "trade_count": _safe_int((global_target or {}).get("trade_count"), 0),
                     "rolling_metrics": _ranking_runtime_metrics(global_target),
                     "last_promotion_ts_ms": int(_now_ms() if global_target_name != global_current_name else global_last_promotion_ts_ms),
+                    "promotion_eligibility": dict(global_target_eligibility or {}),
                 }
+                if global_ope_gate_meta:
+                    global_meta["ope_gate"] = dict(global_ope_gate_meta)
+                if global_graph_gate_meta:
+                    global_meta["graph_gate"] = dict(global_graph_gate_meta)
                 if global_stat_gate_meta:
                     global_meta["stat_gate"] = dict(global_stat_gate_meta)
+                global_change = {
+                    "scope": MODEL_COMPETITION_SCOPE,
+                    "symbol": MODEL_COMPETITION_SYMBOL,
+                    "horizon_s": MODEL_COMPETITION_HORIZON_S,
+                    "from_model_name": str(global_current_name),
+                    "to_model_name": str(global_target_name),
+                    "reason": str(global_reason),
+                    "comparison_metric": str(global_promotion_delta.get("metric") or "net_pnl"),
+                    "challenger_delta": float(global_promotion_delta.get("delta") or 0.0),
+                    "challenger_score_delta": float(global_score_delta),
+                    "challenger_return_delta": float(global_return_delta),
+                    "challenger_pnl_delta": float(global_pnl_delta),
+                    "cooldown_active": bool(global_cooldown_active),
+                    "ope_gate": global_ope_gate_meta,
+                    "stat_gate": global_stat_gate_meta,
+                    "graph_gate": global_graph_gate_meta,
+                    "promotion_eligibility": dict(global_target_eligibility or {}),
+                    "best_promotion_eligibility": dict(global_best_eligibility or {}),
+                    "current_promotion_eligibility": dict(global_current_eligibility or {}),
+                    "system_guard": dict(promotion_system_guard or {}),
+                }
                 if global_target_name != global_current_name:
                     set_champion_assignment(
                         con=con,
@@ -2663,26 +3575,18 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                         state="champion",
                         meta=global_meta,
                     )
-                    changes.append(
-                        {
-                            "scope": MODEL_COMPETITION_SCOPE,
-                            "symbol": MODEL_COMPETITION_SYMBOL,
-                            "horizon_s": MODEL_COMPETITION_HORIZON_S,
-                            "from_model_name": str(global_current_name),
-                            "to_model_name": str(global_target_name),
-                            "reason": str(global_reason),
-                            "comparison_metric": str(global_promotion_delta.get("metric") or "net_pnl"),
-                            "challenger_delta": float(global_promotion_delta.get("delta") or 0.0),
-                            "challenger_score_delta": float(global_score_delta),
-                            "challenger_return_delta": float(global_return_delta),
-                            "challenger_pnl_delta": float(global_pnl_delta),
-                            "cooldown_active": bool(global_cooldown_active),
-                            "stat_gate": global_stat_gate_meta,
-                        }
-                    )
+                    changes.append(global_change)
+                elif global_stat_gate_meta and str(global_reason).endswith("_stat_gate_blocked"):
+                    changes.append(global_change)
+                elif global_best_eligibility.get("block_reasons"):
+                    changes.append(global_change)
             else:
                 _clear_model_competition_champion(con=con)
-                if global_current_row:
+                if global_current_row or global_best_eligibility.get("block_reasons"):
+                    global_ope_gate_meta = dict(global_ope_gate or {}) if bool((global_ope_gate or {}).get("applied")) else {}
+                    global_graph_gate_meta = (
+                        dict(global_graph_gate or {}) if bool((global_graph_gate or {}).get("applied")) else {}
+                    )
                     global_stat_gate_meta = (
                         dict(global_stat_gate or {})
                         if bool((global_stat_gate or {}).get("validation_enabled", (global_stat_gate or {}).get("enabled")))
@@ -2702,7 +3606,13 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                             "challenger_return_delta": float(global_return_delta),
                             "challenger_pnl_delta": float(global_pnl_delta),
                             "cooldown_active": bool(global_cooldown_active),
+                            "ope_gate": global_ope_gate_meta,
                             "stat_gate": global_stat_gate_meta,
+                            "graph_gate": global_graph_gate_meta,
+                            "promotion_eligibility": {},
+                            "best_promotion_eligibility": dict(global_best_eligibility or {}),
+                            "current_promotion_eligibility": dict(global_current_eligibility or {}),
+                            "system_guard": dict(promotion_system_guard or {}),
                         }
                     )
 

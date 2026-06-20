@@ -30,6 +30,7 @@ from engine.artifacts.store import LocalArtifactStore
 from engine.model_registry import register_model, register_model_family
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect, init_db
+from engine.runtime.workload_profiles import assert_offline_work_allowed, model_family_n_jobs
 from engine.strategy import feature_registry
 from engine.strategy.feature_registry import build_feature_snapshot, feature_set_tag_from_ids
 from engine.strategy.era_boost import (
@@ -885,7 +886,7 @@ class LGBMRegressorModel:
             "n_estimators": 100,
             "min_child_samples": 2,
             "random_state": 42,
-            "n_jobs": 1,
+            "n_jobs": model_family_n_jobs("LGBM_N_JOBS"),
             "verbosity": -1,
             "deterministic": True,
             "force_col_wise": True,
@@ -1349,6 +1350,11 @@ def run_tabular_training_job(
     model_kind: str,
     version_prefix: str,
 ) -> int:
+    try:
+        assert_offline_work_allowed(job_name=f"train_{family}_models")
+    except RuntimeError as exc:
+        print(f"[workload_profile] {exc}")
+        return 3
     init_db()
     plan = load_lifecycle_plan(str(family))
     cfg = _resolve_training_config(str(family), plan)

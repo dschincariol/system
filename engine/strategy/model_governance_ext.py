@@ -80,10 +80,13 @@ def record_governance_snapshot(
     champion_name: str = "",
     challenger_name: str = "",
     status: str = "ok",
+    con=None,
 ) -> Dict[str, Any]:
     init_db()
     ts_ms = _now_ms()
-    con = connect()
+    owns_connection = con is None
+    if owns_connection:
+        con = connect()
     try:
         cur = con.execute(
             """
@@ -102,19 +105,21 @@ def record_governance_snapshot(
                 json.dumps(summary or {}, separators=(",", ":"), sort_keys=True),
             ),
         )
-        con.commit()
+        if owns_connection:
+            con.commit()
         return {"ok": True, "id": int(cur.lastrowid or 0), "ts_ms": int(ts_ms)}
     finally:
-        try:
-            con.close()
-        except Exception as e:
-            _warn_nonfatal(
-                "MODEL_GOVERNANCE_RECORD_CLOSE_FAILED",
-                e,
-                once_key="record_close",
-                source=str(source or "unknown"),
-                regime=str(regime or "global"),
-            )
+        if owns_connection:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "MODEL_GOVERNANCE_RECORD_CLOSE_FAILED",
+                    e,
+                    once_key="record_close",
+                    source=str(source or "unknown"),
+                    regime=str(regime or "global"),
+                )
 
 
 def build_governance_summary(limit_audit: int = 20) -> Dict[str, Any]:

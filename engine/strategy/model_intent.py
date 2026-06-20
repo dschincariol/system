@@ -112,6 +112,14 @@ def build_model_intent(
     u_score = _safe_float(universe_score, score)
     prob = _safe_float(ex.get("probability"), conf)
     uncertainty = _safe_float(ex.get("uncertainty"), max(0.0, 1.0 - conf))
+    epistemic_uncertainty = _safe_float(
+        ex.get("epistemic_uncertainty", ex.get("ensemble_epistemic_uncertainty"))
+    )
+    aleatoric_uncertainty = _safe_float(ex.get("aleatoric_uncertainty"))
+    predictive_uncertainty = _safe_float(ex.get("predictive_uncertainty"))
+    uncertainty_ts_ms = _safe_float(
+        ex.get("uncertainty_ts_ms", ex.get("model_ts_ms", ex.get("feature_ts_ms")))
+    )
     conf_raw = _safe_float(ex.get("raw_confidence"), conf)
     side = "FLAT"
     if z > 0:
@@ -139,6 +147,24 @@ def build_model_intent(
         "universe_score": float(u_score if u_score is not None else score),
         "selected_features": infer_selected_features(ex),
     }
+
+    uncertainty_detail: Dict[str, Any] = {}
+    if epistemic_uncertainty is not None:
+        intent["epistemic_uncertainty"] = float(max(0.0, epistemic_uncertainty))
+        uncertainty_detail["epistemic_uncertainty"] = float(max(0.0, epistemic_uncertainty))
+    if aleatoric_uncertainty is not None:
+        intent["aleatoric_uncertainty"] = float(max(0.0, aleatoric_uncertainty))
+        uncertainty_detail["aleatoric_uncertainty"] = float(max(0.0, aleatoric_uncertainty))
+    if predictive_uncertainty is not None:
+        intent["predictive_uncertainty"] = float(max(0.0, predictive_uncertainty))
+        uncertainty_detail["predictive_uncertainty"] = float(max(0.0, predictive_uncertainty))
+    if uncertainty_ts_ms is not None and uncertainty_ts_ms > 0:
+        intent["uncertainty_ts_ms"] = int(uncertainty_ts_ms)
+        uncertainty_detail["ts_ms"] = int(uncertainty_ts_ms)
+    if isinstance(ex.get("uncertainty_detail"), dict):
+        uncertainty_detail.update(dict(ex.get("uncertainty_detail") or {}))
+    if uncertainty_detail:
+        intent["uncertainty_detail"] = uncertainty_detail
 
     if regime is not None:
         intent["regime"] = str(regime)

@@ -13,7 +13,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from capital_allocator import CapitalAllocator
+from engine.strategy.capital_allocator import CapitalAllocator
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.event_replay import replay_state
 from engine.runtime.runtime_meta import meta_get, meta_set
@@ -707,6 +707,60 @@ def _load_latest_trade_attribution_rows(con) -> Dict[Tuple[int, str, str], Dict[
             "decision_json": _safe_json_dict(decision_json),
         }
     return out
+
+
+def _net_cost_evidence_for_signal(
+    con,
+    *,
+    model_id: str,
+    model_name: str,
+    symbol: str,
+    horizon_s: int,
+    source_alert_id: Optional[int],
+) -> Dict[str, Any]:
+    try:
+        from engine.runtime.storage import table_exists
+
+        if not table_exists(con, "net_after_cost_labels"):
+            return {"available": False, "n": 0}
+    except Exception:
+        return {"available": False, "n": 0}
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(1), AVG(net_return), AVG(gross_return), AVG(execution_cost_return),
+                   AVG(total_cost_bps), MAX(computed_at_ts_ms)
+            FROM net_after_cost_labels
+            WHERE UPPER(TRIM(symbol))=UPPER(TRIM(?))
+              AND horizon_s=?
+              AND realized=1
+              AND (
+                (? IS NOT NULL AND source_alert_id=?)
+                OR COALESCE(NULLIF(TRIM(model_id), ''), 'baseline') = COALESCE(NULLIF(TRIM(?), ''), 'baseline')
+                OR model_name=?
+              )
+            """,
+            (
+                str(symbol or "").upper().strip(),
+                int(horizon_s or 0),
+                source_alert_id,
+                source_alert_id,
+                _normalize_model_id(model_id),
+                str(model_name or "").strip(),
+            ),
+        ).fetchone()
+    except Exception:
+        return {"available": False, "n": 0}
+    n = _safe_int((row or [0])[0], 0)
+    return {
+        "available": bool(n > 0),
+        "n": int(n),
+        "avg_net_return": (None if not row or row[1] is None else _safe_float(row[1], 0.0)),
+        "avg_gross_return": (None if not row or row[2] is None else _safe_float(row[2], 0.0)),
+        "avg_execution_cost_return": (None if not row or row[3] is None else _safe_float(row[3], 0.0)),
+        "avg_total_cost_bps": (None if not row or row[4] is None else _safe_float(row[4], 0.0)),
+        "latest_computed_at_ts_ms": _safe_int((row or [0, 0, 0, 0, 0, 0])[5], 0),
+    }
 
 
 def _shadow_qty(confidence: float) -> float:
@@ -3995,6 +4049,16 @@ def recompute_marketplace_scores() -> Dict[str, Any]:
                 attribution_extra.get("notional_traded"), 0.0
             )
             meta["score_source"] = "pnl_attribution"
+            net_cost_evidence = _net_cost_evidence_for_signal(
+                con,
+                model_id=str(model_id),
+                model_name=str(name),
+                symbol=str(sym),
+                horizon_s=int(horizon_s),
+                source_alert_id=(int(source_alert_id) if source_alert_id is not None else None),
+            )
+            meta["net_cost_evidence"] = dict(net_cost_evidence)
+            meta["net_cost_label_count"] = _safe_int(net_cost_evidence.get("n"), 0)
             if attribution_model_version not in (None, ""):
                 meta["model_version"] = str(attribution_model_version)
             model_kind = _extract_model_kind(model_json, signal_json)

@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, List
 
 from engine.data.default_symbols import parse_symbol_limit
 from engine.data.finra_short import fetch_short_interest_records

@@ -8,6 +8,7 @@ import os
 from typing import Any, Dict, Sequence
 
 from engine.rl.shadow_runner import RLShadowRunner, ShadowRunnerConfig
+from engine.runtime.platform import default_local_models_dir
 
 
 def _live_portfolio_weights() -> Dict[str, float]:
@@ -44,7 +45,10 @@ def main(argv: Sequence[str] | None = None) -> Dict[str, Any]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--algo", default=os.environ.get("RL_PORTFOLIO_ALGO", "ppo"), choices=["ppo", "sac"])
     parser.add_argument("--symbols", default=os.environ.get("RL_PORTFOLIO_SYMBOLS", "SPY,AAPL,MSFT"))
-    parser.add_argument("--model-root", default=os.environ.get("RL_PORTFOLIO_MODEL_ROOT", "models/rl"))
+    parser.add_argument(
+        "--model-root",
+        default=os.environ.get("RL_PORTFOLIO_MODEL_ROOT", str((default_local_models_dir() / "rl").resolve())),
+    )
     parser.add_argument("--checkpoint", default=os.environ.get("RL_PORTFOLIO_CHECKPOINT", ""))
     args = parser.parse_args(list(argv) if argv is not None else None)
 

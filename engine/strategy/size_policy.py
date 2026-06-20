@@ -10,6 +10,7 @@ import json
 from typing import Optional, Dict, Any, List
 
 from engine.runtime.storage import connect, init_db
+from engine.strategy.ope_gate import evaluate_policy_ope_gate
 
 
 def _safe_json_dict(raw: Any) -> Dict[str, Any]:
@@ -20,7 +21,28 @@ def _safe_json_dict(raw: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def load_latest_size_policy(con=None) -> Optional[Dict[str, Any]]:
+def _size_policy_ope_passed(con, policy: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    policy_id = int(policy.get("policy_id") or 0)
+    policy_ts_ms = int(policy.get("ts_ms") or 0)
+    candidate_key = f"size_policy:{policy_id}" if policy_id > 0 else "size_policy:latest"
+    return evaluate_policy_ope_gate(
+        model_id=candidate_key,
+        model_name="size_policy",
+        candidate_type="sizing_policy",
+        candidate_version=str(policy_ts_ms or policy_id or "latest"),
+        regime="global",
+        metadata={
+            "candidate_key": candidate_key,
+            "policy_id": candidate_key,
+            "policy_type": "sizing_policy",
+            "size_policy_id": policy_id,
+            "size_policy_ts_ms": policy_ts_ms,
+        },
+        con=con,
+    )
+
+
+def load_latest_size_policy(con=None, *, require_ope: bool = True) -> Optional[Dict[str, Any]]:
     """
     Returns the latest size policy blob with decoded bucket points.
     """
@@ -97,7 +119,7 @@ def load_latest_size_policy(con=None) -> Optional[Dict[str, Any]]:
                 "factor": float(f),
             })
 
-        return {
+        policy = {
             "policy_id": int(pid),
             "ts_ms": int(ts_ms),
             "lookback_days": int(lookback_days),
@@ -107,6 +129,12 @@ def load_latest_size_policy(con=None) -> Optional[Dict[str, Any]]:
             "metrics": metrics,
             "points": points,
         }
+        if bool(require_ope):
+            ope_ok, ope_reason = _size_policy_ope_passed(con, policy)
+            if not bool(ope_ok):
+                return None
+            policy["ope_gate"] = dict(ope_reason or {})
+        return policy
     finally:
         if owns:
             con.close()

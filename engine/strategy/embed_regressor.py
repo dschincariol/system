@@ -8,7 +8,6 @@ legacy ridge path and a torch MLP path under the same storage schema.
 
 import io
 import logging
-import os
 import time
 import uuid
 from typing import Any, Dict, Tuple, Optional, List

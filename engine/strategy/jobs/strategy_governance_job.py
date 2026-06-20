@@ -37,6 +37,7 @@ from engine.runtime.storage import (
     release_job_lock,
     touch_job_lock,
 )
+from engine.strategy.ope_gate import evaluate_policy_ope_gate
 
 try:
     from engine.strategy.promotion_audit import audit
@@ -52,6 +53,17 @@ try:
     from engine.strategy.portfolio import init_portfolio_db
 except Exception:
     init_portfolio_db = None
+
+try:
+    from engine.strategy.strategy_promotion_governance import (
+        ensure_strategy_promotion_governance_schema,
+        evaluate_strategy_promotion_governance,
+        mark_strategy_promotion_promoted,
+    )
+except Exception:
+    ensure_strategy_promotion_governance_schema = None
+    evaluate_strategy_promotion_governance = None
+    mark_strategy_promotion_promoted = None
 
 
 # ----------------------------------------------------------------------
@@ -291,6 +303,16 @@ def main():
             except Exception as e:
                 _warn_nonfatal("STRATEGY_GOVERNANCE_INIT_PORTFOLIO_DB_FAILED", e, once_key="init_portfolio_db")
 
+        if callable(ensure_strategy_promotion_governance_schema):
+            try:
+                ensure_strategy_promotion_governance_schema(con)
+            except Exception as e:
+                _warn_nonfatal(
+                    "STRATEGY_GOVERNANCE_PROMOTION_SCHEMA_FAILED",
+                    e,
+                    once_key="strategy_promotion_governance_schema",
+                )
+
         if not acquire_job_lock(str(LOCK_NAME), str(OWNER), int(PID), ttl_s=int(LOCK_STALE_S)):
             print(json.dumps({"ok": True, "skipped": True, "reason": "lock held"}))
             return 0
@@ -313,6 +335,18 @@ def main():
             release_job_lock(str(LOCK_NAME), str(OWNER), int(PID))
             print(json.dumps({"ok": False, "error": "no fresh strategy_metrics"}))
             return 2
+
+        promotion_system_guard: Dict[str, object] = {"passed": False, "reason": {"blockers": ["promotion_guard_unavailable"]}}
+        try:
+            from engine.strategy.promotion_guard import promotion_allowed
+
+            promotion_system_allowed, promotion_system_reason = promotion_allowed()
+            promotion_system_guard = {
+                "passed": bool(promotion_system_allowed),
+                "reason": dict(promotion_system_reason or {}),
+            }
+        except Exception as e:
+            _warn_nonfatal("STRATEGY_GOVERNANCE_PROMOTION_GUARD_FAILED", e, once_key="promotion_guard")
 
         passing: List[Tuple[str, float]] = []
         validation: Dict[str, Dict] = {}
@@ -339,9 +373,11 @@ def main():
             if reg:
                 if current_stage == "shadow":
                     pass
-                elif sharpe_simple >= MIN_SHARPE and max_dd <= MAX_DD:
+                elif current_stage == "live" and sharpe_simple >= MIN_SHARPE and max_dd <= MAX_DD:
+                    pass
+                elif current_stage != "live":
                     con.execute(
-                        "UPDATE strategy_registry SET stage='live', updated_ts_ms=? WHERE strategy_name=?",
+                        "UPDATE strategy_registry SET stage='paper', updated_ts_ms=? WHERE strategy_name=?",
                         (int(now_ms), str(name)),
                     )
                 else:
@@ -389,8 +425,8 @@ def main():
 
         if not passing:
             _set_meta(con, "last_strategy_validation", json.dumps(validation))
-            release_job_lock(str(LOCK_NAME), str(OWNER), int(PID))
             con.commit()
+            release_job_lock(str(LOCK_NAME), str(OWNER), int(PID))
             print(json.dumps({"ok": True, "promoted": False}))
             return 0
 
@@ -472,6 +508,84 @@ def main():
 
         if streak >= PROMOTE_STREAK and cooldown_ok:
             if current_champ != champion:
+                promotion_ope_ok = True
+                promotion_ope_gate = {}
+                try:
+                    promotion_ope_ok, promotion_ope_gate = evaluate_policy_ope_gate(
+                        model_id=f"strategy:{champion}",
+                        model_name=str(champion),
+                        candidate_version=str(now_ms),
+                        regime="global",
+                        metadata={
+                            "candidate_key": f"strategy:{champion}",
+                            "strategy_name": str(champion),
+                            "source": "strategy_governance_job",
+                        },
+                        con=con,
+                    )
+                except Exception as e:
+                    promotion_ope_ok = False
+                    promotion_ope_gate = {
+                        "applied": True,
+                        "passed": False,
+                        "status": f"ope_gate_error:{type(e).__name__}",
+                    }
+                    _warn_nonfatal(
+                        "STRATEGY_GOVERNANCE_OPE_GATE_FAILED",
+                        e,
+                        once_key=f"ope_gate:{champion}",
+                        champion=str(champion),
+                    )
+                validation["promotion_ope_gate"] = dict(promotion_ope_gate or {})
+                if not bool(promotion_ope_ok):
+                    _set_meta(con, "last_strategy_validation", json.dumps(validation))
+                    _set_meta(con, "last_strategy_governance_ts_ms", str(now_ms))
+                    con.commit()
+                    release_job_lock(str(LOCK_NAME), str(OWNER), int(PID))
+                    print(json.dumps({"ok": True, "promoted": False, "blocked_by": "ope_gate"}))
+                    return 0
+
+                champion_metrics = dict((latest.get(str(champion)) or {}).get("metrics") or {})
+                champion_stage = str(stage_map.get(str(champion), "paper"))
+                strategy_promotion_governance: Dict[str, object] = {
+                    "passed": True,
+                    "not_required": champion_stage == "live",
+                }
+                if champion_stage != "live":
+                    if not callable(evaluate_strategy_promotion_governance):
+                        strategy_promotion_governance = {
+                            "passed": False,
+                            "blockers": ["strategy_promotion_governance_unavailable"],
+                        }
+                    else:
+                        promotion_governance_ok, strategy_promotion_governance = evaluate_strategy_promotion_governance(
+                            con,
+                            strategy_name=str(champion),
+                            metrics=champion_metrics,
+                            audit_block=True,
+                            system_guard=dict(promotion_system_guard or {}),
+                        )
+                        strategy_promotion_governance = dict(strategy_promotion_governance or {})
+                        strategy_promotion_governance["passed"] = bool(promotion_governance_ok)
+                    validation["strategy_promotion_governance"] = dict(strategy_promotion_governance or {})
+                    if not bool(strategy_promotion_governance.get("passed")):
+                        _set_meta(con, "last_strategy_validation", json.dumps(validation))
+                        _set_meta(con, "last_strategy_governance_ts_ms", str(now_ms))
+                        con.commit()
+                        release_job_lock(str(LOCK_NAME), str(OWNER), int(PID))
+                        blockers = list(dict(strategy_promotion_governance or {}).get("blockers") or [])
+                        print(
+                            json.dumps(
+                                {
+                                    "ok": True,
+                                    "promoted": False,
+                                    "blocked_by": "strategy_promotion_governance",
+                                    "blockers": blockers,
+                                }
+                            )
+                        )
+                        return 0
+
                 try:
                     if current_champ and str(current_champ) != str(champion):
                         con.execute(
@@ -489,6 +603,12 @@ def main():
                         "UPDATE strategy_registry SET stage='live', updated_ts_ms=? WHERE strategy_name=?",
                         (int(now_ms), str(champion)),
                     )
+                    if champion_stage != "live" and callable(mark_strategy_promotion_promoted):
+                        mark_strategy_promotion_promoted(
+                            con,
+                            strategy_name=str(champion),
+                            governance=dict(strategy_promotion_governance or {}),
+                        )
                 except Exception as e:
                     _warn_nonfatal(
                         "STRATEGY_GOVERNANCE_PROMOTION_STAGE_UPDATE_FAILED",
@@ -498,28 +618,13 @@ def main():
                         challenger=str(challenger or ""),
                         current_champion=str(current_champ or ""),
                     )
+                    raise
 
                 _set_meta(con, "strategy_champion", champion)
                 if challenger:
                     _set_meta(con, "strategy_challenger", challenger)
                 _set_meta(con, "last_strategy_promotion_ts_ms", str(now_ms))
                 promoted = True
-
-                if audit:
-                    try:
-                        audit(
-                            actor="strategy_governance",
-                            action="PROMOTE_STRATEGY",
-                            model_name=str(champion),
-                            reason={"validation": validation},
-                        )
-                    except Exception as e:
-                        _warn_nonfatal(
-                            "STRATEGY_GOVERNANCE_AUDIT_FAILED",
-                            e,
-                            once_key="promotion_audit",
-                            champion=str(champion),
-                        )
 
         _set_meta(con, "last_strategy_validation", json.dumps(validation))
         _set_meta(con, "last_strategy_governance_ts_ms", str(now_ms))
@@ -540,6 +645,7 @@ def main():
                         "validation_count": int(len(validation)),
                         "passing_count": int(len(passing)),
                     },
+                    con=con,
                 )
             except Exception as e:
                 _warn_nonfatal(
@@ -550,8 +656,24 @@ def main():
                     challenger=str(challenger or ""),
                 )
 
-        release_job_lock(str(LOCK_NAME), str(OWNER), int(PID))
         con.commit()
+        release_job_lock(str(LOCK_NAME), str(OWNER), int(PID))
+
+        if promoted and audit:
+            try:
+                audit(
+                    actor="strategy_governance",
+                    action="PROMOTE_STRATEGY",
+                    model_name=str(champion),
+                    reason={"validation": validation},
+                )
+            except Exception as e:
+                _warn_nonfatal(
+                    "STRATEGY_GOVERNANCE_AUDIT_FAILED",
+                    e,
+                    once_key="promotion_audit",
+                    champion=str(champion),
+                )
 
         print(json.dumps({
             "ok": True,

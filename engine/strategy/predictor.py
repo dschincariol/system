@@ -62,11 +62,17 @@ from engine.strategy.models.lgbm_ranker import (
     load_model_from_artifact as load_lgbm_ranker_model_from_artifact,
     ranker_scores_to_signals,
 )
+from engine.strategy.models.itransformer import load_model_from_artifact as load_itransformer_model_from_artifact
 from engine.strategy.models.lgbm_regressor import load_model_from_artifact as load_lgbm_model_from_artifact
 from engine.strategy.models.patchtst import load_model_from_artifact as load_patchtst_model_from_artifact
 from engine.strategy.models.xgb_regressor import load_model_from_artifact as load_xgb_model_from_artifact
 from engine.strategy.feature_expansion import build_feature_vector, feature_set_tag
-from engine.strategy.feature_registry import build_feature_snapshot, feature_set_tag_from_ids, resolve_feature_ids
+from engine.strategy.feature_registry import (
+    assert_no_shadow_features,
+    build_feature_snapshot,
+    feature_set_tag_from_ids,
+    resolve_feature_ids,
+)
 from engine.strategy.feature_neutralization import neutralize_mode, neutralize_predictions
 from engine.strategy.ood import score_ood
 from engine.strategy.model_config import (
@@ -510,6 +516,8 @@ def _model_family(model_name: str) -> str:
         return "xgb_regressor"
     if name == "patchtst" or name.startswith("patchtst"):
         return "patchtst"
+    if name == "itransformer" or name.startswith("itransformer"):
+        return "itransformer"
     if name == "gbm_regressor" or name.startswith("gbm_regressor"):
         return "gbm_regressor"
     if name == "temporal_predictor" or name.startswith("temporal_predictor"):
@@ -517,6 +525,25 @@ def _model_family(model_name: str) -> str:
     if name.startswith("regime_stats_") or name == "regime_stats":
         return "regime_stats"
     return "embed_regressor"
+
+
+def _live_feature_contract_required() -> bool:
+    try:
+        from engine.runtime.live_ai_safety import live_ai_required
+
+        return bool(live_ai_required())
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_live_feature_contract_required_fallback",
+            "PREDICTOR_LIVE_FEATURE_CONTRACT_REQUIRED_FAILED",
+            e,
+            warn_key="predictor_live_feature_contract_required_fallback",
+        )
+        modes = {
+            str(os.environ.get("ENGINE_MODE") or "").strip().lower(),
+            str(os.environ.get("EXECUTION_MODE") or "").strip().lower(),
+        }
+        return "live" in modes
 
 
 def _resolve_active_model(symbol: str, horizon_s: int, forced_model_name: Optional[str] = None) -> Dict[str, Any]:
@@ -568,6 +595,12 @@ def _resolve_active_model(symbol: str, horizon_s: int, forced_model_name: Option
         model_name=model_name,
         model_spec=(spec or config),
     )
+    if _live_feature_contract_required():
+        assert_no_shadow_features(
+            list(feature_ids),
+            context="live_model_serving",
+            model_name=str(model_name),
+        )
     model_version = ""
     try:
         model_version = str(spec.get("model_version") or "").strip()
@@ -839,7 +872,12 @@ def _predict_via_temporal_adapter(
     return float(z2), float(conf2), explain
 
 
-def _latest_feature_snapshot_features(symbol: str, feature_ids: List[str]) -> Optional[Dict[str, Any]]:
+def _latest_feature_snapshot_features(
+    symbol: str,
+    feature_ids: List[str],
+    *,
+    decision_ts_ms: int | None = None,
+) -> Optional[Dict[str, Any]]:
     group = _registry_feature_set_tag(feature_ids)
     if not group:
         return None
@@ -859,6 +897,28 @@ def _latest_feature_snapshot_features(symbol: str, feature_ids: List[str]) -> Op
         return None
     if not isinstance(snap, dict):
         return None
+    decision_ts = int(decision_ts_ms or 0)
+    if decision_ts > 0 and int(snap.get("ts_ms") or 0) > int(decision_ts):
+        return None
+    if decision_ts > 0:
+        try:
+            from engine.strategy.model_feature_snapshots import summarize_model_feature_snapshots
+
+            check_snap = dict(snap)
+            check_snap["ts_ms"] = int(decision_ts)
+            validation = summarize_model_feature_snapshots([check_snap])
+            if not bool(validation.get("ok", True)):
+                return None
+        except Exception as e:
+            _warn_nonfatal(
+                "predictor_feature_snapshot_pit_validation_failed",
+                "PREDICTOR_FEATURE_SNAPSHOT_PIT_VALIDATION_FAILED",
+                e,
+                warn_key=f"predictor_feature_snapshot_pit_validation_failed:{symbol}:{group}",
+                symbol=str(symbol),
+                feature_set_tag=str(group),
+            )
+            return None
     features = snap.get("features")
     if isinstance(features, dict):
         return dict(features)
@@ -871,7 +931,8 @@ def _cached_or_build_feature_snapshot(
     symbol: str,
     feature_ids: List[str],
 ) -> Dict[str, Any]:
-    cached = _latest_feature_snapshot_features(str(symbol), list(feature_ids or []))
+    decision_ts_ms = int((event or {}).get("ts_ms", 0) or time.time() * 1000) if isinstance(event, dict) else int(time.time() * 1000)
+    cached = _latest_feature_snapshot_features(str(symbol), list(feature_ids or []), decision_ts_ms=int(decision_ts_ms))
     if isinstance(cached, dict) and cached:
         return cached
     return build_feature_snapshot(
@@ -1280,6 +1341,103 @@ def _predict_via_patchtst_adapter(
     return float(z2), float(max(conf, conf2)), explain
 
 
+def _predict_via_itransformer_adapter(
+    query_vec: np.ndarray,
+    sym: str,
+    h: int,
+    *,
+    event: Optional[Dict] = None,
+    active_model_name: str,
+    active_model_version: str,
+    active_family: str,
+    feature_ids: List[str],
+    knn_z: float,
+    wsum: float,
+    knn_ex: Dict[str, Any],
+    regime_at_trade: str,
+) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+    del query_vec, active_model_version
+    try:
+        spec = get_model_spec(str(active_model_name), regime="global") or {}
+    except Exception:
+        spec = {}
+    if str(spec.get("source_stage") or "").strip() != "champion":
+        return None
+    location = _artifact_location_for_model(str(active_model_name))
+    if not any(str(location.get(key) or "").strip() for key in ("alias", "sha256", "path")):
+        return None
+    event_payload = dict(event or {})
+    if not event_payload:
+        event_payload = {"ts_ms": int(time.time() * 1000), "title": "", "body": "", "source": ""}
+    try:
+        model = load_itransformer_model_from_artifact(
+            alias=str(location.get("alias") or ""),
+            sha256=str(location.get("sha256") or ""),
+            path=(str(location.get("path") or "") or None),
+        )
+        model_feature_ids = list(getattr(model, "feature_ids", None) or feature_ids or [])
+        feature_map = _cached_or_build_feature_snapshot(
+            event=event_payload,
+            symbol=str(sym),
+            feature_ids=list(model_feature_ids),
+        )
+        vector = np.asarray([float(dict(feature_map or {}).get(fid, 0.0) or 0.0) for fid in model_feature_ids], dtype=np.float32)
+        seq_len = int(getattr(model, "seq_len", 1) or 1)
+        X = np.repeat(vector.reshape(1, 1, -1), seq_len, axis=1)
+        prediction_payload = model.predict_with_uncertainty(X)
+        pred_z = float(prediction_payload.get("prediction") or 0.0)
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_itransformer_predict_failed",
+            "PREDICTOR_ITRANSFORMER_PREDICT_FAILED",
+            e,
+            warn_key=f"predictor_itransformer_predict_failed:{active_model_name}:{sym}:{h}",
+            symbol=str(sym),
+            horizon_s=int(h),
+            model_name=str(active_model_name),
+        )
+        return None
+
+    metrics = dict(getattr(model, "training_metrics", {}) or {})
+    n_support = int(metrics.get("n_train") or 0)
+    conf = float(max(0.0, min(1.0, confidence_from_n(max(0, n_support)))))
+    explain = {
+        "model": "itransformer",
+        "model_name": str(active_model_name),
+        "model_family": "itransformer",
+        "model_kind": "itransformer",
+        "regime_at_trade": str(regime_at_trade),
+        "feature_ids": list(getattr(model, "feature_ids", None) or feature_ids or []),
+        "feature_set_tag": _registry_feature_set_tag(list(getattr(model, "feature_ids", None) or feature_ids or [])),
+        "feature_schema": dict(getattr(model, "feature_schema", {}) or {}),
+        "feature_snapshot": dict(feature_map or {}),
+        "seq_len": int(getattr(model, "seq_len", 0) or 0),
+        "n_horizons": int(getattr(model, "n_horizons", 0) or 0),
+        "model_n": int(n_support),
+        "training_metrics": dict(metrics),
+        "artifact_alias": str(location.get("alias") or ""),
+        "epistemic_uncertainty": float(prediction_payload.get("epistemic_uncertainty") or 0.0),
+        "uncertainty_ts_ms": int(prediction_payload.get("uncertainty_ts_ms") or int(time.time() * 1000)),
+        "uncertainty_detail": dict(prediction_payload.get("uncertainty_detail") or {"method": "deterministic"}),
+        "fallback_knn": {
+            "knn_z": float(knn_z),
+            "weight_sum": float(wsum),
+            "knn": knn_ex,
+        },
+    }
+    explain = _attach_ood_diagnostics(
+        explain,
+        model,
+        dict(feature_map or {}),
+        warn_key=f"predictor_ood_score_failed:itransformer:{active_model_name}:{sym}:{h}",
+    )
+    if active_family != "itransformer":
+        explain["requested_model_family"] = str(active_family)
+    z2, conf2, prior_ex = _blend_with_priors(sym, int(h), float(pred_z), float(max(1, n_support)))
+    explain["prior"] = prior_ex
+    return float(z2), float(max(conf, conf2)), explain
+
+
 def _predict_via_embed_adapter(
     query_vec: np.ndarray,
     sym: str,
@@ -1431,6 +1589,7 @@ _MODEL_ADAPTERS: Dict[str, Callable[..., Optional[Tuple[float, float, Dict[str, 
     "lgbm_ranker": _predict_via_lgbm_ranker_adapter,
     "xgb_regressor": _predict_via_xgb_adapter,
     "patchtst": _predict_via_patchtst_adapter,
+    "itransformer": _predict_via_itransformer_adapter,
     "embed_regressor": _predict_via_embed_adapter,
     "regime_stats": _predict_via_regime_stats_adapter,
 }
