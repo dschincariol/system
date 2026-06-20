@@ -12,11 +12,11 @@ IMPORTANT:
 - This file does NOT assume a specific model naming scheme.
 - You must provide GROUP_MODEL_MAP_JSON mapping group_id -> model_name via env.
 
-Example env (PowerShell):
-  $env:GROUP_BASELINE_MODEL_NAME="base_model"
-  $env:GROUP_MODEL_MAP_JSON='{"weather":"wx_model","factor_universe":"factors_model","social":"social_model"}'
-  $env:GROUP_SCORE_HORIZONS_JSON='[300, 900, 3600, 14400]'
-  $env:GROUP_SCORE_REGIMES_JSON='["global","risk_on","risk_off","neutral"]'
+Example env (bash):
+  export GROUP_BASELINE_MODEL_NAME="base_model"
+  export GROUP_MODEL_MAP_JSON='{"weather":"wx_model","factor_universe":"factors_model","social":"social_model"}'
+  export GROUP_SCORE_HORIZONS_JSON='[300, 900, 3600, 14400]'
+  export GROUP_SCORE_REGIMES_JSON='["global","risk_on","risk_off","neutral"]'
 """
 
 import os

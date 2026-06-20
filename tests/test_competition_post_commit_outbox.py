@@ -95,6 +95,16 @@ class CompetitionPostCommitOutboxTests(unittest.TestCase):
             "max_drawdown": 0.0,
             "model_kind": "test_model",
             "model_ts_ms": int(first_signal_ts_ms),
+            "net_cost_label_count": int(max(1, trades)),
+            "net_cost_evidence_available": True,
+            "net_cost_evidence": {
+                "available": True,
+                "n": int(max(1, trades)),
+                "avg_net_return": float(net_pnl) / float(max(1, trades)),
+                "avg_gross_return": (float(net_pnl) / float(max(1, trades))) + 0.001,
+                "avg_execution_cost_return": 0.001,
+                "avg_total_cost_bps": 10.0,
+            },
         }
         con = self.storage.connect()
         try:

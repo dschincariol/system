@@ -13,6 +13,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+def _var_db_path(name: str) -> str:
+    path = (REPO_ROOT / "var" / "db" / name).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 class ProdPreflightExternalServiceTests(unittest.TestCase):
     def _load_module(self):
         import engine.runtime.prod_preflight as prod_preflight
@@ -24,7 +30,7 @@ class ProdPreflightExternalServiceTests(unittest.TestCase):
             os.environ,
             {
                 "ENV": "dev",
-                "DB_PATH": str((Path.cwd() / "prod_preflight_external.db").resolve()),
+                "DB_PATH": _var_db_path("prod_preflight_external.db"),
                 "ALLOW_TRAINING": "0",
             },
             clear=True,

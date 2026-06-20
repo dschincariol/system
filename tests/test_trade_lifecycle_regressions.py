@@ -709,6 +709,59 @@ class TradeLifecycleRegressionTests(unittest.TestCase):
         self.assertGreater(int(integrity.get("inconsistent_position_count") or 0), 0)
         self.assertGreater(int(integrity.get("pricing_unavailable_count") or 0), 0)
 
+    def test_execution_quality_supervisor_does_not_require_broker_in_safe_mode(self) -> None:
+        prev = {
+            "ENGINE_MODE": os.environ.get("ENGINE_MODE"),
+            "EXECUTION_MODE": os.environ.get("EXECUTION_MODE"),
+            "DISABLE_LIVE_EXECUTION": os.environ.get("DISABLE_LIVE_EXECUTION"),
+            "BROKER": os.environ.get("BROKER"),
+            "BROKER_NAME": os.environ.get("BROKER_NAME"),
+        }
+        os.environ["ENGINE_MODE"] = "safe"
+        os.environ["EXECUTION_MODE"] = "safe"
+        os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+        os.environ["BROKER"] = "ibkr"
+        os.environ["BROKER_NAME"] = "ibkr"
+        try:
+            storage, execution_ledger, execution_quality_supervisor = _reload_modules(
+                "engine.runtime.storage",
+                "engine.execution.execution_ledger",
+                "engine.execution.execution_quality_supervisor",
+            )
+            storage.init_db()
+            execution_ledger.init_execution_ledger()
+
+            with patch.object(
+                execution_quality_supervisor,
+                "get_broker_connection_health",
+                return_value={
+                    "ok": False,
+                    "broker": "ibkr",
+                    "state": "configuration_invalid",
+                    "detail": "ibkr_connection_credentials_missing",
+                },
+            ) as broker_health:
+                snapshot = execution_quality_supervisor.refresh_execution_quality_supervisor()
+
+            self.assertEqual(str(snapshot.get("state") or ""), "ok")
+            broker_health.assert_called_once_with(readonly=True)
+            self.assertNotIn("broker_or_sim_connection_valid", list(snapshot.get("failed_gates") or []))
+            broker_gate = dict((snapshot.get("gates") or {}).get("broker_or_sim_connection_valid") or {})
+            self.assertTrue(bool(broker_gate.get("ok")))
+            self.assertIn("required=False", str(broker_gate.get("detail") or ""))
+            account_state = dict(snapshot.get("account_state") or {})
+            self.assertTrue(bool(account_state.get("ok")))
+            self.assertEqual(
+                str(account_state.get("detail") or ""),
+                "broker_not_required_for_safe_execution_mode",
+            )
+        finally:
+            for key, value in prev.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_broker_sim_numeric_guards_and_missing_earnings_calendar_degrade_quietly(self) -> None:
         storage, broker_sim = _reload_modules(
             "engine.runtime.storage",

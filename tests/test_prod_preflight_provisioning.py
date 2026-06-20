@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,7 +22,119 @@ def _reload_module():
     return importlib.reload(prod_preflight)
 
 
+def _compose_postgres_tuning_env() -> dict[str, str]:
+    return {
+        "PREFLIGHT_REQUIRE_DOCKER_POSTGRES_TUNING": "1",
+        "TRADING_RESOURCE_HOST_MEMORY": "123g",
+        "TRADING_RESOURCE_MIN_HEADROOM_MEMORY": "24g",
+        "TIMESCALE_CPUS": "8",
+        "TIMESCALE_MEM_LIMIT": "32g",
+        "TIMESCALE_MAX_CONNECTIONS": "100",
+        "TIMESCALE_SHARED_BUFFERS": "8GB",
+        "TIMESCALE_EFFECTIVE_CACHE_SIZE": "22GB",
+        "TIMESCALE_WORK_MEM": "48MB",
+        "TIMESCALE_WORK_MEM_ACTIVE_CONNECTIONS": "64",
+        "TIMESCALE_WORK_MEM_NODE_FACTOR": "2",
+        "TIMESCALE_MAINTENANCE_WORK_MEM": "2GB",
+        "TIMESCALE_AUTOVACUUM_WORK_MEM": "512MB",
+        "TIMESCALE_WAL_BUFFERS": "64MB",
+        "TIMESCALE_MIN_WAL_SIZE": "4GB",
+        "TIMESCALE_MAX_WAL_SIZE": "16GB",
+        "TIMESCALE_WAL_KEEP_SIZE": "1GB",
+        "TIMESCALE_MAX_SLOT_WAL_KEEP_SIZE": "8GB",
+        "TIMESCALE_WAL_DISK_BUDGET": "40g",
+        "TIMESCALE_ARCHIVE_MODE": "on",
+        "TIMESCALE_ARCHIVE_TIMEOUT": "60s",
+        "TIMESCALE_CHECKPOINT_TIMEOUT": "15min",
+        "TIMESCALE_CHECKPOINT_COMPLETION_TARGET": "0.9",
+        "TIMESCALE_MAX_WORKER_PROCESSES": "16",
+        "TIMESCALE_MAX_PARALLEL_WORKERS": "8",
+        "TIMESCALE_MAX_PARALLEL_WORKERS_PER_GATHER": "4",
+        "TIMESCALE_MAX_PARALLEL_MAINTENANCE_WORKERS": "4",
+        "TIMESCALE_TIMESCALEDB_MAX_BACKGROUND_WORKERS": "8",
+        "TIMESCALE_AUTOVACUUM": "on",
+        "TIMESCALE_AUTOVACUUM_MAX_WORKERS": "4",
+        "TIMESCALE_AUTOVACUUM_NAPTIME": "10s",
+        "TIMESCALE_AUTOVACUUM_VACUUM_COST_LIMIT": "4000",
+        "TIMESCALE_AUTOVACUUM_VACUUM_COST_DELAY": "2ms",
+        "TIMESCALE_RANDOM_PAGE_COST": "1.1",
+        "TIMESCALE_EFFECTIVE_IO_CONCURRENCY": "200",
+        "TIMESCALE_MAINTENANCE_IO_CONCURRENCY": "200",
+    }
+
+
 class ProdPreflightProvisioningTests(unittest.TestCase):
+    def test_systemd_prod_preflight_unit_declares_production_contract(self) -> None:
+        unit = (REPO_ROOT / "ops/server/systemd/trading-prod-preflight.service").read_text(encoding="utf-8")
+
+        self.assertIn("Type=oneshot", unit)
+        self.assertIn("User=trading", unit)
+        self.assertIn("Group=trading", unit)
+        self.assertIn("EnvironmentFile=-/etc/trading/trading.env", unit)
+        self.assertNotIn("EnvironmentFile=-/etc/trading/provider.env", unit)
+        self.assertIn("Environment=TS_SECRETS_PROVIDER=systemd-creds", unit)
+        self.assertIn(
+            "LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred",
+            unit,
+        )
+        self.assertIn(
+            "LoadCredentialEncrypted=redis_password:/etc/credstore.encrypted/redis_password.cred",
+            unit,
+        )
+        self.assertIn(
+            "LoadCredentialEncrypted=object_store_secret_key:/etc/credstore.encrypted/object_store_secret_key.cred",
+            unit,
+        )
+        self.assertIn(
+            "LoadCredentialEncrypted=dashboard_api_token:/etc/credstore.encrypted/dashboard_api_token.cred",
+            unit,
+        )
+        self.assertIn("ExecStart=/opt/trading/venv/bin/python engine/runtime/prod_preflight.py --json", unit)
+        self.assertIn("ReadWritePaths=/var/lib/trading /var/backups/trading", unit)
+        self.assertIn("ProtectSystem=strict", unit)
+
+    def test_server_provisioning_registers_prod_preflight_paths(self) -> None:
+        bootstrap = (REPO_ROOT / "ops/server/bootstrap.sh").read_text(encoding="utf-8")
+        verify = (REPO_ROOT / "ops/server/verify.sh").read_text(encoding="utf-8")
+        runner = (REPO_ROOT / "ops/server/run_prod_preflight.sh").read_text(encoding="utf-8")
+
+        self.assertIn("trading-prod-preflight.service", bootstrap)
+        self.assertIn("trading-prod-preflight.service", verify)
+        self.assertIn("check_prod_preflight_runner", verify)
+        self.assertIn(
+            "redis_password object_store_secret_key dashboard_api_token",
+            (REPO_ROOT / "ops/server/credstore/install.sh").read_text(encoding="utf-8"),
+        )
+        self.assertIn("--property=\"LoadCredentialEncrypted=pg_password_app:${CREDSTORE_DIR}/pg_password_app.cred\"", runner)
+        self.assertIn("--property=\"LoadCredentialEncrypted=redis_password:${CREDSTORE_DIR}/redis_password.cred\"", runner)
+        self.assertIn(
+            "--property=\"LoadCredentialEncrypted=object_store_secret_key:${CREDSTORE_DIR}/object_store_secret_key.cred\"",
+            runner,
+        )
+        self.assertIn(
+            "--property=\"LoadCredentialEncrypted=dashboard_api_token:${CREDSTORE_DIR}/dashboard_api_token.cred\"",
+            runner,
+        )
+        self.assertIn("TS_SECRETS_PROVIDER=systemd-creds", runner)
+        self.assertNotIn('if [ -r "$PROVIDER_ENV" ]', runner)
+        self.assertIn("engine/runtime/prod_preflight.py --json", runner)
+
+    def test_relative_runtime_data_root_fails_closed(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TS_PG_DSN": "host=timescaledb port=5432 user=trading dbname=trading password=inline-test",
+                "DB_PATH": "data/runtime",
+            },
+            clear=True,
+        ):
+            prod_preflight = _reload_module()
+            notes, errors, snapshot = prod_preflight._production_provisioning_gate()
+
+        self.assertEqual(notes, [])
+        self.assertTrue(any("runtime data root must be absolute: data/runtime" in error for error in errors), errors)
+        self.assertEqual(snapshot["data_root"]["path"], "data/runtime")
+
     def test_missing_systemd_credential_directory_fails_actionably(self) -> None:
         data_root = Path.cwd()
         with patch.dict(
@@ -124,6 +237,88 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIn("credential source ok provider=inline_or_env_password", notes)
         self.assertEqual(snapshot["credentials"]["required_names"], [])
+
+    def test_compose_postgres_tuning_fits_123g_host_profile(self) -> None:
+        from engine.runtime.postgres_tuning import BYTES_IN_GIB, docker_postgres_tuning_snapshot
+
+        snapshot = docker_postgres_tuning_snapshot(_compose_postgres_tuning_env(), required=True)
+
+        self.assertTrue(snapshot["ok"], snapshot)
+        self.assertEqual(snapshot["derivation"]["memory_source"], "TIMESCALE_MEM_LIMIT")
+        self.assertLessEqual(
+            snapshot["memory_budget"]["estimated_peak_bytes"],
+            snapshot["memory_budget"]["allowed_peak_bytes"],
+        )
+        self.assertEqual(snapshot["wal_budget"]["configured_retained_wal_ceiling_bytes"], 25 * BYTES_IN_GIB)
+
+    def test_compose_postgres_tuning_rejects_insufficient_host_headroom(self) -> None:
+        from engine.runtime.postgres_tuning import docker_postgres_tuning_snapshot
+
+        env = _compose_postgres_tuning_env()
+        env["TRADING_RESOURCE_HOST_MEMORY"] = "40g"
+        snapshot = docker_postgres_tuning_snapshot(env, required=True)
+
+        self.assertFalse(snapshot["ok"])
+        self.assertTrue(any("exceeds host headroom" in error for error in snapshot["errors"]), snapshot)
+
+    def test_compose_postgres_tuning_rejects_wal_budget_overrun(self) -> None:
+        from engine.runtime.postgres_tuning import docker_postgres_tuning_snapshot
+
+        env = _compose_postgres_tuning_env()
+        env["TIMESCALE_MAX_WAL_SIZE"] = "32GB"
+        snapshot = docker_postgres_tuning_snapshot(env, required=True)
+
+        self.assertFalse(snapshot["ok"])
+        self.assertTrue(
+            any("WAL retention budget exceeds configured disk budget" in error for error in snapshot["errors"]),
+            snapshot,
+        )
+
+    def test_compose_postgres_tuning_rejects_effective_pg_settings_drift(self) -> None:
+        from engine.runtime.postgres_tuning import PG_SETTING_SPECS, docker_postgres_tuning_snapshot
+
+        env = _compose_postgres_tuning_env()
+        effective_settings = {
+            spec.pg_name: {"setting": env[spec.env], "unit": ""}
+            for spec in PG_SETTING_SPECS
+        }
+        effective_settings["shared_buffers"] = {"setting": "4GB", "unit": ""}
+
+        snapshot = docker_postgres_tuning_snapshot(env, required=True, effective_settings=effective_settings)
+
+        self.assertFalse(snapshot["ok"])
+        self.assertEqual(snapshot["effective_mismatches"][0]["name"], "shared_buffers")
+        self.assertTrue(
+            any("postgres effective setting mismatch: shared_buffers" in error for error in snapshot["errors"])
+        )
+
+    def test_prod_preflight_postgres_tuning_gate_fails_before_runtime_config(self) -> None:
+        env = _compose_postgres_tuning_env()
+        env["TIMESCALE_EFFECTIVE_CACHE_SIZE"] = "40GB"
+        env["PREFLIGHT_POSTGRES_TUNING_QUERY_EFFECTIVE"] = "0"
+        with patch.dict(os.environ, env, clear=True):
+            prod_preflight = _reload_module()
+            notes, warnings, errors, snapshot = prod_preflight._postgres_tuning_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertTrue(any("effective_cache_size exceeds service memory limit" in error for error in errors), errors)
+        self.assertFalse(snapshot["ok"])
+
+    def test_compile_files_uses_temp_cache_for_read_only_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td) / "readonly"
+            root.mkdir()
+            source = root / "module.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            root.chmod(0o555)
+            try:
+                prod_preflight = _reload_module()
+                errors = prod_preflight._compile_files([str(source)])
+            finally:
+                root.chmod(0o755)
+
+        self.assertEqual(errors, [])
 
     def test_main_stops_before_config_when_provisioning_fails(self) -> None:
         stdout = io.StringIO()

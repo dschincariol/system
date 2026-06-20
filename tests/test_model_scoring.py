@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import pickle
 import sys
@@ -201,6 +202,158 @@ class ModelScoringTests(unittest.TestCase):
         self.assertAlmostEqual(float(rows[1][5]), 0.015, places=6)
         self.assertIsNotNone(rows[1][6])
         self.assertNotEqual(float(rows[0][6]), float(rows[1][6]))
+
+    def test_unresolved_scoring_uses_latest_tracking_and_synthetic_fallback_once(self) -> None:
+        scorer = self.public_model_scoring.ModelScorer(online_updates_enabled=False, batch_limit=10)
+        t0 = 1_700_090_000_000
+        con = self.storage.connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO predictions(
+                  ts_ms, event_id, symbol, horizon_s, predicted_z, confidence,
+                  model_name, model_id, model_version
+                )
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (int(t0), 9301, "AAPL", 60, 0.04, 0.7, "index_probe", "index_probe:AAPL:v1", "v1"),
+            )
+            prediction_id = int(
+                con.execute("SELECT id FROM predictions WHERE event_id=9301 AND symbol='AAPL'").fetchone()[0]
+            )
+            con.execute(
+                """
+                INSERT INTO tracked_predictions(
+                  ts_ms, symbol, model_name, model_version, prediction, confidence,
+                  features_version, event_id, horizon_s, prediction_id, source_alert_id,
+                  model_id, tracking_source, metadata_json
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(t0 - 10),
+                    "AAPL",
+                    "index_probe",
+                    "v1",
+                    0.01,
+                    0.4,
+                    "old_features",
+                    9301,
+                    60,
+                    int(prediction_id),
+                    1,
+                    "index_probe:AAPL:v1",
+                    "old_tracker",
+                    json.dumps({"feature_ts_ms": int(t0 - 10)}),
+                ),
+            )
+            con.execute(
+                """
+                INSERT INTO tracked_predictions(
+                  ts_ms, symbol, model_name, model_version, prediction, confidence,
+                  features_version, event_id, horizon_s, prediction_id, source_alert_id,
+                  model_id, tracking_source, metadata_json
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(t0 + 5),
+                    "AAPL",
+                    "index_probe",
+                    "v1",
+                    0.04,
+                    0.7,
+                    "latest_features",
+                    9301,
+                    60,
+                    int(prediction_id),
+                    2,
+                    "index_probe:AAPL:v1",
+                    "latest_tracker",
+                    json.dumps({"feature_ts_ms": int(t0)}),
+                ),
+            )
+            latest_tracked_id = int(
+                con.execute(
+                    """
+                    SELECT id
+                    FROM tracked_predictions
+                    WHERE prediction_id=?
+                    ORDER BY ts_ms DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (int(prediction_id),),
+                ).fetchone()[0]
+            )
+            con.execute(
+                """
+                INSERT INTO predictions(
+                  ts_ms, event_id, symbol, horizon_s, predicted_z, confidence,
+                  model_name, model_id, model_version
+                )
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (int(t0 + 1000), 9302, "MSFT", 60, -0.02, 0.6, "missing_tracking", "missing:MSFT:v1", "v1"),
+            )
+            missing_tracking_prediction_id = int(
+                con.execute("SELECT id FROM predictions WHERE event_id=9302 AND symbol='MSFT'").fetchone()[0]
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        unresolved = scorer._load_unresolved_predictions(limit=10)
+        by_prediction_id = {int(row["prediction_id"]): row for row in unresolved if row.get("prediction_id")}
+        self.assertEqual(
+            int(by_prediction_id[prediction_id]["tracked_prediction_id"]),
+            int(latest_tracked_id),
+        )
+        self.assertEqual(str(by_prediction_id[prediction_id]["features_version"]), "latest_features")
+        self.assertEqual(
+            int(by_prediction_id[missing_tracking_prediction_id]["tracked_prediction_id"]),
+            -1 * int(missing_tracking_prediction_id),
+        )
+        self.assertEqual(
+            str(by_prediction_id[missing_tracking_prediction_id]["tracking_source"]),
+            "predictions_table",
+        )
+
+        asyncio.run(scorer.record_outcome("AAPL", t0 + 60_000, 0.05))
+        asyncio.run(scorer.record_outcome("MSFT", t0 + 61_000, -0.03))
+
+        result = asyncio.run(scorer.score_models())
+        self.assertEqual(int(result["scored_predictions"]), 2)
+        rerun = asyncio.run(scorer.score_models())
+        self.assertEqual(int(rerun.get("scored_predictions", 0)), 0)
+
+        con = self.storage.connect(readonly=True)
+        try:
+            rows = con.execute(
+                """
+                SELECT tracked_prediction_id, prediction_id, metadata_json
+                FROM model_performance
+                WHERE model_name IN ('index_probe', 'missing_tracking')
+                ORDER BY model_name ASC
+                """
+            ).fetchall()
+        finally:
+            con.close()
+
+        self.assertEqual(len(rows), 2)
+        tracked_ids = {int(row[0]) for row in rows}
+        self.assertEqual(tracked_ids, {int(latest_tracked_id), -1 * int(missing_tracking_prediction_id)})
+        metadata = [json.loads(str(row[2] or "{}")) for row in rows]
+        self.assertIn("latest_features", {str(item.get("features_version")) for item in metadata})
+
+    def test_postgres_unresolved_scoring_query_is_bounded_lateral_join(self) -> None:
+        sql = self.engine_model_scoring._unresolved_predictions_sql(postgres=True)
+        normalized = " ".join(str(sql).split())
+
+        self.assertIn("WITH unresolved_predictions AS MATERIALIZED", normalized)
+        self.assertIn("LEFT JOIN LATERAL", normalized)
+        self.assertIn("WHERE mp.prediction_id = p.id", normalized)
+        self.assertIn("ORDER BY tp2.ts_ms DESC, tp2.id DESC LIMIT 1", normalized)
+        self.assertNotIn("ON tp.id = ( SELECT", normalized)
 
     def test_score_models_updates_online_model_artifact(self) -> None:
         scorer = self.public_model_scoring.ModelScorer(online_updates_enabled=True, batch_limit=10)

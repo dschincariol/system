@@ -19,6 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.promotion_test_helpers import passing_deconfounded_payload
+
 MODEL_NAME = "gbm_regressor_AAPL_1710000123456_abcdef1"
 MODEL_VERSION = "gbm-20260411-test"
 HORIZON_S = 300
@@ -228,12 +230,28 @@ class GBMRegressorTests(unittest.TestCase):
         from engine.runtime.runtime_meta import meta_set
         from engine.strategy.promotion_audit import record_statistical_evidence
 
+        evidence_ts = int(time.time() * 1000)
         record_statistical_evidence(
             model_id=MODEL_NAME,
             test_name="white_reality_check",
+            ts=int(evidence_ts),
             p_value=0.01,
             decision="pass",
             payload={"source": "gbm_regressor_fixture"},
+        )
+        record_statistical_evidence(
+            model_id=MODEL_NAME,
+            test_name="deconfounded_signal_validation",
+            ts=int(evidence_ts),
+            t_stat=4.2,
+            p_value=0.01,
+            decision="pass",
+            payload={
+                "source": "gbm_regressor_fixture",
+                "passed": True,
+                "status": "evaluated",
+                **passing_deconfounded_payload(12),
+            },
         )
         replay_ts_ms = int(time.time() * 1000)
         replay_payload = {

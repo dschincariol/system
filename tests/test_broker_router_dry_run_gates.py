@@ -26,6 +26,15 @@ def _sample_orders() -> list[dict]:
     return [{"symbol": "AAPL", "action": "BUY", "qty": 1.0}]
 
 
+def _live_broker_contract_env(broker: str = "alpaca") -> dict[str, str]:
+    broker = str(broker or "alpaca").strip().lower()
+    return {
+        "LIVE_BROKER": broker,
+        "BROKER": broker,
+        "BROKER_NAME": broker,
+    }
+
+
 def _case_permutations(value: str) -> list[str]:
     variants = [""]
     for ch in value:
@@ -51,6 +60,24 @@ def _mute_router_side_effects(stack: ExitStack, broker_router) -> None:
 
 
 class BrokerRouterDryRunGateTests(unittest.TestCase):
+    def test_production_gate_providers_are_wired_on_import(self) -> None:
+        gates, broker_router, broker_alpaca_rest, broker_ibkr_gateway = _reload_modules(
+            "engine.runtime.gates",
+            "engine.execution.broker_router",
+            "engine.execution.broker_alpaca_rest",
+            "engine.execution.broker_ibkr_gateway",
+        )
+
+        self.assertIs(broker_router._execution_gate_snapshot, gates.execution_gate_snapshot)
+        self.assertIs(broker_alpaca_rest.execution_gate_snapshot, gates.execution_gate_snapshot)
+        self.assertIs(broker_ibkr_gateway._execution_gate_snapshot, gates.execution_gate_snapshot)
+        self.assertTrue(callable(broker_router._kill_switch_snapshot))
+        self.assertTrue(callable(broker_router._get_execution_mode))
+        self.assertTrue(callable(broker_alpaca_rest.kill_switch_snapshot))
+        self.assertTrue(callable(broker_alpaca_rest.get_execution_mode))
+        self.assertTrue(callable(broker_ibkr_gateway._kill_switch_snapshot))
+        self.assertTrue(callable(broker_ibkr_gateway._get_execution_mode))
+
     def test_rl_source_markers_block_all_casing_permutations(self) -> None:
         (broker_router,) = _reload_modules("engine.execution.broker_router")
 
@@ -72,6 +99,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
             "BROKER_FAILOVER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
             "DISABLE_LIVE_EXECUTION": "0",
+            **_live_broker_contract_env("alpaca"),
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -124,6 +152,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
             "BROKER_FAILOVER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
             "DISABLE_LIVE_EXECUTION": "0",
+            **_live_broker_contract_env("alpaca"),
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -201,6 +230,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
             "DISABLE_LIVE_EXECUTION": "0",
             "EXECUTION_PRELIVE_RECONCILE": "0",
             "ENGINE_MODE": "live",
+            **_live_broker_contract_env("alpaca"),
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -240,6 +270,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
             "DISABLE_LIVE_EXECUTION": "0",
             "EXECUTION_PRELIVE_RECONCILE": "1",
+            **_live_broker_contract_env("alpaca"),
         }
         real_import = builtins.__import__
 
@@ -293,6 +324,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
             "DISABLE_LIVE_EXECUTION": "0",
             "EXECUTION_PRELIVE_RECONCILE": "true",
+            **_live_broker_contract_env("ibkr"),
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -382,6 +414,7 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
             "BROKER_FAILOVER": "alpaca,sim",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
             "DISABLE_LIVE_EXECUTION": "0",
+            **_live_broker_contract_env("alpaca"),
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -407,15 +440,48 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         live_adapter.assert_not_called()
         sim_adapter.assert_not_called()
 
+    def test_live_router_rejects_broker_contract_mismatch_before_adapter(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "ENGINE_MODE": "live",
+            "LIVE_BROKER": "ibkr",
+            "BROKER": "sim",
+            "BROKER_NAME": "sim",
+            "BROKER_FAILOVER": "ibkr",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            ibkr_adapter = Mock(side_effect=AssertionError("ibkr adapter must not run with mismatched live broker identity"))
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_ibkr_apply", ibkr_adapter))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "live_broker_contract_invalid")
+        self.assertEqual(result["reason"], "broker_must_be_live")
+        self.assertEqual(result["broker_contract"]["expected_live_broker"], "ibkr")
+        self.assertEqual(result["broker_contract"]["broker"], "sim")
+        ibkr_adapter.assert_not_called()
+
     def test_missing_credentials_result_stops_failover_and_retry(self) -> None:
         orders = _sample_orders()
         env = {
             "ENGINE_MODE": "live",
-            "BROKER_FAILOVER": "alpaca,ibkr",
+            "BROKER_FAILOVER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "3",
             "BROKER_ROUTER_RETRY_BASE_S": "0",
             "BROKER_ROUTER_RETRY_MAX_S": "0",
             "DISABLE_LIVE_EXECUTION": "0",
+            **_live_broker_contract_env("alpaca"),
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -449,11 +515,12 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         orders = _sample_orders()
         env = {
             "ENGINE_MODE": "live",
-            "BROKER_FAILOVER": "alpaca,ibkr",
+            "BROKER_FAILOVER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "3",
             "BROKER_ROUTER_RETRY_BASE_S": "0",
             "BROKER_ROUTER_RETRY_MAX_S": "0",
             "DISABLE_LIVE_EXECUTION": "0",
+            **_live_broker_contract_env("alpaca"),
         }
 
         with patch.dict(os.environ, env, clear=False):
@@ -524,6 +591,54 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
             execution_degraded={"active": False, "detail": {}},
             kill_switches={"global": False},
         )
+        sim_adapter.assert_not_called()
+
+    def test_stale_kill_switch_cache_snapshot_blocks_before_adapter(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "BROKER_FAILOVER": "sim",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "ENGINE_MODE": "paper",
+            "EXECUTION_MODE": "paper",
+            "DISABLE_LIVE_EXECUTION": "0",
+            "KILL_SWITCH_GLOBAL": "0",
+            "TRADING_KILL_SWITCH": "0",
+            "KILL_SWITCH": "0",
+            "EXECUTION_BLOCK_EVENT_BUS_CRITICAL_BACKPRESSURE": "0",
+        }
+        stale_clear_snapshot = {
+            "state": [],
+            "loaded_ts_ms": 1_000,
+            "max_age_ms": 10,
+            "source": "engine.cache.wrappers.kill_switch:db",
+            "cache_fresh": False,
+            "cache_status": "fresh",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            gates, broker_router = _reload_modules("engine.runtime.gates", "engine.execution.broker_router")
+            kill_switch_snapshot = Mock(return_value=stale_clear_snapshot)
+            get_execution_mode = Mock(return_value={"mode": "paper", "armed": 0})
+            sim_adapter = Mock(side_effect=AssertionError("broker adapter should not run with stale kill-switch cache"))
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(gates, "_now_ms", return_value=2_000))
+                stack.enter_context(patch.object(gates, "_get_lifecycle_state", return_value={"state": "LIVE"}))
+                stack.enter_context(patch.object(broker_router, "_execution_gate_snapshot", gates.execution_gate_snapshot))
+                stack.enter_context(patch.object(broker_router, "_kill_switch_snapshot", kill_switch_snapshot))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                stack.enter_context(patch.object(broker_router, "_sim_apply", sim_adapter))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "execution_blocked")
+        self.assertEqual(result["gate"]["reason"], "kill_switch_cache_stale")
+        self.assertFalse(bool(result["gate"]["real_trading_allowed"]))
         sim_adapter.assert_not_called()
 
 

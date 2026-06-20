@@ -14,7 +14,7 @@ Usage:
 Exit code:
     0 if every check passed, 1 otherwise.
 
-Cross-platform: pure Python stdlib + optional psycopg for --db-dsn.
+Linux-only: pure Python stdlib + optional psycopg for --db-dsn.
 """
 from __future__ import annotations
 
@@ -570,14 +570,13 @@ def audit_db08(run_tests: bool) -> PromptResult:
 
 
 def audit_db09(run_tests: bool) -> PromptResult:
-    p = PromptResult(prompt="DB-09", title="Secrets via systemd-creds (+ DPAPI / plaintext)")
+    p = PromptResult(prompt="DB-09", title="Secrets via systemd-creds (+ plaintext dev fallback)")
     for f in [
         "services/secrets/__init__.py",
         "services/secrets/loader.py",
         "services/secrets/rotation.py",
         "services/secrets/providers/__init__.py",
         "services/secrets/providers/systemd_creds.py",
-        "services/secrets/providers/dpapi.py",
         "services/secrets/providers/plaintext.py",
         "ops/server/credstore/install.sh",
         "ops/server/credstore/rotate_master_key.sh",
@@ -586,7 +585,6 @@ def audit_db09(run_tests: bool) -> PromptResult:
         "docs/Secrets_Rotation_Runbook.md",
         "tests/test_secrets_loader.py",
         "tests/test_secrets_provider_systemd.py",
-        "tests/test_secrets_provider_dpapi.py",
         "tests/test_secrets_provider_plaintext.py",
         "tests/test_secrets_rotation.py",
         "tests/test_no_legacy_secret_paths.py",

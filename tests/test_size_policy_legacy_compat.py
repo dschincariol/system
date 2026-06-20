@@ -49,7 +49,7 @@ class SizePolicyLegacyCompatTests(unittest.TestCase):
                     return _FakeCursor([(0, 0.0, 1.0, 42, 0.1, 0.2, 0.3)])
                 raise AssertionError(f"unexpected query: {sql!r} params={params!r}")
 
-        policy = size_policy.load_latest_size_policy(con=_FakeConnection())
+        policy = size_policy.load_latest_size_policy(con=_FakeConnection(), require_ope=False)
 
         self.assertIsNotNone(policy)
         assert policy is not None
@@ -57,6 +57,87 @@ class SizePolicyLegacyCompatTests(unittest.TestCase):
         self.assertEqual(policy["lookback_days"], 90)
         self.assertEqual(policy["buckets"], 10)
         self.assertEqual(len(policy["points"]), 1)
+
+    def test_load_latest_size_policy_blocks_when_ope_gate_fails(self) -> None:
+        import engine.strategy.size_policy as size_policy
+
+        size_policy = importlib.reload(size_policy)
+
+        class _FakeCursor:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchone(self):
+                return self._rows[0] if self._rows else None
+
+            def fetchall(self):
+                return list(self._rows)
+
+        class _FakeConnection:
+            def execute(self, sql, params=()):
+                text = " ".join(str(sql).split()).lower()
+                if "select id, ts_ms, method, params_json, metrics_json" in text:
+                    return _FakeCursor(
+                        [
+                            (
+                                7,
+                                2222,
+                                "bucket_sharpe_monotone",
+                                '{"lookback_days":90,"buckets":10}',
+                                '{"n_samples":42}',
+                            )
+                        ]
+                    )
+                if "from size_policy_points" in text:
+                    return _FakeCursor([(0, 0.0, 1.0, 42, 0.1, 0.2, 0.3)])
+                raise AssertionError(f"unexpected query: {sql!r} params={params!r}")
+
+        with patch.object(size_policy, "_size_policy_ope_passed", return_value=(False, {"status": "missing_propensities"})):
+            policy = size_policy.load_latest_size_policy(con=_FakeConnection())
+
+        self.assertIsNone(policy)
+
+    def test_load_latest_size_policy_returns_policy_when_ope_gate_passes(self) -> None:
+        import engine.strategy.size_policy as size_policy
+
+        size_policy = importlib.reload(size_policy)
+
+        class _FakeCursor:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchone(self):
+                return self._rows[0] if self._rows else None
+
+            def fetchall(self):
+                return list(self._rows)
+
+        class _FakeConnection:
+            def execute(self, sql, params=()):
+                text = " ".join(str(sql).split()).lower()
+                if "select id, ts_ms, method, params_json, metrics_json" in text:
+                    return _FakeCursor(
+                        [
+                            (
+                                8,
+                                3333,
+                                "bucket_sharpe_monotone",
+                                '{"lookback_days":90,"buckets":10}',
+                                '{"n_samples":42}',
+                            )
+                        ]
+                    )
+                if "from size_policy_points" in text:
+                    return _FakeCursor([(0, 0.0, 1.0, 42, 0.1, 0.2, 0.3)])
+                raise AssertionError(f"unexpected query: {sql!r} params={params!r}")
+
+        with patch.object(size_policy, "_size_policy_ope_passed", return_value=(True, {"status": "passed"})):
+            policy = size_policy.load_latest_size_policy(con=_FakeConnection())
+
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertEqual(policy["policy_id"], 8)
+        self.assertEqual(policy["ope_gate"]["status"], "passed")
 
     def test_position_sizing_uses_loader_points_for_factor_lookup(self) -> None:
         import engine.strategy.position_sizing as position_sizing

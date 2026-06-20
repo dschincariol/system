@@ -83,3 +83,95 @@ def test_operator_start_regular_failure_is_not_reconciled():
     }
 
     assert not pipeline_smoke_test._operator_start_is_proxy_only(payload)
+
+
+def test_health_ready_for_smoke_accepts_advisory_health_reasons_without_critical_blockers():
+    payload = {
+        "ok": False,
+        "body": {
+            "db": {"ok": True},
+            "prices": {"last_ts_ms": 1_700_000_000_000, "age_s": 12.0},
+            "critical_blockers": [],
+            "reasons": ["data_gate:model_inputs_valid"],
+        },
+    }
+
+    assert pipeline_smoke_test._health_ready_for_smoke(payload)
+
+
+def test_health_ready_for_smoke_accepts_provider_only_critical_blockers():
+    payload = {
+        "ok": False,
+        "body": {
+            "db": {"ok": True},
+            "prices": {"last_ts_ms": 1_700_000_000_000, "age_s": 12.0},
+            "critical_blockers": ["providers_not_ok"],
+        },
+    }
+
+    assert pipeline_smoke_test._health_ready_for_smoke(payload)
+
+
+def test_health_ready_for_smoke_rejects_execution_critical_blocker():
+    payload = {
+        "ok": False,
+        "body": {
+            "db": {"ok": True},
+            "prices": {"last_ts_ms": 1_700_000_000_000, "age_s": 12.0},
+            "critical_blockers": ["execution_supervisor_critical"],
+        },
+    }
+
+    assert not pipeline_smoke_test._health_ready_for_smoke(payload)
+
+
+def test_start_job_and_wait_accepts_successful_history_when_job_summary_is_stale(monkeypatch):
+    snapshots = iter(
+        [
+            {"update_universe": {"running": False, "last_event_ts_ms": 100}},
+            {"update_universe": {"running": False, "last_event_ts_ms": 100, "last_exit_code": 1}},
+        ]
+    )
+    histories = iter(
+        [
+            [{"event": "exit", "exit_code": 0, "ts_ms": 100}],
+            [{"event": "exit", "exit_code": 0, "ts_ms": 200}],
+        ]
+    )
+
+    monkeypatch.setattr(pipeline_smoke_test, "_jobs_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(pipeline_smoke_test, "_job_history", lambda _name, limit=10: next(histories))
+    monkeypatch.setattr(pipeline_smoke_test, "_req", lambda *_args, **_kwargs: {"ok": True})
+
+    result = pipeline_smoke_test._start_job_and_wait("update_universe", timeout_s=5)
+
+    assert result["ok"] is True
+    assert result["history"]["ts_ms"] == 200
+
+
+def test_start_job_and_wait_accepts_immediate_successful_start_completion(monkeypatch):
+    requests = []
+    monkeypatch.setattr(
+        pipeline_smoke_test,
+        "_jobs_snapshot",
+        lambda: {"compute_drift": {"running": False, "last_event_ts_ms": 100}},
+    )
+    monkeypatch.setattr(
+        pipeline_smoke_test,
+        "_job_history",
+        lambda _name, limit=10: [{"event": "exit", "exit_code": 0, "ts_ms": 100}],
+    )
+
+    def _req(path, *args, **kwargs):
+        requests.append((path, kwargs))
+        return {"ok": True, "exit_code": 0}
+
+    monkeypatch.setattr(pipeline_smoke_test, "_req", _req)
+
+    result = pipeline_smoke_test._start_job_and_wait("compute_drift", timeout_s=5)
+
+    assert result["ok"] is True
+    assert result["start"]["exit_code"] == 0
+    assert result["history"] is None
+    assert requests[0][1]["body"]["confirmation"] == "JOB_ACTION"
+    assert requests[0][1]["body"]["consequence_ack"] is True

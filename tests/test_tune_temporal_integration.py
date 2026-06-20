@@ -21,6 +21,7 @@ def test_tune_models_resumes_and_records_best_params(monkeypatch, tmp_path) -> N
         return row
 
     monkeypatch.setenv("OPTUNA_DB_PATH", str(tmp_path / "studies.sqlite"))
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "offline")
     monkeypatch.setattr(tune_models, "record_best_params", fake_record_best_params)
 
     result1 = tune_models.run_tuning_job(
@@ -43,3 +44,22 @@ def test_tune_models_resumes_and_records_best_params(monkeypatch, tmp_path) -> N
     assert recorded[-1]["model_family"] == "temporal_predictor"
     assert result2["results"][0]["trials_before"] == result1["results"][0]["trials_after"]
     assert result2["results"][0]["trials_after"] == result1["results"][0]["trials_after"] + 1
+
+
+def test_tune_models_live_profile_requires_ack(monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "live")
+    monkeypatch.delenv("OFFLINE_TRAINING_LIVE_PROFILE_ACK", raising=False)
+    monkeypatch.delenv("OFFLINE_TRAINING_LIVE_PROFILE_OWNER", raising=False)
+    monkeypatch.delenv("OFFLINE_TRAINING_LIVE_PROFILE_REASON", raising=False)
+
+    result = tune_models.run_tuning_job(
+        model_families=["temporal_predictor"],
+        symbols=["AAPL"],
+        n_trials=1,
+        seed=3,
+        allow_smoke_objective=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "offline_training_live_profile_ack_required"
+    assert "OFFLINE_TRAINING_LIVE_PROFILE_ACK" in result["detail"]

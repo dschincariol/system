@@ -41,11 +41,18 @@ def test_pool_uses_env_url_and_pool_size(monkeypatch):
     assert calls[1] == ("ping",)
 
 
-def test_default_redis_urls_follow_platform(monkeypatch):
+def test_pool_resolves_password_secret(monkeypatch):
+    redis_pool = importlib.reload(importlib.import_module("engine.cache.redis_pool"))
+
+    monkeypatch.setenv("TS_REDIS_URL", "redis://127.0.0.1:6380/2")
+    monkeypatch.setenv("TS_REDIS_PASSWORD_SECRET", "redis_password")
+    monkeypatch.setattr(redis_pool, "_secret_text_from_env", lambda *names: "secret")
+
+    assert redis_pool.redis_url() == "redis://:secret@127.0.0.1:6380/2"
+
+
+def test_default_redis_url_is_linux_socket(monkeypatch):
     platform = importlib.reload(importlib.import_module("engine.runtime.platform"))
 
     monkeypatch.setattr(platform.sys, "platform", "linux")
     assert platform.default_redis_url() == "unix:///var/run/redis/trading.sock"
-
-    monkeypatch.setattr(platform.sys, "platform", "win32")
-    assert platform.default_redis_url() == "redis://127.0.0.1:6379/0"

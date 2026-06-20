@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   filterCommandItems,
   fuzzyScoreText,
+  isPaletteJobActionAllowed,
   isSafePaletteJobAction,
   parseDecisionIdQuery,
 } from "../ui/command_palette.mjs";
@@ -32,11 +33,29 @@ test("decision ID parser accepts pasted IDs without broad text matches", () => {
   assert.equal(parseDecisionIdQuery("decision latest"), "");
 });
 
-test("palette job actions exclude trading and destructive job names", () => {
-  assert.equal(isSafePaletteJobAction("poll_prices", "start"), true);
-  assert.equal(isSafePaletteJobAction("portfolio_backtest", "start"), true);
-  assert.equal(isSafePaletteJobAction("broker_apply_orders", "start"), false);
-  assert.equal(isSafePaletteJobAction("portfolio_rebalance", "start"), false);
-  assert.equal(isSafePaletteJobAction("force_promote", "start"), false);
-  assert.equal(isSafePaletteJobAction("poll_prices", "delete"), false);
+test("palette job actions use backend safety metadata", () => {
+  const pollPrices = {
+    name: "poll_prices",
+    safety: "data_refresh",
+    action_policy: { start: { enabled: true }, stop: { enabled: true } },
+  };
+  const brokerApplyOrders = {
+    name: "broker_apply_orders",
+    safety: "execution_sensitive",
+    action_policy: { start: { enabled: true, safety_confirmation_required: true } },
+  };
+  const unavailable = {
+    name: "llm_factor_discovery",
+    safety: "unavailable",
+    action_policy: { start: { enabled: false, disabled_reason: "Missing prerequisite" } },
+  };
+
+  assert.equal(isSafePaletteJobAction(pollPrices, "start"), true);
+  assert.equal(isPaletteJobActionAllowed(pollPrices, "start"), true);
+  assert.equal(isSafePaletteJobAction(brokerApplyOrders, "start"), false);
+  assert.equal(isPaletteJobActionAllowed(brokerApplyOrders, "start"), true);
+  assert.equal(isSafePaletteJobAction(unavailable, "start"), false);
+  assert.equal(isPaletteJobActionAllowed(unavailable, "start"), false);
+  assert.equal(isSafePaletteJobAction("poll_prices", "start"), false);
+  assert.equal(isSafePaletteJobAction(pollPrices, "delete"), false);
 });

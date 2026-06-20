@@ -77,6 +77,24 @@ class ExternalServiceReadinessTests(unittest.TestCase):
         self.assertEqual(redis_status.get("target"), "cache.local:6379")
         self.assertTrue(any("ping ok" in item for item in list(redis_status.get("notes") or [])))
 
+    def test_explicit_redis_backend_resolves_password_secret_before_probe(self) -> None:
+        self._set_env("LIVE_CACHE_BACKEND", "redis")
+        self._set_env("LIVE_CACHE_REDIS_URL", "redis://cache.local:6379/0")
+        self._set_env("LIVE_CACHE_REDIS_PASSWORD_SECRET", "redis_password")
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_secret_text_from_env", return_value="redis-secret") as load_secret:
+            with patch.object(readiness, "_probe_redis", return_value=(True, None)) as probe:
+                summary = readiness.check_external_service_readiness()
+
+        self.assertTrue(bool(summary.get("ok")))
+        load_secret.assert_any_call(
+            "LIVE_CACHE_REDIS_PASSWORD_SECRET",
+            "TS_REDIS_PASSWORD_SECRET",
+            "REDIS_PASSWORD_SECRET",
+        )
+        probe.assert_called_with("redis://:redis-secret@cache.local:6379/0", timeout_s=2.0)
+
     def test_required_timescale_auth_probe_failure_fails(self) -> None:
         self._set_env("PREFLIGHT_REQUIRE_TIMESCALE", "1")
         self._set_env("TIMESCALE_DSN", "postgresql://trading:bad@db.local:5432/trading")
@@ -88,6 +106,59 @@ class ExternalServiceReadinessTests(unittest.TestCase):
 
         self.assertFalse(bool(summary.get("ok")))
         self.assertTrue(any("authentication failed" in item for item in summary.get("errors") or []))
+
+    def test_required_timescale_url_with_inline_password_skips_secret_resolution(self) -> None:
+        self._set_env("PREFLIGHT_REQUIRE_TIMESCALE", "1")
+        self._set_env("TIMESCALE_DSN", "postgresql://trading:inline-pass@db.local:5432/trading")
+        self._set_env("TIMESCALE_PRICES_DSN", None)
+        self._set_env("TS_SECRETS_PROVIDER", "systemd-creds")
+        self._set_env("CREDENTIALS_DIRECTORY", None)
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_probe_postgres", return_value=(True, None)) as probe:
+            summary = readiness.check_external_service_readiness()
+
+        self.assertTrue(bool(summary.get("ok")))
+        self.assertEqual(probe.call_count, 2)
+        probe.assert_called_with(
+            "postgresql://trading:inline-pass@db.local:5432/trading",
+            timeout_s=2.0,
+        )
+
+    def test_required_timescale_resolves_passwordless_dsn_before_probe(self) -> None:
+        self._set_env("PREFLIGHT_REQUIRE_TIMESCALE", "1")
+        self._set_env("TIMESCALE_DSN", "host=db.local port=5432 user=trading dbname=trading")
+        self._set_env("TIMESCALE_PRICES_DSN", None)
+        readiness = self._load_module()
+
+        with patch.object(
+            readiness,
+            "_postgres_probe_dsn",
+            return_value="host=db.local port=5432 user=trading dbname=trading password=secret",
+        ) as resolve:
+            with patch.object(readiness, "_probe_postgres", return_value=(True, None)) as probe:
+                summary = readiness.check_external_service_readiness()
+
+        self.assertTrue(bool(summary.get("ok")))
+        self.assertEqual(resolve.call_count, 2)
+        probe.assert_called_with(
+            "host=db.local port=5432 user=trading dbname=trading password=secret",
+            timeout_s=2.0,
+        )
+
+    def test_required_timescale_credential_resolution_failure_fails(self) -> None:
+        self._set_env("PREFLIGHT_REQUIRE_TIMESCALE", "1")
+        self._set_env("TIMESCALE_DSN", "host=db.local port=5432 user=trading dbname=trading")
+        self._set_env("TIMESCALE_PRICES_DSN", None)
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_postgres_probe_dsn", side_effect=RuntimeError("missing credential")):
+            with patch.object(readiness, "_probe_postgres", side_effect=AssertionError("probe should not run")):
+                summary = readiness.check_external_service_readiness()
+
+        self.assertFalse(bool(summary.get("ok")))
+        self.assertTrue(any("credential resolution failed" in item for item in summary.get("errors") or []))
+        self.assertTrue(any("missing credential" in item for item in summary.get("errors") or []))
 
     def test_required_object_storage_needs_endpoint_credentials_and_mirror(self) -> None:
         self._set_env("PREFLIGHT_REQUIRE_OBJECT_STORAGE", "1")
@@ -119,6 +190,28 @@ class ExternalServiceReadinessTests(unittest.TestCase):
         self.assertTrue(any("bucket is missing" in item for item in summary.get("errors") or []))
         self.assertTrue(any("access key is missing" in item for item in summary.get("errors") or []))
         self.assertTrue(any("secret key is missing" in item for item in summary.get("errors") or []))
+
+    def test_required_object_storage_resolves_secret_key_credential(self) -> None:
+        self._set_env("PREFLIGHT_REQUIRE_OBJECT_STORAGE", "1")
+        self._set_env("OBJECT_STORE_ENDPOINT", "http://minio.local:9000")
+        self._set_env("OBJECT_STORE_BUCKET", "artifacts")
+        self._set_env("OBJECT_STORE_ACCESS_KEY", "minio")
+        self._set_env("OBJECT_STORE_SECRET_KEY", None)
+        self._set_env("OBJECT_STORE_SECRET_KEY_SECRET", "object_store_secret_key")
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_secret_text_from_env", return_value="object-secret") as load_secret:
+            with patch.object(readiness, "_probe_object_storage_bucket", return_value=(True, None)) as probe:
+                summary = readiness.check_external_service_readiness()
+
+        self.assertTrue(bool(summary.get("ok")))
+        load_secret.assert_called_with(
+            "OBJECT_STORE_SECRET_KEY_SECRET",
+            "MINIO_SECRET_KEY_SECRET",
+            "AWS_SECRET_ACCESS_KEY_SECRET",
+        )
+        kwargs = dict(probe.call_args.kwargs)
+        self.assertEqual(kwargs.get("secret_key"), "object-secret")
 
     def test_required_object_storage_bucket_probe_failure_fails(self) -> None:
         self._set_env("PREFLIGHT_REQUIRE_OBJECT_STORAGE", "1")

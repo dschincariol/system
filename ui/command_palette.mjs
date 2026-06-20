@@ -5,20 +5,6 @@ const STYLE_ID = "dashboardCommandPaletteStyle";
 const DATA_TTL_MS = 15000;
 const DEFAULT_LIMIT = 14;
 
-const UNSAFE_JOB_PATTERNS = [
-  /broker/i,
-  /apply[_-]?orders/i,
-  /\border\b/i,
-  /trade/i,
-  /live[_-]?trading/i,
-  /kill/i,
-  /emergency/i,
-  /force/i,
-  /promote/i,
-  /rollback/i,
-  /rebalance/i,
-];
-
 function asArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -128,9 +114,28 @@ export function parseDecisionIdQuery(query) {
 export function isSafePaletteJobAction(jobName, action = "start") {
   const normalizedAction = String(action || "").trim().toLowerCase();
   if (!["start", "stop"].includes(normalizedAction)) return false;
-  const name = String(jobName || "").trim();
-  if (!name) return false;
-  return !UNSAFE_JOB_PATTERNS.some((pattern) => pattern.test(name));
+  const row = jobName && typeof jobName === "object" ? jobName : null;
+  if (!row) return false;
+  const policy = getJobActionPolicy(row, normalizedAction);
+  if (!policy || policy.enabled === false) return false;
+  const safety = cleanLabel(row.safety).toLowerCase();
+  if (safety === "unavailable") return false;
+  return !policy.safety_confirmation_required && !["execution_sensitive", "destructive_admin"].includes(safety);
+}
+
+function getJobActionPolicy(row, action) {
+  const policies = row && row.action_policy && typeof row.action_policy === "object" ? row.action_policy : {};
+  const policy = policies[String(action || "").trim().toLowerCase()];
+  return policy && typeof policy === "object" ? policy : null;
+}
+
+export function isPaletteJobActionAllowed(row, action = "start") {
+  const normalizedAction = String(action || "").trim().toLowerCase();
+  if (!["start", "stop"].includes(normalizedAction)) return false;
+  const policy = getJobActionPolicy(row, normalizedAction);
+  if (!policy || policy.enabled === false) return false;
+  if (cleanLabel(row && row.safety).toLowerCase() === "unavailable") return false;
+  return true;
 }
 
 function normalizeSymbolsPayload(payload) {
@@ -402,20 +407,8 @@ function buildStaticItems(doc, options) {
   return items;
 }
 
-function getExposedJobActions(doc) {
-  const byJob = new Map();
-  doc.querySelectorAll("button[data-job][data-action]").forEach((btn) => {
-    const job = cleanLabel(btn.getAttribute("data-job"));
-    const action = cleanLabel(btn.getAttribute("data-action")).toLowerCase();
-    if (!isSafePaletteJobAction(job, action)) return;
-    if (!byJob.has(job)) byJob.set(job, new Set());
-    byJob.get(job).add(action);
-  });
-  return byJob;
-}
-
 function buildJobItems(doc, jobs, options) {
-  const exposed = getExposedJobActions(doc);
+  void doc;
   const items = [];
   for (const row of asArray(jobs)) {
     const name = cleanLabel(row && row.name);
@@ -423,28 +416,33 @@ function buildJobItems(doc, jobs, options) {
     const running = !!(row && row.running);
     const group = cleanLabel(row && row.group);
     const mode = cleanLabel(row && row.mode);
+    const workflow = cleanLabel(row && row.workflow);
+    const safety = cleanLabel(row && (row.safety_label || row.safety));
     items.push({
       id: commandId("job-select", name),
       title: `Select job ${name}`,
-      subtitle: [running ? "running" : "idle", group, mode].filter(Boolean).join(" / "),
+      subtitle: [running ? "running" : "idle", workflow || group, mode, safety].filter(Boolean).join(" / "),
       badge: "Job",
-      keywords: [name, group, mode, row && row.script],
+      keywords: [name, group, workflow, mode, row && row.script, row && row.purpose, safety],
       priority: 35,
       run: () => options.selectJob && options.selectJob(name),
     });
 
-    const actions = exposed.get(name);
-    if (!actions) continue;
-    actions.forEach((action) => {
+    ["start", "stop"].forEach((action) => {
+      if (!isPaletteJobActionAllowed(row, action)) return;
       if (action === "start" && running) return;
       if (action === "stop" && !running) return;
+      const policy = getJobActionPolicy(row, action) || {};
       items.push({
         id: commandId(`job-${action}`, name),
         title: `${capitalize(action)} job ${name}`,
-        subtitle: "Uses existing job control endpoint with confirmation",
-        badge: "Confirm",
+        subtitle: [
+          policy.safety_confirmation_required ? "Backend safety confirmation required" : "Backend confirmation required",
+          safety,
+        ].filter(Boolean).join(" / "),
+        badge: policy.safety_confirmation_required ? "Guarded" : "Confirm",
         confirm: true,
-        keywords: [name, action, "job", "control"],
+        keywords: [name, action, "job", "control", safety, workflow],
         priority: 30,
         run: () => options.runJobAction && options.runJobAction(name, action),
       });

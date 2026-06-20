@@ -156,6 +156,21 @@ class EnsembleModelInterfaceTests(unittest.TestCase):
         self.assertTrue(bool(metadata.get("supports_online_update")))
         self.assertEqual(metadata.get("model_interface"), "BaseModel")
 
+    def test_unfitted_online_model_does_not_return_dummy_zero_in_live_mode(self) -> None:
+        model = self.online_model.OnlineModel(
+            model_name="sgd_unfitted",
+            feature_ids=["f_0"],
+            default_confidence=0.6,
+        )
+
+        with patch.dict(os.environ, {"EXECUTION_MODE": "live", "BROKER": "ibkr"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "live_online_model_unfitted_dummy_prediction"):
+                model.predict([1.0])
+
+        with patch.dict(os.environ, {"EXECUTION_MODE": "paper", "BROKER": "sim"}, clear=False):
+            result = model.predict([1.0])
+        self.assertEqual(float(result.get("prediction") or 0.0), 0.0)
+
     def test_mixed_gbm_and_online_models_serve_side_by_side_in_ensemble(self) -> None:
         self._store_feature_snapshot("AMD", scale=1.4)
         gbm = self._fit_gbm_wrapper(model_name="gbm_alpha", default_confidence=0.83)
@@ -188,6 +203,10 @@ class EnsembleModelInterfaceTests(unittest.TestCase):
         )
         self.assertGreaterEqual(float(result.get("confidence") or 0.0), 0.0)
         self.assertLessEqual(float(result.get("confidence") or 0.0), 1.0)
+        self.assertIn("ensemble_epistemic_uncertainty", result)
+        self.assertGreaterEqual(float(result.get("ensemble_epistemic_uncertainty") or 0.0), 0.0)
+        ensemble_output = dict(result.get("ensemble_output") or {})
+        self.assertIn("epistemic_uncertainty", ensemble_output)
 
     def test_ensemble_parallel_workers_are_resolved_from_env_at_call_time(self) -> None:
         os.environ["INFERENCE_ENSEMBLE_PARALLEL_WORKERS"] = "6"

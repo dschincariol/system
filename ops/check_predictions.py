@@ -1,40 +1,19 @@
-"""
-FILE: check_predictions.py
+"""Compatibility launcher for ``engine.runtime.jobs.check_predictions``."""
 
-Operational helper script for `check_predictions`.
-"""
+from __future__ import annotations
 
-# check_predictions.py
-import os
-import sqlite3
+import sys
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-def main() -> int:
-    db_path = os.environ.get("DB_PATH", str(Path("./data/trading.db").resolve()))
-    con = sqlite3.connect(db_path)
-    try:
-        # This script is intentionally read-only and presentation-oriented: it
-        # answers "are predictions landing?" without any runtime side effects.
-        total = con.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
-        print("predictions_total =", total)
+from ops._engine_job_wrapper import import_engine_module, run_engine_module
 
-        rows = con.execute(
-                """
-                SELECT p.symbol, p.horizon_s, p.predicted_z, p.confidence, e.title
-                FROM predictions p
-                JOIN events e ON e.id = p.event_id
-                ORDER BY p.ts_ms DESC
-                LIMIT 20
-                """
-            ).fetchall()
-
-        for sym, h, z, conf, title in rows:
-                print(f"{sym} h={h} z={z:+.3f} conf={conf:.2f} :: {title}")
-    finally:
-        con.close()
-    return 0
-
+_ENGINE_MODULE = "engine.runtime.jobs.check_predictions"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_engine_module(_ENGINE_MODULE))
+
+sys.modules[__name__] = import_engine_module(_ENGINE_MODULE)

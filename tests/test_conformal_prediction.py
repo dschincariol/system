@@ -83,3 +83,22 @@ def test_model_intent_carries_conformal_fields_and_overrides_confidence_in_gate(
     assert intent["conformal_interval_lower"] == pytest.approx(0.25)
     assert intent["conformal_interval_upper"] == pytest.approx(1.75)
     assert intent["conformal_size_mult"] == pytest.approx(0.66)
+
+
+def test_model_intent_carries_epistemic_uncertainty_for_sizing():
+    intent = build_model_intent(
+        symbol="AAPL",
+        horizon_s=3600,
+        expected_z=1.0,
+        confidence=0.8,
+        explain={
+            "epistemic_uncertainty": 0.34,
+            "aleatoric_uncertainty": 0.12,
+            "uncertainty_ts_ms": 1_710_000_000_000,
+        },
+    )
+
+    assert intent["epistemic_uncertainty"] == pytest.approx(0.34)
+    assert intent["aleatoric_uncertainty"] == pytest.approx(0.12)
+    assert intent["uncertainty_ts_ms"] == 1_710_000_000_000
+    assert intent["uncertainty_detail"]["epistemic_uncertainty"] == pytest.approx(0.34)

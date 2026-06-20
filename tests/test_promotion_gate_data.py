@@ -32,6 +32,12 @@ def test_promotion_gate_response_shape_includes_comparison_checklist_and_safe_ac
                 "max_drift_ratio": 0.08,
                 "model_pnl_snapshot": {"embed_regressor": 12.5},
                 "statistical_gate": {"enabled": True},
+                "deconfounded_signal_validation": {
+                    "passed": False,
+                    "status": "weak_incremental_effect",
+                    "coefficient": 0.0,
+                    "residual_ic": 0.0,
+                },
                 "cpcv_gate": {"enabled": True},
             },
         },
@@ -92,6 +98,8 @@ def test_promotion_gate_response_shape_includes_comparison_checklist_and_safe_ac
     assert checklist["crit_alerts"]["state"] == "pass"
     assert checklist["replay_validation"]["state"] == "pass"
     assert checklist["statistical_gate"]["state"] == "unavailable"
+    assert checklist["deconfounded_signal_validation"]["state"] == "fail"
+    assert checklist["deconfounded_signal_validation"]["observed"]["status"] == "weak_incremental_effect"
 
 
 def test_rollback_requires_justification_after_confirmation():

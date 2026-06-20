@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from engine.strategy import promotion_guard
+from tests.promotion_test_helpers import passing_deconfounded_payload
 
 
 def _champion_returns() -> list[float]:
@@ -42,6 +43,7 @@ def test_decorrelated_additive_signal_passes_marginal_contribution_gate() -> Non
         challenger_returns=challenger,
         champion_returns=champion,
         models_returns={"champion_model": champion, "additive_model": challenger},
+        deconfounded_validation=passing_deconfounded_payload(len(challenger)),
         persist=False,
         alpha=1.0,
         bootstrap_samples=99,
@@ -69,6 +71,7 @@ def test_correlated_challenger_with_sharpe_uplift_passes_correlation_override() 
         challenger_returns=challenger,
         champion_returns=champion,
         models_returns={"champion_model": champion, "uplift_model": challenger},
+        deconfounded_validation=passing_deconfounded_payload(len(challenger)),
         persist=False,
         alpha=1.0,
         bootstrap_samples=99,
@@ -101,6 +104,7 @@ def test_pool_gate_metrics_are_persisted_as_promotion_evidence(monkeypatch) -> N
         challenger_returns=challenger,
         champion_returns=champion,
         models_returns={"champion_model": champion, "persist_model": challenger},
+        deconfounded_validation=passing_deconfounded_payload(len(challenger)),
         persist=True,
         alpha=1.0,
         bootstrap_samples=99,

@@ -970,6 +970,161 @@ body.theme-tech .overlayLegendSummary{
   color:var(--muted);
 }
 
+.jobCatalogControls {
+  align-items: center;
+}
+
+.jobCatalogControls .input,
+.jobCatalogControls select {
+  min-height: 34px;
+}
+
+.jobCatalogControls .input {
+  min-width: min(320px, 100%);
+}
+
+.jobCatalogTableWrap {
+  overflow: auto;
+  margin-top: 10px;
+}
+
+.jobCatalogTable {
+  width: 100%;
+  min-width: 980px;
+  table-layout: fixed;
+}
+
+.jobCatalogTable th,
+.jobCatalogTable td {
+  vertical-align: top;
+}
+
+.jobCatalogTable th:nth-child(1),
+.jobCatalogTable td:nth-child(1) {
+  width: 18%;
+}
+
+.jobCatalogTable th:nth-child(2),
+.jobCatalogTable td:nth-child(2) {
+  width: 13%;
+}
+
+.jobCatalogTable th:nth-child(6),
+.jobCatalogTable td:nth-child(6) {
+  width: 28%;
+}
+
+.jobCatalogTable th:nth-child(7),
+.jobCatalogTable td:nth-child(7) {
+  width: 18%;
+}
+
+.jobCatalogGroupRow th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: var(--text, #e6edf3);
+  background: var(--panel2, #111722);
+  text-align: left;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.jobCatalogGroupRow span {
+  color: var(--muted, #8b949e);
+  font-weight: 700;
+}
+
+.jobCatalogRow.is-selected {
+  outline: 2px solid var(--status-info, #56B4E9);
+  outline-offset: -2px;
+}
+
+.jobCatalogSelect {
+  display: block;
+  width: 100%;
+  border: 0;
+  padding: 0;
+  color: var(--text, #e6edf3);
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.jobCatalogSub,
+.jobCatalogPurpose {
+  margin-top: 4px;
+  color: var(--muted, #8b949e);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.jobCatalogPrereq {
+  display: inline-block;
+  overflow-wrap: anywhere;
+}
+
+.jobCatalogBlocked {
+  color: var(--status-warn, #E69F00);
+}
+
+.jobCatalogActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.jobCatalogEmpty {
+  color: var(--muted, #8b949e);
+  text-align: center;
+}
+
+.governanceEvidenceTable,
+.governanceShadowTable {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.governanceEvidenceTable th,
+.governanceEvidenceTable td,
+.governanceShadowTable th,
+.governanceShadowTable td {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.governanceEvidenceTable th:nth-child(1) { width: 15%; }
+.governanceEvidenceTable th:nth-child(2) { width: 9%; }
+.governanceEvidenceTable th:nth-child(3) { width: 10%; }
+.governanceEvidenceTable th:nth-child(4) { width: 8%; }
+.governanceEvidenceTable th:nth-child(5) { width: 14%; }
+.governanceEvidenceTable th:nth-child(6) { width: 18%; }
+.governanceEvidenceTable th:nth-child(7) { width: 26%; }
+
+.governanceEvidenceBlockers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+
+.governanceEvidenceBlocker {
+  border: 1px solid var(--border, rgba(48,54,61,.7));
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--panel2, #111722);
+  overflow-wrap: anywhere;
+}
+
+.governanceEvidenceSummary {
+  margin-bottom: 10px;
+}
+
 /* responsive collapse */
 
 @media (max-width:1400px){

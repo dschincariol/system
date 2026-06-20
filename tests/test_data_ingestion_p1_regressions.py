@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import importlib
-import os
 import sys
 import threading
 from pathlib import Path

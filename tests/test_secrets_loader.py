@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import sys
 
 import pytest
@@ -12,8 +11,6 @@ def test_default_provider_dispatches_by_platform(monkeypatch):
     monkeypatch.delenv("TS_SECRETS_PROVIDER", raising=False)
     monkeypatch.setattr(loader.sys, "platform", "linux")
     assert loader.selected_provider_name() == "systemd-creds"
-    monkeypatch.setattr(loader.sys, "platform", "win32")
-    assert loader.selected_provider_name() == "dpapi"
 
 
 def test_plaintext_happy_path_logs_success(monkeypatch, tmp_path):

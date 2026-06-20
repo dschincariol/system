@@ -268,6 +268,8 @@ class EnsembleOperationalPathsTests(unittest.TestCase):
         self.assertIn("ensemble_family_performance", tables)
         self.assertIn("insider_transactions", tables)
         self.assertIn("congressional_trades", tables)
+        self.assertIsNotNone(latest_schema_version)
+        self.assertEqual(int(latest_schema_version[0] or 0), int(storage.SCHEMA_VERSION))
         self.assertEqual(int(runtime_meta_version[0] or 0), int(storage.SCHEMA_VERSION))
 
     def test_repair_schema_backfills_execution_table_columns(self) -> None:

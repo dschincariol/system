@@ -194,7 +194,7 @@ class StagingProdPreflightHarnessTests(unittest.TestCase):
         self.assertIn("TS_PG_DSN=", env_example)
         self.assertNotIn("stage-secret", env_example)
         self.assertIn("I_UNDERSTAND_THIS_USES_PRODUCTION_CREDENTIALS", docs)
-        self.assertIn("artifacts/preflight/staging", docs)
+        self.assertIn("var/artifacts/preflight/staging", docs)
 
 
 if __name__ == "__main__":

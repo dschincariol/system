@@ -119,9 +119,10 @@ ensure_venv() {
   fi
 
   require_python_311 "$VENV_DIR/bin/python"
-  log "installing Python dependencies from requirements.txt"
+  REQ_FILE="$(bash "$ROOT/deploy/bin/resolve_python_requirements.sh" "$ROOT")"
+  log "installing Python dependencies from $REQ_FILE"
   "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel setuptools
-  "$VENV_DIR/bin/python" -m pip install -r "$ROOT/requirements.txt"
+  "$VENV_DIR/bin/python" -m pip install -r "$REQ_FILE"
 }
 
 ensure_node() {

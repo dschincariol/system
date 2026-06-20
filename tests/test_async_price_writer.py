@@ -101,6 +101,9 @@ class AsyncPriceWriterTests(unittest.TestCase):
         self.assertEqual(float(written_prices[0]["price"]), 201.25)
         self.assertFalse(bool(snapshot.get("thread_alive")))
         self.assertEqual(int(snapshot.get("flushed_rows") or 0), 1)
+        self.assertIn("last_flush_latency_ms", snapshot)
+        self.assertIn("last_db_write_duration_ms", snapshot)
+        self.assertIn("dropped_rows", snapshot)
 
 
 if __name__ == "__main__":

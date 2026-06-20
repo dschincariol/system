@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -58,3 +59,39 @@ def test_sentence_transformer_encoder_stable_vectors() -> None:
     assert first.shape == (2, 3)
     np.testing.assert_allclose(first, second)
     assert np.all(np.linalg.norm(first, axis=1) > 0.0)
+
+
+def test_sentence_transformer_encoder_passes_cpu_device_by_default(monkeypatch) -> None:
+    from engine.nlp.encoder import SentenceTransformerEncoder
+
+    captured = {}
+
+    class _FakeCuda:
+        def is_available(self) -> bool:
+            return True
+
+    class _FakeTorch:
+        cuda = _FakeCuda()
+
+    class _FakeSentenceTransformer:
+        def __init__(self, model_name: str, **kwargs) -> None:
+            captured["model_name"] = model_name
+            captured.update(kwargs)
+
+        def encode(self, *_args, **_kwargs) -> np.ndarray:
+            return np.asarray([[1.0]], dtype=np.float32)
+
+    monkeypatch.delenv("NLP_DEVICE", raising=False)
+    monkeypatch.delenv("EMBED_DEVICE", raising=False)
+    monkeypatch.delenv("TORCH_DEVICE", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch())
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        types.SimpleNamespace(SentenceTransformer=_FakeSentenceTransformer),
+    )
+
+    encoder = SentenceTransformerEncoder()
+    encoder.encode(["text"])
+
+    assert captured["device"] == "cpu"

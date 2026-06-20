@@ -26,6 +26,7 @@ AUDITED_SAFE_ROUTE_PATHS = [
     "/api/system/config",
     "/api/server/status",
     "/api/jobs",
+    "/api/jobs/catalog",
     "/api/jobs/log",
     "/api/jobs/history",
     "/api/db/health",
@@ -44,6 +45,7 @@ EXPECTED_RESPONSE_KEYS = {
     "/api/system/config": {"ok", "status", "health", "config"},
     "/api/server/status": {"ok", "ts_ms", "uptime_s", "host", "port"},
     "/api/jobs": {"ok", "ts_ms", "jobs", "pipeline_order", "allowed"},
+    "/api/jobs/catalog": {"ok", "ts_ms", "jobs", "catalog", "pipeline_order", "allowed"},
     "/api/jobs/log": {"ok", "job"},
     "/api/jobs/history": {"ok", "job"},
     "/api/db/health": {"ok", "ts_ms", "runtime_health", "system_snapshot"},
@@ -65,6 +67,7 @@ SAFE_LOCAL_HANDLER_NAMES = {
     "api_get_ingestion_status",
     "api_get_server_status",
     "api_get_jobs",
+    "api_get_jobs_catalog",
     "api_get_job_log",
     "api_get_job_history",
     "api_get_db_health",
@@ -1241,8 +1244,10 @@ def test_lightweight_system_snapshot_uses_health_lifecycle_when_available(route_
 
     snapshot = api_system._build_system_state_snapshot({}, route_runtime["ctx"])
 
-    assert snapshot["state"] == "LIVE"
+    assert snapshot["state"] == "DEGRADED"
     assert snapshot["status"] == "DEGRADED"
+    assert snapshot["runtime_lifecycle_state"]["state"] == "LIVE"
+    assert snapshot["readiness_state_reason"] == "mode_safe_not_live"
     assert snapshot["system_state_detail"]["detail"] == "market_data_healthy"
     assert snapshot["execution_allowed"] is False
 

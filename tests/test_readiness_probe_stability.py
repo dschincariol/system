@@ -218,6 +218,7 @@ def test_safe_no_credential_readiness_tolerates_skipped_trading_gates(monkeypatc
     monkeypatch.setenv("BROKER_NAME", "sim")
     monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "1")
     monkeypatch.setenv("KILL_SWITCH_GLOBAL", "1")
+    monkeypatch.setenv("ALLOW_CREDENTIAL_DATA_PROVIDERS_IN_SAFE", "0")
 
     startup_gates = {
         "config_valid": {"ok": True, "detail": "ok"},
@@ -258,6 +259,122 @@ def test_safe_no_credential_readiness_tolerates_skipped_trading_gates(monkeypatc
     assert validation["safe_to_operate"] is True
     assert validation["gates"]["scoring_pipeline_operational"]["safe_mode_skipped"] is True
     assert validation["gates"]["execution_engine_initialized"]["safe_mode_skipped"] is True
+
+
+def test_api_readiness_downgrades_safe_lifecycle_live(monkeypatch):
+    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.setattr(api_system, "_cached_health_snapshot", lambda *, allow_sync_on_miss=True: {})
+    monkeypatch.setattr(
+        api_system,
+        "_build_readiness_snapshot",
+        lambda *_args, **_kwargs: {
+            "ts_ms": 123456,
+            "status": "RUNNING",
+            "state": "LIVE",
+            "mode": "safe",
+            "execution_mode": "safe",
+            "execution_allowed": False,
+            "reasons": [],
+            "readiness": {"ok": True, "ready": True, "issues": [], "steps": []},
+            "production_validation": {
+                "status": "healthy",
+                "safe_to_operate": True,
+                "unsafe_to_operate": False,
+                "summary_reason": "production_validation_ok",
+                "current_degraded_reasons": [],
+            },
+            "health": {"ok": True, "lifecycle": {"state": "LIVE", "detail": "market_data_healthy"}},
+            "graph": {"ok": True},
+            "system_state_detail": {"state": "LIVE", "detail": "market_data_healthy"},
+        },
+    )
+
+    response = api_system.api_get_readiness({}, {})
+
+    assert response["ok"] is False
+    assert response["ready"] is False
+    assert response["status"] == "DEGRADED"
+    assert response["mode"] == "safe"
+    assert response["state"] == "DEGRADED"
+    assert response["runtime_lifecycle_state"]["state"] == "LIVE"
+    assert "mode_safe_not_live" in response["reasons"]
+
+
+def test_production_validation_requires_live_trading_preflight(monkeypatch):
+    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
+    live_preflight = importlib.reload(importlib.import_module("engine.runtime.live_trading_preflight"))
+    monkeypatch.setenv("ENGINE_MODE", "live")
+    monkeypatch.setenv("EXECUTION_MODE", "live")
+    monkeypatch.setattr(
+        live_preflight,
+        "live_trading_preflight",
+        lambda **_kwargs: {
+            "ok": False,
+            "required": True,
+            "mode": "live",
+            "execution_mode": "live",
+            "reason": "backup_evidence_json_missing",
+            "blockers": ["backup_evidence_json_missing", "position_reconcile_not_exercised"],
+            "backup_restore_evidence": {"ok": False, "required": True},
+            "position_reconcile_evidence": {"ok": False, "required": True},
+        },
+    )
+    startup_gates = {
+        "config_valid": {"ok": True, "detail": "ok"},
+        "database_reachable": {"ok": True, "detail": "ok"},
+        "schema_valid": {"ok": True, "detail": "ok"},
+        "core_services_initialized": {"ok": True, "detail": "ok"},
+        "required_api_dependencies_available": {"ok": True, "detail": "ok"},
+        "no_port_binding_conflict": {"ok": True, "detail": "ok"},
+        "ui_static_assets_present": {"ok": True, "detail": "ok"},
+    }
+    data_gates = {
+        "ingestion_active": {"ok": True, "detail": "ok"},
+        "ingestion_not_stale": {"ok": True, "detail": "ok"},
+        "critical_features_valid": {"ok": True, "detail": "ok"},
+        "model_inputs_valid": {"ok": True, "detail": "ok"},
+        "scoring_pipeline_operational": {"ok": True, "detail": "ok"},
+    }
+    execution_gates = {
+        "execution_engine_initialized": {"ok": True, "detail": "ok"},
+        "order_state_consistent": {"ok": True, "detail": "ok"},
+        "position_state_consistent": {"ok": True, "detail": "ok"},
+        "pnl_calculation_valid": {"ok": True, "detail": "ok"},
+    }
+    snapshot = {
+        "ts_ms": 123456,
+        "status": "RUNNING",
+        "state": "LIVE",
+        "mode": "live",
+        "execution_mode": "live",
+        "system_state_detail": {"state": "LIVE", "detail": "ok"},
+        "health": {
+            "startup_validation": {"ok": True, "gates": startup_gates},
+            "data_pipeline_gates": {"ok": True, "gates": data_gates},
+            "execution_supervisor": {"ok": True, "state": "ok", "gates": execution_gates, "alerts": []},
+            "execution_barrier": {"mode": "live", "allowed": False, "reason": "readiness_not_ready"},
+            "lifecycle": {"state": "LIVE", "detail": "ok"},
+        },
+        "services": {"engine": {"running": True}},
+        "ingestion": {"ok": True},
+        "graph": {"ok": True},
+        "database_debug": {"failure_classification": {"primary_cause": ""}},
+        "readiness": {"ok": False, "ready": False},
+    }
+
+    validation = api_system._build_production_validation(
+        snapshot,
+        ctx=None,
+        runtime_watchdogs={"ok": True, "pipeline_watchdog_state": {}},
+    )
+
+    assert validation["status"] == "failed"
+    assert validation["safe_to_operate"] is False
+    assert validation["gates"]["live_trading_preflight"]["status"] == "failed"
+    assert "backup_evidence_json_missing" in validation["gates"]["live_trading_preflight"]["blockers"]
+    assert "position_reconcile_not_exercised" in validation["live_trading_preflight"]["blockers"]
 
 
 def test_trading_readiness_stays_blocked_when_service_readiness_is_ok(monkeypatch):

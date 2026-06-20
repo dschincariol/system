@@ -10,7 +10,9 @@ const NPM_RANGE = ">=10.0.0 <11";
 const PYTHON_RANGE = ">=3.11";
 const NODE_TESTS = [
   "tests/test_canvas_line_chart_helpers.mjs",
+  "tests/test_confirmation_modal.mjs",
   "tests/test_command_palette_helpers.mjs",
+  "tests/test_job_catalog_ui.mjs",
   "tests/test_symbol_context.mjs",
   "tests/test_mobile_ops_helpers.mjs",
   "tests/test_replay_ui_helpers.mjs",
@@ -57,15 +59,10 @@ function pythonVersionOk(version) {
   return version && cmpVersion(version, [3, 11, 0]) >= 0;
 }
 
-function commandName(command) {
-  return process.platform === "win32" && command === "npm" ? "npm.cmd" : command;
-}
-
 function runCapture(command, args) {
-  return spawnSync(commandName(command), args, {
+  return spawnSync(command, args, {
     cwd: ROOT,
     encoding: "utf8",
-    windowsHide: true,
   });
 }
 
@@ -78,14 +75,9 @@ function findPython() {
   for (const envName of ["PYTHON", "OPERATOR_PYTHON"]) {
     if (process.env[envName]) candidates.push({ command: process.env[envName], args: [], source: `$${envName}` });
   }
-  if (process.platform === "win32") {
-    candidates.push({ command: "py", args: ["-3.11"], source: "py -3.11" });
-    candidates.push({ command: "python", args: [], source: "python" });
-  } else {
-    candidates.push({ command: "python", args: [], source: "python" });
-    candidates.push({ command: "python3", args: [], source: "python3" });
-    candidates.push({ command: "python3.11", args: [], source: "python3.11" });
-  }
+  candidates.push({ command: "python", args: [], source: "python" });
+  candidates.push({ command: "python3", args: [], source: "python3" });
+  candidates.push({ command: "python3.11", args: [], source: "python3.11" });
 
   for (const candidate of candidates) {
     const result = runCapture(candidate.command, [
@@ -202,11 +194,10 @@ function preflight() {
 
 function runStep(command, args) {
   console.log(`\n$ ${formatCommand(command, args)}`);
-  const result = spawnSync(commandName(command), args, {
+  const result = spawnSync(command, args, {
     cwd: ROOT,
     env: process.env,
     stdio: "inherit",
-    windowsHide: true,
   });
   if (result.error) {
     console.error(`UI validation could not start ${command}: ${result.error.message}`);

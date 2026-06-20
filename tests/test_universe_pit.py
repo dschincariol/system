@@ -299,7 +299,10 @@ class UniversePitTests(unittest.TestCase):
                 ],
             )
 
-        with patch.object(lgbm_mod, "connect", side_effect=self._connect), patch.object(
+        with patch.dict(
+            os.environ,
+            {"RUNTIME_WORKLOAD_PROFILE": "offline", "ALLOW_TRAINING": "1"},
+        ), patch.object(lgbm_mod, "connect", side_effect=self._connect), patch.object(
             lgbm_mod, "init_db", return_value=None
         ), patch.object(
             lgbm_mod, "load_lifecycle_plan", return_value={}

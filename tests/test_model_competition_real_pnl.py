@@ -17,7 +17,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.promotion_test_helpers import passing_deconfounded_payload
+
 pytestmark = pytest.mark.requires_postgres
+
+
+def _postgres_backend_enabled() -> bool:
+    backend = str(os.environ.get("TS_STORAGE_BACKEND") or "").strip().lower()
+    return backend in {"postgres", "postgresql", "timescale"} and bool(os.environ.get("TS_PG_DSN"))
 
 
 def _reload_modules(*module_names: str):
@@ -51,6 +58,10 @@ class ModelCompetitionRealPnlTests(unittest.TestCase):
             "CHAMPION_PROMOTION_MIN_DEFLATED_SHARPE",
             "CHAMPION_PROMOTION_MIN_OBSERVATIONS",
             "CHAMPION_PROMOTION_FDR_ALPHA",
+            "CPCV_ENABLED",
+            "ENGINE_MODE",
+            "ENV",
+            "ENGINE_SUPERVISED",
             "SPA_TEST_ENABLED",
             "SPA_MIN_MODELS",
             "SPA_BOOTSTRAP_SAMPLES",
@@ -88,6 +99,26 @@ class ModelCompetitionRealPnlTests(unittest.TestCase):
     @staticmethod
     def _flat_oos_returns(value: float, n_obs: int = 60) -> list[float]:
         return [float(value)] * int(n_obs)
+
+    @staticmethod
+    def _stat_gate_row(model_name: str, returns: list[float]) -> dict:
+        return {
+            "model_id": str(model_name),
+            "model_name": str(model_name),
+            "score": 0.99,
+            "trades": len(returns),
+            "wins": sum(1 for value in returns if value > 0.0),
+            "losses": sum(1 for value in returns if value < 0.0),
+            "net_pnl": float(sum(returns)),
+            "meta": {
+                "score_source": "pnl_attribution",
+                "realized_trade_pnls": [float(value) for value in returns],
+                "rolling_total_pnl": float(sum(returns)),
+                "net_cost_label_count": len(returns),
+                "net_cost_evidence_available": True,
+                "net_cost_evidence": {"available": True, "n": len(returns)},
+            },
+        }
 
     def _latest_statistical_evidence(self, model_id: str, test_name: str = "white_reality_check") -> dict:
         con = self.storage.connect()
@@ -135,6 +166,7 @@ class ModelCompetitionRealPnlTests(unittest.TestCase):
         model_kind: str = "test_model",
         realized_trade_pnls: list[float] | None = None,
         notional_traded: float | None = None,
+        net_cost_evidence: bool = True,
     ) -> None:
         meta = {
             "score_source": str(score_source),
@@ -156,8 +188,23 @@ class ModelCompetitionRealPnlTests(unittest.TestCase):
             "model_kind": str(model_kind),
             "model_ts_ms": int(first_signal_ts_ms),
         }
+        if net_cost_evidence:
+            meta["net_cost_label_count"] = int(max(1, trades))
+            meta["net_cost_evidence_available"] = True
+            meta["net_cost_evidence"] = {
+                "available": True,
+                "n": int(max(1, trades)),
+                "avg_net_return": float(net_pnl) / float(max(1, trades)),
+                "avg_gross_return": (float(net_pnl) / float(max(1, trades))) + 0.001,
+                "avg_execution_cost_return": 0.001,
+                "avg_total_cost_bps": 10.0,
+            }
         if realized_trade_pnls is not None:
             meta["realized_trade_pnls"] = [float(value) for value in list(realized_trade_pnls)]
+            deconfounded_n_obs = len(meta["realized_trade_pnls"])
+        else:
+            deconfounded_n_obs = int(max(8, trades))
+        meta["deconfounded_validation"] = passing_deconfounded_payload(deconfounded_n_obs)
         if notional_traded is not None:
             meta["notional_traded"] = float(notional_traded)
         con = self.storage.connect()
@@ -187,6 +234,41 @@ class ModelCompetitionRealPnlTests(unittest.TestCase):
                     int(last_signal_ts_ms),
                     int(last_signal_ts_ms),
                     json.dumps(meta, separators=(",", ":"), sort_keys=True),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _insert_champion_assignment(
+        self,
+        *,
+        model_name: str,
+        symbol: str = "AAPL",
+        horizon_s: int = 300,
+        assigned_ts_ms: int | None = None,
+    ) -> None:
+        now_ms = int(assigned_ts_ms or int(time.time() * 1000))
+        con = self.storage.connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO champion_assignments(
+                  scope, symbol, horizon_s, model_name, challenger_name, regime, state, assigned_ts_ms, updated_ts_ms, meta_json
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "global",
+                    str(symbol).upper().strip(),
+                    int(horizon_s),
+                    str(model_name),
+                    "",
+                    "global",
+                    "champion",
+                    int(now_ms),
+                    int(now_ms),
+                    json.dumps({"last_promotion_ts_ms": 0}, separators=(",", ":"), sort_keys=True),
                 ),
             )
             con.commit()
@@ -309,11 +391,291 @@ class ModelCompetitionRealPnlTests(unittest.TestCase):
                     "first_signal_ts_ms": now_ms - 10_000,
                     "last_signal_ts_ms": now_ms,
                     "observation_duration_ms": 10_000,
+                    "net_cost_label_count": 4,
+                    "net_cost_evidence": {"available": True, "n": 4},
                 },
             }
         )
 
         self.assertTrue(eligible)
+
+    def test_candidate_eligibility_blocks_missing_net_cost_evidence(self) -> None:
+        now_ms = int(time.time() * 1000)
+        eligible = self.champion_manager._candidate_is_eligible(
+            {
+                "score": 0.95,
+                "trades": 4,
+                "wins": 3,
+                "losses": 1,
+                "net_pnl": 40.0,
+                "meta": {
+                    "rolling_total_pnl": 40.0,
+                    "first_signal_ts_ms": now_ms - 10_000,
+                    "last_signal_ts_ms": now_ms,
+                    "observation_duration_ms": 10_000,
+                },
+            }
+        )
+
+        self.assertFalse(eligible)
+
+    def test_promotion_stat_gate_blocks_insufficient_observations_in_live_mode(self) -> None:
+        os.environ["ENGINE_MODE"] = "live"
+        os.environ["CHAMPION_PROMOTION_USE_STAT_GATE"] = "0"
+        os.environ["CPCV_ENABLED"] = "0"
+        os.environ["CHAMPION_PROMOTION_MIN_OBSERVATIONS"] = "5"
+        self._reload_runtime_modules()
+
+        row = self._stat_gate_row("live_low_obs", [0.2, 0.2, 0.2, 0.2])
+        champion = self._stat_gate_row("live_current", [0.0, 0.0, 0.0, 0.0])
+
+        with patch.object(self.champion_manager, "assess_challenger") as assess_challenger:
+            passed, diagnostics = self.champion_manager._evaluate_promotion_stat_gate(
+                row,
+                n_competing_trials=1,
+                champion_row=champion,
+            )
+
+        assess_challenger.assert_not_called()
+        self.assertFalse(bool(passed))
+        self.assertFalse(bool(diagnostics.get("passed")))
+        self.assertEqual(str(diagnostics.get("status") or ""), "insufficient_observations")
+        self.assertEqual(str(diagnostics.get("promotion_mode") or ""), "live")
+        self.assertTrue(bool(diagnostics.get("fail_closed")))
+        self.assertEqual(int(diagnostics.get("current_observations") or 0), 4)
+        self.assertEqual(int(diagnostics.get("required_observations") or 0), 5)
+        self.assertIn("insufficient_observations", list(diagnostics.get("blockers") or []))
+
+    def test_promotion_stat_gate_blocks_insufficient_observations_in_paper_mode(self) -> None:
+        os.environ["ENGINE_MODE"] = "paper"
+        os.environ["CHAMPION_PROMOTION_USE_STAT_GATE"] = "0"
+        os.environ["CPCV_ENABLED"] = "0"
+        os.environ["CHAMPION_PROMOTION_MIN_OBSERVATIONS"] = "5"
+        self._reload_runtime_modules()
+
+        row = self._stat_gate_row("paper_low_obs", [0.2, 0.2, 0.2, 0.2])
+
+        passed, diagnostics = self.champion_manager._evaluate_promotion_stat_gate(row, n_competing_trials=1)
+
+        self.assertFalse(bool(passed))
+        self.assertFalse(bool(diagnostics.get("passed")))
+        self.assertEqual(str(diagnostics.get("status") or ""), "insufficient_observations")
+        self.assertEqual(str(diagnostics.get("promotion_mode") or ""), "paper")
+        self.assertEqual(int(diagnostics.get("challenger_observations") or 0), 4)
+        self.assertEqual(int(diagnostics.get("champion_observations", -1)), 0)
+        self.assertEqual(int(diagnostics.get("current_observations") or 0), 4)
+        self.assertEqual(int(diagnostics.get("min_observations") or 0), 5)
+
+    def test_safe_and_shadow_modes_keep_explicit_low_observation_advisory(self) -> None:
+        for mode_name in ("safe", "shadow"):
+            with self.subTest(mode_name=mode_name):
+                os.environ["ENGINE_MODE"] = mode_name
+                os.environ["CHAMPION_PROMOTION_USE_STAT_GATE"] = "0"
+                os.environ["CPCV_ENABLED"] = "0"
+                os.environ["CHAMPION_PROMOTION_MIN_OBSERVATIONS"] = "5"
+                self._reload_runtime_modules()
+
+                row = self._stat_gate_row(f"{mode_name}_low_obs", [0.2, 0.2, 0.2, 0.2])
+                passed, diagnostics = self.champion_manager._evaluate_promotion_stat_gate(row, n_competing_trials=1)
+
+                self.assertTrue(bool(passed))
+                self.assertTrue(bool(diagnostics.get("passed")))
+                self.assertEqual(str(diagnostics.get("status") or ""), "insufficient_observations_advisory")
+                self.assertEqual(str(diagnostics.get("promotion_mode") or ""), mode_name)
+                self.assertFalse(bool(diagnostics.get("fail_closed")))
+                self.assertTrue(bool(diagnostics.get("advisory")))
+
+    def test_competition_cycle_blocks_low_observation_bootstrap_without_incumbent(self) -> None:
+        if not _postgres_backend_enabled():
+            self.skipTest("postgres backend required for assignment-path promotion schema")
+        os.environ["ENGINE_MODE"] = "paper"
+        os.environ["CHAMPION_PROMOTION_USE_STAT_GATE"] = "0"
+        os.environ["CPCV_ENABLED"] = "0"
+        os.environ["CHAMPION_PROMOTION_MIN_OBSERVATIONS"] = "5"
+        self._reload_runtime_modules()
+
+        now_ms = int(time.time() * 1000)
+        first_ts = now_ms - 10_000
+        returns = [0.3, 0.3, 0.3, 0.3]
+        self._insert_marketplace_row(
+            model_id="low_obs_bootstrap",
+            model_name="low_obs_bootstrap",
+            symbol="AAPL",
+            horizon_s=300,
+            score=0.99,
+            net_pnl=sum(returns),
+            trades=len(returns),
+            wins=len(returns),
+            losses=0,
+            first_signal_ts_ms=first_ts,
+            last_signal_ts_ms=now_ms,
+            stage="challenger",
+            realized_trade_pnls=returns,
+        )
+        replay_models = {
+            "low_obs_bootstrap|AAPL|300|global": {
+                "approved": True,
+                "model_name": "low_obs_bootstrap",
+                "symbol": "AAPL",
+                "horizon_s": 300,
+                "regime": "global",
+            }
+        }
+
+        with patch.object(self.champion_manager, "promotion_allowed", return_value=(True, {"allowed": True})), patch.object(
+            self.champion_manager,
+            "_evaluate_candidate_graph_gate",
+            return_value=(True, {"applied": False, "passed": True}),
+        ), patch.object(
+            self.champion_manager,
+            "_evaluate_candidate_ope_gate",
+            return_value=(True, {"applied": False, "passed": True}),
+        ), patch.object(
+            self.champion_manager,
+            "get_cached_replay_validation_snapshot",
+            return_value={"fresh": True, "snapshot": {"models": replay_models}},
+        ), patch.object(
+            self.champion_manager,
+            "run_self_critic",
+            return_value={"blocked_keys": []},
+        ), patch.object(
+            self.champion_manager,
+            "compute_capital_plan",
+            return_value={},
+        ), patch.object(
+            self.champion_manager,
+            "_sync_assignment_to_model_registry",
+            return_value=None,
+        ), patch.object(
+            self.champion_manager,
+            "_sync_registry_runtime",
+            return_value=None,
+        ), patch.object(
+            self.champion_manager,
+            "audit",
+            return_value=None,
+        ):
+            result = self.champion_manager.evaluate_competition_cycle()
+
+        assignment = self.champion_manager.get_champion_assignment("global", "AAPL", 300)
+        changes = list(result.get("changes") or [])
+        blocked = next((change for change in changes if str((change or {}).get("symbol") or "") == "AAPL"), {})
+        stat_gate = dict(blocked.get("stat_gate") or {})
+
+        self.assertTrue(bool(result.get("ok")))
+        self.assertEqual(assignment, {})
+        self.assertEqual(str(blocked.get("reason") or ""), "bootstrap_best_stat_gate_blocked")
+        self.assertEqual(str(blocked.get("to_model_name") or ""), "")
+        self.assertEqual(str(stat_gate.get("status") or ""), "insufficient_observations")
+        self.assertEqual(int(stat_gate.get("current_observations") or 0), 4)
+        self.assertEqual(int(stat_gate.get("required_observations") or 0), 5)
+
+    def test_competition_cycle_blocks_low_observation_challenger_with_incumbent(self) -> None:
+        if not _postgres_backend_enabled():
+            self.skipTest("postgres backend required for assignment-path promotion schema")
+        os.environ["ENGINE_MODE"] = "paper"
+        os.environ["CHAMPION_PROMOTION_USE_STAT_GATE"] = "0"
+        os.environ["CPCV_ENABLED"] = "0"
+        os.environ["CHAMPION_PROMOTION_MIN_OBSERVATIONS"] = "5"
+        self._reload_runtime_modules()
+
+        now_ms = int(time.time() * 1000)
+        first_ts = now_ms - 10_000
+        current_returns = [0.0, 0.0, 0.0, 0.0]
+        challenger_returns = [0.3, 0.3, 0.3, 0.3]
+        self._insert_marketplace_row(
+            model_id="low_obs_current",
+            model_name="low_obs_current",
+            symbol="AAPL",
+            horizon_s=300,
+            score=0.50,
+            net_pnl=0.1,
+            trades=len(current_returns),
+            wins=1,
+            losses=3,
+            first_signal_ts_ms=first_ts,
+            last_signal_ts_ms=now_ms,
+            stage="champion",
+            realized_trade_pnls=current_returns,
+        )
+        self._insert_marketplace_row(
+            model_id="low_obs_challenger",
+            model_name="low_obs_challenger",
+            symbol="AAPL",
+            horizon_s=300,
+            score=0.99,
+            net_pnl=sum(challenger_returns),
+            trades=len(challenger_returns),
+            wins=len(challenger_returns),
+            losses=0,
+            first_signal_ts_ms=first_ts,
+            last_signal_ts_ms=now_ms,
+            stage="challenger",
+            realized_trade_pnls=challenger_returns,
+        )
+        self._insert_champion_assignment(
+            model_name="low_obs_current",
+            assigned_ts_ms=now_ms - 5_000,
+        )
+        replay_models = {
+            "low_obs_current|AAPL|300|global": {"approved": True, "model_name": "low_obs_current", "symbol": "AAPL", "horizon_s": 300, "regime": "global"},
+            "low_obs_challenger|AAPL|300|global": {"approved": True, "model_name": "low_obs_challenger", "symbol": "AAPL", "horizon_s": 300, "regime": "global"},
+        }
+
+        with patch.object(self.champion_manager, "promotion_allowed", return_value=(True, {"allowed": True})), patch.object(
+            self.champion_manager,
+            "_evaluate_candidate_graph_gate",
+            return_value=(True, {"applied": False, "passed": True}),
+        ), patch.object(
+            self.champion_manager,
+            "_evaluate_candidate_ope_gate",
+            return_value=(True, {"applied": False, "passed": True}),
+        ), patch.object(
+            self.champion_manager,
+            "get_cached_replay_validation_snapshot",
+            return_value={"fresh": True, "snapshot": {"models": replay_models}},
+        ), patch.object(
+            self.champion_manager,
+            "run_self_critic",
+            return_value={"blocked_keys": []},
+        ), patch.object(
+            self.champion_manager,
+            "compute_capital_plan",
+            return_value={},
+        ), patch.object(
+            self.champion_manager,
+            "_sync_assignment_to_model_registry",
+            return_value=None,
+        ), patch.object(
+            self.champion_manager,
+            "_sync_registry_runtime",
+            return_value=None,
+        ), patch.object(
+            self.champion_manager,
+            "audit",
+            return_value=None,
+        ):
+            result = self.champion_manager.evaluate_competition_cycle()
+
+        assignment = self.champion_manager.get_champion_assignment("global", "AAPL", 300)
+        blocked = next(
+            (
+                change
+                for change in list(result.get("changes") or [])
+                if str((change or {}).get("symbol") or "") == "AAPL"
+                and str((change or {}).get("reason") or "").endswith("_stat_gate_blocked")
+            ),
+            {},
+        )
+        stat_gate = dict(blocked.get("stat_gate") or {})
+
+        self.assertTrue(bool(result.get("ok")))
+        self.assertEqual(str(assignment.get("model_name") or ""), "low_obs_current")
+        self.assertEqual(str(blocked.get("from_model_name") or ""), "low_obs_current")
+        self.assertEqual(str(blocked.get("to_model_name") or ""), "low_obs_current")
+        self.assertEqual(str(stat_gate.get("status") or ""), "insufficient_observations")
+        self.assertEqual(int(stat_gate.get("current_observations") or 0), 4)
+        self.assertEqual(int(stat_gate.get("required_observations") or 0), 5)
 
     def test_competition_cycle_promotes_higher_real_pnl_challenger_even_with_lower_score(self) -> None:
         now_ms = int(time.time() * 1000)
@@ -1110,6 +1472,263 @@ class ModelCompetitionRealPnlTests(unittest.TestCase):
                 for change in list(result.get("changes") or [])
             )
         )
+
+    def test_global_model_competition_blocks_best_when_self_critic_blocks_context(self) -> None:
+        if not _postgres_backend_enabled():
+            self.skipTest("postgres backend required for assignment-path promotion schema")
+        now_ms = int(time.time() * 1000)
+        first_ts = now_ms - 60_000
+        self._insert_marketplace_row(
+            model_id="global_blocked",
+            model_name="global_blocked",
+            symbol="AAPL",
+            horizon_s=300,
+            score=0.99,
+            net_pnl=80.0,
+            trades=60,
+            wins=60,
+            losses=0,
+            first_signal_ts_ms=first_ts,
+            last_signal_ts_ms=now_ms,
+            realized_trade_pnls=self._flat_oos_returns(0.2),
+        )
+        replay_models = {
+            "global_blocked|baseline|AAPL|300|global": {
+                "approved": True,
+                "model_name": "global_blocked",
+                "symbol": "AAPL",
+                "horizon_s": 300,
+                "regime": "global",
+            }
+        }
+
+        with patch.object(self.champion_manager, "promotion_allowed", return_value=(True, {"allowed": True})), patch.object(
+            self.champion_manager,
+            "get_cached_replay_validation_snapshot",
+            return_value={"fresh": True, "snapshot": {"models": replay_models}},
+        ), patch.object(
+            self.champion_manager,
+            "run_self_critic",
+            return_value={"blocked_keys": ["global_blocked|baseline|AAPL|300|global"]},
+        ), patch.object(
+            self.champion_manager,
+            "compute_capital_plan",
+            return_value={},
+        ), patch.object(
+            self.champion_manager,
+            "_sync_registry_runtime",
+            return_value=None,
+        ):
+            result = self.champion_manager.evaluate_competition_cycle()
+
+        assignment = self.champion_manager.get_champion_assignment(
+            self.champion_manager.MODEL_COMPETITION_SCOPE,
+            self.champion_manager.MODEL_COMPETITION_SYMBOL,
+            self.champion_manager.MODEL_COMPETITION_HORIZON_S,
+        )
+        global_change = next(
+            (row for row in list(result.get("changes") or []) if str((row or {}).get("scope") or "") == self.champion_manager.MODEL_COMPETITION_SCOPE),
+            {},
+        )
+
+        self.assertEqual(assignment, {})
+        self.assertEqual(str(global_change.get("reason") or ""), "best_blocked_self_critic")
+        self.assertIn("self_critic_blocked", list(dict(global_change.get("best_promotion_eligibility") or {}).get("block_reasons") or []))
+
+    def test_global_model_competition_blocks_best_without_replay_approval(self) -> None:
+        if not _postgres_backend_enabled():
+            self.skipTest("postgres backend required for assignment-path promotion schema")
+        now_ms = int(time.time() * 1000)
+        first_ts = now_ms - 60_000
+        self._insert_marketplace_row(
+            model_id="global_missing_replay",
+            model_name="global_missing_replay",
+            symbol="AAPL",
+            horizon_s=300,
+            score=0.99,
+            net_pnl=80.0,
+            trades=60,
+            wins=60,
+            losses=0,
+            first_signal_ts_ms=first_ts,
+            last_signal_ts_ms=now_ms,
+            realized_trade_pnls=self._flat_oos_returns(0.2),
+        )
+
+        with patch.object(self.champion_manager, "promotion_allowed", return_value=(True, {"allowed": True})), patch.object(
+            self.champion_manager,
+            "get_cached_replay_validation_snapshot",
+            return_value={"fresh": True, "snapshot": {"models": {}}},
+        ), patch.object(
+            self.champion_manager,
+            "run_self_critic",
+            return_value={"blocked_keys": []},
+        ), patch.object(
+            self.champion_manager,
+            "compute_capital_plan",
+            return_value={},
+        ), patch.object(
+            self.champion_manager,
+            "_sync_registry_runtime",
+            return_value=None,
+        ):
+            result = self.champion_manager.evaluate_competition_cycle()
+
+        assignment = self.champion_manager.get_champion_assignment(
+            self.champion_manager.MODEL_COMPETITION_SCOPE,
+            self.champion_manager.MODEL_COMPETITION_SYMBOL,
+            self.champion_manager.MODEL_COMPETITION_HORIZON_S,
+        )
+        global_change = next(
+            (row for row in list(result.get("changes") or []) if str((row or {}).get("scope") or "") == self.champion_manager.MODEL_COMPETITION_SCOPE),
+            {},
+        )
+
+        self.assertEqual(assignment, {})
+        self.assertEqual(str(global_change.get("reason") or ""), "replay_gate_blocked")
+        self.assertIn("replay_missing", list(dict(global_change.get("best_promotion_eligibility") or {}).get("block_reasons") or []))
+
+    def test_global_model_competition_blocks_best_when_replay_snapshot_is_stale(self) -> None:
+        if not _postgres_backend_enabled():
+            self.skipTest("postgres backend required for assignment-path promotion schema")
+        now_ms = int(time.time() * 1000)
+        first_ts = now_ms - 60_000
+        self._insert_marketplace_row(
+            model_id="global_stale_replay",
+            model_name="global_stale_replay",
+            symbol="AAPL",
+            horizon_s=300,
+            score=0.99,
+            net_pnl=80.0,
+            trades=60,
+            wins=60,
+            losses=0,
+            first_signal_ts_ms=first_ts,
+            last_signal_ts_ms=now_ms,
+            realized_trade_pnls=self._flat_oos_returns(0.2),
+        )
+        replay_models = {
+            "global_stale_replay|baseline|AAPL|300|global": {
+                "approved": True,
+                "model_name": "global_stale_replay",
+                "symbol": "AAPL",
+                "horizon_s": 300,
+                "regime": "global",
+            }
+        }
+
+        with patch.object(
+            self.champion_manager,
+            "get_cached_replay_validation_snapshot",
+            return_value={"fresh": False, "snapshot": {"models": replay_models}},
+        ), patch.object(
+            self.champion_manager,
+            "run_self_critic",
+            return_value={"blocked_keys": []},
+        ), patch.object(
+            self.champion_manager,
+            "compute_capital_plan",
+            return_value={},
+        ):
+            result = self.champion_manager.evaluate_competition_cycle()
+
+        assignment = self.champion_manager.get_champion_assignment(
+            self.champion_manager.MODEL_COMPETITION_SCOPE,
+            self.champion_manager.MODEL_COMPETITION_SYMBOL,
+            self.champion_manager.MODEL_COMPETITION_HORIZON_S,
+        )
+        global_change = next(
+            (row for row in list(result.get("changes") or []) if str((row or {}).get("scope") or "") == self.champion_manager.MODEL_COMPETITION_SCOPE),
+            {},
+        )
+
+        self.assertEqual(str(result.get("status") or ""), "replay_stale")
+        self.assertEqual(assignment, {})
+        self.assertEqual(str(global_change.get("reason") or ""), "replay_stale")
+        self.assertIn("replay_stale", list(dict(global_change.get("best_promotion_eligibility") or {}).get("block_reasons") or []))
+
+    def test_global_model_competition_assigns_valid_replay_approved_candidate(self) -> None:
+        if not _postgres_backend_enabled():
+            self.skipTest("postgres backend required for assignment-path promotion schema")
+        now_ms = int(time.time() * 1000)
+        first_ts = now_ms - 60_000
+        self._insert_marketplace_row(
+            model_id="global_replay_valid",
+            model_name="global_replay_valid",
+            symbol="AAPL",
+            horizon_s=300,
+            score=0.99,
+            net_pnl=80.0,
+            trades=60,
+            wins=60,
+            losses=0,
+            first_signal_ts_ms=first_ts,
+            last_signal_ts_ms=now_ms,
+            realized_trade_pnls=self._flat_oos_returns(0.2),
+        )
+        replay_models = {
+            "global_replay_valid|baseline|AAPL|300|global": {
+                "approved": True,
+                "model_name": "global_replay_valid",
+                "symbol": "AAPL",
+                "horizon_s": 300,
+                "regime": "global",
+            }
+        }
+
+        with patch.object(self.champion_manager, "promotion_allowed", return_value=(True, {"allowed": True})), patch.object(
+            self.champion_manager,
+            "_evaluate_candidate_graph_gate",
+            return_value=(True, {"applied": False, "passed": True}),
+        ), patch.object(
+            self.champion_manager,
+            "_evaluate_candidate_ope_gate",
+            return_value=(True, {"applied": False, "passed": True}),
+        ), patch.object(
+            self.champion_manager,
+            "_evaluate_promotion_stat_gate",
+            return_value=(True, {"enabled": True, "validation_enabled": True, "passed": True, "status": "passed"}),
+        ), patch.object(
+            self.champion_manager,
+            "get_cached_replay_validation_snapshot",
+            return_value={"fresh": True, "snapshot": {"models": replay_models}},
+        ), patch.object(
+            self.champion_manager,
+            "run_self_critic",
+            return_value={"blocked_keys": []},
+        ), patch.object(
+            self.champion_manager,
+            "compute_capital_plan",
+            return_value={},
+        ), patch.object(
+            self.champion_manager,
+            "_sync_assignment_to_model_registry",
+            return_value=None,
+        ), patch.object(
+            self.champion_manager,
+            "_sync_registry_runtime",
+            return_value=None,
+        ), patch.object(
+            self.champion_manager,
+            "audit",
+            return_value=None,
+        ):
+            result = self.champion_manager.evaluate_competition_cycle()
+
+        assignment = self.champion_manager.get_champion_assignment(
+            self.champion_manager.MODEL_COMPETITION_SCOPE,
+            self.champion_manager.MODEL_COMPETITION_SYMBOL,
+            self.champion_manager.MODEL_COMPETITION_HORIZON_S,
+        )
+        global_change = next(
+            (row for row in list(result.get("changes") or []) if str((row or {}).get("scope") or "") == self.champion_manager.MODEL_COMPETITION_SCOPE),
+            {},
+        )
+
+        self.assertEqual(str(assignment.get("model_name") or ""), "global_replay_valid")
+        self.assertEqual(str(global_change.get("reason") or ""), "bootstrap_best")
+        self.assertTrue(bool(dict(global_change.get("promotion_eligibility") or {}).get("eligible")))
+        self.assertTrue(bool(dict(assignment.get("meta") or {}).get("promotion_eligibility", {}).get("eligible")))
 
     def test_compute_capital_plan_globally_scales_group_budgets(self) -> None:
         prev_total_cap = os.environ.get("COMPETITION_TOTAL_CAPITAL_FRACTION")

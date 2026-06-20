@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRADING_USER="${TRADING_USER:-trading}"
 TRADING_GROUP="${TRADING_GROUP:-trading}"
 INSTALL_ROOT="${TRADING_INSTALL_ROOT:-/opt/trading}"
+APP_ROOT="${TRADING_APP_ROOT:-${INSTALL_ROOT}/app}"
 DATA_ROOT="${TRADING_DATA_ROOT:-/var/lib/trading}"
 DB_DIR="${TRADING_DB_DIR:-${DATA_ROOT}/db}"
 REDIS_DIR="${TRADING_REDIS_DIR:-${DATA_ROOT}/redis}"
@@ -115,7 +116,7 @@ check_credstore() {
   require_command systemd-creds
   log "checking encrypted credential inventory"
   local name path owner group mode
-  for name in master_key pg_password_app pg_password_ingest pg_password_reader; do
+  for name in master_key pg_password_app pg_password_ingest pg_password_reader redis_password object_store_secret_key dashboard_api_token; do
     path="${CREDSTORE_DIR}/${name}.cred"
     [ -r "$path" ] || fail "missing encrypted credential ${path}"
     owner="$(stat -c '%U' "$path")"
@@ -136,10 +137,20 @@ check_systemd_units() {
   fi
 
   local unit
-  for unit in trading-api.service trading-jobs.service trading-stream-prices.service trading-ingest.service trading.target; do
+  for unit in trading-prod-preflight.service trading-api.service trading-jobs.service trading-stream-prices.service trading-ingest.service trading.target; do
     [ -f "${source_dir}/${unit}" ] || fail "missing systemd unit ${source_dir}/${unit}"
     systemd-analyze verify "${source_dir}/${unit}"
   done
+}
+
+check_prod_preflight_runner() {
+  log "checking production preflight runner"
+  local runner="${APP_ROOT}/ops/server/run_prod_preflight.sh"
+  if [ ! -f "$runner" ]; then
+    runner="${SCRIPT_DIR}/run_prod_preflight.sh"
+  fi
+  [ -x "$runner" ] || fail "missing executable production preflight runner ${runner}"
+  bash -n "$runner"
 }
 
 check_backup_assets() {
@@ -184,6 +195,7 @@ main() {
   check_filesystem
   check_credstore
   check_systemd_units
+  check_prod_preflight_runner
   check_backup_assets
   log "all checks passed"
 }

@@ -59,3 +59,15 @@ def test_xgb_family_defaults_to_shadow_on_import():
     family = registry.get_registered_model_family("xgb_regressor")
     assert family["default_stage"] == "shadow"
     assert family["promotion_guard"].endswith("promotion_guard.assess_challenger")
+
+
+def test_xgb_default_n_jobs_is_configurable_and_bounded(monkeypatch):
+    monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "offline")
+    monkeypatch.setenv("XGB_N_JOBS", "10")
+    monkeypatch.setenv("MODEL_TRAIN_MAX_N_JOBS", "4")
+    module = importlib.import_module("engine.strategy.models.xgb_regressor")
+
+    model = module.XGBRegressorModel(feature_ids=list(FEATURE_IDS))
+
+    assert model.hyperparams["n_jobs"] == 4

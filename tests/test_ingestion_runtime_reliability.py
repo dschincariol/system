@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import base64
 import json
 import os
 import sqlite3
@@ -17,6 +18,8 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+VALID_DATA_SOURCE_MASTER_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
 
 
 def _reload_modules(*module_names: str):
@@ -177,12 +180,47 @@ def test_safe_no_credential_child_spawn_sanitizes_control_plane_overlay() -> Non
     assert "OPENAI_API_KEY" not in env
 
 
+def test_ingestion_child_spawn_uses_bounded_child_pool_profile() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "ENGINE_MODE": "safe",
+            "EXECUTION_MODE": "safe",
+            "YFINANCE_ENABLED": "1",
+            "INGESTION_TUNING_PROFILE": "host_32t_123g",
+            "TS_PG_POOL_SIZE": "12",
+            "TIMESCALE_POOL_MAX_SIZE": "8",
+            "TIMESCALE_PRICES_POOL_MAX_SIZE": "8",
+        },
+        clear=False,
+    ):
+        (ingestion_runtime,) = _reload_modules("engine.runtime.ingestion_runtime")
+        captured: dict[str, dict[str, str]] = {}
+
+        def _fake_popen(*_args, **kwargs):
+            captured["env"] = dict(kwargs.get("env") or {})
+            return SimpleNamespace(pid=12345, poll=lambda: None)
+
+        with patch.object(ingestion_runtime.subprocess, "Popen", side_effect=_fake_popen):
+            ingestion_runtime._spawn_child_once("poll_prices")
+
+    env = captured["env"]
+    assert env["ENGINE_PROCESS_ROLE"] == "ingestion_child"
+    assert env["TS_PG_POOL_PROFILE"] == "jobs"
+    assert env["TS_PG_POOL_SIZE"] == "3"
+    assert env["TS_PG_POOL_MIN_SIZE"] == "1"
+    assert env["TIMESCALE_POOL_MAX_SIZE"] == "4"
+    assert env["TIMESCALE_PRICES_POOL_MAX_SIZE"] == "4"
+
+
 class IngestionRuntimeReliabilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.prev_liveness_queue_enabled = os.environ.get("SQLITE_LIVENESS_QUEUE_ENABLED")
+        self.prev_data_source_master_key = os.environ.get("DATA_SOURCE_MASTER_KEY")
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "ingestion_runtime.db")
         os.environ["SQLITE_LIVENESS_QUEUE_ENABLED"] = "0"
+        os.environ["DATA_SOURCE_MASTER_KEY"] = VALID_DATA_SOURCE_MASTER_KEY
         (storage,) = _reload_modules("engine.runtime.storage")
         storage.init_db()
 
@@ -206,6 +244,10 @@ class IngestionRuntimeReliabilityTests(unittest.TestCase):
             os.environ.pop("SQLITE_LIVENESS_QUEUE_ENABLED", None)
         else:
             os.environ["SQLITE_LIVENESS_QUEUE_ENABLED"] = str(self.prev_liveness_queue_enabled)
+        if self.prev_data_source_master_key is None:
+            os.environ.pop("DATA_SOURCE_MASTER_KEY", None)
+        else:
+            os.environ["DATA_SOURCE_MASTER_KEY"] = str(self.prev_data_source_master_key)
         self.tmp.cleanup()
 
     def test_provider_router_opens_circuit_after_repeated_health_failures(self) -> None:

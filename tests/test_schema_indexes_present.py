@@ -93,3 +93,25 @@ def test_targeted_performance_indexes_exist() -> None:
             expected.add("idx_trade_attribution_ledger_source_alert_ts_desc")
         missing = sorted(expected - set(indexes))
         assert not missing, "Targeted indexes missing: " + ", ".join(missing)
+
+
+def test_model_scoring_indexes_exist() -> None:
+    storage_pg = _prepare_db()
+    with storage_pg.connect_ro_direct(timeout_s=1) as conn:
+        indexes = _indexes(conn)
+        expected = {
+            "idx_tracked_predictions_prediction_id_ts_id",
+            "idx_model_performance_prediction_id",
+            "ux_model_performance_tracked_prediction_id",
+        }
+        missing = sorted(expected - set(indexes))
+        assert not missing, "Model scoring indexes missing: " + ", ".join(missing)
+
+        tracked_index = " ".join(indexes["idx_tracked_predictions_prediction_id_ts_id"].split())
+        assert "prediction_id" in tracked_index
+        assert "ts_ms DESC" in tracked_index
+        assert "id DESC" in tracked_index
+        assert "WHERE (prediction_id IS NOT NULL)" in tracked_index
+        assert "prediction_id" in indexes["idx_model_performance_prediction_id"]
+        assert "WHERE (prediction_id IS NOT NULL)" in indexes["idx_model_performance_prediction_id"]
+        assert "CREATE UNIQUE INDEX" in indexes["ux_model_performance_tracked_prediction_id"]

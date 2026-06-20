@@ -63,6 +63,16 @@ def test_unsigned_report_is_no_go_evidence():
     assert signed["report_sha256"]
 
 
+def test_parse_args_defaults_operator_probe_to_dashboard_bridge(monkeypatch):
+    monkeypatch.setattr(soak, "DEFAULT_DASHBOARD_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(soak, "DEFAULT_OPERATOR_URL", "http://127.0.0.1:8000/operator")
+
+    args = soak.parse_args([])
+
+    assert args.dashboard_url == "http://127.0.0.1:8000"
+    assert args.operator_url == "http://127.0.0.1:8000/operator"
+
+
 def test_finalize_report_marks_unsigned_no_go_with_exit_code(monkeypatch):
     monkeypatch.delenv("SOAK_REPORT_SIGNING_KEY", raising=False)
     report = {"status": "GO", "failures": []}

@@ -44,7 +44,10 @@ base_verified_at=""
 wal_verified_at=""
 wal_observed_file=""
 restore_drill_report=""
+restore_drill_verified_at=""
 restore_time_to_recover_s=""
+signature_status="not_required"
+evidence_read_group="${TS_BACKUP_EVIDENCE_READ_GROUP:-${TS_BACKUP_READ_GROUP:-}}"
 
 mkdir -p "$evidence_dir" "$work_dir"
 
@@ -53,6 +56,37 @@ is_truthy() {
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+backup_evidence_signature_required() {
+  is_truthy "${BACKUP_EVIDENCE_REQUIRE_SIGNATURE:-0}" \
+    || is_truthy "${BACKUP_EVIDENCE_SIGNATURE_REQUIRED:-0}" \
+    || is_truthy "${PREFLIGHT_REQUIRE_BACKUP_EVIDENCE:-0}" \
+    || [ "${ENGINE_MODE:-}" = "live" ] \
+    || [ "${EXECUTION_MODE:-}" = "live" ]
+}
+
+backup_evidence_signing_key_available() {
+  if [ -n "${BACKUP_EVIDENCE_HMAC_KEY:-}" ] || [ -n "${BACKUP_EVIDENCE_SIGNING_KEY:-}" ]; then
+    return 0
+  fi
+  if [ -n "${BACKUP_EVIDENCE_HMAC_KEY_FILE:-}" ] && [ -s "${BACKUP_EVIDENCE_HMAC_KEY_FILE}" ] && [ -r "${BACKUP_EVIDENCE_HMAC_KEY_FILE}" ]; then
+    return 0
+  fi
+  if [ -n "${BACKUP_EVIDENCE_SIGNING_KEY_FILE:-}" ] && [ -s "${BACKUP_EVIDENCE_SIGNING_KEY_FILE}" ] && [ -r "${BACKUP_EVIDENCE_SIGNING_KEY_FILE}" ]; then
+    return 0
+  fi
+  return 1
+}
+
+file_mtime_iso() {
+  date -u -d "@$(stat -c %Y "$1")" +%Y-%m-%dT%H:%M:%SZ
+}
+
+report_value() {
+  local report="$1"
+  local key="$2"
+  awk -F= -v key="$key" '$1==key {print $2; exit}' "$report"
 }
 
 lock_path="${TS_BACKUP_EVIDENCE_LOCK:-${evidence_dir}/backup_restore_evidence.lock}"
@@ -168,6 +202,15 @@ fresh_enough() {
   [ "$age" -le "$max_age_s" ]
 }
 
+publish_report_file() {
+  local path="$1"
+  [ -e "$path" ] || return 0
+  chmod 0640 "$path"
+  if [ -n "$evidence_read_group" ]; then
+    chgrp "$evidence_read_group" "$path"
+  fi
+}
+
 reuse_base_backup_if_fresh() {
   local latest verify_log
   latest="$(readlink -f "${base_dir}/latest" 2>/dev/null || true)"
@@ -181,7 +224,7 @@ reuse_base_backup_if_fresh() {
   fresh_enough "$verify_log" "$base_reuse_max_s" || return 1
   base_backup_dir="$latest"
   base_verify_log="$verify_log"
-  base_verified_at="$(date -u -d "@$(stat -c %Y "$verify_log")" +%Y-%m-%dT%H:%M:%SZ)"
+  base_verified_at="$(file_mtime_iso "$verify_log")"
   base_backup_status="pass"
   printf 'base_backup_reused=%s\n' "$latest" > "${work_dir}/base_backup.out"
   return 0
@@ -206,7 +249,7 @@ run_base_backup() {
   if [ ! -s "$base_verify_log" ]; then
     return 1
   fi
-  base_verified_at="$(date -u -d "@$(stat -c %Y "$base_verify_log")" +%Y-%m-%dT%H:%M:%SZ)"
+  base_verified_at="$(file_mtime_iso "$base_verify_log")"
   base_backup_status="pass"
   return 0
 }
@@ -238,7 +281,7 @@ verify_wal_archive() {
       latest_epoch="$(stat -c %Y "$latest_file")"
       if [ "$latest_epoch" -ge "$start_epoch" ]; then
         wal_observed_file="$latest_file"
-        wal_verified_at="$(date -u -d "@${latest_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+        wal_verified_at="$(file_mtime_iso "$latest_file")"
         wal_archive_status="pass"
         printf 'observed_wal=%s\n' "$latest_file" >> "${work_dir}/wal_archive.out"
         return 0
@@ -260,7 +303,11 @@ reuse_restore_drill_if_fresh() {
   grep -q '^status=pass$' "$latest_report" || return 1
   fresh_enough "$latest_report" "$restore_reuse_max_s" || return 1
   restore_drill_report="$latest_report"
-  restore_time_to_recover_s="$(awk -F= '$1=="time_to_recover_s" {print $2; exit}' "$restore_drill_report")"
+  restore_time_to_recover_s="$(report_value "$restore_drill_report" time_to_recover_s)"
+  restore_drill_verified_at="$(report_value "$restore_drill_report" generated_at)"
+  if [ -z "$restore_drill_verified_at" ]; then
+    restore_drill_verified_at="$(file_mtime_iso "$restore_drill_report")"
+  fi
   restore_drill_status="pass"
   printf 'restore_drill_reused=%s\n' "$latest_report" > "${work_dir}/restore_drill.out"
   return 0
@@ -281,7 +328,11 @@ run_restore_drill() {
       | cut -d' ' -f2-
   )"
   if [ -n "$restore_drill_report" ] && [ -f "$restore_drill_report" ]; then
-    restore_time_to_recover_s="$(awk -F= '$1=="time_to_recover_s" {print $2; exit}' "$restore_drill_report")"
+    restore_time_to_recover_s="$(report_value "$restore_drill_report" time_to_recover_s)"
+    restore_drill_verified_at="$(report_value "$restore_drill_report" generated_at)"
+    if [ -z "$restore_drill_verified_at" ]; then
+      restore_drill_verified_at="$(file_mtime_iso "$restore_drill_report")"
+    fi
   fi
   if [ "$rc" -eq 0 ] && [ -n "$restore_drill_report" ] && grep -q '^status=pass$' "$restore_drill_report"; then
     restore_drill_status="pass"
@@ -307,7 +358,9 @@ write_reports() {
     printf 'wal_observed_file=%s\n' "$wal_observed_file"
     printf 'restore_drill_status=%s\n' "$restore_drill_status"
     printf 'restore_drill_report=%s\n' "$restore_drill_report"
+    printf 'restore_drill_verified_at=%s\n' "$restore_drill_verified_at"
     printf 'restore_time_to_recover_s=%s\n' "$restore_time_to_recover_s"
+    printf 'signature_status=%s\n' "$signature_status"
     printf '\n[script_checks]\n'
     [ -f "${work_dir}/script_checks.out" ] && cat "${work_dir}/script_checks.out"
     printf '\n[systemd_checks]\n'
@@ -319,6 +372,7 @@ write_reports() {
     printf '\n[restore_drill]\n'
     [ -f "${work_dir}/restore_drill.out" ] && tail -n 160 "${work_dir}/restore_drill.out"
   } > "$report_txt"
+  publish_report_file "$report_txt"
 
   REPORT_JSON="$report_json" \
   STATUS="$status" \
@@ -335,8 +389,12 @@ write_reports() {
   WAL_OBSERVED_FILE="$wal_observed_file" \
   RESTORE_DRILL_STATUS="$restore_drill_status" \
   RESTORE_DRILL_REPORT="$restore_drill_report" \
+  RESTORE_DRILL_VERIFIED_AT="$restore_drill_verified_at" \
   RESTORE_TIME_TO_RECOVER_S="$restore_time_to_recover_s" \
+  SIGNATURE_STATUS="$signature_status" \
   python3 - <<'PY'
+import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -360,7 +418,59 @@ def maybe_float(value: str):
         return None
 
 
+def truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def signing_key():
+    for name in ("BACKUP_EVIDENCE_HMAC_KEY", "BACKUP_EVIDENCE_SIGNING_KEY"):
+        value = os.environ.get(name) or ""
+        if value.strip():
+            return value.encode("utf-8"), f"env:{name}"
+    for name in ("BACKUP_EVIDENCE_HMAC_KEY_FILE", "BACKUP_EVIDENCE_SIGNING_KEY_FILE"):
+        raw_path = (os.environ.get(name) or "").strip()
+        if not raw_path:
+            continue
+        try:
+            value = Path(raw_path).read_text(encoding="utf-8").strip()
+        except Exception:
+            return None, f"unreadable:{name}"
+        if value:
+            return value.encode("utf-8"), f"file:{name}"
+        return None, f"empty:{name}"
+    return None, "missing"
+
+
+def canonical_payload_bytes(payload):
+    unsigned = dict(payload)
+    unsigned.pop("signature", None)
+    return json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def signature_input_bytes(payload_bytes, *, algorithm, key_id, signed_at, payload_sha256):
+    metadata_bytes = json.dumps(
+        {
+            "algorithm": str(algorithm),
+            "key_id": str(key_id),
+            "payload_sha256": str(payload_sha256),
+            "signed_at": str(signed_at),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return payload_bytes + b"\n" + metadata_bytes
+
+
 generated_at = os.environ["GENERATED_AT"]
+signature_required = truthy(
+    os.environ.get("BACKUP_EVIDENCE_REQUIRE_SIGNATURE")
+    or os.environ.get("BACKUP_EVIDENCE_SIGNATURE_REQUIRED")
+    or os.environ.get("PREFLIGHT_REQUIRE_BACKUP_EVIDENCE")
+    or "0"
+) or (os.environ.get("ENGINE_MODE") or "").strip().lower() == "live" or (
+    os.environ.get("EXECUTION_MODE") or ""
+).strip().lower() == "live"
 payload = {
     "schema_version": 1,
     "generated_at": generated_at,
@@ -389,23 +499,62 @@ payload = {
     "restore_drill": {
         "status": os.environ["RESTORE_DRILL_STATUS"],
         "report": os.environ["RESTORE_DRILL_REPORT"],
-        "verified_at": generated_at if os.environ["RESTORE_DRILL_STATUS"] == "pass" else "",
-        "verified_at_ts": ts(generated_at) if os.environ["RESTORE_DRILL_STATUS"] == "pass" else None,
+        "verified_at": os.environ["RESTORE_DRILL_VERIFIED_AT"] if os.environ["RESTORE_DRILL_STATUS"] == "pass" else "",
+        "verified_at_ts": ts(os.environ["RESTORE_DRILL_VERIFIED_AT"]) if os.environ["RESTORE_DRILL_STATUS"] == "pass" else None,
         "time_to_recover_s": maybe_float(os.environ["RESTORE_TIME_TO_RECOVER_S"]),
     },
 }
+key, key_source = signing_key()
+if key:
+    payload_bytes = canonical_payload_bytes(payload)
+    payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+    algorithm = "hmac-sha256"
+    key_id = os.environ.get("BACKUP_EVIDENCE_KEY_ID", "backup-evidence")
+    signed_at = generated_at
+    payload["signature"] = {
+        "status": "signed",
+        "algorithm": algorithm,
+        "key_id": key_id,
+        "key_source": key_source,
+        "signed_at": signed_at,
+        "payload_sha256": payload_sha256,
+        "value": hmac.new(
+            key,
+            signature_input_bytes(
+                payload_bytes,
+                algorithm=algorithm,
+                key_id=key_id,
+                signed_at=signed_at,
+                payload_sha256=payload_sha256,
+            ),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+else:
+    payload["signature"] = {
+        "status": "unsigned" if not signature_required else "key_missing",
+        "required": signature_required,
+        "algorithm": "hmac-sha256",
+        "key_id": os.environ.get("BACKUP_EVIDENCE_KEY_ID", "backup-evidence"),
+        "key_source": key_source,
+        "signed_at": "",
+        "payload_sha256": "",
+        "value": "",
+    }
 target = Path(os.environ["REPORT_JSON"])
 target.parent.mkdir(parents=True, exist_ok=True)
 with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(target.parent), delete=False) as fh:
-    json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+    json.dump(payload, fh, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     fh.write("\n")
     tmp = fh.name
 Path(tmp).replace(target)
 PY
+  publish_report_file "$report_json"
 
   ln -sfn "$(basename "$report_txt")" "$latest_txt"
   mkdir -p "$(dirname "$latest_json")"
   cp "$report_json" "${latest_json}.$$"
+  publish_report_file "${latest_json}.$$"
   mv -f "${latest_json}.$$" "$latest_json"
 }
 
@@ -415,6 +564,14 @@ check_systemd || overall_rc=1
 run_base_backup || overall_rc=1
 verify_wal_archive || overall_rc=1
 run_restore_drill || overall_rc=1
+if backup_evidence_signing_key_available; then
+  signature_status="signed"
+elif backup_evidence_signature_required; then
+  signature_status="key_missing"
+  overall_rc=1
+else
+  signature_status="unsigned"
+fi
 
 if [ "$overall_rc" -eq 0 ]; then
   write_reports pass

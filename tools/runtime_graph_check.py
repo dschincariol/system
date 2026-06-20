@@ -5,6 +5,7 @@ Tooling or validation script for `runtime_graph_check`.
 """
 
 import argparse
+import base64
 import importlib
 import os
 import pkgutil
@@ -14,13 +15,52 @@ import sys
 import tempfile
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, MutableMapping, Optional, Set, Tuple
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENGINE_DIR = os.path.join(ROOT, "engine")
 RUNTIME_DIR = os.path.join(ENGINE_DIR, "runtime")
-LOG_DIR = os.path.join(ROOT, "logs")
-DATA_DIR = os.path.join(ROOT, "data")
+LOG_DIR = os.path.join(ROOT, "var", "log")
+DATA_DIR = os.path.join(ROOT, "var", "db")
+_VALIDATION_DATA_SOURCE_MASTER_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
+_LOCAL_EXTERNAL_SERVICE_POP_KEYS = (
+    "TS_PG_DSN",
+    "TS_PG_DSN_FILE",
+    "PG_DSN",
+    "TIMESCALE_DSN",
+    "TIMESCALE_URL",
+    "TIMESCALE_DATABASE_URL",
+    "TIMESCALE_PRICES_DSN",
+    "TIMESCALE_PRICES_URL",
+    "TIMESCALE_PRICES_DATABASE_URL",
+    "LIVE_CACHE_REDIS_URL",
+    "REDIS_URL",
+    "REDIS_CACHE_URL",
+    "TS_REDIS_URL",
+    "OBJECT_STORE_ENDPOINT",
+    "OBJECT_STORE_BUCKET",
+    "OBJECT_STORE_ACCESS_KEY",
+    "OBJECT_STORE_SECRET_KEY",
+    "OBJECT_STORE_SESSION_TOKEN",
+    "MINIO_ENDPOINT",
+    "MINIO_BUCKET",
+    "MINIO_ACCESS_KEY",
+    "MINIO_SECRET_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+)
+_LOCAL_EXTERNAL_SERVICE_DEFAULTS = {
+    "TS_STORAGE_BACKEND": "sqlite",
+    "TIMESCALE_ENABLED": "0",
+    "TIMESCALE_PRICES_ENABLED": "0",
+    "TELEMETRY_READ_BACKEND": "sqlite",
+    "PRICE_READ_BACKEND": "sqlite",
+    "LIVE_CACHE_BACKEND": "memory",
+    "PREFLIGHT_REQUIRE_TIMESCALE": "0",
+    "PREFLIGHT_REQUIRE_REDIS": "0",
+    "PREFLIGHT_REQUIRE_OBJECT_STORAGE": "0",
+}
 
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -41,6 +81,20 @@ def _production_validation_profile(env: Dict[str, str]) -> bool:
         env.get("OPERATOR_MODE"),
     )
     return any(str(value or "").strip().lower() in {"prod", "production", "live"} for value in profile_values)
+
+
+def _startup_validation_mode(env: MutableMapping[str, str]) -> bool:
+    return str(env.get("TRADING_VALIDATION_MODE", "") or "").strip().lower() == "startup"
+
+
+def _local_startup_validation_profile(env: MutableMapping[str, str]) -> bool:
+    return bool(_startup_validation_mode(env) and not _production_validation_profile(dict(env)))
+
+
+def _scrub_local_external_service_env(env: MutableMapping[str, str]) -> None:
+    for key in _LOCAL_EXTERNAL_SERVICE_POP_KEYS:
+        env.pop(key, None)
+    env.update(_LOCAL_EXTERNAL_SERVICE_DEFAULTS)
 
 
 def _is_missing_optional_module(error: ModuleNotFoundError, module_name: str) -> bool:
@@ -75,9 +129,8 @@ def bootstrap_validation_env(extra_env: Optional[Dict[str, str]] = None) -> Dict
     if not str(os.environ.get("TRADING_VALIDATION_IMPORT_HEAVY_ENTRYPOINTS", "") or "").strip():
         os.environ["TRADING_VALIDATION_IMPORT_HEAVY_ENTRYPOINTS"] = "0"
     if (
-        str(os.environ.get("TRADING_VALIDATION_MODE", "") or "").strip().lower() == "startup"
+        _local_startup_validation_profile(os.environ)
         and not str(os.environ.get("TS_STORAGE_BACKEND", "") or "").strip()
-        and not _production_validation_profile(dict(os.environ))
     ):
         os.environ["TS_STORAGE_BACKEND"] = "sqlite"
 
@@ -96,6 +149,16 @@ def bootstrap_validation_env(extra_env: Optional[Dict[str, str]] = None) -> Dict
     except Exception as e:
         sys.stderr.write(f"[runtime_graph_check.bootstrap_validation_env] {type(e).__name__}: {e}\n")
         sys.stderr.flush()
+
+    if _local_startup_validation_profile(os.environ):
+        _scrub_local_external_service_env(os.environ)
+
+    # Startup graph validation runs supervised imports, which require a
+    # production-shaped key. Use deterministic validation material unless the
+    # caller explicitly opts into validating real production dependencies.
+    if not _production_validation_profile(dict(os.environ)):
+        os.environ["DATA_SOURCE_MASTER_KEY"] = _VALIDATION_DATA_SOURCE_MASTER_KEY
+        os.environ.pop("DATA_SOURCE_MASTER_KEY_FILE", None)
 
     return dict(os.environ)
 
@@ -224,10 +287,11 @@ def _run_cold_boot_db_bootstrap_check(*, timeout_s: float = 180.0) -> Dict[str, 
                 "AUTO_BOOT_DAEMONS": "0",
                 "SQLITE_TRACE_REPORT_EVERY_S": "0",
                 "TRADING_VALIDATION_MODE": "startup",
-                "TS_STORAGE_BACKEND": "sqlite",
                 "TS_PG_SCHEMA_PER_DB_PATH": "1",
             }
         )
+        if not _production_validation_profile(env):
+            _scrub_local_external_service_env(env)
 
         check_code = (
             "import sys\n"
@@ -287,10 +351,11 @@ def _run_timeseries_sidecar_startup_check(*, timeout_s: float = 180.0) -> Dict[s
                 "AUTO_BOOT_DAEMONS": "0",
                 "SQLITE_TRACE_REPORT_EVERY_S": "0",
                 "TRADING_VALIDATION_MODE": "startup",
-                "TS_STORAGE_BACKEND": "sqlite",
                 "TS_PG_SCHEMA_PER_DB_PATH": "1",
             }
         )
+        if not _production_validation_profile(env):
+            _scrub_local_external_service_env(env)
 
         check_code = (
             "import json\n"
@@ -354,6 +419,8 @@ def _run_timeseries_sidecar_startup_check(*, timeout_s: float = 180.0) -> Dict[s
 
 
 def _cleanup_validation_schema_for_result(label: str, result: Dict[str, object]) -> None:
+    if not _production_validation_profile(dict(os.environ)):
+        return
     db_path = str((result or {}).get("db_path") or "").strip()
     if not db_path:
         return
@@ -445,7 +512,10 @@ def run_canonical_validation(mode: str = "full", extra_env: Optional[Dict[str, s
 
     print("\nJOB REGISTRY\n")
     try:
-        from engine.runtime.job_registry import ALLOWED_JOBS, validate_job_registry_paths, validate_runtime_architecture
+        job_registry = importlib.reload(importlib.import_module("engine.runtime.job_registry"))
+        ALLOWED_JOBS = job_registry.ALLOWED_JOBS
+        validate_job_registry_paths = job_registry.validate_job_registry_paths
+        validate_runtime_architecture = job_registry.validate_runtime_architecture
 
         print("Registered jobs:", len(ALLOWED_JOBS))
         for name in sorted(ALLOWED_JOBS.keys()):

@@ -295,8 +295,59 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertTrue(bool(snapshot["gates"]["schema_valid"]["ok"]))
         self.assertTrue(bool(snapshot["gates"]["log_path_writable"]["ok"]))
         self.assertTrue(bool(snapshot["gates"]["required_directories_present"]["ok"]))
+        self.assertTrue(bool(snapshot["gates"]["disk_headroom_available"]["ok"]))
         self.assertTrue(bool(snapshot["gates"]["ui_static_assets_present"]["ok"]))
         self.assertTrue(bool(snapshot["gates"]["no_port_binding_conflict"]["ok"]))
+
+    def test_startup_validation_blocks_critical_disk_pressure(self) -> None:
+        storage, health = _reload_modules("engine.runtime.storage", "engine.runtime.health")
+        storage.init_db()
+
+        snapshot = health.get_startup_validation_snapshot(
+            health={
+                "db": {"ok": True, "initialized": True, "db_path": os.environ["DB_PATH"]},
+                "disk_pressure": {
+                    "ok": False,
+                    "status": "critical",
+                    "critical": ["root:disk_critical:free_bytes=1024:free_pct=0.01"],
+                    "warnings": [],
+                    "paths": [],
+                },
+                "ingestion_runtime": {"running": True, "stale": False, "last_publish_ts_ms": 123},
+                "ingestion_freshness": {
+                    "critical_ok": True,
+                    "stale_critical_sources": [],
+                    "runtime_reason_codes": [],
+                },
+                "job_summary": {"ok": True, "required_missing": [], "required_stale": []},
+                "predictions": {
+                    "ok": True,
+                    "detail": "ok",
+                    "count": 5,
+                    "recent_count": 2,
+                    "history_count": 8,
+                    "history_recent_count": 2,
+                    "last_ts_ms": 123,
+                    "age_s": 1.0,
+                    "max_age_s": 600.0,
+                },
+                "execution_barrier": {"ok": True, "reason": "health_fast_path", "allowed": False},
+                "execution_supervisor": {"state": "ok"},
+                "broker_connection": {"ok": False, "state": "disconnected", "broker": "sim"},
+            },
+            db_validation={
+                "ok": True,
+                "quick_check": "ok",
+                "missing_tables": [],
+                "schema_version": 1,
+                "schema_status": "applied",
+            },
+        )
+
+        self.assertFalse(snapshot["ok"])
+        self.assertIn("disk_headroom_available", snapshot["blocking_gates"])
+        self.assertIn("filesystem", snapshot["critical_systems_missing"])
+        self.assertIn("disk_pressure_critical", snapshot["gates"]["disk_headroom_available"]["detail"])
 
     def test_startup_validation_accepts_structural_db_validation_when_quick_check_skipped_or_not_applicable(self) -> None:
         health, startup_gates = _reload_modules("engine.runtime.health", "engine.runtime.startup_gates")
@@ -1341,6 +1392,51 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertFalse(bool(snapshot.get("ok")))
         self.assertFalse(bool(snapshot.get("position_reconcile_ok")))
         self.assertIn("position_reconcile_failed", issue_codes)
+        self.assertIn("position_reconcile", list(snapshot.get("waiting_on") or []))
+
+    def test_readiness_snapshot_blocks_live_missing_position_reconcile_evidence(self) -> None:
+        (health,) = _reload_modules("engine.runtime.health")
+        os.environ["ENGINE_MODE"] = "live"
+
+        snapshot = health.get_readiness_snapshot(
+            health={
+                "prices": {"ok": True, "last_ts_ms": 123, "age_s": 1, "max_age_s": 60},
+                "providers": {"ok": True, "healthy": 1, "total": 1},
+                "labels": {"ok": True, "count": 10},
+                "model": {"ok": True, "support_n": 10},
+                "execution_barrier": {"ok": True, "reason": "health_fast_path", "allowed": True},
+                "broker_connection": {"ok": True, "state": "connected", "broker": "alpaca"},
+                "db": {"ok": True, "initialized": True, "exists": True, "db_path": os.environ["DB_PATH"]},
+                "job_summary": {"ok": True, "total": 1, "stale": 0, "stale_jobs": []},
+                "timeseries_storage": {"ok": True, "enabled": False},
+                "feature_store": {"ok": True, "enabled": False},
+                "portfolio_runtime": {"degraded": False, "detail": "ok"},
+                "execution_supervisor": {"ok": True, "state": "ok", "failed_gates": []},
+                "position_reconcile": {
+                    "required": True,
+                    "ok": False,
+                    "available": False,
+                    "exercised": False,
+                    "status": "empty",
+                    "broker": "alpaca",
+                    "blockers": ["position_reconcile_not_exercised"],
+                    "detail": "position_reconcile_audit_empty",
+                },
+                "execution_degraded": {"active": False, "severity": "WARNING"},
+                "startup_validation": {"ok": True},
+            },
+            preflight={"ok": True},
+            system_state={"state": "LIVE", "mode": "live"},
+            graph={"ok": True},
+        )
+
+        issue_codes = {str(item.get("code") or "") for item in list(snapshot.get("issues") or [])}
+        issue_details = "\n".join(str(item.get("detail") or "") for item in list(snapshot.get("issues") or []))
+
+        self.assertFalse(bool(snapshot.get("ok")))
+        self.assertFalse(bool(snapshot.get("position_reconcile_ok")))
+        self.assertIn("position_reconcile_failed", issue_codes)
+        self.assertIn("position_reconcile_not_exercised", issue_details)
         self.assertIn("position_reconcile", list(snapshot.get("waiting_on") or []))
 
     def test_startup_validation_allows_safe_mode_prediction_cold_start(self) -> None:

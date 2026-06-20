@@ -1,40 +1,19 @@
-"""
-FILE: check_alerts.py
+"""Compatibility launcher for ``engine.runtime.jobs.check_alerts``."""
 
-Operational helper script for `check_alerts`.
-"""
+from __future__ import annotations
 
-# check_alerts.py
-from engine.runtime.storage import connect, init_db
+import sys
+from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-def main() -> int:
-    init_db()
-    con = connect(readonly=True)
-    try:
-        # `check_*` scripts are lightweight manual diagnostics. They are meant
-        # for humans at a terminal, not for structured runtime integration.
-        total = con.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
-        print("alerts_total =", total)
+from ops._engine_job_wrapper import import_engine_module, run_engine_module
 
-        rows = con.execute(
-                """
-                SELECT severity, rule_id, symbol, horizon_s, expected_z, confidence, event_title, explain_json
-                FROM alerts
-                ORDER BY ts_ms DESC
-                LIMIT 25
-                """
-            ).fetchall()
-
-        for sev, rule_id, sym, h, z, conf, title, explain_json in rows:
-                explain = ""
-                if explain_json:
-                    explain = " | explain_json=1"
-                print(f"{sev} {rule_id} {sym} h={h} z={z:+.3f} conf={conf:.2f} :: {title}{explain}")
-    finally:
-        con.close()
-    return 0
-
+_ENGINE_MODULE = "engine.runtime.jobs.check_alerts"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_engine_module(_ENGINE_MODULE))
+
+sys.modules[__name__] = import_engine_module(_ENGINE_MODULE)

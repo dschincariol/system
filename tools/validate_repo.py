@@ -16,6 +16,44 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_LOCAL_RUNTIME_EXTERNAL_SERVICE_POP_KEYS = (
+    "TS_PG_DSN",
+    "TS_PG_DSN_FILE",
+    "PG_DSN",
+    "TIMESCALE_DSN",
+    "TIMESCALE_URL",
+    "TIMESCALE_DATABASE_URL",
+    "TIMESCALE_PRICES_DSN",
+    "TIMESCALE_PRICES_URL",
+    "TIMESCALE_PRICES_DATABASE_URL",
+    "LIVE_CACHE_REDIS_URL",
+    "REDIS_URL",
+    "REDIS_CACHE_URL",
+    "TS_REDIS_URL",
+    "OBJECT_STORE_ENDPOINT",
+    "OBJECT_STORE_BUCKET",
+    "OBJECT_STORE_ACCESS_KEY",
+    "OBJECT_STORE_SECRET_KEY",
+    "OBJECT_STORE_SESSION_TOKEN",
+    "MINIO_ENDPOINT",
+    "MINIO_BUCKET",
+    "MINIO_ACCESS_KEY",
+    "MINIO_SECRET_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+)
+_LOCAL_RUNTIME_EXTERNAL_SERVICE_DEFAULTS = {
+    "TS_STORAGE_BACKEND": "sqlite",
+    "TIMESCALE_ENABLED": "0",
+    "TIMESCALE_PRICES_ENABLED": "0",
+    "TELEMETRY_READ_BACKEND": "sqlite",
+    "PRICE_READ_BACKEND": "sqlite",
+    "LIVE_CACHE_BACKEND": "memory",
+    "PREFLIGHT_REQUIRE_TIMESCALE": "0",
+    "PREFLIGHT_REQUIRE_REDIS": "0",
+    "PREFLIGHT_REQUIRE_OBJECT_STORAGE": "0",
+}
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -27,11 +65,15 @@ def _run(label: str, args: list[str], env: dict[str, str]) -> None:
     run_env = env
     if label in {"unit-tests", "pytest-tests"}:
         run_env = _unit_test_env(env)
+    elif label == "runtime-graph-startup":
+        run_env = _runtime_graph_startup_env(env)
     subprocess.run(args, check=True, cwd=str(ROOT), env=run_env)
 
 
 def _cleanup_validation_pg_schemas(env: dict[str, str]) -> None:
     if _env_truthy(env.get("TRADING_KEEP_VALIDATION_PG_SCHEMAS")):
+        return
+    if not _production_dependency_validation(env):
         return
     if not str(env.get("TS_PG_DSN") or "").strip():
         return
@@ -45,7 +87,7 @@ def _cleanup_validation_pg_schemas(env: dict[str, str]) -> None:
         result = cleanup_validation_schemas(exclude=exclude)
         dropped = list(result.get("dropped") or [])
         if dropped:
-            print(f"\n=== validation-pg-schema-cleanup ===")
+            print("\n=== validation-pg-schema-cleanup ===")
             print(f"dropped {len(dropped)} hashed validation schema(s)")
     except Exception as exc:
         print(f"\nWARNING validation-pg-schema-cleanup failed: {type(exc).__name__}: {exc}")
@@ -77,6 +119,27 @@ def _project_pytest(python: str) -> list[str]:
 def _env_truthy(value: str | None) -> bool:
     raw = str(value or "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _production_dependency_validation(env: dict[str, str]) -> bool:
+    return bool(
+        _env_truthy(env.get("TRADING_VALIDATE_REPO_LIVE"))
+        or _env_truthy(env.get("TRADING_VALIDATION_REQUIRE_PROD_DEPS"))
+    )
+
+
+def _scrub_local_runtime_external_service_env(env: dict[str, str]) -> None:
+    for key in _LOCAL_RUNTIME_EXTERNAL_SERVICE_POP_KEYS:
+        env.pop(key, None)
+    env.update(_LOCAL_RUNTIME_EXTERNAL_SERVICE_DEFAULTS)
+
+
+def _runtime_graph_startup_env(env: dict[str, str]) -> dict[str, str]:
+    run_env = dict(env)
+    run_env["TRADING_VALIDATION_MODE"] = "startup"
+    if not _production_dependency_validation(run_env):
+        _scrub_local_runtime_external_service_env(run_env)
+    return run_env
 
 
 def _parse_simple_env_file(env_path: Path) -> dict[str, str]:
@@ -125,9 +188,8 @@ def _load_compose_live_defaults(env: dict[str, str]) -> None:
     _load_env_file_defaults(env, ROOT / "deploy" / "compose" / ".env")
 
     dashboard_port = str(env.get("DASHBOARD_PUBLIC_PORT") or "8000").strip() or "8000"
-    operator_port = str(env.get("OPERATOR_PUBLIC_PORT") or "4001").strip() or "4001"
     env.setdefault("PIPELINE_SMOKE_BASE", f"http://127.0.0.1:{dashboard_port}")
-    env.setdefault("PIPELINE_SMOKE_OPERATOR_BASE", f"http://127.0.0.1:{operator_port}")
+    env.setdefault("PIPELINE_SMOKE_OPERATOR_BASE", f"http://127.0.0.1:{dashboard_port}/operator")
     if str(env.get("OPERATOR_API_TOKEN") or "").strip():
         env.setdefault("PIPELINE_SMOKE_OPERATOR_TOKEN", str(env.get("OPERATOR_API_TOKEN") or "").strip())
 
@@ -248,6 +310,10 @@ def main(argv: list[str] | None = None) -> int:
     _load_dotenv_defaults(env)
     if args.live:
         _load_compose_live_defaults(env)
+        env.setdefault("TRADING_VALIDATE_REPO_LIVE", "1")
+        env.setdefault("TRADING_VALIDATION_REQUIRE_PROD_DEPS", "1")
+    else:
+        env.setdefault("TRADING_VALIDATE_REPO_LIVE", "0")
     env.setdefault("TS_PG_SCHEMA_PER_DB_PATH", "1")
     env.setdefault("TS_PG_POOL_SIZE", "12")
     env.setdefault("TS_PG_POOL_MIN_SIZE", "2")
@@ -256,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     pytest = _project_pytest(python)
     checks: list[tuple[str, list[str]]] = [
         ("syntax", [python, "tools/syntax_check_workspace.py"]),
+        ("ruff-static-release-gate", [python, "-m", "ruff", "check", "engine/", "routes/", "services/", "tests/"]),
         ("docs", [python, "tools/validate_docs.py"]),
         ("ui-asset-refs", [python, "tools/check_local_asset_refs.py"]),
         ("dependency-lock", [python, "tools/validate_dependency_lock.py"]),

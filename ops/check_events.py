@@ -1,41 +1,19 @@
-"""
-FILE: check_events.py
+"""Compatibility launcher for ``engine.runtime.jobs.check_events``."""
 
-Operational helper script for `check_events`.
-"""
+from __future__ import annotations
 
-# check_events.py
-import os
-import sqlite3
+import sys
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-def main() -> int:
-    db_path = os.environ.get("DB_PATH", str(Path("./data/trading.db").resolve()))
-    con = sqlite3.connect(db_path)
-    try:
-        # This check intentionally bypasses runtime helpers so it can inspect a
-        # DB file directly, even when the rest of the app environment is broken.
-        total = con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-        print("events_total =", total)
+from ops._engine_job_wrapper import import_engine_module, run_engine_module
 
-        rows = con.execute(
-                """
-                SELECT ts_ms, source, title, url
-                FROM events
-                ORDER BY ts_ms DESC
-                LIMIT 15
-                """
-            ).fetchall()
-
-        for ts_ms, source, title, url in rows:
-                print(source, "::", title)
-                if url:
-                    print("  ", url)
-    finally:
-        con.close()
-    return 0
-
+_ENGINE_MODULE = "engine.runtime.jobs.check_events"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_engine_module(_ENGINE_MODULE))
+
+sys.modules[__name__] = import_engine_module(_ENGINE_MODULE)

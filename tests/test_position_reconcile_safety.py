@@ -256,6 +256,48 @@ class PositionReconcileSafetyTests(unittest.TestCase):
         self.assertEqual(int(kill_state_count[0] or 0), 0)
         self.assertEqual(int(kill_audit_count[0] or 0), 0)
 
+    def test_position_mismatch_records_orphan_and_quantity_counts(self) -> None:
+        self.position_reconcile._ensure_schema(self.con)
+        _save_baseline_to_db(self.con, "alpaca", 1_710_000_000_000, {"MSFT": 1.0})
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    self.position_reconcile,
+                    "_broker_positions",
+                    return_value=(
+                        True,
+                        "ok",
+                        [
+                            {"symbol": "AAPL", "qty": 1.0},
+                            {"symbol": "MSFT", "qty": 2.0},
+                        ],
+                    ),
+                )
+            )
+            stack.enter_context(patch.object(self.position_reconcile, "_load_baseline", _load_baseline_from_db))
+            stack.enter_context(patch.object(self.position_reconcile, "_save_baseline", _save_baseline_to_db))
+            stack.enter_context(patch.object(self.position_reconcile, "_now_ms", return_value=1_710_000_000_100))
+
+            result = self.position_reconcile.pre_live_position_reconcile("alpaca", con=self.con)
+
+        self.assertFalse(bool(result.get("ok")))
+        self.assertEqual(str(result.get("status") or ""), "mismatch")
+        detail = dict(result.get("detail") or {})
+        self.assertEqual(int(detail.get("broker_orphan_n") or 0), 1)
+        self.assertEqual(int(detail.get("quantity_mismatch_n") or 0), 1)
+
+        evidence = self.position_reconcile.position_reconcile_evidence_snapshot(
+            engine_mode="live",
+            broker="alpaca",
+            con=self.con,
+            now_ms=1_710_000_000_200,
+        )
+        self.assertFalse(bool(evidence.get("ok")))
+        self.assertIn("position_reconcile_orphan_positions", list(evidence.get("blockers") or []))
+        self.assertIn("position_reconcile_mismatched_positions", list(evidence.get("blockers") or []))
+        self.assertEqual(int(evidence.get("orphan_position_n") or 0), 1)
+        self.assertEqual(int(evidence.get("quantity_mismatch_n") or 0), 1)
+
     def test_repeated_position_fetch_failures_trip_persistent_global_halt(self) -> None:
         os.environ["POSITION_RECONCILE_FETCH_FAILURE_HALT_THRESHOLD"] = "2"
         os.environ["POSITION_RECONCILE_FETCH_FAILURE_COOLDOWN_MS"] = "60000"

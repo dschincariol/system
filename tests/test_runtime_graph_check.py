@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 from tools.runtime_graph_check import (
+    _VALIDATION_DATA_SOURCE_MASTER_KEY,
     _collect_entrypoint_imports,
     _embedded_startup_validation_error,
     _run_cold_boot_db_bootstrap_check,
@@ -46,6 +47,37 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertEqual(str(env.get("TRADING_VALIDATION_IMPORT_DASHBOARD") or ""), "0")
         self.assertEqual(str(env.get("TRADING_VALIDATION_IMPORT_HEAVY_ENTRYPOINTS") or ""), "0")
 
+    def test_bootstrap_validation_env_uses_validation_master_key_for_local_startup(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DATA_SOURCE_MASTER_KEY": "raw-dev-key",
+                "DATA_SOURCE_MASTER_KEY_FILE": "/tmp/raw-dev-key",
+                "ENV": "dev",
+                "ENGINE_MODE": "safe",
+            },
+            clear=True,
+        ):
+            env = bootstrap_validation_env()
+
+        self.assertEqual(env["DATA_SOURCE_MASTER_KEY"], _VALIDATION_DATA_SOURCE_MASTER_KEY)
+        self.assertNotIn("DATA_SOURCE_MASTER_KEY_FILE", env)
+
+    def test_bootstrap_validation_env_preserves_prod_dependency_master_key(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_VALIDATION_REQUIRE_PROD_DEPS": "1",
+                "DATA_SOURCE_MASTER_KEY": "real-prod-key",
+                "DATA_SOURCE_MASTER_KEY_FILE": "/run/secrets/data_source_master_key",
+            },
+            clear=True,
+        ):
+            env = bootstrap_validation_env()
+
+        self.assertEqual(env["DATA_SOURCE_MASTER_KEY"], "real-prod-key")
+        self.assertEqual(env["DATA_SOURCE_MASTER_KEY_FILE"], "/run/secrets/data_source_master_key")
+
     def test_entrypoint_imports_skip_dashboard_by_default(self) -> None:
         with patch.dict(
             "os.environ",
@@ -62,10 +94,42 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertNotIn("engine.app", modules)
 
     def test_startup_bootstrap_uses_sqlite_backend_by_default(self) -> None:
-        with patch.dict(os.environ, {"TRADING_VALIDATION_MODE": "startup"}, clear=True):
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_VALIDATION_MODE": "startup",
+                "TIMESCALE_ENABLED": "1",
+                "TIMESCALE_DSN": "postgresql://timescale.local/trading",
+                "TIMESCALE_PRICES_ENABLED": "1",
+                "TIMESCALE_PRICES_DSN": "postgresql://prices.local/trading",
+                "TELEMETRY_READ_BACKEND": "timescale",
+                "PRICE_READ_BACKEND": "timescale",
+                "TS_PG_DSN": "host=127.0.0.1 port=5432 dbname=trading",
+                "LIVE_CACHE_BACKEND": "redis",
+                "LIVE_CACHE_REDIS_URL": "redis://127.0.0.1:6379/0",
+                "REDIS_URL": "redis://127.0.0.1:6379/0",
+                "PREFLIGHT_REQUIRE_TIMESCALE": "1",
+                "PREFLIGHT_REQUIRE_REDIS": "1",
+                "PREFLIGHT_REQUIRE_OBJECT_STORAGE": "1",
+            },
+            clear=True,
+        ):
             env = bootstrap_validation_env()
 
         self.assertEqual(str(env.get("TS_STORAGE_BACKEND") or ""), "sqlite")
+        self.assertEqual(str(env.get("TIMESCALE_ENABLED") or ""), "0")
+        self.assertEqual(str(env.get("TIMESCALE_PRICES_ENABLED") or ""), "0")
+        self.assertEqual(str(env.get("TELEMETRY_READ_BACKEND") or ""), "sqlite")
+        self.assertEqual(str(env.get("PRICE_READ_BACKEND") or ""), "sqlite")
+        self.assertEqual(str(env.get("LIVE_CACHE_BACKEND") or ""), "memory")
+        self.assertEqual(str(env.get("PREFLIGHT_REQUIRE_TIMESCALE") or ""), "0")
+        self.assertEqual(str(env.get("PREFLIGHT_REQUIRE_REDIS") or ""), "0")
+        self.assertEqual(str(env.get("PREFLIGHT_REQUIRE_OBJECT_STORAGE") or ""), "0")
+        self.assertNotIn("TIMESCALE_DSN", env)
+        self.assertNotIn("TIMESCALE_PRICES_DSN", env)
+        self.assertNotIn("TS_PG_DSN", env)
+        self.assertNotIn("LIVE_CACHE_REDIS_URL", env)
+        self.assertNotIn("REDIS_URL", env)
 
     def test_startup_bootstrap_preserves_production_backend_requirement(self) -> None:
         with patch.dict(
@@ -74,12 +138,24 @@ class RuntimeGraphCheckTests(unittest.TestCase):
                 "TRADING_VALIDATION_MODE": "startup",
                 "TS_STORAGE_BACKEND": "",
                 "TS_ENV": "production",
+                "TIMESCALE_ENABLED": "1",
+                "TIMESCALE_DSN": "postgresql://timescale.local/trading",
+                "TS_PG_DSN": "host=timescaledb dbname=trading",
+                "LIVE_CACHE_BACKEND": "redis",
+                "REDIS_URL": "redis://redis.local:6379/0",
+                "PREFLIGHT_REQUIRE_REDIS": "1",
             },
             clear=True,
         ):
             env = bootstrap_validation_env()
 
         self.assertEqual(str(env.get("TS_STORAGE_BACKEND") or ""), "")
+        self.assertEqual(str(env.get("TIMESCALE_ENABLED") or ""), "1")
+        self.assertEqual(str(env.get("TIMESCALE_DSN") or ""), "postgresql://timescale.local/trading")
+        self.assertEqual(str(env.get("TS_PG_DSN") or ""), "host=timescaledb dbname=trading")
+        self.assertEqual(str(env.get("LIVE_CACHE_BACKEND") or ""), "redis")
+        self.assertEqual(str(env.get("REDIS_URL") or ""), "redis://redis.local:6379/0")
+        self.assertEqual(str(env.get("PREFLIGHT_REQUIRE_REDIS") or ""), "1")
 
     def test_embedded_startup_validation_detects_blocking_checks(self) -> None:
         message = _embedded_startup_validation_error(
@@ -154,7 +230,21 @@ class RuntimeGraphCheckTests(unittest.TestCase):
             stdout="{'ok': True}",
             stderr="",
         )
-        with patch("tools.runtime_graph_check.subprocess.run", return_value=completed) as mock_run:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TIMESCALE_ENABLED": "1",
+                    "TIMESCALE_DSN": "postgresql://timescale.local/trading",
+                    "TS_PG_DSN": "host=127.0.0.1 port=5432 dbname=trading",
+                    "LIVE_CACHE_BACKEND": "redis",
+                    "REDIS_URL": "redis://127.0.0.1:6379/0",
+                    "PREFLIGHT_REQUIRE_REDIS": "1",
+                },
+                clear=False,
+            ),
+            patch("tools.runtime_graph_check.subprocess.run", return_value=completed) as mock_run,
+        ):
             result = _run_cold_boot_db_bootstrap_check(timeout_s=12.5)
 
         self.assertTrue(bool(result.get("ok")))
@@ -166,6 +256,12 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertEqual(str(env.get("AUTO_BOOT_DAEMONS") or ""), "0")
         self.assertEqual(str(env.get("SQLITE_TRACE_REPORT_EVERY_S") or ""), "0")
         self.assertEqual(str(env.get("TS_PG_SCHEMA_PER_DB_PATH") or ""), "1")
+        self.assertEqual(str(env.get("TS_STORAGE_BACKEND") or ""), "sqlite")
+        self.assertEqual(str(env.get("TIMESCALE_ENABLED") or ""), "0")
+        self.assertEqual(str(env.get("LIVE_CACHE_BACKEND") or ""), "memory")
+        self.assertNotIn("TIMESCALE_DSN", env)
+        self.assertNotIn("TS_PG_DSN", env)
+        self.assertNotIn("REDIS_URL", env)
         self.assertTrue(str(env.get("DB_PATH") or "").endswith("cold_boot_validation.db"))
 
     def test_cold_boot_db_bootstrap_check_surfaces_timeouts(self) -> None:
@@ -186,7 +282,27 @@ class RuntimeGraphCheckTests(unittest.TestCase):
             stdout='{"ok": true, "enabled": false}',
             stderr="",
         )
-        with patch("tools.runtime_graph_check.subprocess.run", return_value=completed) as mock_run:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TIMESCALE_ENABLED": "1",
+                    "TIMESCALE_DSN": "postgresql://timescale.local/trading",
+                    "TIMESCALE_PRICES_ENABLED": "1",
+                    "TIMESCALE_PRICES_DSN": "postgresql://prices.local/trading",
+                    "TELEMETRY_READ_BACKEND": "timescale",
+                    "PRICE_READ_BACKEND": "timescale",
+                    "TS_PG_DSN": "host=127.0.0.1 port=5432 dbname=trading",
+                    "LIVE_CACHE_BACKEND": "redis",
+                    "LIVE_CACHE_REDIS_URL": "redis://127.0.0.1:6379/0",
+                    "REDIS_URL": "redis://127.0.0.1:6379/0",
+                    "PREFLIGHT_REQUIRE_TIMESCALE": "1",
+                    "PREFLIGHT_REQUIRE_REDIS": "1",
+                },
+                clear=False,
+            ),
+            patch("tools.runtime_graph_check.subprocess.run", return_value=completed) as mock_run,
+        ):
             result = _run_timeseries_sidecar_startup_check(timeout_s=13.5)
 
         self.assertTrue(bool(result.get("ok")))
@@ -198,12 +314,59 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertEqual(str(env.get("AUTO_BOOT_DAEMONS") or ""), "0")
         self.assertEqual(str(env.get("SQLITE_TRACE_REPORT_EVERY_S") or ""), "0")
         self.assertEqual(str(env.get("TS_PG_SCHEMA_PER_DB_PATH") or ""), "1")
+        self.assertEqual(str(env.get("TS_STORAGE_BACKEND") or ""), "sqlite")
+        self.assertEqual(str(env.get("TIMESCALE_ENABLED") or ""), "0")
+        self.assertEqual(str(env.get("TIMESCALE_PRICES_ENABLED") or ""), "0")
+        self.assertEqual(str(env.get("TELEMETRY_READ_BACKEND") or ""), "sqlite")
+        self.assertEqual(str(env.get("PRICE_READ_BACKEND") or ""), "sqlite")
+        self.assertEqual(str(env.get("LIVE_CACHE_BACKEND") or ""), "memory")
+        self.assertNotIn("TIMESCALE_DSN", env)
+        self.assertNotIn("TIMESCALE_PRICES_DSN", env)
+        self.assertNotIn("TS_PG_DSN", env)
+        self.assertNotIn("LIVE_CACHE_REDIS_URL", env)
+        self.assertNotIn("REDIS_URL", env)
         self.assertTrue(str(env.get("DB_PATH") or "").endswith("timeseries_validation.db"))
         cmd = list(mock_run.call_args.args[0] or [])
         self.assertIn("init_timeseries_storage", str(cmd[2]))
         self.assertIn("ensure_schema", str(cmd[2]))
         self.assertIn("get_timeseries_storage_snapshot", str(cmd[2]))
         self.assertIn("RUNTIME_GRAPH_TIMESERIES_SCHEMA_TIMEOUT_S", str(cmd[2]))
+
+    def test_timeseries_sidecar_startup_check_preserves_production_dependencies(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["python", "-c", "print('ok')"],
+            returncode=0,
+            stdout='{"ok": true, "enabled": true}',
+            stderr="",
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TRADING_VALIDATION_REQUIRE_PROD_DEPS": "1",
+                    "TIMESCALE_ENABLED": "1",
+                    "TIMESCALE_DSN": "postgresql://timescale.local/trading",
+                    "TS_PG_DSN": "host=timescaledb dbname=trading",
+                    "LIVE_CACHE_BACKEND": "redis",
+                    "REDIS_URL": "redis://redis.local:6379/0",
+                    "PREFLIGHT_REQUIRE_REDIS": "1",
+                },
+                clear=True,
+            ),
+            patch("tools.runtime_graph_check.subprocess.run", return_value=completed) as mock_run,
+        ):
+            result = _run_timeseries_sidecar_startup_check(timeout_s=13.5)
+
+        self.assertTrue(bool(result.get("ok")))
+        env = dict(mock_run.call_args.kwargs.get("env") or {})
+        self.assertEqual(str(env.get("TRADING_VALIDATION_REQUIRE_PROD_DEPS") or ""), "1")
+        self.assertEqual(str(env.get("TIMESCALE_ENABLED") or ""), "1")
+        self.assertEqual(str(env.get("TIMESCALE_DSN") or ""), "postgresql://timescale.local/trading")
+        self.assertEqual(str(env.get("TS_PG_DSN") or ""), "host=timescaledb dbname=trading")
+        self.assertEqual(str(env.get("LIVE_CACHE_BACKEND") or ""), "redis")
+        self.assertEqual(str(env.get("REDIS_URL") or ""), "redis://redis.local:6379/0")
+        self.assertEqual(str(env.get("PREFLIGHT_REQUIRE_REDIS") or ""), "1")
+        self.assertNotEqual(str(env.get("TS_STORAGE_BACKEND") or ""), "sqlite")
 
     def test_startup_runtime_graph_accepts_registered_job_entrypoints(self) -> None:
         with (

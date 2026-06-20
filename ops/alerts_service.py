@@ -21,7 +21,7 @@ def _normalize_explain_json(val) -> str:
     except Exception as e:
         logging.warning("alerts_service normalize_explain_json_failed err=%s", e)
         return "{}"
-from dashboard_config import (
+from engine.runtime.dashboard_config import (
     EQ_CRIT_EMAIL_TO,
     EQ_CRIT_EMAIL_FROM,
     EQ_CRIT_SMTP_HOST,

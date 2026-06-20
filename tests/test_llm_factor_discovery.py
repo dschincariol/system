@@ -6,12 +6,24 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from engine.strategy.discovery.llm_factor_generator import (
     cumulative_trial_count,
     run_llm_factor_discovery,
+    validate_llm_candidate_expression,
 )
-from engine.strategy.discovery.registry import ensure_discovery_schema, list_evaluations, list_registered_features
+from engine.strategy.discovery.base import CandidateFeature, EvaluationResult
+from engine.strategy.discovery.registry import (
+    FEATURE_STAGE_LIVE,
+    ensure_discovery_schema,
+    list_evaluations,
+    list_registered_features,
+    record_candidate,
+    record_evaluation,
+    register_feature,
+)
+from engine.strategy.experiment_ledger import fetch_experiment_ledger
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FEATURE_IDS = ["f0", "f1", "f2", "f3"]
@@ -129,6 +141,73 @@ def test_llm_factor_discovery_cumulative_fdr_denominator_grows(monkeypatch):
     assert cumulative_trial_count(con=con) == 2
 
 
+def test_llm_factor_discovery_revises_under_strict_budget_and_persists_lineage(monkeypatch):
+    train, test, cutoff = _frames()
+    con = sqlite3.connect(":memory:")
+    ensure_discovery_schema(con)
+    monkeypatch.setenv("LLM_EVAL_MIN_TS", str(cutoff))
+    monkeypatch.setenv("LLM_FACTOR_CANDIDATES", "2")
+    prompts: list[dict] = []
+
+    def mocked_llm(**kwargs):
+        prompt = json.loads(str(kwargs["prompt"]))
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return json.dumps({"candidates": [{"expression": "x0", "hypothesis": "too close to primitive"}]})
+        return json.dumps({"candidates": [{"expression": "(x1*x2)", "hypothesis": "revised non-linear carry"}]})
+
+    summary = run_llm_factor_discovery(
+        symbols=["AAPL"],
+        train_frames=train,
+        test_frames=test,
+        feature_ids=list(FEATURE_IDS),
+        con=con,
+        llm_client=mocked_llm,
+        q_threshold=0.10,
+        t_threshold=2.0,
+    )
+
+    assert len(prompts) == 2
+    assert summary["trial_budget"] == 2
+    assert summary["trials_used"] == 2
+    assert summary["accepted"] == 1
+    assert summary["redundant"] == 1
+    assert summary["by_symbol"]["AAPL"]["final_decision"] == "accepted"
+    assert prompts[1]["revision_context"]["failure_modes"]["redundant"] == 1
+
+    registered = list_registered_features(con=con)
+    assert len(registered) == 1
+    rows = fetch_experiment_ledger(candidate_key=registered[0].hash, con=con)
+    assert rows
+    latest = rows[0]
+    assert latest["promotion_decision"] == "accepted"
+    assert latest["prompt_hash"]
+    assert latest["model_name"]
+    assert latest["model_hash"]
+    assert latest["trial_budget"] == 2
+    assert latest["trial_count"] == 2
+    assert latest["fdr_json"]["decision"] == "accepted"
+    lineage = latest["search_space_json"]["params"]["candidate_lineage"]
+    assert lineage["attempt_idx"] == 1
+    assert lineage["parent_hash"]
+
+    loop_rows = fetch_experiment_ledger(candidate_name="llm_factor_loop.AAPL", con=con)
+    assert loop_rows
+    assert loop_rows[0]["status"] == "accepted"
+    assert loop_rows[0]["model_name"]
+    assert loop_rows[0]["trial_count"] == 2
+    assert len(loop_rows[0]["evidence_json"]["evaluation_history"]) == 2
+
+
+def test_llm_dsl_validation_is_explicit_and_bounded():
+    ok = validate_llm_candidate_expression("(x0*x1)", allowed_names={"x0", "x1"}, max_complexity=4)
+    bad = validate_llm_candidate_expression("__import__('os')", allowed_names={"x0", "x1"}, max_complexity=4)
+
+    assert ok["ok"] is True
+    assert bad["ok"] is False
+    assert bad["reason"] in {"unknown_variable", "parse_failed:ValueError"}
+
+
 def test_llm_factor_discovery_scores_only_post_cutoff_for_qualification(monkeypatch):
     train, test, cutoff = _frames(leakage=True)
     con = sqlite3.connect(":memory:")
@@ -153,6 +232,40 @@ def test_llm_factor_discovery_scores_only_post_cutoff_for_qualification(monkeypa
     assert summary["registered_experimental"] == 0
     assert not list_registered_features(con=con)
     assert list_evaluations(con=con)[0]["decision"] != "accepted"
+
+
+def test_llm_factor_live_registration_requires_accepted_ledger_evidence():
+    con = sqlite3.connect(":memory:")
+    ensure_discovery_schema(con)
+    candidate = CandidateFeature(
+        source="llm_factor",
+        symbol="AAPL",
+        expression="(x0*x1)",
+        params={
+            "feature_map": {"x0": "f0", "x1": "f1"},
+            "prompt_hash": "prompt-a",
+            "model_name": "unit-model",
+            "trial_budget": 2,
+            "trial_count": 1,
+        },
+    )
+    record = record_candidate(candidate, con=con, ts=123)
+
+    with pytest.raises(ValueError, match="evaluation_missing"):
+        register_feature(candidate, candidate_id=record.id, stage=FEATURE_STAGE_LIVE, con=con, ts=124)
+
+    failed = EvaluationResult(
+        candidate_hash=candidate.hash,
+        feature_id=candidate.feature_id,
+        t_stat=1.0,
+        p_value=0.5,
+        q_value=0.5,
+        decision="fdr_failed",
+        n_obs=64,
+    )
+    record_evaluation(record.id, failed, con=con, ts=125)
+    with pytest.raises(ValueError, match="evaluation_not_accepted"):
+        register_feature(candidate, candidate_id=record.id, stage=FEATURE_STAGE_LIVE, con=con, ts=126)
 
 
 def test_llm_factor_discovery_noops_without_key(monkeypatch):

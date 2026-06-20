@@ -67,6 +67,31 @@ def test_lgbm_ranker_recovers_planted_cross_sectional_order(monkeypatch):
     assert metrics["top_bottom_quintile_spread"] > 0.0
 
 
+def test_lgbm_ranker_default_n_jobs_is_configurable_and_bounded(monkeypatch):
+    monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "offline")
+    monkeypatch.setenv("LGBM_RANKER_N_JOBS", "14")
+    monkeypatch.setenv("MODEL_TRAIN_MAX_N_JOBS", "6")
+    module = importlib.import_module("engine.strategy.models.lgbm_ranker")
+
+    model = module.LGBMRankerModel(feature_ids=list(FEATURE_IDS))
+
+    assert model.hyperparams["n_jobs"] == 6
+
+
+def test_lgbm_ranker_training_job_requires_live_profile_ack(monkeypatch, capsys):
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "live")
+    monkeypatch.delenv("OFFLINE_TRAINING_LIVE_PROFILE_ACK", raising=False)
+    monkeypatch.delenv("OFFLINE_TRAINING_LIVE_PROFILE_OWNER", raising=False)
+    monkeypatch.delenv("OFFLINE_TRAINING_LIVE_PROFILE_REASON", raising=False)
+    module = importlib.import_module("engine.strategy.models.lgbm_ranker")
+
+    rc = module.run_ranker_training_job()
+
+    assert rc == 3
+    assert "offline_training_live_profile_ack_required" in capsys.readouterr().out
+
+
 def test_lgbm_ranker_era_boost_persists_training_tables(monkeypatch):
     monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
     monkeypatch.setenv("LGBM_ERA_BOOST", "1")

@@ -29,10 +29,26 @@ def _reload_modules(*module_names: str):
 
 
 class AuditInvariantTests(unittest.TestCase):
+    MODE_ENV_KEYS = (
+        "EXECUTION_MODE",
+        "ENGINE_MODE",
+        "BROKER",
+        "BROKER_NAME",
+        "LIVE_BROKER",
+        "BROKER_FAILOVER",
+    )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "audit_test.db"
+        self._prev_mode_env = {key: os.environ.get(key) for key in self.MODE_ENV_KEYS}
         os.environ["DB_PATH"] = str(self.db_path)
+        os.environ["EXECUTION_MODE"] = "paper"
+        os.environ["ENGINE_MODE"] = "paper"
+        os.environ["BROKER"] = "sim"
+        os.environ["BROKER_NAME"] = "sim"
+        os.environ["LIVE_BROKER"] = "sim"
+        os.environ["BROKER_FAILOVER"] = "sim"
 
         _reload_modules(
             "engine.runtime.db_guard",
@@ -62,6 +78,11 @@ class AuditInvariantTests(unittest.TestCase):
             storage.close_pooled_connections()
         except Exception as e:
             sys.stderr.write(f"[test_audit_invariants] close_pooled_connections_failed: {type(e).__name__}: {e}\n")
+        for key, value in self._prev_mode_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[str(key)] = str(value)
         self.tmp.cleanup()
 
     def _executescript(self, script: str) -> None:

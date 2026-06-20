@@ -291,14 +291,21 @@ def test_kill_switch_status_rows_replace_pre_mouse_heuristic():
     assert "lineHeight" not in kill_js
 
 
-def test_dashboard_unsafe_job_buttons_fail_closed_with_execution_barrier():
+def test_dashboard_job_catalog_uses_backend_safety_contract():
     html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
     js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    catalog_js = (REPO_ROOT / "ui" / "job_catalog.js").read_text(encoding="utf-8")
 
+    assert 'id="jobCatalogCard"' in html
+    assert 'id="jobCatalogSearch"' in html
+    assert 'id="jobCatalogBody"' in html
     assert 'data-job="broker_apply_orders" data-action="start"' in html
-    assert "isSafePaletteJobAction" in js
+    assert "from \"./job_catalog.js\"" in js
+    assert "renderJobCatalogRows(view, { selectedJob })" in js
+    assert "action_policy" in catalog_js
+    assert "safety_confirmation_required" in catalog_js
     assert "function syncJobActionSafetyState" in js
-    assert "Execution barrier/read-only mode blocks this job." in js
+    assert "Execution barrier/read-only mode blocks job starts." in js
     assert "window.__LAST_EXECUTION_BARRIER__ = j;" in js
     assert "syncJobActionSafetyState();" in js
 

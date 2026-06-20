@@ -122,3 +122,17 @@ def test_artifacts_root_explicit_override_wins(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setenv("TRADING_DATA", str(tmp_path / "runtime_data"))
 
     assert artifacts_root() == (tmp_path / "explicit_artifacts").resolve()
+
+
+def test_artifacts_root_uses_local_var_default(monkeypatch) -> None:
+    from engine.artifacts import paths as artifact_paths
+
+    monkeypatch.delenv("TS_ARTIFACTS_ROOT", raising=False)
+    monkeypatch.delenv("TRADING_DATA", raising=False)
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setattr(artifact_paths, "_running_python_tests", lambda: False)
+
+    expected = Path(__file__).resolve().parents[1] / "var" / "artifacts"
+    assert artifact_paths.artifacts_root() == expected.resolve()

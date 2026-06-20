@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from engine.artifacts.store import LocalArtifactStore
 from engine.runtime import dbapi_compat as dbapi
+from engine.runtime.platform import default_local_artifacts_dir, default_local_models_dir
 from engine.runtime.storage import connect
 
 MODEL_PATTERNS = (
@@ -33,6 +34,8 @@ def _default_source_roots() -> list[Path]:
         Path(os.environ.get("MODEL_ARTIFACT_ROOT", "")),
         Path(os.environ.get("ARTIFACT_ROOT", "")),
         Path(os.environ.get("DB_PATH", "")) / "models",
+        default_local_models_dir(),
+        default_local_artifacts_dir(),
         ROOT / "models",
         ROOT / "artifacts",
         ROOT / "data" / "models",

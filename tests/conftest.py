@@ -30,7 +30,6 @@ os.environ.setdefault("TS_PG_CONNECT_TIMEOUT", "1")
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "linux_only: test runs only on Linux")
-    config.addinivalue_line("markers", "windows_only: test runs only on Windows")
     config.addinivalue_line(
         "markers",
         "requires_postgres: test needs a reachable Postgres instance "
@@ -87,15 +86,11 @@ def _parse_pg_dsn(dsn: str) -> tuple[str, int] | tuple[str, None]:
 
 
 def _platform_default_pg_target() -> tuple[str, int | None]:
-    if sys.platform == "linux":
-        return "/var/run/postgresql", None
-    return "127.0.0.1", 5432
+    return "/var/run/postgresql", None
 
 
 def _platform_default_redis_url() -> str:
-    if sys.platform == "linux":
-        return "unix:///var/run/redis/trading.sock"
-    return "redis://127.0.0.1:6379/0"
+    return "unix:///var/run/redis/trading.sock"
 
 
 @functools.lru_cache(maxsize=1)
@@ -125,8 +120,6 @@ def pytest_runtest_setup(item):
     keywords = item.keywords
     if "linux_only" in keywords and sys.platform != "linux":
         pytest.skip("linux-only test")
-    if "windows_only" in keywords and sys.platform != "win32":
-        pytest.skip("windows-only test")
     if "requires_postgres" in keywords and not _postgres_reachable():
         pytest.skip("postgres not reachable at TS_PG_DSN")
     if "requires_redis" in keywords and not _redis_reachable():
@@ -158,6 +151,7 @@ def _default_test_secrets(monkeypatch, tmp_path, request):
     secret_dir = tmp_path / "test_secrets"
     secret_dir.mkdir()
     for name, value in {
+        "data_source_master_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
         "master_key": "test-master-key",
         "pg_password_app": "test-app-password",
         "pg_password_ingest": "test-ingest-password",

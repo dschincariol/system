@@ -17,6 +17,7 @@ BACKUP_DRILL_DIR="${TRADING_BACKUP_DRILL_DIR:-${BACKUP_ROOT}/drills}"
 BACKUP_EVIDENCE_DIR="${TRADING_BACKUP_EVIDENCE_DIR:-${BACKUP_ROOT}/evidence}"
 ETC_DIR="${TRADING_ETC_DIR:-/etc/trading}"
 TRADING_ENV_FILE="${TRADING_ENV_FILE:-${ETC_DIR}/trading.env}"
+BACKUP_EVIDENCE_HMAC_KEY_FILE="${TRADING_BACKUP_EVIDENCE_HMAC_KEY_FILE:-${ETC_DIR}/backup_evidence.hmac.key}"
 PROVIDER_ENV="${TRADING_PROVIDER_ENV:-${ETC_DIR}/provider.env}"
 SYSTEMD_DST_DIR="${TRADING_SYSTEMD_DIR:-/etc/systemd/system}"
 POSTGRES_VERSION="${TRADING_POSTGRES_VERSION:-}"
@@ -129,6 +130,33 @@ ensure_trading_user() {
   if ! id -u "$TRADING_USER" >/dev/null 2>&1; then
     useradd --system --gid "$TRADING_GROUP" --home-dir "${TRADING_DATA_ROOT:-/var/lib/trading}" --shell /usr/sbin/nologin "$TRADING_USER"
   fi
+}
+
+ensure_backup_evidence_hmac_key() {
+  local key_dir tmp
+  key_dir="$(dirname "$BACKUP_EVIDENCE_HMAC_KEY_FILE")"
+  install -d -o root -g "$TRADING_GROUP" -m 0750 "$key_dir"
+  if [ -f "$BACKUP_EVIDENCE_HMAC_KEY_FILE" ]; then
+    [ -s "$BACKUP_EVIDENCE_HMAC_KEY_FILE" ] || die "backup evidence HMAC key file is empty: ${BACKUP_EVIDENCE_HMAC_KEY_FILE}"
+    chown root:"$TRADING_GROUP" "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+    chmod 0640 "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+    log "using existing backup evidence HMAC key: ${BACKUP_EVIDENCE_HMAC_KEY_FILE}"
+    return 0
+  fi
+
+  tmp="$(mktemp "${key_dir}/backup_evidence.hmac.key.tmp.XXXXXX")"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32 > "$tmp"
+  else
+    python3 - <<'PY' > "$tmp"
+import secrets
+
+print(secrets.token_hex(32))
+PY
+  fi
+  install -m 0640 -o root -g "$TRADING_GROUP" "$tmp" "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+  rm -f "$tmp"
+  log "created backup evidence HMAC key: ${BACKUP_EVIDENCE_HMAC_KEY_FILE}"
 }
 
 detect_postgres_bin_dir() {
@@ -311,11 +339,14 @@ create_backup_layout() {
     install -d -o "$TRADING_USER" -g "$TRADING_GROUP" -m 0770 "$dir"
   done
   if [ "$COMPOSE_MODE" -eq 1 ]; then
-    local pg_uid_gid
+    local pg_uid pg_uid_gid
     pg_uid_gid="$(compose_postgres_uid_gid)"
-    chown "$pg_uid_gid" "$BACKUP_ROOT"
-    chown -R "$pg_uid_gid" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"
-    chmod 0770 "$BACKUP_ROOT" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"
+    pg_uid="${pg_uid_gid%%:*}"
+    chown "${pg_uid}:${TRADING_GROUP}" "$BACKUP_ROOT"
+    chown -R "${pg_uid}:${TRADING_GROUP}" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"
+    chmod 2750 "$BACKUP_ROOT" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_WAL_DIR/.tmp" "$BACKUP_DRILL_DIR"
+    find "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR" -type d -exec chmod 2750 {} +
+    find "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR" -type f -exec chmod 0640 {} +
   fi
 }
 
@@ -333,6 +364,7 @@ write_runtime_env() {
     set_env_var TS_BACKUP_DOCKER_IMAGE ""
     set_env_var TS_BACKUP_DOCKER_EXEC_CONTAINER "$TIMESCALE_CONTAINER"
     set_env_var TS_BACKUP_DOCKER_EXEC_USER "postgres"
+    set_env_var TS_BACKUP_READ_GROUP "$TRADING_GROUP"
     set_env_var TS_RESTORE_DOCKER_IMAGE "$TIMESCALE_IMAGE"
     set_env_var TS_RESTORE_DOCKER_USER "postgres"
     set_env_var TS_RESTORE_DRILL_ALLOW_DIRECT "1"
@@ -350,6 +382,9 @@ write_runtime_env() {
   set_env_var BACKUP_EVIDENCE_WAL_RPO_S "120"
   set_env_var BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S "7776000"
   set_env_var BACKUP_EVIDENCE_RTO_S "1800"
+  set_env_var BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S "120"
+  set_env_var BACKUP_EVIDENCE_REQUIRE_SIGNATURE "1"
+  set_env_var BACKUP_EVIDENCE_HMAC_KEY_FILE "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
 }
 
 configure_compose_archive() {
@@ -485,6 +520,7 @@ Environment=TS_RESTORE_DRILL_DIR=${BACKUP_DRILL_DIR}
 Environment=TS_BACKUP_DOCKER_IMAGE=
 Environment=TS_BACKUP_DOCKER_EXEC_CONTAINER=${TIMESCALE_CONTAINER}
 Environment=TS_BACKUP_DOCKER_EXEC_USER=postgres
+Environment=TS_BACKUP_READ_GROUP=${TRADING_GROUP}
 Environment=TS_RESTORE_DOCKER_IMAGE=${TIMESCALE_IMAGE}
 Environment=TS_RESTORE_DOCKER_USER=postgres
 Environment=TS_RESTORE_DRILL_ALLOW_DIRECT=1
@@ -513,6 +549,7 @@ run_evidence() {
       TS_BACKUP_DOCKER_IMAGE= \
       TS_BACKUP_DOCKER_EXEC_CONTAINER="$TIMESCALE_CONTAINER" \
       TS_BACKUP_DOCKER_EXEC_USER=postgres \
+      TS_BACKUP_READ_GROUP="$TRADING_GROUP" \
       TS_RESTORE_DOCKER_IMAGE="$TIMESCALE_IMAGE" \
       TS_RESTORE_DOCKER_USER=postgres \
       TS_RESTORE_DRILL_ALLOW_DIRECT=1 \
@@ -520,6 +557,8 @@ run_evidence() {
       TS_RESTORE_DB="$POSTGRES_DB" \
       TS_RESTORE_USER="$TIMESCALE_USER" \
       BACKUP_EVIDENCE_PATH="${BACKUP_EVIDENCE_DIR}/latest_backup_restore_evidence.json" \
+      BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1 \
+      BACKUP_EVIDENCE_HMAC_KEY_FILE="$BACKUP_EVIDENCE_HMAC_KEY_FILE" \
       "${BACKUP_SCRIPT_DST_DIR}/backup_restore_evidence.sh"
   else
     runuser -u postgres -- env \
@@ -531,6 +570,8 @@ run_evidence() {
       TS_BACKUP_WAL_DIR="$BACKUP_WAL_DIR" \
       TS_RESTORE_DRILL_DIR="$BACKUP_DRILL_DIR" \
       BACKUP_EVIDENCE_PATH="${BACKUP_EVIDENCE_DIR}/latest_backup_restore_evidence.json" \
+      BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1 \
+      BACKUP_EVIDENCE_HMAC_KEY_FILE="$BACKUP_EVIDENCE_HMAC_KEY_FILE" \
       "${BACKUP_SCRIPT_DST_DIR}/backup_restore_evidence.sh"
   fi
 }
@@ -556,6 +597,7 @@ main() {
   if [ "$COMPOSE_MODE" -eq 0 ]; then
     ensure_group_membership postgres "$TRADING_GROUP"
   fi
+  ensure_backup_evidence_hmac_key
   create_backup_layout
   install_backup_scripts
   write_runtime_env

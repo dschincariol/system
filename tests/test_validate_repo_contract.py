@@ -45,6 +45,7 @@ class ValidateRepoContractTests(unittest.TestCase):
         expected_labels = {
             "unit-tests": [
                 "syntax",
+                "ruff-static-release-gate",
                 "docs",
                 "ui-asset-refs",
                 "dependency-lock",
@@ -55,6 +56,7 @@ class ValidateRepoContractTests(unittest.TestCase):
             ],
             "pytest-tests": [
                 "syntax",
+                "ruff-static-release-gate",
                 "docs",
                 "ui-asset-refs",
                 "dependency-lock",
@@ -93,6 +95,67 @@ class ValidateRepoContractTests(unittest.TestCase):
             ["python-bin", "tools/runtime_graph_check.py", "--mode", "startup"],
         )
         self.assertEqual(runtime_graph_call[2]["PYTHONPATH"], str(root))
+        self.assertEqual(runtime_graph_call[2]["TRADING_VALIDATE_REPO_LIVE"], "0")
+
+    def test_runtime_graph_startup_env_is_hermetic_by_default(self) -> None:
+        run_env = validate_repo._runtime_graph_startup_env(
+            {
+                "PYTHONPATH": str(Path("repo")),
+                "TIMESCALE_ENABLED": "1",
+                "TIMESCALE_DSN": "postgresql://timescale.local/trading",
+                "TIMESCALE_PRICES_ENABLED": "1",
+                "TIMESCALE_PRICES_DSN": "postgresql://prices.local/trading",
+                "TELEMETRY_READ_BACKEND": "timescale",
+                "PRICE_READ_BACKEND": "timescale",
+                "TS_PG_DSN": "host=127.0.0.1 port=5432 dbname=trading",
+                "LIVE_CACHE_BACKEND": "redis",
+                "LIVE_CACHE_REDIS_URL": "redis://127.0.0.1:6379/0",
+                "REDIS_URL": "redis://127.0.0.1:6379/0",
+                "PREFLIGHT_REQUIRE_TIMESCALE": "1",
+                "PREFLIGHT_REQUIRE_REDIS": "1",
+                "PREFLIGHT_REQUIRE_OBJECT_STORAGE": "1",
+            }
+        )
+
+        self.assertEqual(run_env["TRADING_VALIDATION_MODE"], "startup")
+        self.assertEqual(run_env["TS_STORAGE_BACKEND"], "sqlite")
+        self.assertEqual(run_env["TIMESCALE_ENABLED"], "0")
+        self.assertEqual(run_env["TIMESCALE_PRICES_ENABLED"], "0")
+        self.assertEqual(run_env["TELEMETRY_READ_BACKEND"], "sqlite")
+        self.assertEqual(run_env["PRICE_READ_BACKEND"], "sqlite")
+        self.assertEqual(run_env["LIVE_CACHE_BACKEND"], "memory")
+        self.assertEqual(run_env["PREFLIGHT_REQUIRE_TIMESCALE"], "0")
+        self.assertEqual(run_env["PREFLIGHT_REQUIRE_REDIS"], "0")
+        self.assertEqual(run_env["PREFLIGHT_REQUIRE_OBJECT_STORAGE"], "0")
+        self.assertNotIn("TIMESCALE_DSN", run_env)
+        self.assertNotIn("TIMESCALE_PRICES_DSN", run_env)
+        self.assertNotIn("TS_PG_DSN", run_env)
+        self.assertNotIn("LIVE_CACHE_REDIS_URL", run_env)
+        self.assertNotIn("REDIS_URL", run_env)
+
+    def test_runtime_graph_startup_env_preserves_live_dependencies(self) -> None:
+        run_env = validate_repo._runtime_graph_startup_env(
+            {
+                "TRADING_VALIDATE_REPO_LIVE": "1",
+                "TRADING_VALIDATION_REQUIRE_PROD_DEPS": "1",
+                "TIMESCALE_ENABLED": "1",
+                "TIMESCALE_DSN": "postgresql://timescale.local/trading",
+                "TS_PG_DSN": "host=timescaledb dbname=trading",
+                "LIVE_CACHE_BACKEND": "redis",
+                "REDIS_URL": "redis://redis.local:6379/0",
+                "PREFLIGHT_REQUIRE_REDIS": "1",
+            }
+        )
+
+        self.assertEqual(run_env["TRADING_VALIDATION_MODE"], "startup")
+        self.assertEqual(run_env["TRADING_VALIDATE_REPO_LIVE"], "1")
+        self.assertEqual(run_env["TRADING_VALIDATION_REQUIRE_PROD_DEPS"], "1")
+        self.assertEqual(run_env["TIMESCALE_ENABLED"], "1")
+        self.assertEqual(run_env["TIMESCALE_DSN"], "postgresql://timescale.local/trading")
+        self.assertEqual(run_env["TS_PG_DSN"], "host=timescaledb dbname=trading")
+        self.assertEqual(run_env["LIVE_CACHE_BACKEND"], "redis")
+        self.assertEqual(run_env["REDIS_URL"], "redis://redis.local:6379/0")
+        self.assertEqual(run_env["PREFLIGHT_REQUIRE_REDIS"], "1")
 
     def test_validate_repo_live_loads_compose_env_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,9 +166,11 @@ class ValidateRepoContractTests(unittest.TestCase):
                 "\n".join(
                     [
                         "DASHBOARD_PUBLIC_PORT=18000",
-                        "OPERATOR_PUBLIC_PORT=14001",
                         "DASHBOARD_API_TOKEN=dashboard-secret",
                         "OPERATOR_API_TOKEN=operator-secret",
+                        "TIMESCALE_ENABLED=1",
+                        "LIVE_CACHE_BACKEND=redis",
+                        "PREFLIGHT_REQUIRE_REDIS=1",
                     ]
                 ),
                 encoding="utf-8",
@@ -130,7 +195,13 @@ class ValidateRepoContractTests(unittest.TestCase):
         self.assertEqual(smoke_call[2]["OPERATOR_API_TOKEN"], "operator-secret")
         self.assertEqual(smoke_call[2]["PIPELINE_SMOKE_OPERATOR_TOKEN"], "operator-secret")
         self.assertEqual(smoke_call[2]["PIPELINE_SMOKE_BASE"], "http://127.0.0.1:18000")
-        self.assertEqual(smoke_call[2]["PIPELINE_SMOKE_OPERATOR_BASE"], "http://127.0.0.1:14001")
+        self.assertEqual(smoke_call[2]["PIPELINE_SMOKE_OPERATOR_BASE"], "http://127.0.0.1:18000/operator")
+        runtime_graph_call = next(call for call in calls if call[0] == "runtime-graph-startup")
+        self.assertEqual(runtime_graph_call[2]["TRADING_VALIDATE_REPO_LIVE"], "1")
+        self.assertEqual(runtime_graph_call[2]["TRADING_VALIDATION_REQUIRE_PROD_DEPS"], "1")
+        self.assertEqual(runtime_graph_call[2]["TIMESCALE_ENABLED"], "1")
+        self.assertEqual(runtime_graph_call[2]["LIVE_CACHE_BACKEND"], "redis")
+        self.assertEqual(runtime_graph_call[2]["PREFLIGHT_REQUIRE_REDIS"], "1")
 
     def test_validate_repo_skips_telemetry_burnin_check_by_default(self) -> None:
         exit_code, calls, _, _ = self._run_main()

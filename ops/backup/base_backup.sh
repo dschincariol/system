@@ -202,7 +202,12 @@ if [ -n "${TS_BACKUP_DOCKER_EXEC_CONTAINER:-}" ]; then
   pg_uid_gid="$(
     docker exec "$TS_BACKUP_DOCKER_EXEC_CONTAINER" sh -lc 'printf "%s:%s\n" "$(id -u postgres)" "$(id -g postgres)"'
   )"
-  chown "$pg_uid_gid" "$work_dir"
+  if [ -n "${TS_BACKUP_READ_GROUP:-}" ]; then
+    chown "${pg_uid_gid%%:*}:${TS_BACKUP_READ_GROUP}" "$work_dir"
+    chmod 2750 "$work_dir"
+  else
+    chown "$pg_uid_gid" "$work_dir"
+  fi
 fi
 log info backup_started "backup_dir=${backup_dir} work_dir=${work_dir}"
 
@@ -211,6 +216,12 @@ run_pg_basebackup > "$pg_basebackup_log" 2>&1
 mv -f "$pg_basebackup_log" "${work_dir}/pg_basebackup.out"
 
 verify_backup_dir "$work_dir"
+
+if [ -n "${TS_BACKUP_READ_GROUP:-}" ] && [ -n "${pg_uid_gid:-}" ]; then
+  chown -R "${pg_uid_gid%%:*}:${TS_BACKUP_READ_GROUP}" "$work_dir"
+  find "$work_dir" -type d -exec chmod 2750 {} +
+  find "$work_dir" -type f -exec chmod 0640 {} +
+fi
 
 mv "$work_dir" "$backup_dir"
 

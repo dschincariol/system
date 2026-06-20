@@ -36,6 +36,15 @@ def _fake_probabilities(texts, model_name=None):
     return out
 
 
+class _FakeCudaAvailable:
+    def is_available(self) -> bool:
+        return True
+
+
+class _FakeTorchCudaAvailable:
+    cuda = _FakeCudaAvailable()
+
+
 class FinbertSentimentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -49,6 +58,9 @@ class FinbertSentimentTests(unittest.TestCase):
                 "FINBERT_MAX_TEXT_LEN",
                 "FINBERT_USE_PERSISTED_ENRICHMENT",
                 "FINBERT_LIVE_INFERENCE_ENABLED",
+                "FINBERT_DEVICE",
+                "NLP_DEVICE",
+                "TORCH_DEVICE",
                 "USE_SYMBOL_SNAPSHOT_FEATURES",
             )
         }
@@ -140,6 +152,22 @@ class FinbertSentimentTests(unittest.TestCase):
         self.assertEqual(float(out["score"]), 0.0)
         self.assertEqual(float(out["confidence"]), 0.0)
         self.assertTrue(bool(out["payload_json"]["missing_text"]))
+
+    def test_default_finbert_device_is_cpu_even_when_cuda_available(self) -> None:
+        for key in ("FINBERT_DEVICE", "NLP_DEVICE", "TORCH_DEVICE"):
+            os.environ.pop(key, None)
+        (finbert,) = _reload_modules("engine.data.finbert_sentiment")
+        original_import_module = importlib.import_module
+
+        def fake_import_module(name: str):
+            if name == "torch":
+                return _FakeTorchCudaAvailable()
+            return original_import_module(name)
+
+        with patch.object(finbert.importlib, "import_module", side_effect=fake_import_module):
+            _, device = finbert._resolved_device()
+
+        self.assertEqual(device, "cpu")
 
     @pytest.mark.requires_postgres
     def test_persistence_write_and_read_round_trip(self) -> None:
@@ -255,7 +283,11 @@ class FinbertSentimentTests(unittest.TestCase):
             "sentiment.finbert.neu",
             "sentiment.finbert.confidence",
         ]
-        with patch.object(feature_registry, "_schedule_feature_store_write", return_value=None):
+        with (
+            patch.object(feature_registry, "_load_feature_store_snapshot", side_effect=AssertionError("stale feature store")),
+            patch.object(feature_registry, "_load_symbol_snapshot", side_effect=AssertionError("stale symbol snapshot")),
+            patch.object(feature_registry, "_schedule_feature_store_write", return_value=None),
+        ):
             snapshot = feature_registry.build_feature_snapshot(
                 event=event,
                 symbol="AAPL",

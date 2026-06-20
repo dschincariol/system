@@ -1,34 +1,19 @@
-"""
-FILE: check_labels.py
+"""Compatibility launcher for ``engine.runtime.jobs.check_labels``."""
 
-Operational helper script for `check_labels`.
-"""
+from __future__ import annotations
 
-# check_labels.py
-import os
-import sqlite3
+import sys
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-def main() -> int:
-    db_path = os.environ.get("DB_PATH", str(Path("./data/trading.db").resolve()))
-    con = sqlite3.connect(db_path)
-    try:
-        # Simple cardinality sanity check for manual debugging, not a monitored
-        # health signal with thresholds or automatic remediation.
-        total = con.execute("SELECT COUNT(*) FROM labels").fetchone()[0]
-        print("labels_total =", total)
+from ops._engine_job_wrapper import import_engine_module, run_engine_module
 
-        rows = con.execute(
-                "SELECT symbol, horizon_s, COUNT(*) FROM labels GROUP BY symbol, horizon_s ORDER BY symbol, horizon_s"
-            ).fetchall()
-
-        for sym, h, c in rows:
-                print(f"{sym} horizon_s={h} count={c}")
-    finally:
-        con.close()
-    return 0
-
+_ENGINE_MODULE = "engine.runtime.jobs.check_labels"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_engine_module(_ENGINE_MODULE))
+
+sys.modules[__name__] = import_engine_module(_ENGINE_MODULE)

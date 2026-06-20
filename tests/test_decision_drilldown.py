@@ -331,6 +331,131 @@ def test_decision_detail_uses_persisted_prediction_explanation_fallback(monkeypa
     assert payload["attribution"]["top_features"][0]["feature_id"] == "momentum_5m"
 
 
+def test_decision_detail_enriches_structured_doc_and_graph_feature_lineage(monkeypatch, tmp_path: Path) -> None:
+    from engine.data import structured_document_events as structured
+    from engine.strategy.graph_relational import (
+        GRAPH_RELATIONAL_FEATURE_IDS,
+        GRAPH_RELATIONAL_GRAPH_ID,
+        GRAPH_RELATIONAL_GROUP,
+        GRAPH_RELATIONAL_SNAPSHOT_VERSION,
+        ensure_graph_relational_schema,
+        store_graph_relational_snapshots,
+    )
+
+    db_path = tmp_path / "decision_feature_visibility.sqlite"
+    _init_decision_drilldown_db(db_path)
+    con = sqlite3.connect(str(db_path))
+    try:
+        structured.ensure_structured_document_event_schema(con)
+        structured.put_structured_document_events(
+            con,
+            [
+                {
+                    "source_document_id": "doc-decision",
+                    "source_event_id": 10,
+                    "symbol": "AAPL",
+                    "document_type": "filing",
+                    "source": "sec",
+                    "event_type": "guidance_cut",
+                    "event_ts_ms": 1700000000000,
+                    "availability_ts_ms": 1700000000000,
+                    "extraction_confidence": 0.71,
+                    "polarity": -1.0,
+                    "feature_id": structured.EVENT_FEATURE_ID["guidance_cut"],
+                    "evidence": "lowered guidance",
+                    "extractor_name": structured.EXTRACTOR_NAME,
+                    "extractor_version": structured.EXTRACTOR_VERSION,
+                    "created_ts_ms": 1700000000001,
+                    "pit_metadata_json": {"availability_ts_ms": 1700000000000},
+                }
+            ],
+        )
+        ensure_graph_relational_schema(con)
+        store_graph_relational_snapshots(
+            [
+                {
+                    "symbol": "AAPL",
+                    "ts_ms": 1700000000100,
+                    "graph_id": GRAPH_RELATIONAL_GRAPH_ID,
+                    "snapshot_version": GRAPH_RELATIONAL_SNAPSHOT_VERSION,
+                    "feature_ids": list(GRAPH_RELATIONAL_FEATURE_IDS),
+                    "features": {GRAPH_RELATIONAL_FEATURE_IDS[0]: 3.0},
+                    "edge_counts": {"sector": 1},
+                    "relationships": [],
+                    "source_timestamps": {
+                        "max_source_ts_ms": 1700000000000,
+                        "max_availability_ts_ms": 1700000000000,
+                        "relationship_hash": "decision-hash",
+                    },
+                    "availability": {GRAPH_RELATIONAL_GROUP: True},
+                    "metadata": {
+                        "graph_id": GRAPH_RELATIONAL_GRAPH_ID,
+                        "snapshot_version": GRAPH_RELATIONAL_SNAPSHOT_VERSION,
+                        "feature_ids": list(GRAPH_RELATIONAL_FEATURE_IDS),
+                        "relationship_hash": "decision-hash",
+                        "snapshot_available": True,
+                        "pit_safe": True,
+                        "max_source_ts_ms": 1700000000000,
+                        "max_availability_ts_ms": 1700000000000,
+                        "direct_trading_authority": False,
+                        "stage": "shadow",
+                    },
+                }
+            ],
+            con=con,
+        )
+        explanation = {
+            "prediction_explanation": {
+                "available": True,
+                "explanation_type": "feature_value_proxy",
+                "model_family": "gbm_regressor",
+                "top_features": [
+                    {
+                        "feature_id": structured.EVENT_FEATURE_ID["guidance_cut"],
+                        "attribution": -0.22,
+                        "value": 0.71,
+                    },
+                    {
+                        "feature_id": GRAPH_RELATIONAL_FEATURE_IDS[0],
+                        "attribution": 0.18,
+                        "value": 3.0,
+                    },
+                ],
+            }
+        }
+        con.execute("UPDATE decision_log SET model_name=?, explain_json=? WHERE id=1", ("gbm_regressor.live", json.dumps(explanation)))
+        con.commit()
+    finally:
+        con.close()
+
+    monkeypatch.setattr(api_read_advanced, "db_connect", lambda: sqlite3.connect(str(db_path)))
+
+    def fetch_decision_detail(decision_id: int):
+        local = sqlite3.connect(str(db_path))
+        try:
+            cur = local.execute("SELECT * FROM decision_log WHERE id=?", (int(decision_id),))
+            row = cur.fetchone()
+            columns = [item[0] for item in cur.description]
+            return dict(zip(columns, row)) if row else None
+        finally:
+            local.close()
+
+    monkeypatch.setattr(api_read_advanced, "fetch_decision_detail", fetch_decision_detail)
+
+    payload = api_read_advanced.get_decision_detail(1)
+
+    assert payload["ok"] is True
+    rows = payload["attribution"]["top_features"]
+    structured_row = next(row for row in rows if row["feature_id"].startswith("structured_doc_events_v1."))
+    graph_row = next(row for row in rows if row["feature_id"].startswith("graph.relational_v1."))
+    assert structured_row["feature_visibility"]["shadow_only"] is True
+    assert structured_row["feature_visibility"]["point_in_time_valid"] is True
+    assert structured_row["feature_visibility"]["lineage"][0]["source_artifact"] == "structured_document_events:doc-decision"
+    assert graph_row["feature_visibility"]["status"] == "shadow_only"
+    assert graph_row["feature_visibility"]["source_artifact"].startswith("graph_relational_snapshots:AAPL:")
+    assert payload["attribution"]["feature_visibility_summary"]["annotated_feature_count"] == 2
+
+
 def test_decision_detail_handles_missing_and_lineage_lookup(monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "decision_drilldown.sqlite"
     _init_decision_drilldown_db(db_path)

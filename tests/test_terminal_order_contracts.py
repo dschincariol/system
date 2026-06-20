@@ -111,7 +111,7 @@ def _patch_terminal_order_storage(monkeypatch):
     monkeypatch.setattr(
         terminal_orders,
         "execution_gate_snapshot",
-        lambda: {"real_trading_allowed": True},
+        lambda **_kwargs: {"real_trading_allowed": True},
     )
     monkeypatch.setattr(terminal_orders, "connect", lambda **_kwargs: _FakeReadConnection())
     monkeypatch.setattr(terminal_orders, "_table_exists", lambda _con, table: table in {"portfolio_orders", "prices"})
@@ -164,7 +164,7 @@ def test_terminal_order_accepts_paper_pipeline_gate(monkeypatch):
     monkeypatch.setattr(
         terminal_orders,
         "execution_gate_snapshot",
-        lambda: {
+        lambda **_kwargs: {
             "real_trading_allowed": False,
             "allow_execution_pipeline": True,
             "allow_simulation": True,
@@ -193,7 +193,7 @@ def test_terminal_flatten_accepts_paper_pipeline_gate(monkeypatch):
     monkeypatch.setattr(
         terminal_orders,
         "execution_gate_snapshot",
-        lambda: {
+        lambda **_kwargs: {
             "real_trading_allowed": False,
             "allow_execution_pipeline": True,
             "allow_simulation": True,
@@ -396,7 +396,7 @@ def test_terminal_snapshot_includes_execution_barrier(monkeypatch):
     monkeypatch.setattr(
         terminal_api,
         "execution_gate_snapshot",
-        lambda: {
+        lambda **_kwargs: {
             "ok": True,
             "real_trading_allowed": False,
             "allowed": True,
@@ -731,6 +731,11 @@ def test_terminal_quantity_contract_survives_intent_weight_normalization():
 
 
 def test_terminal_quantity_contract_loads_as_explicit_qty_with_neutral_weights(monkeypatch):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.setenv("BROKER", "sim")
+    monkeypatch.setenv("BROKER_NAME", "sim")
+    monkeypatch.setenv("LIVE_BROKER", "sim")
     monkeypatch.setattr(execution_intents, "DEFAULT_DECISION_ENGINE", None)
     monkeypatch.setattr(execution_intents, "get_competition_policy_for_intent", lambda **_kwargs: {})
 

@@ -52,6 +52,17 @@ def test_meta_label_multiplier_edges() -> None:
     assert meta_labeling.meta_label_multiplier(0.65, lower=0.45, upper=0.65) == 1.0
 
 
+def test_meta_label_lgbm_n_jobs_is_configurable_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("lightgbm")
+    monkeypatch.setenv("META_LABEL_N_JOBS", "9")
+    monkeypatch.setenv("MODEL_TRAIN_MAX_N_JOBS", "3")
+
+    model, backend = meta_labeling._new_classifier()
+
+    assert backend == "lightgbm"
+    assert int(model.get_params()["n_jobs"]) == 3
+
+
 def test_isotonic_calibration_does_not_worsen_brier_and_bins_are_ordered() -> None:
     raw = np.asarray([0.05, 0.15, 0.20, 0.35, 0.60, 0.75, 0.80, 0.90], dtype=float)
     labels = np.asarray([0, 0, 0, 1, 0, 1, 1, 1], dtype=int)

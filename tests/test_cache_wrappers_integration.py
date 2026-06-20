@@ -32,11 +32,10 @@ def test_cache_keys_honor_test_namespace(monkeypatch):
 
 
 def test_all_wrapper_reads_decode_loader_payloads(monkeypatch):
+    monkeypatch.delenv("KILL_SWITCH_CACHE_TTL_S", raising=False)
+
     def fake_read(key, loader=None, *, ttl_s=None):
-        if key == keys.kill_switch("snapshot"):
-            assert ttl_s is None
-        else:
-            assert ttl_s is not None
+        assert ttl_s is not None
         return loader()
 
     for module in (
@@ -71,51 +70,155 @@ def test_all_wrapper_reads_decode_loader_payloads(monkeypatch):
     assert feature_snapshots.latest("AAPL", "fg")["symbol"] == "AAPL"
 
 
-def test_kill_switch_cache_is_sticky_without_ttl(monkeypatch):
-    now_s = {"value": 0}
+def test_kill_switch_cache_uses_bounded_ttl_and_reloads_stale_snapshot(monkeypatch):
+    monkeypatch.delenv("KILL_SWITCH_CACHE_TTL_S", raising=False)
+    now_ms_value = {"value": 1_000_000}
     cache = {}
     ttl_values = []
+    invalidated = []
+    primed = []
 
     def fake_prime(key, value, *, ttl_s=None):
-        expires_at = None if ttl_s is None else now_s["value"] + int(ttl_s)
-        cache[key] = (value, expires_at)
+        primed.append((key, ttl_s))
+        cache[key] = value
 
     def fake_read(key, loader=None, *, ttl_s=None):
         ttl_values.append(ttl_s)
-        entry = cache.get(key)
-        if entry is not None:
-            value, expires_at = entry
-            if expires_at is None or now_s["value"] < expires_at:
-                return value
-        if loader is None:
-            return None
-        loaded = loader()
-        if loaded is not None:
-            fake_prime(key, loaded, ttl_s=ttl_s)
-        return loaded
+        return cache.get(key)
+
+    def fake_invalidate(key):
+        invalidated.append(key)
+        cache.pop(key, None)
 
     monkeypatch.setattr(kill_switch.store, "prime", fake_prime)
     monkeypatch.setattr(kill_switch.store, "read", fake_read)
+    monkeypatch.setattr(kill_switch.store, "invalidate", fake_invalidate)
+    monkeypatch.setattr(kill_switch, "now_ms", lambda: now_ms_value["value"])
+    monkeypatch.setattr(kill_switch, "KILL_SWITCH_TTL_S", 30)
     monkeypatch.setattr(
         kill_switch,
         "_load_snapshot",
-        lambda: {"state": [{"scope": "global", "key": "global", "enabled": 1}]},
+        lambda: {"state": [{"scope": "global", "key": "global", "enabled": 1}], "source": "unit_db"},
     )
 
-    kill_switch.prime_kill_switch()
-    now_s["value"] += 600
+    cache[keys.kill_switch("snapshot")] = codec.encode(
+        {
+            "state": [{"scope": "global", "key": "global", "enabled": 0}],
+            "loaded_ts_ms": now_ms_value["value"] - 31_000,
+            "source": "unit_old_cache",
+            "max_age_ms": 30_000,
+        },
+        version=kill_switch.KILL_SWITCH_CODEC_VERSION,
+    )
 
-    def fail_loader():
-        raise AssertionError("loader should not run while sticky kill switch cache is present")
+    state = kill_switch.read_kill_switch()
 
-    monkeypatch.setattr(kill_switch, "_load_snapshot", fail_loader)
+    assert state["state"][0]["enabled"] == 1
+    assert state["loaded_ts_ms"] == now_ms_value["value"]
+    assert state["max_age_ms"] == 30_000
+    assert state["cache_status"] == "stale_reloaded"
+    assert state["cache_fresh"] is True
+    assert invalidated == [keys.kill_switch("snapshot")]
+    assert primed == [(keys.kill_switch("snapshot"), 30)]
+    assert ttl_values == [30]
 
-    assert kill_switch.read_kill_switch()["state"][0]["enabled"] == 1
-    assert cache[keys.kill_switch("snapshot")][1] is None
-    assert ttl_values == [None]
+
+def test_kill_switch_stale_cache_fails_closed_when_reload_unavailable(monkeypatch):
+    monkeypatch.delenv("KILL_SWITCH_CACHE_TTL_S", raising=False)
+    now_ms_value = {"value": 2_000_000}
+    key = keys.kill_switch("snapshot")
+    cache = {
+        key: codec.encode(
+            {
+                "state": [{"scope": "global", "key": "global", "enabled": 0}],
+                "loaded_ts_ms": now_ms_value["value"] - 60_000,
+                "source": "unit_old_cache",
+                "max_age_ms": 30_000,
+            },
+            version=kill_switch.KILL_SWITCH_CODEC_VERSION,
+        )
+    }
+
+    monkeypatch.setattr(kill_switch.store, "read", lambda cache_key, loader=None, *, ttl_s=None: cache.get(cache_key))
+    monkeypatch.setattr(kill_switch.store, "invalidate", lambda cache_key: cache.pop(cache_key, None))
+    monkeypatch.setattr(kill_switch.store, "prime", lambda cache_key, value, *, ttl_s=None: cache.update({cache_key: value}))
+    monkeypatch.setattr(kill_switch, "now_ms", lambda: now_ms_value["value"])
+    monkeypatch.setattr(kill_switch, "_load_snapshot", lambda: kill_switch.fail_closed_snapshot("db down"))
+
+    state = kill_switch.read_kill_switch()
+
+    assert state["cache_status"] == "stale_fail_closed"
+    row = state["state"][0]
+    assert row["scope"] == "global"
+    assert row["key"] == "provider_unavailable"
+    assert row["enabled"] == 1
+    assert row["reason"] == "kill_switch_provider_unavailable"
+
+
+def test_kill_switch_read_fails_closed_when_provider_unavailable(monkeypatch):
+    monkeypatch.delenv("KILL_SWITCH_CACHE_TTL_S", raising=False)
+
+    def fake_read(key, loader=None, *, ttl_s=None):
+        return loader()
+
+    def fail_connect(*_args, **_kwargs):
+        raise RuntimeError("kill switch db unavailable")
+
+    monkeypatch.setattr(kill_switch.store, "read", fake_read)
+    monkeypatch.setattr(kill_switch.storage, "connect", fail_connect)
+
+    state = kill_switch.read_kill_switch()
+
+    assert state["source"] == "engine.cache.wrappers.kill_switch:provider_unavailable"
+    assert state["loaded_ts_ms"] > 0
+    assert state["max_age_ms"] > 0
+    row = state["state"][0]
+    assert row["scope"] == "global"
+    assert row["key"] == "provider_unavailable"
+    assert row["enabled"] == 1
+    assert row["reason"] == "kill_switch_provider_unavailable"
+
+
+def test_kill_switch_provider_unavailable_source_wins_over_generic_error(monkeypatch):
+    monkeypatch.delenv("KILL_SWITCH_CACHE_TTL_S", raising=False)
+    now_ms_value = {"value": 3_000_000}
+    payload = {
+        "state": [
+            {
+                "scope": "global",
+                "key": "provider_unavailable",
+                "enabled": 1,
+                "reason": "kill_switch_provider_unavailable",
+                "actor": "unit",
+                "meta": {"error": "db down"},
+                "created_ts_ms": 0,
+                "updated_ts_ms": now_ms_value["value"],
+            }
+        ],
+        "loaded_ts_ms": now_ms_value["value"],
+        "source": "engine.cache.wrappers.kill_switch:error",
+        "max_age_ms": 30_000,
+    }
+
+    monkeypatch.setattr(kill_switch, "now_ms", lambda: now_ms_value["value"])
+    monkeypatch.setattr(
+        kill_switch.store,
+        "read",
+        lambda _key, _loader=None, *, ttl_s=None: codec.encode(
+            payload,
+            version=kill_switch.KILL_SWITCH_CODEC_VERSION,
+        ),
+    )
+
+    state = kill_switch.read_kill_switch()
+
+    assert state["source"] == "engine.cache.wrappers.kill_switch:provider_unavailable"
+    assert state["cache_status"] == "fresh"
+    assert state["state"][0]["key"] == "provider_unavailable"
 
 
 def test_wrapper_codec_version_mismatch_invalidates_repopulates_and_emits_metric(monkeypatch):
+    monkeypatch.delenv("KILL_SWITCH_CACHE_TTL_S", raising=False)
     key = keys.kill_switch("snapshot")
     cache = {
         key: codec.encode({"state": [{"scope": "global", "key": "global", "enabled": 0}]}, version=1)
@@ -154,7 +257,7 @@ def test_wrapper_codec_version_mismatch_invalidates_repopulates_and_emits_metric
 
     assert state["state"][0]["enabled"] == 1
     assert deleted == [key]
-    assert primed == [(key, 2, None)]
+    assert primed == [(key, 2, 30)]
     assert loader_calls["count"] == 1
     assert metrics[0][0] == "codec_version_mismatch_count"
     assert metrics[0][2]["extra_tags"]["expected_version"] == 2
@@ -278,6 +381,8 @@ def test_no_direct_redis_imports_or_get_set_calls_outside_cache_store():
     os.environ.get("TS_CACHE_REAL_INTEGRATION") != "1",
     reason="set TS_CACHE_REAL_INTEGRATION=1 with Redis and Postgres/Timescale configured",
 )
+@pytest.mark.requires_postgres
+@pytest.mark.requires_redis
 def test_real_redis_postgres_wrappers_integration():
     pytest.importorskip("redis")
 

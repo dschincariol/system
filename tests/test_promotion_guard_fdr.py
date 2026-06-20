@@ -6,8 +6,11 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+
+from tests.promotion_test_helpers import passing_deconfounded_payload
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -49,6 +52,7 @@ def test_assess_challenger_blocks_lucky_reality_check_failure() -> None:
             model_name=LUCKY_MODEL_ID,
             challenger_returns=returns,
             champion_returns=returns,
+            deconfounded_validation=passing_deconfounded_payload(len(returns)),
             bootstrap_samples=199,
             random_state=42,
         )
@@ -56,9 +60,11 @@ def test_assess_challenger_blocks_lucky_reality_check_failure() -> None:
         rows = promotion_audit.fetch_latest_statistical_evidence(model_id=LUCKY_MODEL_ID)
         assert not passed
         assert diagnostics["tests"]["white_reality_check"]["p_value"] > 0.10
-        assert len(rows) == 1
-        assert rows[0]["test_name"] == "white_reality_check"
-        assert rows[0]["decision"] == "fail"
+        assert {row["test_name"] for row in rows} == {
+            "white_reality_check",
+            "deconfounded_signal_validation",
+        }
+        assert any(row["test_name"] == "white_reality_check" and row["decision"] == "fail" for row in rows)
         storage.close_pooled_connections()
 
 
@@ -81,6 +87,7 @@ def test_assess_challenger_requires_fdr_and_factor_threshold_for_new_features() 
             new_features=["factor.good", "factor.bad"],
             feature_p_values={"factor.good": 0.001, "factor.bad": 0.50},
             feature_t_stats={"factor.good": 4.0, "factor.bad": 4.0},
+            deconfounded_validation=passing_deconfounded_payload(40),
             bootstrap_samples=199,
             random_state=7,
         )
@@ -91,11 +98,12 @@ def test_assess_challenger_requires_fdr_and_factor_threshold_for_new_features() 
 
         assert not passed
         assert not diagnostics["tests"]["benjamini_hochberg_fdr"]["passed"]
-        assert len(latest) == 4
+        assert len(latest) == 5
         assert {row["test_name"] for row in latest} == {
             "white_reality_check",
             "benjamini_hochberg_fdr",
             "harvey_liu_zhu_factor_threshold",
+            "deconfounded_signal_validation",
         }
         assert any(row["feature_id"] == "factor.bad" and row["decision"] == "fail" for row in latest)
         storage.close_pooled_connections()
@@ -120,6 +128,7 @@ def test_assess_challenger_passes_and_persists_reconstructable_payloads() -> Non
             new_features=["factor.good"],
             feature_p_values={"factor.good": 0.001},
             feature_t_stats={"factor.good": 4.5},
+            deconfounded_validation=passing_deconfounded_payload(40),
             bootstrap_samples=199,
             random_state=9,
         )
@@ -130,7 +139,8 @@ def test_assess_challenger_passes_and_persists_reconstructable_payloads() -> Non
         assert passed
         assert diagnostics["passed"]
         assert decision["decision"] == "pass"
-        assert len(rows) == 3
+        assert len(rows) == 4
+        assert any(row["test_name"] == "deconfounded_signal_validation" for row in rows)
         reality = next(row for row in rows if row["test_name"] == "white_reality_check")
         assert "bootstrap_distribution" in reality["payload"]
         assert len(reality["payload"]["bootstrap_distribution"]) == 199
@@ -154,6 +164,7 @@ def test_assess_challenger_rejects_duplicate_model_evidence() -> None:
             "model_name": DUPLICATE_MODEL_ID,
             "challenger_returns": [0.02 + (idx % 5) * 0.001 for idx in range(40)],
             "champion_returns": [0.001 * (idx % 3) for idx in range(40)],
+            "deconfounded_validation": passing_deconfounded_payload(40),
             "bootstrap_samples": 199,
             "random_state": 11,
         }
@@ -232,14 +243,47 @@ def test_model_registry_refuses_direct_promotion_without_passing_evidence() -> N
         with pytest.raises(RuntimeError, match="latest statistical evidence"):
             model_registry.promote_to_champion(DIRECT_MODEL_ID, "test_kind", 123, regime="global")
 
+        ts = int(1234567890000)
         promotion_audit.record_statistical_evidence(
             model_id=DIRECT_MODEL_ID,
+            ts=ts,
             test_name="white_reality_check",
             p_value=0.01,
             decision="pass",
             payload={"test": "registry_guard"},
         )
-        model_registry.promote_to_champion(DIRECT_MODEL_ID, "test_kind", 123, regime="global")
+        promotion_audit.record_statistical_evidence(
+            model_id=DIRECT_MODEL_ID,
+            ts=ts,
+            test_name="deconfounded_signal_validation",
+            t_stat=4.0,
+            p_value=0.01,
+            decision="pass",
+            payload={"test": "registry_guard", "passed": True},
+        )
+        replay_snapshot = {
+            "ok": True,
+            "fresh": True,
+            "updated_ts_ms": ts,
+            "age_ms": 0,
+            "snapshot": {
+                "models": {
+                    f"{DIRECT_MODEL_ID}|AAPL|300|global": {
+                        "approved": True,
+                        "model_name": DIRECT_MODEL_ID,
+                        "model_id": DIRECT_MODEL_ID,
+                        "model_kind": "test_kind",
+                        "model_ts_ms": 123,
+                        "regime": "global",
+                    }
+                }
+            },
+        }
+        with patch(
+            "engine.strategy.model_marketplace.get_cached_replay_validation_snapshot",
+            return_value=replay_snapshot,
+        ):
+            model_registry.promote_to_champion(DIRECT_MODEL_ID, "test_kind", 123, regime="global")
         champion = model_registry.get_stage_latest(DIRECT_MODEL_ID, "champion", regime="global")
 
         assert champion is not None

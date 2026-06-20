@@ -26,14 +26,8 @@ systemd units unchanged. When run from a bundle outside `/opt/trading/app`, it
 mirrors the source tree into `/opt/trading/app` while excluding local state,
 secrets, virtualenvs, `node_modules`, logs, caches, databases, and diagnostics.
 
-On Windows, build the mirrorable bundle first:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools/build_linux_deploy_bundle.ps1
-```
-
-Then mirror `dist/linux-server/` to the Linux host and follow
-`deploy/LINUX_SERVER_CODEX_DEPLOY.md`.
+For remote installs, mirror a clean Linux checkout or filtered source directory
+to the Linux host and follow `deploy/LINUX_SERVER_CODEX_DEPLOY.md`.
 
 Heavy Python dependency installation can be skipped for infrastructure-only test runs:
 
@@ -68,7 +62,9 @@ Bootstrap installs the matching `trading-base-backup`, `trading-backup-evidence`
 Live preflight reads the latest evidence JSON, the base-backup directory, WAL
 archive, and restore-drill reports. In live mode it fails closed when the
 latest verified base backup, WAL archive verification, restore drill, or
-restore duration violates the configured `BACKUP_EVIDENCE_*` policy.
+restore duration violates the configured `BACKUP_EVIDENCE_*` policy. Live mode
+and production preflight with backup evidence required also require a
+verifiable HMAC-SHA256 signature on `latest_backup_restore_evidence.json`.
 
 On an already-bootstrapped host, use the focused installer when only the
 backup evidence gate assets need to be deployed:
@@ -86,10 +82,46 @@ sudo bash ops/server/install_backup_evidence_gate.sh --compose --restart-postgre
 The focused installer deploys the backup scripts, backup evidence timers,
 `/var/backups/trading` layout, PostgreSQL archive settings, and the evidence
 environment entries consumed by live preflight.
+It creates `/etc/trading/backup_evidence.hmac.key` when missing, preserves an
+existing key, sets it to `root:trading 0640`, and writes
+`BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1` plus
+`BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key` to
+`/etc/trading/trading.env`.
 In `--compose` mode it reads `deploy/compose/.env`, stores only the backup
 connection secret in `/etc/trading/provider.env`, runs version-matched
 Postgres tools from the Timescale image, and requires a TimescaleDB container
 recreate so the WAL archive bind mount and archive command take effect.
+
+Manual key creation uses the same ownership contract:
+
+```bash
+sudo groupadd --system trading 2>/dev/null || true
+sudo install -d -o root -g trading -m 0750 /etc/trading
+openssl rand -hex 32 | sudo tee /etc/trading/backup_evidence.hmac.key >/dev/null
+sudo chown root:trading /etc/trading/backup_evidence.hmac.key
+sudo chmod 0640 /etc/trading/backup_evidence.hmac.key
+```
+
+Verify the signed evidence path after install or key rotation:
+
+```bash
+sudo -u postgres env \
+  BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1 \
+  BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key \
+  /opt/trading/ops/backup/backup_restore_evidence.sh
+
+sudo -u trading env \
+  ENGINE_MODE=live \
+  PREFLIGHT_REQUIRE_BACKUP_EVIDENCE=1 \
+  BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1 \
+  BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key \
+  /opt/trading/venv/bin/python /opt/trading/app/engine/runtime/prod_preflight.py --json
+```
+
+For rotation, write a new key file with the same owner and mode, update
+`BACKUP_EVIDENCE_HMAC_KEY_FILE`, restart the preflight/runtime service or
+remount the compose secret, run the evidence job, and keep the old key until the
+new signed evidence passes preflight.
 
 ## Deployment Layout
 
@@ -100,10 +132,11 @@ recreate so the WAL archive bind mount and archive command take effect.
 - Runtime config: `/etc/trading/`
 - Encrypted credentials: `/etc/credstore.encrypted/`
 
-No secrets live in this repository. Bootstrap installs the master key and
-`ts_ingest`, `ts_app`, and `ts_reader` passwords as systemd encrypted
-credentials under `/etc/credstore.encrypted/`; application units receive only
-the credentials they declare with `LoadCredentialEncrypted=`.
+No secrets live in this repository. Bootstrap installs the master key,
+`ts_ingest`, `ts_app`, and `ts_reader` passwords, the Redis password, the
+object-store secret key, and the dashboard API token as systemd encrypted credentials under
+`/etc/credstore.encrypted/`; application units receive only the credentials
+they declare with `LoadCredentialEncrypted=`.
 
 Required encrypted credential names on the single-server systemd host are:
 
@@ -111,13 +144,46 @@ Required encrypted credential names on the single-server systemd host are:
 - `pg_password_app`
 - `pg_password_ingest`
 - `pg_password_reader`
+- `redis_password`
+- `object_store_secret_key`
+- `dashboard_api_token`
+
+Use passwordless dependency URLs in `/etc/trading/trading.env` and point the
+runtime at credential names instead of putting secret values in env files. For
+example, set `TS_PG_DSN`/`TIMESCALE_DSN` without `password=`, set
+`LIVE_CACHE_REDIS_PASSWORD_SECRET=redis_password`, and set
+`OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key`. For strict production
+mutation auth, set `DASHBOARD_API_TOKEN_SECRET=dashboard_api_token`.
 
 `python engine/runtime/prod_preflight.py --json` validates the credential
 directory exposed by systemd through `CREDENTIALS_DIRECTORY`, checks the
 Postgres role password credential required by the current process, and verifies
-that the runtime data root from `DB_PATH` exists and is readable, writable, and
-searchable before schema initialization. This preflight is intentionally static:
-it checks credential files and permissions without decrypting secret material.
+that the absolute runtime data root from `DB_PATH` exists and is readable,
+writable, and searchable before schema initialization. Set
+`DB_PATH=/var/lib/trading` on production systemd hosts; relative values fail
+closed. This preflight is intentionally static: it checks credential files and
+permissions without decrypting secret material.
+
+Run the production preflight through systemd so decrypted credentials are
+available to the process:
+
+```bash
+sudo systemctl start trading-prod-preflight.service
+sudo journalctl -u trading-prod-preflight.service -n 200 --no-pager
+```
+
+For an ad hoc SSH check that streams the JSON result to the terminal, run:
+
+```bash
+sudo /opt/trading/app/ops/server/run_prod_preflight.sh
+```
+
+Both paths load `pg_password_app`, `redis_password`,
+`object_store_secret_key`, and `dashboard_api_token` with
+`LoadCredentialEncrypted=` and run as the `trading` service account. A direct
+shell invocation outside systemd is expected to fail in production unless it is
+already inside a unit with
+`CREDENTIALS_DIRECTORY` set.
 For Compose deployments, the equivalent Postgres bootstrap secret is the
 `password=` value already present in `TS_PG_DSN` inside the runtime container.
 

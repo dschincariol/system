@@ -204,6 +204,110 @@ class ExecutionPolicyEngineRegressionTests(unittest.TestCase):
         policy = json.loads(str(audit_row[0] or "{}"))
         self.assertEqual(int(policy.get("slices") or 0), 7)
 
+    def test_learned_execution_slicing_preserves_trade_intent_and_stamps_guard(self) -> None:
+        from engine.execution.contextual_bandit_slicer import validate_routed_learned_orders
+
+        now_ms = 1_710_000_005_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 20.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.04,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "source_order_id": 111,
+            "learned_execution_slicing": 1,
+            "true_spread_bps": 35.0,
+            "intraday_vol_bps": 90.0,
+            "adverse_selection_bps": 14.0,
+            "fill_risk": 0.05,
+        }
+
+        with self._patch_policy_dependencies():
+            with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                with patch.object(
+                    self.execution_policy_engine,
+                    "evaluate_policy_ope_gate",
+                    return_value=(True, {"applied": True, "passed": True, "status": "passed"}),
+                ):
+                    shaped = self.execution_policy_engine.apply_execution_policy(
+                        [order],
+                        con=self.con,
+                        actor="test",
+                        mode="paper",
+                        broker="sim",
+                    )
+
+        self.assertGreater(len(shaped), 0)
+        self.assertAlmostEqual(sum(float(row.get("qty") or 0.0) for row in shaped), 20.0, places=9)
+        self.assertTrue(all(str(row.get("symbol") or "") == "AAPL" for row in shaped))
+        self.assertTrue(all(str(row.get("side") or "").upper() == "BUY" for row in shaped))
+        self.assertTrue(all(int(row.get("execution_policy_locked") or 0) == 1 for row in shaped))
+        self.assertTrue(all(int(row.get("learned_execution_locked") or 0) == 1 for row in shaped))
+        self.assertIsNone(validate_routed_learned_orders(shaped))
+
+        first = dict(shaped[0])
+        self.assertEqual(first.get("learned_execution_policy_scope"), "execution_only")
+        constraints = dict(first.get("learned_execution_constraints") or {})
+        self.assertLessEqual(
+            float(first.get("learned_execution_slice_pct") or 0.0),
+            float(constraints.get("base_slice_pct") or 0.0),
+        )
+        self.assertEqual(
+            sorted(first.get("learned_execution_allowed_fields") or []),
+            [
+                "entry_delay_ms",
+                "slice_interval_ms",
+                "slice_pct",
+                "target_participation",
+            ],
+        )
+
+    def test_learned_execution_slicing_blocks_without_passing_ope(self) -> None:
+        now_ms = 1_710_000_005_500
+        order = {
+            "symbol": "AAPL",
+            "qty": 20.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.04,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "source_order_id": 112,
+            "learned_execution_slicing": 1,
+            "true_spread_bps": 35.0,
+            "intraday_vol_bps": 90.0,
+            "adverse_selection_bps": 14.0,
+            "fill_risk": 0.05,
+        }
+
+        with self._patch_policy_dependencies():
+            with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                with patch.object(
+                    self.execution_policy_engine,
+                    "evaluate_policy_ope_gate",
+                    return_value=(False, {"applied": True, "passed": False, "status": "missing_propensities"}),
+                ):
+                    shaped = self.execution_policy_engine.apply_execution_policy(
+                        [order],
+                        con=self.con,
+                        actor="test",
+                        mode="paper",
+                        broker="sim",
+                    )
+
+        self.assertGreater(len(shaped), 0)
+        self.assertTrue(all(int(row.get("execution_policy_locked") or 0) == 1 for row in shaped))
+        self.assertTrue(all(int(row.get("learned_execution_locked") or 0) == 0 for row in shaped))
+        learned = dict(shaped[0].get("learned_execution") or {})
+        self.assertEqual(learned.get("reason"), "ope_gate_blocked")
+        self.assertEqual(dict(learned.get("ope_gate") or {}).get("status"), "missing_propensities")
+
     def test_ood_log_only_audits_without_suppressing(self) -> None:
         now_ms = 1_710_000_010_000
         order = {
@@ -291,6 +395,265 @@ class ExecutionPolicyEngineRegressionTests(unittest.TestCase):
         self.assertEqual(str(row[0] or ""), "ood_hard_block")
         decision = json.loads(str(row[1] or "{}"))
         self.assertEqual(str(decision.get("blocked_by") or ""), "ood_hard_block")
+
+    def test_live_risk_increasing_order_requires_uncertainty_production_policy(self) -> None:
+        now_ms = 1_710_000_030_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 1.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "source_order_id": 303,
+        }
+
+        env = {
+            "DECISION_ENGINE_ENABLED": "1",
+            "DECISION_MIN_CONFIDENCE": "0.70",
+            "DECISION_MIN_ABS_PREDICTION": "0.80",
+            "UNCERTAINTY_SIZING_MODE": "log_only",
+            "UNCERTAINTY_HIGH_THRESHOLD": "0.70",
+            "UNCERTAINTY_HARD_THRESHOLD": "0.95",
+            "UNCERTAINTY_MAX_AGE_MS": "300000",
+            "OOD_SUPPRESS_THRESHOLD": "1.50",
+            "OOD_HARD_THRESHOLD": "3.00",
+            "EXECUTION_MODE": "live",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("UNCERTAINTY_SIZING_PRODUCTION_POLICY", None)
+            with self._patch_policy_dependencies():
+                with patch.object(
+                    self.execution_policy_engine,
+                    "score_order_meta_label",
+                    return_value={"enabled": False, "applied": False, "probability": None, "multiplier": 1.0},
+                ):
+                    with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                        shaped = self.execution_policy_engine.apply_execution_policy(
+                            [order],
+                            con=self.con,
+                            actor="test",
+                            mode="live",
+                            broker="ibkr",
+                        )
+
+        self.assertEqual(shaped, [])
+        row = self.con.execute(
+            "SELECT suppression_reason, decision_json FROM trade_attribution_ledger ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row[0] or ""), "live_ai_safety_live_uncertainty_production_policy_missing")
+        decision = json.loads(str(row[1] or "{}"))
+        self.assertEqual(str(decision.get("blocked_by") or ""), "live_ai_safety")
+
+    def test_live_order_blocks_model_serving_fallback_before_execution(self) -> None:
+        now_ms = 1_710_000_035_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 1.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "model_name": "live_model",
+            "serve_fallback_active": True,
+            "fallback_reason": "requested_live_model_unavailable",
+            "source_order_id": 304,
+        }
+
+        env = {
+            "DECISION_ENGINE_ENABLED": "1",
+            "DECISION_MIN_CONFIDENCE": "0.70",
+            "DECISION_MIN_ABS_PREDICTION": "0.80",
+            "UNCERTAINTY_SIZING_MODE": "log_only",
+            "UNCERTAINTY_SIZING_PRODUCTION_POLICY": "strict",
+            "UNCERTAINTY_HIGH_THRESHOLD": "0.70",
+            "UNCERTAINTY_HARD_THRESHOLD": "0.95",
+            "UNCERTAINTY_MAX_AGE_MS": "300000",
+            "OOD_SUPPRESS_THRESHOLD": "1.50",
+            "OOD_HARD_THRESHOLD": "3.00",
+            "EXECUTION_MODE": "live",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with self._patch_policy_dependencies():
+                with patch.object(
+                    self.execution_policy_engine,
+                    "score_order_meta_label",
+                    return_value={"enabled": False, "applied": False, "probability": None, "multiplier": 1.0},
+                ):
+                    with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                        shaped = self.execution_policy_engine.apply_execution_policy(
+                            [order],
+                            con=self.con,
+                            actor="test",
+                            mode="live",
+                            broker="ibkr",
+                        )
+
+        self.assertEqual(shaped, [])
+        row = self.con.execute(
+            "SELECT suppression_reason, decision_json FROM trade_attribution_ledger ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row[0] or ""), "live_ai_safety_live_model_resolution_fallback")
+        decision = json.loads(str(row[1] or "{}"))
+        self.assertEqual(str(decision.get("blocked_by") or ""), "live_ai_safety")
+        gate = dict(decision.get("live_ai_safety") or {})
+        self.assertIn("live_model_resolution_fallback", list(gate.get("blockers") or []))
+
+    def test_conformal_gate_and_size_shrinks_wide_interval_order(self) -> None:
+        now_ms = 1_710_000_040_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 10.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "conformal": {
+                "available": True,
+                "ts_ms": now_ms,
+                "interval_excludes_zero": True,
+                "interval_lower": 0.1,
+                "interval_upper": 3.1,
+                "interval_width": 3.0,
+                "size_mult": 0.25,
+            },
+            "source_order_id": 304,
+        }
+
+        with patch.dict(os.environ, {"CONFORMAL_MODE": "gate_and_size"}, clear=False):
+            with self._patch_policy_dependencies():
+                with patch.object(
+                    self.execution_policy_engine,
+                    "score_order_meta_label",
+                    return_value={"enabled": False, "applied": False, "probability": None, "multiplier": 1.0},
+                ):
+                    with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                        shaped = self.execution_policy_engine.apply_execution_policy(
+                            [order],
+                            con=self.con,
+                            actor="test",
+                            mode="paper",
+                            broker="sim",
+                        )
+
+        self.assertTrue(shaped)
+        self.assertAlmostEqual(sum(float(row.get("qty") or 0.0) for row in shaped), 2.5, places=9)
+        for row in shaped:
+            self.assertAlmostEqual(float(row.get("uncertainty_size_mult") or 0.0), 0.25, places=9)
+            self.assertEqual(str(row.get("uncertainty_action") or ""), "SIZE_COMPRESSION")
+
+    def test_high_epistemic_uncertainty_shrinks_risk_increasing_order(self) -> None:
+        now_ms = 1_710_000_050_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 10.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "model_intent": {
+                "epistemic_uncertainty": 0.75,
+                "uncertainty_ts_ms": now_ms,
+            },
+            "source_order_id": 305,
+        }
+        env = {
+            "UNCERTAINTY_SIZING_MODE": "enforce",
+            "UNCERTAINTY_HIGH_THRESHOLD": "0.50",
+            "UNCERTAINTY_HARD_THRESHOLD": "1.00",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            with self._patch_policy_dependencies():
+                with patch.object(
+                    self.execution_policy_engine,
+                    "score_order_meta_label",
+                    return_value={"enabled": False, "applied": False, "probability": None, "multiplier": 1.0},
+                ):
+                    with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                        shaped = self.execution_policy_engine.apply_execution_policy(
+                            [order],
+                            con=self.con,
+                            actor="test",
+                            mode="paper",
+                            broker="sim",
+                        )
+
+        self.assertTrue(shaped)
+        self.assertAlmostEqual(sum(float(row.get("qty") or 0.0) for row in shaped), 5.0, places=9)
+        for row in shaped:
+            self.assertAlmostEqual(float(row.get("uncertainty_size_mult") or 0.0), 0.5, places=9)
+            gate = dict(row.get("uncertainty_gate") or {})
+            self.assertIn("high_model_uncertainty", list(gate.get("reasons") or []))
+
+    def test_stale_uncertainty_shrinks_live_order_when_policy_allows(self) -> None:
+        now_ms = 1_710_000_060_000
+        order = {
+            "symbol": "AAPL",
+            "qty": 10.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "model_intent": {
+                "uncertainty": 0.1,
+                "uncertainty_ts_ms": now_ms - 10_000,
+            },
+            "source_order_id": 306,
+        }
+        env = {
+            "DECISION_ENGINE_ENABLED": "1",
+            "DECISION_MIN_CONFIDENCE": "0.70",
+            "DECISION_MIN_ABS_PREDICTION": "0.80",
+            "EXECUTION_MODE": "live",
+            "UNCERTAINTY_SIZING_PRODUCTION_POLICY": "shrink",
+            "UNCERTAINTY_HIGH_THRESHOLD": "0.70",
+            "UNCERTAINTY_HARD_THRESHOLD": "0.95",
+            "UNCERTAINTY_MAX_AGE_MS": "1000",
+            "UNCERTAINTY_STALE_SIZE_MULT": "0.20",
+            "OOD_SUPPRESS_THRESHOLD": "1.50",
+            "OOD_HARD_THRESHOLD": "3.00",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            with self._patch_policy_dependencies():
+                with patch.object(
+                    self.execution_policy_engine,
+                    "score_order_meta_label",
+                    return_value={"enabled": False, "applied": False, "probability": None, "multiplier": 1.0},
+                ):
+                    with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                        shaped = self.execution_policy_engine.apply_execution_policy(
+                            [order],
+                            con=self.con,
+                            actor="test",
+                            mode="live",
+                            broker="ibkr",
+                        )
+
+        self.assertTrue(shaped)
+        self.assertAlmostEqual(sum(float(row.get("qty") or 0.0) for row in shaped), 2.0, places=9)
+        for row in shaped:
+            gate = dict(row.get("uncertainty_gate") or {})
+            self.assertAlmostEqual(float(row.get("uncertainty_size_mult") or 0.0), 0.2, places=9)
+            self.assertIn("stale_uncertainty", list(gate.get("reasons") or []))
 
     def test_alpha_decay_boundary_suppresses_order_at_exact_ttl(self) -> None:
         now_ms = 1_710_000_100_000

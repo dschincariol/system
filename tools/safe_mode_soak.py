@@ -9,8 +9,13 @@ from typing import Dict, List, Tuple
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUT = os.path.join(ROOT, "logs", "safe_mode_soak.ndjson")
-RUNTIME_LOG = os.path.join(ROOT, "logs", "runtime.log")
+DEFAULT_OUT = os.path.join(ROOT, "var", "log", "safe_mode_soak.ndjson")
+RUNTIME_LOG = os.path.join(ROOT, "var", "log", "runtime.log")
+DEFAULT_DASHBOARD_URL = str(os.environ.get("PIPELINE_SMOKE_BASE") or "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_OPERATOR_URL = str(
+    os.environ.get("PIPELINE_SMOKE_OPERATOR_BASE")
+    or f"{DEFAULT_DASHBOARD_URL}/operator"
+).rstrip("/")
 
 FAIL_PATTERNS = (
     "traceback",
@@ -38,7 +43,19 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
 def _http_json(url: str, timeout: float) -> Tuple[bool, float, object]:
     started = time.time()
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        headers = {"Accept": "application/json"}
+        dashboard_token = str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip()
+        if dashboard_token:
+            headers["X-API-Token"] = dashboard_token
+        operator_token = str(
+            os.environ.get("PIPELINE_SMOKE_OPERATOR_TOKEN")
+            or os.environ.get("OPERATOR_API_TOKEN")
+            or ""
+        ).strip()
+        if operator_token and ":4001/" in str(url):
+            headers["X-Operator-Token"] = operator_token
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
             return True, (time.time() - started) * 1000.0, payload
@@ -114,8 +131,12 @@ def main() -> int:
     parser.add_argument("--interval-s", type=int, default=30)
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument("--out", default=DEFAULT_OUT)
+    parser.add_argument("--base-url", default=DEFAULT_DASHBOARD_URL)
+    parser.add_argument("--operator-url", default=DEFAULT_OPERATOR_URL)
     args = parser.parse_args()
 
+    base_url = str(args.base_url).rstrip("/")
+    operator_url = str(args.operator_url).rstrip("/")
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     log_offsets: Dict[str, int] = {}
     deadline = time.time() + max(60, int(args.duration_s))
@@ -125,10 +146,10 @@ def main() -> int:
         while time.time() < deadline:
             sample_no += 1
             ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            operator_ok, operator_ms, operator = _http_json("http://127.0.0.1:4001/api/operator/status", args.timeout_s)
-            health_ok, health_ms, health = _http_json("http://127.0.0.1:8000/api/health", args.timeout_s)
-            system_ok, system_ms, system_state = _http_json("http://127.0.0.1:8000/api/system/state", args.timeout_s)
-            jobs_ok, jobs_ms, jobs = _http_json("http://127.0.0.1:8000/api/jobs", args.timeout_s)
+            operator_ok, operator_ms, operator = _http_json(f"{operator_url}/api/operator/status", args.timeout_s)
+            health_ok, health_ms, health = _http_json(f"{base_url}/api/health", args.timeout_s)
+            system_ok, system_ms, system_state = _http_json(f"{base_url}/api/system/state", args.timeout_s)
+            jobs_ok, jobs_ms, jobs = _http_json(f"{base_url}/api/jobs", args.timeout_s)
             log_matches = _scan_log(RUNTIME_LOG, log_offsets)
 
             record = {

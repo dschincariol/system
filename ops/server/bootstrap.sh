@@ -14,7 +14,8 @@ TRADING_GROUP="${TRADING_GROUP:-trading}"
 INSTALL_ROOT="${TRADING_INSTALL_ROOT:-/opt/trading}"
 APP_ROOT="${TRADING_APP_ROOT:-/opt/trading/app}"
 VENV_DIR="${TRADING_VENV_DIR:-${INSTALL_ROOT}/venv}"
-REQUIREMENTS_FILE="${TRADING_REQUIREMENTS_FILE:-${REPO_ROOT}/requirements.txt}"
+DEPENDENCY_PROFILE="${TRADING_DEPENDENCY_PROFILE:-cpu}"
+REQUIREMENTS_FILE="${TRADING_REQUIREMENTS_FILE:-}"
 
 DATA_ROOT="${TRADING_DATA_ROOT:-/var/lib/trading}"
 DB_DIR="${TRADING_DB_DIR:-${DATA_ROOT}/db}"
@@ -36,6 +37,7 @@ ETC_DIR="${TRADING_ETC_DIR:-/etc/trading}"
 CREDSTORE_DIR="${TRADING_CREDSTORE_DIR:-/etc/credstore.encrypted}"
 PROVIDER_ENV="${TRADING_PROVIDER_ENV:-${ETC_DIR}/provider.env}"
 TRADING_ENV_FILE="${TRADING_ENV_FILE:-${ETC_DIR}/trading.env}"
+BACKUP_EVIDENCE_HMAC_KEY_FILE="${TRADING_BACKUP_EVIDENCE_HMAC_KEY_FILE:-${ETC_DIR}/backup_evidence.hmac.key}"
 
 POSTGRES_VERSION="${TRADING_POSTGRES_VERSION:-16}"
 POSTGRES_DB="${TRADING_POSTGRES_DB:-trading}"
@@ -310,6 +312,7 @@ sync_app_source() {
     --exclude 'env/' \
     --exclude 'ENV/' \
     --exclude 'node_modules/' \
+    --exclude 'var/' \
     --exclude '__pycache__/' \
     --exclude '.pytest_cache/' \
     --exclude '.ruff_cache/' \
@@ -532,34 +535,128 @@ bytes_to_mb_setting() {
   fi
 }
 
+first_env_value() {
+  local name value
+  for name in "$@"; do
+    value="${!name:-}"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+  return 1
+}
+
+size_to_mb() {
+  local raw lower number unit
+  raw="$(printf '%s' "$1" | tr -d '[:space:]')"
+  lower="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  if ! printf '%s' "$lower" | grep -Eq '^[0-9]+([.][0-9]+)?([kmgt]i?b?|b)?$'; then
+    die "invalid size setting: ${1}"
+  fi
+  number="$(printf '%s' "$lower" | sed -E 's/^([0-9]+([.][0-9]+)?).*/\1/')"
+  unit="$(printf '%s' "$lower" | sed -E 's/^[0-9]+([.][0-9]+)?//')"
+  case "$unit" in
+    g|gb|gib) awk -v n="$number" 'BEGIN { printf "%d", n * 1024 }' ;;
+    m|mb|mib) awk -v n="$number" 'BEGIN { printf "%d", n }' ;;
+    k|kb|kib) awk -v n="$number" 'BEGIN { v = n / 1024; printf "%d", v < 1 ? 1 : v }' ;;
+    b|"") awk -v n="$number" 'BEGIN { v = n / 1048576; printf "%d", v < 1 ? 1 : v }' ;;
+    *) die "invalid size unit in setting: ${1}" ;;
+  esac
+}
+
+size_env_or_default_mb() {
+  local default_mb="$1"
+  shift
+  local raw
+  raw="$(first_env_value "$@" || true)"
+  if [ -n "$raw" ]; then
+    size_to_mb "$raw"
+  else
+    printf '%s' "$default_mb"
+  fi
+}
+
+cgroup_memory_limit_mb() {
+  local path raw
+  for path in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    [ -r "$path" ] || continue
+    raw="$(cat "$path" 2>/dev/null || true)"
+    [ -n "$raw" ] && [ "$raw" != "max" ] || continue
+    if printf '%s' "$raw" | grep -Eq '^[0-9]+$' && [ "$raw" -gt 0 ] && [ "$raw" -lt 1152921504606846976 ]; then
+      printf '%s' "$((raw / 1048576))"
+      return 0
+    fi
+  done
+  return 1
+}
+
+postgres_tuning_ram_mb() {
+  local raw host_mb cgroup_mb
+  raw="$(first_env_value TRADING_POSTGRES_MEMORY_LIMIT TIMESCALE_MEM_LIMIT TIMESCALE_MEMORY_LIMIT || true)"
+  if [ -n "$raw" ]; then
+    size_to_mb "$raw"
+    return 0
+  fi
+  host_mb="$(( $(awk '/MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))"
+  cgroup_mb="$(cgroup_memory_limit_mb || true)"
+  if [ -n "$cgroup_mb" ] && [ "$cgroup_mb" -gt 0 ] && [ "$cgroup_mb" -lt "$host_mb" ]; then
+    printf '%s' "$cgroup_mb"
+  else
+    printf '%s' "$host_mb"
+  fi
+}
+
 tune_postgres() {
   log "rendering PostgreSQL tuning"
-  local mem_kb ram_mb vcpu max_connections
-  local shared_buffers_mb effective_cache_mb work_mem_mb maintenance_mb
+  local ram_mb vcpu max_connections
+  local shared_buffers_mb effective_cache_mb work_mem_mb maintenance_mb autovacuum_work_mem_mb
   local max_worker_processes max_parallel_workers max_parallel_workers_per_gather
-  local max_parallel_maintenance_workers autovacuum_max_workers tmp
+  local max_parallel_maintenance_workers timescaledb_max_background_workers autovacuum_max_workers tmp
+  local wal_buffers min_wal_size max_wal_size wal_keep_size max_slot_wal_keep_size
+  local archive_timeout checkpoint_timeout checkpoint_completion_target
+  local random_page_cost effective_io_concurrency maintenance_io_concurrency
+  local autovacuum_naptime autovacuum_vacuum_cost_limit autovacuum_vacuum_cost_delay
 
-  mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
-  ram_mb="$((mem_kb / 1024))"
+  ram_mb="$(postgres_tuning_ram_mb)"
   vcpu="$(nproc)"
-  max_connections="$POSTGRES_MAX_CONNECTIONS"
+  max_connections="${TRADING_POSTGRES_MAX_CONNECTIONS:-${TIMESCALE_MAX_CONNECTIONS:-${POSTGRES_MAX_CONNECTIONS}}}"
 
-  shared_buffers_mb="$((ram_mb / 4))"
-  effective_cache_mb="$(((ram_mb * 3) / 4))"
-  work_mem_mb="$((((ram_mb * 5) / 1000) / max_connections))"
+  shared_buffers_mb="$(size_env_or_default_mb "$((ram_mb / 4))" TRADING_POSTGRES_SHARED_BUFFERS TIMESCALE_SHARED_BUFFERS)"
+  effective_cache_mb="$(size_env_or_default_mb "$(((ram_mb * 3) / 4))" TRADING_POSTGRES_EFFECTIVE_CACHE_SIZE TIMESCALE_EFFECTIVE_CACHE_SIZE)"
+  work_mem_mb="$(size_env_or_default_mb "$((((ram_mb * 5) / 1000) / max_connections))" TRADING_POSTGRES_WORK_MEM TIMESCALE_WORK_MEM)"
   [ "$work_mem_mb" -lt 4 ] && work_mem_mb=4
-  maintenance_mb="$((ram_mb / 16))"
+  maintenance_mb="$(size_env_or_default_mb "$((ram_mb / 16))" TRADING_POSTGRES_MAINTENANCE_WORK_MEM TIMESCALE_MAINTENANCE_WORK_MEM)"
   [ "$maintenance_mb" -lt 64 ] && maintenance_mb=64
   [ "$maintenance_mb" -gt 2048 ] && maintenance_mb=2048
+  autovacuum_work_mem_mb="$(size_env_or_default_mb "$((ram_mb / 128))" TRADING_POSTGRES_AUTOVACUUM_WORK_MEM TIMESCALE_AUTOVACUUM_WORK_MEM)"
+  [ "$autovacuum_work_mem_mb" -lt 128 ] && autovacuum_work_mem_mb=128
+  [ "$autovacuum_work_mem_mb" -gt 1024 ] && autovacuum_work_mem_mb=1024
 
-  max_worker_processes="$((vcpu * 2))"
-  max_parallel_workers="$vcpu"
-  max_parallel_workers_per_gather="$((vcpu / 2))"
+  max_worker_processes="${TRADING_POSTGRES_MAX_WORKER_PROCESSES:-${TIMESCALE_MAX_WORKER_PROCESSES:-$((vcpu * 2))}}"
+  max_parallel_workers="${TRADING_POSTGRES_MAX_PARALLEL_WORKERS:-${TIMESCALE_MAX_PARALLEL_WORKERS:-$vcpu}}"
+  max_parallel_workers_per_gather="${TRADING_POSTGRES_MAX_PARALLEL_WORKERS_PER_GATHER:-${TIMESCALE_MAX_PARALLEL_WORKERS_PER_GATHER:-$((vcpu / 2))}}"
   [ "$max_parallel_workers_per_gather" -lt 1 ] && max_parallel_workers_per_gather=1
-  max_parallel_maintenance_workers="$((vcpu / 2))"
+  max_parallel_maintenance_workers="${TRADING_POSTGRES_MAX_PARALLEL_MAINTENANCE_WORKERS:-${TIMESCALE_MAX_PARALLEL_MAINTENANCE_WORKERS:-$((vcpu / 2))}}"
   [ "$max_parallel_maintenance_workers" -lt 2 ] && max_parallel_maintenance_workers=2
-  autovacuum_max_workers="$((vcpu / 2))"
+  timescaledb_max_background_workers="${TRADING_POSTGRES_TIMESCALEDB_MAX_BACKGROUND_WORKERS:-${TIMESCALE_TIMESCALEDB_MAX_BACKGROUND_WORKERS:-$vcpu}}"
+  [ "$timescaledb_max_background_workers" -lt 4 ] && timescaledb_max_background_workers=4
+  autovacuum_max_workers="${TRADING_POSTGRES_AUTOVACUUM_MAX_WORKERS:-${TIMESCALE_AUTOVACUUM_MAX_WORKERS:-$((vcpu / 2))}}"
   [ "$autovacuum_max_workers" -lt 3 ] && autovacuum_max_workers=3
+  wal_buffers="${TRADING_POSTGRES_WAL_BUFFERS:-${TIMESCALE_WAL_BUFFERS:-64MB}}"
+  min_wal_size="${TRADING_POSTGRES_MIN_WAL_SIZE:-${TIMESCALE_MIN_WAL_SIZE:-4GB}}"
+  max_wal_size="${TRADING_POSTGRES_MAX_WAL_SIZE:-${TIMESCALE_MAX_WAL_SIZE:-16GB}}"
+  wal_keep_size="${TRADING_POSTGRES_WAL_KEEP_SIZE:-${TIMESCALE_WAL_KEEP_SIZE:-1GB}}"
+  max_slot_wal_keep_size="${TRADING_POSTGRES_MAX_SLOT_WAL_KEEP_SIZE:-${TIMESCALE_MAX_SLOT_WAL_KEEP_SIZE:-8GB}}"
+  archive_timeout="${TRADING_POSTGRES_ARCHIVE_TIMEOUT:-${TIMESCALE_ARCHIVE_TIMEOUT:-60s}}"
+  checkpoint_timeout="${TRADING_POSTGRES_CHECKPOINT_TIMEOUT:-${TIMESCALE_CHECKPOINT_TIMEOUT:-15min}}"
+  checkpoint_completion_target="${TRADING_POSTGRES_CHECKPOINT_COMPLETION_TARGET:-${TIMESCALE_CHECKPOINT_COMPLETION_TARGET:-0.9}}"
+  random_page_cost="${TRADING_POSTGRES_RANDOM_PAGE_COST:-${TIMESCALE_RANDOM_PAGE_COST:-1.1}}"
+  effective_io_concurrency="${TRADING_POSTGRES_EFFECTIVE_IO_CONCURRENCY:-${TIMESCALE_EFFECTIVE_IO_CONCURRENCY:-200}}"
+  maintenance_io_concurrency="${TRADING_POSTGRES_MAINTENANCE_IO_CONCURRENCY:-${TIMESCALE_MAINTENANCE_IO_CONCURRENCY:-200}}"
+  autovacuum_naptime="${TRADING_POSTGRES_AUTOVACUUM_NAPTIME:-${TIMESCALE_AUTOVACUUM_NAPTIME:-10s}}"
+  autovacuum_vacuum_cost_limit="${TRADING_POSTGRES_AUTOVACUUM_VACUUM_COST_LIMIT:-${TIMESCALE_AUTOVACUUM_VACUUM_COST_LIMIT:-4000}}"
+  autovacuum_vacuum_cost_delay="${TRADING_POSTGRES_AUTOVACUUM_VACUUM_COST_DELAY:-${TIMESCALE_AUTOVACUUM_VACUUM_COST_DELAY:-2ms}}"
 
   install -d -o postgres -g postgres -m 0755 "/etc/postgresql/${POSTGRES_VERSION}/main/conf.d"
   if ! grep -Eq "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf.d'" "/etc/postgresql/${POSTGRES_VERSION}/main/postgresql.conf"; then
@@ -574,12 +671,28 @@ tune_postgres() {
     -e "s|{{ effective_cache_size }}|$(bytes_to_mb_setting "$effective_cache_mb")|g" \
     -e "s|{{ work_mem }}|$(bytes_to_mb_setting "$work_mem_mb")|g" \
     -e "s|{{ maintenance_work_mem }}|$(bytes_to_mb_setting "$maintenance_mb")|g" \
+    -e "s|{{ autovacuum_work_mem }}|$(bytes_to_mb_setting "$autovacuum_work_mem_mb")|g" \
+    -e "s|{{ wal_buffers }}|${wal_buffers}|g" \
+    -e "s|{{ min_wal_size }}|${min_wal_size}|g" \
+    -e "s|{{ max_wal_size }}|${max_wal_size}|g" \
+    -e "s|{{ wal_keep_size }}|${wal_keep_size}|g" \
+    -e "s|{{ max_slot_wal_keep_size }}|${max_slot_wal_keep_size}|g" \
+    -e "s|{{ archive_timeout }}|${archive_timeout}|g" \
+    -e "s|{{ checkpoint_timeout }}|${checkpoint_timeout}|g" \
+    -e "s|{{ checkpoint_completion_target }}|${checkpoint_completion_target}|g" \
+    -e "s|{{ random_page_cost }}|${random_page_cost}|g" \
+    -e "s|{{ effective_io_concurrency }}|${effective_io_concurrency}|g" \
+    -e "s|{{ maintenance_io_concurrency }}|${maintenance_io_concurrency}|g" \
     -e "s|{{ postgres_socket_dir }}|${POSTGRES_SOCKET_DIR}|g" \
     -e "s|{{ max_worker_processes }}|${max_worker_processes}|g" \
     -e "s|{{ max_parallel_workers }}|${max_parallel_workers}|g" \
     -e "s|{{ max_parallel_workers_per_gather }}|${max_parallel_workers_per_gather}|g" \
     -e "s|{{ max_parallel_maintenance_workers }}|${max_parallel_maintenance_workers}|g" \
+    -e "s|{{ timescaledb_max_background_workers }}|${timescaledb_max_background_workers}|g" \
     -e "s|{{ autovacuum_max_workers }}|${autovacuum_max_workers}|g" \
+    -e "s|{{ autovacuum_naptime }}|${autovacuum_naptime}|g" \
+    -e "s|{{ autovacuum_vacuum_cost_limit }}|${autovacuum_vacuum_cost_limit}|g" \
+    -e "s|{{ autovacuum_vacuum_cost_delay }}|${autovacuum_vacuum_cost_delay}|g" \
     "$POSTGRES_TEMPLATE" > "$tmp"
 
   if install_if_changed_from_file "$tmp" "/etc/postgresql/${POSTGRES_VERSION}/main/conf.d/trading.conf" 0644 postgres postgres; then
@@ -670,7 +783,34 @@ read_credstore_secret() {
   systemd-creds decrypt --name="$name" "$path" -
 }
 
+ensure_backup_evidence_hmac_key() {
+  local key_dir tmp
+  key_dir="$(dirname "$BACKUP_EVIDENCE_HMAC_KEY_FILE")"
+  install -d -o root -g "$TRADING_GROUP" -m 0750 "$key_dir"
+  if [ -f "$BACKUP_EVIDENCE_HMAC_KEY_FILE" ]; then
+    [ -s "$BACKUP_EVIDENCE_HMAC_KEY_FILE" ] || die "backup evidence HMAC key file is empty: ${BACKUP_EVIDENCE_HMAC_KEY_FILE}"
+    chown root:"$TRADING_GROUP" "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+    chmod 0640 "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+    return 0
+  fi
+
+  tmp="$(mktemp "${key_dir}/backup_evidence.hmac.key.tmp.XXXXXX")"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32 > "$tmp"
+  else
+    python3 - <<'PY' > "$tmp"
+import secrets
+
+print(secrets.token_hex(32))
+PY
+  fi
+  install -m 0640 -o root -g "$TRADING_GROUP" "$tmp" "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+  rm -f "$tmp"
+  log "created backup evidence HMAC key: ${BACKUP_EVIDENCE_HMAC_KEY_FILE}"
+}
+
 write_runtime_env_files() {
+  ensure_backup_evidence_hmac_key
   write_if_changed "$TRADING_ENV_FILE" 0640 "$TRADING_USER" "$TRADING_GROUP" <<EOF || true
 TS_ENV=production
 TRADING_ENV=production
@@ -679,7 +819,7 @@ APP_ROOT=${APP_ROOT}
 PYTHONPATH=${APP_ROOT}
 DATA_DIR=${DATA_ROOT}
 LOG_DIR=${APP_LOG_DIR}
-DB_PATH=${DB_DIR}/trading.sqlite
+DB_PATH=${DATA_ROOT}
 SQLITE_LIVENESS_DB_PATH=${DB_DIR}/trading.liveness.sqlite
 DASHBOARD_HOST=127.0.0.1
 DASHBOARD_PORT=${DASHBOARD_PORT}
@@ -704,6 +844,9 @@ BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S=93600
 BACKUP_EVIDENCE_RPO_S=120
 BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=7776000
 BACKUP_EVIDENCE_RTO_S=1800
+BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S=120
+BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
+BACKUP_EVIDENCE_HMAC_KEY_FILE=${BACKUP_EVIDENCE_HMAC_KEY_FILE}
 TIMESCALE_ENABLED=1
 TIMESCALE_PRICES_ENABLED=1
 EOF
@@ -920,21 +1063,40 @@ install_python_runtime() {
     return
   fi
 
-  if [ ! -f "$REQUIREMENTS_FILE" ]; then
-    log "requirements file not found, skipping pip install: ${REQUIREMENTS_FILE}"
+  local resolved_requirements
+  if [ -n "$REQUIREMENTS_FILE" ]; then
+    if [[ "$REQUIREMENTS_FILE" = /* ]]; then
+      resolved_requirements="$REQUIREMENTS_FILE"
+    else
+      resolved_requirements="${REPO_ROOT}/${REQUIREMENTS_FILE}"
+    fi
+  else
+    resolved_requirements="$(
+      TRADING_DEPENDENCY_PROFILE="$DEPENDENCY_PROFILE" \
+        bash "${REPO_ROOT}/deploy/bin/resolve_python_requirements.sh" "$REPO_ROOT"
+    )"
+  fi
+
+  if [ ! -f "$resolved_requirements" ]; then
+    log "requirements file not found, skipping pip install: ${resolved_requirements}"
     return
   fi
 
   local req_hash marker
-  req_hash="$(sha256sum "$REQUIREMENTS_FILE" | awk '{print $1}')"
-  marker="${VENV_DIR}/.requirements.sha256"
+  req_hash="$(
+    {
+      sha256sum "$resolved_requirements"
+      find "$REPO_ROOT" -maxdepth 1 -name 'requirements*.txt' -type f -print0 | sort -z | xargs -0 sha256sum
+    } | sha256sum | awk '{print $1}'
+  )"
+  marker="${VENV_DIR}/.requirements.${DEPENDENCY_PROFILE}.sha256"
   if [ -f "$marker" ] && [ "$(cat "$marker")" = "$req_hash" ]; then
     log "Python requirements already installed for ${req_hash}"
     return
   fi
 
   PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
-  PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install -r "$REQUIREMENTS_FILE"
+  PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install -r "$resolved_requirements"
   printf '%s' "$req_hash" > "$marker"
   chown -R "$TRADING_USER:$TRADING_GROUP" "$VENV_DIR"
 }
@@ -1013,6 +1175,7 @@ install_systemd_units() {
   install -d -m 0755 "$SYSTEMD_DST_DIR"
   local unit changed=0
   for unit in \
+    trading-prod-preflight.service \
     trading-api.service \
     trading-jobs.service \
     trading-stream-prices.service \
@@ -1061,9 +1224,11 @@ install_systemd_units() {
 setup_logrotate() {
   log "configuring logrotate"
   write_if_changed /etc/logrotate.d/trading 0644 root root <<EOF || true
-${APP_LOG_DIR}/*.log /var/log/postgresql/*.log {
+${APP_LOG_DIR}/*.log ${APP_LOG_DIR}/*.out ${APP_LOG_DIR}/*.err ${APP_LOG_DIR}/*.jsonl ${APP_ROOT}/boot/*.log ${APP_ROOT}/data/ai_operator_log.jsonl /var/log/postgresql/*.log {
     daily
-    rotate 14
+    maxsize 50M
+    rotate 10
+    maxage 21
     compress
     delaycompress
     missingok

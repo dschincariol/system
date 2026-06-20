@@ -313,3 +313,215 @@ export function buildPromotionActionPayload({
     preview: preview && typeof preview === "object" ? preview : {},
   };
 }
+
+const GOVERNANCE_EVIDENCE_STATE_LABELS = Object.freeze({
+  pass: "Pass",
+  block: "Block",
+  unknown: "Unknown",
+});
+
+const GOVERNANCE_EVIDENCE_STATE_TONES = Object.freeze({
+  pass: "ok",
+  block: "crit",
+  unknown: "dim",
+});
+
+function governanceEvidenceStateKey(value) {
+  const key = String(value || "").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(GOVERNANCE_EVIDENCE_STATE_LABELS, key) ? key : "unknown";
+}
+
+function governanceFiniteNumber(value, fallback = null) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function governanceFormatCount(value) {
+  const n = governanceFiniteNumber(value, 0) || 0;
+  return String(Math.max(0, Math.trunc(n)));
+}
+
+function governanceFormatTime(value) {
+  const ts = governanceFiniteNumber(value, 0) || 0;
+  if (ts <= 0) return "not recorded";
+  try {
+    return new Date(ts).toLocaleString();
+  } catch (_e) {
+    return String(Math.trunc(ts));
+  }
+}
+
+function governanceFormatScore(value) {
+  const n = governanceFiniteNumber(value);
+  if (n == null) return "not available";
+  return Math.abs(n) >= 100 ? n.toFixed(2) : Math.abs(n) >= 1 ? n.toFixed(3) : n.toFixed(4);
+}
+
+function governanceEvidencePill(state) {
+  const key = governanceEvidenceStateKey(state);
+  return `<span class="pill ${escapeHtml(GOVERNANCE_EVIDENCE_STATE_TONES[key])}">${escapeHtml(GOVERNANCE_EVIDENCE_STATE_LABELS[key])}</span>`;
+}
+
+function governanceEvidenceRows(payload = {}) {
+  return Array.isArray(payload.evidence) ? payload.evidence : [];
+}
+
+function governanceEvidenceBlockerRows(payload = {}) {
+  const blockers = Array.isArray(payload.blockers) ? payload.blockers : [];
+  if (blockers.length) return blockers;
+  const promotion = payload.promotion_blockers && typeof payload.promotion_blockers === "object"
+    ? payload.promotion_blockers
+    : {};
+  return Array.isArray(promotion.evidence_blockers) ? promotion.evidence_blockers : [];
+}
+
+export function summarizeGovernanceEvidence(payload = {}) {
+  const rows = governanceEvidenceRows(payload);
+  const blockers = governanceEvidenceBlockerRows(payload);
+  const unknowns = Array.isArray(payload.unknowns) ? payload.unknowns : [];
+  const state = governanceEvidenceStateKey(payload.state || (blockers.length ? "block" : rows.length ? "pass" : "unknown"));
+  const latest = rows.reduce(
+    (maxTs, row) => Math.max(maxTs, governanceFiniteNumber(row && row.last_update_ts_ms, 0) || 0),
+    0
+  );
+  return {
+    state,
+    label: GOVERNANCE_EVIDENCE_STATE_LABELS[state],
+    evidenceCount: rows.length,
+    blockerCount: blockers.length,
+    unknownCount: unknowns.length,
+    latestTsMs: latest,
+    meta: `${rows.length} sources | ${blockers.length} blockers | ${unknowns.length} unknown`,
+  };
+}
+
+function renderGovernanceEvidenceTable(rows) {
+  if (!rows.length) {
+    return `<div class="metric-meta">No governance evidence rows returned.</div>`;
+  }
+  return `
+    <div class="table-wrap governanceEvidenceTableWrap">
+      <table class="governanceEvidenceTable">
+        <thead>
+          <tr>
+            <th>Evidence</th>
+            <th>State</th>
+            <th>Freshness</th>
+            <th>Samples</th>
+            <th>Last update</th>
+            <th>Source</th>
+            <th>Remediation</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((row) => `
+            <tr class="table-row" data-evidence-state="${escapeHtml(governanceEvidenceStateKey(row && row.state))}">
+              <td>
+                <div class="metric-title">${escapeHtml(row && (row.label || row.key) || "Evidence")}</div>
+                <div class="metric-meta mono">${escapeHtml(row && row.key || "")}</div>
+              </td>
+              <td>${governanceEvidencePill(row && row.state)}</td>
+              <td>${escapeHtml(row && row.freshness || "unknown")}</td>
+              <td class="mono">${escapeHtml(governanceFormatCount(row && row.sample_count))}</td>
+              <td>${escapeHtml(governanceFormatTime(row && row.last_update_ts_ms))}</td>
+              <td class="mono">${escapeHtml(row && row.source_artifact || "")}</td>
+              <td>${escapeHtml(row && row.remediation || "")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderGovernanceEvidenceBlockers(blockers) {
+  const rows = Array.isArray(blockers) ? blockers.slice(0, 8) : [];
+  if (!rows.length) {
+    return `<div class="metric-meta">No active governance evidence blockers.</div>`;
+  }
+  return `
+    <div class="governanceEvidenceBlockers">
+      ${rows.map((row) => `
+        <div class="governanceEvidenceBlocker">
+          <div class="metric-title">${escapeHtml(row && (row.label || row.key) || "Blocker")}</div>
+          <div class="metric-meta mono">${escapeHtml(row && row.source_artifact || "")}</div>
+          <div class="metric-meta">${escapeHtml(row && row.remediation || "")}</div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderGovernanceShadowCapital(payload = {}) {
+  const shadow = payload.shadow_capital && typeof payload.shadow_capital === "object" ? payload.shadow_capital : {};
+  const rows = Array.isArray(shadow.rows) ? shadow.rows.slice(0, 5) : [];
+  const evidence = shadow.evidence && typeof shadow.evidence === "object" ? shadow.evidence : {};
+  if (!rows.length) {
+    return `
+      <div class="structuredSummaryRow">
+        <div class="structuredSummaryLabel">Shadow capital</div>
+        <div class="structuredSummaryValue">${governanceEvidencePill(evidence.state || "block")}</div>
+        <div class="structuredSummaryMeta">${escapeHtml(evidence.remediation || "No shadow-capital rows returned.")}</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="structuredSummaryRow">
+      <div class="structuredSummaryLabel">Shadow capital</div>
+      <div class="structuredSummaryValue">${governanceEvidencePill(evidence.state || "unknown")}</div>
+      <div class="structuredSummaryMeta">Top score ${escapeHtml(governanceFormatScore(rows[0] && rows[0].score))} from ${escapeHtml(rows[0] && rows[0].model_name || "model")}</div>
+    </div>
+    <div class="table-wrap governanceShadowTableWrap">
+      <table class="governanceShadowTable">
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Score</th>
+            <th>Samples</th>
+            <th>Total PnL</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((row) => `
+            <tr class="table-row">
+              <td class="mono">${escapeHtml(row && row.model_name || "")}</td>
+              <td class="mono">${escapeHtml(governanceFormatScore(row && row.score))}</td>
+              <td class="mono">${escapeHtml(governanceFormatCount(row && row.n))}</td>
+              <td class="mono">${escapeHtml(governanceFormatScore(row && row.total_pnl))}</td>
+              <td>${escapeHtml(governanceFormatTime(row && row.ts_ms))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+export function renderGovernanceEvidenceCenter(target, payload = {}) {
+  if (!target) return summarizeGovernanceEvidence(payload);
+  const summary = summarizeGovernanceEvidence(payload);
+  const rows = governanceEvidenceRows(payload);
+  const blockers = governanceEvidenceBlockerRows(payload);
+  const authority = payload.authority && typeof payload.authority === "object" ? payload.authority : {};
+  target.innerHTML = `
+    <div class="structuredSummaryGrid governanceEvidenceSummary">
+      <div class="structuredSummaryRow">
+        <div class="structuredSummaryLabel">Evidence state</div>
+        <div class="structuredSummaryValue">${governanceEvidencePill(summary.state)}</div>
+        <div class="structuredSummaryMeta">${escapeHtml(summary.meta)}</div>
+      </div>
+      <div class="structuredSummaryRow">
+        <div class="structuredSummaryLabel">Last update</div>
+        <div class="structuredSummaryValue">${escapeHtml(governanceFormatTime(summary.latestTsMs))}</div>
+        <div class="structuredSummaryMeta">${escapeHtml(authority.mode || "read_only_governance_evidence")}</div>
+      </div>
+      ${renderGovernanceShadowCapital(payload)}
+    </div>
+    <div class="small table-section-title">Evidence blockers</div>
+    ${renderGovernanceEvidenceBlockers(blockers)}
+    <div class="small table-section-title">Evidence sources</div>
+    ${renderGovernanceEvidenceTable(rows)}
+  `;
+  return summary;
+}

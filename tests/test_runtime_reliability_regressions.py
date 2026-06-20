@@ -147,16 +147,45 @@ class _PragmaProbeConnection:
 
 
 class RuntimeReliabilityRegressionTests(unittest.TestCase):
+    RUNTIME_ENV_KEYS = (
+        "EXECUTION_MODE",
+        "ENGINE_MODE",
+        "BROKER",
+        "BROKER_NAME",
+        "LIVE_BROKER",
+        "BROKER_FAILOVER",
+        "DECISION_ENGINE_ENABLED",
+        "DECISION_MIN_CONFIDENCE",
+        "DECISION_MIN_ABS_PREDICTION",
+        "UNCERTAINTY_SIZING_PRODUCTION_POLICY",
+        "UNCERTAINTY_HIGH_THRESHOLD",
+        "UNCERTAINTY_HARD_THRESHOLD",
+        "UNCERTAINTY_MAX_AGE_MS",
+        "OOD_SUPPRESS_THRESHOLD",
+        "OOD_HARD_THRESHOLD",
+        "RL_ALLOW_FALLBACK_AGENT",
+    )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._prev_allow_training = os.environ.get("ALLOW_TRAINING")
         self._prev_sqlite_liveness_queue_enabled = os.environ.get("SQLITE_LIVENESS_QUEUE_ENABLED")
         self._prev_sqlite_trace_report_every_s = os.environ.get("SQLITE_TRACE_REPORT_EVERY_S")
+        self._prev_runtime_env = {key: os.environ.get(key) for key in self.RUNTIME_ENV_KEYS}
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "runtime_reliability.db")
         os.environ["ENGINE_SUPERVISED"] = "1"
         os.environ["ALLOW_TRAINING"] = "0"
         os.environ["SQLITE_LIVENESS_QUEUE_ENABLED"] = "0"
         os.environ["SQLITE_TRACE_REPORT_EVERY_S"] = "0"
+        os.environ["EXECUTION_MODE"] = "paper"
+        os.environ["ENGINE_MODE"] = "paper"
+        os.environ["BROKER"] = "sim"
+        os.environ["BROKER_NAME"] = "sim"
+        os.environ["LIVE_BROKER"] = "sim"
+        os.environ["BROKER_FAILOVER"] = "sim"
+        for key in self.RUNTIME_ENV_KEYS:
+            if key.startswith(("DECISION_", "UNCERTAINTY_", "OOD_", "RL_")):
+                os.environ.pop(key, None)
         _reload_modules("engine.runtime.db_guard", "engine.runtime.storage")
 
     def tearDown(self) -> None:
@@ -191,6 +220,11 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             os.environ.pop("SQLITE_TRACE_REPORT_EVERY_S", None)
         else:
             os.environ["SQLITE_TRACE_REPORT_EVERY_S"] = str(self._prev_sqlite_trace_report_every_s)
+        for key, value in self._prev_runtime_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[str(key)] = str(value)
         self.tmp.cleanup()
 
     def _set_shadow_env(self):
@@ -1206,10 +1240,12 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             "BROKER_ROUTER_RETRY_ATTEMPTS": os.environ.get("BROKER_ROUTER_RETRY_ATTEMPTS"),
             "BROKER_ROUTER_RETRY_BASE_S": os.environ.get("BROKER_ROUTER_RETRY_BASE_S"),
             "BROKER_ROUTER_RETRY_MAX_S": os.environ.get("BROKER_ROUTER_RETRY_MAX_S"),
+            "BROKER_FAILOVER": os.environ.get("BROKER_FAILOVER"),
         }
         os.environ["BROKER_ROUTER_RETRY_ATTEMPTS"] = "2"
         os.environ["BROKER_ROUTER_RETRY_BASE_S"] = "0"
         os.environ["BROKER_ROUTER_RETRY_MAX_S"] = "0"
+        os.environ["BROKER_FAILOVER"] = "sim"
         try:
             storage, broker_router, metrics_store, observability = _reload_modules(
                 "engine.runtime.storage",
@@ -1621,6 +1657,61 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
         finally:
             self._restore_shadow_env(prev_env)
 
+    def test_execution_gate_loads_default_db_execution_mode_without_callback(self) -> None:
+        prev_env = {
+            "EXECUTION_MODE": os.environ.get("EXECUTION_MODE"),
+            "ENGINE_MODE": os.environ.get("ENGINE_MODE"),
+            "OPERATOR_MODE": os.environ.get("OPERATOR_MODE"),
+            "MODE": os.environ.get("MODE"),
+        }
+        try:
+            for key in prev_env:
+                os.environ.pop(key, None)
+            storage, execution_mode, gates = _reload_modules(
+                "engine.runtime.storage",
+                "engine.execution.execution_mode",
+                "engine.runtime.gates",
+            )
+            storage.init_db()
+            execution_mode.set_execution_mode("paper", actor="test", reason="db_default")
+
+            allowed = gates.execution_gate_snapshot(
+                system_state={"state": "LIVE"},
+                kill_switches={},
+                risk_state_getter=lambda _key, default=None: default,
+            )
+
+            self.assertTrue(bool(allowed["allow_execution_pipeline"]))
+            self.assertEqual(str(allowed["mode"]), "paper")
+            self.assertEqual(str(allowed["reason"]), "mode_paper")
+            self.assertEqual(str(allowed["source"]), "default_execution_mode_db")
+        finally:
+            self._restore_shadow_env(prev_env)
+
+    def test_execution_gate_does_not_treat_env_live_as_db_arming(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            storage, execution_mode, gates = _reload_modules(
+                "engine.runtime.storage",
+                "engine.execution.execution_mode",
+                "engine.runtime.gates",
+            )
+            storage.init_db()
+            execution_mode.set_execution_mode("paper", actor="test", reason="db_paper")
+
+            blocked = gates.execution_gate_snapshot(
+                system_state={"state": "LIVE"},
+                kill_switches={},
+                risk_state_getter=lambda _key, default=None: default,
+            )
+
+            self.assertFalse(bool(blocked["real_trading_allowed"]))
+            self.assertEqual(str(blocked["mode"]), "paper")
+            self.assertEqual(str(blocked["reason"]), "mode_paper")
+            self.assertNotEqual(int(blocked.get("armed") or 0), 1)
+        finally:
+            self._restore_shadow_env(prev_env)
+
     def test_execution_gate_blocks_critical_ingestion_degradation(self) -> None:
         prev_env = self._set_shadow_env()
         try:
@@ -1962,7 +2053,12 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             )
             storage.init_db()
             execution_mode.set_execution_mode("live", actor="test", reason="live_mode")
-            execution_mode.set_execution_armed(1, actor="test", reason="armed")
+            with patch.object(
+                execution_mode,
+                "_assert_live_arming_preflight",
+                return_value=None,
+            ):
+                execution_mode.set_execution_armed(1, actor="test", reason="armed")
             lifecycle_state.set_state(lifecycle_state.DEGRADED, "critical_source_failed:prices")
 
             allowed, reason, detail = execution_mode.execution_allowed_for_real_trading()
@@ -1984,7 +2080,12 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             )
             storage.init_db()
             execution_mode.set_execution_mode("live", actor="test", reason="live_mode")
-            execution_mode.set_execution_armed(1, actor="test", reason="armed")
+            with patch.object(
+                execution_mode,
+                "_assert_live_arming_preflight",
+                return_value=None,
+            ):
+                execution_mode.set_execution_armed(1, actor="test", reason="armed")
             lifecycle_state.set_state(lifecycle_state.LIVE, "unit_test_live")
 
             allowed, reason, detail = execution_mode.execution_allowed_for_real_trading()

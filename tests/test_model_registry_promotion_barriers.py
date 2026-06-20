@@ -46,12 +46,23 @@ def registry_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _record_pass(promotion_audit: Any, *, model_id: str) -> None:
+    ts = int(time.time() * 1000)
     promotion_audit.record_statistical_evidence(
         model_id=str(model_id),
+        ts=ts,
         test_name="white_reality_check",
         p_value=0.01,
         decision="pass",
         payload={"source": "unit"},
+    )
+    promotion_audit.record_statistical_evidence(
+        model_id=str(model_id),
+        ts=ts,
+        test_name="deconfounded_signal_validation",
+        t_stat=4.0,
+        p_value=0.01,
+        decision="pass",
+        payload={"source": "unit", "passed": True},
     )
 
 
@@ -206,3 +217,26 @@ def test_direct_champion_registration_and_lifecycle_live_are_blocked(registry_st
     assert version["stage"] == "champion"
     assert version["status"] == "live"
     assert version["live_ready"] is True
+
+
+def test_registry_promotion_requires_ope_for_rl_policy(registry_stack: tuple[Any, ...]) -> None:
+    _, storage, runtime_meta, promotion_audit, _, _, model_registry, _ = registry_stack
+    model_id = "rlpolicy_AAPL_1700000000004_abcdef4"
+
+    model_registry.register_model(
+        model_name=model_id,
+        model_kind="rl_policy",
+        model_ts_ms=1700000000004,
+        stage="challenger",
+        metrics={"score": 1.0, "policy_type": "rl"},
+        regime="global",
+    )
+    _record_pass(promotion_audit, model_id=model_id)
+    _set_replay(runtime_meta, model_id=model_id, model_kind="rl_policy", model_ts_ms=1700000000004)
+
+    with pytest.raises(RuntimeError, match="OPE gate blocked promotion"):
+        model_registry.promote_to_champion(model_id, "rl_policy", 1700000000004, regime="global")
+
+    latest_block = [row for row in _audit_rows(storage) if row["model_name"] == model_id][-1]
+    assert latest_block["action"] == "block"
+    assert "OPE gate blocked promotion" in latest_block["reason"]["detail"]

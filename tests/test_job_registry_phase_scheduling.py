@@ -90,6 +90,11 @@ class JobRegistryPhaseSchedulingTests(unittest.TestCase):
         pipeline = list(job_registry.PIPELINE_ORDER)
 
         self.assertIn("compute_tsfresh_snapshots", job_registry.INGESTION_DAEMON_JOBS)
+        self.assertTrue(job_registry.is_offline_workload_job("compute_tsfresh_snapshots"))
+        self.assertEqual(
+            job_registry.get_job_meta("compute_tsfresh_snapshots").get("resource_class"),
+            "training",
+        )
         for job_name in (
             "backfill_universe_pit",
             "process_finbert_sentiment",
@@ -117,6 +122,15 @@ class JobRegistryPhaseSchedulingTests(unittest.TestCase):
         self.assertEqual(spec[1], "daemon")
         self.assertIn("snapshot_equity", job_registry.JOB_ORDER)
         self.assertIn("snapshot_equity", job_registry.get_boot_jobs())
+
+    def test_registry_classifies_training_and_replay_as_offline_workload(self) -> None:
+        (job_registry,) = _reload_modules("engine.runtime.job_registry")
+
+        self.assertTrue(job_registry.is_offline_workload_job("train_lgbm_models"))
+        self.assertTrue(job_registry.is_offline_workload_job("pipeline_train_and_eval"))
+        self.assertTrue(job_registry.is_offline_workload_job("backtest_cpcv"))
+        self.assertFalse(job_registry.is_offline_workload_job("ingestion_runtime"))
+        self.assertFalse(job_registry.is_offline_workload_job("broker_apply_orders"))
 
     def test_job_files_are_registered_or_explicitly_quarantined(self) -> None:
         (job_registry,) = _reload_modules("engine.runtime.job_registry")

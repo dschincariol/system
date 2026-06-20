@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import sqlite3
 from urllib.parse import urlparse
 
@@ -26,7 +27,7 @@ def _patch_broker_storage(monkeypatch):
 
 
 def test_broker_config_masks_credentials_blocks_activation_until_test_and_audits(monkeypatch):
-    monkeypatch.setenv("DATA_SOURCE_MASTER_KEY", "unit-test-master-key")
+    monkeypatch.setenv("DATA_SOURCE_MASTER_KEY", base64.b64encode(bytes(range(32))).decode("ascii"))
     _patch_broker_storage(monkeypatch)
 
     saved = api_broker_config.api_post_broker_config(
@@ -100,3 +101,41 @@ def test_broker_config_masks_credentials_blocks_activation_until_test_and_audits
     assert "test_connection" in actions
     assert actions.count("config_update") >= 2
     assert "KEY12345" not in str(audit)
+
+
+def test_broker_config_activation_rejects_stale_connection_test(monkeypatch):
+    monkeypatch.setenv("DATA_SOURCE_MASTER_KEY", base64.b64encode(bytes(range(32))).decode("ascii"))
+    monkeypatch.setenv("BROKER_CONNECTION_TEST_MAX_AGE_S", "60")
+    _patch_broker_storage(monkeypatch)
+
+    monkeypatch.setattr(api_broker_config, "_now_ms", lambda: 1_000_000)
+    tested = api_broker_config.api_post_broker_test_connection(
+        urlparse("/api/broker/test_connection"),
+        {
+            "active_broker": "alpaca",
+            "paper_live_mode": "paper",
+            "base_url": "https://paper-api.alpaca.markets",
+            "credentials": {"api_key": "KEY12345", "secret": "SECRET98765"},
+            "actor": "pytest",
+        },
+        {},
+    )
+    assert tested["ok"] is True
+
+    monkeypatch.setattr(api_broker_config, "_now_ms", lambda: 1_000_000 + 120_000)
+    blocked = api_broker_config.api_post_broker_config(
+        urlparse("/api/broker/config"),
+        {
+            "active_broker": "alpaca",
+            "paper_live_mode": "paper",
+            "base_url": "https://paper-api.alpaca.markets",
+            "active": True,
+            "disabled": False,
+            "actor": "pytest",
+        },
+        {},
+    )
+
+    assert blocked["ok"] is False
+    assert blocked["error"] == "broker_test_stale"
+    assert blocked["test_max_age_ms"] == 60_000

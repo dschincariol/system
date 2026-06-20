@@ -62,6 +62,7 @@ function contributionRows(payload, limit) {
         attribution,
         absAttribution: Math.abs(attribution),
         direction: attribution > 0 ? "positive" : attribution < 0 ? "negative" : "neutral",
+        featureVisibility: asObject(item.feature_visibility),
       };
     })
     .filter(Boolean);
@@ -70,6 +71,26 @@ function contributionRows(payload, limit) {
     return a.featureId.localeCompare(b.featureId);
   });
   return rows.slice(0, Math.max(1, Number(limit) || 6));
+}
+
+function featureVisibilityLine(row) {
+  const visibility = asObject(row && row.featureVisibility);
+  if (!Object.keys(visibility).length) return "";
+  const pit = asObject(visibility.pit_status);
+  const confidence = asObject(visibility.confidence);
+  const parts = [
+    visibility.shadow_only ? "shadow-only" : "",
+    visibility.feature_available ? "feature available" : "feature unavailable",
+    visibility.point_in_time_valid ? "PIT valid" : "PIT warning",
+    visibility.status ? String(visibility.status).replace(/_/g, " ") : "",
+  ].filter(Boolean);
+  const confidenceMax = numOrNull(confidence.max);
+  if (confidenceMax != null) parts.push(`confidence ${confidenceMax.toFixed(2)}`);
+  const sourceArtifact = String(visibility.source_artifact || "").trim();
+  if (sourceArtifact) parts.push(`source ${sourceArtifact}`);
+  const reasonCodes = asArray(pit.reason_codes).map((item) => String(item || "").trim()).filter(Boolean);
+  if (reasonCodes.length) parts.push(`PIT reasons ${reasonCodes.slice(0, 3).join(", ")}`);
+  return parts.join(" | ");
 }
 
 export function normalizeDecisionAttribution(payload = {}, opts = {}) {
@@ -137,11 +158,15 @@ function formatValue(value, digits = 4) {
 function renderRows(rows) {
   return rows.map((row) => {
     const sideClass = row.direction === "negative" ? "is-negative" : row.direction === "positive" ? "is-positive" : "is-neutral";
+    const visibilityLine = featureVisibilityLine(row);
     return `
       <div class="decisionAttributionRow ${sideClass}" role="listitem" aria-label="${escapeHTML(`${row.label}: ${row.sign}${formatValue(row.absAttribution)} ${row.directionLabel}`)}">
         <div class="decisionAttributionFeature">
           <span class="decisionAttributionRank">${escapeHTML(String(row.rank))}</span>
-          <span>${escapeHTML(row.label)}</span>
+          <span class="decisionAttributionFeatureText">
+            <span class="decisionAttributionFeatureName">${escapeHTML(row.label)}</span>
+            ${visibilityLine ? `<span class="decisionAttributionFeatureMeta">${escapeHTML(visibilityLine)}</span>` : ""}
+          </span>
         </div>
         <div class="decisionAttributionTrack" aria-hidden="true">
           <span class="decisionAttributionZero"></span>
@@ -166,6 +191,7 @@ function renderTable(rows) {
           <th>Contribution</th>
           <th>Relative Magnitude</th>
           <th>Feature Value</th>
+          <th>Lineage / PIT</th>
         </tr>
       </thead>
       <tbody>
@@ -176,6 +202,7 @@ function renderTable(rows) {
             <td class="mono">${escapeHTML(row.attribution.toFixed(6))}</td>
             <td class="mono">${escapeHTML(`${row.sharePct.toFixed(1)}%`)}</td>
             <td class="mono">${escapeHTML(formatValue(row.value))}</td>
+            <td>${escapeHTML(featureVisibilityLine(row) || "standard feature")}</td>
           </tr>
         `).join("")}
       </tbody>

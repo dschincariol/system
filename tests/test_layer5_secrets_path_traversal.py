@@ -1,7 +1,7 @@
 """Layer 5 negative test: secret-name path traversal.
 
-All three secret providers (`systemd-creds`, `dpapi`, `plaintext`)
-must reject any secret name that contains path separators or parent
+Secret providers (`systemd-creds`, `plaintext`) must reject any secret
+name that contains path separators or parent
 directory references. Without this gate, a caller could read
 arbitrary files on the host (`../../etc/passwd`, etc.).
 
@@ -12,8 +12,6 @@ never opens a wrong file.
 
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -159,30 +157,6 @@ def test_plaintext_provider_never_returns_bytes_for_malicious_name(
             decoy.unlink()
 
 
-# ---- dpapi provider --------------------------------------------------
-
-@pytest.mark.parametrize("malicious_name", _REJECTED_BY_VALIDATOR + _REJECTED_BY_SAFETY_NET)
-def test_dpapi_provider_never_returns_bytes_for_malicious_name(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    malicious_name: str,
-) -> None:
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    decoy = _decoy_setup(tmp_path)
-    try:
-        from services.secrets.providers import dpapi
-
-        with pytest.raises(SecretNotAvailable):
-            result = dpapi.load(malicious_name)
-            assert result is None, (
-                f"dpapi.load({malicious_name!r}) returned bytes — "
-                f"security boundary breached."
-            )
-    finally:
-        if decoy.exists():
-            decoy.unlink()
-
-
 # ---- Documented validator hole — locked in as an explicit test -----
 
 @pytest.mark.parametrize("name", _REJECTED_BY_VALIDATOR)
@@ -213,7 +187,6 @@ def test_explicit_validator_catches_separator_names(
 @pytest.mark.parametrize("provider_module", [
     "services.secrets.providers.systemd_creds",
     "services.secrets.providers.plaintext",
-    "services.secrets.providers.dpapi",
 ])
 def test_empty_or_whitespace_secret_name_rejected(
     monkeypatch: pytest.MonkeyPatch,
@@ -224,7 +197,6 @@ def test_empty_or_whitespace_secret_name_rejected(
 
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
     monkeypatch.setenv("TS_DEV_SECRETS_DIR", str(tmp_path))
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.delenv("TS_ENV", raising=False)
 
     mod = importlib.import_module(provider_module)

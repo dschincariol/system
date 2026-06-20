@@ -17,9 +17,14 @@ import psutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LOG_DIR = ROOT / "logs"
+LOG_DIR = ROOT / "var" / "log"
 DEFAULT_OUT = LOG_DIR / "runtime_stability_probe.ndjson"
-DEFAULT_DB_PATH = Path(os.environ.get("DB_PATH") or str(ROOT / "data" / "trading.db"))
+DEFAULT_DB_PATH = Path(os.environ.get("DB_PATH") or str(ROOT / "var" / "db" / "trading.db"))
+DEFAULT_DASHBOARD_URL = str(os.environ.get("PIPELINE_SMOKE_BASE") or "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_OPERATOR_URL = str(
+    os.environ.get("PIPELINE_SMOKE_OPERATOR_BASE")
+    or f"{DEFAULT_DASHBOARD_URL}/operator"
+).rstrip("/")
 DEFAULT_LOG_PATHS = (
     LOG_DIR / "runtime.log",
     LOG_DIR / "engine.log",
@@ -45,7 +50,19 @@ FAIL_PATTERNS = (
 def _http_json(url: str, timeout: float) -> Tuple[bool, float, object]:
     started = time.time()
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        headers = {"Accept": "application/json"}
+        dashboard_token = str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip()
+        if dashboard_token:
+            headers["X-API-Token"] = dashboard_token
+        operator_token = str(
+            os.environ.get("PIPELINE_SMOKE_OPERATOR_TOKEN")
+            or os.environ.get("OPERATOR_API_TOKEN")
+            or ""
+        ).strip()
+        if operator_token and ":4001/" in str(url):
+            headers["X-Operator-Token"] = operator_token
+        req = urllib.request.Request(str(url), headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw)
             return True, (time.time() - started) * 1000.0, payload
@@ -419,8 +436,8 @@ def main() -> int:
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument("--warmup-s", type=int, default=45)
     parser.add_argument("--out", default=str(DEFAULT_OUT))
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--operator-url", default="http://127.0.0.1:4001")
+    parser.add_argument("--base-url", default=DEFAULT_DASHBOARD_URL)
+    parser.add_argument("--operator-url", default=DEFAULT_OPERATOR_URL)
     parser.add_argument("--skip-operator", action="store_true")
     parser.add_argument("--launch-command", default="")
     parser.add_argument("--launch-cwd", default=str(ROOT))

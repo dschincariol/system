@@ -48,9 +48,17 @@ _POST_BOOTSTRAP_STORAGE_HELPERS = (
 _EXTERNAL_SCHEMA_MODULES = (
     ("engine.runtime.storage_live_ingestion_schema", "SCHEMA"),
     ("engine.execution.execution_ledger", "SCHEMA"),
+    ("engine.execution.order_idempotency", "SCHEMA"),
     ("engine.execution.order_command_boundary", "SCHEMA"),
     ("engine.strategy.portfolio", "SCHEMA"),
     ("engine.execution.broker_sim", "SCHEMA"),
+)
+_EXTERNAL_SCHEMA_FUNCTIONS = (
+    ("engine.strategy.net_after_cost_labels", "ensure_net_after_cost_labels_schema"),
+    ("engine.data.structured_document_events", "ensure_structured_document_event_schema"),
+)
+_EXTERNAL_SCHEMA_TABLE_ATTRS = (
+    ("engine.strategy.net_after_cost_labels", "TABLE_NAME"),
 )
 _OWNED_LIVE_TABLE_OWNER_MODULES = {
     "prices": {
@@ -135,6 +143,9 @@ _DOCUMENTED_INDEXES = {
     "idx_execution_orders_model_submit_ts",
     "idx_execution_orders_symbol_submit_ts",
     "idx_execution_orders_order_uid",
+    "uq_execution_order_idempotency_client",
+    "idx_execution_order_idempotency_status",
+    "idx_execution_order_idempotency_symbol_ts",
     "idx_order_commands_ts",
     "idx_order_commands_batch_mode",
     "idx_order_events_ts",
@@ -408,6 +419,24 @@ _CRITICAL_TABLE_SPECS = {
         "status": {"type": "TEXT", "pk": 0, "notnull": True, "default": "'submitted'"},
         "extra_json": {"type": "TEXT", "pk": 0},
     },
+    "execution_order_idempotency": {
+        "order_uid": {"type": "TEXT", "pk": 1},
+        "broker": {"type": "TEXT", "pk": 0, "notnull": True},
+        "portfolio_orders_id": {"type": "INTEGER", "pk": 0},
+        "portfolio_ts_ms": {"type": "INTEGER", "pk": 0},
+        "source_order_id": {"type": "INTEGER", "pk": 0},
+        "source_alert_id": {"type": "INTEGER", "pk": 0},
+        "symbol": {"type": "TEXT", "pk": 0, "notnull": True},
+        "client_order_id": {"type": "TEXT", "pk": 0, "notnull": True},
+        "broker_order_id": {"type": "TEXT", "pk": 0},
+        "status": {"type": "TEXT", "pk": 0, "notnull": True},
+        "first_seen_ts_ms": {"type": "INTEGER", "pk": 0, "notnull": True},
+        "claimed_ts_ms": {"type": "INTEGER", "pk": 0, "notnull": True},
+        "updated_ts_ms": {"type": "INTEGER", "pk": 0, "notnull": True},
+        "submit_ts_ms": {"type": "INTEGER", "pk": 0},
+        "last_error": {"type": "TEXT", "pk": 0},
+        "payload_json": {"type": "TEXT", "pk": 0, "notnull": True},
+    },
     "order_commands": {
         "command_id": {"type": "TEXT", "pk": 1},
         "ts_ms": {"type": "INTEGER", "pk": 0, "notnull": True},
@@ -510,6 +539,13 @@ def _canonical_schema_sources(storage_module) -> list[str]:
     for module_name, attr_name in _EXTERNAL_SCHEMA_MODULES:
         module = importlib.import_module(module_name)
         sources.append(str(getattr(module, attr_name)))
+    for module_name, attr_name in _EXTERNAL_SCHEMA_FUNCTIONS:
+        module = importlib.import_module(module_name)
+        sources.append(inspect.getsource(getattr(module, attr_name)))
+    for module_name, attr_name in _EXTERNAL_SCHEMA_TABLE_ATTRS:
+        module = importlib.import_module(module_name)
+        table_name = str(getattr(module, attr_name))
+        sources.append(f"CREATE TABLE IF NOT EXISTS {table_name}")
     return sources
 
 
@@ -1067,6 +1103,46 @@ def test_init_db_rebuilds_legacy_prices_schema_to_owned_contract(storage_runtime
     assert row == (4001, "IWM", 201.5, 201.5, "legacy_feed")
 
 
+def test_init_db_rebuilds_prices_extra_json_drift_to_owned_contract(storage_runtime) -> None:
+    storage = storage_runtime["storage"]
+    db_path = storage_runtime["db_path"]
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute(
+            """
+            CREATE TABLE prices (
+                ts_ms INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                price REAL,
+                px REAL,
+                source TEXT,
+                extra_json TEXT,
+                PRIMARY KEY(symbol, ts_ms)
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO prices(ts_ms, symbol, price, px, source, extra_json)
+            VALUES (4002, 'IWM', 202.5, 202.5, 'legacy_feed', '{"bid":202.4}')
+            """
+        )
+
+    storage.init_db()
+
+    actual_columns = _table_columns(db_path, "prices")
+    assert set(actual_columns) == {"ts_ms", "symbol", "price", "px", "source"}
+    assert actual_columns["symbol"]["pk"] == 1
+    assert actual_columns["ts_ms"]["pk"] == 2
+
+    with sqlite3.connect(str(db_path)) as con:
+        row = con.execute(
+            "SELECT ts_ms, symbol, price, px, source FROM prices"
+        ).fetchone()
+
+    assert row == (4002, "IWM", 202.5, 202.5, "legacy_feed")
+
+
 def test_init_db_rebuilds_legacy_price_quotes_raw_schema(storage_runtime) -> None:
     storage = storage_runtime["storage"]
     db_path = storage_runtime["db_path"]
@@ -1114,6 +1190,62 @@ def test_init_db_rebuilds_legacy_price_quotes_raw_schema(storage_runtime) -> Non
         ).fetchone()
 
     assert row == ("MSFT", "polygon", "legacy", 2001, 2001, 2001, 2001, "polygon")
+
+
+def test_init_db_rebuilds_price_quotes_raw_pk_drift(storage_runtime) -> None:
+    storage = storage_runtime["storage"]
+    db_path = storage_runtime["db_path"]
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute(
+            """
+            CREATE TABLE price_quotes_raw (
+                ts_ms INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                event_type TEXT,
+                event_ts_ms INTEGER,
+                last REAL,
+                bid REAL,
+                ask REAL,
+                spread REAL,
+                volume REAL,
+                trade_ts_ms INTEGER,
+                quote_ts_ms INTEGER,
+                ingest_ts_ms INTEGER,
+                source TEXT,
+                PRIMARY KEY(symbol, provider, event_key, ts_ms)
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO price_quotes_raw(
+                ts_ms, symbol, provider, event_key, event_type, event_ts_ms,
+                last, bid, ask, spread, volume, trade_ts_ms, quote_ts_ms, ingest_ts_ms, source
+            )
+            VALUES (2002, 'MSFT', 'polygon', 'evt-1', 'trade', 2002, 302.0, 301.5, 302.5, 1.0, 11.0, 2002, 2002, 2002, 'polygon')
+            """
+        )
+
+    storage.init_db()
+
+    actual_columns = _table_columns(db_path, "price_quotes_raw")
+    assert actual_columns["symbol"]["pk"] == 1
+    assert actual_columns["provider"]["pk"] == 2
+    assert actual_columns["event_key"]["pk"] == 3
+    assert actual_columns["ts_ms"]["pk"] == 0
+
+    with sqlite3.connect(str(db_path)) as con:
+        row = con.execute(
+            """
+            SELECT symbol, provider, event_key, event_type, event_ts_ms, trade_ts_ms, quote_ts_ms, ingest_ts_ms, source
+            FROM price_quotes_raw
+            """
+        ).fetchone()
+
+    assert row == ("MSFT", "polygon", "evt-1", "trade", 2002, 2002, 2002, 2002, "polygon")
 
 
 def test_init_db_reapplies_live_ingestion_schema_when_version_markers_are_current(storage_runtime) -> None:

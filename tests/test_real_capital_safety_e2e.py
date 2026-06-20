@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import importlib
 import io
 import json
@@ -7,6 +10,7 @@ import socket
 import sys
 import time
 from contextlib import ExitStack, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +22,50 @@ from engine.runtime.live_trading_preflight import DEFAULT_LIVE_CONFIRM_PHRASE
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def _sign_backup_evidence(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    key_id: str = "real-capital-safety-e2e",
+) -> dict[str, Any]:
+    signed = dict(payload)
+    signed.pop("signature", None)
+    payload_bytes = json.dumps(
+        signed,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+    algorithm = "hmac-sha256"
+    signed_at = (
+        datetime.fromtimestamp(time.time(), tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    metadata_bytes = json.dumps(
+        {
+            "algorithm": algorithm,
+            "key_id": key_id,
+            "payload_sha256": payload_sha256,
+            "signed_at": signed_at,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    signed["signature"] = {
+        "status": "signed",
+        "algorithm": algorithm,
+        "key_id": key_id,
+        "signed_at": signed_at,
+        "payload_sha256": payload_sha256,
+        "value": hmac.new(key.encode("utf-8"), payload_bytes + b"\n" + metadata_bytes, hashlib.sha256).hexdigest(),
+    }
+    return signed
 
 
 def _free_tcp_port() -> int:
@@ -148,9 +196,15 @@ class _FakeBrokerClient:
 
 def _configure_live_env(monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "real_capital_safety_e2e.db"
+    master_key_path = tmp_path / "data_source_master_key"
+    master_key_path.write_text(base64.b64encode(bytes(range(1, 33))).decode("ascii"), encoding="utf-8")
+    master_key_path.chmod(0o600)
+    monkeypatch.delenv("DATA_SOURCE_MASTER_KEY", raising=False)
+    monkeypatch.setenv("DATA_SOURCE_MASTER_KEY_FILE", str(master_key_path))
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("TS_STORAGE_BACKEND", "sqlite")
     monkeypatch.setenv("TS_PG_SCHEMA_PER_DB_PATH", "1")
+    monkeypatch.setenv("TS_ARTIFACTS_ROOT", str(tmp_path / "artifacts"))
     monkeypatch.setenv("TS_REDIS_KEY_PREFIX", f"real_capital_safety_e2e_{tmp_path.name}")
     monkeypatch.setenv("ENGINE_SUPERVISED", "1")
     monkeypatch.setenv("ALLOW_TRAINING", "0")
@@ -173,6 +227,49 @@ def _configure_live_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("LIVE_TRADING_REQUIRE_CONFIRMATION", "1")
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "live-token-1234567890")
     monkeypatch.setenv("LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN", "1")
+    monkeypatch.setenv("OPERATOR_API_TOKEN", "operator-token-real-capital-safety-e2e-0123456789abcdef")
+    monkeypatch.setenv("DECISION_ENGINE_ENABLED", "1")
+    monkeypatch.setenv("DECISION_MIN_CONFIDENCE", "0.70")
+    monkeypatch.setenv("DECISION_MIN_ABS_PREDICTION", "0.80")
+    monkeypatch.setenv("UNCERTAINTY_SIZING_PRODUCTION_POLICY", "strict")
+    monkeypatch.setenv("UNCERTAINTY_HIGH_THRESHOLD", "0.70")
+    monkeypatch.setenv("UNCERTAINTY_HARD_THRESHOLD", "0.95")
+    monkeypatch.setenv("UNCERTAINTY_MAX_AGE_MS", "300000")
+    monkeypatch.setenv("OOD_SUPPRESS_THRESHOLD", "1.50")
+    monkeypatch.setenv("OOD_HARD_THRESHOLD", "3.00")
+    monkeypatch.setenv("MODEL_NAME", "baseline")
+    from engine.artifacts.store import LocalArtifactStore
+
+    artifact_alias = "model:baseline:current"
+    artifact_ref = LocalArtifactStore().put(
+        b"real-capital-safety-e2e-model",
+        content_type="application/octet-stream",
+        kind="model",
+        alias=artifact_alias,
+        metadata={"model_name": "baseline"},
+    )
+    monkeypatch.setenv(
+        "MODEL_INSTANCE_CONFIG_JSON",
+        json.dumps(
+            [
+                {
+                    "family": "embed_regressor",
+                    "model_name": "baseline",
+                    "horizons_s": [300],
+                    "feature_ids": ["f_0"],
+                    "symbol_universe": ["*"],
+                    "model_kind": "ridge",
+                    "enabled": True,
+                    "prediction_enabled": True,
+                    "experimental": False,
+                    "artifact_alias": artifact_alias,
+                    "artifact_sha256": artifact_ref.sha256,
+                }
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
 
     monkeypatch.setenv("LIVE_BROKER", "alpaca")
     monkeypatch.setenv("BROKER", "alpaca")
@@ -211,32 +308,70 @@ def _configure_live_env(monkeypatch, tmp_path: Path) -> None:
 
     now = time.time()
     evidence_path = tmp_path / "latest_backup_restore_evidence.json"
+    backup_evidence_key = "real-capital-safety-e2e-signing-key"
     evidence_path.write_text(
         json.dumps(
-            {
-                "schema_version": 1,
-                "generated_at_ts": now,
-                "status": "pass",
-                "base_backup": {"status": "pass", "verified_at_ts": now},
-                "wal_archive": {"status": "pass", "verified_at_ts": now},
-                "restore_drill": {
+            _sign_backup_evidence(
+                {
+                    "schema_version": 1,
+                    "generated_at_ts": now,
                     "status": "pass",
-                    "verified_at_ts": now,
-                    "time_to_recover_s": 60,
+                    "base_backup": {"status": "pass", "verified_at_ts": now},
+                    "wal_archive": {"status": "pass", "verified_at_ts": now},
+                    "restore_drill": {
+                        "status": "pass",
+                        "verified_at_ts": now,
+                        "time_to_recover_s": 60,
+                    },
                 },
-            },
+                backup_evidence_key,
+            ),
             separators=(",", ":"),
             sort_keys=True,
         ),
         encoding="utf-8",
     )
     monkeypatch.setenv("BACKUP_EVIDENCE_PATH", str(evidence_path))
+    monkeypatch.setenv("BACKUP_EVIDENCE_HMAC_KEY", backup_evidence_key)
     monkeypatch.setenv("BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S", "3600")
     monkeypatch.setenv("BACKUP_EVIDENCE_RPO_S", "3600")
     monkeypatch.setenv("BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S", "3600")
     monkeypatch.setenv("BACKUP_EVIDENCE_RTO_S", "300")
-    monkeypatch.delenv("BACKUP_EVIDENCE_REQUIRE_SIGNATURE", raising=False)
-    monkeypatch.delenv("BACKUP_EVIDENCE_SIGNATURE_REQUIRED", raising=False)
+    monkeypatch.setenv("TS_ARTIFACTS_ROOT", str(tmp_path / "artifacts"))
+
+    from engine.artifacts.store import LocalArtifactStore
+
+    artifact_alias = "model:real_capital_safety_e2e:current"
+    artifact_ref = LocalArtifactStore().put(
+        b"real-capital-safety-e2e-artifact",
+        content_type="application/octet-stream",
+        kind="model",
+        alias=artifact_alias,
+        metadata={"model_name": "real_capital_safety_e2e"},
+    )
+    monkeypatch.setenv("MODEL_NAME", "real_capital_safety_e2e")
+    monkeypatch.setenv(
+        "MODEL_INSTANCE_CONFIG_JSON",
+        json.dumps(
+            [
+                {
+                    "family": "embed_regressor",
+                    "model_name": "real_capital_safety_e2e",
+                    "horizons_s": [300],
+                    "feature_ids": ["f_0"],
+                    "symbol_universe": ["*"],
+                    "model_kind": "ridge",
+                    "enabled": True,
+                    "prediction_enabled": True,
+                    "experimental": False,
+                    "artifact_alias": artifact_alias,
+                    "artifact_sha256": artifact_ref.sha256,
+                }
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
 
 
 def _invalidate_execution_mode_cache() -> None:
@@ -318,10 +453,10 @@ def _seed_runtime(modules: SimpleNamespace, *, now_ms: int | None = None) -> int
                 "INSERT INTO job_heartbeats(job_name, owner, pid, ts_ms, extra_json) VALUES (?,?,?,?,?)",
                 (job_name, "test", 123, now, "{}"),
             )
-        for offset in range(5):
+        for offset in range(31):
             con.execute(
                 "INSERT OR REPLACE INTO equity_history(ts_ms, equity) VALUES (?,?)",
-                (now - (4 - offset) * 1_000, 100_000.0),
+                (now - (30 - offset) * 1_000, 100_000.0),
             )
         con.commit()
     finally:

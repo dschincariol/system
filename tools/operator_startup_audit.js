@@ -2,6 +2,11 @@
 "use strict";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.OPERATOR_AUDIT_TIMEOUT_MS || 12000);
+const OPERATOR_TOKEN = String(
+  process.env.PIPELINE_SMOKE_OPERATOR_TOKEN ||
+  process.env.OPERATOR_API_TOKEN ||
+  ""
+).trim();
 
 const checks = [
   {
@@ -89,6 +94,9 @@ async function fetchCheck(check) {
   try {
     const response = await fetch(check.url, {
       cache: "no-store",
+      headers: OPERATOR_TOKEN && check.url.includes(":4001/")
+        ? { "X-Operator-Token": OPERATOR_TOKEN }
+        : {},
       signal: controller.signal
     });
     const text = await response.text();

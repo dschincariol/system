@@ -1471,6 +1471,67 @@ tbody tr:nth-child(odd) td{ background: rgba(255,255,255,.01); }
       color:var(--muted);
     }
 
+    .readinessEvidenceGrid{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap:10px;
+      margin:10px 0;
+    }
+    .readinessEvidenceGroup{
+      border:1px solid rgba(48,54,61,.72);
+      border-radius:8px;
+      background:rgba(10,13,18,.68);
+      padding:10px;
+      min-width:0;
+    }
+    .readinessEvidenceGroup-blocked{ border-color:var(--status-blocked); border-style:dashed; }
+    .readinessEvidenceGroup-warn{ border-color:var(--status-warn); border-style:dashed; }
+    .readinessEvidenceGroup-unavailable{ border-color:var(--status-unavailable); border-style:dotted; }
+    .readinessEvidenceGroup-ok{ border-color:var(--status-ok); }
+    .readinessEvidenceGroupHead{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+      margin-bottom:8px;
+    }
+    .readinessEvidenceOwner{
+      color:var(--text);
+      font-weight:800;
+      text-decoration:none;
+      overflow-wrap:anywhere;
+    }
+    .readinessEvidenceOwner:hover{ color:var(--info); text-decoration:underline; }
+    .readinessEvidenceList{
+      list-style:none;
+      display:flex;
+      flex-direction:column;
+      gap:7px;
+      padding:0;
+      margin:0;
+    }
+    .readinessEvidenceItem{
+      display:flex;
+      align-items:flex-start;
+      gap:8px;
+      min-width:0;
+      border-top:1px solid rgba(48,54,61,.35);
+      padding-top:7px;
+    }
+    .readinessEvidenceItem:first-child{ border-top:0; padding-top:0; }
+    .readinessEvidenceItemMain{
+      display:flex;
+      flex-direction:column;
+      gap:3px;
+      min-width:0;
+      font-size:12px;
+      line-height:1.35;
+    }
+    .readinessEvidenceItemMain b,
+    .readinessEvidenceItemMain span{
+      overflow-wrap:anywhere;
+    }
+
     /* Canvas polish */
     canvas{
       border: 1px solid var(--border);
@@ -1813,10 +1874,26 @@ tr.symbolContextMatch td{
   color:var(--text);
   font-size:12px;
 }
-.decisionAttributionFeature span:last-child{
+.decisionAttributionFeatureText{
+  display:grid;
+  gap:3px;
+  min-width:0;
+}
+.decisionAttributionFeatureName{
   overflow:hidden;
   text-overflow:ellipsis;
   white-space:nowrap;
+}
+.decisionAttributionFeatureMeta{
+  color:var(--muted);
+  font-size:11px;
+  line-height:1.25;
+  white-space:normal;
+}
+.featureVisibilityPanel{
+  display:grid;
+  gap:12px;
+  margin-top:10px;
 }
 .decisionAttributionRank{
   flex:0 0 auto;
@@ -2546,6 +2623,33 @@ tr.symbolContextMatch td{
     </div>
   </div>
 
+  <div class="card collapsible" id="readinessEvidencePanel" data-screens="overview,operate" aria-labelledby="readinessEvidenceTitle">
+    <h2 id="readinessEvidenceTitle">Readiness Evidence <span id="readinessEvidenceMeta" class="pill dim meta-pill-offset">loading</span></h2>
+    <div class="small">Authoritative blockers and warnings from runtime, execution, broker, data, and governance evidence.</div>
+    <div id="readinessEvidenceGroups" class="readinessEvidenceGrid" aria-live="polite">
+      <div class="metric-meta">Loading readiness evidence.</div>
+    </div>
+    <div class="table-wrap table-wrap-spaced-sm">
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Evidence</th>
+            <th>Owner</th>
+            <th>Age</th>
+            <th>Remediation</th>
+          </tr>
+        </thead>
+        <tbody id="readinessEvidenceBlockers">
+          <tr class="table-row"><td colspan="5" class="metric-meta">(loading...)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="readinessEvidenceNotes" class="opsNotes small">
+      <div class="opsNote">(loading...)</div>
+    </div>
+  </div>
+
   <div class="card" id="recommendedActionCard">
     <h2 class="card-header">🎯 Recommended Action <span id="recommendedActionStatePill" class="pill dim meta-pill-offset">loading</span></h2>
     <div class="recommendedActionGrid">
@@ -2973,6 +3077,44 @@ Trade Execution Integrity —
       <div id="console" class="console"></div>
     </div>
 
+    <div class="card collapsible" id="jobCatalogCard" data-screens="operate">
+      <h2>Job Catalog</h2>
+      <div class="small">Registered runtime jobs with backend-owned safety, prerequisites, latest state, and log links.</div>
+
+      <div class="btnRow jobCatalogControls">
+        <input id="jobCatalogSearch" class="input" placeholder="Search jobs, providers, stages" />
+        <select id="jobCatalogSafety" title="Safety filter">
+          <option value="">All safety classes</option>
+        </select>
+        <select id="jobCatalogWorkflow" title="Workflow filter">
+          <option value="">All workflows</option>
+        </select>
+        <select id="jobCatalogMode" title="Mode filter">
+          <option value="">All modes</option>
+        </select>
+        <span class="pill dim" id="jobCatalogCount">0 jobs</span>
+      </div>
+
+      <div class="tableWrap jobCatalogTableWrap">
+        <table class="jobCatalogTable">
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Safety</th>
+              <th>Stage</th>
+              <th>Mode</th>
+              <th>Latest</th>
+              <th>Prerequisites</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="jobCatalogBody">
+            <tr><td colspan="7" class="jobCatalogEmpty">Loading job catalog...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="card collapsible" id="logViewerCard" data-screens="operate">
       <h2>📜 Log Viewer</h2>
       <div class="small">Filter Python-served job and operator logs without losing the existing raw tail console above.</div>
@@ -3053,6 +3195,22 @@ Trade Execution Integrity —
       <div class="small section-note-title">Current blockers</div>
       <div id="dataHealthNotes" class="opsNotes small">
         <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="structuredDocumentsHealthCard" data-screens="data">
+      <h2>Structured Document Events</h2>
+      <div class="small">Read-only extraction health, confidence, source lineage, and point-in-time status for structured document feature groups.</div>
+      <div id="structuredDocumentsVisibility" class="featureVisibilityPanel">
+        <div class="metric-meta">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="graphFeaturesHealthCard" data-screens="data">
+      <h2>Graph Features</h2>
+      <div class="small">Read-only graph-relational snapshot freshness, feature availability, shadow-only status, and point-in-time validity.</div>
+      <div id="graphFeaturesVisibility" class="featureVisibilityPanel">
+        <div class="metric-meta">(loading...)</div>
       </div>
     </div>
 
@@ -3355,6 +3513,24 @@ loading
       <details class="rawToggle">
         <summary>View Raw Promotion Gate Payload</summary>
         <pre id="promotionGateRaw" class="mono small" style="max-height:360px; overflow:auto;">(loading...)</pre>
+      </details>
+    </div>
+
+    <div class="card collapsible" id="governanceEvidenceCard" data-screens="explain,analyze">
+      <h2 class="card-header">Governance Evidence <span id="governanceEvidenceMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Read-only evidence for promotion, generated-candidate trust, model-risk controls, and shadow capital.</div>
+      <div id="governanceEvidenceBody">
+        <div class="structuredSummaryGrid">
+          <div class="structuredSummaryRow">
+            <div class="structuredSummaryLabel">Evidence state</div>
+            <div class="structuredSummaryValue">Loading</div>
+            <div class="structuredSummaryMeta">Governance evidence is loading.</div>
+          </div>
+        </div>
+      </div>
+      <details class="rawToggle">
+        <summary>View Raw Governance Evidence</summary>
+        <pre id="governanceEvidenceRaw" class="console" style="height:260px;">(loading...)</pre>
       </details>
     </div>
 
@@ -3742,7 +3918,7 @@ loading
 
     <div class="card collapsible" id="performanceDivergenceCard" data-screens="overview,explain,analyze">
       <h2 class="card-header">Model Performance Divergence <span id="performanceDivergenceMeta" class="pill dim meta-pill-offset">loading</span></h2>
-      <div class="small">Expected, backtest, shadow, and live realized behavior from existing dashboard read paths.</div>
+      <div class="small">Expected, backtest, shadow, live realized, and production drift/calibration behavior from existing read paths.</div>
       <div class="pill-row">
         <span class="pill dim" id="performanceDivergenceSelected">selected -</span>
         <span class="pill dim mono" id="performanceDivergenceUpdated">updated -</span>
@@ -4245,6 +4421,160 @@ loading
       </div>
       <div class="small section-note-title">Execution notes</div>
       <div id="executionMetricsNotes" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionBySymbolTcaCard" data-screens="execution">
+      <h2 class="card-header">Execution TCA by Symbol <span id="executionBySymbolTcaMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">By-symbol slippage, latency, fill-quality, implementation-shortfall, and VWAP fields from the execution diagnostics serializer.</div>
+      <div class="tableControls" data-table-controls="executionBySymbolTca">
+        <label class="sr-only" for="executionBySymbolTcaFilter">Filter by-symbol execution TCA</label>
+        <input id="executionBySymbolTcaFilter" class="tableSearchInput" data-dashboard-table-filter="executionBySymbolTca" placeholder="Search symbols" autocomplete="off" spellcheck="false">
+        <span class="tableCount" data-dashboard-table-count="executionBySymbolTca">0 rows</span>
+      </div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionBySymbolTca" data-sort-key="symbol">Symbol <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionBySymbolTca" data-sort-key="n_fills" data-sort-default="desc">Fills <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionBySymbolTca" data-sort-key="avg_slippage_bps" data-sort-default="desc">Slip bps <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionBySymbolTca" data-sort-key="avg_latency_ms" data-sort-default="desc">Latency <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionBySymbolTca" data-sort-key="avg_fill_quality_score" data-sort-default="desc">Quality <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionBySymbolTca" data-sort-key="avg_implementation_shortfall_bps" data-sort-default="desc">IS/VWAP <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody id="executionBySymbolTcaBody">
+            <tr class="table-row"><td colspan="6" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionOutcomeCard" data-screens="execution">
+      <h2 class="card-header">Execution Outcomes <span id="executionOutcomesMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Partial fills, rejected terminal intents, and suppressed portfolio intents with stable reason codes.</div>
+      <div class="tableControls" data-table-controls="executionOutcomes">
+        <label class="sr-only" for="executionOutcomesFilter">Filter execution outcomes</label>
+        <input id="executionOutcomesFilter" class="tableSearchInput" data-dashboard-table-filter="executionOutcomes" placeholder="Search outcomes" autocomplete="off" spellcheck="false">
+        <span class="tableCount" data-dashboard-table-count="executionOutcomes">0 rows</span>
+      </div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOutcomes" data-sort-key="state">Outcome <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOutcomes" data-sort-key="symbol">Symbol <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOutcomes" data-sort-key="fill_ratio" data-sort-default="desc">Fill <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOutcomes" data-sort-key="reason_code">Reason <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionOutcomes" data-sort-key="ts_ms" data-sort-default="desc">Updated <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody id="executionOutcomesBody">
+            <tr class="table-row"><td colspan="5" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionTraceCard" data-screens="execution,explain">
+      <h2 class="card-header">Execution Trace <span id="executionTraceMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Intent-to-route-to-fill trace rows for filled, partial, rejected, and suppressed outcomes.</div>
+      <div class="tableControls" data-table-controls="executionTrace">
+        <label class="sr-only" for="executionTraceFilter">Filter execution trace</label>
+        <input id="executionTraceFilter" class="tableSearchInput" data-dashboard-table-filter="executionTrace" placeholder="Search trace rows" autocomplete="off" spellcheck="false">
+        <span class="tableCount" data-dashboard-table-count="executionTrace">0 rows</span>
+      </div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionTrace" data-sort-key="symbol">Symbol <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionTrace" data-sort-key="intent">Intent <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionTrace" data-sort-key="route">Route <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionTrace" data-sort-key="fill">Fill <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+              <th><button class="tableSortButton" type="button" data-dashboard-table-sort="executionTrace" data-sort-key="outcome">Outcome <span class="tableSortIndicator" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody id="executionTraceBody">
+            <tr class="table-row"><td colspan="5" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionRollingTcaCard" data-screens="execution">
+      <h2>Rolling Execution Quality</h2>
+      <div class="small">Rolling slippage, latency, fees, and implementation shortfall windows.</div>
+      <div class="table-wrap table-wrap-spaced">
+        <table>
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>State</th>
+              <th>Fills</th>
+              <th>Slip bps</th>
+              <th>Latency</th>
+              <th>IS bps</th>
+            </tr>
+          </thead>
+          <tbody id="executionRollingTcaBody">
+            <tr class="table-row"><td colspan="6" class="metric-meta">(loading...)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionMicrostructureCard" data-screens="execution">
+      <h2 class="card-header">LOB &amp; DeepLOB Diagnostics <span id="executionLobMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">L2 freshness, top-of-book depth, simulator calibration, replay readiness, and shadow DeepLOB status.</div>
+      <div class="pill-row">
+        <span class="pill dim" id="executionL2Pill">L2 —</span>
+        <span class="pill dim" id="executionDeepLobPill">DeepLOB —</span>
+        <span class="pill dim" id="executionLobCalibrationPill">calibration —</span>
+      </div>
+      <div id="executionLobGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">LOB</div><div class="opsStatValue">—</div></div>
+      </div>
+      <div class="small section-note-title">Warnings</div>
+      <div id="executionLobWarnings" class="opsNotes small">
+        <div class="opsNote">(loading...)</div>
+      </div>
+    </div>
+
+    <div class="card collapsible" id="executionSlicingCard" data-screens="execution">
+      <h2 class="card-header">Learned Slicing Diagnostics <span id="executionSlicingMeta" class="pill dim meta-pill-offset">loading</span></h2>
+      <div class="small">Read-only contextual-bandit slicing state. Backend execution policy, risk, broker, and barrier gates remain authoritative.</div>
+      <div id="executionSlicingGrid" class="opsStatGrid">
+        <div class="opsStat"><div class="opsStatLabel">Policy</div><div class="opsStatValue">—</div></div>
+      </div>
+      <div class="row" style="gap:12px; align-items:flex-start;">
+        <div style="flex:1 1 280px; min-width:260px;">
+          <div class="small table-section-title">Selected actions</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Action</th><th>Count</th></tr></thead>
+              <tbody id="executionActionDistBody">
+                <tr class="table-row"><td colspan="2" class="metric-meta">(loading...)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div style="flex:2 1 420px; min-width:320px;">
+          <div class="small table-section-title">Baseline comparison</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Policy</th><th>IS bps</th><th>Slip bps</th><th>Fill Risk</th><th>Adverse bps</th></tr></thead>
+              <tbody id="executionBaselineBody">
+                <tr class="table-row"><td colspan="5" class="metric-meta">(loading...)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="small section-note-title">Slicing notes</div>
+      <div id="executionSlicingNotes" class="opsNotes small">
         <div class="opsNote">(loading...)</div>
       </div>
     </div>

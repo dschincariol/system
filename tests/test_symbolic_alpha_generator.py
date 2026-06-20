@@ -200,7 +200,10 @@ class SymbolicAlphaGeneratorTests(unittest.TestCase):
         def _audit(**kwargs):
             audits.append(dict(kwargs))
 
-        with patch.object(pipeline, "training_allowed", return_value=True), patch.object(
+        with patch.dict(
+            os.environ,
+            {"RUNTIME_WORKLOAD_PROFILE": "offline", "ALLOW_TRAINING": "1"},
+        ), patch.object(pipeline, "training_allowed", return_value=True), patch.object(
             pipeline, "_data_gates_or_exit", return_value=None
         ), patch.object(pipeline, "acquire_job_lock", return_value=True), patch.object(
             pipeline, "release_job_lock", return_value=None

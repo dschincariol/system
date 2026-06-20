@@ -33,6 +33,12 @@ class TsfreshFeatureTests(unittest.TestCase):
                 "TSFRESH_WINDOW_S",
                 "TSFRESH_FC_PROFILE",
                 "TSFRESH_MAX_FEATURES",
+                "TSFRESH_N_JOBS",
+                "TSFRESH_MAX_N_JOBS",
+                "TSFRESH_SNAPSHOT_SYMBOL_LIMIT",
+                "TSFRESH_SNAPSHOT_MAX_SYMBOLS",
+                "TSFRESH_SNAPSHOT_BATCH_SIZE",
+                "TSFRESH_SNAPSHOT_MAX_BATCH_SIZE",
                 "TSFRESH_USE_PERSISTED_SNAPSHOTS",
                 "TSFRESH_LIVE_COMPUTE_ENABLED",
                 "TSFRESH_SNAPSHOT_BUCKET_SEC",
@@ -44,6 +50,12 @@ class TsfreshFeatureTests(unittest.TestCase):
         os.environ["TSFRESH_WINDOW_S"] = "3600"
         os.environ["TSFRESH_FC_PROFILE"] = "minimal"
         os.environ["TSFRESH_MAX_FEATURES"] = "6"
+        os.environ["TSFRESH_N_JOBS"] = "0"
+        os.environ["TSFRESH_MAX_N_JOBS"] = "1"
+        os.environ["TSFRESH_SNAPSHOT_SYMBOL_LIMIT"] = "10"
+        os.environ["TSFRESH_SNAPSHOT_MAX_SYMBOLS"] = "10"
+        os.environ["TSFRESH_SNAPSHOT_BATCH_SIZE"] = "4"
+        os.environ["TSFRESH_SNAPSHOT_MAX_BATCH_SIZE"] = "4"
         os.environ["TSFRESH_USE_PERSISTED_SNAPSHOTS"] = "1"
         os.environ["TSFRESH_LIVE_COMPUTE_ENABLED"] = "0"
         os.environ["TSFRESH_SNAPSHOT_BUCKET_SEC"] = "60"
@@ -95,6 +107,53 @@ class TsfreshFeatureTests(unittest.TestCase):
             len(set(first.get_tsfresh_feature_ids())),
         )
         self.assertTrue(all(fid.startswith("tsfresh.") for fid in first.get_tsfresh_feature_ids()))
+
+    def test_tsfresh_parallelism_is_configurable_and_bounded(self) -> None:
+        os.environ["TSFRESH_N_JOBS"] = "8"
+        os.environ["TSFRESH_MAX_N_JOBS"] = "3"
+        tsfresh_features, = _reload_modules("engine.strategy.tsfresh_features")
+
+        self.assertEqual(tsfresh_features.TSFRESH_N_JOBS, 3)
+
+        from engine.strategy.discovery.tsfresh_discoverer import TsfreshDiscoverer
+
+        discoverer = TsfreshDiscoverer(n_jobs=9)
+        self.assertEqual(discoverer.n_jobs, 3)
+
+    def test_tsfresh_snapshot_materialization_bounds_symbols_and_batches(self) -> None:
+        os.environ["TSFRESH_SNAPSHOT_SYMBOL_LIMIT"] = "2"
+        os.environ["TSFRESH_SNAPSHOT_MAX_SYMBOLS"] = "2"
+        os.environ["TSFRESH_SNAPSHOT_BATCH_SIZE"] = "1"
+        os.environ["TSFRESH_SNAPSHOT_MAX_BATCH_SIZE"] = "1"
+        tsfresh_features, = _reload_modules("engine.strategy.tsfresh_features")
+        built_symbols: list[str] = []
+        stored_batch_sizes: list[int] = []
+
+        def fake_build(*, symbol, ts_ms, window_s, con=None):
+            built_symbols.append(str(symbol))
+            return {"symbol": str(symbol), "ts": int(ts_ms), "window_s": int(window_s), "features": {}}
+
+        def fake_store(snapshots, *, con=None):
+            rows = list(snapshots or [])
+            stored_batch_sizes.append(len(rows))
+            return len(rows)
+
+        with (
+            patch.object(tsfresh_features, "build_tsfresh_feature_snapshot", side_effect=fake_build),
+            patch.object(tsfresh_features, "store_tsfresh_feature_snapshots", side_effect=fake_store),
+        ):
+            summary = tsfresh_features.materialize_tsfresh_feature_snapshots(
+                symbols=["aapl", "msft", "AAPL", "nvda"],
+                ts_ms=1_710_000_000_123,
+                window_s=3600,
+            )
+
+        self.assertEqual(built_symbols, ["AAPL", "MSFT"])
+        self.assertEqual(stored_batch_sizes, [1, 1])
+        self.assertEqual(int(summary["symbols"]), 2)
+        self.assertEqual(int(summary["snapshots"]), 2)
+        self.assertEqual(int(summary["symbol_limit"]), 2)
+        self.assertEqual(int(summary["batch_size"]), 1)
 
     @unittest.skipUnless(importlib.util.find_spec("tsfresh") is not None, "tsfresh not installed")
     def test_extracts_features_from_synthetic_series(self) -> None:
@@ -156,7 +215,7 @@ class TsfreshFeatureTests(unittest.TestCase):
     def test_train_serve_parity_uses_persisted_tsfresh_snapshot_when_enabled(self) -> None:
         os.environ["USE_TSFRESH_FEATURES"] = "1"
         os.environ["USE_SYMBOL_SNAPSHOT_FEATURES"] = "0"
-        storage = self._init_storage()
+        self._init_storage()
         tsfresh_features, feature_registry, feature_expansion = _reload_modules(
             "engine.strategy.tsfresh_features",
             "engine.strategy.feature_registry",

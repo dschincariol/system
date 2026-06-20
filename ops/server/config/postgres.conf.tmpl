@@ -1,5 +1,5 @@
 # Managed by ops/server/bootstrap.sh.
-# Host-derived values are rendered at bootstrap time.
+# Host/container-derived values are rendered at bootstrap time.
 
 listen_addresses = 'localhost'
 port = 5432
@@ -10,21 +10,29 @@ shared_buffers = '{{ shared_buffers }}'
 effective_cache_size = '{{ effective_cache_size }}'
 work_mem = '{{ work_mem }}'
 maintenance_work_mem = '{{ maintenance_work_mem }}'
+autovacuum_work_mem = '{{ autovacuum_work_mem }}'
 
-wal_buffers = '16MB'
+wal_buffers = '{{ wal_buffers }}'
 wal_level = replica
 wal_compression = on
 archive_mode = on
 archive_command = '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"'
-archive_timeout = '60s'
-checkpoint_completion_target = 0.9
-random_page_cost = 1.1
-effective_io_concurrency = 200
+archive_timeout = '{{ archive_timeout }}'
+min_wal_size = '{{ min_wal_size }}'
+max_wal_size = '{{ max_wal_size }}'
+wal_keep_size = '{{ wal_keep_size }}'
+max_slot_wal_keep_size = '{{ max_slot_wal_keep_size }}'
+checkpoint_timeout = '{{ checkpoint_timeout }}'
+checkpoint_completion_target = {{ checkpoint_completion_target }}
+random_page_cost = {{ random_page_cost }}
+effective_io_concurrency = {{ effective_io_concurrency }}
+maintenance_io_concurrency = {{ maintenance_io_concurrency }}
 
 max_worker_processes = {{ max_worker_processes }}
 max_parallel_workers = {{ max_parallel_workers }}
 max_parallel_workers_per_gather = {{ max_parallel_workers_per_gather }}
 max_parallel_maintenance_workers = {{ max_parallel_maintenance_workers }}
+timescaledb.max_background_workers = {{ timescaledb_max_background_workers }}
 
 shared_preload_libraries = 'timescaledb,pg_stat_statements'
 password_encryption = scram-sha-256
@@ -45,5 +53,7 @@ deadlock_timeout = '1s'
 
 autovacuum = on
 autovacuum_max_workers = {{ autovacuum_max_workers }}
-autovacuum_naptime = '10s'
+autovacuum_naptime = '{{ autovacuum_naptime }}'
+autovacuum_vacuum_cost_limit = {{ autovacuum_vacuum_cost_limit }}
+autovacuum_vacuum_cost_delay = '{{ autovacuum_vacuum_cost_delay }}'
 default_statistics_target = 100

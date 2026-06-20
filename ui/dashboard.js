@@ -117,6 +117,7 @@ import {
 } from "./decision_drilldown.mjs";
 import { renderDecisionStepper } from "./decision_stepper.js";
 import { renderDecisionAttribution } from "./decision_attribution.js";
+import { renderFeatureVisibility } from "./feature_visibility.js";
 import { requestConfirmation } from "./confirmation_modal.mjs";
 
 import {
@@ -132,6 +133,8 @@ import {
   modelLabel,
   normalizePromotionGatePayload,
   promotionGateStateTone,
+  renderGovernanceEvidenceCenter,
+  summarizeGovernanceEvidence,
   summarizeCooldown,
   validatePromotionActionInput
 } from "./promotion_gate.mjs";
@@ -184,13 +187,25 @@ import {
   renderHealthScoreSummary
 } from "./health_score.js";
 import {
+  guardBrokerActivationWithReadinessEvidence,
+  renderReadinessEvidencePanel
+} from "./readiness_evidence.js";
+import {
   applyDashboardPersonaView,
   getDefaultDashboardScreen,
   getActiveDashboardPersona,
   isDashboardScreenAllowed,
   wireDashboardPersonaControls
 } from "./view_router.js";
-import { initCommandPalette, isSafePaletteJobAction } from "./command_palette.mjs";
+import { initCommandPalette } from "./command_palette.mjs";
+import {
+  buildJobCatalogViewModel,
+  getJobActionPolicy,
+  isJobActionEnabled,
+  jobCatalogFilterOptions,
+  jobSafetyTone,
+  renderJobCatalogRows,
+} from "./job_catalog.js";
 
 import {
   loadNewsPanels,
@@ -1201,6 +1216,7 @@ function layoutDashboardPanels(screen = ACTIVE_DASHBOARD_SCREEN) {
         "portfolioCard",
       ],
       center: [
+        "governanceEvidenceCard",
         "governanceSummaryCard",
         "strategyStatusCard",
         "promotionAuditCard",
@@ -1235,6 +1251,7 @@ function layoutDashboardPanels(screen = ACTIVE_DASHBOARD_SCREEN) {
         "proChartsCard",
       ],
       right: [
+        "governanceEvidenceCard",
         "strategyMetricsCard",
         "modelMetricsCard",
         "telemetryCard",
@@ -1459,6 +1476,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
     explain: [
       loadDecisions(),
       loadHumanAlignmentSummary(),
+      loadGovernanceEvidence(),
       loadGovernanceSummary(),
       loadPromotionGate(),
       loadStrategyStatus(),
@@ -1479,6 +1497,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
       loadSocialRegimes({ symbol: _getSelectedSymbolOptional() }),
       loadSocialBlocks({ symbol: _getSelectedSymbolOptional() }),
       loadWeatherWidgets({ symbol: _getActiveSymbol("SPY") }),
+      loadGovernanceEvidence(),
       loadPromotionAudit(),
       loadCausalScores(),
       refreshCalibCurves(),
@@ -1681,6 +1700,9 @@ const DASHBOARD_TABLE_DEFAULTS = Object.freeze({
   executionOrders: { sortKey: "updatedTs", sortDir: "desc", maxRows: 40 },
   executionFills: { sortKey: "ts_ms", sortDir: "desc", maxRows: 40 },
   suppressedTrades: { sortKey: "ts_ms", sortDir: "desc", maxRows: 12 },
+  executionBySymbolTca: { sortKey: "avg_slippage_bps", sortDir: "desc", maxRows: 40 },
+  executionOutcomes: { sortKey: "ts_ms", sortDir: "desc", maxRows: 40 },
+  executionTrace: { sortKey: "ts_ms", sortDir: "desc", maxRows: 40 },
 });
 const DASHBOARD_TABLE_STATE = {};
 const DASHBOARD_TABLE_RENDERERS = new Map();
@@ -1711,6 +1733,32 @@ const SUPPRESSED_TRADE_TABLE_COLUMNS = Object.freeze([
   { key: "symbol", accessor: (row) => row && row.symbol },
   { key: "reason", accessor: (row) => row && row.reason },
   { key: "lineage", accessor: (row) => row && row.lineage },
+]);
+const EXECUTION_BY_SYMBOL_TCA_COLUMNS = Object.freeze([
+  { key: "symbol", accessor: (row) => row && row.symbol },
+  { key: "n_fills", accessor: (row) => row && row.n_fills, searchable: false },
+  { key: "avg_slippage_bps", accessor: (row) => row && row.avg_slippage_bps, searchable: false },
+  { key: "avg_latency_ms", accessor: (row) => row && row.avg_latency_ms, searchable: false },
+  { key: "avg_fill_quality_score", accessor: (row) => row && row.avg_fill_quality_score, searchable: false },
+  { key: "avg_implementation_shortfall_bps", accessor: (row) => row && row.avg_implementation_shortfall_bps, searchable: false },
+  { key: "avg_vwap_px", accessor: (row) => row && row.avg_vwap_px, searchable: false },
+]);
+const EXECUTION_OUTCOME_TABLE_COLUMNS = Object.freeze([
+  { key: "state", accessor: (row) => row && row.state },
+  { key: "symbol", accessor: (row) => row && row.symbol },
+  { key: "fill_ratio", accessor: (row) => row && row.fill_ratio, searchable: false },
+  { key: "reason_code", accessor: (row) => row && row.reason_code },
+  { key: "reason", accessor: (row) => row && row.reason },
+  { key: "ts_ms", accessor: (row) => row && row.ts_ms, searchable: false },
+]);
+const EXECUTION_TRACE_TABLE_COLUMNS = Object.freeze([
+  { key: "symbol", accessor: (row) => row && row.symbol },
+  { key: "intent", accessor: (row) => row && row.intent },
+  { key: "route", accessor: (row) => row && row.route },
+  { key: "fill", accessor: (row) => row && row.fill },
+  { key: "outcome", accessor: (row) => row && row.outcome },
+  { key: "reason", accessor: (row) => row && row.reason },
+  { key: "ts_ms", accessor: (row) => row && row.ts_ms, searchable: false, hidden: true },
 ]);
 
 function getDashboardTableState(tableId) {
@@ -2786,6 +2834,49 @@ async function loadGovernanceSummary() {
     setPanelState("governanceSummaryCard", {
       state: "error",
       reason: `Governance summary unavailable: ${describeUiError(e)}`,
+    });
+  }
+}
+
+async function loadGovernanceEvidence() {
+  const metaEl = document.getElementById("governanceEvidenceMeta");
+  const bodyEl = document.getElementById("governanceEvidenceBody");
+  const rawEl = document.getElementById("governanceEvidenceRaw");
+  if (!metaEl || !bodyEl) return;
+
+  metaEl.textContent = "loading";
+  bodyEl.innerHTML = "";
+
+  try {
+    const payload = await fetchJSON("/api/governance/evidence?limit=25", { allowBusinessFalse: true });
+    const summary = renderGovernanceEvidenceCenter(bodyEl, payload || {});
+    metaEl.textContent = `${summary.label} • ${summary.meta}`;
+    if (rawEl) rawEl.textContent = JSON.stringify(payload || {}, null, 2);
+    updateDashboardLiveState(
+      { governanceEvidence: payload },
+      { sourceTs: summary.latestTsMs || extractCollectionRealtimeTs(payload) || Date.now() }
+    );
+    setPanelState("governanceEvidenceCard", {
+      state: summary.state === "block" ? "degraded" : summary.state === "pass" ? "fresh" : "unknown",
+      reason: `Governance evidence ${summary.label.toLowerCase()} with ${summary.blockerCount} blockers across ${summary.evidenceCount} sources.`,
+    });
+  } catch (e) {
+    const fallback = {
+      ok: false,
+      state: "unknown",
+      evidence: [],
+      blockers: [],
+      shadow_capital: { rows: [] },
+      authority: { mode: "read_only_governance_evidence" },
+    };
+    const summary = summarizeGovernanceEvidence(fallback);
+    metaEl.textContent = "unavailable";
+    bodyEl.innerHTML = `<div class="metric-meta">Governance evidence unavailable: ${escapeHTML(describeUiError(e))}</div>`;
+    if (rawEl) rawEl.textContent = JSON.stringify({ error: e && e.message ? e.message : String(e) }, null, 2);
+    updateDashboardLiveState({}, { errorKey: "governanceEvidence", error: e });
+    setPanelState("governanceEvidenceCard", {
+      state: "error",
+      reason: `Governance evidence unavailable: ${describeUiError(e)}; ${summary.meta}.`,
     });
   }
 }
@@ -4021,6 +4112,13 @@ function wirePromotionExplainUI() {
 
 
 let selectedJob = "poll_prices";
+let lastJobCatalogRows = [];
+const JOB_CATALOG_FILTERS = {
+  search: "",
+  safety: "",
+  workflow: "",
+  mode: "",
+};
 
 
 let _killSwitchSnapshot = null;
@@ -4055,6 +4153,7 @@ function setSelectedJob(name) {
   const el = document.getElementById("selectedJob");
   if (el) el.textContent = name;
   syncLogViewerSourceLabel();
+  renderJobCatalog();
   if (getLogViewerSource() === "selected_job") {
     void loadStructuredLogViewer();
   }
@@ -4247,24 +4346,37 @@ function setJobStatusPill(running, exitCode) {
   }
 }
 
-function jobActionSafetyReason(name, action) {
+function getCatalogJobRow(name) {
   const normalizedName = String(name || "").trim();
+  if (!normalizedName) return null;
+  return (lastJobCatalogRows || []).find((row) => String(row && (row.name || row.id) || "").trim() === normalizedName) || null;
+}
+
+function jobActionSafetyReason(row, action) {
   const normalizedAction = String(action || "").trim().toLowerCase();
-  if (!normalizedName || normalizedAction !== "start") return "";
-  if (isSafePaletteJobAction(normalizedName, normalizedAction)) return "";
-  if (isReadOnlyMode()) {
-    return "Execution barrier/read-only mode blocks this job.";
+  if (!row || !normalizedAction) return "";
+  const policy = getJobActionPolicy(row, normalizedAction);
+  if (policy && policy.enabled === false) {
+    return String(policy.disabled_reason || row.disabled_reason || "Job action is unavailable.").trim();
+  }
+  if (normalizedAction === "start" && isReadOnlyMode()) {
+    return "Execution barrier/read-only mode blocks job starts.";
   }
   return "";
 }
 
-function applyJobActionSafety(btn) {
+function applyJobActionSafety(btn, rowOverride = null) {
   if (!btn) return;
   const name = String(btn.getAttribute("data-job") || "").trim();
   const action = String(btn.getAttribute("data-action") || "").trim().toLowerCase();
-  const unsafeStart = !!name && action === "start" && !isSafePaletteJobAction(name, action);
-  const reason = jobActionSafetyReason(name, action);
-  btn.classList.toggle("dangerAction", unsafeStart);
+  const row = rowOverride || getCatalogJobRow(name);
+  const policy = getJobActionPolicy(row, action);
+  const guardedStart = action === "start" && !!(policy && policy.safety_confirmation_required);
+  const reason = jobActionSafetyReason(row, action);
+  btn.classList.toggle("dangerAction", guardedStart || ["execution_sensitive", "destructive_admin"].includes(String(row && row.safety || "")));
+  if (row && row.safety) {
+    btn.dataset.jobSafety = String(row.safety);
+  }
   if (reason) {
     btn.dataset.safetyBlocked = "1";
     btn.disabled = true;
@@ -4281,6 +4393,11 @@ function applyJobActionSafety(btn) {
       btn.disabled = false;
     }
   }
+  if (!reason && policy && policy.confirmation_required) {
+    btn.title = policy.safety_confirmation_required
+      ? "Backend confirmation is required for this guarded job."
+      : "Backend confirmation is required for this job action.";
+  }
 }
 
 function syncJobActionSafetyState() {
@@ -4288,19 +4405,148 @@ function syncJobActionSafetyState() {
 }
 
 function setJobButtonState(name, state) {
-  document.querySelectorAll(`button[data-job="${name}"]`).forEach(btn => {
+  const row = getCatalogJobRow(name);
+  document.querySelectorAll("#jobConsoleCard button[data-job][data-action]").forEach(btn => {
+    if (String(btn.getAttribute("data-job") || "").trim() !== String(name || "").trim()) return;
     btn.dataset.jobState = state || "";
     btn.disabled = (state === "running");
     btn.classList.toggle("job-running", state === "running");
     btn.classList.toggle("job-error", state === "error");
+    btn.classList.toggle("job-unavailable", String(row && row.safety || "") === "unavailable");
 
-    let label = btn.getAttribute("data-label") || btn.textContent.trim();
-    if (!btn.getAttribute("data-label")) btn.setAttribute("data-label", label);
+    const label = String(row && row.quick_label || btn.getAttribute("data-label") || btn.textContent.trim()).trim();
+    btn.setAttribute("data-label", label);
 
     if (state === "running") btn.textContent = `⏳ ${label}`;
     else if (state === "error") btn.textContent = `❌ ${label}`;
     else btn.textContent = label;
-    applyJobActionSafety(btn);
+    applyJobActionSafety(btn, row);
+  });
+}
+
+function formatJobCatalogOptionLabel(value) {
+  return String(value || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+function setJobCatalogSelectOptions(el, values, allLabel, current) {
+  if (!el) return;
+  const selected = String(current || el.value || "").trim();
+  const options = [`<option value="">${esc(allLabel)}</option>`].concat(
+    (values || []).map((value) => `<option value="${esc(value)}">${esc(formatJobCatalogOptionLabel(value))}</option>`),
+  );
+  el.innerHTML = options.join("");
+  el.value = values && values.includes(selected) ? selected : "";
+}
+
+function readJobCatalogFilters() {
+  const searchEl = document.getElementById("jobCatalogSearch");
+  const safetyEl = document.getElementById("jobCatalogSafety");
+  const workflowEl = document.getElementById("jobCatalogWorkflow");
+  const modeEl = document.getElementById("jobCatalogMode");
+  JOB_CATALOG_FILTERS.search = searchEl ? String(searchEl.value || "").trim() : "";
+  JOB_CATALOG_FILTERS.safety = safetyEl ? String(safetyEl.value || "").trim() : "";
+  JOB_CATALOG_FILTERS.workflow = workflowEl ? String(workflowEl.value || "").trim() : "";
+  JOB_CATALOG_FILTERS.mode = modeEl ? String(modeEl.value || "").trim() : "";
+  return { ...JOB_CATALOG_FILTERS };
+}
+
+function syncJobCatalogFilterOptions(rows) {
+  const options = jobCatalogFilterOptions(rows || []);
+  setJobCatalogSelectOptions(
+    document.getElementById("jobCatalogSafety"),
+    options.safety,
+    "All safety classes",
+    JOB_CATALOG_FILTERS.safety,
+  );
+  setJobCatalogSelectOptions(
+    document.getElementById("jobCatalogWorkflow"),
+    options.workflows,
+    "All workflows",
+    JOB_CATALOG_FILTERS.workflow,
+  );
+  setJobCatalogSelectOptions(
+    document.getElementById("jobCatalogMode"),
+    options.modes,
+    "All modes",
+    JOB_CATALOG_FILTERS.mode,
+  );
+}
+
+function renderJobCatalog(rows = lastJobCatalogRows) {
+  const body = document.getElementById("jobCatalogBody");
+  if (!body) return;
+  const filters = readJobCatalogFilters();
+  syncJobCatalogFilterOptions(rows || []);
+  const view = buildJobCatalogViewModel(rows || [], filters);
+  body.innerHTML = renderJobCatalogRows(view, { selectedJob });
+
+  const countEl = document.getElementById("jobCatalogCount");
+  if (countEl) {
+    const blocked = view.filtered.some((row) => jobSafetyTone(row) === "unavailable");
+    countEl.className = buildPillClassName(countEl, blocked ? "warn" : "neutral");
+    countEl.textContent = `${view.filtered.length}/${view.rows.length} jobs`;
+  }
+}
+
+function syncQuickJobButtonsFromCatalog() {
+  document.querySelectorAll("button[data-job][data-action]").forEach((btn) => {
+    const name = String(btn.getAttribute("data-job") || "").trim();
+    const row = getCatalogJobRow(name);
+    if (!row) {
+      applyJobActionSafety(btn);
+      return;
+    }
+    const running = !!row.running;
+    const code = row.exit_code ?? row.last_exit_code;
+    setJobButtonState(
+      name,
+      running ? "running" : (code && code !== 0 ? "error" : "idle"),
+    );
+  });
+}
+
+function wireJobCatalogControls() {
+  const controls = [
+    document.getElementById("jobCatalogSearch"),
+    document.getElementById("jobCatalogSafety"),
+    document.getElementById("jobCatalogWorkflow"),
+    document.getElementById("jobCatalogMode"),
+  ].filter(Boolean);
+  controls.forEach((el) => {
+    if (el._boundJobCatalogFilter) return;
+    el._boundJobCatalogFilter = true;
+    el.addEventListener("input", () => renderJobCatalog());
+    el.addEventListener("change", () => renderJobCatalog());
+  });
+
+  const body = document.getElementById("jobCatalogBody");
+  if (!body || body._boundJobCatalogActions) return;
+  body._boundJobCatalogActions = true;
+  body.addEventListener("click", async (event) => {
+    const selectBtn = event.target && event.target.closest ? event.target.closest("[data-job-select]") : null;
+    if (selectBtn) {
+      const name = String(selectBtn.getAttribute("data-job-select") || "").trim();
+      if (!name) return;
+      setSelectedJob(name);
+      renderJobCatalog();
+      await Promise.allSettled([loadLog(), loadStructuredLogViewer(), loadJobHistory()]);
+      return;
+    }
+
+    const actionBtn = event.target && event.target.closest ? event.target.closest("button[data-job][data-action]") : null;
+    if (!actionBtn || !body.contains(actionBtn)) return;
+    const name = String(actionBtn.getAttribute("data-job") || "").trim();
+    const action = String(actionBtn.getAttribute("data-action") || "").trim().toLowerCase();
+    if (!name || !action || actionBtn.disabled) return;
+    try {
+      await jobAction(name, action);
+    } catch (e) {
+      toast(`Job ${action} failed: ${e && e.message ? e.message : e}`, "bad", 4200);
+    }
   });
 }
 
@@ -4671,20 +4917,17 @@ async function loadTemporalModels() {
 
 async function loadJobs() {
   const data = await fetchJSON("/api/jobs");
-  const jobs = (data && data.jobs) ? data.jobs : [];
-  const cur = jobs.find(j => j.name === selectedJob);
+  const jobs = (data && (data.catalog || data.jobs)) ? (data.catalog || data.jobs) : [];
+  lastJobCatalogRows = Array.isArray(jobs) ? jobs : [];
+  renderJobCatalog(lastJobCatalogRows);
+  syncQuickJobButtonsFromCatalog();
+  const cur = lastJobCatalogRows.find(j => j.name === selectedJob);
   syncLogViewerSourceLabel();
   if (!cur) {
     setJobStatusPill(false, null);
     return;
   }
   setJobStatusPill(!!cur.running, cur.exit_code);
-setJobButtonState(
-  cur.name,
-  cur.running ? "running" :
-  (cur.exit_code && cur.exit_code !== 0 ? "error" : "idle")
-);
-
 }
 
 async function loadLog() {
@@ -4796,17 +5039,33 @@ async function loadDataHealthScreen() {
   const summaryGrid = document.getElementById("dataHealthSummaryGrid");
   if (!summaryGrid) return;
 
-  const [ingestionRes, telemetryRes, barrierRes, providerRes] = await Promise.allSettled([
+  const [ingestionRes, telemetryRes, barrierRes, providerRes, featureVisibilityRes] = await Promise.allSettled([
     fetchJSON("/api/ingestion/status"),
     fetchJSON("/api/telemetry"),
     fetchJSON("/api/execution/barrier", { allowBusinessFalse: true }),
     fetchJSON("/api/operator/provider_telemetry"),
+    fetchJSON("/api/data/feature_visibility?limit=12", { allowBusinessFalse: true }),
   ]);
 
   const ingestionPayload = ingestionRes.status === "fulfilled" ? ingestionRes.value : null;
   const telemetry = telemetryRes.status === "fulfilled" ? telemetryRes.value : null;
   const barrier = barrierRes.status === "fulfilled" ? barrierRes.value : null;
   const providerPayload = providerRes.status === "fulfilled" ? providerRes.value : null;
+  const featureVisibility = featureVisibilityRes.status === "fulfilled"
+    ? featureVisibilityRes.value
+    : {
+        ok: false,
+        structured_documents: { status: "unavailable", warnings: ["feature visibility route unavailable"] },
+        graph_features: { status: "unavailable", warnings: ["feature visibility route unavailable"] },
+      };
+
+  renderFeatureVisibility(
+    {
+      structured: "structuredDocumentsVisibility",
+      graph: "graphFeaturesVisibility",
+    },
+    featureVisibility
+  );
 
   const ingestion = extractIngestionStatus(ingestionPayload);
   const providerTelemetry = extractProviderTelemetry(providerPayload);
@@ -4983,6 +5242,9 @@ async function loadDataHealthScreen() {
   }
   if (providerRes.status !== "fulfilled") {
     healthNotes.push("provider telemetry unavailable from the Python dashboard server snapshot");
+  }
+  if (featureVisibilityRes.status !== "fulfilled") {
+    healthNotes.push("structured document and graph feature visibility unavailable");
   }
   renderNotes("dataHealthNotes", healthNotes, "No active ingestion blockers reported by the current snapshots.");
 
@@ -5939,6 +6201,17 @@ async function brokerConfigTestConnection() {
 
 async function brokerConfigActivate() {
   const payload = brokerConfigFormPayload({ active: true, disabled: false });
+  const readinessGuard = await guardBrokerActivationWithReadinessEvidence({
+    fetchJSON,
+    requestConfirmation,
+    toast,
+    payload,
+  });
+  if (!readinessGuard || readinessGuard.ok !== true) return;
+  if (readinessGuard.evidence) {
+    renderReadinessEvidencePanel(readinessGuard.evidence, { root: document });
+    window.__LAST_READINESS_EVIDENCE__ = readinessGuard.evidence;
+  }
   const confirmation = await requestConfirmation({
     title: "Activate broker configuration",
     action: "activate broker configuration",
@@ -6004,17 +6277,407 @@ function wireBrokerConfigControls() {
   }
 }
 
+function executionDiagnosticsTone(state, fallback = "dim") {
+  const token = String(state || "").toLowerCase();
+  if (["fresh", "ready", "available", "active", "shadow_ready"].includes(token)) return "ok";
+  if (["stale", "partial", "shadow_or_blocked", "shadow_disabled", "disabled"].includes(token)) return "warn";
+  if (["blocked", "shadow_blocked", "rejected", "suppressed"].includes(token)) return "blocked";
+  if (["unavailable", "error"].includes(token)) return "dim";
+  return fallback;
+}
+
+function formatBps(value, digits = 2) {
+  const n = numOrNull(value);
+  return n == null ? "—" : `${formatDecimal(n, digits)} bps`;
+}
+
+function formatMsValue(value) {
+  const n = numOrNull(value);
+  return n == null ? "—" : `${formatDecimal(n, 0)} ms`;
+}
+
+function buildExecutionOutcomeRows(diagnostics) {
+  const orderFlow = asObject(diagnostics && diagnostics.order_flow);
+  const partialRows = asArray(orderFlow.partial_fills).map((row) => {
+    const latestTs = pickTimestamp(row && row.latest_fill_ts_ms, row && row.submit_ts_ms);
+    const fillRatio = numOrNull(row && row.fill_ratio);
+    return {
+      kind: row && row.state === "filled" ? "filled_order" : "partial_fill",
+      state: row && row.state || "partial",
+      symbol: String((row && row.symbol) || "").trim().toUpperCase(),
+      fill_ratio: fillRatio,
+      fill_text: safeJoin([
+        `${formatDecimal(row && row.filled_qty, 4)}/${formatDecimal(row && row.ordered_qty, 4)}`,
+        fillRatio == null ? "" : formatPercent(fillRatio),
+      ]),
+      reason_code: row && row.state === "partial" ? "partial_fill" : "filled",
+      reason: row && row.state === "partial" ? "Order is partially filled." : "Order has fills recorded.",
+      ts_ms: latestTs,
+      source_alert_id: row && row.source_alert_id,
+      portfolio_orders_id: row && row.portfolio_orders_id,
+      client_order_id: row && row.client_order_id,
+    };
+  });
+
+  const rejectedRows = asArray(orderFlow.rejected_intents).map((row) => ({
+    kind: "rejected_intent",
+    state: "rejected",
+    symbol: String((row && row.symbol) || "").trim().toUpperCase(),
+    fill_ratio: null,
+    fill_text: row && row.qty != null ? `${formatDecimal(row.qty, 4)} requested` : "not routed",
+    reason_code: String((row && row.reason_code) || "rejected"),
+    reason: String((row && row.reason) || (row && row.reason_code) || "Terminal intent rejected."),
+    ts_ms: row && row.ts_ms,
+    source_alert_id: row && row.source_alert_id,
+    portfolio_orders_id: row && row.portfolio_orders_id,
+    client_order_id: row && row.client_order_id,
+  }));
+
+  const suppressedRows = asArray(orderFlow.suppressed_intents).map((row) => ({
+    kind: "suppressed_intent",
+    state: "suppressed",
+    symbol: String((row && row.symbol) || "").trim().toUpperCase(),
+    fill_ratio: null,
+    fill_text: "not routed",
+    reason_code: String((row && row.reason_code) || "suppressed"),
+    reason: String((row && row.reason) || (row && row.reason_code) || "Portfolio intent suppressed."),
+    ts_ms: row && row.ts_ms,
+    source_alert_id: row && row.source_alert_id,
+    portfolio_orders_id: row && row.portfolio_orders_id,
+    client_order_id: row && row.client_order_id,
+  }));
+
+  return [...partialRows, ...rejectedRows, ...suppressedRows]
+    .sort((a, b) => intOr(b && b.ts_ms, 0) - intOr(a && a.ts_ms, 0));
+}
+
+function renderExecutionDiagnosticsUnavailable(reason) {
+  const detail = String(reason || "execution diagnostics unavailable");
+  setPillTone("executionBySymbolTcaMeta", "dim", "unavailable");
+  setPillTone("executionOutcomesMeta", "dim", "unavailable");
+  setPillTone("executionTraceMeta", "dim", "unavailable");
+  setPillTone("executionLobMeta", "dim", "unavailable");
+  setPillTone("executionL2Pill", "dim", "L2 unavailable");
+  setPillTone("executionDeepLobPill", "dim", "DeepLOB unavailable");
+  setPillTone("executionLobCalibrationPill", "dim", "calibration unavailable");
+  setPillTone("executionSlicingMeta", "dim", "unavailable");
+  renderEmptyTableBody("executionBySymbolTcaBody", 6, detail);
+  renderEmptyTableBody("executionOutcomesBody", 5, detail);
+  renderEmptyTableBody("executionTraceBody", 5, detail);
+  renderEmptyTableBody("executionRollingTcaBody", 6, detail);
+  renderEmptyTableBody("executionActionDistBody", 2, detail);
+  renderEmptyTableBody("executionBaselineBody", 5, detail);
+  renderNotes("executionLobWarnings", [detail]);
+  renderNotes("executionSlicingNotes", [detail]);
+  syncDashboardTableControls("executionBySymbolTca", buildTableView([], EXECUTION_BY_SYMBOL_TCA_COLUMNS));
+  syncDashboardTableControls("executionOutcomes", buildTableView([], EXECUTION_OUTCOME_TABLE_COLUMNS));
+  syncDashboardTableControls("executionTrace", buildTableView([], EXECUTION_TRACE_TABLE_COLUMNS));
+  setPanelState("executionBySymbolTcaCard", { state: "error", reason: detail });
+  setPanelState("executionOutcomeCard", { state: "error", reason: detail });
+  setPanelState("executionTraceCard", { state: "error", reason: detail });
+  setPanelState("executionMicrostructureCard", { state: "error", reason: detail });
+  setPanelState("executionSlicingCard", { state: "error", reason: detail });
+}
+
+function renderExecutionDiagnostics(diagnostics, requestStatus = "fulfilled") {
+  if (requestStatus !== "fulfilled" || !diagnostics || diagnostics.ok === false) {
+    renderExecutionDiagnosticsUnavailable(diagnostics && diagnostics.error ? diagnostics.error : "execution diagnostics request failed");
+    return;
+  }
+
+  const tca = asObject(diagnostics.tca);
+  const bySymbolRows = asArray(tca.by_symbol);
+  const latestFillAgeMs = numOrNull(tca.latest_fill_age_ms);
+  setPillTone(
+    "executionBySymbolTcaMeta",
+    executionDiagnosticsTone(tca.state),
+    bySymbolRows.length ? `${formatDecimal(bySymbolRows.length, 0)} symbols` : String(tca.reason || "no TCA rows"),
+    latestFillAgeMs,
+    300_000,
+    1_800_000
+  );
+  const renderExecutionBySymbolRows = () => renderDashboardTableView({
+    tableId: "executionBySymbolTca",
+    bodyId: "executionBySymbolTcaBody",
+    columns: EXECUTION_BY_SYMBOL_TCA_COLUMNS,
+    rows: bySymbolRows,
+    emptyText: "No by-symbol execution TCA rows.",
+    filteredEmptyText: "No by-symbol execution rows match the current filter.",
+    colspan: 6,
+    rowToHtml: (row) => {
+      const selectedClass = _symbolContextClassFor(row && row.symbol);
+      return `
+        <tr${_plainTableRowClass(selectedClass)}>
+          <td class="mono">${escapeHTML(row && row.symbol ? row.symbol : "—")}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatDecimal(row && row.n_fills, 0))}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatBps(row && row.avg_slippage_bps))}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatMsValue(row && row.avg_latency_ms))}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatDecimal(row && row.avg_fill_quality_score, 3))}</td>
+          <td class="mono metric-meta">${escapeHTML(safeJoin([
+            `IS ${formatBps(row && row.avg_implementation_shortfall_bps)}`,
+            `VWAP ${formatCurrencyValue(row && row.avg_vwap_px, 4)}`,
+          ]))}</td>
+        </tr>
+      `;
+    },
+  });
+  DASHBOARD_TABLE_RENDERERS.set("executionBySymbolTca", renderExecutionBySymbolRows);
+  const tcaView = renderExecutionBySymbolRows();
+  setPanelState("executionBySymbolTcaCard", {
+    state: bySymbolRows.length ? (latestFillAgeMs != null && latestFillAgeMs >= 1_800_000 ? "stale" : "fresh") : "empty",
+    reason: bySymbolRows.length
+      ? `Rendered ${tcaView.filteredRowsCount}/${bySymbolRows.length} by-symbol TCA rows.`
+      : "No symbol-level execution quality rows are available.",
+  });
+
+  const rollingRows = asArray(tca.rolling);
+  const rollingBody = document.getElementById("executionRollingTcaBody");
+  if (rollingBody) {
+    rollingBody.innerHTML = rollingRows.length
+      ? rollingRows.map((row) => `
+        <tr class="table-row">
+          <td class="mono">${escapeHTML(row && row.window ? row.window : "—")}</td>
+          <td>${escapeHTML(row && row.state ? row.state : "—")}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatDecimal(row && row.n_fills, 0))}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatBps(row && row.avg_slippage_bps))}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatMsValue(row && row.avg_latency_ms))}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatBps(row && row.avg_implementation_shortfall_bps))}</td>
+        </tr>
+      `).join("")
+      : `<tr class="table-row"><td colspan="6" class="metric-meta">No rolling execution windows available.</td></tr>`;
+  }
+
+  const outcomeRows = buildExecutionOutcomeRows(diagnostics);
+  const orderFlow = asObject(diagnostics.order_flow);
+  const outcomeCounts = asObject(orderFlow.outcome_counts);
+  const latestOutcomeTs = outcomeRows.reduce((max, row) => Math.max(max, intOr(row && row.ts_ms, 0)), 0) || null;
+  setPillTone(
+    "executionOutcomesMeta",
+    outcomeRows.length ? "warn" : "dim",
+    outcomeRows.length
+      ? safeJoin([
+          outcomeCounts.partial_fills ? `${formatDecimal(outcomeCounts.partial_fills, 0)} partial` : "",
+          outcomeCounts.rejected_intents ? `${formatDecimal(outcomeCounts.rejected_intents, 0)} rejected` : "",
+          outcomeCounts.suppressed_intents ? `${formatDecimal(outcomeCounts.suppressed_intents, 0)} suppressed` : "",
+        ]) || `${formatDecimal(outcomeRows.length, 0)} outcomes`
+      : "no adverse outcomes",
+    latestOutcomeTs ? ageMsFromTimestamp(latestOutcomeTs) : null,
+    300_000,
+    1_800_000
+  );
+  const renderExecutionOutcomeRows = () => renderDashboardTableView({
+    tableId: "executionOutcomes",
+    bodyId: "executionOutcomesBody",
+    columns: EXECUTION_OUTCOME_TABLE_COLUMNS,
+    rows: outcomeRows,
+    emptyText: "No partial, rejected, or suppressed outcomes.",
+    filteredEmptyText: "No execution outcomes match the current filter.",
+    colspan: 5,
+    rowToHtml: (row) => {
+      const lookup = normalizeDecisionLookup({
+        sourceAlertId: row && row.source_alert_id,
+        portfolioOrderId: row && row.portfolio_orders_id,
+        clientOrderId: row && row.client_order_id,
+        surface: "execution_outcomes",
+      });
+      const selectedClass = _symbolContextClassFor(row && row.symbol);
+      const rowAttrs = hasDecisionLookup(lookup) ? _decisionLookupAttr(lookup, selectedClass) : _plainTableRowClass(selectedClass);
+      return `
+        <tr${rowAttrs}>
+          <td>${escapeHTML(row && row.state ? row.state : "—")}</td>
+          <td class="mono">${escapeHTML(row && row.symbol ? row.symbol : "—")}</td>
+          <td class="mono metric-meta">${escapeHTML(row && row.fill_text ? row.fill_text : "—")}</td>
+          <td>${escapeHTML(safeJoin([row && row.reason_code, row && row.reason], " — ") || "—")}</td>
+          <td class="mono metric-meta">${escapeHTML(fmtTime(row && row.ts_ms))}</td>
+        </tr>
+      `;
+    },
+  });
+  DASHBOARD_TABLE_RENDERERS.set("executionOutcomes", renderExecutionOutcomeRows);
+  renderExecutionOutcomeRows();
+  setPanelState("executionOutcomeCard", {
+    state: outcomeRows.length ? "stale" : "fresh",
+    reason: outcomeRows.length
+      ? "Rejected, suppressed, or partial-fill outcomes are visible with reasons."
+      : "No rejected, suppressed, or partial-fill outcomes were returned.",
+  });
+
+  const traceRows = asArray(diagnostics.drilldowns);
+  setPillTone("executionTraceMeta", traceRows.length ? "ok" : "dim", traceRows.length ? `${formatDecimal(traceRows.length, 0)} trace rows` : "no trace rows");
+  const renderExecutionTraceRows = () => renderDashboardTableView({
+    tableId: "executionTrace",
+    bodyId: "executionTraceBody",
+    columns: EXECUTION_TRACE_TABLE_COLUMNS,
+    rows: traceRows,
+    emptyText: "No execution trace rows available.",
+    filteredEmptyText: "No execution trace rows match the current filter.",
+    colspan: 5,
+    rowToHtml: (row) => {
+      const lookup = normalizeDecisionLookup({
+        sourceAlertId: row && row.source_alert_id,
+        portfolioOrderId: row && row.portfolio_orders_id,
+        clientOrderId: row && row.client_order_id,
+        surface: "execution_trace",
+      });
+      const selectedClass = _symbolContextClassFor(row && row.symbol);
+      const rowAttrs = hasDecisionLookup(lookup) ? _decisionLookupAttr(lookup, selectedClass) : _plainTableRowClass(selectedClass);
+      return `
+        <tr${rowAttrs}>
+          <td class="mono">${escapeHTML(row && row.symbol ? row.symbol : "—")}</td>
+          <td>${escapeHTML(row && row.intent ? row.intent : "—")}</td>
+          <td>${escapeHTML(row && row.route ? row.route : "—")}</td>
+          <td class="mono metric-meta">${escapeHTML(row && row.fill ? row.fill : "—")}</td>
+          <td>${escapeHTML(safeJoin([row && row.outcome, row && row.reason], " — ") || "—")}</td>
+        </tr>
+      `;
+    },
+  });
+  DASHBOARD_TABLE_RENDERERS.set("executionTrace", renderExecutionTraceRows);
+  renderExecutionTraceRows();
+  setPanelState("executionTraceCard", {
+    state: traceRows.length ? "fresh" : "empty",
+    reason: traceRows.length
+      ? "Execution trace rows include route, fill, rejection, or suppression outcomes."
+      : "No execution trace rows are currently available.",
+  });
+
+  const lob = asObject(diagnostics.lob);
+  const l2 = asObject(lob.l2_feed);
+  const sim = asObject(lob.simulation);
+  const deeplob = asObject(lob.deeplob);
+  setPillTone("executionLobMeta", executionDiagnosticsTone(lob.state), String(lob.state || "LOB —"));
+  setPillTone(
+    "executionL2Pill",
+    executionDiagnosticsTone(l2.state),
+    `L2 ${String(l2.state || "unknown")}`,
+    numOrNull(l2.age_ms),
+    numOrNull(l2.max_age_ms) || 60_000,
+    300_000
+  );
+  setPillTone("executionDeepLobPill", executionDiagnosticsTone(deeplob.state), String(deeplob.state || "DeepLOB —"));
+  setPillTone("executionLobCalibrationPill", executionDiagnosticsTone(sim.state), String(sim.calibration_status || sim.state || "calibration —"));
+  const depth = asObject(l2.snapshot_depth);
+  const lobGrid = document.getElementById("executionLobGrid");
+  if (lobGrid) {
+    lobGrid.innerHTML = buildStatGridMarkup([
+      {
+        label: "L2 Freshness",
+        value: l2.age_ms == null ? "—" : formatAgeMs(l2.age_ms),
+        meta: `rows ${formatDecimal(l2.sample_n, 0)} / ${formatDecimal(l2.required_rows, 0)}`,
+      },
+      {
+        label: "Top Depth",
+        value: formatDecimal(depth.avg_top_depth_qty, 2),
+        meta: `depth rows ${formatDecimal(depth.top_depth_rows, 0)} · spread ${formatBps(depth.avg_spread_bps)}`,
+      },
+      {
+        label: "Simulation",
+        value: sim.replay_ready ? "ready" : String(sim.calibration_status || "unavailable"),
+        meta: `sample ${formatDecimal(sim.sample_n, 0)} / ${formatDecimal(sim.required_fills, 0)}`,
+      },
+      {
+        label: "DeepLOB",
+        value: String(deeplob.state || "—"),
+        meta: asObject(deeplob.readiness).reason || "shadow-only execution timing diagnostics",
+      },
+    ]);
+  }
+  const lobWarnings = asArray(lob.warnings);
+  renderNotes("executionLobWarnings", lobWarnings, "LOB and DeepLOB diagnostics report no active blockers.");
+  setPanelState("executionMicrostructureCard", {
+    state: lobWarnings.length ? (l2.state === "stale" ? "stale" : "blocked") : "fresh",
+    reason: lobWarnings.length ? `LOB blockers: ${lobWarnings.join(", ")}` : "LOB and shadow DeepLOB diagnostics are ready.",
+  });
+
+  const learned = asObject(diagnostics.learned_slicing);
+  const learnedPolicy = asObject(learned.policy);
+  setPillTone(
+    "executionSlicingMeta",
+    executionDiagnosticsTone(learned.state),
+    `${String(learnedPolicy.name || "policy")} ${String(learned.state || "—")}`
+  );
+  const slicingGrid = document.getElementById("executionSlicingGrid");
+  if (slicingGrid) {
+    slicingGrid.innerHTML = buildStatGridMarkup([
+      {
+        label: "Policy",
+        value: String(learnedPolicy.name || "—"),
+        meta: `scope ${String(learnedPolicy.scope || "—")}`,
+      },
+      {
+        label: "Recent",
+        value: `${formatDecimal(learnedPolicy.applied_recent, 0)} applied`,
+        meta: `${formatDecimal(learnedPolicy.requested_recent, 0)} requested · ${formatDecimal(learnedPolicy.blocked_recent, 0)} blocked`,
+      },
+      {
+        label: "Authority",
+        value: asObject(learned.authority).live_authority_granted ? "granted" : "not granted",
+        meta: "execution-parameter bounds only",
+      },
+      {
+        label: "Shadow",
+        value: String(asObject(learned.shadow).state || "—"),
+        meta: String(asObject(learned.shadow).reason || "shadow status unavailable"),
+      },
+    ]);
+  }
+  const actionRows = asArray(learned.selected_action_distribution);
+  const actionBody = document.getElementById("executionActionDistBody");
+  if (actionBody) {
+    actionBody.innerHTML = actionRows.length
+      ? actionRows.map((row) => `
+        <tr class="table-row">
+          <td>${escapeHTML(row && row.action_id ? row.action_id : "—")}</td>
+          <td class="mono table-cell-num">${escapeHTML(formatDecimal(row && row.count, 0))}</td>
+        </tr>
+      `).join("")
+      : `<tr class="table-row"><td colspan="2" class="metric-meta">No recent learned slicing actions.</td></tr>`;
+  }
+  const baseline = asObject(learned.baseline_comparison);
+  const baselineSummary = asObject(baseline.summary);
+  const baselineBody = document.getElementById("executionBaselineBody");
+  if (baselineBody) {
+    const policies = Object.entries(baselineSummary);
+    baselineBody.innerHTML = policies.length
+      ? policies.map(([name, raw]) => {
+        const row = asObject(raw);
+        return `
+          <tr class="table-row">
+            <td>${escapeHTML(name)}</td>
+            <td class="mono table-cell-num">${escapeHTML(formatBps(row.implementation_shortfall_bps))}</td>
+            <td class="mono table-cell-num">${escapeHTML(formatBps(row.slippage_bps))}</td>
+            <td class="mono table-cell-num">${escapeHTML(formatPercent(row.fill_risk))}</td>
+            <td class="mono table-cell-num">${escapeHTML(formatBps(row.adverse_selection_bps))}</td>
+          </tr>
+        `;
+      }).join("")
+      : `<tr class="table-row"><td colspan="5" class="metric-meta">${escapeHTML(baseline.reason || "Baseline comparison unavailable.")}</td></tr>`;
+  }
+  const slicingNotes = [];
+  slicingNotes.push(`policy state: ${String(learned.state || "unknown")} (${String(learned.reason || "no reason")})`);
+  slicingNotes.push(`exploration: ${String(asObject(learned.exploration).state || "unavailable")}`);
+  asArray(learned.recent_suppression_reasons).slice(0, 4).forEach((row) => {
+    slicingNotes.push(`${String((row && row.symbol) || "UNKNOWN")} ${String((row && row.reason_code) || "suppressed")}: ${String((row && row.reason) || "")}`);
+  });
+  renderNotes("executionSlicingNotes", slicingNotes, "No recent learned slicing decisions or suppressions were returned.");
+  setPanelState("executionSlicingCard", {
+    state: learned.state === "active" ? "fresh" : (learned.state === "unavailable" ? "empty" : "stale"),
+    reason: String(learned.reason || "Learned slicing state rendered."),
+  });
+}
+
 async function loadDashboardExecutionScreen() {
   const snapshotGrid = document.getElementById("executionSnapshotGrid");
   if (!snapshotGrid) return;
 
-  const [snapshotRes, ordersRes, fillsRes, metricsRes, overlaysRes, suppressionRes] = await Promise.allSettled([
+  const [snapshotRes, ordersRes, fillsRes, metricsRes, overlaysRes, suppressionRes, diagnosticsRes] = await Promise.allSettled([
     fetchJSON("/api/terminal/snapshot"),
     fetchJSON("/api/terminal/orders"),
     fetchJSON("/api/terminal/fills"),
     fetchJSON("/api/execution/metrics"),
     fetchJSON("/api/execution/overlays"),
     fetchJSON("/api/audit/records?table=trade_attribution_ledger&limit=50", { allowBusinessFalse: true }),
+    fetchJSON("/api/execution/diagnostics?limit=80", { allowBusinessFalse: true }),
   ]);
 
   const snapshot = snapshotRes.status === "fulfilled" ? snapshotRes.value : null;
@@ -6023,8 +6686,10 @@ async function loadDashboardExecutionScreen() {
   const metrics = metricsRes.status === "fulfilled" ? metricsRes.value : null;
   const overlays = overlaysRes.status === "fulfilled" ? overlaysRes.value : null;
   const suppressionPayload = suppressionRes.status === "fulfilled" ? suppressionRes.value : null;
+  const diagnosticsPayload = diagnosticsRes.status === "fulfilled" ? diagnosticsRes.value : null;
 
   renderSuppressedTrades(suppressionPayload, suppressionRes.status);
+  renderExecutionDiagnostics(diagnosticsPayload, diagnosticsRes.status);
 
   const account = asObject(asObject(snapshot && snapshot.equity).account);
   const snapshotPositions = asArray(snapshot && snapshot.positions);
@@ -8090,16 +8755,18 @@ const refreshStartedAt = Date.now();
 let systemState = null;
 let health = null;
 let readiness = null;
+let readinessEvidence = null;
 let executionBarrier = null;
 let stressPayload = null;
 let trainingStatus = null;
 let trainingError = null;
 const sharedFailures = [];
 
-const [healthRes, systemStateRes, readinessRes, barrierRes, stressRes, trainingRes] = await Promise.allSettled([
+const [healthRes, systemStateRes, readinessRes, readinessEvidenceRes, barrierRes, stressRes, trainingRes] = await Promise.allSettled([
   fetchJSON("/api/health", { allowBusinessFalse: true }),
   fetchJSON("/api/system/state", { allowBusinessFalse: true }),
   fetchJSON("/api/readiness", { allowBusinessFalse: true }),
+  fetchJSON("/api/operator/readiness_evidence", { allowBusinessFalse: true }),
   fetchJSON("/api/execution/barrier", { allowBusinessFalse: true }),
   fetchJSON("/api/market_stress"),
   fetchJSON("/api/training_status", { allowBusinessFalse: true }),
@@ -8129,6 +8796,24 @@ if (readinessRes.status === "fulfilled") {
   window.__LAST_READINESS__ = readiness;
 } else {
   sharedFailures.push(createFailureItem("readiness", "/api/readiness", readinessRes.reason));
+}
+
+if (readinessEvidenceRes.status === "fulfilled") {
+  readinessEvidence = readinessEvidenceRes.value;
+  window.__LAST_READINESS_EVIDENCE__ = readinessEvidence;
+  renderReadinessEvidencePanel(readinessEvidence, { root: document });
+} else {
+  sharedFailures.push(createFailureItem("readiness_evidence", "/api/operator/readiness_evidence", readinessEvidenceRes.reason));
+  renderReadinessEvidencePanel({
+    ok: false,
+    status: "unavailable",
+    mode: "unknown",
+    execution_mode: "unknown",
+    items: [],
+    blockers: [],
+    warnings: [],
+    unavailable: [],
+  }, { root: document });
 }
 
 if (barrierRes.status === "fulfilled") {
@@ -8484,6 +9169,7 @@ function wireUI() {
   wirePromotionExplainUI();
   wireLogViewerControls();
   wireJobActionButtons();
+  wireJobCatalogControls();
   wireDashboardTableControls();
   wireBrokerConfigControls();
 

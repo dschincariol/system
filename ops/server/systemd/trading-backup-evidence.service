@@ -10,6 +10,7 @@ User=postgres
 Group=trading
 EnvironmentFile=-/etc/trading/trading.env
 EnvironmentFile=-/etc/trading/provider.env
+Environment=BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
 Environment=PGHOST=/var/run/postgresql
 Environment=PGPORT=5432
 Environment=PGUSER=postgres

@@ -12,7 +12,6 @@ if str(ROOT) not in sys.path:
 
 psycopg = pytest.importorskip("psycopg")
 
-from engine.runtime import storage
 from engine.runtime.platform import default_pg_dsn
 from engine.runtime.locks_pg import advisory_lock
 

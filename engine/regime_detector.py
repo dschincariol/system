@@ -616,6 +616,7 @@ def resolve_regime_snapshot(
             _safe_int((snapshot or {}).get("ts_ms"), 0),
         )
     )
+    cached = DEFAULT_REGIME_DETECTOR.resolve_latest(symbol_key, target_time_ms=requested_time)
     if enqueue_refresh:
         DEFAULT_REGIME_DETECTOR.submit_refresh_nowait(
             symbol_key,
@@ -623,7 +624,6 @@ def resolve_regime_snapshot(
             ts_ms=requested_time,
             source=source or "resolve_regime_snapshot",
         )
-    cached = DEFAULT_REGIME_DETECTOR.resolve_latest(symbol_key, target_time_ms=requested_time)
     if has_known_regime(cached):
         return dict(cached)
     if allow_inline_fallback and snapshot is not None:

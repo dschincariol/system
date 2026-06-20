@@ -1,0 +1,39 @@
+[Unit]
+Description=Trading production readiness preflight
+Documentation=file:/opt/trading/app/ops/server/README.md
+Wants=network-online.target postgresql.service redis-server.service pgbouncer.service
+After=network-online.target postgresql.service redis-server.service pgbouncer.service
+
+[Service]
+Type=oneshot
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading/app
+EnvironmentFile=-/etc/trading/trading.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TS_SERVICE_NAME=trading-prod-preflight
+Environment=TS_SECRETS_PROVIDER=systemd-creds
+Environment=TS_PG_ROLE=app
+Environment=ENGINE_SUPERVISED=1
+Environment=BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
+LoadCredentialEncrypted=master_key:/etc/credstore.encrypted/master_key.cred
+LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred
+LoadCredentialEncrypted=redis_password:/etc/credstore.encrypted/redis_password.cred
+LoadCredentialEncrypted=object_store_secret_key:/etc/credstore.encrypted/object_store_secret_key.cred
+LoadCredentialEncrypted=dashboard_api_token:/etc/credstore.encrypted/dashboard_api_token.cred
+ExecStart=/opt/trading/venv/bin/python engine/runtime/prod_preflight.py --json
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-prod-preflight
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/trading /var/backups/trading /opt/trading/app/data /opt/trading/app/logs
+LimitNOFILE=65536
+LimitNPROC=4096
+TasksMax=4096
+
+[Install]
+WantedBy=trading.target

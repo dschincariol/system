@@ -30,8 +30,19 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-DEFAULT_OUT_DIR = ROOT / "logs" / "market_session_soaks"
+DEFAULT_LOG_DIR = ROOT / "var" / "log"
+DEFAULT_OUT_DIR = DEFAULT_LOG_DIR / "market_session_soaks"
 DEFAULT_SESSION_SECONDS = int(6.5 * 60 * 60)
+DEFAULT_DASHBOARD_URL = str(
+    os.environ.get("SOAK_DASHBOARD_URL")
+    or os.environ.get("PIPELINE_SMOKE_BASE")
+    or "http://127.0.0.1:8000"
+).rstrip("/")
+DEFAULT_OPERATOR_URL = str(
+    os.environ.get("SOAK_OPERATOR_URL")
+    or os.environ.get("PIPELINE_SMOKE_OPERATOR_BASE")
+    or f"{DEFAULT_DASHBOARD_URL}/operator"
+).rstrip("/")
 EXIT_OK = 0
 EXIT_NO_GO = 2
 FAIL_PATTERNS = (
@@ -184,6 +195,13 @@ def _http_json(
     headers = {"Accept": "application/json"}
     if token:
         headers["X-API-Token"] = token
+    operator_token = str(
+        os.environ.get("PIPELINE_SMOKE_OPERATOR_TOKEN")
+        or os.environ.get("OPERATOR_API_TOKEN")
+        or ""
+    ).strip()
+    if operator_token and ":4001/" in str(url):
+        headers["X-Operator-Token"] = operator_token
     if request_id:
         headers["X-Request-ID"] = request_id
         headers["X-Correlation-ID"] = request_id
@@ -583,8 +601,8 @@ class SoakRunner:
         self.log_cursors = [LogCursor(Path(path)) for path in self._log_paths()]
 
     def _log_paths(self) -> list[str]:
-        paths = {str(ROOT / "logs" / "runtime.log"), str(ROOT / "logs" / "engine.log")}
-        for path in glob.glob(str(ROOT / "logs" / "*.combined.log")):
+        paths = {str(DEFAULT_LOG_DIR / "runtime.log"), str(DEFAULT_LOG_DIR / "engine.log")}
+        for path in glob.glob(str(DEFAULT_LOG_DIR / "*.combined.log")):
             paths.add(path)
         return sorted(paths)
 
@@ -599,7 +617,13 @@ class SoakRunner:
 
     def get(self, path: str, *, base: str | None = None) -> HttpResult:
         url = (base or self.args.dashboard_url).rstrip("/") + path
-        return _http_json("GET", url, timeout_s=self.args.timeout_s, request_id=self.correlation_id)
+        return _http_json(
+            "GET",
+            url,
+            token=self.token,
+            timeout_s=self.args.timeout_s,
+            request_id=self.correlation_id,
+        )
 
     def post(self, path: str, body: dict[str, Any]) -> HttpResult:
         url = self.args.dashboard_url.rstrip("/") + path
@@ -921,8 +945,8 @@ def finalize_report(report: dict[str, Any]) -> dict[str, Any]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Full market-session paper/live-data soak")
-    parser.add_argument("--dashboard-url", default=os.environ.get("SOAK_DASHBOARD_URL", "http://127.0.0.1:8000"))
-    parser.add_argument("--operator-url", default=os.environ.get("SOAK_OPERATOR_URL", "http://127.0.0.1:4001"))
+    parser.add_argument("--dashboard-url", default=DEFAULT_DASHBOARD_URL)
+    parser.add_argument("--operator-url", default=DEFAULT_OPERATOR_URL)
     parser.add_argument("--duration-s", type=int, default=int(os.environ.get("SOAK_DURATION_S", DEFAULT_SESSION_SECONDS)))
     parser.add_argument("--interval-s", type=int, default=int(os.environ.get("SOAK_INTERVAL_S", "30")))
     parser.add_argument("--timeout-s", type=float, default=float(os.environ.get("SOAK_HTTP_TIMEOUT_S", "15")))

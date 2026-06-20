@@ -84,6 +84,58 @@ class LiveCacheTests(unittest.TestCase):
         self.assertTrue(bool(snapshot.get("degraded")))
         self.assertIn("redis_dependency_unavailable", str(snapshot.get("fallback_reason") or ""))
 
+    def test_redis_backend_resolves_password_secret(self) -> None:
+        self._set_env("LIVE_CACHE_BACKEND", "redis")
+        self._set_env("LIVE_CACHE_REDIS_URL", "redis://localhost:6379/0")
+        self._set_env("LIVE_CACHE_REDIS_PASSWORD_SECRET", "redis_password")
+        (live_cache,) = _reload_modules("engine.runtime.live_cache")
+
+        with patch.object(live_cache, "_secret_text_from_env", return_value="secret"):
+            config = live_cache.LiveCacheConfig.from_env()
+
+        self.assertEqual(config.redis_url, "redis://:secret@localhost:6379/0")
+
+    @pytest.mark.requires_redis
+    def test_explicit_redis_live_cache_round_trip(self) -> None:
+        redis_url = os.environ.get("TS_REDIS_URL") or os.environ.get("REDIS_URL") or "redis://127.0.0.1:6379/0"
+        self._set_env("LIVE_CACHE_BACKEND", "redis")
+        self._set_env("LIVE_CACHE_REDIS_URL", redis_url)
+        self._set_env("LIVE_CACHE_REDIS_KEY_PREFIX", f"trading-system:test:{os.getpid()}:{int(time.time() * 1000)}")
+        (live_cache,) = _reload_modules("engine.runtime.live_cache")
+        live_cache.close_live_cache()
+        backend = live_cache.get_live_cache()
+        try:
+            snapshot = live_cache.get_live_cache_snapshot()
+            if str(snapshot.get("resolved_backend") or "") != "redis":
+                raise unittest.SkipTest(f"redis live cache backend unavailable: {snapshot}")
+            self.assertEqual(str(snapshot.get("resolved_backend") or ""), "redis")
+            self.assertTrue(bool(snapshot.get("ok")), snapshot)
+
+            self.assertTrue(
+                backend.set_price_snapshot(
+                    "ZZREDIS",
+                    {"symbol": "ZZREDIS", "price": 123.45},
+                    ttl_s=30,
+                    snapshot_ts_ms=1000,
+                )
+            )
+            self.assertEqual(float((backend.get_price_snapshot("ZZREDIS") or {}).get("price") or 0.0), 123.45)
+
+            self.assertTrue(
+                backend.set_feature_snapshot(
+                    "ZZREDIS",
+                    {"symbol": "ZZREDIS", "features": {"f": 1.0}},
+                    ttl_s=30,
+                    snapshot_ts_ms=1000,
+                )
+            )
+            feature = backend.get_feature_snapshot("ZZREDIS") or {}
+            self.assertEqual(dict(feature.get("features") or {}), {"f": 1.0})
+        finally:
+            backend.clear_price("ZZREDIS")
+            backend.clear_feature("ZZREDIS")
+            live_cache.close_live_cache()
+
     @pytest.mark.requires_postgres
     def test_price_and_feature_surfaces_report_live_cache_backend(self) -> None:
         storage, live_cache, price_cache, feature_store = _reload_modules(

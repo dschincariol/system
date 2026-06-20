@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 
 from engine.strategy import promotion_guard
+from tests.promotion_test_helpers import passing_deconfounded_payload
 
 
 def _month_ts(year: int, month: int, day: int) -> int:
@@ -87,6 +88,7 @@ def test_consistent_challenger_passes_era_gate_with_regime_labels(monkeypatch) -
         regime_labels=["risk_on"] * 4 + ["risk_off"] * 4 + ["neutral"] * 4,
         challenger_predictions=challenger,
         realized_returns=challenger,
+        deconfounded_validation=passing_deconfounded_payload(len(challenger)),
         persist=False,
         alpha=1.0,
         bootstrap_samples=99,
@@ -124,6 +126,7 @@ def test_era_table_is_persisted_as_promotion_evidence(monkeypatch) -> None:
         evaluation_timestamps=timestamps,
         challenger_predictions=returns,
         realized_returns=returns,
+        deconfounded_validation=passing_deconfounded_payload(len(returns)),
         persist=True,
         alpha=1.0,
         bootstrap_samples=99,

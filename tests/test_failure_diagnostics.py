@@ -550,7 +550,6 @@ class FailureDiagnosticsTests(unittest.TestCase):
             REPO_ROOT / "ops" / "compute_factor_group_scores.py",
             REPO_ROOT / "ops" / "train_model_v2.py",
             REPO_ROOT / "services" / "data_source_manager.py",
-            REPO_ROOT / "scripts" / "staging_e2e.ps1",
             REPO_ROOT / "start_all.py",
             REPO_ROOT / "start_ingestion.py",
             REPO_ROOT / "start_system.py",

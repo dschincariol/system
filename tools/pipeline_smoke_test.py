@@ -152,9 +152,9 @@ def _health_ready_for_smoke(obj):
     last_ts_ms = int(prices.get("last_ts_ms") or 0)
     age_s = float(prices.get("age_s") or 1e9)
     prices_ready = bool(last_ts_ms > 0 and age_s <= 180.0)
-    only_provider_blockers = bool(critical) and all(x == "providers_not_ok" for x in critical)
+    no_blocking_critical_failure = not critical or all(x == "providers_not_ok" for x in critical)
 
-    return bool(db_ok and prices_ready and only_provider_blockers)
+    return bool(db_ok and prices_ready and no_blocking_critical_failure)
 
 
 def _run_smoke_jobs():
@@ -197,6 +197,17 @@ def _job_started_since(name, before_event_ts=0, before_hist_ts=0):
     return None
 
 
+def _latest_job_history_since(name, before_hist_ts=0):
+    for hist_row in _job_history(name, limit=10):
+        try:
+            hist_ts = int(hist_row.get("ts_ms") or 0)
+        except Exception:
+            hist_ts = 0
+        if hist_ts > int(before_hist_ts):
+            return hist_row
+    return None
+
+
 def _start_job_and_wait(name, timeout_s=JOB_TIMEOUT):
     before = dict((_jobs_snapshot().get(name) or {}))
     before_event_ts = int(before.get("last_event_ts_ms") or 0)
@@ -212,10 +223,22 @@ def _start_job_and_wait(name, timeout_s=JOB_TIMEOUT):
         start = _req(
             "/api/jobs/start",
             method="POST",
-            body={"name": name},
+            body={
+                "name": name,
+                "confirmation": "JOB_ACTION",
+                "consequence_ack": True,
+            },
             timeout=JOB_START_REQUEST_TIMEOUT,
         )
         _require_ok(f"job_start_{name}", start)
+        if isinstance(start, dict) and start.get("exit_code") == 0:
+            return {
+                "job": name,
+                "ok": True,
+                "start": start,
+                "state": dict((_jobs_snapshot().get(name) or {})),
+                "history": None,
+            }
     except Exception as e:
         reconcile_deadline = time.time() + max(5, min(15, int(timeout_s)))
         reconciled_state = None
@@ -251,19 +274,9 @@ def _start_job_and_wait(name, timeout_s=JOB_TIMEOUT):
         running = bool(row.get("running"))
         if running or event_ts > before_event_ts:
             saw_activity = True
-        if saw_activity and not running:
-            latest = None
-            for hist_row in _job_history(name, limit=10):
-                try:
-                    hist_ts = int(hist_row.get("ts_ms") or 0)
-                except Exception:
-                    hist_ts = 0
-                if hist_ts > before_hist_ts:
-                    latest = hist_row
-                    break
-            if latest is None:
-                time.sleep(0.5)
-                continue
+        latest = _latest_job_history_since(name, before_hist_ts=before_hist_ts)
+        if latest is not None:
+            saw_activity = True
             event = str(latest.get("event") or "").strip().lower()
             exit_code = latest.get("exit_code")
             if event == "exit" and exit_code in (None, 0):
@@ -274,7 +287,16 @@ def _start_job_and_wait(name, timeout_s=JOB_TIMEOUT):
                     "state": row,
                     "history": latest,
                 }
+            if event == "start" and running:
+                time.sleep(0.5)
+                continue
+            if event == "start" and not running:
+                time.sleep(0.5)
+                continue
             raise RuntimeError(f"job_failed:{name}:event={event}:exit_code={exit_code}")
+        if saw_activity and not running:
+            time.sleep(0.5)
+            continue
         time.sleep(1.0)
 
     raise RuntimeError(

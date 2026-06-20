@@ -186,6 +186,7 @@ def test_train_ensemble_derives_causal_prior_when_lambda_is_set(monkeypatch):
     )
     monkeypatch.setenv("ENSEMBLE_CAUSAL_PRIOR_LAMBDA", "5.0")
     monkeypatch.setenv("ENSEMBLE_REFIT_LOOKBACK_DAYS", "1")
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "offline")
 
     result = train_ensemble.run(con=con)
 

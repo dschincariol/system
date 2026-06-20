@@ -115,6 +115,10 @@ class BrokerFillRealShadowIsolationTests(unittest.TestCase):
         self.assertAlmostEqual(float(trade["px_in"]), 100.0)
         self.assertAlmostEqual(float(trade["px_out"]), 110.0)
         self.assertAlmostEqual(float(trade["fees_total"]), 0.30)
+        self.assertAlmostEqual(float(trade["entry_qty"]), 10.0)
+        self.assertAlmostEqual(float(trade["exit_qty"]), 10.0)
+        self.assertAlmostEqual(float(trade["entry_notional"]), 1000.0)
+        self.assertAlmostEqual(float(trade["exit_notional"]), 1100.0)
 
     def test_shadow_broker_sim_fill_does_not_mirror_to_labels_or_execution_ledger(self) -> None:
         storage, broker_sim, execution_ledger = _reload_modules(

@@ -11,7 +11,7 @@ import unittest
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from typing import Any, Dict, Iterable
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from engine.runtime.live_trading_preflight import DEFAULT_LIVE_CONFIRM_PHRASE
 
@@ -33,6 +33,8 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "DB_PATH",
         "ENGINE_SUPERVISED",
         "ALLOW_TRAINING",
+        "LIVE_BROKER",
+        "BROKER",
         "BROKER_NAME",
         "BROKER_FAILOVER",
         "BROKER_START_CASH",
@@ -76,6 +78,17 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "TS_PG_SCHEMA",
         "TS_PG_SCHEMA_PER_DB_PATH",
         "TS_REDIS_KEY_PREFIX",
+        "DECISION_ENGINE_ENABLED",
+        "DECISION_MIN_CONFIDENCE",
+        "DECISION_MIN_ABS_PREDICTION",
+        "UNCERTAINTY_SIZING_PRODUCTION_POLICY",
+        "UNCERTAINTY_HIGH_THRESHOLD",
+        "UNCERTAINTY_HARD_THRESHOLD",
+        "UNCERTAINTY_MAX_AGE_MS",
+        "OOD_SUPPRESS_THRESHOLD",
+        "OOD_HARD_THRESHOLD",
+        "RL_ALLOW_FALLBACK_AGENT",
+        "EXECUTION_MAX_SIGNAL_AGE_S",
     )
 
     def setUp(self) -> None:
@@ -86,6 +99,8 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["DB_PATH"] = str(self.db_path)
         os.environ["ENGINE_SUPERVISED"] = "1"
         os.environ["ALLOW_TRAINING"] = "0"
+        os.environ["LIVE_BROKER"] = "sim"
+        os.environ["BROKER"] = "sim"
         os.environ["BROKER_NAME"] = "sim"
         os.environ["BROKER_FAILOVER"] = "sim"
         os.environ["BROKER_START_CASH"] = "100000"
@@ -129,6 +144,17 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["TS_REDIS_KEY_PREFIX"] = f"broker_apply_orders_modes_{Path(self.tmp.name).name}"
         os.environ["EXECUTION_MODE"] = "paper"
         os.environ["ENGINE_MODE"] = "paper"
+        os.environ.pop("DECISION_ENGINE_ENABLED", None)
+        os.environ.pop("DECISION_MIN_CONFIDENCE", None)
+        os.environ.pop("DECISION_MIN_ABS_PREDICTION", None)
+        os.environ.pop("UNCERTAINTY_SIZING_PRODUCTION_POLICY", None)
+        os.environ.pop("UNCERTAINTY_HIGH_THRESHOLD", None)
+        os.environ.pop("UNCERTAINTY_HARD_THRESHOLD", None)
+        os.environ.pop("UNCERTAINTY_MAX_AGE_MS", None)
+        os.environ.pop("OOD_SUPPRESS_THRESHOLD", None)
+        os.environ.pop("OOD_HARD_THRESHOLD", None)
+        os.environ.pop("RL_ALLOW_FALLBACK_AGENT", None)
+        os.environ["EXECUTION_MAX_SIGNAL_AGE_S"] = "3600"
 
         self._reload_runtime_modules()
         self._reset_runtime_controls()
@@ -160,6 +186,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
             self.drawdown_state,
             self.capital_guard,
             self.kill_switch,
+            _decision_engine,
             self.portfolio_execution_intents,
             self.execution_policy_engine,
             self.broker_router,
@@ -176,6 +203,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
             "engine.strategy.drawdown_state",
             "engine.strategy.capital_guard",
             "engine.execution.kill_switch",
+            "engine.decision_engine",
             "engine.strategy.portfolio_execution_intents",
             "engine.execution.execution_policy_engine",
             "engine.execution.broker_router",
@@ -288,11 +316,83 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
     def _set_mode(self, mode: str, *, armed: int = 0) -> None:
         os.environ["EXECUTION_MODE"] = str(mode)
         os.environ["ENGINE_MODE"] = str(mode)
+        if str(mode).strip().lower() == "live":
+            self._set_live_ai_contract_env()
         if str(mode).strip().lower() == "live" and int(armed or 0) == 1:
             os.environ.setdefault("LIVE_TRADING_CONFIRM", DEFAULT_LIVE_CONFIRM_PHRASE)
         self._reload_runtime_modules()
         self.execution_mode.set_execution_mode(str(mode), actor="test", reason="unit_test")
-        self.execution_mode.set_execution_armed(int(armed), actor="test", reason="unit_test")
+        if str(mode).strip().lower() == "live" and int(armed or 0) == 1:
+            with patch.object(
+                self.execution_mode,
+                "_assert_live_arming_preflight",
+                return_value=None,
+            ):
+                self.execution_mode.set_execution_armed(int(armed), actor="test", reason="unit_test")
+        else:
+            self.execution_mode.set_execution_armed(int(armed), actor="test", reason="unit_test")
+
+    def _set_live_ai_contract_env(self) -> None:
+        os.environ["DECISION_ENGINE_ENABLED"] = "1"
+        os.environ["DECISION_MIN_CONFIDENCE"] = "0.01"
+        os.environ["DECISION_MIN_ABS_PREDICTION"] = "0.01"
+        os.environ["UNCERTAINTY_SIZING_PRODUCTION_POLICY"] = "strict"
+        os.environ["UNCERTAINTY_HIGH_THRESHOLD"] = "0.70"
+        os.environ["UNCERTAINTY_HARD_THRESHOLD"] = "0.95"
+        os.environ["UNCERTAINTY_MAX_AGE_MS"] = "300000"
+        os.environ["OOD_SUPPRESS_THRESHOLD"] = "1.50"
+        os.environ["OOD_HARD_THRESHOLD"] = "3.00"
+        os.environ["RL_ALLOW_FALLBACK_AGENT"] = "0"
+
+    def _seed_live_alpaca_route(self) -> None:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "0"
+        os.environ["LIVE_TRADING_CONFIRM"] = DEFAULT_LIVE_CONFIRM_PHRASE
+        os.environ["LIVE_BROKER"] = "alpaca"
+        os.environ["BROKER"] = "alpaca"
+        os.environ["BROKER_NAME"] = "alpaca"
+        os.environ["BROKER_FAILOVER"] = "alpaca"
+        os.environ["CAPITAL_AWARE_KILL_SWITCH"] = "0"
+        os.environ["MODEL_AWARE_KILL_SWITCH"] = "0"
+        now_ms = self._seed_runtime_live()
+        self._set_mode("live", armed=1)
+        self._seed_portfolio_order(ts_ms=now_ms)
+
+    def _healthy_live_route_stack(self, stack: ExitStack, *, adapter: Mock) -> None:
+        gates = importlib.import_module("engine.runtime.gates")
+        def _passthrough_execution_policy(*args: Any, **kwargs: Any) -> list[dict]:
+            if "intents" in kwargs:
+                return list(kwargs.get("intents") or [])
+            return list((args[0] if args else []) or [])
+
+        stack.enter_context(patch.object(gates, "live_trading_preflight", return_value={"ok": True, "reason": "ok"}))
+        stack.enter_context(patch("engine.runtime.health.run_preflight", return_value={"ok": True}))
+        stack.enter_context(patch.object(self.broker_apply_orders, "apply_execution_policy", side_effect=_passthrough_execution_policy))
+        stack.enter_context(patch.object(self.broker_apply_orders, "execution_allowed", return_value=(True, "ok", {})))
+        stack.enter_context(patch.object(self.broker_apply_orders, "get_competition_policy_for_intent", return_value={}))
+        stack.enter_context(patch.object(self.broker_apply_orders, "pre_live_position_reconcile", return_value={"ok": True}))
+        stack.enter_context(
+            patch.object(
+                self.broker_apply_orders,
+                "apply_execution_risk_governor",
+                side_effect=lambda _con, orders, **_kwargs: (list(orders or []), {"ok": True}),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                self.broker_apply_orders,
+                "refresh_broker_connection_health",
+                return_value={"ok": True, "state": "connected"},
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                self.broker_apply_orders,
+                "refresh_execution_quality_supervisor",
+                return_value={"ok": True, "state": "ok"},
+            )
+        )
+        stack.enter_context(patch.object(self.broker_router, "_prelive_reconcile", return_value={"ok": True}))
+        stack.enter_context(patch.object(self.broker_router, "_alpaca_apply", adapter))
 
     def _seed_portfolio_order(
         self,
@@ -521,13 +621,56 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertEqual(self._db_fetchone("SELECT event_type FROM order_events ORDER BY id DESC LIMIT 1"), "execution_block")
         self.assertEqual(self._db_fetchone("SELECT status FROM order_events ORDER BY id DESC LIMIT 1"), "blocked")
 
-    def test_live_mode_armed_blocked_by_disable_live_execution(self) -> None:
-        os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+    def test_live_mode_unarmed_non_kill_switch_cascade_still_execution_gate(self) -> None:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "0"
         now_ms = self._seed_runtime_live()
-        self._set_mode("live", armed=1)
+        self._set_mode("live", armed=0)
         self._seed_portfolio_order(ts_ms=now_ms)
 
+        with patch.object(
+            self.broker_apply_orders,
+            "execution_allowed",
+            return_value=(False, "runtime_state_block", {"scope": "global", "key": "UNKNOWN"}),
+        ):
+            rc, out, _ = self._run_main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "execution_gate")
+        self.assertEqual(out["reason"], "mode_live_unarmed")
+        self.assertEqual(out["kill_switch_cascade"]["reason"], "runtime_state_block")
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_commands") or 0), 0)
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_events") or 0), 1)
+
+    def test_live_mode_unarmed_preserves_actual_kill_switch_layer(self) -> None:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "0"
+        now_ms = self._seed_runtime_live()
+        self._set_mode("live", armed=0)
+        self._seed_portfolio_order(ts_ms=now_ms)
+        self.kill_switch.activate("global", "global", reason="unit_test", actor="test")
+        self.lifecycle_state.set_state(self.lifecycle_state.LIVE, "kill_switch_db_still_active")
+
         rc, out, _ = self._run_main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "kill_switch")
+        self.assertIn("kill_switch", str(out["reason"]))
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_commands") or 0), 0)
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM order_events") or 0), 1)
+
+    def test_live_mode_armed_blocked_by_disable_live_execution(self) -> None:
+        os.environ["DISABLE_LIVE_EXECUTION"] = "0"
+        os.environ["LIVE_TRADING_CONFIRM"] = DEFAULT_LIVE_CONFIRM_PHRASE
+        now_ms = self._seed_runtime_live()
+        self._set_mode("live", armed=1)
+        os.environ["DISABLE_LIVE_EXECUTION"] = "1"
+        self._seed_portfolio_order(ts_ms=now_ms)
+
+        with patch.object(self.kill_switch, "_get_lifecycle_state", return_value={"state": "LIVE"}):
+            rc, out, _ = self._run_main()
 
         self.assertEqual(rc, 0)
         self.assertEqual(out["status"], "blocked")
@@ -547,6 +690,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
     def test_live_mode_blocks_disabled_prelive_reconcile_before_position_reconcile(self) -> None:
         os.environ["DISABLE_LIVE_EXECUTION"] = "0"
         os.environ["EXECUTION_PRELIVE_RECONCILE"] = "0"
+        os.environ["LIVE_TRADING_CONFIRM"] = DEFAULT_LIVE_CONFIRM_PHRASE
         now_ms = self._seed_runtime_live()
         self._set_mode("live", armed=1)
         self._seed_portfolio_order(ts_ms=now_ms)
@@ -575,6 +719,42 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertEqual(out["layer"], "position_reconcile_policy")
         self.assertEqual(out["reason"], "prelive_reconcile_disabled_for_live")
         self.assertFalse(bool(out["prelive_reconcile_policy"]["ok"]))
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+
+    def test_live_mode_routes_real_order_to_adapter_with_production_gate_providers(self) -> None:
+        self._seed_live_alpaca_route()
+        gates = importlib.import_module("engine.runtime.gates")
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 1})
+
+        with ExitStack() as stack:
+            self._healthy_live_route_stack(stack, adapter=adapter)
+            rc, out, _ = self._run_main(competition_policy={})
+
+        self.assertEqual(rc, 0)
+        self.assertIs(self.broker_router._execution_gate_snapshot, gates.execution_gate_snapshot)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["mode"], "live")
+        self.assertTrue(bool(out["result"]["ok"]))
+        self.assertEqual(out["result"]["status"], "adapter_called")
+        adapter.assert_called_once()
+        routed_orders = adapter.call_args.kwargs["override_orders"]
+        self.assertEqual(len(routed_orders), 1)
+        self.assertEqual(routed_orders[0]["symbol"], "AAPL")
+
+    def test_live_mode_missing_router_gate_provider_blocks_before_adapter(self) -> None:
+        self._seed_live_alpaca_route()
+        adapter = Mock(side_effect=AssertionError("adapter must not run without router gate provider"))
+
+        with ExitStack() as stack:
+            self._healthy_live_route_stack(stack, adapter=adapter)
+            stack.enter_context(patch.object(self.broker_router, "_execution_gate_snapshot", None))
+            rc, out, _ = self._run_main(competition_policy={})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["mode"], "live")
+        self.assertFalse(bool(out["result"]["ok"]))
+        self.assertEqual(out["result"]["status"], "execution_blocked_gate_unavailable")
+        adapter.assert_not_called()
         self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
 
     def test_execution_policy_applied(self) -> None:

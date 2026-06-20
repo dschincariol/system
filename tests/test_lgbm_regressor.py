@@ -128,6 +128,18 @@ def test_lgbm_family_defaults_to_shadow_on_import():
     assert family["promotion_guard"].endswith("promotion_guard.assess_challenger")
 
 
+def test_lgbm_default_n_jobs_is_configurable_and_bounded(monkeypatch):
+    monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "offline")
+    monkeypatch.setenv("LGBM_N_JOBS", "12")
+    monkeypatch.setenv("MODEL_TRAIN_MAX_N_JOBS", "5")
+    module = importlib.import_module("engine.strategy.models.lgbm_regressor")
+
+    model = module.LGBMRegressorModel(feature_ids=list(FEATURE_IDS))
+
+    assert model.hyperparams["n_jobs"] == 5
+
+
 def test_lgbm_era_boost_reduces_per_era_score_std_and_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(feature_registry, "expected_columns", lambda *args, **kwargs: list(FEATURE_IDS))
     module = importlib.import_module("engine.strategy.models.lgbm_regressor")

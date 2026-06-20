@@ -168,7 +168,7 @@ def test_configure_connection_rolls_back_dirty_connection(monkeypatch):
 
     assert conn.rollbacks == 1
     assert conn.autocommit is False
-    assert statements == ['SET search_path = "trading", public']
+    assert statements == [f"SET search_path = {storage_pool.quote_ident(storage_pool.schema_name())}, public"]
 
 
 def test_risk_state_probe_closes_idle_connection(monkeypatch):
@@ -206,6 +206,179 @@ def test_get_db_validation_snapshot_strict_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="db down"):
         storage_pg.get_db_validation_snapshot(strict=True)
+
+
+class _FakeValidationCursor:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class _FakeValidationConnection:
+    def __init__(self, *, tables, columns, indexes, migration_ids):
+        self._tables = list(tables)
+        self._columns = dict(columns)
+        self._indexes = list(indexes)
+        self._migration_ids = list(migration_ids)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        text = str(sql)
+        if "FROM information_schema.tables" in text and "table_type = 'BASE TABLE'" in text:
+            return _FakeValidationCursor([(table,) for table in sorted(self._tables)])
+        if "FROM information_schema.columns c" in text:
+            table = str((params or ("",))[0])
+            rows = []
+            for name, spec in self._columns.get(table, {}).items():
+                rows.append(
+                    (
+                        name,
+                        spec.get("type", "TEXT"),
+                        spec.get("udt_name", "text"),
+                        1 if spec.get("notnull", False) else 0,
+                        spec.get("default"),
+                        int(spec.get("pk", 0) or 0),
+                    )
+                )
+            return _FakeValidationCursor(rows)
+        if "FROM pg_indexes" in text:
+            return _FakeValidationCursor([(index_name,) for index_name in self._indexes])
+        if "SELECT id FROM schema_migrations" in text:
+            return _FakeValidationCursor([(migration_id,) for migration_id in self._migration_ids])
+        raise AssertionError(f"unexpected validation SQL: {text}")
+
+
+def _schema_migrations_columns():
+    return {
+        "id": {"type": "INTEGER", "udt_name": "int4", "pk": 1},
+        "description": {"type": "TEXT", "udt_name": "text"},
+        "applied_at": {"type": "TIMESTAMP WITH TIME ZONE", "udt_name": "timestamptz"},
+    }
+
+
+def test_postgres_validation_fails_missing_recent_migration_column_and_index(monkeypatch):
+    columns = {
+        "schema_migrations": _schema_migrations_columns(),
+        "alert_acks": {
+            "alert_id": {"type": "BIGINT", "udt_name": "int8", "pk": 1},
+            "acked_ts_ms": {"type": "BIGINT", "udt_name": "int8"},
+        },
+        "alert_lifecycle_events": {
+            "id": {"type": "BIGINT", "udt_name": "int8", "pk": 1},
+            "alert_id": {"type": "BIGINT", "udt_name": "int8"},
+            "ts_ms": {"type": "BIGINT", "udt_name": "int8"},
+        },
+    }
+    fake = _FakeValidationConnection(
+        tables=columns,
+        columns=columns,
+        indexes=[],
+        migration_ids=[1, 54, 55],
+    )
+
+    monkeypatch.setattr(storage_pg, "_validation_contract", lambda: (
+        {
+            "schema_migrations": ("id", "description", "applied_at"),
+            "alert_acks": ("alert_id", "acked_ts_ms", "expires_ts_ms"),
+            "alert_lifecycle_events": ("id", "alert_id", "ts_ms"),
+        },
+        ("idx_alert_lifecycle_events_alert_ts",),
+    ))
+    monkeypatch.setattr(storage_pg, "_expected_migration_ids", lambda: (1, 54, 55))
+    monkeypatch.setattr(storage_pg, "_current_expected_schema_version", lambda: 55)
+    monkeypatch.setattr(storage_pg, "connection", lambda readonly=True: fake)
+
+    snapshot = storage_pg.get_db_validation_snapshot(include_quick_check=False)
+
+    assert snapshot["ok"] is False, snapshot
+    assert snapshot["schema_version_ok"] is True, snapshot
+    assert snapshot["missing_columns"] == {"alert_acks": ["expires_ts_ms"]}, snapshot
+    assert snapshot["missing_indexes"] == ["idx_alert_lifecycle_events_alert_ts"], snapshot
+
+
+def test_postgres_validation_fails_stale_schema_migrations(monkeypatch):
+    columns = {"schema_migrations": _schema_migrations_columns()}
+    fake = _FakeValidationConnection(
+        tables=columns,
+        columns=columns,
+        indexes=[],
+        migration_ids=[1, 54],
+    )
+
+    monkeypatch.setattr(storage_pg, "_validation_contract", lambda: (
+        {"schema_migrations": ("id", "description", "applied_at")},
+        (),
+    ))
+    monkeypatch.setattr(storage_pg, "_expected_migration_ids", lambda: (1, 54, 55))
+    monkeypatch.setattr(storage_pg, "_current_expected_schema_version", lambda: 55)
+    monkeypatch.setattr(storage_pg, "connection", lambda readonly=True: fake)
+
+    snapshot = storage_pg.get_db_validation_snapshot(include_quick_check=False)
+
+    assert snapshot["ok"] is False, snapshot
+    assert snapshot["schema_version"] == 54, snapshot
+    assert snapshot["expected_schema_version"] == 55, snapshot
+    assert snapshot["schema_version_ok"] is False, snapshot
+    assert snapshot["schema_status"] == "stale", snapshot
+    assert snapshot["schema_migration_missing_ids"] == [55], snapshot
+
+
+def test_postgres_validation_fails_owned_live_ingestion_type_drift(monkeypatch):
+    import engine.runtime.storage_live_ingestion_schema as live_schema
+
+    columns = {
+        "schema_migrations": _schema_migrations_columns(),
+        "prices": {
+            "symbol": {"type": "TEXT", "udt_name": "text", "pk": 1},
+            "ts_ms": {"type": "BIGINT", "udt_name": "int8", "pk": 2},
+            "price": {"type": "TEXT", "udt_name": "text"},
+        },
+    }
+    fake = _FakeValidationConnection(
+        tables=columns,
+        columns=columns,
+        indexes=[],
+        migration_ids=[1, 55],
+    )
+
+    monkeypatch.setattr(storage_pg, "_validation_contract", lambda: (
+        {"schema_migrations": ("id", "description", "applied_at")},
+        (),
+    ))
+    monkeypatch.setattr(storage_pg, "_expected_migration_ids", lambda: (1, 55))
+    monkeypatch.setattr(storage_pg, "_current_expected_schema_version", lambda: 55)
+    monkeypatch.setattr(storage_pg, "connection", lambda readonly=True: fake)
+    monkeypatch.setattr(
+        live_schema,
+        "OWNED_LIVE_TABLE_COLUMN_SPECS",
+        {
+            "prices": {
+                "symbol": {"type": "TEXT", "pk": 1},
+                "ts_ms": {"type": "INTEGER", "pk": 2},
+                "price": {"type": "REAL", "pk": 0},
+            },
+        },
+    )
+    monkeypatch.setattr(live_schema, "OWNED_LIVE_TABLE_REQUIRED_INDEXES", {"prices": ()})
+
+    snapshot = storage_pg.get_db_validation_snapshot(include_quick_check=False)
+
+    assert snapshot["ok"] is False, snapshot
+    assert snapshot["owned_schema_ok"] is False, snapshot
+    assert snapshot["owned_type_mismatches"] == {
+        "prices": {"price": {"expected": "REAL", "actual": "TEXT"}}
+    }, snapshot
+    assert snapshot["owned_drift_tables"] == ["prices"], snapshot
 
 
 def test_put_normalized_event_uses_timescale_conflict_key(monkeypatch):

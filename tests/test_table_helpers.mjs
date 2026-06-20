@@ -114,10 +114,10 @@ test("dashboard and terminal table wiring uses shared helpers and preserves dril
   assert.match(dashboardJs, /buildTableView/);
   assert.match(terminalJs, /buildTableView/);
 
-  for (const tableId of ["recentDecisions", "executionOrders", "executionFills", "suppressedTrades"]) {
+  for (const tableId of ["recentDecisions", "executionOrders", "executionFills", "suppressedTrades", "executionBySymbolTca", "executionOutcomes", "executionTrace"]) {
     assert.match(dashboardHtml, new RegExp(`data-dashboard-table-filter="${tableId}"`));
   }
-  for (const tableId of ["executionOrders", "executionFills", "suppressedTrades"]) {
+  for (const tableId of ["executionOrders", "executionFills", "suppressedTrades", "executionBySymbolTca", "executionOutcomes", "executionTrace"]) {
     assert.match(dashboardHtml, new RegExp(`data-dashboard-table-sort="${tableId}"`));
   }
   for (const inputId of ["posFilter", "ordFilter", "fillsFilter"]) {
@@ -128,6 +128,8 @@ test("dashboard and terminal table wiring uses shared helpers and preserves dril
   assert.match(dashboardJs, /renderExecutionOrdersRows[\s\S]*decisionLookupForOrderIntent[\s\S]*_decisionLookupAttr/);
   assert.match(dashboardJs, /renderExecutionFillsRows[\s\S]*normalizeDecisionLookup[\s\S]*_decisionLookupAttr/);
   assert.match(dashboardJs, /renderSuppressedRows[\s\S]*_decisionLookupAttr/);
+  assert.match(dashboardJs, /renderExecutionOutcomeRows[\s\S]*normalizeDecisionLookup[\s\S]*_decisionLookupAttr/);
+  assert.match(dashboardJs, /renderExecutionTraceRows[\s\S]*normalizeDecisionLookup[\s\S]*_decisionLookupAttr/);
 });
 
 test("shared status vocabulary covers desktop mobile terminal states", () => {

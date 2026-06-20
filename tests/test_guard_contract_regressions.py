@@ -106,6 +106,112 @@ def test_promotion_guard_blocks_when_equity_drift_is_critical(runtime_modules) -
     assert "equity_drift_crit" in reason["blockers"]
 
 
+def test_promotion_guard_blocks_strict_when_alert_table_missing(
+    runtime_modules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    (promotion_guard,) = _reload_modules("engine.strategy.promotion_guard")
+    monkeypatch.setattr(promotion_guard, "init_db", lambda: None)
+    monkeypatch.setattr(
+        promotion_guard,
+        "table_exists",
+        lambda _con, table: False if str(table) == "alerts" else True,
+    )
+
+    allowed, reason = promotion_guard.promotion_allowed()
+
+    assert allowed is False
+    assert reason["promotion_governance_strict"] is True
+    assert reason["crit_alerts_available"] is False
+    assert reason["crit_alerts"] is None
+    assert "crit_alerts_unavailable" in reason["blockers"]
+
+
+def test_promotion_guard_blocks_strict_when_drift_tables_missing(
+    runtime_modules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    (promotion_guard,) = _reload_modules("engine.strategy.promotion_guard")
+    monkeypatch.setattr(promotion_guard, "init_db", lambda: None)
+    monkeypatch.setattr(
+        promotion_guard,
+        "table_exists",
+        lambda _con, table: False if str(table) in {"equity_drift", "model_drift"} else True,
+    )
+
+    allowed, reason = promotion_guard.promotion_allowed()
+
+    assert allowed is False
+    assert reason["promotion_governance_strict"] is True
+    assert reason["equity_drift_available"] is False
+    assert reason["equity_drift_crit_points"] is None
+    assert reason["model_drift_available"] is False
+    assert reason["max_drift_ratio"] is None
+    assert "equity_drift_unavailable" in reason["blockers"]
+    assert "model_drift_unavailable" in reason["blockers"]
+
+
+def test_promotion_guard_blocks_strict_on_postgres_style_governance_query_failures(
+    runtime_modules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("PROMOTION_MAX_DRIFT_RATIO", "0.25")
+    (promotion_guard,) = _reload_modules("engine.strategy.promotion_guard")
+
+    class _Rows:
+        def __init__(self, one=None, all_rows=None):
+            self._one = one
+            self._all = list(all_rows or [])
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return list(self._all)
+
+    class _PostgresFailureConnection:
+        def execute(self, sql, params=()):
+            del params
+            text = " ".join(str(sql).lower().split())
+            if "from model_promotion_audit" in text:
+                return _Rows((None,))
+            if "from alerts" in text:
+                raise RuntimeError('psycopg.errors.UndefinedTable: relation "alerts" does not exist')
+            if "from equity_drift" in text:
+                return _Rows((0,))
+            if "from model_drift" in text:
+                raise RuntimeError('psycopg.errors.UndefinedColumn: column "drift_ratio" does not exist')
+            if "from trade_attribution_ledger" in text:
+                return _Rows(all_rows=[])
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(promotion_guard, "init_db", lambda: None)
+    monkeypatch.setattr(promotion_guard, "get_guard", lambda *_args, **_kwargs: "1")
+    monkeypatch.setattr(promotion_guard, "connect", lambda: _PostgresFailureConnection())
+    monkeypatch.setattr(promotion_guard, "table_exists", lambda _con, _table: True)
+
+    allowed, reason = promotion_guard.promotion_allowed()
+
+    assert allowed is False
+    assert reason["promotion_governance_strict"] is True
+    assert reason["crit_alerts_available"] is True
+    assert reason["crit_alerts"] is None
+    assert reason["max_drift_ratio"] is None
+    assert "crit_alerts_unavailable" in reason["blockers"]
+    assert "model_drift_unavailable" in reason["blockers"]
+    assert "query_failed:RuntimeError:psycopg.errors.UndefinedTable" in reason["crit_alerts_error"]
+    assert "query_failed:RuntimeError:psycopg.errors.UndefinedColumn" in reason["model_drift_error"]
+
+
 def test_promotion_guard_blocks_live_when_backup_restore_evidence_missing(
     runtime_modules,
     monkeypatch: pytest.MonkeyPatch,
@@ -123,6 +229,62 @@ def test_promotion_guard_blocks_live_when_backup_restore_evidence_missing(
     assert allowed is False
     assert "backup_evidence_base_backup_missing" in reason["blockers"]
     assert reason["backup_restore_evidence"]["required"] is True
+
+
+def test_promotion_guard_blocks_paper_when_position_reconcile_not_exercised(
+    runtime_modules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    monkeypatch.setenv("BROKER", "paper")
+    monkeypatch.setenv("BROKER_NAME", "paper")
+    monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    (promotion_guard,) = _reload_modules("engine.strategy.promotion_guard")
+
+    allowed, reason = promotion_guard.promotion_allowed()
+
+    assert allowed is False
+    assert "position_reconcile_not_exercised" in reason["blockers"]
+    assert reason["position_reconcile_evidence"]["required"] is True
+
+
+def test_promotion_reconcile_runner_executes_before_paper_promotion(
+    runtime_modules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    monkeypatch.setenv("BROKER", "paper")
+    monkeypatch.setenv("BROKER_NAME", "paper")
+    monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    promotion_guard, position_reconcile = _reload_modules(
+        "engine.strategy.promotion_guard",
+        "engine.execution.position_reconcile",
+    )
+    calls: list[str] = []
+
+    def _run_reconcile(broker):
+        calls.append(str(broker))
+        return {"ok": True, "status": "ok", "broker": str(broker), "fatal_reconcile": False}
+
+    monkeypatch.setattr(position_reconcile, "pre_live_position_reconcile", _run_reconcile)
+    monkeypatch.setattr(
+        position_reconcile,
+        "position_reconcile_evidence_snapshot",
+        lambda **kwargs: {
+            "ok": True,
+            "required": True,
+            "mode": kwargs.get("engine_mode"),
+            "broker": kwargs.get("broker"),
+            "blockers": [],
+        },
+    )
+
+    result = promotion_guard.run_position_reconcile_before_promotion()
+
+    assert result["ok"] is True
+    assert result["required"] is True
+    assert result["broker"] == "sim"
+    assert calls == ["sim"]
 
 
 def test_global_risk_envelope_prefers_runtime_gate_snapshot(runtime_modules, monkeypatch: pytest.MonkeyPatch) -> None:

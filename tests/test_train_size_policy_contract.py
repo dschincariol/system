@@ -112,9 +112,6 @@ class TrainSizePolicyContractTests(unittest.TestCase):
             def fetchall(self):
                 return list(self._rows)
 
-            def fetchall(self):
-                return list(self._rows)
-
         class _FakeConnection:
             def __init__(self) -> None:
                 self.closed = False

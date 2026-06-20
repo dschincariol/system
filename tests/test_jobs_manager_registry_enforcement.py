@@ -114,6 +114,34 @@ def test_registry_includes_safe_bootstrap_job_files() -> None:
     assert result["ok"] is True
 
 
+def test_jobs_manager_blocks_offline_training_job_in_live_profile_without_ack(monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_WORKLOAD_PROFILE", "live")
+    monkeypatch.setenv("ALLOW_TRAINING", "1")
+    monkeypatch.delenv("OFFLINE_TRAINING_LIVE_PROFILE_ACK", raising=False)
+    monkeypatch.setattr(jobs_manager, "_write_job_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(jobs_manager, "_job_launch_trace_append", lambda *args, **kwargs: None)
+
+    manager = object.__new__(jobs_manager.JobManager)
+    manager._lock = threading.Lock()
+    manager._jobs = {
+        "train_lgbm_models": jobs_manager.JobState(
+            "train_lgbm_models",
+            "engine/strategy/jobs/train_lgbm_models.py",
+            "oneshot",
+        )
+    }
+    manager._jobs["train_lgbm_models"].meta = job_registry.get_job_meta("train_lgbm_models")
+    manager._preflight_fn = None
+    manager._get_kill_switches_fn = None
+    manager._get_execution_mode_fn = None
+
+    result = manager.start("train_lgbm_models")
+
+    assert result["ok"] is False
+    assert result["error"] == "offline_training_live_profile_ack_required"
+    assert result["job"] == "train_lgbm_models"
+
+
 def test_alpaca_trade_updates_stream_has_validator_entrypoint() -> None:
     script = job_registry.ALLOWED_JOBS["alpaca_trade_updates_stream"][0]
 

@@ -508,11 +508,11 @@ def detect_magic_localhost(src: str, rel: str, st: AuditState) -> None:
             evidence=excerpt(src, line, context=2),
             recommended_prompt=(
                 f"Open `{rel}:{line}`. The literal `{m.group(0)}` is hardcoded. "
-                f"Cross-platform routing must go through env vars resolved by "
+                f"Linux routing must go through env vars resolved by "
                 f"`engine/runtime/platform.py`. Replace this literal with a call "
                 f"to the appropriate `default_*` helper (or read the env var "
-                f"directly) so dev (Windows TCP) and prod (Linux Unix socket) "
-                f"can both work without source changes."
+                f"directly) so dev and prod Linux socket defaults work without "
+                f"source changes."
             ),
         )
 

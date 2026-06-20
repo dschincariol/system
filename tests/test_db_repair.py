@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +81,63 @@ class DBRepairTests(unittest.TestCase):
             self.assertGreaterEqual(int(validation.get("schema_version") or 0), int(storage.SCHEMA_VERSION))
 
             storage.close_pooled_connections()
+
+    def test_db_guard_honors_explicit_sqlite_validation_backend(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir, patch.dict(
+            os.environ,
+            {
+                "DB_PATH": str(Path(tmpdir) / "sqlite_validation.db"),
+                "SQLITE_LIVENESS_DB_ENABLED": "0",
+                "SQLITE_TRACE_REPORT_EVERY_S": "0",
+                "TS_STORAGE_BACKEND": "sqlite",
+                "TRADING_VALIDATION_MODE": "startup",
+                "DATA_SOURCE_MANAGER_READ_ONLY": "1",
+                "ENGINE_PRIMARY_BOOTSTRAP_DONE": "1",
+            },
+            clear=False,
+        ):
+            db_guard, storage = _reload_modules(
+                "engine.runtime.db_guard",
+                "engine.runtime.storage",
+            )
+            storage.init_db()
+            out = db_guard.ensure_db_ok()
+            storage.close_pooled_connections()
+
+        self.assertTrue(bool(out.get("ok")), out)
+        self.assertEqual(str(out.get("storage") or ""), "sqlite")
+        self.assertNotIn("postgres_connect_failed", str(out))
+
+    def test_repair_schema_delegates_postgres_backend_to_migrator(self) -> None:
+        repair_schema, storage, migrator = _reload_modules(
+            "engine.runtime.jobs.repair_schema",
+            "engine.runtime.storage",
+            "engine.runtime.schema.migrator",
+        )
+        validation = {
+            "ok": True,
+            "backend": "postgres",
+            "schema_version": 56,
+            "expected_schema_version": 56,
+            "schema_version_ok": True,
+        }
+
+        with patch.object(repair_schema, "load_runtime_config", return_value=SimpleNamespace(db_path="/var/lib/trading")):
+            with patch.object(storage, "_SQLITE_TEST_BACKEND", False, create=True):
+                with patch.object(storage, "init_db") as init_db:
+                    with patch.object(storage, "get_db_validation_snapshot", return_value=validation) as validate:
+                        with patch.object(migrator, "apply_migrations", return_value=[56]) as apply:
+                            with patch.object(migrator, "expected_schema_version", return_value=56):
+                                result = repair_schema.run(include_quick_check=False)
+
+        self.assertTrue(bool(result.get("ok")), result)
+        self.assertEqual(str(result.get("backend") or ""), "postgres")
+        self.assertEqual(result.get("applied_migrations"), [56])
+        self.assertEqual(int(result.get("schema_version") or 0), 56)
+        self.assertEqual(int(result.get("expected_schema_version") or 0), 56)
+        self.assertEqual(init_db.call_count, 2)
+        apply.assert_called_once_with()
+        validate.assert_called_once_with(include_quick_check=False)
 
     def test_storage_validation_skips_missing_schema_table_warnings_on_empty_db(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir, patch.dict(

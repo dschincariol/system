@@ -6,7 +6,7 @@ trap 'rc=$?; echo "[run-staging-prod-preflight] ERROR line ${BASH_LINENO[0]} whi
 APP_ROOT="${TRADING_APP_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PYTHON_BIN="${TRADING_PYTHON_BIN:-${APP_ROOT}/.venv/bin/python}"
 ENV_FILE="${STAGING_PREFLIGHT_ENV_FILE:-${APP_ROOT}/deploy/env/staging-prod-preflight.env}"
-EVIDENCE_DIR="${STAGING_PREFLIGHT_EVIDENCE_DIR:-${APP_ROOT}/artifacts/preflight}"
+EVIDENCE_DIR="${STAGING_PREFLIGHT_EVIDENCE_DIR:-${APP_ROOT}/var/artifacts/preflight}"
 TARGET_ENV="${STAGING_PREFLIGHT_TARGET_ENV:-staging}"
 TIMEOUT_S="${PREFLIGHT_SMOKE_TIMEOUT_S:-900}"
 

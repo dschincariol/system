@@ -14,7 +14,6 @@ ROOTS = [
     "start_all.py",
     "run_dev.py",
     "dashboard_server.py",
-    "dashboard_config.py",
     "engine",
     "ops",
     "scripts",
