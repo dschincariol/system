@@ -64,6 +64,8 @@ SYSTEMD_DST_DIR="${TRADING_SYSTEMD_DIR:-/etc/systemd/system}"
 CREDSTORE_INSTALL_SCRIPT="${SCRIPT_DIR}/credstore/install.sh"
 BACKUP_SCRIPT_SRC_DIR="${REPO_ROOT}/ops/backup"
 BACKUP_SCRIPT_DST_DIR="${INSTALL_ROOT}/ops/backup"
+SERVER_SCRIPT_SRC_DIR="${REPO_ROOT}/ops/server"
+SERVER_SCRIPT_DST_DIR="${INSTALL_ROOT}/ops/server"
 
 APT_UPDATED=0
 POSTGRES_RESTART_NEEDED=0
@@ -1171,6 +1173,20 @@ install_backup_scripts() {
   install_if_changed_from_file "${REPO_ROOT}/tools/restore_sanity.sql" "${INSTALL_ROOT}/tools/restore_sanity.sql" 0644 root "$TRADING_GROUP" >/dev/null || true
 }
 
+install_server_ops_scripts() {
+  log "installing server ops scripts"
+  install -d -o root -g "$TRADING_GROUP" -m 0750 "$SERVER_SCRIPT_DST_DIR"
+  local script
+  for script in \
+    disk_remediation.sh \
+    zfs_tuning.sh
+  do
+    if install_if_changed_from_file "${SERVER_SCRIPT_SRC_DIR}/${script}" "${SERVER_SCRIPT_DST_DIR}/${script}" 0755 root "$TRADING_GROUP"; then
+      :
+    fi
+  done
+}
+
 install_systemd_units() {
   log "installing trading systemd units"
   install -d -m 0755 "$SYSTEMD_DST_DIR"
@@ -1280,6 +1296,7 @@ main() {
   install_node_runtime
   install_node_dependencies
   install_backup_scripts
+  install_server_ops_scripts
   install_systemd_units
   setup_logrotate
   setup_firewall

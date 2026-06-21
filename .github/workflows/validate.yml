@@ -60,6 +60,14 @@ jobs:
             tests/test_os_migration_gates.py
         shell: bash
 
+      - name: Run disk remediation ops tests
+        env:
+          PYTHONPATH: .
+        run: |
+          bash tests/ops/test_zfs_tuning.sh
+          bash tests/ops/test_disk_remediation_relocate_docker.sh
+        shell: bash
+
       - name: Run canonical repository validation
         env:
           PYTHONPATH: .

@@ -78,6 +78,23 @@ relocation script. It records before/after captures and refuses to suggest an
 in-place ashift repair. See
 [DISK_RETENTION_RUNBOOK.md](../../docs/DISK_RETENTION_RUNBOOK.md).
 
+## Disk Remediation
+
+Bootstrap installs the disk-retention remediation entrypoints to
+`/opt/trading/ops/server` with root ownership and executable mode:
+
+```bash
+sudo bash /opt/trading/ops/server/disk_remediation.sh diagnose
+sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker --dry-run
+sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker
+```
+
+The source of truth remains the checked-in `ops/server/disk_remediation.sh`.
+`verify.sh` checks the deployed remediation and ZFS tuning scripts are present,
+executable, and pass `bash -n`. See
+[DISK_RETENTION_RUNBOOK.md](../../docs/DISK_RETENTION_RUNBOOK.md) before any
+cleanup, rollback, or backup-root relocation command.
+
 ## Backup And Restore
 
 Current runtime storage is Postgres-backed. Backup ownership for this host layer is:
@@ -187,6 +204,7 @@ new signed evidence passes preflight.
 ## Deployment Layout
 
 - App checkout: `/opt/trading/app`
+- Server ops scripts: `/opt/trading/ops/server`
 - Python venv: `/opt/trading/venv`
 - Data: `/var/lib/trading/`
 - Backups staging: `/var/backups/trading/`

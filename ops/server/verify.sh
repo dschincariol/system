@@ -24,6 +24,7 @@ PGBOUNCER_PORT="${TRADING_PGBOUNCER_PORT:-6432}"
 REDIS_SOCKET="${TRADING_REDIS_SOCKET:-/var/run/redis/trading.sock}"
 SYSTEMD_DIR="${TRADING_SYSTEMD_DIR:-/etc/systemd/system}"
 BACKUP_SCRIPT_DIR="${TRADING_BACKUP_SCRIPT_DIR:-${INSTALL_ROOT}/ops/backup}"
+SERVER_SCRIPT_DIR="${TRADING_SERVER_SCRIPT_DIR:-${INSTALL_ROOT}/ops/server}"
 
 log() {
   printf '[verify] %s\n' "$*"
@@ -199,6 +200,15 @@ check_backup_assets() {
   done
 }
 
+check_server_ops_assets() {
+  log "checking server ops scripts"
+  local script
+  for script in disk_remediation.sh zfs_tuning.sh; do
+    [ -x "${SERVER_SCRIPT_DIR}/${script}" ] || fail "missing executable server ops script ${SERVER_SCRIPT_DIR}/${script}"
+    bash -n "${SERVER_SCRIPT_DIR}/${script}"
+  done
+}
+
 main() {
   check_postgres
   check_redis
@@ -209,6 +219,7 @@ main() {
   check_cpu_power_policy_assets
   check_prod_preflight_runner
   check_backup_assets
+  check_server_ops_assets
   log "all checks passed"
 }
 

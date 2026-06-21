@@ -117,8 +117,9 @@ a maintenance-window migration to a newly created `ashift=12` pool, followed by
 Docker/backups restore evidence, not an in-place repair. The script never
 destroys or recreates the pool.
 
-T1.3c consumes the PGDATA dataset spec through `/home/david/gitsandbox/disk-remediation.sh`
-when it creates `zpool/docker/timescaledb-pgdata`:
+T1.3c consumes the PGDATA dataset spec through the deployed
+`/opt/trading/ops/server/disk_remediation.sh` tool when it creates
+`zpool/docker/timescaledb-pgdata`:
 
 | Property | Value | Reason |
 | --- | --- | --- |
@@ -135,6 +136,41 @@ caching when choosing `TIMESCALE_EFFECTIVE_CACHE_SIZE`. T1.4 caps ARC at
 reserved for ZFS metadata and non-PGDATA datasets instead of becoming a second
 copy of Postgres shared buffers.
 
+
+## Move Backup Root To ZFS
+
+Use the installed remediation tool when `/var/backups/trading` itself still
+lives on root storage:
+
+```bash
+sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-backups
+```
+
+The command stages a `zpool/trading-backups` dataset, copies with
+`rsync -aHAX --numeric-ids --info=progress2`, then normalizes the relocated WAL
+archive target before the dataset is mounted back at `/var/backups/trading`.
+The normalized target is `TS_BACKUP_POSTGRES_UID` (default `70`) and
+`TS_BACKUP_GROUP` (default `trading`) with `2750` on `/var/backups/trading/wal`
+and `.tmp`. This step is required because `rsync --numeric-ids` intentionally
+preserves any pre-existing wrong owner or mode from the source tree.
+
+After relocation, run the evidence gate and inspect the signed target artifact:
+
+```bash
+sudo /opt/trading/ops/backup/backup_restore_evidence.sh
+jq '{status,wal_archive_target,wal_archiver}' \
+  /var/backups/trading/evidence/latest_backup_restore_evidence.json
+```
+
+Run `wal_archive_catchup.sh` only after the target and dataset are healthy and
+the operator has confirmed there is enough backup-dataset headroom for the
+`.ready` backlog:
+
+```bash
+sudo docker exec -u postgres trading-timescaledb \
+  /opt/trading/ops/backup/wal_archive_catchup.sh
+```
+
 ## Move Existing Docker State To ZFS
 
 Use this sequence for a live host that still has named Docker volumes on root
@@ -143,14 +179,14 @@ ext4. Do not prune or delete Docker volumes until the restore drill has passed.
 ### Preferred: relocate Docker data-root
 
 For host `bart`, where the live `compose_timescaledb-data` volume still resides
-under `/var/lib/docker` on the root ext4 filesystem, use the sibling remediation
-tool. The command moves Docker's whole data-root to the dedicated
+under `/var/lib/docker` on the root ext4 filesystem, use the installed
+remediation tool. The command moves Docker's whole data-root to the dedicated
 `zpool/docker` dataset, creates a tuned child dataset for Timescale PGDATA, and
 keeps a rollback copy before root space is reclaimed.
 
 ```bash
-sudo bash /home/david/gitsandbox/disk-remediation.sh relocate-docker --dry-run
-sudo bash /home/david/gitsandbox/disk-remediation.sh relocate-docker
+sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker --dry-run
+sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker
 ```
 
 The command enforces these gates in production code:
@@ -183,7 +219,7 @@ The command enforces these gates in production code:
 Rollback is guarded by the state directory written during relocation:
 
 ```bash
-sudo bash /home/david/gitsandbox/disk-remediation.sh relocate-docker --rollback
+sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker --rollback
 ```
 
 Rollback stops the stack and Docker, restores the archived Docker tree to the

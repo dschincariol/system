@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-REMEDIATION_SCRIPT="$(cd "${REPO_ROOT}/../.." && pwd)/disk-remediation.sh"
+REMEDIATION_SCRIPT="${REPO_ROOT}/ops/server/disk_remediation.sh"
 
 bash -n "$REMEDIATION_SCRIPT"
 
@@ -84,5 +84,55 @@ require_output "sudo rm -rf '/zpool/docker-rollback/var-lib-docker."
 grep -Fq 'relocate-docker)   cmd_relocate_docker "$@" ;;' "$REMEDIATION_SCRIPT"
 grep -Fq 'write_docker_daemon_json "$DOCKER_DATA_ROOT" 0' "$REMEDIATION_SCRIPT"
 grep -Fq 'write_docker_daemon_json "" 1' "$REMEDIATION_SCRIPT"
+grep -Fq 'run_cmd cp -a "$DOCKER_RELOCATION_STATE_DIR/daemon.json.before" "$DOCKER_DAEMON_JSON"' "$REMEDIATION_SCRIPT"
+grep -Fq 'run_cmd rm -f "$DOCKER_DAEMON_JSON"' "$REMEDIATION_SCRIPT"
+grep -Fq 'BACKUP_POSTGRES_UID="${TS_BACKUP_POSTGRES_UID:-70}"' "$REMEDIATION_SCRIPT"
+grep -Fq 'normalize_backup_wal_target_permissions "$stage"' "$REMEDIATION_SCRIPT"
+grep -Fq 'chown "${BACKUP_POSTGRES_UID}:${BACKUP_GROUP}" "$root" "$wal" "$tmp"' "$REMEDIATION_SCRIPT"
+grep -Fq 'chmod 2750 "$root" "$wal" "$tmp"' "$REMEDIATION_SCRIPT"
+
+python3 - "$REMEDIATION_SCRIPT" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+old_path = "/home/david/gitsandbox" + "/disk" + "-remediation.sh"
+if old_path in text:
+    raise SystemExit("old machine-specific disk remediation path remains in script")
+
+cmd = text[text.index("cmd_relocate_docker()"): text.index("cmd_install_monitor()")]
+for needle in (
+    'if [ "$source_root" = "$DOCKER_DATA_ROOT" ]; then',
+    'echo "Docker already uses $DOCKER_DATA_ROOT; running verification only."',
+    "verify_docker_root",
+    "verify_timescale_pgdata_on_zfs",
+    "verify_compose_health",
+    "return 0",
+):
+    if needle not in cmd:
+        raise SystemExit(f"relocate-docker idempotency guard missing {needle!r}")
+
+if cmd.index('assert_pool_space "$source_bytes"') > cmd.index("stop_compose_and_docker"):
+    raise SystemExit("space gate must run before stopping Docker")
+if cmd.index('verify_copy_size "$source_root" "$source_bytes"') > cmd.index('write_docker_daemon_json "$DOCKER_DATA_ROOT" 0'):
+    raise SystemExit("copy-size verification must precede daemon.json switch")
+if cmd.index("verify_timescale_pgdata_on_zfs") > cmd.index('archive_old_docker_root "$source_root" "$rollback_source" "$source_bytes"'):
+    raise SystemExit("runtime verification must precede old-root archive/removal")
+
+archive = text[text.index("archive_old_docker_root()"): text.index("assert_root_free_increased()")]
+real_archive = archive[archive.index('  mkdir -p "$rollback_source"'):]
+if real_archive.index('[ "$archive_bytes" -ge "$min_bytes" ]') > real_archive.index('rm -rf "$source_root"'):
+    raise SystemExit("rollback archive >=99% assertion must precede rm -rf")
+
+rollback = text[text.index("rollback_relocate_docker()"): text.index("cmd_relocate_docker()")]
+for needle in (
+    'load_relocation_state',
+    'run_cmd cp -a "$DOCKER_RELOCATION_STATE_DIR/daemon.json.before" "$DOCKER_DAEMON_JSON"',
+    'run_cmd rm -f "$DOCKER_DAEMON_JSON"',
+    "verify_compose_health",
+):
+    if needle not in rollback:
+        raise SystemExit(f"rollback guard missing {needle!r}")
+PY
 
 echo "[test_disk_remediation_relocate_docker] ok"
