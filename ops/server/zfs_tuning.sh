@@ -47,6 +47,10 @@ Defaults:
   TRADING_ZFS_PGDATA_PRIMARYCACHE=metadata
   TRADING_ZFS_EXPECT_ASHIFT=12
 
+TRADING_ZFS_DATA_COMPRESSION is enforced on every existing dataset under the
+pool; the dedicated PGDATA dataset uses TRADING_ZFS_PGDATA_COMPRESSION, which
+defaults to the same lz4 policy.
+
 The apply action is idempotent and captures before/after zpool, zfs, and zdb
 state under TRADING_ZFS_CAPTURE_DIR. It never destroys or recreates a pool.
 EOF
@@ -148,6 +152,24 @@ ensure_poolwide_atime_off() {
   done < <(zfs list -H -r -o name "$POOL")
 }
 
+expected_compression_for_dataset() {
+  local dataset="$1"
+  if [ "$dataset" = "$PGDATA_DATASET" ]; then
+    printf '%s\n' "$PGDATA_COMPRESSION"
+  else
+    printf '%s\n' "$DATA_COMPRESSION"
+  fi
+}
+
+ensure_poolwide_compression() {
+  local dataset expected
+  while IFS= read -r dataset; do
+    [ -n "$dataset" ] || continue
+    expected="$(expected_compression_for_dataset "$dataset")"
+    ensure_zfs_prop "$dataset" compression "$expected"
+  done < <(zfs list -H -r -o name "$POOL")
+}
+
 apply_pgdata_spec_if_present() {
   if ! zfs_dataset_exists "$PGDATA_DATASET"; then
     log "PGDATA dataset ${PGDATA_DATASET} is not present yet; T1.3c must create it with:"
@@ -169,7 +191,7 @@ cmd_apply() {
   ensure_zpool_prop autotrim on
   ensure_poolwide_atime_off
   zfs_dataset_exists "$DATA_DATASET" || die "missing data dataset: ${DATA_DATASET}"
-  ensure_zfs_prop "$DATA_DATASET" compression "$DATA_COMPRESSION"
+  ensure_poolwide_compression
   apply_pgdata_spec_if_present
 
   capture_state after
@@ -225,6 +247,17 @@ verify_poolwide_atime_off() {
   log "verified atime=off on all existing ${POOL} datasets"
 }
 
+verify_poolwide_compression() {
+  local dataset current expected
+  while IFS= read -r dataset; do
+    [ -n "$dataset" ] || continue
+    expected="$(expected_compression_for_dataset "$dataset")"
+    current="$(zfs_prop_value "$dataset" compression)"
+    [ "$current" = "$expected" ] || die "${dataset} compression=${current}, expected ${expected}"
+  done < <(zfs list -H -r -o name "$POOL")
+  log "verified compression policy on all existing ${POOL} datasets"
+}
+
 verify_pgdata_spec() {
   if ! zfs_dataset_exists "$PGDATA_DATASET"; then
     if [ "$PGDATA_REQUIRED" = "0" ]; then
@@ -248,7 +281,7 @@ cmd_verify() {
   assert_zpool_prop autotrim on
   verify_poolwide_atime_off
   zfs_dataset_exists "$DATA_DATASET" || die "missing data dataset: ${DATA_DATASET}"
-  assert_zfs_prop "$DATA_DATASET" compression "$DATA_COMPRESSION"
+  verify_poolwide_compression
   verify_pgdata_spec
   log "ZFS tuning verified"
 }

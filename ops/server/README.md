@@ -71,11 +71,11 @@ sudo bash ops/server/zfs_tuning.sh apply
 bash ops/server/zfs_tuning.sh verify
 ```
 
-The script enables pool autotrim, disables dataset atime, changes `zpool/data`
-compression to `lz4`, verifies actual on-disk ashift with `zdb`, and asserts
-the dedicated Timescale PGDATA dataset properties consumed by the T1.3c
-relocation script. It records before/after captures and refuses to suggest an
-in-place ashift repair. See
+The script enables pool autotrim, disables dataset atime, enforces
+`compression=lz4` on every existing dataset under the pool, verifies actual
+on-disk ashift with `zdb`, and asserts the dedicated Timescale PGDATA dataset
+properties consumed by the T1.3c relocation script. It records before/after
+captures and refuses to suggest an in-place ashift repair. See
 [DISK_RETENTION_RUNBOOK.md](../../docs/DISK_RETENTION_RUNBOOK.md).
 
 ## Disk Remediation

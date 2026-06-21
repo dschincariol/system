@@ -58,10 +58,11 @@ target_value() {
   case "$prop" in
     atime) printf 'off\n' ;;
     compression)
-      case "$dataset" in
-        zpool/data|zpool/docker/timescaledb-pgdata) printf 'lz4\n' ;;
-        *) printf 'zstd\n' ;;
-      esac
+      if [ "${FAKE_ZFS_BAD_CHILD_COMPRESSION:-0}" = "1" ] && [ "$dataset" = "zpool/docker" ]; then
+        printf 'zstd\n'
+      else
+        printf 'lz4\n'
+      fi
       ;;
     recordsize)
       [ "$dataset" = "zpool/docker/timescaledb-pgdata" ] && printf '16K\n' || printf '128K\n'
@@ -167,7 +168,9 @@ grep -Fq "setting zpool autotrim: off -> on" <<<"$apply_output"
 grep -Fq "setting zpool/docker/timescaledb-pgdata primarycache: all -> metadata" <<<"$apply_output"
 grep -Fq "zpool set autotrim=on zpool" "$fake_log"
 grep -Fq "zfs set atime=off zpool" "$fake_log"
-grep -Fq "zfs set compression=lz4 zpool/data" "$fake_log"
+grep -Fxq "zfs set compression=lz4 zpool" "$fake_log"
+grep -Fxq "zfs set compression=lz4 zpool/data" "$fake_log"
+grep -Fxq "zfs set compression=lz4 zpool/docker" "$fake_log"
 grep -Fq "zfs set recordsize=16K zpool/docker/timescaledb-pgdata" "$fake_log"
 grep -Fq "zfs set logbias=throughput zpool/docker/timescaledb-pgdata" "$fake_log"
 grep -Fq "zfs set compression=lz4 zpool/docker/timescaledb-pgdata" "$fake_log"
@@ -177,7 +180,21 @@ verify_output="$(
   env "${run_env[@]}" FAKE_ZFS_MODE=target FAKE_ZPOOL_AUTOTRIM=on bash "$SCRIPT" verify
 )"
 grep -Fq "actual zpool on-disk ashift=12" <<<"$verify_output"
+grep -Fq "verified compression policy on all existing zpool datasets" <<<"$verify_output"
 grep -Fq "ZFS tuning verified" <<<"$verify_output"
+
+set +e
+compression_output="$(
+  env "${run_env[@]}" FAKE_ZFS_MODE=target FAKE_ZPOOL_AUTOTRIM=on FAKE_ZFS_BAD_CHILD_COMPRESSION=1 bash "$SCRIPT" verify 2>&1
+)"
+compression_rc=$?
+set -e
+
+[ "$compression_rc" -ne 0 ] || {
+  echo "child dataset compression mismatch verification unexpectedly passed" >&2
+  exit 1
+}
+grep -Fq "zpool/docker compression=zstd, expected lz4" <<<"$compression_output"
 
 set +e
 ashift_output="$(

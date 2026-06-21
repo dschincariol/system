@@ -105,8 +105,9 @@ The apply action enforces the pool and general dataset policy:
 - `zpool set autotrim=on zpool` for the NVMe-backed pool.
 - `atime=off` on every existing dataset under `zpool`, with the root dataset
   set so future children inherit the policy unless deliberately overridden.
-- `compression=lz4` on `zpool/data`, replacing the old `gzip-4` default with a
-  low-CPU compression policy.
+- `compression=lz4` on every existing dataset under `zpool`, replacing the old
+  `gzip-4` data default and catching child datasets that drift to a higher-CPU
+  compression policy.
 - If the dedicated PGDATA dataset already exists, the same PGDATA properties
   listed below are applied in place.
 
@@ -115,7 +116,9 @@ because `zpool get ashift` can report default `0`. It fails unless every vdev
 reports `ashift=12`; ashift is immutable on existing vdevs, so a mismatch means
 a maintenance-window migration to a newly created `ashift=12` pool, followed by
 Docker/backups restore evidence, not an in-place repair. The script never
-destroys or recreates the pool.
+destroys or recreates the pool. It also walks every existing dataset under
+`zpool` and fails if any child has `atime` or `compression` outside the T2.5
+policy.
 
 T1.3c consumes the PGDATA dataset spec through the deployed
 `/opt/trading/ops/server/disk_remediation.sh` tool when it creates
