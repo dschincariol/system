@@ -8,6 +8,17 @@
 
 import { renderChartAccessibility } from "./chart_a11y.js";
 import { applyInlineMetricAnnotation, setMetricValueAttribute } from "./tooltip.js";
+import {
+  MARKET_STRESS_THRESHOLDS,
+  classifyMarketStressScore,
+  normalizeMarketStressThresholds,
+} from "./market_stress_thresholds.js";
+
+export {
+  MARKET_STRESS_THRESHOLDS,
+  classifyMarketStressScore,
+  normalizeMarketStressThresholds,
+} from "./market_stress_thresholds.js";
 
 export function syncMarketStressSparklineSize(canvas) {
   if (!canvas) return { width: 900, height: 48, ratio: 1 };
@@ -48,6 +59,233 @@ function stressBody(payload) {
   return asObject(root.stress && typeof root.stress === "object" ? root.stress : root);
 }
 
+const SPARKLINE_PADDING = Object.freeze({ top: 4, right: 2, bottom: 4, left: 2 });
+const SPARKLINE_BANDS = Object.freeze({
+  normal: "rgba(46, 160, 67, 0.10)",
+  warning: "rgba(210, 153, 34, 0.13)",
+  critical: "rgba(248, 81, 73, 0.13)",
+});
+const SPARKLINE_LINES = Object.freeze({
+  warning: "rgba(210, 153, 34, 0.92)",
+  critical: "rgba(248, 81, 73, 0.95)",
+  series: "rgba(240, 246, 252, 0.95)",
+});
+
+function niceStressMax(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v) || v <= 1) return 1;
+  const padded = v * 1.08;
+  if (padded <= 1.25) return 1.25;
+  if (padded <= 1.5) return 1.5;
+  if (padded <= 2) return 2;
+  if (padded <= 3) return Math.ceil(padded * 4) / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(padded));
+  return Math.ceil((padded / magnitude) * 4) * magnitude / 4;
+}
+
+function buildBandRect({ key, label, startValue, endValue, yFor, width }) {
+  const yStart = yFor(startValue);
+  const yEnd = yFor(endValue);
+  const y = Math.min(yStart, yEnd);
+  return {
+    key,
+    label,
+    startValue,
+    endValue,
+    x: 0,
+    y,
+    width,
+    height: Math.max(0, Math.abs(yStart - yEnd)),
+    fillStyle: SPARKLINE_BANDS[key] || "rgba(139, 148, 158, 0.10)",
+  };
+}
+
+export function buildMarketStressSparklineModel(series = [], size = {}, thresholdSource = {}) {
+  const thresholds = normalizeMarketStressThresholds(thresholdSource);
+  const width = Math.max(1, Number(size.width) || 900);
+  const height = Math.max(1, Number(size.height) || 48);
+  const padding = {
+    ...SPARKLINE_PADDING,
+    ...(asObject(size.padding)),
+  };
+  const plot = {
+    left: Math.max(0, Number(padding.left) || 0),
+    right: Math.max(0, Number(padding.right) || 0),
+    top: Math.max(0, Number(padding.top) || 0),
+    bottom: Math.max(0, Number(padding.bottom) || 0),
+  };
+  plot.width = Math.max(1, width - plot.left - plot.right);
+  plot.height = Math.max(1, height - plot.top - plot.bottom);
+
+  const rows = (Array.isArray(series) ? series : [])
+    .map((point, index) => ({
+      index,
+      time: point && (point.time ?? point.ts_ms ?? point.t ?? index + 1),
+      value: Number(point && point.value),
+      raw: point,
+    }))
+    .filter((point) => Number.isFinite(point.value));
+  const values = rows.map((point) => point.value);
+  const observedMin = values.length ? Math.min(...values) : 0;
+  const observedMax = values.length ? Math.max(...values) : 0;
+  const domainMin = Math.min(0, observedMin);
+  const domainMax = Math.max(
+    niceStressMax(Math.max(1, thresholds.critical, thresholds.warning, observedMax)),
+    domainMin + 1e-6,
+  );
+  const domainSpan = Math.max(1e-6, domainMax - domainMin);
+  const yFor = (value) => plot.top + ((domainMax - Number(value)) / domainSpan) * plot.height;
+  const xFor = (index) => (
+    rows.length <= 1
+      ? plot.left + (plot.width / 2)
+      : plot.left + (index / (rows.length - 1)) * plot.width
+  );
+  const clampDomain = (value) => Math.max(domainMin, Math.min(domainMax, Number(value)));
+
+  const bands = [
+    buildBandRect({
+      key: "critical",
+      label: "High stress",
+      startValue: clampDomain(thresholds.critical),
+      endValue: domainMax,
+      yFor,
+      width,
+    }),
+    buildBandRect({
+      key: "warning",
+      label: "Elevated stress",
+      startValue: clampDomain(thresholds.warning),
+      endValue: clampDomain(thresholds.critical),
+      yFor,
+      width,
+    }),
+    buildBandRect({
+      key: "normal",
+      label: "Normal",
+      startValue: domainMin,
+      endValue: clampDomain(thresholds.warning),
+      yFor,
+      width,
+    }),
+  ].filter((band) => band.height > 0);
+  const thresholdLines = [
+    {
+      key: "warning",
+      label: "Warning",
+      value: thresholds.warning,
+      y: yFor(thresholds.warning),
+      strokeStyle: SPARKLINE_LINES.warning,
+    },
+    {
+      key: "critical",
+      label: "Critical",
+      value: thresholds.critical,
+      y: yFor(thresholds.critical),
+      strokeStyle: SPARKLINE_LINES.critical,
+    },
+  ].filter((line) => line.y >= 0 && line.y <= height);
+  const points = rows.map((point, index) => {
+    const classification = classifyMarketStressScore(point.value, thresholds);
+    return {
+      ...point,
+      x: xFor(index),
+      y: yFor(point.value),
+      band: classification.state,
+      bandLabel: classification.label,
+    };
+  });
+
+  return {
+    width,
+    height,
+    plot,
+    domainMin,
+    domainMax,
+    observedMin,
+    observedMax,
+    thresholds,
+    bands,
+    thresholdLines,
+    points,
+    hasData: points.length >= 2,
+  };
+}
+
+export function clearMarketStressSparklineMetadata(canvas) {
+  if (!canvas || typeof canvas.removeAttribute !== "function") return;
+  [
+    "data-stress-scale-min",
+    "data-stress-scale-max",
+    "data-stress-observed-max",
+    "data-stress-threshold-warning",
+    "data-stress-threshold-critical",
+    "data-stress-thresholds",
+  ].forEach((name) => canvas.removeAttribute(name));
+}
+
+export function applyMarketStressSparklineMetadata(canvas, model) {
+  if (!canvas || !model || typeof canvas.setAttribute !== "function") return;
+  canvas.setAttribute("data-stress-scale-min", model.domainMin.toFixed(3));
+  canvas.setAttribute("data-stress-scale-max", model.domainMax.toFixed(3));
+  canvas.setAttribute("data-stress-observed-max", model.observedMax.toFixed(3));
+  canvas.setAttribute("data-stress-threshold-warning", model.thresholds.warning.toFixed(3));
+  canvas.setAttribute("data-stress-threshold-critical", model.thresholds.critical.toFixed(3));
+  canvas.setAttribute("data-stress-thresholds", JSON.stringify(model.thresholds));
+}
+
+export function marketStressSparklineSummary(model) {
+  if (!model || !Array.isArray(model.points) || !model.points.length) {
+    return "Market stress history: no numeric stress history is available.";
+  }
+  const first = model.points[0].value;
+  const last = model.points[model.points.length - 1].value;
+  const delta = last - first;
+  const movement = Math.abs(delta) <= 1e-12
+    ? "flat versus the first point"
+    : `${delta > 0 ? "up" : "down"} ${Math.abs(delta).toFixed(3)} versus the first point`;
+  return (
+    `Market stress history: latest stress score ${last.toFixed(3)}; ${movement}; ` +
+    `range ${model.observedMin.toFixed(3)} to ${model.observedMax.toFixed(3)}; ` +
+    `warning line ${model.thresholds.warning.toFixed(3)}, critical line ${model.thresholds.critical.toFixed(3)}; ` +
+    `chart scale ${model.domainMin.toFixed(3)} to ${model.domainMax.toFixed(3)}.`
+  );
+}
+
+export function drawMarketStressSparkline(ctx, model) {
+  if (!ctx || !model) return;
+  const { width, height, bands, thresholdLines, points } = model;
+  ctx.clearRect(0, 0, width, height);
+
+  if (typeof ctx.save === "function") ctx.save();
+  for (const band of bands) {
+    ctx.fillStyle = band.fillStyle;
+    ctx.fillRect(band.x, band.y, band.width, band.height);
+  }
+
+  for (const line of thresholdLines) {
+    ctx.beginPath();
+    if (typeof ctx.setLineDash === "function") ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = line.strokeStyle;
+    ctx.moveTo(0, line.y);
+    ctx.lineTo(width, line.y);
+    ctx.stroke();
+  }
+  if (typeof ctx.setLineDash === "function") ctx.setLineDash([]);
+
+  if (points.length >= 2) {
+    ctx.beginPath();
+    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = SPARKLINE_LINES.series;
+    points.forEach((point, index) => {
+      if (index === 0) ctx.moveTo(point.x, point.y);
+      else ctx.lineTo(point.x, point.y);
+    });
+    ctx.stroke();
+  }
+  if (typeof ctx.restore === "function") ctx.restore();
+}
+
 export function buildMarketStressComponentRows(payload = {}) {
   const s = stressBody(payload);
   return [
@@ -66,6 +304,7 @@ export function buildMarketStressComponentRows(payload = {}) {
 export function buildMarketStressTopDriver(payload = {}) {
   const s = stressBody(payload);
   const score = numOrNull(s.stress_score);
+  const thresholds = normalizeMarketStressThresholds(payload && payload.thresholds);
   const scoredRows = buildMarketStressComponentRows(s)
     .map((row) => ({
       ...row,
@@ -74,9 +313,7 @@ export function buildMarketStressTopDriver(payload = {}) {
     .filter((row) => row.zNumber !== null);
   scoredRows.sort((a, b) => Math.abs(b.zNumber) - Math.abs(a.zNumber));
   const driver = scoredRows[0] || null;
-  const tone = score === null
-    ? "unavailable"
-    : (score >= 0.75 ? "crit" : score >= 0.55 ? "warn" : "ok");
+  const tone = classifyMarketStressScore(score, thresholds).tone;
   const scoreText = score === null ? "Stress unavailable" : `Stress ${score.toFixed(2)}`;
 
   if (!driver) {
@@ -186,12 +423,11 @@ export async function loadMarketStress(fetchJSON) {
     window.__LAST_MARKET_STRESS__ = j;
 
     const s = j.stress || {};
+    const thresholds = normalizeMarketStressThresholds(j.thresholds || s.thresholds);
     const score = Number(s.stress_score ?? 0);
     const ts_ms = Number(s.ts_ms ?? 0);
 
-    let cls = "pill ok";
-    if (score >= 0.75) cls = "pill bad";
-    else if (score >= 0.55) cls = "pill warn";
+    const cls = classifyMarketStressScore(score, thresholds).pillClass;
 
     badge.className = cls;
     badge.textContent = Number.isFinite(score) ? score.toFixed(3) : "—";
@@ -332,6 +568,7 @@ export async function loadMarketStressHistory(fetchJSON) {
 
     ctx.clearRect(0, 0, w, h);
     if (!j || !j.ok || !Array.isArray(j.series)) {
+      clearMarketStressSparklineMetadata(canvas);
       renderChartAccessibility(canvas, {
         title: "Market stress history",
         series: [],
@@ -352,6 +589,7 @@ export async function loadMarketStressHistory(fetchJSON) {
       .filter((p) => Number.isFinite(p.value));
     const ys = series.map((p) => p.value);
     if (ys.length < 2) {
+      clearMarketStressSparklineMetadata(canvas);
       renderChartAccessibility(canvas, {
         title: "Market stress history",
         series,
@@ -363,21 +601,10 @@ export async function loadMarketStressHistory(fetchJSON) {
       return;
     }
 
-    const min = 0;
-    const max = 1;
-
-    ctx.beginPath();
-    ctx.strokeStyle = "#aaa";
-
-    ys.forEach((v, i) => {
-      const x = (i / (ys.length - 1)) * w;
-      const y = h - ((v - min) / (max - min)) * h;
-
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-
-    ctx.stroke();
+    const thresholds = normalizeMarketStressThresholds(j.thresholds || j.market_stress_thresholds);
+    const model = buildMarketStressSparklineModel(series, { width: w, height: h }, thresholds);
+    drawMarketStressSparkline(ctx, model);
+    applyMarketStressSparklineMetadata(canvas, model);
 
     renderChartAccessibility(canvas, {
       title: "Market stress history",
@@ -386,6 +613,12 @@ export async function loadMarketStressHistory(fetchJSON) {
       timeKey: "time",
       valueLabel: "stress score",
       valueFormatter: (v) => Number(v).toFixed(3),
+      summary: marketStressSparklineSummary(model),
+      columns: [
+        { label: "Point", value: (row) => row.timeText || row.index },
+        { label: "Stress score", value: (row) => Number(row.value).toFixed(3) },
+        { label: "Band", value: (row) => classifyMarketStressScore(row.value, thresholds).label },
+      ],
       chartType: "canvas-sparkline",
     });
 
@@ -395,6 +628,7 @@ export async function loadMarketStressHistory(fetchJSON) {
       ctx.setTransform(size.ratio, 0, 0, size.ratio, 0, 0);
     }
     ctx.clearRect(0, 0, size.width, size.height);
+    clearMarketStressSparklineMetadata(canvas);
     renderChartAccessibility(canvas, {
       title: "Market stress history",
       series: [],

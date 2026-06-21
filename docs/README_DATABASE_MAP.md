@@ -6,6 +6,8 @@ Last verified against code: 2026-06-17
 
 It is not meant to replace the schema in `engine/runtime/storage.py` or `engine/runtime/storage_pg.py`. It is meant to make the schema understandable.
 
+Canonical: [Database_Schema.md](Database_Schema.md) is the authoritative, complete table register (kept in lockstep with `engine/runtime/schema/table_classification.py`). This map is a curated data-flow subset, not a complete register, and does not re-list every table.
+
 If you want the short version:
 
 - the database is the shared memory of the system
@@ -48,7 +50,7 @@ Cold boot and migration ownership:
 
 Test storage requirements:
 
-- pytest/unittest defaults set `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temp `DB_PATH`
+- pytest defaults set `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temp `DB_PATH`
 - tests that intentionally exercise real Postgres should use the `requires_postgres` marker and a reachable `TS_PG_DSN`
 - SQLite-specific tests are compatibility and contention-regression tests, not proof that production storage is available
 
@@ -197,8 +199,8 @@ These tables answer:
 | Table | Role |
 | --- | --- |
 | `model_registry` | canonical registry of models |
-| `champion_assignments` | active champion selections |
-| `model_marketplace_scores` | model ranking or marketplace-style scoring |
+| `champion_assignments` | active champion selections; production writes are owned by `engine.strategy.model_competition.repository` |
+| `model_marketplace_scores` | model ranking or marketplace-style scoring; production writes are owned by `engine.strategy.model_competition.repository` |
 | `model_competition_rankings` | realized competition rankings; candidates without net-after-cost label evidence are excluded |
 | `model_promotion_audit` | promotion and rollback-style audit trail |
 | `model_promotion_cooldown` | cooldown gates after promotion activity |

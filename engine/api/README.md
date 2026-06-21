@@ -11,13 +11,20 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
 - [http_parsing.py](http_parsing.py)
   Parsing and normalization helpers.
 - [api_system.py](api_system.py)
-  System-level dashboard and runtime endpoints.
+  Read-only system, health, readiness, telemetry, and runtime diagnostic endpoints.
+- [system/](system/)
+  Extracted helper package for `api_system.py` route metadata, shared response
+  helpers, and readiness contract metadata.
+- [api_self_repair.py](api_self_repair.py)
+  Mutating self-repair and schema-repair endpoints.
 - [api_operator_handlers.py](api_operator_handlers.py)
   Operator-facing status and control handlers.
 - [api_jobs.py](api_jobs.py)
   Job catalog, status, history, and job-control endpoints.
 - [api_read.py](api_read.py)
   Core read APIs.
+- [api_read_advanced.py](api_read_advanced.py)
+  Large advanced read-only data surface (model diagnostics, temporal eval, portfolio backtest/snapshot, rolling/by-symbol/by-confidence execution metrics, social features/regimes/blocks, validation rows, shadow-capital scoring, size policy, recent decisions, and decision-detail drilldowns). It is not a route module: it has no `ROUTE_SPECS` and no `api_*` handlers, instead exporting 18 public `get_*`/`run_*` accessors (plus internal `_` helpers) that are lazily imported by the thin route handlers in [api_ops_handlers.py](api_ops_handlers.py) and the dashboard aggregator [api_dashboard_reads.py](api_dashboard_reads.py).
 - [api_write.py](api_write.py)
   Mutating APIs, including alert acknowledgement, shelving, resolution, job-history writes, and promotion guard toggles.
 - [api_dashboard_reads.py](api_dashboard_reads.py)
@@ -34,6 +41,12 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
   Route metadata for ops, diagnostics, execution analytics, and governance read surfaces.
 - [api_ops_handlers.py](api_ops_handlers.py)
   Thin handler implementations for the ops route set.
+- [api_handlers.py](api_handlers.py)
+  Legacy compatibility bridge exporting the `api_get_kill_switches`, `api_get_job_log`, and `api_get_job_history` handlers that `dashboard_server.py` imports best-effort; it normalizes kill-switch snapshots and applies log level/query/limit filters without routing back through the status handlers.
+- [api_ui_metrics.py](api_ui_metrics.py)
+  Canonical UI-metrics adapter that registers `/api/ui/metrics` (`ROUTE_SPECS_UI_METRICS`) and provides `build_ui_metrics_snapshot`, which normalizes existing read-only PnL, PnL-summary, broker/account, positions, risk-summary, portfolio-risk, and terminal-positions payloads into one stable shape for top-level UI cards. It adds no new broker/account semantics; the `api_get_ui_metrics` route handler lives in `dashboard_server.py` and calls this normalizer.
+- [api_relevance.py](api_relevance.py)
+  Thin pass-through endpoint (`api_get_relevance_stats`) that returns input-relevance statistics from `engine.strategy.relevance`; business logic stays in the strategy layer.
 - [api_governance.py](api_governance.py)
   Governance-specific handlers for promotion status, rollback, calibration, governance summaries, and governance-evidence drilldowns.
 - [governance_evidence.py](governance_evidence.py)
@@ -45,7 +58,7 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
 - [../terminal/api/api_terminal_orders.py](../terminal/api/api_terminal_orders.py)
   Risk-gated terminal order-entry handlers that emit normal portfolio-order intents.
 - [api_system.py](api_system.py)
-  System/operator diagnostics, support snapshots, service status, provider telemetry, watchdogs, and self-repair entrypoints.
+  System/operator diagnostics, support snapshots, service status, provider telemetry, watchdogs, and read-only aggregation surfaces. `api_system.py` remains the compatibility facade; route specs and shared response helpers are delegated to [system/](system/).
 
 ## Terminal Order Contract
 
@@ -54,6 +67,42 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
 Manual quantity orders keep portfolio-weight fields neutral: `from_weight = 0.0`, `to_weight = 0.0`, and `delta_weight = 0.0`. The requested quantity is stored in `explain_json.terminal_order` with `sizing = "quantity"`, positive `qty`, and signed `signed_qty`; `BUY` derives a positive signed quantity and `SELL` derives a negative signed quantity. The execution-intent loader turns that payload into `qty`, `order_sizing = "quantity"`, and `terminal_order = true`, while preserving neutral weights so weight-based consumers do not mistake share quantity for allocation.
 
 Before writing an intent, terminal mutations also enforce fresh price, max quantity, max notional, optional per-symbol caps, and duplicate-recent-order controls. Rejections are persisted to `terminal_intent_rejections` with stable reason codes.
+
+## Market Candle Contract
+
+`GET /api/market/candles` is the canonical live chart history endpoint for dashboard and terminal pro charts. Query parameters are `symbol`, `tf`, `limit`, and `max_points`.
+
+`limit` is normalized to `10..5000` and caps the number of newest candles kept after tick aggregation. The storage read may fetch more raw rows than the final candle count, but bounded SQLite and Timescale quote queries apply their row limit to the newest eligible rows first and then return rows in ascending timestamp order before candle building. This preserves dense-symbol recency without changing the frontend contract.
+
+`max_points` is an optional presentation cap. When supplied, it is normalized to `50..20000`; when omitted, it defaults to the normalized `limit`. If the post-`limit` candle array still exceeds `max_points`, the API downsamples the ascending array and always includes the newest candle. Responses keep `candles` ascending by `ts_ms`; `meta.limit`, `meta.max_points`, `meta.fetch_limit`, and `meta.order` expose the effective bounds and ordering.
+
+The dashboard and terminal pro-chart VWAP overlay is a client-side loaded-window VWAP, not a session VWAP. It accumulates `close * volume` and volume over only the candles currently loaded from this endpoint and subsequent stream updates; the accumulator does not reset at trading-session boundaries. Do not relabel it as session VWAP unless the API contract first carries reliable symbol asset-class, exchange timezone, and session-boundary metadata and the production indicator accumulator resets on those boundaries.
+
+## Replay Day Contract
+
+`GET /api/replay/day` returns a read-only historical day payload for the dashboard Historical Replay panel. Query parameters include `date`, `symbol`, `model_id`/`model`, `tf`, `max_points`, and `event_limit`.
+
+The endpoint prefers persisted `price_bars` rows when that table has `ts_ms`, `symbol`, `o`, `h`, `l`, and `c`, preserving those values as `open`, `high`, `low`, and `close` in the response. If bars are unavailable, it aggregates supported snapshot tables into synthetic OHLCV candles with `_build_candles_from_rows`. Responses keep `candles` ascending by `ts_ms`, mirror them under `streams.candles`, and report the selected source under `meta.sources.price`.
+
+Replay UI consumers must treat candles as OHLC, not close-only line points. Event streams use millisecond timestamps; fills carry their own execution price, while decisions and orders may not, so the browser renderer anchors price-less markers to the nearest replay candle close without mutating the API payload.
+
+Browser consumers also enforce candle geometry defensively: malformed high/low
+values are normalized so the displayed wick always contains open and close.
+Pro-chart candles require an explicit finite positive `t`/`time`; missing,
+zero, negative, or malformed timestamps are dropped instead of being rendered at
+epoch zero.
+
+## News Sentiment Contract
+
+`GET /api/news/sentiment` preserves missing source sentiment as JSON `null`.
+True numeric `0.0` remains a valid neutral sentiment value. The response `meta`
+includes `count`, `valid_sentiment`, `missing_sentiment`, and `ready`; `ready`
+means at least one numeric sentiment point is available for charting.
+
+Dashboard consumers must treat `null` or malformed sentiment values as skipped
+unavailable points, not neutral values. The browser chart is responsible for
+display clamping to the expected `[-1, 1]` sentiment range and for exposing
+clipped/skipped counts in its accessibility summary.
 
 ## Broker Config Contract
 
@@ -73,6 +122,94 @@ The main surfaces are:
 - service-status and trading-readiness summaries
 
 These payloads are consumed by the dashboard, the local operator server, and the bounded operator AI sidecar.
+
+## Self-Repair Contract
+
+Self-repair is mounted from `engine/api/api_self_repair.py`, not from
+`api_system.py`. The canonical route specs are:
+
+- `POST /api/system/self_repair`
+- `POST /api/operator/self_repair`
+- `POST /api/system/repair_schema`
+- `POST /api/repair_schema`
+
+`dashboard_server.py` imports `ROUTE_SPECS_SELF_REPAIR` and validates at import
+time that these routes resolve to `engine.api.api_self_repair`. `api_system.py`
+keeps compatibility exports for direct callers, but its `ROUTE_SPECS_SYSTEM`
+remains read-only for health, state, readiness, telemetry, and diagnostics.
+
+## Alpha Decay Chart Contract
+
+`GET /api/alpha_decay` is owned by `engine/api/api_system.py::api_get_alpha_decay`.
+`dashboard_server.py` only mounts the route from `ROUTE_SPECS_SYSTEM` and validates
+at import time that the registered handler still resolves to the `api_system`
+function. Do not add a dashboard-local handler or fallback route for this path.
+
+The response is consumed by `ui/risk_charts.js` and includes `runtime`,
+`runtime_history`, `strategies`, `strategy_history`, `ready`, and `unavailable`.
+Keep those fields backward-compatible when changing the handler.
+
+The `limit` query parameter caps `runtime_history` globally, but caps
+`strategy_history` per strategy. The strategy history query must use a
+per-strategy window so one strategy with many recent rows cannot starve other
+strategies out of the chart selector. The response also reports
+`strategy_history_limit_per_strategy` for operator/debug visibility.
+
+Chart numeric fields preserve the difference between unavailable values and real
+zeros. `runtime.min_throttle_mult`, `runtime_history[].min_throttle_mult`,
+`strategies[].throttle_mult`, `strategy_history[].throttle_mult`, and chart
+metrics such as `rolling_sharpe` are `null` when the source value is missing and
+`0.0` when the runtime intentionally reported a zero multiplier or zero metric.
+
+## Portfolio Risk UI Contract
+
+`GET /api/risk/portfolio` is owned by
+`engine/api/api_system.py::api_get_portfolio_risk`. The payload includes
+`caps`, `summary`, `info`, and up to 200 `history` rows from
+`portfolio_risk_snapshots`; the API returns those rows newest-first by `ts_ms`.
+
+UI consumers that need the latest snapshot must select the row with the maximum
+numeric `ts_ms` rather than assuming a positional row. This keeps risk headroom
+stable if tests, replay tooling, or compatibility callers pass ascending
+history. The browser bullet-bar thresholds live in
+`ui/bullet_bars.js`: OK is `<0.85` of cap, Watch is `>=0.85` through exactly
+`1.00`, and Over is strictly `>1.00`.
+
+The risk-history chart draws a zero baseline with `yFor(0)` only when zero is
+inside the visible y-domain. A plot midpoint is not a semantic zero reference
+and must not be used for net-exposure crossing charts.
+
+## Portfolio Backtest Chart Contract
+
+`GET /api/portfolio/backtest/latest` and its alias
+`GET /api/backtest/portfolio/latest` return the latest run and ordered
+`run.points`. Point fields `ret`, `equity`, and `drawdown` are nullable chart
+values: missing database values are emitted as JSON `null`, while true `0.0`
+values remain numeric zeros. UI renderers must treat nulls as gaps or unavailable
+states, not as zero-valued observations.
+
+The same payload includes `run.benchmark` for the optional equity overlay. The
+canonical benchmark is `SPY` from the production `prices` table, using
+`COALESCE(price, px)` as the raw price. The API queries benchmark rows between
+the first and last finite portfolio-equity points in the run and emits
+`benchmark.points[].value` normalized so the first valid SPY price equals the
+first finite portfolio equity value. `benchmark.available=false` is an honest
+non-broken state; `unavailable_reason` identifies cases such as a missing
+`prices` table, no SPY rows in the run window, or fewer than two usable prices.
+
+## Model Performance Divergence Contract
+
+`GET /api/model/performance_divergence` is assembled by
+`model_performance_divergence.py` from existing backtest, shadow, live PnL,
+execution, registry, and production-monitoring reads. Each `comparisons[]` row
+must keep stable `key`, `label`, `unit`, `expected`, `shadow`, `realized`,
+`delta`, `status`, and `explanation` fields so the dashboard can rank chartable
+metrics without depending on backend row order.
+
+The browser default chart ranks rows by status severity, displayed absolute
+delta, source freshness, then product importance. Backend changes may add rows
+or reorder `comparisons[]`, but they must not rely on row order to choose the
+operator-facing chart metric.
 
 ## Execution Diagnostics Contract
 

@@ -10,6 +10,7 @@ import { chartVolumeColor } from "./utils.js";
 import {
   applyPriceLinesToSeries,
   createIndicatorState,
+  toDecisionWindowBands,
   toLightweightMarkers,
   updateIndicatorState,
 } from "./decision_overlays.js";
@@ -149,17 +150,30 @@ export function installChartResizeObserver(
   {
     ResizeObserverClass = typeof ResizeObserver !== "undefined" ? ResizeObserver : null,
     propertyName = "_proChartResizeObserver",
+    sizeFallback = {},
   } = {}
 ) {
   if (!containerEl || !chart || !ResizeObserverClass) return null;
+  const fallbackWidth = Number(sizeFallback.width);
+  const fallbackHeight = Number(sizeFallback.height);
 
   const resizeObserver = new ResizeObserverClass(() => {
     const rect = typeof containerEl.getBoundingClientRect === "function"
       ? containerEl.getBoundingClientRect()
       : { width: containerEl.clientWidth || 0, height: containerEl.clientHeight || 0 };
+    const width = (
+      Number(rect.width) ||
+      Number(containerEl.clientWidth) ||
+      (Number.isFinite(fallbackWidth) && fallbackWidth > 0 ? fallbackWidth : 0)
+    );
+    const height = (
+      Number(rect.height) ||
+      Number(containerEl.clientHeight) ||
+      (Number.isFinite(fallbackHeight) && fallbackHeight > 0 ? fallbackHeight : 0)
+    );
     chart.applyOptions({
-      width: Math.max(10, Math.floor(rect.width)),
-      height: Math.max(10, Math.floor(rect.height)),
+      width: Math.max(10, Math.floor(width)),
+      height: Math.max(10, Math.floor(height)),
     });
   });
   resizeObserver.observe(containerEl);
@@ -185,6 +199,7 @@ export function createProChart(
     chartOptions = {},
     resizeObserverOptions = {},
     includeInitialSize = false,
+    initialSizeFallback = {},
   } = {}
 ) {
   if (!containerEl) throw new Error("container_missing");
@@ -192,10 +207,18 @@ export function createProChart(
   if (typeof createChart !== "function") throw new Error("LightweightCharts not available");
 
   containerEl.innerHTML = "";
+  const fallbackWidth = Number(initialSizeFallback.width);
+  const fallbackHeight = Number(initialSizeFallback.height);
   const initialSize = includeInitialSize
     ? {
-        width: Math.max(10, Math.floor(containerEl.clientWidth || 1200)),
-        height: Math.max(10, Math.floor(containerEl.clientHeight || 420)),
+        width: Math.max(10, Math.floor(
+          Number(containerEl.clientWidth) ||
+          (Number.isFinite(fallbackWidth) && fallbackWidth > 0 ? fallbackWidth : 1200)
+        )),
+        height: Math.max(10, Math.floor(
+          Number(containerEl.clientHeight) ||
+          (Number.isFinite(fallbackHeight) && fallbackHeight > 0 ? fallbackHeight : 420)
+        )),
       }
     : {};
   const chart = createChart(containerEl, _mergeOptions(_mergeOptions(BASE_CHART_OPTIONS, initialSize), chartOptions));
@@ -213,6 +236,177 @@ export function clearMarkerLayer(state) {
     state.markerLayer = null;
     state.markerSeries = null;
   }
+}
+
+function _timeCoordinate(timeScale, time) {
+  if (!timeScale) return null;
+  const t = Number(time);
+  if (!Number.isFinite(t)) return null;
+
+  try {
+    if (typeof timeScale.timeToIndex === "function" && typeof timeScale.logicalToCoordinate === "function") {
+      const index = timeScale.timeToIndex(t, true);
+      const coord = Number.isFinite(index) ? timeScale.logicalToCoordinate(index) : null;
+      if (Number.isFinite(coord)) return coord;
+    }
+  } catch {}
+
+  try {
+    if (typeof timeScale.timeToCoordinate === "function") {
+      const coord = timeScale.timeToCoordinate(t);
+      if (Number.isFinite(coord)) return coord;
+    }
+  } catch {}
+
+  return null;
+}
+
+class DecisionWindowBandsRenderer {
+  constructor(source) {
+    this.source = source;
+  }
+
+  draw(target) {
+    const source = this.source || {};
+    const bands = Array.isArray(source.bands) ? source.bands : [];
+    const chart = source.chart;
+    if (!bands.length || !chart || typeof chart.timeScale !== "function") return;
+
+    target.useMediaCoordinateSpace(({ context, mediaSize }) => {
+      const timeScale = chart.timeScale();
+      const width = Math.max(0, Number(mediaSize && mediaSize.width) || 0);
+      const height = Math.max(0, Number(mediaSize && mediaSize.height) || 0);
+      if (!width || !height) return;
+
+      for (const band of bands) {
+        const startX = _timeCoordinate(timeScale, band.startTime);
+        const endX = _timeCoordinate(timeScale, band.endTime);
+        if (!Number.isFinite(startX) && !Number.isFinite(endX)) continue;
+
+        const leftRaw = Number.isFinite(startX) ? startX : 0;
+        const rightRaw = Number.isFinite(endX) ? endX : width;
+        const left = Math.max(0, Math.min(width, Math.min(leftRaw, rightRaw)));
+        const right = Math.max(0, Math.min(width, Math.max(leftRaw, rightRaw)));
+        const bandWidth = Math.max(3, right - left);
+
+        context.save();
+        context.fillStyle = band.fillColor || "rgba(139, 148, 158, 0.13)";
+        context.fillRect(left, 0, bandWidth, height);
+        context.strokeStyle = band.borderColor || "rgba(139, 148, 158, 0.35)";
+        context.lineWidth = 1;
+        context.beginPath();
+        context.moveTo(left + 0.5, 0);
+        context.lineTo(left + 0.5, height);
+        context.moveTo(left + bandWidth - 0.5, 0);
+        context.lineTo(left + bandWidth - 0.5, height);
+        context.stroke();
+        context.restore();
+      }
+    });
+  }
+}
+
+class DecisionWindowBandsPaneView {
+  constructor(primitive) {
+    this.primitive = primitive;
+  }
+
+  renderer() {
+    return new DecisionWindowBandsRenderer(this.primitive._source());
+  }
+
+  zOrder() {
+    return "bottom";
+  }
+}
+
+class DecisionWindowBandsPrimitive {
+  constructor(bands = []) {
+    this._bands = Array.isArray(bands) ? bands : [];
+    this._chart = null;
+    this._requestUpdate = null;
+    this._paneViews = [new DecisionWindowBandsPaneView(this)];
+  }
+
+  attached({ chart, requestUpdate } = {}) {
+    this._chart = chart || null;
+    this._requestUpdate = typeof requestUpdate === "function" ? requestUpdate : null;
+  }
+
+  detached() {
+    this._chart = null;
+    this._requestUpdate = null;
+  }
+
+  paneViews() {
+    return this._paneViews;
+  }
+
+  updateAllViews() {}
+
+  setBands(bands = []) {
+    this._bands = Array.isArray(bands) ? bands : [];
+    try { if (this._requestUpdate) this._requestUpdate(); } catch {}
+  }
+
+  bands() {
+    return this._bands.slice();
+  }
+
+  _source() {
+    return {
+      chart: this._chart,
+      bands: this._bands,
+    };
+  }
+}
+
+export function clearWindowBandsForState(state) {
+  if (!state) return;
+  try {
+    const anchor = state.windowBandSeries;
+    if (anchor && state.windowBandLayer && typeof anchor.detachPrimitive === "function") {
+      anchor.detachPrimitive(state.windowBandLayer);
+    }
+  } catch {}
+  state.windowBandLayer = null;
+  state.windowBandSeries = null;
+}
+
+export function applyWindowBandsToState(
+  state,
+  windows,
+  {
+    anchor = markerAnchorSeries(state),
+    rows = (state && (state.candlesData || state.history)) || [],
+    bandMapper = toDecisionWindowBands,
+  } = {}
+) {
+  if (!state) return [];
+  const bands = bandMapper(windows || [], rows || []);
+
+  if (!bands.length || !anchor || typeof anchor.attachPrimitive !== "function") {
+    clearWindowBandsForState(state);
+    return bands;
+  }
+
+  try {
+    if (!state.windowBandLayer || state.windowBandSeries !== anchor) {
+      clearWindowBandsForState(state);
+      state.windowBandLayer = new DecisionWindowBandsPrimitive(bands);
+      state.windowBandSeries = anchor;
+      anchor.attachPrimitive(state.windowBandLayer);
+      return bands;
+    }
+
+    if (typeof state.windowBandLayer.setBands === "function") {
+      state.windowBandLayer.setBands(bands);
+    }
+  } catch {
+    clearWindowBandsForState(state);
+  }
+
+  return bands;
 }
 
 export function markerAnchorSeries(state) {
@@ -298,14 +492,14 @@ export function safeNumber(value) {
 }
 
 export function normalizeCandle(candle) {
-  const time = Number(candle?.t ?? candle?.time ?? 0);
+  const time = safeNumber(candle?.t ?? candle?.time);
   const open = safeNumber(candle?.o ?? candle?.open ?? candle?.price ?? candle?.last ?? candle?.close);
   const high = safeNumber(candle?.h ?? candle?.high ?? candle?.price ?? candle?.last ?? candle?.close);
   const low = safeNumber(candle?.l ?? candle?.low ?? candle?.price ?? candle?.last ?? candle?.close);
   const close = safeNumber(candle?.c ?? candle?.close ?? candle?.price ?? candle?.last);
   const volume = safeNumber(candle?.v ?? candle?.volume ?? 0) ?? 0;
 
-  if (!Number.isFinite(time) || open === null || high === null || low === null || close === null) {
+  if (time === null || time <= 0 || open === null || high === null || low === null || close === null) {
     return null;
   }
 

@@ -49,7 +49,19 @@ def _clean_text(value: Any) -> str:
 def _secret_text_from_env(*env_names: str) -> str:
     secret_name = ""
     for env_name in env_names:
-        secret_name = _clean_text(os.environ.get(env_name))
+        name = _clean_text(env_name)
+        file_env_names = [name] if name.endswith("_FILE") else []
+        if name.endswith("_SECRET"):
+            file_env_names.append(f"{name.removesuffix('_SECRET')}_FILE")
+        for file_env_name in file_env_names:
+            path = _clean_text(os.environ.get(file_env_name))
+            if path:
+                from engine.runtime.secret_sources import read_secret_text_file
+
+                return read_secret_text_file(path)
+        if name.endswith("_FILE"):
+            continue
+        secret_name = _clean_text(os.environ.get(name))
         if secret_name:
             break
     if not secret_name:
@@ -81,10 +93,10 @@ def _probe_socket(host: str, port: int, *, timeout_s: float) -> tuple[bool, str 
 
 def _probe_postgres(dsn: str, *, timeout_s: float) -> tuple[bool, str | None]:
     try:
-        import psycopg2
+        import psycopg
 
         timeout = max(1, int(float(timeout_s)))
-        con = psycopg2.connect(str(dsn), connect_timeout=timeout)
+        con = psycopg.connect(str(dsn), connect_timeout=timeout)
         try:
             with con.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -107,16 +119,13 @@ def _postgres_probe_dsn(dsn: str) -> str:
     if scheme in _TIMESCALE_SCHEMES and parsed.hostname:
         if parsed.password:
             return raw
-        password = _clean_text(
-            os.environ.get("TIMESCALE_PASSWORD")
-            or os.environ.get("TS_PG_PASSWORD")
-            or os.environ.get("PGPASSWORD")
-        )
-        return _url_with_password(raw, password) if password else raw
+        from engine.runtime.platform import connection_info_with_pg_password
 
-    from engine.runtime.platform import dsn_with_pg_password
+        return connection_info_with_pg_password(raw)
 
-    return dsn_with_pg_password(raw)
+    from engine.runtime.platform import connection_info_with_pg_password
+
+    return connection_info_with_pg_password(raw)
 
 
 def _redis_command(*parts: str) -> bytes:
@@ -437,6 +446,18 @@ def _check_object_storage_service(*, required: bool, timeout_s: float) -> dict[s
         or os.environ.get("MINIO_ACCESS_KEY")
         or os.environ.get("AWS_ACCESS_KEY_ID")
     )
+    if not access_key:
+        try:
+            access_key = _secret_text_from_env(
+                "OBJECT_STORE_ACCESS_KEY_FILE",
+                "MINIO_ACCESS_KEY_FILE",
+                "AWS_ACCESS_KEY_ID_FILE",
+                "OBJECT_STORE_ACCESS_KEY_SECRET",
+                "MINIO_ACCESS_KEY_SECRET",
+                "AWS_ACCESS_KEY_ID_SECRET",
+            )
+        except Exception:
+            access_key = ""
     dataset_prefix = _clean_text(os.environ.get("TRAINING_DATASET_URI_PREFIX"))
     object_scheme = _object_scheme(dataset_prefix)
     active = required or object_scheme in OBJECT_STORAGE_SCHEMES
@@ -451,6 +472,9 @@ def _check_object_storage_service(*, required: bool, timeout_s: float) -> dict[s
     if not secret_key:
         try:
             secret_key = _secret_text_from_env(
+                "OBJECT_STORE_SECRET_KEY_FILE",
+                "MINIO_SECRET_KEY_FILE",
+                "AWS_SECRET_ACCESS_KEY_FILE",
                 "OBJECT_STORE_SECRET_KEY_SECRET",
                 "MINIO_SECRET_KEY_SECRET",
                 "AWS_SECRET_ACCESS_KEY_SECRET",

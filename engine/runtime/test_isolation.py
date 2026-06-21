@@ -45,6 +45,8 @@ _SCRUB_ENV_NAMES = {
     "ASYNC_PRICE_WRITER_ENABLED",
     "CREDENTIALS_DIRECTORY",
     "DASHBOARD_API_TOKEN",
+    "DASHBOARD_API_TOKEN_FILE",
+    "DASHBOARD_API_TOKEN_SECRET",
     "DATA_SOURCE_MASTER_KEY",
     "DATA_SOURCE_MASTER_KEY_FILE",
     "DISABLE_LIVE_EXECUTION",
@@ -108,6 +110,7 @@ _SCRUB_ENV_PREFIXES = (
     "FINNHUB_",
     "FRED_",
     "GOOGLE_API_",
+    "HTTP_PROXY",
     "IBKR_",
     "KILL_SWITCH",
     "NEWSAPI_",
@@ -119,6 +122,12 @@ _SCRUB_ENV_PREFIXES = (
     "TWITTER_",
     "X_API_",
 )
+_SCRUB_ENV_EXACT_LOWER = {
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+}
 
 
 def running_python_tests() -> bool:
@@ -154,7 +163,11 @@ def _write_default_test_secrets(root: Path) -> Path:
 
 def _should_scrub_env_key(key: str) -> bool:
     key_s = str(key or "").strip()
-    return bool(key_s in _SCRUB_ENV_NAMES or any(key_s.startswith(prefix) for prefix in _SCRUB_ENV_PREFIXES))
+    return bool(
+        key_s in _SCRUB_ENV_NAMES
+        or key_s.lower() in _SCRUB_ENV_EXACT_LOWER
+        or any(key_s.startswith(prefix) for prefix in _SCRUB_ENV_PREFIXES)
+    )
 
 
 def _env_truthy(value: str | None) -> bool:

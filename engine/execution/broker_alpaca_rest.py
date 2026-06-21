@@ -27,12 +27,14 @@ Limit microstructure knobs:
 import json
 import logging
 import os
+import hashlib
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from engine.data._credentials import get_data_credential
 from engine.execution.broker_failover_policy import terminal_broker_failure
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
@@ -122,6 +124,7 @@ EXEC_SYMBOL_CONCENTRATION_CAP = float(
         os.environ.get("PORTFOLIO_RISK_MAX_SYMBOL_GROSS", os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_SINGLE", "0.35")),
     )
 )
+
 EXEC_DIRECTION_CONCENTRATION_CAP = float(
     os.environ.get(
         "EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP",
@@ -130,6 +133,14 @@ EXEC_DIRECTION_CONCENTRATION_CAP = float(
 )
 LOG = get_logger("engine.execution.broker_alpaca_rest")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+def _alpaca_key_id() -> str:
+    return str(get_data_credential("ALPACA_KEY_ID") or KEY_ID or "").strip()
+
+
+def _alpaca_secret_key() -> str:
+    return str(get_data_credential("ALPACA_SECRET_KEY") or SECRET or "").strip()
 
 
 class AlpacaCredentialError(RuntimeError):
@@ -153,8 +164,8 @@ def _alpaca_live_endpoint_required() -> bool:
 
 
 def alpaca_credentials_status(*, require_live_endpoint: Optional[bool] = None) -> Dict[str, Any]:
-    key_id = str(os.environ.get("ALPACA_KEY_ID", KEY_ID) or "").strip()
-    secret = str(os.environ.get("ALPACA_SECRET_KEY", SECRET) or "").strip()
+    key_id = _alpaca_key_id()
+    secret = _alpaca_secret_key()
     base_url = str(os.environ.get("ALPACA_BASE_URL", BASE_URL) or "").strip()
     require_live = _alpaca_live_endpoint_required() if require_live_endpoint is None else bool(require_live_endpoint)
     missing = []
@@ -553,17 +564,19 @@ def apply_alpaca_trade_update(update: Dict[str, Any], *, source: str = "websocke
 # ============================================================
 
 def _headers() -> Dict[str, str]:
+    key_id = _alpaca_key_id()
+    secret = _alpaca_secret_key()
     return {
-        "APCA-API-KEY-ID": KEY_ID,
-        "APCA-API-SECRET-KEY": SECRET,
+        "APCA-API-KEY-ID": key_id,
+        "APCA-API-SECRET-KEY": secret,
         "Content-Type": "application/json",
     }
 
 
-def _req(method: str, path: str, payload: Optional[dict] = None) -> Any:
+def _req(method: str, path: str, payload: Optional[dict] = None, timeout_s: Optional[float] = None) -> Any:
     # Transport errors are allowed to raise here; callers decide whether a
     # given Alpaca failure is retryable, degradable, or execution-blocking.
-    if not KEY_ID or not SECRET:
+    if not _alpaca_key_id() or not _alpaca_secret_key():
         raise AlpacaCredentialError("alpaca credentials missing")
     url = BASE_URL.rstrip("/") + path
     data = None
@@ -571,7 +584,11 @@ def _req(method: str, path: str, payload: Optional[dict] = None) -> Any:
         data = json.dumps(payload).encode("utf-8")
     r = urllib.request.Request(url, data=data, headers=_headers(), method=method.upper())
     try:
-        with urllib.request.urlopen(r, timeout=20) as resp:
+        timeout = max(0.1, min(20.0, float(timeout_s if timeout_s is not None else 20.0)))
+    except Exception:
+        timeout = 20.0
+    try:
+        with urllib.request.urlopen(r, timeout=float(timeout)) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
@@ -651,17 +668,17 @@ def _prelive_reconcile_or_block(broker: str = "alpaca") -> Optional[Dict[str, An
 # Account / Positions
 # ============================================================
 
-def get_account() -> Dict[str, Any]:
-    return _req("GET", "/v2/account")
+def get_account(timeout_s: Optional[float] = None) -> Dict[str, Any]:
+    return _req("GET", "/v2/account", timeout_s=timeout_s)
 
 
-def get_positions() -> List[Dict[str, Any]]:
-    res = _req("GET", "/v2/positions")
+def get_positions(timeout_s: Optional[float] = None) -> List[Dict[str, Any]]:
+    res = _req("GET", "/v2/positions", timeout_s=timeout_s)
     return list(res or [])
 
 
-def get_order(order_id: str) -> Dict[str, Any]:
-    return _req("GET", f"/v2/orders/{str(order_id)}")
+def get_order(order_id: str, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+    return _req("GET", f"/v2/orders/{str(order_id)}", timeout_s=timeout_s)
 
 
 def _alpaca_cancel_remaining_qty(order: Dict[str, Any]) -> float:
@@ -693,13 +710,19 @@ def cancel_order(order_id: str, timeout_s: Optional[float] = None) -> Dict[str, 
     )
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
-    cancel_response = _req("DELETE", f"/v2/orders/{str(order_id)}")
+    cancel_response = _req("DELETE", f"/v2/orders/{str(order_id)}", timeout_s=verify_timeout_s)
     deadline = time.monotonic() + max(0.0, float(verify_timeout_s))
     last_order: Dict[str, Any] = dict(cancel_response or {}) if isinstance(cancel_response, dict) else {}
     last_error = ""
     while True:
         try:
-            last_order = dict(get_order(str(order_id)) or {})
+            last_order = dict(
+                get_order(
+                    str(order_id),
+                    timeout_s=min(float(verify_timeout_s), max(0.1, float(deadline - time.monotonic()))),
+                )
+                or {}
+            )
             last_error = ""
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -803,19 +826,236 @@ def replace_limit_order(
     }
 
 
-def list_orders(status: str = "all", limit: int = 500, after_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+def list_orders(
+    status: str = "all",
+    limit: int = 500,
+    after_ts_ms: Optional[int] = None,
+    timeout_s: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     parts = [f"status={status}", "direction=asc", f"limit={int(limit)}"]
     if after_ts_ms is not None:
         dt = datetime.fromtimestamp(float(after_ts_ms) / 1000.0, tz=timezone.utc)
         after = dt.isoformat().replace("+00:00", "Z")
         parts.append(f"after={after}")
     path = "/v2/orders?" + "&".join(parts)
-    res = _req("GET", path)
+    res = _req("GET", path, timeout_s=timeout_s)
     return list(res or [])
 
 
-def list_open_orders(limit: int = 500) -> List[Dict[str, Any]]:
-    return list_orders(status="open", limit=int(limit))
+def list_open_orders(limit: int = 500, timeout_s: Optional[float] = None) -> List[Dict[str, Any]]:
+    return list_orders(status="open", limit=int(limit), timeout_s=timeout_s)
+
+
+def _shutdown_client_order_id(command_id: str, symbol: str, qty: float) -> str:
+    raw = f"alpaca:shutdown_flatten:{command_id}:{symbol}:{float(qty):.12g}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"alp_flat_{digest}"
+
+
+def _position_qty(position: Dict[str, Any]) -> float:
+    return _safe_float((position or {}).get("qty"), 0.0)
+
+
+def cancel_open_orders(timeout_s: float = 10.0, command_id: Optional[str] = None) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    try:
+        orders = list_open_orders(timeout_s=max(0.1, float(deadline - time.monotonic())))
+    except Exception as exc:
+        _warn_nonfatal(
+            "ALPACA_SHUTDOWN_OPEN_ORDERS_LIST_FAILED",
+            exc,
+            once_key="shutdown_open_orders_list",
+            command_id=str(command_id or ""),
+        )
+        return {
+            "ok": False,
+            "broker": "alpaca",
+            "status": "open_orders_list_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    results: List[Dict[str, Any]] = []
+    failed_n = 0
+    cancelled_n = 0
+    audit = record_broker_action_audit(
+        broker="alpaca",
+        action="cancel_open_orders_attempt",
+        status="attempted",
+        mode=str(os.environ.get("ENGINE_MODE", "")),
+        payload={
+            "command_id": str(command_id or ""),
+            "open_order_count": int(len(orders or [])),
+            "shutdown_cancel": True,
+        },
+    )
+    if not bool(audit.get("ok")):
+        return {
+            "ok": False,
+            "broker": "alpaca",
+            "status": "broker_action_audit_failed",
+            "command_id": str(command_id or ""),
+            "audit": audit,
+        }
+    for order in list(orders or []):
+        oid = str((order or {}).get("id") or (order or {}).get("order_id") or "").strip()
+        if not oid:
+            failed_n += 1
+            results.append({"ok": False, "status": "missing_order_id", "order": dict(order or {})})
+            continue
+        if time.monotonic() >= deadline:
+            failed_n += 1
+            results.append({"ok": False, "status": "cancel_timeout_before_order", "order_id": oid})
+            break
+        try:
+            result = cancel_order(oid, timeout_s=max(0.1, float(deadline - time.monotonic())))
+        except Exception as exc:
+            _warn_nonfatal(
+                "ALPACA_SHUTDOWN_CANCEL_ORDER_FAILED",
+                exc,
+                once_key=f"shutdown_cancel_order:{oid}",
+                command_id=str(command_id or ""),
+                order_id=oid,
+            )
+            result = {
+                "ok": False,
+                "broker": "alpaca",
+                "status": "cancel_exception",
+                "order_id": oid,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if bool(result.get("ok")):
+            cancelled_n += 1
+        else:
+            failed_n += 1
+        results.append(dict(result or {}))
+
+    return {
+        "ok": failed_n == 0,
+        "broker": "alpaca",
+        "status": "cancel_open_orders_complete" if failed_n == 0 else "cancel_open_orders_incomplete",
+        "command_id": str(command_id or ""),
+        "open_order_count": int(len(orders or [])),
+        "cancelled_n": int(cancelled_n),
+        "failed_n": int(failed_n),
+        "results": results,
+    }
+
+
+def flatten_positions(
+    *,
+    timeout_s: float = 10.0,
+    command_id: str,
+    max_abs_qty_per_symbol: float,
+    max_total_abs_qty: float,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    try:
+        positions = get_positions(timeout_s=max(0.1, float(deadline - time.monotonic())))
+    except Exception as exc:
+        _warn_nonfatal(
+            "ALPACA_SHUTDOWN_POSITIONS_FETCH_FAILED",
+            exc,
+            once_key="shutdown_positions_fetch",
+            command_id=str(command_id or ""),
+        )
+        return {
+            "ok": False,
+            "broker": "alpaca",
+            "status": "positions_fetch_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    flatten_rows: List[Dict[str, Any]] = []
+    total_abs_qty = 0.0
+    for position in list(positions or []):
+        symbol = str((position or {}).get("symbol") or "").strip().upper()
+        qty = _position_qty(dict(position or {}))
+        if not symbol or abs(float(qty)) <= 1e-9:
+            continue
+        total_abs_qty += abs(float(qty))
+        if abs(float(qty)) > float(max_abs_qty_per_symbol):
+            return {
+                "ok": False,
+                "broker": "alpaca",
+                "status": "flatten_symbol_qty_limit_exceeded",
+                "symbol": symbol,
+                "qty": float(qty),
+                "max_abs_qty_per_symbol": float(max_abs_qty_per_symbol),
+            }
+        flatten_rows.append({"symbol": symbol, "position_qty": float(qty), "flatten_qty": -float(qty)})
+
+    if total_abs_qty > float(max_total_abs_qty):
+        return {
+            "ok": False,
+            "broker": "alpaca",
+            "status": "flatten_total_qty_limit_exceeded",
+            "total_abs_qty": float(total_abs_qty),
+            "max_total_abs_qty": float(max_total_abs_qty),
+        }
+
+    submitted: List[Dict[str, Any]] = []
+    failed_n = 0
+    for row in flatten_rows:
+        if time.monotonic() >= deadline:
+            failed_n += 1
+            submitted.append({"ok": False, "status": "flatten_timeout_before_submit", **row})
+            break
+        symbol = str(row["symbol"])
+        qty = float(row["flatten_qty"])
+        client_oid = _shutdown_client_order_id(str(command_id), symbol, qty)
+        audit = record_broker_action_audit(
+            broker="alpaca",
+            action="position_flatten_attempt",
+            status="attempted",
+            symbol=symbol,
+            qty=float(qty),
+            client_order_id=client_oid,
+            payload={
+                "command_id": str(command_id),
+                "position_qty": float(row["position_qty"]),
+                "order_type": "MARKET",
+                "shutdown_flatten": True,
+            },
+        )
+        if not bool(audit.get("ok")):
+            failed_n += 1
+            submitted.append({"ok": False, "status": "broker_action_audit_failed", **row, "audit": audit})
+            continue
+        try:
+            response = _submit_market_order(symbol, qty, client_oid, timeout_s=max(0.1, float(deadline - time.monotonic())))
+            submitted.append(
+                {
+                    "ok": True,
+                    "status": "flatten_submitted",
+                    **row,
+                    "client_order_id": client_oid,
+                    "broker_order_id": str((response or {}).get("id") or ""),
+                    "response": dict(response or {}) if isinstance(response, dict) else response,
+                }
+            )
+        except Exception as exc:
+            failed_n += 1
+            submitted.append(
+                {
+                    "ok": False,
+                    "status": "flatten_submit_exception",
+                    **row,
+                    "client_order_id": client_oid,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    return {
+        "ok": failed_n == 0,
+        "broker": "alpaca",
+        "status": "flatten_positions_submitted" if failed_n == 0 else "flatten_positions_incomplete",
+        "command_id": str(command_id),
+        "position_count": int(len(flatten_rows)),
+        "submitted_n": int(sum(1 for item in submitted if bool(item.get("ok")))),
+        "failed_n": int(failed_n),
+        "total_abs_qty": float(total_abs_qty),
+        "results": submitted,
+    }
 
 
 def list_orders_after(after_ts_ms: int, status: str = "all", limit: int = 500) -> List[Dict[str, Any]]:
@@ -1051,7 +1291,7 @@ def _apply_execution_risk_caps(
 # Order Submission
 # ============================================================
 
-def _submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, Any]:
+def _submit_market_order(symbol: str, qty: float, client_oid: str, timeout_s: Optional[float] = None) -> Dict[str, Any]:
     side = "buy" if qty > 0 else "sell"
     payload = {
         "symbol": symbol,
@@ -1061,10 +1301,16 @@ def _submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, 
         "time_in_force": ORDER_TIF,
         "client_order_id": client_oid,
     }
-    return _req("POST", "/v2/orders", payload)
+    return _req("POST", "/v2/orders", payload, timeout_s=timeout_s)
 
 
-def _submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: str) -> Dict[str, Any]:
+def _submit_limit_order(
+    symbol: str,
+    qty: float,
+    limit_price: float,
+    client_oid: str,
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
     side = "buy" if qty > 0 else "sell"
     payload = {
         "symbol": symbol,
@@ -1075,7 +1321,7 @@ def _submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid:
         "limit_price": str(float(limit_price)),
         "client_order_id": client_oid,
     }
-    return _req("POST", "/v2/orders", payload)
+    return _req("POST", "/v2/orders", payload, timeout_s=timeout_s)
 
 
 def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: str) -> Dict[str, Any]:
@@ -1674,7 +1920,9 @@ def run_trade_updates_stream_daemon(stop_event: Any = None) -> None:
         return
     if websocket is None:
         raise RuntimeError(f"websocket-client unavailable: {_WEBSOCKET_IMPORT_ERROR}")
-    if not KEY_ID or not SECRET:
+    key_id = _alpaca_key_id()
+    secret = _alpaca_secret_key()
+    if not key_id or not secret:
         log_failure(
             LOG,
             event="alpaca_trade_updates_ws_missing_credentials",
@@ -1697,7 +1945,7 @@ def run_trade_updates_stream_daemon(stop_event: Any = None) -> None:
         last_message_ms = connected_at_ms
 
         def _on_open(ws) -> None:
-            ws.send(json.dumps({"action": "auth", "key": KEY_ID, "secret": SECRET}))
+            ws.send(json.dumps({"action": "auth", "key": key_id, "secret": secret}))
             ws.send(json.dumps({"action": "listen", "data": {"streams": ["trade_updates"]}}))
             emit_counter("alpaca_trade_updates_ws_connect", 1, component="engine.execution.broker_alpaca_rest", broker="alpaca")
 

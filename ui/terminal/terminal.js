@@ -18,8 +18,11 @@ import {
 } from "../symbol_context.mjs";
 import { renderChartAccessibility } from "../chart_a11y.js";
 import {
+  buildIndicatorAccessibilitySummary,
   buildOverlayAccessibilitySummary,
   decisionOverlayLegendItems,
+  decisionWindowLegendItems,
+  indicatorOverlayLegendItems,
   normalizeDecisionOverlayPayload
 } from "../decision_overlays.js";
 import { buildTableView } from "../utils.js";
@@ -743,18 +746,31 @@ function renderWatch() {
 
 function markerShapeGlyph(shape) {
   const raw = String(shape || "").trim();
+  if (raw === "line") return "---";
   if (raw === "arrowUp") return "^";
   if (raw === "arrowDown") return "v";
   if (raw === "square") return "[]";
   if (raw === "circle") return "o";
+  if (raw === "band") return "band";
   return "-";
 }
 
-function renderOverlayLegend(payload) {
+function renderOverlayLegend(payload, overlays = STATE.ov) {
   if (!el.overlayLegend) return;
   const normalized = normalizeDecisionOverlayPayload(payload || {});
-  const items = decisionOverlayLegendItems(normalized);
-  const summary = buildOverlayAccessibilitySummary(normalized);
+  const indicatorOverlays = {
+    vwap: !!(overlays && overlays.vwap),
+    ema: !!(overlays && overlays.ema),
+    equity: !!(overlays && overlays.equity),
+  };
+  const items = [
+    ...indicatorOverlayLegendItems(indicatorOverlays),
+    ...decisionOverlayLegendItems(normalized),
+    ...decisionWindowLegendItems(normalized),
+  ];
+  const indicatorSummary = buildIndicatorAccessibilitySummary(indicatorOverlays);
+  const decisionSummary = buildOverlayAccessibilitySummary(normalized);
+  const summary = `${indicatorSummary} ${decisionSummary}`;
   const windows = Array.isArray(normalized.windows) ? normalized.windows : [];
   const levels = Array.isArray(normalized.price_lines) ? normalized.price_lines : [];
   el.overlayLegend.setAttribute("aria-label", summary);
@@ -762,7 +778,7 @@ function renderOverlayLegend(payload) {
     <div class="overlayLegendItems">
       ${items.map((item) => `
         <span class="overlayLegendItem">
-          <span class="overlayLegendGlyph" style="border-color:${esc(item.color)}; color:${esc(item.color)}">${esc(markerShapeGlyph(item.shape))}</span>
+          <span class="overlayLegendGlyph" style="border-color:${esc(item.color)}; color:${esc(item.color)}; background:${esc(item.fillColor || "transparent")}">${esc(markerShapeGlyph(item.shape))}</span>
           <span>${esc(item.label)}</span>
           <span class="mono muted">${esc(item.text)}</span>
           <span class="mono">${esc(String(item.count))}</span>
@@ -849,7 +865,7 @@ async function bootChart() {
     equitySeries,
     decisionOverlay,
   });
-  renderOverlayLegend(overlays.markers ? (decisionOverlay || { markers }) : { markers: [] });
+  renderOverlayLegend(overlays.markers ? (decisionOverlay || { markers }) : { markers: [] }, overlays);
 
   if (el.chartHealth) el.chartHealth.textContent = "live";
 }

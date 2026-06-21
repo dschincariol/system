@@ -112,6 +112,23 @@ def get_price_persistence_mode() -> Dict[str, Any]:
     )
 
 
+def price_persistence_backpressure_status(result: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Normalize async price persistence status for producer throttling."""
+    payload = dict(result or {})
+    status = dict(payload.get("async_persistence") or {})
+    accepted = bool(status.get("accepted", payload.get("async_persistence_accepted", True)))
+    backpressure = bool(status.get("backpressure") or payload.get("async_persistence_backpressure") or not accepted)
+    reason = str(status.get("reason") or ("enqueue_rejected" if not accepted else "")).strip()
+    return {
+        "required": bool(status.get("required")),
+        "attempted": bool(status.get("attempted")),
+        "accepted": bool(accepted),
+        "backpressure": bool(backpressure),
+        "reason": reason,
+        "writer": dict(status.get("writer") or {}),
+    }
+
+
 # =========================
 # PROVIDER CONFIG
 # =========================
@@ -557,6 +574,16 @@ def publish_price_events(
     async_writer_enabled = bool(persistence_mode.get("async_price_writer_enabled"))
     if async_required and bool(write_policy.require_async_during_cutover) and not async_writer_enabled:
         raise RuntimeError("price_router_sqlite_cutover_requires_async_price_writer")
+    async_persistence_status: Dict[str, Any] = {
+        "required": bool(pg_price_rows or pg_quote_rows or pg_raw_rows),
+        "attempted": False,
+        "accepted": True,
+        "backpressure": False,
+        "reason": "",
+        "price_rows": int(len(pg_price_rows)),
+        "quote_rows": int(len(pg_quote_rows)),
+        "raw_rows": int(len(pg_raw_rows)),
+    }
 
     def _write(db):
         n_raw = int(len(raw_rows)) if bool(write_raw and not sqlite_write_raw) else 0
@@ -779,13 +806,80 @@ def publish_price_events(
                             extra={"row_count": len(raw_rows)},
                         )
                 try:
-                    enqueue_price_persistence(
-                        prices=tuple(pg_price_rows),
-                        quotes=tuple(pg_quote_rows),
-                        raw=tuple(pg_raw_rows),
-                        source=str(component),
+                    async_persistence_status["attempted"] = True
+                    accepted = bool(
+                        enqueue_price_persistence(
+                            prices=tuple(pg_price_rows),
+                            quotes=tuple(pg_quote_rows),
+                            raw=tuple(pg_raw_rows),
+                            source=str(component),
+                        )
                     )
+                    async_persistence_status["accepted"] = bool(accepted)
+                    writer_snapshot: Dict[str, Any] = {}
+                    try:
+                        writer_snapshot = dict(get_async_writer().get_snapshot() or {})
+                    except Exception:
+                        writer_snapshot = {}
+                    writer_backpressure = bool(writer_snapshot.get("backpressure_active"))
+                    if not accepted or writer_backpressure:
+                        reason = (
+                            "enqueue_rejected"
+                            if not accepted
+                            else str(writer_snapshot.get("last_backpressure_reason") or "writer_backpressure")
+                        )
+                        async_persistence_status["backpressure"] = True
+                        async_persistence_status["reason"] = str(reason)
+                        async_persistence_status["writer"] = dict(writer_snapshot or {})
+                        row_count = int(len(pg_price_rows) + len(pg_quote_rows) + len(pg_raw_rows))
+                        emit_counter(
+                            "price_router_async_persistence_backpressure_rows",
+                            int(row_count),
+                            component="engine.runtime.price_router",
+                            job=job,
+                            extra_tags={"reason": str(reason), "source": str(component)},
+                        )
+                        record_component_health(
+                            "price_router_async_persistence",
+                            ok=False,
+                            status="backpressure",
+                            detail=str(reason),
+                            observed_ts_ms=int(time.time() * 1000),
+                            extra={
+                                "source": str(component),
+                                "price_rows": int(len(pg_price_rows)),
+                                "quote_rows": int(len(pg_quote_rows)),
+                                "raw_rows": int(len(pg_raw_rows)),
+                                "writer_queue_depth": int(writer_snapshot.get("queue_depth") or 0),
+                                "writer_queue_maxsize": int(writer_snapshot.get("queue_maxsize") or 0),
+                            },
+                        )
+                        if not accepted:
+                            log_failure(
+                                LOG,
+                                event="price_router_async_persistence_enqueue_rejected",
+                                code="PRICE_ROUTER_ASYNC_PERSISTENCE_ENQUEUE_REJECTED",
+                                message="price_router_async_persistence_enqueue_rejected",
+                                error=RuntimeError(str(reason)),
+                                level=logging.WARNING,
+                                component="engine.runtime.price_router",
+                                persist=False,
+                                extra={
+                                    "price_rows": int(len(pg_price_rows)),
+                                    "quote_rows": int(len(pg_quote_rows)),
+                                    "raw_rows": int(len(pg_raw_rows)),
+                                    "writer": dict(writer_snapshot or {}),
+                                },
+                            )
+                    else:
+                        async_persistence_status["backpressure"] = False
+                        async_persistence_status["reason"] = ""
+                        async_persistence_status["writer"] = dict(writer_snapshot or {})
                 except Exception as e:
+                    async_persistence_status["attempted"] = True
+                    async_persistence_status["accepted"] = False
+                    async_persistence_status["backpressure"] = True
+                    async_persistence_status["reason"] = f"{type(e).__name__}:{e}"
                     log_failure(
                         LOG,
                         event="price_router_async_persistence_enqueue_failed",
@@ -839,9 +933,12 @@ def publish_price_events(
             "raw": n_raw,
             "quotes": n_quotes,
             "prices": n_prices,
+            "async_persistence": async_persistence_status,
         }
 
-    needs_sqlite_txn = bool(con is not None or sqlite_write_raw or sqlite_write_quotes or sqlite_write_prices or update_symbols)
+    needs_sqlite_txn = bool(
+        con is not None or sqlite_write_raw or sqlite_write_quotes or sqlite_write_prices or update_symbols
+    )
     counts = _write(con) if con is not None else (_write(None) if not needs_sqlite_txn else run_write_txn(_write))
 
     if emit_telemetry:
@@ -904,6 +1001,9 @@ def publish_price_events(
         },
     )
 
+    async_persistence_result = counts.get("async_persistence") or async_persistence_status
+    async_persistence_view = dict(async_persistence_result or {})
+
     return {
         "events": int(counts.get("events") or 0),
         "raw": int(counts.get("raw") or 0),
@@ -912,6 +1012,9 @@ def publish_price_events(
         "dedup_drops": dedup,
         "gap_events": gaps,
         "normalization_failures": normalization_failures,
+        "async_persistence": async_persistence_result,
+        "async_persistence_accepted": bool(async_persistence_view.get("accepted", True)),
+        "async_persistence_backpressure": bool(async_persistence_view.get("backpressure")),
     }
 
 

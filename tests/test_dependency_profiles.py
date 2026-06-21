@@ -48,6 +48,9 @@ def test_cpu_default_requirements_exclude_nvidia_only_packages() -> None:
     assert "xgboost-cpu" in names
     assert "xgboost" not in names
     assert not {name for name in names if name == "pynvml" or name.startswith("nvidia-")}
+    assert "psycopg" in names
+    assert "psycopg2" not in names
+    assert "psycopg2-binary" not in names
 
 
 def test_nvidia_profile_contains_nvidia_diagnostics_packages() -> None:

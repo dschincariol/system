@@ -6,6 +6,8 @@
   UI-facing pills, labels, and top-line operator guidance.
 */
 
+import { classifyMarketStressScore } from "./market_stress_thresholds.js";
+
 function _pill(cls, label) {
   return { cls: cls || "dim", label: String(label || "—") };
 }
@@ -51,10 +53,8 @@ function _marketPill(stressPayload) {
     stressPayload.stress &&
     stressPayload.stress.stress_score
   );
-  if (!Number.isFinite(score)) return _pill("dim", "unknown");
-  if (score >= 0.75) return _pill("bad", "high stress");
-  if (score >= 0.55) return _pill("warn", "elevated stress");
-  return _pill("ok", "normal");
+  const state = classifyMarketStressScore(score);
+  return _pill(state.pillClass.replace(/^pill\s+/, ""), state.label);
 }
 
 function _trainingPill(health) {

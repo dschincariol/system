@@ -171,22 +171,6 @@ def _mark_execution_ledger_schema_ready(con) -> None:
         )
 
 
-def _table_exists(con, table_name: str) -> bool:
-    try:
-        row = con.execute(
-            """
-            SELECT 1
-            FROM sqlite_master
-            WHERE type='table' AND name=?
-            LIMIT 1
-            """,
-            (str(table_name),),
-        ).fetchone()
-        return bool(row)
-    except Exception:
-        return False
-
-
 def _trade_outcome_label(pnl_value: float) -> str:
     if float(pnl_value) > 0.0:
         return "win"

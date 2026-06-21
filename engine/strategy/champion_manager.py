@@ -30,6 +30,11 @@ from engine.strategy.model_marketplace import (
     recompute_marketplace_scores,
     run_self_critic,
 )
+from engine.strategy.model_competition import (
+    CompetitionRepository,
+    IllegalChampionTransition,  # noqa: F401 - compatibility re-export
+    PromotionStatGateEvaluator,
+)
 from engine.strategy.ope_gate import evaluate_policy_ope_gate
 from engine.strategy.learned_alpha_decay import champion_gate_for_candidate
 
@@ -85,19 +90,6 @@ ON {_POST_COMMIT_OUTBOX_TABLE}(status, available_ts_ms, lease_expires_ts_ms, id)
 _COMPETITION_LOCK = threading.RLock()
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
-_ASSIGNMENT_STATES = {"shadow", "challenger", "champion", "retired"}
-_ALLOWED_ASSIGNMENT_TRANSITIONS = {
-    ("shadow", "challenger"),
-    ("challenger", "champion"),
-    ("champion", "retired"),
-    ("challenger", "shadow"),
-}
-
-
-class IllegalChampionTransition(RuntimeError):
-    """Raised when a model attempts to bypass the shadow/challenger path."""
-
-
 def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
     key = str(once_key or "")
     if key:
@@ -797,74 +789,29 @@ def _load_all_champions() -> List[Dict[str, Any]]:
 
 
 def _sync_marketplace_stages(con, candidates: List[Dict[str, Any]], champion_name: str) -> None:
-    for row in candidates or []:
-        con.execute(
-            """
-            UPDATE model_marketplace_scores
-            SET stage=?, updated_ts_ms=?
-            WHERE model_name=? AND symbol=? AND horizon_s=? AND regime=?
-              AND model_id=?
-            """,
-            (
-                "champion" if str(row.get("model_name") or "") == str(champion_name or "") else "challenger",
-                int(_now_ms()),
-                str(row.get("model_name") or ""),
-                str(row.get("symbol") or "").upper().strip(),
-                int(row.get("horizon_s") or 0),
-                str(row.get("regime") or "global"),
-                str(row.get("model_id") or "baseline"),
-            ),
-        )
+    CompetitionRepository(con).set_marketplace_stage_for_score_keys(
+        candidates,
+        champion_name=str(champion_name or ""),
+        updated_ts_ms=int(_now_ms()),
+    )
 
 
 def _clear_champion_assignment(*, scope: str, symbol: str, horizon_s: int, con) -> None:
-    con.execute(
-        """
-        DELETE FROM champion_assignments
-        WHERE scope=? AND symbol=? AND horizon_s=?
-        """,
-        (
-            str(scope or ""),
-            str(symbol or "").upper().strip(),
-            int(horizon_s or 0),
-        ),
+    CompetitionRepository(con).clear_champion_assignment(
+        scope=str(scope or ""),
+        symbol=str(symbol or ""),
+        horizon_s=int(horizon_s or 0),
     )
 
 
 def get_champion_assignment(scope: str, symbol: str, horizon_s: int = 0) -> Dict[str, Any]:
     con = connect()
     try:
-        row = con.execute(
-            """
-            SELECT scope, symbol, horizon_s, model_name, challenger_name, regime, state, assigned_ts_ms, updated_ts_ms, meta_json
-            FROM champion_assignments
-            WHERE scope=? AND symbol=? AND horizon_s=?
-            """,
-            (str(scope), str(symbol).upper().strip(), int(horizon_s)),
-        ).fetchone()
-
-        if not row:
-            return {}
-
-        try:
-            meta = json.loads(row[9]) if row[9] else {}
-            if not isinstance(meta, dict):
-                meta = {}
-        except Exception:
-            meta = {}
-
-        return {
-            "scope": str(row[0] or ""),
-            "symbol": str(row[1] or ""),
-            "horizon_s": int(row[2] or 0),
-            "model_name": str(row[3] or ""),
-            "challenger_name": str(row[4] or ""),
-            "regime": str(row[5] or "global"),
-            "state": str(row[6] or "champion"),
-            "assigned_ts_ms": int(row[7] or 0),
-            "updated_ts_ms": int(row[8] or 0),
-            "meta": meta,
-        }
+        return CompetitionRepository(con).get_champion_assignment(
+            scope=str(scope),
+            symbol=str(symbol),
+            horizon_s=int(horizon_s),
+        )
     finally:
         try:
             con.close()
@@ -873,45 +820,11 @@ def get_champion_assignment(scope: str, symbol: str, horizon_s: int = 0) -> Dict
 
 
 def _current_assignment_state(db, payload: Dict[str, Any]) -> Optional[str]:
-    row = db.execute(
-        """
-        SELECT state
-        FROM champion_assignments
-        WHERE scope=?
-          AND symbol=?
-          AND horizon_s=?
-          AND model_name=?
-        LIMIT 1
-        """,
-        (
-            str(payload["scope"]),
-            str(payload["symbol"]),
-            int(payload["horizon_s"]),
-            str(payload["model_name"]),
-        ),
-    ).fetchone()
-    if not row:
-        return None
-    return str(row[0] or "").strip().lower() or None
+    return CompetitionRepository(db).current_assignment_state(payload)
 
 
 def _validate_assignment_transition(db, payload: Dict[str, Any]) -> None:
-    new_state = str(payload.get("state") or "champion").strip().lower()
-    if new_state not in _ASSIGNMENT_STATES:
-        raise IllegalChampionTransition(f"unknown champion assignment state: {new_state}")
-    current_state = _current_assignment_state(db, payload)
-    if new_state == "champion" and current_state != "challenger":
-        raise IllegalChampionTransition(
-            f"cannot transition model {payload['model_name']} to champion from "
-            f"{current_state or 'unassigned'}; current state must be challenger"
-        )
-    if current_state is None or current_state == new_state:
-        return
-    if (current_state, new_state) not in _ALLOWED_ASSIGNMENT_TRANSITIONS:
-        raise IllegalChampionTransition(
-            f"illegal champion assignment transition for model {payload['model_name']}: "
-            f"{current_state} -> {new_state}"
-        )
+    CompetitionRepository(db).validate_assignment_transition(payload)
 
 
 def set_champion_assignment(
@@ -942,33 +855,17 @@ def set_champion_assignment(
     }
 
     def _apply(db) -> None:
-        _validate_assignment_transition(db, payload)
-        db.execute(
-            """
-            INSERT INTO champion_assignments(
-              scope, symbol, horizon_s, model_name, challenger_name, regime, state, assigned_ts_ms, updated_ts_ms, meta_json
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(scope, symbol, horizon_s) DO UPDATE SET
-              model_name=excluded.model_name,
-              challenger_name=excluded.challenger_name,
-              regime=excluded.regime,
-              state=excluded.state,
-              updated_ts_ms=excluded.updated_ts_ms,
-              meta_json=excluded.meta_json
-            """,
-            (
-                payload["scope"],
-                payload["symbol"],
-                payload["horizon_s"],
-                payload["model_name"],
-                payload["challenger_name"],
-                payload["regime"],
-                payload["state"],
-                payload["assigned_ts_ms"],
-                payload["updated_ts_ms"],
-                _json_dumps(payload["meta"]),
-            ),
+        CompetitionRepository(db).set_champion_assignment(
+            scope=str(payload["scope"]),
+            symbol=str(payload["symbol"]),
+            model_name=str(payload["model_name"]),
+            horizon_s=int(payload["horizon_s"]),
+            challenger_name=str(payload["challenger_name"]),
+            regime=str(payload["regime"]),
+            state=str(payload["state"]),
+            meta=dict(payload["meta"]),
+            assigned_ts_ms=int(payload["assigned_ts_ms"]),
+            updated_ts_ms=int(payload["updated_ts_ms"]),
         )
 
     if con is None:
@@ -1196,16 +1093,10 @@ def get_model_competition_rankings(limit: int = 25, ranking_scope: str = "global
 
 
 def _clear_model_competition_champion(*, con) -> None:
-    con.execute(
-        """
-        DELETE FROM champion_assignments
-        WHERE scope=? AND symbol=? AND horizon_s=?
-        """,
-        (
-            MODEL_COMPETITION_SCOPE,
-            MODEL_COMPETITION_SYMBOL,
-            MODEL_COMPETITION_HORIZON_S,
-        ),
+    CompetitionRepository(con).clear_champion_assignment(
+        scope=MODEL_COMPETITION_SCOPE,
+        symbol=MODEL_COMPETITION_SYMBOL,
+        horizon_s=MODEL_COMPETITION_HORIZON_S,
     )
 
 
@@ -2303,6 +2194,7 @@ def _evaluate_promotion_stat_gate(
         ),
         current_feature_ids=_promotion_feature_ids(champion_row),
         challenger_feature_ids=_promotion_feature_ids(candidate),
+        candidate_symbols=[str(candidate.get("symbol") or metrics.get("symbol") or "").upper().strip()],
         candidate_features=feature_payload.get("candidate_features"),
         deconfounded_validation=(
             feature_payload.get("deconfounded_validation")
@@ -2731,7 +2623,6 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
         con = connect()
         try:
             _ensure_post_commit_schema(con)
-            stat_gate_cache: Dict[Tuple[str, str], Tuple[bool, Dict[str, Any]]] = {}
             ope_gate_cache: Dict[Tuple[str, str, str, int, str], Tuple[bool, Dict[str, Any]]] = {}
             graph_gate_cache: Dict[Tuple[str, str], Tuple[bool, Dict[str, Any]]] = {}
 
@@ -2762,29 +2653,15 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                     graph_gate_cache[cache_key] = (bool(ok), dict(payload or {}))
                 return bool(ok), dict(payload or {})
 
-            def _cached_promotion_stat_gate(
-                target_row: Optional[Dict[str, Any]],
-                trial_count: int,
-                *,
-                candidate_returns: Optional[Dict[str, List[float]]],
-                incumbent_row: Optional[Dict[str, Any]],
-            ) -> Tuple[bool, Dict[str, Any]]:
-                cache_key = _promotion_stat_gate_cache_key(target_row)
-                if cache_key[0] and cache_key in stat_gate_cache:
-                    cached_ok, cached_payload = stat_gate_cache[cache_key]
-                    payload = dict(cached_payload or {})
-                    payload["cache_hit"] = True
-                    return bool(cached_ok), payload
-                ok, payload = _evaluate_promotion_stat_gate(
-                    target_row,
-                    int(trial_count),
-                    models_returns=candidate_returns,
-                    champion_row=incumbent_row,
-                    con=con,
-                )
-                if cache_key[0]:
-                    stat_gate_cache[cache_key] = (bool(ok), dict(payload or {}))
-                return bool(ok), dict(payload or {})
+            stat_gate_evaluator = PromotionStatGateEvaluator(
+                evaluate_gate=_evaluate_promotion_stat_gate,
+                cache_key=_promotion_stat_gate_cache_key,
+                candidate_version=_promotion_candidate_version,
+                enqueue_legacy_hypothesis=_enqueue_post_commit,
+                safe_int=_safe_int,
+                safe_float=_safe_float,
+                con=con,
+            )
 
             rows = con.execute(
                 """
@@ -3107,25 +2984,12 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                         target_name = str((target or {}).get("model_name") or "")
 
                 if target_name and target_name != str(current_name):
-                    stat_gate_ok, stat_gate = _cached_promotion_stat_gate(
+                    stat_gate_ok, stat_gate = stat_gate_evaluator.evaluate(
                         target,
                         _promotion_trial_count(candidates),
                         candidate_returns=_promotion_models_returns(candidates),
                         incumbent_row=current_row,
                     )
-                    if bool((stat_gate or {}).get("record_legacy_hypothesis")):
-                        _enqueue_post_commit(
-                            "record_hypothesis_result",
-                            model_name=str((target or {}).get("model_name") or ""),
-                            candidate_version=_promotion_candidate_version(target),
-                            n_observations=_safe_int((stat_gate or {}).get("n_observations"), 0),
-                            t_statistic=_safe_float((stat_gate or {}).get("t_statistic"), 0.0),
-                            deflated_sharpe=_safe_float((stat_gate or {}).get("deflated_sharpe"), 0.0),
-                            threshold_t=_safe_float((stat_gate or {}).get("threshold_t"), 0.0),
-                            n_competing_trials=_safe_int((stat_gate or {}).get("n_competing_trials"), 0),
-                            passed=bool((stat_gate or {}).get("passed")),
-                            diagnostics=dict(stat_gate or {}),
-                        )
                     if not stat_gate_ok:
                         reason = f"{reason}_stat_gate_blocked"
                         if current_row and not (current_blocked or hard_demote):
@@ -3469,25 +3333,12 @@ def evaluate_competition_cycle() -> Dict[str, Any]:
                     global_target_name = str((global_target or {}).get("model_name") or "").strip()
 
             if global_target_name and global_target_name != str(global_current_name):
-                global_stat_gate_ok, global_stat_gate = _cached_promotion_stat_gate(
+                global_stat_gate_ok, global_stat_gate = stat_gate_evaluator.evaluate(
                     global_target,
                     max(1, len(global_rows)),
                     candidate_returns=_promotion_models_returns(global_rows),
                     incumbent_row=global_current_row,
                 )
-                if bool((global_stat_gate or {}).get("record_legacy_hypothesis")):
-                    _enqueue_post_commit(
-                        "record_hypothesis_result",
-                        model_name=str((global_target or {}).get("model_name") or ""),
-                        candidate_version=_promotion_candidate_version(global_target),
-                        n_observations=_safe_int((global_stat_gate or {}).get("n_observations"), 0),
-                        t_statistic=_safe_float((global_stat_gate or {}).get("t_statistic"), 0.0),
-                        deflated_sharpe=_safe_float((global_stat_gate or {}).get("deflated_sharpe"), 0.0),
-                        threshold_t=_safe_float((global_stat_gate or {}).get("threshold_t"), 0.0),
-                        n_competing_trials=_safe_int((global_stat_gate or {}).get("n_competing_trials"), 0),
-                        passed=bool((global_stat_gate or {}).get("passed")),
-                        diagnostics=dict(global_stat_gate or {}),
-                    )
                 if not global_stat_gate_ok:
                     global_reason = f"{global_reason}_stat_gate_blocked"
                     if global_current_row and not global_current_invalid:

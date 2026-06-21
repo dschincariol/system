@@ -488,8 +488,8 @@ def evaluate_trade_suppression(
                 float(slip.get("mean_bps") or 0.0),
                 float(slip.get("vol_bps") or 0.0),
                 float(slip.get("z") or 0.0),
-                float(action.get("size_mult") or 1.0),
-                float(action.get("throttle_mult") or 1.0),
+                _safe_float(action.get("size_mult"), 1.0),
+                _safe_float(action.get("throttle_mult"), 1.0),
                 int(action.get("hard_block") or 0),
                 str(action.get("reason") or ""),
                 json.dumps(audit, separators=(",", ":"), sort_keys=True),
@@ -516,8 +516,8 @@ def evaluate_trade_suppression(
                 float(slip.get("z") or 0.0),
                 float(lat.get("var_z") or 0.0),
                 json.dumps(execution_degradation or {}, separators=(",", ":"), sort_keys=True),
-                float(action.get("size_mult") or 1.0),
-                float(action.get("throttle_mult") or 1.0),
+                _safe_float(action.get("size_mult"), 1.0),
+                _safe_float(action.get("throttle_mult"), 1.0),
                 int(action.get("hard_block") or 0),
                 str(action.get("reason") or ""),
                 json.dumps(audit, separators=(",", ":"), sort_keys=True),
@@ -529,8 +529,8 @@ def evaluate_trade_suppression(
                 set_state("tse_state", str(action.get("state") or "NONE"))
                 set_state("tse_action", str(action.get("action") or "NONE"))
                 set_state("tse_reason", str(action.get("reason") or ""))
-                set_state("tse_size_mult", str(float(action.get("size_mult") or 1.0)))
-                set_state("tse_throttle_mult", str(float(action.get("throttle_mult") or 1.0)))
+                set_state("tse_size_mult", str(_safe_float(action.get("size_mult"), 1.0)))
+                set_state("tse_throttle_mult", str(_safe_float(action.get("throttle_mult"), 1.0)))
                 set_state("execution_pause", "1" if int(action.get("hard_block") or 0) == 1 else "0")
             except Exception as e:
                 _warn_nonfatal("TRADE_SUPPRESSION_ENGINE_STATE_WRITE_FAILED", e, state=str(action.get("state") or "NONE"))
@@ -541,8 +541,8 @@ def evaluate_trade_suppression(
             "state": str(action.get("state") or "NONE"),
             "action": str(action.get("action") or "NONE"),
             "fp_streak": int(fp_streak),
-            "size_mult": float(action.get("size_mult") or 1.0),
-            "throttle_mult": float(action.get("throttle_mult") or 1.0),
+            "size_mult": _safe_float(action.get("size_mult"), 1.0),
+            "throttle_mult": _safe_float(action.get("throttle_mult"), 1.0),
             "hard_block": bool(int(action.get("hard_block") or 0)),
             "reason": str(action.get("reason") or ""),
             "slippage_mean_bps": float(slip.get("mean_bps") or 0.0),

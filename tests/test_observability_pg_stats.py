@@ -87,6 +87,23 @@ class _FakeConnection:
             return _Cursor([{"state": "active", "count": 3}, {"state": "idle", "count": 7}])
         if "from pg_stat_replication" in text:
             return _Cursor([])
+        if "from pg_stat_archiver" in text:
+            return _Cursor(
+                [
+                    {
+                        "archived_count": 20,
+                        "failed_count": 1,
+                        "last_archived_at_ts": 110.0,
+                        "last_failed_at_ts": 100.0,
+                        "last_archived_wal": "0000000100000000000000AB",
+                        "last_failed_wal": "0000000100000000000000AA",
+                    }
+                ]
+            )
+        if "from pg_ls_waldir()" in text:
+            return _Cursor([{"wal_bytes": 32 * 1024 * 1024, "wal_files": 2}])
+        if "from pg_ls_dir('pg_wal/archive_status')" in text:
+            return _Cursor([{"ready_count": 1}])
         if "select to_regclass(?)" in text:
             return _Cursor([("price_provider_health",)])
         if "from price_provider_health" in text:
@@ -130,6 +147,9 @@ def test_pg_observability_snapshot_emits_dashboard_metrics():
     assert "postgres.table.writes_total" in metrics
     assert "postgres.database.cache_hit_ratio" in metrics
     assert "postgres.connections.active" in metrics
+    assert "postgres.wal_archiver.failed_count" in metrics
+    assert "postgres.wal.directory_bytes" in metrics
+    assert "postgres.wal.archive_ready_count" in metrics
     assert "ingestion.source_lag_s" in metrics
     assert any(row["value_text"] and "SELECT * FROM prices" in row["value_text"] for row in captured)
 
@@ -149,4 +169,7 @@ def test_pg_observability_snapshot_noops_without_pg_stat_statements():
     assert result["ok"] is True
     assert result["skipped"] is True
     assert result["reason"] == "pg_stat_statements_unavailable"
-    assert captured == []
+    assert result["emitted"] > 0
+    metrics = {args[0] for args, _kwargs in captured}
+    assert "postgres.wal_archiver.failed_count" in metrics
+    assert "postgres.wal.directory_bytes" in metrics

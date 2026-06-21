@@ -1406,7 +1406,7 @@ class BrokerAdapterLineageRegressionTests(unittest.TestCase):
     def test_alpaca_cancel_order_reports_unverified_when_order_remains_open(self) -> None:
         (alpaca,) = _reload_modules("engine.execution.broker_alpaca_rest")
 
-        def fake_req(method, path, payload=None):
+        def fake_req(method, path, payload=None, **_kwargs):
             del payload
             if str(method).upper() == "DELETE":
                 return {}
@@ -1427,7 +1427,7 @@ class BrokerAdapterLineageRegressionTests(unittest.TestCase):
     def test_alpaca_cancel_order_reports_verified_terminal_cancel(self) -> None:
         (alpaca,) = _reload_modules("engine.execution.broker_alpaca_rest")
 
-        def fake_req(method, path, payload=None):
+        def fake_req(method, path, payload=None, **_kwargs):
             del payload
             if str(method).upper() == "DELETE":
                 return {}

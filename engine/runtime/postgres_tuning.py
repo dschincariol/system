@@ -64,6 +64,7 @@ PG_SETTING_SPECS: tuple[SettingSpec, ...] = (
     SettingSpec("TIMESCALE_EFFECTIVE_IO_CONCURRENCY", "effective_io_concurrency", "int"),
     SettingSpec("TIMESCALE_MAINTENANCE_IO_CONCURRENCY", "maintenance_io_concurrency", "int"),
     SettingSpec("TIMESCALE_ARCHIVE_MODE", "archive_mode", "bool"),
+    SettingSpec("TIMESCALE_ARCHIVE_COMMAND", "archive_command", "archive_command"),
     SettingSpec("TIMESCALE_ARCHIVE_TIMEOUT", "archive_timeout", "duration"),
 )
 
@@ -221,6 +222,20 @@ def _setting_value(spec: SettingSpec, raw: str) -> Any:
             return False
         raise ValueError(f"invalid boolean {raw!r}")
     return str(raw)
+
+
+def archive_command_uses_audited_script(command: Any) -> bool:
+    text = str(command or "").strip()
+    if not text:
+        return False
+    required_fragment = str(os.environ.get("TIMESCALE_ARCHIVE_COMMAND_REQUIRED_FRAGMENT") or "wal_archive.sh").strip()
+    if required_fragment and required_fragment not in text:
+        return False
+    if "%p" not in text or "%f" not in text:
+        return False
+    padded = f" {text} "
+    inline_fragments = (" cp %p ", " cp \"%p\" ", "mkdir -p ", "test ! -f ")
+    return not any(fragment in padded for fragment in inline_fragments)
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -522,6 +537,11 @@ def docker_postgres_tuning_snapshot(
         errors.append("postgres tuning checkpoint_completion_target must be at least 0.8")
     if configured.get("archive_mode") is False and required:
         errors.append("postgres tuning archive_mode must be on")
+    archive_command = str(configured.get("archive_command") or "").strip()
+    if required and not archive_command:
+        errors.append("postgres tuning archive_command must invoke wal_archive.sh")
+    elif archive_command and not archive_command_uses_audited_script(archive_command):
+        errors.append("postgres tuning archive_command must invoke audited wal_archive.sh with %p and %f")
     archive_timeout = float(configured.get("archive_timeout") or 0.0)
     if archive_timeout and archive_timeout > 120:
         warnings.append("postgres tuning archive_timeout above 120s weakens WAL RPO")

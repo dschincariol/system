@@ -6,12 +6,10 @@ for the local/service runtime.
 """
 
 import atexit
-import base64
 import json
 import logging
 import os
 import py_compile
-import re
 import signal
 import socket
 import subprocess
@@ -24,6 +22,36 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from engine.runtime.platform import default_local_db_dir, default_local_db_path, default_local_log_dir
+from engine.startup.env import (
+    append_env_line as _startup_append_env_line,
+    ensure_local_env_file as _startup_ensure_local_env_file,
+    ensure_local_secret_file as _startup_ensure_local_secret_file,
+    env_bool as _startup_env_bool,
+    env_file_has_nonempty_value as _startup_env_file_has_nonempty_value,
+    env_float as _startup_env_float,
+    env_int as _startup_env_int,
+    strict_runtime_requires_explicit_db_path as _startup_strict_runtime_requires_explicit_db_path,
+)
+from engine.startup.mode import pick_mode_from_argv_or_env as _startup_pick_mode_from_argv_or_env
+from engine.startup.phase import record_first_failure as _startup_record_first_failure
+from engine.startup.phase import record_phase as _startup_record_phase
+from engine.startup.subprocesses import import_smoke_subprocess as _startup_import_smoke_subprocess
+from engine.startup.subprocesses import module_name_from_path as _startup_module_name_from_path
+from engine.startup.subprocesses import run_runtime_graph_validation as _startup_run_runtime_graph_validation
+from engine.startup.validation import persist_startup_validation as _startup_persist_startup_validation
+from engine.startup.validation import redact_for_log as _startup_redact_for_log
+from engine.startup.validation import redact_log_string as _startup_redact_log_string
+from engine.startup.validation import startup_validation_summary as _startup_validation_summary_impl
+from engine.startup.validation import validation_gate_payload as _startup_validation_gate_payload
+from engine.startup.dashboard import coerce_ts_ms as _startup_coerce_ts_ms
+from engine.startup.dashboard import dashboard_returned_after_clean_shutdown as _startup_dashboard_returned_after_clean_shutdown
+from engine.startup.dashboard import dashboard_stop_requested as _startup_dashboard_stop_requested
+from engine.startup.dashboard import run_dashboard_server as _startup_run_dashboard_server
+from engine.startup.dashboard import run_dashboard_server_post_bind_validation as _startup_run_dashboard_server_post_bind_validation
+from engine.startup.dashboard import wait_for_dashboard_bind as _startup_wait_for_dashboard_bind
+from engine.startup.shutdown import bootstrap_runtime_side_effects as _startup_bootstrap_runtime_side_effects
+from engine.startup.shutdown import handle_signal as _startup_handle_signal
+from engine.startup.shutdown import request_dashboard_runtime_stop as _startup_request_dashboard_runtime_stop
 
 warnings.filterwarnings(
     "ignore",
@@ -58,6 +86,7 @@ except Exception as e:
 # Absolute base directory for systemd-managed Linux execution.
 # ------------------------------------------------------------------
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_DATA_SOURCE_MASTER_KEY_FILE = Path("data") / "secrets" / "data_source_master_key"
 
 # HARD ENFORCE: ensure no shadow copies of start_system are executed
 EXPECTED_PATH = os.path.join(_BASE_DIR, "start_system.py")
@@ -66,104 +95,39 @@ if os.path.abspath(__file__) != os.path.abspath(EXPECTED_PATH):
 
 
 def _env_file_has_nonempty_value(env_path: Path, key: str) -> bool:
-    if not env_path.exists():
-        return False
-    try:
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, value = line.split("=", 1)
-            if name.strip() == key and value.strip():
-                return True
-    except Exception as e:
-        _early_log_nonfatal("START_SYSTEM_ENV_FILE_READ_FAILED", e, path=str(env_path), key=str(key))
-    return False
+    return _startup_env_file_has_nonempty_value(env_path, key, warn=_early_log_nonfatal)
 
 
 def _append_env_line(env_path: Path, line: str) -> None:
-    existing = ""
-    try:
-        existing = env_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        existing = ""
-    with env_path.open("a", encoding="utf-8", newline="") as fh:
-        if existing and not existing.endswith(("\n", "\r")):
-            fh.write("\n")
-        fh.write(str(line).rstrip("\r\n") + "\n")
+    _startup_append_env_line(env_path, line)
+
+
+def _ensure_local_secret_file(path: Path) -> None:
+    _startup_ensure_local_secret_file(path, warn=_early_log_nonfatal)
 
 
 def _strict_runtime_requires_explicit_db_path() -> bool:
-    try:
-        from engine.runtime.config_schema import get_runtime_safety_context
-
-        requires_explicit = bool(get_runtime_safety_context().get("strict_runtime"))
-    except Exception:
-        env_raw = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "dev").strip().lower()
-        env = "prod" if env_raw in {"prod", "production"} else env_raw
-        engine_mode = str(os.environ.get("ENGINE_MODE") or "safe").strip().lower()
-        supervised = str(os.environ.get("ENGINE_SUPERVISED") or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        explicit_dev_env = bool(str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "").strip()) and env in {
-            "dev",
-            "test",
-        }
-        requires_explicit = bool(
-            supervised or env == "prod" or (engine_mode in {"live", "shadow", "paper"} and not explicit_dev_env)
-        )
-    return bool(requires_explicit)
+    return _startup_strict_runtime_requires_explicit_db_path()
 
 
 def _ensure_local_env_file() -> None:
-    env_path = Path(_BASE_DIR) / ".env"
-    example_path = Path(_BASE_DIR) / ".env.example"
+    _startup_ensure_local_env_file(
+        Path(_BASE_DIR),
+        _LOCAL_DATA_SOURCE_MASTER_KEY_FILE,
+        warn=_early_log_nonfatal,
+    )
 
-    if not env_path.exists():
-        if example_path.exists():
-            env_path.write_text(example_path.read_text(encoding="utf-8"), encoding="utf-8")
-        else:
-            env_path.write_text("", encoding="utf-8")
-
-    if not _env_file_has_nonempty_value(env_path, "DATA_SOURCE_MASTER_KEY"):
-        key = base64.b64encode(os.urandom(32)).decode("ascii")
-        _append_env_line(env_path, f"DATA_SOURCE_MASTER_KEY={key}")
 
 def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
-    raw = os.environ.get(name)
-    try:
-        value = int(float(str(raw if raw is not None else default).strip()))
-    except Exception:
-        value = int(default)
-    if minimum is not None:
-        value = max(int(minimum), value)
-    if maximum is not None:
-        value = min(int(maximum), value)
-    return value
+    return _startup_env_int(os.environ, name, default, minimum=minimum, maximum=maximum)
+
 
 def _env_float(name: str, default: float, *, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
-    raw = os.environ.get(name)
-    try:
-        value = float(str(raw if raw is not None else default).strip())
-    except Exception:
-        value = float(default)
-    if minimum is not None:
-        value = max(float(minimum), value)
-    if maximum is not None:
-        value = min(float(maximum), value)
-    return value
+    return _startup_env_float(os.environ, name, default, minimum=minimum, maximum=maximum)
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return bool(default)
+    return _startup_env_bool(os.environ, name, default)
 
 
 _LOG_DIR = os.path.abspath(
@@ -217,6 +181,7 @@ _SKIP_RUNTIME_GRAPH_CHECK = str(
     os.environ.get("TRADING_SKIP_RUNTIME_GRAPH_CHECK", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
 
+
 def _safe_print(*args, **kwargs) -> None:
     kwargs.setdefault("flush", True)
     try:
@@ -225,6 +190,7 @@ def _safe_print(*args, **kwargs) -> None:
         _early_log_nonfatal("START_SYSTEM_SAFE_PRINT_FAILED", e)
     except Exception as e:
         _early_log_nonfatal("START_SYSTEM_SAFE_PRINT_FAILED", e)
+
 
 def _bootstrap_start_system_env() -> None:
     sys.dont_write_bytecode = True
@@ -455,68 +421,28 @@ def _run_nonfatal_with_timeout(label: str, fn, *, timeout_s: float = 2.0) -> boo
 
 
 def _startup_validation_summary(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    snap = dict(snapshot or {})
-    gates = dict(snap.get("gates") or snap.get("checks") or {})
-    blocking_gates = list(snap.get("blocking_gates") or snap.get("blocking_checks") or [])
-    return {
-        "ok": bool(snap.get("ok")),
-        "mode": str(snap.get("mode") or ""),
-        "blocking_checks": list(blocking_gates),
-        "blocking_gates": list(blocking_gates),
-        "critical_systems_missing": list(snap.get("critical_systems_missing") or []),
-        "reasons": list(snap.get("reasons") or []),
-        "health_reasons": list(snap.get("health_reasons") or []),
-        "checks": gates,
-        "gates": gates,
-        "db_validation": dict(snap.get("db_validation") or {}),
-        "ts_ms": int(snap.get("ts_ms") or int(time.time() * 1000)),
-    }
-
-
-_SENSITIVE_LOG_KEYS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "credential",
-    "dsn",
-    "password",
-    "secret",
-    "token",
-)
+    return _startup_validation_summary_impl(snapshot, now_ms=int(time.time() * 1000))
 
 
 def _redact_log_string(value: str) -> str:
-    text = str(value)
-    text = re.sub(r"(?i)(password\s*=\s*)[^\s,;}\"]+", r"\1<redacted>", text)
-    text = re.sub(r"(?i)(://[^:/@\s]+:)[^@/\s]+@", r"\1<redacted>@", text)
-    text = re.sub(r"(?i)((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^&\s,;}\"]+", r"\1<redacted>", text)
-    return text
+    return _startup_redact_log_string(value)
 
 
 def _redact_for_log(value: Any, *, key: str = "") -> Any:
-    key_l = str(key or "").strip().lower()
-    sensitive_key = any(marker in key_l for marker in _SENSITIVE_LOG_KEYS)
-    if isinstance(value, dict):
-        return {str(k): _redact_for_log(v, key=str(k)) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_for_log(v, key=key) for v in value]
-    if isinstance(value, tuple):
-        return [_redact_for_log(v, key=key) for v in value]
-    if sensitive_key and value not in (None, "", False, True) and not isinstance(value, (int, float)):
-        return "<redacted>"
-    if isinstance(value, str):
-        return _redact_log_string(value)
-    return value
+    return _startup_redact_for_log(value, key=key)
 
 
 def _persist_startup_validation(snapshot: Optional[Dict[str, Any]], *, stage: str, attempt: int, timeout_s: float) -> None:
-    payload = _startup_validation_summary(snapshot)
-    payload["stage"] = str(stage)
-    payload["attempt"] = int(attempt)
-    payload["timeout_s"] = float(timeout_s)
-    _STARTUP_TRACE["startup_health_validation"] = payload
-    _persist_startup_trace()
-    _meta_set_json("startup_health_validation", payload)
+    _startup_persist_startup_validation(
+        _STARTUP_TRACE,
+        snapshot,
+        stage=stage,
+        attempt=attempt,
+        timeout_s=timeout_s,
+        persist_startup_trace=_persist_startup_trace,
+        meta_set_json=_meta_set_json,
+        now_ms=int(time.time() * 1000),
+    )
 
 
 def _log_startup_validation(stage: str, snapshot: Optional[Dict[str, Any]], *, level: str = "warning", attempt: int = 0, timeout_s: float = 0.0) -> None:
@@ -613,36 +539,32 @@ def _await_startup_health(*, mode: str, timeout_s: float) -> Dict[str, Any]:
         )
     )
 
+
 def _record_phase(phase: str, *, status: str = "started", detail: str = "", extra: Optional[dict] = None) -> None:
-    now_ms = int(time.time() * 1000)
-    entry = {
-        "phase": str(phase),
-        "status": str(status),
-        "detail": str(detail or ""),
-        "ts_ms": now_ms,
-    }
-    if isinstance(extra, dict) and extra:
-        entry["extra"] = dict(extra)
-    _STARTUP_TRACE["phase"] = str(phase)
-    _STARTUP_TRACE.setdefault("phases", []).append(entry)
+    _startup_record_phase(
+        _STARTUP_TRACE,
+        phase,
+        status=status,
+        detail=detail,
+        extra=extra,
+        now_ms=int(time.time() * 1000),
+    )
     _persist_startup_trace()
 
+
 def _record_first_failure(phase: str, exc: BaseException, *, file_path: str = "", line_no: Optional[int] = None, module: str = "") -> None:
-    if _STARTUP_TRACE.get("first_failure"):
-        return
-    tb = traceback.extract_tb(exc.__traceback__) if getattr(exc, "__traceback__", None) else []
-    leaf = tb[-1] if tb else None
-    _STARTUP_TRACE["first_failure"] = {
-        "phase": str(phase),
-        "type": type(exc).__name__,
-        "error": str(exc),
-        "module": str(module or (leaf.name if leaf else "")),
-        "file": str(file_path or (leaf.filename if leaf else "")),
-        "line": int(line_no or (leaf.lineno if leaf else 0) or 0),
-        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-12000:],
-        "ts_ms": int(time.time() * 1000),
-    }
-    _persist_startup_trace()
+    before = _STARTUP_TRACE.get("first_failure")
+    _startup_record_first_failure(
+        _STARTUP_TRACE,
+        phase,
+        exc,
+        file_path=file_path,
+        line_no=line_no,
+        module=module,
+        now_ms=int(time.time() * 1000),
+    )
+    if not before and _STARTUP_TRACE.get("first_failure"):
+        _persist_startup_trace()
 
 
 def _evaluate_startup_prebind_gates(*, mode: str) -> Dict[str, Any]:
@@ -659,81 +581,20 @@ def _evaluate_startup_prebind_gates(*, mode: str) -> Dict[str, Any]:
     return payload
 
 def _module_name_from_path(path_value: str) -> str:
-    rel = str(path_value or "").replace("\\", "/").strip()
-    if not rel:
-        return ""
-    if rel.endswith(".py"):
-        rel = rel[:-3]
-    return rel.replace("/", ".").strip(".")
+    return _startup_module_name_from_path(path_value)
 
 
 def _import_smoke_subprocess(module_name: str, abs_path: str, *, timeout_s: float) -> Dict[str, Any]:
-    code = (
-        "import importlib, importlib.util, sys\n"
-        "module_name = sys.argv[1]\n"
-        "abs_path = sys.argv[2]\n"
-        "if module_name:\n"
-        "    importlib.import_module(module_name)\n"
-        "else:\n"
-        "    spec = importlib.util.spec_from_file_location('startup_import_smoke_target', abs_path)\n"
-        "    if spec is None or spec.loader is None:\n"
-        "        raise ImportError(f'module_spec_unavailable:{abs_path}')\n"
-        "    module = importlib.util.module_from_spec(spec)\n"
-        "    spec.loader.exec_module(module)\n"
+    return _startup_import_smoke_subprocess(
+        module_name,
+        abs_path,
+        timeout_s=timeout_s,
+        base_dir=_BASE_DIR,
+        executable=sys.executable,
+        environ=os.environ,
+        run=subprocess.run,
+        log_swallowed=_log_swallowed,
     )
-    env = dict(os.environ)
-    env["PYTHONPATH"] = _BASE_DIR + os.pathsep + str(env.get("PYTHONPATH", ""))
-    env["TRADING_IMPORT_SMOKE_CHILD"] = "1"
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", code, str(module_name or ""), str(abs_path)],
-            cwd=_BASE_DIR,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=max(1.0, float(timeout_s)),
-        )
-    except subprocess.TimeoutExpired as e:
-        _log_swallowed(
-            "IMPORT_SMOKE_SUBPROCESS_TIMEOUT",
-            module=str(module_name or ""),
-            path=str(abs_path),
-            timeout_s=float(timeout_s),
-        )
-        return {
-            "ok": False,
-            "error_type": "TimeoutError",
-            "error": f"import_timeout_after_{float(timeout_s):.1f}s",
-            "stdout": str(e.stdout or "").strip()[-4000:],
-            "stderr": str(e.stderr or "").strip()[-4000:],
-        }
-    except Exception as e:
-        _log_swallowed(
-            "IMPORT_SMOKE_SUBPROCESS_FAILED",
-            module=str(module_name or ""),
-            path=str(abs_path),
-            error=str(e),
-        )
-        return {
-            "ok": False,
-            "error_type": type(e).__name__,
-            "error": str(e),
-            "stdout": "",
-            "stderr": "".join(traceback.format_exception(type(e), e, e.__traceback__))[-4000:],
-        }
-
-    if int(proc.returncode or 0) != 0:
-        stderr_text = str(proc.stderr or "").strip()
-        stdout_text = str(proc.stdout or "").strip()
-        return {
-            "ok": False,
-            "error_type": "ImportError",
-            "error": f"import_process_exit_{int(proc.returncode)}",
-            "stdout": stdout_text[-4000:],
-            "stderr": stderr_text[-4000:],
-        }
-
-    return {"ok": True}
 
 
 def _run_import_smoke() -> None:
@@ -901,48 +762,22 @@ def _run_production_validation_gate() -> None:
         })
     else:
         checks.append(check_name)
-        try:
-            env = dict(os.environ)
-            env.setdefault("PYTHONPATH", _BASE_DIR)
-            env["TRADING_VALIDATION_MODE"] = "startup"
+        failure = _startup_run_runtime_graph_validation(
+            script_path,
+            base_dir=_BASE_DIR,
+            executable=sys.executable,
+            environ=os.environ,
+            timeout_s=_VALIDATION_TIMEOUT_S,
+            run=subprocess.run,
+        )
+        if failure is not None:
+            failures.append(failure)
 
-            proc = subprocess.run(
-                [sys.executable, script_path],
-                cwd=_BASE_DIR,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=_VALIDATION_TIMEOUT_S,
-            )
-
-            stdout_text = str(proc.stdout or "").strip()
-            stderr_text = str(proc.stderr or "").strip()
-
-            if int(proc.returncode or 0) != 0:
-                failures.append({
-                    "name": str(check_name),
-                    "script": str(script_path),
-                    "error": f"validation_failed:{check_name}",
-                    "exit_code": int(proc.returncode),
-                    "stdout": stdout_text[-12000:],
-                    "stderr": stderr_text[-12000:],
-                })
-        except subprocess.TimeoutExpired as e:
-            failures.append({
-                "name": str(check_name),
-                "script": str(script_path),
-                "error": f"validation_timeout:{check_name}",
-                "exit_code": None,
-                "stdout": str((e.stdout or "")).strip()[-12000:],
-                "stderr": str((e.stderr or "")).strip()[-12000:],
-            })
-
-    _STARTUP_TRACE["validation_gate"] = {
-        "ok": len(failures) == 0,
-        "checks": checks,
-        "failures": failures,
-        "ts_ms": int(time.time() * 1000),
-    }
+    _STARTUP_TRACE["validation_gate"] = _startup_validation_gate_payload(
+        checks,
+        failures,
+        now_ms=int(time.time() * 1000),
+    )
     _persist_startup_trace()
 
     if failures:
@@ -1912,30 +1747,19 @@ def _perform_startup_health_validation(*, mode: str) -> None:
 
 
 def _request_dashboard_runtime_stop(reason: str) -> None:
-    stopped = False
-    _INGESTION_WATCHDOG_STOP.set()
-    try:
+    def _stop_server_loader():
         from dashboard_server import stop_server
 
-        stop_server()
-        stopped = True
-    except Exception as stop_err:
-        _log_swallowed("STARTUP_HEALTH_STOP_SERVER_FAILED", error=str(stop_err), reason=str(reason))
+        return stop_server
 
-    try:
-        runtime_shutdown()
-        stopped = True
-    except Exception as shutdown_err:
-        _log_swallowed("STARTUP_HEALTH_RUNTIME_SHUTDOWN_FAILED", error=str(shutdown_err), reason=str(reason))
-
-    try:
-        _terminate_ingestion()
-        stopped = True
-    except Exception as ingestion_err:
-        _log_swallowed("STARTUP_HEALTH_INGESTION_TERMINATE_FAILED", error=str(ingestion_err), reason=str(reason))
-
-    if not stopped:
-        _log_swallowed("STARTUP_HEALTH_RUNTIME_STOP_NOT_CONFIRMED", reason=str(reason))
+    _startup_request_dashboard_runtime_stop(
+        reason,
+        watchdog_stop=_INGESTION_WATCHDOG_STOP,
+        stop_server_loader=_stop_server_loader,
+        runtime_shutdown=runtime_shutdown,
+        terminate_ingestion=_terminate_ingestion,
+        log_swallowed=_log_swallowed,
+    )
 
 
 def _handle_late_startup_health_validation_failure(exc: BaseException, *, mode: str, scope: str) -> None:
@@ -2010,15 +1834,14 @@ def _start_startup_health_validation_async(*, mode: str) -> threading.Thread:
 
 
 def _wait_for_dashboard_bind(*, host: str, port: int, timeout_s: float) -> bool:
-    deadline = time.monotonic() + max(0.5, float(timeout_s))
-    address = (str(host), int(port))
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(address, timeout=0.25):
-                return True
-        except OSError:
-            time.sleep(0.25)
-    return False
+    return _startup_wait_for_dashboard_bind(
+        host=host,
+        port=port,
+        timeout_s=timeout_s,
+        create_connection=socket.create_connection,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+    )
 
 
 def _run_dashboard_server_post_bind_validation(
@@ -2029,98 +1852,45 @@ def _run_dashboard_server_post_bind_validation(
     port: int,
 ) -> None:
     bind_wait_timeout_s = max(5.0, min(120.0, float(_STARTUP_HEALTH_TIMEOUT_S)))
-
-    def _runner() -> None:
-        try:
-            _record_phase(
-                "STARTUP_HEALTH",
-                status="started",
-                detail="await_dashboard_bind_before_async_validation",
-                extra={
-                    "host": str(host),
-                    "port": int(port),
-                    "timeout_s": float(bind_wait_timeout_s),
-                },
-            )
-            LOG.warning(
-                "STARTUP_HEALTH_AWAIT_DASHBOARD_BIND host=%s port=%s timeout_s=%s",
-                host,
-                port,
-                bind_wait_timeout_s,
-            )
-            if not _wait_for_dashboard_bind(
-                host=str(host),
-                port=int(port),
-                timeout_s=float(bind_wait_timeout_s),
-            ):
-                raise TimeoutError(f"dashboard_bind_timeout:{host}:{port}")
-            _record_phase(
-                "STARTUP_HEALTH",
-                status="started",
-                detail="dashboard_bound_async_validation_scheduled",
-                extra={"host": str(host), "port": int(port)},
-            )
-            LOG.warning(
-                "STARTUP_HEALTH_DASHBOARD_BOUND host=%s port=%s starting_async_validation",
-                host,
-                port,
-            )
-            _start_startup_health_validation_async(mode=str(mode))
-        except Exception as e:
-            _record_first_failure(
-                "STARTUP_HEALTH",
-                e,
-                file_path=__file__,
-                module="start_system.bind_wait",
-            )
-            _record_phase(
-                "STARTUP_HEALTH",
-                status="failed",
-                detail=str(e),
-                extra={"host": str(host), "port": int(port)},
-            )
-            _log_swallowed(
-                "STARTUP_HEALTH_BIND_WAIT_FAILED",
-                mode=str(mode),
-                host=str(host),
-                port=int(port),
-                error=str(e),
-            )
-            _handle_late_startup_health_validation_failure(
-                e,
-                mode=str(mode),
-                scope="dashboard_bind_wait",
-            )
-
-    threading.Thread(
-        target=_runner,
-        name="startup_health_bind_wait",
-        daemon=True,
-    ).start()
-    run_server()
+    _startup_run_dashboard_server_post_bind_validation(
+        run_server,
+        mode=mode,
+        host=host,
+        port=port,
+        bind_wait_timeout_s=bind_wait_timeout_s,
+        wait_for_bind=_wait_for_dashboard_bind,
+        start_startup_health_validation_async=_start_startup_health_validation_async,
+        record_phase=_record_phase,
+        record_first_failure=_record_first_failure,
+        log_warning=LOG.warning,
+        log_swallowed=_log_swallowed,
+        handle_late_startup_health_validation_failure=_handle_late_startup_health_validation_failure,
+        file_path=__file__,
+        thread_factory=threading.Thread,
+    )
 
 
 def _run_dashboard_server(run_server, *, mode: str) -> None:
-    _perform_startup_health_validation(mode=str(mode))
-    run_server()
+    _startup_run_dashboard_server(
+        run_server,
+        mode=mode,
+        perform_startup_health_validation=_perform_startup_health_validation,
+    )
 
 
 def _coerce_ts_ms(value: Any) -> int:
     try:
-        return int(str(value or "0").strip() or "0")
+        return _startup_coerce_ts_ms(value)
     except Exception as e:
         _log_swallowed("COERCE_TS_MS_FAILED", error=str(e), value_type=type(value).__name__)
         return 0
 
 
 def _dashboard_stop_requested() -> bool:
-    try:
-        module = sys.modules.get("dashboard_server")
-        event = getattr(module, "_SERVER_STOP_EVENT", None) if module is not None else None
-        return bool(callable(getattr(event, "is_set", None)) and event.is_set())
-    except Exception as e:
-        _log_swallowed("DASHBOARD_STOP_REQUEST_CHECK_FAILED", error=str(e))
-        return False
+    return _startup_dashboard_stop_requested(
+        dashboard_module=sys.modules.get("dashboard_server"),
+        log_swallowed=_log_swallowed,
+    )
 
 
 def _dashboard_returned_after_clean_shutdown(
@@ -2132,33 +1902,35 @@ def _dashboard_returned_after_clean_shutdown(
     try:
         from engine.runtime.lifecycle_state import SHUTTING_DOWN
 
-        if str(lifecycle.get("state") or "").strip().upper() == str(SHUTTING_DOWN):
-            return True
+        shutdown_states = (str(SHUTTING_DOWN),)
     except Exception as e:
         _log_swallowed("DASHBOARD_SHUTTING_DOWN_STATE_IMPORT_FAILED", error=str(e))
-        if str(lifecycle.get("state") or "").strip().upper() in {"SHUTTING_DOWN", "SHUTDOWN", "SHUTTING"}:
-            return True
+        shutdown_states = ("SHUTTING_DOWN", "SHUTDOWN", "SHUTTING")
 
-    if _dashboard_stop_requested() and not bool(stop_requested_at_enter):
-        return True
-
-    clean_ts_ms = _coerce_ts_ms(lifecycle.get("last_clean_shutdown_ts_ms"))
-    return bool(clean_ts_ms > 0 and clean_ts_ms >= int(run_enter_ts_ms or 0))
+    return _startup_dashboard_returned_after_clean_shutdown(
+        lifecycle,
+        run_enter_ts_ms=run_enter_ts_ms,
+        stop_requested_at_enter=stop_requested_at_enter,
+        stop_requested_now=_dashboard_stop_requested(),
+        shutdown_states=shutdown_states,
+        coerce_ts_ms_fn=_coerce_ts_ms,
+    )
 
 
 def _handle_signal(signum, _frame) -> None:
-    _INGESTION_WATCHDOG_STOP.set()
-    try:
+    def _mark_clean_shutdown_loader():
         from engine.runtime.lifecycle_state import mark_clean_shutdown
-        mark_clean_shutdown()
-    except Exception:
-        _log_swallowed("MARK_CLEAN_SHUTDOWN_FAILED", signal=int(signum))
-    _terminate_ingestion()
-    try:
-        runtime_shutdown()
-    except Exception:
-        _log_swallowed("RUNTIME_SHUTDOWN_FAILED", signal=int(signum))
-    raise SystemExit(0)
+
+        return mark_clean_shutdown
+
+    _startup_handle_signal(
+        int(signum),
+        watchdog_stop=_INGESTION_WATCHDOG_STOP,
+        mark_clean_shutdown_loader=_mark_clean_shutdown_loader,
+        terminate_ingestion=_terminate_ingestion,
+        runtime_shutdown=runtime_shutdown,
+        log_swallowed=_log_swallowed,
+    )
 
 
 def _db_repair_lock_contention(value: Any) -> bool:
@@ -2210,37 +1982,23 @@ def _run_startup_db_repair() -> Any:
 
 
 def _bootstrap_runtime_side_effects() -> None:
-    _INGESTION_WATCHDOG_STOP.clear()
-    atexit.register(_terminate_ingestion)
-    atexit.register(_cleanup_pid_file)
-    _write_pid_file()
-
-    try:
-        signal.signal(signal.SIGTERM, _handle_signal)
-        signal.signal(signal.SIGINT, _handle_signal)
-    except Exception as e:
-        LOG.exception("SIGNAL_HANDLER_REGISTRATION_FAILED")
-        raise RuntimeError(f"signal_handler_registration_failed:{type(e).__name__}:{e}") from e
-
-    try:
-        _run_startup_db_repair()
-    except Exception:
-        LOG.exception("DB_REPAIR_FAILED")
-        raise
+    _startup_bootstrap_runtime_side_effects(
+        watchdog_stop=_INGESTION_WATCHDOG_STOP,
+        register_atexit=atexit.register,
+        register_signal=signal.signal,
+        sigterm=signal.SIGTERM,
+        sigint=signal.SIGINT,
+        handle_signal_fn=_handle_signal,
+        terminate_ingestion=_terminate_ingestion,
+        cleanup_pid_file=_cleanup_pid_file,
+        write_pid_file=_write_pid_file,
+        run_startup_db_repair=_run_startup_db_repair,
+        log_exception=LOG.exception,
+    )
 
 
 def _pick_mode_from_argv_or_env() -> str:
-    # Prefer explicit argv, else env, else SAFE
-    if len(sys.argv) >= 2 and str(sys.argv[1] or "").strip():
-        mode = str(sys.argv[1]).strip().lower()
-    else:
-        mode = str(os.environ.get("ENGINE_MODE", "") or "").strip().lower() or "safe"
-
-    allowed = {"safe", "shadow", "live"}
-    if mode not in allowed:
-        raise RuntimeError(f"invalid ENGINE_MODE: {mode}")
-
-    return mode
+    return _startup_pick_mode_from_argv_or_env(sys.argv, os.environ)
 
 
 def main():

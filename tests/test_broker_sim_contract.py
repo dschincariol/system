@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sqlite3
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +20,14 @@ def _reload_module():
     import engine.execution.broker_sim as broker_sim
 
     return importlib.reload(broker_sim)
+
+
+def _reload_modules(*module_names: str):
+    modules = []
+    for name in module_names:
+        module = importlib.import_module(name)
+        modules.append(importlib.reload(module))
+    return modules
 
 
 class BrokerSimContractTests(unittest.TestCase):
@@ -120,6 +131,183 @@ class BrokerSimContractTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "no_orders")
         mark_to_market.assert_called_once_with(fake_con, 1234, book_key=None, best_effort=True)
+
+
+class BrokerSimOverrideOrderPipelineTests(unittest.TestCase):
+    ENV_KEYS = (
+        "DB_PATH",
+        "BROKER_START_CASH",
+        "BROKER_LATENCY_SLEEP",
+        "TS_TESTING",
+        "TS_STORAGE_BACKEND",
+    )
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db_path = Path(self.tmp.name) / "broker_sim_override_pipeline.db"
+        self._env_backup = {key: os.environ.get(key) for key in self.ENV_KEYS}
+        os.environ["DB_PATH"] = str(self.db_path)
+        os.environ["BROKER_START_CASH"] = "100000"
+        os.environ["BROKER_LATENCY_SLEEP"] = "0"
+        os.environ["TS_TESTING"] = "1"
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
+        _reload_modules("engine.runtime.db_guard", "engine.runtime.storage")
+
+    def tearDown(self) -> None:
+        try:
+            (storage,) = _reload_modules("engine.runtime.storage")
+            storage.close_pooled_connections()
+        finally:
+            for key, value in self._env_backup.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            self.tmp.cleanup()
+
+    def _init_runtime(self):
+        storage, broker_sim, execution_ledger = _reload_modules(
+            "engine.runtime.storage",
+            "engine.execution.broker_sim",
+            "engine.execution.execution_ledger",
+        )
+        storage.init_db()
+        broker_sim.init_broker_db()
+        execution_ledger.init_execution_ledger()
+        return storage, broker_sim
+
+    def _seed_price(self, storage, *, ts_ms: int) -> None:
+        con = storage.connect()
+        try:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prices (
+                  ts_ms INTEGER NOT NULL,
+                  symbol TEXT NOT NULL,
+                  price REAL,
+                  px REAL,
+                  source TEXT,
+                  PRIMARY KEY(symbol, ts_ms)
+                )
+                """
+            )
+            con.execute(
+                "INSERT INTO prices(ts_ms, symbol, price, px, source) VALUES (?,?,?,?,?)",
+                (int(ts_ms), "AAPL", 100.0, 100.0, "test"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def test_override_orders_dry_run_preserves_preview_without_writes(self) -> None:
+        storage, broker_sim = self._init_runtime()
+        now_ms = int(time.time() * 1000)
+        self._seed_price(storage, ts_ms=now_ms)
+
+        orders = [{"source_order_id": 7001, "symbol": "AAPL", "to_side": "LONG", "qty": 1.0}]
+        result = broker_sim.apply_new_portfolio_orders(
+            dry_run=True,
+            override_orders=[dict(orders[0])],
+            override_order_id=77,
+            override_ts_ms=now_ms,
+        )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("status"), "dry_run_preview")
+        self.assertEqual(result.get("broker"), "sim")
+        self.assertEqual(result.get("order_id"), 77)
+        self.assertEqual(result.get("orders"), orders)
+
+        con = storage.connect(readonly=True)
+        try:
+            self.assertEqual(int(con.execute("SELECT COUNT(*) FROM broker_fills").fetchone()[0] or 0), 0)
+            self.assertEqual(int(con.execute("SELECT COUNT(*) FROM broker_positions").fetchone()[0] or 0), 0)
+            self.assertEqual(int(con.execute("SELECT COUNT(*) FROM broker_order_state").fetchone()[0] or 0), 0)
+            self.assertEqual(int(con.execute("SELECT COUNT(*) FROM execution_orders").fetchone()[0] or 0), 0)
+            self.assertEqual(int(con.execute("SELECT COUNT(*) FROM execution_fills").fetchone()[0] or 0), 0)
+            last_applied = con.execute(
+                "SELECT value FROM broker_meta WHERE key='last_portfolio_orders_id'"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertIsNone(last_applied)
+
+    def test_override_orders_live_sim_persists_state_and_ledger_effects(self) -> None:
+        storage, broker_sim = self._init_runtime()
+        now_ms = int(time.time() * 1000)
+        self._seed_price(storage, ts_ms=now_ms)
+
+        orders = [
+            {
+                "source_order_id": 7002,
+                "symbol": "AAPL",
+                "to_side": "LONG",
+                "qty": 1.0,
+                "source_alert_id": 42,
+                "event_id": 99,
+                "horizon_s": 300,
+                "model_id": "override-test",
+            }
+        ]
+        with patch("engine.execution.kill_switch.execution_allowed", return_value=(True, None, None)):
+            with patch.object(broker_sim, "get_execution_liquidity_snapshot", return_value={}):
+                with patch.object(broker_sim, "_earnings_proximity_decay", return_value=0.0):
+                    with patch.object(broker_sim, "_get_factor_feature_asof", return_value=0.0):
+                        with patch.object(broker_sim, "_prime_broker_order_state_after_commit", return_value=None):
+                            result = broker_sim.apply_new_portfolio_orders(
+                                dry_run=False,
+                                override_orders=[dict(orders[0])],
+                                override_order_id=78,
+                                override_ts_ms=now_ms,
+                            )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("status"), "applied")
+        self.assertEqual(result.get("broker"), "sim")
+        self.assertEqual(result.get("order_id"), 78)
+        self.assertGreaterEqual(int(result.get("fills_written") or 0), 1)
+
+        con = storage.connect(readonly=True)
+        try:
+            position = con.execute("SELECT qty FROM broker_positions WHERE symbol='AAPL'").fetchone()
+            fill_count = int(con.execute("SELECT COUNT(*) FROM broker_fills WHERE symbol='AAPL'").fetchone()[0] or 0)
+            order_state = con.execute(
+                "SELECT state FROM broker_order_state WHERE source_order_id=7002 AND symbol='AAPL'"
+            ).fetchone()
+            execution_orders = int(
+                con.execute("SELECT COUNT(*) FROM execution_orders WHERE symbol='AAPL'").fetchone()[0] or 0
+            )
+            execution_fills = int(
+                con.execute("SELECT COUNT(*) FROM execution_fills WHERE symbol='AAPL'").fetchone()[0] or 0
+            )
+            last_applied = con.execute(
+                "SELECT value FROM broker_meta WHERE key='last_portfolio_orders_id'"
+            ).fetchone()
+            account_columns = {str(row[1]) for row in con.execute("PRAGMA table_info(broker_account)").fetchall()}
+            if "id" in account_columns:
+                cash = float(con.execute("SELECT cash FROM broker_account WHERE id=1").fetchone()[0])
+            else:
+                cash = float(
+                    con.execute(
+                        """
+                        SELECT cash
+                        FROM broker_account
+                        ORDER BY COALESCE(updated_ts_ms, ts_ms, 0) DESC, ts_ms DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()[0]
+                )
+        finally:
+            con.close()
+
+        self.assertIsNotNone(position)
+        self.assertAlmostEqual(float(position[0]), 1.0, places=6)
+        self.assertGreaterEqual(fill_count, 1)
+        self.assertEqual(tuple(order_state or ()), ("FILLED",))
+        self.assertEqual(execution_orders, 1)
+        self.assertGreaterEqual(execution_fills, 1)
+        self.assertEqual(tuple(last_applied or ()), ("78",))
+        self.assertLess(cash, 100000.0)
 
 
 if __name__ == "__main__":

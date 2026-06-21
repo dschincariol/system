@@ -28,10 +28,13 @@ COMPOSE_ENV_FILE="${TRADING_COMPOSE_ENV_FILE:-${REPO_ROOT}/deploy/compose/.env}"
 COMPOSE_EXTERNAL_FILE="${TRADING_COMPOSE_EXTERNAL_FILE:-${REPO_ROOT}/deploy/compose/docker-compose.external-services.yml}"
 COMPOSE_STACK_FILE="${TRADING_COMPOSE_STACK_FILE:-${REPO_ROOT}/deploy/compose/docker-compose.stack.yml}"
 TIMESCALE_CONTAINER="${TRADING_TIMESCALE_CONTAINER:-trading-timescaledb}"
+REDIS_CONTAINER="${TRADING_REDIS_CONTAINER:-trading-redis}"
+MINIO_CONTAINER="${TRADING_MINIO_CONTAINER:-trading-minio}"
 TIMESCALE_IMAGE="${TRADING_TIMESCALE_IMAGE:-}"
 TIMESCALE_PORT="${TRADING_TIMESCALE_PORT:-5432}"
 TIMESCALE_USER="${TRADING_TIMESCALE_USER:-trading}"
 TIMESCALE_PASSWORD="${TRADING_TIMESCALE_PASSWORD:-}"
+TIMESCALE_PASSWORD_FILE="${TRADING_TIMESCALE_PASSWORD_FILE:-}"
 RESTART_POSTGRES=0
 RUN_EVIDENCE=0
 COMPOSE_MODE=0
@@ -45,6 +48,13 @@ die() {
   exit 1
 }
 
+read_secret_file() {
+  local path="$1"
+  [ -n "$path" ] || return 1
+  [ -r "$path" ] || die "secret file is not readable: ${path}"
+  tr -d '\r\n' < "$path"
+}
+
 usage() {
   cat <<'EOF'
 Usage: install_backup_evidence_gate.sh [--compose] [--restart-postgres] [--run-evidence]
@@ -54,6 +64,8 @@ Installs only the backup/WAL/restore evidence production assets:
   - /var/backups/trading filesystem layout
   - backup/restore systemd timers
   - PostgreSQL archive config when a local cluster config exists
+  - bounded WAL archive catch-up for stalled Compose archivers
+  - missing Compose storage path settings, copied from the current container mounts
   - /etc/trading/trading.env evidence and PostgreSQL binary settings
 
 Options:
@@ -253,6 +265,32 @@ set_provider_env_var() {
   rm -f "$tmp"
 }
 
+set_compose_env_var() {
+  local key="$1"
+  local value="$2"
+  local tmp
+
+  [ -f "$COMPOSE_ENV_FILE" ] || die "compose env file missing: ${COMPOSE_ENV_FILE}"
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    index($0, key "=") == 1 || index($0, "#" key "=") == 1 {
+      if (!done) {
+        print key "=" value
+        done = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done) {
+        print key "=" value
+      }
+    }
+  ' "$COMPOSE_ENV_FILE" > "$tmp"
+  cat "$tmp" > "$COMPOSE_ENV_FILE"
+  rm -f "$tmp"
+}
+
 compose_env_value() {
   local key="$1"
   python3 - "$COMPOSE_ENV_FILE" "$key" <<'PY'
@@ -278,6 +316,72 @@ for raw_line in path.read_text(encoding="utf-8").splitlines():
 PY
 }
 
+compose_container_mount_source() {
+  local container="$1"
+  local destination="$2"
+  if ! docker inspect "$container" >/dev/null 2>&1; then
+    return 1
+  fi
+  docker inspect "$container" | DESTINATION="$destination" python3 -c '
+import json
+import os
+import sys
+
+destination = os.environ["DESTINATION"]
+data = json.load(sys.stdin)
+for container in data:
+    for mount in container.get("Mounts") or []:
+        if mount.get("Destination") == destination:
+            print(mount.get("Source") or "")
+            raise SystemExit(0)
+raise SystemExit(1)
+'
+}
+
+ensure_compose_env_mount_source() {
+  local key="$1"
+  local container="$2"
+  local destination="$3"
+  local current source
+
+  current="$(compose_env_value "$key")"
+  source="$(compose_container_mount_source "$container" "$destination" || true)"
+  if [ -n "$current" ]; then
+    if [ -n "$source" ] && [ "$current" != "$source" ]; then
+      die "compose env ${key}=${current} does not match running ${container} mount ${destination}=${source}; refusing to move storage"
+    fi
+    return 0
+  fi
+  [ -n "$source" ] || die "compose env ${key} is missing and ${container}:${destination} mount source is unavailable"
+  set_compose_env_var "$key" "$source"
+  log "recorded ${key} from ${container}:${destination}"
+}
+
+ensure_compose_env_value() {
+  local key="$1"
+  local value="$2"
+  local current
+
+  current="$(compose_env_value "$key")"
+  if [ -n "$current" ]; then
+    if [ "$current" != "$value" ]; then
+      die "compose env ${key}=${current} does not match required value ${value}; refusing to rewrite"
+    fi
+    return 0
+  fi
+  set_compose_env_var "$key" "$value"
+  log "recorded ${key}=${value}"
+}
+
+normalize_compose_storage_env() {
+  [ "$COMPOSE_MODE" -eq 1 ] || return 0
+  ensure_compose_env_mount_source TRADING_TIMESCALE_DATA "$TIMESCALE_CONTAINER" /var/lib/postgresql/data
+  ensure_compose_env_mount_source TRADING_REDIS_DATA "$REDIS_CONTAINER" /data
+  ensure_compose_env_mount_source TRADING_MINIO_DATA "$MINIO_CONTAINER" /data
+  ensure_compose_env_mount_source TRADING_BACKUP_ROOT "$TIMESCALE_CONTAINER" /var/backups/trading
+  ensure_compose_env_value TRADING_BACKUP_WAL_DIR "$BACKUP_WAL_DIR"
+}
+
 load_compose_env() {
   [ -f "$COMPOSE_ENV_FILE" ] || die "compose env file missing: ${COMPOSE_ENV_FILE}"
 
@@ -287,10 +391,13 @@ load_compose_env() {
   TIMESCALE_PORT="${TIMESCALE_PORT:-5432}"
   TIMESCALE_USER="${TRADING_TIMESCALE_USER:-$(compose_env_value TIMESCALE_USER)}"
   TIMESCALE_USER="${TIMESCALE_USER:-trading}"
-  TIMESCALE_PASSWORD="${TRADING_TIMESCALE_PASSWORD:-$(compose_env_value TIMESCALE_PASSWORD)}"
+  TIMESCALE_PASSWORD_FILE="${TRADING_TIMESCALE_PASSWORD_FILE:-$(compose_env_value TIMESCALE_PASSWORD_FILE)}"
+  if [ -z "$TIMESCALE_PASSWORD" ] && [ -n "$TIMESCALE_PASSWORD_FILE" ]; then
+    TIMESCALE_PASSWORD="$(read_secret_file "$TIMESCALE_PASSWORD_FILE")"
+  fi
   POSTGRES_DB="${TRADING_POSTGRES_DB:-$(compose_env_value TIMESCALE_DB)}"
   POSTGRES_DB="${POSTGRES_DB:-trading}"
-  [ -n "$TIMESCALE_PASSWORD" ] || die "TIMESCALE_PASSWORD is required in compose mode"
+  [ -n "$TIMESCALE_PASSWORD" ] || die "TIMESCALE_PASSWORD_FILE is required in compose mode"
 }
 
 compose_postgres_uid_gid() {
@@ -310,6 +417,7 @@ install_backup_scripts() {
   local script
   for script in \
     wal_archive.sh \
+    wal_archive_catchup.sh \
     base_backup.sh \
     state_snapshot.sh \
     artifact_snapshot.sh \
@@ -385,22 +493,85 @@ write_runtime_env() {
   set_env_var BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S "120"
   set_env_var BACKUP_EVIDENCE_REQUIRE_SIGNATURE "1"
   set_env_var BACKUP_EVIDENCE_HMAC_KEY_FILE "$BACKUP_EVIDENCE_HMAC_KEY_FILE"
+  set_env_var TS_BACKUP_EVIDENCE_LOCK_TIMEOUT_S "30"
+  set_env_var TS_BACKUP_EVIDENCE_PROBE_TIMEOUT_S "5"
+  set_env_var TS_BACKUP_EVIDENCE_SYSTEMCTL_TIMEOUT_S "5"
+  set_env_var TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP "0"
+  set_env_var TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL "0"
+  set_env_var TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP "0"
+  set_env_var TS_BACKUP_EVIDENCE_BASE_BACKUP_TIMEOUT_S "7200"
+  set_env_var TS_BACKUP_EVIDENCE_WAL_SWITCH_TIMEOUT_S "30"
+  set_env_var TS_BACKUP_EVIDENCE_WAL_ARCHIVER_STATS_TIMEOUT_S "30"
+  set_env_var TS_BACKUP_EVIDENCE_WAL_CATCHUP_TIMEOUT_S "300"
+  set_env_var TS_BACKUP_EVIDENCE_RESTORE_DRILL_TIMEOUT_S "3600"
+  set_env_var TS_BACKUP_EVIDENCE_SIGNATURE_TIMEOUT_S "30"
+  set_env_var TS_BACKUP_EVIDENCE_PUBLISH_TIMEOUT_S "30"
+  if [ "$COMPOSE_MODE" -eq 1 ]; then
+    set_compose_env_var TRADING_WAL_ARCHIVE_SCRIPT "${BACKUP_SCRIPT_DST_DIR}/wal_archive.sh"
+    set_compose_env_var TRADING_WAL_ARCHIVE_CATCHUP_SCRIPT "${BACKUP_SCRIPT_DST_DIR}/wal_archive_catchup.sh"
+    set_compose_env_var TIMESCALE_ARCHIVE_COMMAND "/opt/trading/ops/backup/wal_archive.sh \"%p\" \"%f\""
+  fi
+}
+
+wait_for_compose_timescale_exec() {
+  local attempt
+  for attempt in $(seq 1 60); do
+    if docker exec "$TIMESCALE_CONTAINER" sh -lc 'true' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  die "TimescaleDB container did not become exec-ready: ${TIMESCALE_CONTAINER}"
+}
+
+run_compose_archive_selftest() {
+  log "running Compose WAL archive command self-test inside ${TIMESCALE_CONTAINER}"
+  docker exec \
+    -u postgres \
+    -e TS_BACKUP_ROOT=/var/backups/trading \
+    -e TS_BACKUP_WAL_DIR=/var/backups/trading/.wal-archive-selftest \
+    -e TS_WAL_ARCHIVE_REQUIRE_MOUNT=1 \
+    "$TIMESCALE_CONTAINER" \
+    sh -lc '
+      set -eu
+      src="${TMPDIR:-/tmp}/wal_archive_selftest.$$"
+      trap "rm -f \"$src\"; rm -rf /var/backups/trading/.wal-archive-selftest" EXIT
+      printf "wal archive self-test\n" > "$src"
+      /opt/trading/ops/backup/wal_archive.sh "$src" "0000000100000000000000FE.selftest"
+    '
+}
+
+run_compose_wal_catchup() {
+  log "running one-shot WAL archive catch-up inside ${TIMESCALE_CONTAINER}"
+  docker exec \
+    -u postgres \
+    -e PGDATA=/var/lib/postgresql/data \
+    -e TS_BACKUP_ROOT=/var/backups/trading \
+    -e TS_BACKUP_WAL_DIR=/var/backups/trading/wal \
+    -e TS_WAL_ARCHIVE_SCRIPT=/opt/trading/ops/backup/wal_archive.sh \
+    -e TS_WAL_ARCHIVE_REQUIRE_MOUNT=1 \
+    "$TIMESCALE_CONTAINER" \
+    /opt/trading/ops/backup/wal_archive_catchup.sh
 }
 
 configure_compose_archive() {
   [ -f "$COMPOSE_EXTERNAL_FILE" ] || die "compose external-services file missing: ${COMPOSE_EXTERNAL_FILE}"
   grep -q '/var/backups/trading/wal' "$COMPOSE_EXTERNAL_FILE" || die "compose file missing WAL archive bind mount: ${COMPOSE_EXTERNAL_FILE}"
-  grep -q 'archive_mode=on' "$COMPOSE_EXTERNAL_FILE" || die "compose file missing archive_mode=on: ${COMPOSE_EXTERNAL_FILE}"
-  grep -q 'archive_command=' "$COMPOSE_EXTERNAL_FILE" || die "compose file missing archive_command: ${COMPOSE_EXTERNAL_FILE}"
+  grep -Eq 'archive_mode=(on|\$\{TIMESCALE_ARCHIVE_MODE:-on\})' "$COMPOSE_EXTERNAL_FILE" || die "compose file missing archive_mode=on default: ${COMPOSE_EXTERNAL_FILE}"
+  grep -q 'wal_archive.sh "%p" "%f"' "$COMPOSE_EXTERNAL_FILE" || die "compose file missing audited WAL archive command: ${COMPOSE_EXTERNAL_FILE}"
+  grep -q '/opt/trading/ops/backup/wal_archive.sh:ro' "$COMPOSE_EXTERNAL_FILE" || die "compose file missing WAL archive script bind mount: ${COMPOSE_EXTERNAL_FILE}"
+  grep -q '/opt/trading/ops/backup/wal_archive_catchup.sh:ro' "$COMPOSE_EXTERNAL_FILE" || die "compose file missing WAL archive catch-up bind mount: ${COMPOSE_EXTERNAL_FILE}"
   if [ "$RESTART_POSTGRES" -eq 1 ]; then
     log "recreating Compose TimescaleDB service to apply WAL archive settings"
     docker compose \
       --env-file "$COMPOSE_ENV_FILE" \
       -f "$COMPOSE_EXTERNAL_FILE" \
-      -f "$COMPOSE_STACK_FILE" \
-      up -d timescaledb
+      up -d --no-deps --force-recreate timescaledb
+    wait_for_compose_timescale_exec
+    run_compose_archive_selftest
+    run_compose_wal_catchup
     docker inspect -f '{{.State.Health.Status}}' "$TIMESCALE_CONTAINER" >/dev/null 2>&1 || true
-    log "Compose TimescaleDB restart requested; verify container health before live promotion"
+    log "Compose TimescaleDB restart and WAL archive catch-up completed; verify signed evidence before live promotion"
   else
     log "Compose TimescaleDB restart still required for WAL archive mount/settings"
   fi
@@ -504,12 +675,12 @@ install_compose_systemd_overrides() {
   local service override_dir override_file
   for service in trading-base-backup.service trading-backup-evidence.service trading-restore-drill.service; do
     override_dir="${SYSTEMD_DST_DIR}/${service}.d"
-    override_file="${override_dir}/10-compose-timescaledb.conf"
+    override_file="${override_dir}/zz-compose-timescaledb.conf"
     install -d -o root -g root -m 0755 "$override_dir"
     cat > "$override_file" <<EOF
 [Service]
 User=root
-Group=root
+Group=${TRADING_GROUP}
 Environment=PGHOST=127.0.0.1
 Environment=PGPORT=${TIMESCALE_PORT}
 Environment=PGUSER=${TIMESCALE_USER}
@@ -521,11 +692,16 @@ Environment=TS_BACKUP_DOCKER_IMAGE=
 Environment=TS_BACKUP_DOCKER_EXEC_CONTAINER=${TIMESCALE_CONTAINER}
 Environment=TS_BACKUP_DOCKER_EXEC_USER=postgres
 Environment=TS_BACKUP_READ_GROUP=${TRADING_GROUP}
+Environment=TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=0
+Environment=TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=0
+Environment=TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0
+Environment=TS_BACKUP_EVIDENCE_WAL_CATCHUP_TIMEOUT_S=300
 Environment=TS_RESTORE_DOCKER_IMAGE=${TIMESCALE_IMAGE}
 Environment=TS_RESTORE_DOCKER_USER=postgres
 Environment=TS_RESTORE_DRILL_ALLOW_DIRECT=1
 Environment=TS_RESTORE_DB=${POSTGRES_DB}
 Environment=TS_RESTORE_USER=${TIMESCALE_USER}
+Restart=no
 EOF
     chmod 0644 "$override_file"
   done
@@ -550,6 +726,9 @@ run_evidence() {
       TS_BACKUP_DOCKER_EXEC_CONTAINER="$TIMESCALE_CONTAINER" \
       TS_BACKUP_DOCKER_EXEC_USER=postgres \
       TS_BACKUP_READ_GROUP="$TRADING_GROUP" \
+      TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=1 \
+      TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=1 \
+      TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=1 \
       TS_RESTORE_DOCKER_IMAGE="$TIMESCALE_IMAGE" \
       TS_RESTORE_DOCKER_USER=postgres \
       TS_RESTORE_DRILL_ALLOW_DIRECT=1 \
@@ -569,6 +748,8 @@ run_evidence() {
       TS_BACKUP_BASE_DIR="$BACKUP_BASE_DIR" \
       TS_BACKUP_WAL_DIR="$BACKUP_WAL_DIR" \
       TS_RESTORE_DRILL_DIR="$BACKUP_DRILL_DIR" \
+      TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=1 \
+      TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=1 \
       BACKUP_EVIDENCE_PATH="${BACKUP_EVIDENCE_DIR}/latest_backup_restore_evidence.json" \
       BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1 \
       BACKUP_EVIDENCE_HMAC_KEY_FILE="$BACKUP_EVIDENCE_HMAC_KEY_FILE" \
@@ -590,6 +771,7 @@ main() {
   require_root
   if [ "$COMPOSE_MODE" -eq 1 ]; then
     load_compose_env
+    normalize_compose_storage_env
   else
     detect_postgres_bin_dir
   fi

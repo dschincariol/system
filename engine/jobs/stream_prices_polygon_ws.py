@@ -46,7 +46,7 @@ from services.data_source_manager import get_manager
 from engine.runtime.lifecycle_state import set_state, LIVE, WARMING_UP, DEGRADED
 from engine.runtime.logging import get_logger
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
-from engine.runtime.price_router import publish_price_events
+from engine.runtime.price_router import price_persistence_backpressure_status, publish_price_events
 from engine.runtime.telemetry_append_buffer import append_price_provider_health
 from engine.runtime.tracing import trace_event
 
@@ -820,10 +820,11 @@ def _flush_to_db(
     min_write_interval_ms: int,
     last_write_by_symbol: Dict[str, int],
     write_price_events: bool = True,
-) -> Tuple[int, int, int, Dict[str, Dict[str, int]]]:
+) -> Tuple[int, int, int, Dict[str, Dict[str, int]], Dict[str, Any]]:
     n_raw = 0
     n_q = 0
     n_px = 0
+    async_persistence: Dict[str, Any] = {}
 
     raw_rows: List[tuple] = []
     q_rows: List[tuple] = []
@@ -1002,6 +1003,7 @@ def _flush_to_db(
             job=JOB_NAME,
             default_provider=PROVIDER_NAME,
         )
+        async_persistence = counts.get("async_persistence") or {}
         n_raw = int(counts.get("raw") or 0)
         n_q = int(counts.get("quotes") or 0)
         n_px = int(counts.get("prices") or 0)
@@ -1022,7 +1024,7 @@ def _flush_to_db(
             micro_rows,
         )
 
-    return n_raw, n_q, n_px, watermark_updates
+    return n_raw, n_q, n_px, watermark_updates, async_persistence
 
 
 def _telemetry_field(telemetry: Optional[Dict[str, Any]], key: str, default: Any = None) -> Any:
@@ -1110,6 +1112,42 @@ def _emit_snapshot_cap_metric(dropped_count: int, snapshot_size: int, max_record
             once_key="snapshot_cap_metric",
             dropped_count=int(max(0, dropped_count)),
         )
+
+
+def _async_persistence_backpressure_pause_s(counts: Dict[str, Any], *, phase: str) -> float:
+    status = price_persistence_backpressure_status(counts)
+    if not bool(status.get("backpressure")):
+        return 0.0
+    reason = str(status.get("reason") or "async_price_writer_backpressure")
+    try:
+        emit_counter(
+            "stream_prices_async_persistence_backpressure",
+            1,
+            component="engine.jobs.stream_prices_polygon_ws",
+            job=JOB_NAME,
+            provider=PROVIDER_NAME,
+            extra_tags={"phase": str(phase), "reason": reason[:80]},
+        )
+    except Exception as e:
+        _warn_nonfatal(
+            "POLYGON_WS_ASYNC_BACKPRESSURE_METRIC_FAILED",
+            e,
+            once_key="async_backpressure_metric",
+            phase=str(phase),
+        )
+    try:
+        set_state(DEGRADED, f"polygon_ws_async_price_writer_backpressure phase={phase} reason={reason}"[:500])
+    except Exception as e:
+        _warn_nonfatal(
+            "POLYGON_WS_SET_ASYNC_BACKPRESSURE_DEGRADED_FAILED",
+            e,
+            once_key="set_async_backpressure_degraded",
+            phase=str(phase),
+            reason=reason[:200],
+        )
+    if not bool(status.get("accepted", True)):
+        raise RuntimeError(f"async_price_writer_enqueue_rejected:{phase}:{reason}")
+    return min(float(WS_RECONNECT_MAX_S), max(0.25, float(WS_RECONNECT_BASE_S)))
 
 
 def _pause_snapshot_subscriptions(manager: Any, cap_state: Dict[str, Any], reason: str) -> None:
@@ -1556,6 +1594,7 @@ def main():
 
             raw_event_counts = {"raw": 0, "quotes": 0, "prices": 0}
             replay_counts = {"raw": 0, "quotes": 0, "prices": 0}
+            async_backpressure_pause_s = 0.0
             snap: Dict[str, Dict[str, Any]] = {}
             disconnect_ts_ms = int(_telemetry_field(telemetry, "last_disconnect_ts_ms", 0) or 0)
 
@@ -1584,6 +1623,10 @@ def main():
                                 )
 
                             replay_counts = run_write_txn(_write_replay)
+                            async_backpressure_pause_s = max(
+                                float(async_backpressure_pause_s),
+                                _async_persistence_backpressure_pause_s(replay_counts, phase="replay"),
+                            )
                             committed_watermarks = _save_committed_watermarks(
                                 committed_watermarks,
                                 _event_watermarks(replay_events),
@@ -1636,6 +1679,10 @@ def main():
                             )
 
                         raw_event_counts = run_write_txn(_write_live)
+                        async_backpressure_pause_s = max(
+                            float(async_backpressure_pause_s),
+                            _async_persistence_backpressure_pause_s(raw_event_counts, phase="live"),
+                        )
                         committed_watermarks = _save_committed_watermarks(
                             committed_watermarks,
                             _event_watermarks(live_events),
@@ -1665,6 +1712,15 @@ def main():
                     last_build_error = (repr(e) or "snapshot_error")[:400]
                     log.warning("polygon snapshot read failed: %s", last_build_error)
                     snap = {}
+
+            if async_backpressure_pause_s > 0:
+                flush_retry_backoff_s = min(
+                    float(WS_RECONNECT_MAX_S),
+                    max(float(WS_RECONNECT_BASE_S), float(flush_retry_backoff_s) * 1.5),
+                )
+                if _STOP_EVENT.wait(timeout=max(0.25, float(async_backpressure_pause_s))):
+                    break
+                continue
 
             if not snap and manager is not None and not writes_paused and sym_to_poly:
                 since_ts_ms = max(
@@ -1761,12 +1817,27 @@ def main():
                         write_price_events=bool(snapshot_should_write_prices),
                     )
 
-                n_raw, n_q, n_px, watermark_updates = run_write_txn(_write_flush)
+                n_raw, n_q, n_px, watermark_updates, snapshot_async_persistence = run_write_txn(_write_flush)
+                async_backpressure_pause_s = max(
+                    float(async_backpressure_pause_s),
+                    _async_persistence_backpressure_pause_s(
+                        {"async_persistence": snapshot_async_persistence},
+                        phase="snapshot",
+                    ),
+                )
                 if watermark_updates:
                     committed_watermarks = _save_committed_watermarks(committed_watermarks, watermark_updates)
                 if snapshot_should_write_prices or snap:
                     last_data_ts_ms = max(int(last_data_ts_ms or 0), int(newest_ts_ms or now_ms))
                     last_data_activity_ts_ms = int(now_ms)
+                if async_backpressure_pause_s > 0:
+                    flush_retry_backoff_s = min(
+                        float(WS_RECONNECT_MAX_S),
+                        max(float(WS_RECONNECT_BASE_S), float(flush_retry_backoff_s) * 1.5),
+                    )
+                    if _STOP_EVENT.wait(timeout=max(0.25, float(async_backpressure_pause_s))):
+                        break
+                    continue
                 try:
                     meta_set("price_provider_active", PROVIDER_NAME, best_effort=True)
                     did = meta_set_if_missing("first_price_ts_ms", str(int(newest_ts_ms or now_ms)))
@@ -1890,6 +1961,13 @@ def main():
                 manager.close()
         except Exception as e:
             _warn_nonfatal("POLYGON_WS_MANAGER_CLOSE_FAILED", e, once_key="manager_close")
+
+        try:
+            from engine.runtime.async_writer import shutdown_async_writer
+
+            shutdown_async_writer(timeout_s=5.0)
+        except Exception as e:
+            _warn_nonfatal("POLYGON_WS_ASYNC_WRITER_SHUTDOWN_FAILED", e, once_key="async_writer_shutdown")
 
         try:
             release_job_lock(JOB_NAME, OWNER, PID)

@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from engine.data._credentials import get_data_credential
 from engine.nlp.cache import bytes_to_vector, vector_to_bytes
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -184,11 +185,12 @@ def encode_news_texts(texts: Sequence[str], config: Optional[NewsEmbeddingConfig
         with SentenceTransformerEncoder(model_name=str(cfg.model_name), batch_size=int(os.environ.get("NEWS_EMBED_BATCH_SIZE", "64"))) as enc:
             return _normalize_matrix(enc.encode(rows))
     if cfg.backend == "openai":
-        if not str(os.environ.get("OPENAI_API_KEY") or "").strip():
+        api_key = str(get_data_credential("OPENAI_API_KEY") or "").strip()
+        if not api_key:
             raise RuntimeError("openai_embedding_backend_requires_OPENAI_API_KEY")
         from openai import OpenAI
 
-        client = OpenAI()
+        client = OpenAI(api_key=api_key)
         response = client.embeddings.create(model=str(cfg.model_name), input=rows)
         vectors = [list(item.embedding) for item in response.data]
         return _normalize_matrix(np.asarray(vectors, dtype=np.float32))

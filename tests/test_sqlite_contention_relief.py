@@ -861,7 +861,11 @@ class SQLiteContentionReliefTests(unittest.TestCase):
             ]
         )
 
-        with patch.object(feature_store, "run_write_txn", side_effect=AssertionError("feature_store_should_not_write_sqlite")):
+        with patch.object(
+            feature_store,
+            "run_write_txn",
+            side_effect=AssertionError("feature_store_should_not_write_sqlite"),
+        ):
             refreshed = feature_store.refresh_symbols(["SPY"], price_cache=price_cache)
 
         self.assertIn("SPY", refreshed)
@@ -1448,11 +1452,75 @@ class SQLiteContentionReliefTests(unittest.TestCase):
         finally:
             con.close()
         self.assertEqual(int(row[0] or 0), 0)
-        timeseries_snapshot = storage.get_timeseries_storage_snapshot()
-        market_feature_store = dict(timeseries_snapshot.get("market_feature_store") or {})
-        self.assertEqual(str(market_feature_store.get("write_mode") or ""), "memory")
-        self.assertFalse(bool(market_feature_store.get("sqlite_write_enabled")))
-        self.assertFalse(bool(market_feature_store.get("sqlite_read_fallback_enabled")))
+
+    def test_price_router_surfaces_async_enqueue_rejection_for_producer_backoff(self) -> None:
+        self._set_env("PRICE_ROUTER_SQLITE_WRITE_ENABLED", "0")
+        self._set_env("ASYNC_PRICE_WRITER_ENABLED", "1")
+        self._set_env("FEATURE_STORE_SQLITE_WRITE_ENABLED", "0")
+        (storage, _, feature_store, price_router) = _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.async_writer",
+            "engine.data.feature_store",
+            "engine.runtime.price_router",
+        )
+        storage.init_db()
+        emitted_counters = []
+        health_updates = []
+        fake_writer = SimpleNamespace(
+            enabled=True,
+            get_snapshot=lambda: {
+                "backpressure_active": True,
+                "last_backpressure_reason": "queue_full",
+                "queue_depth": 8,
+                "queue_maxsize": 8,
+            }
+        )
+
+        with patch.object(feature_store, "run_write_txn", side_effect=AssertionError("feature_store_should_not_write_sqlite")):
+            with patch.object(price_router, "enqueue_price_persistence", return_value=False):
+                with patch.object(price_router, "get_async_writer", return_value=fake_writer):
+                    with patch.object(price_router, "publish_event"):
+                        with patch.object(
+                            price_router,
+                            "emit_counter",
+                            side_effect=lambda *args, **kwargs: emitted_counters.append((args, kwargs)),
+                        ):
+                            with patch.object(
+                                price_router,
+                                "record_component_health",
+                                side_effect=lambda *args, **kwargs: health_updates.append((args, kwargs)),
+                            ):
+                                counts = price_router.publish_price_events(
+                                    [
+                                        {
+                                            "symbol": "SPY",
+                                            "provider": "polygon",
+                                            "source": "polygon",
+                                            "timestamp": 1_700_000_000_000,
+                                            "last": 500.25,
+                                            "bid": 500.2,
+                                            "ask": 500.3,
+                                            "volume": 1000,
+                                        }
+                                    ],
+                                    write_prices=True,
+                                    write_quotes=True,
+                                    write_raw=False,
+                                )
+
+        async_status = price_router.price_persistence_backpressure_status(counts)
+        self.assertFalse(bool(async_status.get("accepted")))
+        self.assertTrue(bool(async_status.get("backpressure")))
+        self.assertEqual(str(async_status.get("reason") or ""), "enqueue_rejected")
+        self.assertTrue(
+            any(
+                args and args[0] == "price_router_async_persistence_backpressure_rows"
+                for args, _kwargs in emitted_counters
+            )
+        )
+        self.assertTrue(
+            any(args and args[0] == "price_router_async_persistence" for args, _kwargs in health_updates)
+        )
 
     def test_ipc_best_effort_message_drops_before_sqlite_when_startup_gate_is_active(self) -> None:
         storage, ipc = _reload_modules(

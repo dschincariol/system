@@ -200,7 +200,7 @@ set_kernel_tuning() {
   log "configuring kernel tuning"
   if write_if_changed /etc/sysctl.d/99-trading.conf 0644 root root <<'EOF'
 vm.overcommit_memory=2
-vm.swappiness=1
+vm.swappiness=10
 net.core.somaxconn=4096
 fs.file-max=262144
 EOF
@@ -1155,6 +1155,7 @@ install_backup_scripts() {
   local script
   for script in \
     wal_archive.sh \
+    wal_archive_catchup.sh \
     base_backup.sh \
     state_snapshot.sh \
     artifact_snapshot.sh \
@@ -1175,6 +1176,7 @@ install_systemd_units() {
   install -d -m 0755 "$SYSTEMD_DST_DIR"
   local unit changed=0
   for unit in \
+    trading-cpu-power-policy.service \
     trading-prod-preflight.service \
     trading-api.service \
     trading-jobs.service \
@@ -1206,6 +1208,7 @@ install_systemd_units() {
     if ! systemctl is-enabled trading.target >/dev/null 2>&1; then
       systemctl enable trading.target >/dev/null
     fi
+    systemctl enable --now trading-cpu-power-policy.service >/dev/null
     for unit in \
       trading-base-backup.timer \
       trading-backup-evidence.timer \

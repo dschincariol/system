@@ -9,6 +9,7 @@ Source, docs, migrations, tests, and deploy assets stay outside this tree.
 | --- | --- |
 | `var/log/` | Runtime, ingestion, operator, soak, and validation logs. |
 | `var/db/` | Local SQLite compatibility files such as `trading.db`, liveness DBs, and Optuna studies. |
+| `var/db/async_price_writer_spool.sqlite` | Local async price-writer SQLite WAL spool when `DB_PATH`/`TS_DATA_ROOT` points into the repo-local data tree. Production deployments keep the same file under the configured runtime data root unless `ASYNC_PRICE_WRITER_SPOOL_PATH` overrides it. |
 | `var/tmp/` | Temporary operator state, generated patches, scratch files, and transient outputs. |
 | `var/artifacts/` | Local artifact-store objects, model caches, retraining datasets, preflight evidence, and generated reports. |
 | `var/audit/` | Local audit-run outputs that previously landed in `.run-audit/`. |
@@ -38,6 +39,22 @@ noise:
 - `data/*.db`, `data/*.sqlite`, and local `data/.data_source_master_key`
 - `artifacts/`
 - `models/`
+
+## Source-Control Hygiene Guard
+
+The repo permits local runtime and dependency outputs to remain on disk, but
+they must stay out of the git index. The enforced check is:
+
+```bash
+python tools/check_repo_artifact_hygiene.py --report
+```
+
+That guard runs in `python tools/validate_repo.py` and in the GitHub
+`Validate` workflow before dependency installation. It fails on tracked
+virtualenvs (`.venv/`, `venv/`, `env/`), `node_modules/`, Python caches,
+repo-local `var/` state, runtime DB/log/temp files, local secret paths, and
+local `.env*` files. The only tracked env files allowed by the guard are
+checked-in `*.env.example` templates.
 
 ## Local Migration
 

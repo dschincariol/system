@@ -19,7 +19,8 @@
   - Overall score = round(100 * earned_points / available_weight)
 
   This keeps the summary deterministic, transparent, and fail-soft when some
-  upstream reads are unavailable.
+  upstream reads are unavailable. Coverage is surfaced separately so a high
+  score from one or two available factors cannot be mistaken for full support.
 */
 
 import { severityRank } from "./alerts.js";
@@ -41,6 +42,8 @@ const CLASSIFICATION_CREDIT = Object.freeze({
   warning: 0.6,
   critical: 0.2,
 });
+
+const LOW_COVERAGE_RATIO = 0.5;
 
 function asFiniteNumber(value) {
   const n = Number(value);
@@ -325,15 +328,61 @@ function summarizeExecution(executionBarrier, executionDegraded, systemStatus = 
   return makeFactor("execution", "Execution", weight, classification, status, detail);
 }
 
-function overallBadge(worst, availableCount, totalCount) {
-  if (availableCount === 0) return { className: "unavailable", label: "waiting" };
+function coverageState(availableCount, totalCount) {
+  const total = Math.max(0, Number(totalCount) || 0);
+  const available = Math.max(0, Number(availableCount) || 0);
+  const ratio = total > 0 ? available / total : 0;
+
+  if (available === 0 || total === 0) {
+    return {
+      ratio: 0,
+      level: "none",
+      className: "unavailable",
+      label: "no coverage",
+      partial: true,
+      low: true,
+    };
+  }
+  if (available < total && ratio <= LOW_COVERAGE_RATIO) {
+    return {
+      ratio,
+      level: "low",
+      className: "high",
+      label: "low coverage",
+      partial: true,
+      low: true,
+    };
+  }
+  if (available < total) {
+    return {
+      ratio,
+      level: "partial",
+      className: "warn",
+      label: "partial coverage",
+      partial: true,
+      low: false,
+    };
+  }
+  return {
+    ratio: 1,
+    level: "full",
+    className: "ok",
+    label: "full coverage",
+    partial: false,
+    low: false,
+  };
+}
+
+function overallBadge(worst, coverage) {
+  const state = coverage || coverageState(0, FACTOR_ORDER.length);
+  if (state.level === "none") return { className: "unavailable", label: "waiting" };
   if (worst === "critical") return { className: "crit", label: "degraded" };
   if (worst === "warning") return { className: "warn", label: "watch" };
-  if (availableCount < totalCount) return { className: "unavailable", label: "partial" };
+  if (state.partial) return { className: state.className, label: state.label };
   return { className: "ok", label: "stable" };
 }
 
-function overallSummary(score, worst, availableCount, totalCount) {
+function overallSummary(score, worst, availableCount, totalCount, coverage) {
   if (availableCount === 0 || score === null) {
     return "Waiting for enough live health inputs to compute the summary.";
   }
@@ -342,6 +391,12 @@ function overallSummary(score, worst, availableCount, totalCount) {
   }
   if (worst === "warning") {
     return "Some core health factors are degraded, but the dashboard still has partial visibility into the system.";
+  }
+  if (coverage && coverage.low) {
+    return `Only ${availableCount}/${totalCount} health factors are available. The score uses available factors only and needs more inputs before it can represent full system health.`;
+  }
+  if (coverage && coverage.partial) {
+    return `Score is based on ${availableCount}/${totalCount} available health factors. Missing factors are not counted as failures, but coverage is not complete.`;
   }
   if (availableCount < totalCount) {
     return "Available health factors look stable. Remaining factors will appear as their inputs arrive.";
@@ -372,7 +427,8 @@ export function computeHealthScore({
   const earnedPoints = availableFactors.reduce((sum, factor) => sum + factor.points, 0);
   const score = availableWeight > 0 ? Math.round((earnedPoints / availableWeight) * 100) : null;
   const worst = worstClassification(availableFactors.map((factor) => factor.classification));
-  const badge = overallBadge(worst, availableFactors.length, orderedFactors.length);
+  const coverage = coverageState(availableFactors.length, orderedFactors.length);
+  const badge = overallBadge(worst, coverage);
 
   return {
     score,
@@ -381,11 +437,39 @@ export function computeHealthScore({
     earnedPoints,
     availableCount: availableFactors.length,
     totalCount: orderedFactors.length,
+    coverageRatio: coverage.ratio,
     coverageText: `${availableFactors.length}/${orderedFactors.length} factors`,
+    coverageLevel: coverage.level,
+    coverageClassName: coverage.className,
+    coverageLabel: coverage.label,
+    partialCoverage: coverage.partial,
+    lowCoverage: coverage.low,
     badgeClassName: badge.className,
     badgeLabel: badge.label,
-    summary: overallSummary(score, worst, availableFactors.length, orderedFactors.length),
+    summary: overallSummary(score, worst, availableFactors.length, orderedFactors.length, coverage),
   };
+}
+
+function updateHealthScoreCoverageClass(cardEl, coverageLevel) {
+  const classes = [
+    "is-health-coverage-none",
+    "is-health-coverage-low",
+    "is-health-coverage-partial",
+    "is-health-coverage-full",
+  ];
+  const level = ["none", "low", "partial", "full"].includes(coverageLevel) ? coverageLevel : "none";
+
+  if (cardEl.classList && typeof cardEl.classList.remove === "function") {
+    cardEl.classList.remove(...classes);
+    cardEl.classList.add(`is-health-coverage-${level}`);
+  } else {
+    const existing = String(cardEl.className || "")
+      .split(/\s+/)
+      .filter((part) => part && !classes.includes(part));
+    existing.push(`is-health-coverage-${level}`);
+    cardEl.className = existing.join(" ");
+  }
+  if (cardEl.dataset) cardEl.dataset.coverage = level;
 }
 
 function buildFactorNode(factor) {
@@ -427,12 +511,26 @@ export function renderHealthScoreSummary(
   if (!cardEl || !valueEl || !badgeEl || !coverageEl || !summaryEl || !factorsEl) return;
 
   const safe = scorecard || computeHealthScore({});
+  updateHealthScoreCoverageClass(cardEl, safe.coverageLevel || "none");
   valueEl.textContent = safe.score === null ? "—" : String(safe.score);
   const badgeToken = statusToken(safe.badgeClassName || "unavailable");
   badgeEl.className = statusPillClasses(badgeToken.key);
   badgeEl.dataset.status = badgeToken.key;
   badgeEl.setAttribute("aria-label", statusAriaLabel(badgeToken.key, safe.badgeLabel || "waiting"));
   badgeEl.textContent = safe.badgeLabel || "waiting";
+  const coverageToken = statusToken(safe.coverageClassName || "unavailable");
+  coverageEl.className = `healthScoreCoverage ${statusPillClasses(coverageToken.key)} mono`;
+  if (coverageEl.dataset) {
+    coverageEl.dataset.status = coverageToken.key;
+    coverageEl.dataset.coverage = safe.coverageLevel || "none";
+  }
+  coverageEl.setAttribute(
+    "aria-label",
+    statusAriaLabel(coverageToken.key, `${safe.coverageLabel || "no coverage"}: ${safe.coverageText || "0/4 factors"}`)
+  );
+  coverageEl.title = safe.partialCoverage
+    ? "Health score is normalized over available factors only; missing factors are shown as coverage."
+    : "All health score factors are currently available.";
   coverageEl.textContent = safe.coverageText || "0/4 factors";
   summaryEl.textContent = safe.summary || "Waiting for enough live health inputs to compute the summary.";
   factorsEl.replaceChildren(...(safe.factors || []).map(buildFactorNode));

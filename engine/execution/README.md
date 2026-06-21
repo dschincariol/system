@@ -32,10 +32,24 @@ The `engine/execution/` tree turns approved portfolio or strategy intents into b
   Polling fills and attribution path.
 - [execution_ledger.py](execution_ledger.py)
   Shared persistence and read helpers for broker order state, fills, and lifecycle evidence.
+  The ledger owns a single `_table_exists` helper for its internal schema probes. Its public `audit_execution_integrity()` payload is covered by a golden-shape regression test so downstream diagnostics can rely on stable keys during later refactors.
 - [trade_attribution_ledger.py](trade_attribution_ledger.py)
   Post-trade attribution ledger.
 - [almgren_chriss.py](almgren_chriss.py)
   Optional transaction-cost estimator used by newer execution-analytics and slicing decisions.
+  Opt-in, env-gated (`ALMGREN_CHRISS_*` knobs) Almgren-Chriss impact estimator for simulation/validation; exposes `estimate_almgren_chriss_costs()`. See "Almgren-Chriss Modules" below for how it differs from the cost-model dataclass of the same basename.
+- [cost_models/almgren_chriss.py](cost_models/almgren_chriss.py)
+  `AlmgrenChrissCost` expected market-impact cost-model dataclass used by simulation and backtest cost accounting. See "Almgren-Chriss Modules" below.
+- [position_reconcile.py](position_reconcile.py)
+  Pre-live broker-vs-runtime position reconciliation gate. `pre_live_position_reconcile(...)` reconciles broker positions against a stored confirmed baseline before live orders and, on out-of-tolerance mismatch or persistent position-fetch failure, trips the global kill switch and blocks execution. Env-gated by `EXECUTION_PRELIVE_RECONCILE`, baseline/bootstrap tokens, and `POSITION_RECONCILE_*` tolerances; also exposes `position_reconcile_evidence_snapshot(...)` for operator diagnostics.
+- [order_idempotency.py](order_idempotency.py)
+  Order idempotency / dedup module behind the "Broker-Native Idempotency" section below. Owns the `execution_order_idempotency` table and the durable claim/mark contract: `compute_order_uid`, `make_client_order_id`, `claim_order_submission` (and its `_durable` variant), the open-order replacement claim helpers, and the `mark_order_submission_submitted` / `_unrecorded` / `_unknown` markers (each with a `_durable` variant) used by Alpaca, IBKR, and the open-order manager.
+- [trade_suppression_engine.py](trade_suppression_engine.py)
+  Execution-degradation suppression engine. `evaluate_trade_suppression(...)` scores false-positive streaks, slippage/latency z-scores, and the execution-degradation snapshot into one of three tiers — `HARD_BLOCK` (size multiplier 0.0), `SOFT_THROTTLE`, or `SIZE_COMPRESSION` — and persists the resulting runtime suppression state and audit detail.
+- [execution_analytics_engine.py](execution_analytics_engine.py)
+  Post-trade execution analytics and slippage-attribution engine. Computes realized slippage vs decision reference price, alpha decay at fill, TTL-breach detection, cancel/replace impact, aggressiveness attribution, and broker performance stats; exposes `build_execution_analytics(...)`, `get_execution_degradation_snapshot(...)`, slippage/latency z-scores, rolling expectancy, adaptive half-life, and `rank_brokers_by_cost(...)`.
+- [execution_microstructure.py](execution_microstructure.py)
+  Execution microstructure layer that maintains the open-order registry and reprices/replaces limit orders by attempt and aggressiveness. Fail-soft (never throws, never blocks other jobs); exposes `manage_open_orders()`, `record_open_order(...)`, `verify_cancel_before_replace(...)`, `try_native_limit_replace(...)`, and `mark_cancel_replace_needs_reconcile(...)` (see "Cancel/Replace Safety" below).
 - [broker_fill_utils.py](broker_fill_utils.py)
   Normalization helpers that turn broker-specific fill payloads into common execution records.
 - [broker_alpaca_rest.py](broker_alpaca_rest.py)
@@ -64,6 +78,24 @@ Live broker routing has additional fail-closed constraints:
 - `DISABLE_LIVE_EXECUTION` blocks real trading when it is unset or set to any value other than `0`, `false`, `no`, or `off`.
 - Pre-live reconciliation must run in live mode unless the break-glass environment contract is explicitly filled and audited.
 - Broker auth/configuration failures and unrecorded broker submissions stop failover instead of retrying into another broker.
+
+## Broker Simulation Pipeline
+
+`broker_sim.py::apply_new_portfolio_orders(...)` keeps its public signature stable
+but now routes through named private phases:
+
+1. load override orders or the latest portfolio-execution intent batch
+2. validate/gate dry-run, empty-batch, and already-applied batch behavior
+3. build sizing and risk-cap context from account, positions, prices, and stress signals
+4. simulate child fills with existing spread, slippage, chunking, LOB, and cost-model logic
+5. persist broker account, positions, fills, order state, and mark-to-market account state
+6. log execution-ledger submit/fill effects for real paper-sim books while keeping shadow books isolated
+7. return the same summary shape used by existing callers
+
+Dry-run override orders still return `dry_run_preview` with the supplied orders and
+do not write broker fills, positions, order state, or execution-ledger rows. Live
+paper-sim override orders still write the broker and execution-ledger evidence
+used by attribution, idempotency, and operator diagnostics.
 
 ## Learned Execution Slicing
 
@@ -140,6 +172,30 @@ The shadow path is blocked unless all readiness checks pass:
 snapshot. When the shadow path is enabled and readiness fails, production
 preflight fails closed and live readiness includes the LOB blockers.
 
+## Almgren-Chriss Modules
+
+The tree contains two distinct Almgren-Chriss modules that share the same
+basename. They are separate, both imported, and not duplicates:
+
+- [almgren_chriss.py](almgren_chriss.py) (196 lines) is an opt-in,
+  env-gated impact **estimator** for simulation and validation. It is disabled
+  unless `ALMGREN_CHRISS_ENABLED=1`, reads its coefficients and bounds from the
+  `ALMGREN_CHRISS_*` knobs, and exposes `estimate_almgren_chriss_costs(...)`,
+  which returns bounded temporary, permanent, and risk-term bps for a single
+  order from a liquidity snapshot. It is imported by
+  [broker_sim.py](broker_sim.py) as a compatibility patch target and by
+  `engine/strategy/portfolio_backtest.py`.
+- [cost_models/almgren_chriss.py](cost_models/almgren_chriss.py) (132 lines)
+  is the `AlmgrenChrissCost` expected market-impact **cost-model** dataclass
+  (`eta`/`gamma`/asset-class coefficient overrides) exposing `components_bps(...)`
+  and `cost_bps(...)`. It is imported by [broker_sim.py](broker_sim.py),
+  `engine/rl/portfolio_env.py`, `engine/strategy/cpcv.py`, and
+  `engine/strategy/gated_backtest.py`.
+
+The shared basename is a mild readability hazard — one is the estimator, the
+other is the cost-model dataclass — but the two modules are distinct and both
+are in active use. They are not duplicates and neither is a dedupe candidate.
+
 ## Broker-Native Idempotency
 
 Live Alpaca and IBKR order submission uses dedicated durable idempotency
@@ -197,6 +253,38 @@ Broker adapter contracts reflect that distinction:
 
 - Alpaca `cancel_order()` sends DELETE, then polls the broker order until it observes `canceled` or zero remaining; otherwise it returns `cancel_not_verified`.
 - IBKR `cancel_order()` calls `cancelOrder()`, then re-queries open orders; it returns verified only when the order disappears from open orders, reports canceled, or reports zero remaining.
+
+## Shutdown And Emergency Broker Risk
+
+[broker_shutdown_risk.py](broker_shutdown_risk.py) owns broker-risk handling for
+runtime shutdown and operator emergency intervention. Live mode requires an
+explicit `BROKER_SHUTDOWN_POLICY`; missing policy fails closed and records an
+audit event instead of assuming a broker action.
+
+Supported policies are:
+
+- `observe_only`: list broker open orders and record the result.
+- `cancel_only` / `cancel_open_orders`: cancel broker open orders, then record
+  the adapter result.
+- `flatten_positions`: flatten reconciled positions without first canceling
+  open orders.
+- `cancel_and_flatten`: cancel open orders, then flatten reconciled positions.
+
+Flattening is deliberately narrower than ordinary order routing. The shutdown
+handler requires fresh pre-live position reconciliation and positive
+`BROKER_SHUTDOWN_FLATTEN_MAX_ABS_QTY_PER_SYMBOL` and
+`BROKER_SHUTDOWN_FLATTEN_MAX_TOTAL_ABS_QTY` limits before any adapter can submit
+market flatten orders. Alpaca uses deterministic shutdown `client_order_id`
+values and IBKR uses deterministic `orderRef` values derived from the durable
+command id, symbol, and quantity so retries are idempotent at the broker-facing
+identifier boundary.
+
+`runtime_shutdown()` calls the handler before stopping runtime jobs. The
+operator dashboard and sidecar expose `POST /api/operator/broker_risk` for
+emergency cancel/flatten commands when the runtime is unhealthy or stopped. All
+paths persist the command/result through `order_commands`, `order_events`, and
+broker action audit rows; duplicate command ids return the previous result
+without submitting another broker action.
 
 ## Extending Execution
 

@@ -4,7 +4,7 @@
    Implements:
      - SSE auto-reconnect + pause on hidden tabs
      - emit-only-when-changed server side (paired with api_market patch)
-     - VWAP overlay (client)
+     - loaded-window VWAP overlay (client)
      - EMA20/EMA50 overlays (client)
      - Fill/intent markers (from /api/terminal/markers)
      - Equity overlay (secondary right scale; from /api/terminal/equity)
@@ -24,9 +24,11 @@ import {
   applyIndicatorSeries,
   applyMarkersToState,
   applyPriceLinesToState,
+  applyWindowBandsToState,
   clearMarkerLayer,
   clearPriceLinesForState,
   clearRetryTimer,
+  clearWindowBandsForState,
   closeEventSource,
   createIndicatorState,
   createProChart,
@@ -44,6 +46,7 @@ import {
   upsertSeriesPoint
 } from "../pro_chart_core.js";
 import {
+  buildIndicatorAccessibilitySummary,
   buildOverlayAccessibilitySummary,
   normalizeDecisionOverlayPayload,
 } from "../decision_overlays.js";
@@ -105,6 +108,7 @@ function _destroyLiveState(st) {
 
   clearMarkerLayer(st);
   clearPriceLinesForState(st);
+  clearWindowBandsForState(st);
   try {
     if (st) {
       st.decisionOverlayPayload = null;
@@ -128,7 +132,9 @@ function _destroyLiveState(st) {
     st.equitySeries = null;
     st.history = [];
     st.volumeHistory = [];
+    st.equityHistory = [];
     st.indicatorState = createIndicatorState([]);
+    st.overlayPrefs = { vwap: true, ema: true, markers: true, equity: true };
   }
 }
 
@@ -148,6 +154,8 @@ const _LIVE = {
   markerLayer: null,
   markerSeries: null,
   priceLineHandles: [],
+  windowBandLayer: null,
+  windowBandSeries: null,
   decisionOverlayPayload: null,
 
   es: null,
@@ -159,7 +167,9 @@ const _LIVE = {
   streamConnected: false,
   history: [],
   volumeHistory: [],
+  equityHistory: [],
   indicatorState: createIndicatorState([]),
+  overlayPrefs: { vwap: true, ema: true, markers: true, equity: true },
 
   _visKey: "",
   _visHandler: null,
@@ -191,11 +201,35 @@ function _fmtFixed(value, digits = 4) {
   return Number.isFinite(n) ? n.toFixed(digits) : "unavailable";
 }
 
+function _seriesValueMap(rows) {
+  return new Map(
+    (Array.isArray(rows) ? rows : [])
+      .filter((row) => Number.isFinite(Number(row && row.time)) && Number.isFinite(Number(row && row.value)))
+      .map((row) => [Number(row.time), Number(row.value)])
+  );
+}
+
+function _latestFieldText(rows, field) {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const value = Number(rows[index] && rows[index][field.key]);
+    if (Number.isFinite(value)) {
+      const formatter = field.formatter || ((v) => _fmtFixed(v, 4));
+      return `${field.label} ${formatter(value)}`;
+    }
+  }
+  return "";
+}
+
 function _renderLiveChartA11y({ errorMessage = "", emptyMessage = "" } = {}) {
   const container = _LIVE.container || (typeof document !== "undefined" ? document.getElementById("terminalChart") : null);
   if (!container) return;
   const { symbol, tf, type } = _liveChartKeyParts();
   const title = `Terminal market chart ${symbol}`;
+  const overlayPrefs = _LIVE.overlayPrefs || {};
+  const vwapByTime = _seriesValueMap(_LIVE.indicatorState && _LIVE.indicatorState.vwap);
+  const ema20ByTime = _seriesValueMap(_LIVE.indicatorState && _LIVE.indicatorState.ema20);
+  const ema50ByTime = _seriesValueMap(_LIVE.indicatorState && _LIVE.indicatorState.ema50);
+  const equityByTime = _seriesValueMap(_LIVE.equityHistory);
   const series = (_LIVE.history || []).map((c) => ({
     time: Number(c.time),
     value: Number(c.close),
@@ -204,12 +238,43 @@ function _renderLiveChartA11y({ errorMessage = "", emptyMessage = "" } = {}) {
     low: Number(c.low),
     close: Number(c.close),
     volume: Number(c.volume || 0),
+    vwap: vwapByTime.get(Number(c.time)),
+    ema20: ema20ByTime.get(Number(c.time)),
+    ema50: ema50ByTime.get(Number(c.time)),
+    equity: equityByTime.get(Number(c.time)),
   })).filter((c) => Number.isFinite(c.time) && Number.isFinite(c.value));
+  const indicatorSummary = buildIndicatorAccessibilitySummary(overlayPrefs);
   const overlaySummary = buildOverlayAccessibilitySummary(_LIVE.decisionOverlayPayload || {});
+  const seriesFields = [
+    { key: "close", label: "Close", formatter: (v) => _fmtFixed(v, 4) },
+    ...(_LIVE.volumeSeries ? [{ key: "volume", label: "Volume", formatter: (v) => _fmtFixed(v, 0) }] : []),
+    ...(overlayPrefs.vwap ? [{ key: "vwap", label: "VWAP", formatter: (v) => _fmtFixed(v, 4) }] : []),
+    ...(overlayPrefs.ema ? [
+      { key: "ema20", label: "EMA20", formatter: (v) => _fmtFixed(v, 4) },
+      { key: "ema50", label: "EMA50", formatter: (v) => _fmtFixed(v, 4) },
+    ] : []),
+    ...(overlayPrefs.equity ? [{ key: "equity", label: "Equity", formatter: (v) => _fmtFixed(v, 2) }] : []),
+  ];
+  const latestVisible = seriesFields.map((field) => _latestFieldText(series, field)).filter(Boolean).join(", ");
+  const columns = [
+    { label: "Time", value: (row) => row.timeText || row.index },
+    { label: "Open", value: (row) => _fmtFixed(row.raw && row.raw.open, 4) },
+    { label: "High", value: (row) => _fmtFixed(row.raw && row.raw.high, 4) },
+    { label: "Low", value: (row) => _fmtFixed(row.raw && row.raw.low, 4) },
+    { label: "Close", value: (row) => _fmtFixed(row.raw && row.raw.close, 4) },
+    ...(_LIVE.volumeSeries ? [{ label: "Volume", value: (row) => _fmtFixed(row.raw && row.raw.volume, 0) }] : []),
+    ...(overlayPrefs.vwap ? [{ label: "VWAP", value: (row) => _fmtFixed(row.raw && row.raw.vwap, 4) }] : []),
+    ...(overlayPrefs.ema ? [
+      { label: "EMA20", value: (row) => _fmtFixed(row.raw && row.raw.ema20, 4) },
+      { label: "EMA50", value: (row) => _fmtFixed(row.raw && row.raw.ema50, 4) },
+    ] : []),
+    ...(overlayPrefs.equity ? [{ label: "Equity", value: (row) => _fmtFixed(row.raw && row.raw.equity, 2) }] : []),
+  ];
 
   renderChartAccessibility(container, {
     title,
     series,
+    seriesFields,
     timeKey: "time",
     valueKey: "value",
     valueLabel: "close",
@@ -217,16 +282,9 @@ function _renderLiveChartA11y({ errorMessage = "", emptyMessage = "" } = {}) {
     emptyMessage: emptyMessage || `No candle history is available for ${symbol}${tf ? ` ${tf}` : ""}.`,
     errorMessage,
     chartType: "lightweight-chart",
-    columns: [
-      { label: "Time", value: (row) => row.timeText || row.index },
-      { label: "Open", value: (row) => _fmtFixed(row.raw && row.raw.open, 4) },
-      { label: "High", value: (row) => _fmtFixed(row.raw && row.raw.high, 4) },
-      { label: "Low", value: (row) => _fmtFixed(row.raw && row.raw.low, 4) },
-      { label: "Close", value: (row) => _fmtFixed(row.raw && row.raw.close, 4) },
-      { label: "Volume", value: (row) => _fmtFixed(row.raw && row.raw.volume, 0) },
-    ],
+    columns,
     summary: series.length
-      ? `${title}: latest close ${Number(series[series.length - 1].close).toFixed(4)} across ${series.length} candles${tf ? ` on ${tf}` : ""}${type ? ` as ${type}` : ""}. ${overlaySummary}`
+      ? `${title}: latest ${latestVisible || `close ${Number(series[series.length - 1].close).toFixed(4)}`} across ${series.length} candles${tf ? ` on ${tf}` : ""}${type ? ` as ${type}` : ""}. ${indicatorSummary} ${overlaySummary}`
       : "",
   });
 }
@@ -280,6 +338,18 @@ function _markerAnchorSeries() {
 
 function _clearPriceLines() {
   clearPriceLinesForState(_LIVE, { anchor: _markerAnchorSeries() });
+}
+
+function _clearWindowBands() {
+  clearWindowBandsForState(_LIVE);
+}
+
+function _applyWindowBands(payload = _LIVE.decisionOverlayPayload, candles = _LIVE.history) {
+  const normalized = normalizeDecisionOverlayPayload(payload || {});
+  return applyWindowBandsToState(_LIVE, normalized.windows || [], {
+    anchor: _markerAnchorSeries(),
+    rows: candles || _LIVE.history,
+  });
 }
 
 function _applyMarkers(markers) {
@@ -497,11 +567,17 @@ export async function startLiveMarketChart(opts) {
 
     updateIndicatorSeriesTail({
       indicatorState: _LIVE.indicatorState,
-      overlays: { vwap: true, ema: true },
+      overlays: {
+        vwap: !!(_LIVE.overlayPrefs && _LIVE.overlayPrefs.vwap),
+        ema: !!(_LIVE.overlayPrefs && _LIVE.overlayPrefs.ema),
+      },
       vwapSeries: _LIVE.vwapSeries,
       ema20Series: _LIVE.ema20Series,
       ema50Series: _LIVE.ema50Series,
     });
+    if (_LIVE.decisionOverlayPayload) {
+      _applyWindowBands(_LIVE.decisionOverlayPayload, _LIVE.history);
+    }
     _renderLiveChartA11y();
   }
 
@@ -558,6 +634,7 @@ export function applyTerminalOverlays({ overlays, markers, equitySeries, decisio
   const wantEMA = !!ov.ema;
   const wantMarkers = !!ov.markers;
   const wantEquity = !!ov.equity;
+  _LIVE.overlayPrefs = { vwap: wantVWAP, ema: wantEMA, markers: wantMarkers, equity: wantEquity };
 
   if (!_LIVE.chart) return;
 
@@ -572,6 +649,7 @@ export function applyTerminalOverlays({ overlays, markers, equitySeries, decisio
   if (wantMarkers) {
     _applyMarkers(normalizedOverlay.markers || []);
     applyPriceLinesToState(_LIVE, normalizedOverlay.price_lines || [], { anchor: _markerAnchorSeries() });
+    _applyWindowBands(normalizedOverlay, _LIVE.history);
   }
   else {
     try {
@@ -583,6 +661,7 @@ export function applyTerminalOverlays({ overlays, markers, equitySeries, decisio
       }
     } catch {}
     _clearPriceLines();
+    _clearWindowBands();
   }
 
   const src = Array.isArray(_LIVE.history) ? _LIVE.history : [];
@@ -601,13 +680,13 @@ export function applyTerminalOverlays({ overlays, markers, equitySeries, decisio
   if (wantEquity && _LIVE.equitySeries) {
     try {
       const series = Array.isArray(equitySeries) ? equitySeries : [];
-      _LIVE.equitySeries.setData(
-        series
-          .map(p => ({ time: Number(p.t), value: Number(p.v) }))
-          .filter(p => Number.isFinite(p.time) && Number.isFinite(p.value))
-      );
+      _LIVE.equityHistory = series
+        .map(p => ({ time: Number(p.t), value: Number(p.v) }))
+        .filter(p => Number.isFinite(p.time) && Number.isFinite(p.value));
+      _LIVE.equitySeries.setData(_LIVE.equityHistory);
     } catch {}
   } else {
+    _LIVE.equityHistory = [];
     try { if (_LIVE.equitySeries) _LIVE.equitySeries.setData([]); } catch {}
   }
   _renderLiveChartA11y();

@@ -10,16 +10,22 @@ import { renderLineChart } from "./charts.js";
 import { renderChartAccessibility } from "./chart_a11y.js";
 import {
   normalizeDecisionMarker,
-  toLightweightMarkers
 } from "./decision_overlays.js";
+import {
+  addSeriesCompat,
+  applyMarkersToState,
+  clearMarkerLayer,
+  createProChart,
+  disconnectResizeObserver,
+  ensureLightweightCharts,
+} from "./pro_chart_core.js";
+import { DEFAULT_RISK_CAPS } from "./risk_headroom_thresholds.js";
 import { _fmtPct } from "./utils.js";
 
 let _lastPortfolioBacktestSummary = null;
 
 const PORTFOLIO_PRO_FLAG_KEY = "dashboard.portfolioBacktest.proCharts.enabled";
-const LIGHTWEIGHT_LOCAL_SRC = "/ui/vendor/lightweight-charts.standalone.production.js";
-const LIGHTWEIGHT_CDN_SRC = "https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js";
-export const PORTFOLIO_DRAWDOWN_THROTTLE = -0.06;
+export const PORTFOLIO_DRAWDOWN_THROTTLE = -DEFAULT_RISK_CAPS.drawdown;
 
 const _PRO = {
   equityChart: null,
@@ -27,6 +33,7 @@ const _PRO = {
   equityResizeObserver: null,
   drawdownResizeObserver: null,
   markerLayer: null,
+  markerSeries: null,
   ddPriceLine: null,
 };
 
@@ -41,6 +48,7 @@ function _fmtMoney(x) {
 }
 
 function _num(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -190,6 +198,17 @@ function _extractBenchmarkLabel(run) {
   );
 }
 
+function _benchmarkUnavailableText(run, fallback = "Benchmark unavailable: endpoint returned no benchmark series.") {
+  const benchmark = run && typeof run.benchmark === "object" ? run.benchmark : {};
+  const label = _extractBenchmarkLabel(run || {});
+  const source = String(benchmark.source || "").trim();
+  const reason = String(benchmark.unavailable_reason || benchmark.reason || "").trim();
+  if (!reason) return fallback;
+  const reasonText = reason.replace(/_/g, " ");
+  const sourceText = source ? ` from ${source}` : "";
+  return `${label} benchmark unavailable${sourceText}: ${reasonText}.`;
+}
+
 function _valueFromPoint(point, keys) {
   if (point && typeof point === "object") {
     for (const key of keys) {
@@ -204,13 +223,19 @@ function _valueFromPoint(point, keys) {
 function _buildBenchmarkSeries(run, portfolioStartValue) {
   const rows = _extractBenchmarkRows(run);
   const label = _extractBenchmarkLabel(run);
+  const benchmark = run && typeof run.benchmark === "object" ? run.benchmark : {};
+  const source = String(benchmark.source || "").trim();
+  const normalization = String(benchmark.normalization || "").trim();
   if (!rows.length) {
     return {
       series: [],
       state: {
         available: false,
         label,
-        text: "Benchmark unavailable: endpoint returned no benchmark series.",
+        source,
+        normalization,
+        unavailableReason: String(benchmark.unavailable_reason || ""),
+        text: _benchmarkUnavailableText(run),
       },
     };
   }
@@ -233,7 +258,13 @@ function _buildBenchmarkSeries(run, portfolioStartValue) {
       state: {
         available: false,
         label,
-        text: "Benchmark unavailable: endpoint benchmark series has fewer than two numeric points.",
+        source,
+        normalization,
+        unavailableReason: String(benchmark.unavailable_reason || "benchmark_points_insufficient"),
+        text: _benchmarkUnavailableText(
+          run,
+          `${label} benchmark unavailable${source ? ` from ${source}` : ""}: fewer than two numeric points.`,
+        ),
       },
     };
   }
@@ -249,7 +280,9 @@ function _buildBenchmarkSeries(run, portfolioStartValue) {
     state: {
       available: true,
       label,
-      text: `${label} benchmark overlay available from endpoint data; normalized to the portfolio start value.`,
+      source,
+      normalization,
+      text: `${label} benchmark overlay available${source ? ` from ${source}` : ""}; normalized to the portfolio start value.`,
     },
   };
 }
@@ -380,32 +413,46 @@ export function buildPortfolioBacktestProViewModel(run = {}) {
   const points = Array.isArray(run && run.points) ? run.points : [];
   const equitySeries = [];
   const drawdownSeries = [];
+  const finiteEquitySeries = [];
+  const finiteDrawdownSeries = [];
 
   for (const [index, point] of points.entries()) {
     const time = _normalizeTime(point && (point.ts_ms ?? point.time ?? point.t), index);
     const equity = _num(point && point.equity);
     if (equity != null) {
-      equitySeries.push({ time, value: equity });
+      const row = { time, value: equity };
+      equitySeries.push(row);
+      finiteEquitySeries.push(row);
+    } else {
+      equitySeries.push({ time });
     }
     const drawdown = _normalizeDrawdownValue(point && point.drawdown);
     if (drawdown != null) {
-      drawdownSeries.push({ time, value: drawdown });
+      const row = { time, value: drawdown };
+      drawdownSeries.push(row);
+      finiteDrawdownSeries.push(row);
+    } else {
+      drawdownSeries.push({ time });
     }
   }
 
   equitySeries.sort((a, b) => Number(a.time) - Number(b.time));
   drawdownSeries.sort((a, b) => Number(a.time) - Number(b.time));
-  const benchmark = _buildBenchmarkSeries(run || {}, equitySeries.length ? equitySeries[0].value : 1);
-  const maxDrawdown = drawdownSeries.length ? Math.min(...drawdownSeries.map((point) => Number(point.value))) : null;
-  const latestEquity = equitySeries.length ? equitySeries[equitySeries.length - 1].value : null;
-  const latestDrawdown = drawdownSeries.length ? drawdownSeries[drawdownSeries.length - 1].value : null;
+  finiteEquitySeries.sort((a, b) => Number(a.time) - Number(b.time));
+  finiteDrawdownSeries.sort((a, b) => Number(a.time) - Number(b.time));
+  const benchmark = _buildBenchmarkSeries(run || {}, finiteEquitySeries.length ? finiteEquitySeries[0].value : 1);
+  const maxDrawdown = finiteDrawdownSeries.length ? Math.min(...finiteDrawdownSeries.map((point) => Number(point.value))) : null;
+  const latestEquity = finiteEquitySeries.length ? finiteEquitySeries[finiteEquitySeries.length - 1].value : null;
+  const latestDrawdown = finiteDrawdownSeries.length ? finiteDrawdownSeries[finiteDrawdownSeries.length - 1].value : null;
   const throttleGap = latestDrawdown == null ? null : latestDrawdown - PORTFOLIO_DRAWDOWN_THROTTLE;
 
   return {
-    ok: equitySeries.length >= 2 && drawdownSeries.length >= 2,
+    ok: finiteEquitySeries.length >= 2 && finiteDrawdownSeries.length >= 2,
     runId: run && run.id != null ? String(run.id) : "",
     equitySeries,
     drawdownSeries,
+    finiteEquitySeries,
+    finiteDrawdownSeries,
     benchmarkSeries: benchmark.series,
     benchmarkState: benchmark.state,
     markers: buildPortfolioBacktestMarkers(points),
@@ -452,10 +499,11 @@ function _setChartDisplay({ pro }) {
 }
 
 function _destroyPortfolioProCharts() {
-  try { if (_PRO.markerLayer && typeof _PRO.markerLayer.detach === "function") _PRO.markerLayer.detach(); } catch {}
-  _PRO.markerLayer = null;
-  try { if (_PRO.equityResizeObserver) _PRO.equityResizeObserver.disconnect(); } catch {}
-  try { if (_PRO.drawdownResizeObserver) _PRO.drawdownResizeObserver.disconnect(); } catch {}
+  const pEq = typeof document !== "undefined" ? document.getElementById("portfolioEquityPro") : null;
+  const pDd = typeof document !== "undefined" ? document.getElementById("portfolioDdPro") : null;
+  clearMarkerLayer(_PRO);
+  disconnectResizeObserver(_PRO.equityResizeObserver, pEq);
+  disconnectResizeObserver(_PRO.drawdownResizeObserver, pDd);
   _PRO.equityResizeObserver = null;
   _PRO.drawdownResizeObserver = null;
   try { if (_PRO.equityChart) _PRO.equityChart.remove(); } catch {}
@@ -465,83 +513,19 @@ function _destroyPortfolioProCharts() {
   _PRO.ddPriceLine = null;
 }
 
-async function _ensureLightweightCharts() {
-  if (typeof window !== "undefined" && window.LightweightCharts) return window.LightweightCharts;
-  if (typeof document === "undefined") throw new Error("document unavailable");
-
-  const load = (src) => new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = src;
-    script.async = true;
-    script.onload = () => resolve(true);
-    script.onerror = () => reject(new Error("failed to load " + src));
-    document.head.appendChild(script);
-  });
-
-  try { await load(LIGHTWEIGHT_LOCAL_SRC); }
-  catch { await load(LIGHTWEIGHT_CDN_SRC); }
-
-  if (!window.LightweightCharts) throw new Error("LightweightCharts not available");
-  return window.LightweightCharts;
-}
-
-function _seriesDef(type) {
-  const lw = window.LightweightCharts || {};
-  const defs = {
-    line: lw.LineSeries,
-    area: lw.AreaSeries,
-    histogram: lw.HistogramSeries,
-  };
-  return defs[type] || null;
-}
-
-function _addSeriesCompat(chart, type, options = {}) {
-  const legacyFns = {
-    line: "addLineSeries",
-    area: "addAreaSeries",
-    histogram: "addHistogramSeries",
-  };
-  const legacyName = legacyFns[type];
-  if (legacyName && typeof chart[legacyName] === "function") return chart[legacyName](options);
-  if (typeof chart.addSeries === "function") {
-    const def = _seriesDef(type);
-    if (def) return chart.addSeries(def, options);
-  }
-  throw new Error(`unsupported_series_type:${type}`);
-}
-
 function _buildChart(container, height = 220) {
-  const chart = window.LightweightCharts.createChart(container, {
-    layout: {
-      background: { color: "#0a0d12" },
-      textColor: "#9da7b3",
+  return createProChart(container, {
+    includeInitialSize: true,
+    initialSizeFallback: { width: 420, height },
+    chartOptions: {
+      rightPriceScale: {
+        scaleMargins: { top: 0.12, bottom: 0.12 },
+      },
     },
-    grid: {
-      vertLines: { color: "#1f2630" },
-      horzLines: { color: "#1f2630" },
+    resizeObserverOptions: {
+      sizeFallback: { width: 420, height },
     },
-    rightPriceScale: {
-      borderColor: "#30363d",
-      scaleMargins: { top: 0.12, bottom: 0.12 },
-    },
-    timeScale: {
-      borderColor: "#30363d",
-      timeVisible: true,
-      secondsVisible: false,
-    },
-    crosshair: { mode: 1 },
-    width: Math.max(10, Math.floor(container.clientWidth || 420)),
-    height: Math.max(10, Math.floor(container.clientHeight || height)),
   });
-  const ro = new ResizeObserver(() => {
-    const rect = container.getBoundingClientRect();
-    chart.applyOptions({
-      width: Math.max(10, Math.floor(rect.width)),
-      height: Math.max(10, Math.floor(rect.height || height)),
-    });
-  });
-  ro.observe(container);
-  return { chart, resizeObserver: ro };
 }
 
 function _hoverSeriesMap(vm) {
@@ -634,7 +618,7 @@ async function _renderPortfolioProCharts(vm) {
   pEq.innerHTML = "";
   pDd.innerHTML = "";
 
-  await _ensureLightweightCharts();
+  await ensureLightweightCharts();
   const eqBuilt = _buildChart(pEq, 220);
   const ddBuilt = _buildChart(pDd, 220);
   _PRO.equityChart = eqBuilt.chart;
@@ -642,7 +626,7 @@ async function _renderPortfolioProCharts(vm) {
   _PRO.equityResizeObserver = eqBuilt.resizeObserver;
   _PRO.drawdownResizeObserver = ddBuilt.resizeObserver;
 
-  const equitySeries = _addSeriesCompat(_PRO.equityChart, "line", {
+  const equitySeries = addSeriesCompat(_PRO.equityChart, "line", {
     color: "#56B4E9",
     lineWidth: 2,
     priceLineVisible: false,
@@ -652,7 +636,7 @@ async function _renderPortfolioProCharts(vm) {
 
   let benchmarkSeries = null;
   if (Array.isArray(vm.benchmarkSeries) && vm.benchmarkSeries.length >= 2) {
-    benchmarkSeries = _addSeriesCompat(_PRO.equityChart, "line", {
+    benchmarkSeries = addSeriesCompat(_PRO.equityChart, "line", {
       color: "#E69F00",
       lineWidth: 2,
       lineStyle: 2,
@@ -662,7 +646,7 @@ async function _renderPortfolioProCharts(vm) {
     benchmarkSeries.setData(vm.benchmarkSeries);
   }
 
-  const drawdownSeries = _addSeriesCompat(_PRO.drawdownChart, "area", {
+  const drawdownSeries = addSeriesCompat(_PRO.drawdownChart, "area", {
     lineColor: "#D55E00",
     topColor: "rgba(213,94,0,0.10)",
     bottomColor: "rgba(213,94,0,0.36)",
@@ -685,13 +669,8 @@ async function _renderPortfolioProCharts(vm) {
     });
   }
 
-  const markers = toLightweightMarkers(vm.markers || []);
-  if (markers.length) {
-    if (typeof equitySeries.setMarkers === "function") {
-      equitySeries.setMarkers(markers);
-    } else if (window.LightweightCharts && typeof window.LightweightCharts.createSeriesMarkers === "function") {
-      _PRO.markerLayer = window.LightweightCharts.createSeriesMarkers(equitySeries, markers);
-    }
+  if (Array.isArray(vm.markers) && vm.markers.length) {
+    applyMarkersToState(_PRO, vm.markers, { anchor: equitySeries });
   }
 
   try { _PRO.equityChart.timeScale().fitContent(); } catch {}
@@ -796,9 +775,9 @@ export async function loadPortfolioBacktestLatest(fetchJSON) {
     const metrics = run.metrics || {};
     const pts = Array.isArray(run.points) ? run.points : [];
     const viewModel = buildPortfolioBacktestProViewModel(run);
-    const equitySeries = viewModel.equitySeries;
+    const equitySeries = viewModel.finiteEquitySeries;
     const equity = equitySeries.map((p) => p.value);
-    const drawdownSeries = viewModel.drawdownSeries;
+    const drawdownSeries = viewModel.finiteDrawdownSeries;
     const maxDd = viewModel.maxDrawdown == null ? 0 : viewModel.maxDrawdown;
     _renderPortfolioMetricAnnotations(viewModel);
     _renderBenchmarkState(viewModel);

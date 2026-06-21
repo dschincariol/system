@@ -11,6 +11,7 @@ Group=trading
 EnvironmentFile=-/etc/trading/trading.env
 EnvironmentFile=-/etc/trading/provider.env
 ExecStart=/bin/bash /opt/trading/ops/backup/restore_drill.sh
+TimeoutStartSec=90min
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal

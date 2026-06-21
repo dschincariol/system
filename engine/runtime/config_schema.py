@@ -344,6 +344,25 @@ def validate_data_source_master_key_config(safety: dict[str, object] | None = No
         raise ConfigError(f"data source master key invalid: {exc}") from exc
 
 
+def validate_production_secret_sources(safety: dict[str, object] | None = None) -> dict[str, object]:
+    """Fail closed when production/live uses inline repo-local secret values."""
+
+    try:
+        from engine.runtime.secret_sources import (
+            format_secret_source_policy_error,
+            secret_source_policy_snapshot,
+        )
+
+        ctx = safety if safety is not None else get_runtime_safety_context()
+        snapshot = secret_source_policy_snapshot(validate_files=bool(ctx.get("strict_runtime")))
+    except Exception as exc:
+        raise ConfigError(f"secret source policy validation failed: {type(exc).__name__}: {exc}") from exc
+
+    if bool(ctx.get("strict_runtime")) and not bool(snapshot.get("ok")):
+        raise ConfigError(format_secret_source_policy_error(snapshot))
+    return snapshot
+
+
 def _normalize_env_name(raw: str) -> str:
     env = str(raw or "").strip().lower()
     if env == "production":
@@ -729,6 +748,7 @@ def load_runtime_config() -> RuntimeConfig:
     profile_defaults = workload_profile_defaults(workload_profile)
     strict_runtime = bool(safety["strict_runtime"])
     require_explicit_training = bool(safety["require_explicit_training"])
+    validate_production_secret_sources(safety)
 
     from engine.runtime.platform import default_data_root, default_local_db_path
 

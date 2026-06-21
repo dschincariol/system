@@ -13,6 +13,8 @@ def main() -> None:
     fd, path = tempfile.mkstemp(prefix="news_ingestion_selftest_", suffix=".db")
     os.close(fd)
     os.environ["DB_PATH"] = path
+    os.environ.setdefault("TS_STORAGE_BACKEND", "sqlite")
+    os.environ.setdefault("TS_TESTING", "1")
 
     from engine.runtime.storage import init_db, connect, put_normalized_event, put_news_event_feature
     from engine.data.event_normalization import normalize_news_event

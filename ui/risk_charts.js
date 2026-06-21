@@ -110,6 +110,51 @@ function drawEmpty(canvas, title, message) {
   });
 }
 
+function setHidden(el, hidden) {
+  if (!el) return;
+  el.hidden = Boolean(hidden);
+  if (el.style) el.style.display = hidden ? "none" : "";
+}
+
+function ensureUnavailableNode(canvas) {
+  const doc = canvas && canvas.ownerDocument ? canvas.ownerDocument : null;
+  if (!doc || !canvas || !canvas.parentNode) return null;
+  const id = `${canvas.id || "chart"}Unavailable`;
+  let node = doc.getElementById(id);
+  if (!node && typeof doc.createElement === "function") {
+    node = doc.createElement("div");
+    node.id = id;
+    node.className = "riskUnavailable";
+    canvas.parentNode.insertBefore(node, canvas);
+  }
+  return node;
+}
+
+function renderCanvasUnavailable(canvas, title, message) {
+  if (!canvas) return;
+  const node = ensureUnavailableNode(canvas);
+  if (node) {
+    node.textContent = String(message || "No chart data is available.");
+    setHidden(node, false);
+  }
+  setHidden(canvas, true);
+  const ctx = canvas.getContext && canvas.getContext("2d");
+  if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+  renderChartAccessibility(canvas, {
+    title,
+    series: [],
+    emptyMessage: message || "No chart data is available.",
+    chartType: "canvas-line",
+  });
+}
+
+function prepareCanvasForData(canvas) {
+  if (!canvas) return;
+  const node = ensureUnavailableNode(canvas);
+  if (node) setHidden(node, true);
+  setHidden(canvas, false);
+}
+
 function drawLegend(ctx, defs, x, y) {
   let offset = 0;
   ctx.font = "11px Consolas, monospace";
@@ -157,6 +202,7 @@ export function buildRiskHistoryViewModel(portfolioRisk = {}) {
   const root = asObject(portfolioRisk);
   const rows = normalizeRiskHistory(root);
   const latest = rows.length ? rows[rows.length - 1] : {};
+  const blockedCount = rows.filter((row) => row.blocked).length;
   const unavailable = [];
   if (rows.length < 2) {
     unavailable.push({
@@ -171,10 +217,10 @@ export function buildRiskHistoryViewModel(portfolioRisk = {}) {
     pointCount: rows.length,
     latest,
     source: "/api/risk/portfolio.history",
-    blockedCount: rows.filter((row) => row.blocked).length,
+    blockedCount,
     unavailable,
     summary: rows.length
-      ? `Risk history uses ${rows.length} timestamped rows; latest gross ${formatPercent(latest.gross)}, net ${formatSignedPercent(latest.net)}, drawdown ${formatPercent(latest.drawdown)}.`
+      ? `Risk history uses ${rows.length} timestamped rows; latest gross ${formatPercent(latest.gross)}, net ${formatSignedPercent(latest.net)}, drawdown ${formatPercent(latest.drawdown)}; blocked context ${blockedCount} of ${rows.length} row${rows.length === 1 ? "" : "s"}.`
       : "Risk history is unavailable.",
   };
 }
@@ -222,15 +268,22 @@ export function renderRiskHistoryChart(canvas, vm) {
     ctx.fillRect(left, padT, Math.max(1, right - left), plotH);
   });
 
-  ctx.strokeStyle = "#20252c";
-  ctx.beginPath();
-  ctx.moveTo(padL, padT + plotH / 2);
-  ctx.lineTo(w - padR, padT + plotH / 2);
-  ctx.stroke();
+  const zeroInRange = yMin <= 0 && yMax >= 0;
+  const zeroY = zeroInRange ? yFor(0) : null;
+  if (zeroInRange) {
+    ctx.strokeStyle = "#20252c";
+    ctx.beginPath();
+    ctx.moveTo(padL, zeroY);
+    ctx.lineTo(w - padR, zeroY);
+    ctx.stroke();
+  }
 
   ctx.fillStyle = "#9da7b1";
   ctx.font = "12px Consolas, monospace";
   ctx.fillText(formatPercent(yMax, 1), 8, padT + 6);
+  if (zeroInRange) {
+    ctx.fillText("0.0%", 8, clamp(zeroY + 4, padT + 10, padT + plotH - 4));
+  }
   ctx.fillText(formatPercent(yMin, 1), 8, padT + plotH);
   ctx.fillText(fmtTime(rows[0].ts_ms), padL, h - 8);
   const lastLabel = fmtTime(rows[rows.length - 1].ts_ms);
@@ -259,8 +312,8 @@ export function renderRiskHistoryChart(canvas, vm) {
 
   renderChartAccessibility(canvas, {
     title: "Portfolio risk history",
-    series: rows.map((row) => ({ ...row, value: row.gross })),
-    valueKey: "value",
+    series: rows,
+    seriesFields: RISK_SERIES,
     timeKey: "ts_ms",
     valueLabel: "gross exposure",
     valueFormatter: (value) => formatPercent(value, 2),
@@ -320,19 +373,33 @@ function normalizeDistribution(rawDistribution) {
   if (Array.isArray(rawDistribution)) {
     return rawDistribution
       .map((row, index) => {
-        if (typeof row === "number") return { bucket: String(index + 1), value: Number(row), count: 1 };
+        if (typeof row === "number") return { bucket: String(index + 1), value: Number(row), count: 1, probability: null };
         const item = asObject(row);
+        const lower = numOrNull(item.lower ?? item.min);
+        const upper = numOrNull(item.upper ?? item.max);
+        const value = numOrNull(item.value ?? item.return ?? item.loss ?? item.midpoint);
+        const count = numOrNull(item.count ?? item.n ?? 0) || 0;
         return {
           bucket: String(item.bucket ?? item.label ?? index + 1),
-          value: numOrNull(item.value ?? item.return ?? item.loss),
-          count: numOrNull(item.count ?? item.n ?? 0) || 0,
+          value,
+          lower,
+          upper,
+          count,
+          probability: numOrNull(item.probability ?? item.prob ?? item.pct),
         };
       })
-      .filter((row) => row.value != null || row.count > 0);
+      .filter((row) => row.value != null || row.count > 0 || row.lower != null || row.upper != null);
   }
   const dist = asObject(rawDistribution);
   const bins = asArray(dist.bins || dist.rows);
   return normalizeDistribution(bins);
+}
+
+function monteCarloMode(hasFan, hasDistribution) {
+  if (hasFan && hasDistribution) return "fan_distribution";
+  if (hasFan) return "fan";
+  if (hasDistribution) return "distribution";
+  return "summary";
 }
 
 export function buildMonteCarloRiskViewModel(payload = {}) {
@@ -348,6 +415,7 @@ export function buildMonteCarloRiskViewModel(payload = {}) {
   const distributionRows = normalizeDistribution(rawDistribution);
   const hasFan = fanRows.length >= 2;
   const hasDistribution = distributionRows.length > 0;
+  const latestFan = hasFan ? fanRows[fanRows.length - 1] : {};
 
   const bars = [
     { key: "var_95", label: "VaR 95", value: positiveLoss(root.var_95), source: "base" },
@@ -388,14 +456,17 @@ export function buildMonteCarloRiskViewModel(payload = {}) {
     horizon: numOrNull(root.horizon),
     bars: bars.map((row) => ({ ...row, fillPct: clamp((row.value / maxValue) * 100, 0, 100) })),
     maxValue,
-    mode: hasFan ? "fan" : (hasDistribution ? "distribution" : "summary"),
+    mode: monteCarloMode(hasFan, hasDistribution),
     fanRows,
     distributionRows,
     hasFan,
     hasDistribution,
     unavailable,
+    fanSummary: hasFan
+      ? `Monte-Carlo fan: latest p05 ${formatSignedPercent(latestFan.p05, 2)}, p50 ${formatSignedPercent(latestFan.p50, 2)}, p95 ${formatSignedPercent(latestFan.p95, 2)} across ${fanRows.length} horizon steps; shaded band spans p05 to p95 around the p50 path.`
+      : "Monte-Carlo fan is unavailable.",
     summary: bars.length
-      ? `Monte-Carlo risk shows ${bars.length} summary tail metrics; fan data ${hasFan ? "available" : "unavailable"}.`
+      ? `Monte-Carlo risk shows ${bars.length} summary tail metrics; fan data ${hasFan ? `available with latest p05 ${formatSignedPercent(latestFan.p05, 2)}, p50 ${formatSignedPercent(latestFan.p50, 2)}, p95 ${formatSignedPercent(latestFan.p95, 2)}` : "unavailable"}; distribution data ${hasDistribution ? "available" : "unavailable"}.`
       : "Monte-Carlo risk summary is unavailable.",
   };
 }
@@ -426,9 +497,10 @@ export function renderMonteCarloFanChart(canvas, vm) {
   if (!canvas) return;
   const model = vm || buildMonteCarloRiskViewModel({});
   if (!model.hasFan || model.fanRows.length < 2) {
-    drawEmpty(canvas, "Monte-Carlo fan", "Fan chart input unavailable: no simulated path quantiles were returned.");
+    renderCanvasUnavailable(canvas, "Monte-Carlo fan", "Fan chart unavailable: no simulated path percentile rows were returned.");
     return;
   }
+  prepareCanvasForData(canvas);
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   const rows = model.fanRows;
@@ -482,11 +554,16 @@ export function renderMonteCarloFanChart(canvas, vm) {
 
   renderChartAccessibility(canvas, {
     title: "Monte-Carlo fan",
-    series: rows.map((row) => ({ ...row, value: row.p50 })),
-    valueKey: "value",
+    series: rows,
+    seriesFields: [
+      { key: "p05", label: "P05", formatter: (value) => formatSignedPercent(value, 2) },
+      { key: "p50", label: "P50", formatter: (value) => formatSignedPercent(value, 2) },
+      { key: "p95", label: "P95", formatter: (value) => formatSignedPercent(value, 2) },
+    ],
     labelKey: "step",
     valueLabel: "median simulated return",
     valueFormatter: (value) => formatSignedPercent(value, 2),
+    summary: model.fanSummary,
     chartType: "canvas-fan",
     columns: [
       { label: "Step", value: (row) => row.raw && row.raw.step },
@@ -494,6 +571,75 @@ export function renderMonteCarloFanChart(canvas, vm) {
       { label: "P50", value: (row) => formatSignedPercent(row.raw && row.raw.p50, 2) },
       { label: "P95", value: (row) => formatSignedPercent(row.raw && row.raw.p95, 2) },
     ],
+  });
+}
+
+export function renderMonteCarloDistributionChart(canvas, vm) {
+  if (!canvas) return;
+  const model = vm || buildMonteCarloRiskViewModel({});
+  if (!model.hasDistribution || !model.distributionRows.length) {
+    renderCanvasUnavailable(canvas, "Monte-Carlo return distribution", "Return distribution unavailable: no simulated final-return buckets were returned.");
+    return;
+  }
+  prepareCanvasForData(canvas);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const rows = model.distributionRows;
+  const counts = rows.map((row) => Math.max(0, numOrNull(row.count) || 0));
+  const values = rows.map((row) => numOrNull(row.value)).filter((value) => value != null);
+  const maxCount = Math.max(1, ...counts);
+  const [xMin, xMax] = safeRange(values.length ? values : [0], -0.1, 0.1);
+  const w = canvas.width;
+  const h = canvas.height;
+  const padL = 48;
+  const padR = 14;
+  const padT = 16;
+  const padB = 28;
+  const plotW = Math.max(10, w - padL - padR);
+  const plotH = Math.max(10, h - padT - padB);
+  const barGap = 2;
+  const barW = Math.max(2, (plotW / Math.max(1, rows.length)) - barGap);
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = "#30363d";
+  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+  ctx.strokeStyle = "rgba(157,167,177,0.35)";
+  ctx.beginPath();
+  ctx.moveTo(padL, padT + plotH);
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.stroke();
+
+  rows.forEach((row, index) => {
+    const count = counts[index] || 0;
+    const x = padL + index * (plotW / Math.max(1, rows.length)) + (barGap / 2);
+    const barH = plotH * (count / maxCount);
+    const y = padT + plotH - barH;
+    const value = numOrNull(row.value);
+    ctx.fillStyle = value != null && value < 0 ? "rgba(230,159,0,0.74)" : "rgba(86,180,233,0.72)";
+    ctx.fillRect(x, y, barW, barH);
+  });
+
+  ctx.fillStyle = "#9da7b1";
+  ctx.font = "11px Consolas, monospace";
+  ctx.fillText(String(maxCount), 8, padT + 8);
+  ctx.fillText(formatSignedPercent(xMin, 1), padL, h - 8);
+  ctx.fillText(formatSignedPercent(xMax, 1), Math.max(padL + 80, w - padR - 82), h - 8);
+
+  renderChartAccessibility(canvas, {
+    title: "Monte-Carlo return distribution",
+    series: rows.map((row) => ({ ...row, label: row.bucket, value: row.count })),
+    valueKey: "value",
+    labelKey: "label",
+    valueLabel: "simulated path count",
+    valueFormatter: (value) => formatNumber(value, 0),
+    chartType: "canvas-histogram",
+    columns: [
+      { label: "Bucket", value: (row) => row.raw && row.raw.bucket },
+      { label: "Return", value: (row) => formatSignedPercent(row.raw && row.raw.value, 2) },
+      { label: "Count", value: (row) => formatNumber(row.raw && row.raw.count, 0) },
+      { label: "Probability", value: (row) => formatPercent(row.raw && row.raw.probability, 2) },
+    ],
+    maxRows: 80,
   });
 }
 
@@ -515,8 +661,63 @@ function groupStrategyHistory(rows) {
   }));
 }
 
-export function buildAlphaDecayViewModel(payload = {}) {
+function finiteValueCount(rows, key) {
+  return asArray(rows).reduce((count, row) => count + (numOrNull(row && row[key]) != null ? 1 : 0), 0);
+}
+
+function alphaStrategyRank(group) {
+  const latest = asObject(group && group.latest);
+  const chartablePoints = finiteValueCount(group && group.rows, "rolling_sharpe");
+  const severity = severityRank(latest.severity);
+  const severityScore = numOrNull(latest.severity_score) || 0;
+  const throttle = numOrNull(latest.throttle_mult);
+  const throttlePressure = throttle == null ? 0 : 1 - clamp(throttle, 0, 1);
+  const structuralBreak = Math.abs(numOrNull(latest.structural_break_z) || 0);
+  const rollingSharpe = numOrNull(latest.rolling_sharpe);
+  const weakSharpe = rollingSharpe == null ? 0 : Math.max(0, -rollingSharpe);
+  return {
+    chartable: chartablePoints >= 2 ? 1 : 0,
+    chartablePoints,
+    severity,
+    severityScore,
+    throttlePressure,
+    structuralBreak,
+    weakSharpe,
+    latestTsMs: Number(latest.ts_ms || 0),
+  };
+}
+
+function compareAlphaStrategies(a, b) {
+  const ar = alphaStrategyRank(a);
+  const br = alphaStrategyRank(b);
+  const fields = [
+    "chartable",
+    "severity",
+    "severityScore",
+    "throttlePressure",
+    "structuralBreak",
+    "weakSharpe",
+    "latestTsMs",
+    "chartablePoints",
+  ];
+  for (const field of fields) {
+    const delta = Number(br[field] || 0) - Number(ar[field] || 0);
+    if (delta) return delta;
+  }
+  return String(a.strategy || "").localeCompare(String(b.strategy || ""));
+}
+
+function alphaStrategyLabel(option) {
+  const strategy = String(option.strategy || "unknown");
+  const severity = String(option.latestSeverity || "unknown").toUpperCase();
+  const points = Number(option.points || 0);
+  return `${strategy} (${severity}, ${points} pt${points === 1 ? "" : "s"})`;
+}
+
+export function buildAlphaDecayViewModel(payload = {}, options = {}) {
   const root = asObject(payload);
+  const opts = asObject(options);
+  const requestedStrategy = String(opts.selectedStrategy || root.selected_strategy || "").trim();
   const history = asArray(root.strategy_history)
     .map((row) => {
       const item = asObject(row);
@@ -526,26 +727,26 @@ export function buildAlphaDecayViewModel(payload = {}) {
         rolling_sharpe: numOrNull(item.rolling_sharpe),
         half_life_buckets: numOrNull(item.half_life_buckets),
         half_life_seconds: numOrNull(item.half_life_seconds),
+        structural_break_z: numOrNull(item.structural_break_z),
         severity: String(item.severity || "ok").toLowerCase(),
         severity_score: numOrNull(item.severity_score) || 0,
         throttle_mult: numOrNull(item.throttle_mult),
         n_obs: numOrNull(item.n_obs) || 0,
       };
     })
-    .filter((row) => row.ts_ms > 0 && row.rolling_sharpe != null);
+    .filter((row) => row.ts_ms > 0);
   const groups = groupStrategyHistory(history);
-  groups.sort((a, b) => {
-    if (b.rows.length !== a.rows.length) return b.rows.length - a.rows.length;
-    const sevDelta = severityRank(b.latest.severity) - severityRank(a.latest.severity);
-    if (sevDelta) return sevDelta;
-    return Number(b.latest.ts_ms || 0) - Number(a.latest.ts_ms || 0);
-  });
-  const selected = groups[0] || { strategy: "", rows: [], latest: {} };
+  groups.sort(compareAlphaStrategies);
+  const requested = requestedStrategy
+    ? groups.find((group) => group.strategy === requestedStrategy)
+    : null;
+  const selected = requested || groups.find((group) => alphaStrategyRank(group).chartable) || groups[0] || { strategy: "", rows: [], latest: {} };
+  const selectedChartableCount = finiteValueCount(selected.rows, "rolling_sharpe");
   const unavailable = asArray(root.unavailable).map((item) => ({
     field: String(asObject(item).field || "alpha_decay"),
     reason: String(asObject(item).reason || "alpha-decay data unavailable"),
   }));
-  if (selected.rows.length < 2) {
+  if (selectedChartableCount < 2) {
     unavailable.push({
       field: "strategy_history",
       reason: "Rolling-Sharpe and half-life chart needs at least two rows for one strategy.",
@@ -553,22 +754,42 @@ export function buildAlphaDecayViewModel(payload = {}) {
   }
   const latest = selected.latest || {};
   return {
-    ok: root.ok !== false && selected.rows.length >= 2,
-    ready: selected.rows.length >= 2,
+    ok: root.ok !== false && selectedChartableCount >= 2,
+    ready: selectedChartableCount >= 2,
     status: String(asObject(root.runtime).status || latest.severity || "unknown"),
     selectedStrategy: selected.strategy,
     rows: selected.rows,
     strategies: groups.map((group) => ({
+      ...alphaStrategyRank(group),
       strategy: group.strategy,
-      points: group.rows.length,
+      points: finiteValueCount(group.rows, "rolling_sharpe"),
       latestSeverity: String(group.latest.severity || "unknown"),
+      latestSeverityScore: numOrNull(group.latest.severity_score) || 0,
       latestTsMs: group.latest.ts_ms || 0,
+      selected: group.strategy === selected.strategy,
     })),
     latest,
     unavailable,
-    summary: selected.rows.length
-      ? `Alpha decay for ${selected.strategy}: ${selected.rows.length} points; latest rolling Sharpe ${formatNumber(latest.rolling_sharpe, 2)}, half-life ${latest.half_life_buckets == null ? "unavailable" : formatNumber(latest.half_life_buckets, 1)} buckets.`
+    summary: selectedChartableCount
+      ? `Alpha decay for ${selected.strategy}: ${selectedChartableCount} points; latest rolling Sharpe ${latest.rolling_sharpe == null ? "unavailable" : formatNumber(latest.rolling_sharpe, 2)}, half-life ${latest.half_life_buckets == null ? "unavailable" : formatNumber(latest.half_life_buckets, 1)} buckets.`
       : "Alpha-decay history is unavailable.",
+  };
+}
+
+export function renderAlphaDecayStrategySelector(select, payload = {}, vm = null, onSelect = null) {
+  if (!select) return;
+  const model = vm || buildAlphaDecayViewModel(payload);
+  const options = asArray(model.strategies);
+  setHidden(select, options.length === 0);
+  select.disabled = options.length < 2;
+  select.innerHTML = options.map((option) => {
+    const selected = option.strategy === model.selectedStrategy ? " selected" : "";
+    const disabled = option.chartable ? "" : " data-unchartable=\"true\"";
+    return `<option value="${escapeHTML(option.strategy)}"${selected}${disabled}>${escapeHTML(alphaStrategyLabel(option))}</option>`;
+  }).join("");
+  select.value = String(model.selectedStrategy || "");
+  select.onchange = () => {
+    if (typeof onSelect === "function") onSelect(String(select.value || ""));
   };
 }
 
@@ -576,7 +797,7 @@ export function renderAlphaDecayChart(canvas, vm) {
   if (!canvas) return;
   const model = vm || buildAlphaDecayViewModel({});
   const rows = asArray(model.rows);
-  if (rows.length < 2) {
+  if (finiteValueCount(rows, "rolling_sharpe") < 2) {
     drawEmpty(canvas, "Alpha-decay rolling Sharpe and half-life", "Alpha-decay history needs at least two points for one strategy.");
     return;
   }
@@ -598,6 +819,24 @@ export function renderAlphaDecayChart(canvas, vm) {
   const xFor = (index) => padL + plotW * (index / Math.max(1, rows.length - 1));
   const ySharpe = (value) => padT + paneH * (1 - ((value - shMin) / Math.max(1e-9, shMax - shMin)));
   const yHalf = (value) => padT + paneH + gap + paneH * (1 - ((value - hlMin) / Math.max(1e-9, hlMax - hlMin)));
+  const strokeSegmented = (valueKey, yFor) => {
+    let started = false;
+    rows.forEach((row, index) => {
+      const value = numOrNull(row && row[valueKey]);
+      if (value == null) {
+        started = false;
+        return;
+      }
+      const x = xFor(index);
+      const y = yFor(value);
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+  };
 
   ctx.clearRect(0, 0, w, h);
   ctx.strokeStyle = "#30363d";
@@ -610,30 +849,13 @@ export function renderAlphaDecayChart(canvas, vm) {
   ctx.strokeStyle = "#56B4E9";
   ctx.lineWidth = 2;
   ctx.beginPath();
-  rows.forEach((row, index) => {
-    const x = xFor(index);
-    const y = ySharpe(row.rolling_sharpe);
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
+  strokeSegmented("rolling_sharpe", ySharpe);
   ctx.stroke();
 
   ctx.strokeStyle = "#E69F00";
   ctx.beginPath();
-  let started = false;
-  rows.forEach((row, index) => {
-    const value = numOrNull(row.half_life_buckets);
-    if (value == null) return;
-    const x = xFor(index);
-    const y = yHalf(value);
-    if (!started) {
-      ctx.moveTo(x, y);
-      started = true;
-    } else {
-      ctx.lineTo(x, y);
-    }
-  });
-  if (started) ctx.stroke();
+  strokeSegmented("half_life_buckets", yHalf);
+  ctx.stroke();
   drawLegend(ctx, [
     { label: "Sharpe", color: "#56B4E9" },
     { label: "Half-life", color: "#E69F00" },
@@ -641,8 +863,11 @@ export function renderAlphaDecayChart(canvas, vm) {
 
   renderChartAccessibility(canvas, {
     title: "Alpha-decay rolling Sharpe and half-life",
-    series: rows.map((row) => ({ ...row, value: row.rolling_sharpe })),
-    valueKey: "value",
+    series: rows,
+    seriesFields: [
+      { key: "rolling_sharpe", label: "Rolling Sharpe", formatter: (value) => formatNumber(value, 3) },
+      { key: "half_life_buckets", label: "Half-life Buckets", formatter: (value) => formatNumber(value, 2) },
+    ],
     timeKey: "ts_ms",
     valueLabel: "rolling Sharpe",
     valueFormatter: (value) => formatNumber(value, 3),
@@ -798,21 +1023,30 @@ export async function loadRiskChartViews({
 
   const riskVm = buildRiskHistoryViewModel(riskRes.status === "fulfilled" ? riskRes.value : {});
   const mcVm = buildMonteCarloRiskViewModel(mcRes.status === "fulfilled" ? mcRes.value : { ok: false, status: "unavailable" });
-  const alphaVm = buildAlphaDecayViewModel(alphaRes.status === "fulfilled" ? alphaRes.value : { ok: false });
+  const alphaPayload = alphaRes.status === "fulfilled" ? alphaRes.value : { ok: false };
+  const alphaSelector = document.getElementById("alphaDecayStrategySelect");
+  let alphaVm = buildAlphaDecayViewModel(alphaPayload, { selectedStrategy: alphaSelector && alphaSelector.value });
   const regimeVm = buildRegimeHistoryViewModel(regimeRes.status === "fulfilled" ? regimeRes.value : { ok: false });
+
+  const applyAlphaDecaySelection = (selectedStrategy = "") => {
+    alphaVm = buildAlphaDecayViewModel(alphaPayload, { selectedStrategy });
+    renderAlphaDecayChart(document.getElementById("alphaDecayChart"), alphaVm);
+    renderAlphaDecayStrategySelector(alphaSelector, alphaPayload, alphaVm, applyAlphaDecaySelection);
+    setText("alphaDecayMeta", alphaVm.ready ? alphaVm.selectedStrategy : "unavailable");
+    setClass("alphaDecayMeta", alphaVm.ready ? "pill ok meta-pill-offset" : "pill unavailable meta-pill-offset");
+  };
 
   renderRiskHistoryChart(document.getElementById("riskHistoryChart"), riskVm);
   renderMonteCarloBars(document.getElementById("monteCarloRiskBars"), mcVm);
   renderMonteCarloFanChart(document.getElementById("monteCarloFanChart"), mcVm);
-  renderAlphaDecayChart(document.getElementById("alphaDecayChart"), alphaVm);
+  renderMonteCarloDistributionChart(document.getElementById("monteCarloDistributionChart"), mcVm);
+  applyAlphaDecaySelection(alphaVm.selectedStrategy);
   renderRegimeHistoryRibbon(document.getElementById("regimeHistoryRibbon"), regimeVm);
 
   setText("riskHistoryMeta", riskVm.ready ? `${riskVm.pointCount} points` : "unavailable");
   setClass("riskHistoryMeta", riskVm.ready ? "pill ok meta-pill-offset" : "pill unavailable meta-pill-offset");
   setText("monteCarloRiskMeta", mcVm.ready ? mcVm.mode : "not ready");
   setClass("monteCarloRiskMeta", mcVm.ready ? "pill ok meta-pill-offset" : "pill warn meta-pill-offset");
-  setText("alphaDecayMeta", alphaVm.ready ? alphaVm.selectedStrategy : "unavailable");
-  setClass("alphaDecayMeta", alphaVm.ready ? "pill ok meta-pill-offset" : "pill unavailable meta-pill-offset");
   setText("regimeHistoryMeta", regimeVm.ready ? `${regimeVm.rows.length} points` : "current only");
   setClass("regimeHistoryMeta", regimeVm.ready ? "pill ok meta-pill-offset" : "pill warn meta-pill-offset");
 

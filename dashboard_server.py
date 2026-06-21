@@ -40,9 +40,29 @@ import time
 import traceback
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional
 from urllib import error as urllib_error, request as urllib_request
 
+from engine.dashboard.db_health import (
+    api_get_db_health as _dashboard_api_get_db_health,
+    api_get_schema_audit as _dashboard_api_get_schema_audit,
+    db_health_snapshot as _dashboard_db_health_snapshot,
+)
+from engine.dashboard.env import env_bool as _env_bool
+from engine.dashboard.env import env_float as _env_float
+from engine.dashboard.env import env_int as _env_int
+from engine.dashboard.routing import (
+    FALLBACK_ROUTE_SPECS as _FALLBACK_ROUTE_SPECS,
+    build_raw_route_specs as _build_raw_route_specs,
+    filter_route_specs_for_handlers as _filter_route_specs_for_handlers,
+    normalize_route_specs as _normalize_route_specs,
+    validate_canonical_route_owners as _validate_canonical_route_owners_impl,
+)
+from engine.dashboard.serialization import (
+    json_dict as _json_dict,
+    normalize_explain_json as _dashboard_normalize_explain_json,
+    snapshot_json_default as _dashboard_snapshot_json_default,
+)
 from engine.runtime.platform import default_local_log_dir
 
 # ------------------------------------------------------------------
@@ -52,15 +72,33 @@ from engine.runtime.platform import default_local_log_dir
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENGINE_DIR = os.path.join(_BASE_DIR, "engine")
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(_BASE_DIR, ".env"))
-except Exception as e:
+def _dashboard_route_contract_introspection_enabled() -> bool:
+    return str(os.environ.get("DASHBOARD_ROUTE_CONTRACT_INTROSPECTION", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _load_dashboard_dotenv(stage: str) -> None:
+    # Route contract tests import this module only to inspect registered route
+    # metadata. Keep that path from hydrating repo-local secrets while leaving
+    # normal dashboard imports and startup dotenv behavior unchanged.
+    if _dashboard_route_contract_introspection_enabled():
+        return
     try:
-        sys.stderr.write(f"[dashboard_server] dotenv_load_failed: {type(e).__name__}: {e}\n")
-        sys.stderr.flush()
-    except Exception:
-        traceback.print_exc()
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(_BASE_DIR, ".env"))
+    except Exception as e:
+        try:
+            sys.stderr.write(f"[dashboard_server] dotenv_load_failed:{stage}: {type(e).__name__}: {e}\n")
+            sys.stderr.flush()
+        except Exception:
+            traceback.print_exc()
+
+
+_load_dashboard_dotenv("import")
 
 try:
     from engine.runtime.dashboard_config import (
@@ -153,31 +191,6 @@ def _safe_print(*args, **kwargs) -> None:
             extra={"args": [str(arg) for arg in args[:10]]},
         )
 
-def _env_int(key: str, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
-    raw = os.environ.get(key)
-    try:
-        value = int(float(str(raw if raw is not None else default).strip()))
-    except Exception:
-        value = int(default)
-    if minimum is not None:
-        value = max(int(minimum), value)
-    if maximum is not None:
-        value = min(int(maximum), value)
-    return value
-
-def _env_float(key: str, default: float, *, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
-    raw = os.environ.get(key)
-    try:
-        value = float(str(raw if raw is not None else default).strip())
-    except Exception:
-        value = float(default)
-    if minimum is not None:
-        value = max(float(minimum), value)
-    if maximum is not None:
-        value = min(float(maximum), value)
-    return value
-
-
 _safe_print("[dashboard_server] module_import_start")
 
 try:
@@ -208,102 +221,24 @@ from engine.runtime.shutdown import runtime_shutdown
 from engine.runtime.storage import DB_PATH
 
 def _db_health_snapshot():
-    result = {
-        "ok": True,
-        "db_path": str(DB_PATH),
-        "cwd": os.getcwd(),
-        "base_dir": _BASE_DIR,
-        "exists": DB_PATH.exists(),
-        "size_bytes": 0,
-        "wal_bytes": 0,
-        "integrity": "unknown",
-        "error": None,
-        "tables": [],
-        "row_counts": {},
-    }
-    try:
-        if DB_PATH.exists():
-            result["size_bytes"] = DB_PATH.stat().st_size
-            wal_path = DB_PATH.with_suffix(DB_PATH.suffix + "-wal")
-            if wal_path.exists():
-                result["wal_bytes"] = wal_path.stat().st_size
+    from engine.runtime.storage import connect_ro
 
-        # Health uses a read-only connection so dashboard inspection cannot become
-        # another writer competing with the runtime for SQLite locks.
-        from engine.runtime.storage import connect_ro
-
-        con = connect_ro()
-        try:
-            row = con.execute("PRAGMA quick_check;").fetchone()
-            if row:
-                result["integrity"] = str(row[0])
-                if str(row[0]).lower() != "ok":
-                    result["ok"] = False
-        finally:
-            con.close()
-
-    except Exception as e:
-        result["ok"] = False
-        result["error"] = str(e)
-
-    return result
+    return _dashboard_db_health_snapshot(
+        db_path=DB_PATH,
+        base_dir=_BASE_DIR,
+        connect_ro=connect_ro,
+    )
 
 def api_get_db_health(_parsed, _ctx=None):
-    snap = _db_health_snapshot()
-    ts_ms = int(time.time() * 1000)
-    snap["ts"] = ts_ms
-    snap["ts_ms"] = ts_ms
-
-    try:
-        from engine.api.api_system import api_get_system_state
-        snap["system_snapshot"] = api_get_system_state(None, {
-            "JOBS": JOBS,
-            "SUPERVISOR": SUPERVISOR,
-            "API_HANDLERS": API_HANDLERS,
-        })
-    except Exception as e:
-        snap["system_snapshot_error"] = str(e)
-
-    try:
-        from engine.runtime.health import get_health_snapshot
-        snap["runtime_health"] = get_health_snapshot()
-    except Exception as e:
-        snap["runtime_health_error"] = str(e)
-
-    try:
-        from engine.api.api_system import _recent_runtime_errors
-        snap["recent_errors"] = _recent_runtime_errors(limit=10)
-    except Exception:
-        snap["recent_errors"] = []
-
-    # add table + row counts
-    try:
-        con = _dashboard_db_connect()
-        try:
-            cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [r[0] for r in cur.fetchall()]
-            snap["tables"] = tables
-            rc = {}
-            for t in tables:
-                try:
-                    row = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
-                    rc[t] = int(row[0]) if row else 0
-                except Exception:
-                    rc[t] = None
-            snap["row_counts"] = rc
-        finally:
-            con.close()
-    except Exception as e:
-        snap["ok"] = False
-        snap["error"] = str(e)
-
-    try:
-        from engine.runtime.storage import get_db_debug_snapshot
-        snap["storage_debug"] = get_db_debug_snapshot()
-    except Exception as e:
-        snap["storage_debug_error"] = str(e)
-
-    return snap
+    return _dashboard_api_get_db_health(
+        _parsed,
+        _ctx,
+        db_health_snapshot_fn=_db_health_snapshot,
+        dashboard_db_connect=_dashboard_db_connect,
+        jobs=JOBS,
+        supervisor=SUPERVISOR,
+        api_handlers=API_HANDLERS,
+    )
 
 # API-layer only access (no direct dev_core access from dashboard)
 from engine.api.internal_access import (
@@ -479,23 +414,7 @@ from engine.runtime.config import (
 # }
 
 def api_get_schema_audit(_parsed):
-    return get_schema_audit()
-
-def api_post_repair_schema(_parsed, _body=None, _ctx=None):
-    if not _repair_schema_run:
-        return {"ok": False, "error": "repair_schema_unavailable"}
-
-    try:
-        result = _repair_schema_run()
-
-        if isinstance(result, dict):
-            return result
-
-        return {"ok": False, "error": "repair_schema_invalid_result", "result": str(result)}
-
-    except Exception as e:
-        _warn_nonfatal("DASHBOARD_SERVER_REPAIR_SCHEMA_FAILED", e, endpoint="api_post_repair_schema")
-        return {"ok": False, "error": str(e)}
+    return _dashboard_api_get_schema_audit(_parsed, get_schema_audit=get_schema_audit)
 
 # ------------------------------------------------------
 # CRIT notifications (email / webhook)
@@ -611,11 +530,6 @@ def _qs_dict(parsed) -> dict[str, str]:
         return {str(k): str(v) for k, v in raw.items()}
     return {}
 
-
-def _json_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return cast(dict[str, Any], value)
-    return {}
 
 _AUTO_PIPELINE_THREAD_STARTED = False
 _AUTO_CHALLENGER_THREAD_STARTED = False
@@ -748,15 +662,6 @@ if not _db_path_raw.is_absolute():
 host = str(os.environ.get("DASHBOARD_HOST", "127.0.0.1") or "").strip() or "127.0.0.1"
 
 port = _env_int("DASHBOARD_PORT", _env_int("PORT", 8000, minimum=1, maximum=65535), minimum=1, maximum=65535)
-
-# ---------------------------------------------------
-# SUPERVISOR AUTO BOOT (deterministic, ENV-gated)
-# ---------------------------------------------------
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.environ.get(key)
-    if v is None:
-        return bool(default)
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 # Default ON for production-safe deterministic boot
 # Force deterministic auto-boot in shadow/live
@@ -1801,16 +1706,7 @@ _DASHBOARD_HTTP_BOUND = False
 _LOCAL_META_CACHE: dict[str, Any] = {}
 
 def _snapshot_json_default(value):
-    try:
-        return str(value)
-    except Exception as e:
-        _warn_nonfatal(
-            "DASHBOARD_SERVER_SNAPSHOT_JSON_DEFAULT_FAILED",
-            e,
-            value_type=type(value).__name__,
-        )
-        snapshot_repr = repr(value)
-        return snapshot_repr
+    return _dashboard_snapshot_json_default(value, warn_nonfatal=_warn_nonfatal)
 
 def _meta_set_json(key: str, payload, *, best_effort: bool = False) -> None:
     _LOCAL_META_CACHE[str(key)] = payload
@@ -2671,35 +2567,12 @@ def _normalize_explain_json(val) -> str:
     - If bytes: decodes utf-8
     - Otherwise: returns JSON-encoded wrapper
     """
-    if val is None:
-        return "{}"
-    try:
-        if isinstance(val, (bytes, bytearray)):
-            val = val.decode("utf-8", errors="replace")
-    except Exception as e:
-        log_failure(
-            log,
-            event="dashboard_server_snapshot_decode_failed",
-            code="DASHBOARD_SERVER_SNAPSHOT_DECODE_FAILED",
-            message=str(e),
-            error=e,
-            level=30,
-            component="dashboard_server",
-            include_health=False,
-            persist=True,
-        )
-
-    s = str(val).strip()
-    if not s:
-        return "{}"
-
-    # if it parses, return original text (keeps exact content)
-    try:
-        json.loads(s)
-        return s
-    except Exception as e:
-        _warn_nonfatal("DASHBOARD_SERVER_EXPLAIN_JSON_PARSE_FAILED", e)
-        return json.dumps({"raw": s})
+    return _dashboard_normalize_explain_json(
+        val,
+        warn_nonfatal=_warn_nonfatal,
+        log_failure_fn=log_failure,
+        log=log,
+    )
 
 # -------------            -- ------------------------------------------------------
 # HTTP HANDLER
@@ -2715,6 +2588,13 @@ except Exception:
     ROUTE_SPECS_SYSTEM = []
 
 ROUTE_SPECS_SYSTEM = list(ROUTE_SPECS_SYSTEM or [])
+
+try:
+    from engine.api.api_self_repair import ROUTE_SPECS_SELF_REPAIR
+except Exception:
+    ROUTE_SPECS_SELF_REPAIR = []
+
+ROUTE_SPECS_SELF_REPAIR = list(ROUTE_SPECS_SELF_REPAIR or [])
 
 try:
     from engine.api.api_jobs import ROUTE_SPECS_JOBS
@@ -2758,173 +2638,11 @@ except Exception:
 # (optional) terminal route modules are consolidated via ROUTE_SPECS_TERMINAL_ALL below
 
 # -------------------------------------------------------------------
-# FALLBACK ROUTES (UI hard-dep)
-# If ROUTE_SPECS_* failed to import or are incomplete, the UI will 404.
-# These map paths -> handler keys in API_HANDLERS below.
-# -------------------------------------------------------------------
-_FALLBACK_ROUTE_SPECS = [
-    {"method": "GET",  "path": "/api/db/health",        "handler": "api_get_db_health"},
-
-    # OPERATOR (required by ui/dashboard.js snapshot bundle)
-    {"method": "GET", "path": "/api/operator_summary", "handler": "api_get_operator_summary"},
-    {"method": "GET",  "path": "/api/operator/sidecar_status",  "handler": "api_get_operator_sidecar_status"},
-    {"method": "GET",  "path": "/api/operator/status",            "handler": "api_get_operator_status"},
-    {"method": "GET",  "path": "/api/operator/bootstrap",         "handler": "api_get_operator_bootstrap_status"},
-    {"method": "GET",  "path": "/api/operator/bootstrapStatus",   "handler": "api_get_operator_bootstrap_status"},
-    {"method": "GET",  "path": "/api/operator/readiness",         "handler": "api_get_readiness"},
-    {"method": "GET",  "path": "/api/operator/health",            "handler": "api_get_health"},
-    {"method": "GET",  "path": "/api/operator/logs",              "handler": "api_get_operator_logs"},
-    {"method": "GET",  "path": "/api/operator/stderr_tail",       "handler": "api_get_operator_stderr_tail"},
-    {"method": "GET",  "path": "/api/operator/db_schema",         "handler": "api_get_schema_audit"},
-    {"method": "GET",  "path": "/api/operator/snapshot",          "handler": "api_get_support_snapshot"},
-    {"method": "GET",  "path": "/api/operator/market_data",       "handler": "api_get_operator_market_data"},
-    {"method": "GET",  "path": "/api/operator/strategy_decisions","handler": "api_get_operator_strategy_decisions"},
-    {"method": "GET",  "path": "/api/operator/preflight",         "handler": "api_get_operator_preflight"},
-
-    {"method": "POST", "path": "/api/operator/start",             "handler": "api_post_operator_start"},
-    {"method": "POST", "path": "/api/operator/bootstrap",         "handler": "api_post_operator_bootstrap"},
-    {"method": "POST", "path": "/api/operator/stop",              "handler": "api_post_operator_stop"},
-    {"method": "POST", "path": "/api/operator/restart",           "handler": "api_post_operator_restart"},
-    {"method": "POST", "path": "/api/operator/restart_engine",    "handler": "api_post_operator_restart"},
-    {"method": "POST", "path": "/api/operator/restart_feeds",     "handler": "api_post_operator_restart_feeds"},
-    {"method": "POST", "path": "/api/operator/emergency_stop",    "handler": "api_post_operator_emergency_stop"},
-    {"method": "POST", "path": "/api/operator/execution_arm",     "handler": "api_post_operator_execution_arm"},
-    {"method": "POST", "path": "/api/operator/clear_manual_halt", "handler": "api_post_operator_clear_manual_halt"},
-    {"method": "POST", "path": "/api/operator/autofix",           "handler": "api_post_operator_autofix"},
-    {"method": "POST", "path": "/api/operator/clearLastError",    "handler": "api_post_operator_clear_last_error"},
-    {"method": "GET",  "path": "/api/operator/institutionalCheck","handler": "api_get_operator_institutional_check"},
-
-
-    {"method": "GET",  "path": "/api/training_status",       "handler": "api_get_training_status"},
-    {"method": "GET",  "path": "/api/pnl",                   "handler": "api_get_pnl"},
-    {"method": "POST", "path": "/api/repair_schema",         "handler": "api_post_repair_schema"},
-    {"method": "GET",  "path": "/api/status",                "handler": "api_get_status"},
-    {"method": "GET",  "path": "/api/liveness",             "handler": "api_get_liveness"},
-    {"method": "GET",  "path": "/api/system/config",         "handler": "api_get_runtime_config"},
-    {"method": "GET",  "path": "/api/supervisor/status",     "handler": "api_get_supervisor_status"},
-    {"method": "GET",  "path": "/api/ingestion/status",      "handler": "api_get_ingestion_status"},
-    {"method": "GET",  "path": "/api/risk/portfolio",        "handler": "api_get_portfolio_risk"},
-    {"method": "GET",  "path": "/api/market/session",        "handler": "api_get_market_session"},
-    {"method": "GET",  "path": "/api/pnl/summary",           "handler": "api_get_pnl_summary"},
-    {"method": "GET",  "path": "/api/risk/summary",          "handler": "api_get_risk_summary"},
-    {"method": "GET",  "path": "/api/models/status",         "handler": "api_get_models_status"},
-    {"method": "POST", "path": "/api/models/promote",        "handler": "api_post_models_promote"},
-
-    # JOBS
-    {"method": "GET",  "path": "/api/jobs",               "handler": "api_get_jobs"},
-    {"method": "GET",  "path": "/api/jobs/catalog",       "handler": "api_get_jobs_catalog"},
-    {"method": "POST", "path": "/api/jobs/start",         "handler": "api_post_job_start"},
-    {"method": "POST", "path": "/api/jobs/stop",          "handler": "api_post_job_stop"},
-    {"method": "GET",  "path": "/api/jobs/log",           "handler": "api_get_job_log"},
-    {"method": "GET",  "path": "/api/jobs/history",       "handler": "api_get_job_history"},
-    {"method": "POST", "path": "/api/pipeline/run",       "handler": "api_post_pipeline_run"},
-
-    # OPS
-    {"method": "GET", "path": "/api/alerts",                          "handler": "api_get_alerts"},
-    {"method": "GET", "path": "/api/notifications/status",            "handler": "api_get_notifications_status"},
-    {"method": "POST", "path": "/api/notifications/test",             "handler": "api_post_notifications_test"},
-    {"method": "GET", "path": "/api/alerts/timeline",                 "handler": "api_get_alerts"},
-    {"method": "GET", "path": "/api/feeds",                           "handler": "api_get_feeds"},
-    {"method": "GET", "path": "/api/validation",                      "handler": "api_get_validation"},
-    {"method": "GET", "path": "/api/model/diagnostics",               "handler": "api_get_model_diagnostics"},
-    {"method": "GET", "path": "/api/model_registry",                  "handler": "api_get_model_registry"},
-    {"method": "GET", "path": "/api/model/registry",                  "handler": "api_get_model_registry"},
-    {"method": "GET", "path": "/api/embed_model_eval",                "handler": "api_get_embed_model_eval"},
-    {"method": "GET", "path": "/api/embed_conf_calib",                "handler": "api_get_embed_conf_calib"},
-    {"method": "GET", "path": "/api/temporal_eval",                   "handler": "api_get_temporal_eval"},
-    {"method": "GET", "path": "/api/temporal/eval",                   "handler": "api_get_temporal_eval"},
-    {"method": "GET", "path": "/api/temporal_models",                 "handler": "api_get_temporal_models"},
-    {"method": "GET", "path": "/api/temporal/models",                 "handler": "api_get_temporal_models"},
-    {"method": "GET", "path": "/api/backtest/portfolio/latest",       "handler": "api_get_latest_portfolio_backtest"},
-    {"method": "GET", "path": "/api/portfolio/backtest/latest",       "handler": "api_get_latest_portfolio_backtest"},
-    {"method": "GET", "path": "/api/execution_metrics",               "handler": "api_get_execution_metrics"},
-    {"method": "GET", "path": "/api/execution/metrics",               "handler": "api_get_execution_metrics"},
-    {"method": "GET", "path": "/api/execution/stats",                 "handler": "api_get_execution_stats"},
-    {"method": "GET", "path": "/api/execution_metrics/rolling",       "handler": "api_get_execution_metrics_rolling"},
-    {"method": "GET", "path": "/api/execution/metrics/rolling",       "handler": "api_get_execution_metrics_rolling"},
-    {"method": "GET", "path": "/api/execution_metrics/by_symbol",     "handler": "api_get_execution_metrics_by_symbol"},
-    {"method": "GET", "path": "/api/execution/metrics/by_symbol",     "handler": "api_get_execution_metrics_by_symbol"},
-    {"method": "GET", "path": "/api/execution_metrics/by_confidence", "handler": "api_get_execution_cost_by_confidence"},
-    {"method": "GET", "path": "/api/execution/metrics/by_confidence", "handler": "api_get_execution_cost_by_confidence"},
-    {"method": "GET", "path": "/api/confidence_mass",                 "handler": "api_get_confidence_mass"},
-    {"method": "GET", "path": "/api/social/features",                 "handler": "api_get_social_features"},
-    {"method": "GET", "path": "/api/social/regimes",                  "handler": "api_get_social_regimes"},
-    {"method": "GET", "path": "/api/social/blocks",                   "handler": "api_get_social_blocks"},
-    {"method": "GET", "path": "/api/relevance_stats",                 "handler": "api_get_relevance_stats"},
-    {"method": "GET", "path": "/api/relevance/stats",                 "handler": "api_get_relevance_stats"},
-    {"method": "POST","path": "/api/champion/rollback",               "handler": "api_post_rollback"},
-
-    # EXECUTION / PORTFOLIO / PROMOTION (UI hard-deps)
-    {"method": "GET", "path": "/api/market_stress",                   "handler": "api_get_market_stress"},
-    {"method": "GET", "path": "/api/market_stress_history",           "handler": "api_get_market_stress_history"},
-    {"method": "GET", "path": "/api/portfolio",                       "handler": "api_get_portfolio"},
-    {"method": "GET", "path": "/api/portfolio/backtest",              "handler": "api_get_portfolio_backtest"},
-    {"method": "GET",  "path": "/api/prices",                          "handler": "api_get_prices"},
-    {"method": "GET",  "path": "/api/trades",                          "handler": "api_get_trades"},
-    {"method": "GET", "path": "/api/broker",                          "handler": "api_get_broker"},
-    {"method": "GET", "path": "/api/strategy/status",                 "handler": "api_get_strategy_status"},
-    {"method": "GET", "path": "/api/strategy_metrics",                "handler": "api_get_strategy_metrics"},
-    {"method": "GET", "path": "/api/strategy/metrics",                "handler": "api_get_strategy_metrics"},
-    {"method": "GET", "path": "/api/alpha_decay",                     "handler": "api_get_alpha_decay"},
-    {"method": "GET", "path": "/api/reconcile/broker_backtest",       "handler": "api_get_reconcile_broker_backtest"},
-    {"method": "GET", "path": "/api/equity_drift",                    "handler": "api_get_equity_drift"},
-    {"method": "GET", "path": "/api/temporal_shadow_eval",            "handler": "api_get_temporal_shadow_eval"},
-    {"method": "GET", "path": "/api/temporal/shadow_eval",            "handler": "api_get_temporal_shadow_eval"},
-    {"method": "GET", "path": "/api/promotion_audit",                 "handler": "api_get_promotion_audit"},
-    {"method": "GET", "path": "/api/promotion/audit",                 "handler": "api_get_promotion_audit"},
-    {"method": "GET", "path": "/api/causal/scores",                   "handler": "api_get_causal_scores"},
-    {"method": "GET", "path": "/api/promotion/status",                "handler": "api_get_promotion_status"},
-    {"method": "GET", "path": "/api/governance/summary",              "handler": "api_get_governance_summary"},
-
-    # UI hard-deps present in ui/dashboard.js but missing from ROUTE_SPECS_* in this repo
-    {"method": "GET",  "path": "/api/system/kill_switches",           "handler": "api_get_kill_switches"},  # alias
-    {"method": "GET",  "path": "/api/alerts/by_id",                   "handler": "api_get_alert_by_id"},
-    {"method": "POST", "path": "/api/alerts/{id}/ack",                "handler": "api_post_alert_ack"},
-    {"method": "POST", "path": "/api/alerts/{id}/shelve",             "handler": "api_post_alert_shelve"},
-    {"method": "POST", "path": "/api/alerts/{id}/resolve",            "handler": "api_post_alert_resolve"},
-    {"method": "GET",  "path": "/api/ui/decisions",                   "handler": "api_get_recent_decisions"},
-    {"method": "GET",  "path": "/api/ui/decision",                    "handler": "api_get_decision_detail"},
-    {"method": "GET",  "path": "/api/data/feature_visibility",        "handler": "api_get_feature_visibility"},
-    {"method": "GET",  "path": "/api/audit/records",                  "handler": "api_get_audit_records"},
-    {"method": "POST", "path": "/api/ui/interaction",                 "handler": "api_post_ui_interaction"},
-    {"method": "POST", "path": "/api/copilot/ask",                    "handler": "api_post_copilot_ask"},
-    {"method": "GET",  "path": "/api/promotion/explain",              "handler": "api_get_promotion_explain"},
-    {"method": "POST", "path": "/api/promotion/enable",               "handler": "api_post_promotion_enable"},
-    {"method": "POST", "path": "/api/system/fix",                     "handler": "api_post_system_fix"},
-    {"method": "GET",  "path": "/api/size_policy",                    "handler": "api_get_size_policy"},
-    {"method": "GET",  "path": "/api/strategy/size_policy",           "handler": "api_get_size_policy"},
-    {"method": "POST", "path": "/api/size_policy/train",              "handler": "api_post_size_policy_train"},
-    {"method": "POST", "path": "/api/strategy/size_policy/train",     "handler": "api_post_size_policy_train"},
-    {"method": "GET",  "path": "/api/model_metrics",                  "handler": "api_get_model_metrics"},
-    {"method": "GET",  "path": "/api/model/metrics",                  "handler": "api_get_model_metrics"},
-    {"method": "GET",  "path": "/api/execution_overlays",             "handler": "api_get_execution_overlays"},
-    {"method": "GET",  "path": "/api/execution/overlays",             "handler": "api_get_execution_overlays"},
-    {"method": "GET",  "path": "/api/crash_analytics",                "handler": "api_get_crash_analytics"},
-    {"method": "GET",  "path": "/api/news/latest",                    "handler": "api_get_news_latest"},
-    {"method": "GET",  "path": "/api/news/sentiment",                 "handler": "api_get_news_sentiment"},
-
-    # MARKET (live candles from Polygon feed via DB)
-    {"method": "GET",  "path": "/api/market/candles",                 "handler": "api_get_market_candles"},
-    {"method": "GET",  "path": "/api/market/stream",                  "handler": "api_get_market_stream"},
-
-    # TERMINAL
-    {"method": "GET",  "path": "/api/terminal/watchlist",             "handler": "api_get_terminal_watchlist"},
-    {"method": "GET",  "path": "/api/terminal/snapshot",              "handler": "api_get_terminal_snapshot"},
-    {"method": "GET",  "path": "/api/terminal/positions",             "handler": "api_get_terminal_positions"},
-    {"method": "GET",  "path": "/api/terminal/orders",                "handler": "api_get_terminal_orders"},
-    {"method": "GET",  "path": "/api/terminal/fills",                 "handler": "api_get_terminal_fills"},
-    {"method": "GET",  "path": "/api/terminal/equity",                "handler": "api_get_terminal_equity"},
-    {"method": "GET",  "path": "/api/terminal/markers",               "handler": "api_get_terminal_markers"},
-    {"method": "GET",  "path": "/api/terminal/decision_overlays",     "handler": "api_get_terminal_decision_overlays"},
-
-    {"method": "POST", "path": "/api/terminal/order",                 "handler": "api_post_terminal_order"},
-    {"method": "POST", "path": "/api/terminal/flatten",               "handler": "api_post_terminal_flatten"},
-]
-
-# -------------------------------------------------------------------
 # FORCE-MERGE ALL ROUTES (SYSTEM + JOBS + OPS + FALLBACK)
 # - Always keep first occurrence of (method,path)
 # - Always normalize to dict {method,path,handler}
+# - Keep public dashboard_server route globals, but source the route table
+#   and helpers from engine.dashboard.routing.
 # -------------------------------------------------------------------
 
 # Load terminal routes if module exists
@@ -2934,50 +2652,19 @@ try:
 except Exception:
     _terminal_routes = []
 
-_RAW_ROUTE_SPECS = (
-    list(ROUTE_SPECS_SYSTEM)
-    + list(ROUTE_SPECS_JOBS)
-    + list(ROUTE_SPECS_OPS)
-    + list(ROUTE_SPECS_MARKET)
-    + list(ROUTE_SPECS_REPLAY)
-    + list(ROUTE_SPECS_DATA_SOURCES)
-    + list(ROUTE_SPECS_UI_METRICS)
-    + list(ROUTE_SPECS_BROKER_CONFIG)
-    + list(_terminal_routes)
-    + list(_FALLBACK_ROUTE_SPECS)
+_RAW_ROUTE_SPECS = _build_raw_route_specs(
+    ROUTE_SPECS_SYSTEM,
+    ROUTE_SPECS_SELF_REPAIR,
+    ROUTE_SPECS_JOBS,
+    ROUTE_SPECS_OPS,
+    ROUTE_SPECS_MARKET,
+    ROUTE_SPECS_REPLAY,
+    ROUTE_SPECS_DATA_SOURCES,
+    ROUTE_SPECS_UI_METRICS,
+    ROUTE_SPECS_BROKER_CONFIG,
+    _terminal_routes,
+    fallback_route_specs=_FALLBACK_ROUTE_SPECS,
 )
-
-def _normalize_route_specs(route_specs):
-    seen = set()
-    out = []
-
-    for r in route_specs:
-        if isinstance(r, dict):
-            method = str(r.get("method", "")).upper().strip()
-            path = str(r.get("path", "")).strip()
-            handler = str(r.get("handler", "")).strip()
-        elif isinstance(r, tuple) and len(r) >= 3:
-            method = str(r[0]).upper().strip()
-            path = str(r[1]).strip()
-            handler = str(r[2]).strip()
-        else:
-            continue
-
-        if not method or not path or not handler:
-            continue
-
-        key = (method, path)
-        if key in seen:
-            continue
-
-        seen.add(key)
-        out.append({
-            "method": method,
-            "path": path,
-            "handler": handler,
-        })
-
-    return out
 
 
 _HANDLER_SIGNATURE_FALLBACK_WARNED: set[tuple[str, int, int]] = set()
@@ -3845,9 +3532,9 @@ def _dashboard_parse_json(value, default=None):
 
 def api_get_market_stress(_parsed=None, _ctx=None):
     try:
-        from engine.strategy.market_stress import get_market_stress_snapshot
+        from engine.strategy.market_stress import get_market_stress_snapshot, market_stress_thresholds
         stress = get_market_stress_snapshot() or {}
-        return {"ok": True, "stress": stress}
+        return {"ok": True, "stress": stress, "thresholds": market_stress_thresholds()}
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_MARKET_STRESS_FAILED", e, endpoint="api_get_market_stress")
         return {"ok": False, "error": str(e), "stress": {}}
@@ -3862,13 +3549,14 @@ def api_get_market_stress_history(parsed, _ctx=None):
 
     con = None
     try:
-        from engine.strategy.market_stress import get_market_stress_snapshot
+        from engine.strategy.market_stress import get_market_stress_snapshot, market_stress_thresholds
 
         con = _dashboard_db_connect()
         series = []
+        thresholds = market_stress_thresholds()
 
         if not _dashboard_table_exists(con, "prices"):
-            return {"ok": True, "series": []}
+            return {"ok": True, "series": [], "thresholds": thresholds}
 
         rows = con.execute(
             """
@@ -3900,7 +3588,7 @@ def api_get_market_stress_history(parsed, _ctx=None):
                 )
                 continue
 
-        return {"ok": True, "series": series}
+        return {"ok": True, "series": series, "thresholds": thresholds}
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_MARKET_STRESS_HISTORY_FAILED", e, endpoint="api_get_market_stress_history")
         return {"ok": False, "error": str(e), "series": []}
@@ -4020,7 +3708,7 @@ def api_get_strategy_status(_parsed=None, _ctx=None):
             if runtime_row:
                 rows.append({"key": "alpha_decay_runtime_ts_ms", "value": str(int(runtime_row[0] or 0))})
                 rows.append({"key": "alpha_decay_status", "value": str(runtime_row[1] or "ok")})
-                rows.append({"key": "alpha_decay_min_throttle_mult", "value": str(float(runtime_row[2] or 1.0))})
+                rows.append({"key": "alpha_decay_min_throttle_mult", "value": str(float(runtime_row[2]) if runtime_row[2] is not None else 1.0)})
                 rows.append({"key": "alpha_decay_severe_count", "value": str(int(runtime_row[3] or 0))})
                 rows.append({"key": "alpha_decay_warn_count", "value": str(int(runtime_row[4] or 0))})
 
@@ -4046,7 +3734,7 @@ def api_get_strategy_status(_parsed=None, _ctx=None):
                     "key": f"alpha_decay:{strategy_name}",
                     "value": (
                         f"severity={severity or 'ok'} "
-                        f"throttle_mult={float(throttle_mult or 1.0)} "
+                        f"throttle_mult={float(throttle_mult) if throttle_mult is not None else 1.0} "
                         f"rolling_sharpe={float(rolling_sharpe or 0.0)} "
                         f"structural_break_z={float(structural_break_z or 0.0)} "
                         f"ts_ms={int(ts_ms or 0)}"
@@ -4114,7 +3802,11 @@ def api_get_strategy_metrics(parsed, _ctx=None):
                     "alpha_decay_structural_break_z": float(m.get("alpha_decay_structural_break_z", 0.0) or 0.0),
                     "alpha_decay_severity": str(m.get("alpha_decay_severity", "ok") or "ok"),
                     "alpha_decay_severity_score": float(m.get("alpha_decay_severity_score", 0.0) or 0.0),
-                    "alpha_decay_throttle_mult": float(m.get("alpha_decay_throttle_mult", 1.0) or 1.0),
+                    "alpha_decay_throttle_mult": (
+                        1.0
+                        if m.get("alpha_decay_throttle_mult") is None
+                        else float(m.get("alpha_decay_throttle_mult"))
+                    ),
                     "alpha_decay_n_obs": int(m.get("alpha_decay_n_obs", 0) or 0),
                     "ts_ms": int(ts_ms or 0),
                 })
@@ -4136,99 +3828,6 @@ def api_get_strategy_metrics(parsed, _ctx=None):
                 con.close()
         except Exception as e:
             _warn_nonfatal("DASHBOARD_SERVER_API_CON_CLOSE_FAILED", e, endpoint="api_get_strategy_metrics")
-
-def api_get_alpha_decay(parsed, _ctx=None):
-    limit_s = _qs_value(parsed, "limit", "50")
-    try:
-        limit = max(1, min(500, int(limit_s)))
-    except Exception:
-        limit = 50
-
-    con = None
-    try:
-        con = _dashboard_db_connect()
-
-        runtime = {}
-        if _dashboard_table_exists(con, "alpha_decay_runtime_history"):
-            row = con.execute(
-                """
-                SELECT ts_ms, status, min_throttle_mult, severe_count, warn_count, detail_json
-                FROM alpha_decay_runtime_history
-                ORDER BY ts_ms DESC
-                LIMIT 1
-                """
-            ).fetchone()
-            if row:
-                runtime = {
-                    "ts_ms": int(row[0] or 0),
-                    "status": str(row[1] or "ok"),
-                    "min_throttle_mult": float(row[2] or 1.0),
-                    "severe_count": int(row[3] or 0),
-                    "warn_count": int(row[4] or 0),
-                    "detail": _dashboard_parse_json(row[5], {}),
-                }
-
-        strategies = []
-        if _dashboard_table_exists(con, "alpha_decay_strategy_metrics"):
-            rows = con.execute(
-                """
-                SELECT m.strategy_name,
-                       m.ts_ms,
-                       m.window_days,
-                       m.bucket_s,
-                       m.rolling_sharpe,
-                       m.half_life_buckets,
-                       m.half_life_seconds,
-                       m.structural_break_z,
-                       m.severity,
-                       m.severity_score,
-                       m.throttle_mult,
-                       m.n_obs,
-                       m.detail_json
-                FROM alpha_decay_strategy_metrics m
-                JOIN (
-                  SELECT strategy_name, MAX(ts_ms) AS ts_ms
-                  FROM alpha_decay_strategy_metrics
-                  GROUP BY strategy_name
-                ) t
-                ON t.strategy_name=m.strategy_name AND t.ts_ms=m.ts_ms
-                ORDER BY m.ts_ms DESC, m.strategy_name ASC
-                LIMIT ?
-                """,
-                (int(limit),),
-            ).fetchall() or []
-
-            for row in rows:
-                strategies.append({
-                    "strategy": str(row[0] or ""),
-                    "ts_ms": int(row[1] or 0),
-                    "window_days": int(row[2] or 0),
-                    "bucket_s": int(row[3] or 0),
-                    "rolling_sharpe": float(row[4] or 0.0),
-                    "half_life_buckets": (None if row[5] is None else float(row[5] or 0.0)),
-                    "half_life_seconds": (None if row[6] is None else float(row[6] or 0.0)),
-                    "structural_break_z": float(row[7] or 0.0),
-                    "severity": str(row[8] or "ok"),
-                    "severity_score": float(row[9] or 0.0),
-                    "throttle_mult": float(row[10] or 1.0),
-                    "n_obs": int(row[11] or 0),
-                    "detail": _dashboard_parse_json(row[12], {}),
-                })
-
-        return {
-            "ok": True,
-            "runtime": runtime,
-            "strategies": strategies,
-        }
-    except Exception as e:
-        _warn_nonfatal("DASHBOARD_SERVER_ALPHA_DECAY_FAILED", e, endpoint="api_get_alpha_decay")
-        return {"ok": False, "error": str(e), "runtime": {}, "strategies": []}
-    finally:
-        try:
-            if con is not None:
-                con.close()
-        except Exception as e:
-            _warn_nonfatal("DASHBOARD_SERVER_API_CON_CLOSE_FAILED", e, endpoint="api_get_alpha_decay")
 
 def api_get_reconcile_broker_backtest(_parsed=None, _ctx=None):
     con = None
@@ -4522,7 +4121,6 @@ from engine.api.api_system import (
     api_get_provider_telemetry,
     api_get_supervisor_diagnostics,
     api_get_support_snapshot,
-    api_post_self_repair,
     api_get_telemetry,
     api_get_telemetry_history,
     api_get_execution_barrier,
@@ -4537,6 +4135,11 @@ from engine.api.api_system import (
     api_get_portfolio_risk,
 )
 
+from engine.api.api_self_repair import (
+    api_post_repair_schema,
+    api_post_self_repair,
+)
+
 from engine.api.api_operator_handlers import (
     api_get_operator_summary,
     api_get_operator_status,
@@ -4548,6 +4151,7 @@ from engine.api.api_operator_handlers import (
     api_post_operator_restart,
     api_post_operator_restart_feeds,
     api_post_operator_emergency_stop,
+    api_post_operator_broker_risk,
     api_post_operator_execution_arm,
     api_post_operator_clear_manual_halt,
     api_post_operator_autofix,
@@ -4740,18 +4344,27 @@ def api_get_news_sentiment(parsed, _ctx=None):
         ).fetchall() or []
 
         rows = list(reversed(rows))
-        series = [
-            {
-                "ts_ms": int(r[0] or 0),
-                "sentiment": float(r[1] or 0.0),
-            }
-            for r in rows
-        ]
+        series = []
+        missing_sentiment = 0
+        valid_sentiment = 0
+        for bucket_ts_ms, raw_sentiment in rows:
+            if raw_sentiment is None:
+                sentiment = None
+                missing_sentiment += 1
+            else:
+                sentiment = float(raw_sentiment)
+                valid_sentiment += 1
+            series.append({"ts_ms": int(bucket_ts_ms or 0), "sentiment": sentiment})
 
         return {
             "ok": True,
             "error": None,
-            "meta": {"ready": bool(series), "count": int(len(series))},
+            "meta": {
+                "ready": valid_sentiment > 0,
+                "count": int(len(series)),
+                "valid_sentiment": int(valid_sentiment),
+                "missing_sentiment": int(missing_sentiment),
+            },
             "series": series,
         }
     except Exception as e:
@@ -5635,6 +5248,7 @@ API_HANDLERS = {
     "api_post_operator_restart": api_post_operator_restart,
     "api_post_operator_restart_feeds": api_post_operator_restart_feeds,
     "api_post_operator_emergency_stop": api_post_operator_emergency_stop,
+    "api_post_operator_broker_risk": api_post_operator_broker_risk,
     "api_post_operator_execution_arm": api_post_operator_execution_arm,
     "api_post_operator_clear_manual_halt": api_post_operator_clear_manual_halt,
     "api_post_operator_autofix": api_post_operator_autofix,
@@ -5761,7 +5375,6 @@ API_HANDLERS = {
     "api_get_broker": api_get_broker,
     "api_get_strategy_status": api_get_strategy_status,
     "api_get_strategy_metrics": api_get_strategy_metrics,
-    "api_get_alpha_decay": api_get_alpha_decay,
     "api_get_reconcile_broker_backtest": api_get_reconcile_broker_backtest,
     "api_get_equity_drift": api_get_equity_drift,
     "api_get_temporal_shadow_eval": api_get_temporal_shadow_eval,
@@ -5776,11 +5389,46 @@ API_HANDLERS = {
     "api_post_models_promote": api_post_models_promote,
 }
 
-ROUTE_SPECS = [
-    route
-    for route in ROUTE_SPECS
-    if str(route.get("handler") or "").strip() in API_HANDLERS
-]
+ROUTE_SPECS = _filter_route_specs_for_handlers(ROUTE_SPECS, API_HANDLERS)
+
+_CANONICAL_ROUTE_OWNERS = {
+    ("GET", "/api/alpha_decay"): {
+        "handler": "api_get_alpha_decay",
+        "module": "engine.api.api_system",
+        "name": "api_get_alpha_decay",
+    },
+    ("POST", "/api/system/self_repair"): {
+        "handler": "api_post_self_repair",
+        "module": "engine.api.api_self_repair",
+        "name": "api_post_self_repair",
+    },
+    ("POST", "/api/operator/self_repair"): {
+        "handler": "api_post_self_repair",
+        "module": "engine.api.api_self_repair",
+        "name": "api_post_self_repair",
+    },
+    ("POST", "/api/system/repair_schema"): {
+        "handler": "api_post_repair_schema",
+        "module": "engine.api.api_self_repair",
+        "name": "api_post_repair_schema",
+    },
+    ("POST", "/api/repair_schema"): {
+        "handler": "api_post_repair_schema",
+        "module": "engine.api.api_self_repair",
+        "name": "api_post_repair_schema",
+    },
+}
+
+
+def _validate_canonical_route_owners() -> None:
+    _validate_canonical_route_owners_impl(
+        route_specs=ROUTE_SPECS,
+        api_handlers=API_HANDLERS,
+        canonical_route_owners=_CANONICAL_ROUTE_OWNERS,
+    )
+
+
+_validate_canonical_route_owners()
 
 # ------------------------------------------------------
 # SERVER
@@ -5814,11 +5462,7 @@ def _run_dashboard_control_plane():
     global _HTTPD, _DASHBOARD_HTTP_BOUND
     _DASHBOARD_HTTP_BOUND = False
 
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(os.path.join(_BASE_DIR, ".env"))
-    except Exception as e:
-        log.exception("dashboard_server_dotenv_load_failed: %s", e)
+    _load_dashboard_dotenv("run_server")
 
     # Lifecycle state writes are DB-backed; defer them until after the socket is
     # bound so dependency outages do not prevent static dashboard access.
@@ -5844,18 +5488,6 @@ def _run_dashboard_control_plane():
         status="ok",
         detail="storage_readiness_deferred_until_after_bind",
     )
-
-    # ---------------------------------------------------
-    # RUNTIME BOOTSTRAP (DB + coordination tables)
-    # ---------------------------------------------------
-    # DEFERRED — bootstrap moved post-bind
-    boot = {
-        "ok": True,
-        "deferred_until_after_bind": True,
-        "steps": [],
-        "errors": [],
-        "ts_ms": int(time.time() * 1000),
-    }
 
     # ---------------------------------------------------
     def _post_bind_boot_safe():

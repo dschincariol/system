@@ -2,7 +2,7 @@
 
 This document maps the main Python files to the most important functions and classes inside them.
 
-Last verified against code: 2026-06-17
+Last verified against code: 2026-06-20
 
 It is designed for the moment when someone asks:
 
@@ -67,9 +67,8 @@ This is the local operator control plane and repair proxy.
 | --- | --- |
 | `_llm(prompt)` | submits the bounded operator-AI prompt to the configured LLM backend |
 | `operatorProxyGet(...)` | proxies operator reads through to dashboard/runtime endpoints |
-| `buildSupportBundle(...)` | assembles operator evidence used by repair and diagnostics flows |
-| `applyPatchFromAnalysis(...)` | writes a guarded patch file change from an approved analysis payload |
-| `rollbackPatchById(...)` | rolls back a previously applied operator patch by patch id |
+| `applyAiPatchWithBackup(...)` | writes a guarded patch file change from an approved analysis payload, backing up the original file first |
+| `rollbackAiPatch(...)` | rolls back a previously applied operator patch by patch id |
 | `logAgentAction(...)` | persists operator-AI action and audit entries |
 
 ## 3. Runtime And Orchestration
@@ -138,40 +137,58 @@ This file owns startup sequencing.
 | --- | --- |
 | `StartupOrchestrator` | coordinates startup order, dependencies, and post-bind flow |
 
+### `engine/runtime/health.py`
+
+This file owns runtime health, readiness inputs, and preflight-facing snapshot evidence.
+
+| Function or Class | What it does |
+| --- | --- |
+| `get_health_snapshot()` | small cache/lock/connection driver that runs the health-check registry and finalizes the canonical snapshot |
+| `HealthSnapshotCheck` | named probe registration unit used by `_HEALTH_SNAPSHOT_CHECKS` |
+| `HealthSnapshotContext` | mutable per-snapshot context shared by focused health probes |
+| `_run_health_checks(...)` | isolates probe exceptions, records registry failures, and continues later checks |
+| `_finalize_health_snapshot(...)` | computes aggregate `ok`, startup gates, reasons, root causes, critical blockers, system stage, and data-flow status |
+
 ## 4. Storage Layer
 
 ### `engine/runtime/storage.py`, `engine/runtime/storage_pg.py`, and `engine/runtime/storage_sqlite.py`
 
-`engine/runtime/storage.py` is the public storage facade. In production-like operation it re-exports the Postgres implementation from `engine/runtime/storage_pg.py`; isolated Python tests can opt into `engine/runtime/storage_sqlite.py` through `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`, and real supervised/prod/live processes reject that SQLite backend.
+`engine/runtime/storage.py` is the public storage facade. It selects one concrete backend, validates the backend module against the `StorageBackend` contract, and then exposes the same facade symbols to callers. Production-like operation selects `engine/runtime/storage_pg.py`; isolated Python tests can opt into `engine/runtime/storage_sqlite.py` through `TS_STORAGE_BACKEND=sqlite` or `TS_TESTING=1`, and real supervised/prod/live processes reject that SQLite backend.
+
+The SQLite/Postgres bridge work is intentionally a bounded first slice: runtime function-code cloning is removed, but `_PG_COMPAT_HELPER_NAMES` remains as a documented compatibility shim until those legacy helpers are moved to backend-neutral repositories. `tools/validate_repo.py` blocks any regression back to code-object cloning and confines the remaining `storage_pg` import to the compatibility loader.
+
+Every `storage.*` symbol listed below — and the `storage.py::*` references in the read paths further down — is a **facade re-export**: the name is reachable on `engine/runtime/storage.py`, but the concrete implementation is physically in `engine/runtime/storage_pg.py` for production-like operation (or `engine/runtime/storage_sqlite.py` under the opt-in test backend). When you need the real body, open `storage_pg.py`.
 
 | Function or Class | What it does |
 | --- | --- |
 | `storage.init_db()` | facade entrypoint that initializes the selected backend schema |
 | `storage.init_timeseries_storage()` | initializes optional Timescale/feature/telemetry sidecars when enabled |
 | `storage.get_timeseries_storage_snapshot()` | returns optional sidecar readiness and degraded-state details |
-| `storage_pg.connect()` / `storage.connect()` | returns a routed DB connection through the active backend |
-| `storage_pg.connect_ro()` / `storage.connect_ro()` | returns a read-oriented connection through the active backend |
-| `storage_pg.run_write_txn(fn, ...)` / `storage.run_write_txn(fn, ...)` | runs a managed write transaction with backend safety behavior |
-| `storage_pg.get_db_validation_snapshot()` | returns strict Postgres schema validation used by preflight/startup |
-| `storage_pg.get_db_debug_snapshot()` | returns richer DB and connection diagnostics |
-| `storage_pg.put_event(...)` | writes an event row |
-| `storage_pg.put_price(...)` | writes a price row |
-| `storage_pg.acquire_job_lock(...)` | obtains a runtime job lock |
-| `storage_pg.release_job_lock(...)` | releases a runtime job lock |
-| `storage_pg.touch_job_lock(...)` | heartbeats a runtime job lock |
-| `storage_pg.put_job_heartbeat(...)` | writes a job heartbeat |
-| `storage_pg.get_job_checkpoint(job_name)` | reads a job checkpoint |
-| `storage_pg.put_job_checkpoint(...)` | writes a job checkpoint |
+| `storage.get_active_backend_name()` | returns `postgres` or `sqlite` for the selected backend |
+| `storage.get_active_backend()` | returns the concrete module after facade contract validation |
+| `storage.connect()` | returns a routed DB connection through the active backend |
+| `storage.connect_ro()` | returns a read-oriented connection through the active backend |
+| `storage.run_write_txn(fn, ...)` | runs a managed write transaction with backend safety behavior |
+| `storage.get_db_validation_snapshot()` | returns schema validation used by preflight/startup |
+| `storage.get_db_debug_snapshot()` | returns richer DB and connection diagnostics |
+| `storage.put_event(...)` | writes an event row |
+| `storage.put_price(...)` | writes a price row |
+| `storage.acquire_job_lock(...)` | obtains a runtime job lock |
+| `storage.release_job_lock(...)` | releases a runtime job lock |
+| `storage.touch_job_lock(...)` | heartbeats a runtime job lock |
+| `storage.put_job_heartbeat(...)` | writes a job heartbeat |
+| `storage.get_job_checkpoint(job_name)` | reads a job checkpoint |
+| `storage.put_job_checkpoint(...)` | writes a job checkpoint |
 
 ### Newer storage helpers added by the integration work
 
 | Function | What it does |
 | --- | --- |
-| `storage_pg.log_alert_interaction(...)` | stores passive alert/decision interaction rows |
-| `storage_pg.log_decision_view(...)` | stores decision-detail view events |
-| `storage_pg.fetch_recent_decisions(limit)` | returns decision cards for the dashboard |
-| `storage_pg.fetch_decision_detail(decision_id)` | builds a decision drilldown payload |
-| `storage_pg.fetch_human_alignment_report(...)` | computes operator-interaction analytics |
+| `storage.log_alert_interaction(...)` | stores passive alert/decision interaction rows |
+| `storage.log_decision_view(...)` | stores decision-detail view events |
+| `storage.fetch_recent_decisions(limit)` | returns decision cards for the dashboard |
+| `storage.fetch_decision_detail(decision_id)` | builds a decision drilldown payload |
+| `storage.fetch_human_alignment_report(...)` | computes operator-interaction analytics |
 | `engine.runtime.event_log.append_event(...)` | writes structured runtime lifecycle events used by diagnostics, execution mode changes, and support snapshots |
 
 ## 5. Strategy And Portfolio
@@ -182,10 +199,19 @@ This is the main portfolio rebalance and portfolio-state logic file.
 
 | Function | What it does |
 | --- | --- |
-| `compute_rebalance()` | main portfolio rebalance routine |
+| `compute_rebalance()` | main portfolio rebalance routine; runs the staged pipeline in production order |
 | `get_portfolio_snapshot(limit_orders)` | returns a snapshot for the dashboard/API |
 | `init_portfolio_db()` | ensures portfolio-specific DB state exists |
 | `_load_recent_alert_candidates(...)` | loads recent alerts as candidate trade inputs |
+| `_load_rebalance_inputs_stage(...)` | loads candidate alerts/current state and marks candidates seen |
+| `_load_allocator_stage(...)` | loads allocator output, live/shadow strategy lists, competition plans, and allocation fallbacks |
+| `_construct_rebalance_targets_stage(...)` | builds multi-strategy target weights before normalization |
+| `_normalize_rebalance_targets_stage(...)` | canonicalizes target side/weight/model metadata and enforces gross caps |
+| `_apply_rebalance_overlays_stage(...)` | applies blacklist, exploration, shrinkage, allocation, volatility, sizing, and execution overlays |
+| `_apply_rebalance_risk_gates_stage(...)` | applies portfolio risk engine, hard risk gate, tail-risk, netting, total-risk, and flip-flop gates |
+| `_apply_rebalance_execution_block_stage(...)` | converts critical degraded phases into an execution-blocked rebalance result |
+| `_emit_rebalance_orders_stage(...)` | emits `portfolio_orders` and updates `portfolio_state` from final targets |
+| `_persist_rebalance_stage(...)` | persists drawdown, strategy, timestamp, and runtime-health metadata |
 | `_pick_best_per_symbol(...)` | chooses the best candidate alert per symbol |
 | `_apply_temporal_dampener(...)` | reduces aggressiveness based on time decay |
 | `_apply_impact_aware_sizing(...)` | adjusts sizing using execution realism and impact |
@@ -202,6 +228,44 @@ This is the main portfolio rebalance and portfolio-state logic file.
 | `_execution_realism_factor(...)` | adjusts sizing based on execution realism |
 | `_load_shadow_performance(...)` | reads shadow performance inputs |
 | `_score_shadow_targets(...)` | scores shadow strategies or targets |
+
+### `engine/strategy/predictor.py`
+
+Live prediction orchestrator and model-family routing — the runtime live-scoring path (`engine/strategy/predict.py` is a separate ~945-byte CLI relevance-stats shim and is not this module).
+
+| Function | What it does |
+| --- | --- |
+| `predict_live_symbol(...)` | produces the live prediction for one symbol across the routed model families |
+| `batch_predict_live_symbols(...)` | batched live-prediction entrypoint used by the runtime scoring path |
+| `predict_event(...)` | scores a labeled event vector through the active model routing |
+| `available_model_families()` | returns the model families currently eligible for routing |
+| `realtime_inference_enabled()` | reports whether realtime inference is currently permitted |
+
+### `engine/strategy/model_marketplace.py`
+
+Champion/challenger marketplace: scoring, replay validation, self-critic, and capital planning for competing models.
+
+| Function | What it does |
+| --- | --- |
+| `update_model_score(...)` | records or updates a model's marketplace score |
+| `recompute_marketplace_scores()` | recomputes marketplace scores across candidates |
+| `run_self_critic(...)` | runs the self-critic review used in the promotion path |
+| `build_replay_validation_snapshot(...)` | builds the replay-validation evidence snapshot |
+| `top_challengers(limit)` | returns the current top challenger candidates |
+| `compute_capital_plan()` | computes the capital allocation plan across the marketplace |
+| `publish_marketplace_snapshot(...)` | publishes the marketplace snapshot for the UI/operator |
+
+### `engine/strategy/champion_manager.py`
+
+Champion/challenger selection and the model-competition lifecycle.
+
+| Function | What it does |
+| --- | --- |
+| `get_champion_assignment(...)` | returns the current champion assignment for a scope/symbol/horizon |
+| `set_champion_assignment(...)` | records a champion assignment |
+| `evaluate_competition_cycle()` | evaluates one competition cycle and stages promotion actions |
+| `run_model_competition_job()` | the registered job that runs the competition end to end |
+| `auto_promote_best()` | promotes the best eligible challenger subject to the governance gates |
 
 ## 6. Execution
 
@@ -315,7 +379,41 @@ This is the advisory-only sidecar added during integration.
 | `_estimate_expected_slippage_bps(...)` | estimates expected slippage |
 | `_advisory_for_order(...)` | builds the advisory payload for one order |
 
-## 7. API Layer
+### `engine/execution/execution_ledger.py`
+
+The execution attribution ledger (the largest execution module, ~231KB). It records order submissions and fills and computes execution analytics, P&L attribution, and capital efficiency.
+
+| Function | What it does |
+| --- | --- |
+| `init_execution_ledger()` | initializes the execution-ledger schema |
+| `log_submit(...)` | records an order submission into the ledger |
+| `log_fill(...)` | records a fill against a previously submitted order |
+| `audit_execution_integrity(...)` | audits ledger integrity and reports inconsistencies |
+| `compute_metrics_snapshot(limit_orders)` | computes the execution-metrics snapshot for the dashboard |
+| `compute_pnl_attribution_snapshot(lookback_orders)` | computes the P&L attribution snapshot |
+| `compute_capital_efficiency_snapshot(limit_orders)` | computes the capital-efficiency snapshot |
+
+## 7. Risk
+
+### `engine/risk/portfolio_risk_engine.py`
+
+The portfolio-risk engine (~81KB, one public entrypoint). It applies additive exposure, drawdown, volatility-target, and correlation-cluster checks and writes the current portfolio-risk state consumed by API reads and the execution barrier.
+
+| Function | What it does |
+| --- | --- |
+| `apply_portfolio_risk_engine(...)` | the public entrypoint: evaluates gross/net caps, the drawdown throttle, volatility targeting, and correlation-cluster limits for a candidate portfolio and persists the resulting risk state and snapshots |
+
+Knob families consumed here are documented in the configuration glossary: `PORTFOLIO_RISK_MAX_GROSS`/`PORTFOLIO_GROSS_CAP` and `PORTFOLIO_RISK_MAX_NET` (gross/net caps, defaults `1.00`/`0.60`), the drawdown throttle (`PORTFOLIO_CAR_MAX`), volatility targeting, and correlation-cluster limits (`PORTFOLIO_RISK_CLUSTER_MAX_GROSS`, default `0.45`).
+
+### `engine/risk/monte_carlo_risk_engine.py`
+
+The Monte Carlo risk refresher. It simulates forward portfolio paths and persists stressed VaR/CVaR and drawdown summaries plus compact visualization artifacts into `risk_state`.
+
+| Function | What it does |
+| --- | --- |
+| `request_monte_carlo_refresh(desired)` | requests a background Monte Carlo refresh (`MC_SIMULATIONS` paths over `MC_HORIZON` steps) and persists the stressed risk summary served by `GET /api/risk/monte_carlo` |
+
+## 8. API Layer
 
 ### `engine/api/api_read_advanced.py`
 
@@ -379,6 +477,7 @@ This file owns the broad system/operator diagnostic surface.
 | `api_get_support_snapshot(...)` | returns the operator repair snapshot package |
 | `api_get_provider_telemetry(...)` | returns provider/feed telemetry and runtime health correlation |
 | `api_get_service_status(...)` | returns engine/operator/runtime status summary |
+| `api_get_alpha_decay(...)` | canonical `/api/alpha_decay` owner; returns latest alpha-decay runtime state plus per-strategy-limited historical strategy rows and runtime rows for `ui/risk_charts.js` |
 
 ### `engine/api/api_broker_config.py`
 
@@ -411,11 +510,14 @@ This file checks whether backup, WAL archive, and restore-drill evidence is fres
 | --- | --- |
 | `backup_restore_evidence_snapshot(...)` | returns base-backup, WAL, and restore-drill freshness against the configured RPO/RTO policy |
 
-## 8. Dashboard Endpoints In `dashboard_server.py`
+## 9. Dashboard Endpoints In `dashboard_server.py`
 
 ### `dashboard_server.py`
 
 Because `dashboard_server.py` is still a large integration boundary, it contains many API functions directly.
+`/api/alpha_decay` is not dashboard-local: `dashboard_server.py` mounts and
+validates `engine/api/api_system.py::api_get_alpha_decay` as the sole production
+handler for that route.
 
 The most important newer ones are:
 
@@ -425,9 +527,9 @@ The most important newer ones are:
 | `api_get_decision_detail(...)` | returns dashboard decision detail |
 | `api_post_ui_interaction(...)` | stores alert/decision interaction events |
 | `api_get_governance_summary(...)` | returns governance summary for the dashboard |
-| `api_get_support_snapshot(...)` | returns operator repair evidence and diagnostics |
-| `api_get_runtime_watchdogs(...)` | returns runtime watchdog signals for the operator layer |
-| `api_get_provider_telemetry(...)` | returns provider/feed telemetry for operator diagnostics |
+
+(`api_get_support_snapshot`, `api_get_runtime_watchdogs`, and `api_get_provider_telemetry` are
+**not** dashboard-local — they are defined in `engine/api/api_system.py`; see that section above.)
 
 Other high-signal ones include:
 
@@ -440,7 +542,7 @@ Other high-signal ones include:
 | `api_get_risk_summary(...)` | returns risk summary |
 | `api_get_models_status(...)` | returns model state |
 
-## 9. Suggested Read Paths By Task
+## 10. Suggested Read Paths By Task
 
 ### "I need to understand startup"
 
@@ -486,13 +588,13 @@ Read:
 5. `engine/execution/execution_ai_advisor.py::list_execution_advisories`
 6. `engine/api/api_governance.py::get_governance_summary`
 
-## 10. Practical Notes
+## 11. Practical Notes
 
 - Files like `dashboard_server.py`, `storage.py`, and `portfolio.py` contain many helpers. Do not start at the top and read linearly without first locating the main entrypoint function.
 - Route metadata and route handlers are split in some places. `api_ops.py` is just route declarations, while handler logic lives elsewhere.
 - Some newer functionality was integrated into existing files instead of isolated subsystems. That is why the function map often points to additions inside `storage.py`, `dashboard_server.py`, and `portfolio.py`.
 
-## 11. Short Summary
+## 12. Short Summary
 
 If you need the shortest version:
 

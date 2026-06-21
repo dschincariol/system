@@ -18,12 +18,12 @@ import importlib
 import inspect
 from contextlib import contextmanager
 from pathlib import Path
-from types import FunctionType
 from typing import Any, Callable, Iterable, Sequence
 
 from engine.runtime.platform import default_data_root
 
 LOGGER = logging.getLogger(__name__)
+STORAGE_BACKEND_NAME = "sqlite"
 sqlite3 = importlib.import_module("sqlite3")
 
 
@@ -4393,397 +4393,6 @@ def _base_schema(con: sqlite3.Connection) -> None:
     _mark_schema_applied(con)
     con.commit()
     return
-    core_tables: dict[str, tuple[Sequence[str], Sequence[Sequence[str]]]] = {
-        "runtime_metrics": (("id", "ts_ms", "metric", "value_num", "value_text", "tags_json"), ()),
-        "schema_migrations": (("version", "name", "applied_ts_ms"), (("version",),)),
-        "broker_account": (
-            (
-                "ts_ms",
-                "updated_ts_ms",
-                "broker",
-                "account_id",
-                "equity",
-                "cash",
-                "buying_power",
-                "maintenance_margin",
-                "day_pnl",
-                "unrealized_pnl",
-                "realized_pnl",
-                "currency",
-                "extra_json",
-            ),
-            (("ts_ms",),),
-        ),
-        "equity_history": (("ts_ms", "equity"), (("ts_ms",),)),
-        "equity_drift": (
-            (
-                "ts_ms",
-                "broker_equity",
-                "backtest_equity",
-                "diff_equity",
-                "diff_equity_pct",
-                "level",
-                "reason",
-                "backtest_run_id",
-                "backtest_ts_ms",
-                "detail_json",
-            ),
-            (("ts_ms",),),
-        ),
-        "events": (("id", "ts_ms", "timestamp", "event_type", "symbol", "source", "title", "body", "url", "event_key", "importance_score", "meta_json"), (("event_key", "ts_ms"),)),
-        "prices": (("id", "ts_ms", "symbol", "price", "source"), (("symbol", "ts_ms", "source"),)),
-        "price_quotes": (("id", "ts_ms", "symbol", "bid", "ask", "last", "price", "provider", "source"), (("symbol", "provider", "ts_ms"),)),
-        "price_quotes_raw": (("id", "ts_ms", "symbol", "provider", "payload_json"), (("symbol", "provider", "ts_ms"),)),
-        "labels": (("id", "event_id", "symbol", "horizon_s", "label", "ts_ms"), ()),
-        "predictions": (("id", "event_id", "symbol", "horizon_s", "prediction", "model_name", "ts_ms"), ()),
-        "shadow_predictions": (("id", "event_id", "symbol", "horizon_s", "model_name", "prediction", "confidence", "ts_ms", "payload_json"), ()),
-        "insider_transactions": (("id", *_INSIDER_TRANSACTION_COLUMNS), (("source_transaction_id",),)),
-        "congressional_trades": (("id", *_CONGRESSIONAL_TRADE_COLUMNS), (("source_trade_id",),)),
-        "news_event_features": (("id", "event_id", "ts_ms", "symbol", "cluster_key", "headline_key", "sentiment_score", "novelty_score", "is_duplicate", "duplicate_count", "company_match_method", "company_match_conf", "source_count", "payload_json", "meta_json", "embedding_backend", "embedding_model_name", "embedding_novelty_score", "embedding_max_similarity", "stale_flag", "novelty_computed_ts_ms", "finbert_label", "finbert_score", "finbert_confidence", "finbert_pos", "finbert_neg", "finbert_neu"), (("event_id",),)),
-        "news_symbol_features": (("id", "event_id", "ts_ms", "symbol", "payload_json"), ()),
-        "options_event_features": (("id", "event_id", "ts_ms", "symbol", "payload_json"), ()),
-        "finbert_sentiment_enrichments": (("id", "ts_ms", "symbol", "event_id", "source_identifier", "model_name", "payload_json"), ()),
-        "finra_short_sale_volume": (("id", *_FINRA_SHORT_SALE_VOLUME_COLUMNS), (("source_record_id",),)),
-        "finra_short_interest": (("id", *_FINRA_SHORT_INTEREST_COLUMNS), (("source_record_id",),)),
-        "crypto_funding_rates": (("id", *_CRYPTO_FUNDING_RATE_COLUMNS), (("source_record_id",),)),
-        "alpha_candidates": (("id", "candidate_name", "candidate_version", "model_family", "feature_ids", "generation_method", "hyperparams", "status", "diagnostics", "created_ts"), ()),
-        "alpha_lifecycle": (("id", "candidate_id", "stage", "outcome", "metrics", "notes", "created_ts", "alert_id", "created_ts_ms", "expires_ts_ms", "half_life_ms", "volatility", "status", "last_touch_ts_ms", "meta_json"), ()),
-        "hypothesis_registry": (("id", "created_ts", "model_name", "candidate_version", "n_observations", "t_statistic", "deflated_sharpe", "threshold_t", "n_competing_trials", "passed", "diagnostics"), ()),
-        "backtest_cpcv_runs": (("id", "created_ts", "ts", "model_name", "candidate_version", "model_id", "n_splits", "n_test_splits", "embargo_pct", "n_paths", "path_index", "path_returns", "path_sharpes", "mean_sharpe", "median_sharpe", "pbo", "sharpe", "deflated_sharpe", "n_trials", "total_return", "max_drawdown", "cfg", "payload", "diagnostics"), ()),
-        "backtest_cpcv_path_results": (("id", "created_ts", "ts", "model_name", "candidate_version", "path_index", "path_returns", "path_sharpes", "sharpe", "deflated_sharpe", "payload"), ()),
-        "drift_retrain_events": (("id", "created_ts", "model_name", "family", "trigger_type", "trigger_metrics", "action_taken", "cooldown_applied", "candidate_version", "outcome_status", "diagnostics"), ()),
-        "model_hyperparameter_registry": (
-            (
-                "id",
-                "ts",
-                "model_family",
-                "model_name",
-                "symbol",
-                "tuner",
-                "objective",
-                "study_name",
-                "params",
-                "params_json",
-                "metric_value",
-                "trial_count",
-                "best_trial_number",
-                "seed",
-                "cpcv_mean_sharpe",
-                "cpcv_median_sharpe",
-                "cpcv_pbo",
-                "diagnostics",
-            ),
-            (),
-        ),
-        "experiment_ledger": (
-            (
-                "id",
-                "ts",
-                "candidate_key",
-                "candidate_name",
-                "candidate_version",
-                "candidate_type",
-                "source",
-                "parent_candidate_key",
-                "model_name",
-                "model_family",
-                "feature_ids_json",
-                "prompt_hash",
-                "model_hash",
-                "search_space_json",
-                "trial_budget",
-                "trial_count",
-                "cpcv_json",
-                "pbo",
-                "dsr",
-                "fdr_json",
-                "redundancy_json",
-                "evidence_json",
-                "promotion_decision",
-                "status",
-                "diagnostics_json",
-                "prev_hash",
-                "row_hash",
-            ),
-            (),
-        ),
-        "model_best_params": (("id", "model_family", "symbol", "ts", "study_name", "params_json", "value", "trial_number", "seed"), (("model_family", "symbol"),)),
-        "model_registry": (
-            (
-                "id",
-                "model_name",
-                "version",
-                "model_version",
-                "family",
-                "model_family",
-                "model_kind",
-                "model_ts_ms",
-                "stage",
-                "regime",
-                "status",
-                "promotion_status",
-                "created_ts",
-                "created_ts_ms",
-                "updated_ts",
-                "updated_ts_ms",
-                "last_promotion_ts_ms",
-                "metadata_json",
-                "metrics_json",
-                "performance_metrics_json",
-                "feature_schema_json",
-                "note",
-                "blob",
-            ),
-            (("model_name", "version"),),
-        ),
-        "models": (
-            (
-                "id",
-                "symbol",
-                "model_name",
-                "version",
-                "model_kind",
-                "status",
-                "is_active",
-                "artifact_uri",
-                "training_start_ts_ms",
-                "training_end_ts_ms",
-                "training_data_window_json",
-                "performance_metrics_json",
-                "metadata_json",
-                "selection_metric_name",
-                "selection_metric_value",
-                "selection_metric_higher_is_better",
-                "created_ts",
-                "created_ts_ms",
-                "updated_ts",
-                "updated_ts_ms",
-            ),
-            (("symbol", "model_name", "version"),),
-        ),
-        "model_versions": (
-            (
-                "model_name",
-                "model_version",
-                "model_kind",
-                "parent_version",
-                "mutation_kind",
-                "stage",
-                "status",
-                "live_ready",
-                "training_job_name",
-                "train_scope_json",
-                "meta_json",
-                "created_ts_ms",
-                "updated_ts_ms",
-            ),
-            (("model_name", "model_version"),),
-        ),
-        "model_version_performance": (
-            (
-                "id",
-                "model_name",
-                "model_version",
-                "metric_scope",
-                "metric_name",
-                "metric_value",
-                "sample_n",
-                "recorded_ts_ms",
-                "meta_json",
-            ),
-            (),
-        ),
-        "model_lifecycle_runs": (
-            (
-                "id",
-                "model_name",
-                "model_version",
-                "parent_version",
-                "action",
-                "status",
-                "triggered_by",
-                "mutation_kind",
-                "details_json",
-                "created_ts_ms",
-                "updated_ts_ms",
-            ),
-            (),
-        ),
-        "model_marketplace_scores": (("id", "model_id", "model_name", "symbol", "horizon_s", "score", "status", "created_ts", "updated_ts", "metadata_json"), ()),
-        "champion_assignments": (("id", "scope", "symbol", "horizon_s", "model_id", "model_name", "assigned_ts_ms", "metadata_json"), (("scope", "symbol", "horizon_s"),)),
-        "model_competition_rankings": (("id", "ranking_scope", "model_id", "model_name", "rank", "score", "created_ts_ms", "metadata_json"), ()),
-        "realized_outcomes": (("id", "symbol", "ts_ms", "realized_return", "metadata_json", "created_ts_ms", "updated_ts_ms"), (("symbol", "ts_ms"),)),
-        "model_performance": (
-            (
-                "id",
-                "tracked_prediction_id",
-                "prediction_id",
-                "outcome_id",
-                "time",
-                "prediction_time",
-                "symbol",
-                "model_id",
-                "model_name",
-                "model_version",
-                "horizon_s",
-                "prediction",
-                "realized_return",
-                "error",
-                "directional_accuracy",
-                "pnl_impact",
-                "rolling_score",
-                "regime_time_ms",
-                "volatility_regime",
-                "trend_regime",
-                "liquidity_regime",
-                "metadata_json",
-                "created_ts_ms",
-                "updated_ts_ms",
-            ),
-            (("tracked_prediction_id",),),
-        ),
-        "production_monitoring_metrics": (
-            (
-                "metric_name",
-                "scope",
-                "dimension",
-                "ts_ms",
-                "value",
-                "baseline_value",
-                "threshold_value",
-                "severity",
-                "state",
-                "action_signal",
-                "labels_available",
-                "sample_n",
-                "details_json",
-            ),
-            (("metric_name", "scope", "dimension"),),
-        ),
-        "job_locks": (("id", "job_name", "owner", "pid", "acquired_ts_ms", "heartbeat_ts_ms", "expires_ms"), (("job_name",),)),
-        "job_heartbeats": (("id", "job_name", "owner", "pid", "ts_ms", "extra_json"), (("job_name",),)),
-        "job_checkpoints": (("id", "job_name", "last_event_id", "last_event_ts_ms", "updated_ts_ms"), (("job_name",),)),
-        "portfolio_bt_runs": (("id", "ts_ms", "start_ts_ms", "end_ts_ms", "metrics_json"), ()),
-        "portfolio_bt_points": (
-            ("run_id", "ts_ms", "ret", "equity", "drawdown", "exec_cost", "slippage", "fees", "detail_json"),
-            (("run_id", "ts_ms"),),
-        ),
-        "risk_state": (("key", "value", "updated_ts_ms"), (("key",),)),
-        "runtime_meta": (("key", "value", "updated_ts_ms"), (("key",),)),
-        "symbols": (("symbol", "score", "status", "asset_class", "meta_json", "updated_ts_ms"), (("symbol",),)),
-        "symbol_universe": (("symbol", "status", "first_seen_ms", "last_seen_ms", "seen_n", "meta_json"), (("symbol",),)),
-        "alerts": (
-            (
-                "id",
-                "ts_ms",
-                "event_id",
-                "event_title",
-                "symbol",
-                "horizon_s",
-                "expected_z",
-                "confidence",
-                "severity",
-                "rule_id",
-                "explain_json",
-                "dedupe_key",
-                "title",
-                "message",
-                "source",
-                "status",
-                "detail_json",
-                "updated_ts_ms",
-                "model_name",
-                "model_id",
-                "model_version",
-            ),
-            (("dedupe_key",),),
-        ),
-        "tracked_predictions": (("id", "ts_ms", "symbol", "model_name", "prediction", "metadata_json"), ()),
-        "execution_orders": (("id", "ts_ms", "symbol", "side", "quantity", "status", "metadata_json"), ()),
-        "execution_fills": (("id", "ts_ms", "order_id", "symbol", "quantity", "price", "metadata_json"), ()),
-        "pnl_attribution": (("id", "ts_ms", "symbol", "pnl", "metadata_json"), ()),
-        "decision_log": (("id", "ts_ms", "symbol", "decision", "reason_json", "metadata_json"), ()),
-        "promotion_statistical_evidence": (
-            (
-                "id",
-                "ts",
-                "model_id",
-                "feature_id",
-                "evidence_kind",
-                "test_name",
-                "t_stat",
-                "p_value",
-                "q_value",
-                "bootstrap_samples",
-                "decision",
-                "payload_json",
-                "prev_hash",
-                "row_hash",
-            ),
-            (("model_id", "evidence_kind", "ts"),),
-        ),
-        "policy_ope_observations": (
-            (
-                "id",
-                "ts_ms",
-                "candidate_key",
-                "model_id",
-                "model_name",
-                "candidate_type",
-                "candidate_version",
-                "symbol",
-                "horizon_s",
-                "regime",
-                "logged_action",
-                "target_action",
-                "behavior_propensity",
-                "target_propensity",
-                "outcome",
-                "logged_model_estimate",
-                "target_model_estimate",
-                "source_table",
-                "source_id",
-                "meta_json",
-                "prev_hash",
-                "row_hash",
-            ),
-            (("candidate_key", "ts_ms"),),
-        ),
-        "policy_ope_evidence": (
-            (
-                "id",
-                "ts_ms",
-                "candidate_key",
-                "model_id",
-                "model_name",
-                "candidate_type",
-                "candidate_version",
-                "symbol",
-                "horizon_s",
-                "regime",
-                "policy_value",
-                "standard_error",
-                "ci_lower",
-                "ci_upper",
-                "n_obs",
-                "effective_n",
-                "support",
-                "max_importance_weight",
-                "confidence_z",
-                "decision",
-                "reason",
-                "config_json",
-                "diagnostics_json",
-                "prev_hash",
-                "row_hash",
-            ),
-            (("candidate_key", "ts_ms"),),
-        ),
-    }
-    for table, (columns, uniques) in core_tables.items():
-        _create_table(con, table, columns, uniques)
-    con.execute("INSERT OR IGNORE INTO schema_migrations(version, name, applied_ts_ms) VALUES (?, ?, ?)", (SCHEMA_VERSION, "test_sqlite_schema", int(time.time() * 1000)))
-    con.commit()
 
 
 def apply_migrations() -> list[int]:
@@ -4814,6 +4423,13 @@ def init_rl_portfolio_tables(con=None) -> None:
 
 
 def close_pooled_connections() -> None:
+    shutdown_liveness_queue = globals().get("shutdown_job_liveness_queue")
+    liveness_thread = globals().get("_SQLITE_LIVENESS_THREAD")
+    if callable(shutdown_liveness_queue) and liveness_thread is not threading.current_thread():
+        try:
+            shutdown_liveness_queue(timeout_s=0.5)
+        except Exception:
+            LOGGER.debug("sqlite_close_pooled_liveness_shutdown_failed", exc_info=True)
     active = _active_write_connection()
     if active is None:
         return None
@@ -6025,7 +5641,7 @@ def fetch_latest_model_hyperparameters(*args: Any, **kwargs: Any):
             db.close()
 
 
-_CLONE_NAMES = [
+_PG_COMPAT_HELPER_NAMES = (
     "_upsert_dict",
     "put_event",
     "put_normalized_event",
@@ -6095,74 +5711,73 @@ _CLONE_NAMES = [
     "_warn_nonfatal_once",
     "_ensure_price_quotes_schema",
     "_ensure_price_quotes_raw_schema",
-]
+)
 
 
-_PG_HELPERS_LOCK = threading.RLock()
-_PG_HELPERS_CLONED = False
-_PG_HELPERS_ERROR: str | None = None
+_PG_COMPAT_PATCH_NAMES = (
+    "connect",
+    "connect_ro",
+    "connect_ro_direct",
+    "connect_rw_direct",
+    "connection",
+    "execute",
+    "fetch_one",
+    "fetch_all",
+    "run_write_txn",
+)
+_PG_COMPAT_HELPERS_LOCK = threading.RLock()
+_PG_COMPAT_IMPORT_ERROR: str | None = None
+_MISSING = object()
 
 
-def _clone_pg_helpers() -> bool:
-    global _PG_HELPERS_CLONED, _PG_HELPERS_ERROR
-    if _PG_HELPERS_CLONED:
-        return True
-    with _PG_HELPERS_LOCK:
-        if _PG_HELPERS_CLONED:
-            return True
+def _load_pg_compat_module():
+    global _PG_COMPAT_IMPORT_ERROR
+    try:
+        from engine.runtime import storage_pg as _pg
+    except Exception as exc:
+        _PG_COMPAT_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        raise RuntimeError(f"sqlite_storage_helper_requires_storage_pg:{_PG_COMPAT_IMPORT_ERROR}") from exc
+    _PG_COMPAT_IMPORT_ERROR = None
+    return _pg
+
+
+def _call_pg_compat_helper(name: str, *args: Any, **kwargs: Any):
+    if name not in _PG_COMPAT_HELPER_NAMES:
+        raise AttributeError(name)
+    with _PG_COMPAT_HELPERS_LOCK:
+        _pg = _load_pg_compat_module()
+        target = getattr(_pg, name, None)
+        if not callable(target):
+            detail = _PG_COMPAT_IMPORT_ERROR or "storage_pg_helper_unavailable"
+            raise RuntimeError(f"sqlite_storage_helper_requires_storage_pg:{name}:{detail}")
+        originals: dict[str, Any] = {}
         try:
-            from engine.runtime import storage_pg as _pg
-        except Exception as exc:
-            _PG_HELPERS_ERROR = f"{type(exc).__name__}: {exc}"
-            return False
-
-        for name in (
-            "_INSIDER_TRANSACTION_COLUMNS",
-            "_CONGRESSIONAL_TRADE_COLUMNS",
-            "_FINRA_SHORT_SALE_VOLUME_COLUMNS",
-            "_FINRA_SHORT_INTEREST_COLUMNS",
-            "_CRYPTO_FUNDING_RATE_COLUMNS",
-            "_NEWS_EVENT_FEATURE_COLUMNS",
-        ):
-            globals()[name] = getattr(_pg, name)
-
-        for name in _CLONE_NAMES:
-            source = getattr(_pg, name)
-            if not isinstance(source, FunctionType):
-                globals()[name] = source
-                continue
-            cloned = FunctionType(
-                source.__code__,
-                globals(),
-                name,
-                source.__defaults__,
-                source.__closure__,
-            )
-            cloned.__kwdefaults__ = source.__kwdefaults__
-            cloned.__doc__ = source.__doc__
-            globals()[name] = cloned
-        _PG_HELPERS_ERROR = None
-        _PG_HELPERS_CLONED = True
-        return True
+            for patch_name in _PG_COMPAT_PATCH_NAMES:
+                originals[patch_name] = getattr(_pg, patch_name, _MISSING)
+                setattr(_pg, patch_name, globals()[patch_name])
+            return target(*args, **kwargs)
+        finally:
+            for patch_name, original in originals.items():
+                if original is _MISSING:
+                    try:
+                        delattr(_pg, patch_name)
+                    except AttributeError:
+                        LOGGER.debug("sqlite_pg_compat_restore_missing", exc_info=True)
+                else:
+                    setattr(_pg, patch_name, original)
 
 
 def _make_lazy_pg_helper(name: str):
     def _lazy_pg_helper(*args: Any, **kwargs: Any):
-        if not _clone_pg_helpers():
-            detail = _PG_HELPERS_ERROR or "storage_pg_helpers_unavailable"
-            raise RuntimeError(f"sqlite_storage_helper_requires_storage_pg:{name}:{detail}")
-        target = globals().get(name)
-        if target is _lazy_pg_helper:
-            raise RuntimeError(f"sqlite_storage_helper_unresolved:{name}")
-        return target(*args, **kwargs)
+        return _call_pg_compat_helper(name, *args, **kwargs)
 
     _lazy_pg_helper.__name__ = name
     _lazy_pg_helper.__qualname__ = name
-    _lazy_pg_helper.__doc__ = "Lazy SQLite helper cloned from storage_pg when Postgres dependencies are installed."
+    _lazy_pg_helper.__doc__ = "SQLite compatibility helper that runs storage_pg SQL through SQLite backend bindings."
     return _lazy_pg_helper
 
 
-for _helper_name in _CLONE_NAMES:
+for _helper_name in _PG_COMPAT_HELPER_NAMES:
     globals().setdefault(_helper_name, _make_lazy_pg_helper(_helper_name))
 del _helper_name
 

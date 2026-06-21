@@ -178,7 +178,12 @@ function statusFreshness(tsMs, nowMs = Date.now()) {
 
 function scoreText(scorecard) {
   const score = scorecard && scorecard.score;
-  return Number.isFinite(Number(score)) ? `Health ${Math.round(Number(score))}/100` : "Health score unavailable";
+  if (!Number.isFinite(Number(score))) return "Health score unavailable";
+  const base = `Health ${Math.round(Number(score))}/100`;
+  if (scorecard && scorecard.partialCoverage && scorecard.coverageText) {
+    return `${base} (${scorecard.coverageText})`;
+  }
+  return base;
 }
 
 function firstNextStep(runtimeSummary) {
@@ -201,6 +206,7 @@ function statusWordAndTone({
   const readinessReady = isReadinessReady(readinessPayload);
   const score = scorecard && Number.isFinite(Number(scorecard.score)) ? Number(scorecard.score) : null;
   const badge = String(scorecard && scorecard.badgeClassName || "").toLowerCase();
+  const partialCoverage = !!(scorecard && scorecard.partialCoverage);
   const tradingPill = asObject(asObject(runtimeSummary).pills).trading || {};
 
   const stoppedSystem = ["KILL_SWITCH", "HALTED", "STOP", "STOPPED", "FAILED"].includes(systemToken);
@@ -218,8 +224,10 @@ function statusWordAndTone({
     || readinessReady === false
     || healthOk === false
     || badge === "warn"
+    || badge === "high"
     || badge === "crit"
     || badge === "unavailable"
+    || partialCoverage
     || (score != null && score < 80);
 
   if (cautious) {

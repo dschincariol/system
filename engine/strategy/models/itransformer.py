@@ -22,6 +22,7 @@ from engine.runtime.hardware import resolve_torch_device, torch_device_is_cuda
 from engine.runtime.storage import init_db, run_write_txn
 from engine.strategy.ensemble.oos_store import upsert_oos_predictions
 from engine.strategy.feature_registry import feature_set_tag_from_ids
+from engine.strategy.model_competition import CompetitionRepository
 from engine.strategy.model_lifecycle import (
     load_lifecycle_plan,
     record_version_performance,
@@ -695,43 +696,26 @@ def _persist_shadow_marketplace_visibility(
     }
 
     def _write(con) -> None:
-        con.execute(
-            """
-            INSERT INTO model_marketplace_scores(
-              model_id, model_name, symbol, horizon_s, regime, stage,
-              score, trades, wins, losses, gross_pnl, net_pnl,
-              avg_confidence, last_signal_ts_ms, updated_ts_ms, meta_json
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(model_id, model_name, symbol, horizon_s, regime) DO UPDATE SET
-              stage=excluded.stage,
-              score=excluded.score,
-              trades=excluded.trades,
-              wins=excluded.wins,
-              losses=excluded.losses,
-              avg_confidence=excluded.avg_confidence,
-              last_signal_ts_ms=excluded.last_signal_ts_ms,
-              updated_ts_ms=excluded.updated_ts_ms,
-              meta_json=excluded.meta_json
-            """,
-            (
-                f"{str(model.model_name)}:{str(version)}",
-                str(model.model_name),
-                str(symbol),
-                int(horizon_s),
-                "global",
-                "shadow",
-                float(score),
-                int(summary.get("target_n") or summary.get("n") or 0),
-                0,
-                0,
-                0.0,
-                0.0,
-                0.0,
-                _safe_int(first.get("ts", first.get("ts_ms")), int(model_ts_ms)),
-                int(time.time() * 1000),
-                json.dumps(meta, separators=(",", ":"), sort_keys=True),
-            ),
+        CompetitionRepository(con).upsert_marketplace_score(
+            {
+                "model_id": f"{str(model.model_name)}:{str(version)}",
+                "model_name": str(model.model_name),
+                "symbol": str(symbol),
+                "horizon_s": int(horizon_s),
+                "regime": "global",
+                "stage": "shadow",
+                "score": float(score),
+                "trades": int(summary.get("target_n") or summary.get("n") or 0),
+                "wins": 0,
+                "losses": 0,
+                "gross_pnl": 0.0,
+                "net_pnl": 0.0,
+                "avg_confidence": 0.0,
+                "last_signal_ts_ms": _safe_int(first.get("ts", first.get("ts_ms")), int(model_ts_ms)),
+            },
+            meta=meta,
+            updated_ts_ms=int(time.time() * 1000),
+            update_pnl_on_conflict=False,
         )
 
     run_write_txn(_write)

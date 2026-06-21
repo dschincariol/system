@@ -2,13 +2,13 @@
 
 This file is loaded automatically into every Claude Code session in this repo. It is the persistent instruction surface for AI assistants working on the codebase.
 
-Last verified against code: 2026-06-11
+Last verified against code: 2026-06-21
 
 ## North Star
 
 Build an autonomous alpha discovery system that searches a universe of inputs, discovers which are useful, builds models linking inputs to predictions, and trades any financial product for profit. The goal is "best in the world" — comparable to Renaissance Technologies, Two Sigma, WorldQuant.
 
-The current system is a substantial supervised trading runtime (~400+ Python files). **Improvements build on existing architecture — never replace it.**
+The current system is a substantial supervised trading runtime (~950+ Python files). **Improvements build on existing architecture — never replace it.**
 
 ## System at a glance
 

@@ -16,7 +16,7 @@ from engine.runtime.storage_pg_prices import (
     PostgresPriceStorageConfig,
     _quote_ident,
     get_price_storage,
-    psycopg2,
+    psycopg,
 )
 
 LOG = get_logger("runtime.price_migration_validation")
@@ -110,11 +110,11 @@ def _sqlite_summary(db_path: str, since_ts_ms: int) -> dict[str, Any]:
 
 
 def _timescale_summary(config: PostgresPriceStorageConfig, since_ts_ms: int) -> dict[str, Any]:
-    if psycopg2 is None:
-        raise RuntimeError("psycopg2_not_installed")
+    if psycopg is None:
+        raise RuntimeError("psycopg_not_installed")
     schema_ref = _quote_ident(str(config.schema_name or "public"))
-    con = psycopg2.connect(
-        dsn=str(config.dsn),
+    con = psycopg.connect(
+        str(config.dsn),
         connect_timeout=int(max(1, round(float(config.connect_timeout_s)))),
         application_name="trading-system-price-migration-validation",
     )
@@ -221,7 +221,7 @@ def build_price_migration_validation_snapshot(
         reasons.append("timescale_price_storage_disabled")
     if not str(config.dsn or "").strip():
         reasons.append("timescale_price_storage_dsn_missing")
-    if psycopg2 is None:
+    if psycopg is None:
         reasons.append("timescale_driver_unavailable")
 
     sqlite_error = ""

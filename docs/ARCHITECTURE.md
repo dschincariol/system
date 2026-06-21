@@ -87,7 +87,7 @@ The observed startup order is:
    - Starts the lifecycle monitor.
    - Starts the model scoring service.
    - Starts `auto_rollback_loop`.
-   - Runs bounded preflight and may call `api_post_self_repair()` if preflight fails.
+   - Runs bounded preflight and may call `engine.api.api_self_repair.api_post_self_repair()` if preflight fails.
    - Validates the dependency graph through the supervisor.
    - Auto-boots daemon jobs when configured.
    - Skips dashboard-side feed auto-boot when isolated ingestion owns feeds.

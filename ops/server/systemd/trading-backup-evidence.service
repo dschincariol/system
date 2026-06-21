@@ -14,9 +14,14 @@ Environment=BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
 Environment=PGHOST=/var/run/postgresql
 Environment=PGPORT=5432
 Environment=PGUSER=postgres
+Environment=TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=0
+Environment=TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=0
+Environment=TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0
+Environment=TS_BACKUP_EVIDENCE_PROBE_TIMEOUT_S=5
+Environment=TS_BACKUP_EVIDENCE_SYSTEMCTL_TIMEOUT_S=5
 ExecStart=/bin/bash /opt/trading/ops/backup/backup_restore_evidence.sh
-Restart=on-failure
-RestartSec=5s
+TimeoutStartSec=8min
+Restart=no
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trading-backup-evidence

@@ -22,10 +22,48 @@ const COLORS = Object.freeze({
   entry: "#56B4E9",
 });
 
+const WINDOW_COLORS = Object.freeze({
+  kill: Object.freeze({
+    fill: "rgba(213, 94, 0, 0.16)",
+    border: "rgba(213, 94, 0, 0.42)",
+  }),
+  suppression: Object.freeze({
+    fill: "rgba(230, 159, 0, 0.15)",
+    border: "rgba(230, 159, 0, 0.40)",
+  }),
+  circuit: Object.freeze({
+    fill: "rgba(115, 183, 230, 0.16)",
+    border: "rgba(115, 183, 230, 0.42)",
+  }),
+  drawdown: Object.freeze({
+    fill: "rgba(204, 121, 167, 0.15)",
+    border: "rgba(204, 121, 167, 0.40)",
+  }),
+  risk: Object.freeze({
+    fill: "rgba(139, 148, 158, 0.13)",
+    border: "rgba(139, 148, 158, 0.35)",
+  }),
+});
+
 const LINE_STYLE = Object.freeze({
   solid: 0,
   dotted: 1,
   dashed: 2,
+});
+
+export const VWAP_OVERLAY_LABEL = "Loaded-window VWAP";
+
+export const VWAP_OVERLAY_SEMANTICS = Object.freeze({
+  kind: "loaded_window",
+  resetPolicy: "none",
+  label: VWAP_OVERLAY_LABEL,
+  description: "accumulates close * volume across the candles currently loaded in the chart and does not reset at trading-session boundaries.",
+});
+
+const INDICATOR_COLORS = Object.freeze({
+  vwap: "#56B4E9",
+  ema: "#E69F00",
+  equity: "#F0E442",
 });
 
 function finiteNumber(value, fallback = null) {
@@ -235,11 +273,15 @@ export function normalizeWindow(raw) {
   if (start == null || start <= 0) return null;
   const end = finiteNumber(source.end_ts_ms ?? source.end);
   const kind = cleanKind(source.kind || source.type || "window");
+  const startS = normalizeEpochSeconds(start);
+  const endS = end != null && end > start ? normalizeEpochSeconds(end) : null;
   return {
     ...source,
     kind,
     start_ts_ms: start,
     end_ts_ms: end != null && end > start ? end : null,
+    start_s: startS,
+    end_s: endS != null && startS != null && endS > startS ? endS : null,
     reason_code: String(source.reason_code || kind).trim() || kind,
     label: String(source.label || kind.replace(/_/g, " ")),
   };
@@ -293,6 +335,92 @@ export function applyPriceLinesToSeries(series, existingHandles, priceLines) {
   return next;
 }
 
+export function decisionWindowStyle(kind) {
+  const normalizedKind = cleanKind(kind);
+  if (normalizedKind.includes("kill")) {
+    return {
+      kind: normalizedKind,
+      label: "Kill-switch window",
+      text: "KILL",
+      fillColor: WINDOW_COLORS.kill.fill,
+      borderColor: WINDOW_COLORS.kill.border,
+    };
+  }
+  if (normalizedKind.includes("circuit")) {
+    return {
+      kind: normalizedKind,
+      label: "Circuit-breaker window",
+      text: "CB",
+      fillColor: WINDOW_COLORS.circuit.fill,
+      borderColor: WINDOW_COLORS.circuit.border,
+    };
+  }
+  if (normalizedKind.includes("drawdown")) {
+    return {
+      kind: normalizedKind,
+      label: "Drawdown throttle window",
+      text: "DD",
+      fillColor: WINDOW_COLORS.drawdown.fill,
+      borderColor: WINDOW_COLORS.drawdown.border,
+    };
+  }
+  if (normalizedKind.includes("suppression")) {
+    return {
+      kind: normalizedKind,
+      label: "Suppression window",
+      text: "TSE",
+      fillColor: WINDOW_COLORS.suppression.fill,
+      borderColor: WINDOW_COLORS.suppression.border,
+    };
+  }
+  return {
+    kind: normalizedKind,
+    label: "Decision window",
+    text: "WIN",
+    fillColor: WINDOW_COLORS.risk.fill,
+    borderColor: WINDOW_COLORS.risk.border,
+  };
+}
+
+export function latestChartTimeSeconds(rows) {
+  const src = Array.isArray(rows) ? rows : [];
+  let latest = null;
+  for (const row of src) {
+    const source = row && typeof row === "object" ? row : {};
+    const time = normalizeEpochSeconds(source.time ?? source.t ?? source.ts ?? source.ts_ms);
+    if (time == null) continue;
+    latest = latest == null ? time : Math.max(latest, time);
+  }
+  return latest;
+}
+
+export function toDecisionWindowBands(windows, chartRows = []) {
+  const latestTime = latestChartTimeSeconds(chartRows);
+  return (Array.isArray(windows) ? windows : [])
+    .map(normalizeWindow)
+    .filter(Boolean)
+    .map((window) => {
+      const startTime = window.start_s;
+      if (startTime == null) return null;
+      const openEnded = window.end_s == null;
+      const endTimeRaw = openEnded ? latestTime : window.end_s;
+      const endTime = endTimeRaw != null && endTimeRaw >= startTime ? endTimeRaw : startTime;
+      const style = decisionWindowStyle(window.kind);
+      return {
+        ...window,
+        startTime,
+        endTime,
+        openEnded,
+        fillColor: String(window.fillColor || window.fill_color || style.fillColor),
+        borderColor: String(window.borderColor || window.border_color || style.borderColor),
+        text: String(window.text || style.text),
+        label: String(window.label || style.label),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => Number(a.startTime) - Number(b.startTime));
+}
+
 export function decisionOverlayLegendItems(payload) {
   const normalized = normalizeDecisionOverlayPayload(payload);
   const counts = new Map();
@@ -311,6 +439,48 @@ export function decisionOverlayLegendItems(payload) {
       count: counts.get(kind) || 0,
     };
   });
+}
+
+export function decisionWindowLegendItems(payload) {
+  const normalized = normalizeDecisionOverlayPayload(payload);
+  const counts = new Map();
+  for (const window of normalized.windows) {
+    counts.set(window.kind, (counts.get(window.kind) || 0) + 1);
+  }
+
+  const seen = new Set();
+  const orderedKinds = [
+    "kill_switch_window",
+    "suppression_window",
+    "suppression_hard_block_window",
+    "circuit_breaker_window",
+    "drawdown_throttle_window",
+    "risk_event_window",
+  ];
+  const kinds = [
+    ...orderedKinds,
+    ...Array.from(counts.keys()).filter((kind) => !orderedKinds.includes(kind)),
+  ];
+
+  return kinds
+    .filter((kind) => {
+      if (seen.has(kind)) return false;
+      seen.add(kind);
+      return (counts.get(kind) || 0) > 0;
+    })
+    .map((kind) => {
+      const style = decisionWindowStyle(kind);
+      return {
+        kind,
+        label: style.label,
+        text: style.text,
+        color: style.borderColor,
+        fillColor: style.fillColor,
+        borderColor: style.borderColor,
+        shape: "band",
+        count: counts.get(kind) || 0,
+      };
+    });
 }
 
 export function buildOverlayAccessibilitySummary(payload) {
@@ -333,6 +503,63 @@ export function buildOverlayAccessibilitySummary(payload) {
   if (normalized.windows.length) parts.push(`${normalized.windows.length} active or recent windows`);
   if (normalized.price_lines.length) parts.push(`${normalized.price_lines.length} price levels`);
   return parts.length ? `Decision overlays: ${parts.join(", ")}.` : "Decision overlays: no automated decision events in the loaded range.";
+}
+
+export function indicatorOverlayLegendItems(overlays = {}) {
+  const ov = overlays && typeof overlays === "object" ? overlays : {};
+  const items = [];
+
+  if (ov.vwap) {
+    items.push({
+      kind: "vwap",
+      label: VWAP_OVERLAY_LABEL,
+      text: "VWAP",
+      color: INDICATOR_COLORS.vwap,
+      shape: "line",
+      count: "",
+    });
+  }
+
+  if (ov.ema) {
+    items.push({
+      kind: "ema",
+      label: "EMA 20/50",
+      text: "EMA",
+      color: INDICATOR_COLORS.ema,
+      shape: "line",
+      count: "",
+    });
+  }
+
+  if (ov.pnl || ov.equity) {
+    items.push({
+      kind: "portfolio_pnl",
+      label: "Portfolio PnL",
+      text: "PNL",
+      color: INDICATOR_COLORS.equity,
+      shape: "line",
+      count: "",
+    });
+  }
+
+  return items;
+}
+
+export function buildIndicatorAccessibilitySummary(overlays = {}) {
+  const ov = overlays && typeof overlays === "object" ? overlays : {};
+  const parts = [];
+
+  if (ov.vwap) {
+    parts.push(`${VWAP_OVERLAY_LABEL}: ${VWAP_OVERLAY_SEMANTICS.description}`);
+  }
+  if (ov.ema) {
+    parts.push("EMA 20/50: exponential moving averages over the loaded candle sequence.");
+  }
+  if (ov.pnl || ov.equity) {
+    parts.push("Portfolio PnL overlay enabled.");
+  }
+
+  return parts.length ? `Indicator overlays: ${parts.join(" ")}` : "Indicator overlays: none enabled.";
 }
 
 function normalizeCandlePoint(point) {
@@ -380,11 +607,12 @@ function trimIndicatorState(state, limit) {
   state.vwap = rebuilt.vwap;
   state.ema20 = rebuilt.ema20;
   state.ema50 = rebuilt.ema50;
+  state.vwapSemantics = rebuilt.vwapSemantics;
   return state;
 }
 
 export function createIndicatorState(candles = []) {
-  const state = { points: [], vwap: [], ema20: [], ema50: [] };
+  const state = { points: [], vwap: [], ema20: [], ema50: [], vwapSemantics: VWAP_OVERLAY_SEMANTICS.kind };
   for (const item of Array.isArray(candles) ? candles : []) {
     const point = normalizeCandlePoint(item);
     if (!point) continue;

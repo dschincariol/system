@@ -5,6 +5,13 @@
   metadata and does not bind DOM behavior or alter runtime business logic.
 */
 
+import {
+  classifyMarketStressScore,
+  marketStressThresholdRangeText,
+} from "./market_stress_thresholds.js";
+
+const MARKET_STRESS_RANGE_TEXT = marketStressThresholdRangeText();
+
 function freezeEntry(key, def) {
   const persona = def && def.persona ? def.persona : {};
   return Object.freeze({
@@ -232,8 +239,8 @@ const MARKET_STRESS_METRICS = Object.freeze({
     shortHelp: "Composite cross-asset market stress gauge.",
     fullHelp: "This score combines volatility, rates, credit, and term-structure inputs into a single stress reading used by the dashboard. Higher values indicate broader market strain.",
     unit: "score",
-    normalRange: "< 0.55",
-    warningRange: "0.55 to < 0.75",
+    normalRange: MARKET_STRESS_RANGE_TEXT.normal,
+    warningRange: MARKET_STRESS_RANGE_TEXT.warning,
     persona: {
       fund_manager: "This is the main regime-level market stress measure surfaced by the dashboard. Higher readings mean the environment is becoming harder for normal positioning.",
       operations: "Operators use this as the canonical stress gauge behind the market condition pill and stress banner.",
@@ -1377,11 +1384,11 @@ const CLASSIFIERS = new Map([
   [
     "market_stress_score",
     (value) => {
-      const n = asFiniteNumber(value);
-      if (n === null) return "unknown";
-      if (n < 0.55) return "normal";
-      if (n < 0.75) return "warning";
-      return "critical";
+      const state = classifyMarketStressScore(value).state;
+      if (state === "normal") return "normal";
+      if (state === "warning") return "warning";
+      if (state === "critical") return "critical";
+      return "unknown";
     },
   ],
   ["z_vix", makeThresholdClassifier(1, 2, { absolute: true, inclusiveNormal: true })],

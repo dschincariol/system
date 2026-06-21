@@ -284,6 +284,42 @@ class ProdPreflightStorageContractTests(unittest.TestCase):
         self.assertIn("retention_status=configured", rendered)
         self.assertEqual(state["accounting"]["retention_status"], "configured")
 
+    def test_main_stops_before_schema_when_storage_placement_invalid(self) -> None:
+        with patch.dict(os.environ, {"ENV": "prod"}, clear=True):
+            prod_preflight = self._load_module()
+            with patch.object(sys, "argv", ["prod_preflight.py"]):
+                with patch.object(
+                    prod_preflight,
+                    "_production_provisioning_gate",
+                    return_value=(["provisioning ok"], [], {"ok": True}),
+                ):
+                    with patch.object(
+                        prod_preflight,
+                        "_disk_pressure_gate",
+                        return_value=(["disk ok"], [], [], {"status": "ok"}),
+                    ):
+                        with patch.object(
+                            prod_preflight,
+                            "_storage_placement_gate",
+                            return_value=(
+                                [],
+                                [],
+                                [
+                                    "storage placement invalid target=timescale_pgdata "
+                                    "reason=forbidden_host_prefix path=/var/lib/docker/volumes/timescaledb-data/_data"
+                                ],
+                                {"ok": False},
+                            ),
+                        ):
+                            with patch.object(
+                                prod_preflight,
+                                "_compile_files",
+                                side_effect=AssertionError("compile should not run"),
+                            ):
+                                rc = prod_preflight.main()
+
+        self.assertEqual(rc, 3)
+
     def test_main_stops_before_smoke_when_sqlite_contract_invalid(self) -> None:
         db_path = _var_db_path("prod_preflight_contracts_main.db")
         with patch.dict(

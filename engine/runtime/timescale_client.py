@@ -22,6 +22,7 @@ from typing import Any, Iterable, Mapping
 
 from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
+from engine.runtime.platform import connection_info_with_pg_password
 
 try:
     import asyncpg
@@ -279,6 +280,8 @@ class TimescaleConfig:
             or os.environ.get("TIMESCALE_DATABASE_URL")
             or ""
         ).strip()
+        if dsn:
+            dsn = connection_info_with_pg_password(dsn)
         enabled = _env_bool("TIMESCALE_ENABLED", default=bool(dsn))
         pool_min_size = tuned_int("TIMESCALE_POOL_MIN_SIZE", 1, 1, 16)
         pool_max_size = max(pool_min_size, tuned_int("TIMESCALE_POOL_MAX_SIZE", 4, 1, 16))

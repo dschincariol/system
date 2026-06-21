@@ -9,9 +9,13 @@ The GitHub `Production backend gate (Postgres + Redis)` job is the go-live backe
 - runs all tests marked `requires_postgres` or `requires_redis`
 - fails if the marker-selected tests collect zero tests or produce any pytest skip
 - runs targeted production-path tests for migrations, Postgres locks, idempotency uniqueness, audit-chain detection, execution arming persistence, promotion evidence, CPCV/model competition, and Redis-backed cache wrappers
+- inherits the repo pytest timeout policy from `pyproject.toml`: a 120 second per-test default through `pytest-timeout` with `timeout_method=thread`
+- inherits the repo pytest socket isolation policy: DNS and non-local sockets are blocked by default, while the provisioned Postgres and Redis services remain reachable through `127.0.0.1`
 - runs `python -m engine.runtime.staging_prod_preflight`, which invokes `engine/runtime/prod_preflight.py --json`, against the CI Postgres target and uploads the redacted evidence artifact
 
 The skip failure is enforced by [tools/run_required_backend_tests.py](../tools/run_required_backend_tests.py), which inspects pytest JUnit XML instead of grepping terminal output.
+
+`@pytest.mark.live_network` tests are not part of this PR gate. They require an explicit run with `TRADING_TEST_ALLOW_LIVE_NETWORK=1` and should be reserved for reviewed live-service smoke checks outside normal CI.
 
 ## Local Reproduction
 
@@ -92,4 +96,6 @@ python tools/run_required_backend_tests.py \
 
 ## Staging Preflight Evidence
 
-For local staging-style evidence, use [docs/STAGING_PROD_PREFLIGHT_EVIDENCE.md](STAGING_PROD_PREFLIGHT_EVIDENCE.md). The CI job creates an env file under `$RUNNER_TEMP`, includes only test credentials such as a synthetic `DATA_SOURCE_MASTER_KEY`, runs the staging harness with ambient-env isolation, and uploads `var/artifacts/preflight/staging/*.json`. The artifact includes a redacted Postgres target summary, guardrail result, `prod_preflight.py --json` output, and subprocess exit code.
+Canonical harness mechanics (setup, run commands, guardrails, evidence contents): see [docs/STAGING_PROD_PREFLIGHT_EVIDENCE.md](STAGING_PROD_PREFLIGHT_EVIDENCE.md).
+
+CI-specific behavior only: the production-backend gate creates an env file under `$RUNNER_TEMP`, includes only test credentials such as a synthetic `DATA_SOURCE_MASTER_KEY`, runs the staging harness with ambient-env isolation, and uploads `var/artifacts/preflight/staging/*.json`. The artifact includes a redacted Postgres target summary, guardrail result, `prod_preflight.py --json` output, and subprocess exit code.

@@ -38,3 +38,19 @@ def test_close_pooled_connections_is_idempotent_when_shutdown_and_atexit_both_fi
 
     assert pool.close_count == 1
     assert storage_pool._POOL is None
+
+
+def test_sqlite_close_pooled_connections_stops_liveness_queue(monkeypatch):
+    from engine.runtime import storage_sqlite
+
+    calls = []
+
+    def fake_shutdown_job_liveness_queue(*, timeout_s=2.0):
+        calls.append(timeout_s)
+        return {"ok": True}
+
+    monkeypatch.setattr(storage_sqlite, "shutdown_job_liveness_queue", fake_shutdown_job_liveness_queue)
+
+    storage_sqlite.close_pooled_connections()
+
+    assert calls == [0.5]

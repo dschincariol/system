@@ -1,1 +1,1 @@
-"""Local unittest package marker."""
+"""Local test package marker for pytest collection."""

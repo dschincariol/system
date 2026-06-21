@@ -2,7 +2,7 @@
 
 This document explains where the code lives and how to navigate it.
 
-Last verified against code: 2026-06-17
+Last verified against code: 2026-06-21
 
 It is written for developers who need to answer:
 
@@ -18,12 +18,14 @@ It is written for developers who need to answer:
 | `boot/` | local launcher and operator startup layer |
 | `deploy/` | deployment and installation scripts |
 | `engine/` | main Python application code |
-| `engine/api/` | dashboard and operator API handlers |
+| `engine/api/` | dashboard and operator API handlers, including `engine/api/system/` helpers for the system API facade |
+| `engine/dashboard/` | decomposition helpers used by the root dashboard facade |
 | `engine/data/` | ingestion, providers, and raw data jobs |
 | `engine/execution/` | broker routing, execution policy, order application |
 | `engine/research/` | offline stress and fragility tooling |
 | `engine/risk/` | risk-specific logic and utilities |
 | `engine/runtime/` | storage, locks, job orchestration, health, lifecycle |
+| `engine/startup/` | decomposition helpers used by the root startup executable facade |
 | `engine/strategy/` | features, labels, models, decisions, governance, portfolio logic |
 | `ops/` | ad hoc operations scripts and utilities |
 | `routes/` | focused route modules mounted by `dashboard_server.py` |
@@ -48,12 +50,16 @@ If you are new, read the code in this order:
 
 That gives you system flow before subsystem detail.
 
+If the change touches provider setup, source lifecycle, or credential storage, insert [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md) before the subsystem you plan to modify.
+
+This is the canonical read order for the repo. The shortest orientation path in [MAINTAINER_INDEX.md](MAINTAINER_INDEX.md) is a trimmed variant of this list.
+
 ## 3. Core Files And What They Own
 
 | File | Ownership |
 | --- | --- |
-| `start_system.py` | top-level Python runtime bootstrap and lifecycle |
-| `dashboard_server.py` | HTTP boundary, dashboard serving, API wiring |
+| `start_system.py` | top-level Python runtime bootstrap and lifecycle facade over `engine/startup/` helpers |
+| `dashboard_server.py` | HTTP boundary, dashboard serving, API wiring facade over `engine/dashboard/` helpers |
 | `engine/runtime/storage.py` | public runtime storage facade and persistence helpers |
 | `engine/runtime/storage_pg.py` | current Postgres-backed storage implementation |
 | `engine/runtime/locks.py` | coordination and lock behavior |
@@ -85,23 +91,70 @@ That gives you system flow before subsystem detail.
 
 ## 4. Critical Infrastructure
 
-These files are high-risk edit surfaces:
+These files are high-risk edit surfaces. This table is the canonical highest-risk-file list for the repo; changes in these files tend to have repo-wide effects.
 
 | File | Why it is sensitive |
 | --- | --- |
 | `engine/runtime/storage.py` | almost every subsystem depends on it |
 | `engine/runtime/locks.py` | concurrency and coordination risk |
 | `engine/runtime/job_registry.py` | startup and launch behavior depend on it |
+| `engine/runtime/jobs_manager.py` | job launch/stop/status orchestration |
+| `engine/runtime/ingestion_runtime.py` | drives ingestion lifecycle and runtime data flow |
 | `start_system.py` | top-level lifecycle and boot ownership |
 | `dashboard_server.py` | API/UI boundary and runtime wiring |
+| `routes/data_sources_routes.py` | HTTP control plane for source management |
+| `services/data_source_manager.py` | DB-authoritative source catalog and credential storage contract |
 | `engine/strategy/portfolio.py` | direct effect on portfolio behavior |
 | `engine/execution/execution_policy_engine.py` | direct effect on execution behavior |
 | `engine/runtime/live_trading_preflight.py` | controls whether live mode can pass startup/preflight |
 | `engine/runtime/live_execution_control.py` | emergency live-capital kill switch and pre-live reconciliation policy |
 | `engine/execution/broker_failover_policy.py` | prevents unsafe live broker failover chains |
 | `boot/operator_server.js` | operator controls, repair actions, and local patch workflow |
+| `services/operator_ai/agent.js` | bounded LLM diagnosis over support snapshots and watchdog context |
 
 ## 5. Where To Make Common Changes
+
+This section is the canonical task-based navigation surface for the repo. The shorter task list in [MAINTAINER_INDEX.md](MAINTAINER_INDEX.md) points here.
+
+### Fix startup or runtime stability
+
+Look in:
+
+- `start_system.py`
+- `engine/startup/` for extracted startup facade helpers
+- `dashboard_server.py`
+- `engine/runtime/startup_orchestrator.py`
+- `engine/runtime/supervisor.py`
+- `engine/runtime/ingestion_runtime.py`
+- `engine/api/api_system.py`
+
+### Change provider setup or source health
+
+Look in:
+
+- [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md)
+- `services/data_source_manager.py`
+- `routes/data_sources_routes.py`
+- `services/credential_encryption.py`
+- `ui/data_sources.html`
+- `ui/data_sources.js`
+
+### Change HTTP or operator surfaces
+
+Look in:
+
+- `engine/api/` (`api_system.py`, `api_ops.py`, `api_jobs.py`, `api_market.py`, and `system/` helpers)
+- `dashboard_server.py`
+- `engine/dashboard/` for extracted dashboard facade helpers
+
+### Decompose an oversized module
+
+Look in:
+
+- [DECOMPOSITION_CONVENTIONS.md](DECOMPOSITION_CONVENTIONS.md)
+- characterization tests for the current public surface
+- the original module facade that must keep existing imports working
+- a new or existing focused package module for the extracted responsibility
 
 ### Add a new ingestion source
 

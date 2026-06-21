@@ -33,7 +33,10 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("TUNE_N_TRIALS: ${TUNE_N_TRIALS:-10}", text)
         self.assertIn("TRADING_IMPORT_SMOKE_IMPORT_JOBS: ${TRADING_IMPORT_SMOKE_IMPORT_JOBS:-0}", text)
         self.assertIn("OPERATOR_DISABLE_INTERNAL_ENGINE_START: \"1\"", text)
-        self.assertIn("OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:?set OPERATOR_API_TOKEN}", text)
+        self.assertIn("OPERATOR_API_TOKEN_FILE: /run/secrets/operator_api_token", text)
+        self.assertIn("DASHBOARD_API_TOKEN_FILE: /run/secrets/dashboard_api_token", text)
+        self.assertIn("DASHBOARD_BIND_CONTEXT: container_internal", text)
+        self.assertIn("${DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${DASHBOARD_PUBLIC_PORT:-8000}:8000", text)
         self.assertIn("OPERATOR_SIDECAR_HOST: operator", text)
         self.assertIn("OPERATOR_SIDECAR_INTERNAL_ONLY: \"1\"", text)
         self.assertIn("cpus: ${RUNTIME_CPUS:-12}", text)
@@ -64,6 +67,10 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("TSFRESH_SNAPSHOT_BATCH_SIZE: ${OFFLINE_TSFRESH_SNAPSHOT_BATCH_SIZE:-250}", offline_block)
         self.assertIn("TUNE_N_TRIALS: ${OFFLINE_TUNE_N_TRIALS:-200}", offline_block)
         self.assertIn("TS_PG_DSN: ${OFFLINE_TS_PG_DSN:?set OFFLINE_TS_PG_DSN to an offline clone}", offline_block)
+        self.assertIn("OBJECT_STORE_ACCESS_KEY_FILE: /run/secrets/minio_root_user", offline_block)
+        self.assertIn("OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_password", offline_block)
+        self.assertNotIn("OBJECT_STORE_ACCESS_KEY: ${OFFLINE_OBJECT_STORE_ACCESS_KEY", offline_block)
+        self.assertNotIn("OBJECT_STORE_SECRET_KEY: ${OFFLINE_OBJECT_STORE_SECRET_KEY", offline_block)
         self.assertIn("cpus: ${OPERATOR_CPUS:-1}", text)
         self.assertIn("mem_limit: ${OPERATOR_MEM_LIMIT:-2g}", text)
         operator_block = text.split("  operator:", 1)[1].split("\n\nnetworks:", 1)[0]
@@ -105,11 +112,26 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         text = external_compose.read_text(encoding="utf-8")
         env_text = env_example.read_text(encoding="utf-8")
 
-        self.assertIn("${TRADING_BACKUP_ROOT:-/var/backups/trading}:/var/backups/trading", text)
+        self.assertIn("${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:/var/lib/postgresql/data", text)
+        self.assertIn("${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:/var/backups/trading", text)
+        self.assertIn("${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}:/data", text)
+        self.assertIn("${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}:/data", text)
+        self.assertNotIn("timescaledb-data:/var/lib/postgresql/data", text)
+        self.assertNotIn("redis-data:/data", text)
+        self.assertNotIn("minio-data:/data", text)
         self.assertIn("x-trading-logging:", text)
         self.assertEqual(text.count("logging: *trading-logging"), 4)
         self.assertIn("archive_mode=${TIMESCALE_ARCHIVE_MODE:-on}", text)
-        self.assertIn("archive_command=mkdir -p /var/backups/trading/wal", text)
+        self.assertIn("TS_BACKUP_ROOT: /var/backups/trading", text)
+        self.assertIn('TS_WAL_ARCHIVE_REQUIRE_MOUNT: "1"', text)
+        self.assertIn("${TRADING_WAL_ARCHIVE_SCRIPT:-../../ops/backup/wal_archive.sh}:/opt/trading/ops/backup/wal_archive.sh:ro", text)
+        self.assertIn(
+            "${TRADING_WAL_ARCHIVE_CATCHUP_SCRIPT:-../../ops/backup/wal_archive_catchup.sh}:/opt/trading/ops/backup/wal_archive_catchup.sh:ro",
+            text,
+        )
+        self.assertIn('archive_command=${TIMESCALE_ARCHIVE_COMMAND:-/opt/trading/ops/backup/wal_archive.sh "%p" "%f"}', text)
+        self.assertNotIn("archive_command=mkdir -p /var/backups/trading/wal", text)
+        self.assertNotIn("cp %p /var/backups/trading/wal/%f", text)
         self.assertIn("archive_timeout=${TIMESCALE_ARCHIVE_TIMEOUT:-60s}", text)
         self.assertIn("cpus: ${TIMESCALE_CPUS:-8}", text)
         self.assertIn("mem_limit: ${TIMESCALE_MEM_LIMIT:-32g}", text)
@@ -119,8 +141,30 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("work_mem=${TIMESCALE_WORK_MEM:-48MB}", text)
         self.assertIn("TRADING_BACKUP_ROOT=/var/backups/trading", env_text)
         self.assertIn("TRADING_BACKUP_WAL_DIR=/var/backups/trading/wal", env_text)
+        self.assertIn("PREFLIGHT_REQUIRE_ZFS_STORAGE=1", env_text)
+        self.assertIn("PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS=1", env_text)
+        self.assertIn("TRADING_ZFS_ROOT=/zpool", env_text)
+        self.assertIn("TRADING_TIMESCALE_DATA=/zpool/trading/timescaledb/data", env_text)
+        self.assertIn("TRADING_REDIS_DATA=/zpool/trading/redis/data", env_text)
+        self.assertIn("TRADING_MINIO_DATA=/zpool/trading/minio/data", env_text)
+        self.assertIn("TRADING_WAL_ARCHIVE_SCRIPT=../../ops/backup/wal_archive.sh", env_text)
+        self.assertIn("TRADING_WAL_ARCHIVE_CATCHUP_SCRIPT=../../ops/backup/wal_archive_catchup.sh", env_text)
+        self.assertIn('TIMESCALE_ARCHIVE_COMMAND=/opt/trading/ops/backup/wal_archive.sh "%p" "%f"', env_text)
         self.assertIn("TIMESCALE_MEM_LIMIT=32g", env_text)
         self.assertIn("TIMESCALE_SHARED_BUFFERS=8GB", env_text)
+        self.assertIn("TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1", env_text)
+        self.assertIn("TIMESCALE_ALLOW_DANGEROUS_PUBLIC_BIND=0", env_text)
+        self.assertIn("${TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${TIMESCALE_PORT:-5432}:5432", text)
+        self.assertNotIn("POSTGRES_PASSWORD:", text)
+        self.assertIn("POSTGRES_PASSWORD_FILE: /run/secrets/timescale_password", text)
+        self.assertIn("file: ${TIMESCALE_PASSWORD_FILE:?set TIMESCALE_PASSWORD_FILE}", text)
+        stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
+        self.assertIn("TS_PG_PASSWORD_FILE: /run/secrets/timescale_password", stack_text)
+        self.assertIn("TIMESCALE_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}", stack_text)
+        self.assertNotIn("password=${TIMESCALE_PASSWORD", stack_text)
+        self.assertNotIn(":${TIMESCALE_PASSWORD", stack_text)
+        self.assertIn("REDIS_URL: redis://redis:6379/0", stack_text)
+        self.assertNotIn("redis://:${REDIS_PASSWORD", stack_text)
 
     def test_external_services_are_resource_bounded(self) -> None:
         external_compose = REPO_ROOT / "deploy" / "compose" / "docker-compose.external-services.yml"
@@ -131,11 +175,18 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         for expected in (
             "cpus: ${REDIS_CPUS:-2}",
             "mem_limit: ${REDIS_MEM_LIMIT:-8g}",
-            "REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}",
+            "redis_password:",
+            "file: ${REDIS_PASSWORD_FILE:?set REDIS_PASSWORD_FILE}",
+            'redis-cli -a "$$(cat /run/secrets/redis_password)" ping',
+            "${REDIS_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379",
             "${REDIS_MAXMEMORY:-6gb}",
             "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}",
             "cpus: ${MINIO_CPUS:-2}",
             "mem_limit: ${MINIO_MEM_LIMIT:-6g}",
+            "MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user",
+            "MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password",
+            "${MINIO_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${MINIO_PORT:-9000}:9000",
+            "${MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, text)
@@ -146,8 +197,21 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "RUNTIME_MEM_LIMIT=48g",
             "RUNTIME_SHM_SIZE=8g",
             "REDIS_MAXMEMORY=6gb",
+            "REDIS_PASSWORD_FILE=../../data/secrets/redis_password",
+            "REDIS_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
+            "REDIS_ALLOW_DANGEROUS_PUBLIC_BIND=0",
             "MINIO_MEM_LIMIT=6g",
+            "MINIO_ROOT_USER_FILE=../../data/secrets/minio_root_user",
+            "MINIO_ROOT_PASSWORD_FILE=../../data/secrets/minio_root_password",
+            "MINIO_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
+            "MINIO_ALLOW_DANGEROUS_PUBLIC_BIND=0",
+            "MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
+            "MINIO_CONSOLE_ALLOW_DANGEROUS_PUBLIC_BIND=0",
             "OPERATOR_MEM_LIMIT=2g",
+            "DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
+            "DASHBOARD_ALLOW_DANGEROUS_PUBLIC_BIND=0",
+            "OPERATOR_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
+            "OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND=0",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, env_text)
@@ -156,10 +220,24 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
         env_example_text = (REPO_ROOT / "deploy" / "compose" / ".env.example").read_text(encoding="utf-8")
 
-        self.assertIn("${TRADING_BACKUP_ROOT:-/var/backups/trading}:/var/backups/trading:ro", stack_text)
-        self.assertIn("TRADING_BACKUP_ROOT: ${TRADING_BACKUP_ROOT:-/var/backups/trading}", stack_text)
+        self.assertIn("${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:/app/data", stack_text)
+        self.assertIn("${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:/app/logs", stack_text)
+        self.assertIn("${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:/var/backups/trading:ro", stack_text)
+        self.assertIn("TRADING_BACKUP_ROOT: ${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}", stack_text)
+        self.assertIn("TRADING_BACKUP_WAL_DIR: ${TRADING_BACKUP_WAL_DIR:?set TRADING_BACKUP_WAL_DIR to the ZFS-backed backup WAL path}", stack_text)
+        self.assertIn("PREFLIGHT_REQUIRE_ZFS_STORAGE: ${PREFLIGHT_REQUIRE_ZFS_STORAGE:-1}", stack_text)
+        self.assertIn("PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS: ${PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS:-1}", stack_text)
+        self.assertNotIn("trading-data:/app/data", stack_text)
+        self.assertNotIn("trading-logs:/app/logs", stack_text)
         self.assertIn("DISK_PRESSURE_WARN_FREE_PCT: ${DISK_PRESSURE_WARN_FREE_PCT:-15}", stack_text)
+        self.assertIn("PREFLIGHT_REQUIRE_PG_WAL_RISK: ${PREFLIGHT_REQUIRE_PG_WAL_RISK:-1}", stack_text)
+        self.assertIn("PREFLIGHT_PG_WAL_CRITICAL_BYTES: ${PREFLIGHT_PG_WAL_CRITICAL_BYTES:-40g}", stack_text)
+        self.assertIn(
+            "PREFLIGHT_PG_WAL_READY_CRITICAL_COUNT: ${PREFLIGHT_PG_WAL_READY_CRITICAL_COUNT:-16}",
+            stack_text,
+        )
         self.assertIn("BACKUP_ACCOUNTING_DU_TIMEOUT_S: ${BACKUP_ACCOUNTING_DU_TIMEOUT_S:-8}", stack_text)
+        self.assertIn('TIMESCALE_ARCHIVE_COMMAND: ${TIMESCALE_ARCHIVE_COMMAND:-/opt/trading/ops/backup/wal_archive.sh "%p" "%f"}', stack_text)
         self.assertIn("PREFLIGHT_REQUIRE_BACKUP_EVIDENCE: ${PREFLIGHT_REQUIRE_BACKUP_EVIDENCE:-1}", stack_text)
         self.assertIn(
             "BACKUP_EVIDENCE_PATH: ${BACKUP_EVIDENCE_PATH:-/var/backups/trading/evidence/latest_backup_restore_evidence.json}",
@@ -187,6 +265,7 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S=120",
             "BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1",
             "BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key",
+            'TIMESCALE_ARCHIVE_COMMAND=/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
             "DOCKER_LOG_DRIVER=local",
             "DOCKER_LOG_MAX_SIZE=50m",
             "DOCKER_LOG_MAX_FILE=5",
@@ -194,7 +273,16 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "DISK_PRESSURE_WARN_FREE_BYTES=21474836480",
             "DISK_PRESSURE_CRITICAL_FREE_PCT=5",
             "DISK_PRESSURE_CRITICAL_FREE_BYTES=5368709120",
+            "PREFLIGHT_REQUIRE_PG_WAL_RISK=1",
+            "PREFLIGHT_PG_WAL_WARN_BYTES=30g",
+            "PREFLIGHT_PG_WAL_CRITICAL_BYTES=40g",
+            "PREFLIGHT_PG_WAL_READY_WARN_COUNT=4",
+            "PREFLIGHT_PG_WAL_READY_CRITICAL_COUNT=16",
+            "PREFLIGHT_PG_WAL_WARN_FREE_BYTES=21474836480",
+            "PREFLIGHT_PG_WAL_CRITICAL_FREE_BYTES=5368709120",
             "BACKUP_ACCOUNTING_DU_TIMEOUT_S=8",
+            "TRADING_RUNTIME_DATA=/zpool/trading/runtime/data",
+            "TRADING_RUNTIME_LOGS=/zpool/trading/runtime/logs",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, env_example_text)
@@ -208,8 +296,9 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("/opt/trading/app/logs/*.log", logrotate)
         self.assertIn("/opt/trading/app/var/log/*.log", logrotate)
         self.assertIn("/opt/trading/app/boot/*.log", logrotate)
-        self.assertIn("/var/lib/docker/volumes/*trading-logs*/_data/*.log", logrotate)
-        self.assertIn("/var/lib/docker/volumes/*trading-data*/_data/ai_operator_log.jsonl", logrotate)
+        self.assertIn("/zpool/trading/runtime/logs/*.log", logrotate)
+        self.assertIn("/zpool/trading/runtime/data/ai_operator_log.jsonl", logrotate)
+        self.assertNotIn("/var/lib/docker/volumes/*trading-logs*/_data/*.log", logrotate)
         self.assertIn("ingestion.stdout.log", logrotate)
         self.assertIn("data/ai_operator_log.jsonl", logrotate)
         self.assertIn("maxsize 50M", logrotate)
@@ -250,12 +339,33 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("--compose", installer)
         self.assertIn("install_compose_systemd_overrides", installer)
         self.assertIn("ensure_backup_evidence_hmac_key", installer)
+        self.assertIn("normalize_compose_storage_env", installer)
+        self.assertIn("ensure_compose_env_mount_source TRADING_TIMESCALE_DATA", installer)
+        self.assertIn("ensure_compose_env_mount_source TRADING_BACKUP_ROOT", installer)
+        self.assertIn("refusing to move storage", installer)
         self.assertIn('set_env_var BACKUP_EVIDENCE_REQUIRE_SIGNATURE "1"', installer)
         self.assertIn('set_env_var BACKUP_EVIDENCE_HMAC_KEY_FILE "$BACKUP_EVIDENCE_HMAC_KEY_FILE"', installer)
+        self.assertIn('set_env_var TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP "0"', installer)
+        self.assertIn('set_env_var TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL "0"', installer)
+        self.assertIn('set_env_var TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP "0"', installer)
+        self.assertIn('set_compose_env_var TRADING_WAL_ARCHIVE_SCRIPT "${BACKUP_SCRIPT_DST_DIR}/wal_archive.sh"', installer)
+        self.assertIn(
+            'set_compose_env_var TRADING_WAL_ARCHIVE_CATCHUP_SCRIPT "${BACKUP_SCRIPT_DST_DIR}/wal_archive_catchup.sh"',
+            installer,
+        )
+        self.assertIn('set_compose_env_var TIMESCALE_ARCHIVE_COMMAND "/opt/trading/ops/backup/wal_archive.sh \\"%p\\" \\"%f\\""', installer)
+        self.assertIn('grep -q \'wal_archive.sh "%p" "%f"\' "$COMPOSE_EXTERNAL_FILE"', installer)
+        self.assertIn("run_compose_archive_selftest", installer)
+        self.assertIn("run_compose_wal_catchup", installer)
+        self.assertIn("up -d --no-deps --force-recreate timescaledb", installer)
         self.assertIn('chown -R "${pg_uid}:${TRADING_GROUP}" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"', installer)
         self.assertIn('find "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR" -type f -exec chmod 0640 {} +', installer)
         self.assertIn("set_env_var TS_BACKUP_READ_GROUP", installer)
         self.assertIn("Environment=TS_BACKUP_READ_GROUP=${TRADING_GROUP}", installer)
+        self.assertIn("Environment=TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0", installer)
+        self.assertIn("Environment=TS_BACKUP_EVIDENCE_WAL_CATCHUP_TIMEOUT_S=300", installer)
+        self.assertIn("Restart=no", installer)
+        self.assertIn("TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=1", installer)
 
     def test_runtime_compose_exposes_provider_and_broker_contract(self) -> None:
         stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
@@ -305,6 +415,11 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "INFERENCE_HEALTH_PROBE_INTERVAL_S",
             "KILL_SWITCH_GLOBAL",
             "DISABLE_LIVE_EXECUTION",
+            "TRADING_CLOCK_MAX_SKEW_MS",
+            "TRADING_CLOCK_REQUIRED_SOURCES",
+            "TRADING_CLOCK_HTTPS_TIME_URLS",
+            "TRADING_CLOCK_REQUIRED_TIMEZONE",
+            "TRADING_CLOCK_CHECK_TIMEOUT_S",
             "TRADING_DEPENDENCY_PROFILE",
             "RUNTIME_HARDWARE_PROFILE",
             "TORCH_DEVICE",
@@ -322,8 +437,16 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
                 self.assertIn(key, env_example_text)
 
         self.assertIn("POLYGON_REST_ENABLED: ${POLYGON_REST_ENABLED:-0}", stack_text)
+        self.assertIn("POLYGON_API_KEY_FILE: /run/secrets/polygon_api_key", stack_text)
         self.assertIn("YFINANCE_ENABLED: ${YFINANCE_ENABLED:-1}", stack_text)
         self.assertIn("TRADIER_ENABLED: ${TRADIER_ENABLED:-0}", stack_text)
+        self.assertIn("TRADIER_API_TOKEN_FILE: /run/secrets/tradier_api_token", stack_text)
+        self.assertIn("ALPACA_KEY_ID_FILE: /run/secrets/alpaca_key_id", stack_text)
+        self.assertIn("ALPACA_SECRET_KEY_FILE: /run/secrets/alpaca_secret_key", stack_text)
+        self.assertNotIn("POLYGON_API_KEY: ${POLYGON_API_KEY", stack_text)
+        self.assertNotIn("TRADIER_API_TOKEN: ${TRADIER_API_TOKEN", stack_text)
+        self.assertNotIn("ALPACA_KEY_ID: ${ALPACA_KEY_ID", stack_text)
+        self.assertNotIn("ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY", stack_text)
         self.assertIn("AUTO_PIPELINE: ${AUTO_PIPELINE:-0}", stack_text)
         self.assertIn("AUTO_PIPELINE_START_DELAY_S: ${AUTO_PIPELINE_START_DELAY_S:-90}", stack_text)
         self.assertIn("MODEL_FEATURE_SNAPSHOT_SLEEP_S: ${MODEL_FEATURE_SNAPSHOT_SLEEP_S:-60}", stack_text)
@@ -332,6 +455,8 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("KILL_SWITCH_GLOBAL: ${KILL_SWITCH_GLOBAL:-1}", stack_text)
         self.assertIn("LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-0}", stack_text)
         self.assertIn("LIVE_TRADING_CONFIRM=0", env_example_text)
+        self.assertIn("TRADING_CLOCK_MAX_SKEW_MS: ${TRADING_CLOCK_MAX_SKEW_MS:-2000}", stack_text)
+        self.assertIn("TRADING_CLOCK_REQUIRED_SOURCES=system_or_https", env_example_text)
         self.assertIn("LIVE_BROKER: ${LIVE_BROKER:-ibkr}", stack_text)
         self.assertIn("BROKER_NAME: ${BROKER_NAME:-ibkr}", stack_text)
         self.assertIn("BROKER: ${BROKER:-ibkr}", stack_text)

@@ -226,6 +226,8 @@ def test_operator_config_logs_and_snapshots_are_redacted():
     text = SERVER_PATH.read_text(encoding="utf-8")
 
     assert "OPERATOR_SENSITIVE_KEY_RE" in text
+    assert "key[_\\-.]?id" in text
+    assert "KEY_ID" in text
     assert "redactOperatorSensitiveText" in text
     assert 'return jsonOk(res, safeEnvForSnapshot(readEnv()));' in text
     assert "sanitized: safeEnvForSnapshot(sanitized)" in text
