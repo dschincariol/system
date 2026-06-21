@@ -56,7 +56,8 @@ jobs:
             tests/test_audit_hashing.py \
             tests/test_secrets_loader.py \
             tests/test_secrets_provider_plaintext.py \
-            tests/test_secrets_provider_systemd.py
+            tests/test_secrets_provider_systemd.py \
+            tests/test_os_migration_gates.py
         shell: bash
 
       - name: Run canonical repository validation

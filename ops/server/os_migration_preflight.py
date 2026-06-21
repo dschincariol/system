@@ -21,6 +21,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "var" / "os_migration"
+SYSTEMD_UNIT_DIR = REPO_ROOT / "ops" / "server" / "systemd"
 GATE_VERSION = "1.0"
 
 UBUNTU_APT_HOST_RE = re.compile(
@@ -52,31 +53,17 @@ INTERESTING_PACKAGES = [
     "amdgpu-install",
 ]
 
-TRADING_UNITS = [
-    "trading.target",
-    "trading-api.service",
-    "trading-jobs.service",
-    "trading-stream-prices.service",
-    "trading-ingest.service",
-    "trading-prod-preflight.service",
-    "trading-operator.service",
-    "trading-engine.service",
-    "trading-upgrade.service",
-    "trading-backup.service",
-    "trading-backup.timer",
-    "trading-base-backup.service",
-    "trading-base-backup.timer",
-    "trading-backup-evidence.service",
-    "trading-backup-evidence.timer",
-    "trading-backup-prune.service",
-    "trading-backup-prune.timer",
-    "trading-state-snapshot.service",
-    "trading-state-snapshot.timer",
-    "trading-artifact-snapshot.service",
-    "trading-artifact-snapshot.timer",
-    "trading-restore-drill.service",
-    "trading-restore-drill.timer",
-]
+def repo_systemd_units(systemd_dir: Path = SYSTEMD_UNIT_DIR) -> list[str]:
+    if not systemd_dir.exists():
+        return []
+    return sorted(
+        path.name
+        for path in systemd_dir.iterdir()
+        if path.is_file() and path.suffix in {".service", ".target", ".timer"}
+    )
+
+
+TRADING_UNITS = repo_systemd_units()
 
 
 def utc_now() -> str:

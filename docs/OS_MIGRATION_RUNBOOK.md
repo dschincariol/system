@@ -7,6 +7,8 @@ The repo-owned gates are:
 - `ops/server/os_migration_preflight.py`: read-only evidence capture before the cutover.
 - `ops/server/os_migration_postflight.py`: read-only PASS/FAIL verification after the cutover.
 
+Preflight systemd evidence is collected from unit names shipped in `ops/server/systemd/`. Keep quiesce and bring-up commands aligned with those repo unit files; do not add ad hoc service names to this runbook unless the matching unit file is added to the repo or verified on the host.
+
 The scripts never perform the OS upgrade, stop services, create ZFS snapshots, roll back ZFS datasets, or start containers. The operator runs those commands explicitly from this runbook.
 
 ## Go/No-Go Rules
@@ -133,10 +135,7 @@ sudo systemctl stop \
   trading-jobs.service \
   trading-stream-prices.service \
   trading-ingest.service \
-  trading-prod-preflight.service \
-  trading-operator.service \
-  trading-engine.service \
-  trading-upgrade.service
+  trading-prod-preflight.service
 ```
 
 4. Stop trading timers so no backup, snapshot, prune, or restore-drill job starts mid-upgrade:
@@ -148,8 +147,7 @@ sudo systemctl stop \
   trading-base-backup.timer \
   trading-backup-evidence.timer \
   trading-backup-prune.timer \
-  trading-restore-drill.timer \
-  trading-backup.timer
+  trading-restore-drill.timer
 ```
 
 5. Flush the database and stop data services:
@@ -159,6 +157,10 @@ docker compose \
   --env-file deploy/compose/.env \
   -f deploy/compose/docker-compose.external-services.yml \
   exec timescaledb sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -X -v ON_ERROR_STOP=1 -c "CHECKPOINT;" -c "SELECT pg_switch_wal();"'
+
+if systemctl list-unit-files pgbouncer.service --no-legend | grep -q '^pgbouncer\.service'; then
+  sudo systemctl stop pgbouncer.service
+fi
 
 docker compose \
   --env-file deploy/compose/.env \
@@ -251,6 +253,8 @@ Run backup evidence before starting trading runtime:
 
 ```bash
 sudo systemctl start \
+  trading-state-snapshot.timer \
+  trading-artifact-snapshot.timer \
   trading-base-backup.timer \
   trading-backup-evidence.timer \
   trading-backup-prune.timer \

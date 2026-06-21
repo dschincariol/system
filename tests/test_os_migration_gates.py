@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import stat
 import subprocess
 import sys
@@ -14,6 +15,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFLIGHT_PATH = REPO_ROOT / "ops" / "server" / "os_migration_preflight.py"
 POSTFLIGHT_PATH = REPO_ROOT / "ops" / "server" / "os_migration_postflight.py"
 RUNBOOK_PATH = REPO_ROOT / "docs" / "OS_MIGRATION_RUNBOOK.md"
+SYSTEMD_UNIT_DIR = REPO_ROOT / "ops" / "server" / "systemd"
+CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "validate.yml"
+RUNBOOK_UNIT_RE = re.compile(r"\b(?:trading|pgbouncer)[A-Za-z0-9_.@-]*\.(?:service|target|timer)\b")
+
+
+def shipped_systemd_units() -> set[str]:
+    return {
+        path.name
+        for path in SYSTEMD_UNIT_DIR.iterdir()
+        if path.is_file() and path.suffix in {".service", ".target", ".timer"}
+    }
 
 
 def load_module(path: Path, name: str):
@@ -145,6 +157,27 @@ class OSMigrationGateTests(unittest.TestCase):
             result = postflight.check_rocm(False, "gfx1151")
         self.assertEqual(result["status"], "PASS")
         self.assertIn("not required", result["detail"])
+
+    def test_preflight_systemd_inventory_matches_shipped_units(self) -> None:
+        preflight = load_module(PREFLIGHT_PATH, "os_migration_preflight_units_test")
+        shipped = shipped_systemd_units()
+        self.assertTrue(shipped)
+        self.assertEqual(set(preflight.TRADING_UNITS), shipped)
+
+    def test_postflight_backup_timers_are_shipped_timer_units(self) -> None:
+        postflight = load_module(POSTFLIGHT_PATH, "os_migration_postflight_timers_test")
+        shipped_timers = {unit for unit in shipped_systemd_units() if unit.endswith(".timer")}
+        self.assertTrue(set(postflight.BACKUP_TIMERS).issubset(shipped_timers))
+
+    def test_runbook_systemd_units_are_shipped_units(self) -> None:
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        referenced = set(RUNBOOK_UNIT_RE.findall(text))
+        missing = referenced - shipped_systemd_units()
+        self.assertFalse(missing, f"runbook references missing systemd units: {sorted(missing)}")
+
+    def test_ci_runs_os_migration_gate_tests(self) -> None:
+        workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("tests/test_os_migration_gates.py", workflow)
 
     def test_runbook_contains_required_operator_gates(self) -> None:
         text = RUNBOOK_PATH.read_text(encoding="utf-8")
