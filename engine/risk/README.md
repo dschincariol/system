@@ -55,6 +55,19 @@ Knob families (module-level constants read from `PORTFOLIO_RISK_*` env):
   (`USE_ALPHA_DECAY_THROTTLE`, `ALPHA_DECAY_FRESH_S`) that rescales per strategy
   from fresh `strategy_metrics`.
 
+Broker-bound defense in depth:
+
+- `engine.strategy.portfolio_risk_gate.apply_execution_risk_governor(...)` rechecks
+  gross and net caps on the final live execution payload before
+  `engine.execution.broker_router` can route to Alpaca, IBKR, or any other
+  broker adapter. This boundary check uses the shaped orders plus current
+  `broker_positions` and pending `broker_order_state` exposure, and blocks on
+  invalid exposure data rather than assuming zero exposure.
+- The execution-time gross cap is `EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP`, falling
+  back to `PORTFOLIO_RISK_MAX_GROSS` then `PORTFOLIO_GROSS_CAP`. The execution-time
+  net cap is `EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP`, falling back to
+  `PORTFOLIO_RISK_MAX_NET` then `PORTFOLIO_MAX_NET_EXPOSURE`.
+
 The Monte Carlo block knobs (`PORTFOLIO_RISK_MC_*`) and live-gating behavior are
 documented in the Monte Carlo sections below.
 
