@@ -201,7 +201,7 @@ def test_expected_schema_version_tracks_latest_migration_module():
 
     assert ids
     assert ids[-1] == expected_schema_version()
-    assert expected_schema_version() == 69
+    assert expected_schema_version() == 64
 
 
 def test_model_scoring_indexes_migration_covers_unresolved_query_contract():

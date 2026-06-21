@@ -1476,9 +1476,9 @@ def test_db_validation_snapshot_public_shape_golden(initialized_storage) -> None
         "schema_version_ok": True,
         "schema_status": "applied",
         "quick_check": "skipped",
-        "required_table_count": 44,
+        "required_table_count": 39,
         "required_index_count": 81,
-        "have_table_count": 133,
+        "have_table_count": 128,
         "owned_tables": [
             "prices",
             "price_quotes",

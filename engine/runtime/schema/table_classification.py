@@ -515,6 +515,12 @@ TABLE_CLASS["runtime_metrics"] = _h(
     write_rate="high",
     read_pattern="metric/time dashboard windows",
 )
+TABLE_CLASS["async_price_writer_spool"] = _r(
+    "bounded local SQLite WAL spool for async price-writer envelopes retained only until successful downstream commit",
+    write_rate="high",
+    read_pattern="oldest-first replay batch selection by created_ts_ms and id",
+    cleanup="delete-after-success; bounded by ASYNC_PRICE_WRITER_QUEUE_MAXSIZE and ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES",
+)
 
 _add(
     (

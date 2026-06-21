@@ -137,7 +137,7 @@ def test_nvidia_telemetry_requires_explicit_feature_flag(monkeypatch) -> None:
     assert nvidia_telemetry_enabled(_FakeTorch(available=True)) is True
 
 
-def test_amd_rocm_profile_is_reported_as_not_validated(monkeypatch) -> None:
+def test_amd_rocm_runtime_profile_requires_matching_dependency_profile(monkeypatch) -> None:
     monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
     monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "cpu")
     from engine.runtime.hardware import runtime_hardware_snapshot
@@ -145,7 +145,20 @@ def test_amd_rocm_profile_is_reported_as_not_validated(monkeypatch) -> None:
     snapshot = runtime_hardware_snapshot(_FakeTorch(available=False))
 
     assert snapshot["amd_profile_selected"] is True
-    assert snapshot["accelerator_profile_error"] == "amd_rocm_profile_not_validated"
+    assert snapshot["amd_dependency_profile_enabled"] is False
+    assert snapshot["accelerator_profile_error"] == "amd_rocm_runtime_requires_amd_rocm_dependency_profile"
+
+
+def test_amd_rocm_runtime_profile_is_valid_with_matching_dependency_profile(monkeypatch) -> None:
+    monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
+    monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime.hardware import runtime_hardware_snapshot
+
+    snapshot = runtime_hardware_snapshot(_FakeTorch(available=False))
+
+    assert snapshot["amd_profile_selected"] is True
+    assert snapshot["amd_dependency_profile_enabled"] is True
+    assert snapshot["accelerator_profile_error"] == ""
 
 
 def test_event_workers_do_not_default_to_cuda() -> None:

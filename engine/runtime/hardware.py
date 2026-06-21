@@ -38,6 +38,7 @@ DEFAULT_DEPENDENCY_PROFILE = "cpu"
 _NVIDIA_PROFILES = {"cuda", "nvidia", "nvidia-cuda", "nvidia_cuda"}
 _NVIDIA_DEPENDENCY_PROFILES = {"cuda", "nvidia", "nvidia-cuda", "nvidia_cuda"}
 _AMD_PROFILES = {"amd", "rocm", "amd-rocm", "amd_rocm"}
+_AMD_DEPENDENCY_PROFILES = {"amd", "rocm", "amd-rocm", "amd_rocm"}
 _WARNED_LOG_KEYS: set[str] = set()
 
 
@@ -106,14 +107,18 @@ def nvidia_dependency_profile_enabled() -> bool:
 
 
 def amd_profile_selected() -> bool:
-    return runtime_hardware_profile() in _AMD_PROFILES or runtime_dependency_profile() in _AMD_PROFILES
+    return runtime_hardware_profile() in _AMD_PROFILES or runtime_dependency_profile() in _AMD_DEPENDENCY_PROFILES
+
+
+def amd_dependency_profile_enabled() -> bool:
+    return runtime_dependency_profile() in _AMD_DEPENDENCY_PROFILES
 
 
 def accelerator_profile_error() -> str:
     hardware_profile = runtime_hardware_profile()
     dependency_profile = runtime_dependency_profile()
-    if hardware_profile in _AMD_PROFILES or dependency_profile in _AMD_PROFILES:
-        return "amd_rocm_profile_not_validated"
+    if hardware_profile in _AMD_PROFILES and dependency_profile not in _AMD_DEPENDENCY_PROFILES:
+        return "amd_rocm_runtime_requires_amd_rocm_dependency_profile"
     if hardware_profile in _NVIDIA_PROFILES and dependency_profile not in _NVIDIA_DEPENDENCY_PROFILES:
         return "nvidia_runtime_requires_nvidia_dependency_profile"
     return ""
@@ -307,6 +312,7 @@ def runtime_hardware_snapshot(torch_module: Any | None = None) -> dict[str, Any]
                 "cuda_available": False,
                 "nvidia_profile_enabled": nvidia_profile_enabled(),
                 "nvidia_dependency_profile_enabled": nvidia_dependency_profile_enabled(),
+                "amd_dependency_profile_enabled": amd_dependency_profile_enabled(),
                 "nvidia_telemetry_enabled": False,
                 "amd_profile_selected": amd_profile_selected(),
                 "disabled_accelerator_reason": "torch_unavailable",
@@ -357,6 +363,7 @@ def runtime_hardware_snapshot(torch_module: Any | None = None) -> dict[str, Any]
         "cuda_available": torch_cuda_available(torch_module),
         "nvidia_profile_enabled": nvidia_profile_enabled(),
         "nvidia_dependency_profile_enabled": nvidia_dependency_profile_enabled(),
+        "amd_dependency_profile_enabled": amd_dependency_profile_enabled(),
         "nvidia_telemetry_enabled": nvidia_telemetry_enabled(torch_module),
         "amd_profile_selected": amd_profile_selected(),
         "disabled_accelerator_reason": ",".join(reasons),
