@@ -6,8 +6,6 @@ import inspect
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 import engine.runtime.health as health
 
 

@@ -16,12 +16,10 @@ import os
 import time
 import json
 import copy
-import logging
 import threading
 from collections import Counter
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Any, Iterable, List, Optional
+from typing import Dict, Any, Iterable, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.hardware import runtime_hardware_snapshot
@@ -3881,10 +3879,11 @@ _HEALTH_SNAPSHOT_CHECKS: tuple[HealthSnapshotCheck, ...] = (
 
 
 def _build_health_snapshot_context(con: Any, now_ms: int) -> HealthSnapshotContext:
-    return HealthSnapshotContext(
-        con=con,
-        now_ms=now_ms,
-        out=_new_health_snapshot_payload(now_ms),
+    return _health_build_snapshot_context(
+        con,
+        now_ms,
+        db_path=Path(DB_PATH),
+        warn=_warn,
     )
 
 
@@ -4343,6 +4342,15 @@ def get_readiness_snapshot(
     system_state: Optional[Dict[str, Any]] = None,
     graph: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    return _health_get_readiness_snapshot(
+        health=health,
+        preflight=preflight,
+        system_state=system_state,
+        graph=graph,
+        environ=os.environ,
+        live_state=_LIVE,
+    )
+
     ts_ms = int(time.time() * 1000)
 
     health = dict(health or {})
