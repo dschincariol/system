@@ -32,9 +32,10 @@ The repo uses a supervised competition model rather than blindly serving the lat
 
 1. challengers first accumulate shadow evidence through [challenger_runtime.py](challenger_runtime.py) and [model_marketplace.py](model_marketplace.py)
 2. replay validation and self-critic checks decide whether a challenger is even eligible
-3. [champion_manager.py](champion_manager.py) compares the current champion and best challenger by score, observation window, replay approval, cooldowns, deconfounded signal evidence, and degradation rules. The same promotion eligibility helper gates both symbol/horizon assignments and the aggregate `MODEL_COMPETITION_SCOPE` champion, so a global best model cannot bypass replay freshness, replay approval, or self-critic blocked keys.
-4. [engine/model_registry.py](../model_registry.py) and champion assignment tables hold the durable promotion state
-5. [predictor.py](predictor.py) asks those assignments which model should serve live
+3. [model_competition/repository.py](model_competition/repository.py) is the write boundary for `model_marketplace_scores` and `champion_assignments`; marketplace scoring, iTransformer shadow visibility, and champion promotion all mutate those tables through the same repository.
+4. [champion_manager.py](champion_manager.py) compares the current champion and best challenger by score, observation window, replay approval, cooldowns, deconfounded signal evidence, and degradation rules. The same promotion eligibility helper gates both symbol/horizon assignments and the aggregate `MODEL_COMPETITION_SCOPE` champion, so a global best model cannot bypass replay freshness, replay approval, or self-critic blocked keys. The cached statistical promotion-gate orchestration lives in [model_competition/promotion_gate.py](model_competition/promotion_gate.py).
+5. [engine/model_registry.py](../model_registry.py) and champion assignment tables hold the durable promotion state
+6. [predictor.py](predictor.py) asks those assignments which model should serve live
 
 Strategy-stage promotion follows the same governance principle. Portfolio shadow
 outperformance records a `strategy_promotion_candidates` row through
@@ -49,9 +50,9 @@ system promotion-guard/cooldown approval, and promotion audit persistence.
 - [model_v2.py](model_v2.py)
   Core model logic and regime-aware helpers.
 - [predict.py](predict.py)
-  Prediction entrypoints.
+  Thin command-line shim (~945 bytes) for manual inspection: it trains lightweight relevance stats from labels and prints them for quick local sanity checks. It is NOT a core prediction module; the live prediction path is [predictor.py](predictor.py).
 - [predictor.py](predictor.py)
-  Predictor orchestration and related model use.
+  Live prediction orchestrator and model routing. Resolves which model family should serve a symbol and horizon (consulting champion assignments), restores the feature contract recorded at training time, runs the appropriate model adapter, and falls back to safer baseline logic when a newer family is missing or not ready.
 - [validation.py](validation.py)
   Validation routines and metrics logic.
 - [decision_snapshot.py](decision_snapshot.py)
@@ -72,6 +73,10 @@ system promotion-guard/cooldown approval, and promotion audit persistence.
   Read-side learning signal extraction and dataset snapshots used by lifecycle decisions.
 - [champion_manager.py](champion_manager.py)
   Champion/challenger coordination helpers that bridge registry state to promotion decisions.
+- [model_competition/repository.py](model_competition/repository.py)
+  Shared model competition repository for marketplace-score and champion-assignment writes.
+- [model_competition/promotion_gate.py](model_competition/promotion_gate.py)
+  Testable cached evaluator for statistical promotion-gate decisions and legacy hypothesis audit queuing.
 - [portfolio_execution_intents.py](portfolio_execution_intents.py)
   Canonical portfolio-to-execution intent shaping used before broker-side policy takes over.
 - [compute_social_regime.py](compute_social_regime.py)
@@ -100,6 +105,16 @@ system promotion-guard/cooldown approval, and promotion audit persistence.
   Explanation payload builder for live and offline model diagnostics.
 - [black_litterman.py](black_litterman.py) and [hrp_allocator.py](hrp_allocator.py)
   Portfolio-construction helpers for blending model views with covariance-aware risk allocation.
+- [portfolio.py](portfolio.py)
+  Core portfolio-construction layer (intent only, no broker routing). Reads quality-gated alerts and current state and produces target weights and rebalance order intents, applying the max-position cap (`PORTFOLIO_MAX_POSITIONS`, default 3), anti-flip-flop minimum hold time before reversing (`PORTFOLIO_MIN_HOLD_S`, default 30 min), capital allocation/optimization (including HRP allocation), and the portfolio risk gate.
+- [model_marketplace.py](model_marketplace.py)
+  Champion/challenger marketplace scoring and shadow-evidence utilities. Records challenger shadow orders, converts their outcomes into comparable scores, validates candidates against replay data and self-critic checks, computes the capital plan, and publishes ranking/capital-allocation snapshots consumed by governance and operator surfaces.
+- [model_feature_snapshots.py](model_feature_snapshots.py)
+  Canonical per-symbol point-in-time feature-snapshot persistence for train/serve parity and backtesting replay. Builds, materializes, stores, backfills, loads, and validates the snapshots under PIT controls so training, live inference, and replay see the same feature vectors.
+- [promotion_guard.py](promotion_guard.py)
+  Final promotion gate. `assess_challenger` blocks or allows a candidate based on runtime safety, drift, alerts, and evaluation-quality thresholds, layering statistical, CPCV, deconfounded, net-cost-evidence, and position-reconcile checks before a model is treated as promotion-eligible.
+- [feature_registry.py](feature_registry.py)
+  Schema-driven feature catalog and resolution for train/serve parity. Owns the registered `feature_ids`, feature groups, base/default serving schema, and shadow/opt-in stages, and canonicalizes feature-id order so training and online inference receive the same deterministic feature vector.
 
 ## Newer Model Families And Controls
 
@@ -142,6 +157,19 @@ The `jobs/` subdirectory contains long-running or one-shot strategy tasks such a
 - [jobs/train_hmm_regime.py](jobs/train_hmm_regime.py)
 - [jobs/drift_triggered_retrain.py](jobs/drift_triggered_retrain.py)
 - [jobs/alpha_discovery_loop.py](jobs/alpha_discovery_loop.py)
+
+## Subdirectories
+
+- [models/](models/)
+  Built-in model families and ensemble-capable wrappers. Current families include the GBM ([models/gbm_model.py](models/gbm_model.py)), LightGBM regressor and ranker ([models/lgbm_regressor.py](models/lgbm_regressor.py), [models/lgbm_ranker.py](models/lgbm_ranker.py)), XGBoost ([models/xgb_regressor.py](models/xgb_regressor.py)), PatchTST ([models/patchtst.py](models/patchtst.py)), iTransformer ([models/itransformer.py](models/itransformer.py)), online ([models/online_model.py](models/online_model.py)), and baseline/conservative fallbacks, all over a shared [models/base_model.py](models/base_model.py).
+- [ensemble/](ensemble/)
+  Stacked ensemble utilities for production prediction blending, including the Ridge meta-learner [ensemble/ridge_meta.py](ensemble/ridge_meta.py), the blender ([ensemble/blender.py](ensemble/blender.py)), hedge blending ([ensemble/hedge.py](ensemble/hedge.py)), and the out-of-sample prediction store ([ensemble/oos_store.py](ensemble/oos_store.py)).
+- [statistics/](statistics/)
+  Statistical acceptance gates for feature and model promotion: multiple-testing ([statistics/multiple_testing.py](statistics/multiple_testing.py)), factor-threshold/Harvey-Liu-Zhu ([statistics/factor_threshold.py](statistics/factor_threshold.py)), and White reality-check ([statistics/reality_check.py](statistics/reality_check.py)) checks reproducible from recorded evidence.
+- [tuning/](tuning/)
+  Optuna-based HPO helpers: persistent study management ([tuning/study.py](tuning/study.py)), reusable objective builders ([tuning/objective.py](tuning/objective.py)), and the parameter-space catalog ([tuning/catalog.py](tuning/catalog.py)).
+- [discovery/](discovery/)
+  Automated factor-discovery engines over a shared framework ([discovery/base.py](discovery/base.py)): LLM-assisted hypothesis generation ([discovery/llm_factor_generator.py](discovery/llm_factor_generator.py)), PySR symbolic discovery ([discovery/pysr_discoverer.py](discovery/pysr_discoverer.py)), and tsfresh-based discovery ([discovery/tsfresh_discoverer.py](discovery/tsfresh_discoverer.py)). The LLM is only a bounded hypothesis generator with no order-path access.
 
 ## Maintenance Guidance
 

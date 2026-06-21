@@ -24,16 +24,47 @@ else
 fi
 
 for service in "${UNIT_DIR}"/*.service; do
-  grep -q '^Restart=on-failure$' "${service}" || {
-    echo "${service}: missing Restart=on-failure" >&2
-    exit 1
-  }
+  if [ "$(basename "${service}")" = "trading-backup-evidence.service" ]; then
+    grep -q '^Restart=no$' "${service}" || {
+      echo "${service}: backup evidence gate must fail instead of auto-restarting" >&2
+      exit 1
+    }
+  else
+    grep -q '^Restart=on-failure$' "${service}" || {
+      echo "${service}: missing Restart=on-failure" >&2
+      exit 1
+    }
+  fi
   grep -q '^NoNewPrivileges=true$' "${service}" || {
     echo "${service}: missing NoNewPrivileges=true" >&2
     exit 1
   }
   grep -q '^ProtectSystem=strict$' "${service}" || {
     echo "${service}: missing ProtectSystem=strict" >&2
+    exit 1
+  }
+done
+
+backup_evidence_service="${UNIT_DIR}/trading-backup-evidence.service"
+grep -q '^Type=oneshot$' "${backup_evidence_service}" || {
+  echo "${backup_evidence_service}: backup evidence gate must remain Type=oneshot" >&2
+  exit 1
+}
+grep -q '^TimeoutStartSec=8min$' "${backup_evidence_service}" || {
+  echo "${backup_evidence_service}: backup evidence gate must use the bounded 8min start timeout" >&2
+  exit 1
+}
+grep -q '^Restart=no$' "${backup_evidence_service}" || {
+  echo "${backup_evidence_service}: backup evidence gate must expose non-zero failures without restart loops" >&2
+  exit 1
+}
+for setting in \
+  TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=0 \
+  TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=0 \
+  TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0
+do
+  grep -q "^Environment=${setting}$" "${backup_evidence_service}" || {
+    echo "${backup_evidence_service}: missing Environment=${setting}" >&2
     exit 1
   }
 done

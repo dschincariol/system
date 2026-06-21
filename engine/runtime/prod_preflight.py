@@ -126,6 +126,25 @@ def _pg_password_env_present(user: str) -> bool:
     return False
 
 
+def _env_value_present(*names: str) -> bool:
+    return any(str(os.environ.get(name) or "").strip() for name in names)
+
+
+def _secret_ref_names(*names: str) -> List[str]:
+    return list(dict.fromkeys(str(os.environ.get(name) or "").strip() for name in names if str(os.environ.get(name) or "").strip()))
+
+
+def _pg_password_file_present(user: str) -> bool:
+    role = str(user or "ts_app").removeprefix("ts_").upper()
+    return _env_value_present(
+        "TS_PG_PASSWORD_FILE",
+        "TIMESCALE_PASSWORD_FILE",
+        f"TS_PG_PASSWORD_{role}_FILE",
+        f"TS_PG_{role}_PASSWORD_FILE",
+        "PGPASSWORD_FILE",
+    )
+
+
 def _required_pg_credential_names() -> List[str]:
     raw = str(
         os.environ.get("PROD_PREFLIGHT_REQUIRED_CREDENTIALS")
@@ -135,23 +154,35 @@ def _required_pg_credential_names() -> List[str]:
     if raw:
         return _split_names(raw)
 
-    configured_dsn = str(os.environ.get("TS_PG_DSN") or "").strip()
-    if configured_dsn and _PG_PASSWORD_RE.search(configured_dsn):
-        return []
-
+    names: List[str] = []
+    configured_dsn = str(os.environ.get("TS_PG_DSN") or os.environ.get("TIMESCALE_DSN") or "").strip()
     user = _dsn_user(configured_dsn)
-    if _pg_password_env_present(user):
-        return []
+    role = str(user or "ts_app").removeprefix("ts_").upper()
 
-    try:
-        from engine.runtime.platform import pg_password_secret_name
+    if not _pg_password_file_present(user):
+        secret_refs = _secret_ref_names(
+            "TS_PG_PASSWORD_SECRET",
+            "TIMESCALE_PASSWORD_SECRET",
+            f"TS_PG_PASSWORD_{role}_SECRET",
+            f"TS_PG_{role}_PASSWORD_SECRET",
+            "PGPASSWORD_SECRET",
+        )
+        if secret_refs:
+            names.extend(secret_refs)
+        else:
+            try:
+                from engine.runtime.platform import pg_password_secret_name
 
-        names = [str(pg_password_secret_name(user))]
-    except Exception:
-        names = ["pg_password_app"]
+                names.append(str(pg_password_secret_name(user)))
+            except Exception:
+                names.append("pg_password_app")
 
     if _env_truthy("PROD_PREFLIGHT_REQUIRE_MASTER_KEY") or _env_truthy("PREFLIGHT_REQUIRE_MASTER_KEY"):
-        names.append("master_key")
+        if _env_value_present("DATA_SOURCE_MASTER_KEY_FILE", "TRADING_MASTER_KEY_FILE"):
+            pass
+        else:
+            master_refs = _secret_ref_names("DATA_SOURCE_MASTER_KEY_SECRET", "TRADING_MASTER_KEY_SECRET")
+            names.extend(master_refs or ["master_key"])
     return list(dict.fromkeys(names))
 
 
@@ -199,7 +230,17 @@ def _production_provisioning_gate() -> Tuple[List[str], List[str], Dict[str, Any
 
     notes: List[str] = []
     errors: List[str] = []
-    snapshot: Dict[str, Any] = {"credentials": {}, "data_root": {}}
+    snapshot: Dict[str, Any] = {"credentials": {}, "data_root": {}, "secret_sources": {}}
+
+    try:
+        from engine.runtime.secret_sources import format_secret_source_policy_error, secret_source_policy_snapshot
+
+        secret_sources = dict(secret_source_policy_snapshot(validate_files=True) or {})
+        snapshot["secret_sources"] = secret_sources
+        if bool(secret_sources.get("required")) and not bool(secret_sources.get("ok")):
+            errors.append(format_secret_source_policy_error(secret_sources))
+    except Exception as exc:
+        errors.append(f"secret source policy validation failed: {type(exc).__name__}: {exc}")
 
     required_names = _required_pg_credential_names()
     try:
@@ -252,8 +293,8 @@ def _production_provisioning_gate() -> Tuple[List[str], List[str], Dict[str, Any
         elif provider == "plaintext":
             secret_dir_raw = str(os.environ.get("TS_DEV_SECRETS_DIR") or "").strip()
             credential_state["dev_secrets_dir"] = secret_dir_raw
-            if _env_truthy("PROD_PREFLIGHT_FORBID_PLAINTEXT_SECRETS", default=False):
-                errors.append("plaintext secrets provider forbidden by PROD_PREFLIGHT_FORBID_PLAINTEXT_SECRETS")
+            if not _env_truthy("PROD_PREFLIGHT_ALLOW_PLAINTEXT_SECRETS", default=False):
+                errors.append("plaintext secrets provider forbidden in production preflight")
             if not secret_dir_raw:
                 errors.append("plaintext credential directory missing: TS_DEV_SECRETS_DIR is unset")
             else:
@@ -271,10 +312,10 @@ def _production_provisioning_gate() -> Tuple[List[str], List[str], Dict[str, Any
         else:
             errors.append(
                 "unsupported secrets provider for production preflight: "
-                f"{provider}; expected systemd-creds or an inline TS_PG_DSN password"
+                f"{provider}; expected systemd-creds, explicit *_SECRET provider refs, or strict *_FILE credentials"
             )
     else:
-        credential_state["source"] = "inline_or_env_password"
+        credential_state["source"] = "file_or_secret_reference"
 
     try:
         data_root = _runtime_data_root()
@@ -317,7 +358,7 @@ def _production_provisioning_gate() -> Tuple[List[str], List[str], Dict[str, Any
         if validated_names:
             notes.append(f"credential source ok provider={provider} names={','.join(validated_names)}")
         else:
-            notes.append("credential source ok provider=inline_or_env_password")
+            notes.append("credential source ok provider=file_or_secret_reference")
         data_state = dict(snapshot.get("data_root") or {})
         notes.append(
             "runtime data root ok "
@@ -451,6 +492,7 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             live_env = dict(live_preflight.get("deployment_contract") or {})
             prelive_reconcile = dict(live_preflight.get("prelive_reconcile") or {})
             backup_restore_evidence = dict(live_preflight.get("backup_restore_evidence") or {})
+            clock_health = dict(live_preflight.get("clock_health") or {})
             execution_arming_audit = dict(live_preflight.get("execution_arming_audit") or {})
             live_ai_safety = dict(live_preflight.get("live_ai_safety") or {})
             lob_deeplob_shadow = dict(live_preflight.get("lob_deeplob_shadow") or {})
@@ -482,6 +524,12 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
                 classified_blockers.update(backup_blockers)
                 issues = "; ".join(backup_blockers)
                 errors.append(f"backup restore evidence invalid: {issues or backup_restore_evidence.get('reason')}")
+
+            if bool(clock_health.get("required")) and not bool(clock_health.get("ok")):
+                clock_blockers = [str(item) for item in list(clock_health.get("blockers") or [])]
+                classified_blockers.update(clock_blockers)
+                issues = "; ".join(clock_blockers)
+                errors.append(f"clock health invalid: {issues or clock_health.get('reason')}")
 
             if bool(execution_arming_audit.get("required")) and not bool(execution_arming_audit.get("ok")):
                 arming_blockers = [str(item) for item in list(execution_arming_audit.get("blockers") or [])]
@@ -526,6 +574,7 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
                     f"chain={','.join(str(item) for item in list(broker_contract.get('chain') or []))} "
                     f"initial_kill_switch_armed={int(bool(initial_hold.get('armed')))} "
                     f"execution_arming_audited={int(bool(arming_audit.get('ok')))} "
+                    f"clock_health={int(bool(clock_health.get('ok', True)))} "
                     f"live_ai_safety={int(bool(live_ai_safety.get('ok')))}"
                 )
     except ConfigError as e:
@@ -694,6 +743,73 @@ def _postgres_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, 
         if effective_settings:
             notes.append(f"postgres effective settings ok count={len(effective_settings)}")
     return notes, warnings, errors, snapshot
+
+
+def _wal_archiver_runtime_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.backup_evidence import wal_archiver_runtime_snapshot
+
+        state = dict(wal_archiver_runtime_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe")) or {})
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_WAL_ARCHIVER_RUNTIME_FAILED",
+            exc,
+            once_key="wal_archiver_runtime_gate",
+        )
+        return [], [], [f"wal archiver runtime validation failed: {type(exc).__name__}: {exc}"], {}
+
+    warnings.extend(str(item) for item in list(state.get("warnings") or []))
+    if not bool(state.get("ok")) and bool(state.get("required")):
+        blockers = ",".join(str(item) for item in list(state.get("blockers") or []))
+        errors.append(f"wal archiver runtime invalid: {blockers or state.get('reason') or 'unknown'}")
+    elif bool(state.get("ok")) and not bool(state.get("skipped")):
+        notes.append(
+            "wal archiver runtime ok "
+            f"archive_mode={state.get('archive_mode')} "
+            f"last_archived_wal={state.get('last_archived_wal')} "
+            f"age_s={state.get('age_s')} "
+            f"failed_count={state.get('failed_count')}"
+        )
+    elif bool(state.get("skipped")):
+        notes.append("wal archiver runtime not required")
+    return notes, warnings, errors, state
+
+
+def _pg_wal_disk_risk_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.backup_evidence import pg_wal_disk_risk_snapshot
+
+        state = dict(pg_wal_disk_risk_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe")) or {})
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_PG_WAL_DISK_RISK_FAILED",
+            exc,
+            once_key="pg_wal_disk_risk_gate",
+        )
+        return [], [], [f"pg_wal disk risk validation failed: {type(exc).__name__}: {exc}"], {}
+
+    warnings.extend(str(item) for item in list(state.get("warnings") or []))
+    if not bool(state.get("ok")) and bool(state.get("required")):
+        blockers = ",".join(str(item) for item in list(state.get("blockers") or []))
+        errors.append(f"pg_wal disk risk invalid: {blockers or state.get('reason') or 'unknown'}")
+    elif bool(state.get("ok")) and not bool(state.get("skipped")):
+        local_space = dict(state.get("local_space") or {})
+        notes.append(
+            "pg_wal disk risk ok "
+            f"wal_bytes={state.get('wal_bytes')} "
+            f"wal_files={state.get('wal_files')} "
+            f"ready_count={state.get('ready_count')} "
+            f"free_bytes={local_space.get('free_bytes')}"
+        )
+    elif bool(state.get("skipped")):
+        notes.append("pg_wal disk risk not required")
+    return notes, warnings, errors, state
 
 
 def _ingestion_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
@@ -888,6 +1004,38 @@ def _operator_sidecar_security_gate() -> Tuple[List[str], List[str], List[str], 
         snapshot["unauthenticated_sensitive_get"] = {"checked": False, "reason": "disabled"}
 
     return notes, warnings, errors, snapshot
+
+
+def _network_exposure_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.live_trading_preflight import public_network_exposure_snapshot
+
+        state = dict(public_network_exposure_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe")) or {})
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_NETWORK_EXPOSURE_FAILED",
+            exc,
+            once_key="network_exposure_gate",
+        )
+        return [], [], [f"network exposure validation failed: {type(exc).__name__}: {exc}"], {}
+
+    public_services = [str(item) for item in list(state.get("public_services") or []) if str(item).strip()]
+    if bool(state.get("required")) and not bool(state.get("ok")):
+        blockers = ",".join(str(item) for item in list(state.get("blockers") or []))
+        errors.append(f"network exposure invalid: {blockers or state.get('reason') or 'unknown'}")
+    elif public_services:
+        ack = dict(state.get("ack") or {})
+        notes.append(
+            "network exposure approved "
+            f"services={','.join(public_services)} "
+            f"owner={ack.get('owner') or ''}"
+        )
+    else:
+        notes.append("network exposure ok public_services=0")
+    return notes, warnings, errors, state
 
 
 def _ensure_schemas() -> List[str]:
@@ -1092,6 +1240,27 @@ def _resource_isolation_gate() -> Tuple[List[str], List[str], Dict[str, Any]]:
     )
 
 
+def _storage_placement_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    try:
+        from engine.runtime.storage_placement import check_storage_placement
+
+        summary = dict(check_storage_placement() or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_STORAGE_PLACEMENT_FAILED",
+            e,
+            once_key="storage_placement_gate",
+        )
+        return [], [], [f"storage placement validation failed: {type(e).__name__}: {e}"], {}
+
+    return (
+        list(summary.get("notes") or []),
+        list(summary.get("warnings") or []),
+        list(summary.get("errors") or []),
+        summary,
+    )
+
+
 def _backup_restore_evidence_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
     notes: List[str] = []
     warnings: List[str] = []
@@ -1179,7 +1348,9 @@ def _disk_pressure_gate() -> Tuple[List[str], List[str], List[str], Dict[str, An
         from engine.runtime.platform import (
             default_backup_root_dir,
             default_container_runtime_roots,
+            default_wal_backup_dir,
         )
+        from engine.runtime.storage_placement import storage_pressure_paths
 
         candidate_paths: list[tuple[str, Path]] = [
             ("root", Path("/")),
@@ -1196,7 +1367,12 @@ def _disk_pressure_gate() -> Tuple[List[str], List[str], List[str], Dict[str, An
                     or default_backup_root_dir()
                 ),
             ),
+            (
+                "backup_wal",
+                Path(os.environ.get("TRADING_BACKUP_WAL_DIR") or default_wal_backup_dir()),
+            ),
         ]
+        candidate_paths.extend(storage_pressure_paths(os.environ))
         docker_paths_raw = str(
             os.environ.get("DISK_PRESSURE_DOCKER_PATHS")
             or ",".join(default_container_runtime_roots())
@@ -1546,12 +1722,16 @@ def main() -> int:
         "external_services": [],
         "backup_restore_evidence": {},
         "disk_pressure": {},
+        "storage_placement": {},
         "lob_deeplob_shadow": {},
         "resource_isolation": {},
         "provisioning": {},
         "postgres_tuning": {},
+        "wal_archiver_runtime": {},
+        "pg_wal_disk_risk": {},
         "ingestion_tuning": {},
         "operator_sidecar_security": {},
+        "network_exposure": {},
         "capital_equity_freshness": {},
     }
 
@@ -1582,6 +1762,19 @@ def main() -> int:
                 print("[disk]", error)
         return 3
 
+    storage_notes, storage_warnings, storage_errors, storage_placement = _storage_placement_gate()
+    result["steps"].extend(storage_notes)
+    result["warnings"].extend(storage_warnings)
+    result["storage_placement"] = dict(storage_placement or {})
+    if storage_errors:
+        result["errors"].extend(storage_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in storage_errors:
+                print("[storage]", error)
+        return 3
+
     tuning_notes, tuning_warnings, tuning_errors, postgres_tuning = _postgres_tuning_gate()
     result["steps"].extend(tuning_notes)
     result["warnings"].extend(tuning_warnings)
@@ -1593,6 +1786,32 @@ def main() -> int:
         else:
             for error in tuning_errors:
                 print("[postgres-tuning]", error)
+        return 3
+
+    wal_archiver_notes, wal_archiver_warnings, wal_archiver_errors, wal_archiver_runtime = _wal_archiver_runtime_gate()
+    result["steps"].extend(wal_archiver_notes)
+    result["warnings"].extend(wal_archiver_warnings)
+    result["wal_archiver_runtime"] = dict(wal_archiver_runtime or {})
+    if wal_archiver_errors:
+        result["errors"].extend(wal_archiver_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in wal_archiver_errors:
+                print("[wal-archiver]", error)
+        return 3
+
+    pg_wal_notes, pg_wal_warnings, pg_wal_errors, pg_wal_disk_risk = _pg_wal_disk_risk_gate()
+    result["steps"].extend(pg_wal_notes)
+    result["warnings"].extend(pg_wal_warnings)
+    result["pg_wal_disk_risk"] = dict(pg_wal_disk_risk or {})
+    if pg_wal_errors:
+        result["errors"].extend(pg_wal_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in pg_wal_errors:
+                print("[pg-wal]", error)
         return 3
 
     ingestion_tuning_notes, ingestion_tuning_warnings, ingestion_tuning_errors, ingestion_tuning = _ingestion_tuning_gate()
@@ -1641,6 +1860,19 @@ def main() -> int:
         else:
             for error in sidecar_errors:
                 print("[operator-sidecar]", error)
+        return 3
+
+    exposure_notes, exposure_warnings, exposure_errors, network_exposure = _network_exposure_gate()
+    result["steps"].extend(exposure_notes)
+    result["warnings"].extend(exposure_warnings)
+    result["network_exposure"] = dict(network_exposure or {})
+    if exposure_errors:
+        result["errors"].extend(exposure_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in exposure_errors:
+                print("[network-exposure]", error)
         return 3
 
     resource_notes, resource_warnings, resource_isolation = _resource_isolation_gate()

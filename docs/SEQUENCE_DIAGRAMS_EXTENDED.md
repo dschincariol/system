@@ -11,6 +11,7 @@ sequenceDiagram
     participant DS as services.data_source_manager
     participant Life as engine.runtime.lifecycle_state
     participant Dash as dashboard_server.py
+    participant Repair as engine.api.api_self_repair
     participant Sup as engine.runtime.supervisor
     participant Orch as engine.runtime.startup_orchestrator
     participant IngEntry as start_ingestion.py
@@ -32,7 +33,7 @@ sequenceDiagram
     Dash->>Dash: start lifecycle monitor, model scoring, auto_rollback_loop
     Dash->>Dash: run bounded preflight
     alt preflight failed
-        Dash->>Dash: api_post_self_repair()
+        Dash->>Repair: api_post_self_repair()
     end
     Dash->>Sup: validate_graph()
     Dash->>Sup: auto-boot daemon jobs when configured
@@ -161,6 +162,7 @@ sequenceDiagram
     participant Op as boot/operator_server.js
     participant Dash as dashboard_server.py
     participant Ops as engine.api.api_operator_handlers
+    participant Repair as engine.api.api_self_repair
     participant Jobs as JobsManager
     participant Safety as kill_switch and execution_mode
 
@@ -180,7 +182,7 @@ sequenceDiagram
 
     Operator->>Dash: POST /api/operator/autofix
     Dash->>Ops: api_post_operator_autofix()
-    Ops->>Dash: api_post_repair_schema(...)
+    Ops->>Repair: api_post_repair_schema(...)
     Ops->>Jobs: restart feed jobs
     Ops-->>Operator: {ok, steps:[repair_schema, restart_feeds]}
 

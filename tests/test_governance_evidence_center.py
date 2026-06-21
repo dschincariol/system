@@ -18,6 +18,15 @@ def _connect() -> sqlite3.Connection:
     return sqlite3.connect(":memory:")
 
 
+def _configure_dashboard_token_file(monkeypatch, tmp_path: Path) -> None:
+    token_file = tmp_path / "dashboard_api_token"
+    token_file.write_text("dashboard-governance-test-token-1234567890", encoding="utf-8")
+    token_file.chmod(0o600)
+    monkeypatch.delenv("DASHBOARD_API_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_API_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("TRADING_SECRET_POLICY_REPO_ROOT", str(tmp_path))
+
+
 def _patch_monitoring(monkeypatch, *, now_ms: int) -> None:
     from engine.strategy import production_monitoring
 
@@ -209,7 +218,7 @@ def test_generated_candidate_provenance_returns_exact_blockers():
     assert "ledger_decision_not_passing" in payload["blockers"][0]["blockers"]
 
 
-def test_shadow_capital_payload_is_registered_and_masks_sensitive_components(monkeypatch):
+def test_shadow_capital_payload_is_registered_and_masks_sensitive_components(monkeypatch, tmp_path):
     from engine.api.governance_evidence import build_shadow_capital_evidence
 
     now_ms = int(time.time() * 1000)
@@ -271,6 +280,7 @@ def test_shadow_capital_payload_is_registered_and_masks_sensitive_components(mon
     monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
     monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
     monkeypatch.setenv("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
+    _configure_dashboard_token_file(monkeypatch, tmp_path)
     dashboard_server = importlib.import_module("dashboard_server")
     route_index = {(str(route["method"]), str(route["path"])): route for route in dashboard_server.ROUTE_SPECS}
     for path in (

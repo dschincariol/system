@@ -1,6 +1,12 @@
 # Database Schema
 
+Last verified against code: 2026-06-21
+
 This document records the production Postgres 16 + TimescaleDB 2.x schema classification. `engine/runtime/schema/table_classification.py` is the importable source of truth; this document is the human review record. New tables must be added there and here before shipping.
+
+This document is the authoritative, complete table register, kept in lockstep with `engine/runtime/schema/table_classification.py`. The curated, human-readable data-flow view is [README_DATABASE_MAP.md](README_DATABASE_MAP.md), which is a subset and does not replace this register.
+
+The register here documents more than raw base tables: it also includes continuous-aggregate views (see [Continuous Aggregates](#continuous-aggregates)) and segment-level / column-level notes (segment keys, time columns, and index plans). Its entry count is therefore expected to be larger than a raw `pg_class` table count. It reconciles with `engine/runtime/schema/table_classification.py`, which classifies every entry as either a `Hypertable` (with its `segmentby` segment keys, time column, and chunk/compression/retention) or a `Regular` table; continuous aggregates/views are documented here and in migration `0004_continuous_aggregates.py` rather than in that dict.
 
 ## Migration Scope
 

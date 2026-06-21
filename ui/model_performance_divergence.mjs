@@ -68,6 +68,86 @@ function _pointTime(point) {
   return ts !== null && ts > 0 ? ts : null;
 }
 
+const STATUS_RANK = {
+  diverged: 4,
+  watch: 3,
+  ok: 2,
+  partial: 1,
+  incomplete: 0,
+};
+
+const PRODUCT_IMPORTANCE_RANK = {
+  return: 100,
+  net_pnl_degradation: 95,
+  shadow_live_disagreement: 90,
+  hit_rate: 85,
+  calibration_ece: 80,
+  conformal_coverage: 75,
+  slippage_bps: 70,
+  fill_rate: 65,
+  prediction_drift: 55,
+  target_label_drift: 50,
+  feature_drift: 45,
+  missing_feature_rate: 40,
+};
+
+function _statusRank(status) {
+  const state = String(status || "incomplete").toLowerCase();
+  return STATUS_RANK[state] ?? 0;
+}
+
+function _productImportance(row) {
+  const key = String(row && row.key || "").toLowerCase();
+  return PRODUCT_IMPORTANCE_RANK[key] ?? 10;
+}
+
+function _deltaRank(row) {
+  const delta = _num(row && row.deltaValue);
+  if (delta == null) return 0;
+  const unit = String(row && row.unit || "");
+  if (unit === "pct") return Math.abs(delta) * 100;
+  return Math.abs(delta);
+}
+
+function _freshnessRank(row) {
+  const times = [
+    row && row.expectedTime,
+    row && row.shadowTime,
+    row && row.realizedTime,
+  ].filter((value) => Number.isFinite(value) && value > 0);
+  return times.length ? Math.max(...times) : 0;
+}
+
+function _chartPointsForRow(row) {
+  if (!row || typeof row !== "object") return [];
+  return [
+    { label: "Expected/backtest", value: row.expectedValue, source: row.expectedSource, time: row.expectedTime },
+    { label: "Shadow", value: row.shadowValue, source: row.shadowSource, time: row.shadowTime },
+    { label: "Live realized", value: row.realizedValue, source: row.realizedSource, time: row.realizedTime },
+  ].filter((point) => Number.isFinite(point.value));
+}
+
+function _rankedChartEntries(rows) {
+  return rows
+    .map((row, index) => ({
+      row,
+      index,
+      points: _chartPointsForRow(row),
+      severity: _statusRank(row && row.status),
+      delta: _deltaRank(row),
+      freshness: _freshnessRank(row),
+      importance: _productImportance(row),
+    }))
+    .filter((entry) => entry.points.length >= 2)
+    .sort((a, b) => (
+      b.severity - a.severity
+      || b.delta - a.delta
+      || b.freshness - a.freshness
+      || b.importance - a.importance
+      || a.index - b.index
+    ));
+}
+
 function _missingDetails(payload, rows) {
   const missing = Array.isArray(payload && payload.missing_sources)
     ? payload.missing_sources.map(String).filter(Boolean)
@@ -78,45 +158,44 @@ function _missingDetails(payload, rows) {
   return [...missing.map((name) => `Missing source: ${name}`), ...metricMissing];
 }
 
-function _chartSeries(rows) {
-  for (const row of rows) {
-    const points = [
-      { label: "Expected/backtest", value: row.expectedValue, source: row.expectedSource, time: row.expectedTime },
-      { label: "Shadow", value: row.shadowValue, source: row.shadowSource, time: row.shadowTime },
-      { label: "Live realized", value: row.realizedValue, source: row.realizedSource, time: row.realizedTime },
-    ].filter((point) => Number.isFinite(point.value));
-    if (points.length >= 2) {
-      return {
-        label: row.label,
-        unit: row.unit,
-        values: points.map((point) => point.value),
-        points,
-      };
-    }
+function _chartSeries(entry) {
+  if (entry && entry.row && Array.isArray(entry.points) && entry.points.length >= 2) {
+    return {
+      key: entry.row.key,
+      label: entry.row.label,
+      unit: entry.row.unit,
+      status: entry.row.status,
+      tone: entry.row.tone,
+      values: entry.points.map((point) => point.value),
+      points: entry.points,
+    };
   }
-  return { label: "Performance", unit: "", values: [], points: [] };
+  return { key: "", label: "Performance", unit: "", status: "incomplete", tone: "dim", values: [], points: [] };
 }
 
-export function buildPerformanceDivergenceViewModel(payload = {}) {
+export function buildPerformanceDivergenceViewModel(payload = {}, options = {}) {
   const safe = payload && typeof payload === "object" ? payload : {};
+  const opts = options && typeof options === "object" ? options : {};
   const selection = safe.selection && typeof safe.selection === "object" ? safe.selection : {};
   const status = safe.status && typeof safe.status === "object" ? safe.status : {};
   const comparisons = Array.isArray(safe.comparisons) ? safe.comparisons : [];
 
-  const rows = comparisons.map((item) => {
+  const rows = comparisons.map((item, index) => {
     const row = item && typeof item === "object" ? item : {};
     const expected = row.expected && typeof row.expected === "object" ? row.expected : null;
     const shadow = row.shadow && typeof row.shadow === "object" ? row.shadow : null;
     const realized = row.realized && typeof row.realized === "object" ? row.realized : null;
     const unit = String(row.unit || "");
+    const key = String(row.key || row.label || `metric_${index}`);
     return {
-      key: String(row.key || ""),
+      key,
       label: String(row.label || row.key || "Metric"),
       unit,
       expectedText: _fmtValue(expected, unit),
       shadowText: _fmtValue(shadow, unit),
       realizedText: _fmtValue(realized, unit),
       deltaText: _fmtDelta(row.delta, unit),
+      deltaValue: _num(row.delta),
       expectedSource: _sourceText(expected),
       shadowSource: _sourceText(shadow),
       realizedSource: _sourceText(realized),
@@ -139,6 +218,28 @@ export function buildPerformanceDivergenceViewModel(payload = {}) {
     : model || strategy || "No model or strategy selected";
   const state = String(status.state || (safe.ok === false ? "error" : "incomplete")).toLowerCase();
   const missing = _missingDetails(safe, rows);
+  const chartEntries = _rankedChartEntries(rows);
+  const requestedMetricKey = String(opts.selectedMetricKey || safe.selected_metric_key || "").trim();
+  const selectedChartEntry = (
+    requestedMetricKey
+      ? chartEntries.find((entry) => entry.row.key === requestedMetricKey)
+      : null
+  ) || chartEntries[0] || null;
+  const selectedMetricKey = selectedChartEntry && selectedChartEntry.row ? selectedChartEntry.row.key : "";
+  const chartOptions = chartEntries.map((entry) => ({
+    key: entry.row.key,
+    label: entry.row.label,
+    status: entry.row.status,
+    tone: entry.row.tone,
+    deltaText: entry.row.deltaText,
+    rank: {
+      severity: entry.severity,
+      delta: entry.delta,
+      freshness: entry.freshness,
+      importance: entry.importance,
+    },
+    selected: entry.row.key === selectedMetricKey,
+  }));
 
   return {
     ok: safe.ok !== false,
@@ -149,7 +250,9 @@ export function buildPerformanceDivergenceViewModel(payload = {}) {
     updatedText: _fmtTime(status.ts_ms || safe.updated_ts_ms),
     rows,
     missing,
-    chart: _chartSeries(rows),
+    chart: _chartSeries(selectedChartEntry),
+    chartOptions,
+    selectedMetricKey,
   };
 }
 
@@ -163,6 +266,48 @@ function _setHtml(root, id, html) {
   const el = root && typeof root.getElementById === "function" ? root.getElementById(id) : null;
   if (el) el.innerHTML = html;
   return el;
+}
+
+function _currentMetricSelection(root) {
+  const el = root && typeof root.getElementById === "function"
+    ? root.getElementById("performanceDivergenceMetric")
+    : null;
+  return el && typeof el.value === "string" ? el.value : "";
+}
+
+function _chartStroke(status) {
+  const state = String(status || "incomplete").toLowerCase();
+  if (state === "diverged") return "#ff6b6b";
+  if (state === "watch") return "#d29922";
+  return "#58a6ff";
+}
+
+function _renderMetricSelector(root, payload, vm, renderLineChart) {
+  const select = root && typeof root.getElementById === "function"
+    ? root.getElementById("performanceDivergenceMetric")
+    : null;
+  const charted = _setText(
+    root,
+    "performanceDivergenceCharted",
+    vm.selectedMetricKey ? `chart ${vm.chart.label} / ${vm.chart.status}` : "chart -",
+  );
+  if (charted) charted.className = `pill ${vm.chart.tone || "dim"}`;
+  if (!select) return;
+
+  const options = Array.isArray(vm.chartOptions) ? vm.chartOptions : [];
+  select.innerHTML = options.length
+    ? options.map((option) => `
+      <option value="${_esc(option.key)}">${_esc(`${option.label} | ${option.status} | ${option.deltaText}`)}</option>
+    `).join("")
+    : `<option value="">No chartable metrics</option>`;
+  select.value = vm.selectedMetricKey || "";
+  select.disabled = options.length <= 1;
+  select.onchange = () => renderPerformanceDivergencePanel(
+    payload,
+    root,
+    renderLineChart,
+    { selectedMetricKey: String(select.value || "") },
+  );
 }
 
 function _renderChart(root, vm, renderLineChart) {
@@ -202,7 +347,7 @@ function _renderChart(root, vm, renderLineChart) {
       { label: "Source", value: (row) => row.raw && row.raw.source },
     ],
     emptyMessage: "No comparable performance data is available for the selected model.",
-    stroke: vm.state === "diverged" ? "#ff6b6b" : vm.state === "watch" ? "#d29922" : "#58a6ff",
+    stroke: _chartStroke(vm.chart.status || vm.state),
     fmtY: (value) => vm.chart.unit === "pct"
       ? `${(Number(value) * 100).toFixed(1)}%`
       : vm.chart.unit === "bps"
@@ -212,13 +357,18 @@ function _renderChart(root, vm, renderLineChart) {
   renderLineChart(canvas, values, opts);
 }
 
-export function renderPerformanceDivergencePanel(payload = {}, root = document, renderLineChart = null) {
-  const vm = buildPerformanceDivergenceViewModel(payload);
+export function renderPerformanceDivergencePanel(payload = {}, root = document, renderLineChart = null, options = {}) {
+  const opts = options && typeof options === "object" ? options : {};
+  const selectedMetricKey = Object.prototype.hasOwnProperty.call(opts, "selectedMetricKey")
+    ? String(opts.selectedMetricKey || "")
+    : _currentMetricSelection(root);
+  const vm = buildPerformanceDivergenceViewModel(payload, { selectedMetricKey });
   const meta = _setText(root, "performanceDivergenceMeta", vm.state);
   if (meta) meta.className = `pill ${vm.tone}`;
   _setText(root, "performanceDivergenceStatus", vm.reason);
   _setText(root, "performanceDivergenceUpdated", `updated ${vm.updatedText}`);
   _setText(root, "performanceDivergenceSelected", vm.selected);
+  _renderMetricSelector(root, payload, vm, renderLineChart);
 
   const rowsHtml = vm.rows.length
     ? vm.rows.map((row) => `

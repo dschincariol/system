@@ -86,6 +86,118 @@ console.log(JSON.stringify({
     assert "against cap" in by_id["drawdown"]["fallbackText"]
 
 
+def test_risk_headroom_uses_latest_timestamp_for_ascending_and_descending_history() -> None:
+    code = r"""
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.argv[1]).href);
+const rows = [
+  { ts_ms: 1000, gross: 0.20, net: 0.10, vol_proxy: 0.010, drawdown: 0.010 },
+  { ts_ms: 2000, gross: 0.40, net: 0.20, vol_proxy: 0.012, drawdown: 0.020 },
+  { ts_ms: 3000, gross: 0.95, net: -0.45, vol_proxy: 0.018, drawdown: 0.055 },
+];
+const build = (history) => mod.buildRiskHeadroomViewModel({
+  portfolioRisk: {
+    ok: true,
+    caps: { gross: 1.0, net: 0.60, drawdown: 0.06, vol_target: 0.02 },
+    history,
+  },
+});
+const asc = build(rows);
+const desc = build([...rows].reverse());
+const values = (vm) => Object.fromEntries(vm.bars.map((bar) => [bar.id, {
+  value: bar.value,
+  ratio: Number(bar.ratio.toFixed(4)),
+  tone: bar.tone,
+}]));
+console.log(JSON.stringify({
+  latestAsc: mod.latestRiskRow({ history: rows }),
+  latestDesc: mod.latestRiskRow({ history: [...rows].reverse() }),
+  asc: values(asc),
+  desc: values(desc),
+}));
+"""
+    parsed = _run_node(code, REPO_ROOT / "ui" / "bullet_bars.js")
+
+    assert parsed["latestAsc"]["ts_ms"] == 3000
+    assert parsed["latestDesc"]["ts_ms"] == 3000
+    assert parsed["asc"] == parsed["desc"]
+    assert parsed["asc"]["gross-exposure"]["value"] == 0.95
+    assert parsed["asc"]["net-exposure"]["value"] == -0.45
+    assert parsed["asc"]["vol-proxy"]["value"] == 0.018
+    assert parsed["asc"]["drawdown"]["value"] == 0.055
+
+
+def test_risk_headroom_bands_and_status_share_boundary_constants() -> None:
+    code = r"""
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.argv[1]).href);
+const thresholds = mod.RISK_HEADROOM_THRESHOLDS;
+const samples = [0.8499, thresholds.watchStart, 0.90, thresholds.cap, 1.0001];
+const bars = samples.map((ratio) => mod.buildBulletBarViewModel({
+  label: `ratio ${ratio}`,
+  value: ratio,
+  cap: 1.0,
+}));
+console.log(JSON.stringify({
+  thresholds,
+  defaultBands: mod.RISK_HEADROOM_BANDS,
+  samples: bars.map((bar) => ({
+    ratio: Number(bar.ratio.toFixed(4)),
+    tone: bar.tone,
+    statusWord: bar.statusWord,
+  })),
+}));
+"""
+    parsed = _run_node(
+        code,
+        REPO_ROOT / "ui" / "bullet_bars.js",
+    )
+
+    assert parsed["thresholds"]["watchStart"] == 0.85
+    assert parsed["thresholds"]["cap"] == 1.0
+    by_key = {row["key"]: row for row in parsed["defaultBands"]}
+    assert by_key["ok"]["end"] == parsed["thresholds"]["watchStart"]
+    assert by_key["watch"]["start"] == parsed["thresholds"]["watchStart"]
+    assert by_key["watch"]["end"] == parsed["thresholds"]["cap"]
+    assert by_key["over"]["start"] == parsed["thresholds"]["cap"]
+    assert [row["tone"] for row in parsed["samples"]] == ["ok", "watch", "watch", "watch", "over"]
+    assert [row["statusWord"] for row in parsed["samples"]] == ["OK", "Watch", "Watch", "Watch", "Over cap"]
+
+
+def test_risk_thresholds_caps_and_portfolio_drawdown_throttle_share_source() -> None:
+    code = r"""
+import { pathToFileURL } from "node:url";
+
+const bullet = await import(pathToFileURL(process.argv[1]).href);
+const shared = await import(pathToFileURL(process.argv[2]).href);
+const portfolio = await import(pathToFileURL(process.argv[3]).href);
+
+console.log(JSON.stringify({
+  sameCapsObject: bullet.DEFAULT_RISK_CAPS === shared.DEFAULT_RISK_CAPS,
+  sameBandsObject: bullet.RISK_HEADROOM_BANDS === shared.RISK_HEADROOM_BANDS,
+  sameThresholdsObject: bullet.RISK_HEADROOM_THRESHOLDS === shared.RISK_HEADROOM_THRESHOLDS,
+  caps: shared.DEFAULT_RISK_CAPS,
+  portfolioDrawdownThrottle: portfolio.PORTFOLIO_DRAWDOWN_THROTTLE,
+  overCapTone: bullet.classifyRiskHeadroomRatio(shared.RISK_HEADROOM_THRESHOLDS.cap + 0.001).tone,
+}));
+"""
+    parsed = _run_node(
+        code,
+        REPO_ROOT / "ui" / "bullet_bars.js",
+        REPO_ROOT / "ui" / "risk_headroom_thresholds.js",
+        REPO_ROOT / "ui" / "portfolio_backtest.js",
+    )
+
+    assert parsed["sameCapsObject"] is True
+    assert parsed["sameBandsObject"] is True
+    assert parsed["sameThresholdsObject"] is True
+    assert parsed["caps"] == {"gross": 1.0, "net": 0.6, "drawdown": 0.06, "vol": 0.02}
+    assert parsed["portfolioDrawdownThrottle"] == -parsed["caps"]["drawdown"]
+    assert parsed["overCapTone"] == "over"
+
+
 def test_bullet_bar_defaults_fail_gracefully_when_data_missing() -> None:
     code = r"""
 import { pathToFileURL } from "node:url";

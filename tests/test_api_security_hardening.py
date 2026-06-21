@@ -145,6 +145,11 @@ def test_production_import_refuses_unset_dashboard_token() -> None:
     env["PYTHONPATH"] = str(REPO_ROOT)
     env["TS_ENV"] = "production"
     env.pop("DASHBOARD_API_TOKEN", None)
+    env.pop("DASHBOARD_API_TOKEN_FILE", None)
+    env.pop("DASHBOARD_API_TOKEN_SECRET", None)
+    env.pop("TS_SECRETS_PROVIDER", None)
+    env.pop("CREDENTIALS_DIRECTORY", None)
+    env.pop("TS_DEV_SECRETS_DIR", None)
 
     result = subprocess.run(
         [sys.executable, "-c", "import engine.api.http_transport"],

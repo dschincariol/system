@@ -9,6 +9,7 @@ and engine instance.
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import subprocess
 import sys
@@ -63,7 +64,7 @@ def _run(label: str, args: list[str], env: dict[str, str]) -> None:
     print(f"\n=== {label} ===")
     print(" ".join(args))
     run_env = env
-    if label in {"unit-tests", "pytest-tests"}:
+    if label in {"pytest-collection", "pytest-tests"}:
         run_env = _unit_test_env(env)
     elif label == "runtime-graph-startup":
         run_env = _runtime_graph_startup_env(env)
@@ -142,6 +143,41 @@ def _runtime_graph_startup_env(env: dict[str, str]) -> dict[str, str]:
     return run_env
 
 
+def _scrub_unit_test_secret_env(env: dict[str, str]) -> None:
+    try:
+        from engine.runtime.secret_sources import SECRET_ENV_SPECS
+    except Exception:
+        secret_env_keys = (
+            "DASHBOARD_API_TOKEN",
+            "DASHBOARD_API_TOKEN_FILE",
+            "DASHBOARD_API_TOKEN_SECRET",
+            "TS_PG_DSN",
+            "TIMESCALE_DSN",
+            "TIMESCALE_PRICES_DSN",
+            "TS_PG_PASSWORD_FILE",
+            "TIMESCALE_PASSWORD_FILE",
+            "PGPASSWORD_FILE",
+            "OBJECT_STORE_ACCESS_KEY",
+            "OBJECT_STORE_SECRET_KEY",
+            "OBJECT_STORE_ACCESS_KEY_FILE",
+            "OBJECT_STORE_SECRET_KEY_FILE",
+            "MINIO_ACCESS_KEY",
+            "MINIO_SECRET_KEY",
+        )
+    else:
+        keys: set[str] = set()
+        for spec in SECRET_ENV_SPECS:
+            keys.add(str(spec.key))
+            keys.update(str(item) for item in spec.file_envs)
+            keys.update(str(item) for item in spec.secret_envs)
+        secret_env_keys = tuple(sorted(keys))
+
+    for key in secret_env_keys:
+        env.pop(str(key), None)
+    for key in ("TS_SECRETS_PROVIDER", "CREDENTIALS_DIRECTORY", "TS_DEV_SECRETS_DIR"):
+        env.pop(key, None)
+
+
 def _parse_simple_env_file(env_path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     try:
@@ -196,6 +232,23 @@ def _load_compose_live_defaults(env: dict[str, str]) -> None:
 
 def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
     run_env = dict(env)
+    _scrub_local_runtime_external_service_env(run_env)
+    _scrub_unit_test_secret_env(run_env)
+    test_tmp_root = Path(
+        run_env.get("TRADING_TEST_TMPDIR")
+        or (Path("/var/tmp") / f"trading-system-tests-{os.getuid()}" / "pytest")
+    )
+    if not test_tmp_root.is_absolute():
+        test_tmp_root = ROOT / test_tmp_root
+    test_tmp_root.mkdir(parents=True, exist_ok=True)
+    for key in ("TMPDIR", "TEMP", "TMP", "PYTEST_DEBUG_TEMPROOT", "TRADING_TEST_TMPDIR"):
+        run_env[key] = str(test_tmp_root)
+    db_root = test_tmp_root / "validate_repo_unit"
+    db_root.mkdir(parents=True, exist_ok=True)
+    run_env["DB_PATH"] = str(db_root / "runtime-test.sqlite")
+    run_env["SQLITE_LIVENESS_DB_PATH"] = str(db_root / "runtime-test.liveness.sqlite")
+    run_env["TS_TESTING"] = "1"
+    run_env["TS_STORAGE_BACKEND"] = "sqlite"
     run_env.setdefault("TRADING_UNIT_TEST_SCHEMA_FAST", "1")
     run_env["TRADING_FAILURE_DIAGNOSTICS_PERSIST"] = "0"
     run_env["TRADING_PG_AUTOINIT_ON_CONNECT"] = "1"
@@ -296,6 +349,81 @@ def _telemetry_dual_write_burnin_command(python: str, env: dict[str, str]) -> li
     ]
 
 
+def _storage_sqlite_pg_compat_violations(root: Path = ROOT) -> list[str]:
+    """Return release-blocking SQLite/Postgres storage bridge scope violations."""
+
+    path = root / "engine" / "runtime" / "storage_sqlite.py"
+    if not path.exists():
+        return []
+    source = path.read_text(encoding="utf-8")
+    violations: list[str] = []
+    for marker in ("FunctionType", ".__code__", "_clone_pg_helpers"):
+        if marker in source:
+            violations.append(f"storage_sqlite legacy code-clone marker still present: {marker}")
+
+    tree = ast.parse(source, filename=str(path))
+
+    def visit(node: ast.AST, function_stack: tuple[str, ...] = ()) -> None:
+        next_stack = function_stack
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            next_stack = (*function_stack, str(node.name))
+        if isinstance(node, ast.ImportFrom):
+            module = str(node.module or "")
+            imports_storage_pg = (
+                module == "engine.runtime.storage_pg"
+                or (
+                    module == "engine.runtime"
+                    and any(alias.name == "storage_pg" for alias in node.names)
+                )
+            )
+            if imports_storage_pg and (not next_stack or next_stack[-1] != "_load_pg_compat_module"):
+                violations.append(
+                    "storage_sqlite may import storage_pg only inside "
+                    f"_load_pg_compat_module; found in {next_stack[-1] if next_stack else '<module>'}"
+                )
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "engine.runtime.storage_pg":
+                    violations.append(
+                        "storage_sqlite may import engine.runtime.storage_pg only inside "
+                        "_load_pg_compat_module"
+                    )
+        for child in ast.iter_child_nodes(node):
+            visit(child, next_stack)
+
+    visit(tree)
+    docs = (
+        (root / "engine" / "runtime" / "README.md").read_text(encoding="utf-8")
+        if (root / "engine" / "runtime" / "README.md").exists()
+        else ""
+    )
+    if "bounded first slice" not in docs or "_PG_COMPAT_HELPER_NAMES" not in docs:
+        violations.append(
+            "engine/runtime/README.md must document the bounded first slice "
+            "and remaining _PG_COMPAT_HELPER_NAMES compatibility shim"
+        )
+    return violations
+
+
+def _validate_storage_backend_scope(root: Path = ROOT) -> None:
+    violations = _storage_sqlite_pg_compat_violations(root)
+    if violations:
+        message = "\n".join(f"- {item}" for item in violations)
+        raise RuntimeError(f"storage backend scope validation failed:\n{message}")
+
+
+def _validate_worktree_layout(root: Path = ROOT) -> None:
+    """Block recurrence of loose duplicate project trees next to the repo."""
+
+    from tools.git_worktree_triage import DEFAULT_DUPLICATE, layout_violations
+
+    duplicate = root.parent / DEFAULT_DUPLICATE.name
+    violations = layout_violations(canonical_root=root, duplicate_path=duplicate)
+    if violations:
+        message = "\n".join(f"- {item}" for item in violations)
+        raise RuntimeError(f"worktree layout validation failed:\n{message}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the canonical repository validation workflow.")
     parser.add_argument(
@@ -318,9 +446,24 @@ def main(argv: list[str] | None = None) -> int:
     env.setdefault("TS_PG_POOL_SIZE", "12")
     env.setdefault("TS_PG_POOL_MIN_SIZE", "2")
 
+    try:
+        _validate_storage_backend_scope(ROOT)
+    except Exception as exc:
+        print("\nValidation failed during storage-backend-scope.")
+        print(str(exc))
+        return 1
+
+    try:
+        _validate_worktree_layout(ROOT)
+    except Exception as exc:
+        print("\nValidation failed during worktree-layout.")
+        print(str(exc))
+        return 1
+
     python = _project_python()
     pytest = _project_pytest(python)
     checks: list[tuple[str, list[str]]] = [
+        ("repo-artifact-hygiene", [python, "tools/check_repo_artifact_hygiene.py"]),
         ("syntax", [python, "tools/syntax_check_workspace.py"]),
         ("ruff-static-release-gate", [python, "-m", "ruff", "check", "engine/", "routes/", "services/", "tests/"]),
         ("docs", [python, "tools/validate_docs.py"]),
@@ -335,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         checks.append(("telemetry-dual-write-burnin", telemetry_burnin_check))
     checks.extend(
         [
-            ("unit-tests", [python, "-m", "unittest", "discover", "-s", "tests", "-v"]),
+            ("pytest-collection", [*pytest, "tests/", "--collect-only", "-q"]),
             ("pytest-tests", [*pytest, "tests/", "-v", "--tb=short"]),
             ("news-selftest", [python, "tools/news_ingestion_selftest.py"]),
         ]

@@ -954,7 +954,7 @@ def apply_execution_policy(
                         execution_policy_json={"tse": tse, "alpha_remaining": alpha_rem},
                     )
                     continue
-                size_scale *= max(0.0, float(tse.get("size_mult") or 1.0))
+                size_scale *= max(0.0, _safe_float(tse.get("size_mult"), 1.0))
 
             if tse_action == "SOFT_THROTTLE":
                 if float(alpha_rem) < float(TSE_SOFT_MIN_ALPHA):
@@ -965,7 +965,7 @@ def apply_execution_policy(
                         execution_policy_json={"tse": tse, "alpha_remaining": alpha_rem},
                     )
                     continue
-                size_scale *= max(0.0, float(tse.get("size_mult") or 1.0))
+                size_scale *= max(0.0, _safe_float(tse.get("size_mult"), 1.0))
                 order_type = "LIMIT"
                 aggressiveness = "PASSIVE"
                 sim_lat_ms = max(sim_lat_ms, SIM_LAT_MS_PASSIVE)
@@ -1031,7 +1031,7 @@ def apply_execution_policy(
             )
             size_scale *= max(
                 0.0,
-                float(execution_decision.get("size_mult") or 1.0),
+                _safe_float(execution_decision.get("size_mult"), 1.0),
             )
             size_scale = max(0.0, min(1.0, float(size_scale)))
 
@@ -1552,7 +1552,7 @@ def apply_execution_policy(
                     row["regime_compatibility"] = float(regime_comp)
                     row["tse_state"] = str(tse.get("state") or "NONE")
                     row["tse_action"] = str(tse.get("action") or "NONE")
-                    row["tse_size_mult"] = float(tse.get("size_mult") or 1.0)
+                    row["tse_size_mult"] = _safe_float(tse.get("size_mult"), 1.0)
                     row["tse_reason"] = str(tse.get("reason") or "")
                     row["capital_mode"] = str(capital_mode)
                     row["capital_preservation_snapshot"] = dict(cpm_snapshot or {})
@@ -1567,12 +1567,12 @@ def apply_execution_policy(
                     row["target_participation"] = float(learned_target_participation)
                     row["expected_slippage_bps"] = float(execution_decision.get("expected_slippage_bps") or 0.0)
                     row["expected_fill_latency_ms"] = int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms)
-                    row["slippage_size_mult"] = float(execution_decision.get("size_mult") or 1.0)
+                    row["slippage_size_mult"] = _safe_float(execution_decision.get("size_mult"), 1.0)
                     row["meta_label_probability"] = meta_label_gate.get("probability")
                     row["meta_label_size_mult"] = float(meta_label_mult)
                     row["meta_label_gate"] = dict(meta_label_gate)
                     row["conformal_interval_excludes_zero"] = conformal_gate.get("interval_excludes_zero")
-                    row["conformal_size_mult"] = float(conformal_gate.get("size_mult") or 1.0)
+                    row["conformal_size_mult"] = _safe_float(conformal_gate.get("size_mult"), 1.0)
                     row["conformal_gate"] = dict(conformal_gate)
                     row["ood_score"] = ood_gate.get("ood_score")
                     row["ood_size_mult"] = float(ood_mult)
@@ -1648,7 +1648,7 @@ def apply_execution_policy(
             row["regime_compatibility"] = float(regime_comp)
             row["tse_state"] = str(tse.get("state") or "NONE")
             row["tse_action"] = str(tse.get("action") or "NONE")
-            row["tse_size_mult"] = float(tse.get("size_mult") or 1.0)
+            row["tse_size_mult"] = _safe_float(tse.get("size_mult"), 1.0)
             row["tse_reason"] = str(tse.get("reason") or "")
             row["capital_mode"] = str(capital_mode)
             row["capital_preservation_snapshot"] = dict(cpm_snapshot or {})
@@ -1661,12 +1661,12 @@ def apply_execution_policy(
             row["entry_delay_ms"] = int(execution_decision.get("entry_delay_ms") or 0)
             row["expected_slippage_bps"] = float(execution_decision.get("expected_slippage_bps") or 0.0)
             row["expected_fill_latency_ms"] = int(execution_decision.get("expected_fill_latency_ms") or sim_lat_ms)
-            row["slippage_size_mult"] = float(execution_decision.get("size_mult") or 1.0)
+            row["slippage_size_mult"] = _safe_float(execution_decision.get("size_mult"), 1.0)
             row["meta_label_probability"] = meta_label_gate.get("probability")
             row["meta_label_size_mult"] = float(meta_label_mult)
             row["meta_label_gate"] = dict(meta_label_gate)
             row["conformal_interval_excludes_zero"] = conformal_gate.get("interval_excludes_zero")
-            row["conformal_size_mult"] = float(conformal_gate.get("size_mult") or 1.0)
+            row["conformal_size_mult"] = _safe_float(conformal_gate.get("size_mult"), 1.0)
             row["conformal_gate"] = dict(conformal_gate)
             row["ood_score"] = ood_gate.get("ood_score")
             row["ood_size_mult"] = float(ood_mult)

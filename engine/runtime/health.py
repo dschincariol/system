@@ -20,8 +20,9 @@ import logging
 import shutil
 import threading
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Iterable, List, Optional
+from typing import Callable, Dict, Any, Iterable, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.hardware import runtime_hardware_snapshot
@@ -2633,9 +2634,1931 @@ def _stale_health_snapshot_payload(payload: Dict[str, Any], *, now_ms: int, cach
     return out
 
 
+@dataclass
+class HealthSnapshotContext:
+    """Mutable state shared by registered health checks."""
+
+    con: Any
+    now_ms: int
+    out: Dict[str, Any]
+    scratch: Dict[str, Any] = field(default_factory=dict)
+    check_failures: List[str] = field(default_factory=list)
+
+    def table_exists(self, table: str) -> bool:
+        try:
+            row = self.con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+                (str(table),),
+            ).fetchone()
+            return bool(row)
+        except Exception as e:
+            _warn("health.table_exists", e, table=table)
+            return False
+
+
+@dataclass(frozen=True)
+class HealthSnapshotCheck:
+    name: str
+    run: Callable[[HealthSnapshotContext], None]
+
+
+def _new_health_snapshot_payload(now_ms: int) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "ts_ms": now_ms,
+        "db_file": {
+            "path": str(DB_PATH),
+            "exists": bool(DB_PATH.exists()),
+        },
+        "reasons": [],
+        "db": {
+            "ok": True,
+            "db_path": str(DB_PATH),
+            "exists": False,
+            "initialized": False,
+            "size_bytes": 0,
+            "wal_bytes": 0,
+            "quick_check": "unknown",
+            "error": None,
+        },
+        "event_log": {
+            "ok": False,
+            "count": 0,
+            "last_ts_ms": None,
+            "age_s": None,
+        },
+    }
+
+
+def _run_health_checks(ctx: HealthSnapshotContext, checks: Iterable[HealthSnapshotCheck]) -> None:
+    for check in checks:
+        try:
+            check.run(ctx)
+        except Exception as e:
+            _warn("health.registry.check", e, check=check.name)
+            ctx.check_failures.append(f"health_check_failed:{check.name}:{type(e).__name__}")
+
+
+def _check_runtime_hardware(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["runtime_hardware"] = runtime_hardware_snapshot()
+    except Exception as e:
+        _warn("health.runtime_hardware", e)
+        out["runtime_hardware"] = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+    _trace_section("runtime_hardware", section_started, ok=bool((out.get("runtime_hardware") or {}).get("ok")))
+
+
+def _check_disk_pressure(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["disk_pressure"] = get_disk_pressure_snapshot()
+    except Exception as e:
+        _warn("health.disk_pressure", e)
+        out["disk_pressure"] = {
+            "ok": False,
+            "status": "error",
+            "critical": [f"disk_pressure_error:{type(e).__name__}:{e}"],
+            "warnings": [],
+            "paths": [],
+        }
+    _trace_section("disk_pressure", section_started, ok=bool((out.get("disk_pressure") or {}).get("ok")))
+
+
+def _check_db(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        if DB_PATH.exists():
+            out["db"]["exists"] = True
+            out["db"]["size_bytes"] = int(DB_PATH.stat().st_size)
+        wal_path = _sqlite_wal_path(DB_PATH)
+        if wal_path is not None:
+            if wal_path.exists():
+                out["db"]["wal_bytes"] = int(wal_path.stat().st_size)
+
+        if HEALTH_RUN_QUICK_CHECK:
+            row = con.execute("PRAGMA quick_check;").fetchone()
+            if row:
+                qc = str(row[0])
+                out["db"]["quick_check"] = qc
+                if qc.lower() != "ok":
+                    out["db"]["ok"] = False
+        else:
+            out["db"]["quick_check"] = "skipped"
+
+        out["db"]["initialized"] = bool(
+            ctx.table_exists("schema_version")
+            or ctx.table_exists("prices")
+            or ctx.table_exists("job_locks")
+        )
+    except Exception as e:
+        out["db"]["ok"] = False
+        out["db"]["error"] = str(e)
+    _trace_section("db", section_started, ok=bool((out.get("db") or {}).get("ok")))
+
+
+def _check_event_log(ctx: HealthSnapshotContext) -> None:
+    now_ms = ctx.now_ms
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        event_log_summary = dict(fetch_event_log_summary() or {})
+        last_ts_ms = event_log_summary.get("last_ts_ms")
+        age_s = None if not last_ts_ms else round((now_ms - int(last_ts_ms)) / 1000.0, 1)
+        out["event_log"] = {
+            "ok": bool(event_log_summary.get("ok")),
+            "count": int(event_log_summary.get("count") or 0),
+            "last_ts_ms": (int(last_ts_ms) if last_ts_ms is not None else None),
+            "age_s": age_s,
+        }
+    except Exception as e:
+        _warn("health.event_log", e)
+        out["event_log"] = {
+            "ok": False,
+            "count": 0,
+            "last_ts_ms": None,
+            "age_s": None,
+        }
+    _trace_section("event_log", section_started, ok=bool((out.get("event_log") or {}).get("ok")))
+
+
+def _check_prices(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        effective_prices_max_age_s = _effective_prices_max_age_s(con)
+        ctx.scratch["effective_prices_max_age_s"] = effective_prices_max_age_s
+        row = con.execute("SELECT MAX(ts_ms) FROM prices").fetchone()
+        if row and row[0]:
+            age_s = (now_ms - int(row[0])) / 1000.0
+            out["prices"] = {
+                "ok": age_s < effective_prices_max_age_s,
+                "age_s": round(age_s, 1),
+                "max_age_s": round(effective_prices_max_age_s, 1),
+                "last_ts_ms": int(row[0]),
+            }
+        else:
+            out["prices"] = {
+                "ok": False,
+                "age_s": None,
+                "max_age_s": round(effective_prices_max_age_s, 1),
+                "last_ts_ms": None,
+            }
+    except Exception as e:
+        _warn("health.prices", e)
+        ctx.scratch["effective_prices_max_age_s"] = HEALTH_PRICES_MAX_AGE_S
+        out["prices"] = {
+            "ok": False,
+            "age_s": None,
+            "max_age_s": HEALTH_PRICES_MAX_AGE_S,
+            "last_ts_ms": None,
+        }
+    _trace_section("prices", section_started, ok=bool((out.get("prices") or {}).get("ok")))
+
+
+def _check_events(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        row = con.execute("SELECT MAX(ts_ms) FROM events").fetchone()
+        if row and row[0]:
+            age_s = (now_ms - int(row[0])) / 1000.0
+            out["events"] = {
+                "ok": age_s < HEALTH_EVENTS_MAX_AGE_S,
+                "age_s": round(age_s, 1),
+                "max_age_s": HEALTH_EVENTS_MAX_AGE_S,
+                "last_ts_ms": int(row[0]),
+            }
+        else:
+            out["events"] = {
+                "ok": False,
+                "age_s": None,
+                "max_age_s": HEALTH_EVENTS_MAX_AGE_S,
+                "last_ts_ms": None,
+            }
+    except Exception as e:
+        _warn("health.events", e)
+        out["events"] = {
+            "ok": False,
+            "age_s": None,
+            "max_age_s": HEALTH_EVENTS_MAX_AGE_S,
+            "last_ts_ms": None,
+        }
+    _trace_section("events", section_started, ok=bool((out.get("events") or {}).get("ok")))
+
+
+def _check_labels(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        row = con.execute("SELECT COUNT(*) FROM labels").fetchone()
+        label_n = int(row[0] or 0)
+        out["labels"] = {
+            "ok": label_n >= HEALTH_MIN_LABELS,
+            "count": label_n,
+            "min_required": HEALTH_MIN_LABELS,
+        }
+    except Exception as e:
+        _warn("health.labels", e)
+        out["labels"] = {
+            "ok": False,
+            "count": 0,
+            "min_required": HEALTH_MIN_LABELS,
+        }
+    _trace_section("labels", section_started, ok=bool((out.get("labels") or {}).get("ok")))
+
+
+def _check_model(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        row = con.execute("SELECT SUM(n) FROM model_stats_regime").fetchone()
+        model_n = int(row[0] or 0)
+        out["model"] = {
+            "ok": model_n >= HEALTH_MIN_MODEL_SUPPORT,
+            "support_n": model_n,
+            "min_required": HEALTH_MIN_MODEL_SUPPORT,
+        }
+    except Exception as e:
+        _warn("health.model", e)
+        out["model"] = {
+            "ok": False,
+            "support_n": 0,
+            "min_required": HEALTH_MIN_MODEL_SUPPORT,
+        }
+    _trace_section("model", section_started, ok=bool((out.get("model") or {}).get("ok")))
+
+
+def _check_competition(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["competition"] = _competition_health_snapshot(ctx.now_ms)
+    except Exception:
+        out["competition"] = {
+            "ok": False,
+            "reasons": ["competition_health_error"],
+            "replay_status": "error",
+            "cycle_status": "error",
+        }
+    _trace_section("competition", section_started, ok=bool((out.get("competition") or {}).get("ok")))
+
+
+def _check_attribution(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["attribution"] = _attribution_health_snapshot(ctx.con, ctx.now_ms)
+    except Exception:
+        out["attribution"] = {
+            "ok": False,
+            "authoritative_model_ratio": 0.0,
+            "authoritative_model_min_ratio": float(HEALTH_ATTRIBUTION_MIN_RATIO),
+        }
+    _trace_section("attribution", section_started, ok=bool((out.get("attribution") or {}).get("ok")))
+
+
+def _check_position_reconcile(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["position_reconcile"] = _latest_position_reconcile_snapshot(ctx.con, ctx.now_ms)
+    except Exception as e:
+        _warn("health.position_reconcile", e)
+        out["position_reconcile"] = {
+            "available": False,
+            "ok": True,
+            "fatal_reconcile": False,
+            "status": "error",
+            "detail": f"position_reconcile_error:{type(e).__name__}:{e}",
+        }
+    _trace_section(
+        "position_reconcile",
+        section_started,
+        ok=bool((out.get("position_reconcile") or {}).get("ok")),
+        available=bool((out.get("position_reconcile") or {}).get("available")),
+    )
+
+
+def _check_training(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        lifecycle = dict(_lc_get_state() or {})
+        runtime_state = str(lifecycle.get("state") or "").strip().upper()
+        mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+        training_allowed = mode_name not in ("live", "shadow")
+        out["training"] = {
+            "mode": "enabled" if training_allowed else "restricted",
+            "allowed": bool(training_allowed),
+            "reason": "" if training_allowed else "engine_mode_restrictive",
+            "source": "health_fast_path",
+            "runtime_state": runtime_state,
+        }
+    except Exception:
+        out["training"] = {"mode": "unknown", "allowed": False}
+    _trace_section("training", section_started, allowed=bool((out.get("training") or {}).get("allowed")))
+
+
+def _check_job_heartbeats(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        row = con.execute(
+            "SELECT job_name, MAX(heartbeat_ts_ms) FROM job_locks GROUP BY job_name"
+        ).fetchall() or []
+
+        jobs = {}
+        for job_name, hb_ts in row:
+            if not hb_ts:
+                continue
+            age_s = (now_ms - int(hb_ts)) / 1000.0
+            ok = age_s < HEALTH_JOBS_MAX_STALE_S
+            jobs[str(job_name)] = {
+                "ok": ok,
+                "age_s": round(age_s, 1),
+                "max_age_s": HEALTH_JOBS_MAX_STALE_S,
+                "last_heartbeat_ts_ms": int(hb_ts),
+                "running": True,
+                "source": "job_locks",
+            }
+
+        out["jobs"] = jobs
+
+    except Exception:
+        out["jobs"] = {}
+    _trace_section("jobs", section_started, count=len(out.get("jobs") or {}))
+
+
+def _check_ingestion_runtime_and_sources(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    out = ctx.out
+    effective_prices_max_age_s = float(
+        ctx.scratch.get("effective_prices_max_age_s") or _effective_prices_max_age_s(con)
+    )
+    ctx.scratch["effective_prices_max_age_s"] = effective_prices_max_age_s
+
+    section_started = time.perf_counter()
+    out["ingestion_runtime"] = _shared_ingestion_runtime_snapshot(
+        con,
+        now_ms=now_ms,
+        effective_prices_max_age_s=effective_prices_max_age_s,
+    )
+    _trace_section(
+        "ingestion_runtime",
+        section_started,
+        running=bool((out.get("ingestion_runtime") or {}).get("running")),
+        stale=bool((out.get("ingestion_runtime") or {}).get("stale")),
+    )
+    section_started = time.perf_counter()
+    try:
+        out["ingestion_pipelines"] = pipeline_health_summary(
+            stale_after_s=max(float(HEALTH_EVENTS_MAX_AGE_S), 900.0)
+        )
+    except Exception as e:
+        _warn("health.ingestion_pipelines", e)
+        out["ingestion_pipelines"] = {"ok": False, "total": 0, "healthy": 0, "stale": 0, "pipelines": {}}
+    _trace_section("ingestion_pipelines", section_started, ok=bool((out.get("ingestion_pipelines") or {}).get("ok")))
+    section_started = time.perf_counter()
+    try:
+        out["options_ingestion"] = _options_ingestion_snapshot(now_ms)
+    except Exception as e:
+        _warn("health.options_ingestion", e)
+        out["options_ingestion"] = {
+            "ok": False,
+            "available": False,
+            "degraded": True,
+            "critical": True,
+            "status": "error",
+            "detail": "options_ingestion_health_error",
+        }
+    _trace_section("options_ingestion", section_started, ok=bool((out.get("options_ingestion") or {}).get("ok")))
+    section_started = time.perf_counter()
+    try:
+        pipeline_statuses = get_all_pipeline_statuses()
+    except Exception as e:
+        _warn("health.ingestion_source_statuses", e)
+        pipeline_statuses = {}
+    try:
+        out["ingestion_freshness"] = _build_ingestion_freshness_snapshot(
+            now_ms=now_ms,
+            prices_snapshot=dict(out.get("prices") or {}),
+            options_snapshot=dict(out.get("options_ingestion") or {}),
+            ingestion_runtime_snapshot=dict(out.get("ingestion_runtime") or {}),
+            pipeline_statuses=dict(pipeline_statuses or {}),
+        )
+        out["ingestion_sources"] = dict((out.get("ingestion_freshness") or {}).get("sources") or {})
+    except Exception as e:
+        _warn("health.ingestion_freshness", e)
+        out["ingestion_freshness"] = {
+            "ok": False,
+            "critical_ok": False,
+            "all_sources_ok": False,
+            "degraded": True,
+            "critical_sources": ["prices", "options"],
+            "stale_sources": ["prices", "options"],
+            "failed_sources": [],
+            "stale_critical_sources": ["prices", "options"],
+            "failed_critical_sources": [],
+            "runtime_reason_codes": ["critical_source_stale:prices", "critical_source_stale:options"],
+            "advisory_reason_codes": [],
+            "reason_codes": ["critical_source_stale:prices", "critical_source_stale:options"],
+            "sources": {},
+        }
+        out["ingestion_sources"] = {}
+    _trace_section(
+        "ingestion_freshness",
+        section_started,
+        ok=bool((out.get("ingestion_freshness") or {}).get("ok")),
+        critical_ok=bool((out.get("ingestion_freshness") or {}).get("critical_ok")),
+    )
+    try:
+        jobs = dict(out.get("jobs") or {})
+        ingestion_runtime = dict(out.get("ingestion_runtime") or {})
+        if bool(ingestion_runtime.get("running")) and not jobs.get("ingestion_runtime"):
+            age_s = None
+            last_publish_ts_ms = _int_or(ingestion_runtime.get("last_publish_ts_ms"))
+            if last_publish_ts_ms > 0:
+                age_s = round((now_ms - last_publish_ts_ms) / 1000.0, 1)
+            jobs["ingestion_runtime"] = {
+                "ok": not bool(ingestion_runtime.get("stale")),
+                "age_s": age_s,
+                "max_age_s": HEALTH_JOBS_MAX_STALE_S,
+                "last_heartbeat_ts_ms": last_publish_ts_ms or None,
+                "running": True,
+                "source": "shared_ingestion_runtime",
+            }
+            out["jobs"] = jobs
+    except Exception as e:
+        _warn("health.jobs.backfill_ingestion_runtime", e)
+    try:
+        jobs = dict(out.get("jobs") or {})
+        stale_jobs = sorted(
+            name for name, row in jobs.items() if not bool((row or {}).get("ok"))
+        )
+        required_job_names = ["ingestion_runtime"]
+        required_missing = sorted(name for name in required_job_names if name not in jobs)
+        required_stale = sorted(
+            name for name in required_job_names if name in jobs and not bool((jobs.get(name) or {}).get("ok"))
+        )
+        out["job_summary"] = {
+            "total": len(jobs),
+            "stale": len(stale_jobs),
+            "stale_jobs": stale_jobs,
+            "required_jobs": required_job_names,
+            "required_missing": required_missing,
+            "required_stale": required_stale,
+            "ok_raw": len(stale_jobs) == 0,
+            "ok": len(required_missing) == 0 and len(required_stale) == 0,
+        }
+    except Exception as e:
+        _warn("health.job_summary", e)
+        out["job_summary"] = {
+            "total": 0,
+            "stale": 0,
+            "stale_jobs": [],
+            "required_jobs": ["ingestion_runtime"],
+            "required_missing": ["ingestion_runtime"],
+            "required_stale": [],
+            "ok_raw": False,
+            "ok": False,
+        }
+
+
+def _check_provider_health(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    out = ctx.out
+    effective_prices_max_age_s = float(
+        ctx.scratch.get("effective_prices_max_age_s") or _effective_prices_max_age_s(con)
+    )
+    ctx.scratch["effective_prices_max_age_s"] = effective_prices_max_age_s
+
+    section_started = time.perf_counter()
+    try:
+        providers = {}
+        healthy_n = 0
+        ingestion_runtime = dict(out.get("ingestion_runtime") or {})
+        runtime_mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+        strict_provider_telemetry = runtime_mode_name in ("paper", "shadow", "live")
+
+        for row in fetch_provider_health_rows():
+            ts_ms = row.get("ts_ms")
+            if ts_ms is None:
+                continue
+            age_s = (now_ms - int(ts_ms)) / 1000.0
+            provider_name = str(row.get("provider") or "")
+            provider_meta = None
+            provider_fatal = None
+            try:
+                provider_meta_raw = str(meta_get(f"provider_session_{provider_name}_last_failure", "") or "").strip()
+                if provider_meta_raw:
+                    provider_meta = json.loads(provider_meta_raw)
+            except Exception as e:
+                _warn("health.providers.session_last_failure", e, provider=provider_name)
+                provider_meta = None
+            try:
+                provider_fatal_raw = str(meta_get(f"provider_session_{provider_name}_fatal", "") or "").strip()
+                if provider_fatal_raw:
+                    provider_fatal = json.loads(provider_fatal_raw)
+            except Exception as e:
+                _warn("health.providers.session_fatal", e, provider=provider_name)
+                provider_fatal = None
+            error_count = _int_or(row.get("error_count"))
+            last_success_ts_ms = _int_or(row.get("last_success_ts_ms"))
+            last_success_age_s = (
+                round(max(0, now_ms - int(last_success_ts_ms)) / 1000.0, 1)
+                if last_success_ts_ms > 0
+                else None
+            )
+            latest_row_ok = bool(row.get("ok")) and age_s < effective_prices_max_age_s
+            circuit_open = bool(
+                int(PROVIDER_CIRCUIT_BREAKER_ERRORS) > 0
+                and error_count >= int(PROVIDER_CIRCUIT_BREAKER_ERRORS)
+                and not latest_row_ok
+            )
+            p_ok = bool(latest_row_ok and not provider_fatal and not circuit_open)
+            providers[provider_name] = {
+                "ok": p_ok,
+                "age_s": round(age_s, 1),
+                "last_ts_ms": int(ts_ms),
+                "last_success_ts_ms": int(last_success_ts_ms) if last_success_ts_ms > 0 else None,
+                "last_success_age_s": last_success_age_s,
+                "error_count": int(error_count),
+                "circuit_open": bool(circuit_open),
+                "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
+                "latency_ms": (
+                    None
+                    if row.get("latency_ms") is None
+                    else int(float(row.get("latency_ms") or 0))
+                ),
+                "n_symbols": int(row.get("n_symbols") or 0),
+                "error": (
+                    None
+                    if row.get("error") is None
+                    else str(row.get("error"))
+                ),
+                "session_last_failure": provider_meta,
+                "session_fatal": provider_fatal,
+            }
+            if p_ok:
+                healthy_n += 1
+
+        if healthy_n <= 0:
+            shared_providers = _dict_or_empty(ingestion_runtime.get("providers"))
+            for provider_name, provider_info in shared_providers.items():
+                if not isinstance(provider_info, dict):
+                    continue
+                age_s = round(_int_or(provider_info.get("age_ms"), 10**12) / 1000.0, 1)
+                circuit_open = bool(provider_info.get("circuit_open"))
+                provider_fatal = provider_info.get("session_fatal")
+                p_ok = bool(provider_info.get("ok")) and not circuit_open and not provider_fatal
+                providers[str(provider_name)] = {
+                    "ok": p_ok,
+                    "age_s": age_s,
+                    "last_ts_ms": _int_or(provider_info.get("last_ts_ms")),
+                    "last_success_ts_ms": (
+                        _int_or(provider_info.get("last_success_ts_ms"))
+                        if provider_info.get("last_success_ts_ms") is not None
+                        else None
+                    ),
+                    "last_success_age_s": (
+                        round(_int_or(provider_info.get("last_success_age_ms")) / 1000.0, 1)
+                        if provider_info.get("last_success_age_ms") is not None
+                        else None
+                    ),
+                    "error_count": _int_or(provider_info.get("error_count")),
+                    "circuit_open": circuit_open,
+                    "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
+                    "latency_ms": (_int_or(provider_info.get("latency_ms")) if provider_info.get("latency_ms") is not None else None),
+                    "n_symbols": _int_or(provider_info.get("n_symbols")),
+                    "error": (None if provider_info.get("error") is None else str(provider_info.get("error"))),
+                    "session_last_failure": provider_info.get("session_last_failure"),
+                    "session_fatal": provider_fatal,
+                }
+                if p_ok:
+                    healthy_n += 1
+
+        if healthy_n <= 0:
+            try:
+                price_row = con.execute(
+                    "SELECT MAX(ts_ms) FROM prices WHERE price IS NOT NULL"
+                ).fetchone()
+                last_price_ts_ms = int((price_row or [0])[0] or 0)
+                if last_price_ts_ms > 0:
+                    price_age_s = (now_ms - int(last_price_ts_ms)) / 1000.0
+                    derived_ok = bool((out.get("prices") or {}).get("ok"))
+                    counts_as_healthy = bool(derived_ok and not strict_provider_telemetry)
+                    providers["derived_from_prices"] = {
+                        "ok": counts_as_healthy,
+                        "age_s": round(price_age_s, 1),
+                        "last_ts_ms": int(last_price_ts_ms),
+                        "synthetic": True,
+                        "strict_provider_telemetry": bool(strict_provider_telemetry),
+                        "latency_ms": None,
+                        "n_symbols": 0,
+                        "error": None if counts_as_healthy else "provider_health_missing",
+                        "session_last_failure": None,
+                        "session_fatal": None,
+                    }
+                    if counts_as_healthy:
+                        healthy_n = max(healthy_n, 1)
+            except Exception as e:
+                _warn("health.providers.derived_from_prices", e)
+
+        out["providers"] = {
+            "ok": healthy_n > 0,
+            "healthy": healthy_n,
+            "total": len(providers),
+            "active_provider": str(meta_get("price_provider_active", "") or ""),
+            "by_provider": providers,
+        }
+    except Exception as e:
+        _warn("health.providers", e)
+        out["providers"] = {
+            "ok": False,
+            "healthy": 0,
+            "total": 0,
+            "active_provider": "",
+            "by_provider": {},
+        }
+    _trace_section(
+        "providers",
+        section_started,
+        ok=bool((out.get("providers") or {}).get("ok")),
+        healthy=int((out.get("providers") or {}).get("healthy") or 0),
+    )
+
+
+def _check_provider_readiness(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["provider_readiness"] = provider_readiness_snapshot(
+            mode=os.environ.get("ENGINE_MODE", "safe"),
+            health=out,
+            now_ms=ctx.now_ms,
+        )
+    except Exception as e:
+        _warn("health.provider_readiness", e)
+        mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+        required = _provider_readiness_enforced(mode_name)
+        out["provider_readiness"] = {
+            "ok": not required,
+            "required": bool(required),
+            "mode": mode_name,
+            "reason": "provider_readiness_error" if required else "not_required",
+            "blockers": (["provider_readiness_error"] if required else []),
+            "required_providers": [],
+            "healthy_required": 0,
+            "total_required": 0,
+            "by_provider": {},
+            "error": f"{type(e).__name__}:{e}",
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section(
+        "provider_readiness",
+        section_started,
+        ok=bool((out.get("provider_readiness") or {}).get("ok")),
+        required=bool((out.get("provider_readiness") or {}).get("required")),
+    )
+
+
+def _check_portfolio(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        row = con.execute("SELECT COUNT(*) FROM portfolio_state").fetchone()
+        state_n = int(row[0] or 0)
+
+        _mode = os.environ.get("ENGINE_MODE", "").strip().lower() or "safe"
+
+        if _mode == "safe":
+            out["portfolio"] = {
+                "ok": True,
+                "positions": state_n,
+            }
+        else:
+            out["portfolio"] = {
+                "ok": state_n > 0,
+                "positions": state_n,
+            }
+    except Exception as e:
+        _warn("health.portfolio", e)
+        out["portfolio"] = {
+            "ok": False,
+            "positions": 0,
+        }
+    _trace_section("portfolio", section_started, ok=bool((out.get("portfolio") or {}).get("ok")))
+
+
+def _check_execution_activity(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        fills_table = None
+        if ctx.table_exists("broker_fills_v2"):
+            fills_table = "broker_fills_v2"
+        elif ctx.table_exists("broker_fills"):
+            fills_table = "broker_fills"
+
+        if fills_table:
+            row = con.execute(
+                f"SELECT COUNT(*), MAX(ts_ms) FROM {fills_table}"
+            ).fetchone()
+            n_fills = int((row or [0, None])[0] or 0)
+            last_fill_ts_ms = (row or [0, None])[1]
+            fill_age_s = None if not last_fill_ts_ms else round((now_ms - int(last_fill_ts_ms)) / 1000.0, 1)
+            out["execution"] = {
+                "ok": True,
+                "fills_table": fills_table,
+                "n_fills": n_fills,
+                "last_fill_ts_ms": int(last_fill_ts_ms) if last_fill_ts_ms else None,
+                "last_fill_age_s": fill_age_s,
+            }
+        else:
+            out["execution"] = {
+                "ok": False,
+                "fills_table": None,
+                "n_fills": 0,
+                "last_fill_ts_ms": None,
+                "last_fill_age_s": None,
+            }
+    except Exception:
+        out["execution"] = {
+            "ok": False,
+            "fills_table": None,
+            "n_fills": 0,
+            "last_fill_ts_ms": None,
+            "last_fill_age_s": None,
+        }
+    _trace_section("execution", section_started, ok=bool((out.get("execution") or {}).get("ok")))
+
+
+def _check_execution_barrier(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        if HEALTH_INCLUDE_EXECUTION_BARRIER:
+            from engine.runtime.gates import execution_gate_snapshot
+            from engine.api.internal_access import get_execution_mode as _get_execution_mode
+
+            kill_switches = _read_kill_switch_snapshot_readonly(con=con)
+            out["kill_switches"] = dict(kill_switches)
+            snap = execution_gate_snapshot(
+                get_execution_mode_fn=_get_execution_mode,
+                kill_switches=kill_switches,
+                risk_state_getter=lambda key, default="": _risk_state_value_readonly(con, str(key), str(default)),
+            )
+            if isinstance(snap, dict):
+                out["execution_barrier"] = snap
+            else:
+                out["execution_barrier"] = {"allowed": False, "reason": "execution_barrier_invalid"}
+        else:
+            mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+            lifecycle = dict(_lc_get_state() or {})
+            runtime_state = str(lifecycle.get("state") or "").strip().upper()
+            runtime_detail = str(lifecycle.get("detail") or "").strip()
+            allowed = mode_name == "live" and runtime_state == _LIVE
+            out["execution_barrier"] = {
+                "ok": True,
+                "mode": mode_name,
+                "armed": 0 if mode_name != "live" else None,
+                "allow_execution": bool(allowed),
+                "allowed": bool(allowed),
+                "reason": "health_fast_path",
+                "source": "engine_mode+lifecycle_state",
+                "runtime_state": runtime_state,
+                "runtime_detail": runtime_detail,
+            }
+    except Exception:
+        out["execution_barrier"] = {"allowed": False, "reason": "execution_barrier_error"}
+    _trace_section("execution_barrier", section_started, allowed=bool((out.get("execution_barrier") or {}).get("allowed")))
+
+
+def _check_recent_errors(ctx: HealthSnapshotContext) -> None:
+    con = ctx.con
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        rows = con.execute(
+            """
+            SELECT ts_ms, severity, message
+            FROM alerts
+            ORDER BY ts_ms DESC
+            LIMIT 10
+            """
+        ).fetchall() or []
+
+        out["recent_errors"] = [
+            {
+                "ts_ms": int(r[0] or 0),
+                "severity": str(r[1] or ""),
+                "message": str(r[2] or ""),
+            }
+            for r in rows
+        ]
+    except Exception:
+        out["recent_errors"] = []
+    _trace_section("recent_errors", section_started, count=len(out.get("recent_errors") or []))
+
+
+def _check_predictions(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["predictions"] = _prediction_flow_snapshot(ctx.con, ctx.now_ms)
+    except Exception as e:
+        _warn("health.predictions", e)
+        out["predictions"] = {
+            "ok": False,
+            "count": 0,
+            "recent_count": 0,
+            "history_count": 0,
+            "history_recent_count": 0,
+            "last_ts_ms": None,
+            "history_last_ts_ms": None,
+            "age_s": None,
+            "max_age_s": float(HEALTH_PREDICTIONS_MAX_AGE_S),
+            "detail": f"prediction_health_error:{type(e).__name__}:{e}",
+        }
+    _trace_section("predictions", section_started, ok=bool((out.get("predictions") or {}).get("ok")))
+
+
+def _check_model_serving(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["model_serving"] = _model_serving_snapshot(ctx.con, ctx.now_ms)
+    except Exception as e:
+        _warn("health.model_serving", e)
+        out["model_serving"] = {
+            "ok": False,
+            "degraded": False,
+            "available": False,
+            "sample_count": 0,
+            "fallback_count": 0,
+            "fallback_rate": 0.0,
+            "detail": f"model_serving_error:{type(e).__name__}:{e}",
+        }
+    _trace_section("model_serving", section_started, ok=bool((out.get("model_serving") or {}).get("ok", True)))
+
+
+def _check_alert_lifecycle(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["alert_lifecycle"] = _alert_lifecycle_snapshot(ctx.con, ctx.now_ms)
+    except Exception as e:
+        _warn("health.alert_lifecycle", e)
+        out["alert_lifecycle"] = {
+            "ok": False,
+            "warning": False,
+            "available": False,
+            "recent_alerts": 0,
+            "seen_count": 0,
+            "consumed_count": 0,
+            "expired_unconsumed_count": 0,
+            "detail": f"alert_lifecycle_error:{type(e).__name__}:{e}",
+        }
+    _trace_section("alert_lifecycle", section_started, ok=bool((out.get("alert_lifecycle") or {}).get("ok", True)))
+
+
+def _check_execution_supervisor(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.execution.execution_quality_supervisor import get_execution_quality_snapshot
+        out["execution_supervisor"] = get_execution_quality_snapshot(readonly=True)
+    except Exception:
+        out["execution_supervisor"] = {
+            "ok": False,
+            "state": "unknown",
+            "alerts": [],
+            "score": 0.0,
+        }
+    _trace_section("execution_supervisor", section_started, ok=bool((out.get("execution_supervisor") or {}).get("ok")))
+
+
+def _check_broker_connection(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.execution.execution_broker_watchdog import get_broker_connection_health
+        out["broker_connection"] = get_broker_connection_health(readonly=True)
+    except Exception:
+        out["broker_connection"] = {
+            "ok": False,
+            "state": "unknown",
+            "broker": os.environ.get("BROKER_NAME", os.environ.get("BROKER", "sim")),
+        }
+    _trace_section("broker_connection", section_started, ok=bool((out.get("broker_connection") or {}).get("ok")))
+
+
+def _check_model_cache(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.model_cache import (
+            get_snapshot as _get_model_cache_snapshot,
+            warm_model_catalog as _warm_model_catalog,
+        )
+
+        model_cache_snapshot = dict(_get_model_cache_snapshot() or {})
+        if (
+            out["db"].get("initialized")
+            and not bool(model_cache_snapshot.get("loaded"))
+        ):
+            model_cache_snapshot = dict(
+                _warm_model_catalog(force=False, readonly=True) or _get_model_cache_snapshot() or {}
+            )
+        out["model_cache"] = model_cache_snapshot
+    except Exception as e:
+        _warn("health.model_cache", e)
+        out["model_cache"] = {
+            "ok": False,
+            "loaded": False,
+            "rows": 0,
+            "last_error": f"model_cache_error:{type(e).__name__}:{e}",
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section("model_cache", section_started, ok=bool((out.get("model_cache") or {}).get("ok")))
+
+
+def _check_runtime_price_cache(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.price_cache import get_cache_health_snapshot
+
+        out["runtime_price_cache"] = dict(
+            get_cache_health_snapshot(stale_after_s=float(HEALTH_RUNTIME_PRICE_CACHE_MAX_AGE_S)) or {}
+        )
+    except Exception as e:
+        _warn("health.runtime_price_cache", e)
+        out["runtime_price_cache"] = {
+            "ok": False,
+            "initialized": False,
+            "stale": True,
+            "detail": f"runtime_price_cache_error:{type(e).__name__}:{e}",
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section(
+        "runtime_price_cache",
+        section_started,
+        ok=bool((out.get("runtime_price_cache") or {}).get("ok")),
+    )
+
+
+def _check_event_bus(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.event_bus import get_event_bus
+
+        event_bus_stats = dict(get_event_bus().get_stats() or {})
+        queue_size = int(event_bus_stats.get("queue_size") or 0)
+        normal_dropped_count = int(event_bus_stats.get("normal_dropped_count") or event_bus_stats.get("dropped_count") or 0)
+        critical_inline_dispatch_count = int(event_bus_stats.get("critical_inline_dispatch_count") or 0)
+        critical_handler_failures = int(event_bus_stats.get("critical_handler_failures") or 0)
+        critical_backpressure_active = bool(event_bus_stats.get("critical_backpressure_active"))
+        normal_overflow_active = bool(event_bus_stats.get("normal_overflow_active"))
+        avg_lag_ms = float(event_bus_stats.get("avg_dispatch_lag_ms") or 0.0)
+        event_bus_ok = bool(
+            event_bus_stats.get("started")
+            and queue_size <= int(HEALTH_EVENT_BUS_MAX_QUEUE_DEPTH)
+            and avg_lag_ms <= float(HEALTH_EVENT_BUS_MAX_LAG_MS)
+            and not normal_overflow_active
+            and not critical_backpressure_active
+            and critical_handler_failures <= 0
+        )
+        detail_parts: List[str] = []
+        if not bool(event_bus_stats.get("started")):
+            detail_parts.append("event_bus_not_started")
+        elif queue_size > int(HEALTH_EVENT_BUS_MAX_QUEUE_DEPTH) or avg_lag_ms > float(HEALTH_EVENT_BUS_MAX_LAG_MS):
+            detail_parts.append(
+                f"event_bus_backlog:queue_size={queue_size}:avg_dispatch_lag_ms={round(avg_lag_ms, 2)}"
+            )
+        if normal_overflow_active:
+            detail_parts.append("event_bus_normal_overflow_active")
+        if critical_backpressure_active:
+            detail_parts.append("event_bus_critical_backpressure_active")
+        if normal_dropped_count > 0:
+            detail_parts.append(f"event_bus_normal_drops:{normal_dropped_count}")
+        if critical_inline_dispatch_count > 0:
+            detail_parts.append(f"event_bus_critical_backpressure:{critical_inline_dispatch_count}")
+        if critical_handler_failures > 0:
+            detail_parts.append(
+                f"event_bus_critical_handler_failures:{critical_handler_failures}:"
+                f"last_failed_event_type={str(event_bus_stats.get('last_failed_event_type') or '')}"
+            )
+        out["event_bus"] = {
+            **event_bus_stats,
+            "ok": bool(event_bus_ok),
+            "detail": ("ok" if event_bus_ok else ";".join(detail_parts or ["event_bus_degraded"])),
+            "max_queue_depth": int(HEALTH_EVENT_BUS_MAX_QUEUE_DEPTH),
+            "max_lag_ms": float(HEALTH_EVENT_BUS_MAX_LAG_MS),
+        }
+    except Exception as e:
+        _warn("health.event_bus", e)
+        out["event_bus"] = {
+            "ok": False,
+            "started": False,
+            "detail": f"event_bus_error:{type(e).__name__}:{e}",
+            "queue_size": 0,
+            "avg_dispatch_lag_ms": None,
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section("event_bus", section_started, ok=bool((out.get("event_bus") or {}).get("ok")))
+
+
+def _check_async_price_persistence(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.async_writer import get_async_writer
+
+        out["async_price_persistence"] = dict(get_async_writer().get_snapshot() or {})
+    except Exception as e:
+        _warn("health.async_price_persistence", e)
+        out["async_price_persistence"] = {
+            "ok": False,
+            "enabled": False,
+            "detail": f"async_price_persistence_error:{type(e).__name__}:{e}",
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section(
+        "async_price_persistence",
+        section_started,
+        ok=bool((out.get("async_price_persistence") or {}).get("ok")),
+    )
+
+
+def _check_pg_price_storage(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.storage_pg_prices import get_price_storage
+
+        out["pg_price_storage"] = dict(get_price_storage().get_snapshot() or {})
+    except Exception as e:
+        _warn("health.pg_price_storage", e)
+        out["pg_price_storage"] = {
+            "ok": False,
+            "enabled": False,
+            "detail": f"pg_price_storage_error:{type(e).__name__}:{e}",
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section("pg_price_storage", section_started, ok=bool((out.get("pg_price_storage") or {}).get("ok")))
+
+
+def _check_price_migration_validation(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.price_migration_validation import get_price_migration_validation_snapshot
+
+        out["price_migration_validation"] = dict(get_price_migration_validation_snapshot() or {})
+    except Exception as e:
+        _warn("health.price_migration_validation", e)
+        out["price_migration_validation"] = {
+            "ok": False,
+            "enabled": False,
+            "detail": f"price_migration_validation_error:{type(e).__name__}:{e}",
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section(
+        "price_migration_validation",
+        section_started,
+        ok=bool((out.get("price_migration_validation") or {}).get("ok")),
+    )
+
+
+def _check_timeseries_storage(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        timeseries_storage = dict(get_timeseries_storage_snapshot() or {})
+        feature_store_snapshot = dict(timeseries_storage.get("feature_store") or {})
+        telemetry_append_buffer_snapshot = dict(timeseries_storage.get("telemetry_append_buffer") or {})
+        telemetry_mirror_snapshot = dict(timeseries_storage.get("telemetry_mirror") or {})
+        timescale_snapshot = dict(timeseries_storage)
+        timescale_snapshot.pop("feature_store", None)
+        timescale_snapshot.pop("telemetry_append_buffer", None)
+        timescale_snapshot.pop("telemetry_mirror", None)
+        out["timeseries_storage"] = timeseries_storage
+        out["timescale"] = timescale_snapshot
+        out["feature_store"] = feature_store_snapshot
+        out["telemetry_append_buffer"] = telemetry_append_buffer_snapshot
+        out["telemetry_mirror"] = telemetry_mirror_snapshot
+    except Exception as e:
+        _warn("health.timeseries_storage", e)
+        error_detail = f"timeseries_storage_error:{type(e).__name__}:{e}"
+        out["timeseries_storage"] = {
+            "ok": False,
+            "enabled": False,
+            "degraded": True,
+            "degraded_reasons": ["timeseries_storage_error"],
+            "detail": error_detail,
+        }
+        out["timescale"] = {
+            "ok": False,
+            "enabled": False,
+            "degraded": True,
+            "degraded_reasons": ["timescale_error"],
+            "detail": error_detail,
+        }
+        out["feature_store"] = {
+            "ok": False,
+            "enabled": False,
+            "degraded": True,
+            "degraded_reasons": ["feature_store_error"],
+            "detail": error_detail,
+        }
+        out["telemetry_append_buffer"] = {
+            "ok": False,
+            "enabled": False,
+            "degraded": True,
+            "degraded_reasons": ["telemetry_append_buffer_error"],
+            "detail": error_detail,
+        }
+        out["telemetry_mirror"] = {
+            "ok": False,
+            "enabled": False,
+            "detail": error_detail,
+        }
+    _trace_section("timeseries_storage", section_started, ok=bool((out.get("timeseries_storage") or {}).get("ok")))
+
+
+def _check_telemetry_migration_validation(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.telemetry_migration_validation import get_telemetry_migration_validation_snapshot
+
+        out["telemetry_migration_validation"] = dict(get_telemetry_migration_validation_snapshot() or {})
+    except Exception as e:
+        _warn("health.telemetry_migration_validation", e)
+        out["telemetry_migration_validation"] = {
+            "ok": False,
+            "enabled": False,
+            "detail": f"telemetry_migration_validation_error:{type(e).__name__}:{e}",
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section(
+        "telemetry_migration_validation",
+        section_started,
+        ok=bool((out.get("telemetry_migration_validation") or {}).get("ok")),
+    )
+
+
+def _check_portfolio_runtime(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["portfolio_runtime"] = _portfolio_runtime_snapshot(con=ctx.con)
+    except Exception as e:
+        _warn("health.portfolio_runtime", e)
+        out["portfolio_runtime"] = {
+            "ok": False,
+            "available": False,
+            "degraded": False,
+            "detail": f"portfolio_runtime_error:{type(e).__name__}:{e}",
+            "updated_ts_ms": None,
+            "degraded_reasons": [],
+            "degraded_codes": [],
+        }
+    _trace_section("portfolio_runtime", section_started, ok=bool((out.get("portfolio_runtime") or {}).get("ok")))
+
+
+def _check_execution_degraded(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["execution_degraded"] = _execution_degraded_snapshot(con=ctx.con)
+    except Exception as e:
+        _warn("health.execution_degraded", e)
+        out["execution_degraded"] = {
+            "active": True,
+            "severity": "CRITICAL",
+            "reason": f"execution_degraded_error:{type(e).__name__}:{e}",
+            "reason_codes": ["execution_degraded_error"],
+            "sources": [],
+        }
+    _trace_section(
+        "execution_degraded",
+        section_started,
+        active=bool((out.get("execution_degraded") or {}).get("active")),
+    )
+
+
+def _check_execution_barrier_refresh(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    if not (HEALTH_INCLUDE_EXECUTION_BARRIER or bool((out.get("execution_degraded") or {}).get("active"))):
+        return
+    section_started = time.perf_counter()
+    out["execution_barrier"] = _refresh_execution_barrier_snapshot(
+        dict(out.get("execution_degraded") or {}),
+        con=ctx.con,
+    )
+    _trace_section(
+        "execution_barrier_refresh",
+        section_started,
+        allowed=bool((out.get("execution_barrier") or {}).get("allowed")),
+    )
+
+
+def _check_component_health(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        component_health = dict(get_component_health_snapshot() or {})
+        out["component_health"] = component_health
+        out["inference_runtime"] = dict(
+            component_health.get("inference")
+            or {
+                "component": "inference",
+                "ok": False,
+                "status": "unknown",
+                "detail": "component_health_unreported",
+                "updated_ts_ms": None,
+                "age_s": None,
+                "stale": True,
+            }
+        )
+        out["execution_runtime"] = dict(
+            component_health.get("execution")
+            or {
+                "component": "execution",
+                "ok": False,
+                "status": "unknown",
+                "detail": "component_health_unreported",
+                "updated_ts_ms": None,
+                "age_s": None,
+                "stale": True,
+            }
+        )
+        out["ingestion_observability"] = dict(
+            component_health.get("ingestion")
+            or {
+                "component": "ingestion",
+                "ok": False,
+                "status": "unknown",
+                "detail": "component_health_unreported",
+                "updated_ts_ms": None,
+                "age_s": None,
+                "stale": True,
+            }
+        )
+    except Exception as e:
+        _warn("health.component_health", e)
+        out["component_health"] = {}
+        out["inference_runtime"] = {
+            "component": "inference",
+            "ok": False,
+            "status": "error",
+            "detail": f"component_health_error:{type(e).__name__}:{e}",
+            "updated_ts_ms": None,
+            "age_s": None,
+            "stale": True,
+        }
+        out["execution_runtime"] = {
+            "component": "execution",
+            "ok": False,
+            "status": "error",
+            "detail": f"component_health_error:{type(e).__name__}:{e}",
+            "updated_ts_ms": None,
+            "age_s": None,
+            "stale": True,
+        }
+        out["ingestion_observability"] = {
+            "component": "ingestion",
+            "ok": False,
+            "status": "error",
+            "detail": f"component_health_error:{type(e).__name__}:{e}",
+            "updated_ts_ms": None,
+            "age_s": None,
+            "stale": True,
+        }
+    _trace_section(
+        "component_health",
+        section_started,
+        inference_ok=bool((out.get("inference_runtime") or {}).get("ok")),
+        execution_ok=bool((out.get("execution_runtime") or {}).get("ok")),
+        ingestion_ok=bool((out.get("ingestion_observability") or {}).get("ok")),
+    )
+
+
+def _check_data_pipeline_gates(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    now_ms = ctx.now_ms
+    section_started = time.perf_counter()
+    try:
+        out["feature_validation"] = dict(get_feature_validation_snapshot() or {})
+        out["model_input_validation"] = dict(get_model_input_validation_snapshot() or {})
+        out["scoring_pipeline"] = dict(get_scoring_pipeline_snapshot() or {})
+        component_health = dict(out.get("component_health") or {})
+        out["feature_runtime"] = dict(
+            component_health.get("feature_engine")
+            or {
+                "component": "feature_engine",
+                "ok": False,
+                "status": "unknown",
+                "detail": "component_health_unreported",
+                "updated_ts_ms": None,
+                "age_s": None,
+                "stale": True,
+            }
+        )
+        out["model_input_runtime"] = dict(
+            component_health.get("model_inputs")
+            or {
+                "component": "model_inputs",
+                "ok": False,
+                "status": "unknown",
+                "detail": "component_health_unreported",
+                "updated_ts_ms": None,
+                "age_s": None,
+                "stale": True,
+            }
+        )
+        out["scoring_runtime"] = dict(
+            component_health.get("scoring_pipeline")
+            or {
+                "component": "scoring_pipeline",
+                "ok": False,
+                "status": "unknown",
+                "detail": "component_health_unreported",
+                "updated_ts_ms": None,
+                "age_s": None,
+                "stale": True,
+            }
+        )
+        out["data_pipeline_gates"] = dict(
+            build_data_pipeline_gate_snapshot(
+                now_ms=now_ms,
+                ingestion_runtime=dict(out.get("ingestion_runtime") or {}),
+                ingestion_freshness=dict(out.get("ingestion_freshness") or {}),
+            )
+            or {}
+        )
+    except Exception as e:
+        _warn("health.data_pipeline_gates", e)
+        out["feature_validation"] = {}
+        out["model_input_validation"] = {}
+        out["scoring_pipeline"] = {}
+        out["feature_runtime"] = {
+            "component": "feature_engine",
+            "ok": False,
+            "status": "error",
+            "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
+            "updated_ts_ms": None,
+            "age_s": None,
+            "stale": True,
+        }
+        out["model_input_runtime"] = {
+            "component": "model_inputs",
+            "ok": False,
+            "status": "error",
+            "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
+            "updated_ts_ms": None,
+            "age_s": None,
+            "stale": True,
+        }
+        out["scoring_runtime"] = {
+            "component": "scoring_pipeline",
+            "ok": False,
+            "status": "error",
+            "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
+            "updated_ts_ms": None,
+            "age_s": None,
+            "stale": True,
+        }
+        out["data_pipeline_gates"] = {
+            "ok": False,
+            "updated_ts_ms": int(now_ms),
+            "gates": {},
+            "failed_gates": [
+                "ingestion_active",
+                "ingestion_not_stale",
+                "critical_features_valid",
+                "model_inputs_valid",
+                "scoring_pipeline_operational",
+            ],
+            "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
+        }
+    _trace_section(
+        "data_pipeline_gates",
+        section_started,
+        ok=bool((out.get("data_pipeline_gates") or {}).get("ok")),
+        failed=len((out.get("data_pipeline_gates") or {}).get("failed_gates") or []),
+    )
+
+
+def _adjust_safe_mode_attribution(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower()
+    attribution_snapshot = dict(out.get("attribution") or {})
+    execution_snapshot = dict(out.get("execution") or {})
+    attribution_rows = _int_or(attribution_snapshot.get("rows"))
+    attribution_orphans = dict(attribution_snapshot.get("orphans") or {})
+    attribution_state_present = bool(
+        attribution_rows > 0
+        or _int_or(attribution_orphans.get("orphan_row_count")) > 0
+        or _int_or(attribution_orphans.get("snapshot_ts_ms")) > 0
+    )
+    execution_fills = _int_or(execution_snapshot.get("n_fills"))
+    if mode_name == "safe" and (not attribution_state_present) and execution_fills <= 0:
+        attribution_snapshot["ok"] = True
+        attribution_snapshot["not_applicable"] = True
+        attribution_snapshot["reason"] = "no_executed_fills"
+        out["attribution"] = attribution_snapshot
+
+
+def _check_startup_validation(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        out["startup_validation"] = get_startup_validation_snapshot(
+            health=out,
+            db_validation=get_db_validation_snapshot(include_quick_check=False),
+        )
+    except Exception as e:
+        _warn("health.startup_validation", e)
+        out["startup_validation"] = {
+            "ok": False,
+            "reasons": [f"startup_validation_error:{type(e).__name__}:{e}"],
+            "blocking_checks": [
+                "config_valid",
+                "database_reachable",
+                "schema_valid",
+                "core_services_initialized",
+            ],
+            "blocking_gates": [
+                "config_valid",
+                "database_reachable",
+                "schema_valid",
+                "core_services_initialized",
+            ],
+            "critical_systems_missing": [],
+        }
+    _trace_section("startup_validation", section_started, ok=bool((out.get("startup_validation") or {}).get("ok")))
+
+
+_HEALTH_SNAPSHOT_CHECKS: tuple[HealthSnapshotCheck, ...] = (
+    HealthSnapshotCheck("runtime_hardware", _check_runtime_hardware),
+    HealthSnapshotCheck("disk_pressure", _check_disk_pressure),
+    HealthSnapshotCheck("db", _check_db),
+    HealthSnapshotCheck("event_log", _check_event_log),
+    HealthSnapshotCheck("prices", _check_prices),
+    HealthSnapshotCheck("events", _check_events),
+    HealthSnapshotCheck("labels", _check_labels),
+    HealthSnapshotCheck("model", _check_model),
+    HealthSnapshotCheck("competition", _check_competition),
+    HealthSnapshotCheck("attribution", _check_attribution),
+    HealthSnapshotCheck("position_reconcile", _check_position_reconcile),
+    HealthSnapshotCheck("training", _check_training),
+    HealthSnapshotCheck("jobs", _check_job_heartbeats),
+    HealthSnapshotCheck("ingestion_runtime", _check_ingestion_runtime_and_sources),
+    HealthSnapshotCheck("providers", _check_provider_health),
+    HealthSnapshotCheck("provider_readiness", _check_provider_readiness),
+    HealthSnapshotCheck("portfolio", _check_portfolio),
+    HealthSnapshotCheck("execution", _check_execution_activity),
+    HealthSnapshotCheck("execution_barrier", _check_execution_barrier),
+    HealthSnapshotCheck("recent_errors", _check_recent_errors),
+    HealthSnapshotCheck("predictions", _check_predictions),
+    HealthSnapshotCheck("model_serving", _check_model_serving),
+    HealthSnapshotCheck("alert_lifecycle", _check_alert_lifecycle),
+    HealthSnapshotCheck("execution_supervisor", _check_execution_supervisor),
+    HealthSnapshotCheck("broker_connection", _check_broker_connection),
+    HealthSnapshotCheck("model_cache", _check_model_cache),
+    HealthSnapshotCheck("runtime_price_cache", _check_runtime_price_cache),
+    HealthSnapshotCheck("event_bus", _check_event_bus),
+    HealthSnapshotCheck("async_price_persistence", _check_async_price_persistence),
+    HealthSnapshotCheck("pg_price_storage", _check_pg_price_storage),
+    HealthSnapshotCheck("price_migration_validation", _check_price_migration_validation),
+    HealthSnapshotCheck("timeseries_storage", _check_timeseries_storage),
+    HealthSnapshotCheck("telemetry_migration_validation", _check_telemetry_migration_validation),
+    HealthSnapshotCheck("portfolio_runtime", _check_portfolio_runtime),
+    HealthSnapshotCheck("execution_degraded", _check_execution_degraded),
+    HealthSnapshotCheck("execution_barrier_refresh", _check_execution_barrier_refresh),
+    HealthSnapshotCheck("component_health", _check_component_health),
+    HealthSnapshotCheck("data_pipeline_gates", _check_data_pipeline_gates),
+    HealthSnapshotCheck("safe_mode_attribution", _adjust_safe_mode_attribution),
+    HealthSnapshotCheck("startup_validation", _check_startup_validation),
+)
+
+
+def _build_health_snapshot_context(con: Any, now_ms: int) -> HealthSnapshotContext:
+    return HealthSnapshotContext(
+        con=con,
+        now_ms=now_ms,
+        out=_new_health_snapshot_payload(now_ms),
+    )
+
+
+def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
+    out = ctx.out
+    mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower()
+
+    db_ok = bool((out.get("db") or {}).get("ok"))
+    event_log_ok = bool((out.get("event_log") or {}).get("ok"))
+    prices_ok = bool((out.get("prices") or {}).get("ok"))
+    events_ok = bool((out.get("events") or {}).get("ok"))
+    jobs_ok = bool((out.get("job_summary") or {}).get("ok"))
+    providers_ok = bool((out.get("providers") or {}).get("ok"))
+    provider_readiness = dict(out.get("provider_readiness") or {})
+    provider_readiness_required = bool(provider_readiness.get("required"))
+    provider_readiness_ok = bool((not provider_readiness_required) or provider_readiness.get("ok"))
+    competition_ok = bool((out.get("competition") or {}).get("ok"))
+    attribution_ok = bool((out.get("attribution") or {}).get("ok"))
+    options_ingestion_ok = bool((out.get("options_ingestion") or {}).get("ok"))
+    startup_validation_ok = bool((out.get("startup_validation") or {}).get("ok"))
+    timeseries_storage_snapshot = dict(out.get("timeseries_storage") or {})
+    timescale_snapshot = dict(out.get("timescale") or {})
+    feature_store_snapshot = dict(out.get("feature_store") or {})
+    portfolio_runtime_snapshot = dict(out.get("portfolio_runtime") or {})
+    position_reconcile_snapshot = dict(out.get("position_reconcile") or {})
+    execution_degraded_snapshot = dict(out.get("execution_degraded") or {})
+    timeseries_ok = bool(timeseries_storage_snapshot.get("ok", True))
+    portfolio_runtime_ok = not bool(portfolio_runtime_snapshot.get("degraded"))
+    position_reconcile_required = mode_name in ("paper", "live")
+    position_reconcile_ok = bool((not position_reconcile_required) or position_reconcile_snapshot.get("ok"))
+    position_reconcile_blocking = bool(position_reconcile_required and not position_reconcile_ok)
+    execution_degraded_active = bool(execution_degraded_snapshot.get("active"))
+    execution_degraded_critical = bool(
+        execution_degraded_active
+        and str(execution_degraded_snapshot.get("severity") or "").strip().upper() == "CRITICAL"
+    )
+    ingestion_freshness = dict(out.get("ingestion_freshness") or {})
+    critical_ingestion_ok = bool(ingestion_freshness.get("critical_ok"))
+    ingestion_runtime_reason_codes = list(ingestion_freshness.get("runtime_reason_codes") or [])
+    ingestion_advisory_reason_codes = list(ingestion_freshness.get("advisory_reason_codes") or [])
+    data_pipeline_gates = dict(out.get("data_pipeline_gates") or {})
+    data_pipeline_gates_ok = bool(data_pipeline_gates.get("ok"))
+    failed_data_pipeline_gates = [
+        str(name)
+        for name in list(data_pipeline_gates.get("failed_gates") or [])
+        if str(name).strip()
+    ]
+    observed_data_pipeline_gate_failures = [
+        name
+        for name in failed_data_pipeline_gates
+        if (
+            (name == "critical_features_valid" and bool(out.get("feature_validation")))
+            or (name == "model_inputs_valid" and bool(out.get("model_input_validation")))
+            or (name == "scoring_pipeline_operational" and bool(out.get("scoring_pipeline")))
+        )
+    ]
+    data_pipeline_runtime_ok = len(observed_data_pipeline_gate_failures) == 0
+
+    barrier = out.get("execution_barrier") or {}
+    barrier_ok = bool(barrier.get("allowed"))
+
+    exec_sup = out.get("execution_supervisor") or {}
+    exec_sup_ok = bool(exec_sup.get("ok"))
+    exec_sup_critical = str(exec_sup.get("state") or "").lower().strip() == "critical"
+    exec_sup_failed_gates = [
+        str(name)
+        for name in list(exec_sup.get("failed_gates") or [])
+        if str(name).strip()
+    ]
+    exec_sup_alert_types = {
+        str(alert.get("alert_type") or "")
+        for alert in list(exec_sup.get("alerts") or [])
+        if str(alert.get("alert_type") or "").strip()
+    }
+    exec_sup_account_state = dict(exec_sup.get("account_state") or {})
+    exec_sup_integrity = dict(exec_sup.get("integrity") or {})
+
+    broker_connection = out.get("broker_connection") or {}
+    broker_ok = bool(broker_connection.get("ok")) and str(broker_connection.get("state") or "").lower().strip() not in (
+        "disconnected",
+        "connect_failed",
+        "reconnect_failed",
+    )
+
+    out["startup"] = {
+        "mode": mode_name,
+        "db_ok": db_ok,
+        "event_log_ok": event_log_ok,
+        "prices_ok": prices_ok,
+        "events_ok": events_ok,
+        "jobs_ok": jobs_ok,
+        "providers_ok": providers_ok,
+        "provider_readiness_ok": provider_readiness_ok,
+        "competition_ok": competition_ok,
+        "attribution_ok": attribution_ok,
+        "critical_ingestion_ok": critical_ingestion_ok,
+        "data_pipeline_gates_ok": data_pipeline_gates_ok,
+        "data_pipeline_runtime_ok": data_pipeline_runtime_ok,
+        "options_ingestion_ok": options_ingestion_ok,
+        "timeseries_ok": timeseries_ok,
+        "portfolio_runtime_ok": portfolio_runtime_ok,
+        "position_reconcile_ok": position_reconcile_ok,
+        "execution_degraded": execution_degraded_active,
+        "startup_validation_ok": startup_validation_ok,
+        "execution_barrier_ok": barrier_ok,
+        "broker_ok": broker_ok,
+        "execution_supervisor_ok": exec_sup_ok,
+        "execution_gates_ok": len(exec_sup_failed_gates) == 0,
+    }
+
+    if not db_ok:
+        out["reasons"].append("db_not_initialized")
+
+    if not event_log_ok:
+        out["reasons"].append("event_log_not_ok")
+
+    if not prices_ok:
+        out["reasons"].append("no_prices")
+
+    if not events_ok and mode_name in ("shadow", "live"):
+        out["reasons"].append("events_not_ok")
+
+    if not jobs_ok:
+        out["reasons"].append("jobs_not_running")
+
+    if not providers_ok:
+        out["reasons"].append("providers_not_ok")
+    if not provider_readiness_ok:
+        out["reasons"].append("provider_readiness_not_ok")
+        out["reasons"].extend(list(provider_readiness.get("blockers") or []))
+
+    if not competition_ok and mode_name in ("shadow", "live"):
+        out["reasons"].append("competition_not_ok")
+    if not attribution_ok:
+        out["reasons"].append("attribution_not_ok")
+        if _int_or((((out.get("attribution") or {}).get("orphans") or {}).get("orphan_row_count"))) > 0:
+            out["reasons"].append("pnl_attribution_orphans_detected")
+
+    if not bool((out.get("ingestion_runtime") or {}).get("running")):
+        out["reasons"].append("ingestion_not_running")
+
+    if bool((out.get("ingestion_runtime") or {}).get("stale")):
+        out["reasons"].append("ingestion_stale")
+
+    out["reasons"].extend(ingestion_runtime_reason_codes)
+    out["reasons"].extend(ingestion_advisory_reason_codes)
+    out["reasons"].extend([f"data_gate:{name}" for name in observed_data_pipeline_gate_failures])
+    if not options_ingestion_ok:
+        out["reasons"].append("options_ingestion_not_ok")
+    if not timeseries_ok:
+        out["reasons"].append("timeseries_storage_not_ok")
+        out["reasons"].extend(
+            [f"timescale_degraded:{reason}" for reason in list(timescale_snapshot.get("degraded_reasons") or [])]
+        )
+        out["reasons"].extend(
+            [f"feature_store_degraded:{reason}" for reason in list(feature_store_snapshot.get("degraded_reasons") or [])]
+        )
+    if bool(portfolio_runtime_snapshot.get("degraded")):
+        out["reasons"].append("portfolio_runtime_degraded")
+        out["reasons"].extend(list(portfolio_runtime_snapshot.get("degraded_codes") or []))
+    if position_reconcile_blocking:
+        out["reasons"].append("position_reconcile_not_ok")
+        out["reasons"].append(
+            f"position_reconcile:{position_reconcile_snapshot.get('status') or 'failed'}"
+        )
+        out["reasons"].extend(list(position_reconcile_snapshot.get("blockers") or []))
+    if not startup_validation_ok:
+        out["reasons"].extend(list((out.get("startup_validation") or {}).get("reasons") or []))
+    if not barrier_ok and mode_name in ("shadow", "live"):
+        out["reasons"].append(f"execution_barrier:{barrier.get('reason', 'blocked')}")
+    if execution_degraded_active:
+        out["reasons"].append(
+            f"execution_degraded:{str(execution_degraded_snapshot.get('reason') or 'execution_degraded')}"
+        )
+        out["reasons"].extend(list(execution_degraded_snapshot.get("reason_codes") or []))
+
+    if not exec_sup_ok and mode_name in ("shadow", "live"):
+        out["reasons"].append("execution_supervisor_unavailable")
+    out["reasons"].extend([f"execution_gate:{name}" for name in exec_sup_failed_gates])
+    for alert_type in (
+        "duplicate_order_risk_detected",
+        "missing_fills_detected",
+        "fill_missing_local_order_reference",
+        "broker_submission_unrecorded_needs_reconcile",
+        "order_position_mismatch",
+        "invalid_account_balance_state",
+        "pricing_unavailable_for_unrealized_pnl",
+    ):
+        if alert_type in exec_sup_alert_types:
+            out["reasons"].append(alert_type)
+    if exec_sup_account_state and not bool(exec_sup_account_state.get("ok", True)):
+        out["reasons"].append("invalid_account_balance_state")
+    if int(exec_sup_integrity.get("pricing_unavailable_count") or 0) > 0:
+        out["reasons"].append("pricing_unavailable_for_unrealized_pnl")
+    if exec_sup_critical:
+        out["reasons"].append("execution_supervisor_critical")
+
+    if not broker_ok and mode_name == "live":
+        out["reasons"].append("broker_connection_unavailable")
+
+    if ctx.check_failures:
+        out["reasons"].extend(ctx.check_failures)
+
+    startup_ok = (
+        db_ok
+        and event_log_ok
+        and prices_ok
+        and jobs_ok
+        and providers_ok
+        and provider_readiness_ok
+        and critical_ingestion_ok
+    )
+    if mode_name == "live":
+        out["ok"] = (
+            startup_ok
+            and startup_validation_ok
+            and events_ok
+            and data_pipeline_runtime_ok
+            and barrier_ok
+            and broker_ok
+            and competition_ok
+            and attribution_ok
+            and timeseries_ok
+            and portfolio_runtime_ok
+            and position_reconcile_ok
+            and exec_sup_ok
+            and (not execution_degraded_critical)
+            and (not exec_sup_critical)
+        )
+    elif mode_name == "shadow":
+        out["ok"] = (
+            startup_ok
+            and startup_validation_ok
+            and events_ok
+            and data_pipeline_runtime_ok
+            and barrier_ok
+            and competition_ok
+            and attribution_ok
+            and timeseries_ok
+            and portfolio_runtime_ok
+            and exec_sup_ok
+            and (not execution_degraded_critical)
+            and (not exec_sup_critical)
+        )
+    else:
+        out["ok"] = (
+            startup_ok
+            and startup_validation_ok
+            and data_pipeline_runtime_ok
+            and timeseries_ok
+            and portfolio_runtime_ok
+            and (not exec_sup_critical)
+        )
+
+    if ctx.check_failures:
+        out["ok"] = False
+
+    if HEALTH_EMIT_METRICS:
+        try:
+            emit_gauge(
+                "job_health",
+                1.0 if bool(out.get("ok")) else 0.0,
+                component="engine.runtime.health",
+                extra_tags={"metric_scope": "health_snapshot"},
+            )
+            emit_gauge(
+                "provider_uptime",
+                float((out.get("providers") or {}).get("healthy") or 0.0),
+                component="engine.runtime.health",
+                extra_tags={"metric_scope": "healthy_providers"},
+            )
+            for component_name in ("ingestion", "inference", "execution"):
+                component_row = dict((out.get("component_health") or {}).get(component_name) or {})
+                emit_gauge(
+                    "component_health_snapshot",
+                    1.0 if bool(component_row.get("ok")) else 0.0,
+                    component="engine.runtime.health",
+                    extra_tags={"observed_component": str(component_name)},
+                )
+            trace_event(
+                "health_snapshot",
+                component="engine.runtime.health",
+                entity_type="health",
+                entity_id="runtime",
+                payload={
+                    "ok": bool(out.get("ok")),
+                    "reasons": list(out.get("reasons") or []),
+                    "prices": out.get("prices") or {},
+                    "providers": out.get("providers") or {},
+                    "job_summary": out.get("job_summary") or {},
+                },
+            )
+        except Exception as e:
+            _warn("health.runtime_event.emit", e)
+
+    root_cause_candidates = list(out.get("reasons") or [])
+
+    critical_blockers = []
+    if not bool(out.get("db", {}).get("ok")):
+        critical_blockers.append("db_not_ok")
+    if not bool(out.get("prices", {}).get("ok")):
+        critical_blockers.append("prices_not_ok")
+    if not bool(out.get("providers", {}).get("ok")):
+        critical_blockers.append("providers_not_ok")
+    if not bool((out.get("provider_readiness") or {}).get("ok")) and bool(
+        (out.get("provider_readiness") or {}).get("required")
+    ):
+        critical_blockers.append("provider_readiness_not_ok")
+        critical_blockers.extend(list((out.get("provider_readiness") or {}).get("blockers") or []))
+    if not bool(out.get("job_summary", {}).get("ok")):
+        critical_blockers.append("jobs_not_ok")
+    if not bool(out.get("competition", {}).get("ok")) and mode_name in ("shadow", "live"):
+        critical_blockers.append("competition_not_ok")
+    if not bool(out.get("attribution", {}).get("ok")):
+        critical_blockers.append("attribution_not_ok")
+    if not timeseries_ok:
+        critical_blockers.append("timeseries_storage_not_ok")
+    if bool(portfolio_runtime_snapshot.get("degraded")):
+        critical_blockers.append("portfolio_runtime_degraded")
+    if position_reconcile_blocking:
+        critical_blockers.append("position_reconcile_not_ok")
+    if execution_degraded_critical:
+        critical_blockers.append("execution_degraded")
+    if mode_name in ("shadow", "live") and not exec_sup_ok:
+        critical_blockers.append("execution_supervisor_unavailable")
+    if exec_sup_critical:
+        critical_blockers.append("execution_supervisor_critical")
+
+    if not bool((out.get("ingestion_runtime") or {}).get("running")):
+        critical_blockers.append("ingestion_not_running")
+
+    if bool((out.get("ingestion_runtime") or {}).get("stale")):
+        critical_blockers.append("ingestion_stale")
+
+    critical_blockers.extend(ingestion_runtime_reason_codes)
+    critical_blockers.extend(ctx.check_failures)
+
+    if not out.get("db", {}).get("ok"):
+        system_stage = "BOOT"
+    elif (
+        not out.get("prices", {}).get("ok")
+        or bool((out.get("ingestion_runtime") or {}).get("stale"))
+        or not critical_ingestion_ok
+    ):
+        system_stage = "INGESTION"
+    elif not out.get("labels", {}).get("ok"):
+        system_stage = "FEATURES"
+    else:
+        system_stage = "EXECUTION"
+
+    data_flow_ok = bool(
+        out.get("db", {}).get("ok")
+        and out.get("prices", {}).get("ok")
+        and out.get("providers", {}).get("ok")
+        and (
+            (not bool((out.get("provider_readiness") or {}).get("required")))
+            or bool((out.get("provider_readiness") or {}).get("ok"))
+        )
+        and out.get("job_summary", {}).get("ok")
+        and not bool((out.get("ingestion_runtime") or {}).get("stale"))
+        and bool(critical_ingestion_ok)
+        and bool((out.get("attribution") or {}).get("ok"))
+        and (mode_name not in ("shadow", "live") or bool((out.get("competition") or {}).get("ok")))
+        and not bool(ctx.check_failures)
+    )
+    out["reasons"] = _dedupe_strs(list(out.get("reasons") or []))
+    out["root_cause_candidates"] = _dedupe_strs(root_cause_candidates)
+    out["critical_blockers"] = _dedupe_strs(critical_blockers)
+    out["system_stage"] = system_stage
+    out["data_flow_ok"] = data_flow_ok
+    try:
+        out["lifecycle"] = dict(_lc_get_state() or {})
+    except Exception as e:
+        _warn("health.lifecycle_state", e)
+        out["lifecycle"] = {"state": "UNKNOWN", "detail": "", "first_price_ts_ms": ""}
+
+    return out
+
+
+
 def get_health_snapshot():
-    # This is the canonical health snapshot consumed by lifecycle, APIs, and
-    # startup checks, so it combines DB, schema, feed, and pipeline status.
+    # Canonical runtime health snapshot consumed by lifecycle, APIs, readiness,
+    # and preflight. Keep this as a small driver; checks live in the registry
+    # above so individual probes can be tested without constructing the whole
+    # runtime health stack.
     now_ms = int(time.time() * 1000)
     cache_ttl_ms = max(0, int(_HEALTH_SNAPSHOT_CACHE_TTL_MS))
     cached_ts_ms = 0
@@ -2673,1777 +4596,9 @@ def get_health_snapshot():
     con = None
     try:
         con = _db_connect()
-        out = {
-            "ok": False,
-            "ts_ms": now_ms,
-            "db_file": {
-                "path": str(DB_PATH),
-                "exists": bool(DB_PATH.exists()),
-            },
-            "reasons": [],
-            "db": {
-                "ok": True,
-                "db_path": str(DB_PATH),
-                "exists": False,
-                "initialized": False,
-                "size_bytes": 0,
-                "wal_bytes": 0,
-                "quick_check": "unknown",
-                "error": None,
-            },
-            "event_log": {
-                "ok": False,
-                "count": 0,
-                "last_ts_ms": None,
-                "age_s": None,
-            },
-        }
-        try:
-            out["runtime_hardware"] = runtime_hardware_snapshot()
-        except Exception as e:
-            _warn("health.runtime_hardware", e)
-            out["runtime_hardware"] = {
-                "ok": False,
-                "error": f"{type(e).__name__}: {e}",
-            }
-
-        section_started = time.perf_counter()
-        try:
-            out["disk_pressure"] = get_disk_pressure_snapshot()
-        except Exception as e:
-            _warn("health.disk_pressure", e)
-            out["disk_pressure"] = {
-                "ok": False,
-                "status": "error",
-                "critical": [f"disk_pressure_error:{type(e).__name__}:{e}"],
-                "warnings": [],
-                "paths": [],
-            }
-        _trace_section("disk_pressure", section_started, ok=bool((out.get("disk_pressure") or {}).get("ok")))
-
-        def _table_exists(table: str) -> bool:
-            try:
-                row = con.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-                    (str(table),),
-                ).fetchone()
-                return bool(row)
-            except Exception as e:
-                _warn("health.table_exists", e, table=table)
-                return False
-
-        # DB/WAL checks are first because most later health queries depend on a
-        # working database handle and consistent schema.
-        section_started = time.perf_counter()
-        try:
-            if DB_PATH.exists():
-                out["db"]["exists"] = True
-                out["db"]["size_bytes"] = int(DB_PATH.stat().st_size)
-            wal_path = _sqlite_wal_path(DB_PATH)
-            if wal_path is not None:
-                if wal_path.exists():
-                    out["db"]["wal_bytes"] = int(wal_path.stat().st_size)
-
-            if HEALTH_RUN_QUICK_CHECK:
-                row = con.execute("PRAGMA quick_check;").fetchone()
-                if row:
-                    qc = str(row[0])
-                    out["db"]["quick_check"] = qc
-                    if qc.lower() != "ok":
-                        out["db"]["ok"] = False
-            else:
-                out["db"]["quick_check"] = "skipped"
-
-            out["db"]["initialized"] = bool(
-                _table_exists("schema_version")
-                or _table_exists("prices")
-                or _table_exists("job_locks")
-            )
-        except Exception as e:
-            out["db"]["ok"] = False
-            out["db"]["error"] = str(e)
-        _trace_section("db", section_started, ok=bool((out.get("db") or {}).get("ok")))
-
-        # ---------------------------
-        # Event log freshness
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            event_log_summary = dict(fetch_event_log_summary() or {})
-            last_ts_ms = event_log_summary.get("last_ts_ms")
-            age_s = None if not last_ts_ms else round((now_ms - int(last_ts_ms)) / 1000.0, 1)
-            out["event_log"] = {
-                "ok": bool(event_log_summary.get("ok")),
-                "count": int(event_log_summary.get("count") or 0),
-                "last_ts_ms": (int(last_ts_ms) if last_ts_ms is not None else None),
-                "age_s": age_s,
-            }
-        except Exception as e:
-            _warn("health.event_log", e)
-            out["event_log"] = {
-                "ok": False,
-                "count": 0,
-                "last_ts_ms": None,
-                "age_s": None,
-            }
-        _trace_section("event_log", section_started, ok=bool((out.get("event_log") or {}).get("ok")))
-
-        # ---------------------------
-        # Prices freshness
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            effective_prices_max_age_s = _effective_prices_max_age_s(con)
-            row = con.execute("SELECT MAX(ts_ms) FROM prices").fetchone()
-            if row and row[0]:
-                age_s = (now_ms - int(row[0])) / 1000.0
-                out["prices"] = {
-                    "ok": age_s < effective_prices_max_age_s,
-                    "age_s": round(age_s, 1),
-                    "max_age_s": round(effective_prices_max_age_s, 1),
-                    "last_ts_ms": int(row[0]),
-                }
-            else:
-                out["prices"] = {
-                    "ok": False,
-                    "age_s": None,
-                    "max_age_s": round(effective_prices_max_age_s, 1),
-                    "last_ts_ms": None,
-                }
-        except Exception as e:
-            _warn("health.prices", e)
-            out["prices"] = {
-                "ok": False,
-                "age_s": None,
-                "max_age_s": HEALTH_PRICES_MAX_AGE_S,
-                "last_ts_ms": None,
-            }
-        _trace_section("prices", section_started, ok=bool((out.get("prices") or {}).get("ok")))
-
-        # ---------------------------
-        # Events freshness
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            row = con.execute("SELECT MAX(ts_ms) FROM events").fetchone()
-            if row and row[0]:
-                age_s = (now_ms - int(row[0])) / 1000.0
-                out["events"] = {
-                    "ok": age_s < HEALTH_EVENTS_MAX_AGE_S,
-                    "age_s": round(age_s, 1),
-                    "max_age_s": HEALTH_EVENTS_MAX_AGE_S,
-                    "last_ts_ms": int(row[0]),
-                }
-            else:
-                out["events"] = {
-                    "ok": False,
-                    "age_s": None,
-                    "max_age_s": HEALTH_EVENTS_MAX_AGE_S,
-                    "last_ts_ms": None,
-                }
-        except Exception as e:
-            _warn("health.events", e)
-            out["events"] = {
-                "ok": False,
-                "age_s": None,
-                "max_age_s": HEALTH_EVENTS_MAX_AGE_S,
-                "last_ts_ms": None,
-            }
-        _trace_section("events", section_started, ok=bool((out.get("events") or {}).get("ok")))
-
-        # ---------------------------
-        # Labels coverage
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            row = con.execute("SELECT COUNT(*) FROM labels").fetchone()
-            label_n = int(row[0] or 0)
-            out["labels"] = {
-                "ok": label_n >= HEALTH_MIN_LABELS,
-                "count": label_n,
-                "min_required": HEALTH_MIN_LABELS,
-            }
-        except Exception as e:
-            _warn("health.labels", e)
-            out["labels"] = {
-                "ok": False,
-                "count": 0,
-                "min_required": HEALTH_MIN_LABELS,
-            }
-        _trace_section("labels", section_started, ok=bool((out.get("labels") or {}).get("ok")))
-
-        # ---------------------------
-        # Model support
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            row = con.execute("SELECT SUM(n) FROM model_stats_regime").fetchone()
-            model_n = int(row[0] or 0)
-            out["model"] = {
-                "ok": model_n >= HEALTH_MIN_MODEL_SUPPORT,
-                "support_n": model_n,
-                "min_required": HEALTH_MIN_MODEL_SUPPORT,
-            }
-        except Exception as e:
-            _warn("health.model", e)
-            out["model"] = {
-                "ok": False,
-                "support_n": 0,
-                "min_required": HEALTH_MIN_MODEL_SUPPORT,
-            }
-        _trace_section("model", section_started, ok=bool((out.get("model") or {}).get("ok")))
-
-        # ---------------------------
-        # Competition loop health
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["competition"] = _competition_health_snapshot(now_ms)
-        except Exception:
-            out["competition"] = {
-                "ok": False,
-                "reasons": ["competition_health_error"],
-                "replay_status": "error",
-                "cycle_status": "error",
-            }
-        _trace_section("competition", section_started, ok=bool((out.get("competition") or {}).get("ok")))
-
-        # ---------------------------
-        # Attribution health
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["attribution"] = _attribution_health_snapshot(con, now_ms)
-        except Exception:
-            out["attribution"] = {
-                "ok": False,
-                "authoritative_model_ratio": 0.0,
-                "authoritative_model_min_ratio": float(HEALTH_ATTRIBUTION_MIN_RATIO),
-            }
-        _trace_section("attribution", section_started, ok=bool((out.get("attribution") or {}).get("ok")))
-
-        section_started = time.perf_counter()
-        try:
-            out["position_reconcile"] = _latest_position_reconcile_snapshot(con, now_ms)
-        except Exception as e:
-            _warn("health.position_reconcile", e)
-            out["position_reconcile"] = {
-                "available": False,
-                "ok": True,
-                "fatal_reconcile": False,
-                "status": "error",
-                "detail": f"position_reconcile_error:{type(e).__name__}:{e}",
-            }
-        _trace_section(
-            "position_reconcile",
-            section_started,
-            ok=bool((out.get("position_reconcile") or {}).get("ok")),
-            available=bool((out.get("position_reconcile") or {}).get("available")),
-        )
-
-        # ---------------------------
-        # Training guard
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            lifecycle = dict(_lc_get_state() or {})
-            runtime_state = str(lifecycle.get("state") or "").strip().upper()
-            mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
-            training_allowed = mode_name not in ("live", "shadow")
-            out["training"] = {
-                "mode": "enabled" if training_allowed else "restricted",
-                "allowed": bool(training_allowed),
-                "reason": "" if training_allowed else "engine_mode_restrictive",
-                "source": "health_fast_path",
-                "runtime_state": runtime_state,
-            }
-        except Exception:
-            out["training"] = {"mode": "unknown", "allowed": False}
-        _trace_section("training", section_started, allowed=bool((out.get("training") or {}).get("allowed")))
-
-        # ---------------------------
-        # Job heartbeats
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            row = con.execute(
-                "SELECT job_name, MAX(heartbeat_ts_ms) FROM job_locks GROUP BY job_name"
-            ).fetchall() or []
-
-            jobs = {}
-            for job_name, hb_ts in row:
-                if not hb_ts:
-                    continue
-                age_s = (now_ms - int(hb_ts)) / 1000.0
-                ok = age_s < HEALTH_JOBS_MAX_STALE_S
-                jobs[str(job_name)] = {
-                    "ok": ok,
-                    "age_s": round(age_s, 1),
-                    "max_age_s": HEALTH_JOBS_MAX_STALE_S,
-                    "last_heartbeat_ts_ms": int(hb_ts),
-                    "running": True,
-                    "source": "job_locks",
-                }
-
-            out["jobs"] = jobs
-
-        except Exception:
-            out["jobs"] = {}
-        _trace_section("jobs", section_started, count=len(out.get("jobs") or {}))
-
-        # ---------------------------
-        # Provider / feed health
-        # ---------------------------
-
-        # ---------------------------
-        # Ingestion runtime visibility (CRITICAL)
-        # ---------------------------
-        effective_prices_max_age_s = _effective_prices_max_age_s(con)
-        section_started = time.perf_counter()
-        out["ingestion_runtime"] = _shared_ingestion_runtime_snapshot(
-            con,
-            now_ms=now_ms,
-            effective_prices_max_age_s=effective_prices_max_age_s,
-        )
-        _trace_section(
-            "ingestion_runtime",
-            section_started,
-            running=bool((out.get("ingestion_runtime") or {}).get("running")),
-            stale=bool((out.get("ingestion_runtime") or {}).get("stale")),
-        )
-        section_started = time.perf_counter()
-        try:
-            out["ingestion_pipelines"] = pipeline_health_summary(
-                stale_after_s=max(float(HEALTH_EVENTS_MAX_AGE_S), 900.0)
-            )
-        except Exception as e:
-            _warn("health.ingestion_pipelines", e)
-            out["ingestion_pipelines"] = {"ok": False, "total": 0, "healthy": 0, "stale": 0, "pipelines": {}}
-        _trace_section("ingestion_pipelines", section_started, ok=bool((out.get("ingestion_pipelines") or {}).get("ok")))
-        section_started = time.perf_counter()
-        try:
-            out["options_ingestion"] = _options_ingestion_snapshot(now_ms)
-        except Exception as e:
-            _warn("health.options_ingestion", e)
-            out["options_ingestion"] = {
-                "ok": False,
-                "available": False,
-                "degraded": True,
-                "critical": True,
-                "status": "error",
-                "detail": "options_ingestion_health_error",
-            }
-        _trace_section("options_ingestion", section_started, ok=bool((out.get("options_ingestion") or {}).get("ok")))
-        section_started = time.perf_counter()
-        try:
-            pipeline_statuses = get_all_pipeline_statuses()
-        except Exception as e:
-            _warn("health.ingestion_source_statuses", e)
-            pipeline_statuses = {}
-        try:
-            out["ingestion_freshness"] = _build_ingestion_freshness_snapshot(
-                now_ms=now_ms,
-                prices_snapshot=dict(out.get("prices") or {}),
-                options_snapshot=dict(out.get("options_ingestion") or {}),
-                ingestion_runtime_snapshot=dict(out.get("ingestion_runtime") or {}),
-                pipeline_statuses=dict(pipeline_statuses or {}),
-            )
-            out["ingestion_sources"] = dict((out.get("ingestion_freshness") or {}).get("sources") or {})
-        except Exception as e:
-            _warn("health.ingestion_freshness", e)
-            out["ingestion_freshness"] = {
-                "ok": False,
-                "critical_ok": False,
-                "all_sources_ok": False,
-                "degraded": True,
-                "critical_sources": ["prices", "options"],
-                "stale_sources": ["prices", "options"],
-                "failed_sources": [],
-                "stale_critical_sources": ["prices", "options"],
-                "failed_critical_sources": [],
-                "runtime_reason_codes": ["critical_source_stale:prices", "critical_source_stale:options"],
-                "advisory_reason_codes": [],
-                "reason_codes": ["critical_source_stale:prices", "critical_source_stale:options"],
-                "sources": {},
-            }
-            out["ingestion_sources"] = {}
-        _trace_section(
-            "ingestion_freshness",
-            section_started,
-            ok=bool((out.get("ingestion_freshness") or {}).get("ok")),
-            critical_ok=bool((out.get("ingestion_freshness") or {}).get("critical_ok")),
-        )
-        try:
-            jobs = dict(out.get("jobs") or {})
-            ingestion_runtime = dict(out.get("ingestion_runtime") or {})
-            if bool(ingestion_runtime.get("running")) and not jobs.get("ingestion_runtime"):
-                age_s = None
-                last_publish_ts_ms = _int_or(ingestion_runtime.get("last_publish_ts_ms"))
-                if last_publish_ts_ms > 0:
-                    age_s = round((now_ms - last_publish_ts_ms) / 1000.0, 1)
-                jobs["ingestion_runtime"] = {
-                    "ok": not bool(ingestion_runtime.get("stale")),
-                    "age_s": age_s,
-                    "max_age_s": HEALTH_JOBS_MAX_STALE_S,
-                    "last_heartbeat_ts_ms": last_publish_ts_ms or None,
-                    "running": True,
-                    "source": "shared_ingestion_runtime",
-                }
-                out["jobs"] = jobs
-        except Exception as e:
-            _warn("health.jobs.backfill_ingestion_runtime", e)
-        try:
-            jobs = dict(out.get("jobs") or {})
-            stale_jobs = sorted(
-                name for name, row in jobs.items() if not bool((row or {}).get("ok"))
-            )
-            required_job_names = ["ingestion_runtime"]
-            required_missing = sorted(name for name in required_job_names if name not in jobs)
-            required_stale = sorted(
-                name for name in required_job_names if name in jobs and not bool((jobs.get(name) or {}).get("ok"))
-            )
-            out["job_summary"] = {
-                "total": len(jobs),
-                "stale": len(stale_jobs),
-                "stale_jobs": stale_jobs,
-                "required_jobs": required_job_names,
-                "required_missing": required_missing,
-                "required_stale": required_stale,
-                "ok_raw": len(stale_jobs) == 0,
-                "ok": len(required_missing) == 0 and len(required_stale) == 0,
-            }
-        except Exception as e:
-            _warn("health.job_summary", e)
-            out["job_summary"] = {
-                "total": 0,
-                "stale": 0,
-                "stale_jobs": [],
-                "required_jobs": ["ingestion_runtime"],
-                "required_missing": ["ingestion_runtime"],
-                "required_stale": [],
-                "ok_raw": False,
-                "ok": False,
-            }
-        section_started = time.perf_counter()
-        try:
-            providers = {}
-            healthy_n = 0
-            ingestion_runtime = dict(out.get("ingestion_runtime") or {})
-            runtime_mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
-            strict_provider_telemetry = runtime_mode_name in ("paper", "shadow", "live")
-
-            for row in fetch_provider_health_rows():
-                ts_ms = row.get("ts_ms")
-                if ts_ms is None:
-                    continue
-                age_s = (now_ms - int(ts_ms)) / 1000.0
-                provider_name = str(row.get("provider") or "")
-                provider_meta = None
-                provider_fatal = None
-                try:
-                    provider_meta_raw = str(meta_get(f"provider_session_{provider_name}_last_failure", "") or "").strip()
-                    if provider_meta_raw:
-                        provider_meta = json.loads(provider_meta_raw)
-                except Exception as e:
-                    _warn("health.providers.session_last_failure", e, provider=provider_name)
-                    provider_meta = None
-                try:
-                    provider_fatal_raw = str(meta_get(f"provider_session_{provider_name}_fatal", "") or "").strip()
-                    if provider_fatal_raw:
-                        provider_fatal = json.loads(provider_fatal_raw)
-                except Exception as e:
-                    _warn("health.providers.session_fatal", e, provider=provider_name)
-                    provider_fatal = None
-                error_count = _int_or(row.get("error_count"))
-                last_success_ts_ms = _int_or(row.get("last_success_ts_ms"))
-                last_success_age_s = (
-                    round(max(0, now_ms - int(last_success_ts_ms)) / 1000.0, 1)
-                    if last_success_ts_ms > 0
-                    else None
-                )
-                latest_row_ok = bool(row.get("ok")) and age_s < effective_prices_max_age_s
-                circuit_open = bool(
-                    int(PROVIDER_CIRCUIT_BREAKER_ERRORS) > 0
-                    and error_count >= int(PROVIDER_CIRCUIT_BREAKER_ERRORS)
-                    and not latest_row_ok
-                )
-                p_ok = bool(latest_row_ok and not provider_fatal and not circuit_open)
-                providers[provider_name] = {
-                    "ok": p_ok,
-                    "age_s": round(age_s, 1),
-                    "last_ts_ms": int(ts_ms),
-                    "last_success_ts_ms": int(last_success_ts_ms) if last_success_ts_ms > 0 else None,
-                    "last_success_age_s": last_success_age_s,
-                    "error_count": int(error_count),
-                    "circuit_open": bool(circuit_open),
-                    "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
-                    "latency_ms": (
-                        None
-                        if row.get("latency_ms") is None
-                        else int(float(row.get("latency_ms") or 0))
-                    ),
-                    "n_symbols": int(row.get("n_symbols") or 0),
-                    "error": (
-                        None
-                        if row.get("error") is None
-                        else str(row.get("error"))
-                    ),
-                    "session_last_failure": provider_meta,
-                    "session_fatal": provider_fatal,
-                }
-                if p_ok:
-                    healthy_n += 1
-
-            if healthy_n <= 0:
-                shared_providers = _dict_or_empty(ingestion_runtime.get("providers"))
-                for provider_name, provider_info in shared_providers.items():
-                    if not isinstance(provider_info, dict):
-                        continue
-                    age_s = round(_int_or(provider_info.get("age_ms"), 10**12) / 1000.0, 1)
-                    circuit_open = bool(provider_info.get("circuit_open"))
-                    provider_fatal = provider_info.get("session_fatal")
-                    p_ok = bool(provider_info.get("ok")) and not circuit_open and not provider_fatal
-                    providers[str(provider_name)] = {
-                        "ok": p_ok,
-                        "age_s": age_s,
-                        "last_ts_ms": _int_or(provider_info.get("last_ts_ms")),
-                        "last_success_ts_ms": (
-                            _int_or(provider_info.get("last_success_ts_ms"))
-                            if provider_info.get("last_success_ts_ms") is not None
-                            else None
-                        ),
-                        "last_success_age_s": (
-                            round(_int_or(provider_info.get("last_success_age_ms")) / 1000.0, 1)
-                            if provider_info.get("last_success_age_ms") is not None
-                            else None
-                        ),
-                        "error_count": _int_or(provider_info.get("error_count")),
-                        "circuit_open": circuit_open,
-                        "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
-                        "latency_ms": (_int_or(provider_info.get("latency_ms")) if provider_info.get("latency_ms") is not None else None),
-                        "n_symbols": _int_or(provider_info.get("n_symbols")),
-                        "error": (None if provider_info.get("error") is None else str(provider_info.get("error"))),
-                        "session_last_failure": provider_info.get("session_last_failure"),
-                        "session_fatal": provider_fatal,
-                    }
-                    if p_ok:
-                        healthy_n += 1
-
-            if healthy_n <= 0:
-                try:
-                    price_row = con.execute(
-                        "SELECT MAX(ts_ms) FROM prices WHERE price IS NOT NULL"
-                    ).fetchone()
-                    last_price_ts_ms = int((price_row or [0])[0] or 0)
-                    if last_price_ts_ms > 0:
-                        price_age_s = (now_ms - int(last_price_ts_ms)) / 1000.0
-                        derived_ok = bool((out.get("prices") or {}).get("ok"))
-                        counts_as_healthy = bool(derived_ok and not strict_provider_telemetry)
-                        providers["derived_from_prices"] = {
-                            "ok": counts_as_healthy,
-                            "age_s": round(price_age_s, 1),
-                            "last_ts_ms": int(last_price_ts_ms),
-                            "synthetic": True,
-                            "strict_provider_telemetry": bool(strict_provider_telemetry),
-                            "latency_ms": None,
-                            "n_symbols": 0,
-                            "error": None if counts_as_healthy else "provider_health_missing",
-                            "session_last_failure": None,
-                            "session_fatal": None,
-                        }
-                        if counts_as_healthy:
-                            healthy_n = max(healthy_n, 1)
-                except Exception as e:
-                    _warn("health.providers.derived_from_prices", e)
-
-            out["providers"] = {
-                "ok": healthy_n > 0,
-                "healthy": healthy_n,
-                "total": len(providers),
-                "active_provider": str(meta_get("price_provider_active", "") or ""),
-                "by_provider": providers,
-            }
-        except Exception as e:
-            _warn("health.providers", e)
-            out["providers"] = {
-                "ok": False,
-                "healthy": 0,
-                "total": 0,
-                "active_provider": "",
-                "by_provider": {},
-            }
-        _trace_section(
-            "providers",
-            section_started,
-            ok=bool((out.get("providers") or {}).get("ok")),
-            healthy=int((out.get("providers") or {}).get("healthy") or 0),
-        )
-
-        section_started = time.perf_counter()
-        try:
-            out["provider_readiness"] = provider_readiness_snapshot(
-                mode=os.environ.get("ENGINE_MODE", "safe"),
-                health=out,
-                now_ms=now_ms,
-            )
-        except Exception as e:
-            _warn("health.provider_readiness", e)
-            mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
-            required = _provider_readiness_enforced(mode_name)
-            out["provider_readiness"] = {
-                "ok": not required,
-                "required": bool(required),
-                "mode": mode_name,
-                "reason": "provider_readiness_error" if required else "not_required",
-                "blockers": (["provider_readiness_error"] if required else []),
-                "required_providers": [],
-                "healthy_required": 0,
-                "total_required": 0,
-                "by_provider": {},
-                "error": f"{type(e).__name__}:{e}",
-                "ts_ms": int(now_ms),
-            }
-        _trace_section(
-            "provider_readiness",
-            section_started,
-            ok=bool((out.get("provider_readiness") or {}).get("ok")),
-            required=bool((out.get("provider_readiness") or {}).get("required")),
-        )
-
-        # ---------------------------
-        # Portfolio presence
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            row = con.execute("SELECT COUNT(*) FROM portfolio_state").fetchone()
-            state_n = int(row[0] or 0)
-
-            _mode = os.environ.get("ENGINE_MODE", "").strip().lower() or "safe"
-
-            if _mode == "safe":
-                out["portfolio"] = {
-                    "ok": True,
-                    "positions": state_n,
-                }
-            else:
-                out["portfolio"] = {
-                    "ok": state_n > 0,
-                    "positions": state_n,
-                }
-        except Exception as e:
-            _warn("health.portfolio", e)
-            out["portfolio"] = {
-                "ok": False,
-                "positions": 0,
-            }
-        _trace_section("portfolio", section_started, ok=bool((out.get("portfolio") or {}).get("ok")))
-
-        # ---------------------------
-        # Execution activity
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            fills_table = None
-            if _table_exists("broker_fills_v2"):
-                fills_table = "broker_fills_v2"
-            elif _table_exists("broker_fills"):
-                fills_table = "broker_fills"
-
-            if fills_table:
-                row = con.execute(
-                    f"SELECT COUNT(*), MAX(ts_ms) FROM {fills_table}"
-                ).fetchone()
-                n_fills = int((row or [0, None])[0] or 0)
-                last_fill_ts_ms = (row or [0, None])[1]
-                fill_age_s = None if not last_fill_ts_ms else round((now_ms - int(last_fill_ts_ms)) / 1000.0, 1)
-                out["execution"] = {
-                    "ok": True,
-                    "fills_table": fills_table,
-                    "n_fills": n_fills,
-                    "last_fill_ts_ms": int(last_fill_ts_ms) if last_fill_ts_ms else None,
-                    "last_fill_age_s": fill_age_s,
-                }
-            else:
-                out["execution"] = {
-                    "ok": False,
-                    "fills_table": None,
-                    "n_fills": 0,
-                    "last_fill_ts_ms": None,
-                    "last_fill_age_s": None,
-                }
-        except Exception:
-            out["execution"] = {
-                "ok": False,
-                "fills_table": None,
-                "n_fills": 0,
-                "last_fill_ts_ms": None,
-                "last_fill_age_s": None,
-            }
-        _trace_section("execution", section_started, ok=bool((out.get("execution") or {}).get("ok")))
-
-        # ---------------------------
-        # Execution barrier
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            if HEALTH_INCLUDE_EXECUTION_BARRIER:
-                from engine.runtime.gates import execution_gate_snapshot
-                from engine.api.internal_access import get_execution_mode as _get_execution_mode
-
-                kill_switches = _read_kill_switch_snapshot_readonly(con=con)
-                out["kill_switches"] = dict(kill_switches)
-                snap = execution_gate_snapshot(
-                    get_execution_mode_fn=_get_execution_mode,
-                    kill_switches=kill_switches,
-                    risk_state_getter=lambda key, default="": _risk_state_value_readonly(con, str(key), str(default)),
-                )
-                if isinstance(snap, dict):
-                    out["execution_barrier"] = snap
-                else:
-                    out["execution_barrier"] = {"allowed": False, "reason": "execution_barrier_invalid"}
-            else:
-                mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
-                lifecycle = dict(_lc_get_state() or {})
-                runtime_state = str(lifecycle.get("state") or "").strip().upper()
-                runtime_detail = str(lifecycle.get("detail") or "").strip()
-                allowed = mode_name == "live" and runtime_state == _LIVE
-                out["execution_barrier"] = {
-                    "ok": True,
-                    "mode": mode_name,
-                    "armed": 0 if mode_name != "live" else None,
-                    "allow_execution": bool(allowed),
-                    "allowed": bool(allowed),
-                    "reason": "health_fast_path",
-                    "source": "engine_mode+lifecycle_state",
-                    "runtime_state": runtime_state,
-                    "runtime_detail": runtime_detail,
-                }
-        except Exception:
-            out["execution_barrier"] = {"allowed": False, "reason": "execution_barrier_error"}
-        _trace_section("execution_barrier", section_started, allowed=bool((out.get("execution_barrier") or {}).get("allowed")))
-
-        # ---------------------------
-        # Recent errors (alerts buffer)
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            rows = con.execute(
-                """
-                SELECT ts_ms, severity, message
-                FROM alerts
-                ORDER BY ts_ms DESC
-                LIMIT 10
-                """
-            ).fetchall() or []
-
-            out["recent_errors"] = [
-                {
-                    "ts_ms": int(r[0] or 0),
-                    "severity": str(r[1] or ""),
-                    "message": str(r[2] or ""),
-                }
-                for r in rows
-            ]
-        except Exception:
-            out["recent_errors"] = []
-        _trace_section("recent_errors", section_started, count=len(out.get("recent_errors") or []))
-
-        # ---------------------------
-        # Prediction flow
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["predictions"] = _prediction_flow_snapshot(con, now_ms)
-        except Exception as e:
-            _warn("health.predictions", e)
-            out["predictions"] = {
-                "ok": False,
-                "count": 0,
-                "recent_count": 0,
-                "history_count": 0,
-                "history_recent_count": 0,
-                "last_ts_ms": None,
-                "history_last_ts_ms": None,
-                "age_s": None,
-                "max_age_s": float(HEALTH_PREDICTIONS_MAX_AGE_S),
-                "detail": f"prediction_health_error:{type(e).__name__}:{e}",
-            }
-        _trace_section("predictions", section_started, ok=bool((out.get("predictions") or {}).get("ok")))
-
-        # ---------------------------
-        # Model serving observability
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["model_serving"] = _model_serving_snapshot(con, now_ms)
-        except Exception as e:
-            _warn("health.model_serving", e)
-            out["model_serving"] = {
-                "ok": False,
-                "degraded": False,
-                "available": False,
-                "sample_count": 0,
-                "fallback_count": 0,
-                "fallback_rate": 0.0,
-                "detail": f"model_serving_error:{type(e).__name__}:{e}",
-            }
-        _trace_section("model_serving", section_started, ok=bool((out.get("model_serving") or {}).get("ok", True)))
-
-        # ---------------------------
-        # Alert lifecycle observability
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["alert_lifecycle"] = _alert_lifecycle_snapshot(con, now_ms)
-        except Exception as e:
-            _warn("health.alert_lifecycle", e)
-            out["alert_lifecycle"] = {
-                "ok": False,
-                "warning": False,
-                "available": False,
-                "recent_alerts": 0,
-                "seen_count": 0,
-                "consumed_count": 0,
-                "expired_unconsumed_count": 0,
-                "detail": f"alert_lifecycle_error:{type(e).__name__}:{e}",
-            }
-        _trace_section("alert_lifecycle", section_started, ok=bool((out.get("alert_lifecycle") or {}).get("ok", True)))
-
-        # ---------------------------
-        # Execution quality supervisor
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.execution.execution_quality_supervisor import get_execution_quality_snapshot
-            out["execution_supervisor"] = get_execution_quality_snapshot(readonly=True)
-        except Exception:
-            out["execution_supervisor"] = {
-                "ok": False,
-                "state": "unknown",
-                "alerts": [],
-                "score": 0.0,
-            }
-        _trace_section("execution_supervisor", section_started, ok=bool((out.get("execution_supervisor") or {}).get("ok")))
-
-        # ---------------------------
-        # Broker connection watchdog
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.execution.execution_broker_watchdog import get_broker_connection_health
-            out["broker_connection"] = get_broker_connection_health(readonly=True)
-        except Exception:
-            out["broker_connection"] = {
-                "ok": False,
-                "state": "unknown",
-                "broker": os.environ.get("BROKER_NAME", os.environ.get("BROKER", "sim")),
-            }
-        _trace_section("broker_connection", section_started, ok=bool((out.get("broker_connection") or {}).get("ok")))
-
-        # ---------------------------
-        # Model cache
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.runtime.model_cache import (
-                get_snapshot as _get_model_cache_snapshot,
-                warm_model_catalog as _warm_model_catalog,
-            )
-
-            model_cache_snapshot = dict(_get_model_cache_snapshot() or {})
-            # Standalone health/preflight runs execute in a fresh process, so
-            # they need to hydrate the in-memory catalog from the persisted
-            # registry before treating the runtime model cache as missing.
-            if (
-                out["db"].get("initialized")
-                and not bool(model_cache_snapshot.get("loaded"))
-            ):
-                model_cache_snapshot = dict(
-                    _warm_model_catalog(force=False, readonly=True) or _get_model_cache_snapshot() or {}
-                )
-            out["model_cache"] = model_cache_snapshot
-        except Exception as e:
-            _warn("health.model_cache", e)
-            out["model_cache"] = {
-                "ok": False,
-                "loaded": False,
-                "rows": 0,
-                "last_error": f"model_cache_error:{type(e).__name__}:{e}",
-                "ts_ms": int(now_ms),
-            }
-        _trace_section("model_cache", section_started, ok=bool((out.get("model_cache") or {}).get("ok")))
-
-        # ---------------------------
-        # Runtime price cache
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.runtime.price_cache import get_cache_health_snapshot
-
-            out["runtime_price_cache"] = dict(
-                get_cache_health_snapshot(stale_after_s=float(HEALTH_RUNTIME_PRICE_CACHE_MAX_AGE_S)) or {}
-            )
-        except Exception as e:
-            _warn("health.runtime_price_cache", e)
-            out["runtime_price_cache"] = {
-                "ok": False,
-                "initialized": False,
-                "stale": True,
-                "detail": f"runtime_price_cache_error:{type(e).__name__}:{e}",
-                "ts_ms": int(now_ms),
-            }
-        _trace_section(
-            "runtime_price_cache",
-            section_started,
-            ok=bool((out.get("runtime_price_cache") or {}).get("ok")),
-        )
-
-        # ---------------------------
-        # Event bus
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.runtime.event_bus import get_event_bus
-
-            event_bus_stats = dict(get_event_bus().get_stats() or {})
-            queue_size = int(event_bus_stats.get("queue_size") or 0)
-            normal_dropped_count = int(event_bus_stats.get("normal_dropped_count") or event_bus_stats.get("dropped_count") or 0)
-            critical_inline_dispatch_count = int(event_bus_stats.get("critical_inline_dispatch_count") or 0)
-            critical_handler_failures = int(event_bus_stats.get("critical_handler_failures") or 0)
-            critical_backpressure_active = bool(event_bus_stats.get("critical_backpressure_active"))
-            normal_overflow_active = bool(event_bus_stats.get("normal_overflow_active"))
-            avg_lag_ms = float(event_bus_stats.get("avg_dispatch_lag_ms") or 0.0)
-            event_bus_ok = bool(
-                event_bus_stats.get("started")
-                and queue_size <= int(HEALTH_EVENT_BUS_MAX_QUEUE_DEPTH)
-                and avg_lag_ms <= float(HEALTH_EVENT_BUS_MAX_LAG_MS)
-                and not normal_overflow_active
-                and not critical_backpressure_active
-                and critical_handler_failures <= 0
-            )
-            detail_parts: List[str] = []
-            if not bool(event_bus_stats.get("started")):
-                detail_parts.append("event_bus_not_started")
-            elif queue_size > int(HEALTH_EVENT_BUS_MAX_QUEUE_DEPTH) or avg_lag_ms > float(HEALTH_EVENT_BUS_MAX_LAG_MS):
-                detail_parts.append(
-                    f"event_bus_backlog:queue_size={queue_size}:avg_dispatch_lag_ms={round(avg_lag_ms, 2)}"
-                )
-            if normal_overflow_active:
-                detail_parts.append("event_bus_normal_overflow_active")
-            if critical_backpressure_active:
-                detail_parts.append("event_bus_critical_backpressure_active")
-            if normal_dropped_count > 0:
-                detail_parts.append(f"event_bus_normal_drops:{normal_dropped_count}")
-            if critical_inline_dispatch_count > 0:
-                detail_parts.append(f"event_bus_critical_backpressure:{critical_inline_dispatch_count}")
-            if critical_handler_failures > 0:
-                detail_parts.append(
-                    f"event_bus_critical_handler_failures:{critical_handler_failures}:"
-                    f"last_failed_event_type={str(event_bus_stats.get('last_failed_event_type') or '')}"
-                )
-            out["event_bus"] = {
-                **event_bus_stats,
-                "ok": bool(event_bus_ok),
-                "detail": ("ok" if event_bus_ok else ";".join(detail_parts or ["event_bus_degraded"])),
-                "max_queue_depth": int(HEALTH_EVENT_BUS_MAX_QUEUE_DEPTH),
-                "max_lag_ms": float(HEALTH_EVENT_BUS_MAX_LAG_MS),
-            }
-        except Exception as e:
-            _warn("health.event_bus", e)
-            out["event_bus"] = {
-                "ok": False,
-                "started": False,
-                "detail": f"event_bus_error:{type(e).__name__}:{e}",
-                "queue_size": 0,
-                "avg_dispatch_lag_ms": None,
-                "ts_ms": int(now_ms),
-            }
-        _trace_section("event_bus", section_started, ok=bool((out.get("event_bus") or {}).get("ok")))
-
-        # ---------------------------
-        # Async price persistence
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.runtime.async_writer import get_async_writer
-
-            out["async_price_persistence"] = dict(get_async_writer().get_snapshot() or {})
-        except Exception as e:
-            _warn("health.async_price_persistence", e)
-            out["async_price_persistence"] = {
-                "ok": False,
-                "enabled": False,
-                "detail": f"async_price_persistence_error:{type(e).__name__}:{e}",
-                "ts_ms": int(now_ms),
-            }
-        _trace_section(
-            "async_price_persistence",
-            section_started,
-            ok=bool((out.get("async_price_persistence") or {}).get("ok")),
-        )
-
-        # ---------------------------
-        # PG / Timescale price storage
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.runtime.storage_pg_prices import get_price_storage
-
-            out["pg_price_storage"] = dict(get_price_storage().get_snapshot() or {})
-        except Exception as e:
-            _warn("health.pg_price_storage", e)
-            out["pg_price_storage"] = {
-                "ok": False,
-                "enabled": False,
-                "detail": f"pg_price_storage_error:{type(e).__name__}:{e}",
-                "ts_ms": int(now_ms),
-            }
-        _trace_section("pg_price_storage", section_started, ok=bool((out.get("pg_price_storage") or {}).get("ok")))
-
-        # ---------------------------
-        # Price migration validation
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.runtime.price_migration_validation import get_price_migration_validation_snapshot
-
-            out["price_migration_validation"] = dict(get_price_migration_validation_snapshot() or {})
-        except Exception as e:
-            _warn("health.price_migration_validation", e)
-            out["price_migration_validation"] = {
-                "ok": False,
-                "enabled": False,
-                "detail": f"price_migration_validation_error:{type(e).__name__}:{e}",
-                "ts_ms": int(now_ms),
-            }
-        _trace_section(
-            "price_migration_validation",
-            section_started,
-            ok=bool((out.get("price_migration_validation") or {}).get("ok")),
-        )
-
-        # ---------------------------
-        # Timeseries / sidecar storage
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            timeseries_storage = dict(get_timeseries_storage_snapshot() or {})
-            feature_store_snapshot = dict(timeseries_storage.get("feature_store") or {})
-            telemetry_append_buffer_snapshot = dict(timeseries_storage.get("telemetry_append_buffer") or {})
-            telemetry_mirror_snapshot = dict(timeseries_storage.get("telemetry_mirror") or {})
-            timescale_snapshot = dict(timeseries_storage)
-            timescale_snapshot.pop("feature_store", None)
-            timescale_snapshot.pop("telemetry_append_buffer", None)
-            timescale_snapshot.pop("telemetry_mirror", None)
-            out["timeseries_storage"] = timeseries_storage
-            out["timescale"] = timescale_snapshot
-            out["feature_store"] = feature_store_snapshot
-            out["telemetry_append_buffer"] = telemetry_append_buffer_snapshot
-            out["telemetry_mirror"] = telemetry_mirror_snapshot
-        except Exception as e:
-            _warn("health.timeseries_storage", e)
-            error_detail = f"timeseries_storage_error:{type(e).__name__}:{e}"
-            out["timeseries_storage"] = {
-                "ok": False,
-                "enabled": False,
-                "degraded": True,
-                "degraded_reasons": ["timeseries_storage_error"],
-                "detail": error_detail,
-            }
-            out["timescale"] = {
-                "ok": False,
-                "enabled": False,
-                "degraded": True,
-                "degraded_reasons": ["timescale_error"],
-                "detail": error_detail,
-            }
-            out["feature_store"] = {
-                "ok": False,
-                "enabled": False,
-                "degraded": True,
-                "degraded_reasons": ["feature_store_error"],
-                "detail": error_detail,
-            }
-            out["telemetry_append_buffer"] = {
-                "ok": False,
-                "enabled": False,
-                "degraded": True,
-                "degraded_reasons": ["telemetry_append_buffer_error"],
-                "detail": error_detail,
-            }
-            out["telemetry_mirror"] = {
-                "ok": False,
-                "enabled": False,
-                "detail": error_detail,
-            }
-        _trace_section("timeseries_storage", section_started, ok=bool((out.get("timeseries_storage") or {}).get("ok")))
-
-        # ---------------------------
-        # Telemetry migration validation
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            from engine.runtime.telemetry_migration_validation import get_telemetry_migration_validation_snapshot
-
-            out["telemetry_migration_validation"] = dict(get_telemetry_migration_validation_snapshot() or {})
-        except Exception as e:
-            _warn("health.telemetry_migration_validation", e)
-            out["telemetry_migration_validation"] = {
-                "ok": False,
-                "enabled": False,
-                "detail": f"telemetry_migration_validation_error:{type(e).__name__}:{e}",
-                "ts_ms": int(now_ms),
-            }
-        _trace_section(
-            "telemetry_migration_validation",
-            section_started,
-            ok=bool((out.get("telemetry_migration_validation") or {}).get("ok")),
-        )
-
-        # ---------------------------
-        # Portfolio runtime degradation
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["portfolio_runtime"] = _portfolio_runtime_snapshot(con=con)
-        except Exception as e:
-            _warn("health.portfolio_runtime", e)
-            out["portfolio_runtime"] = {
-                "ok": False,
-                "available": False,
-                "degraded": False,
-                "detail": f"portfolio_runtime_error:{type(e).__name__}:{e}",
-                "updated_ts_ms": None,
-                "degraded_reasons": [],
-                "degraded_codes": [],
-            }
-        _trace_section("portfolio_runtime", section_started, ok=bool((out.get("portfolio_runtime") or {}).get("ok")))
-
-        # ---------------------------
-        # Shared execution degradation snapshot
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["execution_degraded"] = _execution_degraded_snapshot(con=con)
-        except Exception as e:
-            _warn("health.execution_degraded", e)
-            out["execution_degraded"] = {
-                "active": True,
-                "severity": "CRITICAL",
-                "reason": f"execution_degraded_error:{type(e).__name__}:{e}",
-                "reason_codes": ["execution_degraded_error"],
-                "sources": [],
-            }
-        _trace_section(
-            "execution_degraded",
-            section_started,
-            active=bool((out.get("execution_degraded") or {}).get("active")),
-        )
-
-        # Recompute the execution barrier once runtime-local degradation signals
-        # are available so the health snapshot matches the shared gate.
-        if HEALTH_INCLUDE_EXECUTION_BARRIER or bool((out.get("execution_degraded") or {}).get("active")):
-            section_started = time.perf_counter()
-            out["execution_barrier"] = _refresh_execution_barrier_snapshot(
-                dict(out.get("execution_degraded") or {}),
-                con=con,
-            )
-            _trace_section(
-                "execution_barrier_refresh",
-                section_started,
-                allowed=bool((out.get("execution_barrier") or {}).get("allowed")),
-            )
-
-        # ---------------------------
-        # Component observability health
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            component_health = dict(get_component_health_snapshot() or {})
-            out["component_health"] = component_health
-            out["inference_runtime"] = dict(
-                component_health.get("inference")
-                or {
-                    "component": "inference",
-                    "ok": False,
-                    "status": "unknown",
-                    "detail": "component_health_unreported",
-                    "updated_ts_ms": None,
-                    "age_s": None,
-                    "stale": True,
-                }
-            )
-            out["execution_runtime"] = dict(
-                component_health.get("execution")
-                or {
-                    "component": "execution",
-                    "ok": False,
-                    "status": "unknown",
-                    "detail": "component_health_unreported",
-                    "updated_ts_ms": None,
-                    "age_s": None,
-                    "stale": True,
-                }
-            )
-            out["ingestion_observability"] = dict(
-                component_health.get("ingestion")
-                or {
-                    "component": "ingestion",
-                    "ok": False,
-                    "status": "unknown",
-                    "detail": "component_health_unreported",
-                    "updated_ts_ms": None,
-                    "age_s": None,
-                    "stale": True,
-                }
-            )
-        except Exception as e:
-            _warn("health.component_health", e)
-            out["component_health"] = {}
-            out["inference_runtime"] = {
-                "component": "inference",
-                "ok": False,
-                "status": "error",
-                "detail": f"component_health_error:{type(e).__name__}:{e}",
-                "updated_ts_ms": None,
-                "age_s": None,
-                "stale": True,
-            }
-            out["execution_runtime"] = {
-                "component": "execution",
-                "ok": False,
-                "status": "error",
-                "detail": f"component_health_error:{type(e).__name__}:{e}",
-                "updated_ts_ms": None,
-                "age_s": None,
-                "stale": True,
-            }
-            out["ingestion_observability"] = {
-                "component": "ingestion",
-                "ok": False,
-                "status": "error",
-                "detail": f"component_health_error:{type(e).__name__}:{e}",
-                "updated_ts_ms": None,
-                "age_s": None,
-                "stale": True,
-            }
-        _trace_section(
-            "component_health",
-            section_started,
-            inference_ok=bool((out.get("inference_runtime") or {}).get("ok")),
-            execution_ok=bool((out.get("execution_runtime") or {}).get("ok")),
-            ingestion_ok=bool((out.get("ingestion_observability") or {}).get("ok")),
-        )
-
-        # ---------------------------
-        # Feature / model / scoring diagnostics
-        # ---------------------------
-        section_started = time.perf_counter()
-        try:
-            out["feature_validation"] = dict(get_feature_validation_snapshot() or {})
-            out["model_input_validation"] = dict(get_model_input_validation_snapshot() or {})
-            out["scoring_pipeline"] = dict(get_scoring_pipeline_snapshot() or {})
-            component_health = dict(out.get("component_health") or {})
-            out["feature_runtime"] = dict(
-                component_health.get("feature_engine")
-                or {
-                    "component": "feature_engine",
-                    "ok": False,
-                    "status": "unknown",
-                    "detail": "component_health_unreported",
-                    "updated_ts_ms": None,
-                    "age_s": None,
-                    "stale": True,
-                }
-            )
-            out["model_input_runtime"] = dict(
-                component_health.get("model_inputs")
-                or {
-                    "component": "model_inputs",
-                    "ok": False,
-                    "status": "unknown",
-                    "detail": "component_health_unreported",
-                    "updated_ts_ms": None,
-                    "age_s": None,
-                    "stale": True,
-                }
-            )
-            out["scoring_runtime"] = dict(
-                component_health.get("scoring_pipeline")
-                or {
-                    "component": "scoring_pipeline",
-                    "ok": False,
-                    "status": "unknown",
-                    "detail": "component_health_unreported",
-                    "updated_ts_ms": None,
-                    "age_s": None,
-                    "stale": True,
-                }
-            )
-            out["data_pipeline_gates"] = dict(
-                build_data_pipeline_gate_snapshot(
-                    now_ms=now_ms,
-                    ingestion_runtime=dict(out.get("ingestion_runtime") or {}),
-                    ingestion_freshness=dict(out.get("ingestion_freshness") or {}),
-                )
-                or {}
-            )
-        except Exception as e:
-            _warn("health.data_pipeline_gates", e)
-            out["feature_validation"] = {}
-            out["model_input_validation"] = {}
-            out["scoring_pipeline"] = {}
-            out["feature_runtime"] = {
-                "component": "feature_engine",
-                "ok": False,
-                "status": "error",
-                "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
-                "updated_ts_ms": None,
-                "age_s": None,
-                "stale": True,
-            }
-            out["model_input_runtime"] = {
-                "component": "model_inputs",
-                "ok": False,
-                "status": "error",
-                "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
-                "updated_ts_ms": None,
-                "age_s": None,
-                "stale": True,
-            }
-            out["scoring_runtime"] = {
-                "component": "scoring_pipeline",
-                "ok": False,
-                "status": "error",
-                "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
-                "updated_ts_ms": None,
-                "age_s": None,
-                "stale": True,
-            }
-            out["data_pipeline_gates"] = {
-                "ok": False,
-                "updated_ts_ms": int(now_ms),
-                "gates": {},
-                "failed_gates": [
-                    "ingestion_active",
-                    "ingestion_not_stale",
-                    "critical_features_valid",
-                    "model_inputs_valid",
-                    "scoring_pipeline_operational",
-                ],
-                "detail": f"data_pipeline_gates_error:{type(e).__name__}:{e}",
-            }
-        _trace_section(
-            "data_pipeline_gates",
-            section_started,
-            ok=bool((out.get("data_pipeline_gates") or {}).get("ok")),
-            failed=len((out.get("data_pipeline_gates") or {}).get("failed_gates") or []),
-        )
-
-        mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower()
-        attribution_snapshot = dict(out.get("attribution") or {})
-        execution_snapshot = dict(out.get("execution") or {})
-        attribution_rows = _int_or(attribution_snapshot.get("rows"))
-        attribution_orphans = dict(attribution_snapshot.get("orphans") or {})
-        attribution_state_present = bool(
-            attribution_rows > 0
-            or _int_or(attribution_orphans.get("orphan_row_count")) > 0
-            or _int_or(attribution_orphans.get("snapshot_ts_ms")) > 0
-        )
-        execution_fills = _int_or(execution_snapshot.get("n_fills"))
-        if mode_name == "safe" and (not attribution_state_present) and execution_fills <= 0:
-            attribution_snapshot["ok"] = True
-            attribution_snapshot["not_applicable"] = True
-            attribution_snapshot["reason"] = "no_executed_fills"
-            out["attribution"] = attribution_snapshot
-
-        section_started = time.perf_counter()
-        try:
-            out["startup_validation"] = get_startup_validation_snapshot(
-                health=out,
-                db_validation=get_db_validation_snapshot(include_quick_check=False),
-            )
-        except Exception as e:
-            _warn("health.startup_validation", e)
-            out["startup_validation"] = {
-                "ok": False,
-                "reasons": [f"startup_validation_error:{type(e).__name__}:{e}"],
-                "blocking_checks": [
-                    "config_valid",
-                    "database_reachable",
-                    "schema_valid",
-                    "core_services_initialized",
-                ],
-                "blocking_gates": [
-                    "config_valid",
-                    "database_reachable",
-                    "schema_valid",
-                    "core_services_initialized",
-                ],
-                "critical_systems_missing": [],
-            }
-        _trace_section("startup_validation", section_started, ok=bool((out.get("startup_validation") or {}).get("ok")))
-
-        db_ok = bool((out.get("db") or {}).get("ok"))
-        event_log_ok = bool((out.get("event_log") or {}).get("ok"))
-        prices_ok = bool((out.get("prices") or {}).get("ok"))
-        events_ok = bool((out.get("events") or {}).get("ok"))
-        jobs_ok = bool((out.get("job_summary") or {}).get("ok"))
-        providers_ok = bool((out.get("providers") or {}).get("ok"))
-        provider_readiness = dict(out.get("provider_readiness") or {})
-        provider_readiness_required = bool(provider_readiness.get("required"))
-        provider_readiness_ok = bool((not provider_readiness_required) or provider_readiness.get("ok"))
-        competition_ok = bool((out.get("competition") or {}).get("ok"))
-        attribution_ok = bool((out.get("attribution") or {}).get("ok"))
-        options_ingestion_ok = bool((out.get("options_ingestion") or {}).get("ok"))
-        startup_validation_ok = bool((out.get("startup_validation") or {}).get("ok"))
-        timeseries_storage_snapshot = dict(out.get("timeseries_storage") or {})
-        timescale_snapshot = dict(out.get("timescale") or {})
-        feature_store_snapshot = dict(out.get("feature_store") or {})
-        portfolio_runtime_snapshot = dict(out.get("portfolio_runtime") or {})
-        position_reconcile_snapshot = dict(out.get("position_reconcile") or {})
-        execution_degraded_snapshot = dict(out.get("execution_degraded") or {})
-        timeseries_ok = bool(timeseries_storage_snapshot.get("ok", True))
-        portfolio_runtime_ok = not bool(portfolio_runtime_snapshot.get("degraded"))
-        position_reconcile_required = mode_name in ("paper", "live")
-        position_reconcile_ok = bool((not position_reconcile_required) or position_reconcile_snapshot.get("ok"))
-        position_reconcile_blocking = bool(position_reconcile_required and not position_reconcile_ok)
-        execution_degraded_active = bool(execution_degraded_snapshot.get("active"))
-        execution_degraded_critical = bool(
-            execution_degraded_active
-            and str(execution_degraded_snapshot.get("severity") or "").strip().upper() == "CRITICAL"
-        )
-        ingestion_freshness = dict(out.get("ingestion_freshness") or {})
-        critical_ingestion_ok = bool(ingestion_freshness.get("critical_ok"))
-        ingestion_runtime_reason_codes = list(ingestion_freshness.get("runtime_reason_codes") or [])
-        ingestion_advisory_reason_codes = list(ingestion_freshness.get("advisory_reason_codes") or [])
-        data_pipeline_gates = dict(out.get("data_pipeline_gates") or {})
-        data_pipeline_gates_ok = bool(data_pipeline_gates.get("ok"))
-        failed_data_pipeline_gates = [
-            str(name)
-            for name in list(data_pipeline_gates.get("failed_gates") or [])
-            if str(name).strip()
-        ]
-        observed_data_pipeline_gate_failures = [
-            name
-            for name in failed_data_pipeline_gates
-            if (
-                (name == "critical_features_valid" and bool(out.get("feature_validation")))
-                or (name == "model_inputs_valid" and bool(out.get("model_input_validation")))
-                or (name == "scoring_pipeline_operational" and bool(out.get("scoring_pipeline")))
-            )
-        ]
-        data_pipeline_runtime_ok = len(observed_data_pipeline_gate_failures) == 0
-
-        barrier = out.get("execution_barrier") or {}
-        barrier_ok = bool(barrier.get("allowed"))
-
-        exec_sup = out.get("execution_supervisor") or {}
-        exec_sup_ok = bool(exec_sup.get("ok"))
-        exec_sup_critical = str(exec_sup.get("state") or "").lower().strip() == "critical"
-        exec_sup_failed_gates = [
-            str(name)
-            for name in list(exec_sup.get("failed_gates") or [])
-            if str(name).strip()
-        ]
-        exec_sup_alert_types = {
-            str(alert.get("alert_type") or "")
-            for alert in list(exec_sup.get("alerts") or [])
-            if str(alert.get("alert_type") or "").strip()
-        }
-        exec_sup_account_state = dict(exec_sup.get("account_state") or {})
-        exec_sup_integrity = dict(exec_sup.get("integrity") or {})
-
-        broker_connection = out.get("broker_connection") or {}
-        broker_ok = bool(broker_connection.get("ok")) and str(broker_connection.get("state") or "").lower().strip() not in (
-            "disconnected",
-            "connect_failed",
-            "reconnect_failed",
-        )
-
-        out["startup"] = {
-            "mode": mode_name,
-            "db_ok": db_ok,
-            "event_log_ok": event_log_ok,
-            "prices_ok": prices_ok,
-            "events_ok": events_ok,
-            "jobs_ok": jobs_ok,
-            "providers_ok": providers_ok,
-            "provider_readiness_ok": provider_readiness_ok,
-            "competition_ok": competition_ok,
-            "attribution_ok": attribution_ok,
-            "critical_ingestion_ok": critical_ingestion_ok,
-            "data_pipeline_gates_ok": data_pipeline_gates_ok,
-            "data_pipeline_runtime_ok": data_pipeline_runtime_ok,
-            "options_ingestion_ok": options_ingestion_ok,
-            "timeseries_ok": timeseries_ok,
-            "portfolio_runtime_ok": portfolio_runtime_ok,
-            "position_reconcile_ok": position_reconcile_ok,
-            "execution_degraded": execution_degraded_active,
-            "startup_validation_ok": startup_validation_ok,
-            "execution_barrier_ok": barrier_ok,
-            "broker_ok": broker_ok,
-            "execution_supervisor_ok": exec_sup_ok,
-            "execution_gates_ok": len(exec_sup_failed_gates) == 0,
-        }
-
-        if not db_ok:
-            out["reasons"].append("db_not_initialized")
-
-        if not event_log_ok:
-            out["reasons"].append("event_log_not_ok")
-
-        if not prices_ok:
-            out["reasons"].append("no_prices")
-
-        if not events_ok and mode_name in ("shadow", "live"):
-            out["reasons"].append("events_not_ok")
-
-        if not jobs_ok:
-            out["reasons"].append("jobs_not_running")
-
-        if not providers_ok:
-            out["reasons"].append("providers_not_ok")
-        if not provider_readiness_ok:
-            out["reasons"].append("provider_readiness_not_ok")
-            out["reasons"].extend(list(provider_readiness.get("blockers") or []))
-
-        if not competition_ok and mode_name in ("shadow", "live"):
-            out["reasons"].append("competition_not_ok")
-        if not attribution_ok:
-            out["reasons"].append("attribution_not_ok")
-            if _int_or((((out.get("attribution") or {}).get("orphans") or {}).get("orphan_row_count"))) > 0:
-                out["reasons"].append("pnl_attribution_orphans_detected")
-
-        if not bool((out.get("ingestion_runtime") or {}).get("running")):
-            out["reasons"].append("ingestion_not_running")
-
-        if bool((out.get("ingestion_runtime") or {}).get("stale")):
-            out["reasons"].append("ingestion_stale")
-
-        out["reasons"].extend(ingestion_runtime_reason_codes)
-        out["reasons"].extend(ingestion_advisory_reason_codes)
-        out["reasons"].extend([f"data_gate:{name}" for name in observed_data_pipeline_gate_failures])
-        if not options_ingestion_ok:
-            out["reasons"].append("options_ingestion_not_ok")
-        if not timeseries_ok:
-            out["reasons"].append("timeseries_storage_not_ok")
-            out["reasons"].extend(
-                [f"timescale_degraded:{reason}" for reason in list(timescale_snapshot.get("degraded_reasons") or [])]
-            )
-            out["reasons"].extend(
-                [f"feature_store_degraded:{reason}" for reason in list(feature_store_snapshot.get("degraded_reasons") or [])]
-            )
-        if bool(portfolio_runtime_snapshot.get("degraded")):
-            out["reasons"].append("portfolio_runtime_degraded")
-            out["reasons"].extend(list(portfolio_runtime_snapshot.get("degraded_codes") or []))
-        if position_reconcile_blocking:
-            out["reasons"].append("position_reconcile_not_ok")
-            out["reasons"].append(
-                f"position_reconcile:{position_reconcile_snapshot.get('status') or 'failed'}"
-            )
-            out["reasons"].extend(list(position_reconcile_snapshot.get("blockers") or []))
-        if not startup_validation_ok:
-            out["reasons"].extend(list((out.get("startup_validation") or {}).get("reasons") or []))
-        if not barrier_ok and mode_name in ("shadow", "live"):
-            out["reasons"].append(f"execution_barrier:{barrier.get('reason', 'blocked')}")
-        if execution_degraded_active:
-            out["reasons"].append(
-                f"execution_degraded:{str(execution_degraded_snapshot.get('reason') or 'execution_degraded')}"
-            )
-            out["reasons"].extend(list(execution_degraded_snapshot.get("reason_codes") or []))
-
-        if not exec_sup_ok and mode_name in ("shadow", "live"):
-            out["reasons"].append("execution_supervisor_unavailable")
-        out["reasons"].extend([f"execution_gate:{name}" for name in exec_sup_failed_gates])
-        for alert_type in (
-            "duplicate_order_risk_detected",
-            "missing_fills_detected",
-            "fill_missing_local_order_reference",
-            "broker_submission_unrecorded_needs_reconcile",
-            "order_position_mismatch",
-            "invalid_account_balance_state",
-            "pricing_unavailable_for_unrealized_pnl",
-        ):
-            if alert_type in exec_sup_alert_types:
-                out["reasons"].append(alert_type)
-        if exec_sup_account_state and not bool(exec_sup_account_state.get("ok", True)):
-            out["reasons"].append("invalid_account_balance_state")
-        if int(exec_sup_integrity.get("pricing_unavailable_count") or 0) > 0:
-            out["reasons"].append("pricing_unavailable_for_unrealized_pnl")
-        if exec_sup_critical:
-            out["reasons"].append("execution_supervisor_critical")
-
-        if not broker_ok and mode_name == "live":
-            out["reasons"].append("broker_connection_unavailable")
-
-        startup_ok = (
-            db_ok
-            and event_log_ok
-            and prices_ok
-            and jobs_ok
-            and providers_ok
-            and provider_readiness_ok
-            and critical_ingestion_ok
-        )
-        if mode_name == "live":
-            out["ok"] = (
-                startup_ok
-                and startup_validation_ok
-                and events_ok
-                and data_pipeline_runtime_ok
-                and barrier_ok
-                and broker_ok
-                and competition_ok
-                and attribution_ok
-                and timeseries_ok
-                and portfolio_runtime_ok
-                and position_reconcile_ok
-                and exec_sup_ok
-                and (not execution_degraded_critical)
-                and (not exec_sup_critical)
-            )
-        elif mode_name == "shadow":
-            out["ok"] = (
-                startup_ok
-                and startup_validation_ok
-                and events_ok
-                and data_pipeline_runtime_ok
-                and barrier_ok
-                and competition_ok
-                and attribution_ok
-                and timeseries_ok
-                and portfolio_runtime_ok
-                and exec_sup_ok
-                and (not execution_degraded_critical)
-                and (not exec_sup_critical)
-            )
-        else:
-            out["ok"] = (
-                startup_ok
-                and startup_validation_ok
-                and data_pipeline_runtime_ok
-                and timeseries_ok
-                and portfolio_runtime_ok
-                and (not exec_sup_critical)
-            )
-
-        if HEALTH_EMIT_METRICS:
-            try:
-                emit_gauge(
-                    "job_health",
-                    1.0 if bool(out.get("ok")) else 0.0,
-                    component="engine.runtime.health",
-                    extra_tags={"metric_scope": "health_snapshot"},
-                )
-                emit_gauge(
-                    "provider_uptime",
-                    float((out.get("providers") or {}).get("healthy") or 0.0),
-                    component="engine.runtime.health",
-                    extra_tags={"metric_scope": "healthy_providers"},
-                )
-                for component_name in ("ingestion", "inference", "execution"):
-                    component_row = dict((out.get("component_health") or {}).get(component_name) or {})
-                    emit_gauge(
-                        "component_health_snapshot",
-                        1.0 if bool(component_row.get("ok")) else 0.0,
-                        component="engine.runtime.health",
-                        extra_tags={"observed_component": str(component_name)},
-                    )
-                trace_event(
-                    "health_snapshot",
-                    component="engine.runtime.health",
-                    entity_type="health",
-                    entity_id="runtime",
-                    payload={
-                        "ok": bool(out.get("ok")),
-                        "reasons": list(out.get("reasons") or []),
-                        "prices": out.get("prices") or {},
-                        "providers": out.get("providers") or {},
-                        "job_summary": out.get("job_summary") or {},
-                    },
-                )
-            except Exception as e:
-                _warn("health.runtime_event.emit", e)
-
-        root_cause_candidates = list(out.get("reasons") or [])
-
-        critical_blockers = []
-        if not bool(out.get("db", {}).get("ok")):
-            critical_blockers.append("db_not_ok")
-        if not bool(out.get("prices", {}).get("ok")):
-            critical_blockers.append("prices_not_ok")
-        if not bool(out.get("providers", {}).get("ok")):
-            critical_blockers.append("providers_not_ok")
-        if not bool((out.get("provider_readiness") or {}).get("ok")) and bool(
-            (out.get("provider_readiness") or {}).get("required")
-        ):
-            critical_blockers.append("provider_readiness_not_ok")
-            critical_blockers.extend(list((out.get("provider_readiness") or {}).get("blockers") or []))
-        if not bool(out.get("job_summary", {}).get("ok")):
-            critical_blockers.append("jobs_not_ok")
-        if not bool(out.get("competition", {}).get("ok")) and mode_name in ("shadow", "live"):
-            critical_blockers.append("competition_not_ok")
-        if not bool(out.get("attribution", {}).get("ok")):
-            critical_blockers.append("attribution_not_ok")
-        if not timeseries_ok:
-            critical_blockers.append("timeseries_storage_not_ok")
-        if bool(portfolio_runtime_snapshot.get("degraded")):
-            critical_blockers.append("portfolio_runtime_degraded")
-        if position_reconcile_blocking:
-            critical_blockers.append("position_reconcile_not_ok")
-        if execution_degraded_critical:
-            critical_blockers.append("execution_degraded")
-        if mode_name in ("shadow", "live") and not exec_sup_ok:
-            critical_blockers.append("execution_supervisor_unavailable")
-        if exec_sup_critical:
-            critical_blockers.append("execution_supervisor_critical")
-
-        if not bool((out.get("ingestion_runtime") or {}).get("running")):
-            critical_blockers.append("ingestion_not_running")
-
-        if bool((out.get("ingestion_runtime") or {}).get("stale")):
-            critical_blockers.append("ingestion_stale")
-
-        critical_blockers.extend(ingestion_runtime_reason_codes)
-
-        if not out.get("db", {}).get("ok"):
-            system_stage = "BOOT"
-        elif (
-            not out.get("prices", {}).get("ok")
-            or bool((out.get("ingestion_runtime") or {}).get("stale"))
-            or not critical_ingestion_ok
-        ):
-            system_stage = "INGESTION"
-        elif not out.get("labels", {}).get("ok"):
-            system_stage = "FEATURES"
-        else:
-            system_stage = "EXECUTION"
-
-        data_flow_ok = bool(
-            out.get("db", {}).get("ok")
-            and out.get("prices", {}).get("ok")
-            and out.get("providers", {}).get("ok")
-            and (
-                (not bool((out.get("provider_readiness") or {}).get("required")))
-                or bool((out.get("provider_readiness") or {}).get("ok"))
-            )
-            and out.get("job_summary", {}).get("ok")
-            and not bool((out.get("ingestion_runtime") or {}).get("stale"))
-            and bool(critical_ingestion_ok)
-            and bool((out.get("attribution") or {}).get("ok"))
-            and (mode_name not in ("shadow", "live") or bool((out.get("competition") or {}).get("ok")))
-        )
-        out["reasons"] = _dedupe_strs(list(out.get("reasons") or []))
-        out["root_cause_candidates"] = _dedupe_strs(root_cause_candidates)
-        out["critical_blockers"] = _dedupe_strs(critical_blockers)
-        out["system_stage"] = system_stage
-        out["data_flow_ok"] = data_flow_ok
-        try:
-            out["lifecycle"] = dict(_lc_get_state() or {})
-        except Exception as e:
-            _warn("health.lifecycle_state", e)
-            out["lifecycle"] = {"state": "UNKNOWN", "detail": "", "first_price_ts_ms": ""}
+        ctx = _build_health_snapshot_context(con, now_ms)
+        _run_health_checks(ctx, _HEALTH_SNAPSHOT_CHECKS)
+        out = _finalize_health_snapshot(ctx)
 
         section_started = time.perf_counter()
         if cache_ttl_ms > 0:

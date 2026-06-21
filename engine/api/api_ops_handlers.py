@@ -460,14 +460,27 @@ def api_get_news_sentiment(parsed, ctx):
                 once_key="api_ops_handlers_market_regime_close",
             )
 
-    series = [
-        {
-            "ts_ms": int(ts_ms or 0),
-            "sentiment": float(tone_mean or 0.0),
-        }
-        for ts_ms, tone_mean in reversed(rows)
-    ]
-    return {"ok": True, "series": series}
+    series = []
+    missing_sentiment = 0
+    valid_sentiment = 0
+    for ts_ms, tone_mean in reversed(rows):
+        if tone_mean is None:
+            sentiment = None
+            missing_sentiment += 1
+        else:
+            sentiment = float(tone_mean)
+            valid_sentiment += 1
+        series.append({"ts_ms": int(ts_ms or 0), "sentiment": sentiment})
+    return {
+        "ok": True,
+        "series": series,
+        "meta": {
+            "ready": valid_sentiment > 0,
+            "count": int(len(series)),
+            "valid_sentiment": int(valid_sentiment),
+            "missing_sentiment": int(missing_sentiment),
+        },
+    }
 
 
 def api_get_human_alignment_summary(parsed, ctx):

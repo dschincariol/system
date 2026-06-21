@@ -1,6 +1,43 @@
 # Secrets Rotation Runbook
 
-This is the single rotation reference for the trading server. Production secrets are systemd encrypted credentials in `/etc/credstore.encrypted/`; application code reads them from `${CREDENTIALS_DIRECTORY}` through `services.secrets.loader`.
+This is the single rotation reference for the trading server. Production secrets are systemd encrypted credentials in `/etc/credstore.encrypted/`, Docker Compose secrets, or root/service-owned files referenced by `*_FILE` variables. Application code reads systemd credentials from `${CREDENTIALS_DIRECTORY}` through `services.secrets.loader` and reads file-backed compose secrets from the configured `*_FILE` paths.
+
+Strict production, supervised, and live runtimes reject inline secret values in process env and repo-local `.env` files when a file/provider source exists. Rotate any credential that was ever pasted into `.env`, `deploy/compose/.env`, `deploy/env/trading.env`, shell history, CI logs, or support bundles.
+
+## File-Backed Compose Secret Rotation
+
+Use this for secrets referenced by `DASHBOARD_API_TOKEN_FILE`,
+`OPERATOR_API_TOKEN_FILE`, `TIMESCALE_PASSWORD_FILE`, `REDIS_PASSWORD_FILE`,
+`MINIO_ROOT_USER_FILE`, `MINIO_ROOT_PASSWORD_FILE`, `POLYGON_API_KEY_FILE`,
+`TRADIER_API_TOKEN_FILE`, `ALPACA_KEY_ID_FILE`, `ALPACA_SECRET_KEY_FILE`, and
+similar file-backed entries.
+
+1. Generate or obtain the replacement value from the backing service/provider.
+2. Write it to a new file outside the repo checkout:
+   ```bash
+   sudo install -o root -g trading -m 0600 /dev/null /etc/trading/secrets/name.next
+   printf '%s' "$NEW_SECRET_VALUE" | sudo tee /etc/trading/secrets/name.next >/dev/null
+   sudo chmod 0600 /etc/trading/secrets/name.next
+   ```
+3. For database, Redis, MinIO, broker, and provider credentials, rotate the backing service/provider credential first, then atomically replace the file path target:
+   ```bash
+   sudo mv /etc/trading/secrets/name.next /etc/trading/secrets/name
+   ```
+4. Recreate containers or restart systemd units that consume the file so Docker secrets and process-level caches reload:
+   ```bash
+   docker compose --env-file deploy/compose/.env \
+     -f deploy/compose/docker-compose.external-services.yml \
+     -f deploy/compose/docker-compose.stack.yml up -d --force-recreate runtime operator
+   ```
+5. Run the production preflight and relevant readiness probe. Do not delete the old credential from the provider until the new runtime path passes.
+6. Remove inline leftovers from repo-local env files and rerun:
+   ```bash
+   python - <<'PY'
+   from engine.runtime.secret_sources import repo_local_secret_key_inventory
+   import json
+   print(json.dumps(repo_local_secret_key_inventory(), indent=2, sort_keys=True))
+   PY
+   ```
 
 ## Master Key Rotation
 

@@ -11,11 +11,13 @@ Moved from dashboard_server to enforce layer isolation.
 
 import json
 import logging
+import math
 import time
 from typing import Any
 
 from engine.api.api_read import _table_exists
 from engine.api.internal_access import db_connect
+from engine.api.redaction import redact_api_payload
 from engine.api.sql_identifiers import require_allowed_table_name, sql_identifier
 from engine.api.feature_visibility import annotate_attribution_feature_visibility
 from engine.runtime.state_cache import cache_get_or_load
@@ -35,6 +37,10 @@ from engine.strategy.shap_explainer import normalize_explanation_payload
 
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
+PORTFOLIO_BACKTEST_BENCHMARK_SYMBOL = "SPY"
+PORTFOLIO_BACKTEST_BENCHMARK_SOURCE = "prices"
+PORTFOLIO_BACKTEST_BENCHMARK_LIMIT = 3000
+PORTFOLIO_BACKTEST_BENCHMARK_NORMALIZATION = "portfolio_start_value"
 
 
 def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra) -> None:
@@ -91,7 +97,8 @@ def _float_or_none(value: Any) -> float | None:
     try:
         if value is None or value == "":
             return None
-        return float(value)
+        out = float(value)
+        return out if math.isfinite(out) else None
     except Exception as e:
         _warn_nonfatal(
             "API_READ_ADVANCED_FLOAT_PARSE_FAILED",
@@ -100,6 +107,166 @@ def _float_or_none(value: Any) -> float | None:
             value_preview=str(value)[:120],
         )
         return None
+
+
+def _benchmark_unavailable(reason: str, *, points: list[dict[str, Any]] | None = None, **extra: Any) -> dict[str, Any]:
+    return {
+        "available": False,
+        "symbol": PORTFOLIO_BACKTEST_BENCHMARK_SYMBOL,
+        "source": PORTFOLIO_BACKTEST_BENCHMARK_SOURCE,
+        "price_field": "COALESCE(price, px)",
+        "normalization": PORTFOLIO_BACKTEST_BENCHMARK_NORMALIZATION,
+        "normalization_detail": (
+            "Benchmark price points are scaled so the first valid benchmark price "
+            "in the portfolio backtest point window equals the first finite "
+            "portfolio equity value."
+        ),
+        "start_value": None,
+        "start_price": None,
+        "start_ts_ms": None,
+        "end_ts_ms": None,
+        "points": list(points or []),
+        "unavailable_reason": str(reason),
+        **extra,
+    }
+
+
+def _first_finite_portfolio_equity(points: list[dict[str, Any]]) -> tuple[int | None, float | None]:
+    for point in points or []:
+        equity = _float_or_none((point or {}).get("equity"))
+        ts_ms = _float_or_none((point or {}).get("ts_ms"))
+        if equity is not None and equity > 0 and ts_ms is not None:
+            return int(ts_ms), float(equity)
+    return None, None
+
+
+def _last_finite_portfolio_ts(points: list[dict[str, Any]]) -> int | None:
+    out: int | None = None
+    for point in points or []:
+        equity = _float_or_none((point or {}).get("equity"))
+        ts_ms = _float_or_none((point or {}).get("ts_ms"))
+        if equity is not None and ts_ms is not None:
+            out = int(ts_ms)
+    return out
+
+
+def _latest_portfolio_backtest_benchmark(
+    con,
+    *,
+    points: list[dict[str, Any]],
+    start_ts_ms: int,
+    end_ts_ms: int,
+) -> dict[str, Any]:
+    start_point_ts_ms, portfolio_start_value = _first_finite_portfolio_equity(points)
+    end_point_ts_ms = _last_finite_portfolio_ts(points)
+    if start_point_ts_ms is None or end_point_ts_ms is None or portfolio_start_value is None:
+        return _benchmark_unavailable(
+            "portfolio_start_value_missing",
+            requested_start_ts_ms=int(start_ts_ms or 0),
+            requested_end_ts_ms=int(end_ts_ms or 0),
+        )
+
+    benchmark_start_ts_ms = int(start_point_ts_ms)
+    benchmark_end_ts_ms = max(int(end_point_ts_ms), int(benchmark_start_ts_ms))
+    if not _table_exists(con, PORTFOLIO_BACKTEST_BENCHMARK_SOURCE):
+        return _benchmark_unavailable(
+            "prices_table_missing",
+            requested_start_ts_ms=int(benchmark_start_ts_ms),
+            requested_end_ts_ms=int(benchmark_end_ts_ms),
+        )
+
+    try:
+        rows = con.execute(
+            """
+            SELECT ts_ms, COALESCE(price, px) AS benchmark_price, source
+            FROM prices
+            WHERE symbol = ?
+              AND ts_ms >= ?
+              AND ts_ms <= ?
+              AND COALESCE(price, px) IS NOT NULL
+              AND COALESCE(price, px) > 0
+            ORDER BY ts_ms ASC
+            LIMIT ?
+            """,
+            (
+                PORTFOLIO_BACKTEST_BENCHMARK_SYMBOL,
+                int(benchmark_start_ts_ms),
+                int(benchmark_end_ts_ms),
+                int(PORTFOLIO_BACKTEST_BENCHMARK_LIMIT),
+            ),
+        ).fetchall() or []
+    except Exception as e:
+        _warn_nonfatal(
+            "API_READ_ADVANCED_PORTFOLIO_BENCHMARK_QUERY_FAILED",
+            e,
+            once_key="portfolio_backtest_benchmark_query_failed",
+            symbol=PORTFOLIO_BACKTEST_BENCHMARK_SYMBOL,
+            source=PORTFOLIO_BACKTEST_BENCHMARK_SOURCE,
+        )
+        return _benchmark_unavailable(
+            "benchmark_query_failed",
+            requested_start_ts_ms=int(benchmark_start_ts_ms),
+            requested_end_ts_ms=int(benchmark_end_ts_ms),
+        )
+
+    raw_points: list[dict[str, Any]] = []
+    for row in rows:
+        ts_value = _float_or_none(row[0])
+        price = _float_or_none(row[1])
+        if ts_value is None or price is None or price <= 0:
+            continue
+        raw_points.append(
+            {
+                "ts_ms": int(ts_value),
+                "price": float(price),
+                "source": str(row[2] or ""),
+            }
+        )
+
+    if not raw_points:
+        return _benchmark_unavailable(
+            "benchmark_prices_missing",
+            requested_start_ts_ms=int(benchmark_start_ts_ms),
+            requested_end_ts_ms=int(benchmark_end_ts_ms),
+        )
+
+    start_price = float(raw_points[0]["price"])
+    normalized_points = [
+        {
+            "ts_ms": int(point["ts_ms"]),
+            "price": float(point["price"]),
+            "value": float(float(point["price"]) / start_price * float(portfolio_start_value)),
+            "source": str(point.get("source") or ""),
+        }
+        for point in raw_points
+    ]
+
+    sources = sorted({str(point.get("source") or "") for point in normalized_points if str(point.get("source") or "")})
+    available = len(normalized_points) >= 2
+    payload = {
+        "available": bool(available),
+        "symbol": PORTFOLIO_BACKTEST_BENCHMARK_SYMBOL,
+        "source": PORTFOLIO_BACKTEST_BENCHMARK_SOURCE,
+        "sources": sources,
+        "price_field": "COALESCE(price, px)",
+        "normalization": PORTFOLIO_BACKTEST_BENCHMARK_NORMALIZATION,
+        "normalization_detail": (
+            "Benchmark price points are scaled so the first valid benchmark price "
+            "in the portfolio backtest point window equals the first finite "
+            "portfolio equity value."
+        ),
+        "start_value": float(portfolio_start_value),
+        "start_price": float(start_price),
+        "start_ts_ms": int(normalized_points[0]["ts_ms"]),
+        "end_ts_ms": int(normalized_points[-1]["ts_ms"]),
+        "requested_start_ts_ms": int(benchmark_start_ts_ms),
+        "requested_end_ts_ms": int(benchmark_end_ts_ms),
+        "points": normalized_points,
+        "point_count": int(len(normalized_points)),
+    }
+    if not available:
+        payload["unavailable_reason"] = "benchmark_prices_insufficient"
+    return payload
 
 
 def _shadow_book_snapshot(con, model_id: str) -> dict:
@@ -446,11 +613,18 @@ def get_latest_portfolio_backtest():
                 detail = {}
             points.append({
                 "ts_ms": int(r[0] or 0),
-                "ret": float(r[1] or 0.0),
-                "equity": float(r[2] or 0.0),
-                "drawdown": float(r[3] or 0.0),
+                "ret": _float_or_none(r[1]),
+                "equity": _float_or_none(r[2]),
+                "drawdown": _float_or_none(r[3]),
                 "detail": detail,
             })
+
+        benchmark = _latest_portfolio_backtest_benchmark(
+            con,
+            points=points,
+            start_ts_ms=int(start_ts_ms or 0),
+            end_ts_ms=int(end_ts_ms or 0),
+        )
 
         return {
             "ok": True,
@@ -461,10 +635,13 @@ def get_latest_portfolio_backtest():
                 "end_ts_ms": int(end_ts_ms or 0),
                 "metrics": metrics,
                 "points": points,
+                "benchmark": benchmark,
             },
             "meta": {
                 "ready": True,
                 "count": int(len(points)),
+                "benchmark_ready": bool(benchmark.get("available")),
+                "benchmark_symbol": str(benchmark.get("symbol") or PORTFOLIO_BACKTEST_BENCHMARK_SYMBOL),
             },
         }
     finally:
@@ -2341,6 +2518,6 @@ def get_audit_records(table: str, limit: int = 100, from_id: int | None = None, 
         "ok": True,
         "ts_ms": int(time.time() * 1000),
         "table": str(table),
-        "records": rows,
+        "records": redact_api_payload(rows),
         "meta": {"ready": True, "count": int(len(rows))},
     }

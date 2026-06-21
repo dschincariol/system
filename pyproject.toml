@@ -30,3 +30,35 @@ py-modules = []
 
 [tool.setuptools.packages.find]
 include = ["engine*", "routes*", "services*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+required_plugins = ["pytest-timeout>=2.4"]
+timeout = "120"
+timeout_method = "thread"
+timeout_func_only = false
+
+[tool.coverage.run]
+branch = true
+source = ["engine", "services", "routes", "ops"]
+relative_files = true
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_also = [
+  "if TYPE_CHECKING:",
+]
+
+[tool.coverage.xml]
+output = "artifacts/coverage/coverage.xml"
+
+[tool.coverage.json]
+output = "artifacts/coverage/coverage.json"
+
+[tool.trading_system.coverage_gate]
+minimum_percent = 52.0
+package_roots = ["engine", "services", "routes", "ops"]
+report_dir = "artifacts/coverage"

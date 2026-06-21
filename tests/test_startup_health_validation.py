@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -229,6 +230,26 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertNotIn("clear-token", text)
         self.assertNotIn("clear-key", text)
         self.assertNotIn(dsn, text)
+
+    def test_local_env_bootstrap_uses_secret_file_pointer_for_master_key(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+        tmp_root = Path(self.tmp.name) / "local_env_bootstrap"
+        tmp_root.mkdir(parents=True)
+        (tmp_root / ".env.example").write_text("# local template\n", encoding="utf-8")
+        start_system._BASE_DIR = str(tmp_root)
+
+        start_system._ensure_local_env_file()
+        start_system._ensure_local_env_file()
+
+        env_text = (tmp_root / ".env").read_text(encoding="utf-8")
+        self.assertIn("DATA_SOURCE_MASTER_KEY_FILE=data/secrets/data_source_master_key", env_text)
+        self.assertEqual(env_text.count("DATA_SOURCE_MASTER_KEY_FILE="), 1)
+        self.assertNotIn("DATA_SOURCE_MASTER_KEY=", env_text)
+        secret_path = tmp_root / "data" / "secrets" / "data_source_master_key"
+        self.assertTrue(secret_path.is_file())
+        self.assertTrue(bool(secret_path.read_text(encoding="utf-8").strip()))
+        mode = stat.S_IMODE(secret_path.stat().st_mode)
+        self.assertFalse(mode & (stat.S_IRWXG | stat.S_IRWXO), oct(mode))
 
     def tearDown(self) -> None:
         try:
@@ -1868,7 +1889,13 @@ class StartupHealthValidationTests(unittest.TestCase):
             previous_dashboard = sys.modules.get("dashboard_server")
             sys.modules["dashboard_server"] = fake_dashboard
             try:
-                with patch.object(start_system, "runtime_shutdown", side_effect=lambda: calls.append("runtime_shutdown")):
+                shutdown_reasons: list[str] = []
+
+                def _runtime_shutdown(**kwargs) -> None:
+                    calls.append("runtime_shutdown")
+                    shutdown_reasons.append(str(kwargs.get("shutdown_reason") or ""))
+
+                with patch.object(start_system, "runtime_shutdown", side_effect=_runtime_shutdown):
                     with patch.object(start_system, "_terminate_ingestion", side_effect=lambda: calls.append("terminate_ingestion")):
                         start_system._handle_late_startup_health_validation_failure(
                             RuntimeError("unit_late_validation_failure"),
@@ -1882,6 +1909,7 @@ class StartupHealthValidationTests(unittest.TestCase):
                     sys.modules["dashboard_server"] = previous_dashboard
 
             self.assertEqual(calls, ["stop_server", "runtime_shutdown", "terminate_ingestion"])
+            self.assertEqual(shutdown_reasons, ["late_startup_health_validation_failed:RuntimeError:unit_late_validation_failure"])
             self.assertTrue(start_system._INGESTION_WATCHDOG_STOP.is_set())
             self.assertEqual(os.environ.get("DISABLE_LIVE_EXECUTION"), "1")
             self.assertEqual(os.environ.get("KILL_SWITCH_GLOBAL"), "1")

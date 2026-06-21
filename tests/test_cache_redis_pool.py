@@ -51,6 +51,18 @@ def test_pool_resolves_password_secret(monkeypatch):
     assert redis_pool.redis_url() == "redis://:secret@127.0.0.1:6380/2"
 
 
+def test_pool_resolves_password_file(monkeypatch, tmp_path):
+    redis_pool = importlib.reload(importlib.import_module("engine.cache.redis_pool"))
+    secret_file = tmp_path / "redis_password"
+    secret_file.write_text("file-secret", encoding="utf-8")
+    secret_file.chmod(0o600)
+
+    monkeypatch.setenv("TS_REDIS_URL", "redis://127.0.0.1:6380/2")
+    monkeypatch.setenv("TS_REDIS_PASSWORD_FILE", str(secret_file))
+
+    assert redis_pool.redis_url() == "redis://:file-secret@127.0.0.1:6380/2"
+
+
 def test_default_redis_url_is_linux_socket(monkeypatch):
     platform = importlib.reload(importlib.import_module("engine.runtime.platform"))
 

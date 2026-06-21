@@ -68,6 +68,8 @@ BOUNDS: dict[str, Bound] = {
     "ASYNC_PRICE_WRITER_RETRY_BASE_S": Bound("ASYNC_PRICE_WRITER_RETRY_BASE_S", 0.25, 0.01, 5.0, "float"),
     "ASYNC_PRICE_WRITER_RETRY_MAX_S": Bound("ASYNC_PRICE_WRITER_RETRY_MAX_S", 5.0, 0.1, 30.0, "float"),
     "ASYNC_PRICE_WRITER_ENQUEUE_TIMEOUT_S": Bound("ASYNC_PRICE_WRITER_ENQUEUE_TIMEOUT_S", 0.05, 0.0, 5.0, "float"),
+    "ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES": Bound("ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES", 268435456, 1048576, 8589934592, "int"),
+    "ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS": Bound("ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS", 50, 10, 60000, "int"),
     "TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S": Bound("TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0, "float"),
     "TELEMETRY_APPEND_BUFFER_FLUSH_JITTER_RATIO": Bound("TELEMETRY_APPEND_BUFFER_FLUSH_JITTER_RATIO", 0.25, 0.0, 1.0, "float"),
     "TELEMETRY_APPEND_BUFFER_MAX_BATCH": Bound("TELEMETRY_APPEND_BUFFER_MAX_BATCH", 128, 1, 4096, "int"),
@@ -276,6 +278,8 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
     timescale_batch = tuned_int("TIMESCALE_BATCH_SIZE", 500, 1, 5000, env=source)
     async_queue = tuned_int("ASYNC_PRICE_WRITER_QUEUE_MAXSIZE", 2048, 32, 32768, env=source)
     async_batch = tuned_int("ASYNC_PRICE_WRITER_BATCH_SIZE", 256, 1, 4096, env=source)
+    async_spool_max_bytes = tuned_int("ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES", 268435456, 1048576, 8589934592, env=source)
+    async_spool_busy_timeout_ms = tuned_int("ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS", 50, 10, 60000, env=source)
     telemetry_batch = tuned_int("TELEMETRY_APPEND_BUFFER_MAX_BATCH", 128, 1, 4096, env=source)
     telemetry_rows = max(
         telemetry_batch,
@@ -410,6 +414,9 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
             "flush_interval_s": tuned_float("ASYNC_PRICE_WRITER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0, env=source),
             "retry_attempts": tuned_int("ASYNC_PRICE_WRITER_RETRY_ATTEMPTS", 4, 1, 10, env=source),
             "enqueue_timeout_s": tuned_float("ASYNC_PRICE_WRITER_ENQUEUE_TIMEOUT_S", 0.05, 0.0, 5.0, env=source),
+            "spool_max_envelopes": int(async_queue),
+            "spool_max_bytes": int(async_spool_max_bytes),
+            "spool_busy_timeout_ms": int(async_spool_busy_timeout_ms),
         },
         "telemetry_append_buffer": {
             "enabled": bool(telemetry_enabled),

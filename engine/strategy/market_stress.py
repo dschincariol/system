@@ -19,6 +19,8 @@ from engine.runtime.storage import connect
 
 _LOOKBACK = 240   # samples
 _ZWIN = 120       # samples for zscore window
+MARKET_STRESS_WARNING_THRESHOLD = 0.55
+MARKET_STRESS_CRITICAL_THRESHOLD = 0.75
 LOG = get_logger("engine.strategy.market_stress")
 
 
@@ -99,12 +101,22 @@ def _ratio(a: float, b: float) -> float:
         return 0.0
     return float(r)
 
+
+def market_stress_thresholds() -> Dict[str, float]:
+    return {
+        "warning": float(MARKET_STRESS_WARNING_THRESHOLD),
+        "critical": float(MARKET_STRESS_CRITICAL_THRESHOLD),
+    }
+
+
 def get_market_stress_snapshot(con=None, ts_ms: Optional[int] = None) -> Dict[str, float]:
     """
     Pure read-only snapshot computed from the local `prices` table.
     Returns a stable dict suitable for /api exposure and for explain_json annotations.
 
-    Stress score is 0..1 (higher = more stress).
+    The cross-asset base score is normalized to 0..1 (higher = more stress).
+    The optional GDELT conflict adjustment is an additive stress bump applied
+    after that normalization, so the final exposed stress_score may exceed 1.0.
     """
     owns = False
     if con is None:
@@ -245,7 +257,8 @@ def get_market_stress_snapshot(con=None, ts_ms: Optional[int] = None) -> Dict[st
                 out["z_gdelt_doc"] = float(gm.get("z_doc_count", 0.0))
                 out["z_gdelt_tone"] = float(gm.get("z_tone_mean", 0.0))
                 out["z_gdelt_conflict"] = float(gm.get("z_conflict_share", 0.0))
-                # Conservative bump: only conflict increases stress; tone is ambiguous
+                # Conservative bump: only conflict increases stress; tone is ambiguous.
+                # Keep the post-GDELT magnitude; consumers scale their displays.
                 out["stress_score"] = float(out["stress_score"]) + max(0.0, float(out["z_gdelt_conflict"]))
         except Exception as e:
             _warn_nonfatal("MARKET_STRESS_GDELT_MACRO_SNAPSHOT_FAILED", e, ts_ms=int(ts_ms))
@@ -258,4 +271,3 @@ def get_market_stress_snapshot(con=None, ts_ms: Optional[int] = None) -> Dict[st
                 con.close()
             except Exception as e:
                 _warn_nonfatal("MARKET_STRESS_CLOSE_FAILED", e, operation="get_market_stress_snapshot")
-

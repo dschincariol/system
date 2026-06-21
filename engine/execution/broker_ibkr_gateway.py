@@ -38,6 +38,7 @@ import json
 import logging
 import re
 import threading
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine.execution.broker_failover_policy import terminal_broker_failure
@@ -665,7 +666,7 @@ def _apply_execution_risk_caps(
 # IB API Client Wrapper
 # ============================================================
 
-def _connect_ib():
+def _connect_ib(timeout_s: Optional[float] = None):
     # Connection setup is intentionally strict in supervised/prod mode so a
     # partially configured IBKR deployment fails early and visibly.
     config_state = ibkr_credentials_status(require_explicit=_explicit_ibkr_config_required())
@@ -806,7 +807,11 @@ def _connect_ib():
     t = threading.Thread(target=app.run, daemon=True)
     t.start()
 
-    if not app._next_order_evt.wait(timeout=10):
+    try:
+        connect_timeout = max(0.1, min(10.0, float(timeout_s if timeout_s is not None else 10.0)))
+    except Exception:
+        connect_timeout = 10.0
+    if not app._next_order_evt.wait(timeout=float(connect_timeout)):
         raise RuntimeError("IBKR: nextValidId not received")
 
     return app
@@ -1501,7 +1506,7 @@ def get_positions_snapshot(timeout_s: float = 10.0) -> Dict[str, float]:
 
 
 def get_positions_live(timeout_s: float = 8.0) -> List[Dict[str, Any]]:
-    app = _connect_ib()
+    app = _connect_ib(timeout_s=timeout_s)
     try:
         with app._pos_lock:
             app._pos = []
@@ -1521,7 +1526,7 @@ def get_positions_live(timeout_s: float = 8.0) -> List[Dict[str, Any]]:
 
 
 def list_open_orders_live(timeout_s: float = 8.0) -> List[Dict[str, Any]]:
-    app = _connect_ib()
+    app = _connect_ib(timeout_s=timeout_s)
     try:
         with app._open_orders_lock:
             app._open_orders = []
@@ -1537,6 +1542,238 @@ def list_open_orders_live(timeout_s: float = 8.0) -> List[Dict[str, Any]]:
             return list(app._open_orders or [])
     finally:
         app.disconnect()
+
+
+def list_open_orders(timeout_s: float = 8.0) -> List[Dict[str, Any]]:
+    return list_open_orders_live(timeout_s=float(timeout_s))
+
+
+def _shutdown_order_ref(command_id: str, symbol: str, qty: float) -> str:
+    raw = f"ibkr:shutdown_flatten:{command_id}:{symbol}:{float(qty):.12g}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return validate_ibkr_order_ref(f"ibk_flat_{digest}")
+
+
+def cancel_open_orders(timeout_s: float = 10.0, command_id: Optional[str] = None) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    try:
+        orders = list_open_orders_live(timeout_s=max(0.1, float(deadline - time.monotonic())))
+    except Exception as exc:
+        _warn_nonfatal(
+            "IBKR_SHUTDOWN_OPEN_ORDERS_LIST_FAILED",
+            exc,
+            once_key="shutdown_open_orders_list",
+            command_id=str(command_id or ""),
+        )
+        return {
+            "ok": False,
+            "broker": "ibkr",
+            "status": "open_orders_list_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    results: List[Dict[str, Any]] = []
+    failed_n = 0
+    cancelled_n = 0
+    audit = record_broker_action_audit(
+        broker="ibkr",
+        action="cancel_open_orders_attempt",
+        status="attempted",
+        mode=str(os.environ.get("ENGINE_MODE", "")),
+        payload={
+            "command_id": str(command_id or ""),
+            "open_order_count": int(len(orders or [])),
+            "shutdown_cancel": True,
+        },
+    )
+    if not bool(audit.get("ok")):
+        return {
+            "ok": False,
+            "broker": "ibkr",
+            "status": "broker_action_audit_failed",
+            "command_id": str(command_id or ""),
+            "audit": audit,
+        }
+    for order in list(orders or []):
+        oid = str((order or {}).get("orderId") or (order or {}).get("id") or "").strip()
+        if not oid:
+            failed_n += 1
+            results.append({"ok": False, "status": "missing_order_id", "order": dict(order or {})})
+            continue
+        if time.monotonic() >= deadline:
+            failed_n += 1
+            results.append({"ok": False, "status": "cancel_timeout_before_order", "broker_order_id": oid})
+            break
+        try:
+            result = cancel_order(oid, timeout_s=max(0.1, float(deadline - time.monotonic())))
+        except Exception as exc:
+            _warn_nonfatal(
+                "IBKR_SHUTDOWN_CANCEL_ORDER_FAILED",
+                exc,
+                once_key=f"shutdown_cancel_order:{oid}",
+                command_id=str(command_id or ""),
+                broker_order_id=oid,
+            )
+            result = {
+                "ok": False,
+                "broker": "ibkr",
+                "status": "cancel_exception",
+                "broker_order_id": oid,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if bool(result.get("ok")):
+            cancelled_n += 1
+        else:
+            failed_n += 1
+        results.append(dict(result or {}))
+
+    return {
+        "ok": failed_n == 0,
+        "broker": "ibkr",
+        "status": "cancel_open_orders_complete" if failed_n == 0 else "cancel_open_orders_incomplete",
+        "command_id": str(command_id or ""),
+        "open_order_count": int(len(orders or [])),
+        "cancelled_n": int(cancelled_n),
+        "failed_n": int(failed_n),
+        "results": results,
+    }
+
+
+def flatten_positions(
+    *,
+    timeout_s: float = 10.0,
+    command_id: str,
+    max_abs_qty_per_symbol: float,
+    max_total_abs_qty: float,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    try:
+        positions = get_positions_live(timeout_s=max(0.1, float(deadline - time.monotonic())))
+    except Exception as exc:
+        _warn_nonfatal(
+            "IBKR_SHUTDOWN_POSITIONS_FETCH_FAILED",
+            exc,
+            once_key="shutdown_positions_fetch",
+            command_id=str(command_id or ""),
+        )
+        return {
+            "ok": False,
+            "broker": "ibkr",
+            "status": "positions_fetch_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    flatten_rows: List[Dict[str, Any]] = []
+    total_abs_qty = 0.0
+    for position in list(positions or []):
+        symbol = str((position or {}).get("symbol") or "").strip().upper()
+        qty = _safe_f((position or {}).get("qty"), 0.0)
+        if not symbol or abs(float(qty)) <= 1e-9:
+            continue
+        total_abs_qty += abs(float(qty))
+        if abs(float(qty)) > float(max_abs_qty_per_symbol):
+            return {
+                "ok": False,
+                "broker": "ibkr",
+                "status": "flatten_symbol_qty_limit_exceeded",
+                "symbol": symbol,
+                "qty": float(qty),
+                "max_abs_qty_per_symbol": float(max_abs_qty_per_symbol),
+            }
+        flatten_rows.append({"symbol": symbol, "position_qty": float(qty), "flatten_qty": -float(qty)})
+
+    if total_abs_qty > float(max_total_abs_qty):
+        return {
+            "ok": False,
+            "broker": "ibkr",
+            "status": "flatten_total_qty_limit_exceeded",
+            "total_abs_qty": float(total_abs_qty),
+            "max_total_abs_qty": float(max_total_abs_qty),
+        }
+
+    app = None
+    submitted: List[Dict[str, Any]] = []
+    failed_n = 0
+    try:
+        if flatten_rows:
+            app = _connect_ib(timeout_s=max(0.1, float(deadline - time.monotonic())))
+        for row in flatten_rows:
+            if time.monotonic() >= deadline:
+                failed_n += 1
+                submitted.append({"ok": False, "status": "flatten_timeout_before_submit", **row})
+                break
+            symbol = str(row["symbol"])
+            qty = float(row["flatten_qty"])
+            order_ref = _shutdown_order_ref(str(command_id), symbol, qty)
+            audit = record_broker_action_audit(
+                broker="ibkr",
+                action="position_flatten_attempt",
+                status="attempted",
+                symbol=symbol,
+                qty=float(qty),
+                client_order_id=str(order_ref),
+                payload={
+                    "command_id": str(command_id),
+                    "position_qty": float(row["position_qty"]),
+                    "order_type": "MARKET",
+                    "broker_native_client_order_ref": str(order_ref),
+                    "shutdown_flatten": True,
+                },
+            )
+            if not bool(audit.get("ok")):
+                failed_n += 1
+                submitted.append({"ok": False, "status": "broker_action_audit_failed", **row, "audit": audit})
+                continue
+            try:
+                oid = _consume_next_order_id(app)
+                contract = _mk_stock_contract(symbol)
+                order = _mk_market_order(qty)
+                placed_ref = _place_order_with_order_ref(
+                    app,
+                    oid,
+                    contract,
+                    order,
+                    client_order_id=str(order_ref),
+                )
+                submitted.append(
+                    {
+                        "ok": True,
+                        "status": "flatten_submitted",
+                        **row,
+                        "client_order_id": str(placed_ref),
+                        "broker_order_id": str(oid),
+                        "orderRef": str(placed_ref),
+                    }
+                )
+            except Exception as exc:
+                failed_n += 1
+                submitted.append(
+                    {
+                        "ok": False,
+                        "status": "flatten_submit_exception",
+                        **row,
+                        "client_order_id": str(order_ref),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    finally:
+        try:
+            if app is not None:
+                app.disconnect()
+        except Exception as exc:
+            _warn_nonfatal("BROKER_IBKR_GATEWAY_DISCONNECT_FAILED", exc, once_key="flatten_positions_disconnect")
+
+    return {
+        "ok": failed_n == 0,
+        "broker": "ibkr",
+        "status": "flatten_positions_submitted" if failed_n == 0 else "flatten_positions_incomplete",
+        "command_id": str(command_id),
+        "position_count": int(len(flatten_rows)),
+        "submitted_n": int(sum(1 for item in submitted if bool(item.get("ok")))),
+        "failed_n": int(failed_n),
+        "total_abs_qty": float(total_abs_qty),
+        "results": submitted,
+    }
 
 
 def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str, Any]:
@@ -1557,7 +1794,7 @@ def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str
     for attempt in range(1, max_retries + 1):
         app = None
         try:
-            app = _connect_ib()
+            app = _connect_ib(timeout_s=timeout_s)
             latency_ms = int(time.time() * 1000) - int(started_ms)
             err_rows = []
             try:
@@ -1685,7 +1922,7 @@ def cancel_order(order_id: str, timeout_s: float = 8.0) -> Dict[str, Any]:
     )
     if not bool(audit.get("ok")):
         return {"ok": False, **audit}
-    app = _connect_ib()
+    app = _connect_ib(timeout_s=timeout_s)
     last_order: Dict[str, Any] = {}
     last_error = ""
     try:

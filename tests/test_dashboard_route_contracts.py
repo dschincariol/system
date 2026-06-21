@@ -1,3 +1,4 @@
+import ast
 import importlib
 import json
 import sqlite3
@@ -84,6 +85,16 @@ def _reload_modules(*module_names: str):
         module = importlib.import_module(name)
         modules.append(importlib.reload(module))
     return modules
+
+
+@pytest.fixture(autouse=True)
+def _dashboard_route_contract_token_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    token_file = tmp_path / "dashboard_api_token"
+    token_file.write_text("dashboard-route-contract-token-1234567890", encoding="utf-8")
+    token_file.chmod(0o600)
+    monkeypatch.delenv("DASHBOARD_API_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_API_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("TRADING_SECRET_POLICY_REPO_ROOT", str(tmp_path))
 
 
 class _FakeJobs:
@@ -339,6 +350,7 @@ def _install_isolated_sqlite_storage(monkeypatch: pytest.MonkeyPatch, db_path: P
         "services.data_source_manager",
         "engine.api.api_jobs",
         "engine.api.api_system",
+        "engine.api.api_self_repair",
         "engine.api.api_market",
         "dashboard_server",
         "engine.model_registry",
@@ -416,7 +428,6 @@ def route_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("RUNTIME_META_BEST_EFFORT_BUFFER_ENABLED", "0")
     monkeypatch.setenv("EVENT_LOG_BUFFER_ENABLED", "0")
     monkeypatch.setenv("TRADING_FAILURE_DIAGNOSTICS_PERSIST", "0")
-    monkeypatch.delenv("DASHBOARD_API_TOKEN", raising=False)
 
     storage = _install_isolated_sqlite_storage(monkeypatch, db_path)
     storage.init_db()
@@ -860,6 +871,260 @@ def test_route_specs_integrity(monkeypatch: pytest.MonkeyPatch):
         if str(route["handler"]) not in api_handlers or not callable(api_handlers.get(str(route["handler"])))
     ]
     assert missing_handlers == [], f"route handlers missing from API_HANDLERS: {missing_handlers}"
+
+
+def test_market_stress_api_returns_threshold_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TIMESCALE_ENABLED", "0")
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("TIMESCALE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
+    monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
+
+    market_stress, dashboard_server = _reload_modules("engine.strategy.market_stress", "dashboard_server")
+    monkeypatch.setattr(
+        market_stress,
+        "get_market_stress_snapshot",
+        lambda: {"ts_ms": 1_700_000_000_000, "stress_score": 1.2},
+    )
+
+    response = dashboard_server.api_get_market_stress()
+
+    assert response["ok"] is True
+    assert response["stress"]["stress_score"] == 1.2
+    assert response["thresholds"] == {"warning": 0.55, "critical": 0.75}
+
+
+def test_dashboard_news_sentiment_preserves_missing_sentiment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TIMESCALE_ENABLED", "0")
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("TIMESCALE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
+    monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
+
+    (dashboard_server,) = _reload_modules("dashboard_server")
+    db_path = tmp_path / "news_sentiment_dashboard.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE social_features (
+              bucket_ts_ms INTEGER NOT NULL,
+              sentiment_mean REAL
+            );
+            """
+        )
+        con.executemany(
+            "INSERT INTO social_features(bucket_ts_ms, sentiment_mean) VALUES (?, ?)",
+            [
+                (1_700_000_000_000, None),
+                (1_700_000_060_000, 0.0),
+                (1_700_000_120_000, 0.25),
+            ],
+        )
+        con.commit()
+
+    monkeypatch.setattr(dashboard_server, "_dashboard_db_connect", lambda: sqlite3.connect(str(db_path)))
+
+    response = dashboard_server.api_get_news_sentiment({"limit": "10"})
+
+    assert response["ok"] is True
+    assert [row["sentiment"] for row in response["series"]] == [None, 0.0, 0.25]
+    assert response["meta"]["ready"] is True
+    assert response["meta"]["count"] == 3
+    assert response["meta"]["valid_sentiment"] == 2
+    assert response["meta"]["missing_sentiment"] == 1
+
+
+def test_ops_news_sentiment_preserves_missing_tone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TIMESCALE_ENABLED", "0")
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("TIMESCALE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
+    monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
+
+    api_ops_handlers, storage = _reload_modules("engine.api.api_ops_handlers", "engine.runtime.storage")
+    db_path = tmp_path / "news_sentiment_ops.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE gdelt_macro_features (
+              bucket_ts_ms INTEGER NOT NULL,
+              tone_mean REAL
+            );
+            """
+        )
+        con.executemany(
+            "INSERT INTO gdelt_macro_features(bucket_ts_ms, tone_mean) VALUES (?, ?)",
+            [
+                (1_700_000_000_000, None),
+                (1_700_000_060_000, 0.0),
+                (1_700_000_120_000, -0.4),
+            ],
+        )
+        con.commit()
+
+    monkeypatch.setattr(storage, "connect_ro", lambda: sqlite3.connect(str(db_path)))
+
+    response = api_ops_handlers.api_get_news_sentiment({"limit": "10"}, {})
+
+    assert response["ok"] is True
+    assert [row["sentiment"] for row in response["series"]] == [None, 0.0, -0.4]
+    assert response["meta"]["ready"] is True
+    assert response["meta"]["count"] == 3
+    assert response["meta"]["valid_sentiment"] == 2
+    assert response["meta"]["missing_sentiment"] == 1
+
+
+def test_alpha_decay_handler_not_shadowed_in_dashboard_server_source():
+    source_path = REPO_ROOT / "dashboard_server.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    local_defs = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "api_get_alpha_decay"
+    ]
+    assert local_defs == [], (
+        f"dashboard_server.py must not define local api_get_alpha_decay at lines {local_defs}"
+    )
+
+    handler_key_lines = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "API_HANDLERS" for target in node.targets):
+            continue
+        for key in node.value.keys:
+            if isinstance(key, ast.Constant) and key.value == "api_get_alpha_decay":
+                handler_key_lines.append(key.lineno)
+
+    assert len(handler_key_lines) == 1, (
+        "alpha-decay handler must appear exactly once in API_HANDLERS; "
+        f"found lines {handler_key_lines}"
+    )
+
+
+def test_alpha_decay_route_has_single_api_system_owner(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TIMESCALE_ENABLED", "0")
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("TIMESCALE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
+    monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
+
+    api_system, dashboard_server = _reload_modules("engine.api.api_system", "dashboard_server")
+
+    def _norm_route(route):
+        if isinstance(route, dict):
+            return {
+                "method": str(route.get("method") or "").upper(),
+                "path": str(route.get("path") or ""),
+                "handler": str(route.get("handler") or ""),
+            }
+        return {
+            "method": str(route[0] or "").upper(),
+            "path": str(route[1] or ""),
+            "handler": str(route[2] or ""),
+        }
+
+    raw_alpha_routes = []
+    for route in dashboard_server._RAW_ROUTE_SPECS:
+        normalized = _norm_route(route)
+        if normalized["method"] == "GET" and normalized["path"] == "/api/alpha_decay":
+            raw_alpha_routes.append(normalized)
+    assert raw_alpha_routes == [
+        {"method": "GET", "path": "/api/alpha_decay", "handler": "api_get_alpha_decay"}
+    ]
+
+    registered_alpha_routes = [
+        route
+        for route in dashboard_server.ROUTE_SPECS
+        if route.get("method") == "GET" and route.get("path") == "/api/alpha_decay"
+    ]
+    assert registered_alpha_routes == [
+        {"method": "GET", "path": "/api/alpha_decay", "handler": "api_get_alpha_decay"}
+    ]
+    assert dashboard_server.API_HANDLERS["api_get_alpha_decay"] is api_system.api_get_alpha_decay
+    assert (
+        getattr(dashboard_server.API_HANDLERS["api_get_alpha_decay"], "__module__", "")
+        == "engine.api.api_system"
+    )
+
+
+def test_self_repair_routes_have_single_api_self_repair_owner(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TIMESCALE_ENABLED", "0")
+    monkeypatch.delenv("TIMESCALE_DSN", raising=False)
+    monkeypatch.delenv("TIMESCALE_URL", raising=False)
+    monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
+    monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
+
+    api_self_repair, api_system, dashboard_server = _reload_modules(
+        "engine.api.api_self_repair",
+        "engine.api.api_system",
+        "dashboard_server",
+    )
+
+    expected_routes = [
+        {"method": "POST", "path": "/api/system/self_repair", "handler": "api_post_self_repair"},
+        {"method": "POST", "path": "/api/operator/self_repair", "handler": "api_post_self_repair"},
+        {"method": "POST", "path": "/api/system/repair_schema", "handler": "api_post_repair_schema"},
+        {"method": "POST", "path": "/api/repair_schema", "handler": "api_post_repair_schema"},
+    ]
+
+    system_route_keys = {
+        (str(route[0] or "").upper(), str(route[1] or ""))
+        for route in api_system.ROUTE_SPECS_SYSTEM
+    }
+    for route in expected_routes:
+        assert (route["method"], route["path"]) not in system_route_keys
+
+    assert [
+        {"method": str(route[0]).upper(), "path": str(route[1]), "handler": str(route[2])}
+        for route in api_self_repair.ROUTE_SPECS_SELF_REPAIR
+    ] == expected_routes
+
+    def _norm_route(route):
+        if isinstance(route, dict):
+            return {
+                "method": str(route.get("method") or "").upper(),
+                "path": str(route.get("path") or ""),
+                "handler": str(route.get("handler") or ""),
+            }
+        return {
+            "method": str(route[0] or "").upper(),
+            "path": str(route[1] or ""),
+            "handler": str(route[2] or ""),
+        }
+
+    for expected in expected_routes:
+        raw_matches = [
+            _norm_route(route)
+            for route in dashboard_server._RAW_ROUTE_SPECS
+            if _norm_route(route)["method"] == expected["method"]
+            and _norm_route(route)["path"] == expected["path"]
+        ]
+        assert raw_matches == [expected]
+
+        registered = [
+            route
+            for route in dashboard_server.ROUTE_SPECS
+            if route.get("method") == expected["method"] and route.get("path") == expected["path"]
+        ]
+        assert registered == [expected]
+
+    assert dashboard_server.API_HANDLERS["api_post_self_repair"] is api_self_repair.api_post_self_repair
+    assert dashboard_server.API_HANDLERS["api_post_repair_schema"] is api_self_repair.api_post_repair_schema
+    assert api_system.api_post_self_repair is api_self_repair.api_post_self_repair
+    assert api_system.api_post_repair_schema is api_self_repair.api_post_repair_schema
 
 
 def test_mutation_controls_are_post_only_and_confirmed(route_runtime):

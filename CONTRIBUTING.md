@@ -97,8 +97,17 @@ If the change also alters operator setup, update `.env.example` in the same chan
 
 ## Validation Expectations
 
-- Run `python tools/validate_repo.py` before merging.
+- Run `npm run test:py` or `python -m pytest tests/ -v --tb=short` for the canonical Python test suite. Avoid the stdlib discovery runner; pytest collects the repository's `unittest.TestCase` tests.
+- Run `python tools/validate_repo.py` before merging. It runs `python tools/validate_docs.py` as its `docs` sub-validator and runs pytest collection before pytest execution, so documentation and Python test gates also run in CI.
+- Run `python tools/check_repo_artifact_hygiene.py --report` when broad local-output or dependency directories are present. The same guard runs in CI and fails if generated caches, virtualenvs, `node_modules/`, repo-local `var/` state, local `.env*`, or secret paths are tracked.
+- Local and CI pytest runs inherit the `pyproject.toml` `pytest-timeout` policy. The default per-test timeout is 120 seconds, `timeout_method` is `thread`, and `pytest-timeout>=2.4` is a required plugin. For an intentionally slow test, add `@pytest.mark.timeout(<seconds>)` directly on that test and include a nearby comment explaining the bound. Prefer a larger explicit bound to `@pytest.mark.timeout(0)`, and never disable timeouts for a whole marker class or CI lane.
 - For doc-only changes, run at minimum `python tools/validate_docs.py`.
 - Keep local Markdown links valid.
 - Keep `docs/adr/` numbering sequential and update `docs/adr/README.md` when adding a new ADR.
 - Do not backfill speculative historical changelog or ADR entries. Record the decision or change from the point where it becomes grounded.
+
+In addition to link, ADR-numbering, required-file, OpenAPI, and changelog checks, `tools/validate_docs.py` enforces three documentation-governance gates (see [docs/adr/0006-documentation-governance-gates.md](docs/adr/0006-documentation-governance-gates.md)):
+
+- **Subsystem-README coverage** — every `engine/<subsystem>/` directory must have a `README.md` and a link row in `docs/DOCUMENTATION_INDEX.md`. Add both when you add a subsystem.
+- **Environment-variable coverage** — every env var read in code must appear in `.env.example`, `docs/REFERENCE_CONFIGURATION_GLOSSARY.md`, or `docs/config_env_allowlist.txt`. Document new variables in the first two; the allowlist only freezes the legacy backlog and should shrink, never grow.
+- **Staleness sentinels** — the map/index docs (`CLAUDE.md`, `MAINTAINER_INDEX.md`, `README_DEVELOPER_MAP.md`, `README_ARCHITECTURE.md`, `README_FUNCTION_MAP.md`, `Database_Schema.md`) must each carry a `Last verified against code` line.

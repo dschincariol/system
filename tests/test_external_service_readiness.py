@@ -206,12 +206,39 @@ class ExternalServiceReadinessTests(unittest.TestCase):
 
         self.assertTrue(bool(summary.get("ok")))
         load_secret.assert_called_with(
+            "OBJECT_STORE_SECRET_KEY_FILE",
+            "MINIO_SECRET_KEY_FILE",
+            "AWS_SECRET_ACCESS_KEY_FILE",
             "OBJECT_STORE_SECRET_KEY_SECRET",
             "MINIO_SECRET_KEY_SECRET",
             "AWS_SECRET_ACCESS_KEY_SECRET",
         )
         kwargs = dict(probe.call_args.kwargs)
         self.assertEqual(kwargs.get("secret_key"), "object-secret")
+
+    def test_required_object_storage_resolves_access_and_secret_key_files(self) -> None:
+        access_file = Path(self.tmp.name) / "object_access_key"
+        secret_file = Path(self.tmp.name) / "object_secret_key"
+        access_file.write_text("file-access", encoding="utf-8")
+        secret_file.write_text("file-secret", encoding="utf-8")
+        access_file.chmod(0o600)
+        secret_file.chmod(0o600)
+        self._set_env("PREFLIGHT_REQUIRE_OBJECT_STORAGE", "1")
+        self._set_env("OBJECT_STORE_ENDPOINT", "http://minio.local:9000")
+        self._set_env("OBJECT_STORE_BUCKET", "artifacts")
+        self._set_env("OBJECT_STORE_ACCESS_KEY", None)
+        self._set_env("OBJECT_STORE_SECRET_KEY", None)
+        self._set_env("OBJECT_STORE_ACCESS_KEY_FILE", str(access_file))
+        self._set_env("OBJECT_STORE_SECRET_KEY_FILE", str(secret_file))
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_probe_object_storage_bucket", return_value=(True, None)) as probe:
+            summary = readiness.check_external_service_readiness()
+
+        self.assertTrue(bool(summary.get("ok")))
+        kwargs = dict(probe.call_args.kwargs)
+        self.assertEqual(kwargs.get("access_key"), "file-access")
+        self.assertEqual(kwargs.get("secret_key"), "file-secret")
 
     def test_required_object_storage_bucket_probe_failure_fails(self) -> None:
         self._set_env("PREFLIGHT_REQUIRE_OBJECT_STORAGE", "1")

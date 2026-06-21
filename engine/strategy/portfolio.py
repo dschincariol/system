@@ -26,6 +26,7 @@ import math
 import logging
 import random
 import threading
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
 from engine.runtime import dbapi_compat as dbapi
@@ -4987,6 +4988,1761 @@ def _emit_order(
     cache_invalidate_namespace("portfolio_snapshot")
 
 
+# Rebalance orchestration is intentionally staged.  Each stage mutates the
+# context in order so compute_rebalance keeps the public contract while making
+# the production path auditable and testable by phase.
+@dataclass
+class _RebalanceAllocatorState:
+    live_strategies: List[str] = field(default_factory=list)
+    shadow_strategies: List[str] = field(default_factory=list)
+    alloc_map: Dict[str, float] = field(default_factory=dict)
+    alloc_detail: Dict[str, Any] = field(default_factory=dict)
+    alloc_regime: Dict[str, Any] = field(default_factory=dict)
+    alloc_regime_conf: float = 0.0
+    alloc_reason: Dict[str, Any] = field(default_factory=dict)
+    alloc_alpha_runtime: Dict[str, Any] = field(default_factory=dict)
+    alloc_portfolio_target_gross: float = 1.0
+    competition_capital_plan: Dict[str, Any] = field(default_factory=dict)
+    competition_policy_cache: Dict[Tuple[str, int, str, str], Dict[str, Any]] = field(default_factory=dict)
+    eff_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
+class _RebalanceContext:
+    con: Any
+    now_ms: int = 0
+    degraded_reasons: List[Dict[str, Any]] = field(default_factory=list)
+    alerts: List[Dict[str, Any]] = field(default_factory=list)
+    alert_meta_index: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    desired: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    allocator: _RebalanceAllocatorState = field(default_factory=_RebalanceAllocatorState)
+    portfolio_diag: Dict[str, Any] = field(default_factory=dict)
+    flip_penalty: Dict[str, Any] = field(default_factory=dict)
+    orders_n: int = 0
+    changed: List[str] = field(default_factory=list)
+    execution_blocked_codes: List[str] = field(default_factory=list)
+
+    def record_degraded_phase(self, phase: str, code: str, error: BaseException | str | None = None) -> None:
+        item: dict[str, Any] = {
+            "phase": str(phase or "").strip(),
+            "code": str(code or "").strip(),
+        }
+        if error is not None:
+            if isinstance(error, BaseException):
+                item["error"] = f"{type(error).__name__}: {error}"
+            else:
+                item["error"] = str(error)
+        self.degraded_reasons.append(item)
+
+
+def _prepare_rebalance_execution(ctx: _RebalanceContext) -> Optional[Dict[str, Any]]:
+    con = ctx.con
+    last = _get_meta(con, "last_rebalance_ts_ms")
+    now_ms = _now_ms()
+    ctx.now_ms = int(now_ms)
+
+    last_exec = _get_meta(con, "last_rebalance_exec_id")
+    if last_exec == str(now_ms):
+        return {"ok": False, "error": "duplicate rebalance execution"}
+
+    try:
+        if not bool(getattr(con, "in_transaction", False)):
+            con.begin_managed_write()
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_TRANSACTION_BEGIN_FAILED", e, once_key="transaction_begin")
+        raise
+
+    _set_meta(con, "last_rebalance_exec_id", str(now_ms))
+
+    if last:
+        try:
+            last_ms = int(last)
+            eff_cd = int(_eff_rebalance_cooldown_s())
+            if (now_ms - last_ms) < int(eff_cd) * 1000:
+                return {
+                    "ok": False,
+                    "error": "rebalance cooldown active",
+                    "cooldown_s": int(eff_cd),
+                }
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_REBALANCE_COOLDOWN_PARSE_FAILED", e, once_key="rebalance_cooldown_parse")
+
+    try:
+        from engine.strategy.capital_guard import trading_allowed
+
+        if not trading_allowed(con):
+            return {"ok": False, "error": "trading halted by capital guard"}
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_CAPITAL_GUARD_CHECK_FAILED", e, once_key="capital_guard_check")
+        return {"ok": False, "error": f"capital_guard check failed: {e}"}
+    return None
+
+
+def _load_rebalance_inputs_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    alerts = _load_recent_alert_candidates(con, PORTFOLIO_LOOKBACK_S)
+    _mark_alert_candidates_seen(
+        con,
+        [dict(alert or {}).get("id") for alert in (alerts or [])],
+        int(now_ms),
+    )
+    ctx.alerts = list(alerts or [])
+    ctx.alert_meta_index = _build_recent_alert_meta_index(alerts)
+    ctx.state = _load_state(con)
+
+    try:
+        _auto_promote_shadow_strategies(con)
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_AUTO_PROMOTION_FAILED", e, once_key="auto_promote_shadow_strategies")
+
+
+def _load_allocator_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    _record_degraded_phase = ctx.record_degraded_phase
+    # ------------------------------------------------------
+    # Multi-Strategy Capital Competition
+    # ------------------------------------------------------
+    live_strategies = _load_live_strategies(con)
+    shadow_strategies = _load_shadow_strategies(con)
+
+    # ------------------------------------------------------
+    # Strategy Allocator (Meta Capital Engine)
+    # - rolling perf scoring
+    # - drawdown-aware scaling
+    # - correlation-adjusted allocation
+    # - dynamic redistribution
+    # - config-driven risk budgets
+    # ------------------------------------------------------
+    alloc_map: Dict[str, float] = {}
+    alloc_detail: Dict[str, Any] = {}
+    alloc_regime: Dict[str, Any] = {}
+    alloc_regime_conf: float = 0.0
+    alloc_reason: Dict[str, Any] = {}
+    alloc_alpha_runtime: Dict[str, Any] = {}
+    alloc_portfolio_target_gross: float = 1.0
+    competition_policy_cache: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
+
+    try:
+        from engine.runtime.strategy_allocator import compute_and_persist_strategy_allocations
+
+        alloc_res = compute_and_persist_strategy_allocations(con, now_ms=int(now_ms)) or {}
+        alloc_map = dict(alloc_res.get("allocations") or {})
+        alloc_detail = dict(alloc_res.get("details") or {})
+        alloc_regime = dict(alloc_res.get("regime") or {})
+        alloc_regime_conf = float(alloc_res.get("regime_confidence", 0.0) or 0.0)
+        alloc_reason = dict(alloc_res.get("reason") or {})
+        alloc_alpha_runtime = dict(alloc_res.get("alpha_decay_runtime") or {})
+        alloc_portfolio_target_gross = float(alloc_res.get("portfolio_target_gross", 1.0) or 1.0)
+    except Exception as e:
+        alloc_map = {}
+        alloc_detail = {}
+        alloc_regime = {}
+        alloc_regime_conf = 0.0
+        alloc_reason = {}
+        alloc_alpha_runtime = {}
+        alloc_portfolio_target_gross = 1.0
+        _record_degraded_phase("strategy_allocator", "PORTFOLIO_STRATEGY_ALLOCATOR_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_STRATEGY_ALLOCATOR_FAILED", Exception("strategy allocator failed"), once_key="strategy_allocator")
+
+    competition_capital_plan = _load_cached_competition_capital_plan(con, int(now_ms))
+
+    try:
+        shadow_perf = _load_shadow_performance(con)
+        for s in shadow_perf:
+            if s not in alloc_map:
+                alloc_map[s] = 0.02
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_SHADOW_PERFORMANCE_LOAD_FAILED", e, once_key="shadow_performance_load")
+
+    # Back-compat fallback: use stored efficiency_score if allocator has no output
+    eff_map = _load_strategy_efficiency(con)
+    ctx.allocator = _RebalanceAllocatorState(
+        live_strategies=list(live_strategies or []),
+        shadow_strategies=list(shadow_strategies or []),
+        alloc_map=dict(alloc_map or {}),
+        alloc_detail=dict(alloc_detail or {}),
+        alloc_regime=dict(alloc_regime or {}),
+        alloc_regime_conf=float(alloc_regime_conf),
+        alloc_reason=dict(alloc_reason or {}),
+        alloc_alpha_runtime=dict(alloc_alpha_runtime or {}),
+        alloc_portfolio_target_gross=float(alloc_portfolio_target_gross),
+        competition_capital_plan=dict(competition_capital_plan or {}),
+        competition_policy_cache=dict(competition_policy_cache or {}),
+        eff_map=dict(eff_map or {}),
+    )
+
+
+def _construct_rebalance_targets_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    alerts = ctx.alerts
+    alert_meta_index = ctx.alert_meta_index
+    allocator = ctx.allocator
+    live_strategies = allocator.live_strategies
+    shadow_strategies = allocator.shadow_strategies
+    alloc_map = allocator.alloc_map
+    alloc_detail = allocator.alloc_detail
+    alloc_regime = allocator.alloc_regime
+    alloc_regime_conf = allocator.alloc_regime_conf
+    alloc_reason = allocator.alloc_reason
+    alloc_alpha_runtime = allocator.alloc_alpha_runtime
+    alloc_portfolio_target_gross = allocator.alloc_portfolio_target_gross
+    competition_capital_plan = allocator.competition_capital_plan
+    competition_policy_cache = allocator.competition_policy_cache
+    eff_map = allocator.eff_map
+    strategy_targets: Dict[str, Dict] = {}
+    total_share = 0.0
+
+    strat = None  # preserve original "last loaded strat" behavior for later get_regime_profile usage
+
+    ordered_strategies: List[Tuple[str, str]] = []
+    seen_strategies = set()
+
+    for sname in live_strategies:
+        ss = str(sname)
+        if ss and ss not in seen_strategies:
+            ordered_strategies.append((ss, "live"))
+            seen_strategies.add(ss)
+
+    for sname in shadow_strategies:
+        ss = str(sname)
+        if ss and ss not in seen_strategies:
+            ordered_strategies.append((ss, "shadow"))
+            seen_strategies.add(ss)
+
+    for sname, stage in ordered_strategies:
+        try:
+            strat = load_strategy_module(str(sname))
+            d = strat.build_desired(alerts=alerts, now_ms=int(now_ms)) or {}
+
+            if alloc_map:
+                share_hint = float(alloc_map.get(str(sname), 0.0) or 0.0)
+            else:
+                share_hint = float((eff_map.get(str(sname)) or {}).get("efficiency_score", 0.0) or 0.0)
+                share_hint = max(0.0, share_hint)
+
+            if str(stage) == "shadow":
+                shadow_metrics = _score_shadow_targets(d)
+                shadow_metrics["allocator_share_hint"] = float(share_hint)
+                shadow_metrics["stage"] = "shadow"
+                if alloc_detail and str(sname) in alloc_detail:
+                    shadow_metrics["allocator_detail"] = alloc_detail.get(str(sname))
+                _record_shadow_strategy_run(
+                    con,
+                    strategy_name=str(sname),
+                    targets=d,
+                    metrics=shadow_metrics,
+                )
+                continue
+
+            strategy_targets[str(sname)] = d
+            total_share += float(max(0.0, share_hint))
+        except Exception as e:
+            _warn_nonfatal(
+                "PORTFOLIO_STRATEGY_TARGET_ROW_FAILED",
+                e,
+                strategy_name=str(sname),
+            )
+            continue
+
+    # If no allocation available, equal weight fallback
+    if total_share <= 1e-9:
+        total_share = float(len(strategy_targets) or 1)
+
+    # Merge with allocator-weighted capital share
+    desired: Dict[str, Dict] = {}
+
+    for sname, targets in strategy_targets.items():
+        if alloc_map:
+            share_raw = float(alloc_map.get(str(sname), 0.0) or 0.0)
+        else:
+            share_raw = float((eff_map.get(str(sname)) or {}).get("efficiency_score", 0.0) or 0.0)
+            share_raw = max(0.0, share_raw)
+
+        share = float(share_raw) / float(total_share) if float(total_share) > 0 else 0.0
+
+        # ------------------------------------------------------
+        # Global Risk Envelope (Top-Down Capital Throttle)
+        # ------------------------------------------------------
+        global_scale = 1.0
+        try:
+            from engine.runtime.global_risk_envelope import compute_global_risk_envelope
+            _g = compute_global_risk_envelope(con, now_ms=int(now_ms)) or {}
+            global_scale = float(_g.get("global_scale", 1.0) or 1.0)
+        except Exception:
+            global_scale = 1.0
+
+        allocator_portfolio_scale = max(0.0, float(alloc_portfolio_target_gross))
+        alpha_runtime_scale = 1.0
+        try:
+            alpha_runtime_scale = _safe_float((alloc_alpha_runtime or {}).get("min_throttle_mult"), 1.0)
+        except Exception:
+            alpha_runtime_scale = 1.0
+        alpha_runtime_scale = max(0.0, min(1.0, float(alpha_runtime_scale)))
+
+        share = (
+            float(share)
+            * float(global_scale)
+            * float(allocator_portfolio_scale)
+            * float(alpha_runtime_scale)
+        )
+
+        for sym, tgt in (targets or {}).items():
+            try:
+                w = float((tgt or {}).get("weight", 0.0) or 0.0)
+                w = float(w) * float(share)
+
+                # ---------------------------------
+                # REGIME EXECUTION ADJUSTMENT
+                # ---------------------------------
+                try:
+                    from engine.strategy.regime_stack import compute_regime_vector
+
+                    reg = compute_regime_vector(symbol=sym, ts_ms=int(now_ms), con=con) or {}
+
+                    compat = 1.0
+
+                    vol_cluster = float((reg.get("micro") or {}).get("vol_clustered", 0.0))
+                    thin_liq = float((reg.get("micro") or {}).get("liquidity_thin", 0.0))
+                    dd_shift = float((reg.get("macro") or {}).get("drawdown_shift", 0.0))
+
+                    stress = max(vol_cluster, thin_liq, dd_shift)
+
+                    compat = max(0.25, 1.0 - float(stress) * 0.5)
+
+                    w = float(w) * float(compat)
+
+                    try:
+                        tgt.setdefault("reason", {})
+                        tgt["reason"]["exec_regime_compat"] = float(compat)
+                        tgt["reason"]["exec_regime_stress"] = float(stress)
+                    except Exception as e:
+                        _warn_nonfatal("PORTFOLIO_EXEC_REGIME_REASON_FAILED", e, once_key="exec_regime_reason")
+
+                except Exception as e:
+                    _warn_nonfatal("PORTFOLIO_EXEC_REGIME_VECTOR_FAILED", e, once_key="exec_regime_vector")
+
+                exj = str((tgt or {}).get("explain_json", "{}") or "{}")
+                model_identity = _extract_model_identity_from_explain(exj)
+                source_alert_id = (tgt or {}).get("source_alert_id")
+                alert_meta = {}
+                if source_alert_id is not None:
+                    try:
+                        alert_meta = dict(alert_meta_index.get(int(source_alert_id)) or {})
+                    except Exception:
+                        alert_meta = {}
+                model_id = _normalize_model_id(
+                    (tgt or {}).get("model_id") or model_identity.get("model_id")
+                )
+                model_name = str(
+                    (tgt or {}).get("model_name")
+                    or model_identity.get("model_name")
+                    or alert_meta.get("model_name")
+                    or ""
+                ).strip()
+                regime_name = str(
+                    (tgt or {}).get("regime")
+                    or model_identity.get("regime")
+                    or alert_meta.get("regime")
+                    or "global"
+                ).strip() or "global"
+                horizon_s = int(
+                    (tgt or {}).get("horizon_s")
+                    or alert_meta.get("horizon_s")
+                    or _extract_horizon_s_from_explain_json(exj)
+                    or 0
+                )
+                competition_policy: Dict[str, Any] = {}
+                competition_reason_code = ""
+                if model_name:
+                    try:
+                        competition_key = (
+                            str(sym).upper().strip(),
+                            int(horizon_s),
+                            str(model_name),
+                            str(regime_name),
+                        )
+                        if competition_key not in competition_policy_cache:
+                            competition_policy_cache[competition_key] = dict(
+                                _competition_policy_from_cached_plan(
+                                    competition_capital_plan,
+                                    symbol=str(sym).upper().strip(),
+                                    horizon_s=int(horizon_s),
+                                    model_name=str(model_name),
+                                    regime=str(regime_name),
+                                )
+                                or {}
+                            )
+                        competition_policy = dict(competition_policy_cache.get(competition_key) or {})
+                    except Exception as e:
+                        competition_policy = {}
+                        _warn_nonfatal(
+                            "PORTFOLIO_COMPETITION_POLICY_LOAD_FAILED",
+                            e,
+                            once_key=f"competition_policy:{sym}:{model_name}:{horizon_s}:{regime_name}",
+                        )
+
+                if model_name and competition_policy:
+                    policy_reason = str((competition_policy or {}).get("reason") or "")
+                    competition_cap_mult = float(
+                        (competition_policy or {}).get("capital_multiplier")
+                        or (competition_policy or {}).get("effective_allocation_fraction")
+                        or (competition_policy or {}).get("model_weight")
+                        or 0.0
+                    )
+                    if bool((competition_policy or {}).get("blocked")) and policy_reason in {
+                        "competition_plan_stale",
+                        "no_group_allocation",
+                    }:
+                        competition_reason_code = policy_reason
+                    elif bool((competition_policy or {}).get("blocked")) or competition_cap_mult <= 0.0:
+                        w = 0.0
+                        competition_reason_code = str(
+                            policy_reason or "competition_blocked"
+                        )
+                    else:
+                        w = float(w) * float(competition_cap_mult)
+                        competition_reason_code = "competition_capital_applied"
+                elif model_name:
+                    competition_reason_code = "competition_policy_missing"
+                else:
+                    competition_reason_code = "model_identity_missing"
+                desired_key = f"{model_id}:{str(sym).upper().strip()}"
+
+                cur = desired.get(desired_key)
+                if cur is None:
+                    desired[desired_key] = dict(tgt)
+                    desired[desired_key]["model_id"] = str(model_id)
+                    desired[desired_key]["model_name"] = str(model_name)
+                    desired[desired_key]["regime"] = str(regime_name)
+                    desired[desired_key]["horizon_s"] = int(horizon_s)
+                    desired[desired_key]["competition_policy"] = dict(competition_policy or {})
+                    desired[desired_key]["symbol"] = str(sym).upper().strip()
+                    desired[desired_key]["weight"] = float(w)
+                    desired[desired_key]["source_alert_id"] = tgt.get("source_alert_id")
+                    desired[desired_key]["prediction_id"] = (
+                        tgt.get("prediction_id")
+                        if tgt.get("prediction_id") not in (None, "")
+                        else alert_meta.get("prediction_id")
+                    )
+                    desired[desired_key]["explain_json"] = exj
+                    desired[desired_key].setdefault("reason", {})
+                    desired[desired_key]["reason"]["strategy"] = str(sname)
+                    desired[desired_key]["reason"]["strategy_share"] = float(share)
+                    desired[desired_key]["reason"]["strategy_alloc"] = {str(sname): float(share)}
+                    desired[desired_key]["reason"]["allocator_regime"] = dict(alloc_regime.get("regimes") or {})
+                    desired[desired_key]["reason"]["allocator_regime_confidence"] = float(alloc_regime_conf)
+                    desired[desired_key]["reason"]["allocator_portfolio_target_gross"] = float(alloc_portfolio_target_gross)
+                    desired[desired_key]["reason"]["allocator_alpha_decay_runtime"] = dict(alloc_alpha_runtime)
+                    desired[desired_key]["reason"]["allocator_reason"] = dict(alloc_reason)
+                    desired[desired_key]["reason"]["score"] = float((tgt.get("reason") or {}).get("score", 0.0) or 0.0)
+                    desired[desired_key]["reason"]["confidence"] = float((tgt.get("reason") or {}).get("confidence", 0.0) or 0.0)
+                    desired[desired_key]["reason"]["expected_z"] = float((tgt.get("reason") or {}).get("expected_z", 0.0) or 0.0)
+                    desired[desired_key]["reason"]["competition"] = {
+                        "policy": dict(competition_policy or {}),
+                        "reason_code": str(competition_reason_code),
+                        "capital_applied_upstream": bool(competition_reason_code == "competition_capital_applied"),
+                        "model_name": str(model_name),
+                        "regime": str(regime_name),
+                        "horizon_s": int(horizon_s),
+                    }
+                    if alloc_detail and str(sname) in alloc_detail:
+                        desired[desired_key]["reason"]["strategy_alloc_detail"] = alloc_detail.get(str(sname))
+                else:
+                    # combine weights from multiple strategies
+                    cur_w = float(cur.get("weight", 0.0) or 0.0)
+                    desired[desired_key]["weight"] = float(cur_w + w)
+                    if model_name and not str(desired[desired_key].get("model_name") or "").strip():
+                        desired[desired_key]["model_name"] = str(model_name)
+                    if not desired[desired_key].get("horizon_s"):
+                        desired[desired_key]["horizon_s"] = int(horizon_s)
+                    if desired[desired_key].get("prediction_id") in (None, "") and (
+                        tgt.get("prediction_id") not in (None, "") or alert_meta.get("prediction_id") not in (None, "")
+                    ):
+                        desired[desired_key]["prediction_id"] = (
+                            tgt.get("prediction_id")
+                            if tgt.get("prediction_id") not in (None, "")
+                            else alert_meta.get("prediction_id")
+                        )
+                    if not str(desired[desired_key].get("regime") or "").strip():
+                        desired[desired_key]["regime"] = str(regime_name)
+                    if competition_policy and not isinstance(desired[desired_key].get("competition_policy"), dict):
+                        desired[desired_key]["competition_policy"] = dict(competition_policy or {})
+                    desired[desired_key].setdefault("reason", {})
+                    desired[desired_key]["reason"]["multi_strategy"] = True
+                    if isinstance(desired[desired_key]["reason"], dict):
+                        desired[desired_key]["reason"]["competition"] = {
+                            "policy": dict(competition_policy or desired[desired_key].get("competition_policy") or {}),
+                            "reason_code": str(competition_reason_code),
+                            "capital_applied_upstream": bool(competition_reason_code == "competition_capital_applied"),
+                            "model_name": str(model_name or desired[desired_key].get("model_name") or ""),
+                            "regime": str(regime_name or desired[desired_key].get("regime") or "global"),
+                            "horizon_s": int(horizon_s or desired[desired_key].get("horizon_s") or 0),
+                        }
+
+                if desired[desired_key].get("source_alert_id") is None:
+                    desired[desired_key]["source_alert_id"] = tgt.get("source_alert_id")
+
+                try:
+                    sa = desired[desired_key]["reason"].get("strategy_alloc")
+                    if not isinstance(sa, dict):
+                        sa = {}
+                    sa[str(sname)] = float(share)
+                    desired[desired_key]["reason"]["strategy_alloc"] = sa
+                    desired[desired_key]["reason"]["allocator_portfolio_target_gross"] = float(alloc_portfolio_target_gross)
+                    desired[desired_key]["reason"]["allocator_alpha_decay_runtime"] = dict(alloc_alpha_runtime)
+                except Exception as e:
+                    _warn_nonfatal("PORTFOLIO_STRATEGY_ALLOC_REASON_FAILED", e, once_key="strategy_alloc_reason")
+            except Exception as e:
+                _warn_nonfatal(
+                    "PORTFOLIO_DESIRED_STRATEGY_ALLOC_FAILED",
+                    e,
+                    strategy_name=str(sname),
+                )
+                continue
+    ctx.desired = desired
+    allocator.competition_policy_cache = competition_policy_cache
+
+
+def _normalize_rebalance_targets_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    desired = ctx.desired
+    # defensive normalization (strategy modules are pluggable)
+    norm: Dict[str, Dict] = {}
+    for desired_key, tgt in (desired or {}).items():
+        try:
+            s = _desired_symbol(desired_key, tgt)
+            if not s:
+                continue
+            side = str((tgt or {}).get("side", "FLAT")).upper()
+            if side not in ("LONG", "SHORT", "FLAT"):
+                side = "FLAT"
+
+            w = float((tgt or {}).get("weight", 0.0))
+            if not (w == w):  # NaN
+                w = 0.0
+
+            # if FLAT, force weight=0
+            if side == "FLAT":
+                w = 0.0
+                side = "FLAT"
+
+            # apply per-symbol cap
+            w = _clamp(abs(w), 0.0, _symbol_cap(s))
+
+            if side == "SHORT":
+                w = -float(w)
+
+            # ------------------------------------------------------
+            # Execution Regime Sizing (feature-aware sizing)
+            # ------------------------------------------------------
+            if PORTFOLIO_USE_EXEC_REGIME and abs(float(w)) > 0.0:
+                _sgn = -1.0 if float(w) < 0 else 1.0
+                _mag = abs(float(w))
+
+                try:
+                    skew_z = float(_get_factor_feature_asof(con, "options.skew_25d_z", int(now_ms)))
+                    flow_z = float(_get_factor_feature_asof(con, "flows.index_constituent_imbalance_z", int(now_ms)))
+                except Exception:
+                    skew_z = 0.0
+                    flow_z = 0.0
+    # =========================
+    # SECTION 6 / ~200 lines
+    # =========================
+
+                stress_mag = max(
+                    0.0,
+                    max(
+                        abs(skew_z) - float(PORTFOLIO_EXEC_SKEW_Z_TH),
+                        abs(flow_z) - float(PORTFOLIO_EXEC_FLOW_Z_TH),
+                    ),
+                )
+
+                stress_mult = 1.0
+                if stress_mag > 0.0:
+                    stress_mult = float(
+                        _clamp(
+                            1.0 - (stress_mag * float(PORTFOLIO_EXEC_STRESS_SIZE_REDUCTION)),
+                            float(PORTFOLIO_EXEC_REGIME_FLOOR),
+                            1.0,
+                        )
+                    )
+
+                # earnings proximity (nearest date)
+                earnings_mult = 1.0
+                try:
+                    row_e = con.execute(
+                        """
+                        SELECT earnings_date
+                        FROM earnings_calendar
+                        WHERE symbol=?
+                        ORDER BY ABS(julianday(earnings_date) - julianday(date('now'))) ASC
+                        LIMIT 1
+                        """,
+                        (str(s),),
+                    ).fetchone()
+
+                    if row_e and row_e[0]:
+                        jd = con.execute(
+                            "SELECT (julianday(?) - julianday(date('now')))",
+                            (str(row_e[0]),),
+                        ).fetchone()
+                        if jd and jd[0] is not None:
+                            days = float(jd[0])
+                            decay = math.exp(-abs(days) / 5.0)
+                            earnings_mult = float(
+                                _clamp(
+                                    1.0 - (decay * float(PORTFOLIO_EXEC_EARNINGS_SIZE_REDUCTION)),
+                                    float(PORTFOLIO_EXEC_REGIME_FLOOR),
+                                    1.0,
+                                )
+                            )
+                except Exception:
+                    earnings_mult = 1.0
+
+                _mag = float(_mag) * float(stress_mult) * float(earnings_mult)
+                w = float(_sgn) * float(_mag)
+
+            # preserve fields expected downstream
+            reason = (tgt or {}).get("reason", {})
+            if not isinstance(reason, dict):
+                reason = {"raw": reason}
+
+            try:
+                reason["confidence"] = float(tgt.get("confidence", reason.get("confidence", 0.0)))
+            except Exception:
+                reason["confidence"] = 0.0
+
+            exj = (tgt or {}).get("explain_json", "{}")
+            if exj is None:
+                exj = "{}"
+            exj = str(exj)
+
+            src_id = tgt.get("source_alert_id") if isinstance(tgt, dict) else None
+            try:
+                src_id = int(src_id) if src_id is not None else None
+            except Exception:
+                src_id = None
+            prediction_id = tgt.get("prediction_id") if isinstance(tgt, dict) else None
+            try:
+                prediction_id = int(prediction_id) if prediction_id not in (None, "") else None
+            except Exception:
+                prediction_id = None
+            prediction_id = _validated_prediction_id(con, prediction_id)
+
+            strategy_name_for_symbol = str(reason.get("strategy") or "").strip().lower()
+            strategy_module_for_symbol = None
+            if strategy_name_for_symbol:
+                try:
+                    strategy_module_for_symbol = load_strategy_module(strategy_name_for_symbol)
+                except Exception:
+                    strategy_module_for_symbol = None
+
+            # --- Regime Vector Injection ---
+            try:
+                from engine.strategy.regime_stack import compute_regime_vector, regime_compatibility
+
+                regime_vector = compute_regime_vector(symbol=s, ts_ms=int(now_ms), con=con)
+
+                try:
+                    regime_profile = (
+                        getattr(strategy_module_for_symbol, "get_regime_profile", lambda: {})()
+                        if strategy_module_for_symbol
+                        else {}
+                    )
+                except Exception:
+                    regime_profile = {}
+
+                compat = float(regime_compatibility(regime_profile, regime_vector))
+                compat = max(0.0, min(1.0, float(compat)))
+
+                regime_conf = float(((regime_vector.get("confidence") or {}).get("overall", 1.0)) or 1.0)
+                regime_conf = max(0.0, min(1.0, float(regime_conf)))
+
+                regime_exec_scale = max(0.25, float(compat) * (0.50 + 0.50 * float(regime_conf)))
+                w = float(w) * float(regime_exec_scale)
+
+                try:
+                    reason["regime_signals"] = dict(regime_vector.get("regimes") or {})
+                    reason["regime_confidence"] = float(regime_conf)
+                    reason["regime_exec_scale"] = float(regime_exec_scale)
+                except Exception as e:
+                    _warn_nonfatal("PORTFOLIO_REGIME_VECTOR_REASON_FAILED", e, once_key="regime_vector_reason")
+            except Exception:
+                regime_vector = {}
+                compat = 1.0
+                regime_conf = 1.0
+                regime_exec_scale = 1.0
+
+            model_identity = _extract_model_identity_from_explain(exj)
+            model_id = _normalize_model_id((tgt or {}).get("model_id") or model_identity.get("model_id"))
+            state_key = f"{model_id}:{s}"
+
+            norm[state_key] = {
+                "model_id": model_id,
+                "side": side,
+                "weight": float(w),
+                "source_alert_id": src_id,
+                "prediction_id": prediction_id,
+                "reason": reason,
+                "explain_json": exj,
+                **model_identity,
+                "symbol": s,
+                "regime_vector": regime_vector,
+                "regime_compatibility": compat,
+                "regime_confidence": regime_conf,
+                "regime_exec_scale": regime_exec_scale,
+                "regime_signals": dict(regime_vector.get("regimes") or {}),
+            }
+
+        except Exception as e:
+            _warn_nonfatal(
+                "PORTFOLIO_NORMALIZE_DESIRED_ROW_FAILED",
+                e,
+                desired_key=str(desired_key),
+            )
+            continue
+
+    desired = norm
+
+    # renormalize gross
+    grossE = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+    eff_cap = float(_eff_gross_cap())
+    if grossE > float(eff_cap) and grossE > 1e-9:
+        scaleE = float(eff_cap) / float(grossE)
+        for sym in list(desired.keys()):
+            desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scaleE)
+    ctx.desired = desired
+
+
+def _apply_rebalance_overlays_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    desired = ctx.desired
+    _record_degraded_phase = ctx.record_degraded_phase
+    # ---            -- ------------------------------------------------------
+    # Auto blacklist enforcement (skip symbols temporarily banned)
+    # ---            -- ------------------------------------------------------
+    try:
+        for desired_key in list(desired.keys()):
+            sym = _desired_symbol(desired_key, desired.get(desired_key))
+            if sym and is_blacklisted(con, sym, now_ms=int(now_ms)):
+                desired.pop(desired_key, None)
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_BLACKLIST_FILTER_FAILED", e, once_key="blacklist_filter")
+
+    # ---            -- ------------------------------------------------------
+    # Exploration cap: if symbol has few realized labels, cap weight
+    # ---            -- ------------------------------------------------------
+    try:
+        for desired_key in list(desired.keys()):
+            sym = _desired_symbol(desired_key, desired.get(desired_key))
+            if not sym:
+                continue
+            row = con.execute(
+                "SELECT COUNT(1) FROM labels WHERE symbol=?",
+                (str(sym),),
+            ).fetchone()
+            nlab = int(row[0] or 0) if row else 0
+
+            if nlab < int(PORTFOLIO_EXPLORE_MIN_LABELS):
+                # Cap exposure for exploration symbols without forcing tiny/no-trade weights
+                w0 = float(desired[desired_key].get("weight", 0.0) or 0.0)
+                sgn = -1.0 if w0 < 0 else 1.0
+                floor_abs = min(float(PORTFOLIO_EXPLORE_MAX_W), max(0.0, abs(w0)))
+                wabs = float(_clamp(abs(w0), floor_abs, float(PORTFOLIO_EXPLORE_MAX_W)))
+                desired[desired_key]["weight"] = float(sgn * wabs)
+                # Tag for explainability/debugging
+                try:
+                    r = desired[desired_key].get("reason") or {}
+                    if isinstance(r, dict):
+                        r["explore_cap"] = True
+                        r["labels_n"] = int(nlab)
+                        desired[desired_key]["reason"] = r
+                except Exception as e:
+                    _warn_nonfatal("PORTFOLIO_EXPLORE_CAP_REASON_FAILED", e, once_key="explore_cap_reason")
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_EXPLORE_CAP_FAILED", e, once_key="explore_cap")
+
+    # Empirical-Bayes alpha shrinkage is applied before expected-return
+    # blending and allocation optimization so thin-history estimates cannot
+    # feed full-size risk downstream.
+    try:
+        from engine.strategy.alpha_shrinkage import apply_alpha_shrinkage_to_desired
+
+        desired, _alpha_shrinkage = apply_alpha_shrinkage_to_desired(
+            con,
+            desired,
+            now_ms=int(now_ms),
+        )
+        try:
+            _put_meta(
+                con,
+                "last_alpha_shrinkage",
+                json.dumps(_alpha_shrinkage or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_ALPHA_SHRINKAGE_META_FAILED", e, once_key="alpha_shrinkage_meta")
+    except Exception as e:
+        _record_degraded_phase("alpha_shrinkage", "PORTFOLIO_ALPHA_SHRINKAGE_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_ALPHA_SHRINKAGE_FAILED", e, once_key="alpha_shrinkage")
+        mode = str(os.environ.get("ENGINE_MODE") or os.environ.get("APP_ENV") or "").strip().lower()
+        execution_mode = str(os.environ.get("EXECUTION_MODE") or "").strip().lower()
+        fail_closed_raw = os.environ.get("ALPHA_SHRINKAGE_FAIL_CLOSED")
+        fail_closed = (
+            str(fail_closed_raw).strip().lower() in {"1", "true", "yes", "on"}
+            if fail_closed_raw is not None
+            else mode in {"live", "prod", "production"} or execution_mode == "live"
+        )
+        if fail_closed:
+            for desired_key in list(desired.keys()):
+                desired[desired_key]["weight"] = 0.0
+                desired[desired_key]["side"] = "FLAT"
+                desired[desired_key].setdefault("reason", {})
+                if isinstance(desired[desired_key]["reason"], dict):
+                    desired[desired_key]["reason"]["alpha_shrinkage"] = {
+                        "enabled": True,
+                        "applied": False,
+                        "failed_closed": True,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+
+    # ---            -- ------------------------------------------------------
+    # Optional expected-return blending (Black-Litterman)
+    # ------------------------------------------------------
+    try:
+        desired = _apply_black_litterman_overlay(con, desired)
+    except Exception as e:
+        _record_degraded_phase("black_litterman", "PORTFOLIO_BLACK_LITTERMAN_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_BLACK_LITTERMAN_FAILED", e, once_key="portfolio_black_litterman")
+
+    # ---            -- ------------------------------------------------------
+    # Capital allocation optimizer (return vs drawdown utility)
+    # ---            -- ------------------------------------------------------
+    try:
+        desired = _optimize_capital_allocation(con, desired)
+    except Exception as e:
+        _record_degraded_phase("capital_allocation_opt", "PORTFOLIO_CAPITAL_ALLOCATION_OPT_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_CAPITAL_ALLOCATION_OPT_FAILED", e, once_key="capital_allocation_opt")
+
+    # ---            -- ------------------------------------------------------
+    # Impact-aware sizing (penalize symbols with bad realized slippage)
+    # ---            -- ------------------------------------------------------
+    try:
+        desired = _apply_impact_aware_sizing(con, desired)
+    except Exception as e:
+        _record_degraded_phase("impact_sizing", "PORTFOLIO_IMPACT_SIZING_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_IMPACT_SIZING_FAILED", e, once_key="impact_sizing")
+
+    # Reward models whose books are less correlated with the rest of the portfolio.
+    try:
+        desired, _model_div = _apply_model_diversification_scoring(con, desired)
+        try:
+            _put_meta(
+                con,
+                "last_model_diversification",
+                json.dumps(_model_div or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_MODEL_DIVERSIFICATION_META_FAILED", e, once_key="model_diversification_meta")
+    except Exception as e:
+        _record_degraded_phase("model_diversification", "PORTFOLIO_MODEL_DIVERSIFICATION_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_MODEL_DIVERSIFICATION_FAILED", e, once_key="model_diversification")
+        _model_div = None
+
+    # hard cap max positions (keep largest abs weights) (dynamic under preserve)
+    desired = apply_max_position_constraint(desired)
+
+    # ---            -- ------------------------------------------------------
+    # Allocation mode is explicit when requested, otherwise preserves the
+    # existing corr-opt -> prune -> legacy fallback order.
+    # ---            -- ------------------------------------------------------
+    desired = _apply_allocation_mode(con, desired)
+
+    # safety: enforce portfolio gross cap even if strategy already normalized
+    gross = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+    eff_cap = float(_eff_gross_cap())
+    if gross > float(eff_cap) and gross > 1e-9:
+        scale = float(eff_cap) / float(gross)
+        for sym in list(desired.keys()):
+            w0 = float(desired[sym].get("weight", 0.0) or 0.0)
+            sign = -1.0 if w0 < 0 else 1.0
+            desired[sym]["weight"] = sign * abs(float(w0) * float(scale))
+
+    # ---            -- ------------------------------------------------------
+    # A) VOL TARGETING (default-on): inverse-vol symbol sizing + portfolio vol target
+    # ---            -- ------------------------------------------------------
+    try:
+        from engine.strategy.risk import (
+            PORTFOLIO_USE_VOL_TARGET,
+            TARGET_VOL,
+            portfolio_realized_vol,
+            portfolio_vol_target_scale,
+            realized_vol_from_prices,
+            symbol_vol_scale,
+            vol_scale_weight,
+        )
+
+        if PORTFOLIO_USE_VOL_TARGET:
+            for desired_key in list(desired.keys()):
+                sym = _desired_symbol(desired_key, desired.get(desired_key))
+                if not sym:
+                    continue
+                vol = realized_vol_from_prices(con, sym)
+                if vol is None:
+                    continue
+
+                sym_scale = float(symbol_vol_scale(vol))
+                desired[desired_key]["weight"] = float(vol_scale_weight(desired[desired_key]["weight"], vol))
+                desired[desired_key].setdefault("reason", {})
+                desired[desired_key]["reason"]["realized_vol"] = float(vol)
+                desired[desired_key]["reason"]["symbol_vol_scale"] = float(sym_scale)
+                desired[desired_key]["reason"]["vol_target_symbol_scaled"] = 1
+
+            vol_scale, pre_portfolio_vol = portfolio_vol_target_scale(con, desired)
+
+            if abs(float(vol_scale) - 1.0) > 1e-12:
+                for sym in list(desired.keys()):
+                    desired[sym]["weight"] = float(desired[sym].get("weight", 0.0) or 0.0) * float(vol_scale)
+                    desired[sym].setdefault("reason", {})
+                    desired[sym]["reason"]["portfolio_vol_target"] = float(TARGET_VOL)
+                    desired[sym]["reason"]["portfolio_vol_pre_scale"] = (
+                        float(pre_portfolio_vol) if pre_portfolio_vol is not None else None
+                    )
+                    desired[sym]["reason"]["portfolio_vol_scale"] = float(vol_scale)
+
+            # renormalize gross after vol targeting
+            gross2 = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+            if gross2 > float(PORTFOLIO_GROSS_CAP) and gross2 > 1e-9:
+                scale2 = float(PORTFOLIO_GROSS_CAP) / float(gross2)
+                for sym in list(desired.keys()):
+                    w0 = float(desired[sym].get("weight", 0.0) or 0.0)
+                    sign = -1.0 if w0 < 0 else 1.0
+                    desired[sym]["weight"] = sign * abs(float(w0) * float(scale2))
+                    desired[sym].setdefault("reason", {})
+                    desired[sym]["reason"]["portfolio_gross_cap_after_vol_target"] = float(PORTFOLIO_GROSS_CAP)
+                    desired[sym]["reason"]["portfolio_gross_scale_after_vol_target"] = float(scale2)
+
+            post_portfolio_vol = portfolio_realized_vol(con, desired)
+            for sym in list(desired.keys()):
+                desired[sym].setdefault("reason", {})
+                desired[sym]["reason"]["portfolio_vol_post_target"] = (
+                    float(post_portfolio_vol) if post_portfolio_vol is not None else None
+                )
+
+            try:
+                _set_risk_state_inline(con, "portfolio_vol_target_enabled", "1")
+                _set_risk_state_inline(con, "portfolio_target_vol", str(float(TARGET_VOL)))
+                _set_risk_state_inline(
+                    con,
+                    "portfolio_realized_vol_pre_target",
+                    "" if pre_portfolio_vol is None else str(float(pre_portfolio_vol)),
+                )
+                _set_risk_state_inline(
+                    con,
+                    "portfolio_realized_vol_post_target",
+                    "" if post_portfolio_vol is None else str(float(post_portfolio_vol)),
+                )
+                _set_risk_state_inline(con, "portfolio_vol_target_scale", str(float(vol_scale)))
+                _set_risk_state_inline(con, "portfolio_vol_target_ts_ms", str(int(_now_ms())))
+            except Exception as e:
+                _warn_nonfatal("PORTFOLIO_VOL_TARGET_STATE_WRITE_FAILED", e, once_key="vol_target_state_write")
+        else:
+            try:
+                _set_risk_state_inline(con, "portfolio_vol_target_enabled", "0")
+                _set_risk_state_inline(con, "portfolio_target_vol", str(float(TARGET_VOL)))
+                _set_risk_state_inline(con, "portfolio_realized_vol_pre_target", "")
+                _set_risk_state_inline(con, "portfolio_realized_vol_post_target", "")
+                _set_risk_state_inline(con, "portfolio_vol_target_scale", "1.0")
+                _set_risk_state_inline(con, "portfolio_vol_target_ts_ms", str(int(_now_ms())))
+            except Exception as e:
+                _warn_nonfatal("PORTFOLIO_VOL_TARGET_STATE_WRITE_FAILED", e, once_key="vol_target_state_write")
+    except Exception as e:
+        _record_degraded_phase("vol_target", "PORTFOLIO_VOL_TARGET_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_VOL_TARGET_FAILED", e, once_key="vol_target")
+    # =========================
+    # SECTION 7 / ~200 lines
+    # =========================
+
+    # ---            -- ------------------------------------------------------
+    # B) STRESS / REGIME GATE (opt-in): compress exposure under stress
+    # Now incorporates:
+    #   • VIX stress
+    #   • Options skew z-score
+    #   • Index constituent flow imbalance z-score
+    # ---            -- ------------------------------------------------------
+    try:
+        if PORTFOLIO_USE_STRESS_GATE and desired:
+            # --- VIX baseline ---
+            st = _vix_stress(con)
+            vix_z = float(st.get("z", 0.0))
+            f_vix = float(_stress_factor_from_vix_z(vix_z))
+
+            # --- Skew + Flow regime factors (latest as-of now_ms) ---
+            skew_z = 0.0
+            flow_z = 0.0
+
+            try:
+                row = con.execute(
+                    """
+                    SELECT value
+                    FROM factor_features
+                    WHERE feature_id='options.skew_25d_z'
+                    ORDER BY asof_ts DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row:
+                    skew_z = float(row[0] or 0.0)
+            except Exception:
+                skew_z = 0.0
+
+            try:
+                row = con.execute(
+                    """
+                    SELECT value
+                    FROM factor_features
+                    WHERE feature_id='flows.index_constituent_imbalance_z'
+                    ORDER BY asof_ts DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row:
+                    flow_z = float(row[0] or 0.0)
+            except Exception:
+                flow_z = 0.0
+
+            # --- Stress magnitude beyond thresholds ---
+            skew_excess = max(0.0, abs(skew_z) - 1.5)
+            flow_excess = max(0.0, abs(flow_z) - 2.0)
+
+            stress_mag = max(skew_excess, flow_excess)
+
+            # compression factor (bounded)
+            f_struct = 1.0
+            if stress_mag > 0.0:
+                f_struct = max(0.20, 1.0 - (0.35 * stress_mag))
+
+            # combined factor
+            f_total = float(min(f_vix, f_struct))
+
+            if f_total < 1.0:
+                for sym in list(desired.keys()):
+                    desired[sym]["weight"] = float(desired[sym]["weight"]) * float(f_total)
+                    desired[sym].setdefault("reason", {})
+                    desired[sym]["reason"]["stress_gate_factor"] = float(f_total)
+                    desired[sym]["reason"]["stress_vix_z"] = float(vix_z)
+                    desired[sym]["reason"]["stress_skew_z"] = float(skew_z)
+                    desired[sym]["reason"]["stress_flow_z"] = float(flow_z)
+
+            # renormalize gross after compression
+            gross_s = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+            eff_cap = float(_eff_gross_cap())
+            if gross_s > float(eff_cap) and gross_s > 1e-9:
+                scale_s = float(eff_cap) / float(gross_s)
+                for sym in list(desired.keys()):
+                    w0 = float(desired[sym].get("weight", 0.0) or 0.0)
+                    sign = -1.0 if w0 < 0 else 1.0
+                    desired[sym]["weight"] = sign * abs(float(w0) * float(scale_s))
+
+    except Exception as e:
+        _record_degraded_phase("stress_gate", "PORTFOLIO_EXEC_REGIME_SIZING_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_EXEC_REGIME_SIZING_FAILED", e, once_key="exec_regime_sizing")
+
+    # ---            -- ------------------------------------------------------
+    # B2) SOCIAL GATE (opt-in): block/downsizing under manipulation risk
+    # ---            -- ------------------------------------------------------
+    try:
+        if PORTFOLIO_USE_SOCIAL_GATE and desired:
+            from engine.strategy.social_risk import social_gate_for_symbol
+
+            for desired_key in list(desired.keys()):
+                sym = _desired_symbol(desired_key, desired.get(desired_key))
+                if not sym:
+                    continue
+                g = social_gate_for_symbol(
+                    con,
+                    str(sym),
+                    int(now_ms),
+                    bucket_sec=int(PORTFOLIO_SOCIAL_BUCKET_SEC),
+                    manip_block_th=float(PORTFOLIO_SOCIAL_MANIP_BLOCK_TH),
+                    shock_th=float(PORTFOLIO_SOCIAL_ATTEN_SHOCK_TH),
+                    shock_factor=float(PORTFOLIO_SOCIAL_SHOCK_FACTOR),
+                ) or {}
+
+                if g.get("block"):
+                    desired[desired_key]["weight"] = 0.0
+                    desired[desired_key]["side"] = "FLAT"
+                    desired[desired_key].setdefault("reason", {})
+                    desired[desired_key]["reason"]["social_gate_block"] = 1
+                    desired[desired_key]["reason"]["social_manip_risk"] = float(g.get("manip_risk", 0.0))
+                    desired[desired_key]["reason"]["social_attention_shock"] = float(g.get("attention_shock", 0.0))
+                    desired[desired_key]["reason"]["social_promo_likelihood"] = float(g.get("promo_likelihood_mean", 0.0))
+                    continue
+
+                f = float(g.get("factor", 1.0))
+                if f < 1.0:
+                    desired[desired_key]["weight"] = float(desired[desired_key]["weight"]) * f
+                    desired[desired_key].setdefault("reason", {})
+                    desired[desired_key]["reason"]["social_gate_factor"] = float(f)
+                    desired[desired_key]["reason"]["social_manip_risk"] = float(g.get("manip_risk", 0.0))
+                    desired[desired_key]["reason"]["social_attention_shock"] = float(g.get("attention_shock", 0.0))
+                    desired[desired_key]["reason"]["social_promo_likelihood"] = float(g.get("promo_likelihood_mean", 0.0))
+
+            # renormalize gross after social compression (still respect gross cap)
+            gross_soc = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+            eff_cap = float(_eff_gross_cap())
+            if gross_soc > float(eff_cap) and gross_soc > 1e-9:
+                scale_soc = float(eff_cap) / float(gross_soc)
+                for sym in list(desired.keys()):
+                    w0 = float(desired[sym].get("weight", 0.0) or 0.0)
+                    sign = -1.0 if w0 < 0 else 1.0
+                    desired[sym]["weight"] = sign * abs(float(w0) * float(scale_soc))
+    except Exception as e:
+        _record_degraded_phase("social_gate", "PORTFOLIO_SOCIAL_GATE_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_SOCIAL_GATE_FAILED", e, once_key="social_gate")
+
+    # ---            -- ------------------------------------------------------
+    # C) VOL-OF-VOL GATE (opt-in): per-symbol compression in unstable regimes
+    # Uses price-only proxy from engine.tech_indicators (if present).
+    # ---            -- ------------------------------------------------------
+    try:
+        if PORTFOLIO_USE_VOV_GATE and desired:
+            try:
+                from engine.strategy.tech_indicators import compute_tech_features
+            except Exception:
+                compute_tech_features = None
+
+            if compute_tech_features:
+                now_ms2 = _now_ms()
+                a = float(PORTFOLIO_VOV_ALPHA)
+                v_lo = float(PORTFOLIO_VOV_FLOOR)
+                v_hi = float(PORTFOLIO_VOV_CEIL)
+                span = max(1e-12, (v_hi - v_lo))
+
+                for desired_key in list(desired.keys()):
+                    sym = _desired_symbol(desired_key, desired.get(desired_key))
+                    if not sym:
+                        continue
+                    tf = compute_tech_features(str(sym), int(now_ms2)) or {}
+                    vv = float(tf.get("vol_of_vol", 0.0))
+
+                    # normalize vv into [0,1] then apply penalty
+                    x = (vv - v_lo) / span
+                    x = float(_clamp(x, 0.0, 1.0))
+
+                    # factor = 1/(1 + alpha*x)
+                    f = float(1.0 / (1.0 + a * x))
+                    desired[desired_key]["weight"] = float(desired[desired_key]["weight"]) * float(f)
+
+                    desired[desired_key].setdefault("reason", {})
+                    desired[desired_key]["reason"]["vov_gate_factor"] = float(f)
+                    desired[desired_key]["reason"]["vov_value"] = float(vv)
+
+                # renormalize gross after vov compression
+                gross_v = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+                eff_cap = float(_eff_gross_cap())
+                if gross_v > float(eff_cap) and gross_v > 1e-9:
+                    scale_v = float(eff_cap) / float(gross_v)
+                    for sym in list(desired.keys()):
+                        desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scale_v)
+    except Exception as e:
+        _record_degraded_phase("vol_of_vol_gate", "PORTFOLIO_VOL_OF_VOL_GATE_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_VOL_OF_VOL_GATE_FAILED", e, once_key="vol_of_vol_gate")
+    # =========================
+    # SECTION 8 / ~200 lines
+    # =========================
+
+    # ---            -- ------------------------------------------------------
+    # Phase 5.2: POSITION SIZE POLICY (confidence -> factor)
+    # (must happen BEFORE orders are emitted)
+    # ---            -- ------------------------------------------------------
+    if conformal_mode() == "gate_and_size":
+        try:
+            for desired_key in list(desired.keys()):
+                reason = _ensure_reason_dict(desired.get(desired_key))
+                conformal_mult = _conformal_size_multiplier_from_reason(reason)
+                if conformal_mult is None:
+                    continue
+                desired[desired_key]["weight"] = float(desired[desired_key]["weight"]) * float(conformal_mult)
+                reason["conformal_size_factor"] = float(conformal_mult)
+                reason["conformal_sizing_applied"] = True
+        except Exception as e:
+            _record_degraded_phase("conformal_sizing", "PORTFOLIO_CONFORMAL_SIZING_FAILED", e)
+            _warn_nonfatal("PORTFOLIO_CONFORMAL_SIZING_FAILED", e, once_key="conformal_sizing")
+
+    try:
+        from engine.strategy.size_policy import load_latest_size_policy, size_factor
+        from engine.strategy.drawdown_state import get_current_drawdown
+
+        pol = load_latest_size_policy(con)
+        if pol:
+            dd = float(get_current_drawdown(con))
+            for sym in list(desired.keys()):
+                try:
+                    conf = float((desired[sym].get("reason") or {}).get("confidence", 0.0))
+                except Exception:
+                    conf = 0.0
+                f = float(size_factor(pol, conf, drawdown=dd))
+
+                desired[sym]["weight"] = float(desired[sym]["weight"]) * f
+
+                # annotate for auditability
+                desired[sym].setdefault("reason", {})
+                desired[sym]["reason"]["size_factor"] = float(f)
+                desired[sym]["reason"]["size_policy_ts_ms"] = int(pol.get("ts_ms", 0))
+                desired[sym]["reason"]["drawdown_for_sizing"] = float(dd)
+    except Exception as e:
+        _record_degraded_phase("size_policy", "PORTFOLIO_SIZE_POLICY_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_SIZE_POLICY_FAILED", e, once_key="size_policy")
+
+    # ---            -- ------------------------------------------------------
+    # Phase 5.3: EXECUTION REALISM (opt-in)
+    # - blocks/downsizes intents when symbol prices are stale
+    # - downsizes under elevated stress (VIX z) if VIX is present
+    # - downsizes under high ATR% (volatility proxy)
+    # ---            -- ------------------------------------------------------
+    if PORTFOLIO_USE_EXEC_REALISM:
+        for desired_key in list(desired.keys()):
+            sym = _desired_symbol(desired_key, desired.get(desired_key))
+            if not sym:
+                continue
+            try:
+                ef, meta = _execution_realism_factor(con, sym, int(now_ms))
+            except Exception:
+                ef, meta = 1.0, {
+                    "staleness_sec": 0.0,
+                    "stress_vix_z_60": 0.0,
+                    "atr_pct": 0.0,
+                    "slippage_bps_est": 0.0,
+                }
+
+            desired[desired_key]["weight"] = float(desired[desired_key].get("weight", 0.0)) * float(ef)
+
+            # annotate for auditability/explainability
+            desired[desired_key].setdefault("reason", {})
+            desired[desired_key]["reason"]["exec_realism_factor"] = float(ef)
+            desired[desired_key]["reason"]["exec_staleness_sec"] = float(meta.get("staleness_sec", 0.0))
+            desired[desired_key]["reason"]["exec_stress_vix_z_60"] = float(meta.get("stress_vix_z_60", 0.0))
+            desired[desired_key]["reason"]["exec_atr_pct"] = float(meta.get("atr_pct", 0.0))
+            desired[desired_key]["reason"]["exec_slippage_bps_est"] = float(meta.get("slippage_bps_est", 0.0))
+
+    # renormalize gross after size policy scaling
+    gross3 = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+    eff_cap = float(_eff_gross_cap())
+    if gross3 > float(eff_cap) and gross3 > 1e-9:
+        scale3 = float(eff_cap) / float(gross3)
+        for sym in list(desired.keys()):
+            desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scale3)
+    # ---            -- ------------------------------------------------------
+    # B2) CAPITAL PRESERVATION MODE: compress gross exposure + annotate reasons
+    # ---            -- ------------------------------------------------------
+    try:
+        if _capital_mode() == "preserve" and desired:
+            cap = float(_eff_gross_cap())
+            gross0 = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+            if gross0 > cap and gross0 > 1e-9:
+                scale_cap = float(cap) / float(gross0)
+                for sym in list(desired.keys()):
+                    desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scale_cap)
+                    desired[sym].setdefault("reason", {})
+                    desired[sym]["reason"]["capital_mode"] = "preserve"
+                    desired[sym]["reason"]["capital_preserve_gross_cap"] = float(cap)
+                    desired[sym]["reason"]["capital_preserve_scale"] = float(scale_cap)
+    except Exception as e:
+        _record_degraded_phase("capital_preserve_scaling", "PORTFOLIO_CAPITAL_PRESERVE_SCALING_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_CAPITAL_PRESERVE_SCALING_FAILED", e, once_key="capital_preserve_scaling")
+
+    # ---            -- ------------------------------------------------------
+    # Phase 6: REGIME-ADAPTIVE CAPITAL SCALING (base * confidence * VIX * drawdown)
+    # ---            -- ------------------------------------------------------
+    try:
+        from engine.strategy.regime_size import regime_capital_scale
+
+        _rs = regime_capital_scale(con=con, anchor=str(PORTFOLIO_REGIME_ANCHOR))
+        mult = float((_rs or {}).get("final_mult", 1.0))
+
+        # persist last scaling decision (auditability)
+        try:
+            _put_meta(
+                con,
+                "last_regime_scaling",
+                json.dumps(_rs or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_REGIME_SCALING_META_FAILED", e, once_key="regime_scaling_meta")
+
+        if mult != 1.0:
+            for sym in list(desired.keys()):
+                try:
+                    desired[sym]["weight"] = float(desired[sym].get("weight", 0.0) or 0.0) * float(mult)
+                    desired[sym].setdefault("reason", {})
+                    desired[sym]["reason"]["regime_anchor"] = str(
+                        (_rs or {}).get("anchor") or str(PORTFOLIO_REGIME_ANCHOR)
+                    )
+                    desired[sym]["reason"]["regime"] = str((_rs or {}).get("regime") or "")
+                    desired[sym]["reason"]["regime_base_mult"] = float((_rs or {}).get("base_mult", 1.0))
+                    desired[sym]["reason"]["regime_conf"] = float((_rs or {}).get("conf", 1.0))
+                    desired[sym]["reason"]["regime_conf_mult"] = float((_rs or {}).get("conf_mult", 1.0))
+                    desired[sym]["reason"]["regime_vix_z"] = (_rs or {}).get("vix_z", None)
+                    desired[sym]["reason"]["regime_vix_mult"] = float((_rs or {}).get("vix_mult", 1.0))
+                    desired[sym]["reason"]["regime_dd"] = (_rs or {}).get("dd", None)
+                    desired[sym]["reason"]["regime_dd_mult"] = float((_rs or {}).get("dd_mult", 1.0))
+                    desired[sym]["reason"]["regime_final_mult"] = float((_rs or {}).get("final_mult", 1.0))
+                except Exception:
+                    _warn_nonfatal("PORTFOLIO_REGIME_SCALING_REASON_FAILED", Exception("regime scaling reason failed"), once_key="regime_scaling_reason")
+
+            # renormalize gross after regime scaling
+            grossR = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+            eff_cap = float(_eff_gross_cap())
+            if grossR > float(eff_cap) and grossR > 1e-9:
+                scaleR = float(eff_cap) / float(grossR)
+                for sym in list(desired.keys()):
+                    desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scaleR)
+    except Exception as e:
+        _record_degraded_phase("regime_scaling", "PORTFOLIO_REGIME_SCALING_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_REGIME_SCALING_FAILED", e, once_key="regime_scaling")
+
+    # ---            -- ------------------------------------------------------
+    # Allocation risk overlays: crowding, concentration, execution capacity
+    # ------------------------------------------------------
+    try:
+        from engine.strategy.allocation_risk_overlay import apply_allocation_risk_overlays
+
+        desired, _overlay = apply_allocation_risk_overlays(
+            con,
+            desired,
+            gross_cap=float(_eff_gross_cap()),
+            now_ms=int(now_ms),
+        )
+        try:
+            _put_meta(
+                con,
+                "last_allocation_risk_overlay",
+                json.dumps(_overlay or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_ALLOCATION_OVERLAY_META_FAILED", e, once_key="allocation_overlay_meta")
+    except Exception as e:
+        _record_degraded_phase("allocation_overlay", "PORTFOLIO_ALLOCATION_OVERLAY_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_ALLOCATION_OVERLAY_FAILED", e, once_key="allocation_overlay")
+        _overlay = None
+    ctx.desired = desired
+
+
+def _apply_rebalance_risk_gates_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    state = ctx.state
+    desired = ctx.desired
+    _record_degraded_phase = ctx.record_degraded_phase
+    # ---            -- ------------------------------------------------------
+    # Phase 1.5: PORTFOLIO RISK ENGINE (institutional exposure / vol / corr / budgets)
+    # ---            -- ------------------------------------------------------
+    try:
+        desired, _risk_engine = apply_portfolio_risk_engine(con, desired, state, now_ms=int(now_ms))
+        try:
+            request_monte_carlo_refresh(desired)
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_MONTE_CARLO_REFRESH_FAILED", e, once_key="monte_carlo_refresh")
+        try:
+            _put_meta(
+                con,
+                "last_portfolio_risk_engine",
+                json.dumps(_risk_engine or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_RISK_ENGINE_META_FAILED", e, once_key="risk_engine_meta")
+    except Exception as e:
+        _record_degraded_phase("risk_engine", "PORTFOLIO_RISK_ENGINE_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_RISK_ENGINE_FAILED", e, once_key="risk_engine")
+        _risk_engine = None
+
+    # ---            -- ------------------------------------------------------
+    # Phase 2: PORTFOLIO HARD RISK GATE (net / turnover / dd add-block)
+    # ---            -- ------------------------------------------------------
+    try:
+        desired, _gate = apply_portfolio_risk_gate(con, desired, state, now_ms=int(now_ms))
+        try:
+            _put_meta(
+                con,
+                "last_risk_gate",
+                json.dumps(_gate or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_RISK_GATE_META_FAILED", e, once_key="risk_gate_meta")
+    except Exception as e:
+        _record_degraded_phase("risk_gate", "PORTFOLIO_RISK_GATE_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_RISK_GATE_FAILED", e, once_key="risk_gate")
+        _gate = None
+
+    # ---            -- ------------------------------------------------------
+    # Burst control: temporal clustering dampener
+    # ---            -- ------------------------------------------------------
+    try:
+        desired = _apply_temporal_dampener(con, desired, now_ms=int(now_ms))
+    except Exception as e:
+        _record_degraded_phase("temporal_dampener", "PORTFOLIO_TEMPORAL_DAMPENER_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_TEMPORAL_DAMPENER_FAILED", e, once_key="temporal_dampener")
+
+    # ---            -- ------------------------------------------------------
+    # Capital-at-Risk gate (tail-risk budget)
+    # ---            -- ------------------------------------------------------
+    try:
+        desired, _car = _apply_capital_at_risk_gate(desired)
+        try:
+            _put_meta(
+                con,
+                "last_capital_at_risk",
+                json.dumps(_car or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_CAPITAL_AT_RISK_META_FAILED", e, once_key="capital_at_risk_meta")
+    except Exception as e:
+        _record_degraded_phase("capital_at_risk", "PORTFOLIO_CAPITAL_AT_RISK_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_CAPITAL_AT_RISK_FAILED", e, once_key="capital_at_risk")
+
+    # Prevent crowded same-direction books from surviving the earlier symbol-level sizing layers.
+    try:
+        desired, _netting = _apply_same_direction_exposure_netting(con, desired)
+        try:
+            _put_meta(
+                con,
+                "last_exposure_netting",
+                json.dumps(_netting or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_EXPOSURE_NETTING_META_FAILED", e, once_key="exposure_netting_meta")
+    except Exception as e:
+        _record_degraded_phase("exposure_netting", "PORTFOLIO_EXPOSURE_NETTING_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_EXPOSURE_NETTING_FAILED", e, once_key="exposure_netting")
+        _netting = None
+
+    # Final hard portfolio-risk clamp after all other portfolio transforms.
+    try:
+        desired, _total_risk = _apply_total_portfolio_risk_limit(con, desired)
+        try:
+            _put_meta(
+                con,
+                "last_total_portfolio_risk",
+                json.dumps(_total_risk or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_TOTAL_RISK_META_FAILED", e, once_key="total_risk_meta")
+    except Exception as e:
+        _record_degraded_phase("total_risk", "PORTFOLIO_TOTAL_RISK_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_TOTAL_RISK_FAILED", e, once_key="total_risk")
+        _total_risk = None
+
+    _flip_penalty = {}
+    try:
+        desired, _flip_penalty = _apply_flip_flop_penalty(con, desired, state)
+    except Exception as e:
+        _record_degraded_phase("flip_flop_penalty", "PORTFOLIO_FLIP_FLOP_PENALTY_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_FLIP_FLOP_PENALTY_FAILED", e, once_key="flip_flop_penalty")
+        _flip_penalty = {}
+
+    portfolio_diag = {}
+    try:
+        portfolio_diag = _build_portfolio_correlation_diagnostics(
+            con,
+            desired,
+            lookback=int(PORTFOLIO_CORR_LOOKBACK),
+            top_n=int(PORTFOLIO_DIAG_CORR_TOP_N),
+        )
+        _persist_portfolio_correlation_diagnostics(con, portfolio_diag, ts_ms=int(now_ms))
+    except Exception as e:
+        _record_degraded_phase("correlation_diagnostics", "PORTFOLIO_CORRELATION_DIAGNOSTICS_FAILED", e)
+        portfolio_diag = {}
+    ctx.desired = desired
+    ctx.flip_penalty = dict(_flip_penalty or {})
+    ctx.portfolio_diag = dict(portfolio_diag or {})
+
+
+def _build_rebalance_result(
+    ctx: _RebalanceContext,
+    *,
+    execution_blocked: bool,
+    execution_blocked_codes: List[str],
+) -> Dict[str, Any]:
+    desired = ctx.desired
+    portfolio_diag = ctx.portfolio_diag
+    return {
+        "ok": True,
+        "strategy": "multi_strategy",
+        "changed": [] if execution_blocked else list(ctx.changed),
+        "orders_n": 0 if execution_blocked else int(ctx.orders_n),
+        "selected": [str((v or {}).get("symbol") or k) for k, v in desired.items()],
+        "execution_blocked": bool(execution_blocked),
+        "execution_blocked_codes": list(execution_blocked_codes),
+        "portfolio_diagnostics": {
+            "degraded": bool(ctx.degraded_reasons),
+            "degraded_reasons": list(ctx.degraded_reasons),
+            "execution_blocked": bool(execution_blocked),
+            "execution_blocked_codes": list(execution_blocked_codes),
+            "position_summary": dict((portfolio_diag or {}).get("position_summary") or {}),
+            "model_summary": dict((portfolio_diag or {}).get("model_summary") or {}),
+            "flip_flop_penalty": dict(ctx.flip_penalty or {}),
+        },
+    }
+
+
+def _apply_rebalance_execution_block_stage(ctx: _RebalanceContext) -> Optional[Dict[str, Any]]:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    execution_blocked_codes = _portfolio_execution_blocked_codes(ctx.degraded_reasons)
+    ctx.execution_blocked_codes = list(execution_blocked_codes)
+    if not execution_blocked_codes:
+        return None
+    _expire_stale_unconsumed_alerts(con, int(now_ms), int(PORTFOLIO_LOOKBACK_S))
+    _set_meta(con, "last_strategy_name", "multi_strategy")
+    _set_meta(con, "last_rebalance_ts_ms", str(now_ms))
+    _persist_portfolio_runtime_health(
+        con,
+        now_ms=int(now_ms),
+        degraded_reasons=list(ctx.degraded_reasons),
+        orders_n=0,
+        changed_symbols=[],
+        execution_blocked=True,
+        execution_blocked_codes=list(execution_blocked_codes),
+    )
+    return _build_rebalance_result(
+        ctx,
+        execution_blocked=True,
+        execution_blocked_codes=list(execution_blocked_codes),
+    )
+
+
+def _emit_rebalance_orders_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    desired = ctx.desired
+    state = ctx.state
+    _mark_alerts_consumed(con, _selected_alert_ids_from_desired(desired), int(now_ms))
+    _expire_stale_unconsumed_alerts(con, int(now_ms), int(PORTFOLIO_LOOKBACK_S))
+
+    orders_n = 0
+    changed = []
+    # =========================
+    # SECTION 9 / ~200 lines
+    # =========================
+
+    # 1) handle symbols in desired set
+    for state_key, tgt in desired.items():
+        sym = str(tgt.get("symbol") or "").strip()
+        model_id = _normalize_model_id(tgt.get("model_id"))
+        cur = state.get(state_key)
+        to_side = str(tgt.get("side", "FLAT")).upper()
+        raw_to_w = float(tgt.get("weight", 0.0) or 0.0)
+        to_w = abs(float(raw_to_w)) if to_side in ("LONG", "SHORT") else 0.0
+        source_alert_id = tgt.get("source_alert_id")
+        prediction_id = tgt.get("prediction_id")
+
+        explain = {
+            "strategy": {
+                "name": "multi_strategy",
+                "min_conf": PORTFOLIO_MIN_CONF,
+                "min_abs_z": PORTFOLIO_MIN_ABS_Z,
+                "max_positions": PORTFOLIO_MAX_POSITIONS,
+                "gross_cap": PORTFOLIO_GROSS_CAP,
+                "max_w_per_symbol": PORTFOLIO_MAX_W_PER_SYMBOL,
+                "score_norm": PORTFOLIO_SCORE_NORM,
+                "min_hold_s": PORTFOLIO_MIN_HOLD_S,
+                "lookback_s": PORTFOLIO_LOOKBACK_S,
+            },
+                "selector": {
+                    "mode": "live_registry_only",
+                    "strategy_name": "multi_strategy",
+                },
+                "signal": tgt.get("reason") or {},
+                "tradability": _tradability_from_explain(tgt.get("explain_json", "{}")),
+                "model_id": model_id,
+            }
+        model_identity = _extract_model_identity_from_explain(tgt.get("explain_json", "{}"))
+        if str(tgt.get("model_name") or model_identity.get("model_name") or "").strip():
+            explain["model_name"] = str(tgt.get("model_name") or model_identity.get("model_name") or "").strip()
+        if str(tgt.get("regime") or model_identity.get("regime") or "").strip():
+            explain["regime"] = str(tgt.get("regime") or model_identity.get("regime") or "").strip()
+        if int(tgt.get("horizon_s") or 0) > 0:
+            explain["horizon_s"] = int(tgt.get("horizon_s") or 0)
+        if model_identity.get("model_kind"):
+            explain["model_kind"] = str(model_identity.get("model_kind"))
+        if model_identity.get("model_ts_ms") is not None:
+            explain["model_ts_ms"] = int(model_identity.get("model_ts_ms"))
+        if model_identity.get("model_version"):
+            explain["model_version"] = str(model_identity.get("model_version"))
+
+        # Empty/flat targets should not create synthetic OPEN rows.
+        if not cur and (to_side == "FLAT" or to_w <= 0.0):
+            continue
+
+        if not cur:
+            # open new
+            _write_state_row(con, model_id, sym, to_side, abs(float(to_w)), now_ms, now_ms, source_alert_id, tgt.get("explain_json", "{}"))
+            _emit_order(con, sym, "OPEN", "FLAT", to_side, 0.0, abs(float(to_w)), source_alert_id, prediction_id, explain)
+            orders_n += 1
+            changed.append(sym)
+            continue
+
+        from_side = str(cur["side"])
+        from_w = abs(float(cur.get("weight", 0.0) or 0.0))
+        opened_ts = int(cur["opened_ts_ms"])
+        age_s = max(0.0, (now_ms - opened_ts) / 1000.0)
+
+        # reversal hold guard
+        if from_side in ("LONG", "SHORT") and to_side != from_side and age_s < float(PORTFOLIO_MIN_HOLD_S):
+            # HOLD (no change)
+            explain["hold_reason"] = f"min_hold not met (age_s={age_s:.1f} < {PORTFOLIO_MIN_HOLD_S})"
+            _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, source_alert_id, prediction_id, explain)
+            orders_n += 1
+            continue
+
+        # compute action
+        if from_side == "FLAT" and to_side != "FLAT" and to_w > 0:
+            _write_state_row(con, model_id, sym, to_side, abs(float(to_w)), now_ms, now_ms, source_alert_id, tgt.get("explain_json", "{}"))
+            _emit_order(con, sym, "OPEN", "FLAT", to_side, 0.0, abs(float(to_w)), source_alert_id, prediction_id, explain)
+            orders_n += 1
+            changed.append(sym)
+            continue
+
+        if from_side in ("LONG", "SHORT") and to_side == from_side:
+            if abs(to_w - from_w) < 1e-6:
+                _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, source_alert_id, prediction_id, explain)
+                orders_n += 1
+            elif to_w > from_w:
+                _write_state_row(con, model_id, sym, from_side, abs(float(to_w)), opened_ts, now_ms, source_alert_id, tgt["explain_json"])
+                _emit_order(con, sym, "INCREASE", from_side, from_side, abs(float(from_w)), abs(float(to_w)), source_alert_id, prediction_id, explain)
+                orders_n += 1
+                changed.append(sym)
+            else:
+                _write_state_row(con, model_id, sym, from_side, abs(float(to_w)), opened_ts, now_ms, source_alert_id, tgt["explain_json"])
+                _emit_order(con, sym, "DECREASE", from_side, from_side, abs(float(from_w)), abs(float(to_w)), source_alert_id, prediction_id, explain)
+                orders_n += 1
+                changed.append(sym)
+            continue
+
+        if from_side in ("LONG", "SHORT") and to_side != from_side:
+            # reverse
+            _write_state_row(con, model_id, sym, to_side, abs(float(to_w)), now_ms, now_ms, source_alert_id, tgt.get("explain_json", "{}"))
+            _emit_order(con, sym, "REVERSE", from_side, to_side, abs(float(from_w)), abs(float(to_w)), source_alert_id, prediction_id, explain)
+            orders_n += 1
+            changed.append(sym)
+            continue
+
+        # fallback: hold
+        _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, source_alert_id, prediction_id, explain)
+        orders_n += 1
+
+    # 2) close symbols not desired anymore (but only if currently open)
+    for state_key, cur in state.items():
+        if state_key in desired:
+            continue
+        sym = str(cur.get("symbol") or "").strip()
+        model_id = _normalize_model_id(cur.get("model_id"))
+        from_side = str(cur["side"])
+        from_w = abs(float(cur.get("weight", 0.0) or 0.0))
+        opened_ts = int(cur["opened_ts_ms"])
+        age_s = max(0.0, (now_ms - opened_ts) / 1000.0)
+
+        if from_side in ("LONG", "SHORT") and from_w > 0:
+            # optional: min hold before closing too
+            if age_s < float(PORTFOLIO_MIN_HOLD_S):
+                explain = {
+                    "model_id": model_id,
+                    "hold_reason": f"min_hold not met for close (age_s={age_s:.1f} < {PORTFOLIO_MIN_HOLD_S})"
+                }
+                _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, None, None, explain)
+                orders_n += 1
+                continue
+
+            _write_state_row(con, model_id, sym, "FLAT", 0.0, now_ms, now_ms, None, "{}")
+            _emit_order(con, sym, "CLOSE", from_side, "FLAT", from_w, 0.0, None, None, {"model_id": model_id, "reason": "no longer selected"})
+            orders_n += 1
+            changed.append(sym)
+    ctx.orders_n = int(orders_n)
+    ctx.changed = list(changed)
+
+
+def _persist_rebalance_stage(ctx: _RebalanceContext) -> None:
+    con = ctx.con
+    now_ms = ctx.now_ms
+    desired = ctx.desired
+    degraded_reasons = ctx.degraded_reasons
+    orders_n = ctx.orders_n
+    changed = ctx.changed
+    # (size policy applied earlier, before order emission)
+    # ---            -- ------------------------------------------------------
+    # Update live drawdown meta (equity proxy from weights)
+    # ---            -- ------------------------------------------------------
+    try:
+        # Simple proxy: peak gross vs current gross
+        gross_now = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
+        peak_raw = _get_meta(con, "peak_gross_weight")
+        peak = float(peak_raw) if peak_raw is not None else gross_now
+        if gross_now > peak:
+            peak = gross_now
+        drawdown = (peak - gross_now) if peak > 1e-9 else 0.0
+
+        _set_meta(con, "peak_gross_weight", str(float(peak)))
+        _set_meta(con, "last_drawdown", str(float(drawdown)))
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_DRAWDOWN_META_FAILED", e, once_key="drawdown_meta")
+
+    # update live drawdown meta (from broker if available)
+    try:
+        from engine.execution.broker_sim import broker_snapshot
+
+        snap = broker_snapshot(limit_fills=0)
+        if snap and snap.get("ok"):
+            dd = snap.get("account", {}).get("drawdown")
+            if dd is not None:
+                _set_meta(con, "live_drawdown", str(float(dd)))
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_LIVE_DRAWDOWN_SYNC_FAILED", e, once_key="live_drawdown_sync")
+
+    _set_meta(con, "last_strategy_name", "multi_strategy")
+    _set_meta(con, "last_rebalance_ts_ms", str(now_ms))
+    _persist_portfolio_runtime_health(
+        con,
+        now_ms=int(now_ms),
+        degraded_reasons=list(degraded_reasons),
+        orders_n=int(orders_n),
+        changed_symbols=list(changed),
+        execution_blocked=False,
+        execution_blocked_codes=[],
+    )
+
+
+
+_REBALANCE_PIPELINE_STAGES = (
+    ("input_loading", _load_rebalance_inputs_stage),
+    ("allocator_loading", _load_allocator_stage),
+    ("target_construction", _construct_rebalance_targets_stage),
+    ("normalization", _normalize_rebalance_targets_stage),
+    ("overlays", _apply_rebalance_overlays_stage),
+    ("risk_gates", _apply_rebalance_risk_gates_stage),
+    ("execution_blocking", _apply_rebalance_execution_block_stage),
+    ("order_emission", _emit_rebalance_orders_stage),
+    ("persistence", _persist_rebalance_stage),
+)
+
+
+def _rebalance_stage_names() -> List[str]:
+    return [str(name) for name, _stage in _REBALANCE_PIPELINE_STAGES]
+
+
+def _run_rebalance_pipeline(ctx: _RebalanceContext) -> Optional[Dict[str, Any]]:
+    for _stage_name, stage in _REBALANCE_PIPELINE_STAGES:
+        stage_result = stage(ctx)
+        if stage_result is not None:
+            return stage_result
+    return None
+
+
 # Pyright hits an internal complexity ceiling on this orchestration function.
 # The diagnostic is not pointing to one incorrect expression, so keep the
 # warning local instead of weakening repo-wide analysis.
@@ -4997,1617 +6753,23 @@ def compute_rebalance() -> Dict:  # pyright: ignore[reportGeneralTypeIssues]
     init_db()
     init_portfolio_db()
     con = connect()
-    degraded_reasons: list[dict[str, Any]] = []
-
-    def _record_degraded_phase(phase: str, code: str, error: BaseException | str | None = None) -> None:
-        item: dict[str, Any] = {
-            "phase": str(phase or "").strip(),
-            "code": str(code or "").strip(),
-        }
-        if error is not None:
-            if isinstance(error, BaseException):
-                item["error"] = f"{type(error).__name__}: {error}"
-            else:
-                item["error"] = str(error)
-        degraded_reasons.append(item)
+    ctx = _RebalanceContext(con=con)
 
     try:
-        # cooldown guard
-        last = _get_meta(con, "last_rebalance_ts_ms")
-        now_ms = _now_ms()
-
-        last_exec = _get_meta(con, "last_rebalance_exec_id")
-        if last_exec == str(now_ms):
-            return {"ok": False, "error": "duplicate rebalance execution"}
-
-        try:
-            if not bool(getattr(con, "in_transaction", False)):
-                con.begin_managed_write()
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_TRANSACTION_BEGIN_FAILED", e, once_key="transaction_begin")
-            raise
-
-        _set_meta(con, "last_rebalance_exec_id", str(now_ms))
-
-        if last:
-            try:
-                last_ms = int(last)
-                eff_cd = int(_eff_rebalance_cooldown_s())
-                if (now_ms - last_ms) < int(eff_cd) * 1000:
-                    return {
-                        "ok": False,
-                        "error": "rebalance cooldown active",
-                        "cooldown_s": int(eff_cd),
-                    }
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_REBALANCE_COOLDOWN_PARSE_FAILED", e, once_key="rebalance_cooldown_parse")
-
-        # capital guard (hard stop) — portfolio is intent-only, but still should not churn state when halted
-        try:
-            from engine.strategy.capital_guard import trading_allowed
-
-            if not trading_allowed(con):
-                return {"ok": False, "error": "trading halted by capital guard"}
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_CAPITAL_GUARD_CHECK_FAILED", e, once_key="capital_guard_check")
-            error_payload = {"ok": False, "error": f"capital_guard check failed: {e}"}
-            return error_payload
-
-        # read alerts + state
-        alerts = _load_recent_alert_candidates(con, PORTFOLIO_LOOKBACK_S)
-        _mark_alert_candidates_seen(
-            con,
-            [dict(alert or {}).get("id") for alert in (alerts or [])],
-            int(now_ms),
-        )
-        alert_meta_index = _build_recent_alert_meta_index(alerts)
-        state = _load_state(con)
-
-        try:
-            _auto_promote_shadow_strategies(con)
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_AUTO_PROMOTION_FAILED", e, once_key="auto_promote_shadow_strategies")
-
-        # ------------------------------------------------------
-        # Multi-Strategy Capital Competition
-        # ------------------------------------------------------
-        live_strategies = _load_live_strategies(con)
-        shadow_strategies = _load_shadow_strategies(con)
-
-        # ------------------------------------------------------
-        # Strategy Allocator (Meta Capital Engine)
-        # - rolling perf scoring
-        # - drawdown-aware scaling
-        # - correlation-adjusted allocation
-        # - dynamic redistribution
-        # - config-driven risk budgets
-        # ------------------------------------------------------
-        alloc_map: Dict[str, float] = {}
-        alloc_detail: Dict[str, Any] = {}
-        alloc_regime: Dict[str, Any] = {}
-        alloc_regime_conf: float = 0.0
-        alloc_reason: Dict[str, Any] = {}
-        alloc_alpha_runtime: Dict[str, Any] = {}
-        alloc_portfolio_target_gross: float = 1.0
-        competition_policy_cache: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
-
-        try:
-            from engine.runtime.strategy_allocator import compute_and_persist_strategy_allocations
-
-            alloc_res = compute_and_persist_strategy_allocations(con, now_ms=int(now_ms)) or {}
-            alloc_map = dict(alloc_res.get("allocations") or {})
-            alloc_detail = dict(alloc_res.get("details") or {})
-            alloc_regime = dict(alloc_res.get("regime") or {})
-            alloc_regime_conf = float(alloc_res.get("regime_confidence", 0.0) or 0.0)
-            alloc_reason = dict(alloc_res.get("reason") or {})
-            alloc_alpha_runtime = dict(alloc_res.get("alpha_decay_runtime") or {})
-            alloc_portfolio_target_gross = float(alloc_res.get("portfolio_target_gross", 1.0) or 1.0)
-        except Exception as e:
-            alloc_map = {}
-            alloc_detail = {}
-            alloc_regime = {}
-            alloc_regime_conf = 0.0
-            alloc_reason = {}
-            alloc_alpha_runtime = {}
-            alloc_portfolio_target_gross = 1.0
-            _record_degraded_phase("strategy_allocator", "PORTFOLIO_STRATEGY_ALLOCATOR_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_STRATEGY_ALLOCATOR_FAILED", Exception("strategy allocator failed"), once_key="strategy_allocator")
-
-        competition_capital_plan = _load_cached_competition_capital_plan(con, int(now_ms))
-
-        try:
-            shadow_perf = _load_shadow_performance(con)
-            for s in shadow_perf:
-                if s not in alloc_map:
-                    alloc_map[s] = 0.02
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_SHADOW_PERFORMANCE_LOAD_FAILED", e, once_key="shadow_performance_load")
-
-        # Back-compat fallback: use stored efficiency_score if allocator has no output
-        eff_map = _load_strategy_efficiency(con)
-
-        strategy_targets: Dict[str, Dict] = {}
-        total_share = 0.0
-
-        strat = None  # preserve original "last loaded strat" behavior for later get_regime_profile usage
-
-        ordered_strategies: List[Tuple[str, str]] = []
-        seen_strategies = set()
-
-        for sname in live_strategies:
-            ss = str(sname)
-            if ss and ss not in seen_strategies:
-                ordered_strategies.append((ss, "live"))
-                seen_strategies.add(ss)
-
-        for sname in shadow_strategies:
-            ss = str(sname)
-            if ss and ss not in seen_strategies:
-                ordered_strategies.append((ss, "shadow"))
-                seen_strategies.add(ss)
-
-        for sname, stage in ordered_strategies:
-            try:
-                strat = load_strategy_module(str(sname))
-                d = strat.build_desired(alerts=alerts, now_ms=int(now_ms)) or {}
-
-                if alloc_map:
-                    share_hint = float(alloc_map.get(str(sname), 0.0) or 0.0)
-                else:
-                    share_hint = float((eff_map.get(str(sname)) or {}).get("efficiency_score", 0.0) or 0.0)
-                    share_hint = max(0.0, share_hint)
-
-                if str(stage) == "shadow":
-                    shadow_metrics = _score_shadow_targets(d)
-                    shadow_metrics["allocator_share_hint"] = float(share_hint)
-                    shadow_metrics["stage"] = "shadow"
-                    if alloc_detail and str(sname) in alloc_detail:
-                        shadow_metrics["allocator_detail"] = alloc_detail.get(str(sname))
-                    _record_shadow_strategy_run(
-                        con,
-                        strategy_name=str(sname),
-                        targets=d,
-                        metrics=shadow_metrics,
-                    )
-                    continue
-
-                strategy_targets[str(sname)] = d
-                total_share += float(max(0.0, share_hint))
-            except Exception as e:
-                _warn_nonfatal(
-                    "PORTFOLIO_STRATEGY_TARGET_ROW_FAILED",
-                    e,
-                    strategy_name=str(sname),
-                )
-                continue
-
-        # If no allocation available, equal weight fallback
-        if total_share <= 1e-9:
-            total_share = float(len(strategy_targets) or 1)
-
-        # Merge with allocator-weighted capital share
-        desired: Dict[str, Dict] = {}
-
-        for sname, targets in strategy_targets.items():
-            if alloc_map:
-                share_raw = float(alloc_map.get(str(sname), 0.0) or 0.0)
-            else:
-                share_raw = float((eff_map.get(str(sname)) or {}).get("efficiency_score", 0.0) or 0.0)
-                share_raw = max(0.0, share_raw)
-
-            share = float(share_raw) / float(total_share) if float(total_share) > 0 else 0.0
-
-            # ------------------------------------------------------
-            # Global Risk Envelope (Top-Down Capital Throttle)
-            # ------------------------------------------------------
-            global_scale = 1.0
-            try:
-                from engine.runtime.global_risk_envelope import compute_global_risk_envelope
-                _g = compute_global_risk_envelope(con, now_ms=int(now_ms)) or {}
-                global_scale = float(_g.get("global_scale", 1.0) or 1.0)
-            except Exception:
-                global_scale = 1.0
-
-            allocator_portfolio_scale = max(0.0, float(alloc_portfolio_target_gross))
-            alpha_runtime_scale = 1.0
-            try:
-                alpha_runtime_scale = float((alloc_alpha_runtime or {}).get("min_throttle_mult", 1.0) or 1.0)
-            except Exception:
-                alpha_runtime_scale = 1.0
-            alpha_runtime_scale = max(0.0, min(1.0, float(alpha_runtime_scale)))
-
-            share = (
-                float(share)
-                * float(global_scale)
-                * float(allocator_portfolio_scale)
-                * float(alpha_runtime_scale)
-            )
-
-            for sym, tgt in (targets or {}).items():
-                try:
-                    w = float((tgt or {}).get("weight", 0.0) or 0.0)
-                    w = float(w) * float(share)
-
-                    # ---------------------------------
-                    # REGIME EXECUTION ADJUSTMENT
-                    # ---------------------------------
-                    try:
-                        from engine.strategy.regime_stack import compute_regime_vector
-
-                        reg = compute_regime_vector(symbol=sym, ts_ms=int(now_ms), con=con) or {}
-
-                        compat = 1.0
-
-                        vol_cluster = float((reg.get("micro") or {}).get("vol_clustered", 0.0))
-                        thin_liq = float((reg.get("micro") or {}).get("liquidity_thin", 0.0))
-                        dd_shift = float((reg.get("macro") or {}).get("drawdown_shift", 0.0))
-
-                        stress = max(vol_cluster, thin_liq, dd_shift)
-
-                        compat = max(0.25, 1.0 - float(stress) * 0.5)
-
-                        w = float(w) * float(compat)
-
-                        try:
-                            tgt.setdefault("reason", {})
-                            tgt["reason"]["exec_regime_compat"] = float(compat)
-                            tgt["reason"]["exec_regime_stress"] = float(stress)
-                        except Exception as e:
-                            _warn_nonfatal("PORTFOLIO_EXEC_REGIME_REASON_FAILED", e, once_key="exec_regime_reason")
-
-                    except Exception as e:
-                        _warn_nonfatal("PORTFOLIO_EXEC_REGIME_VECTOR_FAILED", e, once_key="exec_regime_vector")
-
-                    exj = str((tgt or {}).get("explain_json", "{}") or "{}")
-                    model_identity = _extract_model_identity_from_explain(exj)
-                    source_alert_id = (tgt or {}).get("source_alert_id")
-                    alert_meta = {}
-                    if source_alert_id is not None:
-                        try:
-                            alert_meta = dict(alert_meta_index.get(int(source_alert_id)) or {})
-                        except Exception:
-                            alert_meta = {}
-                    model_id = _normalize_model_id(
-                        (tgt or {}).get("model_id") or model_identity.get("model_id")
-                    )
-                    model_name = str(
-                        (tgt or {}).get("model_name")
-                        or model_identity.get("model_name")
-                        or alert_meta.get("model_name")
-                        or ""
-                    ).strip()
-                    regime_name = str(
-                        (tgt or {}).get("regime")
-                        or model_identity.get("regime")
-                        or alert_meta.get("regime")
-                        or "global"
-                    ).strip() or "global"
-                    horizon_s = int(
-                        (tgt or {}).get("horizon_s")
-                        or alert_meta.get("horizon_s")
-                        or _extract_horizon_s_from_explain_json(exj)
-                        or 0
-                    )
-                    competition_policy: Dict[str, Any] = {}
-                    competition_reason_code = ""
-                    if model_name:
-                        try:
-                            competition_key = (
-                                str(sym).upper().strip(),
-                                int(horizon_s),
-                                str(model_name),
-                                str(regime_name),
-                            )
-                            if competition_key not in competition_policy_cache:
-                                competition_policy_cache[competition_key] = dict(
-                                    _competition_policy_from_cached_plan(
-                                        competition_capital_plan,
-                                        symbol=str(sym).upper().strip(),
-                                        horizon_s=int(horizon_s),
-                                        model_name=str(model_name),
-                                        regime=str(regime_name),
-                                    )
-                                    or {}
-                                )
-                            competition_policy = dict(competition_policy_cache.get(competition_key) or {})
-                        except Exception as e:
-                            competition_policy = {}
-                            _warn_nonfatal(
-                                "PORTFOLIO_COMPETITION_POLICY_LOAD_FAILED",
-                                e,
-                                once_key=f"competition_policy:{sym}:{model_name}:{horizon_s}:{regime_name}",
-                            )
-
-                    if model_name and competition_policy:
-                        policy_reason = str((competition_policy or {}).get("reason") or "")
-                        competition_cap_mult = float(
-                            (competition_policy or {}).get("capital_multiplier")
-                            or (competition_policy or {}).get("effective_allocation_fraction")
-                            or (competition_policy or {}).get("model_weight")
-                            or 0.0
-                        )
-                        if bool((competition_policy or {}).get("blocked")) and policy_reason in {
-                            "competition_plan_stale",
-                            "no_group_allocation",
-                        }:
-                            competition_reason_code = policy_reason
-                        elif bool((competition_policy or {}).get("blocked")) or competition_cap_mult <= 0.0:
-                            w = 0.0
-                            competition_reason_code = str(
-                                policy_reason or "competition_blocked"
-                            )
-                        else:
-                            w = float(w) * float(competition_cap_mult)
-                            competition_reason_code = "competition_capital_applied"
-                    elif model_name:
-                        competition_reason_code = "competition_policy_missing"
-                    else:
-                        competition_reason_code = "model_identity_missing"
-                    desired_key = f"{model_id}:{str(sym).upper().strip()}"
-
-                    cur = desired.get(desired_key)
-                    if cur is None:
-                        desired[desired_key] = dict(tgt)
-                        desired[desired_key]["model_id"] = str(model_id)
-                        desired[desired_key]["model_name"] = str(model_name)
-                        desired[desired_key]["regime"] = str(regime_name)
-                        desired[desired_key]["horizon_s"] = int(horizon_s)
-                        desired[desired_key]["competition_policy"] = dict(competition_policy or {})
-                        desired[desired_key]["symbol"] = str(sym).upper().strip()
-                        desired[desired_key]["weight"] = float(w)
-                        desired[desired_key]["source_alert_id"] = tgt.get("source_alert_id")
-                        desired[desired_key]["prediction_id"] = (
-                            tgt.get("prediction_id")
-                            if tgt.get("prediction_id") not in (None, "")
-                            else alert_meta.get("prediction_id")
-                        )
-                        desired[desired_key]["explain_json"] = exj
-                        desired[desired_key].setdefault("reason", {})
-                        desired[desired_key]["reason"]["strategy"] = str(sname)
-                        desired[desired_key]["reason"]["strategy_share"] = float(share)
-                        desired[desired_key]["reason"]["strategy_alloc"] = {str(sname): float(share)}
-                        desired[desired_key]["reason"]["allocator_regime"] = dict(alloc_regime.get("regimes") or {})
-                        desired[desired_key]["reason"]["allocator_regime_confidence"] = float(alloc_regime_conf)
-                        desired[desired_key]["reason"]["allocator_portfolio_target_gross"] = float(alloc_portfolio_target_gross)
-                        desired[desired_key]["reason"]["allocator_alpha_decay_runtime"] = dict(alloc_alpha_runtime)
-                        desired[desired_key]["reason"]["allocator_reason"] = dict(alloc_reason)
-                        desired[desired_key]["reason"]["score"] = float((tgt.get("reason") or {}).get("score", 0.0) or 0.0)
-                        desired[desired_key]["reason"]["confidence"] = float((tgt.get("reason") or {}).get("confidence", 0.0) or 0.0)
-                        desired[desired_key]["reason"]["expected_z"] = float((tgt.get("reason") or {}).get("expected_z", 0.0) or 0.0)
-                        desired[desired_key]["reason"]["competition"] = {
-                            "policy": dict(competition_policy or {}),
-                            "reason_code": str(competition_reason_code),
-                            "capital_applied_upstream": bool(competition_reason_code == "competition_capital_applied"),
-                            "model_name": str(model_name),
-                            "regime": str(regime_name),
-                            "horizon_s": int(horizon_s),
-                        }
-                        if alloc_detail and str(sname) in alloc_detail:
-                            desired[desired_key]["reason"]["strategy_alloc_detail"] = alloc_detail.get(str(sname))
-                    else:
-                        # combine weights from multiple strategies
-                        cur_w = float(cur.get("weight", 0.0) or 0.0)
-                        desired[desired_key]["weight"] = float(cur_w + w)
-                        if model_name and not str(desired[desired_key].get("model_name") or "").strip():
-                            desired[desired_key]["model_name"] = str(model_name)
-                        if not desired[desired_key].get("horizon_s"):
-                            desired[desired_key]["horizon_s"] = int(horizon_s)
-                        if desired[desired_key].get("prediction_id") in (None, "") and (
-                            tgt.get("prediction_id") not in (None, "") or alert_meta.get("prediction_id") not in (None, "")
-                        ):
-                            desired[desired_key]["prediction_id"] = (
-                                tgt.get("prediction_id")
-                                if tgt.get("prediction_id") not in (None, "")
-                                else alert_meta.get("prediction_id")
-                            )
-                        if not str(desired[desired_key].get("regime") or "").strip():
-                            desired[desired_key]["regime"] = str(regime_name)
-                        if competition_policy and not isinstance(desired[desired_key].get("competition_policy"), dict):
-                            desired[desired_key]["competition_policy"] = dict(competition_policy or {})
-                        desired[desired_key].setdefault("reason", {})
-                        desired[desired_key]["reason"]["multi_strategy"] = True
-                        if isinstance(desired[desired_key]["reason"], dict):
-                            desired[desired_key]["reason"]["competition"] = {
-                                "policy": dict(competition_policy or desired[desired_key].get("competition_policy") or {}),
-                                "reason_code": str(competition_reason_code),
-                                "capital_applied_upstream": bool(competition_reason_code == "competition_capital_applied"),
-                                "model_name": str(model_name or desired[desired_key].get("model_name") or ""),
-                                "regime": str(regime_name or desired[desired_key].get("regime") or "global"),
-                                "horizon_s": int(horizon_s or desired[desired_key].get("horizon_s") or 0),
-                            }
-
-                    if desired[desired_key].get("source_alert_id") is None:
-                        desired[desired_key]["source_alert_id"] = tgt.get("source_alert_id")
-
-                    try:
-                        sa = desired[desired_key]["reason"].get("strategy_alloc")
-                        if not isinstance(sa, dict):
-                            sa = {}
-                        sa[str(sname)] = float(share)
-                        desired[desired_key]["reason"]["strategy_alloc"] = sa
-                        desired[desired_key]["reason"]["allocator_portfolio_target_gross"] = float(alloc_portfolio_target_gross)
-                        desired[desired_key]["reason"]["allocator_alpha_decay_runtime"] = dict(alloc_alpha_runtime)
-                    except Exception as e:
-                        _warn_nonfatal("PORTFOLIO_STRATEGY_ALLOC_REASON_FAILED", e, once_key="strategy_alloc_reason")
-                except Exception as e:
-                    _warn_nonfatal(
-                        "PORTFOLIO_DESIRED_STRATEGY_ALLOC_FAILED",
-                        e,
-                        strategy_name=str(sname),
-                    )
-                    continue
-
-        # defensive normalization (strategy modules are pluggable)
-        norm: Dict[str, Dict] = {}
-        for desired_key, tgt in (desired or {}).items():
-            try:
-                s = _desired_symbol(desired_key, tgt)
-                if not s:
-                    continue
-                side = str((tgt or {}).get("side", "FLAT")).upper()
-                if side not in ("LONG", "SHORT", "FLAT"):
-                    side = "FLAT"
-
-                w = float((tgt or {}).get("weight", 0.0))
-                if not (w == w):  # NaN
-                    w = 0.0
-
-                # if FLAT, force weight=0
-                if side == "FLAT":
-                    w = 0.0
-                    side = "FLAT"
-
-                # apply per-symbol cap
-                w = _clamp(abs(w), 0.0, _symbol_cap(s))
-
-                if side == "SHORT":
-                    w = -float(w)
-
-                # ------------------------------------------------------
-                # Execution Regime Sizing (feature-aware sizing)
-                # ------------------------------------------------------
-                if PORTFOLIO_USE_EXEC_REGIME and abs(float(w)) > 0.0:
-                    _sgn = -1.0 if float(w) < 0 else 1.0
-                    _mag = abs(float(w))
-
-                    try:
-                        skew_z = float(_get_factor_feature_asof(con, "options.skew_25d_z", int(now_ms)))
-                        flow_z = float(_get_factor_feature_asof(con, "flows.index_constituent_imbalance_z", int(now_ms)))
-                    except Exception:
-                        skew_z = 0.0
-                        flow_z = 0.0
-# =========================
-# SECTION 6 / ~200 lines
-# =========================
-
-                    stress_mag = max(
-                        0.0,
-                        max(
-                            abs(skew_z) - float(PORTFOLIO_EXEC_SKEW_Z_TH),
-                            abs(flow_z) - float(PORTFOLIO_EXEC_FLOW_Z_TH),
-                        ),
-                    )
-
-                    stress_mult = 1.0
-                    if stress_mag > 0.0:
-                        stress_mult = float(
-                            _clamp(
-                                1.0 - (stress_mag * float(PORTFOLIO_EXEC_STRESS_SIZE_REDUCTION)),
-                                float(PORTFOLIO_EXEC_REGIME_FLOOR),
-                                1.0,
-                            )
-                        )
-
-                    # earnings proximity (nearest date)
-                    earnings_mult = 1.0
-                    try:
-                        row_e = con.execute(
-                            """
-                            SELECT earnings_date
-                            FROM earnings_calendar
-                            WHERE symbol=?
-                            ORDER BY ABS(julianday(earnings_date) - julianday(date('now'))) ASC
-                            LIMIT 1
-                            """,
-                            (str(s),),
-                        ).fetchone()
-
-                        if row_e and row_e[0]:
-                            jd = con.execute(
-                                "SELECT (julianday(?) - julianday(date('now')))",
-                                (str(row_e[0]),),
-                            ).fetchone()
-                            if jd and jd[0] is not None:
-                                days = float(jd[0])
-                                decay = math.exp(-abs(days) / 5.0)
-                                earnings_mult = float(
-                                    _clamp(
-                                        1.0 - (decay * float(PORTFOLIO_EXEC_EARNINGS_SIZE_REDUCTION)),
-                                        float(PORTFOLIO_EXEC_REGIME_FLOOR),
-                                        1.0,
-                                    )
-                                )
-                    except Exception:
-                        earnings_mult = 1.0
-
-                    _mag = float(_mag) * float(stress_mult) * float(earnings_mult)
-                    w = float(_sgn) * float(_mag)
-
-                # preserve fields expected downstream
-                reason = (tgt or {}).get("reason", {})
-                if not isinstance(reason, dict):
-                    reason = {"raw": reason}
-
-                try:
-                    reason["confidence"] = float(tgt.get("confidence", reason.get("confidence", 0.0)))
-                except Exception:
-                    reason["confidence"] = 0.0
-
-                exj = (tgt or {}).get("explain_json", "{}")
-                if exj is None:
-                    exj = "{}"
-                exj = str(exj)
-
-                src_id = tgt.get("source_alert_id") if isinstance(tgt, dict) else None
-                try:
-                    src_id = int(src_id) if src_id is not None else None
-                except Exception:
-                    src_id = None
-                prediction_id = tgt.get("prediction_id") if isinstance(tgt, dict) else None
-                try:
-                    prediction_id = int(prediction_id) if prediction_id not in (None, "") else None
-                except Exception:
-                    prediction_id = None
-                prediction_id = _validated_prediction_id(con, prediction_id)
-
-                strategy_name_for_symbol = str(reason.get("strategy") or "").strip().lower()
-                strategy_module_for_symbol = None
-                if strategy_name_for_symbol:
-                    try:
-                        strategy_module_for_symbol = load_strategy_module(strategy_name_for_symbol)
-                    except Exception:
-                        strategy_module_for_symbol = None
-
-                # --- Regime Vector Injection ---
-                try:
-                    from engine.strategy.regime_stack import compute_regime_vector, regime_compatibility
-
-                    regime_vector = compute_regime_vector(symbol=s, ts_ms=int(now_ms), con=con)
-
-                    try:
-                        regime_profile = (
-                            getattr(strategy_module_for_symbol, "get_regime_profile", lambda: {})()
-                            if strategy_module_for_symbol
-                            else {}
-                        )
-                    except Exception:
-                        regime_profile = {}
-
-                    compat = float(regime_compatibility(regime_profile, regime_vector))
-                    compat = max(0.0, min(1.0, float(compat)))
-
-                    regime_conf = float(((regime_vector.get("confidence") or {}).get("overall", 1.0)) or 1.0)
-                    regime_conf = max(0.0, min(1.0, float(regime_conf)))
-
-                    regime_exec_scale = max(0.25, float(compat) * (0.50 + 0.50 * float(regime_conf)))
-                    w = float(w) * float(regime_exec_scale)
-
-                    try:
-                        reason["regime_signals"] = dict(regime_vector.get("regimes") or {})
-                        reason["regime_confidence"] = float(regime_conf)
-                        reason["regime_exec_scale"] = float(regime_exec_scale)
-                    except Exception as e:
-                        _warn_nonfatal("PORTFOLIO_REGIME_VECTOR_REASON_FAILED", e, once_key="regime_vector_reason")
-                except Exception:
-                    regime_vector = {}
-                    compat = 1.0
-                    regime_conf = 1.0
-                    regime_exec_scale = 1.0
-
-                model_identity = _extract_model_identity_from_explain(exj)
-                model_id = _normalize_model_id((tgt or {}).get("model_id") or model_identity.get("model_id"))
-                state_key = f"{model_id}:{s}"
-
-                norm[state_key] = {
-                    "model_id": model_id,
-                    "side": side,
-                    "weight": float(w),
-                    "source_alert_id": src_id,
-                    "prediction_id": prediction_id,
-                    "reason": reason,
-                    "explain_json": exj,
-                    **model_identity,
-                    "symbol": s,
-                    "regime_vector": regime_vector,
-                    "regime_compatibility": compat,
-                    "regime_confidence": regime_conf,
-                    "regime_exec_scale": regime_exec_scale,
-                    "regime_signals": dict(regime_vector.get("regimes") or {}),
-                }
-
-            except Exception as e:
-                _warn_nonfatal(
-                    "PORTFOLIO_NORMALIZE_DESIRED_ROW_FAILED",
-                    e,
-                    desired_key=str(desired_key),
-                )
-                continue
-
-        desired = norm
-
-        # renormalize gross
-        grossE = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-        eff_cap = float(_eff_gross_cap())
-        if grossE > float(eff_cap) and grossE > 1e-9:
-            scaleE = float(eff_cap) / float(grossE)
-            for sym in list(desired.keys()):
-                desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scaleE)
-
-        # ---            -- ------------------------------------------------------
-        # Auto blacklist enforcement (skip symbols temporarily banned)
-        # ---            -- ------------------------------------------------------
-        try:
-            for desired_key in list(desired.keys()):
-                sym = _desired_symbol(desired_key, desired.get(desired_key))
-                if sym and is_blacklisted(con, sym, now_ms=int(now_ms)):
-                    desired.pop(desired_key, None)
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_BLACKLIST_FILTER_FAILED", e, once_key="blacklist_filter")
-
-        # ---            -- ------------------------------------------------------
-        # Exploration cap: if symbol has few realized labels, cap weight
-        # ---            -- ------------------------------------------------------
-        try:
-            for desired_key in list(desired.keys()):
-                sym = _desired_symbol(desired_key, desired.get(desired_key))
-                if not sym:
-                    continue
-                row = con.execute(
-                    "SELECT COUNT(1) FROM labels WHERE symbol=?",
-                    (str(sym),),
-                ).fetchone()
-                nlab = int(row[0] or 0) if row else 0
-
-                if nlab < int(PORTFOLIO_EXPLORE_MIN_LABELS):
-                    # Cap exposure for exploration symbols without forcing tiny/no-trade weights
-                    w0 = float(desired[desired_key].get("weight", 0.0) or 0.0)
-                    sgn = -1.0 if w0 < 0 else 1.0
-                    floor_abs = min(float(PORTFOLIO_EXPLORE_MAX_W), max(0.0, abs(w0)))
-                    wabs = float(_clamp(abs(w0), floor_abs, float(PORTFOLIO_EXPLORE_MAX_W)))
-                    desired[desired_key]["weight"] = float(sgn * wabs)
-                    # Tag for explainability/debugging
-                    try:
-                        r = desired[desired_key].get("reason") or {}
-                        if isinstance(r, dict):
-                            r["explore_cap"] = True
-                            r["labels_n"] = int(nlab)
-                            desired[desired_key]["reason"] = r
-                    except Exception as e:
-                        _warn_nonfatal("PORTFOLIO_EXPLORE_CAP_REASON_FAILED", e, once_key="explore_cap_reason")
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_EXPLORE_CAP_FAILED", e, once_key="explore_cap")
-
-        # Empirical-Bayes alpha shrinkage is applied before expected-return
-        # blending and allocation optimization so thin-history estimates cannot
-        # feed full-size risk downstream.
-        try:
-            from engine.strategy.alpha_shrinkage import apply_alpha_shrinkage_to_desired
-
-            desired, _alpha_shrinkage = apply_alpha_shrinkage_to_desired(
-                con,
-                desired,
-                now_ms=int(now_ms),
-            )
-            try:
-                _put_meta(
-                    con,
-                    "last_alpha_shrinkage",
-                    json.dumps(_alpha_shrinkage or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_ALPHA_SHRINKAGE_META_FAILED", e, once_key="alpha_shrinkage_meta")
-        except Exception as e:
-            _record_degraded_phase("alpha_shrinkage", "PORTFOLIO_ALPHA_SHRINKAGE_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_ALPHA_SHRINKAGE_FAILED", e, once_key="alpha_shrinkage")
-            mode = str(os.environ.get("ENGINE_MODE") or os.environ.get("APP_ENV") or "").strip().lower()
-            execution_mode = str(os.environ.get("EXECUTION_MODE") or "").strip().lower()
-            fail_closed_raw = os.environ.get("ALPHA_SHRINKAGE_FAIL_CLOSED")
-            fail_closed = (
-                str(fail_closed_raw).strip().lower() in {"1", "true", "yes", "on"}
-                if fail_closed_raw is not None
-                else mode in {"live", "prod", "production"} or execution_mode == "live"
-            )
-            if fail_closed:
-                for desired_key in list(desired.keys()):
-                    desired[desired_key]["weight"] = 0.0
-                    desired[desired_key]["side"] = "FLAT"
-                    desired[desired_key].setdefault("reason", {})
-                    if isinstance(desired[desired_key]["reason"], dict):
-                        desired[desired_key]["reason"]["alpha_shrinkage"] = {
-                            "enabled": True,
-                            "applied": False,
-                            "failed_closed": True,
-                            "error": f"{type(e).__name__}: {e}",
-                        }
-
-        # ---            -- ------------------------------------------------------
-        # Optional expected-return blending (Black-Litterman)
-        # ------------------------------------------------------
-        try:
-            desired = _apply_black_litterman_overlay(con, desired)
-        except Exception as e:
-            _record_degraded_phase("black_litterman", "PORTFOLIO_BLACK_LITTERMAN_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_BLACK_LITTERMAN_FAILED", e, once_key="portfolio_black_litterman")
-
-        # ---            -- ------------------------------------------------------
-        # Capital allocation optimizer (return vs drawdown utility)
-        # ---            -- ------------------------------------------------------
-        try:
-            desired = _optimize_capital_allocation(con, desired)
-        except Exception as e:
-            _record_degraded_phase("capital_allocation_opt", "PORTFOLIO_CAPITAL_ALLOCATION_OPT_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_CAPITAL_ALLOCATION_OPT_FAILED", e, once_key="capital_allocation_opt")
-
-        # ---            -- ------------------------------------------------------
-        # Impact-aware sizing (penalize symbols with bad realized slippage)
-        # ---            -- ------------------------------------------------------
-        try:
-            desired = _apply_impact_aware_sizing(con, desired)
-        except Exception as e:
-            _record_degraded_phase("impact_sizing", "PORTFOLIO_IMPACT_SIZING_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_IMPACT_SIZING_FAILED", e, once_key="impact_sizing")
-
-        # Reward models whose books are less correlated with the rest of the portfolio.
-        try:
-            desired, _model_div = _apply_model_diversification_scoring(con, desired)
-            try:
-                _put_meta(
-                    con,
-                    "last_model_diversification",
-                    json.dumps(_model_div or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_MODEL_DIVERSIFICATION_META_FAILED", e, once_key="model_diversification_meta")
-        except Exception as e:
-            _record_degraded_phase("model_diversification", "PORTFOLIO_MODEL_DIVERSIFICATION_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_MODEL_DIVERSIFICATION_FAILED", e, once_key="model_diversification")
-            _model_div = None
-
-        # hard cap max positions (keep largest abs weights) (dynamic under preserve)
-        desired = apply_max_position_constraint(desired)
-
-        # ---            -- ------------------------------------------------------
-        # Allocation mode is explicit when requested, otherwise preserves the
-        # existing corr-opt -> prune -> legacy fallback order.
-        # ---            -- ------------------------------------------------------
-        desired = _apply_allocation_mode(con, desired)
-
-        # safety: enforce portfolio gross cap even if strategy already normalized
-        gross = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-        eff_cap = float(_eff_gross_cap())
-        if gross > float(eff_cap) and gross > 1e-9:
-            scale = float(eff_cap) / float(gross)
-            for sym in list(desired.keys()):
-                w0 = float(desired[sym].get("weight", 0.0) or 0.0)
-                sign = -1.0 if w0 < 0 else 1.0
-                desired[sym]["weight"] = sign * abs(float(w0) * float(scale))
-
-        # ---            -- ------------------------------------------------------
-        # A) VOL TARGETING (default-on): inverse-vol symbol sizing + portfolio vol target
-        # ---            -- ------------------------------------------------------
-        try:
-            from engine.strategy.risk import (
-                PORTFOLIO_USE_VOL_TARGET,
-                TARGET_VOL,
-                portfolio_realized_vol,
-                portfolio_vol_target_scale,
-                realized_vol_from_prices,
-                symbol_vol_scale,
-                vol_scale_weight,
-            )
-
-            if PORTFOLIO_USE_VOL_TARGET:
-                for desired_key in list(desired.keys()):
-                    sym = _desired_symbol(desired_key, desired.get(desired_key))
-                    if not sym:
-                        continue
-                    vol = realized_vol_from_prices(con, sym)
-                    if vol is None:
-                        continue
-
-                    sym_scale = float(symbol_vol_scale(vol))
-                    desired[desired_key]["weight"] = float(vol_scale_weight(desired[desired_key]["weight"], vol))
-                    desired[desired_key].setdefault("reason", {})
-                    desired[desired_key]["reason"]["realized_vol"] = float(vol)
-                    desired[desired_key]["reason"]["symbol_vol_scale"] = float(sym_scale)
-                    desired[desired_key]["reason"]["vol_target_symbol_scaled"] = 1
-
-                vol_scale, pre_portfolio_vol = portfolio_vol_target_scale(con, desired)
-
-                if abs(float(vol_scale) - 1.0) > 1e-12:
-                    for sym in list(desired.keys()):
-                        desired[sym]["weight"] = float(desired[sym].get("weight", 0.0) or 0.0) * float(vol_scale)
-                        desired[sym].setdefault("reason", {})
-                        desired[sym]["reason"]["portfolio_vol_target"] = float(TARGET_VOL)
-                        desired[sym]["reason"]["portfolio_vol_pre_scale"] = (
-                            float(pre_portfolio_vol) if pre_portfolio_vol is not None else None
-                        )
-                        desired[sym]["reason"]["portfolio_vol_scale"] = float(vol_scale)
-
-                # renormalize gross after vol targeting
-                gross2 = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-                if gross2 > float(PORTFOLIO_GROSS_CAP) and gross2 > 1e-9:
-                    scale2 = float(PORTFOLIO_GROSS_CAP) / float(gross2)
-                    for sym in list(desired.keys()):
-                        w0 = float(desired[sym].get("weight", 0.0) or 0.0)
-                        sign = -1.0 if w0 < 0 else 1.0
-                        desired[sym]["weight"] = sign * abs(float(w0) * float(scale2))
-                        desired[sym].setdefault("reason", {})
-                        desired[sym]["reason"]["portfolio_gross_cap_after_vol_target"] = float(PORTFOLIO_GROSS_CAP)
-                        desired[sym]["reason"]["portfolio_gross_scale_after_vol_target"] = float(scale2)
-
-                post_portfolio_vol = portfolio_realized_vol(con, desired)
-                for sym in list(desired.keys()):
-                    desired[sym].setdefault("reason", {})
-                    desired[sym]["reason"]["portfolio_vol_post_target"] = (
-                        float(post_portfolio_vol) if post_portfolio_vol is not None else None
-                    )
-
-                try:
-                    _set_risk_state_inline(con, "portfolio_vol_target_enabled", "1")
-                    _set_risk_state_inline(con, "portfolio_target_vol", str(float(TARGET_VOL)))
-                    _set_risk_state_inline(
-                        con,
-                        "portfolio_realized_vol_pre_target",
-                        "" if pre_portfolio_vol is None else str(float(pre_portfolio_vol)),
-                    )
-                    _set_risk_state_inline(
-                        con,
-                        "portfolio_realized_vol_post_target",
-                        "" if post_portfolio_vol is None else str(float(post_portfolio_vol)),
-                    )
-                    _set_risk_state_inline(con, "portfolio_vol_target_scale", str(float(vol_scale)))
-                    _set_risk_state_inline(con, "portfolio_vol_target_ts_ms", str(int(_now_ms())))
-                except Exception as e:
-                    _warn_nonfatal("PORTFOLIO_VOL_TARGET_STATE_WRITE_FAILED", e, once_key="vol_target_state_write")
-            else:
-                try:
-                    _set_risk_state_inline(con, "portfolio_vol_target_enabled", "0")
-                    _set_risk_state_inline(con, "portfolio_target_vol", str(float(TARGET_VOL)))
-                    _set_risk_state_inline(con, "portfolio_realized_vol_pre_target", "")
-                    _set_risk_state_inline(con, "portfolio_realized_vol_post_target", "")
-                    _set_risk_state_inline(con, "portfolio_vol_target_scale", "1.0")
-                    _set_risk_state_inline(con, "portfolio_vol_target_ts_ms", str(int(_now_ms())))
-                except Exception as e:
-                    _warn_nonfatal("PORTFOLIO_VOL_TARGET_STATE_WRITE_FAILED", e, once_key="vol_target_state_write")
-        except Exception as e:
-            _record_degraded_phase("vol_target", "PORTFOLIO_VOL_TARGET_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_VOL_TARGET_FAILED", e, once_key="vol_target")
-# =========================
-# SECTION 7 / ~200 lines
-# =========================
-
-        # ---            -- ------------------------------------------------------
-        # B) STRESS / REGIME GATE (opt-in): compress exposure under stress
-        # Now incorporates:
-        #   • VIX stress
-        #   • Options skew z-score
-        #   • Index constituent flow imbalance z-score
-        # ---            -- ------------------------------------------------------
-        try:
-            if PORTFOLIO_USE_STRESS_GATE and desired:
-                # --- VIX baseline ---
-                st = _vix_stress(con)
-                vix_z = float(st.get("z", 0.0))
-                f_vix = float(_stress_factor_from_vix_z(vix_z))
-
-                # --- Skew + Flow regime factors (latest as-of now_ms) ---
-                skew_z = 0.0
-                flow_z = 0.0
-
-                try:
-                    row = con.execute(
-                        """
-                        SELECT value
-                        FROM factor_features
-                        WHERE feature_id='options.skew_25d_z'
-                        ORDER BY asof_ts DESC
-                        LIMIT 1
-                        """
-                    ).fetchone()
-                    if row:
-                        skew_z = float(row[0] or 0.0)
-                except Exception:
-                    skew_z = 0.0
-
-                try:
-                    row = con.execute(
-                        """
-                        SELECT value
-                        FROM factor_features
-                        WHERE feature_id='flows.index_constituent_imbalance_z'
-                        ORDER BY asof_ts DESC
-                        LIMIT 1
-                        """
-                    ).fetchone()
-                    if row:
-                        flow_z = float(row[0] or 0.0)
-                except Exception:
-                    flow_z = 0.0
-
-                # --- Stress magnitude beyond thresholds ---
-                skew_excess = max(0.0, abs(skew_z) - 1.5)
-                flow_excess = max(0.0, abs(flow_z) - 2.0)
-
-                stress_mag = max(skew_excess, flow_excess)
-
-                # compression factor (bounded)
-                f_struct = 1.0
-                if stress_mag > 0.0:
-                    f_struct = max(0.20, 1.0 - (0.35 * stress_mag))
-
-                # combined factor
-                f_total = float(min(f_vix, f_struct))
-
-                if f_total < 1.0:
-                    for sym in list(desired.keys()):
-                        desired[sym]["weight"] = float(desired[sym]["weight"]) * float(f_total)
-                        desired[sym].setdefault("reason", {})
-                        desired[sym]["reason"]["stress_gate_factor"] = float(f_total)
-                        desired[sym]["reason"]["stress_vix_z"] = float(vix_z)
-                        desired[sym]["reason"]["stress_skew_z"] = float(skew_z)
-                        desired[sym]["reason"]["stress_flow_z"] = float(flow_z)
-
-                # renormalize gross after compression
-                gross_s = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-                eff_cap = float(_eff_gross_cap())
-                if gross_s > float(eff_cap) and gross_s > 1e-9:
-                    scale_s = float(eff_cap) / float(gross_s)
-                    for sym in list(desired.keys()):
-                        w0 = float(desired[sym].get("weight", 0.0) or 0.0)
-                        sign = -1.0 if w0 < 0 else 1.0
-                        desired[sym]["weight"] = sign * abs(float(w0) * float(scale_s))
-
-        except Exception as e:
-            _record_degraded_phase("stress_gate", "PORTFOLIO_EXEC_REGIME_SIZING_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_EXEC_REGIME_SIZING_FAILED", e, once_key="exec_regime_sizing")
-
-        # ---            -- ------------------------------------------------------
-        # B2) SOCIAL GATE (opt-in): block/downsizing under manipulation risk
-        # ---            -- ------------------------------------------------------
-        try:
-            if PORTFOLIO_USE_SOCIAL_GATE and desired:
-                from engine.strategy.social_risk import social_gate_for_symbol
-
-                for desired_key in list(desired.keys()):
-                    sym = _desired_symbol(desired_key, desired.get(desired_key))
-                    if not sym:
-                        continue
-                    g = social_gate_for_symbol(
-                        con,
-                        str(sym),
-                        int(now_ms),
-                        bucket_sec=int(PORTFOLIO_SOCIAL_BUCKET_SEC),
-                        manip_block_th=float(PORTFOLIO_SOCIAL_MANIP_BLOCK_TH),
-                        shock_th=float(PORTFOLIO_SOCIAL_ATTEN_SHOCK_TH),
-                        shock_factor=float(PORTFOLIO_SOCIAL_SHOCK_FACTOR),
-                    ) or {}
-
-                    if g.get("block"):
-                        desired[desired_key]["weight"] = 0.0
-                        desired[desired_key]["side"] = "FLAT"
-                        desired[desired_key].setdefault("reason", {})
-                        desired[desired_key]["reason"]["social_gate_block"] = 1
-                        desired[desired_key]["reason"]["social_manip_risk"] = float(g.get("manip_risk", 0.0))
-                        desired[desired_key]["reason"]["social_attention_shock"] = float(g.get("attention_shock", 0.0))
-                        desired[desired_key]["reason"]["social_promo_likelihood"] = float(g.get("promo_likelihood_mean", 0.0))
-                        continue
-
-                    f = float(g.get("factor", 1.0))
-                    if f < 1.0:
-                        desired[desired_key]["weight"] = float(desired[desired_key]["weight"]) * f
-                        desired[desired_key].setdefault("reason", {})
-                        desired[desired_key]["reason"]["social_gate_factor"] = float(f)
-                        desired[desired_key]["reason"]["social_manip_risk"] = float(g.get("manip_risk", 0.0))
-                        desired[desired_key]["reason"]["social_attention_shock"] = float(g.get("attention_shock", 0.0))
-                        desired[desired_key]["reason"]["social_promo_likelihood"] = float(g.get("promo_likelihood_mean", 0.0))
-
-                # renormalize gross after social compression (still respect gross cap)
-                gross_soc = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-                eff_cap = float(_eff_gross_cap())
-                if gross_soc > float(eff_cap) and gross_soc > 1e-9:
-                    scale_soc = float(eff_cap) / float(gross_soc)
-                    for sym in list(desired.keys()):
-                        w0 = float(desired[sym].get("weight", 0.0) or 0.0)
-                        sign = -1.0 if w0 < 0 else 1.0
-                        desired[sym]["weight"] = sign * abs(float(w0) * float(scale_soc))
-        except Exception as e:
-            _record_degraded_phase("social_gate", "PORTFOLIO_SOCIAL_GATE_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_SOCIAL_GATE_FAILED", e, once_key="social_gate")
-
-        # ---            -- ------------------------------------------------------
-        # C) VOL-OF-VOL GATE (opt-in): per-symbol compression in unstable regimes
-        # Uses price-only proxy from engine.tech_indicators (if present).
-        # ---            -- ------------------------------------------------------
-        try:
-            if PORTFOLIO_USE_VOV_GATE and desired:
-                try:
-                    from engine.strategy.tech_indicators import compute_tech_features
-                except Exception:
-                    compute_tech_features = None
-
-                if compute_tech_features:
-                    now_ms2 = _now_ms()
-                    a = float(PORTFOLIO_VOV_ALPHA)
-                    v_lo = float(PORTFOLIO_VOV_FLOOR)
-                    v_hi = float(PORTFOLIO_VOV_CEIL)
-                    span = max(1e-12, (v_hi - v_lo))
-
-                    for desired_key in list(desired.keys()):
-                        sym = _desired_symbol(desired_key, desired.get(desired_key))
-                        if not sym:
-                            continue
-                        tf = compute_tech_features(str(sym), int(now_ms2)) or {}
-                        vv = float(tf.get("vol_of_vol", 0.0))
-
-                        # normalize vv into [0,1] then apply penalty
-                        x = (vv - v_lo) / span
-                        x = float(_clamp(x, 0.0, 1.0))
-
-                        # factor = 1/(1 + alpha*x)
-                        f = float(1.0 / (1.0 + a * x))
-                        desired[desired_key]["weight"] = float(desired[desired_key]["weight"]) * float(f)
-
-                        desired[desired_key].setdefault("reason", {})
-                        desired[desired_key]["reason"]["vov_gate_factor"] = float(f)
-                        desired[desired_key]["reason"]["vov_value"] = float(vv)
-
-                    # renormalize gross after vov compression
-                    gross_v = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-                    eff_cap = float(_eff_gross_cap())
-                    if gross_v > float(eff_cap) and gross_v > 1e-9:
-                        scale_v = float(eff_cap) / float(gross_v)
-                        for sym in list(desired.keys()):
-                            desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scale_v)
-        except Exception as e:
-            _record_degraded_phase("vol_of_vol_gate", "PORTFOLIO_VOL_OF_VOL_GATE_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_VOL_OF_VOL_GATE_FAILED", e, once_key="vol_of_vol_gate")
-# =========================
-# SECTION 8 / ~200 lines
-# =========================
-
-        # ---            -- ------------------------------------------------------
-        # Phase 5.2: POSITION SIZE POLICY (confidence -> factor)
-        # (must happen BEFORE orders are emitted)
-        # ---            -- ------------------------------------------------------
-        if conformal_mode() == "gate_and_size":
-            try:
-                for desired_key in list(desired.keys()):
-                    reason = _ensure_reason_dict(desired.get(desired_key))
-                    conformal_mult = _conformal_size_multiplier_from_reason(reason)
-                    if conformal_mult is None:
-                        continue
-                    desired[desired_key]["weight"] = float(desired[desired_key]["weight"]) * float(conformal_mult)
-                    reason["conformal_size_factor"] = float(conformal_mult)
-                    reason["conformal_sizing_applied"] = True
-            except Exception as e:
-                _record_degraded_phase("conformal_sizing", "PORTFOLIO_CONFORMAL_SIZING_FAILED", e)
-                _warn_nonfatal("PORTFOLIO_CONFORMAL_SIZING_FAILED", e, once_key="conformal_sizing")
-
-        try:
-            from engine.strategy.size_policy import load_latest_size_policy, size_factor
-            from engine.strategy.drawdown_state import get_current_drawdown
-
-            pol = load_latest_size_policy(con)
-            if pol:
-                dd = float(get_current_drawdown(con))
-                for sym in list(desired.keys()):
-                    try:
-                        conf = float((desired[sym].get("reason") or {}).get("confidence", 0.0))
-                    except Exception:
-                        conf = 0.0
-                    f = float(size_factor(pol, conf, drawdown=dd))
-
-                    desired[sym]["weight"] = float(desired[sym]["weight"]) * f
-
-                    # annotate for auditability
-                    desired[sym].setdefault("reason", {})
-                    desired[sym]["reason"]["size_factor"] = float(f)
-                    desired[sym]["reason"]["size_policy_ts_ms"] = int(pol.get("ts_ms", 0))
-                    desired[sym]["reason"]["drawdown_for_sizing"] = float(dd)
-        except Exception as e:
-            _record_degraded_phase("size_policy", "PORTFOLIO_SIZE_POLICY_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_SIZE_POLICY_FAILED", e, once_key="size_policy")
-
-        # ---            -- ------------------------------------------------------
-        # Phase 5.3: EXECUTION REALISM (opt-in)
-        # - blocks/downsizes intents when symbol prices are stale
-        # - downsizes under elevated stress (VIX z) if VIX is present
-        # - downsizes under high ATR% (volatility proxy)
-        # ---            -- ------------------------------------------------------
-        if PORTFOLIO_USE_EXEC_REALISM:
-            for desired_key in list(desired.keys()):
-                sym = _desired_symbol(desired_key, desired.get(desired_key))
-                if not sym:
-                    continue
-                try:
-                    ef, meta = _execution_realism_factor(con, sym, int(now_ms))
-                except Exception:
-                    ef, meta = 1.0, {
-                        "staleness_sec": 0.0,
-                        "stress_vix_z_60": 0.0,
-                        "atr_pct": 0.0,
-                        "slippage_bps_est": 0.0,
-                    }
-
-                desired[desired_key]["weight"] = float(desired[desired_key].get("weight", 0.0)) * float(ef)
-
-                # annotate for auditability/explainability
-                desired[desired_key].setdefault("reason", {})
-                desired[desired_key]["reason"]["exec_realism_factor"] = float(ef)
-                desired[desired_key]["reason"]["exec_staleness_sec"] = float(meta.get("staleness_sec", 0.0))
-                desired[desired_key]["reason"]["exec_stress_vix_z_60"] = float(meta.get("stress_vix_z_60", 0.0))
-                desired[desired_key]["reason"]["exec_atr_pct"] = float(meta.get("atr_pct", 0.0))
-                desired[desired_key]["reason"]["exec_slippage_bps_est"] = float(meta.get("slippage_bps_est", 0.0))
-
-        # renormalize gross after size policy scaling
-        gross3 = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-        eff_cap = float(_eff_gross_cap())
-        if gross3 > float(eff_cap) and gross3 > 1e-9:
-            scale3 = float(eff_cap) / float(gross3)
-            for sym in list(desired.keys()):
-                desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scale3)
-        # ---            -- ------------------------------------------------------
-        # B2) CAPITAL PRESERVATION MODE: compress gross exposure + annotate reasons
-        # ---            -- ------------------------------------------------------
-        try:
-            if _capital_mode() == "preserve" and desired:
-                cap = float(_eff_gross_cap())
-                gross0 = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-                if gross0 > cap and gross0 > 1e-9:
-                    scale_cap = float(cap) / float(gross0)
-                    for sym in list(desired.keys()):
-                        desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scale_cap)
-                        desired[sym].setdefault("reason", {})
-                        desired[sym]["reason"]["capital_mode"] = "preserve"
-                        desired[sym]["reason"]["capital_preserve_gross_cap"] = float(cap)
-                        desired[sym]["reason"]["capital_preserve_scale"] = float(scale_cap)
-        except Exception as e:
-            _record_degraded_phase("capital_preserve_scaling", "PORTFOLIO_CAPITAL_PRESERVE_SCALING_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_CAPITAL_PRESERVE_SCALING_FAILED", e, once_key="capital_preserve_scaling")
-
-        # ---            -- ------------------------------------------------------
-        # Phase 6: REGIME-ADAPTIVE CAPITAL SCALING (base * confidence * VIX * drawdown)
-        # ---            -- ------------------------------------------------------
-        try:
-            from engine.strategy.regime_size import regime_capital_scale
-
-            _rs = regime_capital_scale(con=con, anchor=str(PORTFOLIO_REGIME_ANCHOR))
-            mult = float((_rs or {}).get("final_mult", 1.0))
-
-            # persist last scaling decision (auditability)
-            try:
-                _put_meta(
-                    con,
-                    "last_regime_scaling",
-                    json.dumps(_rs or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_REGIME_SCALING_META_FAILED", e, once_key="regime_scaling_meta")
-
-            if mult != 1.0:
-                for sym in list(desired.keys()):
-                    try:
-                        desired[sym]["weight"] = float(desired[sym].get("weight", 0.0) or 0.0) * float(mult)
-                        desired[sym].setdefault("reason", {})
-                        desired[sym]["reason"]["regime_anchor"] = str(
-                            (_rs or {}).get("anchor") or str(PORTFOLIO_REGIME_ANCHOR)
-                        )
-                        desired[sym]["reason"]["regime"] = str((_rs or {}).get("regime") or "")
-                        desired[sym]["reason"]["regime_base_mult"] = float((_rs or {}).get("base_mult", 1.0))
-                        desired[sym]["reason"]["regime_conf"] = float((_rs or {}).get("conf", 1.0))
-                        desired[sym]["reason"]["regime_conf_mult"] = float((_rs or {}).get("conf_mult", 1.0))
-                        desired[sym]["reason"]["regime_vix_z"] = (_rs or {}).get("vix_z", None)
-                        desired[sym]["reason"]["regime_vix_mult"] = float((_rs or {}).get("vix_mult", 1.0))
-                        desired[sym]["reason"]["regime_dd"] = (_rs or {}).get("dd", None)
-                        desired[sym]["reason"]["regime_dd_mult"] = float((_rs or {}).get("dd_mult", 1.0))
-                        desired[sym]["reason"]["regime_final_mult"] = float((_rs or {}).get("final_mult", 1.0))
-                    except Exception:
-                        _warn_nonfatal("PORTFOLIO_REGIME_SCALING_REASON_FAILED", Exception("regime scaling reason failed"), once_key="regime_scaling_reason")
-
-                # renormalize gross after regime scaling
-                grossR = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-                eff_cap = float(_eff_gross_cap())
-                if grossR > float(eff_cap) and grossR > 1e-9:
-                    scaleR = float(eff_cap) / float(grossR)
-                    for sym in list(desired.keys()):
-                        desired[sym]["weight"] = float(desired[sym]["weight"]) * float(scaleR)
-        except Exception as e:
-            _record_degraded_phase("regime_scaling", "PORTFOLIO_REGIME_SCALING_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_REGIME_SCALING_FAILED", e, once_key="regime_scaling")
-
-        # ---            -- ------------------------------------------------------
-        # Allocation risk overlays: crowding, concentration, execution capacity
-        # ------------------------------------------------------
-        try:
-            from engine.strategy.allocation_risk_overlay import apply_allocation_risk_overlays
-
-            desired, _overlay = apply_allocation_risk_overlays(
-                con,
-                desired,
-                gross_cap=float(_eff_gross_cap()),
-                now_ms=int(now_ms),
-            )
-            try:
-                _put_meta(
-                    con,
-                    "last_allocation_risk_overlay",
-                    json.dumps(_overlay or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_ALLOCATION_OVERLAY_META_FAILED", e, once_key="allocation_overlay_meta")
-        except Exception as e:
-            _record_degraded_phase("allocation_overlay", "PORTFOLIO_ALLOCATION_OVERLAY_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_ALLOCATION_OVERLAY_FAILED", e, once_key="allocation_overlay")
-            _overlay = None
-
-        # ---            -- ------------------------------------------------------
-        # Phase 1.5: PORTFOLIO RISK ENGINE (institutional exposure / vol / corr / budgets)
-        # ---            -- ------------------------------------------------------
-        try:
-            desired, _risk_engine = apply_portfolio_risk_engine(con, desired, state, now_ms=int(now_ms))
-            try:
-                request_monte_carlo_refresh(desired)
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_MONTE_CARLO_REFRESH_FAILED", e, once_key="monte_carlo_refresh")
-            try:
-                _put_meta(
-                    con,
-                    "last_portfolio_risk_engine",
-                    json.dumps(_risk_engine or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_RISK_ENGINE_META_FAILED", e, once_key="risk_engine_meta")
-        except Exception as e:
-            _record_degraded_phase("risk_engine", "PORTFOLIO_RISK_ENGINE_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_RISK_ENGINE_FAILED", e, once_key="risk_engine")
-            _risk_engine = None
-
-        # ---            -- ------------------------------------------------------
-        # Phase 2: PORTFOLIO HARD RISK GATE (net / turnover / dd add-block)
-        # ---            -- ------------------------------------------------------
-        try:
-            desired, _gate = apply_portfolio_risk_gate(con, desired, state, now_ms=int(now_ms))
-            try:
-                _put_meta(
-                    con,
-                    "last_risk_gate",
-                    json.dumps(_gate or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_RISK_GATE_META_FAILED", e, once_key="risk_gate_meta")
-        except Exception as e:
-            _record_degraded_phase("risk_gate", "PORTFOLIO_RISK_GATE_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_RISK_GATE_FAILED", e, once_key="risk_gate")
-            _gate = None
-
-        # ---            -- ------------------------------------------------------
-        # Burst control: temporal clustering dampener
-        # ---            -- ------------------------------------------------------
-        try:
-            desired = _apply_temporal_dampener(con, desired, now_ms=int(now_ms))
-        except Exception as e:
-            _record_degraded_phase("temporal_dampener", "PORTFOLIO_TEMPORAL_DAMPENER_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_TEMPORAL_DAMPENER_FAILED", e, once_key="temporal_dampener")
-
-        # ---            -- ------------------------------------------------------
-        # Capital-at-Risk gate (tail-risk budget)
-        # ---            -- ------------------------------------------------------
-        try:
-            desired, _car = _apply_capital_at_risk_gate(desired)
-            try:
-                _put_meta(
-                    con,
-                    "last_capital_at_risk",
-                    json.dumps(_car or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_CAPITAL_AT_RISK_META_FAILED", e, once_key="capital_at_risk_meta")
-        except Exception as e:
-            _record_degraded_phase("capital_at_risk", "PORTFOLIO_CAPITAL_AT_RISK_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_CAPITAL_AT_RISK_FAILED", e, once_key="capital_at_risk")
-
-        # Prevent crowded same-direction books from surviving the earlier symbol-level sizing layers.
-        try:
-            desired, _netting = _apply_same_direction_exposure_netting(con, desired)
-            try:
-                _put_meta(
-                    con,
-                    "last_exposure_netting",
-                    json.dumps(_netting or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_EXPOSURE_NETTING_META_FAILED", e, once_key="exposure_netting_meta")
-        except Exception as e:
-            _record_degraded_phase("exposure_netting", "PORTFOLIO_EXPOSURE_NETTING_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_EXPOSURE_NETTING_FAILED", e, once_key="exposure_netting")
-            _netting = None
-
-        # Final hard portfolio-risk clamp after all other portfolio transforms.
-        try:
-            desired, _total_risk = _apply_total_portfolio_risk_limit(con, desired)
-            try:
-                _put_meta(
-                    con,
-                    "last_total_portfolio_risk",
-                    json.dumps(_total_risk or {}, separators=(",", ":"), sort_keys=True),
-                )
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_TOTAL_RISK_META_FAILED", e, once_key="total_risk_meta")
-        except Exception as e:
-            _record_degraded_phase("total_risk", "PORTFOLIO_TOTAL_RISK_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_TOTAL_RISK_FAILED", e, once_key="total_risk")
-            _total_risk = None
-
-        _flip_penalty = {}
-        try:
-            desired, _flip_penalty = _apply_flip_flop_penalty(con, desired, state)
-        except Exception as e:
-            _record_degraded_phase("flip_flop_penalty", "PORTFOLIO_FLIP_FLOP_PENALTY_FAILED", e)
-            _warn_nonfatal("PORTFOLIO_FLIP_FLOP_PENALTY_FAILED", e, once_key="flip_flop_penalty")
-            _flip_penalty = {}
-
-        portfolio_diag = {}
-        try:
-            portfolio_diag = _build_portfolio_correlation_diagnostics(
-                con,
-                desired,
-                lookback=int(PORTFOLIO_CORR_LOOKBACK),
-                top_n=int(PORTFOLIO_DIAG_CORR_TOP_N),
-            )
-            _persist_portfolio_correlation_diagnostics(con, portfolio_diag, ts_ms=int(now_ms))
-        except Exception as e:
-            _record_degraded_phase("correlation_diagnostics", "PORTFOLIO_CORRELATION_DIAGNOSTICS_FAILED", e)
-            portfolio_diag = {}
-
-        execution_blocked_codes = _portfolio_execution_blocked_codes(degraded_reasons)
-        execution_blocked = bool(execution_blocked_codes)
-        if execution_blocked:
-            _expire_stale_unconsumed_alerts(con, int(now_ms), int(PORTFOLIO_LOOKBACK_S))
-            _set_meta(con, "last_strategy_name", "multi_strategy")
-            _set_meta(con, "last_rebalance_ts_ms", str(now_ms))
-            _persist_portfolio_runtime_health(
-                con,
-                now_ms=int(now_ms),
-                degraded_reasons=list(degraded_reasons),
-                orders_n=0,
-                changed_symbols=[],
-                execution_blocked=True,
-                execution_blocked_codes=list(execution_blocked_codes),
-            )
-            con.commit()
-            return {
-                "ok": True,
-                "strategy": "multi_strategy",
-                "changed": [],
-                "orders_n": 0,
-                "selected": [str((v or {}).get("symbol") or k) for k, v in desired.items()],
-                "execution_blocked": True,
-                "execution_blocked_codes": list(execution_blocked_codes),
-                "portfolio_diagnostics": {
-                    "degraded": bool(degraded_reasons),
-                    "degraded_reasons": list(degraded_reasons),
-                    "execution_blocked": True,
-                    "execution_blocked_codes": list(execution_blocked_codes),
-                    "position_summary": dict((portfolio_diag or {}).get("position_summary") or {}),
-                    "model_summary": dict((portfolio_diag or {}).get("model_summary") or {}),
-                    "flip_flop_penalty": dict(_flip_penalty or {}),
-                },
-            }
-
-        _mark_alerts_consumed(con, _selected_alert_ids_from_desired(desired), int(now_ms))
-        _expire_stale_unconsumed_alerts(con, int(now_ms), int(PORTFOLIO_LOOKBACK_S))
-
-        orders_n = 0
-        changed = []
-# =========================
-# SECTION 9 / ~200 lines
-# =========================
-
-        # 1) handle symbols in desired set
-        for state_key, tgt in desired.items():
-            sym = str(tgt.get("symbol") or "").strip()
-            model_id = _normalize_model_id(tgt.get("model_id"))
-            cur = state.get(state_key)
-            to_side = str(tgt.get("side", "FLAT")).upper()
-            raw_to_w = float(tgt.get("weight", 0.0) or 0.0)
-            to_w = abs(float(raw_to_w)) if to_side in ("LONG", "SHORT") else 0.0
-            source_alert_id = tgt.get("source_alert_id")
-            prediction_id = tgt.get("prediction_id")
-
-            explain = {
-                "strategy": {
-                    "name": "multi_strategy",
-                    "min_conf": PORTFOLIO_MIN_CONF,
-                    "min_abs_z": PORTFOLIO_MIN_ABS_Z,
-                    "max_positions": PORTFOLIO_MAX_POSITIONS,
-                    "gross_cap": PORTFOLIO_GROSS_CAP,
-                    "max_w_per_symbol": PORTFOLIO_MAX_W_PER_SYMBOL,
-                    "score_norm": PORTFOLIO_SCORE_NORM,
-                    "min_hold_s": PORTFOLIO_MIN_HOLD_S,
-                    "lookback_s": PORTFOLIO_LOOKBACK_S,
-                },
-                    "selector": {
-                        "mode": "live_registry_only",
-                        "strategy_name": "multi_strategy",
-                    },
-                    "signal": tgt.get("reason") or {},
-                    "tradability": _tradability_from_explain(tgt.get("explain_json", "{}")),
-                    "model_id": model_id,
-                }
-            model_identity = _extract_model_identity_from_explain(tgt.get("explain_json", "{}"))
-            if str(tgt.get("model_name") or model_identity.get("model_name") or "").strip():
-                explain["model_name"] = str(tgt.get("model_name") or model_identity.get("model_name") or "").strip()
-            if str(tgt.get("regime") or model_identity.get("regime") or "").strip():
-                explain["regime"] = str(tgt.get("regime") or model_identity.get("regime") or "").strip()
-            if int(tgt.get("horizon_s") or 0) > 0:
-                explain["horizon_s"] = int(tgt.get("horizon_s") or 0)
-            if model_identity.get("model_kind"):
-                explain["model_kind"] = str(model_identity.get("model_kind"))
-            if model_identity.get("model_ts_ms") is not None:
-                explain["model_ts_ms"] = int(model_identity.get("model_ts_ms"))
-            if model_identity.get("model_version"):
-                explain["model_version"] = str(model_identity.get("model_version"))
-
-            # Empty/flat targets should not create synthetic OPEN rows.
-            if not cur and (to_side == "FLAT" or to_w <= 0.0):
-                continue
-
-            if not cur:
-                # open new
-                _write_state_row(con, model_id, sym, to_side, abs(float(to_w)), now_ms, now_ms, source_alert_id, tgt.get("explain_json", "{}"))
-                _emit_order(con, sym, "OPEN", "FLAT", to_side, 0.0, abs(float(to_w)), source_alert_id, prediction_id, explain)
-                orders_n += 1
-                changed.append(sym)
-                continue
-
-            from_side = str(cur["side"])
-            from_w = abs(float(cur.get("weight", 0.0) or 0.0))
-            opened_ts = int(cur["opened_ts_ms"])
-            age_s = max(0.0, (now_ms - opened_ts) / 1000.0)
-
-            # reversal hold guard
-            if from_side in ("LONG", "SHORT") and to_side != from_side and age_s < float(PORTFOLIO_MIN_HOLD_S):
-                # HOLD (no change)
-                explain["hold_reason"] = f"min_hold not met (age_s={age_s:.1f} < {PORTFOLIO_MIN_HOLD_S})"
-                _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, source_alert_id, prediction_id, explain)
-                orders_n += 1
-                continue
-
-            # compute action
-            if from_side == "FLAT" and to_side != "FLAT" and to_w > 0:
-                _write_state_row(con, model_id, sym, to_side, abs(float(to_w)), now_ms, now_ms, source_alert_id, tgt.get("explain_json", "{}"))
-                _emit_order(con, sym, "OPEN", "FLAT", to_side, 0.0, abs(float(to_w)), source_alert_id, prediction_id, explain)
-                orders_n += 1
-                changed.append(sym)
-                continue
-
-            if from_side in ("LONG", "SHORT") and to_side == from_side:
-                if abs(to_w - from_w) < 1e-6:
-                    _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, source_alert_id, prediction_id, explain)
-                    orders_n += 1
-                elif to_w > from_w:
-                    _write_state_row(con, model_id, sym, from_side, abs(float(to_w)), opened_ts, now_ms, source_alert_id, tgt["explain_json"])
-                    _emit_order(con, sym, "INCREASE", from_side, from_side, abs(float(from_w)), abs(float(to_w)), source_alert_id, prediction_id, explain)
-                    orders_n += 1
-                    changed.append(sym)
-                else:
-                    _write_state_row(con, model_id, sym, from_side, abs(float(to_w)), opened_ts, now_ms, source_alert_id, tgt["explain_json"])
-                    _emit_order(con, sym, "DECREASE", from_side, from_side, abs(float(from_w)), abs(float(to_w)), source_alert_id, prediction_id, explain)
-                    orders_n += 1
-                    changed.append(sym)
-                continue
-
-            if from_side in ("LONG", "SHORT") and to_side != from_side:
-                # reverse
-                _write_state_row(con, model_id, sym, to_side, abs(float(to_w)), now_ms, now_ms, source_alert_id, tgt.get("explain_json", "{}"))
-                _emit_order(con, sym, "REVERSE", from_side, to_side, abs(float(from_w)), abs(float(to_w)), source_alert_id, prediction_id, explain)
-                orders_n += 1
-                changed.append(sym)
-                continue
-
-            # fallback: hold
-            _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, source_alert_id, prediction_id, explain)
-            orders_n += 1
-
-        # 2) close symbols not desired anymore (but only if currently open)
-        for state_key, cur in state.items():
-            if state_key in desired:
-                continue
-            sym = str(cur.get("symbol") or "").strip()
-            model_id = _normalize_model_id(cur.get("model_id"))
-            from_side = str(cur["side"])
-            from_w = abs(float(cur.get("weight", 0.0) or 0.0))
-            opened_ts = int(cur["opened_ts_ms"])
-            age_s = max(0.0, (now_ms - opened_ts) / 1000.0)
-
-            if from_side in ("LONG", "SHORT") and from_w > 0:
-                # optional: min hold before closing too
-                if age_s < float(PORTFOLIO_MIN_HOLD_S):
-                    explain = {
-                        "model_id": model_id,
-                        "hold_reason": f"min_hold not met for close (age_s={age_s:.1f} < {PORTFOLIO_MIN_HOLD_S})"
-                    }
-                    _emit_order(con, sym, "HOLD", from_side, from_side, from_w, from_w, None, None, explain)
-                    orders_n += 1
-                    continue
-
-                _write_state_row(con, model_id, sym, "FLAT", 0.0, now_ms, now_ms, None, "{}")
-                _emit_order(con, sym, "CLOSE", from_side, "FLAT", from_w, 0.0, None, None, {"model_id": model_id, "reason": "no longer selected"})
-                orders_n += 1
-                changed.append(sym)
-
-        # (size policy applied earlier, before order emission)
-        # ---            -- ------------------------------------------------------
-        # Update live drawdown meta (equity proxy from weights)
-        # ---            -- ------------------------------------------------------
-        try:
-            # Simple proxy: peak gross vs current gross
-            gross_now = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-            peak_raw = _get_meta(con, "peak_gross_weight")
-            peak = float(peak_raw) if peak_raw is not None else gross_now
-            if gross_now > peak:
-                peak = gross_now
-            drawdown = (peak - gross_now) if peak > 1e-9 else 0.0
-
-            _set_meta(con, "peak_gross_weight", str(float(peak)))
-            _set_meta(con, "last_drawdown", str(float(drawdown)))
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_DRAWDOWN_META_FAILED", e, once_key="drawdown_meta")
-
-        # update live drawdown meta (from broker if available)
-        try:
-            from engine.execution.broker_sim import broker_snapshot
-
-            snap = broker_snapshot(limit_fills=0)
-            if snap and snap.get("ok"):
-                dd = snap.get("account", {}).get("drawdown")
-                if dd is not None:
-                    _set_meta(con, "live_drawdown", str(float(dd)))
-        except Exception as e:
-            _warn_nonfatal("PORTFOLIO_LIVE_DRAWDOWN_SYNC_FAILED", e, once_key="live_drawdown_sync")
-
-        _set_meta(con, "last_strategy_name", "multi_strategy")
-        _set_meta(con, "last_rebalance_ts_ms", str(now_ms))
-        _persist_portfolio_runtime_health(
-            con,
-            now_ms=int(now_ms),
-            degraded_reasons=list(degraded_reasons),
-            orders_n=int(orders_n),
-            changed_symbols=list(changed),
+        early_return = _prepare_rebalance_execution(ctx)
+        if early_return is not None:
+            return early_return
+
+        pipeline_return = _run_rebalance_pipeline(ctx)
+        con.commit()
+        if pipeline_return is not None:
+            return pipeline_return
+
+        return _build_rebalance_result(
+            ctx,
             execution_blocked=False,
             execution_blocked_codes=[],
         )
-        con.commit()
-
-        return {
-            "ok": True,
-            "strategy": "multi_strategy",
-            "changed": changed,
-            "orders_n": int(orders_n),
-            "selected": [str((v or {}).get("symbol") or k) for k, v in desired.items()],
-            "execution_blocked": False,
-            "execution_blocked_codes": [],
-            "portfolio_diagnostics": {
-                "degraded": bool(degraded_reasons),
-                "degraded_reasons": list(degraded_reasons),
-                "execution_blocked": False,
-                "execution_blocked_codes": [],
-                "position_summary": dict((portfolio_diag or {}).get("position_summary") or {}),
-                "model_summary": dict((portfolio_diag or {}).get("model_summary") or {}),
-                "flip_flop_penalty": dict(_flip_penalty or {}),
-            },
-        }
 
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_REBALANCE_FAILED", e, once_key="portfolio_rebalance_failed")

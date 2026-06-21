@@ -443,7 +443,7 @@ def apply_alpha_decay_runtime_state(details: Dict[str, Dict[str, Any]], ts_ms: i
     try:
         set_risk_state("alpha_decay_summary", json.dumps(summary, separators=(",", ":"), sort_keys=True))
         set_risk_state("alpha_decay_status", str(summary.get("status") or "ok"))
-        set_risk_state("alpha_decay_min_throttle_mult", str(float(summary.get("min_throttle_mult", 1.0) or 1.0)))
+        set_risk_state("alpha_decay_min_throttle_mult", str(_safe_float(summary.get("min_throttle_mult"), 1.0)))
         set_risk_state("alpha_decay_portfolio_health", json.dumps(portfolio, separators=(",", ":"), sort_keys=True))
         set_risk_state("alpha_decay_portfolio_status", str(summary.get("status") or "ok"))
     except Exception as e:

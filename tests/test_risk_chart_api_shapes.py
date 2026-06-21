@@ -100,6 +100,52 @@ def test_monte_carlo_shape_documents_missing_fan_input(monkeypatch) -> None:
     assert payload["cvar_95"] == -0.03
 
 
+def test_monte_carlo_shape_reports_populated_fan_and_distribution(monkeypatch) -> None:
+    from engine.runtime import risk_state
+
+    raw = json.dumps(
+        {
+            "ready": True,
+            "status": "ok",
+            "ts_ms": 3000,
+            "simulations": 1500,
+            "horizon": 2,
+            "var_95": -0.01,
+            "cvar_95": -0.03,
+            "fan": [
+                {"step": 1, "p05": -0.02, "p50": 0.0, "p95": 0.02},
+                {"step": 2, "p05": -0.04, "p50": 0.01, "p95": 0.05},
+            ],
+            "distribution": [
+                {"bucket": "-4% to 0%", "value": -0.02, "count": 12, "probability": 0.24},
+                {"bucket": "0% to 4%", "value": 0.02, "count": 38, "probability": 0.76},
+            ],
+        }
+    )
+    monkeypatch.setattr(risk_state, "get_state_row", lambda key, default: (raw, 3000))
+    monkeypatch.setattr(
+        risk_state,
+        "get_state",
+        lambda key, default="": {
+            "monte_carlo_risk_status": "idle",
+            "monte_carlo_risk_pending": "0",
+            "monte_carlo_risk_ts_ms": "3000",
+        }.get(key, default),
+    )
+
+    payload = api_system.api_get_monte_carlo_risk(None)
+
+    assert payload["ok"] is True
+    assert payload["chart_detail"] == {
+        "mode": "fan_distribution",
+        "has_distribution": True,
+        "has_fan": True,
+        "unavailable": [],
+    }
+    assert payload["fan"][1]["p95"] == 0.05
+    assert payload["distribution"][0]["count"] == 12
+
+
 def test_alpha_decay_shape_returns_latest_and_history(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "alpha.db"
     with _connect(db_path) as con:
@@ -159,6 +205,149 @@ def test_alpha_decay_shape_returns_latest_and_history(tmp_path, monkeypatch) -> 
     assert len(payload["strategy_history"]) == 2
     assert payload["strategy_history"][0]["strategy"] == "mean_reversion"
     assert payload["strategy_history"][1]["rolling_sharpe"] == 0.18
+
+
+def test_alpha_decay_shape_preserves_null_zero_and_nonzero_throttles(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "alpha-null-zero.db"
+    with _connect(db_path) as con:
+        con.executescript(
+            """
+            CREATE TABLE alpha_decay_runtime_history (
+              ts_ms INTEGER PRIMARY KEY,
+              status TEXT,
+              min_throttle_mult REAL,
+              severe_count INTEGER,
+              warn_count INTEGER,
+              detail_json TEXT
+            );
+            CREATE TABLE alpha_decay_strategy_metrics (
+              strategy_name TEXT,
+              ts_ms INTEGER,
+              window_days INTEGER,
+              bucket_s INTEGER,
+              rolling_sharpe REAL,
+              half_life_buckets REAL,
+              half_life_seconds REAL,
+              structural_break_z REAL,
+              severity TEXT,
+              severity_score REAL,
+              throttle_mult REAL,
+              n_obs INTEGER,
+              detail_json TEXT,
+              PRIMARY KEY(strategy_name, ts_ms, window_days)
+            );
+            """
+        )
+        con.executemany(
+            "INSERT INTO alpha_decay_runtime_history VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1000, "ok", None, 0, 0, "{}"),
+                (2000, "severe", 0.0, 1, 0, "{}"),
+                (3000, "warn", 0.7, 0, 1, "{}"),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO alpha_decay_strategy_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("mean_reversion", 1000, 7, 3600, None, None, None, None, "ok", None, None, 0, "{}"),
+                ("mean_reversion", 2000, 7, 3600, 0.0, 0.0, 0.0, 0.0, "severe", 0.0, 0.0, 8, "{}"),
+                ("mean_reversion", 3000, 7, 3600, 0.18, 2.0, 7200.0, -1.4, "warn", 0.4, 0.7, 20, "{}"),
+                ("blocked_alpha", 3000, 7, 3600, 0.0, 1.0, 3600.0, 0.0, "severe", 1.0, 0.0, 12, "{}"),
+            ],
+        )
+
+    from engine.runtime import storage
+
+    monkeypatch.setattr(storage, "connect", lambda readonly=True: _connect(db_path))
+
+    payload = api_system.api_get_alpha_decay(None)
+
+    assert payload["ok"] is True
+    assert [row["min_throttle_mult"] for row in payload["runtime_history"]] == [None, 0.0, 0.7]
+    mean_reversion_history = [
+        row for row in payload["strategy_history"] if row["strategy"] == "mean_reversion"
+    ]
+    assert [row["rolling_sharpe"] for row in mean_reversion_history] == [None, 0.0, 0.18]
+    assert [row["throttle_mult"] for row in mean_reversion_history] == [None, 0.0, 0.7]
+    blocked_latest = next(row for row in payload["strategies"] if row["strategy"] == "blocked_alpha")
+    assert blocked_latest["rolling_sharpe"] == 0.0
+    assert blocked_latest["throttle_mult"] == 0.0
+
+
+def test_alpha_decay_strategy_history_limit_is_per_strategy(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "alpha-per-strategy.db"
+    with _connect(db_path) as con:
+        con.executescript(
+            """
+            CREATE TABLE alpha_decay_strategy_metrics (
+              strategy_name TEXT,
+              ts_ms INTEGER,
+              window_days INTEGER,
+              bucket_s INTEGER,
+              rolling_sharpe REAL,
+              half_life_buckets REAL,
+              half_life_seconds REAL,
+              structural_break_z REAL,
+              severity TEXT,
+              severity_score REAL,
+              throttle_mult REAL,
+              n_obs INTEGER,
+              detail_json TEXT,
+              PRIMARY KEY(strategy_name, ts_ms, window_days)
+            );
+            """
+        )
+        rows = []
+        for ts_ms in (1000, 2000, 3000, 4000, 5000):
+            rows.append(("noisy_alpha", ts_ms, 7, 3600, 0.40 - (ts_ms / 10000.0), 5.0, 18000.0, 0.0, "ok", 0.1, 1.0, 20, "{}"))
+        rows.extend(
+            [
+                ("quiet_alpha", 1500, 7, 3600, -0.20, 2.0, 7200.0, -1.5, "warn", 0.5, 0.6, 20, "{}"),
+                ("quiet_alpha", 2500, 7, 3600, -0.30, 1.5, 5400.0, -2.0, "severe", 0.9, 0.2, 20, "{}"),
+            ]
+        )
+        con.executemany(
+            "INSERT INTO alpha_decay_strategy_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+    from engine.runtime import storage
+
+    monkeypatch.setattr(storage, "connect", lambda readonly=True: _connect(db_path))
+
+    payload = api_system.api_get_alpha_decay({"limit": "2"})
+    grouped = {}
+    for row in payload["strategy_history"]:
+        grouped.setdefault(row["strategy"], []).append(row["ts_ms"])
+
+    assert payload["ok"] is True
+    assert payload["strategy_history_limit_per_strategy"] == 2
+    assert grouped["noisy_alpha"] == [4000, 5000]
+    assert grouped["quiet_alpha"] == [1500, 2500]
+
+
+def test_alpha_decay_runtime_state_preserves_zero_min_throttle(monkeypatch) -> None:
+    from engine.runtime import alpha_decay_monitor
+
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(alpha_decay_monitor, "set_risk_state", lambda key, value: captured.setdefault(key, value))
+    monkeypatch.setattr(alpha_decay_monitor, "get_lifecycle_state", lambda: {"state": "LIVE", "detail": ""})
+    monkeypatch.setattr(alpha_decay_monitor, "set_lifecycle_state", lambda *_args, **_kwargs: None)
+
+    summary = alpha_decay_monitor.apply_alpha_decay_runtime_state(
+        {
+            "blocked_alpha": {
+                "alpha_decay_severity": "severe",
+                "alpha_decay_throttle_mult": 0.0,
+                "alpha_decay_rolling_sharpe": 0.0,
+                "alpha_decay_severity_score": 1.0,
+            }
+        },
+        ts_ms=1234,
+    )
+
+    assert summary["min_throttle_mult"] == 0.0
+    assert captured["alpha_decay_min_throttle_mult"] == "0.0"
 
 
 def test_regime_history_shape_uses_decision_snapshots(tmp_path, monkeypatch) -> None:

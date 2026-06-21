@@ -34,14 +34,14 @@ class _EmptyRowsConnection:
         return None
 
 
-def _patch_self_repair_lightweight(api_system, monkeypatch):
+def _patch_self_repair_lightweight(api_self_repair, monkeypatch):
     first_run = importlib.import_module("engine.runtime.first_run")
     repair_schema_module = importlib.import_module("engine.runtime.jobs.repair_schema")
-    monkeypatch.setattr(api_system, "run_preflight", lambda: {"ok": True})
-    monkeypatch.setattr(api_system, "api_get_runtime_health", lambda *_args, **_kwargs: {"ok": True})
-    monkeypatch.setattr(api_system, "api_get_trading_readiness", lambda *_args, **_kwargs: {"ready": True})
-    monkeypatch.setattr(api_system, "_db_connect", lambda readonly=True: _EmptyRowsConnection())
-    monkeypatch.setattr(api_system, "run_write_txn", lambda fn, **_kwargs: fn(_EmptyRowsConnection()))
+    monkeypatch.setattr(api_self_repair, "run_preflight", lambda: {"ok": True})
+    monkeypatch.setattr(api_self_repair, "api_get_runtime_health", lambda *_args, **_kwargs: {"ok": True})
+    monkeypatch.setattr(api_self_repair, "api_get_trading_readiness", lambda *_args, **_kwargs: {"ready": True})
+    monkeypatch.setattr(api_self_repair, "_db_connect", lambda readonly=True: _EmptyRowsConnection())
+    monkeypatch.setattr(api_self_repair, "run_write_txn", lambda fn, **_kwargs: fn(_EmptyRowsConnection()))
     monkeypatch.setattr(repair_schema_module, "run", lambda: {"ok": True})
     monkeypatch.setattr(first_run, "bootstrap_first_run", lambda mode="paper": {"ok": True, "mode": mode})
 
@@ -54,15 +54,18 @@ def test_api_post_self_repair_uses_runtime_mode_without_snapshot(tmp_path, monke
     monkeypatch.setenv("TIMESCALE_ENABLED", "0")
     monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
 
-    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
-    _patch_self_repair_lightweight(api_system, monkeypatch)
+    api_self_repair = importlib.reload(importlib.import_module("engine.api.api_self_repair"))
+    _patch_self_repair_lightweight(api_self_repair, monkeypatch)
 
     def _unexpected_snapshot(*_args, **_kwargs):
         raise AssertionError("_build_system_snapshot should not be used by api_post_self_repair")
 
+    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
     monkeypatch.setattr(api_system, "_build_system_snapshot", _unexpected_snapshot)
 
-    result = api_system.api_post_self_repair(None, None, {"SUPERVISOR": _FakeSupervisor()})
+    assert api_system.api_post_self_repair is api_self_repair.api_post_self_repair
+
+    result = api_self_repair.api_post_self_repair(None, None, {"SUPERVISOR": _FakeSupervisor()})
 
     assert result["ok"] is True
     assert result["mode"] == "safe"
@@ -78,11 +81,11 @@ def test_self_repair_skips_provider_daemons_under_isolated_ingestion(monkeypatch
     monkeypatch.setenv("POLYGON_WS_ENABLED", "0")
     monkeypatch.setenv("IBKR_ENABLED", "0")
 
-    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
-    _patch_self_repair_lightweight(api_system, monkeypatch)
+    api_self_repair = importlib.reload(importlib.import_module("engine.api.api_self_repair"))
+    _patch_self_repair_lightweight(api_self_repair, monkeypatch)
 
     supervisor = _RecordingSupervisor()
-    result = api_system.api_post_self_repair(None, None, {"SUPERVISOR": supervisor})
+    result = api_self_repair.api_post_self_repair(None, None, {"SUPERVISOR": supervisor})
 
     assert result["ok"] is True
     assert "ingestion_runtime" not in supervisor.started
@@ -105,11 +108,11 @@ def test_self_repair_does_not_start_disabled_paid_provider_daemons(monkeypatch):
     monkeypatch.setenv("IBKR_ENABLED", "0")
     monkeypatch.setenv("POLYGON_API_KEY", "unit-test-placeholder")
 
-    api_system = importlib.reload(importlib.import_module("engine.api.api_system"))
-    _patch_self_repair_lightweight(api_system, monkeypatch)
+    api_self_repair = importlib.reload(importlib.import_module("engine.api.api_self_repair"))
+    _patch_self_repair_lightweight(api_self_repair, monkeypatch)
 
     supervisor = _RecordingSupervisor()
-    result = api_system.api_post_self_repair(None, None, {"SUPERVISOR": supervisor})
+    result = api_self_repair.api_post_self_repair(None, None, {"SUPERVISOR": supervisor})
 
     assert result["ok"] is True
     assert "stream_prices_polygon_ws" not in supervisor.started

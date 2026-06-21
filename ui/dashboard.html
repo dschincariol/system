@@ -83,6 +83,21 @@
   margin-bottom:12px;
   box-shadow: var(--shadow);
 }
+.healthScoreBar.is-health-coverage-low{
+  border-color: var(--status-high);
+  background:
+    repeating-linear-gradient(135deg, rgba(204,121,167,.12) 0 2px, transparent 2px 10px),
+    var(--panel2);
+}
+.healthScoreBar.is-health-coverage-partial{
+  border-color: var(--status-warn);
+  background:
+    linear-gradient(90deg, rgba(230,159,0,.12), transparent 42%),
+    var(--panel2);
+}
+.healthScoreBar.is-health-coverage-none{
+  border-color: var(--status-unavailable);
+}
 .healthScoreLead{
   display:flex;
   flex-direction:column;
@@ -111,6 +126,11 @@
 .healthScoreCoverage{
   color: var(--muted);
   font-size:12px;
+}
+.healthScoreCoverage.pill{
+  padding:3px 8px;
+  border:1px solid var(--border);
+  align-self:center;
 }
 .healthScoreSummary{
   font-size:12px;
@@ -2878,9 +2898,9 @@ Trade Execution Integrity —
   </div>
   <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:0 0 10px;">
     <span id="proChartsHealth" class="pill dim">boot</span>
-    <label class="pill dim" style="gap:8px;">
-      <input id="proChartsOvVWAP" type="checkbox" checked />
-      VWAP
+    <label class="pill dim" style="gap:8px;" title="Loaded-window VWAP accumulates close * volume over the candles currently loaded in the chart and does not reset at trading-session boundaries.">
+      <input id="proChartsOvVWAP" type="checkbox" checked aria-label="Toggle Loaded-window VWAP overlay" />
+      Loaded-window VWAP
     </label>
     <label class="pill dim" style="gap:8px;">
       <input id="proChartsOvEMA" type="checkbox" checked />
@@ -3923,6 +3943,12 @@ loading
         <span class="pill dim" id="performanceDivergenceSelected">selected -</span>
         <span class="pill dim mono" id="performanceDivergenceUpdated">updated -</span>
       </div>
+      <div class="btnRow performanceDivergenceControls">
+        <select id="performanceDivergenceMetric" title="Chart metric" aria-label="Chart metric">
+          <option value="">Loading metrics</option>
+        </select>
+        <span class="pill dim" id="performanceDivergenceCharted">chart -</span>
+      </div>
       <canvas id="performanceDivergenceChart" width="900" height="120" style="width:100%; height:120px; margin-top:8px; border:1px solid #30363d; border-radius:10px; background:#0a0d12;"></canvas>
       <div id="performanceDivergenceChartA11y" class="chartA11y"></div>
       <div class="table-wrap table-wrap-spaced-sm">
@@ -4185,11 +4211,16 @@ loading
           <div id="monteCarloRiskBars"></div>
           <canvas id="monteCarloFanChart" width="900" height="160"></canvas>
           <div id="monteCarloFanChartA11y" class="chartA11y"></div>
+          <canvas id="monteCarloDistributionChart" width="900" height="160"></canvas>
+          <div id="monteCarloDistributionChartA11y" class="chartA11y"></div>
         </div>
         <div class="riskChartBlock">
           <div class="riskChartHeader">
             <h3>Alpha Decay</h3>
-            <span id="alphaDecayMeta" class="pill dim meta-pill-offset">loading</span>
+            <div class="riskChartControls">
+              <span id="alphaDecayMeta" class="pill dim meta-pill-offset">loading</span>
+              <select id="alphaDecayStrategySelect" class="riskChartSelect" aria-label="Alpha decay strategy"></select>
+            </div>
           </div>
           <canvas id="alphaDecayChart" width="900" height="220"></canvas>
           <div id="alphaDecayChartA11y" class="chartA11y"></div>

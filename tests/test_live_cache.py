@@ -95,6 +95,19 @@ class LiveCacheTests(unittest.TestCase):
 
         self.assertEqual(config.redis_url, "redis://:secret@localhost:6379/0")
 
+    def test_redis_backend_resolves_password_file(self) -> None:
+        secret_file = Path(self.tmp.name) / "redis_password"
+        secret_file.write_text("file-secret", encoding="utf-8")
+        secret_file.chmod(0o600)
+        self._set_env("LIVE_CACHE_BACKEND", "redis")
+        self._set_env("LIVE_CACHE_REDIS_URL", "redis://localhost:6379/0")
+        self._set_env("LIVE_CACHE_REDIS_PASSWORD_FILE", str(secret_file))
+        (live_cache,) = _reload_modules("engine.runtime.live_cache")
+
+        config = live_cache.LiveCacheConfig.from_env()
+
+        self.assertEqual(config.redis_url, "redis://:file-secret@localhost:6379/0")
+
     @pytest.mark.requires_redis
     def test_explicit_redis_live_cache_round_trip(self) -> None:
         redis_url = os.environ.get("TS_REDIS_URL") or os.environ.get("REDIS_URL") or "redis://127.0.0.1:6379/0"

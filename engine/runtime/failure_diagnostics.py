@@ -109,6 +109,16 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
     return _safe_text(value, limit=_JSON_SAFE_MAX_FALLBACK)
 
 
+def _redact_diagnostic_payload(value: Any) -> Any:
+    try:
+        from engine.api.redaction import redact_api_payload
+
+        return redact_api_payload(value)
+    except Exception as e:
+        _log_internal_nonfatal("failure_diagnostics_redaction_failed", e)
+        return value
+
+
 def _ctx_summary(ctx: Any) -> Dict[str, Any]:
     if not isinstance(ctx, dict):
         return {}
@@ -309,7 +319,7 @@ def build_failure_payload(
             "".join(traceback.format_exception(type(error), error, error.__traceback__)),
             limit=16000,
         )
-    return payload
+    return _redact_diagnostic_payload(payload)
 
 
 def log_failure(
@@ -363,8 +373,9 @@ def log_failure(
                 "diagnostics_error": f"{type(build_error).__name__}: {_safe_text(build_error, limit=1024)}",
             },
         }
+        payload = _redact_diagnostic_payload(payload)
     exc_info = None
-    if error is not None:
+    if error is not None and _env_truthy(os.environ.get("TRADING_FAILURE_DIAGNOSTICS_RAW_EXC_INFO")):
         exc_info = (type(error), error, error.__traceback__)
     try:
         logger.log(

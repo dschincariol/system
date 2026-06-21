@@ -132,6 +132,9 @@ class El {
     this.innerHTML = "";
     this.className = "";
     this.title = "";
+    this.value = "";
+    this.disabled = false;
+    this.onchange = null;
   }
 }
 
@@ -174,6 +177,174 @@ await loadPerformanceDivergence(async () => {
 }, doc);
 assert.match(elements.get("performanceDivergenceStatus").textContent, /endpoint unavailable/i);
 assert.match(elements.get("performanceDivergenceRows").innerHTML, /No comparable performance data/);
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_performance_divergence_frontend_ranks_and_switches_chart_metric() -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for dashboard frontend helper test")
+
+    script = r"""
+import assert from "node:assert/strict";
+import {
+  buildPerformanceDivergenceViewModel,
+  renderPerformanceDivergencePanel,
+} from "./ui/model_performance_divergence.mjs";
+
+class El {
+  constructor() {
+    this.textContent = "";
+    this.innerHTML = "";
+    this.className = "";
+    this.title = "";
+    this.value = "";
+    this.disabled = false;
+    this.onchange = null;
+  }
+}
+
+const elements = new Map();
+const doc = {
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, new El());
+    return elements.get(id);
+  },
+};
+
+const payload = {
+  ok: true,
+  selection: { model_id: "alpha", strategy: "mean_reversion" },
+  status: { state: "diverged", reason: "at least one metric diverged", ts_ms: 1700000020000 },
+  comparisons: [
+    {
+      key: "hit_rate",
+      label: "Hit Rate",
+      unit: "pct",
+      expected: { value: 0.60, unit: "pct", source: "backtest", ts_ms: 1700000010000 },
+      realized: { value: 0.61, unit: "pct", source: "live", ts_ms: 1700000015000 },
+      delta: 0.01,
+      status: "ok",
+      explanation: "aligned",
+    },
+    {
+      key: "return",
+      label: "Return",
+      unit: "pct",
+      expected: { value: 0.10, unit: "pct", source: "backtest", ts_ms: 1700000010000 },
+      realized: { value: 0.04, unit: "pct", source: "live", ts_ms: 1700000014000 },
+      delta: -0.06,
+      status: "diverged",
+      explanation: "return diverged",
+    },
+    {
+      key: "fill_rate",
+      label: "Fill Rate",
+      unit: "pct",
+      expected: { value: 0.95, unit: "pct", source: "registry", ts_ms: 1700000009000 },
+      realized: { value: 0.75, unit: "pct", source: "execution", ts_ms: 1700000013000 },
+      delta: -0.20,
+      status: "diverged",
+      explanation: "fill rate diverged",
+    },
+  ],
+};
+
+const vm = buildPerformanceDivergenceViewModel(payload);
+assert.equal(vm.selectedMetricKey, "fill_rate");
+assert.equal(vm.chart.label, "Fill Rate");
+assert.deepEqual(vm.chartOptions.map((option) => option.key), ["fill_rate", "return", "hit_rate"]);
+
+const selectedVm = buildPerformanceDivergenceViewModel(payload, { selectedMetricKey: "return" });
+assert.equal(selectedVm.chart.label, "Return");
+assert.equal(selectedVm.state, "diverged");
+assert.equal(selectedVm.rows.length, 3);
+
+const importanceVm = buildPerformanceDivergenceViewModel({
+  ok: true,
+  status: { state: "ok", reason: "aligned", ts_ms: 1700000020000 },
+  comparisons: [
+    {
+      key: "fill_rate",
+      label: "Fill Rate",
+      unit: "pct",
+      expected: { value: 0.95, unit: "pct", source: "registry", ts_ms: 1700000010000 },
+      realized: { value: 0.94, unit: "pct", source: "execution", ts_ms: 1700000015000 },
+      delta: -0.01,
+      status: "ok",
+      explanation: "aligned",
+    },
+    {
+      key: "return",
+      label: "Return",
+      unit: "pct",
+      expected: { value: 0.10, unit: "pct", source: "backtest", ts_ms: 1700000010000 },
+      realized: { value: 0.09, unit: "pct", source: "live", ts_ms: 1700000015000 },
+      delta: -0.01,
+      status: "ok",
+      explanation: "aligned",
+    },
+  ],
+});
+assert.equal(importanceVm.selectedMetricKey, "return");
+
+const freshnessVm = buildPerformanceDivergenceViewModel({
+  ok: true,
+  status: { state: "ok", reason: "aligned", ts_ms: 1700000030000 },
+  comparisons: [
+    {
+      key: "return",
+      label: "Return",
+      unit: "pct",
+      expected: { value: 0.10, unit: "pct", source: "backtest", ts_ms: 1700000010000 },
+      realized: { value: 0.09, unit: "pct", source: "live", ts_ms: 1700000015000 },
+      delta: -0.01,
+      status: "ok",
+      explanation: "aligned",
+    },
+    {
+      key: "fill_rate",
+      label: "Fill Rate",
+      unit: "pct",
+      expected: { value: 0.95, unit: "pct", source: "registry", ts_ms: 1700000020000 },
+      realized: { value: 0.94, unit: "pct", source: "execution", ts_ms: 1700000025000 },
+      delta: -0.01,
+      status: "ok",
+      explanation: "aligned",
+    },
+  ],
+});
+assert.equal(freshnessVm.selectedMetricKey, "fill_rate");
+
+const chartCalls = [];
+const rendered = renderPerformanceDivergencePanel(payload, doc, (_canvas, values, opts) => {
+  chartCalls.push({ values, opts });
+});
+
+assert.equal(rendered.selectedMetricKey, "fill_rate");
+assert.equal(elements.get("performanceDivergenceMetric").value, "fill_rate");
+assert.equal(elements.get("performanceDivergenceMetric").disabled, false);
+assert.match(elements.get("performanceDivergenceMetric").innerHTML, /Fill Rate \| diverged/);
+assert.equal(chartCalls[chartCalls.length - 1].opts.valueLabel, "Fill Rate");
+assert.equal(elements.get("performanceDivergenceMeta").textContent, "diverged");
+assert.equal(elements.get("performanceDivergenceStatus").textContent, "at least one metric diverged");
+
+elements.get("performanceDivergenceMetric").value = "return";
+elements.get("performanceDivergenceMetric").onchange();
+assert.equal(chartCalls[chartCalls.length - 1].opts.valueLabel, "Return");
+assert.equal(elements.get("performanceDivergenceMetric").value, "return");
+assert.equal(elements.get("performanceDivergenceMeta").textContent, "diverged");
+assert.equal(elements.get("performanceDivergenceStatus").textContent, "at least one metric diverged");
+assert.match(elements.get("performanceDivergenceRows").innerHTML, /Fill Rate/);
 """
     result = subprocess.run(
         [node, "--input-type=module", "-e", script],

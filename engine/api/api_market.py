@@ -20,6 +20,7 @@ HTTP/API handlers for market endpoints.
 import json
 import logging
 import time
+from math import ceil
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine.api.http_parsing import qs as _qs
@@ -88,8 +89,30 @@ def _rows_since(
     since_ts_ms: int,
     limit: int,
 ) -> List[Tuple[int, Optional[float], Optional[float]]]:
-    """Returns [(ts_ms, last, volume), ...]"""
+    """Returns ascending [(ts_ms, last, volume), ...] from the newest bounded rows."""
     return fetch_quote_rows(symbol=str(symbol), since_ts_ms=int(since_ts_ms), limit=int(limit))
+
+
+def _quote_rows_ascending(
+    rows: List[Tuple[int, Optional[float], Optional[float]]],
+) -> List[Tuple[int, Optional[float], Optional[float]]]:
+    return sorted(list(rows or []), key=lambda row: int(row[0] or 0))
+
+
+def _downsample_keep_latest(candles: List[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
+    items = list(candles or [])
+    max_n = int(max_points or 0)
+    if max_n <= 0 or len(items) <= max_n:
+        return items
+
+    step = max(1, int(ceil(len(items) / float(max_n))))
+    sampled = items[::step]
+    if sampled and sampled[-1] is not items[-1]:
+        sampled[-1] = items[-1]
+    if len(sampled) > max_n:
+        sampled = sampled[:max_n]
+        sampled[-1] = items[-1]
+    return sampled
 
 
 def _build_candles_from_rows(
@@ -174,10 +197,12 @@ def api_get_market_candles(parsed: Any, _ctx=None) -> Dict[str, Any]:
     except Exception:
         limit = 500
 
-    try:
-        max_points = int(max_points_s) if max_points_s else limit
-        max_points = max(50, min(20000, max_points))
-    except Exception:
+    if max_points_s:
+        try:
+            max_points = max(50, min(20000, int(max_points_s)))
+        except Exception:
+            max_points = limit
+    else:
         max_points = limit
 
     tf_ms = _tf_to_ms(tf)
@@ -187,14 +212,13 @@ def api_get_market_candles(parsed: Any, _ctx=None) -> Dict[str, Any]:
     lookback_ms = max(tf_ms * fetch_limit, 6 * 60 * 60_000)
     since = max(0, now_ms - lookback_ms)
 
-    rows = _rows_since(symbol=symbol, since_ts_ms=since, limit=fetch_limit)
+    rows = _quote_rows_ascending(_rows_since(symbol=symbol, since_ts_ms=since, limit=fetch_limit))
     candles = _build_candles_from_rows(rows, tf_ms=tf_ms)
     if len(candles) > limit:
         candles = candles[-limit:]
 
     if max_points and len(candles) > max_points:
-        step = max(1, int(len(candles) / max_points))
-        candles = candles[::step][:max_points]
+        candles = _downsample_keep_latest(candles, max_points)
 
     return {
         "ok": True,
@@ -205,6 +229,10 @@ def api_get_market_candles(parsed: Any, _ctx=None) -> Dict[str, Any]:
             "ready": bool(candles),
             "count": int(len(candles)),
             "tf_ms": int(tf_ms),
+            "limit": int(limit),
+            "max_points": int(max_points),
+            "fetch_limit": int(fetch_limit),
+            "order": "ascending",
         },
     }
 

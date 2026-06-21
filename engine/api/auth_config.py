@@ -62,14 +62,9 @@ def dashboard_api_token_from_env(*, environ: Mapping[str, Any] | None = None) ->
     token = env_text("DASHBOARD_API_TOKEN", environ=env)
     if token:
         return token
-    secret_name = env_text("DASHBOARD_API_TOKEN_SECRET", environ=env)
-    if not secret_name:
-        return ""
-    if env is not os.environ:
-        return ""
-    from services.secrets.loader import load_secret
+    from engine.runtime.secret_sources import read_secret_text_from_env
 
-    return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+    return read_secret_text_from_env("DASHBOARD_API_TOKEN", environ=env)
 
 
 def _env_int(

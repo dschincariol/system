@@ -3,7 +3,8 @@
 README:
 - Source: normalized news events, their symbol mappings, FinBERT/lexical
   sentiment, and persisted story embeddings.
-- Cadence: periodic batch, default ``NEWS_FLOW_POLL_SECONDS=900``.
+- Cadence: periodic batch registered in ``engine.runtime.job_registry``
+  with ``cadence_seconds=900``.
 - Availability lag: novelty and features use ``availability_ts_ms`` from the
   ingested event timestamp and only compare to prior rows with availability
   <= the candidate story.

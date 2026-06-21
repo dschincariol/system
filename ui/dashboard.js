@@ -35,8 +35,7 @@ import { fetchJSON, fetchWithTimeout as _fetchWithTimeout } from "./api_client.j
 import {
   applyStalenessState,
   setPanelState,
-  setSurfaceState,
-  stalenessClassNames
+  setSurfaceState
 } from "./panel_state.js";
 
 import {
@@ -118,6 +117,7 @@ import {
 import { renderDecisionStepper } from "./decision_stepper.js";
 import { renderDecisionAttribution } from "./decision_attribution.js";
 import { renderFeatureVisibility } from "./feature_visibility.js";
+import { loadDataHealthScreen as loadDataHealthScreenModule } from "./data_health.js";
 import { requestConfirmation } from "./confirmation_modal.mjs";
 
 import {
@@ -174,6 +174,7 @@ import {
 } from "./ui_metrics.js";
 import {
   buildRiskHeadroomViewModel,
+  latestRiskRow,
   renderBulletBars
 } from "./bullet_bars.js";
 import { renderRegimeRibbon } from "./regime_ribbon.js";
@@ -4050,12 +4051,6 @@ function extractIngestionStatus(payload) {
   return Object.keys(nested).length ? nested : root;
 }
 
-function extractProviderTelemetry(payload) {
-  const root = asObject(payload);
-  const nested = asObject(root.provider_telemetry);
-  return Object.keys(nested).length ? nested : root;
-}
-
 function buildStatGridMarkup(items) {
   return asArray(items)
     .map((item) => {
@@ -5036,308 +5031,11 @@ function wireLogViewerControls() {
 }
 
 async function loadDataHealthScreen() {
-  const summaryGrid = document.getElementById("dataHealthSummaryGrid");
-  if (!summaryGrid) return;
-
-  const [ingestionRes, telemetryRes, barrierRes, providerRes, featureVisibilityRes] = await Promise.allSettled([
-    fetchJSON("/api/ingestion/status"),
-    fetchJSON("/api/telemetry"),
-    fetchJSON("/api/execution/barrier", { allowBusinessFalse: true }),
-    fetchJSON("/api/operator/provider_telemetry"),
-    fetchJSON("/api/data/feature_visibility?limit=12", { allowBusinessFalse: true }),
-  ]);
-
-  const ingestionPayload = ingestionRes.status === "fulfilled" ? ingestionRes.value : null;
-  const telemetry = telemetryRes.status === "fulfilled" ? telemetryRes.value : null;
-  const barrier = barrierRes.status === "fulfilled" ? barrierRes.value : null;
-  const providerPayload = providerRes.status === "fulfilled" ? providerRes.value : null;
-  const featureVisibility = featureVisibilityRes.status === "fulfilled"
-    ? featureVisibilityRes.value
-    : {
-        ok: false,
-        structured_documents: { status: "unavailable", warnings: ["feature visibility route unavailable"] },
-        graph_features: { status: "unavailable", warnings: ["feature visibility route unavailable"] },
-      };
-
-  renderFeatureVisibility(
-    {
-      structured: "structuredDocumentsVisibility",
-      graph: "graphFeaturesVisibility",
-    },
-    featureVisibility
-  );
-
-  const ingestion = extractIngestionStatus(ingestionPayload);
-  const providerTelemetry = extractProviderTelemetry(providerPayload);
-  const telemetryProviders = asObject(telemetry && telemetry.providers);
-  const providerMap = asObject(
-    Object.keys(asObject(providerTelemetry.providers)).length
-      ? providerTelemetry.providers
-      : ingestion.providers
-  );
-  const providerEntries = Object.entries(providerMap)
-    .map(([name, raw]) => {
-      const row = asObject(raw);
-      const updatedTs = pickTimestamp(row.updated_ts_ms, row.last_price_ts_ms, row.ts_ms);
-      const ageMs = numOrNull(row.price_age_ms) ?? ageMsFromTimestamp(updatedTs);
-      let statusText = String(row.status || "").trim().toUpperCase();
-      if (!statusText) {
-        if (row.ok === false) statusText = "DEGRADED";
-        else if (row.running === false) statusText = "STOPPED";
-        else if (row.running === true || row.ok === true) statusText = "LIVE";
-        else statusText = "UNKNOWN";
-      }
-      const tone = row.ok === false || statusText === "STOPPED"
-        ? "crit"
-        : freshnessTone(ageMs, 60_000, 300_000);
-      const notes = safeJoin([
-        row.error ? `error ${row.error}` : "",
-        row.owner ? `owner ${row.owner}` : "",
-        numOrNull(row.last_seq) != null && Number(row.last_seq) > 0 ? `seq ${intOr(row.last_seq, 0)}` : "",
-      ]);
-      return {
-        name,
-        statusText,
-        tone,
-        ageMs,
-        updatedTs,
-        notes: notes || "—",
-      };
-    })
-    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
-
-  const healthyProviders = numOrNull(providerTelemetry.healthy_providers)
-    ?? numOrNull(ingestion.healthy_providers)
-    ?? numOrNull(telemetryProviders.healthy);
-  const totalProviders = Math.max(
-    providerEntries.length,
-    numOrNull(telemetryProviders.total) ?? 0,
-    numOrNull(healthyProviders) ?? 0
-  );
-  const priceAgeMs = numOrNull(providerTelemetry.price_age_ms) ?? numOrNull(ingestion.price_age_ms);
-  const latestPriceTs = pickTimestamp(providerTelemetry.last_price_ts_ms, ingestion.last_price_ts_ms);
-  const updatedTs = pickTimestamp(
-    providerTelemetry.updated_ts_ms,
-    ingestion.updated_ts_ms,
-    telemetry && telemetry.ts_ms,
-    barrier && barrier.ts_ms,
-    latestPriceTs
-  );
-  const updatedAgeMs = ageMsFromTimestamp(updatedTs);
-  const pipelineStatus = ingestionRes.status === "fulfilled"
-    ? String(ingestion.status || (ingestion.running ? "RUNNING" : "STOPPED") || "UNKNOWN")
-    : "UNAVAILABLE";
-  const pipelineTone = ingestionRes.status !== "fulfilled"
-    ? "dim"
-    : (ingestion.ok ? "ok" : ingestion.running ? "warn" : "bad");
-  const providersTone = healthyProviders == null
-    ? "dim"
-    : (healthyProviders <= 0
-      ? "bad"
-      : (totalProviders > 0 && healthyProviders < totalProviders ? "warn" : "ok"));
-  const barrierAllowed = barrier ? !!barrier.allowed : null;
-  const barrierReason = String(
-    (barrier && barrier.reason)
-    || (asObject(barrier && barrier.execution_barrier).reason)
-    || ""
-  ).trim();
-  const telemetryTone = telemetry
-    ? ((telemetry.health && telemetry.health.ok) ? "ok" : "warn")
-    : "dim";
-
-  summaryGrid.innerHTML = buildStatGridMarkup([
-    {
-      label: "Pipeline",
-      value: pipelineStatus,
-      meta: ingestionRes.status === "fulfilled"
-        ? (safeJoin([
-            ingestion.running ? "running" : "not running",
-            ingestion.active_child ? `child ${ingestion.active_child}` : "",
-          ]) || "—")
-        : "snapshot unavailable",
-    },
-    {
-      label: "Visible Jobs",
-      value: formatDecimal(ingestion.visible_jobs_running, 0),
-      meta: ingestionRes.status === "fulfilled"
-        ? (asArray(ingestion.stale_jobs).length
-          ? `stale ${asArray(ingestion.stale_jobs).join(", ")}`
-          : "no stale ingestion jobs")
-        : "snapshot unavailable",
-    },
-    {
-      label: "Fresh Rows",
-      value: formatDecimal(ingestion.fresh_rows, 0),
-      meta: ingestionRes.status === "fulfilled"
-        ? `symbols ${formatDecimal(ingestion.fresh_symbols, 0)}`
-        : "snapshot unavailable",
-    },
-    {
-      label: "Price Age",
-      value: formatAgeMs(priceAgeMs),
-      meta: latestPriceTs ? `last price ${fmtTime(latestPriceTs)}` : "last price —",
-    },
-    {
-      label: "Providers",
-      value: totalProviders > 0
-        ? `${intOr(healthyProviders, 0)}/${intOr(totalProviders, 0)}`
-        : (healthyProviders == null ? "—" : `${intOr(healthyProviders, 0)}`),
-      meta: telemetryProviders.total != null
-        ? `runtime total ${intOr(telemetryProviders.total, 0)}`
-        : "provider count from snapshot",
-    },
-    {
-      label: "Execution Gate",
-      value: barrierAllowed == null ? "—" : (barrierAllowed ? "ALLOWED" : "BLOCKED"),
-      meta: barrierReason || "no active execution block",
-    },
-  ]);
-
-  setPillTone("dataPipelinePill", pipelineTone, `pipeline ${pipelineStatus}`);
-  setPillTone(
-    "dataProvidersPill",
-    providersTone,
-    totalProviders > 0
-      ? `providers ${intOr(healthyProviders, 0)}/${intOr(totalProviders, 0)}`
-      : (healthyProviders == null ? "providers —" : `providers ${intOr(healthyProviders, 0)}`)
-  );
-  setPillTone(
-    "dataFreshnessPill",
-    freshnessTone(priceAgeMs, 30_000, 120_000),
-    `price age ${formatAgeMs(priceAgeMs)}`,
-    priceAgeMs,
-    30_000,
-    120_000
-  );
-  setPillTone(
-    "dataBarrierPill",
-    barrierAllowed == null ? "dim" : (barrierAllowed ? "ok" : "bad"),
-    barrierAllowed == null ? "barrier —" : `barrier ${barrierAllowed ? "ALLOWED" : "BLOCKED"}`
-  );
-  setPillTone(
-    "dataTelemetryPill",
-    telemetryTone,
-    telemetry ? `telemetry ${String(telemetry.system_state || "UNKNOWN")}` : "telemetry —"
-  );
-  setPillTone(
-    "dataUpdatedPill",
-    freshnessTone(updatedAgeMs, 60_000, 300_000),
-    `updated ${formatAgeMs(updatedAgeMs)}`,
-    updatedAgeMs,
-    60_000,
-    300_000
-  );
-
-  const healthNotes = [];
-  if (barrierAllowed === false && barrierReason) {
-    healthNotes.push(`execution blocked: ${barrierReason}`);
-  }
-  asArray(ingestion.reasons).slice(0, 5).forEach((reason) => {
-    healthNotes.push(`ingestion: ${String(reason)}`);
+  return loadDataHealthScreenModule({
+    fetchJSON,
+    document,
+    renderFeatureVisibility,
   });
-  if (!healthNotes.length && telemetry && telemetry.health && telemetry.health.ok === false) {
-    asArray(telemetry.health.reasons).slice(0, 3).forEach((reason) => {
-      healthNotes.push(`runtime: ${String(reason)}`);
-    });
-  }
-  if (providerRes.status !== "fulfilled") {
-    healthNotes.push("provider telemetry unavailable from the Python dashboard server snapshot");
-  }
-  if (featureVisibilityRes.status !== "fulfilled") {
-    healthNotes.push("structured document and graph feature visibility unavailable");
-  }
-  renderNotes("dataHealthNotes", healthNotes, "No active ingestion blockers reported by the current snapshots.");
-
-  const providersMetaText = totalProviders > 0
-    ? `${intOr(healthyProviders, 0)}/${intOr(totalProviders, 0)} healthy`
-    : (healthyProviders == null ? "provider telemetry unavailable" : "no providers reported");
-  setPillTone("dataProvidersMeta", providersTone, providersMetaText);
-
-  const providersBody = document.getElementById("dataProvidersBody");
-  if (providersBody) {
-    if (!providerEntries.length) {
-      providersBody.innerHTML = `<tr class="table-row"><td colspan="5" class="metric-meta">(no provider rows reported)</td></tr>`;
-    } else {
-      providersBody.innerHTML = providerEntries.map((row) => `
-        <tr class="table-row">
-          <td class="mono">${escapeHTML(String(row.name || ""))}</td>
-          <td><span class="${escapeHTML(pillClassNames(row.tone))}">${escapeHTML(row.statusText)}</span></td>
-          <td><span class="${escapeHTML(`${pillClassNames(freshnessTone(row.ageMs, 30_000, 120_000))} ${stalenessClassNames(row.ageMs, 30_000, 120_000)}`.trim())}">${escapeHTML(formatAgeMs(row.ageMs))}</span></td>
-          <td class="mono metric-meta">${row.updatedTs ? escapeHTML(fmtTime(row.updatedTs)) : "—"}</td>
-          <td class="metric-meta">${escapeHTML(row.notes)}</td>
-        </tr>
-      `).join("");
-    }
-  }
-
-  const providersFallback = document.getElementById("dataProvidersFallback");
-  if (providersFallback) {
-    const pipelineSummary = asObject(ingestion.summary);
-    providersFallback.textContent = safeJoin([
-      pipelineSummary.active_child ? `active child ${pipelineSummary.active_child}` : "",
-      numOrNull(pipelineSummary.visible_jobs_running) != null ? `visible jobs ${formatDecimal(pipelineSummary.visible_jobs_running, 0)}` : "",
-      numOrNull(providerTelemetry.child_pid) != null && Number(providerTelemetry.child_pid) > 0 ? `pid ${intOr(providerTelemetry.child_pid, 0)}` : "",
-    ]) || "";
-  }
-
-  const runtimeGrid = document.getElementById("dataRuntimeGrid");
-  if (runtimeGrid) {
-    runtimeGrid.innerHTML = buildStatGridMarkup([
-      {
-        label: "CPU",
-        value: telemetry ? `${formatDecimal(telemetry.cpu_percent, 1)}%` : "—",
-        meta: telemetry ? `threads ${formatDecimal(telemetry.thread_count, 0)}` : "telemetry unavailable",
-      },
-      {
-        label: "Memory",
-        value: telemetry ? `${formatDecimal(telemetry.process_rss_mb, 0)}MB` : "—",
-        meta: telemetry ? `${formatDecimal(telemetry.memory_percent, 1)}% of host` : "telemetry unavailable",
-      },
-      {
-        label: "DB Size",
-        value: telemetry ? `${formatDecimal(telemetry.db_size_mb, 1)}MB` : "—",
-        meta: telemetry ? `state ${String(telemetry.system_state || "UNKNOWN")}` : "telemetry unavailable",
-      },
-      {
-        label: "Alerts / 1h",
-        value: telemetry ? formatDecimal(asObject(telemetry.alerts).last_hour, 0) : "—",
-        meta: telemetry ? `crit open ${formatDecimal(asObject(telemetry.alerts).critical_open, 0)}` : "telemetry unavailable",
-      },
-      {
-        label: "Fills",
-        value: telemetry ? formatDecimal(asObject(telemetry.execution).n_fills, 0) : "—",
-        meta: telemetry
-          ? `last fill ${formatAgeMs(ageMsFromTimestamp(asObject(telemetry.execution).last_fill_ts_ms))}`
-          : "telemetry unavailable",
-      },
-      {
-        label: "Supervisor",
-        value: telemetry ? formatDecimal(asObject(telemetry.supervisor).n_jobs, 0) : "—",
-        meta: telemetry
-          ? (asObject(telemetry.supervisor).delegated ? "delegated" : "local")
-          : "telemetry unavailable",
-      },
-    ]);
-  }
-
-  const runtimeNotes = [];
-  if (telemetry) {
-    runtimeNotes.push(`system state: ${String(telemetry.system_state || "UNKNOWN")}`);
-    if (telemetry.vol_target && telemetry.vol_target.enabled) {
-      runtimeNotes.push(`vol target enabled: target ${formatDecimal(telemetry.vol_target.target_vol, 4)} scale ${formatDecimal(telemetry.vol_target.scale, 2)}x`);
-    } else {
-      runtimeNotes.push("vol target: off");
-    }
-  }
-  if (barrierAllowed === false) {
-    runtimeNotes.push(`execution barrier reason: ${barrierReason || "blocked"}`);
-  } else if (barrierAllowed === true) {
-    runtimeNotes.push("execution barrier clear");
-  }
-  if (telemetryRes.status !== "fulfilled") {
-    runtimeNotes.push("runtime telemetry unavailable");
-  }
-  renderNotes("dataRuntimeNotes", runtimeNotes, "No runtime anomalies reported.");
 }
 
 async function loadPositionsExposureScreen() {
@@ -5368,8 +5066,7 @@ async function loadPositionsExposureScreen() {
   const stateRows = asArray(portfolio && portfolio.state);
   const orderRows = asArray(portfolio && portfolio.orders);
   const diagnostics = asObject(portfolio && portfolio.diagnostics);
-  const riskHistory = asArray(riskPortfolio && riskPortfolio.history);
-  const riskLatest = asObject(riskHistory[0]);
+  const riskLatest = latestRiskRow(riskPortfolio);
   const brokerPositions = asArray(broker && broker.positions);
   const terminalRows = asArray(terminal && terminal.rows);
   const liveSymbolCount = new Set(

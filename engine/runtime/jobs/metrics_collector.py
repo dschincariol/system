@@ -49,6 +49,17 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
     )
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        out = float(value)
+        return out if out == out else float(default)
+    except Exception as e:
+        _warn_nonfatal("METRICS_COLLECTOR_FLOAT_PARSE_FAILED", e, once_key="float_parse")
+        return float(default)
+
+
 def _table_exists(con, table: str) -> bool:
     try:
         row = con.execute(
@@ -185,7 +196,7 @@ def _collect_snapshot() -> Dict[str, Any]:
                     LIMIT 1
                     """
                 ).fetchone()
-                metrics["alpha_decay_min_throttle_mult"] = float((row or [1.0, 0, 0])[0] or 1.0)
+                metrics["alpha_decay_min_throttle_mult"] = _safe_float((row or [1.0, 0, 0])[0], 1.0)
                 metrics["alpha_decay_severe_count"] = float((row or [1.0, 0, 0])[1] or 0.0)
                 metrics["alpha_decay_warn_count"] = float((row or [1.0, 0, 0])[2] or 0.0)
             except Exception as e:

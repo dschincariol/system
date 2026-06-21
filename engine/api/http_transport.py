@@ -320,6 +320,7 @@ _SENSITIVE_GET_ENDPOINT_PATHS = frozenset(
 _DESTRUCTIVE_ENDPOINT_PATHS = frozenset(
     {
         "/api/operator/emergency_stop",
+        "/api/operator/broker_risk",
         "/api/operator/clear_manual_halt",
         "/api/operator/stop",
         "/api/operator/restart",
@@ -346,6 +347,16 @@ _CONFIRMATION_REGISTRY = {
         "required_token": "KILL",
         "severity": "emergency",
         "consequence": "Immediately stops operator jobs, trips the global kill switch, and disarms execution.",
+        "hold_ms": 3000,
+        "require_ack": True,
+        "require_actor": True,
+        "require_source": True,
+    },
+    "/api/operator/broker_risk": {
+        "action_id": "operator.broker_risk",
+        "required_token": "BROKER_RISK",
+        "severity": "emergency",
+        "consequence": "Cancels live broker orders and may submit flattening orders under configured shutdown-risk limits.",
         "hold_ms": 3000,
         "require_ack": True,
         "require_actor": True,

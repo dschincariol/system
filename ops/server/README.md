@@ -43,28 +43,75 @@ sudo bash ops/server/verify.sh
 
 The verifier checks PostgreSQL, TimescaleDB, Redis over its Unix socket, PgBouncer over `/var/run/postgresql/.s.PGSQL.6432`, filesystem ownership, and systemd unit syntax.
 
+## Memory Pressure
+
+Run the memory-pressure hardening installer on `bart` and equivalent ZFS
+single-server hosts:
+
+```bash
+sudo bash ops/server/memory_pressure_hardening.sh install
+sudo bash ops/server/memory_pressure_hardening.sh verify
+```
+
+The installer persists `vm.swappiness=10`, creates managed zram and disk
+swapfile systemd units, and caps ZFS ARC at 48 GiB for the 128 GiB host class.
+It is idempotent and reversible with
+`sudo bash ops/server/memory_pressure_hardening.sh remove`. See
+[MEMORY_PRESSURE_RUNBOOK.md](../../docs/MEMORY_PRESSURE_RUNBOOK.md) for the
+size rationale, verifier contract, deleted `/tmp` file detector, and reclaim
+procedure.
+
+## ZFS Tuning
+
+Run the T2.5 ZFS tuning automation before accepting the Docker data-root move
+on `bart`:
+
+```bash
+sudo bash ops/server/zfs_tuning.sh apply
+bash ops/server/zfs_tuning.sh verify
+```
+
+The script enables pool autotrim, disables dataset atime, changes `zpool/data`
+compression to `lz4`, verifies actual on-disk ashift with `zdb`, and asserts
+the dedicated Timescale PGDATA dataset properties consumed by the T1.3c
+relocation script. It records before/after captures and refuses to suggest an
+in-place ashift repair. See
+[DISK_RETENTION_RUNBOOK.md](../../docs/DISK_RETENTION_RUNBOOK.md).
+
 ## Backup And Restore
 
 Current runtime storage is Postgres-backed. Backup ownership for this host layer is:
 
 - `ops/backup/wal_archive.sh` for continuous WAL archiving into `/var/backups/trading/wal/`
+- `ops/backup/wal_archive_catchup.sh` for bounded one-shot catch-up of
+  `pg_wal/archive_status/*.ready` segments through the audited archive script
 - `ops/backup/base_backup.sh` for scheduled `pg_basebackup` plus `pg_verifybackup`
 - `ops/backup/state_snapshot.sh` and `ops/backup/artifact_snapshot.sh` for configuration and artifact evidence
 - `ops/backup/prune.sh` for retention pruning
 - `ops/backup/restore.sh` and `ops/backup/restore_drill.sh` for clean-target restore verification
-- `ops/backup/backup_restore_evidence.sh` for the pre-live evidence run that
-  verifies installed backup timers, performs a base backup, forces WAL
-  archival, runs a clean-target restore drill, and writes
+- `ops/backup/backup_restore_evidence.sh` for the pre-live and recurring
+  evidence gate that verifies installed backup timers, reuses fresh base-backup
+  and restore-drill evidence, forces bounded WAL archival proof, checks
+  `pg_stat_archiver`, and writes
   `/var/backups/trading/evidence/backup_restore_evidence_<timestamp>.txt`
   plus `latest_backup_restore_evidence.json`
 
 Bootstrap installs the matching `trading-base-backup`, `trading-backup-evidence`, `trading-backup-prune`, and `trading-restore-drill` systemd units and timers. A backup is not considered operationally valid until a restore drill has produced a passing report. `trading-backup-evidence.timer` refreshes WAL archive proof every 60 seconds and reuses fresh base-backup/restore-drill evidence until the configured policy windows expire.
+The timer path is check-only for heavyweight work: it does not run a base
+backup, restore drill, or WAL catch-up unless the operator explicitly sets
+`TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=1`,
+`TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=1`, or
+`TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=1`. Missing, stale, inaccessible, or
+overdue evidence is reported as a failed non-zero gate result. The systemd
+service is `Type=oneshot` with `TimeoutStartSec=8min` and `Restart=no`, so it must transition
+to success or failure instead of remaining in `activating`.
 Live preflight reads the latest evidence JSON, the base-backup directory, WAL
 archive, and restore-drill reports. In live mode it fails closed when the
-latest verified base backup, WAL archive verification, restore drill, or
-restore duration violates the configured `BACKUP_EVIDENCE_*` policy. Live mode
-and production preflight with backup evidence required also require a
-verifiable HMAC-SHA256 signature on `latest_backup_restore_evidence.json`.
+latest verified base backup, WAL archive verification, `pg_stat_archiver`
+state, restore drill, or restore duration violates the configured
+`BACKUP_EVIDENCE_*` policy. Live mode and production preflight with backup
+evidence required also require a verifiable HMAC-SHA256 signature on
+`latest_backup_restore_evidence.json`.
 
 On an already-bootstrapped host, use the focused installer when only the
 backup evidence gate assets need to be deployed:
@@ -87,10 +134,24 @@ existing key, sets it to `root:trading 0640`, and writes
 `BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1` plus
 `BACKUP_EVIDENCE_HMAC_KEY_FILE=/etc/trading/backup_evidence.hmac.key` to
 `/etc/trading/trading.env`.
+It also writes check-only evidence defaults for the recurring timer:
+`TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=0`,
+`TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=0`, and
+`TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0`.
 In `--compose` mode it reads `deploy/compose/.env`, stores only the backup
 connection secret in `/etc/trading/provider.env`, runs version-matched
 Postgres tools from the Timescale image, and requires a TimescaleDB container
-recreate so the WAL archive bind mount and archive command take effect.
+recreate so the WAL archive bind mount and archive command take effect. The
+installer also runs the archive command inside the container and then runs
+`wal_archive_catchup.sh` once, so existing `.ready` WAL backlog is copied to
+the ZFS backup dataset without staging on root. The backup root must be mounted
+at `/var/backups/trading` and writable by the container `postgres` UID; on the
+Timescale image used by this host that is expected to look like
+`0750 70:trading`.
+Generated Compose systemd overrides run the evidence service as `root` with
+primary group `trading`, set `TS_BACKUP_READ_GROUP=trading`, and publish
+evidence as `0640`, so the service can enumerate the `0750 70:trading` backup
+tree while non-group readers cannot.
 
 Manual key creation uses the same ownership contract:
 
@@ -134,9 +195,9 @@ new signed evidence passes preflight.
 
 No secrets live in this repository. Bootstrap installs the master key,
 `ts_ingest`, `ts_app`, and `ts_reader` passwords, the Redis password, the
-object-store secret key, and the dashboard API token as systemd encrypted credentials under
-`/etc/credstore.encrypted/`; application units receive only the credentials
-they declare with `LoadCredentialEncrypted=`.
+object-store secret key, the dashboard API token, and the operator API token as
+systemd encrypted credentials under `/etc/credstore.encrypted/`; application
+units receive only the credentials they declare with `LoadCredentialEncrypted=`.
 
 Required encrypted credential names on the single-server systemd host are:
 
@@ -147,13 +208,16 @@ Required encrypted credential names on the single-server systemd host are:
 - `redis_password`
 - `object_store_secret_key`
 - `dashboard_api_token`
+- `operator_api_token`
 
 Use passwordless dependency URLs in `/etc/trading/trading.env` and point the
 runtime at credential names instead of putting secret values in env files. For
 example, set `TS_PG_DSN`/`TIMESCALE_DSN` without `password=`, set
 `LIVE_CACHE_REDIS_PASSWORD_SECRET=redis_password`, and set
 `OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key`. For strict production
-mutation auth, set `DASHBOARD_API_TOKEN_SECRET=dashboard_api_token`.
+mutation auth and operator-sidecar access, set
+`DASHBOARD_API_TOKEN_SECRET=dashboard_api_token` and
+`OPERATOR_API_TOKEN_SECRET=operator_api_token`.
 
 `python engine/runtime/prod_preflight.py --json` validates the credential
 directory exposed by systemd through `CREDENTIALS_DIRECTORY`, checks the
@@ -179,13 +243,12 @@ sudo /opt/trading/app/ops/server/run_prod_preflight.sh
 ```
 
 Both paths load `pg_password_app`, `redis_password`,
-`object_store_secret_key`, and `dashboard_api_token` with
+`object_store_secret_key`, `dashboard_api_token`, and `operator_api_token` with
 `LoadCredentialEncrypted=` and run as the `trading` service account. A direct
 shell invocation outside systemd is expected to fail in production unless it is
-already inside a unit with
-`CREDENTIALS_DIRECTORY` set.
-For Compose deployments, the equivalent Postgres bootstrap secret is the
-`password=` value already present in `TS_PG_DSN` inside the runtime container.
+already inside a unit with `CREDENTIALS_DIRECTORY` set. For Compose
+deployments, keep Postgres DSNs passwordless and mount the password through
+`TIMESCALE_PASSWORD_FILE`/`TS_PG_PASSWORD_FILE`.
 
 ## Services
 
@@ -214,6 +277,36 @@ journalctl -u trading-api.service -f
 
 PostgreSQL and PgBouncer logs are also rotated from `/var/log/postgresql/`. Application file logs are not configured at this layer; systemd units send stdout and stderr to journald.
 
+## CPU Power Policy
+
+Host `bart` runs the trading runtime as a plugged-in, latency-sensitive
+workstation. Bootstrap installs and enables
+`trading-cpu-power-policy.service`, which applies the reviewed CPU performance
+policy at boot before `trading.target`.
+
+The policy uses `powerprofilesctl set performance` when a non-degraded
+performance profile is available, sets AMD EPP sysfs values to `performance`
+when present, and falls back to the `performance` governor only when profile and
+EPP controls are unavailable. Re-running the service is idempotent.
+
+Agent-runnable verification is read-only:
+
+```bash
+bash ops/server/cpu_power_policy.sh verify
+```
+
+The output reports power-profiles-daemon profile/degraded state, `amd_pstate`
+status, scaling driver, governor, EPP, and `intended_state=PASS` or `FAIL`.
+The production target requires the policy service, so starting
+`trading.target` through systemd does not silently bypass this boot policy.
+
+This trades higher watts, heat, and fan activity for sustained clocks and lower
+scheduling latency. The policy touches only CPU power state and does not set
+ROCm/GPU clocks, power limits, or accelerator runtime profiles. Keep GPU
+thermal and power limits in the ROCm-specific deployment layer and validate the
+combined CPU+GPU thermal envelope during soak. Full revert instructions are in
+[../../docs/CPU_POWER_POLICY.md](../../docs/CPU_POWER_POLICY.md).
+
 ## Network
 
 `ufw` defaults to deny inbound and allow outbound. Bootstrap allows SSH (`22/tcp`) and the operator UI port (`4001/tcp` by default). Override with:
@@ -227,6 +320,7 @@ Redis is bound to localhost and exposes `/var/run/redis/trading.sock`. PgBouncer
 ## Tests
 
 ```bash
+bash tests/ops/test_cpu_power_policy.sh
 bash tests/ops/test_bootstrap_idempotent.sh
 bash tests/ops/test_systemd_units_lint.sh
 ```

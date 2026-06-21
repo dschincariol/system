@@ -718,6 +718,45 @@ def _parse_failover_chain() -> List[str]:
     return configured_failover_chain()
 
 
+def list_open_orders_router(*, broker: Optional[str] = None, timeout_s: float = 10.0) -> Dict[str, Any]:
+    from engine.execution.broker_shutdown_risk import list_open_orders_for_broker
+
+    selected = str(broker or (_parse_failover_chain()[0] if _parse_failover_chain() else "sim"))
+    return list_open_orders_for_broker(broker=selected, timeout_s=float(timeout_s))
+
+
+def cancel_open_orders_router(
+    *,
+    broker: Optional[str] = None,
+    timeout_s: float = 10.0,
+    command_id: str = "",
+) -> Dict[str, Any]:
+    from engine.execution.broker_shutdown_risk import cancel_open_orders_for_broker
+
+    selected = str(broker or (_parse_failover_chain()[0] if _parse_failover_chain() else "sim"))
+    return cancel_open_orders_for_broker(
+        broker=selected,
+        timeout_s=float(timeout_s),
+        command_id=str(command_id or "broker-router-cancel"),
+    )
+
+
+def flatten_positions_router(
+    *,
+    broker: Optional[str] = None,
+    timeout_s: float = 10.0,
+    command_id: str = "",
+) -> Dict[str, Any]:
+    from engine.execution.broker_shutdown_risk import flatten_positions_for_broker
+
+    selected = str(broker or (_parse_failover_chain()[0] if _parse_failover_chain() else "sim"))
+    return flatten_positions_for_broker(
+        broker=selected,
+        timeout_s=float(timeout_s),
+        command_id=str(command_id or "broker-router-flatten"),
+    )
+
+
 def _adaptive_execute_orders(
     *,
     broker_name: str,

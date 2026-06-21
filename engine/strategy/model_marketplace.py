@@ -18,6 +18,7 @@ from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.event_replay import replay_state
 from engine.runtime.runtime_meta import meta_get, meta_set
 from engine.runtime.storage import connect, init_db, run_write_txn
+from engine.strategy.model_competition import CompetitionRepository
 
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -2157,44 +2158,10 @@ def _write_marketplace_row(con, cur: Dict[str, Any], now: Optional[int] = None) 
     meta = dict(cur.get("meta") or meta)
     cur["updated_ts_ms"] = int(ts_now)
 
-    con.execute(
-        """
-        INSERT INTO model_marketplace_scores(
-          model_id, model_name, symbol, horizon_s, regime, stage, score, trades, wins, losses,
-          gross_pnl, net_pnl, avg_confidence, last_signal_ts_ms, updated_ts_ms, meta_json
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(model_id, model_name, symbol, horizon_s, regime) DO UPDATE SET
-          stage=excluded.stage,
-          score=excluded.score,
-          trades=excluded.trades,
-          wins=excluded.wins,
-          losses=excluded.losses,
-          gross_pnl=excluded.gross_pnl,
-          net_pnl=excluded.net_pnl,
-          avg_confidence=excluded.avg_confidence,
-          last_signal_ts_ms=excluded.last_signal_ts_ms,
-          updated_ts_ms=excluded.updated_ts_ms,
-          meta_json=excluded.meta_json
-        """,
-        (
-            _normalize_model_id(cur.get("model_id")),
-            str(cur.get("model_name") or ""),
-            sym,
-            int(cur.get("horizon_s") or 0),
-            str(cur.get("regime") or "global"),
-            str(cur.get("stage") or "challenger"),
-            float(cur.get("score") or 0.0),
-            int(cur.get("trades") or 0),
-            int(cur.get("wins") or 0),
-            int(cur.get("losses") or 0),
-            float(cur.get("gross_pnl") or 0.0),
-            float(cur.get("net_pnl") or 0.0),
-            float(cur.get("avg_confidence") or 0.0),
-            int(cur.get("last_signal_ts_ms") or 0),
-            int(ts_now),
-            json.dumps(meta, separators=(",", ":"), sort_keys=True),
-        ),
+    CompetitionRepository(con).upsert_marketplace_score(
+        cur,
+        meta=meta,
+        updated_ts_ms=int(ts_now),
     )
     return cur
 
@@ -2330,44 +2297,25 @@ def update_model_score(
         score = _safe_float(tmp_cur.get("score"), 0.0)
         old_meta = dict(tmp_cur.get("meta") or old_meta)
 
-        con.execute(
-            """
-            INSERT INTO model_marketplace_scores(
-              model_id, model_name, symbol, horizon_s, regime, stage, score, trades, wins, losses,
-              gross_pnl, net_pnl, avg_confidence, last_signal_ts_ms, updated_ts_ms, meta_json
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(model_id, model_name, symbol, horizon_s, regime) DO UPDATE SET
-              stage=excluded.stage,
-              score=excluded.score,
-              trades=excluded.trades,
-              wins=excluded.wins,
-              losses=excluded.losses,
-              gross_pnl=excluded.gross_pnl,
-              net_pnl=excluded.net_pnl,
-              avg_confidence=excluded.avg_confidence,
-              last_signal_ts_ms=excluded.last_signal_ts_ms,
-              updated_ts_ms=excluded.updated_ts_ms,
-              meta_json=excluded.meta_json
-            """,
-            (
-                model_id,
-                name,
-                sym,
-                int(horizon_s),
-                reg,
-                stg,
-                float(score),
-                int(trades),
-                int(wins),
-                int(losses),
-                float(gross_pnl),
-                float(net_pnl),
-                float(avg_conf),
-                int(now),
-                int(now),
-                json.dumps(old_meta, separators=(",", ":"), sort_keys=True),
-            ),
+        CompetitionRepository(con).upsert_marketplace_score(
+            {
+                "model_id": model_id,
+                "model_name": name,
+                "symbol": sym,
+                "horizon_s": int(horizon_s),
+                "regime": reg,
+                "stage": stg,
+                "score": float(score),
+                "trades": int(trades),
+                "wins": int(wins),
+                "losses": int(losses),
+                "gross_pnl": float(gross_pnl),
+                "net_pnl": float(net_pnl),
+                "avg_confidence": float(avg_conf),
+                "last_signal_ts_ms": int(now),
+            },
+            meta=old_meta,
+            updated_ts_ms=int(now),
         )
         con.commit()
 
@@ -4098,7 +4046,7 @@ def recompute_marketplace_scores() -> Dict[str, Any]:
             cur.setdefault("meta", {})["window_end_ts_ms"] = int(now)
 
         def _rewrite_scores(db) -> int:
-            db.execute("DELETE FROM model_marketplace_scores")
+            CompetitionRepository(db).delete_all_marketplace_scores()
             written_local = 0
             for cur in rows_to_write:
                 _write_marketplace_row(db, cur, now=now)

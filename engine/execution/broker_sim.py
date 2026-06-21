@@ -1703,6 +1703,468 @@ def _equity(con, ts_ms: int, book_key: Optional[str] = None) -> float:
         eq = float(acct.get("equity") or 0.0)
     return float(eq)
 
+
+def _broker_sim_phase_load_orders(
+    con,
+    *,
+    override_orders: Optional[List[dict]],
+    override_order_id: Optional[int],
+    override_ts_ms: Optional[int],
+    now_ms: int,
+) -> Dict[str, Any]:
+    if override_orders is not None:
+        return {
+            "orders": list(override_orders or []),
+            "order_id": (int(override_order_id) if override_order_id is not None else None),
+            "ts_ms": (int(override_ts_ms) if override_ts_ms is not None else int(now_ms)),
+            "override": True,
+        }
+
+    # Read the latest *row-per-order* portfolio_orders batch (no orders_json dependency).
+    from engine.strategy.portfolio_execution_intents import load_latest_execution_intents
+
+    batch = load_latest_execution_intents(con)
+    return {
+        "orders": list(batch.get("intents") or []),
+        "order_id": batch.get("batch_id"),
+        "ts_ms": int(batch.get("batch_ts_ms") or now_ms),
+        "override": False,
+    }
+
+
+def _broker_sim_phase_validate_gate(
+    con,
+    *,
+    loaded: Dict[str, Any],
+    dry_run: bool,
+    now_ms: int,
+    book_key: Optional[str],
+    ale_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    orders = list(loaded.get("orders") or [])
+    order_id = loaded.get("order_id")
+
+    if (not bool(loaded.get("override"))) and not orders:
+        acct = _mark_to_market(con, int(now_ms), book_key=book_key, best_effort=True)
+        return {
+            "continue": False,
+            "summary": {"ok": True, "status": "no_orders", "broker": "sim", "account": acct},
+        }
+
+    if dry_run:
+        return {
+            "continue": False,
+            "summary": {
+                "ok": True,
+                "status": "dry_run_preview",
+                "broker": "sim",
+                "order_id": (int(order_id) if order_id is not None else None),
+                "orders": orders,
+                "ale": dict(ale_meta),
+                "account": _read_account(con, book_key=book_key),
+            },
+        }
+
+    if order_id is not None:
+        last_applied = _get_meta(con, "last_portfolio_orders_id", book_key=book_key)
+        if last_applied is not None:
+            try:
+                if int(last_applied) >= int(order_id):
+                    acct = _mark_to_market(con, int(now_ms), book_key=book_key, best_effort=True)
+                    return {
+                        "continue": False,
+                        "summary": {
+                            "ok": True,
+                            "status": "already_applied",
+                            "broker": "sim",
+                            "order_id": int(order_id),
+                            "account": acct,
+                        },
+                    }
+            except Exception as e:
+                _warn_nonfatal(
+                    "broker_sim_last_applied_order_guard_failed",
+                    "BROKER_SIM_LAST_APPLIED_ORDER_GUARD_FAILED",
+                    e,
+                    warn_key="broker_sim_last_applied_order_guard_failed",
+                    order_id=order_id,
+                    last_applied=last_applied,
+                    book_key=str(book_key or ""),
+                )
+
+    return {"continue": True, "orders": orders}
+
+
+def _broker_sim_phase_size_cap(
+    con,
+    *,
+    ts_ms: int,
+    now_ms: int,
+    book_key: Optional[str],
+) -> Dict[str, Any]:
+    acct = _read_account(con, book_key=book_key)
+    cash = float(acct.get("cash") or 0.0)
+    equity = float(_equity(con, int(ts_ms), book_key=book_key) or 0.0)
+    position_qty_map = _position_qty_map(con, book_key=book_key)
+    position_price_map = _position_price_map(con, position_qty_map, int(ts_ms))
+
+    # Conservative deployable base allows testing leverage constraints even in sim.
+    equity = float(
+        compute_deployable_equity(
+            {"equity": float(equity), "cash": float(cash), "buying_power": float(equity)},
+            default_equity=float(equity),
+        )
+        or 0.0
+    )
+
+    if not _is_finite(equity) or equity <= 0.0:
+        acct0 = _read_account(con, book_key=book_key)
+        fallback_equity = max(
+            _safe_f(acct0.get("equity"), 0.0),
+            _safe_f(acct0.get("cash"), 0.0),
+            _safe_f(BROKER_START_EQUITY, 0.0),
+            _safe_f(BROKER_START_CASH, 0.0),
+            1.0,
+        )
+        equity = float(fallback_equity)
+        _write_account(
+            con,
+            cash=float(max(_safe_f(acct0.get("cash"), 0.0), _safe_f(BROKER_START_CASH, 0.0))),
+            equity=float(equity),
+            ts_ms=int(now_ms),
+            book_key=book_key,
+        )
+        con.commit()
+
+    base_max_notional_budget = max(0.0, float(equity) * float(BROKER_MAX_TRADE_PCT_EQUITY))
+
+    skew_z = _get_factor_feature_asof(con, "options.skew_25d_z", int(ts_ms))
+    flow_z = _get_factor_feature_asof(con, "flows.index_constituent_imbalance_z", int(ts_ms))
+
+    stress_mag = max(
+        0.0,
+        max(
+            abs(float(skew_z)) - float(_EXEC_SKEW_Z_THRESH),
+            abs(float(flow_z)) - float(_EXEC_FLOW_Z_THRESH),
+        ),
+    )
+
+    stress_size_mult = 1.0
+    if stress_mag > 0.0:
+        stress_size_mult = float(_clamp(1.0 - (stress_mag * float(_EXEC_STRESS_SIZE_MAX_REDUCTION)), 0.20, 1.0))
+
+    stress_slip_add_bps = 0.0
+    if stress_mag > 0.0:
+        stress_slip_add_bps = float(_clamp(stress_mag * float(_EXEC_STRESS_SLIP_ADD_BPS), 0.0, 5.0))
+
+    stress_latency_mult = 1.0
+    if abs(float(flow_z)) > float(_EXEC_FLOW_Z_THRESH):
+        stress_latency_mult = float(
+            _clamp(
+                1.0 + 0.25 * (abs(float(flow_z)) - float(_EXEC_FLOW_Z_THRESH)),
+                1.0,
+                float(_EXEC_STRESS_LATENCY_MULT_MAX),
+            )
+        )
+
+    max_notional_budget = max(0.0, float(base_max_notional_budget) * float(stress_size_mult))
+
+    return {
+        "acct": acct,
+        "cash": float(cash),
+        "equity": float(equity),
+        "position_qty_map": position_qty_map,
+        "position_price_map": position_price_map,
+        "base_max_notional_budget": float(base_max_notional_budget),
+        "max_notional_budget": float(max_notional_budget),
+        "chunk_cap_notional": max(1e-9, float(max_notional_budget) * float(BROKER_CHUNK_PCT or 0.33)),
+        "skew_z": float(skew_z),
+        "flow_z": float(flow_z),
+        "stress_size_mult": float(stress_size_mult),
+        "stress_slip_add_bps": float(stress_slip_add_bps),
+        "stress_latency_mult": float(stress_latency_mult),
+    }
+
+
+def _broker_sim_phase_log_ledger_effects(
+    con,
+    *,
+    order: Dict[str, Any],
+    symbol: str,
+    delta: float,
+    px_mid: float,
+    ts_ms: int,
+    order_id: Optional[int],
+    order_uid: str,
+    client_order_id: str,
+    risk_cap_audit: Dict[str, Any],
+    book_key: Optional[str],
+) -> None:
+    if _is_shadow_book(book_key):
+        return
+
+    try:
+        from engine.execution.execution_ledger import log_submit
+
+        _extra = dict(order or {})
+        try:
+            ex = _extra.get("explain") or {}
+            if isinstance(ex, dict):
+                strat = (ex.get("strategy") or {}) if isinstance(ex.get("strategy"), dict) else {}
+                if strat.get("name"):
+                    _extra["strategy_name"] = str(strat.get("name"))
+        except Exception as e:
+            _warn_nonfatal(
+                "broker_sim_strategy_name_extract_failed",
+                "BROKER_SIM_STRATEGY_NAME_EXTRACT_FAILED",
+                e,
+                warn_key=f"broker_sim_strategy_name_extract_failed:{symbol}",
+                symbol=str(symbol),
+            )
+
+        _extra["order_uid"] = str(order_uid)
+        _extra["idempotency_status"] = "submitted"
+        _extra["portfolio_risk_caps"] = dict(risk_cap_audit or {})
+
+        submit_ts_ms = int(ts_ms)
+        if not bool(getattr(con, "in_transaction", False)):
+            _begin_managed_write(con)
+
+        log_submit(
+            client_order_id=str(client_order_id),
+            broker="sim",
+            symbol=str(symbol),
+            qty=float(delta),
+            submit_ts_ms=int(submit_ts_ms),
+            ref_px=float(px_mid),
+            broker_order_id=None,
+            portfolio_orders_id=(int(order_id) if order_id is not None else None),
+            source_alert_id=(int(order.get("source_alert_id")) if order.get("source_alert_id") is not None else None),
+            extra=_extra,
+            order_uid=str(order_uid),
+            idempotency_status="submitted",
+            con=con,
+        )
+
+        mark_order_submission_submitted(
+            con=con,
+            order_uid=str(order_uid),
+            client_order_id=str(client_order_id),
+            broker_order_id=None,
+            submit_ts_ms=int(submit_ts_ms),
+        )
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_execution_ledger_submit_failed",
+            "BROKER_SIM_EXECUTION_LEDGER_SUBMIT_FAILED",
+            e,
+            warn_key=f"broker_sim_execution_ledger_submit_failed:{symbol}:{order_id}",
+            symbol=str(symbol),
+            order_id=(int(order_id) if order_id is not None else None),
+        )
+
+
+def _broker_sim_phase_persist_fill_effects(
+    con,
+    *,
+    order: Dict[str, Any],
+    symbol: str,
+    order_id: Optional[int],
+    ts_ms: int,
+    fill_ts: int,
+    book_key: Optional[str],
+    qty_cap: float,
+    px_mid_use: float,
+    px_exec: float,
+    new_qty: float,
+    new_avg: float,
+    fee: float,
+    notional: float,
+    explain: Dict[str, Any],
+    exec_spread_bps: float,
+    chunk_lob_slip_bps: float,
+    lob_adverse_bps: float,
+    lob_impact_bps: float,
+    almgren_chriss: Dict[str, Any],
+    client_order_id: str,
+    order_ttl_ms: int,
+    state_meta: Dict[str, Any],
+) -> None:
+    _write_position(con, symbol, qty=float(new_qty), avg_px=float(new_avg), ts_ms=int(fill_ts), book_key=book_key)
+
+    _write_fill(
+        con,
+        ts_ms=int(fill_ts),
+        source_order_id=(int(order.get("source_order_id")) if order.get("source_order_id") is not None else order_id),
+        symbol=symbol,
+        qty=float(qty_cap),
+        px=float(px_exec),
+        fees=float(fee),
+        note=(
+            f"spread_bps={float(exec_spread_bps):.4f} "
+            f"slippage_bps={float(chunk_lob_slip_bps):.4f} "
+            f"lob_adv_bps={float(lob_adverse_bps):.4f} "
+            f"lob_impact_bps={float(lob_impact_bps):.4f} "
+            f"ac_bps={float(almgren_chriss.get('execution_cost_bps') or 0.0):.4f} "
+            f"fee_bps={BROKER_FEE_BPS}"
+        ),
+        explain_json=json.dumps(explain),
+        client_order_id=client_order_id,
+        book_key=book_key,
+        source=("shadow" if _is_shadow_book(book_key) else "sim"),
+    )
+
+    if not _is_shadow_book(book_key):
+        try:
+            label_extra = dict(explain)
+            label_extra["placeholder_exec_label"] = True
+            label_extra["placeholder_reason"] = "entry_fill_only"
+            con.execute(
+                """
+                INSERT OR REPLACE INTO labels_exec (
+                  event_id,
+                  symbol,
+                  horizon_s,
+                  ts_ms,
+                  source,
+                  realized,
+                  side,
+                  gross_ret,
+                  net_ret,
+                  mid_in,
+                  mid_out,
+                  spread_in,
+                  fees_bps,
+                  slippage_bps,
+                  spread_bps,
+                  total_cost_bps,
+                  extra_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(order.get("event_id") or 0),
+                    symbol,
+                    int(order.get("horizon_s") or 0),
+                    int(fill_ts),
+                    "broker_sim_placeholder",
+                    0,
+                    1 if qty_cap > 0 else -1,
+                    0.0,
+                    0.0,
+                    float(px_mid_use),
+                    float(px_exec),
+                    float(exec_spread_bps),
+                    float(BROKER_FEE_BPS),
+                    float(chunk_lob_slip_bps),
+                    float(exec_spread_bps),
+                    float(
+                        BROKER_FEE_BPS
+                        + float(chunk_lob_slip_bps)
+                        + float(exec_spread_bps)
+                        + float(almgren_chriss.get("execution_cost_bps") or 0.0)
+                    ),
+                    json.dumps(label_extra, separators=(",", ":"), sort_keys=True),
+                ),
+            )
+        except Exception as e:
+            _warn_nonfatal(
+                "broker_sim_placeholder_exec_label_write_failed",
+                "BROKER_SIM_PLACEHOLDER_EXEC_LABEL_WRITE_FAILED",
+                e,
+                warn_key=f"broker_sim_placeholder_exec_label_write_failed:{symbol}",
+                symbol=str(symbol),
+                source_order_id=int(order.get("source_order_id") or 0),
+            )
+
+    if _is_shadow_book(book_key):
+        con.execute(
+            """
+            UPDATE broker_shadow_order_state
+            SET state=?, updated_ts_ms=?
+            WHERE book_key=? AND source_order_id=? AND symbol=? AND state='PENDING'
+            """,
+            ("FILLED", _now_ms(), str(_book_key(book_key)), int(order.get("source_order_id") or 0), symbol),
+        )
+        return
+
+    filled_ts_ms = _now_ms()
+    con.execute(
+        """
+        UPDATE broker_order_state
+        SET state=?, updated_ts_ms=?
+        WHERE source_order_id=? AND symbol=? AND state='PENDING'
+        """,
+        ("FILLED", filled_ts_ms, int(order.get("source_order_id") or 0), symbol),
+    )
+    _prime_broker_order_state_after_commit(
+        con,
+        source_order_id=int(order.get("source_order_id") or 0),
+        symbol=str(symbol),
+        state="FILLED",
+        created_ts_ms=int(ts_ms),
+        updated_ts_ms=int(filled_ts_ms),
+        ttl_ms=(int(order_ttl_ms) if order_ttl_ms is not None else None),
+        meta=state_meta,
+    )
+
+
+def _broker_sim_phase_persist_account_positions(
+    con,
+    *,
+    cash: float,
+    now_ms: int,
+    book_key: Optional[str],
+) -> Dict[str, Any]:
+    cash = _safe_f(cash, 0.0)
+
+    if _broker_account_uses_singleton_id(con):
+        if _is_shadow_book(book_key):
+            _write_account(
+                con,
+                float(cash),
+                float(_read_account(con, book_key=book_key).get("equity", 1.0)),
+                int(now_ms),
+                book_key=book_key,
+            )
+        else:
+            con.execute(
+                "UPDATE broker_account SET cash=?, updated_ts_ms=? WHERE id=1",
+                (float(cash), int(now_ms)),
+            )
+    else:
+        acct_now = _read_account(con, book_key=book_key)
+        _write_account(
+            con,
+            float(cash),
+            float(acct_now.get("equity", 1.0)),
+            int(now_ms),
+            book_key=book_key,
+        )
+    con.commit()
+
+    return _mark_to_market(con, int(now_ms), book_key=book_key)
+
+
+def _broker_sim_phase_return_summary(
+    *,
+    book_key: Optional[str],
+    order_id: Optional[int],
+    wrote_fills: bool,
+    fills_written: int,
+    account: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "broker": "sim",
+        "book_key": _book_key(book_key),
+        "status": "applied" if wrote_fills else "no_changes",
+        "order_id": (int(order_id) if order_id is not None else None),
+        "fills_written": int(fills_written),
+        "account": account,
+    }
+
+
 def apply_new_portfolio_orders(
     max_rows: int = 500,
     dry_run: bool = False,
@@ -1725,152 +2187,57 @@ def apply_new_portfolio_orders(
     con = connect()
     try:
         now_ms = _now_ms()
-
-        if override_orders is not None:
-            order_id = int(override_order_id) if override_order_id is not None else None
-            ts_ms = int(override_ts_ms) if override_ts_ms is not None else int(now_ms)
-            orders = list(override_orders or [])
-        else:
-            # Read the latest *row-per-order* portfolio_orders batch (no orders_json dependency)
-            from engine.strategy.portfolio_execution_intents import load_latest_execution_intents
-
-            batch = load_latest_execution_intents(con)
-            orders = list(batch.get("intents") or [])
-            order_id = batch.get("batch_id")
-            ts_ms = int(batch.get("batch_ts_ms") or now_ms)
-
-            if not orders:
-                acct = _mark_to_market(con, now_ms, book_key=book_key, best_effort=True)
-                return {"ok": True, "status": "no_orders", "broker": "sim", "account": acct}
-
-        # -----------------------------
-        # ALE/EPE integration note:
-        # - EPE should already have TTL-filtered these intents before routing.
-        # - broker_sim still enforces per-order TTL locally (defense in depth).
-        # -----------------------------
+        # Phase 1: load orders.
+        loaded = _broker_sim_phase_load_orders(
+            con,
+            override_orders=override_orders,
+            override_order_id=override_order_id,
+            override_ts_ms=override_ts_ms,
+            now_ms=int(now_ms),
+        )
+        orders = list(loaded.get("orders") or [])
+        order_id = loaded.get("order_id")
+        ts_ms = int(loaded.get("ts_ms") or now_ms)
         ale_meta = {"ok": True, "note": "ale_applied_upstream_or_ttl_guard_local"}
 
-        # -----------------------------
-        # DRY RUN: preview only, no state mutation
-        # -----------------------------
-        if dry_run:
-            return {
-                "ok": True,
-                "status": "dry_run_preview",
-                "broker": "sim",
-                "order_id": (int(order_id) if order_id is not None else None),
-                "orders": orders,
-                "ale": ale_meta,
-                "account": _read_account(con, book_key=book_key),
-            }
-
-        # execute orders (already shaped upstream by EPE; still TTL-guarded per-order below)
-        orders = list(orders or [])
-
-
-        # idempotency guard: only apply each batch once (skip when order_id is None)
-        if order_id is not None:
-            last_applied = _get_meta(con, "last_portfolio_orders_id", book_key=book_key)
-            if last_applied is not None:
-                try:
-                    if int(last_applied) >= int(order_id):
-                        acct = _mark_to_market(con, now_ms, book_key=book_key, best_effort=True)
-                        return {"ok": True, "status": "already_applied", "broker": "sim", "order_id": int(order_id), "account": acct}
-                except Exception as e:
-                    _warn_nonfatal(
-                        "broker_sim_last_applied_order_guard_failed",
-                        "BROKER_SIM_LAST_APPLIED_ORDER_GUARD_FAILED",
-                        e,
-                        warn_key="broker_sim_last_applied_order_guard_failed",
-                        order_id=order_id,
-                        last_applied=last_applied,
-                        book_key=str(book_key or ""),
-                    )
-
-        acct = _read_account(con, book_key=book_key)
-        cash = float(acct.get("cash") or 0.0)
-        equity = float(_equity(con, ts_ms, book_key=book_key) or 0.0)
-        position_qty_map = _position_qty_map(con, book_key=book_key)
-        position_price_map = _position_price_map(con, position_qty_map, int(ts_ms))
-
-        # conservative deployable base (allows testing leverage constraints even in sim)
-        equity = float(
-            compute_deployable_equity(
-                {"equity": float(equity), "cash": float(cash), "buying_power": float(equity)},
-                default_equity=float(equity),
-            )
-            or 0.0
+        # Phase 2: validate/gate batch-level execution.
+        gate = _broker_sim_phase_validate_gate(
+            con,
+            loaded=loaded,
+            dry_run=bool(dry_run),
+            now_ms=int(now_ms),
+            book_key=book_key,
+            ale_meta=ale_meta,
         )
+        if not bool(gate.get("continue")):
+            return dict(gate.get("summary") or {})
 
-        # guard: sizing needs a positive reference; recover from empty/uninitialized account state
-        if not _is_finite(equity) or equity <= 0.0:
-            acct0 = _read_account(con, book_key=book_key)
-            fallback_equity = max(
-                _safe_f(acct0.get("equity"), 0.0),
-                _safe_f(acct0.get("cash"), 0.0),
-                _safe_f(BROKER_START_EQUITY, 0.0),
-                _safe_f(BROKER_START_CASH, 0.0),
-                1.0,
-            )
-            equity = float(fallback_equity)
-            _write_account(
-                con,
-                cash=float(max(_safe_f(acct0.get("cash"), 0.0), _safe_f(BROKER_START_CASH, 0.0))),
-                equity=float(equity),
-                ts_ms=int(now_ms),
-                book_key=book_key,
-            )
-            con.commit()
-
-        base_max_notional_budget = max(0.0, float(equity) * float(BROKER_MAX_TRADE_PCT_EQUITY))
-
-        # ------------------------------------------------------------
-        # Execution ROI conditioning (sizing/execution only; not signal)
-        # Uses factor_features + earnings_calendar:
-        # - options.skew_25d_z: stressed skew => smaller size + more slippage
-        # - flows.index_constituent_imbalance_z: rotation => smaller size + more slippage/latency
-        # - earnings proximity: near earnings => smaller size + more slippage
-        # ------------------------------------------------------------
-        skew_z = _get_factor_feature_asof(con, "options.skew_25d_z", int(ts_ms))
-        flow_z = _get_factor_feature_asof(con, "flows.index_constituent_imbalance_z", int(ts_ms))
-
-        stress_mag = max(
-            0.0,
-            max(
-                abs(float(skew_z)) - float(_EXEC_SKEW_Z_THRESH),
-                abs(float(flow_z)) - float(_EXEC_FLOW_Z_THRESH),
-            ),
+        orders = list(gate.get("orders") or [])
+        # Phase 3: size/cap using current account, position, and stress context.
+        sizing = _broker_sim_phase_size_cap(
+            con,
+            ts_ms=int(ts_ms),
+            now_ms=int(now_ms),
+            book_key=book_key,
         )
-
-        # Global stress sizing multiplier (bounded)
-        stress_size_mult = 1.0
-        if stress_mag > 0.0:
-            stress_size_mult = float(_clamp(1.0 - (stress_mag * float(_EXEC_STRESS_SIZE_MAX_REDUCTION)), 0.20, 1.0))
-
-        # Global stress slippage/latency adds (bounded)
-        stress_slip_add_bps = 0.0
-        if stress_mag > 0.0:
-            stress_slip_add_bps = float(_clamp(stress_mag * float(_EXEC_STRESS_SLIP_ADD_BPS), 0.0, 5.0))
-
-        stress_latency_mult = 1.0
-        if abs(float(flow_z)) > float(_EXEC_FLOW_Z_THRESH):
-            stress_latency_mult = float(
-                _clamp(
-                    1.0 + 0.25 * (abs(float(flow_z)) - float(_EXEC_FLOW_Z_THRESH)),
-                    1.0,
-                    float(_EXEC_STRESS_LATENCY_MULT_MAX),
-                )
-            )
-
-        max_notional_budget = max(0.0, float(base_max_notional_budget) * float(stress_size_mult))
-
-        # default chunk cap (may be overridden per-order by EPE)
-        chunk_cap_notional = max(1e-9, float(max_notional_budget) * float(BROKER_CHUNK_PCT or 0.33))
+        cash = float(sizing.get("cash") or 0.0)
+        equity = float(sizing.get("equity") or 0.0)
+        position_qty_map = dict(sizing.get("position_qty_map") or {})
+        position_price_map = dict(sizing.get("position_price_map") or {})
+        skew_z = float(sizing.get("skew_z") or 0.0)
+        flow_z = float(sizing.get("flow_z") or 0.0)
+        stress_size_mult = float(sizing.get("stress_size_mult") or 1.0)
+        stress_slip_add_bps = float(sizing.get("stress_slip_add_bps") or 0.0)
+        stress_latency_mult = float(sizing.get("stress_latency_mult") or 1.0)
+        max_notional_budget = float(sizing.get("max_notional_budget") or 0.0)
+        chunk_cap_notional = float(sizing.get("chunk_cap_notional") or 1e-9)
 
         wrote_fills = False
         fills_written = 0
         submitted_count = min(len(orders or []), int(max_rows))
 
+        # Phase 4: simulate fills. Per-fill persistence and ledger effects are
+        # delegated to named phase helpers so the write path stays auditable.
         for o in (orders or [])[: int(max_rows)]:
             symbol = str(o.get("symbol") or "").strip()
             order_ttl_ms = int(o.get("alpha_ttl_ms") or 0)
@@ -2133,69 +2500,19 @@ def apply_new_portfolio_orders(
                     meta=state_meta,
                 )
 
-            # --- execution ledger mirror (ensure metrics + attribution work in real/paper sim) ---
-            # Shadow books are training/evaluation state and must not feed PnL attribution.
-            if not _is_shadow_book(book_key):
-                # Create/refresh execution_orders row keyed by the same client_order_id used by _write_fill.
-                try:
-                    from engine.execution.execution_ledger import log_submit
-
-                    _extra = dict(o or {})
-                    try:
-                        ex = _extra.get("explain") or {}
-                        if isinstance(ex, dict):
-                            strat = (ex.get("strategy") or {}) if isinstance(ex.get("strategy"), dict) else {}
-                            if strat.get("name"):
-                                _extra["strategy_name"] = str(strat.get("name"))
-                    except Exception as e:
-                        _warn_nonfatal(
-                            "broker_sim_strategy_name_extract_failed",
-                            "BROKER_SIM_STRATEGY_NAME_EXTRACT_FAILED",
-                            e,
-                            warn_key=f"broker_sim_strategy_name_extract_failed:{symbol}",
-                            symbol=str(symbol),
-                        )
-
-                    _extra["order_uid"] = str(order_uid)
-                    _extra["idempotency_status"] = "submitted"
-                    _extra["portfolio_risk_caps"] = dict(risk_cap_audit or {})
-
-                    submit_ts_ms = int(ts_ms)
-                    if not bool(getattr(con, "in_transaction", False)):
-                        _begin_managed_write(con)
-
-                    log_submit(
-                        client_order_id=str(client_order_id),
-                        broker="sim",
-                        symbol=str(symbol),
-                        qty=float(delta),
-                        submit_ts_ms=int(submit_ts_ms),
-                        ref_px=float(px_mid),
-                        broker_order_id=None,
-                        portfolio_orders_id=(int(order_id) if order_id is not None else None),
-                        source_alert_id=(int(o.get("source_alert_id")) if o.get("source_alert_id") is not None else None),
-                        extra=_extra,
-                        order_uid=str(order_uid),
-                        idempotency_status="submitted",
-                        con=con,
-                    )
-
-                    mark_order_submission_submitted(
-                        con=con,
-                        order_uid=str(order_uid),
-                        client_order_id=str(client_order_id),
-                        broker_order_id=None,
-                        submit_ts_ms=int(submit_ts_ms),
-                    )
-                except Exception as e:
-                    _warn_nonfatal(
-                        "broker_sim_execution_ledger_submit_failed",
-                        "BROKER_SIM_EXECUTION_LEDGER_SUBMIT_FAILED",
-                        e,
-                        warn_key=f"broker_sim_execution_ledger_submit_failed:{symbol}:{order_id}",
-                        symbol=str(symbol),
-                        order_id=(int(order_id) if order_id is not None else None),
-                    )
+            _broker_sim_phase_log_ledger_effects(
+                con,
+                order=o,
+                symbol=str(symbol),
+                delta=float(delta),
+                px_mid=float(px_mid),
+                ts_ms=int(ts_ms),
+                order_id=(int(order_id) if order_id is not None else None),
+                order_uid=str(order_uid),
+                client_order_id=str(client_order_id),
+                risk_cap_audit=dict(risk_cap_audit or {}),
+                book_key=book_key,
+            )
 
             remaining = float(delta)
             position_qty_map[str(symbol).upper().strip()] = float(cur_qty) + float(delta)
@@ -2501,8 +2818,6 @@ def apply_new_portfolio_orders(
 
                 fill_ts = int(fill_ts)
 
-                _write_position(con, symbol, qty=float(new_qty), avg_px=float(new_avg), ts_ms=fill_ts, book_key=book_key)
-
                 explain = {
                     "mid_px": float(px_mid_use),
                     "exec_px": float(px_exec),
@@ -2560,121 +2875,31 @@ def apply_new_portfolio_orders(
                     explain["shadow_book_key"] = str(_book_key(book_key))
                     explain["shadow_model_id"] = str(o.get("model_id") or "")
 
-                _write_fill(
+                _broker_sim_phase_persist_fill_effects(
                     con,
-                    ts_ms=fill_ts,
-                    source_order_id=(int(o.get("source_order_id")) if o.get("source_order_id") is not None else order_id),
+                    order=o,
                     symbol=symbol,
-                    qty=float(qty_cap),
-                    px=float(px_exec),
-                    fees=float(fee),
-                    note=(
-                        f"spread_bps={float(exec_spread_bps):.4f} "
-                        f"slippage_bps={float(chunk_lob_slip_bps):.4f} "
-                        f"lob_adv_bps={float(lob_adverse_bps):.4f} "
-                        f"lob_impact_bps={float(lob_impact_bps):.4f} "
-                        f"ac_bps={float(almgren_chriss.get('execution_cost_bps') or 0.0):.4f} "
-                        f"fee_bps={BROKER_FEE_BPS}"
-                    ),
-                    explain_json=json.dumps(explain),
-                    client_order_id=client_order_id,
+                    order_id=(int(order_id) if order_id is not None else None),
+                    ts_ms=int(ts_ms),
+                    fill_ts=int(fill_ts),
                     book_key=book_key,
-                    source=("shadow" if _is_shadow_book(book_key) else "sim"),
+                    qty_cap=float(qty_cap),
+                    px_mid_use=float(px_mid_use),
+                    px_exec=float(px_exec),
+                    new_qty=float(new_qty),
+                    new_avg=float(new_avg),
+                    fee=float(fee),
+                    notional=float(notional),
+                    explain=explain,
+                    exec_spread_bps=float(exec_spread_bps),
+                    chunk_lob_slip_bps=float(chunk_lob_slip_bps),
+                    lob_adverse_bps=float(lob_adverse_bps),
+                    lob_impact_bps=float(lob_impact_bps),
+                    almgren_chriss=dict(almgren_chriss or {}),
+                    client_order_id=str(client_order_id),
+                    order_ttl_ms=int(order_ttl_ms),
+                    state_meta=state_meta,
                 )
-
-                # best-effort execution labels (if the table exists)
-                if not _is_shadow_book(book_key):
-                    try:
-                        label_extra = dict(explain)
-                        label_extra["placeholder_exec_label"] = True
-                        label_extra["placeholder_reason"] = "entry_fill_only"
-                        con.execute(
-                            """
-                            INSERT OR REPLACE INTO labels_exec (
-                              event_id,
-                              symbol,
-                              horizon_s,
-                              ts_ms,
-                              source,
-                              realized,
-                              side,
-                              gross_ret,
-                              net_ret,
-                              mid_in,
-                              mid_out,
-                              spread_in,
-                              fees_bps,
-                              slippage_bps,
-                              spread_bps,
-                              total_cost_bps,
-                              extra_json
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                int(o.get("event_id") or 0),
-                                symbol,
-                                int(o.get("horizon_s") or 0),
-                                int(fill_ts),
-                                "broker_sim_placeholder",
-                                0,
-                                1 if qty_cap > 0 else -1,
-                                0.0,
-                                0.0,
-                                float(px_mid_use),
-                                float(px_exec),
-                                float(exec_spread_bps),
-                                float(BROKER_FEE_BPS),
-                                float(chunk_lob_slip_bps),
-                                float(exec_spread_bps),
-                                float(
-                                    BROKER_FEE_BPS
-                                    + float(chunk_lob_slip_bps)
-                                    + float(exec_spread_bps)
-                                    + float(almgren_chriss.get("execution_cost_bps") or 0.0)
-                                ),
-                                json.dumps(label_extra, separators=(",", ":"), sort_keys=True),
-                            ),
-                        )
-                    except Exception as e:
-                        _warn_nonfatal(
-                            "broker_sim_placeholder_exec_label_write_failed",
-                            "BROKER_SIM_PLACEHOLDER_EXEC_LABEL_WRITE_FAILED",
-                            e,
-                            warn_key=f"broker_sim_placeholder_exec_label_write_failed:{symbol}",
-                            symbol=str(symbol),
-                            source_order_id=int(o.get("source_order_id") or 0),
-                        )
-
-                if _is_shadow_book(book_key):
-                    con.execute(
-                        """
-                        UPDATE broker_shadow_order_state
-                        SET state=?, updated_ts_ms=?
-                        WHERE book_key=? AND source_order_id=? AND symbol=? AND state='PENDING'
-                        """,
-                        ("FILLED", _now_ms(), str(_book_key(book_key)), int(o.get("source_order_id") or 0), symbol),
-                    )
-                else:
-                    filled_ts_ms = _now_ms()
-                    con.execute(
-                        """
-                        UPDATE broker_order_state
-                        SET state=?, updated_ts_ms=?
-                        WHERE source_order_id=? AND symbol=? AND state='PENDING'
-                        """,
-                        ("FILLED", filled_ts_ms, int(o.get("source_order_id") or 0), symbol),
-                    )
-                    _prime_broker_order_state_after_commit(
-                        con,
-                        source_order_id=int(o.get("source_order_id") or 0),
-                        symbol=str(symbol),
-                        state="FILLED",
-                        created_ts_ms=int(ts_ms),
-                        updated_ts_ms=int(filled_ts_ms),
-                        ttl_ms=(int(order_ttl_ms) if order_ttl_ms is not None else None),
-                        meta=state_meta,
-                    )
 
                 wrote_fills = True
                 fills_written += 1
@@ -2700,50 +2925,27 @@ def apply_new_portfolio_orders(
 
                 max_notional_budget = max(0.0, float(max_notional_budget) - abs(float(notional)))
 
-        # persist cash and MTM equity
-        cash = _safe_f(cash, 0.0)
-
-        if _broker_account_uses_singleton_id(con):
-            if _is_shadow_book(book_key):
-                _write_account(
-                    con,
-                    float(cash),
-                    float(_read_account(con, book_key=book_key).get("equity", 1.0)),
-                    int(now_ms),
-                    book_key=book_key,
-                )
-            else:
-                con.execute(
-                    "UPDATE broker_account SET cash=?, updated_ts_ms=? WHERE id=1",
-                    (float(cash), int(now_ms)),
-                )
-        else:
-            acct_now = _read_account(con, book_key=book_key)
-            _write_account(
-                con,
-                float(cash),
-                float(acct_now.get("equity", 1.0)),
-                int(now_ms),
-                book_key=book_key,
-            )
-        con.commit()
-
-        acct2 = _mark_to_market(con, int(now_ms), book_key=book_key)
+        # Phase 5: persist account/positions and mark to market.
+        acct2 = _broker_sim_phase_persist_account_positions(
+            con,
+            cash=float(cash),
+            now_ms=int(now_ms),
+            book_key=book_key,
+        )
 
         # mark orders applied (idempotency)
         if order_id is not None:
             _set_meta(con, "last_portfolio_orders_id", str(order_id), book_key=book_key)
             con.commit()
 
-        return {
-            "ok": True,
-            "broker": "sim",
-            "book_key": _book_key(book_key),
-            "status": "applied" if wrote_fills else "no_changes",
-            "order_id": (int(order_id) if order_id is not None else None),
-            "fills_written": int(fills_written),
-            "account": acct2,
-        }
+        # Phase 6: return summary.
+        return _broker_sim_phase_return_summary(
+            book_key=book_key,
+            order_id=(int(order_id) if order_id is not None else None),
+            wrote_fills=bool(wrote_fills),
+            fills_written=int(fills_written),
+            account=acct2,
+        )
     finally:
         con.close()
 

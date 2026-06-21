@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import re
@@ -1397,6 +1398,181 @@ def test_db_validation_reports_contract_fields(initialized_storage) -> None:
     assert validation["missing_cols"] == validation["missing_columns"], validation
     assert "price_feed_lock" in validation["required_tables"], validation
     assert "options_symbol_ingestion_state" in validation["required_tables"], validation
+
+
+def test_db_validation_snapshot_public_shape_golden(initialized_storage) -> None:
+    storage = initialized_storage["storage"]
+
+    validation = storage.get_db_validation_snapshot(include_quick_check=False)
+    public_shape = {
+        "keys": sorted(validation.keys()),
+        "ok": validation["ok"],
+        "storage": validation["storage"],
+        "backend": validation["backend"],
+        "db_exists": validation["db_exists"],
+        "schema_version": validation["schema_version"],
+        "expected_schema_version": validation["expected_schema_version"],
+        "schema_version_ok": validation["schema_version_ok"],
+        "schema_status": validation["schema_status"],
+        "quick_check": validation["quick_check"],
+        "required_table_count": len(validation["required_tables"]),
+        "required_index_count": len(validation["required_indexes"]),
+        "have_table_count": len(validation["have_tables"]),
+        "owned_tables": validation["owned_tables"],
+        "execution_orders_columns": validation["required_columns"]["execution_orders"],
+        "pnl_attribution_columns": validation["required_columns"]["pnl_attribution"],
+        "empty_drift": {
+            "missing_tables": validation["missing_tables"],
+            "missing_columns": validation["missing_columns"],
+            "missing_cols": validation["missing_cols"],
+            "missing_indexes": validation["missing_indexes"],
+            "owned_missing_tables": validation["owned_missing_tables"],
+            "owned_missing_columns": validation["owned_missing_columns"],
+            "owned_unexpected_columns": validation["owned_unexpected_columns"],
+            "owned_type_mismatches": validation["owned_type_mismatches"],
+            "owned_pk_mismatches": validation["owned_pk_mismatches"],
+            "owned_missing_indexes": validation["owned_missing_indexes"],
+            "owned_drift_tables": validation["owned_drift_tables"],
+        },
+    }
+
+    assert public_shape == {
+        "keys": [
+            "backend",
+            "db_exists",
+            "db_path",
+            "expected_schema_version",
+            "have_tables",
+            "missing_cols",
+            "missing_columns",
+            "missing_indexes",
+            "missing_tables",
+            "ok",
+            "owned_drift_tables",
+            "owned_missing_columns",
+            "owned_missing_indexes",
+            "owned_missing_tables",
+            "owned_pk_mismatches",
+            "owned_schema_ok",
+            "owned_tables",
+            "owned_type_mismatches",
+            "owned_unexpected_columns",
+            "quick_check",
+            "required_columns",
+            "required_indexes",
+            "required_tables",
+            "schema_status",
+            "schema_version",
+            "schema_version_ok",
+            "storage",
+            "ts_ms",
+        ],
+        "ok": True,
+        "storage": "sqlite",
+        "backend": "sqlite",
+        "db_exists": True,
+        "schema_version": storage.SCHEMA_VERSION,
+        "expected_schema_version": storage.SCHEMA_VERSION,
+        "schema_version_ok": True,
+        "schema_status": "applied",
+        "quick_check": "skipped",
+        "required_table_count": 44,
+        "required_index_count": 81,
+        "have_table_count": 133,
+        "owned_tables": [
+            "prices",
+            "price_quotes",
+            "price_quotes_raw",
+            "price_provider_health",
+            "ingestion_pipeline_health",
+            "price_feed_lock",
+            "options_symbol_ingestion_state",
+        ],
+        "execution_orders_columns": [
+            "client_order_id",
+            "order_uid",
+            "idempotency_status",
+            "broker",
+            "portfolio_orders_id",
+            "source_alert_id",
+            "prediction_id",
+            "model_id",
+            "model_version",
+            "symbol",
+            "qty",
+            "submit_ts_ms",
+            "ref_px",
+            "expected_px",
+            "mid_px",
+            "bid_px",
+            "ask_px",
+            "spread_bps",
+            "broker_order_id",
+            "status",
+            "extra_json",
+        ],
+        "pnl_attribution_columns": [
+            "ts_ms",
+            "source_alert_id",
+            "prediction_id",
+            "model_id",
+            "model_version",
+            "symbol",
+            "pnl",
+            "fees",
+            "slippage_bps",
+            "position_size",
+            "avg_price",
+            "realized_pnl",
+            "unrealized_pnl",
+            "extra_json",
+        ],
+        "empty_drift": {
+            "missing_tables": [],
+            "missing_columns": {},
+            "missing_cols": {},
+            "missing_indexes": [],
+            "owned_missing_tables": [],
+            "owned_missing_columns": {},
+            "owned_unexpected_columns": {},
+            "owned_type_mismatches": {},
+            "owned_pk_mismatches": {},
+            "owned_missing_indexes": {},
+            "owned_drift_tables": [],
+        },
+    }
+
+
+def test_storage_facade_exposes_validated_backend_contract(initialized_storage) -> None:
+    storage = initialized_storage["storage"]
+
+    backend = storage.get_active_backend()
+
+    assert storage.get_active_backend_name() == "sqlite"
+    assert backend.STORAGE_BACKEND_NAME == "sqlite"
+    for symbol in storage._REQUIRED_BACKEND_SYMBOLS:
+        assert hasattr(backend, symbol), symbol
+
+
+def test_sqlite_base_schema_has_no_dead_statements_after_terminal_return() -> None:
+    storage_sqlite = importlib.import_module("engine.runtime.storage_sqlite")
+    tree = ast.parse(inspect.getsource(storage_sqlite._base_schema))
+    body = tree.body[0].body
+    return_indexes = [idx for idx, node in enumerate(body) if isinstance(node, ast.Return)]
+
+    assert return_indexes, "_base_schema should end with an explicit return after commit"
+    assert return_indexes[-1] == len(body) - 1
+
+
+def test_sqlite_pg_compat_helpers_do_not_clone_runtime_function_code() -> None:
+    storage_sqlite = importlib.import_module("engine.runtime.storage_sqlite")
+    source = inspect.getsource(storage_sqlite)
+
+    assert "FunctionType" not in source
+    assert ".__code__" not in source
+    assert "_clone_pg_helpers" not in source
+    assert "put_event" in storage_sqlite._PG_COMPAT_HELPER_NAMES
+    assert callable(storage_sqlite.put_event)
 
 
 def test_db_validation_reports_owned_table_contract_fields(initialized_storage) -> None:

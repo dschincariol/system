@@ -44,6 +44,7 @@ def _compose_postgres_tuning_env() -> dict[str, str]:
         "TIMESCALE_MAX_SLOT_WAL_KEEP_SIZE": "8GB",
         "TIMESCALE_WAL_DISK_BUDGET": "40g",
         "TIMESCALE_ARCHIVE_MODE": "on",
+        "TIMESCALE_ARCHIVE_COMMAND": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
         "TIMESCALE_ARCHIVE_TIMEOUT": "60s",
         "TIMESCALE_CHECKPOINT_TIMEOUT": "15min",
         "TIMESCALE_CHECKPOINT_COMPLETION_TARGET": "0.9",
@@ -73,6 +74,8 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertIn("EnvironmentFile=-/etc/trading/trading.env", unit)
         self.assertNotIn("EnvironmentFile=-/etc/trading/provider.env", unit)
         self.assertIn("Environment=TS_SECRETS_PROVIDER=systemd-creds", unit)
+        self.assertIn("Environment=DASHBOARD_API_TOKEN_SECRET=dashboard_api_token", unit)
+        self.assertIn("Environment=OPERATOR_API_TOKEN_SECRET=operator_api_token", unit)
         self.assertIn(
             "LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred",
             unit,
@@ -89,6 +92,10 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
             "LoadCredentialEncrypted=dashboard_api_token:/etc/credstore.encrypted/dashboard_api_token.cred",
             unit,
         )
+        self.assertIn(
+            "LoadCredentialEncrypted=operator_api_token:/etc/credstore.encrypted/operator_api_token.cred",
+            unit,
+        )
         self.assertIn("ExecStart=/opt/trading/venv/bin/python engine/runtime/prod_preflight.py --json", unit)
         self.assertIn("ReadWritePaths=/var/lib/trading /var/backups/trading", unit)
         self.assertIn("ProtectSystem=strict", unit)
@@ -102,7 +109,7 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertIn("trading-prod-preflight.service", verify)
         self.assertIn("check_prod_preflight_runner", verify)
         self.assertIn(
-            "redis_password object_store_secret_key dashboard_api_token",
+            "redis_password object_store_secret_key dashboard_api_token operator_api_token",
             (REPO_ROOT / "ops/server/credstore/install.sh").read_text(encoding="utf-8"),
         )
         self.assertIn("--property=\"LoadCredentialEncrypted=pg_password_app:${CREDSTORE_DIR}/pg_password_app.cred\"", runner)
@@ -115,6 +122,12 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
             "--property=\"LoadCredentialEncrypted=dashboard_api_token:${CREDSTORE_DIR}/dashboard_api_token.cred\"",
             runner,
         )
+        self.assertIn(
+            "--property=\"LoadCredentialEncrypted=operator_api_token:${CREDSTORE_DIR}/operator_api_token.cred\"",
+            runner,
+        )
+        self.assertIn("DASHBOARD_API_TOKEN_SECRET=dashboard_api_token", runner)
+        self.assertIn("OPERATOR_API_TOKEN_SECRET=operator_api_token", runner)
         self.assertIn("TS_SECRETS_PROVIDER=systemd-creds", runner)
         self.assertNotIn('if [ -r "$PROVIDER_ENV" ]', runner)
         self.assertIn("engine/runtime/prod_preflight.py --json", runner)
@@ -222,21 +235,56 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_inline_dsn_password_does_not_require_secret_provider(self) -> None:
+    def test_inline_dsn_password_is_rejected_in_strict_preflight(self) -> None:
         with patch.dict(
             os.environ,
             {
                 "TS_PG_DSN": "host=timescaledb port=5432 user=trading dbname=trading password=inline-test",
                 "DB_PATH": str(Path.cwd()),
+                "PROD_LOCK": "1",
+                "TRADING_ENFORCE_SECRET_SOURCE_POLICY": "1",
+                "TRADING_SECRET_POLICY_REPO_ROOT": str(Path.cwd() / "missing-secret-policy-test-root"),
             },
             clear=True,
         ):
             prod_preflight = _reload_module()
             notes, errors, snapshot = prod_preflight._production_provisioning_gate()
 
+        self.assertEqual(notes, [])
+        rendered = "\n".join(errors)
+        self.assertIn("inline_secret_env:TS_PG_DSN", rendered)
+        self.assertEqual(snapshot["credentials"]["required_names"], ["pg_password_app"])
+
+    def test_password_file_does_not_require_secret_provider(self) -> None:
+        data_root = Path.cwd()
+        with tempfile.TemporaryDirectory(prefix="prod_preflight_secret_policy_") as tmp:
+            tmp_path = Path(tmp)
+            password_file = tmp_path / "secrets" / "timescale_password"
+            password_file.parent.mkdir(parents=True, exist_ok=True)
+            password_file.write_text("file-backed-password", encoding="utf-8")
+            password_file.chmod(0o600)
+            repo_root = tmp_path / "repo"
+            repo_root.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "TS_PG_DSN": "host=timescaledb port=5432 user=trading dbname=trading",
+                    "TS_PG_PASSWORD_FILE": str(password_file),
+                    "DB_PATH": str(data_root),
+                    "PROD_LOCK": "1",
+                    "TRADING_ENFORCE_SECRET_SOURCE_POLICY": "1",
+                    "TRADING_SECRET_POLICY_REPO_ROOT": str(repo_root),
+                    "TS_CREDENTIAL_AUDIT_ENABLED": "0",
+                },
+                clear=True,
+            ):
+                prod_preflight = _reload_module()
+                notes, errors, snapshot = prod_preflight._production_provisioning_gate()
+
         self.assertEqual(errors, [])
-        self.assertIn("credential source ok provider=inline_or_env_password", notes)
+        self.assertIn("credential source ok provider=file_or_secret_reference", notes)
         self.assertEqual(snapshot["credentials"]["required_names"], [])
+        self.assertTrue(snapshot["secret_sources"]["ok"])
 
     def test_compose_postgres_tuning_fits_123g_host_profile(self) -> None:
         from engine.runtime.postgres_tuning import BYTES_IN_GIB, docker_postgres_tuning_snapshot
@@ -271,6 +319,32 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertFalse(snapshot["ok"])
         self.assertTrue(
             any("WAL retention budget exceeds configured disk budget" in error for error in snapshot["errors"]),
+            snapshot,
+        )
+
+    def test_compose_postgres_tuning_rejects_inline_archive_command(self) -> None:
+        from engine.runtime.postgres_tuning import docker_postgres_tuning_snapshot
+
+        env = _compose_postgres_tuning_env()
+        env["TIMESCALE_ARCHIVE_COMMAND"] = "mkdir -p /var/backups/trading/wal && cp %p /var/backups/trading/wal/%f"
+        snapshot = docker_postgres_tuning_snapshot(env, required=True)
+
+        self.assertFalse(snapshot["ok"])
+        self.assertTrue(
+            any("archive_command must invoke audited wal_archive.sh" in error for error in snapshot["errors"]),
+            snapshot,
+        )
+
+    def test_compose_postgres_tuning_rejects_noop_archive_command(self) -> None:
+        from engine.runtime.postgres_tuning import docker_postgres_tuning_snapshot
+
+        env = _compose_postgres_tuning_env()
+        env["TIMESCALE_ARCHIVE_COMMAND"] = "/bin/true"
+        snapshot = docker_postgres_tuning_snapshot(env, required=True)
+
+        self.assertFalse(snapshot["ok"])
+        self.assertTrue(
+            any("archive_command must invoke audited wal_archive.sh" in error for error in snapshot["errors"]),
             snapshot,
         )
 

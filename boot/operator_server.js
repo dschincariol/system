@@ -719,11 +719,45 @@ function timingSafeTokenEquals(supplied, expected) {
   }
 }
 
+function readSecretFileText(filePath) {
+  const raw = String(filePath || "").trim();
+  if (!raw) return "";
+  try {
+    return String(fs.readFileSync(raw, "utf-8") || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function readCredentialSecretText(secretName) {
+  const name = String(secretName || "").trim();
+  if (!name || !/^[A-Za-z0-9_.@:-]+$/.test(name)) return "";
+  for (const dirRaw of [process.env.CREDENTIALS_DIRECTORY, process.env.TS_DEV_SECRETS_DIR]) {
+    const dir = String(dirRaw || "").trim();
+    if (!dir) continue;
+    try {
+      const target = path.resolve(dir, name);
+      const resolvedDir = path.resolve(dir);
+      if (target !== resolvedDir && target.startsWith(resolvedDir + path.sep)) {
+        const value = readSecretFileText(target);
+        if (value) return value;
+      }
+    } catch {}
+  }
+  return "";
+}
+
 function operatorApiTokenFromConfig() {
   let env = {};
   try {
     env = readEnv();
   } catch {}
+  const fileToken = readSecretFileText(process.env.OPERATOR_API_TOKEN_FILE || env.OPERATOR_API_TOKEN_FILE);
+  if (fileToken) return fileToken;
+  const providerToken = readCredentialSecretText(
+    process.env.OPERATOR_API_TOKEN_SECRET || env.OPERATOR_API_TOKEN_SECRET || "operator_api_token"
+  );
+  if (providerToken) return providerToken;
   return String(
     process.env.OPERATOR_API_TOKEN ||
     env.OPERATOR_API_TOKEN ||
@@ -736,6 +770,12 @@ function dashboardApiTokenFromConfig() {
   try {
     env = readEnv();
   } catch {}
+  const fileToken = readSecretFileText(process.env.DASHBOARD_API_TOKEN_FILE || env.DASHBOARD_API_TOKEN_FILE);
+  if (fileToken) return fileToken;
+  const providerToken = readCredentialSecretText(
+    process.env.DASHBOARD_API_TOKEN_SECRET || env.DASHBOARD_API_TOKEN_SECRET || "dashboard_api_token"
+  );
+  if (providerToken) return providerToken;
   return String(
     process.env.DASHBOARD_API_TOKEN ||
     env.DASHBOARD_API_TOKEN ||
@@ -837,6 +877,15 @@ const OPERATOR_CONFIRMATION_REGISTRY = Object.freeze({
     consequence: "Forces SAFE mode, disarms execution, trips the global kill switch, and stops the engine.",
     requireReason: true,
     minReasonLength: 10,
+    holdMs: 3000,
+  },
+  "operator.broker_risk": {
+    requiredToken: "BROKER_RISK",
+    severity: "emergency",
+    consequence: "Cancels live broker orders and may submit flattening orders under configured shutdown-risk limits.",
+    requireReason: true,
+    minReasonLength: 10,
+    requireTarget: true,
     holdMs: 3000,
   },
   "operator.config_write": {
@@ -1914,7 +1963,11 @@ function ensureEnvFile() {
   try {
     const envNow = readEnv();
     const tok = String(envNow.DASHBOARD_API_TOKEN || "").trim();
-    if (!tok) {
+    const externalToken = (
+      readSecretFileText(process.env.DASHBOARD_API_TOKEN_FILE || envNow.DASHBOARD_API_TOKEN_FILE) ||
+      readCredentialSecretText(process.env.DASHBOARD_API_TOKEN_SECRET || envNow.DASHBOARD_API_TOKEN_SECRET || "dashboard_api_token")
+    );
+    if (!tok && !externalToken) {
       const secrets = loadSecrets();
       let token = "";
 
@@ -3186,6 +3239,70 @@ function emergencyStop() {
   return { ok: true, status: "STOPPING", managed: false };
 }
 
+function runBrokerRiskCommand(body = {}, confirmation = {}) {
+  const payload = (body && typeof body === "object" && !Array.isArray(body)) ? body : {};
+  const policy = String(payload.policy || payload.action || "").trim();
+  if (!policy) {
+    return { ok: false, error: "broker_risk_policy_required" };
+  }
+
+  let sanitized = {};
+  try {
+    ensureEnvFile();
+    const envObj = readEnv();
+    sanitized = validateAndSanitizeEnv(envObj).sanitized || {};
+  } catch (e) {
+    return { ok: false, error: "broker_risk_env_load_failed", detail: String(e && e.message ? e.message : e) };
+  }
+
+  const actor = String(payload.actor || payload.who || confirmation.actor || "operator_server").trim() || "operator_server";
+  const reason = String(payload.reason || payload.justification || confirmation.reason || "operator broker risk action").trim();
+  const broker = String(payload.broker || "").trim();
+  const engineMode = String(payload.engine_mode || payload.mode || sanitized.ENGINE_MODE || process.env.ENGINE_MODE || "").trim();
+  const commandId = String(payload.command_id || payload.request_id || confirmation.request_id || `broker-risk-${Date.now()}`).trim();
+  const timeoutS = clampNumber(payload.timeout_s || payload.timeout || 15, 15, 1, 120);
+  const python = pickPythonCmd();
+  const args = python === "py" ? ["-3", "-u", "-m"] : ["-u", "-m"];
+  const cliArgs = [
+    ...args,
+    "engine.execution.broker_shutdown_risk",
+    "--policy", policy,
+    "--timeout-s", String(timeoutS),
+    "--command-id", commandId,
+    "--actor", actor,
+    "--reason", reason,
+    "--source", "operator_sidecar",
+  ];
+  if (broker) cliArgs.push("--broker", broker);
+  if (engineMode) cliArgs.push("--engine-mode", engineMode);
+
+  const r = spawnSyncSafe(python, cliArgs, {
+    cwd: ROOT,
+    env: { ...process.env, ...sanitized, PYTHONPATH: ROOT },
+    stdio: "pipe",
+    timeout: Math.max(5000, Math.ceil(timeoutS * 1000) + 5000),
+  });
+  const stdout = String(r.stdout || "").trim();
+  const stderr = String(r.stderr || "").trim();
+  let parsed = null;
+  try {
+    const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    parsed = lines.length ? JSON.parse(lines[lines.length - 1]) : null;
+  } catch (e) {
+    parsed = null;
+  }
+  const ok = Number(r.status || 0) === 0 && !!(parsed && parsed.ok);
+  return {
+    ok,
+    status: ok ? "broker_risk_complete" : "broker_risk_failed",
+    command: parsed,
+    exit_status: Number(r.status || 0),
+    signal: r.signal || null,
+    stdout_tail: stdout.slice(-4000),
+    stderr_tail: stderr.slice(-4000),
+  };
+}
+
 // --------------------------------------------------
 // Health + Readiness (backend integration)
 // --------------------------------------------------
@@ -4089,9 +4206,9 @@ function tailLog(lines = 200) {
 }
 
 const REDACTED_SECRET = "***REDACTED***";
-const OPERATOR_SENSITIVE_KEY_RE = /(?:^|[_\-.])(?:token|secret|password|passwd|passphrase|api[_\-.]?key|access[_\-.]?key|private[_\-.]?key|master[_\-.]?key|hmac[_\-.]?key|credential|credentials|dsn|database[_\-.]?url|redis[_\-.]?url|broker[_\-.]?key|provider[_\-.]?key)(?:$|[_\-.])/i;
-const OPERATOR_SENSITIVE_TEXT_KEY_RE = /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|ACCESS_KEY|PRIVATE_KEY|MASTER_KEY|HMAC_KEY|CREDENTIAL|CREDENTIALS|DSN|DATABASE_URL|REDIS_URL|BROKER_KEY|PROVIDER_KEY)[A-Z0-9_]*)\s*=\s*([^\s"'`]+)/gi;
-const OPERATOR_SENSITIVE_JSON_KEY_RE = /("([^"]*(?:token|secret|password|passwd|passphrase|api[_-]?key|access[_-]?key|private[_-]?key|master[_-]?key|hmac[_-]?key|credential|credentials|dsn|database[_-]?url|redis[_-]?url|broker[_-]?key|provider[_-]?key)[^"]*)"\s*:\s*)"([^"]*)"/gi;
+const OPERATOR_SENSITIVE_KEY_RE = /(?:^|[_\-.])(?:token|secret|password|passwd|passphrase|api[_\-.]?key|key[_\-.]?id|access[_\-.]?key|private[_\-.]?key|master[_\-.]?key|hmac[_\-.]?key|credential|credentials|dsn|database[_\-.]?url|redis[_\-.]?url|broker[_\-.]?key|provider[_\-.]?key)(?:$|[_\-.])/i;
+const OPERATOR_SENSITIVE_TEXT_KEY_RE = /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_KEY|KEY_ID|ACCESS_KEY|PRIVATE_KEY|MASTER_KEY|HMAC_KEY|CREDENTIAL|CREDENTIALS|DSN|DATABASE_URL|REDIS_URL|BROKER_KEY|PROVIDER_KEY)[A-Z0-9_]*)\s*=\s*([^\s"'`]+)/gi;
+const OPERATOR_SENSITIVE_JSON_KEY_RE = /("([^"]*(?:token|secret|password|passwd|passphrase|api[_-]?key|key[_-]?id|access[_-]?key|private[_-]?key|master[_-]?key|hmac[_-]?key|credential|credentials|dsn|database[_-]?url|redis[_-]?url|broker[_-]?key|provider[_-]?key)[^"]*)"\s*:\s*)"([^"]*)"/gi;
 const URL_PASSWORD_RE = /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)([^@\s/]+)(@)/gi;
 
 function isOperatorSensitiveKey(keyName) {
@@ -7094,6 +7211,22 @@ app.post("/api/operator/emergency_stop", (req, res) => {
     ok: !!result.ok,
     status: status(),
     result
+  }, result && result.ok ? 200 : 500);
+});
+
+app.post("/api/operator/broker_risk", (req, res) => {
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const policy = String(body.policy || body.action || "").trim() || "unspecified";
+  const broker = String(body.broker || body.target || "").trim() || "configured";
+  const confirmation = requireOperatorConfirmation(req, res, "operator.broker_risk", {
+    target: `${broker}:${policy}`,
+  });
+  if (!confirmation) return;
+  const result = runBrokerRiskCommand(body, confirmation);
+  return sendOperatorPayload(res, {
+    ok: !!result.ok,
+    status: result.ok ? "BROKER_RISK_COMPLETE" : "BROKER_RISK_FAILED",
+    result,
   }, result && result.ok ? 200 : 500);
 });
 

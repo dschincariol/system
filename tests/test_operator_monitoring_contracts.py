@@ -47,6 +47,59 @@ def test_missing_portfolio_backtest_is_explicit_empty_state(monkeypatch, tmp_pat
     assert _derive_response_status(payload) == 200
 
 
+def test_latest_portfolio_backtest_preserves_null_zero_and_nonzero_points(monkeypatch, tmp_path: Path):
+    db_path = tmp_path / "portfolio-null-points.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE portfolio_bt_runs (
+              id INTEGER PRIMARY KEY,
+              ts_ms INTEGER,
+              start_ts_ms INTEGER,
+              end_ts_ms INTEGER,
+              metrics_json TEXT
+            );
+            CREATE TABLE portfolio_bt_points (
+              run_id INTEGER,
+              ts_ms INTEGER,
+              ret REAL,
+              equity REAL,
+              drawdown REAL,
+              detail_json TEXT
+            );
+            """
+        )
+        con.execute(
+            "INSERT INTO portfolio_bt_runs VALUES (?, ?, ?, ?, ?)",
+            (1, 4000, 1000, 3000, "{}"),
+        )
+        con.executemany(
+            "INSERT INTO portfolio_bt_points VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, 1000, None, None, None, "{}"),
+                (1, 2000, 0.0, 0.0, 0.0, "{}"),
+                (1, 3000, 0.12, 1.12, -0.03, "{}"),
+            ],
+        )
+        con.commit()
+
+    monkeypatch.setattr(api_read_advanced, "db_connect", lambda: sqlite3.connect(str(db_path)))
+
+    payload = api_read_advanced.get_latest_portfolio_backtest()
+
+    assert payload["ok"] is True
+    points = payload["run"]["points"]
+    assert points[0]["ret"] is None
+    assert points[0]["equity"] is None
+    assert points[0]["drawdown"] is None
+    assert points[1]["ret"] == 0.0
+    assert points[1]["equity"] == 0.0
+    assert points[1]["drawdown"] == 0.0
+    assert points[2]["ret"] == 0.12
+    assert points[2]["equity"] == 1.12
+    assert points[2]["drawdown"] == -0.03
+
+
 def test_weather_effect_tolerates_baseline_schema_without_spearman(monkeypatch, tmp_path: Path):
     db_path = tmp_path / "weather.db"
     with sqlite3.connect(str(db_path)) as con:

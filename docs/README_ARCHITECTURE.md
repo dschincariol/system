@@ -2,7 +2,9 @@
 
 This document explains the repo in plain English.
 
-Last verified against code: 2026-06-11
+Last verified against code: 2026-06-21
+
+For the grounded, code-referenced architecture reference (exact entrypoints, control planes, and modules), see [ARCHITECTURE.md](ARCHITECTURE.md). This document is its plain-English companion.
 
 If you want the shortest answer, this system is a supervised trading platform that:
 
@@ -130,7 +132,7 @@ flowchart TD
 ## 6. Storage Model
 
 The persistent center of gravity is the runtime storage facade in `engine/runtime/storage.py`.
-Current production-like storage is Postgres-backed through `engine/runtime/storage_pg.py`; older SQLite-era wording may still appear in historical docs or tests, but new storage behavior should be treated as a migration-backed runtime contract.
+Current production-like storage is Postgres-backed through `engine/runtime/storage_pg.py`, selected and contract-validated by the facade before callers can use it. Older SQLite-era wording may still appear in historical docs or tests, but new storage behavior should be treated as a migration-backed runtime contract.
 
 This matters because nearly every major subsystem reads from or writes to the same storage layer:
 

@@ -61,6 +61,45 @@ _LOCAL_EXTERNAL_SERVICE_DEFAULTS = {
     "PREFLIGHT_REQUIRE_REDIS": "0",
     "PREFLIGHT_REQUIRE_OBJECT_STORAGE": "0",
 }
+_LOCAL_SECRET_INLINE_POP_KEYS = (
+    "DASHBOARD_API_TOKEN",
+    "OPERATOR_API_TOKEN",
+    "DATA_SOURCE_MASTER_KEY",
+    "TRADING_MASTER_KEY",
+    "APP_MASTER_KEY",
+    "BACKUP_EVIDENCE_HMAC_KEY",
+    "ALPACA_KEY_ID",
+    "ALPACA_SECRET_KEY",
+    "POLYGON_API_KEY",
+    "POLYGON_KEY",
+    "TRADIER_API_TOKEN",
+    "OPENAI_API_KEY",
+    "TIMESCALE_PASSWORD",
+    "TS_PG_PASSWORD",
+    "PGPASSWORD",
+    "TS_PG_PASSWORD_APP",
+    "TS_PG_APP_PASSWORD",
+    "TS_PG_PASSWORD_INGEST",
+    "TS_PG_INGEST_PASSWORD",
+    "TS_PG_PASSWORD_READER",
+    "TS_PG_READER_PASSWORD",
+    "REDIS_PASSWORD",
+    "MINIO_ROOT_USER",
+    "MINIO_ROOT_PASSWORD",
+    "MINIO_ACCESS_KEY",
+    "MINIO_SECRET_KEY",
+    "OBJECT_STORE_ACCESS_KEY",
+    "OBJECT_STORE_SECRET_KEY",
+    "OBJECT_STORE_SESSION_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+)
+_LOCAL_VALIDATION_FILE_SECRETS = {
+    "DATA_SOURCE_MASTER_KEY_FILE": _VALIDATION_DATA_SOURCE_MASTER_KEY,
+    "DASHBOARD_API_TOKEN_FILE": "validation-dashboard-token-0000000000000000",
+    "OPERATOR_API_TOKEN_FILE": "validation-operator-token-0000000000000000",
+}
 
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -73,6 +112,8 @@ def _env_truthy(value: object) -> bool:
 def _production_validation_profile(env: Dict[str, str]) -> bool:
     if _env_truthy(env.get("TRADING_VALIDATION_REQUIRE_PROD_DEPS")):
         return True
+    if _startup_validation_mode(env):
+        return False
     profile_values = (
         env.get("TS_ENV"),
         env.get("ENV"),
@@ -93,8 +134,51 @@ def _local_startup_validation_profile(env: MutableMapping[str, str]) -> bool:
 
 def _scrub_local_external_service_env(env: MutableMapping[str, str]) -> None:
     for key in _LOCAL_EXTERNAL_SERVICE_POP_KEYS:
-        env.pop(key, None)
+        env[key] = ""
     env.update(_LOCAL_EXTERNAL_SERVICE_DEFAULTS)
+
+
+def _write_validation_secret_file(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(value), encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _local_secret_source_env_keys() -> Tuple[str, ...]:
+    try:
+        from engine.runtime.secret_sources import SECRET_ENV_SPECS
+    except Exception:
+        keys: Set[str] = set(_LOCAL_SECRET_INLINE_POP_KEYS)
+        for key in tuple(_LOCAL_SECRET_INLINE_POP_KEYS):
+            keys.add(f"{key}_FILE")
+            keys.add(f"{key}_SECRET")
+        keys.update(_LOCAL_VALIDATION_FILE_SECRETS.keys())
+        return tuple(sorted(keys))
+
+    keys: Set[str] = set()
+    for spec in SECRET_ENV_SPECS:
+        keys.add(str(spec.key))
+        keys.update(str(item) for item in spec.file_envs)
+        keys.update(str(item) for item in spec.secret_envs)
+    return tuple(sorted(keys))
+
+
+def _configure_local_secret_source_policy(env: MutableMapping[str, str], root_dir: Path) -> None:
+    if _production_validation_profile(dict(env)):
+        return
+    for key in _local_secret_source_env_keys():
+        env[key] = ""
+    for key in ("TS_SECRETS_PROVIDER", "CREDENTIALS_DIRECTORY", "TS_DEV_SECRETS_DIR"):
+        env[key] = ""
+    root_dir.mkdir(parents=True, exist_ok=True)
+    policy_root = root_dir / "empty_secret_policy_repo"
+    policy_root.mkdir(parents=True, exist_ok=True)
+    env["TRADING_SECRET_POLICY_REPO_ROOT"] = str(policy_root)
+    secret_dir = root_dir / "secrets"
+    for env_name, value in _LOCAL_VALIDATION_FILE_SECRETS.items():
+        path = secret_dir / env_name.lower()
+        _write_validation_secret_file(path, value)
+        env[env_name] = str(path)
 
 
 def _is_missing_optional_module(error: ModuleNotFoundError, module_name: str) -> bool:
@@ -154,11 +238,11 @@ def bootstrap_validation_env(extra_env: Optional[Dict[str, str]] = None) -> Dict
         _scrub_local_external_service_env(os.environ)
 
     # Startup graph validation runs supervised imports, which require a
-    # production-shaped key. Use deterministic validation material unless the
-    # caller explicitly opts into validating real production dependencies.
+    # production-shaped key. Use deterministic file-backed validation material
+    # unless the caller explicitly opts into validating real production
+    # dependencies.
     if not _production_validation_profile(dict(os.environ)):
-        os.environ["DATA_SOURCE_MASTER_KEY"] = _VALIDATION_DATA_SOURCE_MASTER_KEY
-        os.environ.pop("DATA_SOURCE_MASTER_KEY_FILE", None)
+        _configure_local_secret_source_policy(os.environ, Path(DATA_DIR) / "runtime_graph_validation")
 
     return dict(os.environ)
 
@@ -292,6 +376,7 @@ def _run_cold_boot_db_bootstrap_check(*, timeout_s: float = 180.0) -> Dict[str, 
         )
         if not _production_validation_profile(env):
             _scrub_local_external_service_env(env)
+            _configure_local_secret_source_policy(env, tmp_root / "validation_secret_policy")
 
         check_code = (
             "import sys\n"
@@ -356,6 +441,7 @@ def _run_timeseries_sidecar_startup_check(*, timeout_s: float = 180.0) -> Dict[s
         )
         if not _production_validation_profile(env):
             _scrub_local_external_service_env(env)
+            _configure_local_secret_source_policy(env, tmp_root / "validation_secret_policy")
 
         check_code = (
             "import json\n"

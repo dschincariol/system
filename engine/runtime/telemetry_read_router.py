@@ -8,9 +8,9 @@ from contextlib import contextmanager
 from typing import Any
 
 try:
-    import psycopg2
+    import psycopg
 except Exception:  # pragma: no cover - optional dependency at runtime
-    psycopg2 = None  # type: ignore[assignment]
+    psycopg = None  # type: ignore[assignment]
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -59,7 +59,7 @@ def _sqlite_table_exists(con: Any, name: str) -> bool:
 
 def _timescale_enabled() -> bool:
     config = TimescaleConfig.from_env()
-    return bool(config.enabled and config.dsn and psycopg2 is not None)
+    return bool(config.enabled and config.dsn and psycopg is not None)
 
 
 def _read_backend_mode() -> str:
@@ -87,10 +87,10 @@ def get_telemetry_read_backend() -> str:
 @contextmanager
 def _timescale_connection():
     config = TimescaleConfig.from_env()
-    if psycopg2 is None or not str(config.dsn or "").strip():
+    if psycopg is None or not str(config.dsn or "").strip():
         raise RuntimeError("timescale_telemetry_reader_not_configured")
-    con = psycopg2.connect(
-        dsn=str(config.dsn),
+    con = psycopg.connect(
+        str(config.dsn),
         connect_timeout=int(max(1, round(float(config.connect_timeout_s)))),
         application_name="trading-system-telemetry-read-router",
     )

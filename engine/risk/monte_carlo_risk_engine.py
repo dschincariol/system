@@ -1,8 +1,9 @@
 """Background Monte Carlo refresher for portfolio risk state.
 
 This module samples portfolio return paths from recent price history and stores
-summary metrics in ``risk_state`` so dashboards and execution gates can consume
-stressed portfolio risk estimates without blocking live paths.
+summary metrics plus compact chart artifacts in ``risk_state`` so dashboards and
+execution gates can consume stressed portfolio risk estimates without blocking
+live paths.
 """
 
 import json
@@ -62,6 +63,68 @@ def _drawdown_percentiles(dd):
         "p95": _pct(dd, 0.95),
         "p99": _pct(dd, 0.99),
     }
+
+
+def _fan_rows(paths_by_step: List[List[float]]) -> List[Dict[str, float]]:
+    rows: List[Dict[str, float]] = []
+    for idx, values in enumerate(paths_by_step or []):
+        if not values:
+            continue
+        rows.append(
+            {
+                "step": int(idx + 1),
+                "p05": _pct(values, 0.05),
+                "p50": _pct(values, 0.50),
+                "p95": _pct(values, 0.95),
+            }
+        )
+    return rows
+
+
+def _distribution_buckets(values: List[float], bucket_count: int = 21) -> List[Dict[str, float]]:
+    vals = [float(v) for v in values or [] if math.isfinite(float(v))]
+    if not vals:
+        return []
+
+    lo = min(vals)
+    hi = max(vals)
+    n_buckets = int(max(1, min(50, bucket_count)))
+    if abs(hi - lo) <= 1e-12:
+        return [
+            {
+                "bucket": f"{lo * 100.0:.2f}%",
+                "lower": float(lo),
+                "upper": float(hi),
+                "value": float(lo),
+                "count": int(len(vals)),
+                "probability": 1.0,
+            }
+        ]
+
+    width = float((hi - lo) / n_buckets)
+    counts = [0 for _ in range(n_buckets)]
+    for value in vals:
+        idx = int((float(value) - lo) / width)
+        idx = max(0, min(n_buckets - 1, idx))
+        counts[idx] += 1
+
+    rows: List[Dict[str, float]] = []
+    total = float(len(vals))
+    for idx, count in enumerate(counts):
+        lower = float(lo + (idx * width))
+        upper = float(hi if idx == n_buckets - 1 else lo + ((idx + 1) * width))
+        midpoint = float((lower + upper) / 2.0)
+        rows.append(
+            {
+                "bucket": f"{lower * 100.0:.2f}% to {upper * 100.0:.2f}%",
+                "lower": lower,
+                "upper": upper,
+                "value": midpoint,
+                "count": int(count),
+                "probability": float(count / total if total > 0.0 else 0.0),
+            }
+        )
+    return rows
 
 
 def _load_history(con, symbol: str, lookback: int) -> List[float]:
@@ -225,7 +288,7 @@ def _cholesky(cov):
 def _simulate(weights, vols, drifts, corr, *, vol_mult=1.0, corr_mult=1.0, drift_shift=0.0):
     n = len(weights)
     if n <= 0:
-        return [], []
+        return [], [], []
 
     corr_adj = []
     for i in range(n):
@@ -242,6 +305,7 @@ def _simulate(weights, vols, drifts, corr, *, vol_mult=1.0, corr_mult=1.0, drift
 
     pnl = []
     dd = []
+    paths_by_step: List[List[float]] = [[] for _ in range(max(0, int(MC_HORIZON)))]
     rng = random.Random()
 
     # This is a pragmatic stress engine, not a full market simulator. The main
@@ -252,7 +316,7 @@ def _simulate(weights, vols, drifts, corr, *, vol_mult=1.0, corr_mult=1.0, drift
         worst = 0.0
         total = 0.0
 
-        for _step in range(MC_HORIZON):
+        for step_idx in range(MC_HORIZON):
             z = [rng.gauss(0.0, 1.0) for _ in range(n)]
             asset_r = []
             for i in range(n):
@@ -260,6 +324,8 @@ def _simulate(weights, vols, drifts, corr, *, vol_mult=1.0, corr_mult=1.0, drift
                 asset_r.append(float(drifts[i]) + float(drift_shift) + float(shock))
             step = sum(float(weights[i]) * float(asset_r[i]) for i in range(n))
             total += step
+            if 0 <= step_idx < len(paths_by_step):
+                paths_by_step[step_idx].append(float(total))
             equity *= (1.0 + step)
             if equity > peak:
                 peak = equity
@@ -268,7 +334,7 @@ def _simulate(weights, vols, drifts, corr, *, vol_mult=1.0, corr_mult=1.0, drift
         pnl.append(float(total))
         dd.append(float(worst))
 
-    return pnl, dd
+    return pnl, dd, _fan_rows(paths_by_step)
 
 
 def _write_status(status: str, info: Optional[Dict[str, Any]] = None, pending: Optional[bool] = None):
@@ -305,8 +371,8 @@ def _worker(desired):
             _write_status("idle", info=info, pending=False)
             return
 
-        base_pnl, base_dd = _simulate(weights, vols, drifts, corr)
-        stress_pnl, stress_dd = _simulate(
+        base_pnl, base_dd, base_fan = _simulate(weights, vols, drifts, corr)
+        stress_pnl, stress_dd, _ = _simulate(
             weights,
             vols,
             drifts,
@@ -335,6 +401,8 @@ def _worker(desired):
             "drawdown_percentiles": _drawdown_percentiles(base_dd),
             "drawdown_cvar_95": _cvar(base_dd, 0.95),
             "drawdown_cvar_99": _cvar(base_dd, 0.99),
+            "fan": base_fan,
+            "distribution": _distribution_buckets(base_pnl),
             "stress": {
                 "vol_mult": float(MC_STRESS_VOL_MULT),
                 "corr_mult": float(MC_STRESS_CORR_MULT),

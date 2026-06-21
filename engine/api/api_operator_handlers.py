@@ -479,6 +479,60 @@ def api_post_operator_emergency_stop(_parsed=None, _body=None, ctx=None):
     }
 
 
+def api_post_operator_broker_risk(_parsed=None, body=None, ctx=None):
+    """Run an explicit broker cancel/flatten command from an operator surface."""
+
+    ctx = _ctx_dict(ctx)
+    payload = body if isinstance(body, dict) else {}
+    policy = str(payload.get("policy") or payload.get("action") or "").strip()
+    if not policy:
+        return {
+            "ok": False,
+            "error": "broker_risk_policy_required",
+            "allowed_policies": [
+                "observe_only",
+                "cancel_only",
+                "flatten_positions",
+                "cancel_and_flatten",
+            ],
+        }
+    actor = str(payload.get("actor") or payload.get("who") or "operator").strip() or "operator"
+    reason = str(payload.get("reason") or payload.get("justification") or "operator_broker_risk").strip()
+    command_id = str(payload.get("command_id") or payload.get("request_id") or "").strip() or None
+    broker = str(payload.get("broker") or "").strip() or None
+    engine_mode = str(payload.get("engine_mode") or payload.get("mode") or "").strip() or None
+    try:
+        timeout_s = float(payload.get("timeout_s") or payload.get("timeout") or 15.0)
+    except Exception:
+        timeout_s = 15.0
+
+    try:
+        from engine.execution.broker_shutdown_risk import handle_broker_shutdown_risk
+
+        return handle_broker_shutdown_risk(
+            policy=policy,
+            broker=broker,
+            engine_mode=engine_mode,
+            timeout_s=timeout_s,
+            command_id=command_id,
+            actor=actor,
+            reason=reason,
+            source="engine.api.api_operator_handlers",
+            require_explicit_live_policy=False,
+        )
+    except Exception as e:
+        return failure_response(
+            LOG,
+            event="api_operator_handlers_broker_risk_failed",
+            code="API_OPERATOR_HANDLERS_BROKER_RISK_FAILED",
+            message=str(e),
+            error=e,
+            component="engine.api.api_operator_handlers",
+            ctx=ctx,
+            extra={"policy": policy, "actor": actor, "broker": broker or ""},
+        )
+
+
 def api_post_operator_execution_arm(_parsed=None, body=None, ctx=None):
     """Arm or disarm audited live execution through the DB execution-mode row."""
 

@@ -69,6 +69,14 @@ class RouteContractIssue:
 
 
 @dataclass(frozen=True)
+class ScreenModuleBoundaryIssue:
+    screen: str
+    source_path: str
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True)
 class _StringLiteral:
     value: str
     line: int
@@ -472,6 +480,107 @@ def find_js_syntax_issues(
     return issues
 
 
+def find_screen_module_boundary_issues(*, root: Path = ROOT) -> list[ScreenModuleBoundaryIssue]:
+    """Keep large dashboard screen controllers in dedicated modules."""
+
+    boundaries = [
+        {
+            "screen": "Data Health",
+            "dashboard_path": "ui/dashboard.js",
+            "module_path": "ui/data_health.js",
+            "required_dashboard_snippets": [
+                'from "./data_health.js"',
+                "loadDataHealthScreenModule({",
+            ],
+            "forbidden_dashboard_snippets": [
+                "/api/operator/provider_telemetry",
+                "/api/data/feature_visibility?limit=12",
+                '"dataProvidersBody"',
+                '"dataHealthNotes"',
+                '"dataRuntimeGrid"',
+            ],
+            "required_module_snippets": [
+                "export async function fetchDataHealthScreen",
+                "export function normalizeDataHealthScreen",
+                "export function renderDataHealthScreen",
+                "export async function loadDataHealthScreen",
+                "/api/operator/provider_telemetry",
+                "/api/data/feature_visibility?limit=12",
+                '"dataProvidersBody"',
+                '"dataHealthNotes"',
+                '"dataRuntimeGrid"',
+            ],
+        },
+    ]
+
+    issues: list[ScreenModuleBoundaryIssue] = []
+    for boundary in boundaries:
+        dashboard_path = str(boundary["dashboard_path"])
+        module_path = str(boundary["module_path"])
+        dashboard_file = root / dashboard_path
+        module_file = root / module_path
+        screen = str(boundary["screen"])
+
+        if not module_file.exists():
+            issues.append(
+                ScreenModuleBoundaryIssue(
+                    screen=screen,
+                    source_path=module_path,
+                    reason="missing_module",
+                    detail=f"{module_path} must own the {screen} screen controller.",
+                )
+            )
+            continue
+        if not dashboard_file.exists():
+            issues.append(
+                ScreenModuleBoundaryIssue(
+                    screen=screen,
+                    source_path=dashboard_path,
+                    reason="missing_dashboard",
+                    detail=f"{dashboard_path} was not found.",
+                )
+            )
+            continue
+
+        dashboard_text = _read_text(root, dashboard_path)
+        module_text = _read_text(root, module_path)
+
+        for snippet in boundary["required_dashboard_snippets"]:
+            if str(snippet) not in dashboard_text:
+                issues.append(
+                    ScreenModuleBoundaryIssue(
+                        screen=screen,
+                        source_path=dashboard_path,
+                        reason="missing_dashboard_delegation",
+                        detail=f"dashboard.js must delegate {screen} through {module_path}: missing {snippet!r}.",
+                    )
+                )
+
+        for snippet in boundary["forbidden_dashboard_snippets"]:
+            if str(snippet) in dashboard_text:
+                issues.append(
+                    ScreenModuleBoundaryIssue(
+                        screen=screen,
+                        source_path=dashboard_path,
+                        reason="centralized_screen_logic",
+                        detail=f"{screen} screen-specific contract {snippet!r} belongs in {module_path}, not dashboard.js.",
+                    )
+                )
+
+        for snippet in boundary["required_module_snippets"]:
+            if str(snippet) not in module_text:
+                issues.append(
+                    ScreenModuleBoundaryIssue(
+                        screen=screen,
+                        source_path=module_path,
+                        reason="missing_module_contract",
+                        detail=f"{module_path} is missing {screen} screen contract snippet {snippet!r}.",
+                    )
+                )
+
+    return issues
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report static dashboard UI contract refs.")
     parser.add_argument("--root", default=str(ROOT))
@@ -492,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
         root=root,
         node_executable=args.node_executable,
     )
+    boundary_issues = find_screen_module_boundary_issues(root=root)
 
     if args.list_assets:
         for path in sorted(assets):
@@ -511,6 +621,12 @@ def main(argv: list[str] | None = None) -> int:
         print("Dashboard JS syntax contract failed.")
         for issue in syntax_issues:
             print(f"{issue.source_path}: {issue.detail}")
+        return 1
+
+    if boundary_issues:
+        print("Dashboard screen module boundary contract failed.")
+        for issue in boundary_issues:
+            print(f"{issue.source_path}: {issue.reason}: {issue.detail}")
         return 1
 
     print(

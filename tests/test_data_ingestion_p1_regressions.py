@@ -51,6 +51,20 @@ def test_data_credential_helper_uses_loader_and_ttl_cache(monkeypatch):
     assert calls == ["POLYGON_API_KEY"]
 
 
+def test_data_credential_helper_prefers_secret_file(monkeypatch, tmp_path):
+    creds = importlib.reload(importlib.import_module("engine.data._credentials"))
+    creds.clear_data_credential_cache()
+    secret_file = tmp_path / "polygon_api_key"
+    secret_file.write_text("file-backed-polygon-key", encoding="utf-8")
+    secret_file.chmod(0o600)
+
+    monkeypatch.setenv("POLYGON_API_KEY_FILE", str(secret_file))
+    monkeypatch.setenv("TS_SECRETS_PROVIDER", "plaintext")
+    monkeypatch.setattr(creds, "load_secret", lambda name: (_ for _ in ()).throw(AssertionError(name)))
+
+    assert creds.get_data_credential("POLYGON_API_KEY", ttl_s=0) == "file-backed-polygon-key"
+
+
 def test_ingesters_do_not_read_provider_credentials_from_environ_directly():
     checked_roots = [REPO_ROOT / "engine" / "data", REPO_ROOT / "engine" / "jobs"]
     allowed = {

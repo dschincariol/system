@@ -446,6 +446,101 @@ def _snapshot_replication(con: Any, writer: MetricWriter, *, ts_ms: int) -> int:
     return int(emitted)
 
 
+def _snapshot_wal_archiver(con: Any, writer: MetricWriter, *, ts_ms: int) -> int:
+    try:
+        row = con.execute(
+            """
+            SELECT
+              archived_count::bigint AS archived_count,
+              failed_count::bigint AS failed_count,
+              EXTRACT(EPOCH FROM last_archived_time) AS last_archived_at_ts,
+              EXTRACT(EPOCH FROM last_failed_time) AS last_failed_at_ts,
+              COALESCE(last_archived_wal, '') AS last_archived_wal,
+              COALESCE(last_failed_wal, '') AS last_failed_wal
+            FROM pg_stat_archiver
+            """
+        ).fetchone()
+    except Exception as exc:
+        _warn_once("pg_stat_archiver_unavailable", "pg_stat_archiver is not readable", exc)
+        return 0
+    if not row:
+        return 0
+    now_s = float(ts_ms) / 1000.0
+    archived_count = _as_int(_row_get(row, "archived_count", 0))
+    failed_count = _as_int(_row_get(row, "failed_count", 1))
+    last_archived_ts = _as_float(_row_get(row, "last_archived_at_ts", 2), default=0.0)
+    last_failed_ts = _as_float(_row_get(row, "last_failed_at_ts", 3), default=0.0)
+    emitted = 0
+    emitted += _write_metric(writer, "postgres.wal_archiver.archived_count", value_num=archived_count, ts_ms=ts_ms)
+    emitted += _write_metric(writer, "postgres.wal_archiver.failed_count", value_num=failed_count, ts_ms=ts_ms)
+    if last_archived_ts > 0:
+        emitted += _write_metric(
+            writer,
+            "postgres.wal_archiver.seconds_since_last_archive",
+            value_num=max(0.0, now_s - last_archived_ts),
+            value_text=str(_row_get(row, "last_archived_wal", 4) or "") or None,
+            ts_ms=ts_ms,
+        )
+    if last_failed_ts > 0:
+        emitted += _write_metric(
+            writer,
+            "postgres.wal_archiver.seconds_since_last_failure",
+            value_num=max(0.0, now_s - last_failed_ts),
+            value_text=str(_row_get(row, "last_failed_wal", 5) or "") or None,
+            ts_ms=ts_ms,
+        )
+    return int(emitted)
+
+
+def _snapshot_pg_wal_risk(con: Any, writer: MetricWriter, *, ts_ms: int) -> int:
+    try:
+        wal_row = con.execute(
+            """
+            SELECT
+              COALESCE(SUM(size), 0)::bigint AS wal_bytes,
+              COUNT(*)::bigint AS wal_files
+            FROM pg_ls_waldir()
+            WHERE name ~ '^[0-9A-F]{24}(\\.[A-Za-z0-9]+)?$'
+            """
+        ).fetchone()
+    except Exception as exc:
+        _warn_once("pg_wal_directory_stats_unavailable", "pg_wal directory stats are not readable", exc)
+        return 0
+    ready_count = 0
+    try:
+        ready_row = con.execute(
+            """
+            SELECT COUNT(*)::bigint AS ready_count
+            FROM pg_ls_dir('pg_wal/archive_status') AS status(name)
+            WHERE name LIKE '%.ready'
+            """
+        ).fetchone()
+        ready_count = _as_int(_row_get(ready_row, "ready_count", 0))
+    except Exception as exc:
+        _warn_once("pg_wal_archive_status_unavailable", "pg_wal archive_status is not readable", exc)
+
+    emitted = 0
+    emitted += _write_metric(
+        writer,
+        "postgres.wal.directory_bytes",
+        value_num=_as_int(_row_get(wal_row, "wal_bytes", 0)),
+        ts_ms=ts_ms,
+    )
+    emitted += _write_metric(
+        writer,
+        "postgres.wal.file_count",
+        value_num=_as_int(_row_get(wal_row, "wal_files", 1)),
+        ts_ms=ts_ms,
+    )
+    emitted += _write_metric(
+        writer,
+        "postgres.wal.archive_ready_count",
+        value_num=ready_count,
+        ts_ms=ts_ms,
+    )
+    return int(emitted)
+
+
 def _pgbouncer_admin_dsn() -> str:
     configured = str(os.environ.get("TS_PGBOUNCER_ADMIN_DSN") or "").strip()
     if configured:
@@ -541,6 +636,8 @@ def snapshot_pg_observability(
 
     con = connect()
     try:
+        emitted += _snapshot_wal_archiver(con, writer, ts_ms=emitted_ts_ms)
+        emitted += _snapshot_pg_wal_risk(con, writer, ts_ms=emitted_ts_ms)
         if not _pg_stat_statements_available(con):
             _warn_once(
                 "pg_stat_statements_noop",
@@ -550,7 +647,7 @@ def snapshot_pg_observability(
                 "ok": True,
                 "skipped": True,
                 "reason": "pg_stat_statements_unavailable",
-                "emitted": 0,
+                "emitted": int(emitted),
                 "ts_ms": emitted_ts_ms,
             }
         emitted += _snapshot_pg_stat_statements(con, writer, ts_ms=emitted_ts_ms, limit=int(statement_limit))

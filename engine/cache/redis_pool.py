@@ -25,7 +25,19 @@ _LOCK = threading.Lock()
 def _secret_text_from_env(*env_names: str) -> str:
     secret_name = ""
     for env_name in env_names:
-        secret_name = str(os.environ.get(env_name) or "").strip()
+        name = str(env_name or "").strip()
+        file_env_names = [name] if name.endswith("_FILE") else []
+        if name.endswith("_SECRET"):
+            file_env_names.append(f"{name.removesuffix('_SECRET')}_FILE")
+        for file_env_name in file_env_names:
+            path = str(os.environ.get(file_env_name) or "").strip()
+            if path:
+                from engine.runtime.secret_sources import read_secret_text_file
+
+                return read_secret_text_file(path)
+        if name.endswith("_FILE"):
+            continue
+        secret_name = str(os.environ.get(name) or "").strip()
         if secret_name:
             break
     if not secret_name:
