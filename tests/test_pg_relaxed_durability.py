@@ -44,8 +44,21 @@ def test_runtime_refetchable_telemetry_wrapper_sets_local_when_relaxed(
     assert "COMMIT" in statements
 
 
-def test_runtime_financial_write_txn_keeps_default_durability_when_relaxed_env_is_set(
+@pytest.mark.parametrize(
+    ("table", "operation"),
+    (
+        ("execution_orders", "record_execution_order"),
+        ("trade_attribution_ledger", "append_ledger_row"),
+        ("broker_order_state", "update_broker_order_state"),
+        ("event_log", "append_audit_event"),
+        ("equity_history", "record_capital_state"),
+        ("capital_preservation_audit", "record_capital_audit"),
+    ),
+)
+def test_runtime_protected_write_txn_keeps_default_durability_when_relaxed_env_is_set(
     monkeypatch: pytest.MonkeyPatch,
+    table: str,
+    operation: str,
 ) -> None:
     statements: list[str] = []
 
@@ -67,23 +80,37 @@ def test_runtime_financial_write_txn_keeps_default_durability_when_relaxed_env_i
     monkeypatch.setattr(storage_pg, "connect", lambda readonly=False, timeout_s=None: FakeConnection())
 
     storage_pg.run_write_txn(
-        lambda con: con.execute("INSERT INTO execution_orders VALUES (...)"),
-        table="execution_orders",
-        operation="record_execution_order",
+        lambda con: con.execute(f"INSERT INTO {table} VALUES (...)"),
+        table=table,
+        operation=operation,
         attempts=1,
     )
 
     assert SET_LOCAL_SYNCHRONOUS_COMMIT_OFF_SQL not in statements
-    assert statements[0].startswith("INSERT INTO execution_orders")
+    assert statements[0].startswith(f"INSERT INTO {table}")
     assert "COMMIT" in statements
 
 
-def test_refetchable_telemetry_wrapper_rejects_protected_financial_tables() -> None:
+@pytest.mark.parametrize(
+    ("table", "operation"),
+    (
+        ("execution_orders", "record_execution_order"),
+        ("trade_attribution_ledger", "append_ledger_row"),
+        ("broker_order_state", "update_broker_order_state"),
+        ("event_log", "append_audit_event"),
+        ("equity_history", "record_capital_state"),
+        ("capital_preservation_audit", "record_capital_audit"),
+    ),
+)
+def test_refetchable_telemetry_wrapper_rejects_protected_financial_tables(
+    table: str,
+    operation: str,
+) -> None:
     with pytest.raises(ValueError, match="unapproved_refetchable_ingestion_telemetry_write"):
         storage_pg.run_refetchable_ingestion_telemetry_txn(
-            lambda con: con.execute("INSERT INTO trade_attribution_ledger VALUES (...)"),
-            table="trade_attribution_ledger",
-            operation="write_ledger_row",
+            lambda con: con.execute(f"INSERT INTO {table} VALUES (...)"),
+            table=table,
+            operation=operation,
             attempts=1,
         )
 

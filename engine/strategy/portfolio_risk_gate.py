@@ -732,7 +732,7 @@ def _apply_execution_exposure_caps(
             "fixed_gross": float(fixed_gross),
             "fixed_net": float(fixed_net),
         }
-        new_order.setdefault("exposure_cap", cap_meta)
+        new_order["exposure_cap"] = cap_meta
         explain = new_order.get("explain")
         if isinstance(explain, dict):
             explain.setdefault("execution", {})

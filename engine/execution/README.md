@@ -77,6 +77,13 @@ Live broker routing has additional fail-closed constraints:
 - Live failover chains must not include `sim`, `paper`, `sandbox`, or mixed live brokers.
 - `DISABLE_LIVE_EXECUTION` blocks real trading when it is unset or set to any value other than `0`, `false`, `no`, or `off`.
 - Pre-live reconciliation must run in live mode unless the break-glass environment contract is explicitly filled and audited.
+- `broker_apply_orders.py` revalidates aggregate gross and net exposure in
+  `apply_execution_risk_governor(...)` after EPE shaping and model/kill-switch
+  gates but before the broker router or any broker adapter sees the payload.
+  The check uses the final broker-bound orders plus local `broker_positions`
+  and pending `broker_order_state` rows. It resizes orders when there is
+  remaining headroom, suppresses orders when there is no headroom, and blocks
+  fail-closed on missing or invalid exposure data.
 - Broker auth/configuration failures and unrecorded broker submissions stop failover instead of retrying into another broker.
 
 ## Broker Simulation Pipeline
