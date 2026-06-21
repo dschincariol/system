@@ -1,6 +1,9 @@
 .git
 .github
 .venv
+.venv*/
+venv/
+env/
 __pycache__/
 *.pyc
 *.pyo
@@ -8,13 +11,18 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
+.ipynb_checkpoints/
 node_modules/
 npm-debug.log*
 logs/
 data/
 tmp/
+temp/
 dist/
 build/
+site/
+htmlcov/
 *.db
 *.sqlite
 *.sqlite3
@@ -29,4 +37,3 @@ pyright_workspace.txt
 ruff_repo.json
 coverage/
 docs/handoff/
-

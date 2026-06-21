@@ -1,10 +1,13 @@
 ARG PYTHON_RUNTIME_IMAGE=python:3.11-slim
 FROM ${PYTHON_RUNTIME_IMAGE}
 
+ARG TRADING_REQUIREMENTS_FILE=requirements.txt
+
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 ENV PYTHONPATH=/app
+ENV TRADING_REQUIREMENTS_FILE=${TRADING_REQUIREMENTS_FILE}
 
 WORKDIR /app
 
@@ -12,14 +15,22 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements*.txt /app/
 
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install -r /app/requirements.txt
+    && case "$TRADING_REQUIREMENTS_FILE" in \
+        requirements.txt) python -m pip install -r /app/requirements.txt ;; \
+        requirements-amd-rocm.txt) \
+            grep -Ev '^(torch|torchaudio|torchvision|triton|numpy|scikit-learn|lightgbm|xgboost)(\\[.*\\])?(==|~=|>=|<=|<|>|===| @ )' /app/requirements.txt > /tmp/requirements-base-rocm.txt; \
+            python -m pip install -r /tmp/requirements-base-rocm.txt; \
+            python -m pip install --upgrade --force-reinstall -r /app/requirements-amd-rocm.txt; \
+            ;; \
+        requirements-*.txt) python -m pip install --upgrade --force-reinstall -r "/app/$TRADING_REQUIREMENTS_FILE" ;; \
+        *) echo "invalid TRADING_REQUIREMENTS_FILE=$TRADING_REQUIREMENTS_FILE" >&2; exit 2 ;; \
+    esac
 
 COPY . /app
 
 RUN mkdir -p /app/data /app/logs /app/artifact_mirror /app/training_datasets
 
 CMD ["python", "start_system.py"]
-

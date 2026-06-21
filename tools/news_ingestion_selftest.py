@@ -8,11 +8,55 @@ import time
 from pathlib import Path
 
 
+def _ensure_column(con, table: str, name: str, column_type: str) -> None:
+    existing = {
+        str(row[1])
+        for row in con.execute(f"PRAGMA table_info({table})").fetchall()
+        if row and len(row) > 1
+    }
+    if name in existing:
+        return
+    con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
+
+
+def _prepare_news_selftest_schema(con) -> None:
+    from engine.data.news_flow import ensure_news_flow_tables
+
+    ensure_news_flow_tables(con)
+    for name, column_type in (
+        ("cluster_key", "TEXT"),
+        ("headline_key", "TEXT"),
+        ("duplicate_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("company_match_method", "TEXT"),
+        ("company_match_conf", "REAL NOT NULL DEFAULT 0.0"),
+        ("source_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("meta_json", "TEXT"),
+    ):
+        _ensure_column(con, "news_event_features", name, column_type)
+    for name, column_type in (
+        ("bucket_ts_ms", "INTEGER"),
+        ("bucket_sec", "INTEGER"),
+        ("news_velocity", "REAL NOT NULL DEFAULT 0.0"),
+        ("sentiment_trend", "REAL NOT NULL DEFAULT 0.0"),
+        ("event_density", "REAL NOT NULL DEFAULT 0.0"),
+        ("event_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("distinct_cluster_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("avg_sentiment", "REAL NOT NULL DEFAULT 0.0"),
+        ("avg_novelty", "REAL NOT NULL DEFAULT 0.0"),
+        ("duplicate_share", "REAL NOT NULL DEFAULT 0.0"),
+    ):
+        _ensure_column(con, "news_symbol_features", name, column_type)
+
+
 def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    fd, path = tempfile.mkstemp(prefix="news_ingestion_selftest_", suffix=".db")
-    os.close(fd)
-    os.environ["DB_PATH"] = path
+    root = Path(tempfile.mkdtemp(prefix="news_ingestion_selftest_"))
+    path = root / "selftest.db"
+    os.environ["DB_PATH"] = str(path)
+    os.environ["TS_STORAGE_BACKEND"] = "sqlite"
+    os.environ["TRADING_DATA"] = str(root / "data")
+    os.environ["DATA_DIR"] = str(root / "data")
+    os.environ["TS_ARTIFACTS_ROOT"] = str(root / "artifacts")
 
     from engine.runtime.storage import init_db, connect, put_normalized_event, put_news_event_feature
     from engine.data.event_normalization import normalize_news_event
@@ -21,6 +65,7 @@ def main() -> None:
     init_db()
     con = connect()
     try:
+        _prepare_news_selftest_schema(con)
         now_ms = int(time.time() * 1000)
         samples = [
             {
@@ -86,7 +131,7 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "db": path,
+                    "db": str(path),
                     "event_count": int(event_count),
                     "duplicate_events": int(dupes),
                     "snapshot": snapshot,

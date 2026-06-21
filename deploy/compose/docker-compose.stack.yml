@@ -17,6 +17,7 @@ services:
       dockerfile: deploy/compose/Dockerfile.runtime
       args:
         PYTHON_RUNTIME_IMAGE: ${PYTHON_RUNTIME_IMAGE:?set PYTHON_RUNTIME_IMAGE}
+        TRADING_REQUIREMENTS_FILE: ${TRADING_REQUIREMENTS_FILE:-requirements.txt}
     image: ${APP_RUNTIME_IMAGE:?set APP_RUNTIME_IMAGE}
     container_name: trading-runtime
     restart: "on-failure:${DOCKER_RESTART_MAX_ATTEMPTS:-5}"
@@ -26,6 +27,7 @@ services:
     environment:
       ENV: ${APP_ENV:-prod}
       ENGINE_SUPERVISED: "1"
+      TRADING_ACCELERATION_PROFILE: ${TRADING_ACCELERATION_PROFILE:-cpu}
       ENGINE_MODE: ${ENGINE_MODE:-safe}
       EXECUTION_MODE: ${EXECUTION_MODE:-safe}
       OPERATOR_MODE: ${OPERATOR_MODE:-safe}

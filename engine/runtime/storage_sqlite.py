@@ -5576,6 +5576,7 @@ _CLONE_NAMES = [
     "put_normalized_event",
     "put_price",
     "_payload_writer",
+    "_news_event_feature_row",
     "_alt_data_row",
     "_alt_data_upsert",
     "put_news_event_feature",
@@ -5661,6 +5662,7 @@ def _clone_pg_helpers() -> bool:
 
         for name in (
             "_INSIDER_TRANSACTION_COLUMNS",
+            "_NEWS_EVENT_FEATURE_COLUMNS",
             "_CONGRESSIONAL_TRADE_COLUMNS",
             "_FINRA_SHORT_SALE_VOLUME_COLUMNS",
             "_FINRA_SHORT_INTEREST_COLUMNS",

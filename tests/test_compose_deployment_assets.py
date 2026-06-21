@@ -21,6 +21,8 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("PROD_LOCK: ${PROD_LOCK:-1}", text)
         self.assertIn("ALLOW_TRAINING: ${ALLOW_TRAINING:-0}", text)
         self.assertIn("TRADING_IMPORT_SMOKE_IMPORT_JOBS: ${TRADING_IMPORT_SMOKE_IMPORT_JOBS:-0}", text)
+        self.assertIn("TRADING_ACCELERATION_PROFILE: ${TRADING_ACCELERATION_PROFILE:-cpu}", text)
+        self.assertIn("TRADING_REQUIREMENTS_FILE: ${TRADING_REQUIREMENTS_FILE:-requirements.txt}", text)
         self.assertIn("OPERATOR_DISABLE_INTERNAL_ENGINE_START: \"1\"", text)
         self.assertIn("OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:?set OPERATOR_API_TOKEN}", text)
         self.assertIn("docker-compose.external-services.yml", (REPO_ROOT / "deploy" / "compose" / "README.md").read_text(encoding="utf-8"))
@@ -46,6 +48,8 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("DOCKER_LOG_MAX_FILE=5", env_text)
         self.assertIn("DOCKER_RESTART_MAX_ATTEMPTS=5", env_text)
         self.assertIn("TRADING_SCHEMA_VALIDATION_BACKOFF_S=30", env_text)
+        self.assertIn("TRADING_REQUIREMENTS_FILE=requirements.txt", env_text)
+        self.assertIn("TRADING_ACCELERATION_PROFILE=cpu", env_text)
 
     def test_compose_dockerfiles_and_ignore_exist(self) -> None:
         runtime_dockerfile = REPO_ROOT / "deploy" / "compose" / "Dockerfile.runtime"
@@ -61,9 +65,25 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         ignore_text = dockerignore.read_text(encoding="utf-8")
 
         self.assertIn("start_system.py", runtime_text)
+        self.assertIn("TRADING_REQUIREMENTS_FILE", runtime_text)
+        self.assertIn("requirements-*.txt", runtime_text)
         self.assertIn("boot/operator_server.js", operator_text)
         self.assertIn("logs/", ignore_text)
         self.assertIn("data/", ignore_text)
+
+    def test_rocm_compose_overlay_is_opt_in_runtime_only(self) -> None:
+        stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
+        rocm_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.amd-rocm.yml").read_text(encoding="utf-8")
+
+        self.assertNotIn("/dev/kfd", stack_text)
+        self.assertNotIn("/dev/dri:/dev/dri", stack_text)
+        self.assertIn("rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1", rocm_text)
+        self.assertIn("TRADING_REQUIREMENTS_FILE: requirements-amd-rocm.txt", rocm_text)
+        self.assertIn("TRADING_ACCELERATION_PROFILE: amd-rocm", rocm_text)
+        self.assertIn("- /dev/dri:/dev/dri", rocm_text)
+        self.assertIn("- /dev/kfd:/dev/kfd", rocm_text)
+        self.assertIn("${TRADING_RENDER_GID:-991}", rocm_text)
+        self.assertIn("${TRADING_VIDEO_GID:-44}", rocm_text)
 
     def test_minio_initializer_retries_until_object_store_is_ready(self) -> None:
         external_compose = REPO_ROOT / "deploy" / "compose" / "docker-compose.external-services.yml"

@@ -122,6 +122,7 @@ Supplementary but useful:
 - Copy [.env.example](.env.example) to `.env` for a new workstation.
 - On Linux/macOS development machines, run `bash tools/bootstrap_local_toolchain.sh` from the repo root. It creates or updates `.venv` with Python 3.11, installs `requirements.txt`, installs Node.js 20.19.4 with npm 10.8.2 inside `.venv` when needed, runs `npm ci`, and links the `python`, `python3`, `node`, `npm`, and `npx` command names into `$HOME/.local/bin` by default.
 - Install Python dependencies with `python -m pip install -r requirements.txt`.
+- The AMD ROCm profile is opt-in. See [docs/ROCM_ACCELERATION.md](docs/ROCM_ACCELERATION.md) for the Strix Halo `gfx1151` requirements file, compose overlay, runtime fallback behavior, and validation harness.
 - Use Node.js 20 LTS (`>=20.17.0 <21`) with npm 10.x for the operator UI. The checked-in `.npmrc` enforces this during `npm ci`.
 - Install Node dependencies reproducibly with `npm ci`; do not edit or vendor `node_modules/`.
 - Prefer `ENGINE_MODE=safe` and `EXECUTION_MODE=safe` until the environment, providers, and operator controls are verified.

@@ -41,6 +41,11 @@ def pytest_configure(config):
         "requires_redis: test needs a reachable Redis instance at "
         "TS_REDIS_URL; auto-skipped when unreachable",
     )
+    config.addinivalue_line(
+        "markers",
+        "requires_rocm: test needs a ROCm-enabled torch runtime and visible HIP device; "
+        "auto-skipped when unavailable",
+    )
 
 
 def _probe_tcp(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -121,6 +126,28 @@ def _redis_reachable() -> bool:
     return _probe_tcp(host, port)
 
 
+@functools.lru_cache(maxsize=1)
+def _rocm_reachable() -> bool:
+    if str(os.environ.get("TRADING_FORCE_ROCM_TESTS", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    try:
+        import torch
+
+        return bool(
+            getattr(getattr(torch, "version", None), "hip", None)
+            and getattr(torch, "cuda", None)
+            and torch.cuda.is_available()
+            and torch.cuda.device_count() > 0
+        )
+    except Exception:
+        return False
+
+
 def pytest_runtest_setup(item):
     keywords = item.keywords
     if "linux_only" in keywords and sys.platform != "linux":
@@ -131,6 +158,8 @@ def pytest_runtest_setup(item):
         pytest.skip("postgres not reachable at TS_PG_DSN")
     if "requires_redis" in keywords and not _redis_reachable():
         pytest.skip("redis not reachable at TS_REDIS_URL")
+    if "requires_rocm" in keywords and not _rocm_reachable():
+        pytest.skip("ROCm torch device not reachable")
 
 
 @pytest.fixture(autouse=True)

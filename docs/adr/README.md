@@ -55,3 +55,5 @@ If the decision changes materially, create a new ADR instead of rewriting histor
 - [0002-api-specification-choice.md](0002-api-specification-choice.md)
 - [0003-docstring-standard.md](0003-docstring-standard.md)
 - [0004-decision-log-format.md](0004-decision-log-format.md)
+- [0005-codex-staged-migration-program.md](0005-codex-staged-migration-program.md)
+- [0006-idle-nvme-keep-or-reclaim-gate.md](0006-idle-nvme-keep-or-reclaim-gate.md)

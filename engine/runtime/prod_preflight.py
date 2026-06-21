@@ -168,7 +168,8 @@ def _schema_validation_backoff_s() -> float:
     ).strip()
     try:
         return max(0.0, min(600.0, float(raw)))
-    except Exception:
+    except Exception as e:
+        _warn_nonfatal("PROD_PREFLIGHT_SCHEMA_BACKOFF_PARSE_FAILED", e, once_key="schema_backoff_parse")
         return 0.0
 
 
@@ -700,6 +701,12 @@ def _docker_log_cap_gate() -> Tuple[List[str], List[str], List[str], Dict[str, A
             check=False,
         )
     except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_DOCKER_PS_FAILED",
+            exc,
+            once_key="docker_log_cap_ps",
+            command="docker ps -q",
+        )
         warnings.append(f"docker log cap check skipped: docker ps failed: {type(exc).__name__}: {exc}")
         state["reason"] = "docker_ps_failed"
         return notes, warnings, errors, state
@@ -727,6 +734,12 @@ def _docker_log_cap_gate() -> Tuple[List[str], List[str], List[str], Dict[str, A
             check=False,
         )
     except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_DOCKER_INSPECT_FAILED",
+            exc,
+            once_key="docker_log_cap_inspect",
+            containers=len(container_ids),
+        )
         errors.append(f"docker log cap validation failed: docker inspect failed: {type(exc).__name__}: {exc}")
         state["reason"] = "docker_inspect_failed"
         return notes, warnings, errors, state
@@ -740,6 +753,12 @@ def _docker_log_cap_gate() -> Tuple[List[str], List[str], List[str], Dict[str, A
     try:
         objects = list(json.loads(inspected.stdout or "[]") or [])
     except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_DOCKER_INSPECT_JSON_FAILED",
+            exc,
+            once_key="docker_log_cap_inspect_json",
+            containers=len(container_ids),
+        )
         errors.append(f"docker log cap validation failed: inspect JSON invalid: {type(exc).__name__}: {exc}")
         state["reason"] = "docker_inspect_invalid_json"
         return notes, warnings, errors, state

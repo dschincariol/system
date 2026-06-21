@@ -14,6 +14,7 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.acceleration import resolve_torch_device
 from engine.runtime.logging import get_logger
 
 LOG = get_logger("engine.data.finbert_sentiment")
@@ -175,17 +176,14 @@ def _source_identifier(payload: Dict[str, Any]) -> str:
 
 def _resolved_device(requested: Any = None) -> Tuple[Any, str]:
     torch = importlib.import_module("torch")
-    device = str(
+    requested_device = str(
         requested
         or os.environ.get("FINBERT_DEVICE")
         or os.environ.get("TORCH_DEVICE")
         or ""
     ).strip().lower()
-    if not device:
-        device = "cuda" if bool(getattr(torch, "cuda", None)) and torch.cuda.is_available() else "cpu"
-    if device.startswith("cuda") and (not bool(getattr(torch, "cuda", None)) or not torch.cuda.is_available()):
-        device = "cpu"
-    return torch, device
+    resolved = resolve_torch_device(torch, requested=requested_device or "auto")
+    return torch, str(resolved.get("effective_device") or "cpu")
 
 
 def load_finbert_model(

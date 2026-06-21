@@ -19,6 +19,7 @@ from engine.artifacts.serialization import dumps_torch_payload, loads_torch_payl
 from engine.artifacts.store import LocalArtifactStore
 from engine.model_registry import register_model, register_model_family
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.acceleration import resolve_torch_device
 from engine.runtime.storage import connect, init_db
 from engine.strategy import feature_registry
 from engine.strategy.feature_registry import build_feature_snapshot, feature_set_tag_from_ids
@@ -36,6 +37,7 @@ from engine.strategy.models.lgbm_regressor import (
     _safe_float,
 )
 from engine.strategy.models.lgbm_regressor import _resolve_retrain_schema_guard
+from engine.strategy.patchtst_core import PatchTST
 from engine.strategy.ensemble.oos_store import upsert_oos_predictions
 from engine.strategy.ood import build_ood_profile, score_ood, summarize_ood_profile
 
@@ -68,10 +70,16 @@ def _register_family() -> None:
 
 _register_family()
 
-if os.environ.get("PATCHTST_USE_CUDA", "0") == "1" and torch.cuda.is_available():
-    DEFAULT_DEVICE = torch.device("cuda")
-else:
-    DEFAULT_DEVICE = torch.device("cpu")
+def _default_device() -> torch.device:
+    resolved = resolve_torch_device(
+        torch,
+        requested=os.environ.get("PATCHTST_DEVICE") or "auto",
+        legacy_cuda_enabled=os.environ.get("PATCHTST_USE_CUDA", "0") == "1",
+    )
+    return torch.device(str(resolved.get("effective_device") or "cpu"))
+
+
+DEFAULT_DEVICE = _default_device()
 
 
 def _set_seed(seed: int) -> None:
@@ -236,8 +244,10 @@ def _assert_config_feature_schema_current(config: Mapping[str, Any]) -> list[str
 
 def _resolve_load_device(config: Mapping[str, Any]) -> torch.device:
     trained_device = str(config.get("device_at_train") or "cpu").strip().lower()
-    if trained_device.startswith("cuda") and torch.cuda.is_available():
-        return torch.device("cuda")
+    if trained_device.startswith("cuda"):
+        resolved = resolve_torch_device(torch, requested="cuda")
+        if str(resolved.get("effective_device") or "cpu").startswith("cuda"):
+            return torch.device("cuda")
     if trained_device.startswith("cuda"):
         logging.getLogger(__name__).warning(
             "patchtst_cuda_trained_loaded_on_cpu model_name=%s device_at_train=%s",
@@ -299,64 +309,6 @@ def _preprocess_sequence_array(
         fit_preprocessing=fit_preprocessing,
     )
     return flat.reshape(int(n_samples), int(seq_len), int(n_features)).astype(np.float32), preprocessing, accounting
-
-
-class PatchTST(nn.Module):
-    """Compact PatchTST encoder using patch tokens and a Transformer encoder."""
-
-    def __init__(
-        self,
-        *,
-        seq_len: int,
-        n_features: int,
-        n_horizons: int,
-        patch_len: int = DEFAULT_PATCH_LEN,
-        stride: int = DEFAULT_STRIDE,
-        d_model: int = DEFAULT_D_MODEL,
-        n_layers: int = DEFAULT_LAYERS,
-        n_heads: int = DEFAULT_HEADS,
-        dropout: float = DEFAULT_DROPOUT,
-    ) -> None:
-        super().__init__()
-        self.seq_len = int(seq_len)
-        self.n_features = int(n_features)
-        self.n_horizons = int(n_horizons)
-        self.patch_len = int(patch_len)
-        self.stride = int(stride)
-        self.d_model = int(d_model)
-        self.n_layers = int(n_layers)
-        self.n_heads = int(n_heads)
-        self.dropout = float(dropout)
-        if self.patch_len <= 0 or self.stride <= 0:
-            raise ValueError("patch_len_and_stride_must_be_positive")
-        if self.seq_len < self.patch_len:
-            raise ValueError("seq_len_must_cover_one_patch")
-        self.n_patches = 1 + ((self.seq_len - self.patch_len) // self.stride)
-        self.patch_projection = nn.Linear(self.patch_len * self.n_features, self.d_model)
-        self.position = nn.Parameter(torch.zeros(1, self.n_patches, self.d_model))
-        layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
-            nhead=self.n_heads,
-            dim_feedforward=self.d_model * 4,
-            dropout=self.dropout,
-            batch_first=True,
-            activation="gelu",
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=self.n_layers)
-        self.norm = nn.LayerNorm(self.d_model)
-        self.head = nn.Linear(self.d_model, self.n_horizons)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError("patchtst_forward_requires_3d")
-        patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
-        patches = patches.permute(0, 1, 3, 2).contiguous()
-        patches = patches.reshape(x.shape[0], self.n_patches, self.patch_len * self.n_features)
-        tokens = self.patch_projection(patches) + self.position
-        encoded = self.encoder(tokens)
-        pooled = self.norm(encoded.mean(dim=1))
-        return self.head(pooled)
 
 
 class PatchTSTRegressor:

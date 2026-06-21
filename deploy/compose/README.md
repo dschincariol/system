@@ -8,6 +8,8 @@ Use these compose assets when you want a containerized staging or production-lik
   Brings up Timescale/Postgres, Redis, and MinIO-style object storage.
 - `docker-compose.stack.yml`
   Brings up the Python runtime and the Node operator sidecar on top of the external dependency network.
+- `docker-compose.amd-rocm.yml`
+  Optional runtime-only ROCm overlay for AMD Strix Halo / `gfx1151` hosts.
 - `.env.example`
   Seed env file for both compose files.
 - `Dockerfile.runtime`
@@ -57,6 +59,44 @@ docker compose \
 ```bash
 python tools/validate_repo.py --live
 ```
+
+## Optional ROCm Runtime Profile
+
+The base stack is CPU-only. For bart-style AMD Strix Halo hosts, use the ROCm
+overlay only after `/dev/dri/renderD128`, `/dev/kfd`, and render/video group
+access are validated:
+
+```bash
+export TRADING_REQUIREMENTS_FILE=requirements-amd-rocm.txt
+export TRADING_ACCELERATION_PROFILE=amd-rocm
+export TRADING_RENDER_GID="$(getent group render | cut -d: -f3)"
+export TRADING_VIDEO_GID="$(getent group video | cut -d: -f3)"
+
+docker compose \
+  --env-file deploy/compose/.env \
+  -f deploy/compose/docker-compose.external-services.yml \
+  -f deploy/compose/docker-compose.stack.yml \
+  -f deploy/compose/docker-compose.amd-rocm.yml \
+  up -d --build
+```
+
+Then validate from inside the runtime container:
+
+```bash
+docker compose \
+  --env-file deploy/compose/.env \
+  -f deploy/compose/docker-compose.external-services.yml \
+  -f deploy/compose/docker-compose.stack.yml \
+  -f deploy/compose/docker-compose.amd-rocm.yml \
+  exec runtime python tools/validate_rocm_acceleration.py --require-gpu
+```
+
+The overlay maps `/dev/dri` and `/dev/kfd` plus the render/video GIDs into the
+runtime container only and switches the runtime build to AMD's
+`rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1` image; the
+operator container remains device-free. See [ROCm Acceleration Profile](../../docs/ROCM_ACCELERATION.md)
+for the package pins, fallback behavior, validation harness, 2 GB UMA / 66 GB
+GTT caveat, and `gfx1151` maturity risk.
 
 For a local compose stack with published ports, export the same auth and base URLs before running live smoke:
 

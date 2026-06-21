@@ -133,6 +133,18 @@ print("__DASHBOARD_ROUTE_SNAPSHOT__" + json.dumps({
     env.setdefault("FEATURE_STORE_ENABLED", "0")
     env.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
     env.setdefault("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
+    for key in (
+        "PORTFOLIO_RISK_MC_VAR_95_BLOCK",
+        "PORTFOLIO_RISK_MC_VAR_99_BLOCK",
+        "PORTFOLIO_RISK_MC_CVAR_95_BLOCK",
+        "PORTFOLIO_RISK_MC_CVAR_99_BLOCK",
+        "PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK",
+        "PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK",
+        "PORTFOLIO_RISK_VOL_HARD_BLOCK",
+        "KILL_SWITCH_MODEL_MAX_DRAWDOWN",
+        "KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES",
+    ):
+        env.setdefault(key, "0")
     result = subprocess.run(
         [sys.executable, "-c", code],
         cwd=str(REPO_ROOT),

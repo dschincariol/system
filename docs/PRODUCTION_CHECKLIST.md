@@ -14,6 +14,7 @@ This checklist is grounded in the deployment artifacts under `deploy/`, the runt
 - For the compose deployment path, copy `deploy/compose/.env.example` to `deploy/compose/.env` and set provider bootstrap credentials there only on the target host. Use `POLYGON_API_KEY`, `TRADIER_API_TOKEN`, `ALPACA_KEY_ID`, and `ALPACA_SECRET_KEY`; leave `PROD_LOCK=1`, `ALLOW_TRAINING=0`, `TRADING_IMPORT_SMOKE_IMPORT_JOBS=0`, `POLYGON_REST_ENABLED=0`, `POLYGON_WS_ENABLED=0`, `TRADIER_ENABLED=0`, `BROKER_NAME=sim`, and `BROKER=sim` until the dependency-only stack is healthy.
 - For local Linux/macOS validation workstations, run `bash tools/bootstrap_local_toolchain.sh` from the repository root. It prepares `.venv`, installs Python dependencies from `requirements.txt`, installs Node.js 20.19.4 with npm 10.8.2 inside `.venv` when needed, runs `npm ci`, and creates user-local shims for the `python`, `python3`, `node`, `npm`, and `npx` command names.
 - Install Python dependencies with `python -m pip install -r requirements.txt`.
+- Keep `TRADING_ACCELERATION_PROFILE=cpu` and `TRADING_REQUIREMENTS_FILE=requirements.txt` unless intentionally validating the opt-in AMD ROCm profile. For bart-style Strix Halo hosts, follow [ROCm Acceleration Profile](ROCM_ACCELERATION.md), run `python tools/validate_rocm_acceleration.py --require-gpu`, and keep the 2 GB UMA / 66 GB GTT memory caveat plus `gfx1151` maturity risk in the deployment notes.
 - Use Node.js 20 LTS (`>=20.17.0 <21`) with npm 10.x for the operator UI. The repository `.npmrc` sets `engine-strict=true`, so `npm ci` fails early on unsupported Node/npm versions.
 - Install Node dependencies reproducibly with `npm ci`.
 - Bring up the Postgres/PgBouncer endpoint required by `TS_PG_DSN` before runtime bring-up. Postgres runtime storage is mandatory for production-like operation; SQLite is not a production fallback.
@@ -69,6 +70,7 @@ The repository already includes these deployment assets:
 - Start the Python runtime through `start_system.py` or the deployment wrapper that invokes it.
 - Start the operator sidecar through `boot/operator_server.js` or the deployment wrapper that invokes it.
 - If you are using the compose deployment path, bring the stack up with both compose files and treat the operator container as a proxy sidecar, not the lifecycle owner of the runtime.
+- If you are using the ROCm compose overlay, confirm only the runtime container has `/dev/dri` and `/dev/kfd`, and confirm startup logs include `runtime_acceleration_probe` with the expected `hip_version`, `torch_cuda_is_available`, device count, and effective device.
 - Confirm the dependency endpoints referenced by `TIMESCALE_DSN`, `TIMESCALE_PRICES_DSN`, `LIVE_CACHE_REDIS_URL`, and `OBJECT_STORE_ENDPOINT` are reachable from the runtime host before allowing the runtime to leave safe mode.
 - Confirm the Postgres endpoint referenced by `TS_PG_DSN` or platform defaults is reachable, and that `python engine/runtime/prod_preflight.py --json` reports the Postgres contract as healthy.
 - Confirm `GET /api/readiness` returns a coherent readiness payload.

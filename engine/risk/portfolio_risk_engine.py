@@ -71,47 +71,62 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
 # -----------------------------
 USE = os.environ.get("PORTFOLIO_USE_RISK_ENGINE", "1") == "1"
 
+def _env_number(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return str(default)
+    return str(raw)
+
+
+def _env_number_any(names: tuple[str, ...], default: str) -> str:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is not None and str(raw).strip() != "":
+            return str(raw)
+    return str(default)
+
+
 # Universe bound for cov/corr computations (top by abs weight)
-MAX_SYMBOLS = int(os.environ.get("PORTFOLIO_RISK_MAX_SYMBOLS", "18"))
+MAX_SYMBOLS = int(_env_number("PORTFOLIO_RISK_MAX_SYMBOLS", "18"))
 
 # Portfolio caps
-MAX_GROSS = float(os.environ.get("PORTFOLIO_RISK_MAX_GROSS", os.environ.get("PORTFOLIO_GROSS_CAP", "1.00")))
-MAX_NET = float(os.environ.get("PORTFOLIO_RISK_MAX_NET", "0.60"))
+MAX_GROSS = float(_env_number_any(("PORTFOLIO_RISK_MAX_GROSS", "PORTFOLIO_GROSS_CAP"), "1.00"))
+MAX_NET = float(_env_number("PORTFOLIO_RISK_MAX_NET", "0.60"))
 
 # Drawdown throttle/hard block
-DD_THROTTLE_START = float(os.environ.get("PORTFOLIO_RISK_DD_THROTTLE_START", "0.06"))
-DD_THROTTLE_MIN_SCALE = float(os.environ.get("PORTFOLIO_RISK_DD_THROTTLE_MIN_SCALE", "0.35"))
-DD_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_DD_HARD_BLOCK", "0.15"))
+DD_THROTTLE_START = float(_env_number("PORTFOLIO_RISK_DD_THROTTLE_START", "0.06"))
+DD_THROTTLE_MIN_SCALE = float(_env_number("PORTFOLIO_RISK_DD_THROTTLE_MIN_SCALE", "0.35"))
+DD_HARD_BLOCK = float(_env_number("PORTFOLIO_RISK_DD_HARD_BLOCK", "0.15"))
 
 # Portfolio vol proxy + targeting
-VOL_LOOKBACK = int(os.environ.get("PORTFOLIO_RISK_VOL_LOOKBACK", os.environ.get("PORTFOLIO_VOL_LOOKBACK", "240")))
-VOL_TARGET = float(os.environ.get("PORTFOLIO_RISK_VOL_TARGET", os.environ.get("PORTFOLIO_TARGET_VOL", "0.020")))
+VOL_LOOKBACK = int(_env_number_any(("PORTFOLIO_RISK_VOL_LOOKBACK", "PORTFOLIO_VOL_LOOKBACK"), "240"))
+VOL_TARGET = float(_env_number_any(("PORTFOLIO_RISK_VOL_TARGET", "PORTFOLIO_TARGET_VOL"), "0.020"))
 VOL_FORECAST_SOURCE = str(os.environ.get("VOL_FORECAST_SOURCE", "trailing") or "trailing").strip().lower()
-PORTFOLIO_VOL_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_VOL_HARD_BLOCK", "0.0"))  # 0 disables
-PORTFOLIO_VOL_FLOOR = float(os.environ.get("PORTFOLIO_RISK_VOL_FLOOR", "0.005"))
-PORTFOLIO_VOL_CEIL = float(os.environ.get("PORTFOLIO_RISK_VOL_CEIL", "0.080"))
+PORTFOLIO_VOL_HARD_BLOCK = float(_env_number("PORTFOLIO_RISK_VOL_HARD_BLOCK", "0.0"))  # 0 disables
+PORTFOLIO_VOL_FLOOR = float(_env_number("PORTFOLIO_RISK_VOL_FLOOR", "0.005"))
+PORTFOLIO_VOL_CEIL = float(_env_number("PORTFOLIO_RISK_VOL_CEIL", "0.080"))
 USE_GEX_VOL_MODIFIER = os.environ.get("PORTFOLIO_RISK_USE_GEX_VOL_MODIFIER", os.environ.get("USE_OPTIONS_FEATURES", "0")) == "1"
 PORTFOLIO_RISK_USE_MONTE_CARLO = os.environ.get("PORTFOLIO_RISK_USE_MONTE_CARLO", "1") == "1"
-PORTFOLIO_RISK_MC_MAX_AGE_S = int(os.environ.get("PORTFOLIO_RISK_MC_MAX_AGE_S", "900"))
-PORTFOLIO_RISK_MC_VAR_95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_VAR_95_BLOCK", "0.0"))
-PORTFOLIO_RISK_MC_VAR_99_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_VAR_99_BLOCK", "0.0"))
-PORTFOLIO_RISK_MC_CVAR_95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_CVAR_95_BLOCK", "0.0"))
-PORTFOLIO_RISK_MC_CVAR_99_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_CVAR_99_BLOCK", "0.0"))
-PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK", "0.0"))
-PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK = float(os.environ.get("PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_MAX_AGE_S = int(_env_number("PORTFOLIO_RISK_MC_MAX_AGE_S", "900"))
+PORTFOLIO_RISK_MC_VAR_95_BLOCK = float(_env_number("PORTFOLIO_RISK_MC_VAR_95_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_VAR_99_BLOCK = float(_env_number("PORTFOLIO_RISK_MC_VAR_99_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_CVAR_95_BLOCK = float(_env_number("PORTFOLIO_RISK_MC_CVAR_95_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_CVAR_99_BLOCK = float(_env_number("PORTFOLIO_RISK_MC_CVAR_99_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK = float(_env_number("PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK", "0.0"))
+PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK = float(_env_number("PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK", "0.0"))
 
 # Per-symbol vol caps (vol-adjusted sizing caps)
 USE_VOL_CAPS = os.environ.get("PORTFOLIO_RISK_USE_VOL_CAPS", "1") == "1"
-SYMBOL_CAP_MAX_W = float(os.environ.get("PORTFOLIO_RISK_SYMBOL_CAP_MAX_W", "0.35"))
-SYMBOL_CAP_MIN_MULT = float(os.environ.get("PORTFOLIO_RISK_SYMBOL_CAP_MIN_MULT", "0.20"))
-MAX_SYMBOL_GROSS = float(os.environ.get("PORTFOLIO_RISK_MAX_SYMBOL_GROSS", os.environ.get("PORTFOLIO_RISK_SYMBOL_CAP_MAX_W", "0.35")))
+SYMBOL_CAP_MAX_W = float(_env_number("PORTFOLIO_RISK_SYMBOL_CAP_MAX_W", "0.35"))
+SYMBOL_CAP_MIN_MULT = float(_env_number("PORTFOLIO_RISK_SYMBOL_CAP_MIN_MULT", "0.20"))
+MAX_SYMBOL_GROSS = float(_env_number_any(("PORTFOLIO_RISK_MAX_SYMBOL_GROSS", "PORTFOLIO_RISK_SYMBOL_CAP_MAX_W"), "0.35"))
 
 # Correlated exposure cluster caps (graph components)
 USE_CORR_CLUSTERS = os.environ.get("PORTFOLIO_RISK_USE_CORR_CLUSTERS", "1") == "1"
-CORR_LOOKBACK = int(os.environ.get("PORTFOLIO_RISK_CORR_LOOKBACK", "240"))
-CLUSTER_CORR_TH = float(os.environ.get("PORTFOLIO_RISK_CLUSTER_CORR_TH", "0.85"))
-CLUSTER_MAX_GROSS = float(os.environ.get("PORTFOLIO_RISK_CLUSTER_MAX_GROSS", "0.45"))
-CLUSTER_MAX_COMPONENTS = int(os.environ.get("PORTFOLIO_RISK_CLUSTER_MAX_COMPONENTS", "12"))
+CORR_LOOKBACK = int(_env_number("PORTFOLIO_RISK_CORR_LOOKBACK", "240"))
+CLUSTER_CORR_TH = float(_env_number("PORTFOLIO_RISK_CLUSTER_CORR_TH", "0.85"))
+CLUSTER_MAX_GROSS = float(_env_number("PORTFOLIO_RISK_CLUSTER_MAX_GROSS", "0.45"))
+CLUSTER_MAX_COMPONENTS = int(_env_number("PORTFOLIO_RISK_CLUSTER_MAX_COMPONENTS", "12"))
 
 # Asset-class budgets
 USE_ASSET_CLASS_BUDGETS = os.environ.get("PORTFOLIO_RISK_USE_ASSET_CLASS_BUDGETS", "1") == "1"
@@ -119,10 +134,10 @@ _ASSET_CLASS_BUDGETS_JSON = os.environ.get("PORTFOLIO_RISK_ASSET_CLASS_BUDGETS_J
 
 # Strategy-level budgets
 USE_STRATEGY_BUDGETS = os.environ.get("PORTFOLIO_RISK_USE_STRATEGY_BUDGETS", "1") == "1"
-STRATEGY_MAX_GROSS = float(os.environ.get("PORTFOLIO_RISK_MAX_STRATEGY_GROSS", "0.60"))
-STRATEGY_MAX_NET = float(os.environ.get("PORTFOLIO_RISK_MAX_STRATEGY_NET", "0.40"))
+STRATEGY_MAX_GROSS = float(_env_number("PORTFOLIO_RISK_MAX_STRATEGY_GROSS", "0.60"))
+STRATEGY_MAX_NET = float(_env_number("PORTFOLIO_RISK_MAX_STRATEGY_NET", "0.40"))
 USE_ALPHA_DECAY_THROTTLE = os.environ.get("PORTFOLIO_RISK_USE_ALPHA_DECAY_THROTTLE", "1") == "1"
-ALPHA_DECAY_THROTTLE_FRESH_S = int(os.environ.get("PORTFOLIO_RISK_ALPHA_DECAY_FRESH_S", "21600"))
+ALPHA_DECAY_THROTTLE_FRESH_S = int(_env_number("PORTFOLIO_RISK_ALPHA_DECAY_FRESH_S", "21600"))
 
 _DEFAULT_ASSET_CLASS_BUDGETS = {
     "EQUITY": 1.00,
