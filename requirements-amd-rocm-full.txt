@@ -1,0 +1,74 @@
+# Complete, reproducible dependency set for the OPT-IN AMD ROCm profile.
+# Target: Strix Halo / gfx1151 (Ryzen AI MAX) on the repo's CPython 3.12 baseline.
+# Validated on host `bart`, 2026-06-21 with AMD's ROCm 7.2.4 PyTorch image.
+#
+# WHY THIS FILE EXISTS
+#   `requirements-amd-rocm.txt` is the authoritative ROCm wheel overlay used by
+#   compose. This file expands it with the base runtime deps for operators who
+#   want a standalone host venv instead of the validated Docker image.
+#
+# Do not install `requirements.txt` before this file in a ROCm venv. The CPU
+# base pins conflict with the validated ROCm stack and can downgrade it:
+#   requirements.txt        ->  this file (ROCm)         reason
+#   torch==2.4.1            ->  torch ROCm 7.2.4 wheel   validated gfx1151 kernels
+#   (no torchaudio)         ->  torchaudio ROCm 7.2.4     match torch build
+#   (no triton-rocm)        ->  triton ROCm 7.2.4         match torch build
+#   numpy==2.1.2            ->  numpy==2.4.6              Python 3.12 ROCm image parity
+#   scikit-learn==1.5.2    ->  scikit-learn==1.9.0      numpy 2.4 compatibility
+#   lightgbm==4.5.0        ->  lightgbm==4.6.0          ROCm overlay pin
+# All other pins are identical to requirements.txt.
+#
+# XGBoost upstream GPU support is CUDA-only; no official AMD ROCm XGBoost wheel is
+# pinned here. The XGBoost pin stays CPU-safe.
+#
+# Build:  python3.12 -m venv .venv-rocm
+#         .venv-rocm/bin/pip install -r requirements-amd-rocm-full.txt
+# Prove:  .venv-rocm/bin/python tools/validate_rocm_acceleration.py --require-gpu
+
+# --- ROCm acceleration stack (deviates from requirements.txt) ---
+torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torch-2.9.1%2Brocm7.2.4.lw.git39497456-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
+torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torchaudio-2.9.0%2Brocm7.2.4.gite3c6ee2b-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
+triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/triton-3.5.1%2Brocm7.2.4.gita272dfa8-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
+numpy==2.4.6
+scikit-learn==1.9.0
+lightgbm==4.6.0
+
+# --- base runtime deps (identical pins to requirements.txt) ---
+asyncpg==0.31.0
+ccxt==4.4.16
+cryptography==47.0.0
+feedparser==6.0.11
+gymnasium==1.2.3
+hmmlearn==0.3.3
+ib_insync==0.9.86
+ibapi==9.81.1.post1
+joblib==1.5.3
+llm==0.31
+msgpack==1.1.2
+nvidia-ml-py==13.595.45
+openai==2.36.0
+optuna==4.8.0
+pandas==3.0.3
+praw==7.8.1
+psutil==6.1.0
+psycopg[binary,pool]==3.3.4
+psycopg-pool==3.3.1
+psycopg2-binary==2.9.12
+pyarrow==19.0.1
+pynvml==13.0.1
+pysr==1.5.10
+python-dotenv==1.0.1
+pytest==9.0.3
+pytest-timeout==2.4.0
+redis==5.3.1
+requests==2.32.3
+scipy==1.17.1
+sentence-transformers==3.0.1
+sqlparse==0.5.5
+stable-baselines3==2.8.0
+transformers==4.57.6
+tsfresh==0.21.1
+urllib3==2.6.3
+websocket-client==1.8.0
+xgboost==2.1.4
+yfinance==0.2.43

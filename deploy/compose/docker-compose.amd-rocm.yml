@@ -1,0 +1,20 @@
+# Optional ROCm runtime overlay for AMD Strix Halo / gfx1151 hosts.
+#
+# Use together with docker-compose.stack.yml only when the target host has
+# working amdgpu/ROCm device nodes and render/video group access.
+
+services:
+  runtime:
+    build:
+      args:
+        PYTHON_RUNTIME_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1
+        TRADING_REQUIREMENTS_FILE: requirements-amd-rocm.txt
+    environment:
+      TRADING_ACCELERATION_PROFILE: amd-rocm
+      PATCHTST_USE_CUDA: "1"
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+    group_add:
+      - "${TRADING_RENDER_GID:-991}"
+      - "${TRADING_VIDEO_GID:-44}"

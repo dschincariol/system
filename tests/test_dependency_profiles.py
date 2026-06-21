@@ -71,7 +71,13 @@ def test_cpu_hot_paths_have_no_module_level_nvidia_imports() -> None:
             assert not (set(imported) & {"pynvml", "nvidia_smi"}), rel
 
 
-def test_dependency_profile_resolver_blocks_unvalidated_rocm_without_override() -> None:
+def test_amd_rocm_profile_contains_rocm_runtime_packages() -> None:
+    names = _requirement_names(REPO / "requirements-amd-rocm.txt")
+
+    assert {"torch", "torchaudio", "triton", "xgboost"}.issubset(names)
+
+
+def test_dependency_profile_resolver_selects_amd_rocm_profile() -> None:
     env = dict(os.environ)
     env["TRADING_DEPENDENCY_PROFILE"] = "amd-rocm"
     env.pop("TRADING_REQUIREMENTS_FILE", None)
@@ -84,14 +90,15 @@ def test_dependency_profile_resolver_blocks_unvalidated_rocm_without_override() 
         check=False,
     )
 
-    assert proc.returncode == 64
-    assert "amd_rocm_dependency_profile_not_validated" in proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().endswith("requirements-amd-rocm.txt")
 
 
 def test_dependency_profile_resolver_selects_cpu_and_nvidia_profiles() -> None:
     for profile, expected in (
         ("cpu", "requirements.txt"),
         ("nvidia-cuda", "requirements-nvidia-cuda.txt"),
+        ("rocm", "requirements-amd-rocm.txt"),
     ):
         env = dict(os.environ)
         env["TRADING_DEPENDENCY_PROFILE"] = profile

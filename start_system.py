@@ -567,6 +567,50 @@ def _record_first_failure(phase: str, exc: BaseException, *, file_path: str = ""
         _persist_startup_trace()
 
 
+def _probe_runtime_acceleration() -> None:
+    def _run_probe() -> None:
+        from engine.runtime.acceleration import probe_torch_acceleration
+
+        snapshot = probe_torch_acceleration(logger=LOG)
+        _STARTUP_TRACE["runtime_acceleration"] = dict(snapshot)
+        _meta_set_json("runtime_acceleration", snapshot)
+
+    try:
+        finished = _run_nonfatal_with_timeout(
+            "runtime_acceleration_probe",
+            _run_probe,
+            timeout_s=5.0,
+        )
+        snapshot = dict(_STARTUP_TRACE.get("runtime_acceleration") or {})
+        if not finished:
+            snapshot = {
+                "ok": False,
+                "torch_imported": False,
+                "effective_device": "cpu",
+                "fallback_reason": "probe_timeout",
+                "ts_ms": int(time.time() * 1000),
+            }
+            _STARTUP_TRACE["runtime_acceleration"] = snapshot
+        _record_phase(
+            "ACCELERATION",
+            status="ok",
+            detail=str(snapshot.get("effective_device") or "cpu"),
+            extra=snapshot,
+        )
+    except Exception as e:
+        snapshot = {
+            "ok": False,
+            "torch_imported": False,
+            "effective_device": "cpu",
+            "fallback_reason": f"probe_failed:{type(e).__name__}",
+            "error": str(e),
+            "ts_ms": int(time.time() * 1000),
+        }
+        _STARTUP_TRACE["runtime_acceleration"] = snapshot
+        _record_phase("ACCELERATION", status="ok", detail="cpu", extra=snapshot)
+        _log_swallowed("RUNTIME_ACCELERATION_PROBE_FAILED", error=f"{type(e).__name__}: {e}")
+
+
 def _evaluate_startup_prebind_gates(*, mode: str) -> Dict[str, Any]:
     from engine.runtime.startup_gates import evaluate_prebind_startup_gates
 
@@ -2044,6 +2088,7 @@ def main():
     os.environ["ENGINE_PRIMARY_BOOTSTRAP_DONE"] = "1"
     _log_runtime_hardware_bootstrap()
     _record_phase("BOOT", status="ok", detail=f"mode={mode}", extra={"pid": int(os.getpid()), "db_path": str(os.environ.get("DB_PATH") or "")})
+    _probe_runtime_acceleration()
 
     _record_phase("CONFIG", status="started", detail="startup_prebind_gates")
     try:
