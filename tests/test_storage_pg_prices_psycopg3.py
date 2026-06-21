@@ -7,22 +7,24 @@ import pytest
 from engine.runtime import storage_pg_prices
 
 
-def _config() -> storage_pg_prices.PostgresPriceStorageConfig:
-    return storage_pg_prices.PostgresPriceStorageConfig(
-        enabled=True,
-        dsn="postgresql://unit-test/trading",
-        schema_name="public",
-        pool_min_size=1,
-        pool_max_size=2,
-        connect_timeout_s=0.2,
-        lock_timeout_s=0.2,
-        command_timeout_s=1.0,
-        idle_in_txn_timeout_s=1.0,
-        retry_attempts=1,
-        retry_base_s=0.01,
-        retry_max_s=0.01,
-        application_name="unit-price-storage",
-    )
+def _config(**overrides: Any) -> storage_pg_prices.PostgresPriceStorageConfig:
+    values = {
+        "enabled": True,
+        "dsn": "postgresql://unit-test/trading",
+        "schema_name": "public",
+        "pool_min_size": 1,
+        "pool_max_size": 2,
+        "connect_timeout_s": 0.2,
+        "lock_timeout_s": 0.2,
+        "command_timeout_s": 1.0,
+        "idle_in_txn_timeout_s": 1.0,
+        "retry_attempts": 1,
+        "retry_base_s": 0.01,
+        "retry_max_s": 0.01,
+        "application_name": "unit-price-storage",
+    }
+    values.update(overrides)
+    return storage_pg_prices.PostgresPriceStorageConfig(**values)
 
 
 def test_price_storage_uses_psycopg3_connection_pool(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,6 +89,38 @@ def test_execute_many_values_renders_psycopg3_executemany() -> None:
     assert "VALUES (%s, %s)" in sql
     assert "ON CONFLICT(symbol)" in sql
     assert rows == [("SPY", 500.0), ("QQQ", 430.0)]
+
+
+def test_prepare_connection_sets_timeouts_without_bind_parameters() -> None:
+    executions: list[tuple[str, tuple[Any, ...] | None]] = []
+
+    class FakeCursor:
+        def __enter__(self) -> "FakeCursor":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+            executions.append((str(sql), tuple(params) if params is not None else None))
+
+    class FakeConnection:
+        def cursor(self) -> FakeCursor:
+            return FakeCursor()
+
+    store = storage_pg_prices.PostgresPriceStorage(
+        _config(command_timeout_s=2.5, lock_timeout_s=0.2, idle_in_txn_timeout_s=3.0)
+    )
+    store._prepare_connection(FakeConnection())
+
+    assert executions[:5] == [
+        ("SET SESSION statement_timeout = 2500", None),
+        ("SET SESSION lock_timeout = 1000", None),
+        ("SET SESSION idle_in_transaction_session_timeout = 3000", None),
+        ("SET SESSION TIME ZONE 'UTC'", None),
+        ("SELECT 1", None),
+    ]
+    assert all("$1" not in sql and "%s" not in sql for sql, _params in executions[:3])
 
 
 def test_failed_price_storage_connection_rolls_back_and_discards(monkeypatch: pytest.MonkeyPatch) -> None:

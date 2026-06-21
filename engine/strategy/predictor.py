@@ -3192,15 +3192,36 @@ def _maybe_apply_lgbm_ranker_batch(
                 sha256=str(loc.get("sha256") or ""),
                 path=(str(loc.get("path") or "") or None),
             )
-            feature_ids = list(getattr(model, "feature_ids", None) or bucket.get("feature_ids") or [])
-            feature_maps = [
-                _cached_or_build_feature_snapshot(
+            feature_ids = [str(feature_id) for feature_id in list(getattr(model, "feature_ids", None) or bucket.get("feature_ids") or [])]
+            feature_maps = []
+            for sym in syms:
+                symbol_key = str(sym).upper().strip()
+                feature_map = _cached_or_build_feature_snapshot(
                     event=event_payload,
                     symbol=str(sym),
                     feature_ids=list(feature_ids),
                 )
-                for sym in syms
-            ]
+                missing_feature_ids = [str(feature_id) for feature_id in feature_ids if str(feature_id) not in feature_map]
+                if missing_feature_ids:
+                    feature_map = build_feature_snapshot(
+                        event=event_payload,
+                        symbol=str(sym),
+                        feature_ids=list(feature_ids),
+                    )
+                    missing_feature_ids = [str(feature_id) for feature_id in feature_ids if str(feature_id) not in feature_map]
+                if missing_feature_ids:
+                    _warn_nonfatal(
+                        "predictor_lgbm_ranker_feature_snapshot_incomplete",
+                        "PREDICTOR_LGBM_RANKER_FEATURE_SNAPSHOT_INCOMPLETE",
+                        RuntimeError("lgbm_ranker_feature_snapshot_incomplete"),
+                        warn_key=f"predictor_lgbm_ranker_feature_snapshot_incomplete:{active.get('model_name')}:{horizon_s}:{symbol_key}",
+                        horizon_s=int(horizon_s),
+                        model_name=str(active.get("model_name") or ""),
+                        symbol=symbol_key,
+                        missing_feature_ids=missing_feature_ids,
+                    )
+                    raise ValueError("lgbm_ranker_feature_snapshot_incomplete")
+                feature_maps.append(dict(feature_map or {}))
             scores = model.predict(feature_maps)
             default_leg = max(1, min(3, int(top_k or 3), len(syms) // 2 if len(syms) > 2 else 1))
             top_n = _ranker_selection_count("LGBM_RANKER_TOP_K", default_leg, len(syms))

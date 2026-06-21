@@ -562,6 +562,29 @@ class StartupHealthValidationTests(unittest.TestCase):
             str(snapshot["gates"]["no_port_binding_conflict"]["detail"] or "").lower(),
         )
 
+    def test_startup_config_accepts_dashboard_token_file_for_remote_bind(self) -> None:
+        (startup_gates,) = _reload_modules("engine.runtime.startup_gates")
+        token_file = Path(self.tmp.name) / "dashboard_api_token"
+        token_file.write_text("production-token-1234567890\n", encoding="utf-8")
+
+        with patch.dict(
+            os.environ,
+            {
+                "DASHBOARD_HOST": "0.0.0.0",
+                "DASHBOARD_API_TOKEN": "",
+                "DASHBOARD_API_TOKEN_FILE": str(token_file),
+            },
+            clear=False,
+        ):
+            snapshot = startup_gates.get_startup_config_snapshot(REPO_ROOT)
+
+        self.assertTrue(bool(snapshot["ok"]))
+        self.assertTrue(bool(snapshot["parsed"]["dashboard_api_token_present"]))
+        self.assertNotIn(
+            "DASHBOARD_API_TOKEN",
+            {str(item.get("key") or "") for item in list(snapshot.get("errors") or [])},
+        )
+
     def test_health_snapshot_exposes_component_observability_sections(self) -> None:
         storage, health, observability = _reload_modules(
             "engine.runtime.storage",

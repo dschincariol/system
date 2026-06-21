@@ -17,6 +17,8 @@ POSTFLIGHT_PATH = REPO_ROOT / "ops" / "server" / "os_migration_postflight.py"
 RUNBOOK_PATH = REPO_ROOT / "docs" / "OS_MIGRATION_RUNBOOK.md"
 SYSTEMD_UNIT_DIR = REPO_ROOT / "ops" / "server" / "systemd"
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "validate.yml"
+BACKUP_EVIDENCE_SCRIPT_PATH = REPO_ROOT / "ops" / "backup" / "backup_restore_evidence.sh"
+BACKUP_EVIDENCE_INSTALLER_PATH = REPO_ROOT / "ops" / "server" / "install_backup_evidence_gate.sh"
 RUNBOOK_UNIT_RE = re.compile(r"\b(?:trading|pgbouncer)[A-Za-z0-9_.@-]*\.(?:service|target|timer)\b")
 
 
@@ -157,6 +159,42 @@ class OSMigrationGateTests(unittest.TestCase):
             result = postflight.check_rocm(False, "gfx1151")
         self.assertEqual(result["status"], "PASS")
         self.assertIn("not required", result["detail"])
+
+    def test_postflight_rocm_marker_without_requirement_is_not_enforced(self) -> None:
+        postflight = load_module(POSTFLIGHT_PATH, "os_migration_postflight_rocm_optional_test")
+        with (
+            patch.object(postflight, "rocm_marker_present", return_value=True),
+            patch.object(postflight.shutil, "which", return_value=None),
+        ):
+            result = postflight.check_rocm(False, "gfx1151")
+        self.assertEqual(result["status"], "PASS")
+        self.assertIn("not required", result["detail"])
+
+    def test_backup_evidence_scripts_grant_operator_read_access(self) -> None:
+        installer = BACKUP_EVIDENCE_INSTALLER_PATH.read_text(encoding="utf-8")
+        evidence_script = BACKUP_EVIDENCE_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("TRADING_OPERATOR_USER", installer)
+        self.assertIn("resolve_compose_path", installer)
+        self.assertIn("grant_operator_backup_evidence_access", installer)
+        self.assertIn('setfacl -m "u:${TRADING_OPERATOR_USER}:--x" "$BACKUP_ROOT"', installer)
+        self.assertIn('chmod o+x "$BACKUP_ROOT"', installer)
+        self.assertIn('chmod o+rx "$BACKUP_EVIDENCE_DIR"', installer)
+        self.assertIn("TS_BACKUP_EVIDENCE_OPERATOR_USER", installer)
+        self.assertIn("grant_evidence_file_read_access", evidence_script)
+        self.assertIn('setfacl -m "u:${user}:r--" "$path"', evidence_script)
+        self.assertIn("grant_evidence_operator_access", evidence_script)
+        self.assertIn('setfacl -m "u:${user}:--x" "$backup_root"', evidence_script)
+        self.assertIn('chmod o+x "$backup_root"', evidence_script)
+        self.assertIn('chmod o+rx "$evidence_dir"', evidence_script)
+        self.assertIn("mode_matches_wal_target_path", evidence_script)
+        self.assertIn('mode_matches "$actual" "$(mode_with_other_execute "$expected")"', evidence_script)
+        self.assertIn("grant_evidence_operator_access\n  wal_target_verified_at=", evidence_script)
+        self.assertIn('chmod o+r "$path"', evidence_script)
+
+    def test_postflight_backup_evidence_requires_wal_archive_target(self) -> None:
+        postflight = POSTFLIGHT_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('"wal_archive_target"', postflight)
 
     def test_preflight_systemd_inventory_matches_shipped_units(self) -> None:
         preflight = load_module(PREFLIGHT_PATH, "os_migration_preflight_units_test")

@@ -113,6 +113,90 @@ def test_safe_mode_projection_sanitizes_child_env_dict(monkeypatch) -> None:
     assert "OPENAI_API_KEY" not in env
 
 
+def test_strict_projection_skips_enabled_providers_with_missing_credential_files(
+    monkeypatch,
+) -> None:
+    manager = DataSourceManager()
+    rows = [
+        {
+            "source_key": "polygon_ws",
+            "source_type": "price_provider",
+            "provider_name": "polygon_ws",
+            "job_name": "stream_prices_polygon_ws",
+            "enabled": True,
+            "credentials": {},
+            "settings": {},
+        },
+        {
+            "source_key": "polygon",
+            "source_type": "price_provider",
+            "provider_name": "polygon",
+            "job_name": "poll_prices",
+            "enabled": True,
+            "credentials": {},
+            "settings": {},
+        },
+        {
+            "source_key": "tradier",
+            "source_type": "options_provider",
+            "provider_name": "tradier",
+            "job_name": "options_poll",
+            "enabled": True,
+            "credentials": {},
+            "settings": {},
+        },
+    ]
+    monkeypatch.setattr(manager, "initialize", lambda: None)
+    monkeypatch.setattr(manager, "list_sources", lambda include_credentials=False: rows)
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_SUPERVISED", "1")
+    monkeypatch.setenv("PROD_LOCK", "1")
+    monkeypatch.setenv("POLYGON_API_KEY_FILE", "./data/secrets/polygon_api_key")
+    monkeypatch.setenv("POLYGON_KEY_FILE", "./data/secrets/polygon_api_key")
+    monkeypatch.setenv("TRADIER_API_TOKEN_FILE", "./data/secrets/tradier_api_token")
+
+    projected = manager.apply_runtime_environment()
+
+    assert projected["POLYGON_REST_ENABLED"] == "0"
+    assert projected["POLYGON_WS_ENABLED"] == "0"
+    assert projected["TRADIER_ENABLED"] == "0"
+    assert "POLYGON_API_KEY_FILE" not in os.environ
+    assert "POLYGON_KEY_FILE" not in os.environ
+    assert "TRADIER_API_TOKEN_FILE" not in os.environ
+
+
+def test_strict_projection_writes_db_credentials_to_runtime_files(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    manager = DataSourceManager()
+    rows = [
+        {
+            "source_key": "polygon",
+            "source_type": "price_provider",
+            "provider_name": "polygon",
+            "job_name": "poll_prices",
+            "enabled": True,
+            "credentials": {"api_key": "polygon-secret"},
+            "settings": {},
+        }
+    ]
+    monkeypatch.setattr(manager, "initialize", lambda: None)
+    monkeypatch.setattr(manager, "list_sources", lambda include_credentials=False: rows)
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_SUPERVISED", "1")
+    monkeypatch.setenv("PROD_LOCK", "1")
+    monkeypatch.setenv("DATA_SOURCE_MANAGER_RUNTIME_SECRET_DIR", str(tmp_path))
+
+    projected = manager.apply_runtime_environment()
+
+    assert projected["POLYGON_REST_ENABLED"] == "1"
+    assert "POLYGON_API_KEY" not in projected
+    secret_path = Path(projected["POLYGON_API_KEY_FILE"])
+    assert secret_path.read_text(encoding="utf-8") == "polygon-secret"
+    assert oct(secret_path.stat().st_mode & 0o777) == "0o600"
+
+
 def test_credential_runtime_env_keys_warns_when_catalog_fails(monkeypatch) -> None:
     import services.data_source_manager as module
 

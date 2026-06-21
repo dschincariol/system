@@ -107,6 +107,16 @@ def _quote_ident(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
+def _session_timeout_ms(timeout_s: Any) -> int:
+    try:
+        seconds = float(timeout_s)
+    except (TypeError, ValueError):
+        seconds = 1.0
+    if not math.isfinite(seconds) or seconds < 1.0:
+        seconds = 1.0
+    return int(seconds * 1000)
+
+
 def _execute_many_values(cur: Any, sql: str, rows: Iterable[tuple[Any, ...]]) -> None:
     batch = [tuple(row) for row in rows]
     if not batch:
@@ -477,11 +487,13 @@ class PostgresPriceStorage:
 
     def _prepare_connection(self, con: Any) -> None:
         with con.cursor() as cur:
-            cur.execute("SET SESSION statement_timeout = %s", (int(max(1.0, self._config.command_timeout_s) * 1000),))
-            cur.execute("SET SESSION lock_timeout = %s", (int(max(1.0, self._config.lock_timeout_s) * 1000),))
             cur.execute(
-                "SET SESSION idle_in_transaction_session_timeout = %s",
-                (int(max(1.0, self._config.idle_in_txn_timeout_s) * 1000),),
+                f"SET SESSION statement_timeout = {_session_timeout_ms(self._config.command_timeout_s)}"
+            )
+            cur.execute(f"SET SESSION lock_timeout = {_session_timeout_ms(self._config.lock_timeout_s)}")
+            cur.execute(
+                "SET SESSION idle_in_transaction_session_timeout = "
+                f"{_session_timeout_ms(self._config.idle_in_txn_timeout_s)}"
             )
             cur.execute("SET SESSION TIME ZONE 'UTC'")
             cur.execute("SELECT 1")

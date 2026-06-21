@@ -251,7 +251,7 @@ def check_backup_evidence(path: Path) -> dict[str, Any]:
     evidence["report"] = report
 
     component_statuses: list[str] = []
-    for key in ("base_backup", "wal_archive", "wal_archiver", "restore_drill"):
+    for key in ("base_backup", "wal_archive", "wal_archiver", "wal_archive_target", "restore_drill"):
         value = report.get(key, {})
         if isinstance(value, dict):
             component_statuses.append(str(value.get("status", "")).lower())
@@ -282,8 +282,17 @@ def check_rocm(require_rocm: bool, expected_gfx: str) -> dict[str, Any]:
         "dev_kfd_rw": path_rw(Path("/dev/kfd")) if Path("/dev/kfd").exists() else False,
         "render_nodes": glob.glob("/dev/dri/renderD*"),
     }
-    if not require_rocm and not marker_present:
-        return pass_check("rocm_device_access", "ROCm not required and no ROCm marker detected", evidence)
+    rocminfo_path = shutil.which("rocminfo")
+    evidence["rocminfo_executable"] = rocminfo_path
+    if not require_rocm:
+        if not marker_present:
+            return pass_check("rocm_device_access", "ROCm not required and no ROCm marker detected", evidence)
+        if rocminfo_path is None:
+            return pass_check(
+                "rocm_device_access",
+                "ROCm markers detected, but ROCm is not required; install rocminfo or run with --require-rocm to enforce",
+                evidence,
+            )
     failures: list[str] = []
     if not Path("/dev/kfd").exists() or not path_rw(Path("/dev/kfd")):
         failures.append("/dev/kfd is missing or not readable/writable by this user")

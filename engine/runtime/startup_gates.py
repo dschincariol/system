@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from engine.api.auth_config import dashboard_api_token_from_env
 from engine.runtime.config_schema import ConfigError, load_runtime_config
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -420,7 +421,7 @@ def get_startup_config_snapshot(repo_root: str | Path | None = None) -> Dict[str
             }
         )
 
-    parsed["dashboard_api_token_present"] = bool(str(os.environ.get("DASHBOARD_API_TOKEN", "") or "").strip())
+    parsed["dashboard_api_token_present"] = bool(dashboard_api_token_from_env())
     if not _is_loopback_host(str(parsed.get("dashboard_host") or "")) and not parsed["dashboard_api_token_present"]:
         errors.append(
             {

@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 TRADING_USER="${TRADING_USER:-trading}"
 TRADING_GROUP="${TRADING_GROUP:-trading}"
+TRADING_OPERATOR_USER="${TRADING_OPERATOR_USER:-${SUDO_USER:-}}"
 INSTALL_ROOT="${TRADING_INSTALL_ROOT:-/opt/trading}"
 BACKUP_SCRIPT_DST_DIR="${TRADING_BACKUP_SCRIPT_DIR:-${INSTALL_ROOT}/ops/backup}"
 BACKUP_ROOT="${TRADING_BACKUP_ROOT:-/var/backups/trading}"
@@ -35,6 +36,8 @@ TIMESCALE_PORT="${TRADING_TIMESCALE_PORT:-5432}"
 TIMESCALE_USER="${TRADING_TIMESCALE_USER:-trading}"
 TIMESCALE_PASSWORD="${TRADING_TIMESCALE_PASSWORD:-}"
 TIMESCALE_PASSWORD_FILE="${TRADING_TIMESCALE_PASSWORD_FILE:-}"
+COMPOSE_POSTGRES_UID=""
+COMPOSE_POSTGRES_GID=""
 RESTART_POSTGRES=0
 RUN_EVIDENCE=0
 COMPOSE_MODE=0
@@ -53,6 +56,23 @@ read_secret_file() {
   [ -n "$path" ] || return 1
   [ -r "$path" ] || die "secret file is not readable: ${path}"
   tr -d '\r\n' < "$path"
+}
+
+resolve_compose_path() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *) python3 - "$COMPOSE_ENV_FILE" "$path" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+print((Path(sys.argv[1]).resolve().parent / sys.argv[2]).resolve())
+PY
+      ;;
+  esac
 }
 
 usage() {
@@ -133,6 +153,12 @@ ensure_group_membership() {
     usermod -aG "$group" "$user"
     log "added ${user} to ${group}"
   fi
+}
+
+operator_user_exists() {
+  [ -n "$TRADING_OPERATOR_USER" ] || return 1
+  [ "$TRADING_OPERATOR_USER" != "root" ] || return 1
+  id -u "$TRADING_OPERATOR_USER" >/dev/null 2>&1
 }
 
 ensure_trading_user() {
@@ -392,6 +418,7 @@ load_compose_env() {
   TIMESCALE_USER="${TRADING_TIMESCALE_USER:-$(compose_env_value TIMESCALE_USER)}"
   TIMESCALE_USER="${TIMESCALE_USER:-trading}"
   TIMESCALE_PASSWORD_FILE="${TRADING_TIMESCALE_PASSWORD_FILE:-$(compose_env_value TIMESCALE_PASSWORD_FILE)}"
+  TIMESCALE_PASSWORD_FILE="$(resolve_compose_path "$TIMESCALE_PASSWORD_FILE")"
   if [ -z "$TIMESCALE_PASSWORD" ] && [ -n "$TIMESCALE_PASSWORD_FILE" ]; then
     TIMESCALE_PASSWORD="$(read_secret_file "$TIMESCALE_PASSWORD_FILE")"
   fi
@@ -402,6 +429,15 @@ load_compose_env() {
 
 compose_postgres_uid_gid() {
   docker run --rm "$TIMESCALE_IMAGE" sh -lc 'printf "%s:%s\n" "$(id -u postgres)" "$(id -g postgres)"'
+}
+
+load_compose_postgres_identity() {
+  [ "$COMPOSE_MODE" -eq 1 ] || return 0
+  [ -n "$COMPOSE_POSTGRES_UID" ] && [ -n "$COMPOSE_POSTGRES_GID" ] && return 0
+  local pg_uid_gid
+  pg_uid_gid="$(compose_postgres_uid_gid)"
+  COMPOSE_POSTGRES_UID="${pg_uid_gid%%:*}"
+  COMPOSE_POSTGRES_GID="${pg_uid_gid##*:}"
 }
 
 install_backup_scripts() {
@@ -447,14 +483,39 @@ create_backup_layout() {
     install -d -o "$TRADING_USER" -g "$TRADING_GROUP" -m 0770 "$dir"
   done
   if [ "$COMPOSE_MODE" -eq 1 ]; then
-    local pg_uid pg_uid_gid
-    pg_uid_gid="$(compose_postgres_uid_gid)"
-    pg_uid="${pg_uid_gid%%:*}"
-    chown "${pg_uid}:${TRADING_GROUP}" "$BACKUP_ROOT"
-    chown -R "${pg_uid}:${TRADING_GROUP}" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"
+    load_compose_postgres_identity
+    chown "${COMPOSE_POSTGRES_UID}:${TRADING_GROUP}" "$BACKUP_ROOT"
+    chown -R "${COMPOSE_POSTGRES_UID}:${TRADING_GROUP}" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"
     chmod 2750 "$BACKUP_ROOT" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_WAL_DIR/.tmp" "$BACKUP_DRILL_DIR"
     find "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR" -type d -exec chmod 2750 {} +
     find "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR" -type f -exec chmod 0640 {} +
+  fi
+}
+
+grant_operator_backup_evidence_access() {
+  local acl_ok=1
+  operator_user_exists || return 0
+  ensure_group_membership "$TRADING_OPERATOR_USER" "$TRADING_GROUP"
+  if ! command -v setfacl >/dev/null 2>&1; then
+    log "setfacl unavailable; ${TRADING_OPERATOR_USER} may need a new login before reading backup evidence through ${TRADING_GROUP}"
+    acl_ok=0
+  else
+    setfacl -m "u:${TRADING_OPERATOR_USER}:--x" "$BACKUP_ROOT" || acl_ok=0
+    setfacl -m "u:${TRADING_OPERATOR_USER}:rwx" "$BACKUP_EVIDENCE_DIR" || acl_ok=0
+    setfacl -d -m "u:${TRADING_OPERATOR_USER}:rwX" "$BACKUP_EVIDENCE_DIR" || acl_ok=0
+    find "$BACKUP_EVIDENCE_DIR" -maxdepth 1 -type f -name '*backup_restore_evidence*.json' \
+      -exec setfacl -m "u:${TRADING_OPERATOR_USER}:r--" {} + 2>/dev/null || acl_ok=0
+    find "$BACKUP_EVIDENCE_DIR" -maxdepth 1 -type f -name '*backup_restore_evidence*.txt' \
+      -exec setfacl -m "u:${TRADING_OPERATOR_USER}:r--" {} + 2>/dev/null || acl_ok=0
+  fi
+  if [ "$acl_ok" -eq 0 ]; then
+    chmod o+x "$BACKUP_ROOT" || true
+    chmod o+rx "$BACKUP_EVIDENCE_DIR" || true
+    find "$BACKUP_EVIDENCE_DIR" -maxdepth 1 -type f -name '*backup_restore_evidence*.json' -exec chmod o+r {} + 2>/dev/null || true
+    find "$BACKUP_EVIDENCE_DIR" -maxdepth 1 -type f -name '*backup_restore_evidence*.txt' -exec chmod o+r {} + 2>/dev/null || true
+    log "granted backup evidence read access with non-listable backup-root fallback"
+  else
+    log "granted ${TRADING_OPERATOR_USER} read access to backup evidence artifacts"
   fi
 }
 
@@ -473,6 +534,11 @@ write_runtime_env() {
     set_env_var TS_BACKUP_DOCKER_EXEC_CONTAINER "$TIMESCALE_CONTAINER"
     set_env_var TS_BACKUP_DOCKER_EXEC_USER "postgres"
     set_env_var TS_BACKUP_READ_GROUP "$TRADING_GROUP"
+    set_env_var TS_BACKUP_EVIDENCE_OPERATOR_USER "$TRADING_OPERATOR_USER"
+    load_compose_postgres_identity
+    set_env_var TS_BACKUP_WAL_TARGET_OWNER_UID "$COMPOSE_POSTGRES_UID"
+    set_env_var TS_BACKUP_WAL_TARGET_GROUP "$TRADING_GROUP"
+    set_env_var TS_BACKUP_WAL_TARGET_DIR_MODE "2750"
     set_env_var TS_RESTORE_DOCKER_IMAGE "$TIMESCALE_IMAGE"
     set_env_var TS_RESTORE_DOCKER_USER "postgres"
     set_env_var TS_RESTORE_DRILL_ALLOW_DIRECT "1"
@@ -692,6 +758,12 @@ Environment=TS_BACKUP_DOCKER_IMAGE=
 Environment=TS_BACKUP_DOCKER_EXEC_CONTAINER=${TIMESCALE_CONTAINER}
 Environment=TS_BACKUP_DOCKER_EXEC_USER=postgres
 Environment=TS_BACKUP_READ_GROUP=${TRADING_GROUP}
+Environment=TS_BACKUP_EVIDENCE_OPERATOR_USER=${TRADING_OPERATOR_USER}
+Environment=TS_BACKUP_WAL_TARGET_OWNER_UID=${COMPOSE_POSTGRES_UID}
+Environment=TS_BACKUP_WAL_TARGET_GROUP=${TRADING_GROUP}
+Environment=TS_BACKUP_WAL_TARGET_DIR_MODE=2750
+# Deliberately check-only: backlog drain stays operator-triggered because a large
+# .ready backlog can consume the backup dataset and should follow the runbook.
 Environment=TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=0
 Environment=TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=0
 Environment=TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0
@@ -726,6 +798,10 @@ run_evidence() {
       TS_BACKUP_DOCKER_EXEC_CONTAINER="$TIMESCALE_CONTAINER" \
       TS_BACKUP_DOCKER_EXEC_USER=postgres \
       TS_BACKUP_READ_GROUP="$TRADING_GROUP" \
+      TS_BACKUP_EVIDENCE_OPERATOR_USER="$TRADING_OPERATOR_USER" \
+      TS_BACKUP_WAL_TARGET_OWNER_UID="$COMPOSE_POSTGRES_UID" \
+      TS_BACKUP_WAL_TARGET_GROUP="$TRADING_GROUP" \
+      TS_BACKUP_WAL_TARGET_DIR_MODE=2750 \
       TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=1 \
       TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=1 \
       TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=1 \
@@ -750,6 +826,7 @@ run_evidence() {
       TS_RESTORE_DRILL_DIR="$BACKUP_DRILL_DIR" \
       TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=1 \
       TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=1 \
+      TS_BACKUP_EVIDENCE_OPERATOR_USER="$TRADING_OPERATOR_USER" \
       BACKUP_EVIDENCE_PATH="${BACKUP_EVIDENCE_DIR}/latest_backup_restore_evidence.json" \
       BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1 \
       BACKUP_EVIDENCE_HMAC_KEY_FILE="$BACKUP_EVIDENCE_HMAC_KEY_FILE" \
@@ -781,6 +858,7 @@ main() {
   fi
   ensure_backup_evidence_hmac_key
   create_backup_layout
+  grant_operator_backup_evidence_access
   install_backup_scripts
   write_runtime_env
   configure_postgres_archive
@@ -789,6 +867,7 @@ main() {
   if [ "$RUN_EVIDENCE" -eq 1 ]; then
     start_backup_timers
     run_evidence
+    grant_operator_backup_evidence_access
   fi
 
   log "installed backup evidence gate assets"

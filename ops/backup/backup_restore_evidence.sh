@@ -14,6 +14,7 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 stamp="${TS_BACKUP_EVIDENCE_STAMP:-$(date -u +%Y-%m-%dT%H%M%SZ)}"
 generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 evidence_dir="${TS_BACKUP_EVIDENCE_DIR:-/var/backups/trading/evidence}"
+backup_root="${TS_BACKUP_ROOT:-$(dirname "$evidence_dir")}"
 work_dir="${TS_BACKUP_EVIDENCE_WORK_DIR:-${evidence_dir}/work/${stamp}}"
 report_txt="${evidence_dir}/backup_restore_evidence_${stamp}.txt"
 report_json="${evidence_dir}/backup_restore_evidence_${stamp}.json"
@@ -72,11 +73,26 @@ wal_archiver_last_failed_wal=""
 wal_archiver_last_failed_at=""
 wal_archiver_last_failed_at_ts=""
 wal_archiver_stats_reset_at=""
+wal_target_status="fail"
+wal_target_verified_at=""
+wal_target_root=""
+wal_target_dir=""
+wal_target_tmp_dir=""
+wal_target_expected_owner_uid=""
+wal_target_expected_group=""
+wal_target_expected_group_gid=""
+wal_target_expected_dir_mode="${TS_BACKUP_WAL_TARGET_DIR_MODE:-2750}"
+wal_target_repaired="false"
+wal_target_issue_count="0"
+wal_target_diagnosis_signature=""
+wal_target_diagnosis_exit_code=""
+wal_target_diagnosis_fix=""
 restore_drill_report=""
 restore_drill_verified_at=""
 restore_time_to_recover_s=""
 signature_status="not_required"
 evidence_read_group="${TS_BACKUP_EVIDENCE_READ_GROUP:-${TS_BACKUP_READ_GROUP:-}}"
+evidence_read_users="${TS_BACKUP_EVIDENCE_READ_USERS:-${TS_BACKUP_EVIDENCE_OPERATOR_USER:-}}"
 
 mkdir -p "$evidence_dir" "$work_dir"
 
@@ -202,6 +218,259 @@ int_seconds() {
     ''|*[!0-9]*) printf '0\n' ;;
     *) printf '%s\n' "$value" ;;
   esac
+}
+
+parent_dir() {
+  local path="$1"
+  path="${path%/}"
+  if [ "${path%/*}" = "$path" ]; then
+    printf '.\n'
+  elif [ -z "${path%/*}" ]; then
+    printf '/\n'
+  else
+    printf '%s\n' "${path%/*}"
+  fi
+}
+
+wal_archive_root_for_dir() {
+  if [ -n "${TS_BACKUP_ROOT:-}" ]; then
+    printf '%s\n' "$TS_BACKUP_ROOT"
+  elif [[ "$wal_dir" == /var/backups/trading || "$wal_dir" == /var/backups/trading/* ]]; then
+    printf '/var/backups/trading\n'
+  else
+    parent_dir "$wal_dir"
+  fi
+}
+
+group_gid_for() {
+  local group="$1"
+  case "$group" in
+    ''|*[!0-9]*)
+      getent group "$group" | awk -F: 'NR == 1 {print $3}'
+      ;;
+    *)
+      printf '%s\n' "$group"
+      ;;
+  esac
+}
+
+mode_matches() {
+  local actual="$1"
+  local expected="$2"
+  [ "$actual" = "$expected" ] || [ "$actual" = "${expected#0}" ]
+}
+
+mode_with_other_execute() {
+  local mode="$1"
+  local prefix last_digit
+  mode="${mode#0}"
+  prefix="${mode%?}"
+  last_digit="${mode#"${prefix}"}"
+  case "$last_digit" in
+    0) last_digit=1 ;;
+    2) last_digit=3 ;;
+    4) last_digit=5 ;;
+    6) last_digit=7 ;;
+  esac
+  printf '%s%s\n' "$prefix" "$last_digit"
+}
+
+mode_matches_wal_target_path() {
+  local path="$1"
+  local actual="$2"
+  local expected="$3"
+  mode_matches "$actual" "$expected" && return 0
+  if [ "$path" = "$backup_root" ] && [ -n "$evidence_read_users" ]; then
+    mode_matches "$actual" "$(mode_with_other_execute "$expected")"
+    return $?
+  fi
+  return 1
+}
+
+append_wal_target_state() {
+  local phase="$1"
+  local path="$2"
+  if [ ! -e "$path" ]; then
+    printf '%s_path_missing=%s\n' "$phase" "$path" >> "${work_dir}/wal_archive_target.out"
+    return 1
+  fi
+  printf '%s_path=%s uid=%s gid=%s mode=%s\n' \
+    "$phase" \
+    "$path" \
+    "$(stat -c %u "$path")" \
+    "$(stat -c %g "$path")" \
+    "$(stat -c %a "$path")" \
+    >> "${work_dir}/wal_archive_target.out"
+}
+
+repair_wal_archive_target() {
+  local rc=0
+  local uid group gid mode current_uid path actual_uid actual_gid actual_mode
+  local paths=()
+
+  : > "${work_dir}/wal_archive_target.out"
+  wal_target_root="$(wal_archive_root_for_dir)"
+  wal_target_dir="$wal_dir"
+  wal_target_tmp_dir="${wal_dir}/.tmp"
+  uid="${TS_BACKUP_WAL_TARGET_OWNER_UID:-}"
+  group="${TS_BACKUP_WAL_TARGET_GROUP:-${evidence_read_group:-}}"
+  current_uid="$(id -u)"
+
+  if [ -z "$uid" ] && [ "$current_uid" -ne 0 ]; then
+    uid="$current_uid"
+  fi
+  if [ -z "$group" ] && [ "$current_uid" -ne 0 ]; then
+    group="$(id -gn)"
+  fi
+  mode="$wal_target_expected_dir_mode"
+
+  printf 'wal_archive_target_root=%s\n' "$wal_target_root" >> "${work_dir}/wal_archive_target.out"
+  printf 'wal_archive_target_dir=%s\n' "$wal_target_dir" >> "${work_dir}/wal_archive_target.out"
+  printf 'wal_archive_target_tmp_dir=%s\n' "$wal_target_tmp_dir" >> "${work_dir}/wal_archive_target.out"
+  printf 'expected_owner_uid=%s\n' "$uid" >> "${work_dir}/wal_archive_target.out"
+  printf 'expected_group=%s\n' "$group" >> "${work_dir}/wal_archive_target.out"
+  printf 'expected_dir_mode=%s\n' "$mode" >> "${work_dir}/wal_archive_target.out"
+
+  case "$uid" in
+    ''|*[!0-9]*)
+      printf 'wal_archive_target_owner_uid_invalid=%s\n' "$uid" >> "${work_dir}/wal_archive_target.out"
+      wal_target_status="fail"
+      return 1
+      ;;
+  esac
+  case "$mode" in
+    ''|*[!0-7]*)
+      printf 'wal_archive_target_dir_mode_invalid=%s\n' "$mode" >> "${work_dir}/wal_archive_target.out"
+      wal_target_status="fail"
+      return 1
+      ;;
+  esac
+  gid="$(group_gid_for "$group")"
+  case "$gid" in
+    ''|*[!0-9]*)
+      printf 'wal_archive_target_group_invalid=%s\n' "$group" >> "${work_dir}/wal_archive_target.out"
+      wal_target_status="fail"
+      return 1
+      ;;
+  esac
+
+  wal_target_expected_owner_uid="$uid"
+  wal_target_expected_group="$group"
+  wal_target_expected_group_gid="$gid"
+  wal_target_expected_dir_mode="$mode"
+
+  if [ ! -d "$wal_target_root" ]; then
+    printf 'wal_archive_target_root_missing=%s\n' "$wal_target_root" >> "${work_dir}/wal_archive_target.out"
+    wal_target_status="fail"
+    return 1
+  fi
+  if [ ! -d "$wal_target_dir" ]; then
+    printf 'wal_archive_target_dir_missing=%s\n' "$wal_target_dir" >> "${work_dir}/wal_archive_target.out"
+    wal_target_status="fail"
+    return 1
+  fi
+  if ! mkdir -p "$wal_target_tmp_dir"; then
+    printf 'wal_archive_target_tmp_prepare_failed=%s\n' "$wal_target_tmp_dir" >> "${work_dir}/wal_archive_target.out"
+    wal_target_status="fail"
+    return 1
+  fi
+
+  paths=("$wal_target_root" "$wal_target_dir" "$wal_target_tmp_dir")
+  for path in "${paths[@]}"; do
+    append_wal_target_state before "$path" || rc=1
+    [ -d "$path" ] || rc=1
+    actual_uid="$(stat -c %u "$path")"
+    actual_gid="$(stat -c %g "$path")"
+    actual_mode="$(stat -c %a "$path")"
+    if [ "$actual_uid" != "$uid" ] || [ "$actual_gid" != "$gid" ] || ! mode_matches_wal_target_path "$path" "$actual_mode" "$mode"; then
+      wal_target_issue_count="$((wal_target_issue_count + 1))"
+      printf 'wal_archive_target_mismatch=%s actual_uid=%s actual_gid=%s actual_mode=%s expected_uid=%s expected_gid=%s expected_mode=%s\n' \
+        "$path" "$actual_uid" "$actual_gid" "$actual_mode" "$uid" "$gid" "$mode" >> "${work_dir}/wal_archive_target.out"
+    fi
+  done
+
+  if [ "$wal_target_issue_count" -gt 0 ]; then
+    wal_target_repaired="true"
+    wal_target_diagnosis_signature="archive_dir_not_writable"
+    wal_target_diagnosis_exit_code="1"
+    wal_target_diagnosis_fix="chown ${uid}:${group} ${wal_target_root} ${wal_target_dir} ${wal_target_tmp_dir}; chmod ${mode} ${wal_target_root} ${wal_target_dir} ${wal_target_tmp_dir}"
+    printf 'diagnosis_original_archive_command_failure_signature=%s\n' "$wal_target_diagnosis_signature" >> "${work_dir}/wal_archive_target.out"
+    printf 'diagnosis_original_archive_command_exit_code=%s\n' "$wal_target_diagnosis_exit_code" >> "${work_dir}/wal_archive_target.out"
+    printf 'diagnosis_failure_signature=%s\n' "$wal_target_diagnosis_signature" >> "${work_dir}/wal_archive_target.out"
+    printf 'diagnosis_archive_command_exit_code=%s\n' "$wal_target_diagnosis_exit_code" >> "${work_dir}/wal_archive_target.out"
+    printf 'diagnosis_fix=%s\n' "$wal_target_diagnosis_fix" >> "${work_dir}/wal_archive_target.out"
+    for path in "${paths[@]}"; do
+      if [ "$current_uid" -eq 0 ]; then
+        chown "${uid}:${gid}" "$path" || rc=1
+      fi
+      chmod "$mode" "$path" || rc=1
+    done
+  fi
+
+  for path in "${paths[@]}"; do
+    append_wal_target_state after "$path" || rc=1
+    actual_uid="$(stat -c %u "$path")"
+    actual_gid="$(stat -c %g "$path")"
+    actual_mode="$(stat -c %a "$path")"
+    if [ "$actual_uid" != "$uid" ] || [ "$actual_gid" != "$gid" ] || ! mode_matches_wal_target_path "$path" "$actual_mode" "$mode"; then
+      rc=1
+    fi
+  done
+
+  grant_evidence_operator_access
+  wal_target_verified_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [ "$rc" -eq 0 ]; then
+    wal_target_status="pass"
+    printf 'wal_archive_target_status=pass\n' >> "${work_dir}/wal_archive_target.out"
+    printf 'wal_archive_target_verified_at=%s\n' "$wal_target_verified_at" >> "${work_dir}/wal_archive_target.out"
+    return 0
+  fi
+  wal_target_status="fail"
+  printf 'wal_archive_target_status=fail\n' >> "${work_dir}/wal_archive_target.out"
+  printf 'wal_archive_target_verified_at=%s\n' "$wal_target_verified_at" >> "${work_dir}/wal_archive_target.out"
+  return 1
+}
+
+grant_evidence_file_read_access() {
+  local path="$1"
+  local user
+  [ -n "$evidence_read_users" ] || return 0
+  IFS=','
+  for user in $evidence_read_users; do
+    user="$(printf '%s' "$user" | tr -d '[:space:]')"
+    [ -n "$user" ] || continue
+    id -u "$user" >/dev/null 2>&1 || continue
+    if command -v setfacl >/dev/null 2>&1; then
+      setfacl -m "u:${user}:r--" "$path" 2>/dev/null || chmod o+r "$path" 2>/dev/null || true
+    else
+      chmod o+r "$path" 2>/dev/null || true
+    fi
+  done
+  unset IFS
+}
+
+grant_evidence_operator_access() {
+  local user acl_ok
+  [ -n "$evidence_read_users" ] || return 0
+  acl_ok=1
+  IFS=','
+  for user in $evidence_read_users; do
+    user="$(printf '%s' "$user" | tr -d '[:space:]')"
+    [ -n "$user" ] || continue
+    id -u "$user" >/dev/null 2>&1 || continue
+    if command -v setfacl >/dev/null 2>&1; then
+      setfacl -m "u:${user}:--x" "$backup_root" 2>/dev/null || acl_ok=0
+      setfacl -m "u:${user}:r-x" "$evidence_dir" 2>/dev/null || acl_ok=0
+      setfacl -d -m "u:${user}:r-X" "$evidence_dir" 2>/dev/null || acl_ok=0
+    else
+      acl_ok=0
+    fi
+  done
+  unset IFS
+  if [ "$acl_ok" -eq 0 ]; then
+    chmod o+x "$backup_root" 2>/dev/null || true
+    chmod o+rx "$evidence_dir" 2>/dev/null || true
+  fi
 }
 
 require_listable_dir() {
@@ -440,10 +709,12 @@ fresh_enough() {
 publish_report_file() {
   local path="$1"
   [ -e "$path" ] || return 0
+  grant_evidence_operator_access
   chmod 0640 "$path"
   if [ -n "$evidence_read_group" ]; then
     chgrp "$evidence_read_group" "$path"
   fi
+  grant_evidence_file_read_access "$path"
 }
 
 reuse_base_backup_if_fresh() {
@@ -797,13 +1068,27 @@ write_reports() {
     printf 'wal_archiver_archived_count=%s\n' "$wal_archiver_archived_count"
     printf 'wal_archiver_last_archived_wal=%s\n' "$wal_archiver_last_archived_wal"
     printf 'wal_archiver_last_archived_at=%s\n' "$wal_archiver_last_archived_at"
-    printf 'wal_archiver_failed_count=%s\n' "$wal_archiver_failed_count"
-    printf 'wal_archiver_last_failed_wal=%s\n' "$wal_archiver_last_failed_wal"
-    printf 'wal_archiver_last_failed_at=%s\n' "$wal_archiver_last_failed_at"
-    printf 'wal_archiver_stats_reset_at=%s\n' "$wal_archiver_stats_reset_at"
-    printf 'restore_drill_status=%s\n' "$restore_drill_status"
-    printf 'restore_drill_report=%s\n' "$restore_drill_report"
-    printf 'restore_drill_verified_at=%s\n' "$restore_drill_verified_at"
+	    printf 'wal_archiver_failed_count=%s\n' "$wal_archiver_failed_count"
+	    printf 'wal_archiver_last_failed_wal=%s\n' "$wal_archiver_last_failed_wal"
+	    printf 'wal_archiver_last_failed_at=%s\n' "$wal_archiver_last_failed_at"
+	    printf 'wal_archiver_stats_reset_at=%s\n' "$wal_archiver_stats_reset_at"
+	    printf 'wal_archive_target_status=%s\n' "$wal_target_status"
+	    printf 'wal_archive_target_verified_at=%s\n' "$wal_target_verified_at"
+	    printf 'wal_archive_target_root=%s\n' "$wal_target_root"
+	    printf 'wal_archive_target_dir=%s\n' "$wal_target_dir"
+	    printf 'wal_archive_target_tmp_dir=%s\n' "$wal_target_tmp_dir"
+	    printf 'wal_archive_target_expected_owner_uid=%s\n' "$wal_target_expected_owner_uid"
+	    printf 'wal_archive_target_expected_group=%s\n' "$wal_target_expected_group"
+	    printf 'wal_archive_target_expected_group_gid=%s\n' "$wal_target_expected_group_gid"
+	    printf 'wal_archive_target_expected_dir_mode=%s\n' "$wal_target_expected_dir_mode"
+	    printf 'wal_archive_target_repaired=%s\n' "$wal_target_repaired"
+	    printf 'wal_archive_target_issue_count=%s\n' "$wal_target_issue_count"
+	    printf 'wal_archive_target_diagnosis_signature=%s\n' "$wal_target_diagnosis_signature"
+	    printf 'wal_archive_target_diagnosis_exit_code=%s\n' "$wal_target_diagnosis_exit_code"
+	    printf 'wal_archive_target_diagnosis_fix=%s\n' "$wal_target_diagnosis_fix"
+	    printf 'restore_drill_status=%s\n' "$restore_drill_status"
+	    printf 'restore_drill_report=%s\n' "$restore_drill_report"
+	    printf 'restore_drill_verified_at=%s\n' "$restore_drill_verified_at"
 	    printf 'restore_time_to_recover_s=%s\n' "$restore_time_to_recover_s"
 	    printf 'signature_status=%s\n' "$signature_status"
 	    printf 'publish_status=%s\n' "$publish_status"
@@ -830,11 +1115,13 @@ write_reports() {
     [ -f "${work_dir}/wal_catchup.out" ] && cat "${work_dir}/wal_catchup.out"
     printf '\n[wal_archive]\n'
     [ -f "${work_dir}/wal_archive.out" ] && cat "${work_dir}/wal_archive.out"
-    printf '\n[wal_archiver]\n'
-    [ -f "${work_dir}/wal_archiver.out" ] && cat "${work_dir}/wal_archiver.out"
-    printf '\n[restore_drill]\n'
-    [ -f "${work_dir}/restore_drill.out" ] && tail -n 160 "${work_dir}/restore_drill.out"
-  } > "$report_txt"
+	    printf '\n[wal_archiver]\n'
+	    [ -f "${work_dir}/wal_archiver.out" ] && cat "${work_dir}/wal_archiver.out"
+	    printf '\n[wal_archive_target]\n'
+	    [ -f "${work_dir}/wal_archive_target.out" ] && cat "${work_dir}/wal_archive_target.out"
+	    printf '\n[restore_drill]\n'
+	    [ -f "${work_dir}/restore_drill.out" ] && tail -n 160 "${work_dir}/restore_drill.out"
+	  } > "$report_txt"
   publish_report_file "$report_txt"
 
   set +e
@@ -863,13 +1150,27 @@ write_reports() {
   WAL_ARCHIVER_LAST_ARCHIVED_AT="$wal_archiver_last_archived_at" \
   WAL_ARCHIVER_LAST_ARCHIVED_AT_TS="$wal_archiver_last_archived_at_ts" \
   WAL_ARCHIVER_FAILED_COUNT="$wal_archiver_failed_count" \
-  WAL_ARCHIVER_LAST_FAILED_WAL="$wal_archiver_last_failed_wal" \
-  WAL_ARCHIVER_LAST_FAILED_AT="$wal_archiver_last_failed_at" \
-  WAL_ARCHIVER_LAST_FAILED_AT_TS="$wal_archiver_last_failed_at_ts" \
-  WAL_ARCHIVER_STATS_RESET_AT="$wal_archiver_stats_reset_at" \
-  RESTORE_DRILL_STATUS="$restore_drill_status" \
-  RESTORE_DRILL_REPORT="$restore_drill_report" \
-  RESTORE_DRILL_VERIFIED_AT="$restore_drill_verified_at" \
+	  WAL_ARCHIVER_LAST_FAILED_WAL="$wal_archiver_last_failed_wal" \
+	  WAL_ARCHIVER_LAST_FAILED_AT="$wal_archiver_last_failed_at" \
+	  WAL_ARCHIVER_LAST_FAILED_AT_TS="$wal_archiver_last_failed_at_ts" \
+	  WAL_ARCHIVER_STATS_RESET_AT="$wal_archiver_stats_reset_at" \
+	  WAL_TARGET_STATUS="$wal_target_status" \
+	  WAL_TARGET_VERIFIED_AT="$wal_target_verified_at" \
+	  WAL_TARGET_ROOT="$wal_target_root" \
+	  WAL_TARGET_DIR="$wal_target_dir" \
+	  WAL_TARGET_TMP_DIR="$wal_target_tmp_dir" \
+	  WAL_TARGET_EXPECTED_OWNER_UID="$wal_target_expected_owner_uid" \
+	  WAL_TARGET_EXPECTED_GROUP="$wal_target_expected_group" \
+	  WAL_TARGET_EXPECTED_GROUP_GID="$wal_target_expected_group_gid" \
+	  WAL_TARGET_EXPECTED_DIR_MODE="$wal_target_expected_dir_mode" \
+	  WAL_TARGET_REPAIRED="$wal_target_repaired" \
+	  WAL_TARGET_ISSUE_COUNT="$wal_target_issue_count" \
+	  WAL_TARGET_DIAGNOSIS_SIGNATURE="$wal_target_diagnosis_signature" \
+	  WAL_TARGET_DIAGNOSIS_EXIT_CODE="$wal_target_diagnosis_exit_code" \
+	  WAL_TARGET_DIAGNOSIS_FIX="$wal_target_diagnosis_fix" \
+	  RESTORE_DRILL_STATUS="$restore_drill_status" \
+	  RESTORE_DRILL_REPORT="$restore_drill_report" \
+	  RESTORE_DRILL_VERIFIED_AT="$restore_drill_verified_at" \
   RESTORE_TIME_TO_RECOVER_S="$restore_time_to_recover_s" \
   PUBLISH_STATUS="$publish_status" \
   LOCK_TIMEOUT_S="$lock_timeout_s" \
@@ -1015,9 +1316,9 @@ payload = {
         "verified_at": os.environ["WAL_CATCHUP_VERIFIED_AT"],
         "verified_at_ts": ts(os.environ["WAL_CATCHUP_VERIFIED_AT"]),
     },
-    "wal_archiver": {
-        "status": os.environ["WAL_ARCHIVER_STATUS"],
-        "source": "pg_stat_archiver",
+	    "wal_archiver": {
+	        "status": os.environ["WAL_ARCHIVER_STATUS"],
+	        "source": "pg_stat_archiver",
         "archive_mode": os.environ["WAL_ARCHIVER_ARCHIVE_MODE"],
         "archive_command": os.environ["WAL_ARCHIVER_ARCHIVE_COMMAND"],
         "archived_count": maybe_int(os.environ["WAL_ARCHIVER_ARCHIVED_COUNT"]),
@@ -1030,12 +1331,38 @@ payload = {
         "last_failed_wal": os.environ["WAL_ARCHIVER_LAST_FAILED_WAL"],
         "last_failed_at": os.environ["WAL_ARCHIVER_LAST_FAILED_AT"],
         "last_failed_at_ts": maybe_float(os.environ["WAL_ARCHIVER_LAST_FAILED_AT_TS"]),
-        "stats_reset": os.environ["WAL_ARCHIVER_STATS_RESET_AT"],
-        "stats_reset_ts": ts(os.environ["WAL_ARCHIVER_STATS_RESET_AT"]),
-    },
-    "restore_drill": {
-        "status": os.environ["RESTORE_DRILL_STATUS"],
-        "report": os.environ["RESTORE_DRILL_REPORT"],
+	        "stats_reset": os.environ["WAL_ARCHIVER_STATS_RESET_AT"],
+	        "stats_reset_ts": ts(os.environ["WAL_ARCHIVER_STATS_RESET_AT"]),
+	    },
+	    "wal_archive_target": {
+	        "status": os.environ["WAL_TARGET_STATUS"],
+	        "source": "filesystem_repair",
+	        "root": os.environ["WAL_TARGET_ROOT"],
+	        "wal_dir": os.environ["WAL_TARGET_DIR"],
+	        "tmp_dir": os.environ["WAL_TARGET_TMP_DIR"],
+	        "expected_owner_uid": maybe_int(os.environ["WAL_TARGET_EXPECTED_OWNER_UID"]),
+	        "expected_group": os.environ["WAL_TARGET_EXPECTED_GROUP"],
+	        "expected_group_gid": maybe_int(os.environ["WAL_TARGET_EXPECTED_GROUP_GID"]),
+	        "expected_dir_mode": os.environ["WAL_TARGET_EXPECTED_DIR_MODE"],
+	        "repaired": truthy(os.environ["WAL_TARGET_REPAIRED"]),
+	        "issue_count": maybe_int(os.environ["WAL_TARGET_ISSUE_COUNT"]),
+	        "verified_at": os.environ["WAL_TARGET_VERIFIED_AT"],
+	        "verified_at_ts": ts(os.environ["WAL_TARGET_VERIFIED_AT"]),
+	        "diagnosis": {
+	            "observed_pg_stat_archiver_failed_count": maybe_int(os.environ["WAL_ARCHIVER_FAILED_COUNT"]),
+	            "observed_pg_stat_archiver_last_failed_wal": os.environ["WAL_ARCHIVER_LAST_FAILED_WAL"],
+	            "observed_pg_stat_archiver_last_failed_at": os.environ["WAL_ARCHIVER_LAST_FAILED_AT"],
+	            "observed_pg_stat_archiver_last_failed_at_ts": maybe_float(os.environ["WAL_ARCHIVER_LAST_FAILED_AT_TS"]),
+	            "original_archive_command_failure_signature": os.environ["WAL_TARGET_DIAGNOSIS_SIGNATURE"],
+	            "original_archive_command_exit_code": maybe_int(os.environ["WAL_TARGET_DIAGNOSIS_EXIT_CODE"]),
+	            "archive_command_failure_signature": os.environ["WAL_TARGET_DIAGNOSIS_SIGNATURE"],
+	            "archive_command_exit_code": maybe_int(os.environ["WAL_TARGET_DIAGNOSIS_EXIT_CODE"]),
+	            "fix": os.environ["WAL_TARGET_DIAGNOSIS_FIX"],
+	        },
+	    },
+	    "restore_drill": {
+	        "status": os.environ["RESTORE_DRILL_STATUS"],
+	        "report": os.environ["RESTORE_DRILL_REPORT"],
         "verified_at": os.environ["RESTORE_DRILL_VERIFIED_AT"] if os.environ["RESTORE_DRILL_STATUS"] == "pass" else "",
         "verified_at_ts": ts(os.environ["RESTORE_DRILL_VERIFIED_AT"]) if os.environ["RESTORE_DRILL_STATUS"] == "pass" else None,
         "time_to_recover_s": maybe_float(os.environ["RESTORE_TIME_TO_RECOVER_S"]),
@@ -1165,6 +1492,7 @@ overall_rc=0
 check_scripts || overall_rc=1
 check_compose || overall_rc=1
 check_systemd || overall_rc=1
+repair_wal_archive_target || overall_rc=1
 run_base_backup || overall_rc=1
 run_wal_archive_catchup || overall_rc=1
 verify_wal_archive || overall_rc=1

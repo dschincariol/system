@@ -108,6 +108,8 @@ _SAFE_NO_CREDENTIAL_ENV = {
     "LIVE_PRICE_PROVIDER_CHAIN": "yfinance",
     "OPTIONS_PROVIDER_CHAIN": "",
 }
+_RUNTIME_CREDENTIAL_DIR_ENV = "DATA_SOURCE_MANAGER_RUNTIME_SECRET_DIR"
+_DEFAULT_RUNTIME_CREDENTIAL_DIR = Path("/run/trading/data-source-secrets")
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -180,9 +182,80 @@ def apply_safe_no_credential_runtime_environment(env: Dict[str, str] | None = No
     target = os.environ if env is None else env
     for key in credential_runtime_env_keys():
         target.pop(str(key), None)
+        target.pop(f"{str(key)}_FILE", None)
     for key, value in _SAFE_NO_CREDENTIAL_ENV.items():
         target[str(key)] = str(value)
     return dict(_SAFE_NO_CREDENTIAL_ENV)
+
+
+def _strict_runtime_secret_projection() -> bool:
+    try:
+        from engine.runtime.config_schema import get_runtime_safety_context
+
+        return bool(get_runtime_safety_context().get("strict_runtime"))
+    except Exception as exc:
+        _warn_nonfatal(
+            "DATA_SOURCE_STRICT_RUNTIME_CONTEXT_FAILED",
+            exc,
+            once_key="strict_runtime_secret_projection",
+        )
+    env = str(os.environ.get("ENV") or os.environ.get("NODE_ENV") or "").strip().lower()
+    if env in {"prod", "production", "staging"}:
+        return True
+    return _env_flag("ENGINE_SUPERVISED", False) or _env_flag("PROD_LOCK", False)
+
+
+def _runtime_credential_dir() -> Path:
+    raw = str(os.environ.get(_RUNTIME_CREDENTIAL_DIR_ENV) or "").strip()
+    return Path(raw).expanduser() if raw else _DEFAULT_RUNTIME_CREDENTIAL_DIR
+
+
+def _runtime_credential_file_name(env_name: str) -> str:
+    safe = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(env_name).strip())
+    safe = "_".join(part for part in safe.split("_") if part)
+    if not safe:
+        raise ValueError("runtime_credential_env_name_empty")
+    return safe
+
+
+def _write_runtime_credential_file(env_name: str, value: str) -> Path:
+    directory = _runtime_credential_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError as exc:
+        _warn_nonfatal(
+            "DATA_SOURCE_RUNTIME_CREDENTIAL_DIR_CHMOD_FAILED",
+            exc,
+            once_key=f"runtime_credential_dir_chmod:{directory}",
+            path=str(directory),
+        )
+    path = directory / _runtime_credential_file_name(env_name)
+    tmp_path = directory / f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    tmp_path.write_text(str(value), encoding="utf-8")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
+    return path
+
+
+def _credential_file_available(env_name: str) -> str:
+    path = str(os.environ.get(f"{str(env_name)}_FILE") or "").strip()
+    if not path:
+        return ""
+    candidate = Path(path).expanduser()
+    try:
+        if candidate.is_file() and candidate.stat().st_size > 0 and os.access(candidate, os.R_OK):
+            return str(candidate)
+    except OSError as exc:
+        _warn_nonfatal(
+            "DATA_SOURCE_CREDENTIAL_FILE_STAT_FAILED",
+            exc,
+            once_key=f"credential_file_available:{env_name}:{candidate}",
+            env_name=str(env_name),
+            path=str(candidate),
+        )
+    return ""
 
 
 def _best_effort_source_status_payload(
@@ -1771,12 +1844,53 @@ class DataSourceManager:
         env: Dict[str, str] = {}
         price_providers: List[str] = []
         option_providers: List[str] = []
+        strict_projection = _strict_runtime_secret_projection()
+        active_row_count = 0
 
         for row in rows:
             definition = self._catalog.get(str(row.get("source_key") or ""))
             credentials = dict(row.get("credentials") or {})
             settings = dict(row.get("settings") or {})
             provider_name = str(row.get("provider_name") or row.get("source_key") or "").strip().lower()
+            credential_env = dict((definition.credential_env or {}) if definition is not None else {})
+            projected_credentials: Dict[str, str] = {}
+            credentials_available = True
+
+            for field_name, env_name in credential_env.items():
+                env_name_s = str(env_name or "").strip()
+                if not env_name_s:
+                    continue
+                value = str(credentials.get(field_name) or "").strip()
+                if value:
+                    if strict_projection:
+                        try:
+                            projected_credentials[f"{env_name_s}_FILE"] = str(
+                                _write_runtime_credential_file(env_name_s, value)
+                            )
+                        except Exception as exc:
+                            credentials_available = False
+                            _warn_nonfatal(
+                                "DATA_SOURCE_MANAGER_RUNTIME_CREDENTIAL_FILE_WRITE_FAILED",
+                                exc,
+                                once_key=f"runtime_credential_file_write:{env_name_s}",
+                                source_key=str(row.get("source_key") or ""),
+                                env_name=env_name_s,
+                            )
+                    else:
+                        projected_credentials[env_name_s] = value
+                    continue
+                file_path = _credential_file_available(env_name_s)
+                if file_path:
+                    projected_credentials[f"{env_name_s}_FILE"] = file_path
+                    continue
+                if (not strict_projection) and str(os.environ.get(env_name_s) or "").strip():
+                    projected_credentials[env_name_s] = str(os.environ.get(env_name_s) or "").strip()
+                    continue
+                credentials_available = False
+
+            if credential_env and not credentials_available:
+                continue
+            active_row_count += 1
 
             if str(row.get("source_type") or "") == "price_provider" and provider_name:
                 price_providers.append(provider_name)
@@ -1785,19 +1899,14 @@ class DataSourceManager:
 
             if definition is None:
                 continue
-            for field_name, env_name in (definition.credential_env or {}).items():
-                value = credentials.get(field_name)
-                if value is not None and str(value).strip() != "":
-                    env[str(env_name)] = str(value)
+            env.update(projected_credentials)
             for field_name, env_name in (definition.setting_env or {}).items():
                 value = settings.get(field_name)
                 if value is not None and str(value).strip() != "":
                     env[str(env_name)] = self._env_string(value)
 
         if job_name_s == "options_poll" and any(
-            str(row.get("provider_name") or "").strip().lower() == "polygon"
-            and bool(row.get("enabled"))
-            and str((row.get("credentials") or {}).get("api_key") or "").strip()
+            self._source_has_runtime_credentials(row)
             for row in self.list_sources(include_credentials=True)
         ):
             option_providers.append("polygon")
@@ -1810,9 +1919,9 @@ class DataSourceManager:
             env["YFINANCE_ENABLED"] = "1" if "yfinance" in chain else "0"
             env["CCXT_ENABLED"] = "1" if "ccxt" in chain else "0"
         elif job_name_s == "stream_prices_polygon_ws":
-            env["POLYGON_WS_ENABLED"] = "1"
+            env["POLYGON_WS_ENABLED"] = "1" if active_row_count > 0 else "0"
         elif job_name_s == "stream_prices_ibkr":
-            env["IBKR_ENABLED"] = "1"
+            env["IBKR_ENABLED"] = "1" if active_row_count > 0 else "0"
         elif job_name_s == "options_poll":
             chain = self._provider_chain(option_providers)
             if chain:
@@ -1836,9 +1945,39 @@ class DataSourceManager:
             if not bool(row.get("enabled")):
                 continue
             merged.update(self.build_job_environment(str(row.get("job_name") or "")))
+        if _strict_runtime_secret_projection():
+            for key in credential_runtime_env_keys():
+                os.environ.pop(str(key), None)
+                os.environ.pop(f"{str(key)}_FILE", None)
         for key, value in merged.items():
             os.environ[str(key)] = str(value)
         return merged
+
+    def _source_has_runtime_credentials(self, row: Dict[str, Any]) -> bool:
+        if str(row.get("provider_name") or "").strip().lower() != "polygon":
+            return False
+        if not bool(row.get("enabled")):
+            return False
+        definition = self._catalog.get(str(row.get("source_key") or ""))
+        if definition is None:
+            return False
+        credential_env = dict(definition.credential_env or {})
+        if not credential_env:
+            return True
+        credentials = dict(row.get("credentials") or {})
+        strict_projection = _strict_runtime_secret_projection()
+        for field_name, env_name in credential_env.items():
+            env_name_s = str(env_name or "").strip()
+            if not env_name_s:
+                continue
+            if str(credentials.get(field_name) or "").strip():
+                continue
+            if _credential_file_available(env_name_s):
+                continue
+            if (not strict_projection) and str(os.environ.get(env_name_s) or "").strip():
+                continue
+            return False
+        return True
 
     def get_provider_registry_overrides(self) -> Dict[str, Dict[str, Any]]:
         self.initialize()

@@ -111,6 +111,8 @@ jq '{base_backup,wal_archive,wal_archiver,restore_drill,signature}' \
   /var/backups/trading/evidence/latest_backup_restore_evidence.json
 ```
 
+When the installer is run through `sudo`, it grants the invoking operator read access to backup evidence artifacts while keeping the backup tree protected. If running from a root shell instead, set `TRADING_OPERATOR_USER=<operator-login>` so the normal operator user can run postflight without sudo.
+
 Expected: every component status is `pass`, and `signature.status` is `signed`.
 
 Quiesce trading in this order:
@@ -285,6 +287,8 @@ python ops/server/os_migration_postflight.py \
   --zfs-pool zpool \
   --preflight-report "${PRE_FLIGHT_REPORT}"
 ```
+
+This mode does not fail solely because `/dev/kfd` or render nodes exist without `rocminfo`; ROCm userspace is enforced only with `--require-rocm`.
 
 Run with ROCm enforcement if T1.1 has landed:
 
