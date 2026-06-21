@@ -665,9 +665,25 @@ def _run_apply_job(
     patch_position_fetch: bool = True,
 ) -> tuple[int, dict[str, Any], str]:
     with ExitStack() as stack:
+        import engine.runtime.health as runtime_health
+
+        stack.enter_context(patch.object(runtime_health, "run_preflight", return_value={"ok": True, "notes": []}))
         stack.enter_context(patch.object(modules.broker_apply_orders, "evaluate_rules", return_value=None))
         stack.enter_context(patch.object(modules.broker_apply_orders, "persist_execution_advisories", return_value=None))
         stack.enter_context(patch.object(modules.broker_apply_orders, "apply_execution_policy", side_effect=_passthrough_execution_policy))
+        stack.enter_context(
+            patch.object(
+                modules.broker_router,
+                "_execution_gate_snapshot",
+                lambda **_: {
+                    "ok": True,
+                    "allowed": True,
+                    "real_trading_allowed": True,
+                    "mode": "live",
+                    "reason": "test_allow",
+                },
+            )
+        )
         stack.enter_context(
             patch.object(
                 modules.portfolio_execution_intents,

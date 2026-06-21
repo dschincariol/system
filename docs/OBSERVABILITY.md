@@ -63,6 +63,7 @@ This document records the observability surfaces that are present in the reposit
 | `INGESTION_TUNING_MAX_BUFFERED_ROWS` | Hard preflight budget for estimated buffered rows across Timescale, async price writer, telemetry append, event-log, runtime-metrics, and runtime-meta buffers. | `1200000` |
 | `ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES` | Logical payload byte cap for the SQLite WAL async price-writer spool. Enqueue rejects and dead-letters new envelopes when the cap or `ASYNC_PRICE_WRITER_QUEUE_MAXSIZE` envelope cap would be exceeded. | `268435456` |
 | `ASYNC_PRICE_WRITER_SPOOL_PATH` | Optional durable spool file override. Empty defaults beside `DB_PATH` when file-shaped, under `DB_PATH` when directory-shaped, then under `TS_DATA_ROOT` or the platform data root. | empty |
+| `ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS` / `ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS` | SQLite writer lock wait and WAL durability mode for the async price-writer spool. Keep synchronous at `FULL` unless an operator explicitly accepts weaker local durability for faster enqueue. | `50` / `FULL` |
 | `INGESTION_CHILD_TS_PG_POOL_SIZE`, `INGESTION_CHILD_TIMESCALE_POOL_MAX_SIZE`, `INGESTION_CHILD_TIMESCALE_PRICES_POOL_MAX_SIZE` | Per-child ingestion pool caps used by spawned feed jobs so the host profile does not multiply parent-sized pools across processes. | `2`, `2`, `2` |
 
 ## Ingestion Backpressure Signals
