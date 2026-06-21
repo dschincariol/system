@@ -48,7 +48,10 @@ Closest current substitutes:
 | [PRODUCTION_BACKEND_CI.md](PRODUCTION_BACKEND_CI.md) | Canonical | You need to reproduce or audit the Postgres/Redis production-backend CI gate and staging preflight evidence. |
 | [LIVE_READINESS_CHECKLIST.md](LIVE_READINESS_CHECKLIST.md) | Canonical | You are moving from safe or paper operation toward live trading. |
 | [STAGING_PROD_PREFLIGHT_EVIDENCE.md](STAGING_PROD_PREFLIGHT_EVIDENCE.md) | Canonical | You need to run the staging prod-preflight harness or review redacted preflight evidence. |
-| [DISK_RETENTION_RUNBOOK.md](DISK_RETENTION_RUNBOOK.md) | Canonical | You need to inspect root/Docker disk pressure, backup accounting, or safe cleanup commands without deleting live state. |
+| [DISK_RETENTION_RUNBOOK.md](DISK_RETENTION_RUNBOOK.md) | Canonical | You need to inspect root/Docker disk pressure, relocate Docker data-root to ZFS, run backup accounting, or use safe cleanup commands without deleting live state. |
+| [MEMORY_PRESSURE_RUNBOOK.md](MEMORY_PRESSURE_RUNBOOK.md) | Canonical | You need to enforce or verify swappiness, zram, disk swap, ZFS ARC caps, deleted `/tmp` holder detection, or disk-backed pytest scratch. |
+| [OS_MIGRATION_RUNBOOK.md](OS_MIGRATION_RUNBOOK.md) | Canonical | You need to move production host `bart` from Ubuntu 25.10 to a supported LTS with repo-tracked preflight/postflight gates and ZFS rollback evidence. |
+| [CPU_POWER_POLICY.md](CPU_POWER_POLICY.md) | Canonical | You need to verify, revert, or audit host `bart` CPU performance-profile enforcement and ROCm/GPU thermal composition. |
 | [Secrets_Rotation_Runbook.md](Secrets_Rotation_Runbook.md) | Canonical | You need to rotate production secrets or credential-encryption key material. |
 | [boot/README.md](../boot/README.md) | Canonical | You are working on the local launcher, operator server, or guarded repair flow. |
 | [deploy/README.md](../deploy/README.md) | Supplementary | You need the current deployment directory layout and install entrypoint. |
@@ -59,19 +62,25 @@ Closest current substitutes:
 | Document | Status | Scope |
 | --- | --- | --- |
 | [REFERENCE_CONFIGURATION_GLOSSARY.md](REFERENCE_CONFIGURATION_GLOSSARY.md) | Canonical | Runtime configuration surfaces, environment-variable families, and secret-management boundaries. |
+| [config_env_allowlist.txt](config_env_allowlist.txt) | Canonical | Frozen allowlist of environment variables read in code but not yet documented in `.env.example` or the glossary; the validator env-coverage gate blocks new undocumented vars while tolerating this legacy backlog. Shrinks as variables are documented. |
 | [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md) | Canonical | Data-source UI, routes, storage tables, mutation payloads, and runtime lifecycle rules. |
 | [DATA_CONTRACTS.md](DATA_CONTRACTS.md) | Canonical | Current payload, row, and response contracts that cross subsystem boundaries. |
+| [PREDICTION_MARKET_MACRO.md](PREDICTION_MARKET_MACRO.md) | Canonical | Kalshi/CME macro expectation, Polymarket event-signal, ForecastEx regulated event-contract, and optional read-only IBKR source setup, storage, feature ids, PIT policy, and promotion boundaries. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | Canonical | Runtime observability signals, operator APIs, and telemetry ownership. |
 | [DEPENDENCY_PROFILES.md](DEPENDENCY_PROFILES.md) | Canonical | CPU/default, NVIDIA CUDA, and reserved AMD/ROCm dependency profile selection and rollback rules. |
 | [README_DATABASE_MAP.md](README_DATABASE_MAP.md) | Canonical | Runtime storage table families, key tables, and data-flow-oriented schema reference. |
 | [Database_Schema.md](Database_Schema.md) | Canonical | Production Postgres/Timescale schema classification and human review register. |
 | [Audit_Chain_Spec.md](Audit_Chain_Spec.md) | Canonical | Audit hash-chain serialization, ordering, and verification contract. |
 | [DOCSTRING_STYLE.md](DOCSTRING_STYLE.md) | Canonical | NumPy-style docstring contract for touched Python modules, classes, and functions. |
+| [DECOMPOSITION_CONVENTIONS.md](DECOMPOSITION_CONVENTIONS.md) | Canonical | Safe pattern for incrementally splitting oversized modules while preserving public entrypoints and behavior. |
 | [openapi/README.md](openapi/README.md) | Canonical | Location and maintenance rule for the incremental OpenAPI source of truth. |
 | [hyperparameter_inventory.md](hyperparameter_inventory.md) | Canonical | Tunable model-training parameters managed by the Optuna tuning catalog. |
 | [README_FUNCTION_MAP.md](README_FUNCTION_MAP.md) | Supplementary | Function-level navigation for large Python entrypoints and major subsystems. |
 | [engine/README.md](../engine/README.md) | Canonical | Top-level engine package map. |
 | [engine/runtime/README.md](../engine/runtime/README.md) | Canonical | Runtime control plane ownership. |
+| [engine/dashboard/README.md](../engine/dashboard/README.md) | Canonical | Extracted helper package for the root dashboard compatibility facade. |
+| [engine/api/system/README.md](../engine/api/system/README.md) | Canonical | Extracted helper package for the system API compatibility facade. |
+| [engine/startup/README.md](../engine/startup/README.md) | Canonical | Extracted startup helper package used by the root runtime executable facade. |
 | [engine/data/README.md](../engine/data/README.md) | Canonical | Data-ingestion ownership and extension points. |
 | [engine/strategy/README.md](../engine/strategy/README.md) | Canonical | Strategy, model, governance, and portfolio ownership. |
 | [engine/execution/README.md](../engine/execution/README.md) | Canonical | Execution, broker, and attribution ownership. |
@@ -79,6 +88,14 @@ Closest current substitutes:
 | [engine/risk/README.md](../engine/risk/README.md) | Canonical | Portfolio-risk and Monte Carlo risk ownership. |
 | [engine/terminal/README.md](../engine/terminal/README.md) | Canonical | Browser-terminal API ownership and terminal safety boundary. |
 | [engine/research/README.md](../engine/research/README.md) | Canonical | Offline research and fragility tooling. |
+| [engine/jobs/README.md](../engine/jobs/README.md) | Canonical | Live price-ingestion jobs, currently the Polygon websocket streamer that publishes trade/quote events into the runtime price tables. |
+| [engine/audit/README.md](../engine/audit/README.md) | Canonical | Tamper-evident SHA-256 hash chain over append-only audit ledger tables: canonical serialization, the append API, and the verifier and CLI that recompute chains and record divergences. |
+| [engine/cache/README.md](../engine/cache/README.md) | Canonical | Redis hot-path cache: write-through store, codec/keyspace, circuit-breaker fallback to Postgres, and typed wrappers for the cached runtime tables. |
+| [engine/backtest/README.md](../engine/backtest/README.md) | Canonical | Leakage-aware backtest primitives — combinatorial purged K-fold CV (purge + embargo) and deflated Sharpe diagnostics used by the promotion gate. |
+| [engine/nlp/README.md](../engine/nlp/README.md) | Canonical | Offline NLP encoders (FinBERT sentiment, sentence-transformer embeddings), the content-hash cache, and recency-weighted symbol-day aggregation for financial text. |
+| [engine/causal/README.md](../engine/causal/README.md) | Canonical | Causal-plausibility scoring of features (Granger with HAC errors, DoWhy backdoor estimation, curated DAGs) and persistence of the composite [0,1] causal score. |
+| [engine/artifacts/README.md](../engine/artifacts/README.md) | Canonical | Content-addressed artifact blob store: SHA256 sharded storage, aliases and reference counting, the centralized serialization facade with AST-lint enforcement, and the fsck verifier plus garbage collector. |
+| [engine/rl/README.md](../engine/rl/README.md) | Canonical | Shadow-only portfolio RL: Gym environment, PPO/SAC agents, env wrappers, and the advisory shadow evaluator writing rl_shadow_decisions (no live order authority). |
 | [services/README.md](../services/README.md) | Canonical | Sidecar-service ownership, especially data-source and operator-AI boundaries. |
 | [ui/README.md](../ui/README.md) | Canonical | Dashboard and data-source UI module reference. |
 
@@ -142,6 +159,7 @@ Canonical documentation in this repository currently consists of:
 - [REFERENCE_CONFIGURATION_GLOSSARY.md](REFERENCE_CONFIGURATION_GLOSSARY.md)
 - [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md)
 - [DATA_CONTRACTS.md](DATA_CONTRACTS.md)
+- [PREDICTION_MARKET_MACRO.md](PREDICTION_MARKET_MACRO.md)
 - [OBSERVABILITY.md](OBSERVABILITY.md)
 - [DEPENDENCY_PROFILES.md](DEPENDENCY_PROFILES.md)
 - [DOCSTRING_STYLE.md](DOCSTRING_STYLE.md)
@@ -154,6 +172,9 @@ Canonical documentation in this repository currently consists of:
 - [LIVE_READINESS_CHECKLIST.md](LIVE_READINESS_CHECKLIST.md)
 - [STAGING_PROD_PREFLIGHT_EVIDENCE.md](STAGING_PROD_PREFLIGHT_EVIDENCE.md)
 - [DISK_RETENTION_RUNBOOK.md](DISK_RETENTION_RUNBOOK.md)
+- [MEMORY_PRESSURE_RUNBOOK.md](MEMORY_PRESSURE_RUNBOOK.md)
+- [OS_MIGRATION_RUNBOOK.md](OS_MIGRATION_RUNBOOK.md)
+- [CPU_POWER_POLICY.md](CPU_POWER_POLICY.md)
 - [Secrets_Rotation_Runbook.md](Secrets_Rotation_Runbook.md)
 - [README_DATABASE_MAP.md](README_DATABASE_MAP.md)
 - [Database_Schema.md](Database_Schema.md)

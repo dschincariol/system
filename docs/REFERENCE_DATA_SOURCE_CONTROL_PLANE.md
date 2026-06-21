@@ -94,6 +94,12 @@ These templates are seeded automatically by [services/data_source_manager.py](..
 | `weather_forecasts` | `weather_provider` | `poll_weather_forecasts` | Yes | None |
 | `weather_alerts` | `weather_provider` | `poll_weather_alerts` | Yes | None |
 | `macro` | `macro_provider` | `poll_macro` | Yes | None |
+| `kalshi_prediction_market_macro` | `prediction_market_provider` | `poll_kalshi_prediction_markets` | No | None |
+| `cme_fedwatch` | `prediction_market_provider` | `poll_cme_fedwatch` | No | `oauth_token` for official API mode |
+| `deribit_crypto_derivatives` | `derivatives_provider` | `poll_deribit_crypto_derivatives` | No | None; public read-only market data only |
+| `sportsbook_odds_research` | `odds_provider` | `poll_sportsbook_odds` | No | `api_key`; read-only odds feed or historical file only |
+| `polymarket_event_signals` | `prediction_market_provider` | `poll_polymarket_prediction_markets` | No | None |
+| `forecastex_event_contracts` | `prediction_market_provider` | `poll_forecastex_event_contracts` | No | None; optional IBKR event-contract market data uses source settings and an explicit contract allowlist |
 | `model_feature_snapshots` | `feature_snapshot` | `snapshot_model_features` | Yes | None |
 | `rss_feed` | `rss_feed` | `ingest_now` | Custom | None; user supplies `name` and `url` in settings |
 
@@ -215,8 +221,56 @@ Implemented checks include:
 - GDELT API reachability
 - SEC public endpoint reachability
 - weather forecast and alert endpoints
+- Kalshi public market-data reachability
+- CME FedWatch official API reachability when an OAuth token is configured, or public-page reachability only when explicitly enabled for fragile research parsing
+- sportsbook odds historical-file readability or read-only feed reachability; betting-account, wallet, wager, order, private-key, and trading-shaped fields are rejected
+- sportsbook odds source enablement does not grant promotion eligibility; `sports_odds_sector_v1.*` remains shadow-only until an explicit active/watch or model-config narrow symbol mapping has complete approval metadata and persisted OOS/net/PIT/deconfounded/readiness evidence passes the promotion gate
+- Polymarket public Gamma event-data reachability; no wallet, bridge, private-key, API-key, or trading credential fields exist for this source
+- ForecastEx public CSV/data reachability; optional IBKR event-contract reads remain read-only and require explicit source settings plus a conid allowlist
 - IBKR socket reachability
 - custom RSS feed URL reachability
+
+## Sportsbook Odds Research Operator Procedure
+
+Sportsbook/Betfair-style odds remain low-priority broad-market data and are
+only eligible for narrow research baskets. A GO candidate requires real
+historical/provider odds, exact approved mappings, and persisted promotion
+evidence. Source enablement alone is never sufficient.
+
+1. Configure `sportsbook_odds_research` in the data-source control plane with
+   either `file_path`/`historical_file` or a read-only `base_url` plus optional
+   `api_key`. Do not enter account, wager, wallet, order, private-key, or
+   trading fields; connection tests reject those keys.
+2. Put approved mappings in `asset_mapping_json`. Each mapping must include an
+   exact normalized sports tuple plus a narrow allowlisted `asset_symbol`,
+   `stage=shadow`, `allow_feature_use=true`, `direct_trading_authority=false`,
+   `owner`, `mapping_rationale`, `mapping_version`, `approval_status=approved`,
+   `approved_by`, `approved_ts_ms`, `approval_reason`, and
+   `approved_for_promotion=true`.
+3. Run the read-only ingestion job through the runtime supervisor, or run a
+   controlled one-shot from Python using
+   `fetch_sportsbook_odds_batch(...)` and `put_sportsbook_odds_batch(...)`
+   against a non-production research database. This stores no-vig normalized
+   snapshots and mapping rows; it does not place or authorize bets.
+4. Run the evidence job after prices are available for the mapped assets:
+
+```bash
+SPORTSBOOK_ODDS_EVENT_STUDY_SYMBOLS=DKNG \
+SPORTSBOOK_ODDS_EVENT_STUDY_START_TS_MS=<start_ms> \
+SPORTSBOOK_ODDS_EVENT_STUDY_END_TS_MS=<end_ms> \
+SPORTSBOOK_ODDS_EVENT_STUDY_HORIZON_S=86400 \
+SPORTSBOOK_ODDS_EVENT_STUDY_LATENCY_MS=900000 \
+SPORTSBOOK_ODDS_EVENT_STUDY_FEE_BPS=1 \
+SPORTSBOOK_ODDS_EVENT_STUDY_SLIPPAGE_BPS=5 \
+python engine/data/jobs/backfill_sportsbook_odds_event_study.py
+```
+
+5. Interpret the printed `promotion_gate`: `go_for_production_features=true`
+   is only possible when approved mappings and persisted
+   `sportsbook_odds_promotion_evidence` pass OOS, net-after-cost, PIT,
+   deconfounding, provider-readiness, production-readiness, and approval gates.
+   Otherwise the result is NO-GO and the `blockers` list is the required
+   remediation input.
 
 If a source type does not need an active connectivity probe, the manager returns `connection_test_not_required`.
 

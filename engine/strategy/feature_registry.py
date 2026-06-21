@@ -32,6 +32,24 @@ from engine.data.finbert_sentiment import (
     resolve_finbert_sentiment_snapshot,
 )
 from engine.data.structured_document_events import STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS
+from engine.data.prediction_market_providers import (
+    PREDICTION_MARKET_EVENT_FEATURE_GROUP,
+    PREDICTION_MARKET_EVENT_FEATURE_IDS,
+    PREDICTION_MARKET_EVENT_PREFIX,
+    PREDICTION_MARKET_MACRO_FEATURE_GROUP,
+    PREDICTION_MARKET_MACRO_FEATURE_IDS,
+    PREDICTION_MARKET_MACRO_PREFIX,
+)
+from engine.data.deribit_crypto_derivatives import (
+    DERIBIT_FEATURE_GROUP,
+    DERIBIT_FEATURE_IDS,
+    DERIBIT_FEATURE_PREFIX,
+)
+from engine.data.sportsbook_odds import (
+    SPORTSBOOK_ODDS_FEATURE_GROUP,
+    SPORTSBOOK_ODDS_FEATURE_IDS,
+    SPORTSBOOK_ODDS_FEATURE_PREFIX,
+)
 from engine.strategy.tsfresh_features import (
     TSFRESH_FEATURE_PREFIX,
     get_default_tsfresh_feature_ids,
@@ -90,6 +108,7 @@ USE_13F_FEATURES = _env_bool("USE_13F_FEATURES", False)
 USE_GOV_FEATURES = _env_bool("USE_GOV_FEATURES", False)
 USE_FUNDAMENTALS_PIT_FEATURES = _env_bool("USE_FUNDAMENTALS_PIT_FEATURES", False)
 USE_BOCPD_FEATURES = _env_bool("USE_BOCPD_FEATURES", False)
+USE_DERIBIT_CRYPTO_DERIVATIVES_FEATURES = _env_bool("USE_DERIBIT_CRYPTO_DERIVATIVES_FEATURES", False)
 
 BASE_FEATURE_IDS = [
     "base.source_credibility",
@@ -283,6 +302,9 @@ _ALL_CONGRESSIONAL_FEATURE_IDS = [
 INSIDER_FEATURE_IDS = list(_ALL_INSIDER_FEATURE_IDS) if USE_INSIDER_FEATURES else []
 SHORT_FEATURE_IDS = list(_ALL_SHORT_FEATURE_IDS) if USE_SHORT_FEATURES else []
 CRYPTO_POSITIONING_FEATURE_IDS = list(_ALL_CRYPTO_POSITIONING_FEATURE_IDS) if USE_FUNDING_FEATURES else []
+DERIBIT_CRYPTO_DERIVATIVES_FEATURE_IDS = (
+    list(DERIBIT_FEATURE_IDS) if USE_DERIBIT_CRYPTO_DERIVATIVES_FEATURES else []
+)
 NEWS_FLOW_FEATURE_IDS = list(_ALL_NEWS_FLOW_FEATURE_IDS) if USE_NEWS_FLOW_FEATURES else []
 ETF_FLOW_FEATURE_IDS = list(_ALL_ETF_FLOW_FEATURE_IDS) if USE_ETF_FLOW_FEATURES else []
 COT_FEATURE_IDS = list(_ALL_COT_FEATURE_IDS) if USE_COT_FEATURES else []
@@ -437,6 +459,7 @@ UNIFIED_SYMBOL_FEATURE_IDS = (
     + list(INSIDER_FEATURE_IDS)
     + list(SHORT_FEATURE_IDS)
     + list(CRYPTO_POSITIONING_FEATURE_IDS)
+    + list(DERIBIT_CRYPTO_DERIVATIVES_FEATURE_IDS)
     + list(NEWS_FLOW_FEATURE_IDS)
     + list(ETF_FLOW_FEATURE_IDS)
     + list(COT_FEATURE_IDS)
@@ -474,6 +497,10 @@ FEATURE_GROUPS = {
     "nlp_filings_v1": list(NLP_FILINGS_FEATURE_IDS),
     "nlp_transcripts_v1": list(NLP_TRANSCRIPTS_FEATURE_IDS),
     "structured_doc_events_v1": list(STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS),
+    DERIBIT_FEATURE_GROUP: list(DERIBIT_FEATURE_IDS),
+    SPORTSBOOK_ODDS_FEATURE_GROUP: list(SPORTSBOOK_ODDS_FEATURE_IDS),
+    PREDICTION_MARKET_MACRO_FEATURE_GROUP: list(PREDICTION_MARKET_MACRO_FEATURE_IDS),
+    PREDICTION_MARKET_EVENT_FEATURE_GROUP: list(PREDICTION_MARKET_EVENT_FEATURE_IDS),
     TS_FOUNDATION_CHRONOS_GROUP: list(TS_FOUNDATION_CHRONOS_FEATURE_IDS),
     GRAPH_RELATIONAL_GROUP: list(GRAPH_RELATIONAL_FEATURE_IDS),
 }
@@ -513,6 +540,14 @@ for _fid in TS_FOUNDATION_CHRONOS_FEATURE_IDS:
 for _fid in GRAPH_RELATIONAL_FEATURE_IDS:
     FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
 for _fid in STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
+for _fid in PREDICTION_MARKET_MACRO_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
+for _fid in PREDICTION_MARKET_EVENT_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
+for _fid in DERIBIT_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
+for _fid in SPORTSBOOK_ODDS_FEATURE_IDS:
     FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
 
 FEATURE_GROUP_METADATA: Dict[str, Dict[str, Any]] = {
@@ -569,6 +604,78 @@ FEATURE_GROUP_METADATA["structured_doc_events_v1"].update(
         **FEATURE_PIT_POLICIES["structured_doc_events"].to_metadata(),
     }
 )
+FEATURE_GROUP_METADATA[PREDICTION_MARKET_MACRO_FEATURE_GROUP].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "provider_category": "macro",
+        "providers": ["kalshi", "cme_fedwatch"],
+        "stage": FEATURE_STAGE_SHADOW,
+        **FEATURE_PIT_POLICIES[PREDICTION_MARKET_MACRO_FEATURE_GROUP].to_metadata(),
+    }
+)
+FEATURE_GROUP_METADATA[PREDICTION_MARKET_EVENT_FEATURE_GROUP].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "provider_category": "event_signal",
+        "providers": ["polymarket", "forecastex", "ibkr_event_contracts"],
+        "stage": FEATURE_STAGE_SHADOW,
+        "requires_explicit_semantic_mapping_for_dispersion": True,
+        "regulated_event_types": ["macro", "energy", "climate_weather", "fx_rates", "equity_index", "commodity"],
+        **FEATURE_PIT_POLICIES[PREDICTION_MARKET_EVENT_FEATURE_GROUP].to_metadata(),
+    }
+)
+FEATURE_GROUP_METADATA[DERIBIT_FEATURE_GROUP].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "feature_prefix": DERIBIT_FEATURE_PREFIX,
+        "provider": "deribit",
+        "provider_category": "crypto_derivatives",
+        "source_type": "derivatives_provider",
+        "stage": FEATURE_STAGE_SHADOW,
+        "shadow_only_until": [
+            "out_of_sample",
+            "net_after_cost",
+            "pit",
+            "deconfounded",
+            "production_readiness",
+        ],
+        "evaluation_scope": ["BTC", "ETH", "SOL", "crypto_equities_explicit_mapping_only"],
+        **FEATURE_PIT_POLICIES[DERIBIT_FEATURE_GROUP].to_metadata(),
+    }
+)
+FEATURE_GROUP_METADATA[SPORTSBOOK_ODDS_FEATURE_GROUP].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "feature_prefix": SPORTSBOOK_ODDS_FEATURE_PREFIX,
+        "provider_category": "sportsbook_odds",
+        "providers": ["betfair_historical", "the_odds_api", "opticodds", "oddsjam", "generic_json"],
+        "source_type": "odds_provider",
+        "stage": FEATURE_STAGE_SHADOW,
+        "research_only": True,
+        "requires_explicit_mapping": True,
+        "no_fuzzy_event_mapping": True,
+        "broad_market_default_allowed": False,
+        "shadow_only_until": [
+            "out_of_sample",
+            "net_after_cost",
+            "pit",
+            "deconfounded",
+            "production_readiness",
+        ],
+        "evaluation_scope": [
+            "sportsbook_equities",
+            "sports_media",
+            "sports_data_providers",
+            "advertising_sensitive_event_studies",
+            "model_calibration_research",
+        ],
+        **FEATURE_PIT_POLICIES[SPORTSBOOK_ODDS_FEATURE_GROUP].to_metadata(),
+    }
+)
 for _group_name, _pit_meta in policy_metadata_for_groups(FEATURE_GROUP_METADATA.keys()).items():
     FEATURE_GROUP_METADATA.setdefault(str(_group_name), {})
     FEATURE_GROUP_METADATA[str(_group_name)].update(_pit_meta)
@@ -618,6 +725,10 @@ _SNAPSHOT_PREFIXES = (
     "news_",
     "fresh_neg_news_",
     "structured_doc_events_v1.",
+    PREDICTION_MARKET_MACRO_PREFIX,
+    PREDICTION_MARKET_EVENT_PREFIX,
+    DERIBIT_FEATURE_PREFIX,
+    SPORTSBOOK_ODDS_FEATURE_PREFIX,
     "etf_",
     "cot_",
     "13f_",
@@ -895,6 +1006,8 @@ def default_feature_ids() -> List[str]:
             out.extend(SHORT_FEATURE_IDS)
         if USE_FUNDING_FEATURES:
             out.extend(CRYPTO_POSITIONING_FEATURE_IDS)
+        if USE_DERIBIT_CRYPTO_DERIVATIVES_FEATURES:
+            out.extend(DERIBIT_CRYPTO_DERIVATIVES_FEATURE_IDS)
         if USE_NEWS_FLOW_FEATURES:
             out.extend(NEWS_FLOW_FEATURE_IDS)
         if USE_ETF_FLOW_FEATURES:
@@ -1094,10 +1207,18 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
         parts.append("short")
     if any(fid in CRYPTO_POSITIONING_FEATURE_IDS or fid.startswith(("funding_", "perp_", "basis_")) for fid in ids):
         parts.append("crypto_positioning")
+    if any(fid.startswith(DERIBIT_FEATURE_PREFIX) for fid in ids):
+        parts.append("deribit_crypto_derivatives_v1_shadow")
+    if any(fid.startswith(SPORTSBOOK_ODDS_FEATURE_PREFIX) for fid in ids):
+        parts.append("sports_odds_sector_v1_shadow")
     if any(fid in NEWS_FLOW_FEATURE_IDS or fid.startswith(("news_", "fresh_neg_news_")) for fid in ids):
         parts.append("news_flow")
     if any(fid.startswith("structured_doc_events_v1.") for fid in ids):
         parts.append("structured_doc_events_v1_shadow")
+    if any(fid.startswith(PREDICTION_MARKET_MACRO_PREFIX) for fid in ids):
+        parts.append("prediction_market_macro_v1_shadow")
+    if any(fid.startswith(PREDICTION_MARKET_EVENT_PREFIX) for fid in ids):
+        parts.append("prediction_market_event_v1_shadow")
     if any(fid in ETF_FLOW_FEATURE_IDS or fid.startswith("etf_") for fid in ids):
         parts.append("etf_flow")
     if any(fid in COT_FEATURE_IDS or fid.startswith("cot_") for fid in ids):

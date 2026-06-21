@@ -909,6 +909,54 @@ def _as_feature_records(
     return [records[fid] for fid in order if str(fid or "").strip()]
 
 
+def evaluate_sportsbook_odds_feature_promotion_gate(
+    *,
+    feature_ids: Any = None,
+    symbols: Any = None,
+    con=None,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Fail closed for sportsbook odds features until explicit evidence passes."""
+
+    try:
+        from engine.data.sportsbook_odds import SPORTSBOOK_ODDS_FEATURE_PREFIX, evaluate_sportsbook_odds_go_gate
+
+        if isinstance(feature_ids, str):
+            raw_feature_ids = [part.strip() for part in feature_ids.split(",") if part.strip()]
+        elif isinstance(feature_ids, (list, tuple, set)):
+            raw_feature_ids = [str(fid).strip() for fid in feature_ids if str(fid or "").strip()]
+        elif feature_ids is None:
+            raw_feature_ids = []
+        else:
+            raw_feature_ids = [str(feature_ids).strip()]
+        requested = [fid for fid in raw_feature_ids if fid.startswith(SPORTSBOOK_ODDS_FEATURE_PREFIX)]
+        if not requested:
+            return True, {
+                "enabled": True,
+                "applied": False,
+                "status": "not_applicable",
+                "passed": True,
+            }
+        symbol_list = []
+        if isinstance(symbols, str):
+            symbol_list = [symbols]
+        elif isinstance(symbols, (list, tuple, set)):
+            symbol_list = [str(symbol) for symbol in symbols if str(symbol or "").strip()]
+        passed, diagnostics = evaluate_sportsbook_odds_go_gate(
+            con,
+            feature_ids=requested,
+            symbols=symbol_list,
+        )
+        return bool(passed), dict(diagnostics or {})
+    except Exception as e:
+        _warn_nonfatal("PROMOTION_GUARD_SPORTSBOOK_ODDS_GATE_FAILED", e)
+        return False, {
+            "enabled": True,
+            "applied": True,
+            "status": f"sportsbook_odds_gate_failed:{type(e).__name__}",
+            "passed": False,
+        }
+
+
 def assess_challenger(
     *,
     model_id: str | None = None,
@@ -930,6 +978,7 @@ def assess_challenger(
     new_features: Any = None,
     current_feature_ids: Any = None,
     challenger_feature_ids: Any = None,
+    candidate_symbols: Any = None,
     feature_returns: Any = None,
     feature_p_values: Any = None,
     feature_t_stats: Any = None,
@@ -1119,6 +1168,13 @@ def assess_challenger(
         diagnostics["tests"]["benjamini_hochberg_fdr"] = {"applied": False, "passed": True, "status": "no_new_features"}
         diagnostics["tests"]["harvey_liu_zhu_factor_threshold"] = {"applied": False, "passed": True, "status": "no_new_features"}
 
+    sportsbook_gate_passed, sportsbook_gate_payload = evaluate_sportsbook_odds_feature_promotion_gate(
+        feature_ids=challenger_feature_ids,
+        symbols=candidate_symbols,
+        con=con,
+    )
+    diagnostics["tests"]["sportsbook_odds_go_gate"] = dict(sportsbook_gate_payload or {})
+
     pool_corr_payload, mpc_payload, pool_gates_passed = _pool_contribution_gates(
         challenger_series=challenger_series,
         champion_series=champion_series,
@@ -1227,6 +1283,7 @@ def assess_challenger(
     diagnostics["passed"] = bool(
         reality.passed
         and feature_gate_passed
+        and sportsbook_gate_passed
         and pool_gates_passed
         and deconfounded_passed
         and era_gate_passed

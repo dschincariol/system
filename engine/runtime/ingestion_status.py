@@ -32,6 +32,8 @@ DEFAULT_INGESTION_PIPELINE_JOBS = [
     "poll_prices",
     "options_poll",
     "poll_macro",
+    "poll_kalshi_prediction_markets",
+    "poll_cme_fedwatch",
     "ingest_now",
     "snapshot_model_features",
     "inference_health_probe",

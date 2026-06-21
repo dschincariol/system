@@ -6,6 +6,8 @@ Last verified against code: 2026-06-17
 
 It is not meant to replace the schema in `engine/runtime/storage.py` or `engine/runtime/storage_pg.py`. It is meant to make the schema understandable.
 
+Canonical: [Database_Schema.md](Database_Schema.md) is the authoritative, complete table register (kept in lockstep with `engine/runtime/schema/table_classification.py`). This map is a curated data-flow subset, not a complete register, and does not re-list every table.
+
 If you want the short version:
 
 - the database is the shared memory of the system
@@ -48,7 +50,7 @@ Cold boot and migration ownership:
 
 Test storage requirements:
 
-- pytest/unittest defaults set `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temp `DB_PATH`
+- pytest defaults set `TS_TESTING=1`, `TS_STORAGE_BACKEND=sqlite`, and a temp `DB_PATH`
 - tests that intentionally exercise real Postgres should use the `requires_postgres` marker and a reachable `TS_PG_DSN`
 - SQLite-specific tests are compatibility and contention-regression tests, not proof that production storage is available
 
@@ -161,6 +163,8 @@ owned schema element is missing.
 | `social_posts`, `social_features`, `social_regimes` | social-source raw and derived features; raw social events are also normalized into `events` |
 | `weather_forecast_region_daily`, `weather_alerts`, `weather_provider_health` | weather source tables and provider state; alert/forecast events are also normalized into `events` |
 | `gdelt_macro_features` | macro/event-style derived features built from normalized news/macro events |
+| `prediction_market_events`, `prediction_market_markets`, `prediction_market_orderbook_snapshots`, `prediction_market_price_history` | read-only Kalshi/CME FedWatch macro expectation, Polymarket event-signal, ForecastEx CSV, and optional IBKR event-contract market-data metadata, probabilities, provider contract ids, product ids, order books, and optional price/trade history feeding shadow PIT features |
+| `sportsbook_odds_snapshots`, `sportsbook_odds_asset_mappings` | read-only sportsbook/Betfair-style event odds and strict sports/event-category to narrow asset or research-label mapping allowlists feeding research-only shadow PIT features |
 
 ### Features, Labels, And Prediction Tables
 
@@ -197,8 +201,8 @@ These tables answer:
 | Table | Role |
 | --- | --- |
 | `model_registry` | canonical registry of models |
-| `champion_assignments` | active champion selections |
-| `model_marketplace_scores` | model ranking or marketplace-style scoring |
+| `champion_assignments` | active champion selections; production writes are owned by `engine.strategy.model_competition.repository` |
+| `model_marketplace_scores` | model ranking or marketplace-style scoring; production writes are owned by `engine.strategy.model_competition.repository` |
 | `model_competition_rankings` | realized competition rankings; candidates without net-after-cost label evidence are excluded |
 | `model_promotion_audit` | promotion and rollback-style audit trail |
 | `model_promotion_cooldown` | cooldown gates after promotion activity |
@@ -315,6 +319,7 @@ These tables support offline analysis more than live control.
 | `embed_model_eval`, `embed_conf_calib` | embedding/evaluation calibration tables |
 | `temporal_model_eval` | evaluation for temporal models |
 | `causal_scores`, `causal_dags` | causal diagnostics and curated DAG definitions |
+| `sportsbook_odds_event_studies`, `sportsbook_odds_promotion_evidence` | research-only odds movement event studies and promotion-gate evidence after realistic latency, fees, slippage, OOS, PIT, deconfounding, readiness, and explicit mapping approval checks |
 
 ## 6. Important Table Shapes
 

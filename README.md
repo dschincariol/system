@@ -91,10 +91,16 @@ Data-source configuration has one canonical contract:
   Canonical workflow and state-transition references.
 - [docs/DATA_CONTRACTS.md](docs/DATA_CONTRACTS.md)
   Current payload and persistence contracts that cross module boundaries.
+- [docs/PREDICTION_MARKET_MACRO.md](docs/PREDICTION_MARKET_MACRO.md)
+  Kalshi/CME macro expectations plus Polymarket event-signal setup, storage,
+  PIT feature ids, and shadow-only promotion boundaries.
 - [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md), [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md), and [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md)
   Canonical operational references for telemetry, failure handling, and production readiness checks.
 - [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md)
   CPU/default, NVIDIA CUDA, and reserved AMD/ROCm dependency profile selection, verification, and CPU rollback.
+- [docs/CPU_POWER_POLICY.md](docs/CPU_POWER_POLICY.md)
+  Boot-enforced CPU performance-profile policy for host `bart`, verifier output,
+  revert steps, and ROCm/GPU thermal composition.
 - [docs/PRODUCTION_BACKEND_CI.md](docs/PRODUCTION_BACKEND_CI.md), [docs/LIVE_READINESS_CHECKLIST.md](docs/LIVE_READINESS_CHECKLIST.md), and [docs/STAGING_PROD_PREFLIGHT_EVIDENCE.md](docs/STAGING_PROD_PREFLIGHT_EVIDENCE.md)
   Production-backend gate reproduction, live enablement readiness, and staging preflight evidence.
 - [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md), [docs/DOCSTRING_STYLE.md](docs/DOCSTRING_STYLE.md), [docs/adr/README.md](docs/adr/README.md), [docs/openapi/README.md](docs/openapi/README.md), and [docs/LICENSING_NOTE.md](docs/LICENSING_NOTE.md)
@@ -139,8 +145,13 @@ Supplementary but useful:
 - Use Node.js 20 LTS (`>=20.17.0 <21`) with npm 10.x for the operator UI. The checked-in `.npmrc` enforces this during `npm ci`.
 - Install Node dependencies reproducibly with `npm ci`; do not edit or vendor `node_modules/`.
 - Prefer `ENGINE_MODE=safe` and `EXECUTION_MODE=safe` until the environment, providers, and operator controls are verified.
-- Run `npm run check:ui` after `npm ci` to validate local asset references, dashboard JS syntax, and browser-helper tests before shipping UI changes.
-- Run `python tools/validate_repo.py` before merging. The default startup graph gate is hermetic and uses sqlite/memory backends even when local `.env` points at Postgres, Timescale, or Redis.
+- Run `python tools/check_repo_artifact_hygiene.py --report` before staging broad changes. Local `.env*`, `.venv/`, `node_modules/`, `__pycache__/`, and `var/` state may exist on disk, but only `*.env.example` templates may be tracked.
+- Run `npm run check:ui` after `npm ci` to validate local asset references, dashboard JS syntax, browser-helper tests, and the fast chart contract pytest lane before shipping UI changes. The chart lane covers risk chart API shapes, risk chart UI helpers, portfolio backtest chart contracts, and model performance divergence frontend behavior.
+- Run `npm run test:ui` when a UI change needs the broader UI pytest allowlist in addition to the browser-helper tests.
+- Run `npm run test:py` for the canonical Python test suite. It runs `python -m pytest tests/ -v --tb=short`; `unittest.TestCase` tests are collected and executed by pytest.
+- Run `python tools/validate_repo.py` before merging. The validator runs pytest collection before pytest execution and the default startup graph gate is hermetic even when local `.env` points at Postgres, Timescale, or Redis.
+- Pytest uses the canonical timeout policy in `pyproject.toml`: every test has a 120 second default timeout through `pytest-timeout` with `timeout_method=thread`. Intentionally slow tests must use a local `@pytest.mark.timeout(<seconds>)` override with a short reason near the test; do not disable timeouts through broad markers or suite-wide command flags.
+- Pytest blocks DNS and non-local sockets by default. Local test servers, Postgres, and Redis must bind to loopback or Unix-domain sockets; live broker or market-data tests must be marked `@pytest.mark.live_network` and run explicitly with `TRADING_TEST_ALLOW_LIVE_NETWORK=1`.
 - Reproduce the Postgres/Redis production-backend CI gate with [docs/PRODUCTION_BACKEND_CI.md](docs/PRODUCTION_BACKEND_CI.md) when changing runtime storage, Redis cache wrappers, migrations, audit-chain behavior, execution arming, or promotion evidence.
 - Run `python tools/validate_repo.py --live` only when a running operator plus engine instance is available and a bounded live smoke test is intended. This mode preserves production dependency requirements for Postgres/Timescale and Redis.
 
@@ -149,10 +160,13 @@ Deterministic local gate commands after bootstrap:
 ```bash
 python --version
 python tools/git_worktree_triage.py
+python tools/check_repo_artifact_hygiene.py
 python -m pytest --version
+npm run test:py
 node --version
 npm --version
 npm run check:ui
+npm run test:ui
 python tools/validate_dependency_lock.py
 ```
 

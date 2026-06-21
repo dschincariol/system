@@ -507,6 +507,149 @@ def _default_catalog() -> Dict[str, SourceDefinition]:
                 "poll_seconds": "MACRO_POLL_SECONDS",
             },
         ),
+        "kalshi_prediction_market_macro": SourceDefinition(
+            source_type="prediction_market_provider",
+            display_name="Kalshi Macro Prediction Markets",
+            provider_name="kalshi",
+            job_name="poll_kalshi_prediction_markets",
+            default_enabled=False,
+            setting_env={
+                "base_url": "KALSHI_PUBLIC_BASE_URL",
+                "series_allowlist": "KALSHI_SERIES_ALLOWLIST",
+                "category_filters": "KALSHI_CATEGORY_FILTERS",
+                "status": "KALSHI_MARKET_STATUS",
+                "poll_seconds": "KALSHI_PREDICTION_MARKET_POLL_SECONDS",
+                "limit": "KALSHI_LIMIT",
+                "max_pages": "KALSHI_MAX_PAGES",
+                "max_orderbooks": "KALSHI_MAX_ORDERBOOKS",
+                "include_orderbooks": "KALSHI_INCLUDE_ORDERBOOKS",
+                "asset_map_json": "PREDICTION_MARKET_MACRO_ASSET_MAP_JSON",
+            },
+        ),
+        "cme_fedwatch": SourceDefinition(
+            source_type="prediction_market_provider",
+            display_name="CME FedWatch",
+            provider_name="cme_fedwatch",
+            job_name="poll_cme_fedwatch",
+            default_enabled=False,
+            credential_env={"oauth_token": "CME_FEDWATCH_OAUTH_TOKEN"},
+            setting_env={
+                "mode": "CME_FEDWATCH_MODE",
+                "base_url": "CME_FEDWATCH_BASE_URL",
+                "public_page_url": "CME_FEDWATCH_PUBLIC_PAGE_URL",
+                "allow_public_page_parse": "CME_FEDWATCH_ALLOW_PUBLIC_PAGE_PARSE",
+                "poll_seconds": "CME_FEDWATCH_POLL_SECONDS",
+                "asset_map_json": "PREDICTION_MARKET_MACRO_ASSET_MAP_JSON",
+            },
+        ),
+        "deribit_crypto_derivatives": SourceDefinition(
+            source_type="derivatives_provider",
+            display_name="Deribit Crypto Derivatives",
+            provider_name="deribit",
+            job_name="poll_deribit_crypto_derivatives",
+            default_enabled=False,
+            setting_env={
+                "enabled_assets": "DERIBIT_ENABLED_ASSETS",
+                "instrument_types": "DERIBIT_INSTRUMENT_TYPES",
+                "expiry_days": "DERIBIT_EXPIRY_DAYS",
+                "min_open_interest": "DERIBIT_MIN_OPEN_INTEREST",
+                "min_volume": "DERIBIT_MIN_VOLUME",
+                "poll_seconds": "DERIBIT_POLL_SECONDS",
+                "mode": "DERIBIT_MODE",
+                "stale_threshold_ms": "DERIBIT_STALE_THRESHOLD_MS",
+                "base_url": "DERIBIT_BASE_URL",
+                "timeout_s": "DERIBIT_TIMEOUT_S",
+                "include_ticker": "DERIBIT_INCLUDE_TICKER",
+                "max_tickers": "DERIBIT_MAX_TICKERS",
+                "include_order_book": "DERIBIT_INCLUDE_ORDER_BOOK",
+                "max_order_books": "DERIBIT_MAX_ORDER_BOOKS",
+                "order_book_depth": "DERIBIT_ORDER_BOOK_DEPTH",
+                "max_spread_bps": "DERIBIT_MAX_SPREAD_BPS",
+                "max_instruments": "DERIBIT_MAX_INSTRUMENTS",
+            },
+        ),
+        "sportsbook_odds_research": SourceDefinition(
+            source_type="odds_provider",
+            display_name="Sportsbook/Betfair Odds Research",
+            provider_name="sportsbook_odds",
+            job_name="poll_sportsbook_odds",
+            default_enabled=False,
+            credential_env={"api_key": "SPORTSBOOK_ODDS_API_KEY"},
+            setting_env={
+                "provider": "SPORTSBOOK_ODDS_PROVIDER",
+                "base_url": "SPORTSBOOK_ODDS_BASE_URL",
+                "url": "SPORTSBOOK_ODDS_URL",
+                "events_path": "SPORTSBOOK_ODDS_EVENTS_PATH",
+                "path": "SPORTSBOOK_ODDS_PATH",
+                "file_path": "SPORTSBOOK_ODDS_FILE_PATH",
+                "historical_file": "SPORTSBOOK_ODDS_HISTORICAL_FILE",
+                "sport_keys": "SPORTSBOOK_ODDS_SPORT_KEYS",
+                "league_allowlist": "SPORTSBOOK_ODDS_LEAGUE_ALLOWLIST",
+                "market_types": "SPORTSBOOK_ODDS_MARKET_TYPES",
+                "event_category_allowlist": "SPORTSBOOK_ODDS_EVENT_CATEGORY_ALLOWLIST",
+                "poll_seconds": "SPORTSBOOK_ODDS_POLL_SECONDS",
+                "timeout_s": "SPORTSBOOK_ODDS_TIMEOUT_S",
+                "min_liquidity": "SPORTSBOOK_ODDS_MIN_LIQUIDITY",
+                "stale_threshold_ms": "SPORTSBOOK_ODDS_STALE_THRESHOLD_MS",
+                "asset_mapping_json": "SPORTSBOOK_ODDS_ASSET_MAPPING_JSON",
+            },
+        ),
+        "polymarket_event_signals": SourceDefinition(
+            source_type="prediction_market_provider",
+            display_name="Polymarket Event Signals",
+            provider_name="polymarket",
+            job_name="poll_polymarket_prediction_markets",
+            default_enabled=False,
+            setting_env={
+                "gamma_base_url": "POLYMARKET_GAMMA_BASE_URL",
+                "data_base_url": "POLYMARKET_DATA_BASE_URL",
+                "clob_base_url": "POLYMARKET_CLOB_BASE_URL",
+                "tags": "POLYMARKET_TAGS",
+                "slugs": "POLYMARKET_SLUG_ALLOWLIST",
+                "keyword_allowlist": "POLYMARKET_KEYWORD_ALLOWLIST",
+                "category_filters": "POLYMARKET_CATEGORY_FILTERS",
+                "event_type_filters": "POLYMARKET_EVENT_TYPE_FILTERS",
+                "status": "POLYMARKET_MARKET_STATUS",
+                "min_liquidity": "POLYMARKET_MIN_LIQUIDITY",
+                "min_volume": "POLYMARKET_MIN_VOLUME",
+                "min_open_interest": "POLYMARKET_MIN_OPEN_INTEREST",
+                "poll_seconds": "POLYMARKET_POLL_SECONDS",
+                "limit": "POLYMARKET_LIMIT",
+                "max_pages": "POLYMARKET_MAX_PAGES",
+                "max_orderbooks": "POLYMARKET_MAX_ORDERBOOKS",
+                "include_orderbooks": "POLYMARKET_INCLUDE_ORDERBOOKS",
+                "include_history": "POLYMARKET_INCLUDE_HISTORY",
+                "include_data_trades": "POLYMARKET_INCLUDE_DATA_TRADES",
+                "asset_basket_map_json": "POLYMARKET_ASSET_BASKET_MAP_JSON",
+                "semantic_event_map_json": "POLYMARKET_SEMANTIC_EVENT_MAP_JSON",
+            },
+        ),
+        "forecastex_event_contracts": SourceDefinition(
+            source_type="prediction_market_provider",
+            display_name="ForecastEx Regulated Event Contracts",
+            provider_name="forecastex",
+            job_name="poll_forecastex_event_contracts",
+            default_enabled=False,
+            setting_env={
+                "base_url": "FORECASTEX_BASE_URL",
+                "file_date_lookback": "FORECASTEX_FILE_DATE_LOOKBACK",
+                "file_dates": "FORECASTEX_FILE_DATES",
+                "file_kinds": "FORECASTEX_FILE_KINDS",
+                "intraday_refresh_window": "FORECASTEX_INTRADAY_REFRESH_WINDOW",
+                "product_allowlist": "FORECASTEX_PRODUCT_ALLOWLIST",
+                "product_category_allowlist": "FORECASTEX_PRODUCT_CATEGORY_ALLOWLIST",
+                "asset_map_json": "FORECASTEX_ASSET_MAP_JSON",
+                "resolution_source_map_json": "FORECASTEX_RESOLUTION_SOURCE_MAP_JSON",
+                "poll_seconds": "FORECASTEX_POLL_SECONDS",
+                "timeout_s": "FORECASTEX_TIMEOUT_S",
+                "ibkr_enabled": "FORECASTEX_IBKR_ENABLED",
+                "ibkr_contract_allowlist": "FORECASTEX_IBKR_CONTRACT_ALLOWLIST",
+                "ibkr_host": "IBKR_HOST",
+                "ibkr_port": "IBKR_PORT",
+                "ibkr_client_id": "IBKR_CLIENT_ID",
+                "ibkr_market_data_type": "IBKR_MARKET_DATA_TYPE",
+            },
+        ),
         "model_feature_snapshots": SourceDefinition(
             source_type="feature_snapshot",
             display_name="Model Feature Snapshots",
@@ -546,6 +689,12 @@ MANAGED_DAEMON_JOBS = {
     "poll_weather_forecasts",
     "poll_weather_alerts",
     "poll_macro",
+    "poll_kalshi_prediction_markets",
+    "poll_cme_fedwatch",
+    "poll_deribit_crypto_derivatives",
+    "poll_sportsbook_odds",
+    "poll_polymarket_prediction_markets",
+    "poll_forecastex_event_contracts",
     "snapshot_model_features",
 }
 
@@ -2435,6 +2584,140 @@ class DataSourceManager:
                 )
                 response.raise_for_status()
                 return _ok("weather_alerts_connection_ok", status_code=int(response.status_code))
+
+            if provider_name == "kalshi":
+                base_url = str(settings.get("base_url") or os.environ.get("KALSHI_PUBLIC_BASE_URL") or "https://external-api.kalshi.com/trade-api/v2").rstrip("/")
+                response = requests.get(
+                    f"{base_url}/series",
+                    params={"limit": 1},
+                    timeout=float(settings.get("timeout_s") or os.environ.get("KALSHI_POLL_TIMEOUT_S") or 10.0),
+                )
+                response.raise_for_status()
+                return _ok("kalshi_public_market_data_connection_ok", status_code=int(response.status_code))
+
+            if provider_name == "cme_fedwatch":
+                mode = str(settings.get("mode") or os.environ.get("CME_FEDWATCH_MODE") or "official_api").strip().lower()
+                if mode in {"official", "official_api", "api"}:
+                    token = str(credentials.get("oauth_token") or os.environ.get("CME_FEDWATCH_OAUTH_TOKEN") or "").strip()
+                    if not token:
+                        return _fail("cme_fedwatch_oauth_token_missing")
+                    base_url = str(settings.get("base_url") or os.environ.get("CME_FEDWATCH_BASE_URL") or "https://markets.api.cmegroup.com/fedwatch/v1").rstrip("/")
+                    response = requests.get(
+                        f"{base_url}/forecasts",
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=float(settings.get("timeout_s") or os.environ.get("CME_FEDWATCH_TIMEOUT_S") or 10.0),
+                    )
+                    response.raise_for_status()
+                    return _ok("cme_fedwatch_official_api_connection_ok", status_code=int(response.status_code))
+                if mode in {"public_page", "page", "scrape"}:
+                    allowed = str(settings.get("allow_public_page_parse") or os.environ.get("CME_FEDWATCH_ALLOW_PUBLIC_PAGE_PARSE") or "0").strip().lower() in {"1", "true", "yes", "on"}
+                    if not allowed:
+                        return _fail("cme_fedwatch_public_page_parse_disabled")
+                    response = requests.get(
+                        str(settings.get("public_page_url") or os.environ.get("CME_FEDWATCH_PUBLIC_PAGE_URL") or "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"),
+                        timeout=float(settings.get("timeout_s") or os.environ.get("CME_FEDWATCH_TIMEOUT_S") or 10.0),
+                    )
+                    response.raise_for_status()
+                    return _ok("cme_fedwatch_public_page_reachable", status_code=int(response.status_code), fragile_parser=True)
+                return _fail(f"cme_fedwatch_mode_unsupported:{mode}")
+
+            if provider_name == "deribit":
+                base_url = str(settings.get("base_url") or os.environ.get("DERIBIT_BASE_URL") or "https://www.deribit.com").rstrip("/")
+                response = requests.get(
+                    f"{base_url}/api/v2/public/get_instruments",
+                    params={"currency": "BTC", "kind": "future", "expired": "false"},
+                    timeout=float(settings.get("timeout_s") or os.environ.get("DERIBIT_TIMEOUT_S") or 10.0),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                instruments = payload.get("result") if isinstance(payload, dict) else []
+                return _ok(
+                    "deribit_public_market_data_connection_ok",
+                    status_code=int(response.status_code),
+                    instruments=int(len(instruments or [])) if isinstance(instruments, list) else 0,
+                    data_only=True,
+                    authenticated=False,
+                    direct_trading_authority=False,
+                )
+
+            if provider_name == "sportsbook_odds":
+                from engine.data.sportsbook_odds import validate_sportsbook_odds_read_only_settings
+
+                validate_sportsbook_odds_read_only_settings(settings, credentials)
+                file_path = str(settings.get("file_path") or settings.get("historical_file") or "").strip()
+                if file_path:
+                    exists = Path(file_path).expanduser().exists()
+                    if not exists:
+                        return _fail("sportsbook_odds_historical_file_missing", data_only=True, research_only=True)
+                    return _ok(
+                        "sportsbook_odds_historical_file_readable",
+                        data_only=True,
+                        research_only=True,
+                        direct_trading_authority=False,
+                    )
+                base_url = str(settings.get("base_url") or settings.get("url") or "").rstrip("/")
+                path = str(settings.get("events_path") or settings.get("path") or "").strip("/")
+                if not base_url:
+                    return _ok(
+                        "sportsbook_odds_research_scaffold_configured",
+                        data_only=True,
+                        research_only=True,
+                        direct_trading_authority=False,
+                    )
+                headers = {}
+                params = {"limit": "1"}
+                api_key = str(credentials.get("api_key") or "").strip()
+                if api_key:
+                    if str(settings.get("api_key_mode") or "query").strip().lower() == "header":
+                        headers[str(settings.get("api_key_header") or "Authorization")] = f"Bearer {api_key}"
+                    else:
+                        params[str(settings.get("api_key_param") or "apiKey")] = api_key
+                response = requests.get(
+                    f"{base_url}/{path}" if path else base_url,
+                    params=params,
+                    headers=headers,
+                    timeout=float(settings.get("timeout_s") or os.environ.get("SPORTSBOOK_ODDS_TIMEOUT_S") or 10.0),
+                )
+                response.raise_for_status()
+                return _ok(
+                    "sportsbook_odds_read_only_feed_connection_ok",
+                    status_code=int(response.status_code),
+                    data_only=True,
+                    research_only=True,
+                    direct_trading_authority=False,
+                )
+
+            if provider_name == "polymarket":
+                base_url = str(
+                    settings.get("gamma_base_url")
+                    or settings.get("base_url")
+                    or os.environ.get("POLYMARKET_GAMMA_BASE_URL")
+                    or "https://gamma-api.polymarket.com"
+                ).rstrip("/")
+                response = requests.get(
+                    f"{base_url}/events",
+                    params={"limit": 1, "active": "true", "closed": "false"},
+                    timeout=float(settings.get("timeout_s") or os.environ.get("POLYMARKET_TIMEOUT_S") or 10.0),
+                )
+                response.raise_for_status()
+                return _ok("polymarket_public_event_data_connection_ok", status_code=int(response.status_code), data_only=True)
+
+            if provider_name == "forecastex":
+                base_url = str(settings.get("base_url") or os.environ.get("FORECASTEX_BASE_URL") or "https://forecastex.com").rstrip("/")
+                response = requests.get(
+                    f"{base_url}/api/download",
+                    params={"type": "summary", "date": time.strftime("%Y%m%d", time.gmtime())},
+                    timeout=float(settings.get("timeout_s") or os.environ.get("FORECASTEX_TIMEOUT_S") or 10.0),
+                )
+                # Current-day summary may not be published before the exchange's
+                # end-of-day release. A reachable CSV endpoint with a provider
+                # JSON miss still proves public data access without enabling IBKR.
+                if int(response.status_code) >= 500:
+                    page = requests.get(f"{base_url}/data", timeout=10)
+                    page.raise_for_status()
+                    return _ok("forecastex_data_page_reachable_current_csv_pending", status_code=int(response.status_code))
+                response.raise_for_status()
+                return _ok("forecastex_public_csv_connection_ok", status_code=int(response.status_code), data_only=True)
 
             if provider_name == "ibkr":
                 host = str(settings.get("host") or os.environ.get("IBKR_HOST") or default_ibkr_host()).strip()

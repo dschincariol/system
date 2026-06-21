@@ -14,7 +14,7 @@ This document records the concrete contracts that are visible in the inspected c
 | Required | The producer always writes it, or the consumer path assumes it exists. |
 | Optional | Present only when the producer has enough context, or only when the underlying table version contains that column. |
 
-Runtime storage note: production and production-like operation use the Postgres-backed facade in `engine/runtime/storage_pg.py`. SQLite remains an isolated Python test backend and a compatibility dialect for older call sites; it is not the production source of truth.
+Runtime storage note: production and production-like operation use the public facade in `engine/runtime/storage.py`, which validates the selected backend before exposing it. The concrete production backend is `engine/runtime/storage_pg.py`. SQLite remains an isolated Python test backend and a compatibility dialect for older call sites; it is not the production source of truth.
 
 ## 1. Canonical Model Intent
 
@@ -326,6 +326,12 @@ Producers:
 - `engine.strategy.portfolio.py`
 - `engine.terminal.api.api_terminal_orders.py`
 
+The strategy producer runs `compute_rebalance()` through explicit stages:
+input loading, allocator loading, target construction, normalization, overlays,
+risk gates, execution blocking, order emission, and persistence. The stage split
+is an orchestration refactor only; emitted `portfolio_orders` rows keep the
+same action, side, weight, lineage, and `explain_json` contract described below.
+
 Consumers:
 - `engine.strategy.portfolio_execution_intents.load_latest_execution_intents(...)`
 - `engine.terminal.api.api_terminal.py`
@@ -351,8 +357,8 @@ Important caveat:
 | `model_id` | `TEXT` | Yes | Producing model id. Terminal writes `baseline`. | model id |
 | `symbol` | `TEXT` | Yes | Asset symbol. | symbol |
 | `action` | `TEXT` | Yes | Portfolio action. The strategy path uses values such as `OPEN`, `INCREASE`, `DECREASE`, `CLOSE`, `REVERSE`, `HOLD`. The terminal path writes `BUY`, `SELL`, and `FLATTEN`. | action code |
-| `from_side` | `TEXT` | No | Prior side when known. | side |
-| `to_side` | `TEXT` | No | Target side when known. | side |
+| `from_side` | `TEXT` | Yes | Prior side. Stored `TEXT NOT NULL` (migration `0022_portfolio_orders.py`); writers must always supply a value. | side |
+| `to_side` | `TEXT` | Yes | Target side. Stored `TEXT NOT NULL` (migration `0022_portfolio_orders.py`); writers must always supply a value. | side |
 | `from_weight` | `REAL` | Yes | Prior portfolio weight in the strategy path. | weight fraction |
 | `to_weight` | `REAL` | Yes | Target portfolio weight in the strategy path. | weight fraction |
 | `delta_weight` | `REAL` | Yes | Weight delta in the portfolio path. Terminal quantity rows keep this at `0.0`; the quantity lives in `explain_json.terminal_order`. | weight fraction |
@@ -585,7 +591,7 @@ Consumers:
 - training loaders that prefer realized `labels_exec.net_z` over gross `labels.impact_z`
 - PatchTST supervised fine-tuning, which first uses realized `net_after_cost_labels.net_return` for `net_edge` targets or `net_after_cost_labels.realized_forward_return` for `forward_return` targets before falling back to legacy labels
 - `engine.strategy.pipeline_train_and_eval._net_eval_metrics(...)`
-- `engine.strategy.model_marketplace` and `engine.strategy.champion_manager`
+- `engine.strategy.model_marketplace` and `engine.strategy.champion_manager`, with shared `model_marketplace_scores` and `champion_assignments` writes routed through `engine.strategy.model_competition.repository`
 - `engine.strategy.promotion_guard.metrics_have_net_cost_evidence(...)`
 
 Failure if malformed:
@@ -1344,3 +1350,388 @@ This route explains blockers only. It does not change the promotion switch or ov
 | `authority` | `TEXT` | Yes | `read_only_governance_evidence`. | enum |
 
 Per-row fields include `ts_ms`, `window_s`, `regime`, `model_name`, optional `model_kind`/`model_ts_ms`, `n`, `rmse`, `dir_acc`, `net_rmse`, slippage metrics, execution-latency metrics when the schema has them, `drawdown_proxy`, `cap_eff`, PnL fields, `score`, sanitized numeric/string `components`, and `source_artifact`.
+
+## 23. Portfolio Backtest API Payload
+
+Producers:
+- `engine.api.api_read_advanced.get_latest_portfolio_backtest()`
+- `engine.strategy.portfolio_backtest.run_backtest()`
+- market-data ingestion jobs that populate `prices`
+
+Consumers:
+- `ui/portfolio_backtest.js`
+- `ui/pro_chart_engine.js` as a fallback portfolio-equity overlay source
+- operator diagnostics that compare latest backtest output to live or paper equity
+
+Failure if malformed:
+- the portfolio backtest chart can imply outperformance without a real market baseline
+- missing benchmark prices can look like a broken chart instead of an unavailable data source
+- zero or null portfolio values can be treated as real observations and distort the equity curve
+
+`GET /api/portfolio/backtest/latest` returns the latest persisted run:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Route success flag. `false` means no run tables or no latest run. | boolean |
+| `run.id` | `INTEGER` | Yes when `ok=true` | Portfolio backtest run id. | id |
+| `run.ts_ms` | `INTEGER` | Yes when `ok=true` | Run creation timestamp. | ms |
+| `run.start_ts_ms` | `INTEGER` | Yes when `ok=true` | Backtest window start. | ms |
+| `run.end_ts_ms` | `INTEGER` | Yes when `ok=true` | Backtest window end. | ms |
+| `run.metrics` | `JSON object` | Yes when `ok=true` | Persisted run metrics. | mixed |
+| `run.points` | `JSON array[object]` | Yes when `ok=true` | Ordered portfolio curve points. | array |
+| `run.points[].ret` | `REAL/null` | Yes | Step return. Missing database values are JSON `null`, not `0.0`. | return fraction |
+| `run.points[].equity` | `REAL/null` | Yes | Portfolio equity at the point. Missing database values are JSON `null`. | equity units |
+| `run.points[].drawdown` | `REAL/null` | Yes | Drawdown at the point. Missing database values are JSON `null`. | fraction |
+| `run.points[].detail` | `JSON object` | Yes | Position, cost, and marker detail decoded from `detail_json`. | JSON |
+| `run.benchmark` | `JSON object` | Yes when `ok=true` | Optional benchmark overlay metadata and points. | object |
+| `meta.benchmark_ready` | `BOOLEAN` | Yes | Mirrors `run.benchmark.available`. | boolean |
+| `meta.benchmark_symbol` | `TEXT` | Yes | Current canonical benchmark symbol. | symbol |
+
+The canonical benchmark is `SPY` from the production `prices` table. The API reads raw benchmark price with `COALESCE(price, px)` for rows between the first and last finite portfolio-equity points in the run, capped to 3000 ordered points. It emits `run.benchmark.points[].value` normalized as:
+
+`normalized_value = raw_spy_price / first_raw_spy_price * first_portfolio_equity`
+
+`run.benchmark.available` is `true` only when at least two usable SPY prices are available. Otherwise `points` is empty or insufficient, the route still returns `ok=true` for the portfolio run, and `run.benchmark.unavailable_reason` explains the missing overlay with reason codes such as `prices_table_missing`, `benchmark_prices_missing`, `benchmark_prices_insufficient`, or `portfolio_start_value_missing`.
+
+## 24. Market Stress API Payloads
+
+Producers:
+- `engine.strategy.market_stress.get_market_stress_snapshot(...)`
+- `dashboard_server.api_get_market_stress(...)`
+- `dashboard_server.api_get_market_stress_history(...)`
+
+Consumers:
+- `ui/market_stress.js`
+- operator overview and runtime summary surfaces that display the market condition
+- strategy and capital guards that read the stress snapshot directly
+
+Failure if malformed:
+- stress spikes above the base normalized range can render off-canvas or disappear from the operator sparkline
+- warning/critical badges can disagree with chart reference lines
+- GDELT conflict stress can be silently misread as a clamped `0..1` score
+
+`/api/market_stress` returns:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Whether the snapshot request succeeded. | boolean |
+| `stress` | `JSON object` | Yes | Latest market-stress snapshot. Empty on error. | object |
+| `thresholds.warning` | `REAL` | Yes | Score where the UI enters elevated/warning stress. | stress score |
+| `thresholds.critical` | `REAL` | Yes | Score where the UI enters high/critical stress. | stress score |
+| `error` | `TEXT` | No | Error detail when `ok=false`. | message |
+
+`stress` includes the cross-asset component levels and z-scores produced by `engine.strategy.market_stress`. The base cross-asset `stress_score` is normalized to `0..1`, but the optional GDELT conflict adjustment is added after that normalization. Therefore the final exposed `stress_score` is non-negative and may exceed `1.0`; consumers must preserve the real magnitude and scale visualizations dynamically rather than clamping the value.
+
+`/api/market_stress_history` returns:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Whether the history request succeeded. | boolean |
+| `series` | `JSON array[object]` | Yes | Ordered historical stress points. Empty when source prices are unavailable. | array |
+| `series[].ts_ms` | `INTEGER` | Yes | Timestamp for the stress point. | ms |
+| `series[].stress_score` | `REAL` | Yes | Historical stress score, preserving post-GDELT values above `1.0`. | stress score |
+| `thresholds.warning` | `REAL` | Yes | Same warning threshold used by badges and chart reference lines. | stress score |
+| `thresholds.critical` | `REAL` | Yes | Same critical threshold used by badges and chart reference lines. | stress score |
+| `error` | `TEXT` | No | Error detail when `ok=false`. | message |
+
+## 25. Prediction-Market Expectation Rows
+
+Producers:
+- `engine.data.jobs.poll_kalshi_prediction_markets`
+- `engine.data.jobs.poll_cme_fedwatch`
+- `engine.data.jobs.poll_polymarket_prediction_markets`
+- `engine.data.jobs.poll_forecastex_event_contracts`
+- `engine.data.prediction_market_storage.put_prediction_market_batch(...)`
+
+Consumers:
+- `engine.data.prediction_market_features.resolve_prediction_market_macro_snapshot(...)`
+- `engine.data.prediction_market_features.resolve_prediction_market_event_snapshot(...)`
+- `engine.strategy.model_feature_snapshots.build_model_feature_snapshot(...)`
+- `backfill_prediction_market_macro` replay materialization
+
+Production enforcement:
+- provider setup, enablement, credentials, settings, and lifecycle projection go through `services.data_source_manager`
+- canonical jobs are registered in `engine.runtime.job_registry`
+- features are explicit `prediction_market_macro_v1.*` or `prediction_market_event_v1.*` ids, registered as `stage=shadow`
+- PIT enforcement uses provider `availability_ts_ms`, not event or resolution date
+- the feature resolver excludes rows with `resolution_ts_ms <= decision_ts_ms`
+- Polymarket markets must be mapped to affected assets, live/non-halted, and liquid before contributing to event features
+- ForecastEx and IBKR event-contract markets must be mapped, active, fresh, and non-sparse before contributing to regulated event features
+- optional IBKR event-contract access is read-only market data and is unavailable unless explicitly enabled with a contract allowlist
+- cross-provider event dispersion requires explicit `semantic_event_id` and `resolution_semantics`; fuzzy title matching is not sufficient
+- live model serving rejects the feature ids through the existing shadow-feature gate
+
+Storage tables:
+- `prediction_market_events`
+- `prediction_market_markets`
+- `prediction_market_orderbook_snapshots`
+- `prediction_market_price_history`
+- `prediction_market_backfill_state`
+
+Common row fields:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `provider_name` | `TEXT` | Yes | Source provider such as `kalshi`, `cme_fedwatch`, `polymarket`, `forecastex`, or `ibkr_event_contracts`. | provider |
+| `provider_category` | `TEXT` | Yes | Normalized provider category such as `macro` or `event_signal`. | category |
+| `source_ts_ms` | `INTEGER` | Yes | Provider/source timestamp for the fact. | ms |
+| `availability_ts_ms` | `INTEGER` | Yes | Earliest timestamp the row can be used by PIT features. | ms |
+| `resolution_ts_ms` | `INTEGER` | No | Event or market resolution timestamp used only to exclude resolved markets from pre-resolution features. | ms |
+| `affected_assets_json` | `JSON array[string]` | Yes | Conservative asset basket for symbol-level feature mapping. | symbols |
+| `semantic_event_id` | `TEXT` | No | Explicit comparable-event identity used for cross-provider dispersion. | id |
+| `resolution_semantics` | `TEXT` | No | Explicit resolution meaning for comparable-event matching. | text |
+| `provider_contract_id` | `TEXT` | No | Provider-native regulated event-contract id, such as ForecastEx contract id or IBKR conid. | id |
+| `product_id` | `TEXT` | No | Provider-native product id used for regulated event category and mapping. | id |
+| `official_resolution_source` | `TEXT` | No | Metadata describing the official source used to resolve the event contract. Not a pre-resolution outcome value. | text |
+| `source_file_date` | `TEXT` | No | ForecastEx CSV file date for replay/backfill provenance. | date |
+| `source_file_kind` | `TEXT` | No | ForecastEx CSV family such as `pairs`, `prices`, or `summary`. | kind |
+| `refresh_cadence` | `TEXT` | No | Provider-declared refresh cadence such as `10m` or `daily_eod`. | cadence |
+| `provider_timestamp_ms` | `INTEGER` | No | Provider/file timestamp distinct from PIT availability timestamp. | ms |
+| `raw_payload_hash` | `TEXT` | Yes | SHA-256 hash of the provider raw payload. | hash |
+| `raw_json` | `JSON object` | Yes | Provider-specific raw payload for audit/debug. | JSON |
+
+`prediction_market_markets` additionally stores `probability`, `previous_probability`, `probability_delta`, `bid_probability`, `ask_probability`, `last_price`, `liquidity`, `volume`, `volume_24h`, `open_interest`, `spread`, `condition_id`, `token_id`, and `outcome_name`.
+
+`prediction_market_orderbook_snapshots` stores best yes/no bids and derived reciprocal asks, midpoint probability, spread, side depths, liquidity, order-book imbalance, condition id, and token id.
+
+`prediction_market_price_history` stores trades or provider price-history samples with condition id, token id, trade timestamp, price, size, and side when available.
+
+Feature ids under `prediction_market_macro_v1.*`:
+
+| Feature id suffix | Meaning |
+| --- | --- |
+| `probability_level` | Liquidity-weighted current implied probability across available providers. |
+| `probability_delta` | Liquidity-weighted latest probability move. |
+| `event_urgency` | Time-to-event urgency score using event timestamp only. |
+| `liquidity_adjusted_probability_move` | Probability move scaled by available liquidity/depth. |
+| `orderbook_imbalance` | Latest Kalshi yes-depth versus no-depth imbalance. |
+| `spread_quality` | Higher value for tighter available spreads. |
+| `cme_vs_kalshi_disagreement` | Absolute probability disagreement when both providers are available. |
+| `kalshi_available` | Provider availability flag. |
+| `cme_available` | Provider availability flag. |
+| `available` | Group-level availability flag before PIT zeroing. |
+
+Feature ids under `prediction_market_event_v1.*`:
+
+| Feature id suffix | Meaning |
+| --- | --- |
+| `crypto_regulation_probability` | Liquidity-weighted Polymarket probability for mapped crypto-regulation events. |
+| `regulated_macro_probability` | Liquidity-weighted ForecastEx/IBKR regulated macro event probability. |
+| `regulated_energy_probability` | Liquidity-weighted regulated energy event probability. |
+| `regulated_climate_weather_probability` | Liquidity-weighted regulated climate/weather event probability. |
+| `regulated_fx_rates_probability` | Liquidity-weighted regulated FX/rates event probability. |
+| `regulated_equity_index_probability` | Liquidity-weighted regulated equity-index event probability. |
+| `regulated_commodity_probability` | Liquidity-weighted regulated commodity event probability. |
+| `probability_momentum` | Liquidity-weighted latest probability move across mapped Polymarket event markets. |
+| `liquidity_adjusted_event_shock` | Probability momentum scaled by market attention/liquidity. |
+| `orderbook_imbalance` | Latest mapped Polymarket yes-token bid depth versus ask depth imbalance. |
+| `spread_quality` | Higher value for tighter available Polymarket spreads. |
+| `event_urgency` | Time-to-event urgency score using event timestamp only. |
+| `market_attention` | Log-scaled volume/liquidity/open-interest attention score. |
+| `cross_provider_dispersion` | Max probability dispersion for explicitly mapped comparable events across providers. |
+| `polymarket_available` | Provider availability flag. |
+| `forecastex_available` | Provider availability flag. |
+| `ibkr_event_contract_available` | Provider availability flag. |
+| `available` | Group-level availability flag before PIT zeroing. |
+
+PIT metadata:
+- feature groups: `prediction_market_macro_v1`, `prediction_market_event_v1`
+- source timestamp field: `latest_source_ts_ms`
+- availability timestamp field: `latest_availability_ts_ms`
+- freshness TTL: 36 hours
+- stale behavior: zero features and mark unavailable
+- stage: `shadow`
+- direct trading authority: `false`
+
+## 27. Sportsbook / Betting-Exchange Odds Research Rows
+
+Producers:
+- `engine.data.jobs.poll_sportsbook_odds`
+- `engine.data.sportsbook_odds.fetch_sportsbook_odds_batch(...)`
+- `engine.data.sportsbook_odds.put_sportsbook_odds_batch(...)`
+- `engine.data.sportsbook_odds.run_sportsbook_odds_promotion_research(...)`
+
+Consumers:
+- `engine.data.sportsbook_odds.resolve_sportsbook_odds_snapshot(...)`
+- `engine.data.sportsbook_odds.evaluate_sportsbook_odds_go_gate(...)`
+- `engine.data.jobs.backfill_sportsbook_odds_event_study`
+- `engine.strategy.promotion_guard.evaluate_sportsbook_odds_feature_promotion_gate(...)`
+- `engine.strategy.model_feature_snapshots.build_model_feature_snapshot(...)` only when explicit `sports_odds_sector_v1.*` ids are requested
+
+Sportsbook and Betfair-style exchange odds are low-priority broad-market data. They are research-only inputs for narrow mappings such as sportsbook equities, sports-media names, data providers, ad-sensitive event studies, sponsor/apparel baskets, or model-calibration experiments. General sports odds must not be added to broad stock/crypto default feature sets.
+
+Production enforcement:
+- provider setup, enablement, API credentials, historical-file paths, and lifecycle projection go through `services.data_source_manager`
+- canonical jobs `poll_sportsbook_odds` and `backfill_sportsbook_odds_event_study` are registered in `engine.runtime.job_registry` with `execution=false` and `direct_trading_authority=false`
+- `engine.data.sportsbook_odds.validate_sportsbook_odds_read_only_settings(...)` rejects betting-account, wager, order, wallet, login, private-key, and trading-shaped settings or credentials
+- raw implied probabilities are converted from American, decimal, fractional, or probability odds and normalized with vig removed before feature use
+- provider readiness diagnostics validate per-snapshot multi-outcome no-vig sums, stale rows, settlement-lookahead rows, optional liquidity coverage, and explicit mapping coverage
+- feature rows require explicit `sportsbook_odds_asset_mappings`; fuzzy inference from team names, event titles, headlines, or provider text is not permitted in production snapshots
+- `inventory_sportsbook_relevant_universe(...)` checks active/watch symbols and explicit model-config symbol universes against the narrow allowlist; wildcard model configs such as `["*"]` are reported but do not qualify as a defensible mapping
+- `allow_feature_use=true` mappings require an asset in the narrow allowlist in `SPORTSBOOK_ODDS_ALLOWED_NARROW_ASSETS`
+- `approved_for_promotion=true` mappings require `owner`, `mapping_rationale`, `mapping_version`, `approval_status=approved`, `approved_by`, `approved_ts_ms`, `approval_reason`, and a narrow allowlisted asset; the GO gate rechecks these fields when reading persisted mappings
+- broad-market symbols such as index ETFs are rejected by production code, not only by tests or docs
+- settlement status is blank until `resolution_ts_ms` is available at or before the row availability timestamp; resolved rows are excluded from pre-resolution snapshots
+- features are explicit `sports_odds_sector_v1.*` ids, registered as `stage=shadow`, `research_only=true`, and `direct_trading_authority=false`
+- `build_model_feature_snapshot(...)` resolves sportsbook odds only when those feature ids are explicitly requested; default unified snapshots omit the group
+- PIT enforcement uses `latest_availability_ts_ms` and zeroes the group when stale or after the decision timestamp
+- `promotion_guard.assess_challenger(...)` calls the sportsbook GO gate for any challenger feature ids under `sports_odds_sector_v1.*`
+- promotion is NO-GO until a specific approved mapping has persisted evidence proving incremental out-of-sample, net-after-cost, PIT-safe, deconfounded, production-ready edge through the existing governance path
+
+Operator evidence path:
+- configure `sportsbook_odds_research` with a real read-only historical file or feed plus `asset_mapping_json`
+- ingest odds through `poll_sportsbook_odds` or an equivalent controlled research one-shot using `fetch_sportsbook_odds_batch(...)` and `put_sportsbook_odds_batch(...)`
+- run `engine/data/jobs/backfill_sportsbook_odds_event_study.py` with explicit `SPORTSBOOK_ODDS_EVENT_STUDY_*` window, latency, fee, slippage, horizon, and symbol settings
+- read `promotion_gate.blockers`; missing historical files, wildcard-only model configs, unmapped assets, incomplete approvals, or missing persisted evidence are NO-GO
+
+Storage tables:
+- `sportsbook_odds_snapshots`
+- `sportsbook_odds_asset_mappings`
+- `sportsbook_odds_event_studies`
+- `sportsbook_odds_promotion_evidence`
+
+`sportsbook_odds_snapshots` stores one normalized row per provider/event/market/outcome:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `provider` | `TEXT` | Yes | Source such as Betfair historical data, The Odds API, OpticOdds, OddsJam, or a generic JSON feed. | provider |
+| `sport_key`, `league`, `event_category` | `TEXT` | Yes/No | Normalized sports/event category used for explicit mapping. | category |
+| `provider_event_id`, `provider_market_id` | `TEXT` | Yes | Provider-native event and market ids. | id |
+| `market_type` | `TEXT` | Yes | Market type such as `moneyline`, `spread`, or `total`. | type |
+| `outcome_name` | `TEXT` | Yes | Outcome/runner/selection name from the provider. | text |
+| `odds_format`, `odds_value` | Mixed | Yes/No | Original odds representation after normalization. | provider units |
+| `raw_implied_probability` | `REAL` | Yes | Probability implied by the quoted odds before vig removal. | probability |
+| `no_vig_probability` | `REAL` | Yes | Multi-outcome normalized probability after vig removal. | probability |
+| `line`, `spread`, `total` | `REAL` | No | Market line values when applicable. | provider units |
+| `source_ts_ms` | `INTEGER` | Yes | Provider/source observation timestamp. | ms |
+| `availability_ts_ms` | `INTEGER` | Yes | Earliest timestamp the row can be used by PIT features. | ms |
+| `volume`, `liquidity` | `REAL` | No | Provider volume/liquidity fields when available. | provider units |
+| `settlement_status`, `settlement_ts_ms`, `resolution_ts_ms` | Mixed | No | Resolution metadata only after settlement is available without lookahead. | mixed |
+| `raw_payload_hash`, `raw_json` | Mixed | Yes | Provider raw payload hash and audit payload. | mixed |
+
+`sportsbook_odds_asset_mappings` stores strict allowlist mappings:
+
+| Field | Meaning |
+| --- | --- |
+| `mapping_key` | Deterministic mapping id. |
+| `sport_key`, `league`, `event_category`, `market_type` | Exact normalized sports category tuple that must match odds rows. |
+| `asset_symbol` | Optional narrow tradable asset symbol. Required when `allow_feature_use=true`. |
+| `research_label` | Optional non-tradable research label for calibration/backfill work. |
+| `stage` | `research` or `shadow`; database and code reject live stages. |
+| `allow_feature_use` | Explicit opt-in for feature snapshots. |
+| `mapping_version`, `mapping_rationale`, `owner`, `source_control_ref` | Governance metadata used to tie mappings to reviewed source-control changes. |
+| `approval_status`, `approved_by`, `approved_ts_ms`, `approval_reason`, `approved_for_promotion` | Promotion approval metadata. Passing promotion evidence requires approved mappings; research/shadow snapshots do not. |
+| `direct_trading_authority` | Always `false`; database checks and code validation enforce this. |
+
+`sportsbook_odds_event_studies` stores research evidence after realistic latency, fees, and slippage. Rows remain `direct_trading_authority=false` and carry a `no_go_reason` until the normal promotion evidence path is satisfied.
+
+`sportsbook_odds_promotion_evidence` stores promotion-gate evidence keyed by run, mapping, symbol, mapping version, feature ids, and dataset hash. Rows record train/test split timestamps, horizon, latency, fees, slippage, OOS sample count, OOS net return, hit rate, p-value, BH-FDR q value, benchmark correlation, provider-readiness status, PIT status, deconfounding status, approval status, production-readiness status, and direct trading authority. Database checks keep `direct_trading_authority=false`; `evaluate_sportsbook_odds_go_gate(...)` rejects production use unless the latest evidence for the requested mapped symbol passes every gate.
+
+Feature ids under `sports_odds_sector_v1.*`:
+
+| Feature id suffix | Meaning |
+| --- | --- |
+| `no_vig_probability_level` | Liquidity-weighted no-vig probability level for explicitly mapped events. |
+| `no_vig_probability_move` | Latest no-vig probability move versus the prior available snapshot. |
+| `liquidity_score` | Log-scaled provider volume/liquidity attention score. |
+| `market_count` | Count of mapped provider/event/market/outcome rows contributing to the snapshot. |
+| `provider_count` | Count of contributing providers. |
+| `available` | Group-level availability flag before PIT zeroing. |
+
+PIT metadata:
+- feature group: `sports_odds_sector_v1`
+- source timestamp field: `latest_source_ts_ms`
+- availability timestamp field: `latest_availability_ts_ms`
+- freshness TTL: `SPORTSBOOK_ODDS_STALE_THRESHOLD_MS`, default 60 minutes
+- stale behavior: zero features and mark unavailable
+- stage: `shadow`
+- research only: `true`
+- direct trading authority: `false`
+
+## 26. Deribit Crypto Derivatives Rows
+
+Producers:
+- `engine.data.jobs.poll_deribit_crypto_derivatives`
+- `engine.data.deribit_crypto_derivatives.fetch_deribit_public_batch(...)`
+- `engine.data.deribit_crypto_derivatives.put_deribit_batch(...)`
+
+Consumers:
+- `engine.data.deribit_crypto_derivatives.resolve_deribit_crypto_derivatives_snapshot(...)`
+- `engine.strategy.model_feature_snapshots.build_model_feature_snapshot(...)`
+- `crypto_positioning` features when Deribit perpetual funding rows are mirrored into `crypto_funding_rates`
+
+Deribit is a crypto derivatives signal source, not a prediction-market feed. It contributes BTC/ETH/SOL options, futures, perpetuals, IV, skew, basis, funding, open interest, and volume information. It does not express event-outcome probabilities and does not get direct order authority.
+
+Production enforcement:
+- provider setup, enablement, settings, lifecycle projection, and connection tests go through `services.data_source_manager`
+- canonical job `poll_deribit_crypto_derivatives` is registered in `engine.runtime.job_registry` with `execution=false` and `direct_trading_authority=false`
+- the control-plane source is disabled by default and has no credential fields
+- `DeribitPublicClient.public_get(...)` and `DeribitPublicWebSocketClient.public_get(...)` reject non-`public/` methods, and settings reject auth/trading-shaped keys
+- features are explicit `deribit_crypto_derivatives_v1.*` ids, registered as `stage=shadow`
+- PIT enforcement uses `latest_availability_ts_ms`, not provider expiry or instrument creation time
+- the resolver maps to crypto symbols only unless a deliberate crypto-equity mapping is enabled in code
+- live model serving rejects these feature ids through the existing shadow-feature gate until out-of-sample, net-after-cost, PIT, deconfounded, and production-readiness evidence supports promotion
+
+Storage tables:
+- `deribit_instruments`
+- `deribit_market_snapshots`
+- `deribit_provider_state`
+
+`deribit_instruments` stores normalized public instrument metadata:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `instrument_name` | `TEXT` | Yes | Deribit instrument name such as `BTC-PERPETUAL` or `BTC-29SEP23-30000-C`. | id |
+| `base_asset` | `TEXT` | Yes | Base asset such as `BTC`, `ETH`, or `SOL`. | symbol |
+| `instrument_type` | `TEXT` | Yes | `option`, `future`, or `perpetual`. | type |
+| `expiry_ts_ms` | `INTEGER` | No | Expiry timestamp for dated futures/options. | ms |
+| `strike` | `REAL` | No | Option strike. | quote currency |
+| `option_type` | `TEXT` | No | `call` or `put`. | type |
+| `is_active` | `BOOLEAN` | Yes | Active instrument flag from provider state. | boolean |
+| `source_ts_ms` | `INTEGER` | Yes | Source observation timestamp assigned by the poller. | ms |
+| `availability_ts_ms` | `INTEGER` | Yes | Earliest time the row can be used by PIT snapshots. | ms |
+| `raw_json` | `JSON object` | Yes | Provider instrument payload. | JSON |
+
+`deribit_market_snapshots` stores read-only market data:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `source_record_id` | `TEXT` | Yes | Deterministic source snapshot id. | id |
+| `instrument_name`, `base_asset`, `instrument_type`, `expiry_ts_ms`, `strike`, `option_type` | Mixed | Yes/No | Normalized instrument identity copied onto the snapshot. | mixed |
+| `mark_price`, `index_price`, `bid_price`, `ask_price`, `mid_price`, `last_price`, `underlying_price` | `REAL` | No | Public ticker/book summary prices. | quote currency |
+| `bid_iv`, `ask_iv`, `mark_iv` | `REAL` | No | Implied volatility normalized to decimal units. | decimal vol |
+| `delta`, `gamma`, `theta`, `vega` | `REAL` | No | Option Greeks when public ticker data provides them. | provider units |
+| `open_interest`, `volume`, `volume_usd` | `REAL` | No | Public positioning and activity fields. | contracts / USD |
+| `current_funding`, `funding_8h` | `REAL` | No | Perpetual funding fields when available. | decimal |
+| `futures_basis`, `perp_basis` | `REAL` | No | `(mark - index) / index` for futures or perpetuals. | decimal |
+| `spread_bps` | `REAL` | No | Best bid/ask spread. | bps |
+| `source_ts_ms`, `availability_ts_ms`, `ingested_ts_ms` | `INTEGER` | Yes | Provider observation, PIT availability, and local ingest timestamps. | ms |
+| `raw_json`, `diagnostics_json` | `JSON object` | Yes | Provider payload and read-only diagnostics. | JSON |
+
+`deribit_provider_state` stores the latest readiness payload, including active instruments, stale instruments, missing IV fields, order-book spread quality, WebSocket reconnect state, latest snapshot age, `public_market_data_only=true`, and `direct_trading_authority=false`.
+
+Feature ids under `deribit_crypto_derivatives_v1.*`:
+
+| Feature id suffix | Meaning |
+| --- | --- |
+| `iv_rank` | Rank of current short-dated IV versus available Deribit IV history. |
+| `short_dated_iv` | Liquidity-weighted nearest-expiry option IV. |
+| `skew_25d_proxy` | 25-delta put IV minus call IV when deltas exist, otherwise best OTM proxy. |
+| `term_structure_slope` | Next-expiry IV minus nearest-expiry IV. |
+| `put_call_open_interest_ratio` | Put open interest divided by call open interest with smoothing. |
+| `futures_basis` | Nearest dated future basis. |
+| `perp_basis` | Latest perpetual basis. |
+| `funding_pressure` | Latest Deribit perpetual funding value. |
+| `volume_shock` | Latest hourly derivatives volume versus prior history. |
+| `vol_regime_high` | High-IV-regime flag from IV rank. |
+| `vol_regime_low` | Low-IV-regime flag from IV rank. |
+| `available` | Group-level availability flag before PIT zeroing. |
+
+PIT metadata:
+- feature group: `deribit_crypto_derivatives_v1`
+- source timestamp field: `latest_source_ts_ms`
+- availability timestamp field: `latest_availability_ts_ms`
+- freshness TTL: `DERIBIT_STALE_THRESHOLD_MS`, default 30 minutes
+- stale behavior: zero features and mark unavailable
+- stage: `shadow`
+- direct trading authority: `false`

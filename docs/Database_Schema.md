@@ -1,6 +1,12 @@
 # Database Schema
 
+Last verified against code: 2026-06-21
+
 This document records the production Postgres 16 + TimescaleDB 2.x schema classification. `engine/runtime/schema/table_classification.py` is the importable source of truth; this document is the human review record. New tables must be added there and here before shipping.
+
+This document is the authoritative, complete table register, kept in lockstep with `engine/runtime/schema/table_classification.py`. The curated, human-readable data-flow view is [README_DATABASE_MAP.md](README_DATABASE_MAP.md), which is a subset and does not replace this register.
+
+The register here documents more than raw base tables: it also includes continuous-aggregate views (see [Continuous Aggregates](#continuous-aggregates)) and segment-level / column-level notes (segment keys, time columns, and index plans). Its entry count is therefore expected to be larger than a raw `pg_class` table count. It reconciles with `engine/runtime/schema/table_classification.py`, which classifies every entry as either a `Hypertable` (with its `segmentby` segment keys, time column, and chunk/compression/retention) or a `Regular` table; continuous aggregates/views are documented here and in migration `0004_continuous_aggregates.py` rather than in that dict.
 
 ## Migration Scope
 
@@ -106,6 +112,9 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `crash_recovery_audit` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
 | `data_source_logs` | Hypertable | time=ts_ms; chunk=1 day; compress=14 days; retain=180 days; segmentby=none | medium | recent operational time windows | operational health metric stream; append-mostly and dashboarded by time |
 | `data_sources` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
+| `deribit_instruments` | Regular | cleanup=n/a | low | instrument upsert and active instrument diagnostics by base asset/type | Deribit public instrument metadata keyed by instrument name |
+| `deribit_market_snapshots` | Regular | cleanup=n/a | medium | latest base-asset availability-time feature snapshot and provider diagnostics | read-only Deribit crypto derivatives market snapshots keyed by source record id |
+| `deribit_provider_state` | Regular | cleanup=n/a | low | provider health lookup by source key | latest Deribit public market-data readiness payload |
 | `decision_log` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `decision_views` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `domain_blacklist` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
@@ -259,6 +268,11 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `position_reconcile_baseline` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `policy_ope_observations` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | logged off-policy decisions, propensities, outcomes, and model estimates used by OPE promotion gates |
 | `policy_ope_evidence` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | append-only doubly robust OPE promotion evidence with uncertainty, support, and pass/fail decision |
+| `prediction_market_events` | Regular | cleanup=n/a | medium | macro/event-contract availability and resolution-window feature filtering | provider-neutral prediction-market event metadata keyed by provider, event id, product id, and source lineage |
+| `prediction_market_markets` | Regular | cleanup=n/a | medium | latest macro/event-contract expectation by provider, event, market, and availability timestamp | provider-neutral prediction-market market metadata, implied probabilities, provider contract ids, product ids, and CSV/source provenance |
+| `prediction_market_orderbook_snapshots` | Regular | cleanup=n/a | medium | latest provider market order-book snapshot before decision timestamp | append-only read-only prediction-market order-book snapshots |
+| `prediction_market_price_history` | Regular | cleanup=n/a | medium | provider market replay by trade and availability timestamp | read-only prediction-market trade and price history when available |
+| `prediction_market_backfill_state` | Regular | cleanup=n/a | low | provider/state-key backfill cursor lookup | resumable prediction-market backfill and replay cursors |
 | `prediction_history` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `predictions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `price_anomalies` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest feature snapshot and historical replay by (symbol, time) | point-in-time feature series; append-mostly and replayed by symbol/time |
@@ -305,6 +319,10 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `social_features` | Hypertable | time=bucket_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest feature snapshot and historical replay by (symbol, time) | point-in-time feature series; append-mostly and replayed by symbol/time |
 | `social_posts` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest feature snapshot and historical replay by (symbol, time) | point-in-time feature series; append-mostly and replayed by symbol/time |
 | `social_regimes` | Hypertable | time=bucket_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest feature snapshot and historical replay by (symbol, time) | point-in-time feature series; append-mostly and replayed by symbol/time |
+| `sportsbook_odds_asset_mappings` | Regular | cleanup=n/a | low | mapping lookup by asset and normalized sports category | strict sports/event category to narrow asset or research-label mapping allowlist |
+| `sportsbook_odds_event_studies` | Regular | cleanup=n/a | low | event-study audit lookup by run and timestamp | research-only sportsbook odds event-study evidence after latency, fees, and slippage |
+| `sportsbook_odds_promotion_evidence` | Regular | cleanup=n/a | low | promotion evidence lookup by symbol, mapping, pass/fail status, and timestamp | sportsbook odds promotion evidence gated by OOS, net-after-cost, PIT, deconfounding, readiness, and mapping approval checks |
+| `sportsbook_odds_snapshots` | Regular | cleanup=n/a | medium | latest explicitly mapped asset/category odds before decision timestamp | append-only read-only sportsbook and betting-exchange odds snapshots with no-vig probabilities |
 | `spillover_beta` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `spillover_beta_versions` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `strategy_allocations` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |

@@ -2,6 +2,8 @@
 
 Use this checklist before moving from safe/paper operation to live trading.
 
+Canonical production-prep procedure for enabling real trading: see [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md) §6 ("Before Enabling Real Trading"). The items below are the live-trading-specific environment and readiness assertions; where they restate §6, treat §6 as the authoritative procedural source and the entries here as the live-mode requirement checklist.
+
 ## Required Environment
 
 - `ENGINE_MODE=live`
@@ -22,6 +24,7 @@ Use this checklist before moving from safe/paper operation to live trading.
 - `UNCERTAINTY_SIZING_PRODUCTION_POLICY` is explicitly set before live sizing. Missing values block risk-increasing live orders; valid values are `log_only`, `shrink`, and `strict`.
 - `CONFORMAL_MODE`, `OOD_MODE`, and `UNCERTAINTY_SIZING_MODE` reflect the accepted rollout policy for conformal intervals, OOD scores, and model/epistemic uncertainty.
 - Options-as-instruments is shadow-only by default: keep `OPTIONS_INSTRUMENTS_MODE=shadow`. Options chain data and options-derived features may run, but live options orders are blocked by `engine.execution.options_readiness`, the broker router, direct Alpaca/IBKR adapter checks, runtime config validation, and live preflight until a reviewed live options broker adapter exists. Any future live enablement must require Greeks, liquidity filters, bid/ask quality, assignment/exercise handling, expiration risk, margin impact, broker support, position limits, and kill-switch integration.
+- Deribit crypto derivatives data is shadow/research-only by default. `poll_deribit_crypto_derivatives` is public read-only market data, has no credential fields, and its `deribit_crypto_derivatives_v1.*` features must pass out-of-sample, net-after-cost, PIT, deconfounded, and production-readiness evidence before any live model can request them. Deribit data must not be used to enable live options, futures, perpetuals, wallet, or exchange-order authority.
 
 ## Storage
 

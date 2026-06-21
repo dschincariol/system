@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -272,6 +273,41 @@ FEATURE_PIT_POLICIES: dict[str, FeaturePITPolicy] = {
         lag_policy="relationship_source_availability_at_or_before_decision",
         stale_behavior="zero_and_mark_unavailable",
     ),
+    "prediction_market_macro_v1": FeaturePITPolicy(
+        group="prediction_market_macro_v1",
+        source_timestamp_field="latest_source_ts_ms",
+        availability_timestamp_field="latest_availability_ts_ms",
+        freshness_ttl_ms=36 * MS_HOUR,
+        lag_policy="provider_market_data_availability_timestamp",
+        stale_behavior="zero_and_mark_unavailable",
+    ),
+    "prediction_market_event_v1": FeaturePITPolicy(
+        group="prediction_market_event_v1",
+        source_timestamp_field="latest_source_ts_ms",
+        availability_timestamp_field="latest_availability_ts_ms",
+        freshness_ttl_ms=36 * MS_HOUR,
+        lag_policy="provider_event_market_data_availability_timestamp",
+        stale_behavior="zero_and_mark_unavailable",
+    ),
+    "deribit_crypto_derivatives_v1": FeaturePITPolicy(
+        group="deribit_crypto_derivatives_v1",
+        source_timestamp_field="latest_source_ts_ms",
+        availability_timestamp_field="latest_availability_ts_ms",
+        freshness_ttl_ms=max(MS_MINUTE, int(os.environ.get("DERIBIT_STALE_THRESHOLD_MS", str(30 * MS_MINUTE)))),
+        lag_policy="deribit_public_market_data_availability_timestamp",
+        stale_behavior="zero_and_mark_unavailable",
+    ),
+    "sports_odds_sector_v1": FeaturePITPolicy(
+        group="sports_odds_sector_v1",
+        source_timestamp_field="latest_source_ts_ms",
+        availability_timestamp_field="latest_availability_ts_ms",
+        freshness_ttl_ms=max(
+            MS_MINUTE,
+            int(os.environ.get("SPORTSBOOK_ODDS_STALE_THRESHOLD_MS", str(60 * MS_MINUTE))),
+        ),
+        lag_policy="sportsbook_odds_provider_availability_timestamp",
+        stale_behavior="zero_and_mark_unavailable",
+    ),
 }
 
 
@@ -309,6 +345,10 @@ _PREFIX_GROUPS: tuple[tuple[str, str], ...] = (
     ("discovered.llm.", "discovered_llm"),
     ("tsfm.chronos_v2.", "ts_foundation_chronos"),
     ("graph.relational_v1.", "graph_relational_v1"),
+    ("prediction_market_macro_v1.", "prediction_market_macro_v1"),
+    ("prediction_market_event_v1.", "prediction_market_event_v1"),
+    ("deribit_crypto_derivatives_v1.", "deribit_crypto_derivatives_v1"),
+    ("sports_odds_sector_v1.", "sports_odds_sector_v1"),
 )
 
 

@@ -74,6 +74,51 @@ The `engine/data/` tree owns external data acquisition and transformation into D
 - Time-series feature backfills:
   [jobs/compute_tsfresh_snapshots.py](jobs/compute_tsfresh_snapshots.py) and
   [jobs/snapshot_model_features.py](jobs/snapshot_model_features.py).
+- Prediction-market alternative data:
+  [prediction_market_providers.py](prediction_market_providers.py),
+  [prediction_market_storage.py](prediction_market_storage.py),
+  [prediction_market_features.py](prediction_market_features.py),
+  [forecastex_event_contracts.py](forecastex_event_contracts.py),
+  [ibkr_event_contracts.py](ibkr_event_contracts.py),
+  [jobs/poll_kalshi_prediction_markets.py](jobs/poll_kalshi_prediction_markets.py),
+  [jobs/poll_cme_fedwatch.py](jobs/poll_cme_fedwatch.py),
+  [jobs/poll_polymarket_prediction_markets.py](jobs/poll_polymarket_prediction_markets.py), and
+  [jobs/poll_forecastex_event_contracts.py](jobs/poll_forecastex_event_contracts.py),
+  [jobs/backfill_prediction_market_macro.py](jobs/backfill_prediction_market_macro.py).
+  These jobs are read-only, disabled by default in the data-source control
+  plane where they are alternative data, and feed shadow-only PIT features.
+  Polymarket reads public Gamma/Data/CLOB market data and never handles wallet,
+  bridge, position, or order-placement flows.
+  ForecastEx reads regulated event-contract CSV files; optional IBKR
+  event-contract access is read-only market data behind an explicit conid
+  allowlist and does not touch execution or account state.
+- Deribit crypto derivatives data:
+  [deribit_crypto_derivatives.py](deribit_crypto_derivatives.py) and
+  [jobs/poll_deribit_crypto_derivatives.py](jobs/poll_deribit_crypto_derivatives.py).
+  This is a public BTC/ETH/SOL derivatives signal source, not a
+  prediction-market feed. It ingests instruments, ticker snapshots, optional
+  order-book snapshots, futures/perpetual basis, funding, option IV/skew, open
+  interest, and volume as shadow-only crypto-volatility and positioning inputs
+  over HTTP by default or public JSON-RPC-over-WebSocket when
+  `DERIBIT_MODE=websocket`. The job is disabled by default in the data-source
+  control plane, has no credential fields, and never calls authenticated Deribit
+  trading endpoints.
+- Sportsbook and betting-exchange odds research:
+  [sportsbook_odds.py](sportsbook_odds.py),
+  [jobs/poll_sportsbook_odds.py](jobs/poll_sportsbook_odds.py), and
+  [jobs/backfill_sportsbook_odds_event_study.py](jobs/backfill_sportsbook_odds_event_study.py).
+  This pipeline is low priority for broad stock/crypto trading and exists only
+  for narrow asset mappings, event studies, and probability-calibration
+  research. It ingests read-only odds feeds or historical files, removes vig
+  before feature use, requires explicit mapping rows, starts disabled in the
+  data-source control plane, and never models sportsbook execution, accounts,
+  balances, wagers, or betting orders. Promotion research writes a separate
+  `sportsbook_odds_promotion_evidence` record only for approved narrow mappings
+  and records OOS, net-after-cost, PIT, deconfounding, provider-readiness, and
+  production-readiness checks. Universe inventory is exact-symbol only: active
+  or watch rows and explicit model-config symbols can qualify when they are in
+  the narrow allowlist; wildcard model configs are diagnostic only and do not
+  make the feature group promotable.
 
 ## Maintenance Guidance
 
@@ -85,6 +130,27 @@ The `engine/data/` tree owns external data acquisition and transformation into D
   The runtime uses them for gating and lifecycle transitions.
 - Preserve point-in-time semantics for training helpers.
   `feature_store.py`, `universe_pit.py`, and the related backfill jobs are only useful if they can reproduce a historical view without leakage.
+- Keep prediction-market providers read-only. Event-contract expectations must
+  enter through normalized storage and PIT snapshots, not execution or order
+  endpoints.
+- Keep crypto derivatives providers read-only until promoted through the same
+  out-of-sample, net-after-cost, PIT, deconfounded, and production-readiness
+  evidence path as other challenger features.
+- Keep sportsbook odds research-only unless a specific narrow asset mapping
+  proves incremental out-of-sample, net-after-cost, PIT-safe, deconfounded, and
+  production-ready edge through `evaluate_sportsbook_odds_go_gate`. Do not add
+  general sports odds to broad-market default feature sets. Approved mappings
+  must carry owner, rationale, mapping version, approver, approval timestamp,
+  approval reason, and `approved_for_promotion=true` before promotion evidence
+  can satisfy the gate.
+- To create a future sportsbook GO candidate, operators must first configure
+  `sportsbook_odds_research` with a read-only historical file or feed, exact
+  approved mappings, and real price coverage. Then run
+  `poll_sportsbook_odds` to persist no-vig odds rows and
+  `backfill_sportsbook_odds_event_study` with explicit
+  `SPORTSBOOK_ODDS_EVENT_STUDY_*` latency/cost/window settings. A missing file,
+  missing approved mapping, wildcard-only model universe, or missing persisted
+  `sportsbook_odds_promotion_evidence` remains NO-GO.
 - Source-specific HTTP failures are not always fatal.
   Document which failures should degrade, retry, or merely log.
 

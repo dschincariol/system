@@ -316,6 +316,41 @@ TABLE_CLASS["crypto_funding_rates"] = _r(
     write_rate="low",
     read_pattern="source id upsert and symbol/availability-time feature snapshot reads",
 )
+TABLE_CLASS["deribit_instruments"] = _r(
+    "Deribit public instrument metadata keyed by instrument name",
+    write_rate="low",
+    read_pattern="instrument upsert and active instrument diagnostics by base asset/type",
+)
+TABLE_CLASS["deribit_market_snapshots"] = _r(
+    "read-only Deribit crypto derivatives market snapshots keyed by source record id",
+    write_rate="medium",
+    read_pattern="latest base-asset availability-time feature snapshot and provider diagnostics",
+)
+TABLE_CLASS["deribit_provider_state"] = _r(
+    "latest Deribit public market-data readiness payload",
+    write_rate="low",
+    read_pattern="provider health lookup by source key",
+)
+TABLE_CLASS["sportsbook_odds_snapshots"] = _r(
+    "append-only read-only sportsbook and betting-exchange odds snapshots with no-vig probabilities",
+    write_rate="medium",
+    read_pattern="latest explicitly mapped asset/category odds before decision timestamp",
+)
+TABLE_CLASS["sportsbook_odds_asset_mappings"] = _r(
+    "strict sports/event category to narrow asset or research-label mapping allowlist",
+    write_rate="low",
+    read_pattern="mapping lookup by asset and normalized sports category",
+)
+TABLE_CLASS["sportsbook_odds_event_studies"] = _r(
+    "research-only sportsbook odds event-study evidence after latency, fees, and slippage",
+    write_rate="low",
+    read_pattern="event-study audit lookup by run and timestamp",
+)
+TABLE_CLASS["sportsbook_odds_promotion_evidence"] = _r(
+    "sportsbook odds promotion evidence gated by OOS, net-after-cost, PIT, deconfounding, readiness, and mapping approval checks",
+    write_rate="low",
+    read_pattern="promotion evidence lookup by symbol, mapping, pass/fail status, and timestamp",
+)
 TABLE_CLASS["etf_shares_outstanding"] = _r(
     "daily ETF shares-outstanding rows upserted by symbol/as-of source record id",
     write_rate="low",
@@ -455,6 +490,31 @@ TABLE_CLASS["macro_vintage_backfill_state"] = _r(
     "resumable state for one-time macro vintage backfills",
     write_rate="low",
     read_pattern="primary-key lookup by macro series id",
+)
+TABLE_CLASS["prediction_market_events"] = _r(
+    "provider-neutral prediction-market event metadata keyed by provider and event id",
+    write_rate="medium",
+    read_pattern="macro event availability and resolution-window feature filtering",
+)
+TABLE_CLASS["prediction_market_markets"] = _r(
+    "provider-neutral prediction-market market metadata and implied probabilities",
+    write_rate="medium",
+    read_pattern="latest macro expectation by provider, event, market, and availability timestamp",
+)
+TABLE_CLASS["prediction_market_orderbook_snapshots"] = _r(
+    "append-only read-only prediction-market order-book snapshots",
+    write_rate="medium",
+    read_pattern="latest provider market order-book snapshot before decision timestamp",
+)
+TABLE_CLASS["prediction_market_price_history"] = _r(
+    "read-only prediction-market trade and price history when available",
+    write_rate="medium",
+    read_pattern="provider market replay by trade and availability timestamp",
+)
+TABLE_CLASS["prediction_market_backfill_state"] = _r(
+    "resumable prediction-market backfill and replay cursors",
+    write_rate="low",
+    read_pattern="provider/state-key backfill cursor lookup",
 )
 TABLE_CLASS["weather_alerts"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "issued_ts"})
 TABLE_CLASS["weather_forecast_region_daily"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "run_ts"})

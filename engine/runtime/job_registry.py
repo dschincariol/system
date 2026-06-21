@@ -359,11 +359,90 @@ ALLOWED_JOBS = {
     {"execution": False, "schedule": "every 21600s", "cadence_seconds": 21600},
 ),
 
+"poll_kalshi_prediction_markets": (
+    "engine/data/jobs/poll_kalshi_prediction_markets.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 900s", "cadence_seconds": 900, "pipeline_stage": "prediction_market_macro_shadow"},
+),
+
+"poll_cme_fedwatch": (
+    "engine/data/jobs/poll_cme_fedwatch.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 21600s", "cadence_seconds": 21600, "pipeline_stage": "prediction_market_macro_shadow"},
+),
+
+"poll_deribit_crypto_derivatives": (
+    "engine/data/jobs/poll_deribit_crypto_derivatives.py",
+    "daemon",
+    None,
+    {
+        "execution": False,
+        "schedule": "every 900s",
+        "cadence_seconds": 900,
+        "pipeline_stage": "deribit_crypto_derivatives_shadow",
+        "direct_trading_authority": False,
+    },
+),
+
+"poll_sportsbook_odds": (
+    "engine/data/jobs/poll_sportsbook_odds.py",
+    "daemon",
+    None,
+    {
+        "execution": False,
+        "schedule": "every 1800s",
+        "cadence_seconds": 1800,
+        "pipeline_stage": "sportsbook_odds_research_shadow",
+        "direct_trading_authority": False,
+    },
+),
+
+"poll_polymarket_prediction_markets": (
+    "engine/data/jobs/poll_polymarket_prediction_markets.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 900s", "cadence_seconds": 900, "pipeline_stage": "prediction_market_event_shadow"},
+),
+
+"poll_forecastex_event_contracts": (
+    "engine/data/jobs/poll_forecastex_event_contracts.py",
+    "daemon",
+    None,
+    {
+        "execution": False,
+        "schedule": "every 600s",
+        "cadence_seconds": 600,
+        "pipeline_stage": "regulated_event_contract_shadow",
+        "direct_trading_authority": False,
+    },
+),
+
 "backfill_macro_vintages": (
     "engine/data/jobs/backfill_macro_vintages.py",
     "oneshot",
     None,
     {"execution": False, "schedule": "manual one-shot", "pipeline_stage": "macro_backfill"},
+),
+
+"backfill_prediction_market_macro": (
+    "engine/data/jobs/backfill_prediction_market_macro.py",
+    "oneshot",
+    None,
+    {"execution": False, "schedule": "manual one-shot", "pipeline_stage": "prediction_market_macro_backfill"},
+),
+
+"backfill_sportsbook_odds_event_study": (
+    "engine/data/jobs/backfill_sportsbook_odds_event_study.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "schedule": "manual one-shot",
+        "pipeline_stage": "sportsbook_odds_research_backfill",
+        "direct_trading_authority": False,
+    },
 ),
 
 "backfill_features": (

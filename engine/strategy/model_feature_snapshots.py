@@ -41,6 +41,28 @@ from engine.data.crypto_positioning import compute_positioning_features as _comp
 from engine.data.weather_features import get_weather_feature_snapshot
 from engine.data.weather_mapping import load_weather_region_map, symbol_regions
 from engine.data.asset_map import asset_class_for_symbol
+from engine.data.prediction_market_features import (
+    resolve_prediction_market_event_snapshot,
+    resolve_prediction_market_macro_snapshot,
+)
+from engine.data.prediction_market_providers import (
+    PREDICTION_MARKET_EVENT_FEATURE_GROUP,
+    PREDICTION_MARKET_EVENT_FEATURE_IDS,
+    PREDICTION_MARKET_MACRO_FEATURE_GROUP,
+    PREDICTION_MARKET_MACRO_FEATURE_IDS,
+)
+from engine.data.deribit_crypto_derivatives import (
+    DERIBIT_FEATURE_GROUP,
+    DERIBIT_FEATURE_IDS,
+    DERIBIT_FEATURE_PREFIX,
+    resolve_deribit_crypto_derivatives_snapshot,
+)
+from engine.data.sportsbook_odds import (
+    SPORTSBOOK_ODDS_FEATURE_GROUP,
+    SPORTSBOOK_ODDS_FEATURE_IDS,
+    SPORTSBOOK_ODDS_FEATURE_PREFIX,
+    resolve_sportsbook_odds_snapshot,
+)
 from engine.runtime.storage import connect, get_timescale_client, register_after_commit
 from engine.strategy.feature_registry import (
     BOCPD_FEATURE_IDS,
@@ -168,6 +190,12 @@ def _feature_set_tag(feature_ids: Sequence[str]) -> str:
         return FEATURE_SET_TAG
     if any(str(fid or "").startswith(GRAPH_RELATIONAL_PREFIX) for fid in list(feature_ids or [])):
         return f"{FEATURE_SET_TAG}+graph_relational_v1_shadow"
+    if any(str(fid or "").startswith("prediction_market_event_v1.") for fid in list(feature_ids or [])):
+        return f"{FEATURE_SET_TAG}+prediction_market_event_v1_shadow"
+    if any(str(fid or "").startswith(DERIBIT_FEATURE_PREFIX) for fid in list(feature_ids or [])):
+        return f"{FEATURE_SET_TAG}+deribit_crypto_derivatives_v1_shadow"
+    if any(str(fid or "").startswith(SPORTSBOOK_ODDS_FEATURE_PREFIX) for fid in list(feature_ids or [])):
+        return f"{FEATURE_SET_TAG}+sports_odds_sector_v1_shadow"
     return f"{FEATURE_SET_TAG}+custom"
 
 
@@ -276,6 +304,10 @@ def summarize_model_feature_snapshots(
         "sentiment",
         "weather",
         "bocpd_regime",
+        DERIBIT_FEATURE_GROUP,
+        SPORTSBOOK_ODDS_FEATURE_GROUP,
+        PREDICTION_MARKET_MACRO_FEATURE_GROUP,
+        PREDICTION_MARKET_EVENT_FEATURE_GROUP,
         TS_FOUNDATION_CHRONOS_GROUP,
         GRAPH_RELATIONAL_GROUP,
     )
@@ -349,6 +381,27 @@ def summarize_model_feature_snapshots(
             "sentiment.ts_ms": ((source_timestamps.get("sentiment") or {}).get("ts_ms")),
             "weather.forecast_run_ts_ms": ((source_timestamps.get("weather") or {}).get("forecast_run_ts_ms")),
             "weather.alert_issued_ts_ms": ((source_timestamps.get("weather") or {}).get("alert_issued_ts_ms")),
+            f"{DERIBIT_FEATURE_GROUP}.latest_source_ts_ms": (
+                (source_timestamps.get(DERIBIT_FEATURE_GROUP) or {}).get("latest_source_ts_ms")
+            ),
+            f"{DERIBIT_FEATURE_GROUP}.latest_availability_ts_ms": (
+                (source_timestamps.get(DERIBIT_FEATURE_GROUP) or {}).get("latest_availability_ts_ms")
+            ),
+            f"{SPORTSBOOK_ODDS_FEATURE_GROUP}.latest_source_ts_ms": (
+                (source_timestamps.get(SPORTSBOOK_ODDS_FEATURE_GROUP) or {}).get("latest_source_ts_ms")
+            ),
+            f"{SPORTSBOOK_ODDS_FEATURE_GROUP}.latest_availability_ts_ms": (
+                (source_timestamps.get(SPORTSBOOK_ODDS_FEATURE_GROUP) or {}).get("latest_availability_ts_ms")
+            ),
+            f"{PREDICTION_MARKET_MACRO_FEATURE_GROUP}.latest_source_ts_ms": (
+                (source_timestamps.get(PREDICTION_MARKET_MACRO_FEATURE_GROUP) or {}).get("latest_source_ts_ms")
+            ),
+            f"{PREDICTION_MARKET_EVENT_FEATURE_GROUP}.latest_source_ts_ms": (
+                (source_timestamps.get(PREDICTION_MARKET_EVENT_FEATURE_GROUP) or {}).get("latest_source_ts_ms")
+            ),
+            f"{PREDICTION_MARKET_MACRO_FEATURE_GROUP}.latest_availability_ts_ms": (
+                (source_timestamps.get(PREDICTION_MARKET_MACRO_FEATURE_GROUP) or {}).get("latest_availability_ts_ms")
+            ),
             f"{TS_FOUNDATION_CHRONOS_GROUP}.price_history_last_ts_ms": (
                 (source_timestamps.get(TS_FOUNDATION_CHRONOS_GROUP) or {}).get("price_history_last_ts_ms")
             ),
@@ -1283,6 +1336,74 @@ def _load_crypto_positioning_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dic
     )
 
 
+def _load_deribit_crypto_derivatives_group(
+    con,
+    *,
+    symbol: str,
+    ts_ms: int,
+    feature_ids: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    requested = [
+        str(fid)
+        for fid in list(feature_ids or DERIBIT_FEATURE_IDS)
+        if str(fid or "").startswith(DERIBIT_FEATURE_PREFIX)
+    ]
+    features = {fid: 0.0 for fid in list(requested or DERIBIT_FEATURE_IDS)}
+    try:
+        resolved, meta, available = resolve_deribit_crypto_derivatives_snapshot(
+            con,
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_deribit_crypto_derivatives_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_DERIBIT_CRYPTO_DERIVATIVES_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_deribit_crypto_derivatives_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_source_ts_ms": None, "latest_availability_ts_ms": None, "status": "error"}, False
+    for fid in features:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
+def _load_sportsbook_odds_group(
+    con,
+    *,
+    symbol: str,
+    ts_ms: int,
+    feature_ids: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    requested = [
+        str(fid)
+        for fid in list(feature_ids or SPORTSBOOK_ODDS_FEATURE_IDS)
+        if str(fid or "").startswith(SPORTSBOOK_ODDS_FEATURE_PREFIX)
+    ]
+    features = {fid: 0.0 for fid in list(requested or SPORTSBOOK_ODDS_FEATURE_IDS)}
+    try:
+        resolved, meta, available = resolve_sportsbook_odds_snapshot(
+            con,
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "model_feature_snapshots_sportsbook_odds_group_failed",
+            "MODEL_FEATURE_SNAPSHOTS_SPORTSBOOK_ODDS_GROUP_FAILED",
+            exc,
+            warn_key="model_feature_snapshots_sportsbook_odds_group_failed",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return features, {"latest_source_ts_ms": None, "latest_availability_ts_ms": None, "status": "error"}, False
+    for fid in features:
+        features[fid] = float(_safe_float((resolved or {}).get(fid), 0.0))
+    return features, dict(meta or {}), bool(available)
+
+
 def _load_news_flow_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
     features = {fid: 0.0 for fid in NEWS_FLOW_FEATURE_IDS}
     if not NEWS_FLOW_FEATURE_IDS:
@@ -1559,6 +1680,14 @@ def _load_macro_group(con, *, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, A
         "asof_ts_ms": latest_asof_ts_ms,
         "effective_ts_ms": latest_effective_ts_ms,
     }, available
+
+
+def _load_prediction_market_macro_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    return resolve_prediction_market_macro_snapshot(con, symbol=str(symbol), ts_ms=int(ts_ms))
+
+
+def _load_prediction_market_event_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+    return resolve_prediction_market_event_snapshot(con, symbol=str(symbol), ts_ms=int(ts_ms))
 
 
 def _load_options_group(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
@@ -1902,6 +2031,16 @@ def build_model_feature_snapshot(
         for fid in ids
         if str(fid or "").startswith(GRAPH_RELATIONAL_PREFIX)
     ]
+    deribit_feature_ids = [
+        str(fid)
+        for fid in ids
+        if str(fid or "").startswith(DERIBIT_FEATURE_PREFIX)
+    ]
+    sportsbook_odds_feature_ids = [
+        str(fid)
+        for fid in ids
+        if str(fid or "").startswith(SPORTSBOOK_ODDS_FEATURE_PREFIX)
+    ]
 
     group_features: Dict[str, float] = {}
     source_timestamps: Dict[str, Any] = {"anchor_ts_ms": int(anchor_ts_ms)}
@@ -1962,6 +2101,42 @@ def build_model_feature_snapshot(
                 ts_ms=int(anchor_ts_ms),
             )
             macro_features, macro_meta, macro_available = ({fid: 0.0 for fid in MACRO_FEATURE_IDS}, {"asof_ts_ms": None}, False)
+        try:
+            prediction_market_macro_features, prediction_market_macro_meta, prediction_market_macro_available = (
+                _load_prediction_market_macro_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_prediction_market_macro_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_PREDICTION_MARKET_MACRO_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_prediction_market_macro_group_failed",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            prediction_market_macro_features, prediction_market_macro_meta, prediction_market_macro_available = (
+                {fid: 0.0 for fid in PREDICTION_MARKET_MACRO_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "latest_source_ts_ms": None},
+                False,
+            )
+        try:
+            prediction_market_event_features, prediction_market_event_meta, prediction_market_event_available = (
+                _load_prediction_market_event_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "model_feature_snapshots_prediction_market_event_group_failed",
+                "MODEL_FEATURE_SNAPSHOTS_PREDICTION_MARKET_EVENT_GROUP_FAILED",
+                exc,
+                warn_key="model_feature_snapshots_prediction_market_event_group_failed",
+                symbol=symbol_key,
+                ts_ms=int(anchor_ts_ms),
+            )
+            prediction_market_event_features, prediction_market_event_meta, prediction_market_event_available = (
+                {fid: 0.0 for fid in PREDICTION_MARKET_EVENT_FEATURE_IDS},
+                {"latest_availability_ts_ms": None, "latest_source_ts_ms": None},
+                False,
+            )
         try:
             options_features, options_meta, options_available = _load_options_group(con, symbol=symbol_key, ts_ms=anchor_ts_ms)
         except Exception as exc:
@@ -2029,6 +2204,63 @@ def build_model_feature_snapshot(
                 {"latest_availability_ts_ms": None, "latest_funding_ts_ms": None},
                 False,
             )
+        deribit_features: Dict[str, float] = {}
+        deribit_meta: Dict[str, Any] = {"latest_availability_ts_ms": None, "latest_source_ts_ms": None, "status": "not_requested"}
+        deribit_available = False
+        if deribit_feature_ids:
+            try:
+                deribit_features, deribit_meta, deribit_available = _load_deribit_crypto_derivatives_group(
+                    con,
+                    symbol=symbol_key,
+                    ts_ms=anchor_ts_ms,
+                    feature_ids=list(deribit_feature_ids),
+                )
+            except Exception as exc:
+                _warn_nonfatal(
+                    "model_feature_snapshots_deribit_crypto_derivatives_group_failed",
+                    "MODEL_FEATURE_SNAPSHOTS_DERIBIT_CRYPTO_DERIVATIVES_GROUP_FAILED",
+                    exc,
+                    warn_key="model_feature_snapshots_deribit_crypto_derivatives_group_failed_outer",
+                    symbol=symbol_key,
+                    ts_ms=int(anchor_ts_ms),
+                )
+                deribit_features, deribit_meta, deribit_available = (
+                    {fid: 0.0 for fid in deribit_feature_ids},
+                    {"latest_availability_ts_ms": None, "latest_source_ts_ms": None, "status": "error"},
+                    False,
+                )
+        sportsbook_odds_features: Dict[str, float] = {}
+        sportsbook_odds_meta: Dict[str, Any] = {
+            "latest_availability_ts_ms": None,
+            "latest_source_ts_ms": None,
+            "status": "not_requested",
+            "research_only": True,
+            "direct_trading_authority": False,
+            "broad_market_default_allowed": False,
+        }
+        sportsbook_odds_available = False
+        if sportsbook_odds_feature_ids:
+            try:
+                sportsbook_odds_features, sportsbook_odds_meta, sportsbook_odds_available = _load_sportsbook_odds_group(
+                    con,
+                    symbol=symbol_key,
+                    ts_ms=anchor_ts_ms,
+                    feature_ids=list(sportsbook_odds_feature_ids),
+                )
+            except Exception as exc:
+                _warn_nonfatal(
+                    "model_feature_snapshots_sportsbook_odds_group_failed",
+                    "MODEL_FEATURE_SNAPSHOTS_SPORTSBOOK_ODDS_GROUP_FAILED",
+                    exc,
+                    warn_key="model_feature_snapshots_sportsbook_odds_group_failed_outer",
+                    symbol=symbol_key,
+                    ts_ms=int(anchor_ts_ms),
+                )
+                sportsbook_odds_features, sportsbook_odds_meta, sportsbook_odds_available = (
+                    {fid: 0.0 for fid in sportsbook_odds_feature_ids},
+                    {"latest_availability_ts_ms": None, "latest_source_ts_ms": None, "status": "error"},
+                    False,
+                )
         try:
             news_flow_features, news_flow_meta, news_flow_available = _load_news_flow_group(
                 con,
@@ -2300,10 +2532,14 @@ def build_model_feature_snapshot(
             tech_features,
             event_features,
             macro_features,
+            prediction_market_macro_features,
+            prediction_market_event_features,
             options_features,
             insider_features,
             short_features,
             crypto_positioning_features,
+            deribit_features,
+            sportsbook_odds_features,
             news_flow_features,
             structured_doc_events_features,
             etf_flow_features,
@@ -2326,6 +2562,8 @@ def build_model_feature_snapshot(
             "tech": bool(tech_available),
             "events": bool(event_available),
             "macro": bool(macro_available),
+            PREDICTION_MARKET_MACRO_FEATURE_GROUP: bool(prediction_market_macro_available),
+            PREDICTION_MARKET_EVENT_FEATURE_GROUP: bool(prediction_market_event_available),
             "options": bool(options_available),
             "insider": bool(insider_available),
             "short": bool(short_available),
@@ -2344,6 +2582,10 @@ def build_model_feature_snapshot(
             "bocpd_regime": bool(bocpd_available),
             TS_FOUNDATION_CHRONOS_GROUP: bool(ts_foundation_available),
         }
+        if deribit_feature_ids:
+            availability[DERIBIT_FEATURE_GROUP] = bool(deribit_available)
+        if sportsbook_odds_feature_ids:
+            availability[SPORTSBOOK_ODDS_FEATURE_GROUP] = bool(sportsbook_odds_available)
         if graph_feature_ids:
             availability[GRAPH_RELATIONAL_GROUP] = bool(graph_available)
         source_timestamps.update(
@@ -2352,6 +2594,8 @@ def build_model_feature_snapshot(
                 "tech": tech_meta,
                 "events": event_meta,
                 "macro": macro_meta,
+                PREDICTION_MARKET_MACRO_FEATURE_GROUP: prediction_market_macro_meta,
+                PREDICTION_MARKET_EVENT_FEATURE_GROUP: prediction_market_event_meta,
                 "options": options_meta,
                 "insider": insider_meta,
                 "short": short_meta,
@@ -2371,6 +2615,10 @@ def build_model_feature_snapshot(
                 TS_FOUNDATION_CHRONOS_GROUP: ts_foundation_meta,
             }
         )
+        if deribit_feature_ids:
+            source_timestamps[DERIBIT_FEATURE_GROUP] = dict(deribit_meta or {})
+        if sportsbook_odds_feature_ids:
+            source_timestamps[SPORTSBOOK_ODDS_FEATURE_GROUP] = dict(sportsbook_odds_meta or {})
         if graph_feature_ids:
             source_timestamps[GRAPH_RELATIONAL_GROUP] = dict(graph_meta or {})
 
