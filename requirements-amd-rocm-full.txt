@@ -16,7 +16,7 @@
 #   numpy==2.1.2            ->  numpy==2.4.6              Python 3.12 ROCm image parity
 #   scikit-learn==1.5.2    ->  scikit-learn==1.9.0      numpy 2.4 compatibility
 #   lightgbm==4.5.0        ->  lightgbm==4.6.0          ROCm overlay pin
-# All other pins are identical to requirements.txt.
+# All other pins are identical to requirements-base.txt.
 #
 # XGBoost upstream GPU support is CUDA-only; no official AMD ROCm XGBoost wheel is
 # pinned here. The XGBoost pin stays CPU-safe.
@@ -45,7 +45,6 @@ ibapi==9.81.1.post1
 joblib==1.5.3
 llm==0.31
 msgpack==1.1.2
-nvidia-ml-py==13.595.45
 openai==2.36.0
 optuna==4.8.0
 pandas==3.0.3
@@ -55,7 +54,6 @@ psycopg[binary,pool]==3.3.4
 psycopg-pool==3.3.1
 psycopg2-binary==2.9.12
 pyarrow==19.0.1
-pynvml==13.0.1
 pysr==1.5.10
 python-dotenv==1.0.1
 pytest==9.0.3

@@ -17,7 +17,6 @@ import time
 import json
 import copy
 import logging
-import shutil
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
@@ -49,8 +48,37 @@ from engine.runtime.telemetry_read_router import fetch_event_log_summary, fetch_
 from engine.runtime.tracing import trace_event
 from engine.runtime.runtime_meta import meta_get
 from engine.runtime.ipc import market_data_status
+from engine.runtime.health_disk import default_disk_pressure_paths as _health_default_disk_pressure_paths
+from engine.runtime.health_disk import disk_path_snapshot as _health_disk_path_snapshot
+from engine.runtime.health_disk import disk_pressure_snapshot as _health_disk_pressure_snapshot
+from engine.runtime.health_disk import nearest_existing_path as _health_nearest_existing_path
+from engine.runtime.health_normalization import dedupe_strs as _health_dedupe_strs
+from engine.runtime.health_normalization import dict_or_empty as _health_dict_or_empty
+from engine.runtime.health_normalization import float_or as _health_float_or
+from engine.runtime.health_normalization import int_or as _health_int_or
+from engine.runtime.health_normalization import json_dict_or_empty as _health_json_dict_or_empty
+from engine.runtime.health_normalization import json_list_or_empty as _health_json_list_or_empty
+from engine.runtime.health_normalization import json_meta_get as _health_json_meta_get
+from engine.runtime.health_normalization import trace_section as _health_trace_section
+from engine.runtime.health_normalization import warn_nonfatal as _health_warn_nonfatal
+from engine.runtime.health_readiness import get_readiness_snapshot as _health_get_readiness_snapshot
+from engine.runtime.health_snapshot import HealthSnapshotCheck
+from engine.runtime.health_snapshot import HealthSnapshotContext
+from engine.runtime.health_snapshot import build_context as _health_build_snapshot_context
+from engine.runtime.health_snapshot import new_payload as _health_new_snapshot_payload
+from engine.runtime.health_snapshot import pending_payload as _health_pending_snapshot_payload
+from engine.runtime.health_snapshot import run_checks as _health_run_checks
+from engine.runtime.health_snapshot import stale_payload as _health_stale_snapshot_payload
+from engine.runtime.health_storage_checks import get_index_names as _health_get_index_names
+from engine.runtime.health_storage_checks import get_table_cols as _health_get_table_cols
+from engine.runtime.health_storage_checks import schema_audit as _health_schema_audit
+from engine.runtime.health_storage_checks import sqlite_wal_path as _health_sqlite_wal_path
+from engine.runtime.health_storage_checks import table_exists as _health_table_exists
 
 log = get_logger("runtime.health")
+
+HealthSnapshotContext.__module__ = __name__
+HealthSnapshotCheck.__module__ = __name__
 
 # ---------------------------------------------------
 # ENV THRESHOLDS
@@ -119,76 +147,35 @@ _HEALTH_SNAPSHOT_TRACE = str(os.environ.get("HEALTH_SNAPSHOT_TRACE", "")).strip(
 
 
 def _warn(scope: str, err: Exception, **extra) -> None:
-    log_failure(
-        log,
-        event="runtime_health_nonfatal",
-        code=str(scope).replace(".", "_"),
-        message=str(scope),
-        error=err,
-        level=logging.WARNING,
-        component="engine.runtime.health",
-        extra=dict(extra or {}) or None,
-        persist=False,
-    )
+    _health_warn_nonfatal(log, log_failure, scope, err, **extra)
 
 
 def _trace_section(name: str, started: float, **extra: Any) -> None:
-    if not _HEALTH_SNAPSHOT_TRACE:
-        return
-    payload: Dict[str, Any] = {
-        "section": str(name),
-        "elapsed_ms": round((time.perf_counter() - float(started)) * 1000.0, 2),
-    }
-    if extra:
-        payload.update(dict(extra))
-    try:
-        log.info(
-            "health_snapshot_section",
-            extra={
-                "event": "health_snapshot_section",
-                "extra_json": payload,
-            },
-        )
-    except Exception as e:
-        _warn("health.trace_section", e, section=str(name))
+    _health_trace_section(
+        name,
+        started,
+        enabled=_HEALTH_SNAPSHOT_TRACE,
+        logger=log,
+        warn=_warn,
+        perf_counter=time.perf_counter,
+        **extra,
+    )
 
 
 def _sqlite_wal_path(db_path: Path) -> Optional[Path]:
-    if not db_path.name:
-        return None
-    return db_path.with_name(f"{db_path.name}-wal")
+    return _health_sqlite_wal_path(db_path)
 
 
 def _int_or(value: Any, default: int = 0) -> int:
-    if value is None or str(value).strip() == "":
-        return int(default)
-    try:
-        return int(value)
-    except Exception as e:
-        _warn("health.int_or", e, value_type=type(value).__name__)
-        return int(default)
+    return _health_int_or(value, default, warn=_warn)
 
 
 def _float_or(value: Any, default: float = 0.0) -> float:
-    if value is None or str(value).strip() == "":
-        return float(default)
-    try:
-        return float(value)
-    except Exception as e:
-        _warn("health.float_or", e, value_type=type(value).__name__)
-        return float(default)
+    return _health_float_or(value, default, warn=_warn)
 
 
 def _dedupe_strs(values: List[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for value in values or []:
-        key = str(value or "").strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(key)
-    return out
+    return _health_dedupe_strs(values)
 
 
 def _csv_env_set(name: str, default: str) -> set[str]:
@@ -208,173 +195,58 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _nearest_existing_path(path: Path) -> Path:
-    candidate = path.expanduser()
-    for item in (candidate, *candidate.parents):
-        try:
-            if item.exists():
-                return item
-        except Exception as exc:
-            _warn("health.disk_path_exists", exc, path=str(item))
-    return Path("/")
+    return _health_nearest_existing_path(path, warn=_warn)
 
 
 def _disk_path_snapshot(label: str, path: Path) -> Dict[str, Any]:
-    requested = path.expanduser()
-    check_path = _nearest_existing_path(requested)
-    out: Dict[str, Any] = {
-        "label": str(label),
-        "path": str(requested),
-        "exists": bool(requested.exists()),
-        "checked_path": str(check_path),
-        "ok": False,
-        "status": "unknown",
-        "warning": False,
-        "critical": False,
-        "detail": "",
-    }
-    try:
-        usage = shutil.disk_usage(str(check_path))
-        total = int(usage.total)
-        free = int(usage.free)
-        used = int(usage.used)
-        free_pct = (float(free) / float(total) * 100.0) if total > 0 else 0.0
-        critical = free <= DISK_PRESSURE_CRITICAL_FREE_BYTES or free_pct <= DISK_PRESSURE_CRITICAL_FREE_PCT
-        warning = (
-            not critical
-            and (free <= DISK_PRESSURE_WARN_FREE_BYTES or free_pct <= DISK_PRESSURE_WARN_FREE_PCT)
-        )
-        status = "critical" if critical else ("warning" if warning else "ok")
-        out.update(
-            {
-                "ok": not critical,
-                "status": status,
-                "warning": bool(warning),
-                "critical": bool(critical),
-                "total_bytes": total,
-                "used_bytes": used,
-                "free_bytes": free,
-                "free_pct": round(free_pct, 2),
-                "used_pct": round(100.0 - free_pct, 2),
-                "detail": (
-                    "ok"
-                    if status == "ok"
-                    else f"disk_{status}:free_bytes={free}:free_pct={free_pct:.2f}"
-                ),
-            }
-        )
-    except Exception as e:
-        out.update(
-            {
-                "ok": False,
-                "status": "error",
-                "critical": True,
-                "detail": f"disk_usage_error:{type(e).__name__}:{e}",
-            }
-        )
-    return out
+    return _health_disk_path_snapshot(
+        label,
+        path,
+        warn_free_pct=DISK_PRESSURE_WARN_FREE_PCT,
+        critical_free_pct=DISK_PRESSURE_CRITICAL_FREE_PCT,
+        warn_free_bytes=DISK_PRESSURE_WARN_FREE_BYTES,
+        critical_free_bytes=DISK_PRESSURE_CRITICAL_FREE_BYTES,
+        warn=_warn,
+    )
 
 
 def _default_disk_pressure_paths() -> list[tuple[str, Path]]:
-    log_root = Path(
-        os.environ.get("TRADING_LOGS")
-        or os.environ.get("LOG_DIR")
-        or str(default_local_log_dir().resolve())
-    ).expanduser()
-    backup_root = Path(
-        os.environ.get("TRADING_BACKUP_ROOT")
-        or os.environ.get("TS_BACKUP_ROOT")
-        or default_backup_root_dir()
-    ).expanduser()
-    paths: list[tuple[str, Path]] = [
-        ("root", Path("/")),
-        ("runtime_data", Path(DB_PATH).expanduser().parent if Path(DB_PATH).suffix else Path(DB_PATH).expanduser()),
-        ("runtime_logs", log_root),
-        ("backup_root", backup_root),
-    ]
-    extra_raw = str(os.environ.get("DISK_PRESSURE_EXTRA_PATHS") or "").strip()
-    for idx, raw in enumerate(part.strip() for part in extra_raw.split(",") if part.strip()):
-        paths.append((f"extra_{idx}", Path(raw).expanduser()))
-    return paths
+    return _health_default_disk_pressure_paths(
+        environ=os.environ,
+        db_path=Path(DB_PATH),
+        default_log_dir=default_local_log_dir,
+        default_backup_dir=default_backup_root_dir,
+    )
 
 
 def get_disk_pressure_snapshot(
     paths: Optional[Iterable[tuple[str, str | Path]]] = None,
 ) -> Dict[str, Any]:
-    requested_paths = list(paths) if paths is not None else _default_disk_pressure_paths()
-    snapshots: list[Dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for label, raw_path in requested_paths:
-        path = Path(raw_path).expanduser()
-        key = (str(label), str(path))
-        if key in seen:
-            continue
-        seen.add(key)
-        snapshots.append(_disk_path_snapshot(str(label), path))
-
-    critical = [
-        f"{item.get('label')}:{item.get('detail')}"
-        for item in snapshots
-        if bool(item.get("critical"))
-    ]
-    warnings = [
-        f"{item.get('label')}:{item.get('detail')}"
-        for item in snapshots
-        if bool(item.get("warning"))
-    ]
-    return {
-        "ok": not critical,
-        "degraded": bool(warnings),
-        "status": "critical" if critical else ("warning" if warnings else "ok"),
-        "warnings": warnings,
-        "critical": critical,
-        "paths": snapshots,
-        "thresholds": {
-            "warn_free_pct": DISK_PRESSURE_WARN_FREE_PCT,
-            "critical_free_pct": DISK_PRESSURE_CRITICAL_FREE_PCT,
-            "warn_free_bytes": DISK_PRESSURE_WARN_FREE_BYTES,
-            "critical_free_bytes": DISK_PRESSURE_CRITICAL_FREE_BYTES,
-        },
-    }
+    return _health_disk_pressure_snapshot(
+        paths,
+        default_paths=_default_disk_pressure_paths,
+        warn_free_pct=DISK_PRESSURE_WARN_FREE_PCT,
+        critical_free_pct=DISK_PRESSURE_CRITICAL_FREE_PCT,
+        warn_free_bytes=DISK_PRESSURE_WARN_FREE_BYTES,
+        critical_free_bytes=DISK_PRESSURE_CRITICAL_FREE_BYTES,
+        warn=_warn,
+    )
 
 
 def _json_meta_get(key: str) -> Dict[str, Any]:
-    try:
-        raw = str(meta_get(key, "") or "").strip()
-        if not raw:
-            return {}
-        payload = json.loads(raw)
-        return payload if isinstance(payload, dict) else {}
-    except Exception as e:
-        _warn("health.meta_get.decode", e, key=key)
-        return {}
+    return _health_json_meta_get(key, meta_get=meta_get, warn=_warn)
 
 
 def _dict_or_empty(value: Any) -> Dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
+    return _health_dict_or_empty(value)
 
 
 def _json_dict_or_empty(raw: Any) -> Dict[str, Any]:
-    text = str(raw or "").strip()
-    if not text:
-        return {}
-    try:
-        payload = json.loads(text)
-    except Exception as e:
-        _warn("health.json_dict_or_empty.decode", e, raw_preview=text[:120])
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    return _health_json_dict_or_empty(raw, warn=_warn)
 
 
 def _json_list_or_empty(raw: Any) -> List[Any]:
-    text = str(raw or "").strip()
-    if not text:
-        return []
-    try:
-        payload = json.loads(text)
-    except Exception as e:
-        _warn("health.json_list_or_empty.decode", e, raw_preview=text[:120])
-        return []
-    return list(payload) if isinstance(payload, list) else []
+    return _health_json_list_or_empty(raw, warn=_warn)
 
 
 def _risk_state_value_readonly(con, key: str, default: str = "") -> str:
@@ -2241,37 +2113,15 @@ def _effective_prices_max_age_s(con) -> float:
 # ---------------------------------------------------
 
 def _table_exists(con, table: str) -> bool:
-    try:
-        row = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-            (str(table),),
-        ).fetchone()
-        return bool(row)
-    except Exception as e:
-        _warn("health.table_exists", e, table=str(table))
-        return False
+    return _health_table_exists(con, table, warn=_warn)
 
 
 def _get_table_cols(con, table: str):
-    try:
-        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
-        return [r[1] for r in rows] if rows else []
-    except Exception as e:
-        _warn("health.table_cols", e, table=str(table))
-        return []
+    return _health_get_table_cols(con, table, warn=_warn)
 
 
 def _get_index_names(con) -> set[str]:
-    try:
-        rows = con.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall() or []
-        return {
-            str(row[0]).strip()
-            for row in rows
-            if row and row[0] is not None and str(row[0]).strip()
-        }
-    except Exception as e:
-        _warn("health.index_names", e)
-        return set()
+    return _health_get_index_names(con, warn=_warn)
 
 
 def _prediction_flow_snapshot(con, now_ms: int) -> Dict[str, Any]:
@@ -2519,50 +2369,11 @@ def get_startup_validation_snapshot(
 def get_schema_audit():
     # Schema audit is stricter than ordinary health checks because it is used to
     # decide whether the runtime is structurally safe to operate.
-    ts_ms = int(time.time() * 1000)
-    try:
-        validation = dict(get_db_validation_snapshot(include_quick_check=False) or {})
-    except Exception as e:
-        _warn("health.db_validation.snapshot", e)
-        return {
-            "ok": False,
-            "ts_ms": ts_ms,
-            "missing_tables": [],
-            "missing_cols": {},
-            "missing_columns": {},
-            "missing_indexes": [],
-            "have_tables": [],
-            "schema_version": None,
-            "expected_schema_version": STORAGE_SCHEMA_VERSION,
-            "schema_version_status": "unavailable",
-            "schema_status": "unavailable",
-            "schema_version_notes": f"{type(e).__name__}: {e}",
-            "schema_version_ok": False,
-            "error": f"{type(e).__name__}: {e}",
-        }
-
-    missing_cols = dict(validation.get("missing_columns") or validation.get("missing_cols") or {})
-    schema_status = str(validation.get("schema_status") or "")
-    return {
-        "ok": bool(validation.get("ok")),
-        "ts_ms": ts_ms,
-        "missing_tables": list(validation.get("missing_tables") or []),
-        "missing_cols": missing_cols,
-        "missing_columns": missing_cols,
-        "missing_indexes": list(validation.get("missing_indexes") or []),
-        "have_tables": list(validation.get("have_tables") or []),
-        "schema_version": validation.get("schema_version"),
-        "expected_schema_version": validation.get("expected_schema_version", STORAGE_SCHEMA_VERSION),
-        "schema_version_status": schema_status,
-        "schema_status": schema_status,
-        "schema_version_notes": str(validation.get("schema_version_notes") or validation.get("error") or ""),
-        "schema_version_ok": bool(validation.get("schema_version_ok", True)),
-        "backend": str(validation.get("backend") or validation.get("storage") or ""),
-        "storage": str(validation.get("storage") or validation.get("backend") or ""),
-        "quick_check": str(validation.get("quick_check") or ""),
-        "owned_schema_ok": bool(validation.get("owned_schema_ok", True)),
-        "owned_drift_tables": list(validation.get("owned_drift_tables") or []),
-    }
+    return _health_schema_audit(
+        get_db_validation_snapshot=get_db_validation_snapshot,
+        storage_schema_version=STORAGE_SCHEMA_VERSION,
+        warn=_warn,
+    )
 
 
 # ---------------------------------------------------
@@ -2575,128 +2386,28 @@ def _health_snapshot_pending_payload(
     reason: str,
     cached_ts_ms: int = 0,
 ) -> Dict[str, Any]:
-    cache_age_ms = max(0, int(now_ms) - int(cached_ts_ms or 0)) if cached_ts_ms else None
-    return {
-        "ok": False,
-        "ts_ms": int(now_ms),
-        "status": "DEGRADED",
-        "warming_up": True,
-        "error": str(reason or "health_snapshot_pending"),
-        "reasons": [str(reason or "health_snapshot_pending")],
-        "db": {
-            "ok": False,
-            "initialized": False,
-            "exists": False,
-            "status": "UNKNOWN",
-            "detail": str(reason or "health_snapshot_pending"),
-        },
-        "lifecycle": {
-            "state": "WARMING_UP",
-            "detail": str(reason or "health_snapshot_pending"),
-            "ts_ms": int(now_ms),
-        },
-        "execution_barrier": {
-            "ok": True,
-            "allowed": False,
-            "allow_execution": False,
-            "allow_execution_pipeline": False,
-            "allow_simulation": False,
-            "real_trading_allowed": False,
-            "mode": str(os.environ.get("EXECUTION_MODE") or os.environ.get("ENGINE_MODE") or "safe").strip().lower() or "safe",
-            "reason": str(reason or "health_snapshot_pending"),
-            "fast_path": True,
-        },
-        "cache": {
-            "source": "runtime_health_singleflight",
-            "stale": True,
-            "age_ms": cache_age_ms,
-            "populated": False,
-            "refresh_in_flight": True,
-        },
-    }
+    return _health_pending_snapshot_payload(
+        now_ms=now_ms,
+        reason=reason,
+        cached_ts_ms=cached_ts_ms,
+        environ=os.environ,
+    )
 
 
 def _stale_health_snapshot_payload(payload: Dict[str, Any], *, now_ms: int, cached_ts_ms: int) -> Dict[str, Any]:
-    out = copy.deepcopy(payload)
-    cache_age_ms = max(0, int(now_ms) - int(cached_ts_ms or 0))
-    cache = dict(out.get("cache") or {})
-    cache.update(
-        {
-            "source": "runtime_health_singleflight",
-            "stale": True,
-            "age_ms": int(cache_age_ms),
-            "populated": True,
-            "refresh_in_flight": True,
-        }
+    return _health_stale_snapshot_payload(
+        payload,
+        now_ms=now_ms,
+        cached_ts_ms=cached_ts_ms,
     )
-    out["cache"] = cache
-    out.setdefault("ts_ms", int(now_ms))
-    return out
-
-
-@dataclass
-class HealthSnapshotContext:
-    """Mutable state shared by registered health checks."""
-
-    con: Any
-    now_ms: int
-    out: Dict[str, Any]
-    scratch: Dict[str, Any] = field(default_factory=dict)
-    check_failures: List[str] = field(default_factory=list)
-
-    def table_exists(self, table: str) -> bool:
-        try:
-            row = self.con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-                (str(table),),
-            ).fetchone()
-            return bool(row)
-        except Exception as e:
-            _warn("health.table_exists", e, table=table)
-            return False
-
-
-@dataclass(frozen=True)
-class HealthSnapshotCheck:
-    name: str
-    run: Callable[[HealthSnapshotContext], None]
 
 
 def _new_health_snapshot_payload(now_ms: int) -> Dict[str, Any]:
-    return {
-        "ok": False,
-        "ts_ms": now_ms,
-        "db_file": {
-            "path": str(DB_PATH),
-            "exists": bool(DB_PATH.exists()),
-        },
-        "reasons": [],
-        "db": {
-            "ok": True,
-            "db_path": str(DB_PATH),
-            "exists": False,
-            "initialized": False,
-            "size_bytes": 0,
-            "wal_bytes": 0,
-            "quick_check": "unknown",
-            "error": None,
-        },
-        "event_log": {
-            "ok": False,
-            "count": 0,
-            "last_ts_ms": None,
-            "age_s": None,
-        },
-    }
+    return _health_new_snapshot_payload(now_ms, db_path=Path(DB_PATH))
 
 
 def _run_health_checks(ctx: HealthSnapshotContext, checks: Iterable[HealthSnapshotCheck]) -> None:
-    for check in checks:
-        try:
-            check.run(ctx)
-        except Exception as e:
-            _warn("health.registry.check", e, check=check.name)
-            ctx.check_failures.append(f"health_check_failed:{check.name}:{type(e).__name__}")
+    _health_run_checks(ctx, checks, warn=_warn)
 
 
 def _check_runtime_hardware(ctx: HealthSnapshotContext) -> None:

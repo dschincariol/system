@@ -81,16 +81,22 @@ driver, device-permission, and Python runtime assumptions in
 export TRADING_DEPENDENCY_PROFILE=amd-rocm
 export RUNTIME_HARDWARE_PROFILE=amd-rocm
 export TRADING_ACCELERATION_PROFILE=amd-rocm
-python -m pip install -r requirements-amd-rocm.txt
+export TORCH_DEVICE=auto
+python -m pip install -r requirements-amd-rocm-full.txt
 python tools/validate_rocm_acceleration.py --json
 python engine/runtime/prod_preflight.py --json
 ```
 
 PyTorch exposes ROCm devices through its `torch.cuda` API, so the runtime
-acceleration resolver uses CUDA/HIP availability checks for the `amd-rocm`,
-`rocm`, and `hip` profile aliases. The AMD NPU is not part of this profile.
-Rollback is the same CPU reset shown below: set the dependency and runtime
-profiles back to `cpu`, reinstall `requirements.txt`, and rerun preflight.
+acceleration resolver uses HIP version, `torch.cuda.is_available()`, and device
+count checks for the `amd-rocm`, `rocm`, and `hip` profile aliases. The AMD NPU
+is not part of this profile. The
+resolver rejects placeholder ROCm requirement files: the selected file must carry
+the validated `gfx1151` / ROCm 7.2.4 wheel markers. Docker builds may select
+`requirements-amd-rocm.txt`; `deploy/compose/Dockerfile.runtime` expands that
+overlay to `requirements-amd-rocm-full.txt` for the actual install. Rollback is
+the same CPU reset shown below: set the dependency and runtime profiles back to
+`cpu`, reinstall `requirements.txt`, and rerun preflight.
 
 ## Verification
 

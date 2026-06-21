@@ -92,6 +92,17 @@ def test_amd_rocm_profile_falls_back_to_cpu_for_cpu_torch() -> None:
     assert resolved["fallback_reason"] == "torch_cuda_unavailable"
 
 
+def test_amd_rocm_profile_requires_visible_device_count() -> None:
+    torch = _FakeTorch(hip="7.2.4", cuda_available=True, count=0)
+
+    resolved = acceleration.resolve_torch_device(torch, requested="auto", profile="amd-rocm")
+
+    assert resolved["effective_device"] == "cpu"
+    assert resolved["fallback_reason"] == "torch_cuda_device_count_zero"
+    assert resolved["torch_cuda_is_available"] is True
+    assert resolved["torch_cuda_device_count"] == 0
+
+
 def test_probe_persists_effective_cpu_env_for_missing_rocm(monkeypatch: pytest.MonkeyPatch) -> None:
     torch = _FakeTorch(hip="", cuda_available=False, count=0)
     monkeypatch.setenv("TRADING_ACCELERATION_PROFILE", "amd-rocm")

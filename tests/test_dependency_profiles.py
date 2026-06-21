@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import os
 import subprocess
+import tomllib
 from pathlib import Path
 
 
@@ -41,6 +42,16 @@ def _requirement_names(path: Path, seen: set[Path] | None = None) -> set[str]:
     return names
 
 
+def _requirement_lines(path: Path) -> set[str]:
+    lines: set[str] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("--") or line.startswith("-r "):
+            continue
+        lines.add(line)
+    return lines
+
+
 def test_cpu_default_requirements_exclude_nvidia_only_packages() -> None:
     names = _requirement_names(REPO / "requirements.txt")
 
@@ -77,6 +88,13 @@ def test_amd_rocm_profile_contains_rocm_runtime_packages() -> None:
     assert {"torch", "torchaudio", "triton", "xgboost"}.issubset(names)
 
 
+def test_pyproject_amd_rocm_extra_matches_requirements_profile() -> None:
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    extra = set(project["project"]["optional-dependencies"]["amd-rocm"])
+
+    assert extra == _requirement_lines(REPO / "requirements-amd-rocm.txt")
+
+
 def test_dependency_profile_resolver_selects_amd_rocm_profile() -> None:
     env = dict(os.environ)
     env["TRADING_DEPENDENCY_PROFILE"] = "amd-rocm"
@@ -92,6 +110,26 @@ def test_dependency_profile_resolver_selects_amd_rocm_profile() -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip().endswith("requirements-amd-rocm.txt")
+
+
+def test_dependency_profile_resolver_rejects_unvalidated_amd_rocm_stub(tmp_path) -> None:
+    stub = tmp_path / "requirements-amd-rocm.txt"
+    stub.write_text("# future AMD/ROCm profile marker only\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["TRADING_DEPENDENCY_PROFILE"] = "amd-rocm"
+    env["TRADING_REQUIREMENTS_FILE"] = str(stub)
+
+    proc = subprocess.run(
+        ["bash", "deploy/bin/resolve_python_requirements.sh", str(REPO)],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert proc.returncode == 65
+    assert "amd_rocm_profile_not_validated" in proc.stderr
 
 
 def test_dependency_profile_resolver_selects_cpu_and_nvidia_profiles() -> None:
@@ -114,3 +152,13 @@ def test_dependency_profile_resolver_selects_cpu_and_nvidia_profiles() -> None:
 
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip().endswith(expected)
+
+
+def test_ci_rocm_profile_job_builds_profile_and_excludes_gpu_marker_by_default() -> None:
+    workflow = (REPO / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
+
+    assert "rocm-profile:" in workflow
+    assert "requirements-amd-rocm.txt" in workflow
+    assert "--build-arg TRADING_DEPENDENCY_PROFILE=amd-rocm" in workflow
+    assert "--build-arg TRADING_REQUIREMENTS_FILE=requirements-amd-rocm.txt" in workflow
+    assert '-m "not requires_rocm"' in workflow

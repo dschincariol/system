@@ -5,16 +5,30 @@ from pathlib import Path
 
 
 class _FakeCuda:
-    def __init__(self, available: bool) -> None:
+    def __init__(self, available: bool, count: int = 0) -> None:
         self._available = bool(available)
+        self._count = int(count)
 
     def is_available(self) -> bool:
         return bool(self._available)
 
+    def device_count(self) -> int:
+        return int(self._count)
+
+    def get_device_name(self, idx: int) -> str:
+        return f"fake-device-{idx}"
+
+
+class _FakeVersion:
+    def __init__(self, hip: str = "", cuda: str = "") -> None:
+        self.hip = hip
+        self.cuda = cuda
+
 
 class _FakeTorch:
-    def __init__(self, available: bool = False) -> None:
-        self.cuda = _FakeCuda(available)
+    def __init__(self, available: bool = False, *, hip: str = "", count: int = 0) -> None:
+        self.version = _FakeVersion(hip=hip)
+        self.cuda = _FakeCuda(available, count=count)
 
     def get_num_threads(self) -> int:
         return 8
@@ -159,6 +173,54 @@ def test_amd_rocm_runtime_profile_is_valid_with_matching_dependency_profile(monk
     assert snapshot["amd_profile_selected"] is True
     assert snapshot["amd_dependency_profile_enabled"] is True
     assert snapshot["accelerator_profile_error"] == ""
+
+
+def test_amd_rocm_auto_selects_hip_device_when_profile_is_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("TORCH_DEVICE", "auto")
+    monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
+    monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime.hardware import resolve_torch_device, runtime_hardware_snapshot
+
+    torch = _FakeTorch(available=True, hip="7.2.4", count=1)
+    resolution = resolve_torch_device(torch)
+    snapshot = runtime_hardware_snapshot(torch)
+
+    assert resolution.resolved == "cuda"
+    assert resolution.accelerator_enabled is True
+    assert resolution.disabled_accelerator_reason == ""
+    assert resolution.hip_version == "7.2.4"
+    assert resolution.rocm_available is True
+    assert resolution.torch_cuda_device_count == 1
+    assert snapshot["devices"]["TORCH_DEVICE"]["resolved"] == "cuda"
+    assert snapshot["devices"]["TORCH_DEVICE"]["rocm_available"] is True
+    assert snapshot["rocm_available"] is True
+    assert snapshot["amd_rocm_acceleration_profile_enabled"] is True
+
+
+def test_explicit_rocm_device_uses_cpu_fallback_when_no_hip_device_is_visible(monkeypatch) -> None:
+    monkeypatch.setenv("TORCH_DEVICE", "rocm")
+    monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
+    monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime.hardware import resolve_torch_device
+
+    resolution = resolve_torch_device(_FakeTorch(available=True, hip="7.2.4", count=0))
+
+    assert resolution.resolved == "cpu"
+    assert resolution.accelerator_enabled is False
+    assert resolution.disabled_accelerator_reason == "torch_cuda_device_count_zero"
+    assert not resolution.disabled_accelerator_reason.startswith("unsupported_device")
+
+
+def test_explicit_hip_device_requires_amd_rocm_dependency_profile(monkeypatch) -> None:
+    monkeypatch.setenv("TORCH_DEVICE", "hip")
+    monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
+    monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "cpu")
+    from engine.runtime.hardware import resolve_torch_device
+
+    resolution = resolve_torch_device(_FakeTorch(available=True, hip="7.2.4", count=1))
+
+    assert resolution.resolved == "cpu"
+    assert resolution.disabled_accelerator_reason == "dependency_profile_not_enabled"
 
 
 def test_event_workers_do_not_default_to_cuda() -> None:

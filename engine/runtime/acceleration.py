@@ -51,8 +51,9 @@ def _torch_cuda_status(torch_module: Any) -> Dict[str, Any]:
     device_count = int(_safe_call(0, cuda.device_count)) if cuda else 0
     devices = []
     if cuda and device_count > 0:
+        get_device_name = getattr(cuda, "get_device_name", None)
         for idx in range(device_count):
-            name = str(_safe_call("", cuda.get_device_name, idx) or "")
+            name = str(_safe_call("", get_device_name, idx) or "") if callable(get_device_name) else ""
             devices.append({"index": int(idx), "name": name})
     return {
         "torch_version": str(getattr(torch_module, "__version__", "") or ""),
@@ -83,6 +84,7 @@ def resolve_torch_device(
     selected_profile = _normalize(profile if profile is not None else acceleration_profile())
     requested_device = _normalize(requested)
     cuda_available = bool(status["torch_cuda_is_available"])
+    device_count = int(status.get("torch_cuda_device_count") or 0)
     rocm_build = bool(status["torch_is_rocm_build"])
 
     if requested_device in {"", "auto"}:
@@ -120,6 +122,14 @@ def resolve_torch_device(
                 "requested_profile": selected_profile or "cpu",
                 "effective_device": "cpu",
                 "fallback_reason": "torch_cuda_unavailable",
+            }
+        if device_count <= 0:
+            return {
+                **status,
+                "requested_device": requested_device,
+                "requested_profile": selected_profile or "cpu",
+                "effective_device": "cpu",
+                "fallback_reason": "torch_cuda_device_count_zero",
             }
         if wants_rocm and not rocm_build:
             return {

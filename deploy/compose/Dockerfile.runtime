@@ -13,14 +13,21 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG TRADING_DEPENDENCY_PROFILE=cpu
+ARG TRADING_REQUIREMENTS_FILE=
 ENV TRADING_DEPENDENCY_PROFILE=${TRADING_DEPENDENCY_PROFILE}
+ENV TRADING_REQUIREMENTS_FILE=${TRADING_REQUIREMENTS_FILE}
 
 COPY requirements*.txt /app/
 COPY deploy/bin/resolve_python_requirements.sh /app/deploy/bin/resolve_python_requirements.sh
 
 RUN python -m pip install --upgrade pip setuptools wheel \
     && REQ_FILE="$(bash /app/deploy/bin/resolve_python_requirements.sh /app)" \
-    && python -m pip install -r "$REQ_FILE"
+    && case "$(basename "$REQ_FILE")" in \
+        requirements-amd-rocm.txt) \
+          python -m pip install -r /app/requirements-amd-rocm-full.txt ;; \
+        *) \
+          python -m pip install -r "$REQ_FILE" ;; \
+      esac
 
 COPY . /app
 

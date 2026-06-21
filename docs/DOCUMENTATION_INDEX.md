@@ -36,6 +36,8 @@ Closest current substitutes:
 
 - [README.md](../README.md)
   `Canonical`. Repo entrypoint and current documentation contract.
+- [OVERVIEW_FOR_NEWCOMERS.md](OVERVIEW_FOR_NEWCOMERS.md)
+  `Supplementary`. Plain-English, diagram-first system tour for new team members and non-technical stakeholders.
 - [MAINTAINER_INDEX.md](MAINTAINER_INDEX.md)
   `Canonical`. Short engineer orientation path.
 
@@ -117,6 +119,7 @@ Known reference gaps:
 | --- | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Canonical | You need the system-level runtime architecture grounded in the current entrypoints and control planes. |
 | [FAILURE_MODES.md](FAILURE_MODES.md) | Canonical | You need the repo's current fail-closed behaviors and the first places to inspect for common runtime failures. |
+| [OVERVIEW_FOR_NEWCOMERS.md](OVERVIEW_FOR_NEWCOMERS.md) | Supplementary | You need a plain-English, diagram-first tour before using the canonical engineering references. |
 | [README_ARCHITECTURE.md](README_ARCHITECTURE.md) | Supplementary | You want a shorter architecture-oriented walkthrough alongside the canonical architecture reference. |
 | [README_SEQUENCE_DIAGRAMS.md](README_SEQUENCE_DIAGRAMS.md) | Canonical | You need startup, decision, governance, or dashboard flows in sequence form. |
 | [STATE_MACHINES.md](STATE_MACHINES.md) | Canonical | You need lifecycle, execution barrier, capital guard, promotion, or repair-gating state transitions. |

@@ -8,6 +8,8 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping
 
+from engine.runtime import acceleration
+
 
 CPU_FIRST_DEVICE_ENV_KEYS = (
     "TORCH_DEVICE",
@@ -51,6 +53,9 @@ class DeviceResolution:
     cuda_available: bool
     accelerator_enabled: bool
     disabled_accelerator_reason: str
+    hip_version: str = ""
+    rocm_available: bool = False
+    torch_cuda_device_count: int = 0
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -114,6 +119,10 @@ def amd_dependency_profile_enabled() -> bool:
     return runtime_dependency_profile() in _AMD_DEPENDENCY_PROFILES
 
 
+def amd_rocm_acceleration_profile_enabled() -> bool:
+    return runtime_hardware_profile() in _AMD_PROFILES and amd_dependency_profile_enabled()
+
+
 def accelerator_profile_error() -> str:
     hardware_profile = runtime_hardware_profile()
     dependency_profile = runtime_dependency_profile()
@@ -135,6 +144,112 @@ def torch_cuda_available(torch_module: Any) -> bool:
         return bool(callable(is_available) and is_available())
     except Exception:
         return False
+
+
+def torch_cuda_device_count(torch_module: Any) -> int:
+    cuda = getattr(torch_module, "cuda", None)
+    device_count = getattr(cuda, "device_count", None)
+    try:
+        return max(0, int(device_count())) if callable(device_count) else 0
+    except Exception:
+        return 0
+
+
+def torch_hip_version(torch_module: Any) -> str:
+    version = getattr(torch_module, "version", None)
+    try:
+        return str(getattr(version, "hip", "") or "")
+    except Exception:
+        return ""
+
+
+def torch_rocm_available(torch_module: Any) -> bool:
+    return bool(torch_hip_version(torch_module) and torch_cuda_available(torch_module) and torch_cuda_device_count(torch_module) > 0)
+
+
+def _legacy_cuda_enabled(legacy_cuda_flag: str | None) -> bool:
+    return bool(legacy_cuda_flag and _truthy(os.environ.get(str(legacy_cuda_flag)), default=False))
+
+
+def _base_resolution(
+    *,
+    raw: Any,
+    source: str,
+    profile: str,
+    torch_module: Any,
+    resolved: str,
+    accelerator_enabled: bool,
+    disabled_accelerator_reason: str,
+) -> DeviceResolution:
+    return DeviceResolution(
+        requested=str(raw or resolved or "cpu"),
+        resolved=str(resolved or "cpu"),
+        source=source,
+        profile=profile,
+        cuda_available=torch_cuda_available(torch_module),
+        accelerator_enabled=bool(accelerator_enabled),
+        disabled_accelerator_reason=str(disabled_accelerator_reason or ""),
+        hip_version=torch_hip_version(torch_module),
+        rocm_available=torch_rocm_available(torch_module),
+        torch_cuda_device_count=torch_cuda_device_count(torch_module),
+    )
+
+
+def _rocm_profile_block_reason() -> str:
+    if runtime_hardware_profile() not in _AMD_PROFILES:
+        return "accelerator_profile_not_enabled"
+    if not amd_dependency_profile_enabled():
+        return "dependency_profile_not_enabled"
+    return ""
+
+
+def _resolve_rocm_torch_device(
+    torch_module: Any,
+    *,
+    raw: Any,
+    source: str,
+    requested_device: str,
+    legacy_cuda_flag: str | None,
+) -> DeviceResolution:
+    profile = runtime_hardware_profile()
+    block_reason = _rocm_profile_block_reason()
+    if block_reason:
+        return _base_resolution(
+            raw=raw,
+            source=source,
+            profile=profile,
+            torch_module=torch_module,
+            resolved="cpu",
+            accelerator_enabled=False,
+            disabled_accelerator_reason=block_reason,
+        )
+
+    snapshot = acceleration.resolve_torch_device(
+        torch_module,
+        requested=requested_device or "auto",
+        profile="amd-rocm",
+        legacy_cuda_enabled=_legacy_cuda_enabled(legacy_cuda_flag),
+    )
+    effective = str(snapshot.get("effective_device") or "cpu").strip().lower() or "cpu"
+    selected = effective == "cuda"
+    resolved = str(requested_device or "cuda").strip().lower() if selected and str(requested_device).startswith("cuda") else effective
+    return DeviceResolution(
+        requested=str(raw or requested_device or "auto"),
+        resolved=resolved,
+        source=source,
+        profile=profile,
+        cuda_available=bool(snapshot.get("torch_cuda_is_available")),
+        accelerator_enabled=bool(selected),
+        disabled_accelerator_reason=str(snapshot.get("fallback_reason") or ""),
+        hip_version=str(snapshot.get("hip_version") or ""),
+        rocm_available=bool(snapshot.get("rocm_available"))
+        or bool(
+            snapshot.get("torch_is_rocm_build")
+            and snapshot.get("torch_cuda_is_available")
+            and int(snapshot.get("torch_cuda_device_count") or 0) > 0
+        ),
+        torch_cuda_device_count=int(snapshot.get("torch_cuda_device_count") or 0),
+    )
 
 
 def _selected_request(
@@ -177,10 +292,19 @@ def resolve_torch_device(
     device = str(raw or "cpu").strip().lower()
     profile = runtime_hardware_profile()
     cuda_available = torch_cuda_available(torch_module)
+    rocm_device_requested = device in {"amd", "rocm", "hip", "amd-rocm", "amd_rocm"}
 
     if device in {"", "default"}:
         device = "cpu"
     if device == "auto":
+        if amd_rocm_acceleration_profile_enabled():
+            return _resolve_rocm_torch_device(
+                torch_module,
+                raw=raw or "auto",
+                source=source,
+                requested_device="auto",
+                legacy_cuda_flag=legacy_cuda_flag,
+            )
         if nvidia_acceleration_profile_enabled() and cuda_available:
             return DeviceResolution(
                 requested=str(raw or "auto"),
@@ -190,6 +314,9 @@ def resolve_torch_device(
                 cuda_available=True,
                 accelerator_enabled=True,
                 disabled_accelerator_reason="",
+                hip_version=torch_hip_version(torch_module),
+                rocm_available=torch_rocm_available(torch_module),
+                torch_cuda_device_count=torch_cuda_device_count(torch_module),
             )
         if not nvidia_profile_enabled():
             reason = "accelerator_profile_not_enabled"
@@ -205,8 +332,27 @@ def resolve_torch_device(
             cuda_available=bool(cuda_available),
             accelerator_enabled=False,
             disabled_accelerator_reason=reason,
+            hip_version=torch_hip_version(torch_module),
+            rocm_available=torch_rocm_available(torch_module),
+            torch_cuda_device_count=torch_cuda_device_count(torch_module),
+        )
+    if rocm_device_requested:
+        return _resolve_rocm_torch_device(
+            torch_module,
+            raw=raw or device,
+            source=source,
+            requested_device="rocm",
+            legacy_cuda_flag=legacy_cuda_flag,
         )
     if device.startswith("cuda"):
+        if runtime_hardware_profile() in _AMD_PROFILES or amd_dependency_profile_enabled():
+            return _resolve_rocm_torch_device(
+                torch_module,
+                raw=raw or device,
+                source=source,
+                requested_device=device,
+                legacy_cuda_flag=legacy_cuda_flag,
+            )
         if not nvidia_profile_enabled():
             return DeviceResolution(
                 requested=str(raw or device),
@@ -216,6 +362,9 @@ def resolve_torch_device(
                 cuda_available=bool(cuda_available),
                 accelerator_enabled=False,
                 disabled_accelerator_reason="accelerator_profile_not_enabled",
+                hip_version=torch_hip_version(torch_module),
+                rocm_available=torch_rocm_available(torch_module),
+                torch_cuda_device_count=torch_cuda_device_count(torch_module),
             )
         if not nvidia_dependency_profile_enabled():
             return DeviceResolution(
@@ -226,6 +375,9 @@ def resolve_torch_device(
                 cuda_available=bool(cuda_available),
                 accelerator_enabled=False,
                 disabled_accelerator_reason="dependency_profile_not_enabled",
+                hip_version=torch_hip_version(torch_module),
+                rocm_available=torch_rocm_available(torch_module),
+                torch_cuda_device_count=torch_cuda_device_count(torch_module),
             )
         if cuda_available:
             return DeviceResolution(
@@ -236,6 +388,9 @@ def resolve_torch_device(
                 cuda_available=True,
                 accelerator_enabled=True,
                 disabled_accelerator_reason="",
+                hip_version=torch_hip_version(torch_module),
+                rocm_available=torch_rocm_available(torch_module),
+                torch_cuda_device_count=torch_cuda_device_count(torch_module),
             )
         return DeviceResolution(
             requested=str(raw or device),
@@ -245,6 +400,9 @@ def resolve_torch_device(
             cuda_available=False,
             accelerator_enabled=False,
             disabled_accelerator_reason="cuda_unavailable",
+            hip_version=torch_hip_version(torch_module),
+            rocm_available=torch_rocm_available(torch_module),
+            torch_cuda_device_count=torch_cuda_device_count(torch_module),
         )
     if device == "cpu":
         reason = "cpu_requested" if source != "default" else "cpu_first_default"
@@ -256,6 +414,9 @@ def resolve_torch_device(
             cuda_available=bool(cuda_available),
             accelerator_enabled=False,
             disabled_accelerator_reason=reason,
+            hip_version=torch_hip_version(torch_module),
+            rocm_available=torch_rocm_available(torch_module),
+            torch_cuda_device_count=torch_cuda_device_count(torch_module),
         )
     return DeviceResolution(
         requested=str(raw or device),
@@ -265,6 +426,9 @@ def resolve_torch_device(
         cuda_available=bool(cuda_available),
         accelerator_enabled=False,
         disabled_accelerator_reason=f"unsupported_device:{device}",
+        hip_version=torch_hip_version(torch_module),
+        rocm_available=torch_rocm_available(torch_module),
+        torch_cuda_device_count=torch_cuda_device_count(torch_module),
     )
 
 
@@ -361,9 +525,13 @@ def runtime_hardware_snapshot(torch_module: Any | None = None) -> dict[str, Any]
         "dependency_profile": runtime_dependency_profile(),
         "accelerator_profile_error": accelerator_profile_error(),
         "cuda_available": torch_cuda_available(torch_module),
+        "hip_version": torch_hip_version(torch_module),
+        "rocm_available": torch_rocm_available(torch_module),
+        "torch_cuda_device_count": torch_cuda_device_count(torch_module),
         "nvidia_profile_enabled": nvidia_profile_enabled(),
         "nvidia_dependency_profile_enabled": nvidia_dependency_profile_enabled(),
         "amd_dependency_profile_enabled": amd_dependency_profile_enabled(),
+        "amd_rocm_acceleration_profile_enabled": amd_rocm_acceleration_profile_enabled(),
         "nvidia_telemetry_enabled": nvidia_telemetry_enabled(torch_module),
         "amd_profile_selected": amd_profile_selected(),
         "disabled_accelerator_reason": ",".join(reasons),

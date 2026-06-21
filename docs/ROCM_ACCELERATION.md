@@ -47,7 +47,10 @@ when the host has working `/dev/kfd`, `/dev/dri`, and render/video group access:
 
 ```bash
 export TRADING_REQUIREMENTS_FILE=requirements-amd-rocm.txt
+export TRADING_DEPENDENCY_PROFILE=amd-rocm
+export RUNTIME_HARDWARE_PROFILE=amd-rocm
 export TRADING_ACCELERATION_PROFILE=amd-rocm
+export TORCH_DEVICE=auto
 export TRADING_RENDER_GID="$(getent group render | cut -d: -f3)"
 export TRADING_VIDEO_GID="$(getent group video | cut -d: -f3)"
 
@@ -61,8 +64,15 @@ docker compose \
 
 The overlay maps `/dev/dri` and `/dev/kfd` into the runtime container and adds
 the host render/video GIDs. It also switches only the runtime build base image to
-`rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1`. The operator
-container receives no GPU devices.
+`rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1`, builds the
+runtime with the validated ROCm requirements profile, and sets
+`TRADING_DEPENDENCY_PROFILE=amd-rocm`, `RUNTIME_HARDWARE_PROFILE=amd-rocm`,
+`TRADING_ACCELERATION_PROFILE=amd-rocm`, and `TORCH_DEVICE=auto` for the runtime
+container. The operator container receives no GPU devices. The dependency
+resolver validates that any ROCm requirements file is the real Strix
+Halo/gfx1151 ROCm 7.2.4 profile, and the runtime Dockerfile expands the
+lightweight `requirements-amd-rocm.txt` selection to
+`requirements-amd-rocm-full.txt` during installation.
 
 ## Runtime Detection
 
@@ -76,14 +86,16 @@ Startup calls `engine.runtime.acceleration.probe_torch_acceleration()` and logs
 - `effective_device`
 - `fallback_reason`
 
-PyTorch exposes ROCm devices through the `torch.cuda` API. The runtime chooses
-GPU only when `TRADING_ACCELERATION_PROFILE=amd-rocm` or an explicit device
-request is set. If torch is CPU-only, HIP is missing, `/dev/kfd` is inaccessible,
-or no HIP device is visible, the effective device is `cpu` and startup
-continues.
+PyTorch exposes ROCm devices through the `torch.cuda` API. Production model code
+selects the ROCm GPU only when the dependency and runtime hardware profiles are
+both `amd-rocm` and PyTorch reports a HIP build, `torch.cuda.is_available()`, and
+a nonzero CUDA/HIP device count. If torch is CPU-only, HIP is missing, `/dev/kfd`
+is inaccessible, or no HIP device is visible, the effective device is `cpu` and
+startup continues.
 
-FinBERT and PatchTST both use this runtime resolver, so the fallback is enforced
-in production model code rather than only in tests or documentation.
+FinBERT, PatchTST, event embeddings, iTransformer, temporal predictors, and the
+time-series foundation encoder use this runtime resolver, so the fallback is
+enforced in production model code rather than only in tests or documentation.
 
 ## Validation Harness
 

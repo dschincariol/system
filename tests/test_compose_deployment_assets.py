@@ -97,6 +97,31 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("logs/", ignore_text)
         self.assertIn("data/", ignore_text)
 
+    def test_rocm_overlay_is_runtime_only_and_selects_amd_rocm_profile(self) -> None:
+        stack_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml").read_text(encoding="utf-8")
+        overlay_text = (REPO_ROOT / "deploy" / "compose" / "docker-compose.amd-rocm.yml").read_text(encoding="utf-8")
+        dockerfile_text = (REPO_ROOT / "deploy" / "compose" / "Dockerfile.runtime").read_text(encoding="utf-8")
+
+        self.assertNotIn("/dev/kfd", stack_text)
+        self.assertNotIn("/dev/dri", stack_text)
+        self.assertIn("services:\n  runtime:", overlay_text)
+        self.assertNotIn("\n  operator:", overlay_text)
+        self.assertIn("PYTHON_RUNTIME_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1", overlay_text)
+        self.assertIn("TRADING_DEPENDENCY_PROFILE: amd-rocm", overlay_text)
+        self.assertIn("RUNTIME_HARDWARE_PROFILE: amd-rocm", overlay_text)
+        self.assertIn("TRADING_ACCELERATION_PROFILE: amd-rocm", overlay_text)
+        self.assertIn("TORCH_DEVICE: auto", overlay_text)
+        self.assertIn("/dev/dri:/dev/dri", overlay_text)
+        self.assertIn("/dev/kfd:/dev/kfd", overlay_text)
+        self.assertIn('group_add:', overlay_text)
+        self.assertIn('"${TRADING_RENDER_GID:-991}"', overlay_text)
+        self.assertIn('"${TRADING_VIDEO_GID:-44}"', overlay_text)
+        self.assertIn("ARG TRADING_REQUIREMENTS_FILE=", dockerfile_text)
+        self.assertIn("ENV TRADING_REQUIREMENTS_FILE=${TRADING_REQUIREMENTS_FILE}", dockerfile_text)
+        self.assertIn("requirements-amd-rocm.txt)", dockerfile_text)
+        self.assertIn("requirements-amd-rocm-full.txt", dockerfile_text)
+        self.assertIn("python -m pip install -r /app/requirements-amd-rocm-full.txt", dockerfile_text)
+
     def test_minio_initializer_retries_until_object_store_is_ready(self) -> None:
         external_compose = REPO_ROOT / "deploy" / "compose" / "docker-compose.external-services.yml"
         text = external_compose.read_text(encoding="utf-8")

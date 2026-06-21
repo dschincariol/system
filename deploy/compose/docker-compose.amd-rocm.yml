@@ -8,9 +8,13 @@ services:
     build:
       args:
         PYTHON_RUNTIME_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1
+        TRADING_DEPENDENCY_PROFILE: amd-rocm
         TRADING_REQUIREMENTS_FILE: requirements-amd-rocm.txt
     environment:
+      TRADING_DEPENDENCY_PROFILE: amd-rocm
+      RUNTIME_HARDWARE_PROFILE: amd-rocm
       TRADING_ACCELERATION_PROFILE: amd-rocm
+      TORCH_DEVICE: auto
       PATCHTST_USE_CUDA: "1"
     devices:
       - /dev/dri:/dev/dri
