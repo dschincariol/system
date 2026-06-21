@@ -66,7 +66,7 @@ Closest current substitutes:
 | [REFERENCE_DATA_SOURCE_CONTROL_PLANE.md](REFERENCE_DATA_SOURCE_CONTROL_PLANE.md) | Canonical | Data-source UI, routes, storage tables, mutation payloads, and runtime lifecycle rules. |
 | [DATA_CONTRACTS.md](DATA_CONTRACTS.md) | Canonical | Current payload, row, and response contracts that cross subsystem boundaries. |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | Canonical | Runtime observability signals, operator APIs, and telemetry ownership. |
-| [DEPENDENCY_PROFILES.md](DEPENDENCY_PROFILES.md) | Canonical | CPU/default, NVIDIA CUDA, and reserved AMD/ROCm dependency profile selection and rollback rules. |
+| [DEPENDENCY_PROFILES.md](DEPENDENCY_PROFILES.md) | Canonical | CPU/default, NVIDIA CUDA, and opt-in AMD/ROCm dependency profile selection and rollback rules. |
 | [README_DATABASE_MAP.md](README_DATABASE_MAP.md) | Canonical | Runtime storage table families, key tables, and data-flow-oriented schema reference. |
 | [Database_Schema.md](Database_Schema.md) | Canonical | Production Postgres/Timescale schema classification and human review register. |
 | [Audit_Chain_Spec.md](Audit_Chain_Spec.md) | Canonical | Audit hash-chain serialization, ordering, and verification contract. |

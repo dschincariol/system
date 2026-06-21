@@ -94,7 +94,7 @@ Data-source configuration has one canonical contract:
 - [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md), [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md), and [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md)
   Canonical operational references for telemetry, failure handling, and production readiness checks.
 - [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md)
-  CPU/default, NVIDIA CUDA, and reserved AMD/ROCm dependency profile selection, verification, and CPU rollback.
+  CPU/default, NVIDIA CUDA, and opt-in AMD/ROCm dependency profile selection, verification, and CPU rollback.
 - [docs/CPU_POWER_POLICY.md](docs/CPU_POWER_POLICY.md)
   Boot-enforced CPU performance-profile policy for host `bart`, verifier output,
   revert steps, and ROCm/GPU thermal composition.

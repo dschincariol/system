@@ -1,8 +1,22 @@
-# Future AMD/ROCm profile marker.
+# Opt-in AMD ROCm profile for Strix Halo / gfx1151 on bart.
 #
-# This repository does not enable AMD GPU/NPU acceleration by default because the
-# target AMD host has not validated ROCm/device access for PyTorch. Do not install
-# this profile directly for production. Supply TRADING_REQUIREMENTS_FILE with a
-# reviewed host-specific ROCm requirements file only after ROCm, container device
-# permissions, and PyTorch HIP support have been validated on the deployment host.
--r requirements-base.txt
+# Host validation on 2026-06-21:
+#   docker run --rm --device=/dev/kfd --device=/dev/dri \
+#     --group-add "$(getent group render | cut -d: -f3)" \
+#     --group-add "$(getent group video | cut -d: -f3)" \
+#     --ipc=host --shm-size 8G \
+#     rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1 \
+#     bash -lc 'python - <<PY ... torch.ones((2, 2), device="cuda", dtype=torch.float16) ... PY'
+#   Result: Radeon 8060S Graphics executed the FP16 matmul successfully.
+#
+# The previous CPython 3.11 / ROCm 6.4 PyTorch profile detected the device but
+# failed the first kernel launch with HIP "invalid device function" on gfx1151.
+# This profile follows AMD's validated Python 3.12 / ROCm 7.2.4 container stack.
+
+torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torch-2.9.1%2Brocm7.2.4.lw.git39497456-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
+torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torchaudio-2.9.0%2Brocm7.2.4.gite3c6ee2b-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
+triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/triton-3.5.1%2Brocm7.2.4.gita272dfa8-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
+numpy==2.4.6
+scikit-learn==1.9.0
+lightgbm==4.6.0
+xgboost==2.1.4

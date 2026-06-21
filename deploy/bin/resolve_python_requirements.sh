@@ -37,8 +37,7 @@ case "$profile" in
     requirements_file="requirements-nvidia-cuda.txt"
     ;;
   amd|rocm|amd-rocm)
-    echo "amd_rocm_dependency_profile_not_validated:profile=$PROFILE_RAW; set TRADING_REQUIREMENTS_FILE to a reviewed host-specific ROCm requirements file after validating ROCm, container device permissions, and PyTorch HIP support" >&2
-    exit 64
+    requirements_file="requirements-amd-rocm.txt"
     ;;
   *)
     echo "unsupported_dependency_profile:$PROFILE_RAW" >&2

@@ -34,7 +34,7 @@ profile.
 | --- | --- | --- |
 | `cpu` | `requirements.txt` | Default live/runtime install. Uses PyTorch CPU wheels and keeps NVIDIA telemetry disabled. |
 | `nvidia-cuda` | `requirements-nvidia-cuda.txt` | Explicit NVIDIA deployment profile. Installs CUDA PyTorch plus `pynvml` and `nvidia-ml-py` for NVIDIA diagnostics. |
-| `amd-rocm` | reserved | Blocked by installer scripts until a reviewed host-specific ROCm requirements file is supplied with `TRADING_REQUIREMENTS_FILE`. |
+| `amd-rocm` | `requirements-amd-rocm.txt` | Opt-in AMD ROCm deployment profile validated for the Strix Halo/gfx1151 host path on `bart`. Defaults remain CPU unless the dependency and runtime acceleration profiles are explicitly selected. |
 
 Installers select a profile through `deploy/bin/resolve_python_requirements.sh`.
 Docker, `deploy/bin/install_python_env.sh`, `deploy/bin/upgrade_trading_system.sh`,
@@ -73,21 +73,24 @@ runtime config that has passed preflight.
 
 ## AMD GPU/NPU
 
-The current AMD host is CPU-only from PyTorch's perspective. Do not set
-`RUNTIME_HARDWARE_PROFILE=amd-rocm`, `TORCH_DEVICE=hip`, `TORCH_DEVICE=rocm`,
-or any NPU accelerator env vars until all of these are true:
+Use AMD ROCm acceleration only on hosts that match the validated ROCm wheel,
+driver, device-permission, and Python runtime assumptions in
+[ROCM_ACCELERATION.md](ROCM_ACCELERATION.md). The checked-in profile is opt-in:
 
-- ROCm or the required AMD runtime is installed on the host.
-- Containers or systemd services have the required render/device permissions.
-- A PyTorch build with validated HIP/ROCm support exists for the exact Python,
-  OS, GPU, and driver combination.
-- A host-specific requirements file has been reviewed and passed preflight.
-- A rollback plan to CPU mode has been tested.
+```bash
+export TRADING_DEPENDENCY_PROFILE=amd-rocm
+export RUNTIME_HARDWARE_PROFILE=amd-rocm
+export TRADING_ACCELERATION_PROFILE=amd-rocm
+python -m pip install -r requirements-amd-rocm.txt
+python tools/validate_rocm_acceleration.py --json
+python engine/runtime/prod_preflight.py --json
+```
 
-Until then, selecting `TRADING_DEPENDENCY_PROFILE=amd-rocm` without
-`TRADING_REQUIREMENTS_FILE` fails before dependency installation, and production
-preflight reports `amd_rocm_profile_not_validated` if the runtime profile is set
-to AMD/ROCm.
+PyTorch exposes ROCm devices through its `torch.cuda` API, so the runtime
+acceleration resolver uses CUDA/HIP availability checks for the `amd-rocm`,
+`rocm`, and `hip` profile aliases. The AMD NPU is not part of this profile.
+Rollback is the same CPU reset shown below: set the dependency and runtime
+profiles back to `cpu`, reinstall `requirements.txt`, and rerun preflight.
 
 ## Verification
 
@@ -107,6 +110,7 @@ For Docker builds, set the same profile before building:
 
 ```bash
 TRADING_DEPENDENCY_PROFILE=cpu docker compose -f deploy/compose/docker-compose.stack.yml build runtime
+TRADING_DEPENDENCY_PROFILE=amd-rocm docker compose -f deploy/compose/docker-compose.stack.yml -f deploy/compose/docker-compose.amd-rocm.yml build runtime
 ```
 
 ## Rollback To CPU

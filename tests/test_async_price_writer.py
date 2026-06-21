@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -44,6 +45,23 @@ class _FakePriceStorage:
             "raw": len(raw or ()),
             "enabled": True,
         }
+
+
+class _FailingPriceStorage:
+    enabled = True
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def write_batch(self, *, prices=(), quotes=(), raw=()):
+        self.calls += 1
+        raise RuntimeError("unit_test_write_failed")
+
+
+def _spool_count(path: Path) -> int:
+    with sqlite3.connect(str(path)) as con:
+        row = con.execute("SELECT COUNT(*) FROM async_price_writer_spool").fetchone()
+    return int(row[0] or 0)
 
 
 class AsyncPriceWriterTests(unittest.TestCase):
@@ -210,6 +228,88 @@ class AsyncPriceWriterTests(unittest.TestCase):
         self.assertGreaterEqual(int(snapshot.get("high_watermark_events") or 0), 1)
         self.assertEqual(int(snapshot.get("dropped_rows") or 0), 0)
         writer.close(timeout_s=0.0)
+
+    def test_failed_write_leaves_spool_row_for_startup_replay(self) -> None:
+        spool_path = Path(self.tmp.name) / "async_price_writer.db"
+        failing = _FailingPriceStorage()
+        writer = self.async_writer.AsyncPriceWriter(
+            config=self._config(
+                spool_path=str(spool_path),
+                dead_letter_path=str(Path(self.tmp.name) / "dead_letter_failed.jsonl"),
+            )
+        )
+
+        with patch.object(writer, "start", return_value={}):
+            self.assertTrue(
+                writer.enqueue(
+                    prices=({"symbol": "SPY", "ts_ms": 1_700_000_000_010, "price": 501.25},),
+                    source="unit_test",
+                )
+            )
+
+        with patch.object(self.async_writer, "get_price_storage", return_value=failing):
+            snapshot = writer.close(timeout_s=1.0)
+
+        self.assertEqual(failing.calls, 1)
+        self.assertEqual(int(snapshot.get("spool_pending_batches") or 0), 1)
+        self.assertEqual(_spool_count(spool_path), 1)
+        self.assertFalse((Path(self.tmp.name) / "dead_letter_failed.jsonl").exists())
+
+        replay_storage = _FakePriceStorage()
+        replay = self.async_writer.AsyncPriceWriter(config=self._config(spool_path=str(spool_path)))
+        with patch.object(self.async_writer, "get_price_storage", return_value=replay_storage):
+            replay_snapshot = replay.close(timeout_s=1.0)
+
+        self.assertEqual(len(replay_storage.calls), 1)
+        self.assertEqual(int(replay_snapshot.get("spool_pending_batches") or 0), 0)
+        self.assertEqual(_spool_count(spool_path), 0)
+
+    def test_spool_enforces_envelope_backpressure_before_accepting_enqueue(self) -> None:
+        writer = self.async_writer.AsyncPriceWriter(
+            config=self._config(
+                queue_maxsize=1,
+                batch_size=8,
+                dead_letter_path=str(Path(self.tmp.name) / "dead_letter_full.jsonl"),
+                shutdown_drain_max_s=0.0,
+            )
+        )
+
+        with patch.object(writer, "start", return_value={}):
+            self.assertTrue(
+                writer.enqueue(
+                    prices=({"symbol": "AAPL", "ts_ms": 1, "price": 1.0},),
+                    source="unit_test",
+                )
+            )
+            self.assertFalse(
+                writer.enqueue(
+                    prices=({"symbol": "MSFT", "ts_ms": 2, "price": 2.0},),
+                    source="unit_test",
+                )
+            )
+
+        snapshot = writer.get_snapshot()
+        self.assertEqual(int(snapshot.get("spool_pending_batches") or 0), 1)
+        self.assertEqual(int(snapshot.get("spool_enqueue_failures") or 0), 1)
+        self.assertEqual(int(snapshot.get("dropped_rows") or 0), 1)
+        writer.close(timeout_s=0.0)
+
+    def test_corrupt_spool_file_is_quarantined_and_recreated(self) -> None:
+        spool_path = Path(self.tmp.name) / "corrupt_spool.sqlite"
+        spool_path.write_bytes(b"not a sqlite database")
+        writer = self.async_writer.AsyncPriceWriter(
+            config=self._config(
+                spool_path=str(spool_path),
+                dead_letter_path=str(Path(self.tmp.name) / "dead_letter_corrupt.jsonl"),
+            )
+        )
+
+        snapshot = writer.start()
+        writer.close(timeout_s=0.0)
+
+        self.assertEqual(int(snapshot.get("spool_corruption_events") or 0), 1)
+        self.assertTrue(spool_path.exists())
+        self.assertTrue(list(Path(self.tmp.name).glob("corrupt_spool.sqlite.corrupt.*")))
 
 
 if __name__ == "__main__":
