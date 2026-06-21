@@ -2,13 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildIndicatorAccessibilitySummary,
   applyPriceLinesToSeries,
   buildOverlayAccessibilitySummary,
   createIndicatorState,
   decisionMarkerStyle,
+  decisionWindowLegendItems,
+  indicatorOverlayLegendItems,
   normalizeDecisionOverlayPayload,
+  toDecisionWindowBands,
   toLightweightMarkers,
   updateIndicatorState,
+  VWAP_OVERLAY_LABEL,
+  VWAP_OVERLAY_SEMANTICS,
 } from "../ui/decision_overlays.js";
 
 class FakeSeries {
@@ -70,9 +76,47 @@ test("decision overlay payload normalizes price levels, windows, and accessibili
   assert.equal(payload.markers[0].kind, "risk_capped");
   assert.deepEqual(payload.price_lines.map((line) => line.kind), ["average_cost", "stop", "take_profit", "cap"]);
   assert.deepEqual(payload.windows.map((window) => window.kind), ["kill_switch_window", "circuit_breaker_window"]);
+  assert.deepEqual(payload.windows.map((window) => window.start_s), [1_789_500_000, 1_789_500_060]);
+  assert.deepEqual(payload.windows.map((window) => window.end_s), [null, 1_789_500_120]);
   assert.match(buildOverlayAccessibilitySummary(payload), /1 risk-capped/);
   assert.match(buildOverlayAccessibilitySummary(payload), /2 active or recent windows/);
   assert.match(buildOverlayAccessibilitySummary(payload), /4 price levels/);
+});
+
+test("decision windows convert milliseconds to chart seconds and extend open ends", () => {
+  const payload = normalizeDecisionOverlayPayload({
+    windows: [
+      { kind: "kill_switch_window", start_ts_ms: 1_789_500_000_123 },
+      { kind: "drawdown_throttle_window", start_ts_ms: 1_789_500_060_000, end_ts_ms: 1_789_500_120_999 },
+    ],
+  });
+
+  const bands = toDecisionWindowBands(payload.windows, [
+    { time: 1_789_499_940, close: 100 },
+    { time: 1_789_500_240, close: 101 },
+  ]);
+
+  assert.equal(bands.length, 2);
+  assert.equal(bands[0].startTime, 1_789_500_000);
+  assert.equal(bands[0].endTime, 1_789_500_240);
+  assert.equal(bands[0].openEnded, true);
+  assert.equal(bands[1].startTime, 1_789_500_060);
+  assert.equal(bands[1].endTime, 1_789_500_120);
+  assert.equal(bands[1].openEnded, false);
+  assert.match(bands[0].fillColor, /^rgba\(/);
+});
+
+test("decision window legend exposes readable band entries", () => {
+  const items = decisionWindowLegendItems({
+    windows: [
+      { kind: "kill_switch_window", start_ts_ms: 1_789_500_000_000 },
+      { kind: "suppression_window", start_ts_ms: 1_789_500_060_000 },
+    ],
+  });
+
+  assert.deepEqual(items.map((item) => item.shape), ["band", "band"]);
+  assert.deepEqual(items.map((item) => item.text), ["KILL", "TSE"]);
+  assert.ok(items.every((item) => item.fillColor && item.borderColor));
 });
 
 test("price-line rendering replaces existing lightweight chart handles", () => {
@@ -93,6 +137,35 @@ test("price-line rendering replaces existing lightweight chart handles", () => {
   assert.equal(second.length, 1);
   assert.deepEqual(series.removed, first);
   assert.equal(series.created[2].title, "take profit");
+});
+
+test("loaded-window VWAP stays cumulative across multi-day candles", () => {
+  const state = createIndicatorState([
+    { time: 1_789_500_000, close: 100, volume: 10 },
+    { time: 1_789_586_400, close: 110, volume: 10 },
+    { time: 1_789_672_800, close: 130, volume: 20 },
+  ]);
+
+  assert.equal(state.vwapSemantics, "loaded_window");
+  assert.deepEqual(
+    state.vwap.map((point) => Number(point.value.toFixed(4))),
+    [100, 105, 117.5],
+  );
+  assert.notEqual(state.vwap[1].value, 110);
+  assert.notEqual(state.vwap[2].value, 130);
+});
+
+test("VWAP overlay label and accessibility text describe loaded-window semantics", () => {
+  assert.equal(VWAP_OVERLAY_LABEL, "Loaded-window VWAP");
+  assert.equal(VWAP_OVERLAY_SEMANTICS.resetPolicy, "none");
+  assert.match(VWAP_OVERLAY_SEMANTICS.description, /does not reset at trading-session boundaries/);
+
+  const indicatorSummary = buildIndicatorAccessibilitySummary({ vwap: true, ema: false, equity: false });
+  assert.match(indicatorSummary, /Loaded-window VWAP/);
+  assert.match(indicatorSummary, /does not reset at trading-session boundaries/);
+
+  const legendItems = indicatorOverlayLegendItems({ vwap: true, ema: false, equity: false });
+  assert.deepEqual(legendItems.map((item) => item.label), ["Loaded-window VWAP"]);
 });
 
 test("indicator state updates streaming candles without full recompute", () => {

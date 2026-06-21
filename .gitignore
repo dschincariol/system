@@ -113,8 +113,12 @@ temp/
 # --------------------------------------------------
 .env
 .env.*
+*.env
+*.env.*
 *.env.local
 !.env.example
+!*.env.example
+data/secrets/
 
 # --------------------------------------------------
 # Editor / OS / backup leftovers

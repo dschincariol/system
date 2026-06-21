@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -66,49 +67,125 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
         prod_preflight = _reload_module()
         stdout = io.StringIO()
 
-        with patch.dict(os.environ, {"PREFLIGHT_ISOLATE_SMOKE_DB": "0"}):
-            with patch.object(sys, "argv", ["prod_preflight.py", "--json"]):
-                    with patch.object(sys, "stdout", stdout):
-                        with patch.object(prod_preflight, "_runtime_config_gate", return_value=(["runtime config ok"], [])):
-                            with patch.object(prod_preflight, "_api_mutation_auth_gate", return_value=(["api mutation auth ok"], [])):
-                                with patch.object(
-                                    prod_preflight,
-                                    "_operator_sidecar_security_gate",
-                                    return_value=(["operator sidecar ok"], [], [], {"ok": True}),
-                                ):
-                                    with patch.object(prod_preflight, "_compile_files", return_value=[]):
-                                        with patch.object(prod_preflight, "_ensure_schemas", return_value=["core db ok"]):
-                                            with patch.object(
-                                                prod_preflight,
-                                                "_verify_sqlite_contract",
-                                                return_value=(["sqlite contract ok"], [], {"ok": True}),
-                                            ):
-                                                with patch.object(
-                                                    prod_preflight,
-                                                    "_check_external_services",
-                                                    return_value=([], [], [], []),
-                                                ):
-                                                    with patch.object(
-                                                        prod_preflight,
-                                                        "SMOKE_CMDS",
-                                                        [("engine.strategy.jobs.train_size_policy", ["python", "-m", "x"])],
-                                                    ):
-                                                        with patch.object(
-                                                            prod_preflight,
-                                                            "_run_cmd",
-                                                            return_value=(1, "[size_policy] not enough samples: 0 < 200"),
-                                                        ):
-                                                            with patch.object(
-                                                                prod_preflight,
-                                                                "_exec_cost_gate_sanity",
-                                                                return_value=([], []),
-                                                            ):
-                                                                with patch.object(
-                                                                    prod_preflight,
-                                                                    "_capital_reconciliation_sanity",
-                                                                    return_value=([], [], []),
-                                                                ):
-                                                                    rc = prod_preflight.main()
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"PREFLIGHT_ISOLATE_SMOKE_DB": "0"}, clear=True))
+            stack.enter_context(patch.object(sys, "argv", ["prod_preflight.py", "--json"]))
+            stack.enter_context(patch.object(sys, "stdout", stdout))
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_production_provisioning_gate",
+                    return_value=(["provisioning ok"], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(prod_preflight, "_disk_pressure_gate", return_value=(["disk ok"], [], [], {"status": "ok"}))
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_storage_placement_gate",
+                    return_value=(["storage placement ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_postgres_tuning_gate",
+                    return_value=(["postgres tuning ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_wal_archiver_runtime_gate",
+                    return_value=(["wal archiver ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_pg_wal_disk_risk_gate",
+                    return_value=(["pg_wal risk ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_ingestion_tuning_gate",
+                    return_value=(["ingestion tuning ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(prod_preflight, "_runtime_config_gate", return_value=(["runtime config ok"], []))
+            )
+            stack.enter_context(
+                patch.object(prod_preflight, "_api_mutation_auth_gate", return_value=(["api mutation auth ok"], []))
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_operator_sidecar_security_gate",
+                    return_value=(["operator sidecar ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_resource_isolation_gate",
+                    return_value=(["resource isolation ok"], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(patch.object(prod_preflight, "_compile_files", return_value=[]))
+            stack.enter_context(patch.object(prod_preflight, "_ensure_schemas", return_value=["core db ok"]))
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_verify_sqlite_contract",
+                    return_value=(["sqlite contract ok"], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_capital_equity_freshness_gate",
+                    return_value=(["capital equity ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(patch.object(prod_preflight, "_check_external_services", return_value=([], [], [], [])))
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_backup_restore_evidence_gate",
+                    return_value=(["backup evidence ok"], [], [], {"fresh": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_lob_deeplob_shadow_gate",
+                    return_value=(["lob readiness ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "SMOKE_CMDS",
+                    [("engine.strategy.jobs.train_size_policy", ["python", "-m", "x"])],
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_run_cmd",
+                    return_value=(1, "[size_policy] not enough samples: 0 < 200"),
+                )
+            )
+            stack.enter_context(patch.object(prod_preflight, "_exec_cost_gate_sanity", return_value=([], [])))
+            stack.enter_context(
+                patch.object(prod_preflight, "_capital_reconciliation_sanity", return_value=([], [], []))
+            )
+            rc = prod_preflight.main()
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(rc, 2)
@@ -338,12 +415,34 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
                         "schema_version": 1,
                         "generated_at_ts": now,
                         "status": "pass",
-                        "base_backup": {"status": "pass", "verified_at_ts": now},
-                        "wal_archive": {"status": "pass", "verified_at_ts": now},
+                        "base_backup": {
+                            "status": "pass",
+                            "verified_at_ts": now,
+                            "backup_dir": str(Path(td) / "base" / "latest"),
+                            "verify_log": str(Path(td) / "evidence" / "base.verify.log"),
+                        },
+                        "wal_archive": {
+                            "status": "pass",
+                            "verified_at_ts": now,
+                            "wal_file": str(Path(td) / "wal" / "0000000100000000000000AA"),
+                        },
+                        "wal_archiver": {
+                            "status": "pass",
+                            "source": "pg_stat_archiver",
+                            "archive_mode": "on",
+                            "archive_command": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
+                            "archived_count": 10,
+                            "last_archived_wal": "0000000100000000000000AA",
+                            "last_archived_at_ts": now,
+                            "failed_count": 0,
+                            "last_failed_wal": "",
+                            "last_failed_at_ts": None,
+                        },
                         "restore_drill": {
                             "status": "pass",
                             "verified_at_ts": now,
                             "time_to_recover_s": 45,
+                            "report": str(Path(td) / "evidence" / "restore_drill.json"),
                         },
                     }
                 ),
@@ -376,6 +475,48 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertIn("backup_evidence_unsigned", state["blockers"])
         self.assertEqual(errors, ["backup restore evidence invalid: backup_evidence_unsigned"])
+
+    def test_wal_archiver_runtime_gate_fails_closed_when_required(self) -> None:
+        prod_preflight = _reload_module()
+
+        with patch.dict(os.environ, {"ENGINE_MODE": "live"}, clear=False):
+            with patch(
+                "engine.runtime.backup_evidence.wal_archiver_runtime_snapshot",
+                return_value={
+                    "ok": False,
+                    "required": True,
+                    "reason": "wal_archiver_archive_command_unaudited",
+                    "blockers": ["wal_archiver_archive_command_unaudited"],
+                    "warnings": [],
+                },
+            ):
+                notes, warnings, errors, state = prod_preflight._wal_archiver_runtime_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(state["reason"], "wal_archiver_archive_command_unaudited")
+        self.assertEqual(errors, ["wal archiver runtime invalid: wal_archiver_archive_command_unaudited"])
+
+    def test_pg_wal_disk_risk_gate_fails_closed_when_required(self) -> None:
+        prod_preflight = _reload_module()
+
+        with patch.dict(os.environ, {"ENGINE_MODE": "live"}, clear=False):
+            with patch(
+                "engine.runtime.backup_evidence.pg_wal_disk_risk_snapshot",
+                return_value={
+                    "ok": False,
+                    "required": True,
+                    "reason": "pg_wal_free_space_critical",
+                    "blockers": ["pg_wal_free_space_critical"],
+                    "warnings": [],
+                },
+            ):
+                notes, warnings, errors, state = prod_preflight._pg_wal_disk_risk_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(state["reason"], "pg_wal_free_space_critical")
+        self.assertEqual(errors, ["pg_wal disk risk invalid: pg_wal_free_space_critical"])
 
 
 if __name__ == "__main__":

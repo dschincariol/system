@@ -43,7 +43,8 @@ class ValidateRepoContractTests(unittest.TestCase):
 
     def test_validate_repo_fails_on_test_failure(self) -> None:
         expected_labels = {
-            "unit-tests": [
+            "pytest-collection": [
+                "repo-artifact-hygiene",
                 "syntax",
                 "ruff-static-release-gate",
                 "docs",
@@ -52,9 +53,10 @@ class ValidateRepoContractTests(unittest.TestCase):
                 "noop-guard",
                 "storage-route-audit",
                 "runtime-graph-startup",
-                "unit-tests",
+                "pytest-collection",
             ],
             "pytest-tests": [
+                "repo-artifact-hygiene",
                 "syntax",
                 "ruff-static-release-gate",
                 "docs",
@@ -63,7 +65,7 @@ class ValidateRepoContractTests(unittest.TestCase):
                 "noop-guard",
                 "storage-route-audit",
                 "runtime-graph-startup",
-                "unit-tests",
+                "pytest-collection",
                 "pytest-tests",
             ],
         }
@@ -279,16 +281,84 @@ class ValidateRepoContractTests(unittest.TestCase):
         )
         self.assertEqual(audit_call[2]["PYTHONPATH"], str(root))
 
-    def test_validate_repo_runs_unittest(self) -> None:
+    def test_storage_backend_scope_validator_allows_documented_compat_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_dir = root / "engine" / "runtime"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "storage_sqlite.py").write_text(
+                "\n".join(
+                    [
+                        "_PG_COMPAT_HELPER_NAMES = ('put_event',)",
+                        "def _load_pg_compat_module():",
+                        "    from engine.runtime import storage_pg as _pg",
+                        "    return _pg",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (runtime_dir / "README.md").write_text(
+                "bounded first slice with _PG_COMPAT_HELPER_NAMES compatibility shim",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(validate_repo._storage_sqlite_pg_compat_violations(root), [])
+
+    def test_storage_backend_scope_validator_blocks_direct_pg_import_and_clone_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_dir = root / "engine" / "runtime"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "storage_sqlite.py").write_text(
+                "\n".join(
+                    [
+                        "from engine.runtime import storage_pg",
+                        "def _clone_pg_helpers():",
+                        "    return storage_pg.put_event.__code__",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (runtime_dir / "README.md").write_text(
+                "bounded first slice with _PG_COMPAT_HELPER_NAMES compatibility shim",
+                encoding="utf-8",
+            )
+
+            violations = validate_repo._storage_sqlite_pg_compat_violations(root)
+
+        self.assertTrue(any("FunctionType" not in item and ".__code__" in item for item in violations))
+        self.assertTrue(any("_clone_pg_helpers" in item for item in violations))
+        self.assertTrue(any("storage_pg only inside _load_pg_compat_module" in item for item in violations))
+
+    def test_worktree_layout_validator_blocks_loose_duplicate_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "system"
+            duplicate = parent / "system-disk-retention-hardening"
+            root.mkdir()
+            duplicate.mkdir()
+
+            with self.assertRaisesRegex(RuntimeError, "not a registered git worktree"):
+                validate_repo._validate_worktree_layout(root)
+
+    def test_validate_repo_runs_pytest_collection_gate(self) -> None:
         exit_code, calls, _, root = self._run_main()
 
         self.assertEqual(exit_code, 0)
-        unittest_call = next(call for call in calls if call[0] == "unit-tests")
+        collection_call = next(call for call in calls if call[0] == "pytest-collection")
         self.assertEqual(
-            unittest_call[1],
-            ["python-bin", "-m", "unittest", "discover", "-s", "tests", "-v"],
+            collection_call[1],
+            ["pytest-bin", "tests/", "--collect-only", "-q"],
         )
-        self.assertEqual(unittest_call[2]["PYTHONPATH"], str(root))
+        self.assertEqual(collection_call[2]["PYTHONPATH"], str(root))
+
+    def test_validate_repo_does_not_run_unittest_discovery(self) -> None:
+        exit_code, calls, _, _ = self._run_main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn("unit-tests", [label for label, _, _ in calls])
+        for _, command, _ in calls:
+            self.assertNotIn("unittest", command)
 
     def test_unit_test_env_forces_safe_test_auth_context(self) -> None:
         run_env = validate_repo._unit_test_env(
@@ -296,14 +366,39 @@ class ValidateRepoContractTests(unittest.TestCase):
                 "APP_ENV": "prod",
                 "PROD_LOCK": "1",
                 "DASHBOARD_API_TOKEN": "live-token-should-not-control-tests",
+                "DASHBOARD_API_TOKEN_FILE": "data/secrets/dashboard_api_token",
+                "TIMESCALE_PASSWORD_FILE": "data/secrets/timescale_password",
+                "OBJECT_STORE_SECRET_KEY": "live-object-secret-should-not-control-tests",
+                "TS_SECRETS_PROVIDER": "systemd",
+                "DB_PATH": "var/runtime/live.sqlite",
+                "SQLITE_LIVENESS_DB_PATH": "var/runtime/live.liveness.sqlite",
+                "TS_STORAGE_BACKEND": "postgres",
             }
         )
 
         self.assertEqual(run_env["APP_ENV"], "test")
         self.assertEqual(run_env["PROD_LOCK"], "0")
+        self.assertEqual(run_env["TS_TESTING"], "1")
+        self.assertEqual(run_env["TS_STORAGE_BACKEND"], "sqlite")
         self.assertNotIn("ENV", run_env)
         self.assertNotIn("NODE_ENV", run_env)
         self.assertNotIn("TS_ENV", run_env)
+        self.assertNotIn("DASHBOARD_API_TOKEN", run_env)
+        self.assertNotIn("DASHBOARD_API_TOKEN_FILE", run_env)
+        self.assertNotIn("TIMESCALE_PASSWORD_FILE", run_env)
+        self.assertNotIn("OBJECT_STORE_SECRET_KEY", run_env)
+        self.assertNotIn("TS_SECRETS_PROVIDER", run_env)
+        self.assertIn("/var/tmp/trading-system-tests-", run_env["TMPDIR"].replace("\\", "/"))
+        self.assertEqual(run_env["TMPDIR"], run_env["PYTEST_DEBUG_TEMPROOT"])
+        self.assertEqual(run_env["TMPDIR"], run_env["TRADING_TEST_TMPDIR"])
+        self.assertEqual(
+            Path(run_env["DB_PATH"]),
+            Path(run_env["TRADING_TEST_TMPDIR"]) / "validate_repo_unit" / "runtime-test.sqlite",
+        )
+        self.assertEqual(
+            Path(run_env["SQLITE_LIVENESS_DB_PATH"]),
+            Path(run_env["TRADING_TEST_TMPDIR"]) / "validate_repo_unit" / "runtime-test.liveness.sqlite",
+        )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,13 @@ The audit hash chain applies to tables classified with `audit=True` in
 `prev_hash` is omitted from the hash input for the first row. Hash columns are
 never part of `canonical_row_bytes`.
 
+The implementation distinguishes a missing predecessor (`prev_hash is None`, the genesis
+row — nothing is prepended) from an explicitly **empty** predecessor (`prev_hash == b""`):
+for the empty case it prepends the fixed sentinel byte string `\x00audit-empty-prev-hash\x00`
+(`_EXPLICIT_EMPTY_PREV_HASH` in `engine/audit/hashing.py`) before `canonical_row_bytes`, so an
+explicitly-empty previous hash never collides with the genesis hash and third parties can
+recompute every row byte-exactly.
+
 ## Row Order
 
 Rows are chained in verifier order:
@@ -65,7 +72,6 @@ python -m engine.audit verify
 python -m engine.audit verify --table trade_attribution_ledger
 python -m engine.audit verify --table trade_attribution_ledger --from-id 1000 --to-id 2000
 python -m engine.audit hash-row --table trade_attribution_ledger --id 123
-python -m engine.audit benchmark --rows 10000
 ```
 
 The verifier recomputes every row in order. A mismatch is written to

@@ -15,10 +15,14 @@ Environment=NODE_ENV=production
 Environment=TS_SERVICE_NAME=trading-api
 Environment=TS_SECRETS_PROVIDER=systemd-creds
 Environment=TS_PG_ROLE=app
+Environment=DASHBOARD_API_TOKEN_SECRET=dashboard_api_token
+Environment=OPERATOR_API_TOKEN_SECRET=operator_api_token
 Environment=OPERATOR_AUTO_START=0
 Environment=OPERATOR_DISABLE_INTERNAL_ENGINE_START=1
 LoadCredentialEncrypted=master_key:/etc/credstore.encrypted/master_key.cred
 LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred
+LoadCredentialEncrypted=dashboard_api_token:/etc/credstore.encrypted/dashboard_api_token.cred
+LoadCredentialEncrypted=operator_api_token:/etc/credstore.encrypted/operator_api_token.cred
 ExecStart=/usr/bin/node boot/operator_server.js
 Restart=on-failure
 RestartSec=5s

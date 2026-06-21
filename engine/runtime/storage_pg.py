@@ -32,6 +32,7 @@ from engine.runtime.storage_pool import (
 )
 
 LOGGER = logging.getLogger(__name__)
+STORAGE_BACKEND_NAME = "postgres"
 
 def _load_expected_schema_version() -> int:
     try:

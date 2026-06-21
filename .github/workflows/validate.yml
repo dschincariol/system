@@ -17,6 +17,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Run repo artifact hygiene guard
+        run: python tools/check_repo_artifact_hygiene.py
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -30,6 +33,11 @@ jobs:
 
       - name: Install Node dependencies
         run: npm ci
+
+      - name: Run UI validation lane
+        env:
+          PYTHONPATH: .
+        run: npm run check:ui
 
       - name: Run Linux SQLite contract tests
         env:
@@ -55,6 +63,52 @@ jobs:
         env:
           PYTHONPATH: .
         run: python tools/validate_repo.py
+
+  coverage:
+    name: Coverage gate (branch, money paths)
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
+      APP_ENV: test
+      ENGINE_MODE: safe
+      EXECUTION_MODE: safe
+      OPERATOR_MODE: safe
+      PROD_LOCK: "0"
+      KILL_SWITCH_GLOBAL: "0"
+      AUTO_BOOT_DAEMONS: "0"
+      AUTO_PIPELINE: "0"
+      TS_STORAGE_BACKEND: sqlite
+      LIVE_CACHE_BACKEND: memory
+      IBKR_ENABLED: "0"
+      CCXT_ENABLED: "0"
+      POLYGON_WS_ENABLED: "0"
+      POLYGON_REST_ENABLED: "0"
+      TRADIER_ENABLED: "0"
+      ALPACA_ENABLED: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies (including pytest-cov)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run branch coverage gate
+        run: python tools/coverage_gate.py run
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-reports
+          path: artifacts/coverage/*
+          if-no-files-found: warn
 
   production-backend:
     name: Production backend gate (Postgres + Redis)

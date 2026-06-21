@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Dict, Tuple
 
+from engine.runtime.secret_sources import read_secret_text_file
 from engine.runtime.test_isolation import running_python_tests
 from services.secrets.loader import SecretNotAvailable, load_secret
 
@@ -47,6 +48,31 @@ def _load_from_secret_provider(name: str) -> str:
     return ""
 
 
+def _load_from_file(name: str) -> str:
+    for candidate in _candidate_names(name):
+        path = str(os.environ.get(f"{candidate}_FILE") or "").strip()
+        if not path:
+            continue
+        value = read_secret_text_file(path)
+        if value:
+            return value
+    return ""
+
+
+def _load_from_explicit_secret(name: str) -> str:
+    for candidate in _candidate_names(name):
+        secret_name = str(os.environ.get(f"{candidate}_SECRET") or "").strip()
+        if not secret_name:
+            continue
+        try:
+            value = _decode_secret(load_secret(secret_name))
+        except SecretNotAvailable:
+            continue
+        if value:
+            return value
+    return ""
+
+
 def _load_from_env_compat(name: str) -> str:
     if str(os.environ.get("TS_SECRETS_PROVIDER") or "").strip() and not running_python_tests():
         return ""
@@ -75,7 +101,12 @@ def get_data_credential(name: str, ttl_s: int = 300) -> str:
         if cached is not None:
             return cached
 
-    value = _load_from_secret_provider(secret_name) or _load_from_env_compat(secret_name)
+    value = (
+        _load_from_file(secret_name)
+        or _load_from_explicit_secret(secret_name)
+        or _load_from_secret_provider(secret_name)
+        or _load_from_env_compat(secret_name)
+    )
 
     with _CACHE_LOCK:
         _CACHE[cache_key] = str(value or "")

@@ -59,6 +59,7 @@ services:
       TIMESCALE_MAX_SLOT_WAL_KEEP_SIZE: ${TIMESCALE_MAX_SLOT_WAL_KEEP_SIZE:-8GB}
       TIMESCALE_WAL_DISK_BUDGET: ${TIMESCALE_WAL_DISK_BUDGET:-40g}
       TIMESCALE_ARCHIVE_MODE: ${TIMESCALE_ARCHIVE_MODE:-on}
+      TIMESCALE_ARCHIVE_COMMAND: ${TIMESCALE_ARCHIVE_COMMAND:-/opt/trading/ops/backup/wal_archive.sh "%p" "%f"}
       TIMESCALE_ARCHIVE_TIMEOUT: ${TIMESCALE_ARCHIVE_TIMEOUT:-60s}
       TIMESCALE_CHECKPOINT_TIMEOUT: ${TIMESCALE_CHECKPOINT_TIMEOUT:-15min}
       TIMESCALE_CHECKPOINT_COMPLETION_TARGET: ${TIMESCALE_CHECKPOINT_COMPLETION_TARGET:-0.9}
@@ -134,23 +135,62 @@ services:
       CUDNN_ALLOW_TF32: ${CUDNN_ALLOW_TF32:-0}
       CUDNN_BENCHMARK: ${CUDNN_BENCHMARK:-0}
       DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_BIND_CONTEXT: container_internal
       DASHBOARD_PORT: 8000
-      DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:?set DASHBOARD_API_TOKEN}
+      DASHBOARD_API_TOKEN_FILE: /run/secrets/dashboard_api_token
       DASHBOARD_API_TOKEN_MIN_LENGTH: ${DASHBOARD_API_TOKEN_MIN_LENGTH:-16}
       OPERATOR_SIDECAR_HOST: operator
       OPERATOR_PORT: 4001
-      OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:?set OPERATOR_API_TOKEN}
+      OPERATOR_API_TOKEN_FILE: /run/secrets/operator_api_token
       OPERATOR_SIDECAR_INTERNAL_ONLY: "1"
       TRADING_DATA: /app/data
       TRADING_LOGS: /app/logs
-      TRADING_BACKUP_ROOT: ${TRADING_BACKUP_ROOT:-/var/backups/trading}
+      TRADING_ZFS_ROOT: ${TRADING_ZFS_ROOT:?set TRADING_ZFS_ROOT to the production ZFS root}
+      TRADING_ALLOWED_STORAGE_PREFIXES: ${TRADING_ALLOWED_STORAGE_PREFIXES:-/zpool,/var/backups/trading}
+      TRADING_ALLOWED_STORAGE_FS_TYPES: ${TRADING_ALLOWED_STORAGE_FS_TYPES:-zfs}
+      TRADING_FORBIDDEN_STORAGE_PREFIXES: ${TRADING_FORBIDDEN_STORAGE_PREFIXES:-/var/lib/docker,/var/lib/containerd}
+      PREFLIGHT_REQUIRE_ZFS_STORAGE: ${PREFLIGHT_REQUIRE_ZFS_STORAGE:-1}
+      PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS: ${PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS:-1}
+      TRADING_TIMESCALE_DATA: ${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}
+      TRADING_REDIS_DATA: ${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}
+      TRADING_MINIO_DATA: ${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}
+      TRADING_RUNTIME_DATA: ${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}
+      TRADING_RUNTIME_LOGS: ${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}
+      TRADING_ARTIFACT_MIRROR: ${TRADING_ARTIFACT_MIRROR:?set TRADING_ARTIFACT_MIRROR to a ZFS-backed host path}
+      TRADING_TRAINING_DATASETS: ${TRADING_TRAINING_DATASETS:?set TRADING_TRAINING_DATASETS to a ZFS-backed host path}
+      TRADING_BACKUP_ROOT: ${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}
+      TRADING_BACKUP_WAL_DIR: ${TRADING_BACKUP_WAL_DIR:?set TRADING_BACKUP_WAL_DIR to the ZFS-backed backup WAL path}
       DB_PATH: ${TRADING_DATA_ROOT:-/app/data}
       DISK_PRESSURE_WARN_FREE_PCT: ${DISK_PRESSURE_WARN_FREE_PCT:-15}
       DISK_PRESSURE_WARN_FREE_BYTES: ${DISK_PRESSURE_WARN_FREE_BYTES:-21474836480}
       DISK_PRESSURE_CRITICAL_FREE_PCT: ${DISK_PRESSURE_CRITICAL_FREE_PCT:-5}
       DISK_PRESSURE_CRITICAL_FREE_BYTES: ${DISK_PRESSURE_CRITICAL_FREE_BYTES:-5368709120}
+      PREFLIGHT_REQUIRE_PG_WAL_RISK: ${PREFLIGHT_REQUIRE_PG_WAL_RISK:-1}
+      PREFLIGHT_PG_WAL_WARN_BYTES: ${PREFLIGHT_PG_WAL_WARN_BYTES:-30g}
+      PREFLIGHT_PG_WAL_CRITICAL_BYTES: ${PREFLIGHT_PG_WAL_CRITICAL_BYTES:-40g}
+      PREFLIGHT_PG_WAL_READY_WARN_COUNT: ${PREFLIGHT_PG_WAL_READY_WARN_COUNT:-4}
+      PREFLIGHT_PG_WAL_READY_CRITICAL_COUNT: ${PREFLIGHT_PG_WAL_READY_CRITICAL_COUNT:-16}
+      PREFLIGHT_PG_WAL_WARN_FREE_BYTES: ${PREFLIGHT_PG_WAL_WARN_FREE_BYTES:-21474836480}
+      PREFLIGHT_PG_WAL_CRITICAL_FREE_BYTES: ${PREFLIGHT_PG_WAL_CRITICAL_FREE_BYTES:-5368709120}
       BACKUP_ACCOUNTING_DU_TIMEOUT_S: ${BACKUP_ACCOUNTING_DU_TIMEOUT_S:-8}
-      TS_PG_DSN: host=timescaledb port=5432 user=${TIMESCALE_USER:?set TIMESCALE_USER} dbname=${TIMESCALE_DB:?set TIMESCALE_DB} password=${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}
+      TRADING_PUBLIC_NETWORK_EXPOSURE_ACK: ${TRADING_PUBLIC_NETWORK_EXPOSURE_ACK:-}
+      TRADING_PUBLIC_NETWORK_EXPOSURE_OWNER: ${TRADING_PUBLIC_NETWORK_EXPOSURE_OWNER:-}
+      TRADING_PUBLIC_NETWORK_EXPOSURE_REASON: ${TRADING_PUBLIC_NETWORK_EXPOSURE_REASON:-}
+      TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST: ${TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}
+      TIMESCALE_ALLOW_DANGEROUS_PUBLIC_BIND: ${TIMESCALE_ALLOW_DANGEROUS_PUBLIC_BIND:-0}
+      REDIS_DANGEROUS_PUBLIC_BIND_HOST: ${REDIS_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}
+      REDIS_ALLOW_DANGEROUS_PUBLIC_BIND: ${REDIS_ALLOW_DANGEROUS_PUBLIC_BIND:-0}
+      MINIO_DANGEROUS_PUBLIC_BIND_HOST: ${MINIO_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}
+      MINIO_ALLOW_DANGEROUS_PUBLIC_BIND: ${MINIO_ALLOW_DANGEROUS_PUBLIC_BIND:-0}
+      MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST: ${MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}
+      MINIO_CONSOLE_ALLOW_DANGEROUS_PUBLIC_BIND: ${MINIO_CONSOLE_ALLOW_DANGEROUS_PUBLIC_BIND:-0}
+      DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST: ${DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}
+      DASHBOARD_ALLOW_DANGEROUS_PUBLIC_BIND: ${DASHBOARD_ALLOW_DANGEROUS_PUBLIC_BIND:-0}
+      OPERATOR_DANGEROUS_PUBLIC_BIND_HOST: ${OPERATOR_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}
+      OPERATOR_PUBLIC_PORT: ${OPERATOR_PUBLIC_PORT:-}
+      OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND: ${OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND:-0}
+      TS_PG_DSN: host=timescaledb port=5432 user=${TIMESCALE_USER:?set TIMESCALE_USER} dbname=${TIMESCALE_DB:?set TIMESCALE_DB}
+      TS_PG_PASSWORD_FILE: /run/secrets/timescale_password
       TS_PG_POOL_PROFILE: ${TS_PG_POOL_PROFILE:-}
       TS_PG_POOL_MIN_SIZE: ${TS_PG_POOL_MIN_SIZE:-}
       TS_PG_POOL_SIZE: ${TS_PG_POOL_SIZE:-}
@@ -162,7 +202,8 @@ services:
       INGESTION_CHILD_TIMESCALE_POOL_MAX_SIZE: ${INGESTION_CHILD_TIMESCALE_POOL_MAX_SIZE:-4}
       INGESTION_CHILD_TIMESCALE_PRICES_POOL_MAX_SIZE: ${INGESTION_CHILD_TIMESCALE_PRICES_POOL_MAX_SIZE:-4}
       TIMESCALE_ENABLED: ${TIMESCALE_ENABLED:-1}
-      TIMESCALE_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}:${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}
+      TIMESCALE_PASSWORD_FILE: /run/secrets/timescale_password
+      TIMESCALE_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}
       TIMESCALE_POOL_MIN_SIZE: ${TIMESCALE_POOL_MIN_SIZE:-1}
       TIMESCALE_POOL_MAX_SIZE: ${TIMESCALE_POOL_MAX_SIZE:-8}
       TIMESCALE_BATCH_SIZE: ${TIMESCALE_BATCH_SIZE:-1000}
@@ -170,13 +211,16 @@ services:
       TIMESCALE_QUEUE_MAXSIZE: ${TIMESCALE_QUEUE_MAXSIZE:-512}
       TIMESCALE_BACKPRESSURE_TIMEOUT_S: ${TIMESCALE_BACKPRESSURE_TIMEOUT_S:-3.0}
       TIMESCALE_PRICES_ENABLED: ${TIMESCALE_PRICES_ENABLED:-1}
-      TIMESCALE_PRICES_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}:${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}
+      TIMESCALE_PRICES_DSN: postgresql://${TIMESCALE_USER:?set TIMESCALE_USER}@timescaledb:5432/${TIMESCALE_DB:?set TIMESCALE_DB}
       TIMESCALE_PRICES_POOL_MIN_SIZE: ${TIMESCALE_PRICES_POOL_MIN_SIZE:-1}
       TIMESCALE_PRICES_POOL_MAX_SIZE: ${TIMESCALE_PRICES_POOL_MAX_SIZE:-8}
       ASYNC_PRICE_WRITER_ENABLED: ${ASYNC_PRICE_WRITER_ENABLED:-1}
       ASYNC_PRICE_WRITER_QUEUE_MAXSIZE: ${ASYNC_PRICE_WRITER_QUEUE_MAXSIZE:-1024}
       ASYNC_PRICE_WRITER_BATCH_SIZE: ${ASYNC_PRICE_WRITER_BATCH_SIZE:-512}
       ASYNC_PRICE_WRITER_FLUSH_INTERVAL_S: ${ASYNC_PRICE_WRITER_FLUSH_INTERVAL_S:-0.25}
+      ASYNC_PRICE_WRITER_SPOOL_PATH: ${ASYNC_PRICE_WRITER_SPOOL_PATH:-}
+      ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES: ${ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES:-268435456}
+      ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS: ${ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS:-50}
       TELEMETRY_APPEND_BUFFER_MAX_BATCH: ${TELEMETRY_APPEND_BUFFER_MAX_BATCH:-256}
       TELEMETRY_APPEND_BUFFER_MAX_ROWS: ${TELEMETRY_APPEND_BUFFER_MAX_ROWS:-4096}
       TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S: ${TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S:-0.25}
@@ -200,17 +244,20 @@ services:
       PRICE_READ_BACKEND: ${PRICE_READ_BACKEND:-auto}
       TELEMETRY_READ_BACKEND: ${TELEMETRY_READ_BACKEND:-auto}
       LIVE_CACHE_BACKEND: ${LIVE_CACHE_BACKEND:-redis}
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
-      TS_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      REDIS_URL: redis://redis:6379/0
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      TS_REDIS_URL: redis://redis:6379/0
+      TS_REDIS_PASSWORD_FILE: /run/secrets/redis_password
       TS_REDIS_POOL_SIZE: ${TS_REDIS_POOL_SIZE:-32}
       TS_REDIS_CONNECT_TIMEOUT_S: ${TS_REDIS_CONNECT_TIMEOUT_S:-0.25}
       TS_REDIS_SOCKET_TIMEOUT_S: ${TS_REDIS_SOCKET_TIMEOUT_S:-0.25}
-      LIVE_CACHE_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      LIVE_CACHE_REDIS_URL: redis://redis:6379/0
+      LIVE_CACHE_REDIS_PASSWORD_FILE: /run/secrets/redis_password
       OBJECT_STORE_ENDPOINT: http://minio:9000
       OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:?set OBJECT_STORE_BUCKET}
       OBJECT_STORE_REGION: ${OBJECT_STORE_REGION:-}
-      OBJECT_STORE_ACCESS_KEY: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
-      OBJECT_STORE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      OBJECT_STORE_ACCESS_KEY_FILE: /run/secrets/minio_root_user
+      OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_password
       ARTIFACT_STORE_MIRROR_ROOT: /app/artifact_mirror
       TRAINING_DATASET_STORE_ROOT: /app/training_datasets
       TRAINING_DATASET_URI_PREFIX: minio://${OBJECT_STORE_BUCKET:?set OBJECT_STORE_BUCKET}/training-datasets
@@ -228,6 +275,11 @@ services:
       BACKUP_EVIDENCE_REQUIRE_SIGNATURE: ${BACKUP_EVIDENCE_REQUIRE_SIGNATURE:-1}
       BACKUP_EVIDENCE_HMAC_KEY_FILE: /run/secrets/backup_evidence_hmac_key
       PREFLIGHT_EXTERNAL_TIMEOUT_S: ${PREFLIGHT_EXTERNAL_TIMEOUT_S:-2.0}
+      TRADING_CLOCK_MAX_SKEW_MS: ${TRADING_CLOCK_MAX_SKEW_MS:-2000}
+      TRADING_CLOCK_REQUIRED_SOURCES: ${TRADING_CLOCK_REQUIRED_SOURCES:-system_or_https}
+      TRADING_CLOCK_HTTPS_TIME_URLS: ${TRADING_CLOCK_HTTPS_TIME_URLS:-https://www.google.com/generate_204,https://www.cloudflare.com/cdn-cgi/trace}
+      TRADING_CLOCK_REQUIRED_TIMEZONE: ${TRADING_CLOCK_REQUIRED_TIMEZONE:-UTC}
+      TRADING_CLOCK_CHECK_TIMEOUT_S: ${TRADING_CLOCK_CHECK_TIMEOUT_S:-1.5}
       PORTFOLIO_USE_RISK_ENGINE: ${PORTFOLIO_USE_RISK_ENGINE:-1}
       PORTFOLIO_RISK_USE_MONTE_CARLO: ${PORTFOLIO_RISK_USE_MONTE_CARLO:-1}
       MODEL_AWARE_KILL_SWITCH: ${MODEL_AWARE_KILL_SWITCH:-1}
@@ -261,6 +313,7 @@ services:
       USE_TS_FOUNDATION_FEATURES: ${USE_TS_FOUNDATION_FEATURES:-0}
       USE_GRAPH_RELATIONAL_FEATURES: ${USE_GRAPH_RELATIONAL_FEATURES:-0}
       LLM_FACTOR_DISCOVERY: ${LLM_FACTOR_DISCOVERY:-0}
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
       SHAP_LIVE_COMPUTE_ENABLED: ${SHAP_LIVE_COMPUTE_ENABLED:-0}
       INFERENCE_HEALTH_PROBE_ENABLED: ${INFERENCE_HEALTH_PROBE_ENABLED:-1}
       INFERENCE_HEALTH_PROBE_SYMBOLS: ${INFERENCE_HEALTH_PROBE_SYMBOLS:-AMD}
@@ -273,11 +326,11 @@ services:
       KILL_SWITCH_GLOBAL: ${KILL_SWITCH_GLOBAL:-1}
       POLYGON_REST_ENABLED: ${POLYGON_REST_ENABLED:-0}
       POLYGON_WS_ENABLED: ${POLYGON_WS_ENABLED:-0}
-      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
-      POLYGON_KEY: ${POLYGON_KEY:-}
+      POLYGON_API_KEY_FILE: /run/secrets/polygon_api_key
+      POLYGON_KEY_FILE: /run/secrets/polygon_api_key
       YFINANCE_ENABLED: ${YFINANCE_ENABLED:-1}
       TRADIER_ENABLED: ${TRADIER_ENABLED:-0}
-      TRADIER_API_TOKEN: ${TRADIER_API_TOKEN:-}
+      TRADIER_API_TOKEN_FILE: /run/secrets/tradier_api_token
       OPTIONS_PROVIDER_CHAIN: ${OPTIONS_PROVIDER_CHAIN:-}
       OPTIONS_SYMBOL_LIMIT: ${OPTIONS_SYMBOL_LIMIT:-}
       OPTIONS_CRITICAL_SYMBOLS: ${OPTIONS_CRITICAL_SYMBOLS:-DIA,SPY,QQQ,IWM}
@@ -286,24 +339,35 @@ services:
       BROKER: ${BROKER:-ibkr}
       BROKER_FAILOVER: ${BROKER_FAILOVER:-ibkr}
       ALPACA_BASE_URL: ${ALPACA_BASE_URL:-https://api.alpaca.markets}
-      ALPACA_KEY_ID: ${ALPACA_KEY_ID:-}
-      ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
+      ALPACA_KEY_ID_FILE: /run/secrets/alpaca_key_id
+      ALPACA_SECRET_KEY_FILE: /run/secrets/alpaca_secret_key
       IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
       IBKR_PORT: ${IBKR_PORT:-7497}
       IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-42}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "${DASHBOARD_PUBLIC_PORT:-8000}:8000"
+      - "${DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${DASHBOARD_PUBLIC_PORT:-8000}:8000"
     volumes:
-      - trading-data:/app/data
-      - trading-logs:/app/logs
-      - artifact-mirror:/app/artifact_mirror
-      - training-datasets:/app/training_datasets
-      - ${TRADING_BACKUP_ROOT:-/var/backups/trading}:/var/backups/trading:ro
+      - ${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:/app/data
+      - ${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:/app/logs
+      - ${TRADING_ARTIFACT_MIRROR:?set TRADING_ARTIFACT_MIRROR to a ZFS-backed host path}:/app/artifact_mirror
+      - ${TRADING_TRAINING_DATASETS:?set TRADING_TRAINING_DATASETS to a ZFS-backed host path}:/app/training_datasets
+      - ${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:/var/backups/trading:ro
     secrets:
+      - timescale_password
+      - redis_password
+      - minio_root_user
+      - minio_root_password
+      - dashboard_api_token
+      - operator_api_token
       - data_source_master_key
       - backup_evidence_hmac_key
+      - polygon_api_key
+      - tradier_api_token
+      - alpaca_key_id
+      - alpaca_secret_key
+      - openai_api_key
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -319,6 +383,9 @@ services:
         - |
           import os, sys, urllib.request
           token = str(os.environ.get("DASHBOARD_API_TOKEN", "") or "").strip()
+          token_file = str(os.environ.get("DASHBOARD_API_TOKEN_FILE", "") or "").strip()
+          if not token and token_file:
+              token = open(token_file, "r", encoding="utf-8").read().strip()
           headers = {"X-API-Token": token} if token else {}
           req = urllib.request.Request("http://127.0.0.1:8000/api/readiness", headers=headers)
           with urllib.request.urlopen(req, timeout=5) as resp:
@@ -409,17 +476,19 @@ services:
       OBJECT_STORE_ENDPOINT: ${OFFLINE_OBJECT_STORE_ENDPOINT:-}
       OBJECT_STORE_BUCKET: ${OFFLINE_OBJECT_STORE_BUCKET:-}
       OBJECT_STORE_REGION: ${OFFLINE_OBJECT_STORE_REGION:-}
-      OBJECT_STORE_ACCESS_KEY: ${OFFLINE_OBJECT_STORE_ACCESS_KEY:-}
-      OBJECT_STORE_SECRET_KEY: ${OFFLINE_OBJECT_STORE_SECRET_KEY:-}
+      OBJECT_STORE_ACCESS_KEY_FILE: /run/secrets/minio_root_user
+      OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_password
       ARTIFACT_STORE_MIRROR_ROOT: /app/offline-artifact_mirror
       TRAINING_DATASET_STORE_ROOT: /app/offline-training_datasets
     volumes:
-      - offline-data:/app/offline-data
-      - offline-artifact-mirror:/app/offline-artifact_mirror
-      - offline-training-datasets:/app/offline-training_datasets
-      - trading-logs:/app/logs
+      - ${TRADING_OFFLINE_DATA:?set TRADING_OFFLINE_DATA to a ZFS-backed host path}:/app/offline-data
+      - ${TRADING_OFFLINE_ARTIFACT_MIRROR:?set TRADING_OFFLINE_ARTIFACT_MIRROR to a ZFS-backed host path}:/app/offline-artifact_mirror
+      - ${TRADING_OFFLINE_TRAINING_DATASETS:?set TRADING_OFFLINE_TRAINING_DATASETS to a ZFS-backed host path}:/app/offline-training_datasets
+      - ${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:/app/logs
     secrets:
       - data_source_master_key
+      - minio_root_user
+      - minio_root_password
     networks:
       - trading-external
 
@@ -444,8 +513,8 @@ services:
       DASHBOARD_BASE: http://runtime:8000
       DASHBOARD_HOST: runtime
       DASHBOARD_PORT: 8000
-      DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:?set DASHBOARD_API_TOKEN}
-      OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:?set OPERATOR_API_TOKEN}
+      DASHBOARD_API_TOKEN_FILE: /run/secrets/dashboard_api_token
+      OPERATOR_API_TOKEN_FILE: /run/secrets/operator_api_token
       OPERATOR_ALLOWED_ORIGIN: ${OPERATOR_ALLOWED_ORIGIN:-http://127.0.0.1:8000}
       TRADING_LOGS: /app/logs
       TRADING_DATA: /app/data
@@ -453,8 +522,11 @@ services:
     expose:
       - "4001"
     volumes:
-      - trading-data:/app/data
-      - trading-logs:/app/logs
+      - ${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:/app/data
+      - ${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:/app/logs
+    secrets:
+      - dashboard_api_token
+      - operator_api_token
     depends_on:
       runtime:
         condition: service_healthy
@@ -465,7 +537,9 @@ services:
         - -e
         - |
           const http = require("http");
-          const token = String(process.env.OPERATOR_API_TOKEN || "");
+          const fs = require("fs");
+          const tokenFile = String(process.env.OPERATOR_API_TOKEN_FILE || "");
+          const token = String(process.env.OPERATOR_API_TOKEN || (tokenFile ? fs.readFileSync(tokenFile, "utf8") : "") || "").trim();
           const req = http.get({
             hostname: "127.0.0.1",
             port: 4001,
@@ -487,17 +561,30 @@ networks:
   trading-external:
     name: trading-external
 
-volumes:
-  trading-data:
-  trading-logs:
-  artifact-mirror:
-  training-datasets:
-  offline-data:
-  offline-artifact-mirror:
-  offline-training-datasets:
-
 secrets:
+  timescale_password:
+    file: ${TIMESCALE_PASSWORD_FILE:?set TIMESCALE_PASSWORD_FILE}
+  redis_password:
+    file: ${REDIS_PASSWORD_FILE:?set REDIS_PASSWORD_FILE}
+  minio_root_user:
+    file: ${MINIO_ROOT_USER_FILE:?set MINIO_ROOT_USER_FILE}
+  minio_root_password:
+    file: ${MINIO_ROOT_PASSWORD_FILE:?set MINIO_ROOT_PASSWORD_FILE}
+  dashboard_api_token:
+    file: ${DASHBOARD_API_TOKEN_FILE:?set DASHBOARD_API_TOKEN_FILE}
+  operator_api_token:
+    file: ${OPERATOR_API_TOKEN_FILE:?set OPERATOR_API_TOKEN_FILE}
   data_source_master_key:
     file: ${DATA_SOURCE_MASTER_KEY_FILE:?set DATA_SOURCE_MASTER_KEY_FILE}
   backup_evidence_hmac_key:
     file: ${BACKUP_EVIDENCE_HMAC_KEY_FILE:?set BACKUP_EVIDENCE_HMAC_KEY_FILE}
+  polygon_api_key:
+    file: ${POLYGON_API_KEY_FILE:-/dev/null}
+  tradier_api_token:
+    file: ${TRADIER_API_TOKEN_FILE:-/dev/null}
+  alpaca_key_id:
+    file: ${ALPACA_KEY_ID_FILE:-/dev/null}
+  alpaca_secret_key:
+    file: ${ALPACA_SECRET_KEY_FILE:-/dev/null}
+  openai_api_key:
+    file: ${OPENAI_API_KEY_FILE:-/dev/null}

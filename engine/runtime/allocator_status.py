@@ -169,7 +169,7 @@ def get_allocator_status(*, window_days: int = 0) -> Dict[str, Any]:
             if r:
                 out["alpha_decay"]["ts_ms"] = int(r[0] or 0)
                 out["alpha_decay"]["status"] = str(r[1] or "ok")
-                out["alpha_decay"]["min_throttle_mult"] = float(r[2] or 1.0)
+                out["alpha_decay"]["min_throttle_mult"] = _safe_float(r[2], 1.0)
                 out["alpha_decay"]["severe_count"] = int(r[3] or 0)
                 out["alpha_decay"]["warn_count"] = int(r[4] or 0)
 
@@ -233,7 +233,7 @@ def get_allocator_status(*, window_days: int = 0) -> Dict[str, Any]:
                     "structural_break_z": float(r[5] or 0.0),
                     "severity": str(r[6] or "ok"),
                     "severity_score": float(r[7] or 0.0),
-                    "throttle_mult": float(r[8] or 1.0),
+                    "throttle_mult": _safe_float(r[8], 1.0),
                     "n_obs": int(r[9] or 0),
                     "detail": detail,
                 })

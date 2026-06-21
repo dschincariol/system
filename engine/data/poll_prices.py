@@ -67,7 +67,7 @@ from engine.runtime.logging import get_logger, log_event
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.runtime_meta import meta_get, meta_set, meta_set_if_missing
 from engine.runtime.lifecycle_state import LIVE, WARMING_UP, set_state
-from engine.runtime.price_router import publish_price_events
+from engine.runtime.price_router import price_persistence_backpressure_status, publish_price_events
 from engine.runtime.telemetry_append_buffer import (
     enqueue_ingest_slippage_rows,
     enqueue_price_provider_health,
@@ -221,7 +221,7 @@ def _enqueue_provider_auxiliary_rows(
             for row in raw_quote_rows
         ]
         try:
-            publish_price_events(
+            publish_counts = publish_price_events(
                 raw_events,
                 con=None,
                 write_prices=False,
@@ -231,6 +231,17 @@ def _enqueue_provider_auxiliary_rows(
                 component="engine.data.poll_prices",
                 job=JOB_NAME,
             )
+            async_status = price_persistence_backpressure_status(publish_counts)
+            if bool(async_status.get("backpressure")):
+                ok = False
+                reason = str(async_status.get("reason") or "async_price_writer_backpressure")
+                _log_nonfatal(
+                    "poll_prices_provider_raw_async_backpressure",
+                    RuntimeError(reason),
+                    warn_key="poll_prices_provider_raw_async_backpressure",
+                    raw_rows=int(len(raw_quote_rows)),
+                    async_persistence=async_status,
+                )
         except Exception as e:
             ok = False
             _log_nonfatal(
@@ -1957,8 +1968,15 @@ def main() -> None:
                 pipeline_dedup_drops = int(publish_counts.get("dedup_drops") or 0)
                 pipeline_gap_events = int(publish_counts.get("gap_events") or 0)
                 pipeline_normalization_failures = int(publish_counts.get("normalization_failures") or 0)
+                async_status = price_persistence_backpressure_status(publish_counts)
+                async_backpressure = bool(async_status.get("backpressure"))
+                if merged_write_ok and async_backpressure:
+                    if not pipeline_error:
+                        pipeline_error = str(async_status.get("reason") or "async_price_writer_backpressure")
+                    fail_s = min(FAIL_MAX_S, fail_s * 2.0 if fail_s else FAIL_BASE_S)
                 pipeline_ok = bool(
                     merged_write_ok and (pipeline_price_rows > 0 or pipeline_quote_rows > 0 or pipeline_raw_rows > 0)
+                    and not async_backpressure
                 )
 
                 if merged_write_ok:
@@ -2056,6 +2074,13 @@ def main() -> None:
                     _log_nonfatal("poll_prices_manager_close_failed", e)
         except Exception as e:
             _log_nonfatal("poll_prices_manager_close_loop_failed", e)
+
+        try:
+            from engine.runtime.async_writer import shutdown_async_writer
+
+            shutdown_async_writer(timeout_s=5.0)
+        except Exception as e:
+            _log_nonfatal("poll_prices_async_writer_shutdown_failed", e)
 
         if _uses_price_feed_lock() and have_price_feed_lock:
             try:

@@ -484,12 +484,26 @@ def _ingestion_writer_diagnostics() -> Dict[str, object]:
                 component="engine.runtime.ingestion_runtime",
                 job=JOB_NAME,
             )
+            emit_gauge(
+                "ingestion_async_price_writer_spool_pending_bytes",
+                _safe_int(async_snapshot.get("spool_pending_bytes"), 0),
+                component="engine.runtime.ingestion_runtime",
+                job=JOB_NAME,
+            )
             if _queue_pressure(async_snapshot):
                 reasons.append("async_price_writer_queue_pressure")
+            if float(async_snapshot.get("spool_bytes_fill_ratio") or 0.0) >= 0.80:
+                reasons.append("async_price_writer_spool_byte_pressure")
+            if bool(async_snapshot.get("backpressure_active")):
+                reasons.append("async_price_writer_backpressure")
             if _safe_int(async_snapshot.get("dropped_rows"), 0) > 0:
                 reasons.append("async_price_writer_dropped_rows")
+            if _safe_int(async_snapshot.get("residual_dropped_rows"), 0) > 0:
+                reasons.append("async_price_writer_residual_dropped_rows")
             if _safe_int(async_snapshot.get("dead_letters"), 0) > 0:
                 reasons.append("async_price_writer_dead_letters")
+            if _safe_int(async_snapshot.get("spool_corruption_events"), 0) > 0:
+                reasons.append("async_price_writer_spool_corruption")
     except Exception as e:
         _warn_failure("INGESTION_RUNTIME_ASYNC_WRITER_SNAPSHOT_FAILED", e)
         diagnostics["async_price_writer"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}

@@ -156,6 +156,62 @@ def test_replay_day_handles_partial_day_and_malformed_json(
     assert "risk_history_missing" in codes
 
 
+def test_replay_day_prefers_price_bars_and_preserves_ohlc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "price-bars.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE price_bars (
+              ts_ms INTEGER NOT NULL,
+              symbol TEXT NOT NULL,
+              tf_s INTEGER NOT NULL,
+              o REAL NOT NULL,
+              h REAL NOT NULL,
+              l REAL NOT NULL,
+              c REAL NOT NULL,
+              v REAL
+            );
+            CREATE TABLE price_quotes (
+              ts_ms INTEGER NOT NULL,
+              symbol TEXT NOT NULL,
+              last REAL,
+              volume REAL
+            );
+            """
+        )
+        con.executemany(
+            "INSERT INTO price_bars(ts_ms, symbol, tf_s, o, h, l, c, v) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (BASE_TS_MS, "SPY", 60, 100.0, 110.0, 95.0, 106.0, 10.0),
+                (BASE_TS_MS + 60_000, "SPY", 60, 106.0, 108.0, 99.0, 101.0, 11.0),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO price_quotes(ts_ms, symbol, last, volume) VALUES (?, ?, ?, ?)",
+            [
+                (BASE_TS_MS, "SPY", 1.0, 1.0),
+                (BASE_TS_MS + 60_000, "SPY", 2.0, 1.0),
+            ],
+        )
+
+    payload = _payload(monkeypatch, db_path, tf="1m")
+
+    assert payload["meta"]["ready"] is True
+    assert payload["meta"]["counts"]["candles"] == 2
+    assert payload["meta"]["sources"]["price"]["source"] == "price_bars"
+    assert payload["candles"][0]["open"] == 100.0
+    assert payload["candles"][0]["high"] == 110.0
+    assert payload["candles"][0]["low"] == 95.0
+    assert payload["candles"][0]["close"] == 106.0
+    assert payload["candles"][0]["volume"] == 10.0
+    assert payload["candles"][0]["source"] == "price_bars"
+    assert payload["candles"][0]["close"] != 1.0
+    assert "no_price_data" not in _gap_codes(payload)
+
+
 def test_replay_day_handles_full_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_path = tmp_path / "full.db"
     with sqlite3.connect(str(db_path)) as con:

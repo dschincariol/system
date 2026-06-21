@@ -13,10 +13,34 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+DEFAULT_TEST_TMP_ROOT = Path("/var/tmp") / f"trading-system-tests-{os.getuid()}" / "pytest"
+
+
+def _configure_disk_backed_test_tmp() -> Path:
+    configured = os.environ.get("TRADING_TEST_TMPDIR")
+    tmp_root = Path(configured).expanduser() if configured else DEFAULT_TEST_TMP_ROOT
+    if not tmp_root.is_absolute():
+        tmp_root = ROOT / tmp_root
+    tmp_root = tmp_root.resolve()
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    for key in ("TMPDIR", "TEMP", "TMP", "PYTEST_DEBUG_TEMPROOT"):
+        os.environ[key] = str(tmp_root)
+    os.environ.setdefault("TRADING_TEST_TMPDIR", str(tmp_root))
+    return tmp_root
+
+
+TEST_TMP_ROOT = _configure_disk_backed_test_tmp()
+
 from engine.runtime.test_isolation import (  # noqa: E402
     apply_runtime_test_defaults,
     cleanup_runtime_test_state,
     reset_runtime_test_env,
+)
+from engine.runtime.test_network_isolation import (  # noqa: E402
+    install_socket_guard,
+    live_network_opt_in_enabled,
+    set_external_network_allowed_for_current_test,
+    uninstall_socket_guard,
 )
 
 apply_runtime_test_defaults()
@@ -29,7 +53,13 @@ os.environ.setdefault("TS_PG_CONNECT_TIMEOUT", "1")
 
 
 def pytest_configure(config):
+    install_socket_guard()
     config.addinivalue_line("markers", "linux_only: test runs only on Linux")
+    config.addinivalue_line(
+        "markers",
+        "live_network: test intentionally contacts non-local live services; "
+        "deselected unless TRADING_TEST_ALLOW_LIVE_NETWORK=1",
+    )
     config.addinivalue_line(
         "markers",
         "requires_postgres: test needs a reachable Postgres instance "
@@ -40,6 +70,26 @@ def pytest_configure(config):
         "requires_redis: test needs a reachable Redis instance at "
         "TS_REDIS_URL; auto-skipped when unreachable",
     )
+
+
+def pytest_unconfigure(config):
+    uninstall_socket_guard()
+
+
+def pytest_collection_modifyitems(config, items):
+    if live_network_opt_in_enabled():
+        return
+    selected = []
+    deselected = []
+    for item in items:
+        if "live_network" in item.keywords:
+            deselected.append(item)
+        else:
+            selected.append(item)
+    if not deselected:
+        return
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 def _probe_tcp(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -116,7 +166,11 @@ def _redis_reachable() -> bool:
     return _probe_tcp(host, port)
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
+    set_external_network_allowed_for_current_test(
+        bool("live_network" in item.keywords and live_network_opt_in_enabled())
+    )
     keywords = item.keywords
     if "linux_only" in keywords and sys.platform != "linux":
         pytest.skip("linux-only test")
@@ -124,6 +178,11 @@ def pytest_runtest_setup(item):
         pytest.skip("postgres not reachable at TS_PG_DSN")
     if "requires_redis" in keywords and not _redis_reachable():
         pytest.skip("redis not reachable at TS_REDIS_URL")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    set_external_network_allowed_for_current_test(False)
 
 
 @pytest.fixture(autouse=True)

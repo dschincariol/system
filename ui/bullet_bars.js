@@ -5,22 +5,28 @@
 
   Accessible bullet bars for operator risk headroom. The module is DOM-light:
   view-model functions are pure, and renderBulletBars only writes into a caller
-  supplied mount element.
+  supplied mount element. Band, status, and default cap thresholds are shared
+  through risk_headroom_thresholds.js.
 */
 
-const DEFAULT_BANDS = Object.freeze([
-  Object.freeze({ key: "ok", label: "OK", start: 0.0, end: 0.75 }),
-  Object.freeze({ key: "watch", label: "Watch", start: 0.75, end: 1.0 }),
-  Object.freeze({ key: "over", label: "Over", start: 1.0, end: 1.25 }),
-]);
-const TRACK_MAX_RATIO = 1.25;
+import {
+  DEFAULT_RISK_CAPS,
+  RISK_HEADROOM_BANDS,
+  RISK_HEADROOM_TRACK_MAX_RATIO,
+  classifyRiskHeadroomRatio,
+} from "./risk_headroom_thresholds.js";
 
-export const DEFAULT_RISK_CAPS = Object.freeze({
-  gross: 1.0,
-  net: 0.6,
-  drawdown: 0.06,
-  vol: 0.02,
-});
+export {
+  DEFAULT_RISK_CAPS,
+  RISK_HEADROOM_BANDS,
+  RISK_HEADROOM_CAP_RATIO,
+  RISK_HEADROOM_THRESHOLDS,
+  RISK_HEADROOM_TRACK_MAX_RATIO,
+  classifyRiskHeadroomRatio,
+} from "./risk_headroom_thresholds.js";
+
+const DEFAULT_BANDS = RISK_HEADROOM_BANDS;
+const TRACK_MAX_RATIO = RISK_HEADROOM_TRACK_MAX_RATIO;
 
 function asObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -73,9 +79,20 @@ function formatSignedPercent(value, digits = 1) {
   return `${pct.toFixed(digits)}%`;
 }
 
-function latestRiskRow(portfolioRisk) {
+export function latestRiskRow(portfolioRisk) {
   const history = asArray(asObject(portfolioRisk).history);
-  return asObject(history[0]);
+  let latest = {};
+  let latestTs = -Infinity;
+  let hasTimestamp = false;
+  for (const row of history) {
+    const item = asObject(row);
+    const ts = numOrNull(item.ts_ms);
+    if (ts == null || ts < latestTs) continue;
+    hasTimestamp = true;
+    latest = item;
+    latestTs = ts;
+  }
+  return hasTimestamp ? asObject(latest) : asObject(history[0]);
 }
 
 function riskSummary(portfolioRisk) {
@@ -144,19 +161,7 @@ export function buildBulletBarViewModel(config = {}) {
   let tone = "unavailable";
   let statusWord = "Unavailable";
   if (!missing) {
-    if (blocked) {
-      tone = "blocked";
-      statusWord = "Blocked";
-    } else if (ratio > 1.0) {
-      tone = "over";
-      statusWord = "Over cap";
-    } else if (ratio >= 0.85) {
-      tone = "watch";
-      statusWord = "Watch";
-    } else {
-      tone = "ok";
-      statusWord = "OK";
-    }
+    ({ tone, statusWord } = classifyRiskHeadroomRatio(ratio, blocked));
   }
 
   const valueFormatter = typeof config.valueFormatter === "function" ? config.valueFormatter : formatPercent;

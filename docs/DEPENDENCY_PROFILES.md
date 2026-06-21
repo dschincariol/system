@@ -24,6 +24,9 @@ python -m pip install -r requirements.txt
 It does not include `pynvml`, `nvidia-ml-py`, any `nvidia-*` package, or the
 CUDA PyTorch wheel. The CPU base profile uses `xgboost-cpu` so a normal Linux
 install does not pull `nvidia-nccl-cu12` through the default XGBoost package.
+Postgres access is standardized on psycopg 3.x (`psycopg[binary,pool]` plus
+`psycopg-pool`); do not add `psycopg2` or `psycopg2-binary` to any dependency
+profile.
 
 ## Profiles
 

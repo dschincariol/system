@@ -6,10 +6,12 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 LOOPBACK_HOST = "127.0.0.1"
 LOCALHOST_NAME = "localhost"
 LOOPBACK_HOSTS = frozenset({LOOPBACK_HOST, "::1", LOCALHOST_NAME})
+POSTGRES_URL_SCHEMES = frozenset({"postgres", "postgresql", "timescale", "timescaledb"})
 DEFAULT_DASHBOARD_HOST = LOOPBACK_HOST
 DEFAULT_DASHBOARD_DEV_PORT = 8000
 DEFAULT_IBKR_HOST = LOOPBACK_HOST
@@ -183,8 +185,53 @@ def pg_password_secret_name(user: str | None = None) -> str:
     return "pg_password_app"
 
 
+def _load_text_file(path: str) -> str:
+    return Path(path).expanduser().read_text(encoding="utf-8").strip()
+
+
+def _load_pg_password_file(user: str | None = None) -> str:
+    role = pg_password_secret_name(user).removeprefix("pg_password_").upper()
+    for name in (
+        "TS_PG_PASSWORD_FILE",
+        "TIMESCALE_PASSWORD_FILE",
+        f"TS_PG_PASSWORD_{role}_FILE",
+        f"TS_PG_{role}_PASSWORD_FILE",
+        "PGPASSWORD_FILE",
+    ):
+        path = str(os.environ.get(name) or "").strip()
+        if path:
+            return _load_text_file(path)
+    return ""
+
+
+def _load_pg_password_secret_ref(user: str | None = None) -> str:
+    role = pg_password_secret_name(user).removeprefix("pg_password_").upper()
+    for name in (
+        "TS_PG_PASSWORD_SECRET",
+        "TIMESCALE_PASSWORD_SECRET",
+        f"TS_PG_PASSWORD_{role}_SECRET",
+        f"TS_PG_{role}_PASSWORD_SECRET",
+        "PGPASSWORD_SECRET",
+    ):
+        secret_name = str(os.environ.get(name) or "").strip()
+        if not secret_name:
+            continue
+        from services.secrets.loader import load_secret
+
+        return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+    return ""
+
+
 def _load_pg_password(user: str | None = None) -> str:
-    configured = str(os.environ.get("TS_PG_PASSWORD") or "").strip()
+    configured_file = _load_pg_password_file(user)
+    if configured_file:
+        return configured_file
+
+    configured_secret = _load_pg_password_secret_ref(user)
+    if configured_secret:
+        return configured_secret
+
+    configured = str(os.environ.get("TS_PG_PASSWORD") or os.environ.get("TIMESCALE_PASSWORD") or "").strip()
     if configured:
         return configured
 
@@ -230,6 +277,39 @@ def dsn_with_pg_password(conninfo: str) -> str:
     user = _dsn_user(raw)
     password = _load_pg_password(user)
     return f"{raw} password={_dsn_value(password)}".strip()
+
+
+def _url_with_pg_password(conninfo: str) -> str:
+    raw = str(conninfo or "").strip()
+    if not raw:
+        return raw
+    parsed = urlsplit(raw)
+    if parsed.password or not parsed.scheme or parsed.scheme.lower() not in POSTGRES_URL_SCHEMES or not parsed.hostname:
+        return raw
+    user = str(parsed.username or default_pg_user())
+    password = _load_pg_password(user)
+    if not password:
+        return raw
+    host = str(parsed.hostname or "")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    auth = f"{quote(user, safe='')}:{quote(password, safe='')}@"
+    return urlunsplit((parsed.scheme, auth + host, parsed.path, parsed.query, parsed.fragment))
+
+
+def connection_info_with_pg_password(conninfo: str) -> str:
+    raw = str(conninfo or "").strip()
+    if not raw:
+        return raw
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return dsn_with_pg_password(raw)
+    if parsed.scheme and parsed.scheme.lower() in POSTGRES_URL_SCHEMES:
+        return _url_with_pg_password(raw)
+    return dsn_with_pg_password(raw)
 
 
 def _pg_port(default: str) -> str:

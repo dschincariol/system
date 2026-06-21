@@ -36,11 +36,11 @@
     su trading trading
 }
 
-/var/lib/docker/volumes/*trading-logs*/_data/*.log
-/var/lib/docker/volumes/*trading-logs*/_data/*.out
-/var/lib/docker/volumes/*trading-logs*/_data/*.err
-/var/lib/docker/volumes/*trading-logs*/_data/*.jsonl
-/var/lib/docker/volumes/*trading-data*/_data/ai_operator_log.jsonl {
+/zpool/trading/runtime/logs/*.log
+/zpool/trading/runtime/logs/*.out
+/zpool/trading/runtime/logs/*.err
+/zpool/trading/runtime/logs/*.jsonl
+/zpool/trading/runtime/data/ai_operator_log.jsonl {
     daily
     maxsize 50M
     rotate 10
@@ -50,5 +50,6 @@
     compress
     delaycompress
     copytruncate
-    su root root
+    create 0640 trading trading
+    su trading trading
 }

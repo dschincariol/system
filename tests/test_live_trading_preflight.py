@@ -14,6 +14,19 @@ from engine.runtime.live_trading_preflight import (
 )
 
 
+GOOD_CLOCK_HEALTH = {
+    "ok": True,
+    "required": True,
+    "mode": "live",
+    "reason": "ok",
+    "blockers": [],
+    "healthy_sources": ["chronyc"],
+    "skew_sources": ["chronyc"],
+    "max_observed_skew_ms": 1.0,
+    "timezone": {"ok": True, "required_timezone": "UTC", "actual_timezone": "UTC"},
+}
+
+
 def _sign_backup_evidence(payload: dict, key: str, *, key_id: str = "live-test-key") -> dict:
     signed = dict(payload)
     signed.pop("signature", None)
@@ -65,12 +78,40 @@ def fresh_backup_restore_evidence(monkeypatch, tmp_path):
             _sign_backup_evidence(
                 {
                     "schema_version": 1,
+                    "generated_at": (
+                        datetime.fromtimestamp(now, tz=timezone.utc)
+                        .replace(microsecond=0)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    ),
                     "generated_at_ts": now,
                     "status": "pass",
-                    "base_backup": {"status": "pass", "verified_at_ts": now},
-                    "wal_archive": {"status": "pass", "verified_at_ts": now},
+                    "base_backup": {
+                        "status": "pass",
+                        "backup_dir": "/var/backups/trading/base/base_20260617",
+                        "verify_log": "/var/backups/trading/base/base_20260617/pg_verifybackup.out",
+                        "verified_at_ts": now,
+                    },
+                    "wal_archive": {
+                        "status": "pass",
+                        "wal_file": "/var/backups/trading/wal/0000000100000000000000AA",
+                        "verified_at_ts": now,
+                    },
+                    "wal_archiver": {
+                        "status": "pass",
+                        "source": "pg_stat_archiver",
+                        "archive_mode": "on",
+                        "archive_command": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
+                        "archived_count": 10,
+                        "last_archived_wal": "0000000100000000000000AA",
+                        "last_archived_at_ts": now,
+                        "failed_count": 0,
+                        "last_failed_wal": "",
+                        "last_failed_at_ts": None,
+                    },
                     "restore_drill": {
                         "status": "pass",
+                        "report": "/var/backups/trading/drills/restore_drill_20260617.txt",
                         "verified_at_ts": now,
                         "time_to_recover_s": 60,
                     },
@@ -86,6 +127,25 @@ def fresh_backup_restore_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("BACKUP_EVIDENCE_RPO_S", "3600")
     monkeypatch.setenv("BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S", "3600")
     monkeypatch.setenv("BACKUP_EVIDENCE_RTO_S", "300")
+    import engine.runtime.live_trading_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "wal_archiver_runtime_snapshot",
+        lambda *, engine_mode=None, required=None, now_ts=None: {
+            "ok": True,
+            "required": engine_mode == "live",
+            "reason": "ok",
+            "blockers": [],
+            "warnings": [],
+            "archive_mode": "on",
+            "archive_command": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
+            "last_archived_wal": "0000000100000000000000AA",
+            "age_s": 1,
+            "failed_count": 0,
+        },
+    )
+    monkeypatch.setattr(preflight, "clock_health_snapshot", lambda *, engine_mode=None: dict(GOOD_CLOCK_HEALTH))
     monkeypatch.setenv("EXECUTION_MODE", "live")
     monkeypatch.setenv("KILL_SWITCH_GLOBAL", "1")
     monkeypatch.setenv("LIVE_TRADING_REQUIRE_CONFIRMATION", "1")
@@ -148,6 +208,7 @@ def _set_live_broker_contract(
     monkeypatch.setenv("BROKER_NAME", broker)
     monkeypatch.setenv("LIVE_BROKER", broker)
     monkeypatch.setenv("BROKER_FAILOVER", broker)
+    monkeypatch.setenv("BROKER_SHUTDOWN_POLICY", "cancel_only")
     if broker == "alpaca":
         monkeypatch.setenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
         if credentials:
@@ -312,6 +373,38 @@ def test_live_trading_preflight_accepts_explicit_live_acknowledgement(monkeypatc
     assert state["ok"] is True
     assert state["blockers"] == []
     assert state["live_ai_safety"]["ok"] is True
+    assert state["clock_health"]["ok"] is True
+
+
+def test_live_trading_preflight_blocks_unsynchronized_clock(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    _set_live_broker_contract(monkeypatch)
+    import engine.runtime.live_trading_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "clock_health_snapshot",
+        lambda *, engine_mode=None: {
+            "ok": False,
+            "required": True,
+            "mode": engine_mode or "live",
+            "reason": "clock_unsynchronized",
+            "blockers": ["clock_unsynchronized"],
+            "sources": [{"name": "timedatectl", "available": True, "synchronized": False}],
+        },
+    )
+
+    state = live_trading_preflight(
+        engine_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="live-token-1234567890",
+        live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
+    )
+
+    assert state["ok"] is False
+    assert "clock_unsynchronized" in state["blockers"]
+    assert state["clock_health"]["reason"] == "clock_unsynchronized"
 
 
 def test_live_trading_preflight_rejects_disabled_decision_gate(monkeypatch):
@@ -1081,6 +1174,40 @@ def test_live_trading_preflight_blocks_tampered_signed_backup_evidence(monkeypat
     assert state["ok"] is False
     assert "backup_evidence_signature_invalid" in state["blockers"]
     assert state["backup_restore_evidence"]["signature"]["status"] == "invalid"
+
+
+def test_live_trading_preflight_blocks_runtime_wal_archiver_failure(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    _set_live_broker_contract(monkeypatch)
+    import engine.runtime.live_trading_preflight as preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "wal_archiver_runtime_snapshot",
+        lambda *, engine_mode=None, required=None, now_ts=None: {
+            "ok": False,
+            "required": True,
+            "reason": "wal_archiver_failure_unrecovered",
+            "blockers": ["wal_archiver_failure_unrecovered"],
+            "warnings": [],
+            "archive_mode": "on",
+            "archive_command": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
+            "last_archived_wal": "0000000100000000000000AA",
+            "failed_count": 1,
+        },
+    )
+
+    state = live_trading_preflight(
+        engine_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="live-token-1234567890",
+        live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
+    )
+
+    assert state["ok"] is False
+    assert "wal_archiver_failure_unrecovered" in state["blockers"]
+    assert state["wal_archiver_runtime"]["required"] is True
 
 
 def test_live_trading_preflight_blocks_missing_position_reconcile_evidence(monkeypatch):

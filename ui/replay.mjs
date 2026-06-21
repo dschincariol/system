@@ -3,6 +3,18 @@
 import { renderChartAccessibility } from "./chart_a11y.js";
 import { chartMarkerStyle, statusToken } from "./utils.js";
 
+const CHART_COLORS = Object.freeze({
+  bg: "#0a0d12",
+  border: "#30363d",
+  grid: "#20252c",
+  axis: "#9da7b1",
+  wick: "#9da7b1",
+  up: statusToken("info").color,
+  down: statusToken("crit").color,
+  neutral: statusToken("neutral").color,
+  selected: "rgba(255,255,255,.55)",
+});
+
 const STATE = {
   payload: null,
   selectedIndex: 0,
@@ -56,6 +68,11 @@ function _fmtTime(tsMs) {
   }
 }
 
+function _fmtOhlc(candle) {
+  if (!candle) return "-";
+  return `O ${_fmtNum(candle.open, 2)} / H ${_fmtNum(candle.high, 2)} / L ${_fmtNum(candle.low, 2)} / C ${_fmtNum(candle.close, 2)}`;
+}
+
 function _todayLocalISO() {
   const d = new Date();
   const y = d.getFullYear();
@@ -70,9 +87,11 @@ function _normalizeCandle(row) {
   const close = _num(row.close ?? row.c ?? row.price ?? row.value, null);
   if (!ts || !Number.isFinite(close)) return null;
   const open = _num(row.open ?? row.o, close);
-  const high = _num(row.high ?? row.h, Math.max(open, close));
-  const low = _num(row.low ?? row.l, Math.min(open, close));
-  return {
+  const rawHigh = _num(row.high ?? row.h, Math.max(open, close));
+  const rawLow = _num(row.low ?? row.l, Math.min(open, close));
+  const high = Math.max(rawHigh, open, close);
+  const low = Math.min(rawLow, open, close);
+  const normalized = {
     ...row,
     ts_ms: ts,
     t: Math.floor(ts / 1000),
@@ -82,6 +101,12 @@ function _normalizeCandle(row) {
     close,
     volume: _num(row.volume ?? row.v, 0) || 0,
   };
+  if (high !== rawHigh || low !== rawLow) {
+    normalized.raw_high = rawHigh;
+    normalized.raw_low = rawLow;
+    normalized.ohlc_corrected = true;
+  }
+  return normalized;
 }
 
 function _normalizeEvent(row, kind) {
@@ -148,6 +173,29 @@ function _nearby(rows, selectedTsMs, windowMs = 15 * 60 * 1000) {
     })
     .sort((a, b) => Math.abs(a.ts_ms - selectedTsMs) - Math.abs(b.ts_ms - selectedTsMs))
     .slice(0, 12);
+}
+
+function _clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function _hexToRgba(hex, alpha = 1) {
+  const match = String(hex || "").match(/^#([0-9a-f]{6})$/i);
+  if (!match) return String(hex || "");
+  const raw = match[1];
+  const r = Number.parseInt(raw.slice(0, 2), 16);
+  const g = Number.parseInt(raw.slice(2, 4), 16);
+  const b = Number.parseInt(raw.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function _textWidth(ctx, text) {
+  if (ctx && typeof ctx.measureText === "function") {
+    try {
+      return ctx.measureText(String(text)).width;
+    } catch {}
+  }
+  return String(text || "").length * 6;
 }
 
 function _hasGap(gaps, stream) {
@@ -346,11 +394,12 @@ function _renderGaps(vm) {
 function _renderSelected(vm) {
   const risk = vm.selected.risk || {};
   const pnl = vm.selected.pnl || {};
+  const candle = vm.selected.candle || null;
   const riskSuffix = vm.selected.riskStale ? " (stale)" : "";
   const pnlSuffix = vm.selected.pnlStale ? " (stale)" : "";
   return `
     <div class="replayStat"><span>Time</span><b class="mono">${_esc(vm.selected.timeLabel)}</b></div>
-    <div class="replayStat"><span>Price</span><b>${_fmtNum(vm.selected.price, 2)}</b></div>
+    <div class="replayStat"><span>OHLC</span><b class="mono">${_esc(_fmtOhlc(candle))}</b></div>
     <div class="replayStat"><span>Risk gross/net${_esc(riskSuffix)}</span><b>${_fmtPct(risk.gross)} / ${_fmtPct(risk.net)}</b></div>
     <div class="replayStat"><span>Drawdown</span><b>${_fmtPct(risk.drawdown)}</b></div>
     <div class="replayStat"><span>Equity${_esc(pnlSuffix)}</span><b>${_fmtNum(pnl.equity, 2)}</b></div>
@@ -368,11 +417,171 @@ export function replayMarkerStyle(kind, row = {}) {
   return { color: statusToken("neutral").color, shape: "circle", label: "Marker" };
 }
 
-function _priceForMarker(candles, marker) {
+function _markerAnchor(candles, marker) {
   const own = _num(marker.price, null);
-  if (Number.isFinite(own)) return own;
+  if (Number.isFinite(own)) {
+    return { price: own, source: "event_price" };
+  }
   const candle = _nearestCandle(candles, marker.ts_ms);
-  return candle ? candle.close : null;
+  return candle ? { price: candle.close, source: "nearest_close", candleTsMs: candle.ts_ms } : { price: null, source: "unavailable" };
+}
+
+function _chartPriceValues(candles, markers) {
+  const prices = [];
+  for (const candle of candles || []) {
+    prices.push(candle.open, candle.high, candle.low, candle.close);
+  }
+  for (const marker of markers || []) {
+    const own = _num(marker.price, null);
+    if (Number.isFinite(own)) prices.push(own);
+  }
+  return prices.filter(Number.isFinite);
+}
+
+function _timeTicks(minTs, maxTs) {
+  if (!Number.isFinite(minTs) || !Number.isFinite(maxTs)) return [];
+  if (minTs === maxTs) return [{ value: minTs, label: _fmtTime(minTs) }];
+  const mid = Math.round(minTs + ((maxTs - minTs) / 2));
+  return _uniqueSorted([minTs, mid, maxTs]).map((value) => ({ value, label: _fmtTime(value) }));
+}
+
+function _priceTicks(minP, maxP, yFor) {
+  if (!Number.isFinite(minP) || !Number.isFinite(maxP)) return [];
+  const mid = minP + ((maxP - minP) / 2);
+  return [maxP, mid, minP].map((value) => ({ value, y: yFor(value), label: _fmtNum(value, 2) }));
+}
+
+export function buildReplayChartModel(vm, options = {}) {
+  const cssW = Math.max(320, Math.floor(options.width || 960));
+  const cssH = Math.max(220, Math.floor(options.height || 280));
+  const candles = vm && vm.streams && Array.isArray(vm.streams.candles) ? vm.streams.candles : [];
+  const noDataText = vm && vm.noData ? "(no replay data)" : "(no price series)";
+  if (!candles.length) {
+    return {
+      ok: false,
+      state: vm && vm.noData ? "empty" : "no_price_series",
+      width: cssW,
+      height: cssH,
+      noDataText,
+      candles: [],
+      markers: [],
+      xTicks: [],
+      yTicks: [],
+      legend: [],
+    };
+  }
+
+  const padL = 52;
+  const padR = 18;
+  const padT = 42;
+  const padB = 34;
+  const minTs = candles[0].ts_ms;
+  const maxTs = candles[candles.length - 1].ts_ms;
+  const visibleMarkers = (vm.markers || [])
+    .filter((marker) => marker && marker.ts_ms >= minTs && marker.ts_ms <= maxTs);
+  const prices = _chartPriceValues(candles, visibleMarkers);
+  if (!prices.length) {
+    return {
+      ok: false,
+      state: "no_numeric_prices",
+      width: cssW,
+      height: cssH,
+      noDataText,
+      candles: [],
+      markers: [],
+      xTicks: [],
+      yTicks: [],
+      legend: [],
+    };
+  }
+
+  let minP = Math.min(...prices);
+  let maxP = Math.max(...prices);
+  if (minP === maxP) {
+    minP -= 1;
+    maxP += 1;
+  }
+  const padP = (maxP - minP) * 0.08;
+  minP -= padP;
+  maxP += padP;
+  const plotW = Math.max(1, cssW - padL - padR);
+  const plotH = Math.max(1, cssH - padT - padB);
+  const xFor = (ts) => {
+    if (minTs === maxTs) return padL + (plotW / 2);
+    return padL + plotW * ((ts - minTs) / Math.max(1, maxTs - minTs));
+  };
+  const yFor = (price) => padT + plotH * (1 - ((price - minP) / Math.max(1e-9, maxP - minP)));
+  const spacing = candles.length > 1 ? plotW / Math.max(1, candles.length - 1) : Math.min(plotW, 12);
+  const bodyWidth = _clamp(spacing * 0.55, 2, 12);
+
+  const candleModels = candles.map((candle) => {
+    const x = xFor(candle.ts_ms);
+    const openY = yFor(candle.open);
+    const highY = yFor(candle.high);
+    const lowY = yFor(candle.low);
+    const closeY = yFor(candle.close);
+    const up = candle.close >= candle.open;
+    const color = up ? CHART_COLORS.up : CHART_COLORS.down;
+    const bodyTop = Math.min(openY, closeY);
+    const rawBodyHeight = Math.abs(closeY - openY);
+    const bodyHeight = Math.max(1, rawBodyHeight);
+    return {
+      ...candle,
+      x,
+      openY,
+      highY,
+      lowY,
+      closeY,
+      bodyX: x - (bodyWidth / 2),
+      bodyY: rawBodyHeight < 1 ? bodyTop - 0.5 : bodyTop,
+      bodyWidth,
+      bodyHeight,
+      up,
+      color,
+      fillColor: _hexToRgba(color, 0.22),
+    };
+  });
+
+  const markerModels = visibleMarkers.map((marker) => {
+    const anchor = _markerAnchor(candles, marker);
+    if (!Number.isFinite(anchor.price)) return null;
+    const style = replayMarkerStyle(marker.markerKind, marker);
+    return {
+      ...marker,
+      anchor,
+      price: anchor.price,
+      x: xFor(marker.ts_ms),
+      y: yFor(anchor.price),
+      style,
+    };
+  }).filter(Boolean);
+
+  const selectedTs = vm && vm.selected ? _tsMs(vm.selected.ts_ms) : null;
+  const selected = selectedTs && selectedTs >= minTs && selectedTs <= maxTs
+    ? { ts_ms: selectedTs, x: xFor(selectedTs), label: _fmtTime(selectedTs) }
+    : null;
+
+  return {
+    ok: true,
+    state: "ready",
+    width: cssW,
+    height: cssH,
+    plot: { left: padL, right: cssW - padR, top: padT, bottom: cssH - padB, width: plotW, height: plotH },
+    domain: { minTs, maxTs, minP, maxP },
+    noDataText,
+    candles: candleModels,
+    markers: markerModels,
+    selected,
+    xTicks: _timeTicks(minTs, maxTs).map((tick) => ({ ...tick, x: xFor(tick.value) })),
+    yTicks: _priceTicks(minP, maxP, yFor),
+    legend: [
+      { kind: "ohlc", label: "OHLC", color: CHART_COLORS.up },
+      { kind: "decision", label: "D decision", color: replayMarkerStyle("decision").color },
+      { kind: "order", label: "O order", color: replayMarkerStyle("order").color },
+      { kind: "fill", label: "F fill", color: replayMarkerStyle("fill", { side: "BUY", qty: 1 }).color },
+      { kind: "selected", label: "selected time", color: CHART_COLORS.selected },
+    ],
+  };
 }
 
 function _renderReplayChartA11y(canvas, vm, errorMessage = "") {
@@ -389,7 +598,7 @@ function _renderReplayChartA11y(canvas, vm, errorMessage = "") {
     volume: c.volume,
   }));
   const summary = series.length
-    ? `Historical replay: ${symbol} close ${_fmtNum(series[series.length - 1].close, 2)} across ${series.length} candles; decisions ${vm.counts.decisions}, orders ${vm.counts.orders}, fills ${vm.counts.fills}.`
+    ? `Historical replay: ${symbol} OHLC candles latest ${_fmtOhlc(series[series.length - 1])} across ${series.length} candles; decisions ${vm.counts.decisions}, orders ${vm.counts.orders}, fills ${vm.counts.fills}.`
     : "";
   const gapMessage = errorMessage || (!vm.ok && vm.gaps.length ? String(vm.gaps[0].message || vm.gaps[0].code || "Replay data is unavailable.") : "");
   renderChartAccessibility(canvas, {
@@ -398,6 +607,12 @@ function _renderReplayChartA11y(canvas, vm, errorMessage = "") {
     timeKey: "time",
     valueKey: "value",
     valueLabel: "close",
+    seriesFields: [
+      { key: "open", label: "Open", formatter: (v) => _fmtNum(v, 2) },
+      { key: "high", label: "High", formatter: (v) => _fmtNum(v, 2) },
+      { key: "low", label: "Low", formatter: (v) => _fmtNum(v, 2) },
+      { key: "close", label: "Close", formatter: (v) => _fmtNum(v, 2) },
+    ],
     valueFormatter: (v) => _fmtNum(v, 2),
     summary,
     emptyMessage: vm.noData ? "No replay data is available for the selected filters." : "No replay price series is available.",
@@ -414,6 +629,52 @@ function _renderReplayChartA11y(canvas, vm, errorMessage = "") {
   });
 }
 
+function _drawReplayLegend(ctx, model) {
+  ctx.font = "11px Consolas, monospace";
+  let x = model.plot.left;
+  let y = 15;
+  const maxX = model.width - 12;
+  for (const item of model.legend || []) {
+    const label = String(item.label || "");
+    const itemW = _textWidth(ctx, label) + 24;
+    if (x > model.plot.left && x + itemW > maxX) {
+      x = model.plot.left;
+      y += 14;
+    }
+    ctx.fillStyle = item.color || CHART_COLORS.axis;
+    ctx.strokeStyle = item.color || CHART_COLORS.axis;
+    ctx.lineWidth = 1.4;
+    if (item.kind === "ohlc") {
+      ctx.beginPath();
+      ctx.moveTo(x + 5, y - 6);
+      ctx.lineTo(x + 5, y + 3);
+      ctx.stroke();
+      ctx.fillRect(x + 2, y - 3, 7, 5);
+    } else if (item.kind === "order") {
+      ctx.fillRect(x + 1, y - 7, 8, 8);
+    } else if (item.kind === "fill") {
+      ctx.beginPath();
+      ctx.moveTo(x + 5, y - 8);
+      ctx.lineTo(x + 10, y + 2);
+      ctx.lineTo(x, y + 2);
+      ctx.closePath();
+      ctx.fill();
+    } else if (item.kind === "selected") {
+      ctx.beginPath();
+      ctx.moveTo(x + 5, y - 8);
+      ctx.lineTo(x + 5, y + 3);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(x + 5, y - 3, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = CHART_COLORS.axis;
+    ctx.fillText(label, x + 14, y);
+    x += itemW;
+  }
+}
+
 export function renderReplayChart(canvas, vm) {
   if (!canvas || !vm) return;
   const ctx = canvas.getContext && canvas.getContext("2d");
@@ -421,101 +682,91 @@ export function renderReplayChart(canvas, vm) {
     _renderReplayChartA11y(canvas, vm, "Replay chart could not get a canvas context.");
     return;
   }
-  const ratio = Math.max(1, Math.min(2, Number(window.devicePixelRatio || 1)));
+  const dpr = typeof window !== "undefined" ? window.devicePixelRatio : 1;
+  const ratio = Math.max(1, Math.min(2, Number(dpr || 1)));
   const cssW = Math.max(320, Math.floor(canvas.clientWidth || canvas.width || 960));
   const cssH = Math.max(220, Math.floor(canvas.clientHeight || canvas.height || 280));
   if (canvas.width !== Math.floor(cssW * ratio)) canvas.width = Math.floor(cssW * ratio);
   if (canvas.height !== Math.floor(cssH * ratio)) canvas.height = Math.floor(cssH * ratio);
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, cssW, cssH);
-  ctx.fillStyle = "#0a0d12";
+  ctx.fillStyle = CHART_COLORS.bg;
   ctx.fillRect(0, 0, cssW, cssH);
-  ctx.strokeStyle = "#30363d";
+  ctx.strokeStyle = CHART_COLORS.border;
   ctx.strokeRect(0.5, 0.5, cssW - 1, cssH - 1);
 
-  const candles = vm.streams.candles || [];
-  if (candles.length < 2) {
-    ctx.fillStyle = "#9da7b1";
+  const model = buildReplayChartModel(vm, { width: cssW, height: cssH });
+  if (!model.ok) {
+    ctx.fillStyle = CHART_COLORS.axis;
     ctx.font = "12px Consolas, monospace";
-    ctx.fillText(vm.noData ? "(no replay data)" : "(no price series)", 12, 24);
+    ctx.fillText(model.noDataText, 12, 24);
     _renderReplayChartA11y(canvas, vm);
     return;
   }
 
-  const padL = 48;
-  const padR = 16;
-  const padT = 18;
-  const padB = 28;
-  const minTs = candles[0].ts_ms;
-  const maxTs = candles[candles.length - 1].ts_ms;
-  const prices = candles.flatMap((c) => [c.high, c.low, c.close]).filter(Number.isFinite);
-  let minP = Math.min(...prices);
-  let maxP = Math.max(...prices);
-  if (minP === maxP) {
-    minP -= 1;
-    maxP += 1;
+  _drawReplayLegend(ctx, model);
+
+  ctx.strokeStyle = CHART_COLORS.grid;
+  ctx.lineWidth = 1;
+  for (const tick of model.yTicks || []) {
+    ctx.beginPath();
+    ctx.moveTo(model.plot.left, tick.y);
+    ctx.lineTo(model.plot.right, tick.y);
+    ctx.stroke();
   }
-  const padP = (maxP - minP) * 0.08;
-  minP -= padP;
-  maxP += padP;
-  const plotW = cssW - padL - padR;
-  const plotH = cssH - padT - padB;
-  const xFor = (ts) => padL + plotW * ((ts - minTs) / Math.max(1, maxTs - minTs));
-  const yFor = (price) => padT + plotH * (1 - ((price - minP) / Math.max(1e-9, maxP - minP)));
 
-  ctx.strokeStyle = "#20252c";
-  ctx.beginPath();
-  ctx.moveTo(padL, padT + plotH / 2);
-  ctx.lineTo(cssW - padR, padT + plotH / 2);
-  ctx.stroke();
-
-  ctx.fillStyle = "#9da7b1";
+  ctx.fillStyle = CHART_COLORS.axis;
   ctx.font = "12px Consolas, monospace";
-  ctx.fillText(_fmtNum(maxP, 2), 8, padT + 4);
-  ctx.fillText(_fmtNum(minP, 2), 8, cssH - padB + 4);
+  for (const tick of model.yTicks || []) {
+    ctx.fillText(tick.label, 8, tick.y + 4);
+  }
 
-  ctx.strokeStyle = "#e6edf3";
-  ctx.lineWidth = 1.8;
-  ctx.beginPath();
-  candles.forEach((c, i) => {
-    const x = xFor(c.ts_ms);
-    const y = yFor(c.close);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
+  ctx.fillStyle = CHART_COLORS.axis;
+  for (const tick of model.xTicks || []) {
+    const width = _textWidth(ctx, tick.label);
+    const x = _clamp(tick.x - (width / 2), model.plot.left, model.plot.right - width);
+    ctx.fillText(tick.label, x, cssH - 10);
+  }
 
-  for (const marker of vm.markers || []) {
-    if (marker.ts_ms < minTs || marker.ts_ms > maxTs) continue;
-    const price = _priceForMarker(candles, marker);
-    if (!Number.isFinite(price)) continue;
-    const x = xFor(marker.ts_ms);
-    const y = yFor(price);
-    const markerStyle = replayMarkerStyle(marker.markerKind, marker);
-    ctx.fillStyle = markerStyle.color;
+  ctx.lineWidth = 1.2;
+  for (const candle of model.candles || []) {
+    ctx.strokeStyle = candle.color || CHART_COLORS.wick;
+    ctx.fillStyle = candle.fillColor || candle.color || CHART_COLORS.neutral;
+    ctx.beginPath();
+    ctx.moveTo(candle.x, candle.highY);
+    ctx.lineTo(candle.x, candle.lowY);
+    ctx.stroke();
+    ctx.fillRect(candle.bodyX, candle.bodyY, candle.bodyWidth, candle.bodyHeight);
+    ctx.strokeRect(candle.bodyX, candle.bodyY, candle.bodyWidth, candle.bodyHeight);
+  }
+
+  if (model.selected) {
+    ctx.strokeStyle = CHART_COLORS.selected;
+    ctx.lineWidth = 1;
+    if (typeof ctx.setLineDash === "function") ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(model.selected.x, model.plot.top);
+    ctx.lineTo(model.selected.x, model.plot.bottom);
+    ctx.stroke();
+    if (typeof ctx.setLineDash === "function") ctx.setLineDash([]);
+  }
+
+  for (const marker of model.markers || []) {
+    ctx.fillStyle = marker.style.color;
     ctx.beginPath();
     if (marker.markerKind === "order") {
-      ctx.rect(x - 4, y - 4, 8, 8);
+      ctx.rect(marker.x - 4, marker.y - 4, 8, 8);
     } else if (marker.markerKind === "fill") {
-      ctx.moveTo(x, y - 6);
-      ctx.lineTo(x + 6, y + 5);
-      ctx.lineTo(x - 6, y + 5);
+      ctx.moveTo(marker.x, marker.y - 6);
+      ctx.lineTo(marker.x + 6, marker.y + 5);
+      ctx.lineTo(marker.x - 6, marker.y + 5);
       ctx.closePath();
     } else {
-      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.arc(marker.x, marker.y, 4, 0, Math.PI * 2);
     }
     ctx.fill();
   }
 
-  if (vm.selected.ts_ms) {
-    const x = xFor(vm.selected.ts_ms);
-    ctx.strokeStyle = "rgba(255,255,255,.55)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(x, padT);
-    ctx.lineTo(x, cssH - padB);
-    ctx.stroke();
-  }
   _renderReplayChartA11y(canvas, vm);
 }
 

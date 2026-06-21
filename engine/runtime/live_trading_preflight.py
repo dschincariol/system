@@ -3,6 +3,7 @@ from __future__ import annotations
 """Central fail-closed checks required before live trading can be enabled."""
 
 import os
+import ipaddress
 from typing import Any, Dict, Optional
 
 from engine.api.auth_config import dashboard_api_token_from_env, dashboard_api_token_issue
@@ -10,9 +11,11 @@ from engine.execution.broker_failover_policy import (
     broker_startup_preflight,
     live_broker_environment_contract,
 )
+from engine.execution.broker_shutdown_risk import broker_shutdown_policy_snapshot
 from engine.execution.options_readiness import live_options_readiness_snapshot
 from engine.execution.position_reconcile import position_reconcile_evidence_snapshot
-from engine.runtime.backup_evidence import backup_restore_evidence_snapshot
+from engine.runtime.backup_evidence import backup_restore_evidence_snapshot, wal_archiver_runtime_snapshot
+from engine.runtime.clock_health import clock_health_snapshot
 from engine.runtime.live_execution_control import (
     DISABLE_LIVE_EXECUTION_REASON,
     env_flag_truthy,
@@ -27,6 +30,9 @@ _TRUTHY_VALUES = {"1", "true", "yes", "on"}
 _FALSEY_VALUES = {"0", "false", "no", "off"}
 DEFAULT_LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_LIVE_TRADING"
 DEFAULT_OPERATOR_TOKEN_MIN_LENGTH = 16
+DEFAULT_PUBLIC_NETWORK_EXPOSURE_ACK_PHRASE = "I_UNDERSTAND_THIS_EXPOSES_TRADING_SERVICES"
+_CONTAINER_INTERNAL_BIND_CONTEXTS = {"container", "container_internal", "docker", "docker_internal", "compose"}
+_PLACEHOLDER_AUDIT_VALUES = {"", "unknown", "none", "n/a", "na", "todo", "tbd", "test", "dev"}
 PLACEHOLDER_OPERATOR_API_TOKENS = {
     "change-me",
     "changeme",
@@ -49,6 +55,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw == "":
         return bool(default)
     return raw in _TRUTHY_VALUES
+
+
+def _env_bool_from(environ: dict[str, Any], name: str, default: bool = False) -> bool:
+    raw = str(environ.get(name, "") or "").strip().lower()
+    if raw == "":
+        return bool(default)
+    return raw in _TRUTHY_VALUES
+
+
+def _env_text_from(environ: dict[str, Any], name: str, default: str = "") -> str:
+    return str(environ.get(name, default) or "").strip()
 
 
 def _env_bool_snapshot(name: str, default: bool = False) -> tuple[bool, bool, str]:
@@ -76,12 +93,9 @@ def operator_api_token_from_env() -> str:
     token = str(os.environ.get("OPERATOR_API_TOKEN", "") or "").strip()
     if token:
         return token
-    secret_name = str(os.environ.get("OPERATOR_API_TOKEN_SECRET", "") or "").strip()
-    if not secret_name:
-        return ""
-    from services.secrets.loader import load_secret
+    from engine.runtime.secret_sources import read_secret_text_from_env
 
-    return load_secret(secret_name).decode("utf-8", "ignore").rstrip("\r\n")
+    return read_secret_text_from_env("OPERATOR_API_TOKEN")
 
 
 def operator_api_token_issue(token: str | None) -> str:
@@ -109,6 +123,225 @@ def _operator_bind_host_is_unsafe(host: str) -> bool:
     if value in {"0.0.0.0", "::", "[::]"}:
         return True
     return value not in {str(item).lower() for item in LOOPBACK_HOSTS}
+
+
+def _is_loopback_bind_host(host: str) -> bool:
+    value = str(host or "").strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    if lowered in {"localhost", "127.0.0.1", "::1", "[::1]"}:
+        return True
+    if value in LOOPBACK_HOSTS:
+        return True
+    try:
+        return bool(ipaddress.ip_address(value.strip("[]")).is_loopback)
+    except ValueError:
+        return False
+
+
+def _is_wildcard_bind_host(host: str) -> bool:
+    value = str(host or "").strip().lower()
+    return value in {"", "*", "0.0.0.0", "::", "[::]"}
+
+
+def _audit_value_ok(value: str, *, min_len: int = 3) -> bool:
+    text = str(value or "").strip()
+    if len(text) < int(min_len):
+        return False
+    if text.lower() in _PLACEHOLDER_AUDIT_VALUES:
+        return False
+    return True
+
+
+def public_network_exposure_ack_snapshot(
+    *, environ: Optional[dict[str, Any]] = None
+) -> Dict[str, Any]:
+    env = dict(os.environ if environ is None else environ)
+    phrase = DEFAULT_PUBLIC_NETWORK_EXPOSURE_ACK_PHRASE
+    ack = _env_text_from(env, "TRADING_PUBLIC_NETWORK_EXPOSURE_ACK")
+    owner = _env_text_from(env, "TRADING_PUBLIC_NETWORK_EXPOSURE_OWNER")
+    reason = _env_text_from(env, "TRADING_PUBLIC_NETWORK_EXPOSURE_REASON")
+    blockers: list[str] = []
+    if ack != phrase:
+        blockers.append("TRADING_PUBLIC_NETWORK_EXPOSURE_ACK_required")
+    if not _audit_value_ok(owner, min_len=3):
+        blockers.append("TRADING_PUBLIC_NETWORK_EXPOSURE_OWNER_required")
+    if not _audit_value_ok(reason, min_len=16):
+        blockers.append("TRADING_PUBLIC_NETWORK_EXPOSURE_REASON_required")
+    return {
+        "ok": not blockers,
+        "reason": "ok" if not blockers else blockers[0],
+        "blockers": blockers,
+        "ack_configured": bool(ack),
+        "expected_ack": phrase,
+        "owner": owner,
+        "exposure_reason": reason,
+    }
+
+
+def _production_network_exposure_required(environ: dict[str, Any], mode: str) -> bool:
+    if str(mode or "").strip().lower() == "live":
+        return True
+    for key in ("ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE", "MODE"):
+        if str(environ.get(key, "") or "").strip().lower() == "live":
+            return True
+    for key in ("ENV", "APP_ENV", "TS_ENV", "NODE_ENV"):
+        if str(environ.get(key, "") or "").strip().lower() in {"prod", "production"}:
+            return True
+    return _env_bool_from(environ, "PROD_LOCK", False)
+
+
+def _service_bind_host(environ: dict[str, Any], service: str) -> tuple[str, str, bool]:
+    candidates = {
+        "timescale": (("TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST", "TIMESCALE_HOST_BIND"), "127.0.0.1"),
+        "redis": (("REDIS_DANGEROUS_PUBLIC_BIND_HOST", "REDIS_HOST_BIND"), "127.0.0.1"),
+        "minio": (("MINIO_DANGEROUS_PUBLIC_BIND_HOST", "MINIO_HOST_BIND"), "127.0.0.1"),
+        "minio_console": (("MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST", "MINIO_CONSOLE_HOST_BIND"), "127.0.0.1"),
+        "dashboard": (("DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST", "DASHBOARD_HOST_BIND"), "127.0.0.1"),
+        "operator": (("OPERATOR_DANGEROUS_PUBLIC_BIND_HOST", "OPERATOR_HOST_BIND"), "127.0.0.1"),
+    }
+    names, default = candidates[service]
+    for name in names:
+        if name in environ:
+            return str(environ.get(name, "") or "").strip(), name, True
+    if service == "operator" and str(environ.get("OPERATOR_PUBLIC_PORT", "") or "").strip():
+        bind_host = str(environ.get("OPERATOR_BIND_HOST", "") or "").strip()
+        if bind_host:
+            return bind_host, "OPERATOR_BIND_HOST", True
+    return default, names[0], False
+
+
+def _service_port_configured(environ: dict[str, Any], service: str) -> tuple[bool, str, str]:
+    specs = {
+        "timescale": ("TIMESCALE_PORT", "5432", True),
+        "redis": ("REDIS_PORT", "6379", True),
+        "minio": ("MINIO_PORT", "9000", True),
+        "minio_console": ("MINIO_CONSOLE_PORT", "9001", True),
+        "dashboard": ("DASHBOARD_PUBLIC_PORT", "8000", True),
+        "operator": ("OPERATOR_PUBLIC_PORT", "", False),
+    }
+    env_name, default, default_enabled = specs[service]
+    raw = str(environ.get(env_name, default if default_enabled else "") or "").strip()
+    return bool(raw), env_name, raw
+
+
+def _service_allow_env(service: str) -> str:
+    return {
+        "timescale": "TIMESCALE_ALLOW_DANGEROUS_PUBLIC_BIND",
+        "redis": "REDIS_ALLOW_DANGEROUS_PUBLIC_BIND",
+        "minio": "MINIO_ALLOW_DANGEROUS_PUBLIC_BIND",
+        "minio_console": "MINIO_CONSOLE_ALLOW_DANGEROUS_PUBLIC_BIND",
+        "dashboard": "DASHBOARD_ALLOW_DANGEROUS_PUBLIC_BIND",
+        "operator": "OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND",
+    }[service]
+
+
+def _dashboard_process_bind_state(environ: dict[str, Any]) -> dict[str, Any] | None:
+    host = _env_text_from(environ, "DASHBOARD_HOST")
+    if not host:
+        return None
+    context = _env_text_from(environ, "DASHBOARD_BIND_CONTEXT").lower()
+    container_internal = context in _CONTAINER_INTERNAL_BIND_CONTEXTS
+    return {
+        "source": "DASHBOARD_HOST",
+        "bind_host": host,
+        "bind_context": context or "host_process",
+        "container_internal": bool(container_internal),
+        "non_loopback": not _is_loopback_bind_host(host),
+        "wildcard": _is_wildcard_bind_host(host),
+    }
+
+
+def public_network_exposure_snapshot(
+    *,
+    engine_mode: Optional[str] = None,
+    environ: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    env = dict(os.environ if environ is None else environ)
+    mode = _normalize_mode(engine_mode if engine_mode is not None else env.get("ENGINE_MODE"), "safe")
+    required = _production_network_exposure_required(env, mode)
+    ack = public_network_exposure_ack_snapshot(environ=env)
+    services: list[dict[str, Any]] = []
+    blockers: list[str] = []
+
+    for service in ("timescale", "redis", "minio", "minio_console", "dashboard", "operator"):
+        host, host_source, host_explicit = _service_bind_host(env, service)
+        port_configured, port_env, port = _service_port_configured(env, service)
+        allow_env = _service_allow_env(service)
+        service_allow = _env_bool_from(env, allow_env, False)
+        host_is_loopback = _is_loopback_bind_host(host)
+        host_is_wildcard = _is_wildcard_bind_host(host)
+        public_host_bind = bool(port_configured and not host_is_loopback)
+        service_blockers: list[str] = []
+        if required and public_host_bind:
+            if not service_allow:
+                service_blockers.append(f"{allow_env}_required")
+            if not bool(ack.get("ok")):
+                service_blockers.extend(str(item) for item in list(ack.get("blockers") or []))
+            if service_blockers:
+                if host_is_wildcard:
+                    blockers.append(f"{service}_0_0_0_0_without_approved_exposure")
+                else:
+                    blockers.append(f"{service}_lan_bind_without_approved_exposure")
+                blockers.extend(service_blockers)
+
+        services.append(
+            {
+                "service": service,
+                "bind_host": host,
+                "bind_host_source": host_source,
+                "bind_host_explicit": bool(host_explicit),
+                "port_env": port_env,
+                "port": port,
+                "port_configured": bool(port_configured),
+                "loopback": bool(host_is_loopback),
+                "wildcard": bool(host_is_wildcard),
+                "public_host_bind": bool(public_host_bind),
+                "allow_env": allow_env,
+                "allow_dangerous_public_bind": bool(service_allow),
+                "approved": bool((not public_host_bind) or (service_allow and ack.get("ok"))),
+                "blockers": service_blockers,
+            }
+        )
+
+    dashboard_process = _dashboard_process_bind_state(env)
+    if dashboard_process is not None:
+        if (
+            required
+            and bool(dashboard_process.get("non_loopback"))
+            and not bool(dashboard_process.get("container_internal"))
+        ):
+            allow_env = _service_allow_env("dashboard")
+            service_allow = _env_bool_from(env, allow_env, False)
+            if not service_allow or not bool(ack.get("ok")):
+                blockers.append("dashboard_process_bind_without_approved_exposure")
+                if bool(dashboard_process.get("wildcard")):
+                    blockers.append("dashboard_0_0_0_0_without_approved_exposure")
+                else:
+                    blockers.append("dashboard_lan_bind_without_approved_exposure")
+                if not service_allow:
+                    blockers.append(f"{allow_env}_required")
+                if not bool(ack.get("ok")):
+                    blockers.extend(str(item) for item in list(ack.get("blockers") or []))
+
+    blockers = list(dict.fromkeys(blockers))
+    public_services = [
+        str(item.get("service"))
+        for item in services
+        if bool(item.get("public_host_bind"))
+    ]
+    return {
+        "ok": not blockers,
+        "required": bool(required),
+        "mode": mode,
+        "reason": "ok" if not blockers else blockers[0],
+        "blockers": blockers,
+        "ack": dict(ack or {}),
+        "services": services,
+        "public_services": public_services,
+        "dashboard_process_bind": dashboard_process or {},
+    }
 
 
 def operator_sidecar_security_snapshot(
@@ -139,13 +372,31 @@ def operator_sidecar_security_snapshot(
         internal_only = _env_bool("OPERATOR_SIDECAR_INTERNAL_ONLY", False)
 
     blockers: list[str] = []
+    exposure: Dict[str, Any] = {}
+    operator_state: Dict[str, Any] = {}
+    operator_public_approved = False
+    if public_port:
+        exposure = public_network_exposure_snapshot(engine_mode=mode)
+        operator_state = next(
+            (
+                dict(item)
+                for item in list(exposure.get("services") or [])
+                if str(dict(item).get("service") or "") == "operator"
+            ),
+            {},
+        )
+        operator_public_approved = bool(
+            operator_state.get("public_host_bind") and operator_state.get("approved")
+        )
     token_issue = operator_api_token_issue(token)
     if token_issue:
         blockers.append(token_issue)
-    if bind_host and _operator_bind_host_is_unsafe(bind_host) and not bool(internal_only):
+    if bind_host and _operator_bind_host_is_unsafe(bind_host) and not bool(internal_only) and not operator_public_approved:
         blockers.append("operator_bind_host_public_without_internal_only")
     if public_port:
-        blockers.append("operator_sidecar_public_port_forbidden")
+        if bool(operator_state.get("public_host_bind")) and not bool(operator_state.get("approved")):
+            blockers.append("operator_sidecar_public_port_forbidden")
+            blockers.append("operator_sidecar_public_port_forbidden_without_approved_exposure")
 
     blockers = list(dict.fromkeys(blockers))
     return {
@@ -229,6 +480,23 @@ def lob_deeplob_shadow_readiness_snapshot(
     snapshot["enabled"] = True
     snapshot["shadow_only"] = True
     return snapshot
+
+
+def production_secret_sources_snapshot() -> Dict[str, Any]:
+    """Return production secret-source policy state without exposing values."""
+
+    try:
+        from engine.runtime.secret_sources import secret_source_policy_snapshot
+
+        return dict(secret_source_policy_snapshot(validate_files=True) or {})
+    except Exception as exc:
+        return {
+            "ok": False,
+            "required": True,
+            "reason": f"secret_source_policy_unavailable:{type(exc).__name__}",
+            "blockers": [f"secret_source_policy_unavailable:{type(exc).__name__}"],
+            "error": str(exc),
+        }
 
 
 def live_confirmation_snapshot(
@@ -723,6 +991,12 @@ def live_environment_contract_snapshot(
     operator_sidecar_security = operator_sidecar_security_snapshot(engine_mode=mode)
     if mode == "live" and not bool(operator_sidecar_security.get("ok")):
         blockers.extend(str(item) for item in list(operator_sidecar_security.get("blockers") or []))
+    public_network_exposure = public_network_exposure_snapshot(engine_mode=mode)
+    if bool(public_network_exposure.get("required")) and not bool(public_network_exposure.get("ok")):
+        blockers.extend(str(item) for item in list(public_network_exposure.get("blockers") or []))
+    secret_sources = production_secret_sources_snapshot()
+    if bool(secret_sources.get("required")) and not bool(secret_sources.get("ok")):
+        blockers.extend(str(item) for item in list(secret_sources.get("blockers") or []))
     phrase = _confirmation_phrase()
 
     blockers = list(dict.fromkeys(blockers))
@@ -743,6 +1017,8 @@ def live_environment_contract_snapshot(
         "broker_preflight": dict(broker_preflight or {}),
         "initial_kill_switch_hold": dict(initial_kill_switch_hold or {}),
         "operator_sidecar_security": dict(operator_sidecar_security or {}),
+        "public_network_exposure": dict(public_network_exposure or {}),
+        "secret_sources": dict(secret_sources or {}),
     }
 
 
@@ -807,9 +1083,21 @@ def live_trading_preflight(
     if mode == "live" and not bool(position_reconcile_evidence.get("ok")):
         blockers.extend(str(item) for item in list(position_reconcile_evidence.get("blockers") or []))
 
+    broker_shutdown_policy = broker_shutdown_policy_snapshot(engine_mode=mode)
+    if mode == "live" and not bool(broker_shutdown_policy.get("ok")):
+        blockers.extend(str(item) for item in list(broker_shutdown_policy.get("blockers") or []))
+
     backup_restore_evidence = backup_restore_evidence_snapshot(engine_mode=mode)
     if mode == "live" and not bool(backup_restore_evidence.get("ok")):
         blockers.extend(str(item) for item in list(backup_restore_evidence.get("blockers") or []))
+
+    wal_archiver_runtime = wal_archiver_runtime_snapshot(engine_mode=mode)
+    if mode == "live" and not bool(wal_archiver_runtime.get("ok")):
+        blockers.extend(str(item) for item in list(wal_archiver_runtime.get("blockers") or []))
+
+    clock_health = clock_health_snapshot(engine_mode=mode)
+    if mode == "live" and not bool(clock_health.get("ok")):
+        blockers.extend(str(item) for item in list(clock_health.get("blockers") or []))
 
     execution_arming_audit = _execution_arming_audit_snapshot(engine_mode=mode)
     if mode == "live" and not bool(execution_arming_audit.get("ok")):
@@ -853,11 +1141,16 @@ def live_trading_preflight(
         "deployment_contract": dict(contract or {}),
         "prelive_reconcile": dict(prelive_reconcile or {}),
         "position_reconcile_evidence": dict(position_reconcile_evidence or {}),
+        "broker_shutdown_policy": dict(broker_shutdown_policy or {}),
         "broker_contract": dict(contract.get("broker_contract") or {}),
         "broker_preflight": dict(contract.get("broker_preflight") or {}),
         "initial_kill_switch_hold": dict(contract.get("initial_kill_switch_hold") or {}),
         "operator_sidecar_security": dict(contract.get("operator_sidecar_security") or {}),
+        "public_network_exposure": dict(contract.get("public_network_exposure") or {}),
+        "secret_sources": dict(contract.get("secret_sources") or {}),
         "backup_restore_evidence": dict(backup_restore_evidence or {}),
+        "wal_archiver_runtime": dict(wal_archiver_runtime or {}),
+        "clock_health": dict(clock_health or {}),
         "execution_arming_audit": dict(execution_arming_audit or {}),
         "live_ai_safety": dict(live_ai_safety or {}),
         "lob_deeplob_shadow": dict(lob_deeplob_shadow or {}),
@@ -888,6 +1181,7 @@ def assert_dashboard_security_config(
 
 __all__ = [
     "DEFAULT_LIVE_CONFIRM_PHRASE",
+    "DEFAULT_PUBLIC_NETWORK_EXPOSURE_ACK_PHRASE",
     "assert_live_execution_arming_preflight",
     "assert_live_trading_confirmation",
     "assert_dashboard_security_config",
@@ -897,4 +1191,7 @@ __all__ = [
     "lob_deeplob_shadow_readiness_snapshot",
     "operator_api_token_issue",
     "operator_sidecar_security_snapshot",
+    "production_secret_sources_snapshot",
+    "public_network_exposure_ack_snapshot",
+    "public_network_exposure_snapshot",
 ]

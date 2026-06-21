@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -17,9 +18,11 @@ from tools.check_dashboard_ui_contract import (  # noqa: E402
     collect_dashboard_endpoint_references,
     collect_dashboard_js_modules,
     find_js_syntax_issues,
+    find_screen_module_boundary_issues,
     find_unregistered_endpoint_references,
     route_path_registered,
 )
+from engine.runtime.secret_sources import SECRET_ENV_SPECS  # noqa: E402
 
 
 OPTIONAL_OR_DEGRADED_API_ENDPOINT_ALLOWLIST: dict[str, str] = {
@@ -106,6 +109,7 @@ os.environ.setdefault("TIMESCALE_ENABLED", "0")
 os.environ.setdefault("FEATURE_STORE_ENABLED", "0")
 os.environ.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
 os.environ.setdefault("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
+os.environ.setdefault("DASHBOARD_ROUTE_CONTRACT_INTROSPECTION", "1")
 
 import dashboard_server
 
@@ -133,15 +137,33 @@ print("__DASHBOARD_ROUTE_SNAPSHOT__" + json.dumps({
     env.setdefault("FEATURE_STORE_ENABLED", "0")
     env.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
     env.setdefault("ENGINE_PRIMARY_BOOTSTRAP_DONE", "1")
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=str(REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
+    env["DASHBOARD_ROUTE_CONTRACT_INTROSPECTION"] = "1"
+    env["ENGINE_MODE"] = "safe"
+    env["EXECUTION_MODE"] = "safe"
+    env["OPERATOR_MODE"] = "safe"
+    env["APP_ENV"] = "test"
+    env["PROD_LOCK"] = "0"
+    for key in ("ENV", "NODE_ENV", "TS_ENV"):
+        env.pop(key, None)
+    with tempfile.TemporaryDirectory(prefix="dashboard-route-contract-") as temp_root:
+        temp_path = Path(temp_root)
+        token_file = temp_path / "dashboard_api_token"
+        token_file.write_text("dashboard-route-contract-token", encoding="utf-8")
+        token_file.chmod(0o600)
+        for spec in SECRET_ENV_SPECS:
+            env[spec.key] = ""
+        env["DASHBOARD_API_TOKEN_FILE"] = str(token_file)
+        env["TRADING_SECRET_POLICY_REPO_ROOT"] = str(temp_path)
+        env.setdefault("DB_PATH", str(temp_path / "dashboard_route_contract.db"))
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
     assert result.returncode == 0, result.stderr or result.stdout
     prefix = "__DASHBOARD_ROUTE_SNAPSHOT__"
     for line in reversed((result.stdout or "").splitlines()):
@@ -159,6 +181,46 @@ def _canonical_route_specs(route_snapshot):
 
 def _api_endpoint_paths(refs):
     return sorted({ref.path for ref in refs if ref.transport in {"http", "eventsource"}})
+
+
+def test_dashboard_route_contract_introspection_still_enforces_security_preflight():
+    code = "import dashboard_server\n"
+    env = dict(os.environ)
+    env["DASHBOARD_ROUTE_CONTRACT_INTROSPECTION"] = "1"
+    env["TIMESCALE_ENABLED"] = "0"
+    env["FEATURE_STORE_ENABLED"] = "0"
+    env["FEATURE_STORE_INIT_ON_STARTUP"] = "0"
+    env["ENGINE_PRIMARY_BOOTSTRAP_DONE"] = "1"
+    env["ENGINE_MODE"] = "safe"
+    env["EXECUTION_MODE"] = "safe"
+    env["OPERATOR_MODE"] = "safe"
+    env["APP_ENV"] = "test"
+    env["PROD_LOCK"] = "0"
+    env["DASHBOARD_HOST"] = "0.0.0.0"
+    for key in ("ENV", "NODE_ENV", "TS_ENV", "TS_SECRETS_PROVIDER", "CREDENTIALS_DIRECTORY", "TS_DEV_SECRETS_DIR"):
+        env.pop(key, None)
+    for spec in SECRET_ENV_SPECS:
+        for key in (spec.key, *spec.file_envs, *spec.secret_envs):
+            env.pop(key, None)
+
+    with tempfile.TemporaryDirectory(prefix="dashboard-route-contract-security-") as temp_root:
+        temp_path = Path(temp_root)
+        env["DB_PATH"] = str(temp_path / "dashboard_route_contract_security.db")
+        env["TRADING_SECRET_POLICY_REPO_ROOT"] = str(temp_path)
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, combined
+    assert "dashboard_security_preflight_failed" in combined
+    assert "dashboard_api_token_required_for_remote_bind" in combined
 
 
 def test_dashboard_html_js_surface_static_smoke():
@@ -184,6 +246,8 @@ def test_chart_accessibility_fallback_contract_is_rendered_by_production_modules
     helper = (REPO_ROOT / "ui" / "chart_a11y.js").read_text(encoding="utf-8")
 
     assert "export function renderChartAccessibility" in helper
+    assert "seriesFields" in helper
+    assert "_defaultMultiSeriesColumns" in helper
     assert 'setAttribute("role"' in helper
     assert 'setAttribute("aria-label"' in helper
     assert 'setAttribute("tabindex"' in helper
@@ -260,11 +324,12 @@ def test_risk_history_monte_carlo_alpha_and_regime_charts_are_lazy_wired():
     dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
     risk_charts_js = (REPO_ROOT / "ui" / "risk_charts.js").read_text(encoding="utf-8")
 
-    for chart_id in ("riskHistoryChart", "monteCarloFanChart", "alphaDecayChart"):
+    for chart_id in ("riskHistoryChart", "monteCarloFanChart", "monteCarloDistributionChart", "alphaDecayChart"):
         assert f'id="{chart_id}"' in html
         assert f'id="{chart_id}A11y"' in html
 
     assert 'id="positionsRiskCharts"' in html
+    assert 'id="alphaDecayStrategySelect"' in html
     assert 'id="monteCarloRiskBars"' in html
     assert 'id="regimeHistoryRibbon"' in html
     assert 'await import("./risk_charts.js")' in dashboard_js
@@ -272,8 +337,19 @@ def test_risk_history_monte_carlo_alpha_and_regime_charts_are_lazy_wired():
     assert "/api/risk/monte_carlo" in risk_charts_js
     assert "/api/alpha_decay" in risk_charts_js
     assert "/api/regime/history" in risk_charts_js
+    assert "renderAlphaDecayStrategySelector(" in risk_charts_js
+    assert "selectedStrategy" in risk_charts_js
+    assert "renderMonteCarloDistributionChart(" in risk_charts_js
+    assert "Return distribution unavailable" in risk_charts_js
     assert "monte_carlo_risk_info stores summary" not in risk_charts_js
     assert "Fan chart input unavailable" in risk_charts_js
+    assert "seriesFields: RISK_SERIES" in risk_charts_js
+    assert 'key: "p05"' in risk_charts_js
+    assert 'key: "p50"' in risk_charts_js
+    assert 'key: "p95"' in risk_charts_js
+    assert 'key: "half_life_buckets"' in risk_charts_js
+    assert "blocked context" in risk_charts_js
+    assert "shaded band spans p05 to p95" in risk_charts_js
 
 
 def test_kill_switch_status_rows_replace_pre_mouse_heuristic():
@@ -308,6 +384,37 @@ def test_dashboard_job_catalog_uses_backend_safety_contract():
     assert "Execution barrier/read-only mode blocks job starts." in js
     assert "window.__LAST_EXECUTION_BARRIER__ = j;" in js
     assert "syncJobActionSafetyState();" in js
+
+
+def test_dashboard_data_health_screen_uses_dedicated_module_boundary():
+    html = (REPO_ROOT / "ui" / "dashboard.html").read_text(encoding="utf-8")
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    data_health_js = (REPO_ROOT / "ui" / "data_health.js").read_text(encoding="utf-8")
+
+    for element_id in (
+        "dataHealthSummaryGrid",
+        "dataProvidersBody",
+        "dataRuntimeGrid",
+        "structuredDocumentsVisibility",
+        "graphFeaturesVisibility",
+    ):
+        assert f'id="{element_id}"' in html
+
+    assert 'from "./data_health.js"' in dashboard_js
+    assert "loadDataHealthScreenModule({" in dashboard_js
+    assert "/api/operator/provider_telemetry" not in dashboard_js
+    assert "/api/data/feature_visibility?limit=12" not in dashboard_js
+    assert '"dataProvidersBody"' not in dashboard_js
+    assert '"dataRuntimeGrid"' not in dashboard_js
+
+    assert "export async function fetchDataHealthScreen" in data_health_js
+    assert "export function normalizeDataHealthScreen" in data_health_js
+    assert "export function renderDataHealthScreen" in data_health_js
+    assert "export async function loadDataHealthScreen" in data_health_js
+    assert "/api/operator/provider_telemetry" in data_health_js
+    assert "/api/data/feature_visibility?limit=12" in data_health_js
+
+    assert find_screen_module_boundary_issues(root=REPO_ROOT) == []
 
 
 def test_dashboard_ui_api_paths_are_registered_or_documented():

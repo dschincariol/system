@@ -130,6 +130,31 @@ test("overview status maps stale data to CAUTION with stale fallback text", () =
   assert.match(doc.getElementById("overviewStatusTile").getAttribute("aria-label"), /Backend 6m ago/);
 });
 
+test("overview status surfaces partial health-score coverage", () => {
+  const status = buildOverviewStatusModel(runtimeInputs({
+    systemState: null,
+    healthPayload: null,
+    readinessPayload: null,
+    executionBarrier: null,
+    stressPayload: null,
+    alerts: [],
+  }));
+
+  const doc = fakeDocument();
+  renderOperatorOverview({
+    status,
+    decision: buildOverviewDecisionModel({ decisionsPayload: { decisions: [] } }),
+    trust: buildOverviewTrustModel({}),
+  }, { document: doc });
+
+  assert.notEqual(status.word, "SAFE");
+  assert.equal(status.score, 100);
+  assert.equal(status.coverageText, "1/4 factors");
+  assert.equal(status.scoreText, "Health 100/100 (1/4 factors)");
+  assert.match(doc.getElementById("overviewStatusScore").textContent, /1\/4 factors/);
+  assert.match(doc.getElementById("overviewStatusTile").getAttribute("aria-label"), /1\/4 factors/);
+});
+
 test("overview status maps blocked execution to STOP", () => {
   const status = buildOverviewStatusModel(runtimeInputs({
     executionBarrier: { allowed: false, mode: "safe", reason: "kill_switch", ts_ms: FRESH_TS },

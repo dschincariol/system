@@ -1209,6 +1209,30 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             self.assertEqual(float(market_stress._safe_last([])), 0.0)
         warn_nonfatal.assert_not_called()
 
+    def test_market_stress_preserves_post_gdelt_scores_above_one(self) -> None:
+        (market_stress,) = _reload_modules("engine.strategy.market_stress")
+
+        def fake_prices(_con, _symbol, ts_ms, _n):
+            return [(int(ts_ms) - (idx * 60_000), 100.0) for idx in range(120)]
+
+        with patch.object(market_stress, "_load_prices", side_effect=fake_prices):
+            with patch(
+                "engine.data.gdelt_macro.get_gdelt_macro_snapshot",
+                return_value={
+                    "z_doc_count": 0.0,
+                    "z_tone_mean": 0.0,
+                    "z_conflict_share": 0.8,
+                },
+            ):
+                snapshot = market_stress.get_market_stress_snapshot(con=object(), ts_ms=1_700_000_000_000)
+
+        self.assertGreater(float(snapshot["stress_score"]), 1.0)
+        self.assertAlmostEqual(float(snapshot["stress_score"]), 1.3, places=9)
+        self.assertEqual(
+            market_stress.market_stress_thresholds(),
+            {"warning": 0.55, "critical": 0.75},
+        )
+
     def test_broker_router_fast_success_suppresses_success_trace_logging(self) -> None:
         prev = os.environ.get("BROKER_ROUTER_SUCCESS_TRACE_MIN_MS")
         os.environ["BROKER_ROUTER_SUCCESS_TRACE_MIN_MS"] = "999999"

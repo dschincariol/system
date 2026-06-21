@@ -89,6 +89,22 @@ def _bootstrap_env_flag(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _bootstrap_redact(value):
+    try:
+        from engine.api.redaction import redact_api_payload, redact_string
+
+        if isinstance(value, str):
+            return redact_string(value)
+        return redact_api_payload(value)
+    except Exception as e:
+        logging.log(
+            logging.WARNING,
+            "runtime_bootstrap_redact_failed error=%s",
+            f"{type(e).__name__}: {e}",
+        )
+        return value
+
+
 def _safe_no_credential_bootstrap_mode() -> bool:
     if _bootstrap_env_flag("ALLOW_CREDENTIAL_DATA_PROVIDERS_IN_SAFE", False):
         return False
@@ -120,8 +136,8 @@ def _bootstrap_stderr_event(event: str, error: BaseException, **extra) -> None:
         "event": str(event),
         "component": "engine.runtime.runtime_bootstrap",
         "error_type": type(error).__name__,
-        "error_message": str(error),
-        "extra": dict(extra or {}),
+        "error_message": _bootstrap_redact(str(error)),
+        "extra": _bootstrap_redact(dict(extra or {})),
         "ts_ms": int(time.time() * 1000),
     }
     try:
@@ -153,14 +169,24 @@ def _bootstrap_stderr_event(event: str, error: BaseException, **extra) -> None:
             )
         return
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
-except ModuleNotFoundError as e:
-    if not _is_missing_optional_module(e, "dotenv"):
+def _dashboard_route_contract_introspection_enabled() -> bool:
+    return str(os.environ.get("DASHBOARD_ROUTE_CONTRACT_INTROSPECTION", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+if not _dashboard_route_contract_introspection_enabled():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
+    except ModuleNotFoundError as e:
+        if not _is_missing_optional_module(e, "dotenv"):
+            _bootstrap_stderr_event("runtime_bootstrap_dotenv_load_failed", e)
+    except Exception as e:
         _bootstrap_stderr_event("runtime_bootstrap_dotenv_load_failed", e)
-except Exception as e:
-    _bootstrap_stderr_event("runtime_bootstrap_dotenv_load_failed", e)
 
 from engine.runtime.config_schema import ConfigError, get_runtime_safety_context, load_runtime_config
 from engine.runtime.platform import default_data_root
@@ -189,9 +215,10 @@ _apply_safe_no_credential_bootstrap_environment()
 try:
     load_runtime_config()
 except ConfigError as e:
-    os.environ["RUNTIME_CONFIG_ERROR"] = str(e)
+    safe_error = str(_bootstrap_redact(str(e)))
+    os.environ["RUNTIME_CONFIG_ERROR"] = safe_error
     if _strict_runtime:
-        raise RuntimeError(f"runtime config invalid: {e}") from e
+        raise RuntimeError(f"runtime config invalid: {safe_error}") from None
 
 from engine.runtime.logging import get_logger
 from engine.runtime.failure_diagnostics import log_failure

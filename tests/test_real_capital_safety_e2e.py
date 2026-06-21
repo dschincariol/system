@@ -218,11 +218,43 @@ def _configure_live_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("BROKER_ROUTER_RETRY_BASE_S", "0")
     monkeypatch.setenv("BROKER_ROUTER_RETRY_MAX_S", "0")
     monkeypatch.setenv("BROKER_LATENCY_SLEEP", "0")
+    import engine.runtime.live_trading_preflight as live_preflight
+
+    monkeypatch.setattr(
+        live_preflight,
+        "wal_archiver_runtime_snapshot",
+        lambda *, engine_mode=None, required=None, now_ts=None: {
+            "ok": True,
+            "required": engine_mode == "live",
+            "reason": "ok",
+            "blockers": [],
+            "warnings": [],
+            "archive_mode": "on",
+            "archive_command": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
+            "last_archived_wal": "0000000100000000000000AA",
+            "age_s": 1,
+            "failed_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        live_preflight,
+        "clock_health_snapshot",
+        lambda *, engine_mode=None: {
+            "ok": True,
+            "required": engine_mode == "live",
+            "reason": "ok",
+            "blockers": [],
+            "healthy_sources": ["chronyc"],
+            "skew_sources": ["chronyc"],
+            "max_observed_skew_ms": 1.0,
+        },
+    )
 
     monkeypatch.setenv("ENGINE_MODE", "live")
     monkeypatch.setenv("EXECUTION_MODE", "live")
     monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
     monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    monkeypatch.setenv("BROKER_SHUTDOWN_POLICY", "cancel_only")
     monkeypatch.setenv("LIVE_TRADING_CONFIRM", DEFAULT_LIVE_CONFIRM_PHRASE)
     monkeypatch.setenv("LIVE_TRADING_REQUIRE_CONFIRMATION", "1")
     monkeypatch.setenv("DASHBOARD_API_TOKEN", "live-token-1234567890")
@@ -314,12 +346,40 @@ def _configure_live_env(monkeypatch, tmp_path: Path) -> None:
             _sign_backup_evidence(
                 {
                     "schema_version": 1,
+                    "generated_at": (
+                        datetime.fromtimestamp(now, tz=timezone.utc)
+                        .replace(microsecond=0)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    ),
                     "generated_at_ts": now,
                     "status": "pass",
-                    "base_backup": {"status": "pass", "verified_at_ts": now},
-                    "wal_archive": {"status": "pass", "verified_at_ts": now},
+                    "base_backup": {
+                        "status": "pass",
+                        "backup_dir": "/var/backups/trading/base/base_20260617",
+                        "verify_log": "/var/backups/trading/base/base_20260617/pg_verifybackup.out",
+                        "verified_at_ts": now,
+                    },
+                    "wal_archive": {
+                        "status": "pass",
+                        "wal_file": "/var/backups/trading/wal/0000000100000000000000AA",
+                        "verified_at_ts": now,
+                    },
+                    "wal_archiver": {
+                        "status": "pass",
+                        "source": "pg_stat_archiver",
+                        "archive_mode": "on",
+                        "archive_command": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
+                        "archived_count": 10,
+                        "last_archived_wal": "0000000100000000000000AA",
+                        "last_archived_at_ts": now,
+                        "failed_count": 0,
+                        "last_failed_wal": "",
+                        "last_failed_at_ts": None,
+                    },
                     "restore_drill": {
                         "status": "pass",
+                        "report": "/var/backups/trading/drills/restore_drill_20260617.txt",
                         "verified_at_ts": now,
                         "time_to_recover_s": 60,
                     },

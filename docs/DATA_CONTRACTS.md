@@ -14,7 +14,7 @@ This document records the concrete contracts that are visible in the inspected c
 | Required | The producer always writes it, or the consumer path assumes it exists. |
 | Optional | Present only when the producer has enough context, or only when the underlying table version contains that column. |
 
-Runtime storage note: production and production-like operation use the Postgres-backed facade in `engine/runtime/storage_pg.py`. SQLite remains an isolated Python test backend and a compatibility dialect for older call sites; it is not the production source of truth.
+Runtime storage note: production and production-like operation use the public facade in `engine/runtime/storage.py`, which validates the selected backend before exposing it. The concrete production backend is `engine/runtime/storage_pg.py`. SQLite remains an isolated Python test backend and a compatibility dialect for older call sites; it is not the production source of truth.
 
 ## 1. Canonical Model Intent
 
@@ -326,6 +326,12 @@ Producers:
 - `engine.strategy.portfolio.py`
 - `engine.terminal.api.api_terminal_orders.py`
 
+The strategy producer runs `compute_rebalance()` through explicit stages:
+input loading, allocator loading, target construction, normalization, overlays,
+risk gates, execution blocking, order emission, and persistence. The stage split
+is an orchestration refactor only; emitted `portfolio_orders` rows keep the
+same action, side, weight, lineage, and `explain_json` contract described below.
+
 Consumers:
 - `engine.strategy.portfolio_execution_intents.load_latest_execution_intents(...)`
 - `engine.terminal.api.api_terminal.py`
@@ -351,8 +357,8 @@ Important caveat:
 | `model_id` | `TEXT` | Yes | Producing model id. Terminal writes `baseline`. | model id |
 | `symbol` | `TEXT` | Yes | Asset symbol. | symbol |
 | `action` | `TEXT` | Yes | Portfolio action. The strategy path uses values such as `OPEN`, `INCREASE`, `DECREASE`, `CLOSE`, `REVERSE`, `HOLD`. The terminal path writes `BUY`, `SELL`, and `FLATTEN`. | action code |
-| `from_side` | `TEXT` | No | Prior side when known. | side |
-| `to_side` | `TEXT` | No | Target side when known. | side |
+| `from_side` | `TEXT` | Yes | Prior side. Stored `TEXT NOT NULL` (migration `0022_portfolio_orders.py`); writers must always supply a value. | side |
+| `to_side` | `TEXT` | Yes | Target side. Stored `TEXT NOT NULL` (migration `0022_portfolio_orders.py`); writers must always supply a value. | side |
 | `from_weight` | `REAL` | Yes | Prior portfolio weight in the strategy path. | weight fraction |
 | `to_weight` | `REAL` | Yes | Target portfolio weight in the strategy path. | weight fraction |
 | `delta_weight` | `REAL` | Yes | Weight delta in the portfolio path. Terminal quantity rows keep this at `0.0`; the quantity lives in `explain_json.terminal_order`. | weight fraction |
@@ -585,7 +591,7 @@ Consumers:
 - training loaders that prefer realized `labels_exec.net_z` over gross `labels.impact_z`
 - PatchTST supervised fine-tuning, which first uses realized `net_after_cost_labels.net_return` for `net_edge` targets or `net_after_cost_labels.realized_forward_return` for `forward_return` targets before falling back to legacy labels
 - `engine.strategy.pipeline_train_and_eval._net_eval_metrics(...)`
-- `engine.strategy.model_marketplace` and `engine.strategy.champion_manager`
+- `engine.strategy.model_marketplace` and `engine.strategy.champion_manager`, with shared `model_marketplace_scores` and `champion_assignments` writes routed through `engine.strategy.model_competition.repository`
 - `engine.strategy.promotion_guard.metrics_have_net_cost_evidence(...)`
 
 Failure if malformed:
@@ -1344,3 +1350,86 @@ This route explains blockers only. It does not change the promotion switch or ov
 | `authority` | `TEXT` | Yes | `read_only_governance_evidence`. | enum |
 
 Per-row fields include `ts_ms`, `window_s`, `regime`, `model_name`, optional `model_kind`/`model_ts_ms`, `n`, `rmse`, `dir_acc`, `net_rmse`, slippage metrics, execution-latency metrics when the schema has them, `drawdown_proxy`, `cap_eff`, PnL fields, `score`, sanitized numeric/string `components`, and `source_artifact`.
+
+## 23. Portfolio Backtest API Payload
+
+Producers:
+- `engine.api.api_read_advanced.get_latest_portfolio_backtest()`
+- `engine.strategy.portfolio_backtest.run_backtest()`
+- market-data ingestion jobs that populate `prices`
+
+Consumers:
+- `ui/portfolio_backtest.js`
+- `ui/pro_chart_engine.js` as a fallback portfolio-equity overlay source
+- operator diagnostics that compare latest backtest output to live or paper equity
+
+Failure if malformed:
+- the portfolio backtest chart can imply outperformance without a real market baseline
+- missing benchmark prices can look like a broken chart instead of an unavailable data source
+- zero or null portfolio values can be treated as real observations and distort the equity curve
+
+`GET /api/portfolio/backtest/latest` returns the latest persisted run:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Route success flag. `false` means no run tables or no latest run. | boolean |
+| `run.id` | `INTEGER` | Yes when `ok=true` | Portfolio backtest run id. | id |
+| `run.ts_ms` | `INTEGER` | Yes when `ok=true` | Run creation timestamp. | ms |
+| `run.start_ts_ms` | `INTEGER` | Yes when `ok=true` | Backtest window start. | ms |
+| `run.end_ts_ms` | `INTEGER` | Yes when `ok=true` | Backtest window end. | ms |
+| `run.metrics` | `JSON object` | Yes when `ok=true` | Persisted run metrics. | mixed |
+| `run.points` | `JSON array[object]` | Yes when `ok=true` | Ordered portfolio curve points. | array |
+| `run.points[].ret` | `REAL/null` | Yes | Step return. Missing database values are JSON `null`, not `0.0`. | return fraction |
+| `run.points[].equity` | `REAL/null` | Yes | Portfolio equity at the point. Missing database values are JSON `null`. | equity units |
+| `run.points[].drawdown` | `REAL/null` | Yes | Drawdown at the point. Missing database values are JSON `null`. | fraction |
+| `run.points[].detail` | `JSON object` | Yes | Position, cost, and marker detail decoded from `detail_json`. | JSON |
+| `run.benchmark` | `JSON object` | Yes when `ok=true` | Optional benchmark overlay metadata and points. | object |
+| `meta.benchmark_ready` | `BOOLEAN` | Yes | Mirrors `run.benchmark.available`. | boolean |
+| `meta.benchmark_symbol` | `TEXT` | Yes | Current canonical benchmark symbol. | symbol |
+
+The canonical benchmark is `SPY` from the production `prices` table. The API reads raw benchmark price with `COALESCE(price, px)` for rows between the first and last finite portfolio-equity points in the run, capped to 3000 ordered points. It emits `run.benchmark.points[].value` normalized as:
+
+`normalized_value = raw_spy_price / first_raw_spy_price * first_portfolio_equity`
+
+`run.benchmark.available` is `true` only when at least two usable SPY prices are available. Otherwise `points` is empty or insufficient, the route still returns `ok=true` for the portfolio run, and `run.benchmark.unavailable_reason` explains the missing overlay with reason codes such as `prices_table_missing`, `benchmark_prices_missing`, `benchmark_prices_insufficient`, or `portfolio_start_value_missing`.
+
+## 24. Market Stress API Payloads
+
+Producers:
+- `engine.strategy.market_stress.get_market_stress_snapshot(...)`
+- `dashboard_server.api_get_market_stress(...)`
+- `dashboard_server.api_get_market_stress_history(...)`
+
+Consumers:
+- `ui/market_stress.js`
+- operator overview and runtime summary surfaces that display the market condition
+- strategy and capital guards that read the stress snapshot directly
+
+Failure if malformed:
+- stress spikes above the base normalized range can render off-canvas or disappear from the operator sparkline
+- warning/critical badges can disagree with chart reference lines
+- GDELT conflict stress can be silently misread as a clamped `0..1` score
+
+`/api/market_stress` returns:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Whether the snapshot request succeeded. | boolean |
+| `stress` | `JSON object` | Yes | Latest market-stress snapshot. Empty on error. | object |
+| `thresholds.warning` | `REAL` | Yes | Score where the UI enters elevated/warning stress. | stress score |
+| `thresholds.critical` | `REAL` | Yes | Score where the UI enters high/critical stress. | stress score |
+| `error` | `TEXT` | No | Error detail when `ok=false`. | message |
+
+`stress` includes the cross-asset component levels and z-scores produced by `engine.strategy.market_stress`. The base cross-asset `stress_score` is normalized to `0..1`, but the optional GDELT conflict adjustment is added after that normalization. Therefore the final exposed `stress_score` is non-negative and may exceed `1.0`; consumers must preserve the real magnitude and scale visualizations dynamically rather than clamping the value.
+
+`/api/market_stress_history` returns:
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Whether the history request succeeded. | boolean |
+| `series` | `JSON array[object]` | Yes | Ordered historical stress points. Empty when source prices are unavailable. | array |
+| `series[].ts_ms` | `INTEGER` | Yes | Timestamp for the stress point. | ms |
+| `series[].stress_score` | `REAL` | Yes | Historical stress score, preserving post-GDELT values above `1.0`. | stress score |
+| `thresholds.warning` | `REAL` | Yes | Same warning threshold used by badges and chart reference lines. | stress score |
+| `thresholds.critical` | `REAL` | Yes | Same critical threshold used by badges and chart reference lines. | stress score |
+| `error` | `TEXT` | No | Error detail when `ok=false`. | message |

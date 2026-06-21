@@ -17,13 +17,20 @@ services:
     environment:
       POSTGRES_DB: ${TIMESCALE_DB:-trading}
       POSTGRES_USER: ${TIMESCALE_USER:-trading}
-      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD:?set TIMESCALE_PASSWORD}
+      POSTGRES_PASSWORD_FILE: /run/secrets/timescale_password
       POSTGRES_INITDB_ARGS: "--data-checksums"
+      TS_BACKUP_ROOT: /var/backups/trading
+      TS_BACKUP_WAL_DIR: /var/backups/trading/wal
+      TS_WAL_ARCHIVE_REQUIRE_MOUNT: "1"
     ports:
-      - "${TIMESCALE_PORT:-5432}:5432"
+      - "${TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${TIMESCALE_PORT:-5432}:5432"
     volumes:
-      - timescaledb-data:/var/lib/postgresql/data
-      - ${TRADING_BACKUP_ROOT:-/var/backups/trading}:/var/backups/trading
+      - ${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:/var/lib/postgresql/data
+      - ${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:/var/backups/trading
+      - ${TRADING_WAL_ARCHIVE_SCRIPT:-../../ops/backup/wal_archive.sh}:/opt/trading/ops/backup/wal_archive.sh:ro
+      - ${TRADING_WAL_ARCHIVE_CATCHUP_SCRIPT:-../../ops/backup/wal_archive_catchup.sh}:/opt/trading/ops/backup/wal_archive_catchup.sh:ro
+    secrets:
+      - timescale_password
     command:
       - postgres
       - -c
@@ -57,7 +64,7 @@ services:
       - -c
       - archive_mode=${TIMESCALE_ARCHIVE_MODE:-on}
       - -c
-      - archive_command=mkdir -p /var/backups/trading/wal && test ! -f /var/backups/trading/wal/%f && cp %p /var/backups/trading/wal/%f || test -f /var/backups/trading/wal/%f
+      - archive_command=${TIMESCALE_ARCHIVE_COMMAND:-/opt/trading/ops/backup/wal_archive.sh "%p" "%f"}
       - -c
       - archive_timeout=${TIMESCALE_ARCHIVE_TIMEOUT:-60s}
       - -c
@@ -113,26 +120,21 @@ services:
     mem_limit: ${REDIS_MEM_LIMIT:-8g}
     memswap_limit: ${REDIS_MEMSWAP_LIMIT:-8g}
     logging: *trading-logging
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
     command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --requirepass
-      - ${REDIS_PASSWORD:?set REDIS_PASSWORD}
-      - --maxmemory
-      - ${REDIS_MAXMEMORY:-6gb}
-      - --maxmemory-policy
-      - ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
+      - sh
+      - -ec
+      - |
+        exec redis-server --appendonly yes --requirepass "$$(cat /run/secrets/redis_password)" --maxmemory "${REDIS_MAXMEMORY:-6gb}" --maxmemory-policy "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}"
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${REDIS_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     volumes:
-      - redis-data:/data
+      - ${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}:/data
+    secrets:
+      - redis_password
     healthcheck:
       test:
         - CMD-SHELL
-        - redis-cli -a $$REDIS_PASSWORD ping
+        - redis-cli -a "$$(cat /run/secrets/redis_password)" ping
       interval: 10s
       timeout: 5s
       retries: 10
@@ -154,13 +156,16 @@ services:
       - --console-address
       - :9001
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${MINIO_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - minio-data:/data
+      - ${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}:/data
+    secrets:
+      - minio_root_user
+      - minio_root_password
     networks:
       - trading-external
 
@@ -170,8 +175,6 @@ services:
     restart: "no"
     logging: *trading-logging
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
       OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:?set OBJECT_STORE_BUCKET}
     depends_on:
       minio:
@@ -181,11 +184,16 @@ services:
       - -c
       - |
         set -eu
+        MINIO_ROOT_USER="$$(cat /run/secrets/minio_root_user)"
+        MINIO_ROOT_PASSWORD="$$(cat /run/secrets/minio_root_password)"
         until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do
           echo "waiting for minio"
           sleep 2
         done
         mc mb --ignore-existing "local/$${OBJECT_STORE_BUCKET}"
+    secrets:
+      - minio_root_user
+      - minio_root_password
     networks:
       - trading-external
 
@@ -193,7 +201,12 @@ networks:
   trading-external:
     name: trading-external
 
-volumes:
-  timescaledb-data:
-  redis-data:
-  minio-data:
+secrets:
+  timescale_password:
+    file: ${TIMESCALE_PASSWORD_FILE:?set TIMESCALE_PASSWORD_FILE}
+  redis_password:
+    file: ${REDIS_PASSWORD_FILE:?set REDIS_PASSWORD_FILE}
+  minio_root_user:
+    file: ${MINIO_ROOT_USER_FILE:?set MINIO_ROOT_USER_FILE}
+  minio_root_password:
+    file: ${MINIO_ROOT_PASSWORD_FILE:?set MINIO_ROOT_PASSWORD_FILE}

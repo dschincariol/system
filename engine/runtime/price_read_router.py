@@ -13,7 +13,7 @@ from engine.runtime.storage import connect_ro
 from engine.runtime.storage_pg_prices import (
     PostgresPriceStorageConfig,
     _quote_ident,
-    psycopg2,
+    psycopg,
 )
 
 LOG = get_logger("runtime.price_read_router")
@@ -57,7 +57,7 @@ def _sqlite_table_exists(con: Any, name: str) -> bool:
 
 def _timescale_enabled() -> bool:
     config = PostgresPriceStorageConfig.from_env()
-    return bool(config.enabled and config.dsn and psycopg2 is not None)
+    return bool(config.enabled and config.dsn and psycopg is not None)
 
 
 def _read_backend_mode() -> str:
@@ -85,10 +85,10 @@ def get_price_read_backend() -> str:
 @contextmanager
 def _timescale_connection():
     config = PostgresPriceStorageConfig.from_env()
-    if psycopg2 is None or not str(config.dsn or "").strip():
+    if psycopg is None or not str(config.dsn or "").strip():
         raise RuntimeError("timescale_price_reader_not_configured")
-    con = psycopg2.connect(
-        dsn=str(config.dsn),
+    con = psycopg.connect(
+        str(config.dsn),
         connect_timeout=int(max(1, round(float(config.connect_timeout_s)))),
         application_name="trading-system-price-read-router",
     )
@@ -235,20 +235,36 @@ def fetch_price_rows(*, symbol: str = "", limit: int = 200) -> List[Dict[str, An
     return _fetch_sqlite_price_rows(symbol=symbol, limit=limit)
 
 
+def _quote_rows_as_tuples(rows: List[Any]) -> List[Tuple[int, Optional[float], Optional[float]]]:
+    out = [
+        (
+            int(row[0] or 0),
+            (float(row[1]) if row[1] is not None else None),
+            (float(row[2]) if row[2] is not None else None),
+        )
+        for row in rows
+    ]
+    return sorted(out, key=lambda row: int(row[0] or 0))
+
+
 def _fetch_timescale_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> List[Tuple[int, Optional[float], Optional[float]]]:
     with _timescale_connection() as (con, schema_name):
         schema_ref = _quote_ident(schema_name)
         params = [str(symbol), int(since_ts_ms), int(limit)]
         sql = f"""
-            SELECT
-              (EXTRACT(EPOCH FROM "time") * 1000)::BIGINT AS ts_ms,
-              last,
-              volume
-            FROM {schema_ref}.price_quotes
-            WHERE symbol = %s
-              AND "time" > TO_TIMESTAMP(%s / 1000.0)
-            ORDER BY "time" ASC
-            LIMIT %s
+            SELECT ts_ms, last, volume
+            FROM (
+              SELECT
+                (EXTRACT(EPOCH FROM "time") * 1000)::BIGINT AS ts_ms,
+                last,
+                volume
+              FROM {schema_ref}.price_quotes
+              WHERE symbol = %s
+                AND "time" > TO_TIMESTAMP(%s / 1000.0)
+              ORDER BY "time" DESC
+              LIMIT %s
+            ) newest_rows
+            ORDER BY ts_ms ASC
         """
         with con.cursor() as cur:
             cur.execute(sql, tuple(params))
@@ -256,27 +272,24 @@ def _fetch_timescale_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) ->
             if not rows:
                 cur.execute(
                     f"""
-                    SELECT
-                      (EXTRACT(EPOCH FROM "time") * 1000)::BIGINT AS ts_ms,
-                      last,
-                      volume
-                    FROM {schema_ref}.price_quotes_raw
-                    WHERE symbol = %s
-                      AND "time" > TO_TIMESTAMP(%s / 1000.0)
-                    ORDER BY "time" ASC
-                    LIMIT %s
+                    SELECT ts_ms, last, volume
+                    FROM (
+                      SELECT
+                        (EXTRACT(EPOCH FROM "time") * 1000)::BIGINT AS ts_ms,
+                        last,
+                        volume
+                      FROM {schema_ref}.price_quotes_raw
+                      WHERE symbol = %s
+                        AND "time" > TO_TIMESTAMP(%s / 1000.0)
+                      ORDER BY "time" DESC
+                      LIMIT %s
+                    ) newest_rows
+                    ORDER BY ts_ms ASC
                     """,
                     tuple(params),
                 )
                 rows = cur.fetchall() or []
-        return [
-            (
-                int(row[0] or 0),
-                (float(row[1]) if row[1] is not None else None),
-                (float(row[2]) if row[2] is not None else None),
-            )
-            for row in rows
-        ]
+        return _quote_rows_as_tuples(rows)
 
 
 def _fetch_sqlite_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> List[Tuple[int, Optional[float], Optional[float]]]:
@@ -287,11 +300,15 @@ def _fetch_sqlite_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> Li
             rows = con.execute(
                 """
                 SELECT ts_ms, last, volume
-                FROM price_quotes
-                WHERE symbol=?
-                  AND ts_ms > ?
+                FROM (
+                  SELECT ts_ms, last, volume
+                  FROM price_quotes
+                  WHERE symbol=?
+                    AND ts_ms > ?
+                  ORDER BY ts_ms DESC
+                  LIMIT ?
+                ) newest_rows
                 ORDER BY ts_ms ASC
-                LIMIT ?
                 """,
                 (str(symbol), int(since_ts_ms), int(limit)),
             ).fetchall() or []
@@ -299,22 +316,19 @@ def _fetch_sqlite_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> Li
             rows = con.execute(
                 """
                 SELECT ts_ms, last, volume
-                FROM price_quotes_raw
-                WHERE symbol=?
-                  AND ts_ms > ?
+                FROM (
+                  SELECT ts_ms, last, volume
+                  FROM price_quotes_raw
+                  WHERE symbol=?
+                    AND ts_ms > ?
+                  ORDER BY ts_ms DESC
+                  LIMIT ?
+                ) newest_rows
                 ORDER BY ts_ms ASC
-                LIMIT ?
                 """,
                 (str(symbol), int(since_ts_ms), int(limit)),
             ).fetchall() or []
-        return [
-            (
-                int(row[0] or 0),
-                (float(row[1]) if row[1] is not None else None),
-                (float(row[2]) if row[2] is not None else None),
-            )
-            for row in rows
-        ]
+        return _quote_rows_as_tuples(rows)
     finally:
         con.close()
 

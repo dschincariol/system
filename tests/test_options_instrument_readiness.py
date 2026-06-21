@@ -288,6 +288,11 @@ def test_live_preflight_surfaces_options_instrument_blockers(monkeypatch):
         "live_ai_safety_snapshot",
         lambda **_kwargs: {"ok": True, "required": True, "blockers": []},
     )
+    monkeypatch.setattr(
+        preflight,
+        "clock_health_snapshot",
+        lambda **_kwargs: {"ok": True, "required": True, "blockers": [], "reason": "ok"},
+    )
 
     state = preflight.live_trading_preflight(engine_mode="live", execution_mode="live")
 

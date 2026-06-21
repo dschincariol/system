@@ -2,6 +2,8 @@
 
 Use this checklist before moving from safe/paper operation to live trading.
 
+Canonical production-prep procedure for enabling real trading: see [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md) §6 ("Before Enabling Real Trading"). The items below are the live-trading-specific environment and readiness assertions; where they restate §6, treat §6 as the authoritative procedural source and the entries here as the live-mode requirement checklist.
+
 ## Required Environment
 
 - `ENGINE_MODE=live`

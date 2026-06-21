@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { renderChartAccessibility } from "../ui/chart_a11y.js";
-import { buildReplayViewModel, renderReplayPanel, replayMarkerStyle } from "../ui/replay.mjs";
+import { buildReplayChartModel, buildReplayViewModel, renderReplayPanel, replayMarkerStyle } from "../ui/replay.mjs";
 
 class FakeElement {
   constructor(id = "", ownerDocument = null) {
@@ -57,6 +57,7 @@ class FakeCanvas extends FakeElement {
       lineTo: noop,
       stroke: noop,
       fillText: noop,
+      measureText: (value) => ({ width: String(value).length * 6 }),
       arc: noop,
       rect: noop,
       closePath: noop,
@@ -144,6 +145,99 @@ test("replay chart markers use tokenized color plus shape semantics", () => {
   assert.equal(sell.label, "SELL");
 });
 
+test("replay chart model uses OHLC bodies and high-low wicks", () => {
+  const t0 = Date.UTC(2026, 0, 2, 14, 30);
+  const vm = buildReplayViewModel({
+    ok: true,
+    read_only: true,
+    date: "2026-01-02",
+    symbol: "SPY",
+    candles: [
+      { ts_ms: t0, open: 100, high: 110, low: 95, close: 106, volume: 10 },
+      { ts_ms: t0 + 60_000, open: 106, high: 108, low: 97, close: 99, volume: 12 },
+    ],
+  });
+
+  const model = buildReplayChartModel(vm, { width: 800, height: 260 });
+  const first = model.candles[0];
+  const second = model.candles[1];
+
+  assert.equal(model.ok, true);
+  assert.equal(model.candles.length, 2);
+  assert.ok(first.highY < Math.min(first.openY, first.closeY));
+  assert.ok(first.lowY > Math.max(first.openY, first.closeY));
+  assert.ok(first.bodyHeight > 1);
+  assert.equal(first.up, true);
+  assert.equal(second.up, false);
+  assert.ok(model.legend.some((item) => item.label === "OHLC"));
+  assert.deepEqual(model.xTicks.map((tick) => tick.value), [t0, t0 + 30_000, t0 + 60_000]);
+});
+
+test("replay candle normalization corrects impossible OHLC bounds before charting", () => {
+  const t0 = Date.UTC(2026, 0, 2, 14, 30);
+  const vm = buildReplayViewModel({
+    ok: true,
+    read_only: true,
+    date: "2026-01-02",
+    symbol: "SPY",
+    candles: [
+      { ts_ms: t0, open: 100, high: 98, low: 102, close: 106, volume: 10 },
+      { ts_ms: t0 + 60_000, open: 106, high: 107, low: 99, close: 101, volume: 12 },
+    ],
+  });
+
+  const normalized = vm.streams.candles[0];
+  assert.equal(normalized.high, 106);
+  assert.equal(normalized.low, 100);
+  assert.equal(normalized.raw_high, 98);
+  assert.equal(normalized.raw_low, 102);
+  assert.equal(normalized.ohlc_corrected, true);
+
+  const model = buildReplayChartModel(vm, { width: 800, height: 260 });
+  const first = model.candles[0];
+  assert.equal(model.ok, true);
+  assert.ok(first.highY <= Math.min(first.openY, first.closeY));
+  assert.ok(first.lowY >= Math.max(first.openY, first.closeY));
+  assert.ok(first.bodyHeight > 1);
+});
+
+test("replay chart model aligns markers by timestamp and anchor price", () => {
+  const t0 = Date.UTC(2026, 0, 2, 14, 30);
+  const fillTs = t0 + 30_000;
+  const decisionTs = t0 + 10_000;
+  const vm = buildReplayViewModel({
+    ok: true,
+    read_only: true,
+    date: "2026-01-02",
+    symbol: "SPY",
+    candles: [
+      { ts_ms: t0, open: 100, high: 104, low: 96, close: 101, volume: 10 },
+      { ts_ms: t0 + 60_000, open: 101, high: 110, low: 98, close: 108, volume: 12 },
+    ],
+    decisions: [{ id: 1, ts_ms: decisionTs, symbol: "SPY", label: "BUY", confidence: 0.8 }],
+    fills: [{ id: 2, ts_ms: fillTs, symbol: "SPY", side: "BUY", qty: 10, price: 106.5 }],
+  });
+
+  const model = buildReplayChartModel(vm, { width: 800, height: 260 });
+  const fill = model.markers.find((marker) => marker.markerKind === "fill");
+  const decision = model.markers.find((marker) => marker.markerKind === "decision");
+  const expectedX = (ts) => model.plot.left + model.plot.width * ((ts - model.domain.minTs) / (model.domain.maxTs - model.domain.minTs));
+  const expectedY = (price) => model.plot.top + model.plot.height * (1 - ((price - model.domain.minP) / (model.domain.maxP - model.domain.minP)));
+
+  assert.ok(fill);
+  assert.equal(fill.price, 106.5);
+  assert.equal(fill.anchor.source, "event_price");
+  assert.ok(Math.abs(fill.x - expectedX(fillTs)) < 0.001);
+  assert.ok(Math.abs(fill.y - expectedY(106.5)) < 0.001);
+
+  assert.ok(decision);
+  assert.equal(decision.price, 101);
+  assert.equal(decision.anchor.source, "nearest_close");
+  assert.equal(decision.anchor.candleTsMs, t0);
+  assert.ok(Math.abs(decision.x - expectedX(decisionTs)) < 0.001);
+  assert.ok(Math.abs(decision.y - expectedY(101)) < 0.001);
+});
+
 test("chart accessibility helper assigns labels and renders fallback table", () => {
   const doc = new FakeDocument();
   const chart = doc.add(new FakeCanvas("demoChart"));
@@ -204,9 +298,53 @@ test("replay panel render gives the canvas an accessible label and fallback tabl
     );
 
     assert.equal(canvas.getAttribute("role"), "img");
-    assert.match(canvas.getAttribute("aria-label"), /Historical replay: SPY close 101\.00/);
-    assert.match(doc.getElementById("replayChartA11y").innerHTML, /Historical replay data table/);
-    assert.match(doc.getElementById("replayChartA11y").innerHTML, /Close/);
+    assert.match(canvas.getAttribute("aria-label"), /Historical replay: SPY OHLC candles latest/);
+    assert.match(canvas.getAttribute("aria-label"), /C 101\.00/);
+    const fallback = doc.getElementById("replayChartA11y").innerHTML;
+    assert.match(fallback, /Historical replay data table/);
+    assert.match(fallback, /Open/);
+    assert.match(fallback, /High/);
+    assert.match(fallback, /Low/);
+    assert.match(fallback, /Close/);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("replay panel render keeps error and empty states accessible", () => {
+  const previousWindow = globalThis.window;
+  globalThis.window = { devicePixelRatio: 1 };
+  try {
+    const doc = new FakeDocument();
+    for (const id of [
+      "replayMeta",
+      "replayStatus",
+      "replayStats",
+      "replaySelected",
+      "replayEvents",
+      "replayGaps",
+      "replayTimeline",
+      "replayChartA11y",
+    ]) {
+      doc.add(new FakeElement(id));
+    }
+    const canvas = doc.add(new FakeCanvas("replayChart"));
+
+    renderReplayPanel(
+      {
+        ok: false,
+        read_only: true,
+        date: "2026-01-02",
+        symbol: "SPY",
+        gaps: [{ stream: "replay", code: "load_failed", message: "Replay load failed.", severity: "warn" }],
+      },
+      doc,
+    );
+
+    assert.equal(canvas.getAttribute("data-chart-a11y-state"), "error");
+    assert.match(canvas.getAttribute("aria-label"), /Replay load failed/);
+    assert.match(doc.getElementById("replayChartA11y").innerHTML, /Replay load failed/);
+    assert.match(doc.getElementById("replayStatus").textContent, /no data/);
   } finally {
     globalThis.window = previousWindow;
   }

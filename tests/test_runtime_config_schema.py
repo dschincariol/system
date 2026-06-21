@@ -37,6 +37,7 @@ LIVE_ENV_CONTRACT = {
     "BROKER_NAME": "alpaca",
     "LIVE_BROKER": "alpaca",
     "BROKER_FAILOVER": "alpaca",
+    "BROKER_SHUTDOWN_POLICY": "cancel_only",
     "ALPACA_BASE_URL": "https://api.alpaca.markets",
     "ALPACA_KEY_ID": "alpaca-key",
     "ALPACA_SECRET_KEY": "alpaca-secret",
@@ -51,6 +52,18 @@ GOOD_BACKUP_EVIDENCE = {
     "base_backup": {"age_s": 1},
     "wal_archive": {"age_s": 1},
     "restore_drill": {"age_s": 1},
+}
+GOOD_WAL_ARCHIVER_RUNTIME = {
+    "ok": True,
+    "required": True,
+    "reason": "ok",
+    "blockers": [],
+    "warnings": [],
+    "archive_mode": "on",
+    "archive_command": '/opt/trading/ops/backup/wal_archive.sh "%p" "%f"',
+    "last_archived_wal": "0000000100000000000000AA",
+    "age_s": 1,
+    "failed_count": 0,
 }
 GOOD_POSITION_RECONCILE_EVIDENCE = {
     "ok": True,
@@ -82,6 +95,17 @@ GOOD_LIVE_AI_SAFETY = {
     "rl_policy": {"ok": True, "required": True, "blockers": []},
     "model_serving": {"ok": True, "required": True, "blockers": []},
 }
+GOOD_CLOCK_HEALTH = {
+    "ok": True,
+    "required": True,
+    "mode": "live",
+    "reason": "ok",
+    "blockers": [],
+    "healthy_sources": ["chronyc"],
+    "skew_sources": ["chronyc"],
+    "max_observed_skew_ms": 1.0,
+    "timezone": {"ok": True, "required_timezone": "UTC", "actual_timezone": "UTC"},
+}
 
 
 def _var_db_path(name: str) -> str:
@@ -91,6 +115,14 @@ def _var_db_path(name: str) -> str:
 
 
 class RuntimeConfigSchemaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._clock_patch = patch(
+            "engine.runtime.live_trading_preflight.clock_health_snapshot",
+            return_value=GOOD_CLOCK_HEALTH,
+        )
+        self._clock_patch.start()
+        self.addCleanup(self._clock_patch.stop)
+
     def _load(self):
         from engine.runtime.config_schema import load_runtime_config
 
@@ -441,6 +473,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
             ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
+            ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
             ), patch(
@@ -510,6 +545,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
             ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
+            ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
             ), patch(
@@ -574,6 +612,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
             ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
+            ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
             ), patch(
@@ -609,6 +650,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
             ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
+            ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
             ), patch(
@@ -641,6 +685,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
             with patch(
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
+            ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
             ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
@@ -675,6 +722,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
             with patch(
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
+            ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
             ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
@@ -711,6 +761,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
             with patch(
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
+            ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
             ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
@@ -889,6 +942,9 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
             with patch(
                 "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
                 return_value=GOOD_BACKUP_EVIDENCE,
+            ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
             ), patch(
                 "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
                 return_value=GOOD_POSITION_RECONCILE_EVIDENCE,

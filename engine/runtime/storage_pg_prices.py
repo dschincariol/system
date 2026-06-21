@@ -14,19 +14,18 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 try:
-    import psycopg2
-    from psycopg2 import pool as psycopg2_pool
-    from psycopg2.extras import execute_values
+    import psycopg
+    from psycopg_pool import ConnectionPool
 except Exception:  # pragma: no cover - optional dependency at runtime
-    psycopg2 = None  # type: ignore[assignment]
-    psycopg2_pool = None  # type: ignore[assignment]
-    execute_values = None  # type: ignore[assignment]
+    psycopg = None  # type: ignore[assignment]
+    ConnectionPool = None  # type: ignore[assignment]
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.logging import get_logger
 from engine.runtime.metrics import emit_counter, emit_timing
 from engine.runtime.observability import record_component_health
+from engine.runtime.platform import connection_info_with_pg_password
 
 LOG = get_logger("runtime.storage_pg_prices")
 _STORE_LOCK = threading.Lock()
@@ -102,6 +101,17 @@ def _env_int(name: str, default: int) -> int:
 
 def _quote_ident(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
+
+
+def _execute_many_values(cur: Any, sql: str, rows: Iterable[tuple[Any, ...]]) -> None:
+    batch = [tuple(row) for row in rows]
+    if not batch:
+        return
+    placeholders = "(" + ", ".join("%s" for _ in range(len(batch[0]))) + ")"
+    rendered_sql = str(sql).replace("VALUES %s", f"VALUES {placeholders}", 1)
+    if rendered_sql == str(sql):
+        raise ValueError("batch_values_placeholder_missing")
+    cur.executemany(rendered_sql, batch)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -197,6 +207,8 @@ class PostgresPriceStorageConfig:
             or os.environ.get("TIMESCALE_DATABASE_URL")
             or ""
         ).strip()
+        if dsn:
+            dsn = connection_info_with_pg_password(dsn)
         enabled = _env_bool("TIMESCALE_PRICES_ENABLED", default=bool(dsn))
         pool_min_size = tuned_int("TIMESCALE_PRICES_POOL_MIN_SIZE", 1, 1, 16)
         pool_max_size = max(pool_min_size, tuned_int("TIMESCALE_PRICES_POOL_MAX_SIZE", 4, 1, 16))
@@ -266,17 +278,30 @@ class PostgresPriceStorage:
     def start(self) -> dict[str, Any]:
         if not self.enabled:
             return self.get_snapshot()
-        if psycopg2_pool is None or execute_values is None or psycopg2 is None:
-            raise RuntimeError("timescale_prices_enabled_but_psycopg2_not_installed")
+        if ConnectionPool is None or psycopg is None:
+            raise RuntimeError("timescale_prices_enabled_but_psycopg_not_installed")
         with self._state_lock:
             if self._pool is None:
-                self._pool = psycopg2_pool.ThreadedConnectionPool(
-                    minconn=int(self._config.pool_min_size),
-                    maxconn=int(self._config.pool_max_size),
-                    dsn=str(self._config.dsn),
-                    connect_timeout=int(max(1, round(self._config.connect_timeout_s))),
-                    application_name=str(self._config.application_name),
+                pool = ConnectionPool(
+                    conninfo=str(self._config.dsn),
+                    min_size=int(self._config.pool_min_size),
+                    max_size=int(self._config.pool_max_size),
+                    timeout=float(self._config.connect_timeout_s),
+                    kwargs={
+                        "connect_timeout": int(max(1, round(self._config.connect_timeout_s))),
+                        "application_name": str(self._config.application_name),
+                    },
+                    open=False,
                 )
+                try:
+                    pool.open(wait=True, timeout=float(self._config.connect_timeout_s))
+                except Exception:
+                    try:
+                        pool.close(timeout=float(self._config.connect_timeout_s))
+                    except Exception:
+                        pass  # no-op-guard: allow - best-effort cleanup after failed pool open
+                    raise
+                self._pool = pool
         self.ensure_schema()
         return self.get_snapshot()
 
@@ -286,7 +311,7 @@ class PostgresPriceStorage:
             self._pool = None
         if pool is not None:
             try:
-                pool.closeall()
+                pool.close(timeout=float(self._config.connect_timeout_s))
             except Exception as exc:
                 self._record_error(exc)
         return self.get_snapshot()
@@ -322,7 +347,7 @@ class PostgresPriceStorage:
             self._pool = None
         if pool is not None:
             try:
-                pool.closeall()
+                pool.close(timeout=float(self._config.connect_timeout_s))
             except Exception as exc:
                 self._record_error(exc)
 
@@ -466,7 +491,7 @@ class PostgresPriceStorage:
             pool = self._pool
         if pool is None:
             raise RuntimeError("timescale_prices_connection_pool_unavailable")
-        con = pool.getconn()
+        con = pool.getconn(timeout=float(self._config.connect_timeout_s))
         discard = False
         con.autocommit = False
         try:
@@ -474,10 +499,19 @@ class PostgresPriceStorage:
             yield con
         except Exception:
             discard = True
+            try:
+                con.rollback()
+            except Exception:
+                pass  # no-op-guard: allow - connection may already be broken
             raise
         finally:
             try:
-                pool.putconn(con, close=discard)
+                if discard:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass  # no-op-guard: allow - pool will discard closed connections
+                pool.putconn(con)
             except Exception as exc:
                 self._record_error(exc)
 
@@ -730,7 +764,7 @@ class PostgresPriceStorage:
             with self._connection() as con:
                 with con.cursor() as cur:
                     if price_rows:
-                        execute_values(
+                        _execute_many_values(
                             cur,
                             f"""
                             INSERT INTO {price_ticks_ref}(
@@ -753,7 +787,7 @@ class PostgresPriceStorage:
                             price_rows,
                         )
                     if quote_rows:
-                        execute_values(
+                        _execute_many_values(
                             cur,
                             f"""
                             INSERT INTO {quotes_ref}(
@@ -774,7 +808,7 @@ class PostgresPriceStorage:
                             quote_rows,
                         )
                     if raw_rows:
-                        execute_values(
+                        _execute_many_values(
                             cur,
                             f"""
                             INSERT INTO {raw_ref}(

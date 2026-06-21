@@ -21,6 +21,7 @@ _SENSITIVE_KEY_EXACT = frozenset(
         "token",
         "api_key",
         "apikey",
+        "key_id",
         "access_key",
         "secret_key",
         "session_key",
@@ -44,6 +45,7 @@ _SENSITIVE_KEY_SUFFIXES = (
     "_token",
     "_api_key",
     "_apikey",
+    "_key_id",
     "_access_key",
     "_secret_key",
     "_session_key",
@@ -87,14 +89,22 @@ _URL_WITH_USERINFO_RE = re.compile(
     re.IGNORECASE,
 )
 _KEY_VALUE_SECRET_RE = re.compile(
-    r"(?P<key>\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|"
-    r"session[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|master[_-]?key|"
+    r"(?P<key>\b[A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|"
+    r"key[_-]?id|session[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|master[_-]?key|"
     r"hmac[_-]?key|account[_-]?id|account[_-]?number|broker[_-]?account[_-]?id|"
-    r"broker[_-]?order[_-]?id|authorization)\b)"
+    r"broker[_-]?order[_-]?id|authorization)[A-Za-z0-9_.-]*\b)"
     r"(?P<sep>\s*[:=]\s*)"
     r"(?P<quote>['\"]?)"
     r"(?P<value>[^'\"\s,;]+)"
     r"(?P=quote)",
+    re.IGNORECASE,
+)
+_JSON_STRING_SECRET_RE = re.compile(
+    r'(?P<prefix>"[^"]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|'
+    r'key[_-]?id|session[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|master[_-]?key|'
+    r'hmac[_-]?key|authorization)[^"]*"\s*:\s*")'
+    r'(?P<value>[^"]*)'
+    r'(?P<suffix>")',
     re.IGNORECASE,
 )
 _AUTHORIZATION_RE = re.compile(
@@ -186,6 +196,10 @@ def redact_string(value: str, known_sensitive_values: set[str] | None = None) ->
         return f"{key}{sep}{quote}{marker}{quote}"
 
     text = _KEY_VALUE_SECRET_RE.sub(_replace_key_value, text)
+    text = _JSON_STRING_SECRET_RE.sub(
+        lambda match: f"{match.group('prefix')}{redacted_marker(match.group('value'))}{match.group('suffix')}",
+        text,
+    )
     for secret in sorted(known_sensitive_values or set(), key=len, reverse=True):
         if secret and len(secret) >= 4:
             text = text.replace(secret, redacted_marker(secret))

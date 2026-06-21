@@ -54,7 +54,7 @@ flowchart TD
     G --> H[start lifecycle monitor<br/>model scoring<br/>auto_rollback_loop]
     H --> I[bounded preflight]
     I --> J{preflight ok?}
-    J -->|no| K[api_post_self_repair()]
+    J -->|no| K[engine.api.api_self_repair<br/>api_post_self_repair()]
     J -->|yes| L[validate supervisor graph]
     K --> L
     L --> M[auto-boot daemon jobs from JOB_ORDER<br/>ingestion_runtime provider_monitor metrics_collector]

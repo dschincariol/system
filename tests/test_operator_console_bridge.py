@@ -10,10 +10,22 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import pytest
+
 
 os.environ.setdefault("TIMESCALE_ENABLED", "0")
 os.environ.setdefault("FEATURE_STORE_ENABLED", "0")
 os.environ.setdefault("FEATURE_STORE_INIT_ON_STARTUP", "0")
+
+
+@pytest.fixture(autouse=True)
+def _dashboard_token_file_for_bridge_tests(tmp_path, monkeypatch):
+    token_file = tmp_path / "dashboard_api_token"
+    token_file.write_text("dashboard-bridge-test-token-1234567890", encoding="utf-8")
+    token_file.chmod(0o600)
+    monkeypatch.delenv("DASHBOARD_API_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_API_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("TRADING_SECRET_POLICY_REPO_ROOT", str(tmp_path))
 
 
 class _FakeResponse:
@@ -520,6 +532,7 @@ def test_operator_sidecar_rejects_sensitive_get_without_operator_token_and_redac
             [
                 "SAFE_SETTING=visible",
                 "DASHBOARD_API_TOKEN=dashboard-secret-1234567890",
+                "ALPACA_KEY_ID=alpaca-key-id-secret",
                 "TS_PG_DSN=host=db user=trading password=pg-secret dbname=trading",
                 "LIVE_CACHE_REDIS_URL=redis://:redis-secret@redis:6379/0",
                 "DATA_SOURCE_MASTER_KEY=master-secret",
@@ -590,6 +603,7 @@ def test_operator_sidecar_rejects_sensitive_get_without_operator_token_and_redac
         assert config["ok"] is True
         assert config["SAFE_SETTING"] == "visible"
         assert config["DASHBOARD_API_TOKEN"] == "***REDACTED***"
+        assert config["ALPACA_KEY_ID"] == "***REDACTED***"
         assert config["TS_PG_DSN"] == "***REDACTED***"
         assert config["LIVE_CACHE_REDIS_URL"] == "***REDACTED***"
         assert config["DATA_SOURCE_MASTER_KEY"] == "***REDACTED***"

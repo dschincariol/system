@@ -15,7 +15,7 @@ import time
 from typing import Dict, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
-from engine.runtime.price_router import publish_price_event
+from engine.runtime.price_router import price_persistence_backpressure_status, publish_price_event
 from engine.runtime.storage import connect, run_write_txn
 
 ANOMALY_THRESHOLD_BPS = float(os.environ.get("PROVIDER_ANOMALY_BPS", "25"))
@@ -403,7 +403,7 @@ def select_best_quotes_from_snapshots(
 
         if publish_selected:
             try:
-                publish_price_event(
+                publish_counts = publish_price_event(
                     {
                         "symbol": str(symbol),
                         "timestamp": int(rec.get("ts_ms") or int(time.time() * 1000)),
@@ -416,6 +416,18 @@ def select_best_quotes_from_snapshots(
                     },
                     component="engine.data.provider_router",
                 )
+                async_status = price_persistence_backpressure_status(publish_counts)
+                if bool(async_status.get("backpressure")):
+                    reason = str(async_status.get("reason") or "async_price_writer_backpressure")
+                    rec["async_persistence_backpressure"] = True
+                    rec["async_persistence_reason"] = reason
+                    _warn_nonfatal(
+                        "PROVIDER_ROUTER_ASYNC_PERSISTENCE_BACKPRESSURE",
+                        RuntimeError(reason),
+                        once_key=f"provider_router_async_persistence_backpressure:{symbol}",
+                        symbol=str(symbol),
+                        provider=str(rec.get("provider") or "router"),
+                    )
             except Exception as e:
                 _warn_nonfatal(
                     "PROVIDER_ROUTER_PUBLISH_PRICE_EVENT_FAILED",

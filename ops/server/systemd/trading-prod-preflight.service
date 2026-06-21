@@ -17,12 +17,17 @@ Environment=TS_SECRETS_PROVIDER=systemd-creds
 Environment=TS_PG_ROLE=app
 Environment=ENGINE_SUPERVISED=1
 Environment=BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
+Environment=DASHBOARD_API_TOKEN_SECRET=dashboard_api_token
+Environment=OPERATOR_API_TOKEN_SECRET=operator_api_token
 LoadCredentialEncrypted=master_key:/etc/credstore.encrypted/master_key.cred
 LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred
 LoadCredentialEncrypted=redis_password:/etc/credstore.encrypted/redis_password.cred
 LoadCredentialEncrypted=object_store_secret_key:/etc/credstore.encrypted/object_store_secret_key.cred
 LoadCredentialEncrypted=dashboard_api_token:/etc/credstore.encrypted/dashboard_api_token.cred
+LoadCredentialEncrypted=operator_api_token:/etc/credstore.encrypted/operator_api_token.cred
 ExecStart=/opt/trading/venv/bin/python engine/runtime/prod_preflight.py --json
+Restart=on-failure
+RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trading-prod-preflight

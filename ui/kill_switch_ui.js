@@ -1,5 +1,7 @@
 "use strict";
 
+import { requestConfirmation } from "./confirmation_modal.mjs";
+
 /*
   ui/kill_switch_ui.js — Kill-switch UI engine
   Extracted from ui/dashboard.js (Phase 6)
@@ -168,6 +170,70 @@ function renderKillSwitchControls(anchorEl, rows) {
       }
     });
   }
+
+  renderBrokerRiskControls(mount);
+}
+
+function renderBrokerRiskControls(mount) {
+  const doc = mount.ownerDocument || document;
+  const id = "brokerRiskControls";
+  let controls = doc.getElementById(id);
+  if (!controls) {
+    controls = doc.createElement("div");
+    controls.id = id;
+    controls.className = "killSwitchRows brokerRiskControls";
+    mount.insertAdjacentElement("afterend", controls);
+  }
+
+  controls.innerHTML = `
+    <div class="killSwitchRow killSwitchRow-crit">
+      <span class="killSwitchLight" aria-hidden="true"></span>
+      <span class="killSwitchName">broker:risk</span>
+      <span class="killSwitchState">OPERATOR</span>
+      <span class="killSwitchReason">confirmed broker order controls</span>
+      <button type="button" class="btn killSwitchAction" data-broker-risk-policy="cancel_only">Cancel</button>
+      <button type="button" class="btn killSwitchAction" data-broker-risk-policy="cancel_and_flatten">Flatten</button>
+    </div>
+  `;
+
+  if (!controls._boundBrokerRiskControls) {
+    controls._boundBrokerRiskControls = true;
+    controls.addEventListener("click", (event) => {
+      const target = event && event.target && event.target.closest
+        ? event.target.closest("[data-broker-risk-policy]")
+        : null;
+      if (!target) return;
+      const policy = target.getAttribute("data-broker-risk-policy") || "";
+      runBrokerRiskAction(policy);
+    });
+  }
+}
+
+async function runBrokerRiskAction(policy) {
+  const normalized = String(policy || "").trim();
+  if (!normalized) return;
+  const confirmation = await requestConfirmation({
+    actionId: "operator.broker_risk",
+    title: normalized === "cancel_only" ? "Cancel Broker Orders" : "Flatten Broker Risk",
+    confirmText: "BROKER_RISK",
+    consequence: "Cancels live broker orders and may submit flattening orders under configured shutdown-risk limits.",
+    holdMs: 3000,
+    requireReason: true,
+    target: `broker:${normalized}`,
+  });
+  if (!confirmation || !confirmation.ok) return;
+  await fetch("/api/operator/broker_risk", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...confirmation.payload,
+      policy: normalized,
+      reason: confirmation.reason,
+      source_surface: "dashboard_kill_switch",
+      source: "dashboard_kill_switch",
+      target: `broker:${normalized}`,
+    }),
+  });
 }
 
 export function showKillSwitchFixHint(key) {

@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import tomllib
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -17,6 +16,10 @@ PIN_RE = re.compile(r"(==|~=|>=|<=|<|>|===)")
 INCLUDE_RE = re.compile(r"^-r\s+(.+)$")
 NVIDIA_ONLY_REQUIREMENTS = {"pynvml", "nvidia-ml-py"}
 NVIDIA_REQUIREMENT_PREFIXES = ("nvidia-",)
+FORBIDDEN_REQUIREMENTS = {
+    "psycopg2": "use psycopg 3.x via psycopg[binary,pool]",
+    "psycopg2-binary": "use psycopg 3.x via psycopg[binary,pool]",
+}
 
 
 def _load_json(path: Path) -> dict:
@@ -85,6 +88,9 @@ def _requirements_report(path: Path, *, strict: bool) -> Tuple[List[str], List[s
     nvidia_in_cpu = _nvidia_requirements(names)
     if nvidia_in_cpu:
         errors.append("requirements_cpu_profile_contains_nvidia_only:" + ",".join(nvidia_in_cpu))
+    forbidden = sorted(name for name in names if name in FORBIDDEN_REQUIREMENTS)
+    for name in forbidden:
+        errors.append(f"requirements_forbidden:{name}:{FORBIDDEN_REQUIREMENTS[name]}")
     return errors, warnings
 
 

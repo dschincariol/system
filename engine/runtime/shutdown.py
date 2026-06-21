@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import time
 import os
+import threading
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from engine.runtime.logging import flush_logging_handlers, get_logger
 
 LOG = get_logger("runtime.shutdown")
+_BROKER_SHUTDOWN_RISK_LOCK = threading.Lock()
+_BROKER_SHUTDOWN_RISK_RESULT: Optional[Dict[str, Any]] = None
+_BROKER_SHUTDOWN_COMMAND_ID = f"broker-risk-runtime-{os.getpid()}-{int(time.time() * 1000)}"
 
 
 def _shutdown_storage_timeout_s() -> float:
@@ -33,7 +37,54 @@ def _storage_timeout_ctx():
         return nullcontext()
 
 
-def runtime_shutdown(*, JOBS: Optional[Any] = None, SUPERVISOR: Optional[Any] = None) -> None:
+def _broker_shutdown_timeout_s() -> float:
+    try:
+        return max(0.1, min(120.0, float(os.environ.get("BROKER_SHUTDOWN_TIMEOUT_S", "10") or 10.0)))
+    except Exception:
+        return 10.0
+
+
+def _run_broker_shutdown_risk(*, shutdown_reason: str) -> Dict[str, Any]:
+    global _BROKER_SHUTDOWN_RISK_RESULT
+    with _BROKER_SHUTDOWN_RISK_LOCK:
+        if _BROKER_SHUTDOWN_RISK_RESULT is not None:
+            result = dict(_BROKER_SHUTDOWN_RISK_RESULT or {})
+            result["duplicate_runtime_shutdown"] = True
+            return result
+
+        try:
+            from engine.execution.broker_shutdown_risk import handle_broker_shutdown_risk
+
+            result = dict(
+                handle_broker_shutdown_risk(
+                    policy=os.environ.get("BROKER_SHUTDOWN_POLICY"),
+                    engine_mode=os.environ.get("ENGINE_MODE", "safe"),
+                    timeout_s=_broker_shutdown_timeout_s(),
+                    command_id=_BROKER_SHUTDOWN_COMMAND_ID,
+                    actor=os.environ.get("BROKER_SHUTDOWN_ACTOR", "runtime_shutdown"),
+                    reason=str(shutdown_reason or "runtime_shutdown"),
+                    source="engine.runtime.shutdown",
+                    require_explicit_live_policy=True,
+                )
+                or {}
+            )
+        except Exception as exc:
+            LOG.exception("runtime_shutdown_broker_risk_failed")
+            result = {
+                "ok": False,
+                "status": "runtime_shutdown_broker_risk_exception",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        _BROKER_SHUTDOWN_RISK_RESULT = dict(result or {})
+        return result
+
+
+def runtime_shutdown(
+    *,
+    JOBS: Optional[Any] = None,
+    SUPERVISOR: Optional[Any] = None,
+    shutdown_reason: str = "runtime_shutdown",
+) -> None:
     shutdown_ts_ms = int(time.time() * 1000)
 
     lifecycle = {}
@@ -67,6 +118,27 @@ def runtime_shutdown(*, JOBS: Optional[Any] = None, SUPERVISOR: Optional[Any] = 
             )
     except Exception:
         LOG.exception("runtime_shutdown_start_event_failed")
+
+    broker_risk_result = _run_broker_shutdown_risk(shutdown_reason=str(shutdown_reason or "runtime_shutdown"))
+    try:
+        from engine.runtime.event_log import append_event
+
+        with _storage_timeout_ctx():
+            append_event(
+                event_type="runtime_shutdown_broker_risk",
+                event_source="runtime.shutdown",
+                entity_type="runtime",
+                entity_id="shutdown",
+                payload={
+                    "shutdown_reason": str(shutdown_reason or "runtime_shutdown"),
+                    "broker_risk": dict(broker_risk_result or {}),
+                    "ts_ms": int(time.time() * 1000),
+                },
+                ts_ms=int(time.time() * 1000),
+                best_effort=True,
+            )
+    except Exception:
+        LOG.exception("runtime_shutdown_broker_risk_event_failed")
 
     # Stop jobs first so child processes release DB handles and background
     # activity before the storage layer is asked to checkpoint and close.

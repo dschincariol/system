@@ -116,7 +116,7 @@ check_credstore() {
   require_command systemd-creds
   log "checking encrypted credential inventory"
   local name path owner group mode
-  for name in master_key pg_password_app pg_password_ingest pg_password_reader redis_password object_store_secret_key dashboard_api_token; do
+  for name in master_key pg_password_app pg_password_ingest pg_password_reader redis_password object_store_secret_key dashboard_api_token operator_api_token; do
     path="${CREDSTORE_DIR}/${name}.cred"
     [ -r "$path" ] || fail "missing encrypted credential ${path}"
     owner="$(stat -c '%U' "$path")"
@@ -137,10 +137,20 @@ check_systemd_units() {
   fi
 
   local unit
-  for unit in trading-prod-preflight.service trading-api.service trading-jobs.service trading-stream-prices.service trading-ingest.service trading.target; do
+  for unit in trading-cpu-power-policy.service trading-prod-preflight.service trading-api.service trading-jobs.service trading-stream-prices.service trading-ingest.service trading.target; do
     [ -f "${source_dir}/${unit}" ] || fail "missing systemd unit ${source_dir}/${unit}"
     systemd-analyze verify "${source_dir}/${unit}"
   done
+}
+
+check_cpu_power_policy_assets() {
+  log "checking CPU power policy assets"
+  local policy="${APP_ROOT}/ops/server/cpu_power_policy.sh"
+  if [ ! -f "$policy" ]; then
+    policy="${SCRIPT_DIR}/cpu_power_policy.sh"
+  fi
+  [ -x "$policy" ] || fail "missing executable CPU power policy script ${policy}"
+  bash -n "$policy"
 }
 
 check_prod_preflight_runner() {
@@ -158,6 +168,7 @@ check_backup_assets() {
   local script unit source_dir
   for script in \
     wal_archive.sh \
+    wal_archive_catchup.sh \
     base_backup.sh \
     state_snapshot.sh \
     artifact_snapshot.sh \
@@ -195,6 +206,7 @@ main() {
   check_filesystem
   check_credstore
   check_systemd_units
+  check_cpu_power_policy_assets
   check_prod_preflight_runner
   check_backup_assets
   log "all checks passed"

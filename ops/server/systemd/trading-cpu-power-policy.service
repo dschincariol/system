@@ -1,0 +1,26 @@
+[Unit]
+Description=Trading CPU power policy
+Documentation=file:/opt/trading/app/docs/CPU_POWER_POLICY.md
+Wants=power-profiles-daemon.service
+After=power-profiles-daemon.service
+Before=trading.target
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/trading/app/ops/server/cpu_power_policy.sh apply
+Restart=on-failure
+RestartSec=30s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-cpu-power-policy
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/sys/devices/system/cpu
+
+[Install]
+WantedBy=multi-user.target

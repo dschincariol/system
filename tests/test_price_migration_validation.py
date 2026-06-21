@@ -80,7 +80,7 @@ class PriceMigrationValidationTests(unittest.TestCase):
 
         with patch.object(validation, "get_async_writer", return_value=fake_writer):
             with patch.object(validation, "get_price_storage", return_value=fake_storage):
-                with patch.object(validation, "psycopg2", object()):
+                with patch.object(validation, "psycopg", object()):
                     with patch.object(validation, "_sqlite_summary", return_value=sqlite_summary):
                         with patch.object(validation, "_timescale_summary", return_value=timescale_summary):
                             snapshot = validation.build_price_migration_validation_snapshot(

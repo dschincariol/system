@@ -28,6 +28,13 @@ function _asElement(target) {
   return target;
 }
 
+function _hasAttribute(el, name) {
+  if (!el) return false;
+  if (typeof el.hasAttribute === "function") return el.hasAttribute(name);
+  if (typeof el.getAttribute === "function") return el.getAttribute(name) != null;
+  return false;
+}
+
 function _esc(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -85,8 +92,46 @@ function _pick(row, keys) {
   return undefined;
 }
 
+function _normalizeSeriesFields(options = {}) {
+  const fields = Array.isArray(options.seriesFields)
+    ? options.seriesFields
+    : (Array.isArray(options.seriesDefinitions)
+        ? options.seriesDefinitions
+        : (Array.isArray(options.valueSeries) ? options.valueSeries : []));
+  return fields
+    .map((field, index) => {
+      if (typeof field === "string") {
+        return { key: field, label: field, formatter: options.valueFormatter };
+      }
+      if (!field || typeof field !== "object") return null;
+      const key = String(field.key || field.valueKey || field.field || `series_${index + 1}`).trim();
+      if (!key && typeof field.value !== "function") return null;
+      return {
+        ...field,
+        key,
+        label: String(field.label || field.valueLabel || key || `Series ${index + 1}`).trim() || `Series ${index + 1}`,
+        formatter: field.formatter || field.valueFormatter || options.valueFormatter,
+      };
+    })
+    .filter(Boolean);
+}
+
+function _seriesFieldValue(field, raw, index) {
+  if (!field) return null;
+  if (typeof field.value === "function") {
+    try {
+      return _num(field.value(raw, index));
+    } catch {
+      return null;
+    }
+  }
+  if (field.key && raw && typeof raw === "object") return _num(raw[field.key]);
+  return null;
+}
+
 export function normalizeChartSeries(series = [], options = {}) {
   const rows = Array.isArray(series) ? series : [];
+  const seriesFields = _normalizeSeriesFields(options);
   const valueKeys = [
     options.valueKey,
     "value",
@@ -104,7 +149,18 @@ export function normalizeChartSeries(series = [], options = {}) {
   return rows.map((row, index) => {
     if (row && typeof row === "object") {
       const rawValue = _pick(row, valueKeys);
-      const value = _num(rawValue);
+      const fieldValues = seriesFields.map((field) => {
+        const value = _seriesFieldValue(field, row, index);
+        return {
+          key: field.key,
+          label: field.label,
+          value,
+          valueText: value == null ? "unavailable" : _formatWith(field.formatter, value),
+          formatter: field.formatter,
+        };
+      });
+      const firstFieldValue = fieldValues.find((field) => field.value != null);
+      const value = _num(rawValue) ?? (firstFieldValue ? firstFieldValue.value : null);
       const time = _pick(row, timeKeys);
       const label = _pick(row, labelKeys);
       return {
@@ -113,7 +169,25 @@ export function normalizeChartSeries(series = [], options = {}) {
         time,
         label,
         value,
+        seriesValues: fieldValues,
         timeText: label != null && label !== "" ? String(label) : (time != null && time !== "" ? formatChartTime(time) : String(index + 1)),
+      };
+    }
+    if (seriesFields.length) {
+      return {
+        index: index + 1,
+        raw: row,
+        time: index + 1,
+        label: "",
+        value: null,
+        seriesValues: seriesFields.map((field) => ({
+          key: field.key,
+          label: field.label,
+          value: null,
+          valueText: "unavailable",
+          formatter: field.formatter,
+        })),
+        timeText: String(index + 1),
       };
     }
     return {
@@ -122,9 +196,14 @@ export function normalizeChartSeries(series = [], options = {}) {
       time: index + 1,
       label: "",
       value: _num(row),
+      seriesValues: [],
       timeText: String(index + 1),
     };
-  }).filter((row) => row.value != null);
+  }).filter((row) => (
+    seriesFields.length
+      ? row.seriesValues.some((field) => field.value != null)
+      : row.value != null
+  ));
 }
 
 function _formatWith(formatter, value) {
@@ -147,6 +226,33 @@ export function buildChartTakeaway(options = {}) {
     : normalizeChartSeries(options.series || [], options);
   if (!rows.length) {
     return `${title}: ${String(options.emptyMessage || "No chart data is available.")}`;
+  }
+
+  const seriesFields = _normalizeSeriesFields(options);
+  const rowSeriesValues = rows.flatMap((row) => Array.isArray(row.seriesValues) ? row.seriesValues : []);
+  const summaryFields = seriesFields.length
+    ? seriesFields
+    : Array.from(new Map(rowSeriesValues.map((field) => [field.key, field])).values());
+  if (summaryFields.length > 1) {
+    const latestParts = [];
+    const rangeParts = [];
+    for (const field of summaryFields) {
+      const values = rows
+        .map((row) => (Array.isArray(row.seriesValues) ? row.seriesValues.find((item) => item.key === field.key) : null))
+        .filter((item) => item && Number.isFinite(item.value));
+      if (!values.length) continue;
+      const latest = values[values.length - 1];
+      const nums = values.map((item) => item.value);
+      const min = Math.min(...nums);
+      const max = Math.max(...nums);
+      const fmt = (value) => _formatWith(field.formatter || options.valueFormatter, value);
+      latestParts.push(`${field.label} ${latest.valueText || fmt(latest.value)}`);
+      rangeParts.push(`${field.label} ${fmt(min)} to ${fmt(max)}`);
+    }
+    if (latestParts.length) {
+      const context = String(options.contextSummary || options.annotationSummary || "").trim();
+      return `${title}: latest ${latestParts.join(", ")}; ranges ${rangeParts.join(", ")}; across ${rows.length} rows.${context ? ` ${context}` : ""}`;
+    }
   }
 
   const values = rows.map((row) => row.value).filter((value) => Number.isFinite(value));
@@ -208,6 +314,22 @@ function _defaultColumns(valueLabel, valueFormatter) {
   ];
 }
 
+function _defaultMultiSeriesColumns(seriesFields, valueFormatter) {
+  return [
+    { label: "Point", value: (row) => row.timeText || row.index },
+    ...seriesFields.map((field) => ({
+      label: field.label,
+      value: (row) => {
+        const match = Array.isArray(row.seriesValues)
+          ? row.seriesValues.find((item) => item.key === field.key)
+          : null;
+        if (!match || match.value == null) return "unavailable";
+        return match.valueText || _formatWith(field.formatter || valueFormatter, match.value);
+      },
+    })),
+  ];
+}
+
 function _renderTableRows(rows, columns, emptyText, maxRows) {
   if (!rows.length) {
     return `<tr><td colspan="${Math.max(1, columns.length)}" class="metric-meta">${_esc(emptyText)}</td></tr>`;
@@ -231,7 +353,7 @@ export function applyChartFocusMetadata(target, options = {}) {
   chartEl.setAttribute("role", options.role || "img");
   chartEl.setAttribute("aria-label", summary);
   if (options.describedBy) chartEl.setAttribute("aria-describedby", options.describedBy);
-  if (options.focusable !== false && !chartEl.hasAttribute("tabindex")) {
+  if (options.focusable !== false && !_hasAttribute(chartEl, "tabindex")) {
     chartEl.setAttribute("tabindex", "0");
   }
   chartEl.setAttribute("data-chart-a11y-title", title);
@@ -253,6 +375,7 @@ export function renderChartAccessibility(target, options = {}) {
   const state = error ? "error" : (rows.length ? "ready" : "empty");
   const summaryId = `${idBase}A11ySummary`;
   const tableId = `${idBase}A11yTable`;
+  const seriesFields = _normalizeSeriesFields(options);
   const summary = String(options.summary || buildChartTakeaway({
     ...options,
     title,
@@ -263,7 +386,9 @@ export function renderChartAccessibility(target, options = {}) {
   const valueLabel = String(options.valueLabel || "Value");
   const columns = Array.isArray(options.columns) && options.columns.length
     ? options.columns
-    : _defaultColumns(valueLabel, options.valueFormatter);
+    : (seriesFields.length > 1
+        ? _defaultMultiSeriesColumns(seriesFields, options.valueFormatter)
+        : _defaultColumns(valueLabel, options.valueFormatter));
   const maxRows = Math.max(1, Number(options.maxRows || DEFAULT_MAX_TABLE_ROWS));
   const hiddenPrefix = rows.length > maxRows
     ? `<div class="chartA11yMeta small">Showing latest ${maxRows} of ${rows.length} points.</div>`

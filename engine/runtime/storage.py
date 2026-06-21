@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 import importlib
 import logging
+from types import ModuleType
+from typing import Any, Protocol
 
 from engine.runtime import dbapi_compat as dbapi
 from engine.runtime.failure_diagnostics import log_failure
@@ -18,6 +20,88 @@ from engine.runtime.test_isolation import apply_runtime_test_defaults, running_p
 
 LOGGER = logging.getLogger(__name__)
 apply_runtime_test_defaults()
+
+
+class StorageBackend(Protocol):
+    """Runtime storage module contract enforced by the public facade."""
+
+    STORAGE_BACKEND_NAME: str
+    SCHEMA_VERSION: int
+    DB_PATH: Any
+
+    def init_db(self, schema: str | None = None) -> Any: ...
+
+    def connect(self, readonly: bool = False, **kwargs: Any) -> Any: ...
+
+    def connect_ro(self) -> Any: ...
+
+    def connect_ro_direct(self, **kwargs: Any) -> Any: ...
+
+    def connect_rw_direct(self, **kwargs: Any) -> Any: ...
+
+    def run_write_txn(self, fn, *args: Any, **kwargs: Any) -> Any: ...
+
+    def get_db_validation_snapshot(
+        self,
+        *,
+        include_quick_check: bool = True,
+        strict: bool = False,
+    ) -> dict[str, Any]: ...
+
+    def get_db_debug_snapshot(self, *, include_quick_check: bool = True) -> dict[str, Any]: ...
+
+
+_REQUIRED_BACKEND_SYMBOLS: tuple[str, ...] = (
+    "STORAGE_BACKEND_NAME",
+    "SCHEMA_VERSION",
+    "DB_PATH",
+    "init_db",
+    "connect",
+    "connect_ro",
+    "connect_ro_direct",
+    "connect_rw_direct",
+    "connection",
+    "execute",
+    "fetch_one",
+    "fetch_all",
+    "run_write_txn",
+    "get_db_validation_snapshot",
+    "get_db_debug_snapshot",
+    "close_pooled_connections",
+    "_table_exists",
+)
+
+
+def _validate_backend_module(module: ModuleType, *, expected_name: str) -> StorageBackend:
+    missing = [name for name in _REQUIRED_BACKEND_SYMBOLS if not hasattr(module, name)]
+    if missing:
+        raise RuntimeError(
+            "runtime storage backend contract violation: "
+            f"{module.__name__} missing {', '.join(sorted(missing))}"
+        )
+    backend_name = str(getattr(module, "STORAGE_BACKEND_NAME", "") or "").strip().lower()
+    if backend_name != str(expected_name).strip().lower():
+        raise RuntimeError(
+            "runtime storage backend contract violation: "
+            f"{module.__name__} declared backend={backend_name or '<unset>'}, expected={expected_name}"
+        )
+    for name in _REQUIRED_BACKEND_SYMBOLS:
+        if name in {"STORAGE_BACKEND_NAME", "SCHEMA_VERSION", "DB_PATH"}:
+            continue
+        if not callable(getattr(module, name)):
+            raise RuntimeError(
+                "runtime storage backend contract violation: "
+                f"{module.__name__}.{name} must be callable"
+            )
+    return module  # type: ignore[return-value]
+
+
+def _publish_backend_symbols(module: ModuleType) -> None:
+    exported = tuple(getattr(module, "__all__", ()) or ())
+    for name in exported:
+        if name.startswith("__"):
+            continue
+        globals()[str(name)] = getattr(module, str(name))
 
 
 def _log_nonfatal(code: str, error: BaseException, **extra: object) -> None:
@@ -66,17 +150,33 @@ def _use_sqlite_test_backend() -> bool:
 
 
 _SQLITE_TEST_BACKEND = _use_sqlite_test_backend()
+_BACKEND_NAME = "sqlite" if _SQLITE_TEST_BACKEND else "postgres"
 
 if _SQLITE_TEST_BACKEND:
     from engine.runtime import storage_sqlite as _sqlite_backend
     _sqlite_backend = importlib.reload(_sqlite_backend)
-    from engine.runtime.storage_sqlite import *  # noqa: F401,F403
-    from engine.runtime.storage_sqlite import init_db as _facade_init_db
+    _BACKEND_MODULE = _validate_backend_module(_sqlite_backend, expected_name="sqlite")
+    _publish_backend_symbols(_BACKEND_MODULE)
+    _facade_init_db = _BACKEND_MODULE.init_db
     DB_PATH = _sqlite_backend._current_db_path()
 else:
     _sqlite_backend = None
-    from engine.runtime.storage_pg import *  # noqa: F401,F403
-    from engine.runtime.storage_pg import init_db as _facade_init_db
+    from engine.runtime import storage_pg as _pg_backend
+    _BACKEND_MODULE = _validate_backend_module(_pg_backend, expected_name="postgres")
+    _publish_backend_symbols(_BACKEND_MODULE)
+    _facade_init_db = _BACKEND_MODULE.init_db
+
+
+def get_active_backend() -> StorageBackend:
+    """Return the concrete backend module selected by the facade."""
+
+    return _BACKEND_MODULE
+
+
+def get_active_backend_name() -> str:
+    """Return ``postgres`` or ``sqlite`` for the selected backend."""
+
+    return _BACKEND_NAME
 
 
 if _SQLITE_TEST_BACKEND:
@@ -359,3 +459,20 @@ if _SQLITE_TEST_BACKEND and _sqlite_backend is not None:
 
     def get_connection_debug_snapshot() -> dict:
         return _with_facade_sqlite_bindings(_sqlite_backend.get_connection_debug_snapshot)
+
+
+def __getattr__(name: str):
+    return getattr(_BACKEND_MODULE, name)
+
+
+__all__ = sorted(
+    {
+        *[str(name) for name in getattr(_BACKEND_MODULE, "__all__", ()) if not str(name).startswith("__")],
+        "StorageBackend",
+        "get_active_backend",
+        "get_active_backend_name",
+        "init_rl_portfolio_tables",
+        "init_db",
+        "table_exists",
+    }
+)

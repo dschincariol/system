@@ -12,9 +12,11 @@ import {
   applyIndicatorSeries,
   applyMarkersToState,
   applyPriceLinesToState,
+  applyWindowBandsToState,
   clearMarkerLayer,
   clearPriceLinesForState,
   clearRetryTimer,
+  clearWindowBandsForState,
   closeEventSource,
   createIndicatorState,
   createProChart,
@@ -38,9 +40,13 @@ import {
   setDashboardProChartOverlayState
 } from "./pro_chart_prefs.js";
 import {
+  buildIndicatorAccessibilitySummary,
   buildOverlayAccessibilitySummary,
   decisionOverlayLegendItems,
+  decisionWindowLegendItems,
+  indicatorOverlayLegendItems,
   normalizeDecisionOverlayPayload,
+  VWAP_OVERLAY_LABEL,
 } from "./decision_overlays.js";
 import {
   getSelectedSymbolContext,
@@ -63,6 +69,8 @@ const _DASH = {
   markerLayer: null,
   markerSeries: null,
   priceLineHandles: [],
+  windowBandLayer: null,
+  windowBandSeries: null,
   decisionOverlayPayload: null,
 
   es: null,
@@ -75,6 +83,7 @@ const _DASH = {
   streamConnected: false,
   candlesData: [],
   volumeData: [],
+  pnlData: [],
   indicatorState: createIndicatorState([]),
 
   crosshairEl: null,
@@ -100,6 +109,7 @@ function _destroyChartState() {
 
   clearMarkerLayer(_DASH);
   clearPriceLinesForState(_DASH);
+  clearWindowBandsForState(_DASH);
   _DASH.decisionOverlayPayload = null;
 
   try { if (_DASH.chart) _DASH.chart.remove(); } catch {}
@@ -117,6 +127,7 @@ function _destroyChartState() {
   _DASH.streamConnected = false;
   _DASH.candlesData = [];
   _DASH.volumeData = [];
+  _DASH.pnlData = [];
   _DASH.indicatorState = createIndicatorState([]);
 }
 
@@ -184,6 +195,18 @@ function _markerAnchorSeries() {
 
 function _clearPriceLines() {
   clearPriceLinesForState(_DASH, { anchor: _markerAnchorSeries() });
+}
+
+function _clearWindowBands() {
+  clearWindowBandsForState(_DASH);
+}
+
+function _applyWindowBands(payload = _DASH.decisionOverlayPayload, candles = _DASH.candlesData) {
+  const normalized = normalizeDecisionOverlayPayload(payload || {});
+  return applyWindowBandsToState(_DASH, normalized.windows || [], {
+    anchor: _markerAnchorSeries(),
+    rows: candles || _DASH.candlesData,
+  });
 }
 
 function _setCrosshairPanel() {
@@ -306,11 +329,35 @@ function _fmtFixed(value, digits = 4) {
   return Number.isFinite(n) ? n.toFixed(digits) : "unavailable";
 }
 
+function _seriesValueMap(rows) {
+  return new Map(
+    (Array.isArray(rows) ? rows : [])
+      .filter((row) => Number.isFinite(Number(row && row.time)) && Number.isFinite(Number(row && row.value)))
+      .map((row) => [Number(row.time), Number(row.value)])
+  );
+}
+
+function _latestFieldText(rows, field) {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const value = Number(rows[index] && rows[index][field.key]);
+    if (Number.isFinite(value)) {
+      const formatter = field.formatter || ((v) => _fmtFixed(v, 4));
+      return `${field.label} ${formatter(value)}`;
+    }
+  }
+  return "";
+}
+
 function _renderDashboardChartA11y({ errorMessage = "", emptyMessage = "" } = {}) {
   const container = _DASH.container || document.getElementById("liveMarketChart");
   if (!container) return;
   const { symbol, tf, type } = _dashboardChartKeyParts();
   const title = `Live market chart ${symbol}`;
+  const overlayState = getDashboardProChartOverlayState();
+  const vwapByTime = _seriesValueMap(_DASH.indicatorState && _DASH.indicatorState.vwap);
+  const ema20ByTime = _seriesValueMap(_DASH.indicatorState && _DASH.indicatorState.ema20);
+  const ema50ByTime = _seriesValueMap(_DASH.indicatorState && _DASH.indicatorState.ema50);
+  const pnlByTime = _seriesValueMap(_DASH.pnlData);
   const series = (_DASH.candlesData || []).map((c) => ({
     time: Number(c.time),
     value: Number(c.close),
@@ -319,12 +366,43 @@ function _renderDashboardChartA11y({ errorMessage = "", emptyMessage = "" } = {}
     low: Number(c.low),
     close: Number(c.close),
     volume: Number(c.volume || 0),
+    vwap: vwapByTime.get(Number(c.time)),
+    ema20: ema20ByTime.get(Number(c.time)),
+    ema50: ema50ByTime.get(Number(c.time)),
+    pnl: pnlByTime.get(Number(c.time)),
   })).filter((c) => Number.isFinite(c.time) && Number.isFinite(c.value));
+  const indicatorSummary = buildIndicatorAccessibilitySummary(overlayState);
   const overlaySummary = buildOverlayAccessibilitySummary(_DASH.decisionOverlayPayload || {});
+  const seriesFields = [
+    { key: "close", label: "Close", formatter: (v) => _fmtFixed(v, 4) },
+    ...(_DASH.volumeSeries ? [{ key: "volume", label: "Volume", formatter: (v) => _fmtFixed(v, 0) }] : []),
+    ...(overlayState.vwap ? [{ key: "vwap", label: VWAP_OVERLAY_LABEL, formatter: (v) => _fmtFixed(v, 4) }] : []),
+    ...(overlayState.ema ? [
+      { key: "ema20", label: "EMA20", formatter: (v) => _fmtFixed(v, 4) },
+      { key: "ema50", label: "EMA50", formatter: (v) => _fmtFixed(v, 4) },
+    ] : []),
+    ...(overlayState.pnl ? [{ key: "pnl", label: "PnL", formatter: (v) => _fmtFixed(v, 2) }] : []),
+  ];
+  const latestVisible = seriesFields.map((field) => _latestFieldText(series, field)).filter(Boolean).join(", ");
+  const columns = [
+    { label: "Time", value: (row) => row.timeText || row.index },
+    { label: "Open", value: (row) => _fmtFixed(row.raw && row.raw.open, 4) },
+    { label: "High", value: (row) => _fmtFixed(row.raw && row.raw.high, 4) },
+    { label: "Low", value: (row) => _fmtFixed(row.raw && row.raw.low, 4) },
+    { label: "Close", value: (row) => _fmtFixed(row.raw && row.raw.close, 4) },
+    ...(_DASH.volumeSeries ? [{ label: "Volume", value: (row) => _fmtFixed(row.raw && row.raw.volume, 0) }] : []),
+    ...(overlayState.vwap ? [{ label: VWAP_OVERLAY_LABEL, value: (row) => _fmtFixed(row.raw && row.raw.vwap, 4) }] : []),
+    ...(overlayState.ema ? [
+      { label: "EMA20", value: (row) => _fmtFixed(row.raw && row.raw.ema20, 4) },
+      { label: "EMA50", value: (row) => _fmtFixed(row.raw && row.raw.ema50, 4) },
+    ] : []),
+    ...(overlayState.pnl ? [{ label: "PnL", value: (row) => _fmtFixed(row.raw && row.raw.pnl, 2) }] : []),
+  ];
 
   renderChartAccessibility(container, {
     title,
     series,
+    seriesFields,
     timeKey: "time",
     valueKey: "value",
     valueLabel: "close",
@@ -332,16 +410,9 @@ function _renderDashboardChartA11y({ errorMessage = "", emptyMessage = "" } = {}
     emptyMessage: emptyMessage || `No candle history is available for ${symbol}${tf ? ` ${tf}` : ""}.`,
     errorMessage,
     chartType: "lightweight-chart",
-    columns: [
-      { label: "Time", value: (row) => row.timeText || row.index },
-      { label: "Open", value: (row) => _fmtFixed(row.raw && row.raw.open, 4) },
-      { label: "High", value: (row) => _fmtFixed(row.raw && row.raw.high, 4) },
-      { label: "Low", value: (row) => _fmtFixed(row.raw && row.raw.low, 4) },
-      { label: "Close", value: (row) => _fmtFixed(row.raw && row.raw.close, 4) },
-      { label: "Volume", value: (row) => _fmtFixed(row.raw && row.raw.volume, 0) },
-    ],
+    columns,
     summary: series.length
-      ? `${title}: latest close ${Number(series[series.length - 1].close).toFixed(4)} across ${series.length} candles${tf ? ` on ${tf}` : ""}${type ? ` as ${type}` : ""}. ${overlaySummary}`
+      ? `${title}: latest ${latestVisible || `close ${Number(series[series.length - 1].close).toFixed(4)}`} across ${series.length} candles${tf ? ` on ${tf}` : ""}${type ? ` as ${type}` : ""}. ${indicatorSummary} ${overlaySummary}`
       : "",
   });
 }
@@ -521,21 +592,22 @@ export function renderTradeMarkers(chart, trades) {
 
 export function renderPortfolioOverlay(chart, pnlData) {
   if (!chart || !_DASH.pnlSeries) return;
+  _DASH.pnlData = (pnlData || [])
+    .map((p) => ({ time: Number(p.time), value: Number(p.value) }))
+    .filter((p) => Number.isFinite(p.time) && Number.isFinite(p.value));
   try {
-    _DASH.pnlSeries.setData(
-      (pnlData || [])
-        .map((p) => ({ time: Number(p.time), value: Number(p.value) }))
-        .filter((p) => Number.isFinite(p.time) && Number.isFinite(p.value))
-    );
+    _DASH.pnlSeries.setData(_DASH.pnlData);
   } catch {}
 }
 
 function _legendShapeGlyph(shape) {
   const raw = String(shape || "");
+  if (raw === "line") return "---";
   if (raw === "arrowUp") return "^";
   if (raw === "arrowDown") return "v";
   if (raw === "square") return "[]";
   if (raw === "circle") return "o";
+  if (raw === "band") return "band";
   return "-";
 }
 
@@ -547,17 +619,23 @@ function _escapeAttr(value) {
     .replaceAll('"', "&quot;");
 }
 
-function _renderOverlayLegend(payload) {
+function _renderOverlayLegend(payload, overlays = getDashboardProChartOverlayState()) {
   const el = document.getElementById("proChartsOverlayLegend");
   if (!el) return;
   const normalized = normalizeDecisionOverlayPayload(payload || {});
-  const summary = buildOverlayAccessibilitySummary(normalized);
-  const items = decisionOverlayLegendItems(normalized);
+  const indicatorSummary = buildIndicatorAccessibilitySummary(overlays || {});
+  const decisionSummary = buildOverlayAccessibilitySummary(normalized);
+  const summary = `${indicatorSummary} ${decisionSummary}`;
+  const items = [
+    ...indicatorOverlayLegendItems(overlays || {}),
+    ...decisionOverlayLegendItems(normalized),
+    ...decisionWindowLegendItems(normalized),
+  ];
   el.setAttribute("aria-label", summary);
   el.innerHTML =
     `<div class="overlayLegendItems">${items.map((item) => (
       `<span class="overlayLegendItem">` +
-      `<span class="overlayLegendGlyph" style="border-color:${_escapeAttr(item.color)}; color:${_escapeAttr(item.color)}">${_escapeAttr(_legendShapeGlyph(item.shape))}</span>` +
+      `<span class="overlayLegendGlyph" style="border-color:${_escapeAttr(item.color)}; color:${_escapeAttr(item.color)}; background:${_escapeAttr(item.fillColor || "transparent")}">${_escapeAttr(_legendShapeGlyph(item.shape))}</span>` +
       `<span>${_escapeAttr(item.label)}</span>` +
       `<span class="mono muted">${_escapeAttr(item.text)}</span>` +
       `<span class="mono">${_escapeAttr(String(item.count))}</span>` +
@@ -632,7 +710,8 @@ async function _refreshOverlays(symbol, candles = _DASH.candlesData) {
     _DASH.decisionOverlayPayload = normalizedOverlay;
     renderTradeMarkers(_DASH.chart, normalizedOverlay.markers);
     applyPriceLinesToState(_DASH, normalizedOverlay.price_lines || [], { anchor: _markerAnchorSeries() });
-    _renderOverlayLegend(normalizedOverlay);
+    _applyWindowBands(normalizedOverlay, candles);
+    _renderOverlayLegend(normalizedOverlay, overlays);
     if (tradesRes.error) {
       _setHealthText(`markers: ${tradesRes.error}`);
     }
@@ -646,8 +725,9 @@ async function _refreshOverlays(symbol, candles = _DASH.candlesData) {
       }
     } catch {}
     _clearPriceLines();
+    _clearWindowBands();
     _DASH.decisionOverlayPayload = null;
-    _renderOverlayLegend({ markers: [] });
+    _renderOverlayLegend({ markers: [] }, overlays);
   }
 
   if (overlays.pnl) {
@@ -657,6 +737,7 @@ async function _refreshOverlays(symbol, candles = _DASH.candlesData) {
       _setHealthText(`overlay: ${pnlRes.error}`);
     }
   } else if (_DASH.pnlSeries) {
+    _DASH.pnlData = [];
     try { _DASH.pnlSeries.setData([]); } catch {}
   }
 
@@ -726,6 +807,9 @@ function _updateBar(bar) {
     ema20Series: _DASH.ema20Series,
     ema50Series: _DASH.ema50Series,
   });
+  if (_DASH.decisionOverlayPayload && overlays.trades) {
+    _applyWindowBands(_DASH.decisionOverlayPayload, _DASH.candlesData);
+  }
   _renderDashboardChartA11y();
 }
 
@@ -826,6 +910,7 @@ export async function loadProCharts(fetchJSON) {
 
   if (_DASH.key === key && _DASH.chart) {
     _setMeta(`${symbol} • ${tf} • ${type}`, "pill ok");
+    await _refreshOverlays(symbol, _DASH.candlesData);
     return;
   }
 

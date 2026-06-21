@@ -20,13 +20,46 @@ const NODE_TESTS = [
   "tests/test_pro_chart_core.mjs",
   "tests/test_decision_stepper.mjs",
   "tests/test_decision_attribution.mjs",
+  "tests/test_health_score.mjs",
   "tests/test_operator_overview.mjs",
+  "tests/test_market_stress_ui.mjs",
+  "tests/test_news_sentiment_ui.mjs",
+  "tests/test_data_health_ui.mjs",
   "tests/test_table_helpers.mjs",
 ];
 const PYTEST_UI_TESTS = [
   "tests/test_dashboard_ui_contract.py",
   "tests/test_ui_asset_refs.py",
   "tests/test_mobile_ops_surface.py",
+  "tests/test_risk_headroom_ui_helpers.py",
+  "tests/test_risk_chart_api_shapes.py",
+  "tests/test_risk_chart_ui_helpers.py",
+  "tests/test_portfolio_backtest_contract.py",
+  "tests/test_model_performance_divergence.py",
+];
+const PYTEST_FAST_CHART_CONTRACT_TESTS = [
+  "tests/test_risk_chart_api_shapes.py",
+  "tests/test_risk_chart_ui_helpers.py",
+  "tests/test_portfolio_backtest_contract.py",
+  "tests/test_model_performance_divergence.py",
+];
+const PYTEST_INTENTIONALLY_EXCLUDED_UI_ADJACENT_TESTS = [
+  {
+    path: "tests/test_backtest_cpcv_integration.py",
+    reason: "integration-scale backend backtest gate",
+  },
+  {
+    path: "tests/test_gated_backtest.py",
+    reason: "strategy/backend gate rather than browser contract",
+  },
+  {
+    path: "tests/test_hpo_surface_robustness.py",
+    reason: "research optimization surface",
+  },
+  {
+    path: "tests/test_optuna_tuning_job.py",
+    reason: "tuning-job coverage with heavier dependency surface",
+  },
 ];
 
 function readJson(path) {
@@ -210,6 +243,17 @@ function runStep(command, args) {
   return 0;
 }
 
+function logPytestScope(withPytest) {
+  const included = withPytest ? PYTEST_UI_TESTS : PYTEST_FAST_CHART_CONTRACT_TESTS;
+  const excluded = PYTEST_INTENTIONALLY_EXCLUDED_UI_ADJACENT_TESTS.map(
+    (item) => `${item.path} (${item.reason})`,
+  );
+  console.log(`UI pytest scope: ${included.join(", ")}`);
+  console.log(
+    `Slow UI-adjacent tests intentionally stay out of this local gate: ${excluded.join(", ")}`,
+  );
+}
+
 function main() {
   const args = new Set(process.argv.slice(2));
   const withPytest = args.has("--pytest");
@@ -219,6 +263,7 @@ function main() {
   const python = preflightResult.python;
   const pythonCommand = python.command;
   const pythonArgs = python.args;
+  logPytestScope(withPytest);
   const steps = withPytest
     ? [
         [pythonCommand, [...pythonArgs, "tools/check_local_asset_refs.py"]],
@@ -228,6 +273,7 @@ function main() {
     : [
         [pythonCommand, [...pythonArgs, "tools/check_local_asset_refs.py"]],
         [pythonCommand, [...pythonArgs, "tools/check_dashboard_ui_contract.py", "--node-executable", process.execPath]],
+        [pythonCommand, [...pythonArgs, "-m", "pytest", ...PYTEST_FAST_CHART_CONTRACT_TESTS]],
         [process.execPath, ["--test", ...NODE_TESTS]],
       ];
 
