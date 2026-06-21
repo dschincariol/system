@@ -38,6 +38,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "BROKER_NAME",
         "BROKER_FAILOVER",
         "BROKER_START_CASH",
+        "BROKER_START_EQUITY",
         "EXECUTION_MODE",
         "ENGINE_MODE",
         "OPERATOR_MODE",
@@ -89,6 +90,16 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "OOD_HARD_THRESHOLD",
         "RL_ALLOW_FALLBACK_AGENT",
         "EXECUTION_MAX_SIGNAL_AGE_S",
+        "EXEC_MAX_ABS_WEIGHT",
+        "EXEC_MAX_ABS_DELTA_WEIGHT",
+        "EXEC_MAX_ORDERS_PER_PASS",
+        "EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP",
+        "EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP",
+        "EXEC_PORTFOLIO_SYMBOL_CONCENTRATION_CAP",
+        "PORTFOLIO_GROSS_CAP",
+        "PORTFOLIO_RISK_MAX_GROSS",
+        "PORTFOLIO_RISK_MAX_NET",
+        "PORTFOLIO_MAX_NET_EXPOSURE",
     )
 
     def setUp(self) -> None:
@@ -104,6 +115,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["BROKER_NAME"] = "sim"
         os.environ["BROKER_FAILOVER"] = "sim"
         os.environ["BROKER_START_CASH"] = "100000"
+        os.environ["BROKER_START_EQUITY"] = "100000"
         os.environ.pop("OPERATOR_MODE", None)
         os.environ.pop("MODE", None)
         os.environ.pop("ENGINE_RUNTIME_MODE", None)
@@ -155,6 +167,16 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ.pop("OOD_HARD_THRESHOLD", None)
         os.environ.pop("RL_ALLOW_FALLBACK_AGENT", None)
         os.environ["EXECUTION_MAX_SIGNAL_AGE_S"] = "3600"
+        os.environ["EXEC_MAX_ABS_WEIGHT"] = "2.0"
+        os.environ["EXEC_MAX_ABS_DELTA_WEIGHT"] = "2.0"
+        os.environ["EXEC_MAX_ORDERS_PER_PASS"] = "50"
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "1.00"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_SYMBOL_CONCENTRATION_CAP"] = "2.0"
+        os.environ["PORTFOLIO_GROSS_CAP"] = "1.00"
+        os.environ["PORTFOLIO_RISK_MAX_GROSS"] = "1.00"
+        os.environ["PORTFOLIO_RISK_MAX_NET"] = "0.60"
+        os.environ["PORTFOLIO_MAX_NET_EXPOSURE"] = "0.60"
 
         self._reload_runtime_modules()
         self._reset_runtime_controls()
@@ -344,7 +366,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["OOD_HARD_THRESHOLD"] = "3.00"
         os.environ["RL_ALLOW_FALLBACK_AGENT"] = "0"
 
-    def _seed_live_alpaca_route(self) -> None:
+    def _seed_live_alpaca_route_base(self) -> int:
         os.environ["DISABLE_LIVE_EXECUTION"] = "0"
         os.environ["LIVE_TRADING_CONFIRM"] = DEFAULT_LIVE_CONFIRM_PHRASE
         os.environ["LIVE_BROKER"] = "alpaca"
@@ -355,9 +377,19 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["MODEL_AWARE_KILL_SWITCH"] = "0"
         now_ms = self._seed_runtime_live()
         self._set_mode("live", armed=1)
+        return now_ms
+
+    def _seed_live_alpaca_route(self) -> None:
+        now_ms = self._seed_live_alpaca_route_base()
         self._seed_portfolio_order(ts_ms=now_ms)
 
-    def _healthy_live_route_stack(self, stack: ExitStack, *, adapter: Mock) -> None:
+    def _healthy_live_route_stack(
+        self,
+        stack: ExitStack,
+        *,
+        adapter: Mock,
+        patch_risk_governor: bool = True,
+    ) -> None:
         gates = importlib.import_module("engine.runtime.gates")
         def _passthrough_execution_policy(*args: Any, **kwargs: Any) -> list[dict]:
             if "intents" in kwargs:
@@ -370,13 +402,14 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         stack.enter_context(patch.object(self.broker_apply_orders, "execution_allowed", return_value=(True, "ok", {})))
         stack.enter_context(patch.object(self.broker_apply_orders, "get_competition_policy_for_intent", return_value={}))
         stack.enter_context(patch.object(self.broker_apply_orders, "pre_live_position_reconcile", return_value={"ok": True}))
-        stack.enter_context(
-            patch.object(
-                self.broker_apply_orders,
-                "apply_execution_risk_governor",
-                side_effect=lambda _con, orders, **_kwargs: (list(orders or []), {"ok": True}),
+        if patch_risk_governor:
+            stack.enter_context(
+                patch.object(
+                    self.broker_apply_orders,
+                    "apply_execution_risk_governor",
+                    side_effect=lambda _con, orders, **_kwargs: (list(orders or []), {"ok": True}),
+                )
             )
-        )
         stack.enter_context(
             patch.object(
                 self.broker_apply_orders,
@@ -393,6 +426,112 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         )
         stack.enter_context(patch.object(self.broker_router, "_prelive_reconcile", return_value={"ok": True}))
         stack.enter_context(patch.object(self.broker_router, "_alpaca_apply", adapter))
+
+    def _seed_price(self, symbol: str, ts_ms: int, price: float = 100.0) -> None:
+        con = self.storage.connect()
+        try:
+            con.execute(
+                "INSERT INTO prices(ts_ms, symbol, price, px, source) VALUES (?,?,?,?,?)",
+                (int(ts_ms), str(symbol).upper(), float(price), float(price), "test"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _seed_broker_position(
+        self,
+        *,
+        ts_ms: int,
+        symbol: str,
+        qty: float,
+        avg_px: float = 100.0,
+        equity: float = 100000.0,
+    ) -> None:
+        con = self.storage.connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO broker_account(id, cash, equity, updated_ts_ms)
+                VALUES(1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  cash=excluded.cash,
+                  equity=excluded.equity,
+                  updated_ts_ms=excluded.updated_ts_ms
+                """,
+                (float(equity), float(equity), int(ts_ms)),
+            )
+            con.execute(
+                """
+                INSERT INTO broker_positions(symbol, qty, avg_px, updated_ts_ms)
+                VALUES(?,?,?,?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                  qty=excluded.qty,
+                  avg_px=excluded.avg_px,
+                  updated_ts_ms=excluded.updated_ts_ms
+                """,
+                (str(symbol).upper(), float(qty), float(avg_px), int(ts_ms)),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _seed_pending_order_state(
+        self,
+        *,
+        ts_ms: int,
+        symbol: str,
+        to_side: str,
+        to_weight: float,
+    ) -> None:
+        con = self.storage.connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO broker_order_state(
+                  source_order_id, symbol, state, created_ts_ms, updated_ts_ms, ttl_ms, meta_json
+                )
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    999,
+                    str(symbol).upper(),
+                    "PENDING",
+                    int(ts_ms),
+                    int(ts_ms),
+                    300000,
+                    json.dumps(
+                        {
+                            "symbol": str(symbol).upper(),
+                            "to_side": str(to_side).upper(),
+                            "to_weight": float(to_weight),
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _run_live_adapter_capture(self, adapter: Mock) -> tuple[int, Dict[str, Any], str]:
+        with ExitStack() as stack:
+            self._healthy_live_route_stack(stack, adapter=adapter, patch_risk_governor=False)
+            return self._run_main(competition_policy={})
+
+    @staticmethod
+    def _signed_weight(order: Dict[str, Any]) -> float:
+        side = str(order.get("to_side") or "").upper()
+        weight = float(order.get("to_weight") or 0.0)
+        if side == "SHORT":
+            return -abs(weight)
+        if side == "LONG":
+            return abs(weight)
+        return 0.0
+
+    def _adapter_orders(self, adapter: Mock) -> list[Dict[str, Any]]:
+        adapter.assert_called_once()
+        return list(adapter.call_args.kwargs["override_orders"] or [])
 
     def _seed_portfolio_order(
         self,
@@ -740,6 +879,176 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         routed_orders = adapter.call_args.kwargs["override_orders"]
         self.assertEqual(len(routed_orders), 1)
         self.assertEqual(routed_orders[0]["symbol"], "AAPL")
+
+    def test_live_gross_cap_resizes_simultaneous_orders_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.40)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.40)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 2})
+
+        with patch("engine.risk.portfolio_risk_engine._apply_portfolio_caps", side_effect=lambda desired, _info: desired):
+            rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertEqual({order["symbol"] for order in routed_orders}, {"AAPL", "MSFT"})
+        self.assertAlmostEqual(sum(abs(self._signed_weight(order)) for order in routed_orders), 0.60, places=9)
+        self.assertAlmostEqual(routed_orders[0]["to_weight"], 0.30, places=9)
+        self.assertAlmostEqual(routed_orders[1]["to_weight"], 0.30, places=9)
+
+    def test_live_gross_cap_exact_boundary_is_not_resized(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.30)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.30)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 2})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertAlmostEqual(sum(abs(self._signed_weight(order)) for order in routed_orders), 0.60, places=9)
+        self.assertEqual([order["to_weight"] for order in routed_orders], [0.30, 0.30])
+
+    def test_live_gross_cap_just_below_boundary_is_not_resized(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.299)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.300)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 2})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertAlmostEqual(sum(abs(self._signed_weight(order)) for order in routed_orders), 0.599, places=9)
+        self.assertEqual([order["to_weight"] for order in routed_orders], [0.299, 0.300])
+
+    def test_live_net_cap_resizes_long_orders_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "2.0"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "0.50"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.40)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.40)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 2})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertAlmostEqual(sum(self._signed_weight(order) for order in routed_orders), 0.50, places=9)
+        self.assertEqual({order["to_side"] for order in routed_orders}, {"LONG"})
+
+    def test_live_net_cap_resizes_short_orders_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "2.0"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "0.50"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="SHORT", to_weight=0.40)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="SHORT", to_weight=0.40)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 2})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertAlmostEqual(sum(self._signed_weight(order) for order in routed_orders), -0.50, places=9)
+        self.assertEqual({order["to_side"] for order in routed_orders}, {"SHORT"})
+
+    def test_live_gross_cap_counts_existing_positions_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_broker_position(ts_ms=now_ms, symbol="AAPL", qty=500.0, avg_px=100.0, equity=100000.0)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.20)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 1})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertEqual(len(routed_orders), 1)
+        self.assertEqual(routed_orders[0]["symbol"], "MSFT")
+        self.assertAlmostEqual(routed_orders[0]["to_weight"], 0.10, places=9)
+
+    def test_live_gross_cap_counts_pending_orders_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_pending_order_state(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.40)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.30)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 1})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertEqual(len(routed_orders), 1)
+        self.assertEqual(routed_orders[0]["symbol"], "MSFT")
+        self.assertAlmostEqual(routed_orders[0]["to_weight"], 0.20, places=9)
+
+    def test_live_gross_cap_suppresses_order_when_no_headroom(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_broker_position(ts_ms=now_ms, symbol="AAPL", qty=600.0, avg_px=100.0, equity=100000.0)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.10)
+        adapter = Mock(side_effect=AssertionError("adapter must not receive over-cap order"))
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["result"]["status"], "no_real_orders")
+        adapter.assert_not_called()
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+
+    def test_live_invalid_exposure_data_blocks_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.10)
+        adapter = Mock(side_effect=AssertionError("adapter must not receive invalid exposure order"))
+
+        invalid_order = {
+            "source_order_id": 1,
+            "ts_ms": now_ms,
+            "model_id": "baseline",
+            "model_name": "baseline",
+            "symbol": "AAPL",
+            "to_side": "LONG",
+            "to_weight": "nan",
+            "delta_weight": 0.10,
+            "execution_target": "real",
+        }
+        with ExitStack() as stack:
+            self._healthy_live_route_stack(stack, adapter=adapter, patch_risk_governor=False)
+            stack.enter_context(patch.object(self.broker_apply_orders, "apply_execution_policy", return_value=[invalid_order]))
+            rc, out, _ = self._run_main(competition_policy={})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "risk_governor")
+        self.assertEqual(out["governor"]["exposure_caps"]["status"], "blocked_invalid_exposure_data")
+        adapter.assert_not_called()
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
 
     def test_live_mode_missing_router_gate_provider_blocks_before_adapter(self) -> None:
         self._seed_live_alpaca_route()

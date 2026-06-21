@@ -23,6 +23,10 @@ from typing import Any, Iterable, Mapping
 from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.platform import connection_info_with_pg_password
+from engine.runtime.pg_durability import (
+    maybe_apply_async_refetchable_pg_durability,
+    refetchable_pg_durability_snapshot,
+)
 
 try:
     import asyncpg
@@ -493,6 +497,7 @@ class TimescaleClient:
                     queue_depth = 0
             loop_alive = bool(self._thread is not None and self._thread.is_alive())
             policy_status = dict(self._policy_status)
+            durability = refetchable_pg_durability_snapshot()
         schema_ok = not (
             list(schema_validation.get("missing_tables") or [])
             or dict(schema_validation.get("missing_columns") or {})
@@ -544,6 +549,7 @@ class TimescaleClient:
             "schema_error": self._schema_error,
             "schema_validation": schema_validation,
             "policy_status": policy_status,
+            "durability": durability,
             "started": bool(loop_alive),
             "connect_timeout_s": float(self._config.connect_timeout_s),
             "command_timeout_s": float(self._config.command_timeout_s),
@@ -1301,6 +1307,11 @@ class TimescaleClient:
                     pool = await self._ensure_pool()
                     async with pool.acquire() as conn:
                         async with conn.transaction():
+                            await maybe_apply_async_refetchable_pg_durability(
+                                conn,
+                                scope="timescale_price_telemetry",
+                                table=table_name,
+                            )
                             await conn.executemany(sql, rows)
                     db_write_duration_ms = float((time.perf_counter() - db_started) * 1000.0)
                     flush_latency_ms = float((time.perf_counter() - flush_started) * 1000.0)

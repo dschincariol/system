@@ -41,6 +41,8 @@ class StorageBackend(Protocol):
 
     def run_write_txn(self, fn, *args: Any, **kwargs: Any) -> Any: ...
 
+    def run_refetchable_ingestion_telemetry_txn(self, fn, *args: Any, **kwargs: Any) -> Any: ...
+
     def get_db_validation_snapshot(
         self,
         *,
@@ -65,6 +67,7 @@ _REQUIRED_BACKEND_SYMBOLS: tuple[str, ...] = (
     "fetch_one",
     "fetch_all",
     "run_write_txn",
+    "run_refetchable_ingestion_telemetry_txn",
     "get_db_validation_snapshot",
     "get_db_debug_snapshot",
     "close_pooled_connections",
@@ -346,6 +349,14 @@ if _SQLITE_TEST_BACKEND and _sqlite_backend is not None:
 
     def run_write_txn(fn, *args, **kwargs):
         return _with_facade_sqlite_bindings(_sqlite_backend.run_write_txn, fn, *args, **kwargs)
+
+    def run_refetchable_ingestion_telemetry_txn(fn, *args, **kwargs):
+        return _with_facade_sqlite_bindings(
+            _sqlite_backend.run_refetchable_ingestion_telemetry_txn,
+            fn,
+            *args,
+            **kwargs,
+        )
 
     def _sqlite_busy(exc: BaseException) -> bool:
         return dbapi.is_sqlite_error(exc, "OperationalError") and (

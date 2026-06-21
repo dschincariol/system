@@ -15,7 +15,7 @@ from engine.runtime.startup_write_gate import (
     noncritical_startup_write_wait_s,
     should_defer_noncritical_startup_write,
 )
-from engine.runtime.storage import connect_ro, run_write_txn
+from engine.runtime.storage import connect_ro, run_refetchable_ingestion_telemetry_txn
 
 LOG = logging.getLogger("engine.runtime.telemetry_append_buffer")
 
@@ -331,7 +331,7 @@ def _write_rows(
             _ensure_price_quotes_raw_schema(con)
         con.executemany(sql, list(rows))
 
-    run_write_txn(
+    run_refetchable_ingestion_telemetry_txn(
         _write,
         attempts=attempts,
         table=str(table),

@@ -297,7 +297,7 @@ def resolve_torch_device(
     if device in {"", "default"}:
         device = "cpu"
     if device == "auto":
-        if amd_rocm_acceleration_profile_enabled():
+        if runtime_hardware_profile() in _AMD_PROFILES or amd_dependency_profile_enabled():
             return _resolve_rocm_torch_device(
                 torch_module,
                 raw=raw or "auto",
@@ -474,9 +474,13 @@ def runtime_hardware_snapshot(torch_module: Any | None = None) -> dict[str, Any]
                 "dependency_profile": runtime_dependency_profile(),
                 "accelerator_profile_error": accelerator_profile_error(),
                 "cuda_available": False,
+                "hip_version": "",
+                "rocm_available": False,
+                "torch_cuda_device_count": 0,
                 "nvidia_profile_enabled": nvidia_profile_enabled(),
                 "nvidia_dependency_profile_enabled": nvidia_dependency_profile_enabled(),
                 "amd_dependency_profile_enabled": amd_dependency_profile_enabled(),
+                "amd_rocm_acceleration_profile_enabled": amd_rocm_acceleration_profile_enabled(),
                 "nvidia_telemetry_enabled": False,
                 "amd_profile_selected": amd_profile_selected(),
                 "disabled_accelerator_reason": "torch_unavailable",

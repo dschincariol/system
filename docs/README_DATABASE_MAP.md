@@ -41,6 +41,20 @@ honored.
 
 Do not infer that new schema work is local-file-only. Treat the runtime storage facade and Postgres migrations as the primary persistence layer, and add migrations/tests for any schema or write-path change.
 
+Postgres durability defaults to the server/session setting for every write.
+`TRADING_REFETCHABLE_PG_DURABILITY_TIER=relaxed` is the only supported opt-in
+for `SET LOCAL synchronous_commit = off`, and production code applies it only
+inside hardcoded refetchable ingestion price/telemetry transactions:
+`engine.runtime.telemetry_append_buffer` flushes for `price_quotes_raw`,
+`price_provider_health`, `weather_provider_health`,
+`ingestion_pipeline_health`, and `ingest_slippage`;
+`engine.runtime.storage_pg_prices.PostgresPriceStorage.write_batch`; and
+Timescale queue flushes for `price_data`, `runtime_metrics`,
+`data_source_logs`, `price_provider_health`, `weather_provider_health`, and
+`ingestion_pipeline_health`. Order, ledger, broker, audit, event-log, model,
+trade-outcome, and capital-state writes stay on default/synchronous Postgres
+durability even when the relaxed tier is enabled.
+
 Cold boot and migration ownership:
 
 - `bootstrap_first_run()`, `repair_schema()`, and `storage.init_db()` own boot-time schema creation and repair.

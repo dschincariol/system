@@ -67,6 +67,8 @@ from engine.runtime.health_snapshot import new_payload as _health_new_snapshot_p
 from engine.runtime.health_snapshot import pending_payload as _health_pending_snapshot_payload
 from engine.runtime.health_snapshot import run_checks as _health_run_checks
 from engine.runtime.health_snapshot import stale_payload as _health_stale_snapshot_payload
+from engine.runtime.health_subsystem_probes import check_disk_pressure as _health_check_disk_pressure
+from engine.runtime.health_subsystem_probes import check_runtime_hardware as _health_check_runtime_hardware
 from engine.runtime.health_storage_checks import get_index_names as _health_get_index_names
 from engine.runtime.health_storage_checks import get_table_cols as _health_get_table_cols
 from engine.runtime.health_storage_checks import schema_audit as _health_schema_audit
@@ -2409,34 +2411,23 @@ def _run_health_checks(ctx: HealthSnapshotContext, checks: Iterable[HealthSnapsh
 
 
 def _check_runtime_hardware(ctx: HealthSnapshotContext) -> None:
-    out = ctx.out
-    section_started = time.perf_counter()
-    try:
-        out["runtime_hardware"] = runtime_hardware_snapshot()
-    except Exception as e:
-        _warn("health.runtime_hardware", e)
-        out["runtime_hardware"] = {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-        }
-    _trace_section("runtime_hardware", section_started, ok=bool((out.get("runtime_hardware") or {}).get("ok")))
+    _health_check_runtime_hardware(
+        ctx,
+        runtime_hardware_snapshot=runtime_hardware_snapshot,
+        warn=_warn,
+        trace_section=_trace_section,
+        perf_counter=time.perf_counter,
+    )
 
 
 def _check_disk_pressure(ctx: HealthSnapshotContext) -> None:
-    out = ctx.out
-    section_started = time.perf_counter()
-    try:
-        out["disk_pressure"] = get_disk_pressure_snapshot()
-    except Exception as e:
-        _warn("health.disk_pressure", e)
-        out["disk_pressure"] = {
-            "ok": False,
-            "status": "error",
-            "critical": [f"disk_pressure_error:{type(e).__name__}:{e}"],
-            "warnings": [],
-            "paths": [],
-        }
-    _trace_section("disk_pressure", section_started, ok=bool((out.get("disk_pressure") or {}).get("ok")))
+    _health_check_disk_pressure(
+        ctx,
+        disk_pressure_snapshot=get_disk_pressure_snapshot,
+        warn=_warn,
+        trace_section=_trace_section,
+        perf_counter=time.perf_counter,
+    )
 
 
 def _check_db(ctx: HealthSnapshotContext) -> None:

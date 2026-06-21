@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from engine.runtime.platform import default_data_root
+from engine.runtime.pg_durability import validate_runtime_refetchable_ingestion_telemetry_write
 
 LOGGER = logging.getLogger(__name__)
 STORAGE_BACKEND_NAME = "sqlite"
@@ -1655,6 +1656,36 @@ def run_write_txn(
     if last_error is not None:
         raise last_error
     return None
+
+
+def run_refetchable_ingestion_telemetry_txn(
+    fn: Callable[[StorageConnection], Any],
+    *,
+    table: str,
+    operation: str,
+    context: dict[str, Any] | None = None,
+    attempts: int = 3,
+    direct: bool = True,
+    maintenance: bool = False,
+    timeout_s: float | None = None,
+    busy_timeout_ms: int | None = None,
+    **kwargs: Any,
+) -> Any:
+    del context, kwargs
+    validate_runtime_refetchable_ingestion_telemetry_write(
+        table=table,
+        operation=operation,
+    )
+    return run_write_txn(
+        fn,
+        attempts=attempts,
+        table=table,
+        operation=operation,
+        direct=direct,
+        maintenance=maintenance,
+        timeout_s=timeout_s,
+        busy_timeout_ms=busy_timeout_ms,
+    )
 
 
 def register_after_commit(con: StorageConnection | None, callback: Callable[[], None]) -> None:

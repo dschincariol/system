@@ -105,21 +105,55 @@ Characterization coverage starts in
 `tests/test_start_system_decomposition_contract.py` and is backed by the
 existing startup health and runtime-configuration tests.
 
+## Runtime Health Slice
+
+The runtime health slice applies the same facade pattern to
+`engine/runtime/health.py` while preserving `engine.runtime.health` as the
+public import surface for APIs, startup validation, preflight, metrics, and
+operator diagnostics.
+
+Current split:
+
+- `engine/runtime/health_normalization.py` owns warning event shaping,
+  optional section timing, primitive coercion, deduplication, and JSON/runtime
+  meta normalization helpers.
+- `engine/runtime/health_disk.py` owns disk pressure path selection and disk
+  usage payload serialization.
+- `engine/runtime/health_storage_checks.py` owns SQLite-compatible table/index
+  helper probes and schema-audit payload shaping.
+- `engine/runtime/health_snapshot.py` owns health snapshot pending/stale
+  payloads, base payload construction, `HealthSnapshotContext`,
+  `HealthSnapshotCheck`, and fail-tolerant check execution.
+- `engine/runtime/health_subsystem_probes.py` owns extracted concrete subsystem
+  probes once they have focused characterization coverage; this slice moves the
+  runtime hardware and disk-pressure probe bodies.
+- `engine/runtime/health_readiness.py` owns readiness payload assembly, issue
+  levels, waiting-on sequencing, and readiness step serialization.
+- `engine/runtime/health.py` remains the compatibility facade and continues to
+  publish the existing health, readiness, preflight, schema-audit, disk-pressure
+  and helper names/signatures. It still owns the concrete subsystem probe
+  registry and the final health-policy aggregation so this slice does not
+  change readiness policy or add gates.
+
+Characterization coverage starts in
+`tests/test_runtime_health_decomposition_contract.py` and is backed by the
+existing startup health, provider readiness, and health snapshot registry
+tests.
+
 ## Follow-Up Priority
 
 Recommended next decomposition targets:
 
-1. `engine/api/api_system.py` - continue with read handler and readiness
-   serialization slices behind the same facade.
+1. `engine/runtime/health.py` - future slices should focus on moving individual
+   subsystem probes behind the facade one at a time. Keep final health-policy
+   aggregation unchanged unless broader readiness characterization is added.
 2. `start_system.py` - future slices should be limited to additional helper
    extraction behind the facade; keep top-level `main()` boot sequencing in the
    executable entrypoint.
-3. `engine/runtime/health.py` - split snapshot collection, readiness scoring,
-   and serialization after adding focused health characterization tests.
-4. `engine/strategy/portfolio.py` - split portfolio construction stages only
+3. `engine/strategy/portfolio.py` - split portfolio construction stages only
    after locking target/order equivalence with fixture-based tests.
-5. `engine/execution/execution_ledger.py` - high blast radius durable execution
+4. `engine/execution/execution_ledger.py` - high blast radius durable execution
    state; decompose only after ledger replay/compatibility tests are in place.
-6. `engine/runtime/storage_sqlite.py` - highest blast radius storage core; keep
+5. `engine/runtime/storage_sqlite.py` - highest blast radius storage core; keep
    last and require migration/storage contract coverage before any structural
    move.

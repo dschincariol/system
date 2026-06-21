@@ -42,6 +42,17 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
   Persistent runtime lifecycle state machine.
 - [health.py](health.py)
   Registry-driven health snapshots and preflight checks used by UI and bootstrap. `get_health_snapshot()` owns cache/lock/connection handling and runs named `HealthSnapshotCheck` probes before the final readiness aggregation.
+- Health helper modules:
+  [health_normalization.py](health_normalization.py),
+  [health_disk.py](health_disk.py),
+  [health_storage_checks.py](health_storage_checks.py),
+  [health_snapshot.py](health_snapshot.py),
+  [health_subsystem_probes.py](health_subsystem_probes.py), and
+  [health_readiness.py](health_readiness.py) hold the decomposed normalization,
+  disk/schema probe, subsystem probe, snapshot scaffolding, and readiness serialization helpers
+  used by the [health.py](health.py) compatibility facade. Keep new concrete
+  subsystem probes registered through `health.py` until they have their own
+  characterization coverage.
 - [hardware.py](hardware.py)
   CPU-first device/profile resolver, bounded torch/BLAS thread defaults, runtime hardware snapshots, and NVIDIA telemetry gating.
 - [live_trading_preflight.py](live_trading_preflight.py)
@@ -128,7 +139,7 @@ If the system starts, stops, hangs, restarts, deadlocks, or corrupts state, the 
 - Treat Postgres runtime storage as required for production-like operation.
   `engine.runtime.storage_pool` records readiness and degraded state; `db_guard.ensure_db_ok()`, `runtime_bootstrap.bootstrap_runtime()`, production preflight, and startup gates fail closed when Postgres cannot be acquired or schema validation fails.
 - Keep runtime hardware CPU-first unless an accelerator profile is deliberately validated.
-  Production defaults are `TRADING_DEPENDENCY_PROFILE=cpu`, `RUNTIME_HARDWARE_PROFILE=cpu`, `TORCH_DEVICE=cpu`, `EMBED_DEVICE=cpu`, `NLP_DEVICE=cpu`, `FINBERT_DEVICE=cpu`, and `TS_FOUNDATION_DEVICE=cpu`, with `TORCH_CPU_THREADS=8` and `TORCH_INTEROP_THREADS=4`. `auto` only selects CUDA when both the NVIDIA dependency profile and NVIDIA runtime profile are active and PyTorch verifies CUDA availability; otherwise health/preflight report the dependency profile, resolved device, disabled accelerator reason, and any profile mismatch. CUDA-specific telemetry, pinned prefetch, TF32, and cuDNN benchmark flags default off and must be enabled explicitly in a validated accelerator profile.
+  Production defaults are `TRADING_DEPENDENCY_PROFILE=cpu`, `RUNTIME_HARDWARE_PROFILE=cpu`, `TORCH_DEVICE=cpu`, `EMBED_DEVICE=cpu`, `NLP_DEVICE=cpu`, `FINBERT_DEVICE=cpu`, and `TS_FOUNDATION_DEVICE=cpu`, with `TORCH_CPU_THREADS=8` and `TORCH_INTEROP_THREADS=4`. `auto` selects NVIDIA CUDA only when both the NVIDIA dependency profile and NVIDIA runtime profile are active and PyTorch verifies CUDA availability. `auto` selects AMD ROCm only when both the `amd-rocm` dependency profile and runtime hardware profile are active and PyTorch reports a HIP build, CUDA/HIP availability, and a nonzero device count; otherwise health/preflight report the dependency profile, resolved device, disabled accelerator reason, and any profile mismatch. CUDA-specific telemetry, pinned prefetch, TF32, and cuDNN benchmark flags default off and must be enabled explicitly in a validated accelerator profile.
 - Keep Postgres schema validation catalog-backed.
   `storage_pg.get_db_validation_snapshot(strict=True)` must fail closed on introspection errors, stale `schema_migrations`, missing required tables/columns/indexes, owned live-ingestion primary-key drift, and unexpected owned columns or type drift.
 - Keep SQLite wording precise.

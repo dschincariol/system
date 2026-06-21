@@ -8,8 +8,10 @@ turnover, and drawdown-driven restrictions before orders are emitted.
 import os
 import json
 import logging
+import math
 from typing import Any, Dict, Tuple, List, Optional
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.storage import table_exists
 
 from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.data.weather_features import get_weather_feature_snapshot
@@ -270,6 +272,496 @@ def _net(desired: Dict[str, Dict[str, Any]]) -> float:
         except Exception as e:
             _warn_nonfatal("PORTFOLIO_RISK_GATE_NET_ACCUMULATION_FAILED", e, once_key="net_accumulation")
     return float(n)
+
+
+def _finite_float(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(float(out)):
+        return None
+    return float(out)
+
+
+def _env_float(*keys: str, default: float) -> float:
+    for key in keys:
+        raw = os.environ.get(str(key))
+        if raw in (None, ""):
+            continue
+        parsed = _finite_float(raw)
+        if parsed is not None:
+            return float(parsed)
+    return float(default)
+
+
+def _table_columns(con: Any, table_name: str) -> set[str]:
+    try:
+        return {
+            str(row[1]).strip().lower()
+            for row in (con.execute(f"PRAGMA table_info({table_name})").fetchall() or [])
+            if row and len(row) > 1 and row[1]
+        }
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_TABLE_COLUMNS_FAILED",
+            e,
+            once_key=f"table_columns:{table_name}",
+            table=str(table_name),
+        )
+        return set()
+
+
+def _latest_price(con: Any, symbol: str) -> Optional[float]:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    try:
+        if not table_exists(con, "prices"):
+            return None
+        cols = _table_columns(con, "prices")
+        price_col = "price" if "price" in cols else ("px" if "px" in cols else None)
+        if price_col is None:
+            return None
+        row = con.execute(
+            f"""
+            SELECT {price_col}
+            FROM prices
+            WHERE UPPER(symbol)=?
+            ORDER BY ts_ms DESC
+            LIMIT 1
+            """,
+            (sym,),
+        ).fetchone()
+        if not row:
+            return None
+        px = _finite_float(row[0])
+        return float(px) if px is not None and px > 0.0 else None
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_PRICE_READ_FAILED",
+            e,
+            once_key=f"latest_price:{sym}",
+            symbol=str(sym),
+        )
+        return None
+
+
+def _read_execution_equity(con: Any, explicit_equity: Optional[float]) -> Tuple[Optional[float], Optional[str]]:
+    eq = _finite_float(explicit_equity)
+    if eq is not None and eq > 0.0:
+        return float(eq), None
+
+    try:
+        if not table_exists(con, "broker_account"):
+            return None, None
+        cols = _table_columns(con, "broker_account")
+        if "equity" not in cols:
+            return None, "broker_account_missing_equity"
+        order_col = "updated_ts_ms" if "updated_ts_ms" in cols else ("ts_ms" if "ts_ms" in cols else "")
+        sql = "SELECT equity FROM broker_account"
+        if "id" in cols:
+            sql += " WHERE id=1"
+        if order_col:
+            sql += f" ORDER BY {order_col} DESC"
+        sql += " LIMIT 1"
+        row = con.execute(sql).fetchone()
+        if not row:
+            return None, None
+        eq = _finite_float(row[0])
+        if eq is None or eq <= 0.0:
+            return None, "broker_account_invalid_equity"
+        return float(eq), None
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_EQUITY_READ_FAILED",
+            e,
+            once_key="execution_equity_read",
+        )
+        return None, "broker_account_equity_read_failed"
+
+
+def _order_signed_target_weight(
+    con: Any,
+    order: Dict[str, Any],
+    equity: Optional[float],
+) -> Tuple[Optional[float], Optional[str]]:
+    if not isinstance(order, dict):
+        return None, "order_not_mapping"
+
+    side = str(order.get("to_side") or order.get("side") or "").strip().upper()
+    raw_weight = order.get("to_weight")
+    if raw_weight is None and order.get("weight") is not None:
+        raw_weight = order.get("weight")
+    if raw_weight not in (None, ""):
+        weight = _finite_float(raw_weight)
+        if weight is None:
+            return None, "invalid_to_weight"
+        if side == "FLAT":
+            return 0.0, None
+        if side == "SHORT":
+            return -abs(float(weight)), None
+        if side == "LONG":
+            return abs(float(weight)), None
+        return float(weight), None
+
+    raw_qty = order.get("qty")
+    if raw_qty in (None, ""):
+        return None, "missing_to_weight"
+    qty = _finite_float(raw_qty)
+    if qty is None:
+        return None, "invalid_qty"
+
+    eq = _finite_float(equity)
+    if eq is None or eq <= 0.0:
+        return None, "missing_equity_for_quantity_order"
+
+    px = None
+    for key in ("ref_px", "mid_px", "expected_px", "limit_px", "price"):
+        if order.get(key) in (None, ""):
+            continue
+        px = _finite_float(order.get(key))
+        if px is not None and px > 0.0:
+            break
+    if px is None or px <= 0.0:
+        px = _latest_price(con, str(order.get("symbol") or ""))
+    if px is None or px <= 0.0:
+        return None, "missing_price_for_quantity_order"
+
+    signed_qty = float(qty)
+    if signed_qty > 0.0 and side == "SHORT":
+        signed_qty = -abs(float(signed_qty))
+    elif signed_qty < 0.0 and side == "LONG":
+        signed_qty = abs(float(signed_qty))
+    return float(signed_qty) * float(px) / float(eq), None
+
+
+def _read_existing_position_weights(
+    con: Any,
+    equity: Optional[float],
+) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    out: Dict[str, float] = {}
+    errors: List[Dict[str, Any]] = []
+    try:
+        if not table_exists(con, "broker_positions"):
+            return out, errors
+        cols = _table_columns(con, "broker_positions")
+        if not {"symbol", "qty"}.issubset(cols):
+            return out, errors
+        px_col = "avg_px" if "avg_px" in cols else ("price" if "price" in cols else None)
+        order_col = "updated_ts_ms" if "updated_ts_ms" in cols else ("ts_ms" if "ts_ms" in cols else "")
+        select_px = px_col if px_col else "NULL"
+        sql = f"SELECT symbol, qty, {select_px} FROM broker_positions"
+        if order_col:
+            sql += f" ORDER BY {order_col} ASC"
+        rows = con.execute(sql).fetchall() or []
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_POSITIONS_READ_FAILED",
+            e,
+            once_key="execution_positions_read",
+        )
+        return out, [{"reason": "broker_positions_read_failed", "error": str(e)}]
+
+    eq = _finite_float(equity)
+    for row in rows:
+        sym = str(row[0] if row else "").strip().upper()
+        if not sym:
+            continue
+        qty = _finite_float(row[1] if len(row) > 1 else None)
+        if qty is None:
+            errors.append({"symbol": sym, "reason": "invalid_position_qty"})
+            continue
+        if abs(float(qty)) <= 1e-12:
+            out.pop(sym, None)
+            continue
+        if eq is None or eq <= 0.0:
+            errors.append({"symbol": sym, "reason": "missing_equity_for_position"})
+            continue
+        px = _finite_float(row[2] if len(row) > 2 else None)
+        if px is None or px <= 0.0:
+            px = _latest_price(con, sym)
+        if px is None or px <= 0.0:
+            errors.append({"symbol": sym, "reason": "missing_position_price"})
+            continue
+        out[sym] = float(qty) * float(px) / float(eq)
+    return out, errors
+
+
+_PENDING_ORDER_STATES = frozenset(
+    {
+        "PENDING",
+        "NEW",
+        "OPEN",
+        "SUBMITTED",
+        "ACCEPTED",
+        "PARTIALLY_FILLED",
+        "HELD",
+    }
+)
+
+
+def _read_pending_order_weights(
+    con: Any,
+    equity: Optional[float],
+) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    out: Dict[str, float] = {}
+    errors: List[Dict[str, Any]] = []
+    try:
+        if not table_exists(con, "broker_order_state"):
+            return out, errors
+        cols = _table_columns(con, "broker_order_state")
+        if not {"symbol", "state"}.issubset(cols):
+            return out, errors
+        order_col = "updated_ts_ms" if "updated_ts_ms" in cols else ("created_ts_ms" if "created_ts_ms" in cols else "")
+        meta_col = "meta_json" if "meta_json" in cols else "NULL"
+        sql = f"SELECT symbol, state, {meta_col} FROM broker_order_state"
+        if order_col:
+            sql += f" ORDER BY {order_col} ASC"
+        rows = con.execute(sql).fetchall() or []
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_PENDING_ORDERS_READ_FAILED",
+            e,
+            once_key="execution_pending_orders_read",
+        )
+        return out, [{"reason": "pending_orders_read_failed", "error": str(e)}]
+
+    for row in rows:
+        sym = str(row[0] if row else "").strip().upper()
+        state = str(row[1] if len(row) > 1 else "").strip().upper()
+        if (not sym) or state not in _PENDING_ORDER_STATES:
+            continue
+        raw_meta = row[2] if len(row) > 2 else None
+        try:
+            meta = json.loads(raw_meta) if raw_meta else {}
+        except Exception as e:
+            errors.append({"symbol": sym, "reason": "invalid_pending_order_meta", "error": str(e)})
+            continue
+        if not isinstance(meta, dict):
+            errors.append({"symbol": sym, "reason": "invalid_pending_order_meta_type"})
+            continue
+        meta.setdefault("symbol", sym)
+        signed, reason = _order_signed_target_weight(con, meta, equity)
+        if signed is None:
+            errors.append({"symbol": sym, "reason": f"pending_{reason or 'invalid_exposure'}"})
+            continue
+        out[sym] = float(signed)
+    return out, errors
+
+
+def _portfolio_metrics(weights: Dict[str, float]) -> Tuple[float, float]:
+    gross = 0.0
+    net = 0.0
+    for value in dict(weights or {}).values():
+        parsed = _finite_float(value)
+        if parsed is None:
+            continue
+        gross += abs(float(parsed))
+        net += float(parsed)
+    return float(gross), float(net)
+
+
+def _max_cap_scale(
+    *,
+    fixed_gross: float,
+    fixed_net: float,
+    mutable_gross: float,
+    mutable_net: float,
+    gross_cap: float,
+    net_cap: float,
+) -> Optional[float]:
+    low = 0.0
+    high = 1.0
+
+    if gross_cap > 0.0:
+        if fixed_gross > gross_cap + 1e-12 and mutable_gross <= 1e-12:
+            return None
+        if mutable_gross > 1e-12:
+            high = min(high, (float(gross_cap) - float(fixed_gross)) / float(mutable_gross))
+
+    if net_cap > 0.0:
+        if abs(float(mutable_net)) <= 1e-12:
+            if abs(float(fixed_net)) > float(net_cap) + 1e-12:
+                return None
+        else:
+            a = (-float(net_cap) - float(fixed_net)) / float(mutable_net)
+            b = (float(net_cap) - float(fixed_net)) / float(mutable_net)
+            lo_net = min(float(a), float(b))
+            hi_net = max(float(a), float(b))
+            low = max(low, lo_net)
+            high = min(high, hi_net)
+
+    if high < low - 1e-12:
+        return None
+    scale = min(1.0, max(0.0, float(high)))
+    if scale < low - 1e-12:
+        return None
+    return float(scale)
+
+
+def _apply_execution_exposure_caps(
+    con: Any,
+    orders: List[Dict[str, Any]],
+    *,
+    equity_usd: Optional[float],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    gross_cap = _env_float(
+        "EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP",
+        "PORTFOLIO_RISK_MAX_GROSS",
+        "PORTFOLIO_GROSS_CAP",
+        default=1.0,
+    )
+    net_cap = _env_float(
+        "EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP",
+        "PORTFOLIO_RISK_MAX_NET",
+        "PORTFOLIO_MAX_NET_EXPOSURE",
+        default=0.60,
+    )
+
+    info: Dict[str, Any] = {
+        "enabled": True,
+        "gross_cap": float(gross_cap),
+        "net_cap": float(net_cap),
+        "scaled": False,
+        "suppressed_n": 0,
+    }
+    if gross_cap <= 0.0 and net_cap <= 0.0:
+        info["enabled"] = False
+        return list(orders or []), info
+    if not orders:
+        return [], info
+
+    equity, equity_error = _read_execution_equity(con, equity_usd)
+    if equity_error:
+        info["equity_error"] = str(equity_error)
+
+    existing, existing_errors = _read_existing_position_weights(con, equity)
+    pending, pending_errors = _read_pending_order_weights(con, equity)
+    exposure_errors: List[Dict[str, Any]] = list(existing_errors or []) + list(pending_errors or [])
+
+    mutable: List[Tuple[int, Dict[str, Any], str, float]] = []
+    symbols = set()
+    for idx, order in enumerate(list(orders or [])):
+        sym = str((order or {}).get("symbol") or "").strip().upper()
+        if not sym:
+            exposure_errors.append({"index": int(idx), "reason": "missing_symbol"})
+            continue
+        signed, reason = _order_signed_target_weight(con, order, equity)
+        if signed is None:
+            exposure_errors.append({"index": int(idx), "symbol": sym, "reason": str(reason or "invalid_exposure")})
+            continue
+        mutable.append((int(idx), order, sym, float(signed)))
+        symbols.add(sym)
+
+    if exposure_errors:
+        info.update(
+            {
+                "ok": False,
+                "status": "blocked_invalid_exposure_data",
+                "errors": exposure_errors,
+            }
+        )
+        return [], info
+
+    fixed = dict(existing or {})
+    fixed.update(pending or {})
+    for sym in symbols:
+        fixed.pop(str(sym), None)
+
+    mutable_weights: Dict[str, float] = {}
+    for _idx, _order, sym, signed in mutable:
+        mutable_weights[sym] = float(signed)
+
+    fixed_gross, fixed_net = _portfolio_metrics(fixed)
+    mutable_gross, mutable_net = _portfolio_metrics(mutable_weights)
+    pre_weights = dict(fixed)
+    pre_weights.update(mutable_weights)
+    pre_gross, pre_net = _portfolio_metrics(pre_weights)
+
+    scale = _max_cap_scale(
+        fixed_gross=float(fixed_gross),
+        fixed_net=float(fixed_net),
+        mutable_gross=float(mutable_gross),
+        mutable_net=float(mutable_net),
+        gross_cap=float(gross_cap),
+        net_cap=float(net_cap),
+    )
+    if scale is None:
+        info.update(
+            {
+                "ok": False,
+                "status": "blocked_exposure_caps_infeasible",
+                "pre_gross": float(pre_gross),
+                "pre_net": float(pre_net),
+                "fixed_gross": float(fixed_gross),
+                "fixed_net": float(fixed_net),
+                "mutable_gross": float(mutable_gross),
+                "mutable_net": float(mutable_net),
+            }
+        )
+        return [], info
+
+    if pre_gross <= float(gross_cap if gross_cap > 0.0 else pre_gross) + 1e-12 and (
+        net_cap <= 0.0 or abs(float(pre_net)) <= float(net_cap) + 1e-12
+    ):
+        scale = 1.0
+
+    out: List[Dict[str, Any]] = []
+    suppressed = 0
+    for _idx, order, _sym, signed in mutable:
+        scaled_signed = float(signed) * float(scale)
+        if abs(float(scaled_signed)) <= 1e-12 and abs(float(signed)) > 1e-12:
+            suppressed += 1
+            continue
+        new_order = dict(order)
+        new_side = "LONG" if scaled_signed > 0.0 else ("SHORT" if scaled_signed < 0.0 else "FLAT")
+        new_abs = abs(float(scaled_signed))
+        from_weight = _finite_float(new_order.get("from_weight"))
+        if from_weight is None:
+            from_weight = 0.0
+        new_order["to_side"] = str(new_side)
+        new_order["to_weight"] = float(new_abs)
+        new_order["delta_weight"] = float(new_abs) - float(abs(from_weight))
+        cap_meta = {
+            "gross_cap": float(gross_cap),
+            "net_cap": float(net_cap),
+            "scale": float(scale),
+            "pre_gross": float(pre_gross),
+            "pre_net": float(pre_net),
+            "fixed_gross": float(fixed_gross),
+            "fixed_net": float(fixed_net),
+        }
+        new_order.setdefault("exposure_cap", cap_meta)
+        explain = new_order.get("explain")
+        if isinstance(explain, dict):
+            explain.setdefault("execution", {})
+            if isinstance(explain.get("execution"), dict):
+                explain["execution"]["exposure_cap"] = cap_meta
+        out.append(new_order)
+
+    post_mutable = {sym: signed * float(scale) for _idx, _order, sym, signed in mutable}
+    post_weights = dict(fixed)
+    post_weights.update(post_mutable)
+    post_gross, post_net = _portfolio_metrics(post_weights)
+    info.update(
+        {
+            "ok": True,
+            "status": "exposure_caps_applied",
+            "scale": float(scale),
+            "scaled": bool(scale < 0.999999),
+            "suppressed_n": int(suppressed),
+            "pre_gross": float(pre_gross),
+            "pre_net": float(pre_net),
+            "post_gross": float(post_gross),
+            "post_net": float(post_net),
+            "fixed_gross": float(fixed_gross),
+            "fixed_net": float(fixed_net),
+            "mutable_gross": float(mutable_gross),
+            "mutable_net": float(mutable_net),
+        }
+    )
+    return out, info
 
 
 def _turnover(desired: Dict[str, Dict[str, Any]], state: Dict[str, Dict[str, Any]]) -> float:
@@ -668,6 +1160,20 @@ def apply_execution_risk_governor(
 
         out.append(o)
 
+    out, exposure_info = _apply_execution_exposure_caps(
+        con,
+        out,
+        equity_usd=equity_usd,
+    )
+    if isinstance(exposure_info, dict) and exposure_info.get("ok") is False:
+        return [], {
+            "ok": False,
+            "status": str(exposure_info.get("status") or "blocked_exposure_caps"),
+            "broker": broker,
+            "mode": mode,
+            "exposure_caps": dict(exposure_info),
+        }
+
     info = {
         "ok": True,
         "status": "governed",
@@ -676,10 +1182,12 @@ def apply_execution_risk_governor(
         "in_n": int(len(list(orders or []))),
         "out_n": int(len(out)),
         "dropped_n": int(dropped),
+        "exposure_cap_dropped_n": int((exposure_info or {}).get("suppressed_n") or 0),
         "equity_usd": (float(equity_usd) if equity_usd is not None else None),
         "max_abs_weight": float(max_abs_w),
         "max_abs_delta_weight": float(max_abs_dw),
         "max_orders_per_pass": int(max_n),
+        "exposure_caps": dict(exposure_info or {}),
     }
     return out, info
 """

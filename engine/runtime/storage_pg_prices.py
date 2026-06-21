@@ -26,6 +26,10 @@ from engine.runtime.logging import get_logger
 from engine.runtime.metrics import emit_counter, emit_timing
 from engine.runtime.observability import record_component_health
 from engine.runtime.platform import connection_info_with_pg_password
+from engine.runtime.pg_durability import (
+    maybe_apply_sync_refetchable_pg_durability,
+    refetchable_pg_durability_snapshot,
+)
 
 LOG = get_logger("runtime.storage_pg_prices")
 _STORE_LOCK = threading.Lock()
@@ -763,6 +767,10 @@ class PostgresPriceStorage:
         def _write() -> None:
             with self._connection() as con:
                 with con.cursor() as cur:
+                    maybe_apply_sync_refetchable_pg_durability(
+                        cur,
+                        scope="storage_pg_prices.write_batch",
+                    )
                     if price_rows:
                         _execute_many_values(
                             cur,
@@ -885,6 +893,7 @@ class PostgresPriceStorage:
             schema_error = self._schema_error
             schema_validation = dict(self._schema_validation)
             policy_status = dict(self._policy_status)
+            durability = refetchable_pg_durability_snapshot()
             last_error = self._last_error
             last_error_ts_ms = int(self._last_error_ts_ms or 0)
             last_connect_ts_ms = int(self._last_connect_ts_ms or 0)
@@ -908,6 +917,7 @@ class PostgresPriceStorage:
             "schema_name": str(self._config.schema_name),
             "schema_validation": schema_validation,
             "policy_status": policy_status,
+            "durability": durability,
             "connect_timeout_s": float(self._config.connect_timeout_s),
             "command_timeout_s": float(self._config.command_timeout_s),
             "lock_timeout_s": float(self._config.lock_timeout_s),

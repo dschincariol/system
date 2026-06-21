@@ -22,6 +22,10 @@ from psycopg.types.json import Jsonb
 import sqlparse
 
 from engine.runtime.platform import default_data_root
+from engine.runtime.pg_durability import (
+    maybe_apply_sync_refetchable_pg_durability,
+    validate_runtime_refetchable_ingestion_telemetry_write,
+)
 from engine.runtime.storage_dialect import to_pg_params
 from engine.runtime.storage_pool import (
     acquire,
@@ -949,6 +953,46 @@ def run_write_txn(
     if last_error is not None:
         raise last_error
     return None
+
+
+def run_refetchable_ingestion_telemetry_txn(
+    fn: Callable[[StorageConnection], Any],
+    *,
+    table: str,
+    operation: str,
+    context: dict[str, Any] | None = None,
+    attempts: int | None = None,
+    direct: bool = True,
+    maintenance: bool = False,
+    timeout_s: float | None = None,
+    busy_timeout_ms: int | None = None,
+):
+    """Run an approved refetchable telemetry write with optional relaxed durability."""
+    validate_runtime_refetchable_ingestion_telemetry_write(
+        table=table,
+        operation=operation,
+    )
+
+    def _write(con: StorageConnection) -> Any:
+        maybe_apply_sync_refetchable_pg_durability(
+            con,
+            scope="runtime_refetchable_ingestion_telemetry",
+            table=table,
+            operation=operation,
+        )
+        return fn(con)
+
+    return run_write_txn(
+        _write,
+        table=table,
+        operation=operation,
+        context=context,
+        attempts=attempts,
+        direct=direct,
+        maintenance=maintenance,
+        timeout_s=timeout_s,
+        busy_timeout_ms=busy_timeout_ms,
+    )
 
 
 def register_after_commit(con: StorageConnection | None, callback: Callable[[], None]) -> None:
