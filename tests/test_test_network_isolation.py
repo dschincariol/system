@@ -46,6 +46,26 @@ def test_runtime_test_env_scrubs_proxy_variables(monkeypatch: pytest.MonkeyPatch
     assert not any(key in env for key in proxy_keys)
 
 
+def test_runtime_cleanup_closes_loaded_timescale_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.runtime import timescale_client
+
+    class FakeTimescaleClient:
+        def __init__(self) -> None:
+            self.close_timeouts: list[float] = []
+
+        def close(self, timeout_s: float | None = None) -> dict[str, object]:
+            self.close_timeouts.append(float(timeout_s or 0.0))
+            return {"ok": True}
+
+    fake_client = FakeTimescaleClient()
+    monkeypatch.setattr(timescale_client, "_CLIENT", fake_client)
+
+    test_isolation.cleanup_runtime_test_state(timeout_s=0.25)
+
+    assert fake_client.close_timeouts == [0.25]
+    assert timescale_client._CLIENT is None
+
+
 def test_loopback_socket_connection_is_allowed() -> None:
     ready = threading.Event()
     accepted = threading.Event()

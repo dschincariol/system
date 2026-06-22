@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from tools import check_repo_artifact_hygiene as hygiene
 
 
@@ -38,6 +40,47 @@ def test_blocks_generated_dependency_and_runtime_paths() -> None:
 
     for path, expected_reason in blocked.items():
         assert expected_reason in (_violation(path) or "")
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_reason"),
+    [
+        ("engine/__pycache__/module.cpython-311.pyc", "python bytecode cache"),
+        ("ui/node_modules/pkg/index.js", "node dependency directory"),
+        ("artifacts/reports/latest.json", "generated artifact output"),
+        ("model-artifacts/champion/model.bin", "generated model artifact output"),
+        ("deploy/env/prod.env", "local environment, secret, or runtime data path"),
+        ("data/secrets/operator-token", "local environment, secret, or runtime data path"),
+        ("engine/runtime/state.sqlite3", "generated runtime/cache file suffix"),
+        ("engine/runtime/service.log.1", "generated runtime/cache file suffix"),
+    ],
+)
+def test_planted_offender_matrix_exercises_every_detector_table(path: str, expected_reason: str) -> None:
+    violation = hygiene.artifact_violation_for_path(path)
+
+    assert violation is not None
+    assert violation.path == path
+    assert violation.reason == expected_reason
+
+
+def test_cli_fails_when_tracked_planted_offenders_are_reported(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    planted = [
+        ".env",
+        "artifacts/generated-model.json",
+        "ui/node_modules/pkg/index.js",
+        "engine/runtime/local.sqlite",
+    ]
+    monkeypatch.setattr(hygiene, "tracked_files", lambda root=hygiene.ROOT: planted)
+
+    exit_code = hygiene.main([])
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    for path in planted:
+        assert path in output
+    assert "Remove these from the index" in output
 
 
 def test_blocks_local_env_and_secret_material_but_not_templates() -> None:

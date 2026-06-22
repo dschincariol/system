@@ -95,12 +95,26 @@ run_reclaim() {
 }
 
 output="$(run_reclaim BACKUP_EVIDENCE_PATH="$fresh_evidence_json")"
+grep -q 'event=decision_required_noop' <<<"$output"
+if grep -q '\[dry-run\] wipefs' <<<"$output"; then
+  echo "branchless invocation unexpectedly reached dry-run provisioning" >&2
+  exit 1
+fi
+
+output="$(run_reclaim IDLE_NVME_DECISION=RETAIN BACKUP_EVIDENCE_PATH="$fresh_evidence_json")"
+grep -q 'event=retain_selected_noop' <<<"$output"
+if grep -q '\[dry-run\] wipefs' <<<"$output"; then
+  echo "RETAIN branch unexpectedly reached dry-run provisioning" >&2
+  exit 1
+fi
+
+output="$(run_reclaim IDLE_NVME_DECISION=RECLAIM BACKUP_EVIDENCE_PATH="$fresh_evidence_json")"
 grep -q 'event=dry_run_default' <<<"$output"
 grep -q '\[dry-run\] wipefs' <<<"$output"
 grep -q 'RECLAIM destroys the Windows/BitLocker install' <<<"$output"
 
 set +e
-output="$(run_reclaim RECLAIM_DRY_RUN=0 BACKUP_EVIDENCE_PATH="$fresh_evidence_json" 2>&1)"
+output="$(run_reclaim IDLE_NVME_DECISION=RECLAIM RECLAIM_DRY_RUN=0 BACKUP_EVIDENCE_PATH="$fresh_evidence_json" 2>&1)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || {
@@ -108,10 +122,15 @@ set -e
   exit 1
 }
 grep -q 'event=confirm_destroy_required' <<<"$output"
+if grep -q 'event=decision_required' <<<"$output"; then
+  echo "apply without CONFIRM_DESTROY hit decision absence guard instead of token refusal" >&2
+  exit 1
+fi
 
 set +e
 output="$(
   run_reclaim \
+    IDLE_NVME_DECISION=RECLAIM \
     RECLAIM_DRY_RUN=0 \
     TARGET_DISK=nvme9n1 \
     CONFIRM_DESTROY=nvme9n1 \
@@ -130,6 +149,25 @@ grep -q 'assessment_target_mismatch expected=nvme9n1 actual=nvme0n1' <<<"$output
 set +e
 output="$(
   run_reclaim \
+    IDLE_NVME_DECISION=RECLAIM \
+    RECLAIM_DRY_RUN=0 \
+    CONFIRM_DESTROY=nvme0n1 \
+    RECLAIM_BACKUP_REQUIRED=0 \
+    BACKUP_EVIDENCE_PATH="$fresh_evidence_json" \
+    2>&1
+)"
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || {
+  echo "apply with backup evidence disabled unexpectedly succeeded" >&2
+  exit 1
+}
+grep -q 'event=backup_evidence_required' <<<"$output"
+
+set +e
+output="$(
+  run_reclaim \
+    IDLE_NVME_DECISION=RECLAIM \
     RECLAIM_DRY_RUN=0 \
     CONFIRM_DESTROY=nvme0n1 \
     BACKUP_EVIDENCE_PATH="$stale_evidence_json" \

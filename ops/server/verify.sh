@@ -75,6 +75,14 @@ check_pgbouncer() {
 check_dir() {
   local path="$1"
   local expected_mode="${2:-750}"
+  check_dir_owner_mode "$path" "$TRADING_USER" "$TRADING_GROUP" "$expected_mode"
+}
+
+check_dir_owner_mode() {
+  local path="$1"
+  local expected_owner="$2"
+  local expected_group="$3"
+  local expected_mode="${4:-750}"
   [ -d "$path" ] || fail "missing directory ${path}"
 
   local owner group mode
@@ -82,8 +90,8 @@ check_dir() {
   group="$(stat -c '%G' "$path")"
   mode="$(stat -c '%a' "$path")"
 
-  [ "$owner" = "$TRADING_USER" ] || fail "${path} owner=${owner}, expected ${TRADING_USER}"
-  [ "$group" = "$TRADING_GROUP" ] || fail "${path} group=${group}, expected ${TRADING_GROUP}"
+  [ "$owner" = "$expected_owner" ] || fail "${path} owner=${owner}, expected ${expected_owner}"
+  [ "$group" = "$expected_group" ] || fail "${path} group=${group}, expected ${expected_group}"
   [ "$mode" = "$expected_mode" ] || fail "${path} mode=${mode}, expected ${expected_mode}"
 }
 
@@ -96,11 +104,11 @@ check_filesystem() {
     "$REDIS_DIR" \
     "$ARTIFACT_DIR" \
     "$NLP_MODELS_DIR" \
-    "$APP_LOG_DIR" \
-    "$ETC_DIR"
+    "$APP_LOG_DIR"
   do
     check_dir "$dir"
   done
+  check_dir_owner_mode "$ETC_DIR" root "$TRADING_GROUP" 750
   for dir in \
     "$BACKUP_ROOT" \
     "$BACKUP_BASE_DIR" \

@@ -423,9 +423,45 @@ def _reset_telemetry_append_buffer_state() -> None:
         return
 
 
+def _shutdown_loaded_timescale_client(*, timeout_s: float = 0.5) -> None:
+    module = sys.modules.get("engine.runtime.timescale_client")
+    if module is None:
+        return
+    client = getattr(module, "_CLIENT", None)
+    if client is None:
+        return
+
+    close_timeout = float(timeout_s or 0.0)
+    config = getattr(client, "_config", None)
+    try:
+        connect_timeout = float(getattr(config, "connect_timeout_s", 0.0) or 0.0)
+        close_timeout = max(close_timeout, min(1.5, connect_timeout + 0.25))
+    except Exception:
+        pass  # no-op-guard: allow timeout inspection is best-effort cleanup only.
+
+    try:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close(timeout_s=close_timeout)
+    except Exception:
+        pass  # no-op-guard: allow cleanup to isolate the next test best-effort.
+
+    lock = getattr(module, "_CLIENT_LOCK", None)
+    try:
+        if lock is not None:
+            with lock:
+                if getattr(module, "_CLIENT", None) is client:
+                    setattr(module, "_CLIENT", None)
+        elif getattr(module, "_CLIENT", None) is client:
+            setattr(module, "_CLIENT", None)
+    except Exception:
+        pass  # no-op-guard: allow stale singleton reset is defensive cleanup only.
+
+
 def _clear_loaded_caches() -> None:
     _call_loaded("engine.data._credentials", "clear_data_credential_cache")
     _clear_state_cache()
+    _call_loaded("engine.cache.wrappers._common", "l1_clear")
     _call_loaded("engine.data.price_cache", "clear_price_cache")
     _call_loaded("engine.data.feature_store", "clear_feature_cache")
     _call_loaded("engine.runtime.live_cache", "close_live_cache")
@@ -478,6 +514,7 @@ def cleanup_runtime_test_state(*, timeout_s: float = 0.5) -> None:
         _call_loaded("engine.runtime.event_log", "shutdown_event_log_buffer", timeout_s=timeout_s)
         _call_loaded("engine.runtime.telemetry_append_buffer", "shutdown_telemetry_append_buffers", timeout_s=timeout_s)
         _reset_telemetry_append_buffer_state()
+        _shutdown_loaded_timescale_client(timeout_s=timeout_s)
         _call_loaded("engine.runtime.metrics_store", "shutdown_runtime_metrics_buffer", timeout_s=timeout_s)
         _call_loaded("engine.runtime.runtime_meta", "shutdown_best_effort_runtime_meta_buffer", timeout_s=timeout_s)
         _call_loaded("engine.strategy.feature_store", "close_feature_store", timeout_s=timeout_s)

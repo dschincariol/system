@@ -17,6 +17,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate Python dependency locks
+        run: python tools/validate_dependency_lock.py --strict
+
       - name: Run repo artifact hygiene guard
         run: python tools/check_repo_artifact_hygiene.py
 
@@ -26,7 +29,7 @@ jobs:
           node-version: "20"
           cache: npm
 
-      - name: Install Python dependencies (including pytest)
+      - name: Install locked Python dev/test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
@@ -56,19 +59,32 @@ jobs:
             tests/test_audit_hashing.py \
             tests/test_secrets_loader.py \
             tests/test_secrets_provider_plaintext.py \
-            tests/test_secrets_provider_systemd.py \
-            tests/test_os_migration_gates.py
+            tests/test_secrets_provider_systemd.py
         shell: bash
 
-      - name: Run disk remediation ops tests
+      - name: Run ops/server pytest and shell test gate
         env:
           PYTHONPATH: .
         run: |
-          bash tests/ops/test_zfs_tuning.sh
-          bash tests/ops/test_disk_remediation_relocate_docker.sh
+          set -euo pipefail
+
+          python -m pytest -q -m "not requires_rocm" tests/ops
+
+          mapfile -t ops_shell_tests < <(find tests/ops -maxdepth 1 -type f -name '*.sh' | sort)
+          if [ "${#ops_shell_tests[@]}" -eq 0 ]; then
+            echo "No tests/ops/*.sh shell tests were discovered" >&2
+            exit 1
+          fi
+
+          printf 'Discovered %s ops shell test(s)\n' "${#ops_shell_tests[@]}"
+          for test_script in "${ops_shell_tests[@]}"; do
+            echo "::group::${test_script}"
+            bash "${test_script}"
+            echo "::endgroup::"
+          done
         shell: bash
 
-      - name: Run canonical repository validation
+      - name: Run canonical repository validation with pyright gate
         env:
           PYTHONPATH: .
         run: python tools/validate_repo.py
@@ -92,7 +108,7 @@ jobs:
           grep -Eq 'gfx1151|Strix Halo' "$resolved"
           grep -Eq 'repo\.radeon\.com/rocm/.+rocm-rel-7\.2\.4' "$resolved"
 
-      - name: Install CPU test dependencies
+      - name: Install locked CPU test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
@@ -104,7 +120,7 @@ jobs:
           python -m pytest -q -m "not requires_rocm" \
             tests/test_dependency_profiles.py \
             tests/test_runtime_hardware.py \
-            tests/test_rocm_acceleration.py \
+            tests/ops/test_rocm_acceleration.py \
             tests/test_compose_deployment_assets.py
 
       - name: Build ROCm runtime image
@@ -147,7 +163,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies (including pytest-cov)
+      - name: Install locked Python dev/test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
@@ -227,7 +243,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies (including pytest)
+      - name: Install locked Python dev/test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt

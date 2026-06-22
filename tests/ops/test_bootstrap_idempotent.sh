@@ -23,6 +23,10 @@ docker run --rm \
   -e TS_SECRET_PG_PASSWORD_APP=test-app-password \
   -e TS_SECRET_PG_PASSWORD_INGEST=test-ingest-password \
   -e TS_SECRET_PG_PASSWORD_READER=test-reader-password \
+  -e TS_SECRET_REDIS_PASSWORD=test-redis-password \
+  -e TS_SECRET_OBJECT_STORE_SECRET_KEY=test-object-store-secret-key \
+  -e TS_SECRET_DASHBOARD_API_TOKEN=test-dashboard-api-token \
+  -e TS_SECRET_OPERATOR_API_TOKEN=test-operator-api-token \
   -v "${REPO_ROOT}:/workspace:ro" \
   -w /workspace \
   "${IMAGE}" \

@@ -52,9 +52,19 @@ def test_bootstrap_installs_and_verify_checks_server_ops_scripts() -> None:
     assert 'bash -n "${SERVER_SCRIPT_DIR}/${script}"' in verify
 
 
+def test_verify_accepts_root_owned_runtime_config_directory() -> None:
+    verify = VERIFY.read_text(encoding="utf-8")
+
+    assert 'check_dir_owner_mode "$ETC_DIR" root "$TRADING_GROUP" 750' in verify
+    assert '"$ETC_DIR"' not in verify.split('for dir in \\', 1)[1].split("do", 1)[0]
+
+
 def test_validate_workflow_runs_disk_remediation_ops_tests() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "Run disk remediation ops tests" in workflow
-    assert "bash tests/ops/test_zfs_tuning.sh" in workflow
-    assert "bash tests/ops/test_disk_remediation_relocate_docker.sh" in workflow
+    assert "Run ops/server pytest and shell test gate" in workflow
+    assert "python -m pytest -q -m \"not requires_rocm\" tests/ops" in workflow
+    assert "find tests/ops -maxdepth 1 -type f -name '*.sh' | sort" in workflow
+    assert 'bash "${test_script}"' in workflow
+    assert "bash tests/ops/test_zfs_tuning.sh" not in workflow
+    assert "bash tests/ops/test_disk_remediation_relocate_docker.sh" not in workflow

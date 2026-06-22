@@ -108,8 +108,8 @@ Current runtime storage is Postgres-backed. Backup ownership for this host layer
 - `ops/backup/restore.sh` and `ops/backup/restore_drill.sh` for clean-target restore verification
 - `ops/backup/backup_restore_evidence.sh` for the pre-live and recurring
   evidence gate that verifies installed backup timers, reuses fresh base-backup
-  and restore-drill evidence, forces bounded WAL archival proof, checks
-  `pg_stat_archiver`, and writes
+  and restore-drill evidence, reasserts/repairs the WAL archive target owner and
+  mode, forces bounded WAL archival proof, checks `pg_stat_archiver`, and writes
   `/var/backups/trading/evidence/backup_restore_evidence_<timestamp>.txt`
   plus `latest_backup_restore_evidence.json`
 
@@ -118,8 +118,11 @@ The timer path is check-only for heavyweight work: it does not run a base
 backup, restore drill, or WAL catch-up unless the operator explicitly sets
 `TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=1`,
 `TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=1`, or
-`TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=1`. Missing, stale, inaccessible, or
-overdue evidence is reported as a failed non-zero gate result. The systemd
+`TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=1`. WAL catch-up is deliberately
+operator-only during normal timer health checks because a large `.ready` backlog
+can consume backup-dataset headroom; repair the archive target/dataset first,
+then run `wal_archive_catchup.sh`. Missing, stale, inaccessible, or overdue
+evidence is reported as a failed non-zero gate result. The systemd
 service is `Type=oneshot` with `TimeoutStartSec=8min` and `Restart=no`, so it must transition
 to success or failure instead of remaining in `activating`.
 Live preflight reads the latest evidence JSON, the base-backup directory, WAL
@@ -164,7 +167,10 @@ installer also runs the archive command inside the container and then runs
 the ZFS backup dataset without staging on root. The backup root must be mounted
 at `/var/backups/trading` and writable by the container `postgres` UID; on the
 Timescale image used by this host that is expected to look like
-`0750 70:trading`.
+`2750 70:trading` on the backup root and WAL target directories. The installer
+writes `TS_BACKUP_WAL_TARGET_OWNER_UID`, `TS_BACKUP_WAL_TARGET_GROUP`, and
+`TS_BACKUP_WAL_TARGET_DIR_MODE=2750` so the recurring evidence gate repairs
+wrong owner/mode drift and records the `wal_archive_target` diagnosis artifact.
 Generated Compose systemd overrides run the evidence service as `root` with
 primary group `trading`, set `TS_BACKUP_READ_GROUP=trading`, and publish
 evidence as `0640`, so the service can enumerate the `0750 70:trading` backup
@@ -204,8 +210,8 @@ new signed evidence passes preflight.
 ## Deployment Layout
 
 - App checkout: `/opt/trading/app`
-- Server ops scripts: `/opt/trading/ops/server`
 - Python venv: `/opt/trading/venv`
+- Server ops scripts: `/opt/trading/ops/server`
 - Data: `/var/lib/trading/`
 - Backups staging: `/var/backups/trading/`
 - Runtime config: `/etc/trading/`
@@ -317,6 +323,11 @@ The output reports power-profiles-daemon profile/degraded state, `amd_pstate`
 status, scaling driver, governor, EPP, and `intended_state=PASS` or `FAIL`.
 The production target requires the policy service, so starting
 `trading.target` through systemd does not silently bypass this boot policy.
+`trading-prod-preflight.service` and the bootstrap-generated production env set
+`PREFLIGHT_REQUIRE_CPU_POWER_POLICY=1`, so production preflight also reruns the
+read-only verifier and fails non-zero on post-boot drift. The recurring
+`observability_snapshot` job records the same state as advisory component
+health under `cpu_power_policy`; it does not reapply the policy.
 
 This trades higher watts, heat, and fan activity for sustained clocks and lower
 scheduling latency. The policy touches only CPU power state and does not set
@@ -338,9 +349,19 @@ Redis is bound to localhost and exposes `/var/run/redis/trading.sock`. PgBouncer
 ## Tests
 
 ```bash
-bash tests/ops/test_cpu_power_policy.sh
-bash tests/ops/test_bootstrap_idempotent.sh
-bash tests/ops/test_systemd_units_lint.sh
+python -m pytest -q -m "not requires_rocm" tests/ops
+for test_script in tests/ops/*.sh; do
+  bash "$test_script"
+done
 ```
 
-The Docker idempotency test uses Debian 12 and skips Python package installation to avoid downloading the full ML dependency stack.
+GitHub Actions runs the same `tests/ops` discovery gate from
+`.github/workflows/validate.yml`: all Python tests under `tests/ops` are
+collected with host-only `requires_rocm` tests deselected on standard no-GPU
+Linux runners, and every `tests/ops/*.sh` script is executed with `bash`.
+Shell tests that need heavyweight local services, such as Docker or PostgreSQL
+server binaries, self-skip when those capabilities are not present; fake-binary
+and static-lint tests still fail CI on non-zero exit.
+
+The Docker idempotency test uses Debian 12 and skips Python package installation
+to avoid downloading the full ML dependency stack.

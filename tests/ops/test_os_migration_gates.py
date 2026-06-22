@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 PREFLIGHT_PATH = REPO_ROOT / "ops" / "server" / "os_migration_preflight.py"
 POSTFLIGHT_PATH = REPO_ROOT / "ops" / "server" / "os_migration_postflight.py"
 RUNBOOK_PATH = REPO_ROOT / "docs" / "OS_MIGRATION_RUNBOOK.md"
@@ -213,9 +213,10 @@ class OSMigrationGateTests(unittest.TestCase):
         missing = referenced - shipped_systemd_units()
         self.assertFalse(missing, f"runbook references missing systemd units: {sorted(missing)}")
 
-    def test_ci_runs_os_migration_gate_tests(self) -> None:
+    def test_ci_runs_ops_gate_tests_by_directory(self) -> None:
         workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
-        self.assertIn("tests/test_os_migration_gates.py", workflow)
+        self.assertIn("python -m pytest -q -m \"not requires_rocm\" tests/ops", workflow)
+        self.assertNotIn("tests/test_os_migration_gates.py", workflow)
 
     def test_runbook_contains_required_operator_gates(self) -> None:
         text = RUNBOOK_PATH.read_text(encoding="utf-8")
