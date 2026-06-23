@@ -9,6 +9,7 @@ import json
 import hashlib
 import logging
 import datetime as _dt
+import os
 from typing import Dict, Any, List, Tuple
 
 import requests
@@ -38,6 +39,9 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
         _WARNED_NONFATAL_KEYS.add(once_key)
 
 _BASE = "https://api.gdeltproject.org/api/v2/doc/doc"
+_GDELT_COOLDOWN_UNTIL_S = 0.0
+_GDELT_DEFAULT_RETRY_AFTER_S = float(os.environ.get("GDELT_DEFAULT_RETRY_AFTER_S", "300"))
+_GDELT_HTTP_UA = os.environ.get("GDELT_HTTP_UA", "trading-system/1.0 gdelt-feed")
 
 # ------            -- ------------------------------------------------------
 # Symbol-aware keyword packs (profit-focused, conservative)
@@ -141,6 +145,50 @@ def _mk_queries_by_symbol(symbols: List[str]) -> Dict[str, str]:
         out[s] = f"({s}) AND ({ors})"
     return out
 
+
+def _retry_after_s(response: Any, default_s: float) -> float:
+    raw = ""
+    try:
+        raw = str((getattr(response, "headers", {}) or {}).get("Retry-After") or "").strip()
+        if raw:
+            return max(1.0, float(raw))
+    except Exception as exc:
+        _warn_nonfatal(
+            "GDELT_RETRY_AFTER_PARSE_FAILED",
+            exc,
+            once_key="retry_after_parse",
+            retry_after=raw,
+        )
+    return float(default_s)
+
+
+def _set_gdelt_cooldown(seconds: float) -> None:
+    global _GDELT_COOLDOWN_UNTIL_S
+    _GDELT_COOLDOWN_UNTIL_S = max(float(_GDELT_COOLDOWN_UNTIL_S), time.time() + max(1.0, float(seconds)))
+
+
+def gdelt_cooldown_remaining_s() -> float:
+    return max(0.0, float(_GDELT_COOLDOWN_UNTIL_S) - time.time())
+
+
+def _gdelt_error_for_response(response: Any, *, sym: str) -> str | None:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code == 429:
+        retry_after = _retry_after_s(response, _GDELT_DEFAULT_RETRY_AFTER_S)
+        _set_gdelt_cooldown(retry_after)
+        return f"gdelt_rate_limited sym={sym} status_code=429 retry_after_s={retry_after:.0f}"
+    if status_code == 503:
+        retry_after = _retry_after_s(response, 300.0)
+        _set_gdelt_cooldown(retry_after)
+        return f"gdelt_temporarily_unavailable sym={sym} status_code=503 retry_after_s={retry_after:.0f}"
+    if status_code == 401:
+        return f"gdelt_credentials_rejected sym={sym} status_code=401"
+    if status_code == 403:
+        return f"gdelt_entitlement_missing sym={sym} status_code=403"
+    if status_code >= 400:
+        return f"gdelt_http_error sym={sym} status_code={status_code}"
+    return None
+
 def ingest_gdelt_doc(
     *,
     symbols: List[str],
@@ -163,6 +211,9 @@ def ingest_gdelt_doc(
     queries = _mk_queries_by_symbol(symbols)
     if not queries:
         return [], errors
+    cooldown_remaining = gdelt_cooldown_remaining_s()
+    if cooldown_remaining > 0:
+        return [], [f"gdelt_rate_limited cooldown_remaining_s={cooldown_remaining:.0f}"]
 
     now = int(time.time())
     start_ts = now - int(lookback_minutes) * 60
@@ -195,9 +246,18 @@ def ingest_gdelt_doc(
             params["sourcelang"] = language
 
         try:
-            r = requests.get(_BASE, params=params, timeout=20)
+            r = requests.get(_BASE, params=params, headers={"User-Agent": _GDELT_HTTP_UA, "Accept": "application/json"}, timeout=20)
+            problem = _gdelt_error_for_response(r, sym=str(sym))
+            if problem:
+                errors.append(problem)
+                if "rate_limited" in problem or "temporarily_unavailable" in problem:
+                    break
+                continue
             r.raise_for_status()
             j = r.json() if format_ == "json" else {}
+            if format_ == "json" and not isinstance(j, dict):
+                errors.append(f"gdelt_malformed_payload sym={sym} payload_type={type(j).__name__}")
+                continue
             arts.extend(
                 [
                     {

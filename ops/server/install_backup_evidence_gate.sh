@@ -455,6 +455,7 @@ install_backup_scripts() {
     wal_archive.sh \
     wal_archive_catchup.sh \
     base_backup.sh \
+    offsite_base_backup_stub.sh \
     state_snapshot.sh \
     artifact_snapshot.sh \
     prune.sh \

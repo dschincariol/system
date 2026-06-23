@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -42,6 +42,72 @@ ETF_SEED_SYMBOLS = [
 CROSS_ASSET_SEED_SYMBOLS = [
     "BTC", "ETH", "SOL", "BNB", "XRP", "MSTR", "COIN", "IBIT", "GBTC", "OIL",
 ]
+
+FX_MAJOR_SEED_SYMBOLS = [
+    "EURUSD",
+    "USDJPY",
+    "GBPUSD",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+    "NZDUSD",
+]
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def oanda_instrument_to_fx_pair(instrument: object) -> str:
+    pair = str(instrument or "").strip().upper().replace("_", "")
+    if not re.fullmatch(r"[A-Z]{6}", pair):
+        raise ValueError(f"invalid_oanda_fx_instrument:{instrument}")
+    return pair
+
+
+def fx_pair_to_oanda_instrument(symbol: object) -> str:
+    pair = oanda_instrument_to_fx_pair(symbol)
+    return f"{pair[:3]}_{pair[3:]}"
+
+
+def is_fx_major_symbol(symbol: object) -> bool:
+    return str(symbol or "").strip().upper() in set(FX_MAJOR_SEED_SYMBOLS)
+
+
+def default_symbol_metadata(symbol: object) -> Dict[str, object]:
+    sym = str(symbol or "").strip().upper()
+    if not is_fx_major_symbol(sym):
+        return {}
+    return {
+        "price_provider": "oanda",
+        "oanda_instrument": fx_pair_to_oanda_instrument(sym),
+        "source_fx_seed": True,
+    }
+
+
+def load_fx_seed_symbols() -> List[str]:
+    override_candidates: List[str] = []
+    for part in str(os.environ.get("OANDA_FX_PAIRS", "") or "").split(","):
+        if not str(part or "").strip():
+            continue
+        try:
+            override_candidates.append(oanda_instrument_to_fx_pair(part))
+        except ValueError as e:
+            _warn_nonfatal(
+                "DEFAULT_SYMBOLS_INVALID_OANDA_FX_PAIR",
+                e,
+                once_key=f"invalid_oanda_fx_pair:{part}",
+                value=repr(part)[:120],
+            )
+    override = _dedupe_symbols(override_candidates)
+    if override:
+        return [sym for sym in override if _VALID_TICKER_RX.match(sym)]
+    if _env_enabled("FX_PAIRS_ENABLED", False):
+        return list(FX_MAJOR_SEED_SYMBOLS)
+    return []
 
 
 def _safe_int(value: object, default: int) -> int:
@@ -206,12 +272,14 @@ def load_default_symbols(*, extra: Optional[Iterable[object]] = None) -> List[st
     sec_symbols = load_sec_seed_symbols() if include_seed_symbols else []
     etf_symbols = ETF_SEED_SYMBOLS if include_seed_symbols else []
     cross_asset_symbols = CROSS_ASSET_SEED_SYMBOLS if include_seed_symbols else []
+    fx_symbols = load_fx_seed_symbols() if include_seed_symbols else []
     return _dedupe_symbols(
         [
             *explicit,
             *file_symbols,
             *etf_symbols,
             *cross_asset_symbols,
+            *fx_symbols,
             *sec_symbols,
             *(extra or []),
         ]

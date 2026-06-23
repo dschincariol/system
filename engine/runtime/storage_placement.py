@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import argparse
+import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -248,6 +251,33 @@ def _root_mount(mount: Mapping[str, str]) -> bool:
     return _norm_path(str(mount.get("mount_point") or "")) == "/"
 
 
+def _mount_evidence(mount: Mapping[str, str]) -> dict[str, str]:
+    return {
+        "mount_point": str(mount.get("mount_point") or ""),
+        "mount_root": str(mount.get("mount_root") or ""),
+        "mount_source": str(mount.get("mount_source") or ""),
+        "filesystem_type": str(mount.get("filesystem_type") or "").lower(),
+        "mount_options": str(mount.get("super_options") or ""),
+    }
+
+
+def _set_target_evidence(
+    target_state: dict[str, Any],
+    *,
+    status: str,
+    level: str,
+    checked_path: str = "",
+    mount: Mapping[str, str] | None = None,
+) -> None:
+    target_state["evidence_status"] = status
+    target_state["evidence_level"] = level
+    if checked_path:
+        target_state["checked_path"] = checked_path
+    if mount:
+        target_state["mount"] = dict(mount)
+        target_state.update(_mount_evidence(mount))
+
+
 def _first_visible_mount(
     *,
     target: StorageTarget,
@@ -372,20 +402,28 @@ def check_storage_placement(
             "host_env": target.host_env,
             "host_path": target.host_path,
             "container_path": target.container_path,
+            "host_source": target.host_path,
+            "container_destination": target.container_path,
             "visible_in_runtime": target.visible_in_runtime,
             "ok": False,
             "reason": "",
+            "evidence_status": "pending",
+            "evidence_level": "none",
+            "checked_path": "",
+            "mount": {},
         }
         targets.append(target_state)
         host_path = _clean(target.host_path)
         if not host_path:
             target_state["reason"] = "missing_host_path_env"
+            _set_target_evidence(target_state, status="needs_evidence", level="missing_host_env")
             errors.append(
                 f"storage placement invalid target={target.name} reason=missing_host_path_env env={target.host_env}"
             )
             continue
         if not Path(host_path).expanduser().is_absolute():
             target_state["reason"] = "host_path_not_absolute"
+            _set_target_evidence(target_state, status="violated", level="invalid_host_path")
             errors.append(
                 f"storage placement invalid target={target.name} reason=host_path_not_absolute path={host_path}"
             )
@@ -394,6 +432,7 @@ def check_storage_placement(
         if forbidden_path:
             target_state["reason"] = "forbidden_host_prefix"
             target_state["forbidden_prefix"] = forbidden_path
+            _set_target_evidence(target_state, status="violated", level="forbidden_host_prefix")
             errors.append(
                 f"storage placement invalid target={target.name} reason=forbidden_host_prefix "
                 f"path={host_path} prefix={forbidden_path}"
@@ -404,6 +443,7 @@ def check_storage_placement(
         target_state["approved_prefix"] = approved_prefix
         if not approved_prefix:
             target_state["reason"] = "host_path_not_under_allowed_prefix"
+            _set_target_evidence(target_state, status="violated", level="unapproved_host_prefix")
             errors.append(
                 f"storage placement invalid target={target.name} reason=host_path_not_under_allowed_prefix "
                 f"path={host_path} allowed={','.join(allowed_prefixes)}"
@@ -414,8 +454,16 @@ def check_storage_placement(
         target_state["checked_path"] = visible_path
         target_state["mount"] = mount
         if mount:
+            target_state.update(_mount_evidence(mount))
             if require_visible and _root_mount(mount):
                 target_state["reason"] = "root_backed_mount"
+                _set_target_evidence(
+                    target_state,
+                    status="violated",
+                    level="root_backed_mount",
+                    checked_path=visible_path,
+                    mount=mount,
+                )
                 errors.append(
                     f"storage placement invalid target={target.name} reason=root_backed_mount "
                     f"path={host_path} checked_path={visible_path}"
@@ -425,6 +473,13 @@ def check_storage_placement(
             if forbidden_mount:
                 target_state["reason"] = "forbidden_mount_source"
                 target_state["forbidden_mount"] = forbidden_mount
+                _set_target_evidence(
+                    target_state,
+                    status="violated",
+                    level="forbidden_mount_source",
+                    checked_path=visible_path,
+                    mount=mount,
+                )
                 errors.append(
                     f"storage placement invalid target={target.name} reason=forbidden_mount_source {forbidden_mount}"
                 )
@@ -433,6 +488,13 @@ def check_storage_placement(
             if fs_type not in allowed_fs_types:
                 target_state["reason"] = "mount_filesystem_not_allowed"
                 target_state["filesystem_type"] = fs_type
+                _set_target_evidence(
+                    target_state,
+                    status="violated",
+                    level="mount_filesystem_not_allowed",
+                    checked_path=visible_path,
+                    mount=mount,
+                )
                 errors.append(
                     f"storage placement invalid target={target.name} reason=mount_filesystem_not_allowed "
                     f"fstype={fs_type or 'unknown'} path={visible_path}"
@@ -441,16 +503,25 @@ def check_storage_placement(
             target_state["ok"] = True
             target_state["reason"] = "verified_mount"
             target_state["filesystem_type"] = fs_type
+            _set_target_evidence(
+                target_state,
+                status="satisfied",
+                level="verified_mount",
+                checked_path=visible_path,
+                mount=mount,
+            )
             continue
 
         if require_visible:
             target_state["reason"] = "host_path_not_visible"
+            _set_target_evidence(target_state, status="needs_evidence", level="host_path_not_visible")
             errors.append(
                 f"storage placement invalid target={target.name} reason=host_path_not_visible path={host_path}"
             )
             continue
         target_state["ok"] = True
         target_state["reason"] = "approved_prefix_unverified"
+        _set_target_evidence(target_state, status="needs_evidence", level="approved_prefix_unverified")
         warnings.append(
             f"storage placement target={target.name} approved by host path prefix but mount not visible path={host_path}"
         )
@@ -460,9 +531,26 @@ def check_storage_placement(
     state["warnings"] = warnings
     state["errors"] = errors
     state["targets"] = targets
+    verified = sum(1 for item in targets if item.get("reason") == "verified_mount")
+    prefix_only = sum(1 for item in targets if item.get("reason") == "approved_prefix_unverified")
+    needs_evidence = sum(1 for item in targets if item.get("evidence_status") == "needs_evidence")
+    violated = sum(1 for item in targets if item.get("evidence_status") == "violated")
+    state["summary"] = {
+        "target_count": len(targets),
+        "verified_mounts": verified,
+        "prefix_only": prefix_only,
+        "needs_evidence_targets": needs_evidence,
+        "violated_targets": violated,
+        "filesystems": sorted({str(item.get("filesystem_type") or "") for item in targets if item.get("filesystem_type")}),
+        "all_required_targets_verified": bool(not errors and prefix_only == 0 and needs_evidence == 0 and violated == 0),
+    }
+    if violated:
+        state["evidence_status"] = "violated"
+    elif needs_evidence:
+        state["evidence_status"] = "needs_evidence"
+    else:
+        state["evidence_status"] = "satisfied"
     if not errors:
-        verified = sum(1 for item in targets if item.get("reason") == "verified_mount")
-        prefix_only = sum(1 for item in targets if item.get("reason") == "approved_prefix_unverified")
         state["notes"].append(
             "storage placement ok "
             f"targets={len(targets)} verified_mounts={verified} prefix_only={prefix_only}"
@@ -470,4 +558,27 @@ def check_storage_placement(
     return state
 
 
-__all__ = ["check_storage_placement", "storage_pressure_paths"]
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Validate production storage placement.")
+    parser.add_argument("--json", action="store_true", help="Print the full placement snapshot as JSON.")
+    args = parser.parse_args(argv)
+
+    state = check_storage_placement()
+    ok = bool(state.get("ok", False))
+    if args.json:
+        print(json.dumps(state, separators=(",", ":"), sort_keys=True))
+    else:
+        for note in list(state.get("notes") or []):
+            print(f"[storage] {note}")
+        for warning in list(state.get("warnings") or []):
+            print(f"[storage][warning] {warning}")
+        for error in list(state.get("errors") or []):
+            print(f"[storage][error] {error}", file=sys.stderr)
+    return 0 if ok else 3
+
+
+__all__ = ["check_storage_placement", "main", "storage_pressure_paths"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

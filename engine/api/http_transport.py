@@ -14,6 +14,7 @@ Delegates to injected:
 - auth configuration
 """
 
+import gzip
 import json
 import hashlib
 import hmac
@@ -153,16 +154,45 @@ def _map_error_to_status(error_code: str) -> int:
         return 413
     if code == "unauthorized" or code.endswith("_unauthorized"):
         return 401
+    if code in {"wrong_credentials", "credentials_rejected"} or code.endswith("_credentials_rejected"):
+        return 401
     if code == "unauthorized_table" or code.startswith("unauthorized_table:"):
         return 400
+    if code in {"entitlement_missing"} or code.endswith("_entitlement_missing"):
+        return 403
     if "forbidden" in code:
         return 403
+    if code in {
+        "execution_blocked",
+        "order_blocked",
+        "safety_gate_blocked",
+        "live_execution_blocked",
+        "prelive_reconcile_blocked",
+        "operator_dashboard_auth_required",
+        "operator_sidecar_token_unconfigured",
+    }:
+        return 403
+    if code in {
+        "pre_trade_rejected",
+        "duplicate_recent_order",
+        "max_qty_exceeded",
+        "max_notional_exceeded",
+        "stale_price",
+        "missing_price",
+    }:
+        return 409
     if code == "unknown_endpoint" or "not_found" in code or "not_registered" in code:
         return 404
     if code.startswith("deprecated") or code.startswith("gone"):
         return 410
     if "rate_limit" in code or "cooldown" in code or "too_many_requests" in code:
         return 429
+    if (
+        code == "missing_credentials"
+        or code.endswith("_credentials_missing")
+        or code.endswith("_account_id_missing")
+    ):
+        return 422
     if (
         code.startswith("missing_")
         or code.startswith("invalid_")
@@ -303,6 +333,7 @@ _PUBLIC_GET_ENDPOINT_PATHS = frozenset(
         "/api/liveness",
         "/api/system/liveness",
         "/api/readiness",
+        "/api/operator/ping",
     }
 )
 
@@ -338,6 +369,8 @@ _DESTRUCTIVE_ENDPOINT_PATHS = frozenset(
         "/api/terminal/flatten",
         "/api/data_sources/delete",
         "/api/data_sources/update",
+        "/api/data_sources/test_save",
+        "/api/data_sources/accounts/update",
     }
 )
 
@@ -484,6 +517,22 @@ _CONFIRMATION_REGISTRY = {
         "required_token": "RESET_CREDENTIALS",
         "severity": "high",
         "consequence": "Clears stored credentials for a configured data source.",
+        "require_ack": True,
+        "body_policy": {"requires_any": ("clear_credential_fields",)},
+    },
+    "/api/data_sources/test_save": {
+        "action_id": "data_sources.test_save_reset_credentials",
+        "required_token": "RESET_CREDENTIALS",
+        "severity": "high",
+        "consequence": "Clears stored credentials and immediately tests the data source.",
+        "require_ack": True,
+        "body_policy": {"requires_any": ("clear_credential_fields",)},
+    },
+    "/api/data_sources/accounts/update": {
+        "action_id": "data_sources.reset_provider_account",
+        "required_token": "RESET_CREDENTIALS",
+        "severity": "high",
+        "consequence": "Clears stored credentials for a shared provider account.",
         "require_ack": True,
         "body_policy": {"requires_any": ("clear_credential_fields",)},
     },
@@ -684,6 +733,21 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
     _MAX_JSON_BODY_BYTES = int(
         os.environ.get("DASHBOARD_MAX_JSON_BODY_BYTES", "1048576")
     )
+
+    # Responses are gzip-compressed when the client advertises gzip and the
+    # payload is large enough to be worth it. This is the single biggest LAN
+    # win for large snapshot/history/log JSON payloads. Static assets get a
+    # short revalidatable cache window so repeat page loads are cheap without
+    # serving stale UI after a deploy. Both are env-tunable; set the gzip
+    # minimum very high to effectively disable compression.
+    try:
+        _GZIP_MIN_BYTES = max(0, int(os.environ.get("DASHBOARD_GZIP_MIN_BYTES", "1024")))
+    except Exception:
+        _GZIP_MIN_BYTES = 1024
+    try:
+        _STATIC_CACHE_MAX_AGE_S = max(0, int(os.environ.get("DASHBOARD_STATIC_CACHE_MAX_AGE_S", "60")))
+    except Exception:
+        _STATIC_CACHE_MAX_AGE_S = 60
 
     dashboard_token = (dashboard_api_token or "").strip()
     if _route_specs_include_mutation(ROUTE_SPECS) or _route_specs_include_sensitive_get(ROUTE_SPECS):
@@ -932,6 +996,35 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             self._response_output_valid = bool(output_valid)
             self._response_streaming = bool(streaming)
 
+        def _client_accepts_gzip(self) -> bool:
+            accept = ""
+            try:
+                accept = str(self.headers.get("Accept-Encoding") or "").lower()
+            except Exception as e:
+                _warn("gzip_accept_encoding_header", e)
+            return "gzip" in accept
+
+        def _maybe_gzip(self, data: bytes):
+            """Return ``(body, content_encoding)`` for a response body.
+
+            Compresses only when the client advertised gzip and the payload
+            clears ``_GZIP_MIN_BYTES``; otherwise returns the data unchanged
+            with ``None`` encoding. Never raises -- compression failures fall
+            back to the original bytes.
+            """
+            try:
+                if (
+                    not data
+                    or _GZIP_MIN_BYTES <= 0
+                    or len(data) < _GZIP_MIN_BYTES
+                    or not self._client_accepts_gzip()
+                ):
+                    return data, None
+                return gzip.compress(data, compresslevel=6), "gzip"
+            except Exception as e:
+                _warn("gzip_compress", e)
+                return data, None
+
         def respond_json(self, obj, status=200, headers=None):
             if isinstance(obj, dict):
                 obj = dict(obj)
@@ -992,6 +1085,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             if req_origin in _DEV_DASHBOARD_ORIGINS:
                 allow_origin = req_origin
 
+            body, content_encoding = self._maybe_gzip(data)
+
             try:
                 self.send_response(int(status))
                 self.send_header(
@@ -999,7 +1094,11 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 )
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Access-Control-Allow-Origin", allow_origin)
-                self.send_header("Vary", "Origin")
+                if content_encoding:
+                    self.send_header("Content-Encoding", content_encoding)
+                    self.send_header("Vary", "Origin, Accept-Encoding")
+                else:
+                    self.send_header("Vary", "Origin")
                 self.send_header(
                     "Access-Control-Allow-Headers",
                     "Content-Type, X-API-Token",
@@ -1010,9 +1109,10 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 )
                 for header_name, header_value in dict(headers or {}).items():
                     self.send_header(str(header_name), str(header_value))
-                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(data)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
             except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as e:
                 _warn("response_write_disconnected", e, status=status)
                 return
@@ -1405,6 +1505,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             self._mutation_confirmation = None
             self._route_sensitivity = ROUTE_SENSITIVITY_PUBLIC
             self._response_redaction_enabled = False
+            self._serving_static = False
 
             self._normalize_ui_legacy_path()
 
@@ -1449,6 +1550,9 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             if not handler_name:
 
                 if method == "GET":
+                    # Mark this as a static-file response so end_headers() can
+                    # attach a revalidatable Cache-Control window for assets.
+                    self._serving_static = True
                     return super().do_GET()
 
                 self._audit_mutation(
@@ -1810,7 +1914,9 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     {
                         "ok": False,
                         "error": "internal_server_error",
-                        "detail": f"{type(e).__name__}: {e}",
+                        "reason_code": "handler_exception",
+                        "message": "Request handler failed unexpectedly.",
+                        "detail": type(e).__name__,
                     },
                     500,
                 )
@@ -1897,6 +2003,31 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
         # --------------------------------------------------------
         # HTTP verbs
         # --------------------------------------------------------
+
+        def end_headers(self):
+            # Attach a short, revalidatable cache window + nosniff to static
+            # asset responses only. API/JSON responses set their own
+            # Cache-Control (no-store) and never reach this branch.
+            if getattr(self, "_serving_static", False):
+                try:
+                    path = urlparse(self.path).path.lower()
+                    cacheable = path.endswith((
+                        ".js", ".mjs", ".css", ".svg", ".png", ".jpg",
+                        ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf",
+                        ".map",
+                    ))
+                    if cacheable and _STATIC_CACHE_MAX_AGE_S > 0:
+                        self.send_header(
+                            "Cache-Control",
+                            f"public, max-age={_STATIC_CACHE_MAX_AGE_S}, must-revalidate",
+                        )
+                    else:
+                        # HTML shells reference versioned assets -> revalidate.
+                        self.send_header("Cache-Control", "no-cache")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                except Exception as e:
+                    _warn("static_cache_headers", e)
+            super().end_headers()
 
         def do_GET(self):
             self._dispatch()

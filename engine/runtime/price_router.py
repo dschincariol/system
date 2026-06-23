@@ -26,6 +26,7 @@ from engine.runtime.async_writer import enqueue_price_persistence, get_async_wri
 from engine.runtime.telemetry_append_buffer import enqueue_price_quotes_raw_rows
 from engine.runtime.timeseries_write_policy import get_timeseries_write_policy
 from engine.runtime.event_bus import publish_event
+from engine.data.price_event_keys import compute_price_raw_event_key
 from engine.data.price_hygiene import filter_split_like_price_rows
 from engine.data.provider_registry import get_provider_definition
 
@@ -171,9 +172,10 @@ def _normalize_event_strict(e: Dict[str, Any], received_ts_ms: int) -> Optional[
     provider = str(e.get("provider") or e.get("source") or "unknown").strip().lower()
     max_age_ms = 7 * 86400 * 1000
 
-    ts_exchange = int(e.get("timestamp") or e.get("ts_ms") or 0)
-    if 0 < ts_exchange < 10_000_000_000:
-        ts_exchange *= 1000
+    raw_ts_exchange = int(e.get("timestamp") or e.get("ts_ms") or 0)
+    if 0 < raw_ts_exchange < 10_000_000_000:
+        raw_ts_exchange *= 1000
+    ts_exchange = int(raw_ts_exchange)
     if ts_exchange <= 0:
         ts_exchange = received_ts_ms
     elif ts_exchange > (received_ts_ms + 300_000):
@@ -241,11 +243,22 @@ def _normalize_event_strict(e: Dict[str, Any], received_ts_ms: int) -> Optional[
     last_update_ts_ms = max(int(trade_ts_ms or 0), int(quote_ts_ms or 0), int(ts_exchange or 0))
     event_key = str(e.get("event_key") or "").strip()
     if not event_key:
-        event_key = f'{provider}|{symbol}|{event_type or "U"}|{ts_exchange}|{e.get("trade_id")}|{e.get("sequence_number")}|{last}|{bid}|{ask}|{e.get("volume")}'
+        raw_event_ts_ms = int(raw_ts_exchange or ts_exchange)
+        event_key = compute_price_raw_event_key(
+            e,
+            provider=provider,
+            symbol=symbol,
+            event_type=event_type or "U",
+            event_ts_ms=raw_event_ts_ms,
+            ts_ms=raw_event_ts_ms,
+        )
+    else:
+        raw_event_ts_ms = int(raw_ts_exchange or ts_exchange)
 
     return {
         "symbol": symbol,
         "timestamp": int(ts_exchange),
+        "raw_ts_ms": int(raw_event_ts_ms),
         "provider": provider,
         "bid": bid,
         "ask": ask,
@@ -274,7 +287,14 @@ def _stream_key(row: Dict[str, Any]) -> str:
 def _event_key(row: Dict[str, Any]) -> str:
     if row.get("event_key"):
         return str(row.get("event_key"))
-    return f'{row["timestamp"]}|{row["last"]}|{row["bid"]}|{row["ask"]}|{row["volume"]}'
+    return compute_price_raw_event_key(
+        row,
+        provider=row.get("provider"),
+        symbol=row.get("symbol"),
+        event_type=row.get("event_type") or "U",
+        event_ts_ms=row.get("timestamp"),
+        ts_ms=row.get("timestamp"),
+    )
 
 
 def _is_duplicate_event(row: Dict[str, Any]) -> bool:
@@ -456,12 +476,12 @@ def publish_price_events(
 
     raw_rows = [
         (
-            int(r["timestamp"]),
+            int(r.get("raw_ts_ms") or r["timestamp"]),
             str(r["symbol"]),
             str(r["provider"]),
             str(r.get("event_key") or _event_key(r)),
             str(r.get("event_type") or ""),
-            int(r.get("timestamp") or 0),
+            int(r.get("raw_ts_ms") or r.get("timestamp") or 0),
             r.get("last"),
             r.get("bid"),
             r.get("ask"),
@@ -539,12 +559,12 @@ def publish_price_events(
     ]
     pg_raw_rows = [
         {
-            "ts_ms": int(r["timestamp"]),
+            "ts_ms": int(r.get("raw_ts_ms") or r["timestamp"]),
             "symbol": str(r["symbol"]),
             "provider": str(r["provider"]),
             "event_key": str(r.get("event_key") or _event_key(r)),
             "event_type": str(r.get("event_type") or ""),
-            "event_ts_ms": int(r.get("timestamp") or 0),
+            "event_ts_ms": int(r.get("raw_ts_ms") or r.get("timestamp") or 0),
             "last": _as_float(r.get("last")),
             "bid": _as_float(r.get("bid")),
             "ask": _as_float(r.get("ask")),
@@ -599,20 +619,15 @@ def publish_price_events(
             _ensure_price_quotes_raw_schema(db)
 
         if sqlite_write_raw and raw_rows:
-            raw_conflict_target = (
-                "(symbol, provider, event_key, ts_ms)"
-                if _uses_postgres_storage(db)
-                else "(symbol, provider, event_key)"
-            )
             try:
                 db.executemany(
-                    f"""
+                    """
                     INSERT INTO price_quotes_raw(
                       ts_ms, symbol, provider, event_key, event_type, event_ts_ms,
                       last, bid, ask, spread, volume,
                       trade_ts_ms, quote_ts_ms, ingest_ts_ms, source
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT{raw_conflict_target} DO UPDATE SET
+                    ON CONFLICT(symbol, provider, event_key, ts_ms) DO UPDATE SET
                       ts_ms=excluded.ts_ms,
                       event_type=excluded.event_type,
                       event_ts_ms=excluded.event_ts_ms,

@@ -195,6 +195,27 @@ def _ensure_post_commit_schema(con) -> None:
     con.executescript(_POST_COMMIT_SCHEMA)
 
 
+def _empty_post_commit_status() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "pending_count": 0,
+        "running_count": 0,
+        "failed_count": 0,
+        "completed_count": 0,
+        "failed_actions": [],
+        "degraded": False,
+    }
+
+
+def _is_missing_relation_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "undefinedtable" in text
+        or "no such table" in text
+        or "does not exist" in text and _POST_COMMIT_OUTBOX_TABLE in text
+    )
+
+
 def _queue_post_commit_action(con, action_name: str, *args: Any, **kwargs: Any) -> int:
     _ensure_post_commit_schema(con)
     now_ms = _now_ms()
@@ -2389,28 +2410,31 @@ def _execute_post_commit_action(action_name: str, args: Optional[List[Any]] = No
 
 
 def get_competition_post_commit_status(*, limit_failed: int = 10) -> Dict[str, Any]:
-    init_db()
     con = connect()
     try:
-        _ensure_post_commit_schema(con)
-        rows = con.execute(
-            f"""
-            SELECT status, COUNT(*)
-            FROM {_POST_COMMIT_OUTBOX_TABLE}
-            GROUP BY status
-            """
-        ).fetchall() or []
-        counts = {str(status or ""): _safe_int(count, 0) for status, count in rows}
-        failed_rows = con.execute(
-            f"""
-            SELECT id, action_name, attempt_count, status, available_ts_ms, lease_expires_ts_ms, last_error
-            FROM {_POST_COMMIT_OUTBOX_TABLE}
-            WHERE status IN ('pending','failed','running')
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            (int(max(1, limit_failed)),),
-        ).fetchall() or []
+        try:
+            rows = con.execute(
+                f"""
+                SELECT status, COUNT(*)
+                FROM {_POST_COMMIT_OUTBOX_TABLE}
+                GROUP BY status
+                """
+            ).fetchall() or []
+            counts = {str(status or ""): _safe_int(count, 0) for status, count in rows}
+            failed_rows = con.execute(
+                f"""
+                SELECT id, action_name, attempt_count, status, available_ts_ms, lease_expires_ts_ms, last_error
+                FROM {_POST_COMMIT_OUTBOX_TABLE}
+                WHERE status IN ('pending','failed','running')
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(max(1, limit_failed)),),
+            ).fetchall() or []
+        except Exception as e:
+            if _is_missing_relation_error(e):
+                return _empty_post_commit_status()
+            raise
         return {
             "ok": True,
             "pending_count": int(counts.get("pending", 0)),

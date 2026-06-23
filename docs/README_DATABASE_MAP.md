@@ -2,7 +2,7 @@
 
 This document explains the main runtime database/storage contract used by the repo in human terms.
 
-Last verified against code: 2026-06-17
+Last verified against code: 2026-06-22
 
 It is not meant to replace the schema in `engine/runtime/storage.py` or `engine/runtime/storage_pg.py`. It is meant to make the schema understandable.
 
@@ -31,6 +31,16 @@ derivation, bounded memory estimate, WAL retention budget, and reachable
 `pg_settings` values. `PREFLIGHT_REQUIRE_DOCKER_POSTGRES_TUNING=1` makes this a
 hard gate for the compose production path.
 
+For compose production, intended settings are not enough. Keep
+`PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE=1` and refresh
+`/var/backups/trading/evidence/postgres_pg_settings.json` from the running
+Timescale container after restarts or tuning changes. The same preflight run also
+uses Docker inspect and Redis `CONFIG GET` evidence under
+`/var/backups/trading/evidence/` to prove the running Timescale container has the
+expected memory/memswap/`/dev/shm` limit, Docker log caps, port bindings, and
+mounts, and that Redis effective `maxmemory` still matches the configured
+container budget.
+
 In older local SQLite-oriented setups, and in the isolated SQLite test backend, the main file was usually:
 
 - `data/trading.db`
@@ -42,18 +52,102 @@ honored.
 Do not infer that new schema work is local-file-only. Treat the runtime storage facade and Postgres migrations as the primary persistence layer, and add migrations/tests for any schema or write-path change.
 
 Postgres durability defaults to the server/session setting for every write.
-`TRADING_REFETCHABLE_PG_DURABILITY_TIER=relaxed` is the only supported opt-in
-for `SET LOCAL synchronous_commit = off`, and production code applies it only
-inside hardcoded refetchable ingestion price/telemetry transactions:
-`engine.runtime.telemetry_append_buffer` flushes for `price_quotes_raw`,
-`price_provider_health`, `weather_provider_health`,
-`ingestion_pipeline_health`, and `ingest_slippage`;
-`engine.runtime.storage_pg_prices.PostgresPriceStorage.write_batch`; and
-Timescale queue flushes for `price_data`, `runtime_metrics`,
-`data_source_logs`, `price_provider_health`, `weather_provider_health`, and
-`ingestion_pipeline_health`. Order, ledger, broker, audit, event-log, model,
-trade-outcome, and capital-state writes stay on default/synchronous Postgres
-durability even when the relaxed tier is enabled.
+`TRADING_REFETCHABLE_PG_DURABILITY_TIER` accepts only `default` and `relaxed`;
+empty/unset behaves as `default`, and invalid values fail production preflight
+and the write-surface configuration path. `relaxed` is the only supported opt-in
+for `SET LOCAL synchronous_commit = off`. The central production allowlist lives
+in `engine.runtime.pg_durability`, and the helper refuses unknown or protected
+tables/scopes instead of trusting call-site strings.
+
+| Write surface | Durability class |
+| --- | --- |
+| `engine.runtime.storage_pg_prices.PostgresPriceStorage.write_batch` for `price_ticks`, `price_quotes`, and `price_quotes_raw` | Refetchable price data; may use relaxed durability when the env tier is `relaxed` |
+| `engine.runtime.telemetry_append_buffer` durable-spools and flushes `price_quotes_raw`, `price_provider_health`, `weather_provider_health`, `ingestion_pipeline_health`, and `ingest_slippage` | Refetchable ingestion telemetry; accepted rows go to a bounded SQLite WAL spool first, then delete only after the Postgres/SQLite write transaction commits; may use relaxed durability when the env tier is `relaxed` |
+| Timescale queue flushes for `price_data`, `runtime_metrics`, `data_source_logs`, `price_provider_health`, `weather_provider_health`, and `ingestion_pipeline_health` | Refetchable price/market-data/telemetry; may use relaxed durability when the env tier is `relaxed` |
+| Normal `engine.runtime.storage.run_write_txn` writes, schema/migration writes, order/broker/ledger/risk/capital/audit/event-log/model/trade-outcome writes, and any unclassified Postgres write | Default Postgres durability; never receives `SET LOCAL synchronous_commit = off` |
+
+The active tier and allowlists are visible in runtime snapshots under
+`durability` for the Postgres price sidecar, Timescale client, and telemetry
+append buffer, and in production preflight JSON under
+`refetchable_pg_durability`. A relaxed snapshot should show `tier=relaxed` and
+`relaxed=true`; that only means the approved refetchable surfaces can relax
+durability, not that protected financial/control writes can opt in. Protected
+table names such as `execution_orders`, `broker_order_state`,
+`trade_attribution_ledger`, `risk_state`, `equity_history`, `event_log`,
+`model_registry`, and `trade_outcomes` are rejected by the durability helper if
+a relaxed-durability scope attempts to include them.
+
+The Postgres price sidecar's normal write path is binary `COPY` into fixed
+unlogged staging tables created by `ensure_schema()`, followed by one
+`INSERT ... SELECT DISTINCT ON (...) ... ON CONFLICT DO UPDATE` per target
+(`price_ticks`, `price_quotes`, and `price_quotes_raw`). Duplicate keys inside a
+flush resolve by the original row order's descending staging ordinal, so retries
+and duplicate events are deterministic. If psycopg binary COPY is unavailable,
+the sidecar records the fallback in its snapshot and uses bounded multi-row
+VALUES upserts; operators can disable COPY or disable that fallback with the
+`TIMESCALE_PRICES_COPY_*` settings.
+
+Before either write path runs, `PostgresPriceStorage.write_batch` normalizes each
+input mapping through a cached row object. Symbol parsing, timestamp-to-datetime
+conversion, numeric coercion, provider/source text selection, and raw-event key
+normalization are computed once per input mapping and then reused by the
+`price_ticks`, `price_quotes`, and `price_quotes_raw` row builders. The
+`storage_pg_prices` snapshot exposes cumulative normalization counters
+(`normalization_safe_float_calls`, `normalization_safe_int_calls`,
+`normalization_datetime_conversions`, `normalization_symbol_parses`, and
+`normalization_event_key_normalizations`) so operators can verify conversion work
+per batch without inspecting tests.
+
+Raw price events use producer-side `price_raw:v1` event keys computed from stable
+provider, symbol, event type, upstream identifiers, and event timestamps. Mutable
+market floats (`last`, `bid`, `ask`, `volume`, spreads, and sizes) are excluded
+from key generation. SQLite direct writes, telemetry-buffer flushes, the
+Postgres price sidecar VALUES path, and the Postgres/Timescale COPY staging path
+all upsert `price_quotes_raw` on `(symbol, provider, event_key, ts_ms)` (or
+`"time"` in the sidecar table) so retries and SQLite-to-Timescale cutover use the
+same raw-event identity.
+
+The asyncpg Timescale sidecar uses the same staging/upsert shape for eligible
+append-heavy hypertables. It prepares deterministic session temp staging tables
+once per pooled connection, loads flushes through `copy_records_to_table()`,
+deduplicates intra-flush conflict keys with `DISTINCT ON (...), _ordinal DESC`,
+and records COPY, fallback, and dedupe counters in the Timescale health
+snapshot. Unsupported tables such as `model_registry`, or connections without
+COPY support, stay on the direct upsert fallback when
+`TIMESCALE_COPY_STAGING_FALLBACK_ENABLED=1`.
+
+Timescale chunk intervals come from
+`engine/runtime/schema/table_classification.py`. Tick/quote, price-bar, and
+health-metric hypertables use daily chunks; feature, decision, audit, and
+execution history defaults stay weekly unless their classification says
+otherwise. Fresh schema creation passes that interval to `create_hypertable`;
+startup/migrations rerun the classified hypertable creation path and call
+`set_chunk_time_interval` so existing deployments converge. Compression setup is
+also rerun idempotently: every compressed hypertable uses
+`timescaledb.compress_orderby = '<real time column> DESC'` while keeping its
+existing segment key policy. The main schema uses each table classification's
+`time_column`; the Postgres price sidecar orders by its real `"time"` columns;
+the asyncpg Timescale sidecar orders price/feature/model/trade hypertables by
+`"timestamp"` and operational telemetry hypertables by `"time"`. Price and
+Timescale sidecar snapshots expose desired and actual
+read-back values under `policy_status.chunk_intervals`, and runtime metrics emit
+`storage_pg_prices_hypertable_chunk_interval_ms` or
+`timescale_hypertable_chunk_interval_ms` gauges per table. Compatibility tables
+created after numbered migrations, such as `labels_price`, also call the
+classified hypertable helper when created.
+
+Production soak acceptance must verify that those policies are applied in the
+running Timescale catalog. `engine.runtime.ingestion_soak` builds the read-only
+`/api/health.ingestion_soak.timescale_policy` report from
+`timescaledb_information.hypertables`, `timescaledb_information.dimensions`,
+`timescaledb_information.jobs`, and `pg_indexes`. Production preflight treats
+missing hypertables, missing dimensions, chunk-interval drift, missing
+compression jobs, and missing scoring indexes such as
+`idx_tracked_predictions_prediction_id_ts_id`,
+`idx_model_performance_prediction_id`, and
+`ux_model_performance_tracked_prediction_id` as applied-policy failures. This
+is separate from migration configuration: a migration existing in the repo is
+not GO evidence until the catalog report is clean.
 
 Cold boot and migration ownership:
 
@@ -132,12 +226,12 @@ These tables support orchestration rather than trading logic directly.
 | --- | --- |
 | `runtime_meta` | small key/value state used across the runtime |
 | `job_history` | start/stop/error history for jobs |
-| `job_locks` | coordination for jobs that must not overlap |
+| `job_locks` | coordination for jobs that must not overlap; the `ingestion_restart_guard/v1::` row prefix is reserved for expiring ingestion child restart-storm accounting |
 | `job_heartbeats` | liveness data from running jobs |
 | `job_checkpoints` | progress checkpoints for resumable or tracked jobs |
 | `event_log` | structured runtime event stream |
 | `event_log_state` | event-log cursor/state tracking |
-| `runtime_metrics` | general metric points for system visibility |
+| `runtime_metrics` | general metric points for system visibility, including `postgres.wal.alert_state` from continuous WAL/storage alert evaluation |
 | `schema_version` | schema version bookkeeping |
 
 ### Market And Ingestion Tables
@@ -149,6 +243,25 @@ For the live-ingestion family, schema ownership lives in `engine/runtime/storage
 `price_quotes_raw`, `price_provider_health`, `ingestion_pipeline_health`,
 `price_feed_lock`, and `options_symbol_ingestion_state`; `poll_prices.py` and
 `options_poll.py` should only read or write rows against those tables.
+`options_poll.py` bulk-loads `options_symbol_ingestion_state` once per run
+(the default 600-symbol cycle fits in one state query), fetches provider HTTP
+snapshots in bounded waves (`OPTIONS_POLL_FETCH_CONCURRENCY`), and keeps chain,
+event, and state writes on the single writer connection. High-volume
+`options_chain` and `options_chain_v2` rows plus symbol-state updates are staged
+in memory until the batch boundary. On Postgres connections with psycopg COPY
+support, option rows flush through temporary COPY staging tables and deterministic
+`INSERT ... SELECT DISTINCT ON (...) ... ON CONFLICT` upserts; SQLite, tests, or
+adapters without COPY fall back to bulk `executemany`. Symbol-state rows flush as
+one bulk `executemany` batch before commit. Commits are clamped to 25 to 50 symbols per batch
+(`OPTIONS_POLL_COMMIT_BATCH_SYMBOLS`; legacy `OPTIONS_POLL_COMMIT_EVERY_SYMBOLS`
+is an alias). State-only transient write failures are recorded through
+`state_write_failures` and do not force per-symbol commits. Provider cooldown,
+disable, and cached-fallback state remains in `options_symbol_ingestion_state`
+and provider health telemetry. Each cycle records
+batching metadata in `ingestion_pipeline_health` under `options_poll`, including
+state-load query count, fetch symbols/max workers, commit batches, max symbols per
+commit, option rows written, state rows written, cached fallback symbols, bulk-write
+failures, and state-write failures.
 Repository validation now also blocks new DDL for that owned family outside the
 approved owner modules, and runtime validation treats unexpected columns, primary-key
 drift, or missing owned indexes on those tables as contract failures.
@@ -160,8 +273,8 @@ owned schema element is missing.
 | Table | Role |
 | --- | --- |
 | `prices` | simple price points |
-| `price_quotes` | top-of-book or quote-like market state |
-| `price_quotes_raw` | provider-specific raw quote captures |
+| `price_quotes` | top-of-book or quote-like market state; SQLite uses `ts_ms`, while canonical Timescale sidecars use `"time"` and project API `ts_ms` at read time |
+| `price_quotes_raw` | provider-specific raw quote captures keyed by `(symbol, provider, event_key, ts_ms)` on SQLite and `(symbol, provider, event_key, "time")` on Timescale; producer `price_raw:v1` keys exclude mutable floats |
 | `price_feed_lock` | single-writer coordination row for the canonical polling price feed path |
 | `price_bars` | aggregated time-bucketed bar data |
 | `price_provider_health` | buffered provider freshness and health state; non-authoritative telemetry alongside canonical `prices` inputs |
@@ -195,6 +308,8 @@ These tables sit between raw data and trade decisions.
 | `temporal_predictions` | temporal-model outputs |
 | `event_embeddings` | stored embedding vectors or references for event content |
 | `event_embeddings_seq` | sequence bookkeeping for embeddings |
+
+`labels_price` rows created by the sqlite-oriented price-label backfill may include `meta_json.fx_clock_corrected=true` and `meta_json.naive_eval_ms` when an FX label used the canonical `engine/data/prices/fx_clock.py` evaluation timestamp instead of the naive wall-clock horizon. This is a sqlite-side audit enrichment only; the Postgres compatibility table records the corrected `ts_eval_ms` but does not have a JSON metadata column.
 | `factor_features` | factor-style features |
 | `factor_observations` | raw factor observations |
 | `factor_group_scores` | grouped factor scoring |

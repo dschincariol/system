@@ -82,6 +82,33 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
         _WARNED_NONFATAL_KEYS.add(once_key)
 
 
+def _connection_looks_postgres(con: Any) -> bool:
+    module = str(type(con).__module__ or "").lower()
+    if "psycopg" in module or module.endswith("storage_pg"):
+        return True
+    return bool(hasattr(con, "pgconn") or hasattr(con, "pipeline"))
+
+
+def _sqlite_table_exists(con: Any, table: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name=? LIMIT 1",
+        (str(table),),
+    ).fetchone()
+    return row is not None
+
+
+def _drawdown_table_exists(con: Any, table: str) -> bool:
+    try:
+        if bool(_table_exists(con, table)):
+            return True
+        if _connection_looks_postgres(con):
+            return False
+    except Exception:
+        if _connection_looks_postgres(con):
+            raise
+    return _sqlite_table_exists(con, table)
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -166,7 +193,7 @@ def record_drawdown_bootstrap_baseline(
 
 def _active_bootstrap_baseline(con, *, now_ms: int) -> dict[str, Any] | None:
     try:
-        if not _table_exists(con, "drawdown_bootstrap_baseline"):
+        if not _drawdown_table_exists(con, "drawdown_bootstrap_baseline"):
             return None
         row = con.execute(
             """
@@ -267,7 +294,7 @@ def evaluate_current_drawdown(
         owns = True
     try:
         try:
-            table_present = bool(_table_exists(con, "equity_history"))
+            table_present = bool(_drawdown_table_exists(con, "equity_history"))
         except Exception as err:
             _warn_nonfatal(
                 "DRAWDOWN_STATE_EQUITY_HISTORY_TABLE_CHECK_FAILED",

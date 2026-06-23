@@ -1,0 +1,10 @@
+# Direct development and test requirements. Install through requirements-dev.txt
+# so pip applies the generated transitive lock in requirements-dev.lock.txt.
+-r requirements.in
+
+coverage[toml]==7.14.2
+pytest==9.0.3
+pytest-cov==7.1.0
+pytest-timeout==2.4.0
+pyright==1.1.410
+ruff==0.15.13

@@ -65,12 +65,22 @@
 
     <div class="status-strip">
       <div class="metric"><div class="metric-label">Configured Sources</div><div class="metric-value" id="metricTotal">0</div></div>
-      <div class="metric"><div class="metric-label">Enabled</div><div class="metric-value" id="metricEnabled">0</div></div>
+      <div class="metric"><div class="metric-label">Enabled / Runnable</div><div class="metric-value" id="metricEnabled">0</div></div>
       <div class="metric"><div class="metric-label">Healthy</div><div class="metric-value" id="metricHealthy">0</div></div>
       <div class="metric"><div class="metric-label">Accumulated Errors</div><div class="metric-value" id="metricErrors">0</div></div>
     </div>
 
     <div id="flash" class="empty flash"></div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Provider Accounts</h2>
+        <span class="pill dim">Shared credentials inherited by dependent feeds</span>
+      </div>
+      <div class="card-body">
+        <div class="account-cards" id="providerAccounts"></div>
+      </div>
+    </section>
 
     <section class="card">
       <div class="card-head">
@@ -113,6 +123,44 @@
         </div>
         <div class="card-body" id="detailPane"></div>
       </aside>
+    </div>
+  </div>
+
+  <div class="modal-shell" id="accountModalShell">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="accountModalTitle">Edit Provider Account</h2>
+        <button class="btn-secondary" id="accountModalCloseBtn" type="button">Close</button>
+      </div>
+      <form class="modal-form" id="accountModalForm">
+        <div class="field">
+          <label for="accountKey">Account Key</label>
+          <input id="accountKey" readonly>
+        </div>
+        <div class="field">
+          <label for="accountProviderName">Provider Name</label>
+          <input id="accountProviderName" readonly>
+        </div>
+        <div class="field full">
+          <label>Account Rules</label>
+          <div class="schema-note" id="accountSchemaSummary"></div>
+        </div>
+        <div class="field full">
+          <label>Credentials</label>
+          <div class="editor-grid" id="accountCredentialsFields"></div>
+          <div class="checkbox-stack">
+            <label class="checkbox-row" for="replaceAccountCredentials">
+              <input id="replaceAccountCredentials" type="checkbox">
+              <span>Replace account credentials with only the values entered below</span>
+            </label>
+          </div>
+          <div class="clear-grid" id="clearAccountCredentials"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn-secondary" id="accountModalCancelBtn" type="button">Cancel</button>
+          <button class="btn" type="submit">Save Account</button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -176,6 +224,7 @@
 
         <div class="modal-actions">
           <button class="btn-secondary" id="modalCancelBtn" type="button">Cancel</button>
+          <button class="btn-secondary" id="modalTestSaveBtn" type="button">Test &amp; Save</button>
           <button class="btn" type="submit">Save Source</button>
         </div>
       </form>

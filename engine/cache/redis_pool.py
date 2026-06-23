@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -18,7 +19,8 @@ except Exception:  # pragma: no cover
 
 _CLIENT: Any | None = None
 _CLIENT_KEY: tuple[str, int] | None = None
-_PINGED_KEY: tuple[str, int] | None = None
+_LAST_HEALTH_CHECK_KEY: tuple[str, int] | None = None
+_LAST_HEALTH_CHECK_MONOTONIC = 0.0
 _LOCK = threading.Lock()
 
 
@@ -74,17 +76,22 @@ def redis_pool_size() -> int:
     return tuned_int("TS_REDIS_POOL_SIZE", 16, 1, 64)
 
 
+def redis_pool_healthcheck_interval_s() -> float:
+    return tuned_float("TS_REDIS_POOL_HEALTHCHECK_INTERVAL_S", 30.0, 0.1, 300.0)
+
+
 def _redis_timeout_s(name: str, default: float) -> float:
     return tuned_float(name, float(default), 0.05, 5.0)
 
 
 def reset_redis_pool() -> None:
-    global _CLIENT, _CLIENT_KEY, _PINGED_KEY
+    global _CLIENT, _CLIENT_KEY, _LAST_HEALTH_CHECK_KEY, _LAST_HEALTH_CHECK_MONOTONIC
     with _LOCK:
         old = _CLIENT
         _CLIENT = None
         _CLIENT_KEY = None
-        _PINGED_KEY = None
+        _LAST_HEALTH_CHECK_KEY = None
+        _LAST_HEALTH_CHECK_MONOTONIC = 0.0
     close = getattr(old, "close", None)
     if callable(close):
         close()
@@ -98,6 +105,13 @@ def redis_watch_error_type():
     if redis is None:
         return None
     return getattr(redis, "WatchError", None)
+
+
+def redis_no_script_error_type():
+    if redis is None:
+        return None
+    exceptions = getattr(redis, "exceptions", None)
+    return getattr(exceptions, "NoScriptError", None)
 
 
 def redis_from_url(url: str, **kwargs: Any):
@@ -115,7 +129,7 @@ def redis_pool():
     continuing in Postgres fall-through mode.
     """
 
-    global _CLIENT, _CLIENT_KEY, _PINGED_KEY
+    global _CLIENT, _CLIENT_KEY, _LAST_HEALTH_CHECK_KEY, _LAST_HEALTH_CHECK_MONOTONIC
     url = redis_url()
     pool_size = redis_pool_size()
     key = (url, int(pool_size))
@@ -132,12 +146,20 @@ def redis_pool():
                 socket_timeout=_redis_timeout_s("TS_REDIS_SOCKET_TIMEOUT_S", 0.25),
             )
             _CLIENT_KEY = key
-            _PINGED_KEY = None
+            _LAST_HEALTH_CHECK_KEY = None
+            _LAST_HEALTH_CHECK_MONOTONIC = 0.0
         client = _CLIENT
-    if _PINGED_KEY != key:
+        now = time.monotonic()
+        should_ping = (
+            _LAST_HEALTH_CHECK_KEY != key
+            or (float(now) - float(_LAST_HEALTH_CHECK_MONOTONIC)) >= redis_pool_healthcheck_interval_s()
+        )
+        if should_ping:
+            _LAST_HEALTH_CHECK_KEY = key
+            _LAST_HEALTH_CHECK_MONOTONIC = float(now)
+    if should_ping:
         try:
             cache_circuit().call(client.ping)
-            _PINGED_KEY = key
         except Exception:
             cache_circuit().force_open("redis_ping_failed")
     return client

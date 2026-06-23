@@ -136,7 +136,8 @@ def _table_exists(con, name: str) -> bool:
     try:
         from engine.runtime.storage import table_exists as _storage_table_exists
 
-        return bool(_storage_table_exists(con, str(name)))
+        if bool(_storage_table_exists(con, str(name))):
+            return True
     except Exception as e:
         _warn_nonfatal(
             "COMPUTE_EXEC_LABELS_STORAGE_TABLE_EXISTS_FAILED",
@@ -144,6 +145,8 @@ def _table_exists(con, name: str) -> bool:
             once_key=f"storage_table_exists:{name}",
             table_name=str(name),
         )
+    if _looks_like_postgres(con):
+        return False
     try:
         row = con.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -159,6 +162,16 @@ def _looks_like_sqlite(con) -> bool:
     module_name = str(getattr(con, "__class__", type(con)).__module__ or "").lower()
     class_name = str(getattr(con, "__class__", type(con)).__name__ or "").lower()
     return "sqlite" in module_name or "sqlite" in class_name
+
+
+def _looks_like_postgres(con) -> bool:
+    module_name = str(getattr(con, "__class__", type(con)).__module__ or "").lower()
+    class_name = str(getattr(con, "__class__", type(con)).__name__ or "").lower()
+    raw = getattr(con, "raw", None)
+    raw_module = str(getattr(getattr(raw, "__class__", type(raw)), "__module__", "") or "").lower()
+    raw_class = str(getattr(getattr(raw, "__class__", type(raw)), "__name__", "") or "").lower()
+    haystack = " ".join((module_name, class_name, raw_module, raw_class))
+    return "psycopg" in haystack or "storage_pg" in haystack
 
 
 def _column_exists(con, table: str, column: str) -> bool:

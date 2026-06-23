@@ -44,10 +44,10 @@ def test_required_backend_junit_inspection_detects_skipped_tests(tmp_path: Path)
         encoding="utf-8",
     )
 
-    test_count, skipped = inspect_junit(junit)
+    inspection = inspect_junit(junit)
 
-    assert test_count == 1
-    assert skipped == ["tests.test_pg::test_needs_postgres: postgres not reachable at TS_PG_DSN"]
+    assert inspection.selected_tests == 1
+    assert inspection.skipped == ["tests.test_pg::test_needs_postgres: postgres not reachable at TS_PG_DSN"]
 
 
 def test_validate_workflow_has_hard_gated_production_backend_job() -> None:

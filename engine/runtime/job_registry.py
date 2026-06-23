@@ -345,6 +345,19 @@ ALLOWED_JOBS = {
     {"execution": False, "fallback_feed": True, "failover": True},
 ),
 
+"ingest_simulated_prices": (
+    "engine/data/jobs/ingest_simulated_prices.py",
+    "oneshot",
+    "price_feed",
+    {
+        "execution": False,
+        "fallback_feed": True,
+        "pipeline_stage": "price_ingestion",
+        "schedule": "manual one-shot",
+        "purpose": "Writes deterministic safe/sim price rows through the production price router.",
+    },
+),
+
 "options_poll": (
     "engine/data/options_poll.py",
     "daemon",

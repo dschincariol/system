@@ -115,6 +115,36 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertTrue(key_file.is_file())
         _assert_local_validation_secret_sources(env)
 
+    def test_full_bootstrap_preserves_password_file_for_passwordless_pg_dsn(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ENV": "dev",
+                "TS_PG_DSN": "host=127.0.0.1 port=5432 user=trading dbname=trading",
+                "TS_PG_PASSWORD_FILE": "/run/user/trading/pg_password_app",
+                "TS_PG_PASSWORD": "raw-runtime-pg-password",
+                "TIMESCALE_PASSWORD_FILE": "/run/user/trading/timescale_password",
+                "OBJECT_STORE_ACCESS_KEY_FILE": "/tmp/raw-object-access",
+            },
+            clear=True,
+        ):
+            env = bootstrap_validation_env()
+
+        self.assertEqual(
+            str(env.get("TS_PG_DSN") or ""),
+            "host=127.0.0.1 port=5432 user=trading dbname=trading",
+        )
+        self.assertEqual(
+            str(env.get("TS_PG_PASSWORD_FILE") or ""),
+            "/run/user/trading/pg_password_app",
+        )
+        self.assertEqual(
+            str(env.get("TIMESCALE_PASSWORD_FILE") or ""),
+            "/run/user/trading/timescale_password",
+        )
+        self.assertEqual(str(env.get("TS_PG_PASSWORD") or ""), "")
+        self.assertEqual(str(env.get("OBJECT_STORE_ACCESS_KEY_FILE") or ""), "")
+
     def test_bootstrap_validation_env_preserves_prod_dependency_master_key(self) -> None:
         with patch.dict(
             os.environ,

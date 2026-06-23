@@ -6,10 +6,18 @@ from typing import Any
 
 from engine.audit.chain import append_chain_row
 from engine.cache import codec, keys, store
-from engine.cache.wrappers._common import after_commit_or_now, now_ms, reload_after_codec_version_mismatch
+from engine.cache.wrappers._common import (
+    after_commit_or_now,
+    l1_get,
+    l1_invalidate,
+    l1_set,
+    now_ms,
+    reload_after_codec_version_mismatch,
+)
+from engine.execution.mode_safety import CANONICAL_EXECUTION_MODES, coerce_execution_mode
 from engine.runtime import storage
 
-MODES = {"paper", "shadow", "live"}
+MODES = set(CANONICAL_EXECUTION_MODES)
 EXECUTION_MODE_CODEC_VERSION = 1
 EXECUTION_MODE_TTL_S = 3600
 
@@ -41,17 +49,38 @@ def _load_mode() -> dict[str, Any]:
             con.close()
 
 
+def _l1_cacheable_mode(state: dict[str, Any] | None) -> bool:
+    payload = dict(state or {})
+    mode = str(payload.get("mode") or "paper").strip().lower()
+    armed = int(payload.get("armed") or 0)
+    return not (mode == "live" and armed == 1)
+
+
+def _l1_store_mode(key: str, state: dict[str, Any] | None) -> None:
+    if _l1_cacheable_mode(state):
+        l1_set(key, dict(state or {}))
+    else:
+        l1_invalidate(key)
+
+
 def read_execution_mode() -> dict[str, Any]:
     key = keys.execution_mode()
+    cached_l1 = l1_get(key)
+    if isinstance(cached_l1, dict):
+        return dict(cached_l1)
 
     def _loader() -> bytes:
         return codec.encode(_load_mode(), version=EXECUTION_MODE_CODEC_VERSION)
 
     raw = store.read(key, _loader, ttl_s=EXECUTION_MODE_TTL_S)
     if raw is None:
-        return _load_mode()
+        state = _load_mode()
+        _l1_store_mode(key, state)
+        return state
     try:
-        return dict(codec.decode(raw, expected_version=EXECUTION_MODE_CODEC_VERSION) or {})
+        state = dict(codec.decode(raw, expected_version=EXECUTION_MODE_CODEC_VERSION) or {})
+        _l1_store_mode(key, state)
+        return state
     except codec.UnsupportedCacheVersion as exc:
         raw = reload_after_codec_version_mismatch(
             key,
@@ -62,23 +91,35 @@ def read_execution_mode() -> dict[str, Any]:
             error=exc,
         )
         if raw is None:
-            return _load_mode()
+            state = _load_mode()
+            _l1_store_mode(key, state)
+            return state
         try:
-            return dict(codec.decode(raw, expected_version=EXECUTION_MODE_CODEC_VERSION) or {})
+            state = dict(codec.decode(raw, expected_version=EXECUTION_MODE_CODEC_VERSION) or {})
+            _l1_store_mode(key, state)
+            return state
         except codec.CacheCodecError:
             store.invalidate(key)
-            return _load_mode()
+            state = _load_mode()
+            _l1_store_mode(key, state)
+            return state
     except codec.CacheCodecError:
         store.invalidate(key)
-        return _load_mode()
+        state = _load_mode()
+        _l1_store_mode(key, state)
+        return state
 
 
 def prime_execution_mode(state: dict[str, Any] | None = None) -> None:
+    key = keys.execution_mode()
+    payload = dict(state or _load_mode())
+    l1_invalidate(key)
     store.prime(
-        keys.execution_mode(),
-        codec.encode(state or _load_mode(), version=EXECUTION_MODE_CODEC_VERSION),
+        key,
+        codec.encode(payload, version=EXECUTION_MODE_CODEC_VERSION),
         ttl_s=EXECUTION_MODE_TTL_S,
     )
+    _l1_store_mode(key, payload)
 
 
 def _ensure_schema(con: Any) -> None:
@@ -123,9 +164,7 @@ def set_execution_mode(
     armed: int | None = None,
     con: Any | None = None,
 ) -> dict[str, Any]:
-    mode_n = str(mode or "").strip().lower()
-    if mode_n not in MODES:
-        mode_n = "paper"
+    mode_n = coerce_execution_mode(mode, source="execution_mode_cache")
     actor_s = str(actor or "operator")
     reason_s = str(reason or "")
     ts_ms = now_ms()
@@ -178,12 +217,15 @@ def set_execution_mode(
         _persist(con)
         after_commit_or_now(con, lambda: prime_execution_mode(state))
     else:
+        key = keys.execution_mode()
+        l1_invalidate(key)
         store.write_through(
-            keys.execution_mode(),
+            key,
             codec.encode(state, version=EXECUTION_MODE_CODEC_VERSION),
             persist=_persist,
             ttl_s=EXECUTION_MODE_TTL_S,
         )
+        _l1_store_mode(key, state)
     return state
 
 

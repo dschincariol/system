@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import subprocess
 import sys
@@ -20,6 +21,9 @@ DEFAULT_PYPROJECT = ROOT / "pyproject.toml"
 class CoverageGateConfig:
     minimum_percent: float
     package_roots: tuple[str, ...]
+    package_minimums: dict[str, float]
+    zero_covered_module_roots: tuple[str, ...]
+    zero_covered_module_allowlist: frozenset[str]
     report_dir: Path
 
 
@@ -68,14 +72,40 @@ def load_config(pyproject_path: Path = DEFAULT_PYPROJECT) -> CoverageGateConfig:
         raise ValueError("tool.trading_system.coverage_gate.package_roots is required")
 
     minimum = float(raw_config.get("minimum_percent"))
+    raw_package_minimums = raw_config.get("package_minimums") or {}
+    package_minimums = {
+        _normalize_root(root): float(value)
+        for root, value in dict(raw_package_minimums).items()
+    }
+    zero_roots = tuple(
+        _normalize_root(str(item))
+        for item in raw_config.get("zero_covered_module_roots") or ()
+    )
+    zero_allowlist = frozenset(
+        _normalize_root(str(item))
+        for item in raw_config.get("zero_covered_module_allowlist") or ()
+    )
     report_dir = Path(str(raw_config.get("report_dir") or "artifacts/coverage"))
     if not report_dir.is_absolute():
         report_dir = ROOT / report_dir
     return CoverageGateConfig(
         minimum_percent=minimum,
         package_roots=roots,
+        package_minimums=package_minimums,
+        zero_covered_module_roots=zero_roots,
+        zero_covered_module_allowlist=zero_allowlist,
         report_dir=report_dir,
     )
+
+
+def _normalize_root(value: str) -> str:
+    return str(value).strip().strip("/").replace("\\", "/")
+
+
+def _path_matches_root(filename: str, root: str) -> bool:
+    normalized = _normalize_root(filename)
+    normalized_root = _normalize_root(root)
+    return normalized == normalized_root or normalized.startswith(f"{normalized_root}/")
 
 
 def _summary_int(summary: dict[str, Any], key: str) -> int:
@@ -86,6 +116,7 @@ def package_summaries(
     coverage_payload: dict[str, Any],
     roots: tuple[str, ...],
 ) -> list[PackageCoverage]:
+    normalized_roots = tuple(_normalize_root(root) for root in roots)
     by_root: dict[str, dict[str, int]] = {
         root: {
             "covered_lines": 0,
@@ -93,22 +124,22 @@ def package_summaries(
             "covered_branches": 0,
             "num_branches": 0,
         }
-        for root in roots
+        for root in normalized_roots
     }
 
     for filename, file_payload in dict(coverage_payload.get("files") or {}).items():
-        parts = Path(str(filename)).parts
-        if not parts:
+        normalized_filename = _normalize_root(str(filename))
+        if not normalized_filename:
             continue
-        root = parts[0]
-        if root not in by_root:
-            continue
-        summary = dict(file_payload.get("summary") or {})
-        aggregate = by_root[root]
-        aggregate["covered_lines"] += _summary_int(summary, "covered_lines")
-        aggregate["num_statements"] += _summary_int(summary, "num_statements")
-        aggregate["covered_branches"] += _summary_int(summary, "covered_branches")
-        aggregate["num_branches"] += _summary_int(summary, "num_branches")
+        for root in normalized_roots:
+            if not _path_matches_root(normalized_filename, root):
+                continue
+            summary = dict(file_payload.get("summary") or {})
+            aggregate = by_root[root]
+            aggregate["covered_lines"] += _summary_int(summary, "covered_lines")
+            aggregate["num_statements"] += _summary_int(summary, "num_statements")
+            aggregate["covered_branches"] += _summary_int(summary, "covered_branches")
+            aggregate["num_branches"] += _summary_int(summary, "num_branches")
 
     return [
         PackageCoverage(
@@ -131,6 +162,95 @@ def total_coverage_percent(coverage_payload: dict[str, Any]) -> float:
     return _percent(covered, measured)
 
 
+def _package_summary_map(
+    coverage_payload: dict[str, Any],
+    roots: tuple[str, ...],
+) -> dict[str, PackageCoverage]:
+    return {summary.root: summary for summary in package_summaries(coverage_payload, roots)}
+
+
+def zero_covered_modules(
+    coverage_payload: dict[str, Any],
+    roots: tuple[str, ...],
+) -> list[str]:
+    modules: list[str] = []
+    for filename, file_payload in dict(coverage_payload.get("files") or {}).items():
+        normalized_filename = _normalize_root(str(filename))
+        if not normalized_filename.endswith(".py"):
+            continue
+        if not any(_path_matches_root(normalized_filename, root) for root in roots):
+            continue
+        summary = dict(file_payload.get("summary") or {})
+        total_lines = _summary_int(summary, "num_statements")
+        covered_lines = _summary_int(summary, "covered_lines")
+        if total_lines > 0 and covered_lines <= 0:
+            modules.append(normalized_filename)
+    return sorted(set(modules))
+
+
+def _format_delta(measured: float, floor: float) -> str:
+    delta = measured - floor
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta:.2f}%"
+
+
+def _module_name_for_path(path: str) -> str:
+    normalized = _normalize_root(path)
+    if normalized.endswith(".py"):
+        normalized = normalized[:-3]
+    return normalized.replace("/", ".")
+
+
+def _iter_python_files(roots: tuple[str, ...]) -> list[Path]:
+    files: list[Path] = []
+    for root in roots:
+        root_path = ROOT / _normalize_root(root)
+        if root_path.is_file() and root_path.suffix == ".py":
+            files.append(root_path)
+        elif root_path.is_dir():
+            files.extend(path for path in root_path.rglob("*.py") if path.is_file())
+    return sorted(set(files))
+
+
+def _imported_modules(path: Path) -> set[str]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return set()
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.add(str(alias.name))
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(str(node.module))
+            for alias in node.names:
+                if alias.name != "*":
+                    imports.add(f"{node.module}.{alias.name}")
+    return imports
+
+
+def production_import_counts(
+    modules: list[str],
+    roots: tuple[str, ...],
+) -> dict[str, int]:
+    module_names = {module: _module_name_for_path(module) for module in modules}
+    counts = {module: 0 for module in modules}
+    for path in _iter_python_files(roots):
+        rel_path = _normalize_root(str(path.relative_to(ROOT)))
+        importer_module = _module_name_for_path(rel_path)
+        imported = _imported_modules(path)
+        for module, module_name in module_names.items():
+            if importer_module == module_name:
+                continue
+            if any(
+                imported_name == module_name or imported_name.startswith(f"{module_name}.")
+                for imported_name in imported
+            ):
+                counts[module] += 1
+    return counts
+
+
 def print_package_summary(
     coverage_payload: dict[str, Any],
     config: CoverageGateConfig,
@@ -150,6 +270,51 @@ def print_package_summary(
             f"{summary.branch_percent:7.2f}%  "
             f"{summary.covered_total}/{summary.measured_total}"
         )
+    if config.package_minimums:
+        print("")
+        print("Required package floors")
+        print("Package           Result  Measured   Floor    Delta  Covered/Measured")
+        print("----------------  ------  --------  ------  -------  ----------------")
+        floor_summaries = _package_summary_map(
+            coverage_payload,
+            tuple(config.package_minimums),
+        )
+        for root, floor in config.package_minimums.items():
+            summary = floor_summaries.get(root) or PackageCoverage(root, 0, 0, 0, 0)
+            result = "PASS" if summary.total_percent + 1e-9 >= floor else "FAIL"
+            print(
+                f"{root:<16}  "
+                f"{result:<6}  "
+                f"{summary.total_percent:7.2f}%  "
+                f"{floor:5.2f}%  "
+                f"{_format_delta(summary.total_percent, floor):>7}  "
+                f"{summary.covered_total}/{summary.measured_total}"
+            )
+    if config.zero_covered_module_roots:
+        remaining = zero_covered_modules(
+            coverage_payload,
+            config.zero_covered_module_roots,
+        )
+        new_modules = [
+            module
+            for module in remaining
+            if module not in config.zero_covered_module_allowlist
+        ]
+        print("")
+        print(
+            "Zero-covered module burndown: "
+            f"remaining={len(remaining)} allowlisted={len(config.zero_covered_module_allowlist)} "
+            f"new={len(new_modules)}"
+        )
+        if remaining:
+            importer_counts = production_import_counts(remaining, config.package_roots)
+            prioritized = sorted(
+                remaining,
+                key=lambda module: (-importer_counts.get(module, 0), module),
+            )
+            print("Zero-covered burndown priority (production importers)")
+            for module in prioritized[:10]:
+                print(f"- {module}: importers={importer_counts.get(module, 0)}")
     return total_percent
 
 
@@ -160,12 +325,44 @@ def check_coverage(coverage_json: Path, config: CoverageGateConfig) -> int:
 
     coverage_payload = json.loads(coverage_json.read_text(encoding="utf-8"))
     total_percent = print_package_summary(coverage_payload, config)
+    failures: list[str] = []
     if total_percent + 1e-9 < config.minimum_percent:
-        print(
-            "Coverage gate FAILED: "
-            f"{total_percent:.2f}% is below {config.minimum_percent:.2f}%",
-            file=sys.stderr,
+        failures.append(
+            f"total {total_percent:.2f}% is below {config.minimum_percent:.2f}%"
         )
+
+    if config.package_minimums:
+        floor_summaries = _package_summary_map(
+            coverage_payload,
+            tuple(config.package_minimums),
+        )
+        for root, floor in config.package_minimums.items():
+            summary = floor_summaries.get(root) or PackageCoverage(root, 0, 0, 0, 0)
+            if summary.total_percent + 1e-9 < floor:
+                failures.append(
+                    f"{root} {summary.total_percent:.2f}% is below {floor:.2f}%"
+                )
+
+    if config.zero_covered_module_roots:
+        remaining = zero_covered_modules(
+            coverage_payload,
+            config.zero_covered_module_roots,
+        )
+        new_zero_modules = [
+            module
+            for module in remaining
+            if module not in config.zero_covered_module_allowlist
+        ]
+        if new_zero_modules:
+            failures.append(
+                "new zero-covered modules under critical roots: "
+                + ", ".join(new_zero_modules)
+            )
+
+    if failures:
+        print("Coverage gate FAILED:", file=sys.stderr)
+        for failure in failures:
+            print(f"- {failure}", file=sys.stderr)
         return 1
 
     print(
@@ -192,7 +389,7 @@ def build_pytest_command(
         "--tb=short",
         "--cov-branch",
         "--cov-fail-under=0",
-        "--cov-report=term-missing:skip-covered",
+        "--cov-report=",
         f"--cov-report=xml:{coverage_xml}",
         f"--cov-report=json:{coverage_json}",
     ]

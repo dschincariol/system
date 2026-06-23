@@ -16,6 +16,48 @@ This document records the concrete contracts that are visible in the inspected c
 
 Runtime storage note: production and production-like operation use the public facade in `engine/runtime/storage.py`, which validates the selected backend before exposing it. The concrete production backend is `engine/runtime/storage_pg.py`. SQLite remains an isolated Python test backend and a compatibility dialect for older call sites; it is not the production source of truth.
 
+## 0. Data-Source Populate Evidence
+
+Producer:
+- `services.data_source_manager.DataSourceManager.populate_now(...)`
+
+Consumers:
+- `GET /api/data_sources`
+- Data Sources UI detail panel
+- runtime source health attachment in `attach_runtime_states_to_sources(...)`
+
+Failure if malformed:
+- a source can appear healthy before any real provider row has landed
+- missing required fields or wrong timestamp/source keys can hide ingestion drift
+- stale rows can be mistaken for current provider availability
+- operators lose the row-count and storage evidence needed to distinguish bad credentials, provider outages, and schema mismatch
+
+Production enforcement:
+- each source has a code-defined `DataSourceContract` with normalized shape, required fields, units, symbol namespace, timestamp timezone, point-in-time availability semantics, unique key, idempotent upsert behavior, storage table, consumer, timestamp field, source field, and stale threshold
+- `populate_now(...)` is a bounded one-shot path, not a broad backfill; it obeys the provider connection-test rate limiter and stops on provider 429 or 503 responses
+- broker data-source populate paths are read-only only; Alpaca is limited to account and positions reads, and order/cancel/replace/flatten paths are rejected by `engine.data.broker_readonly`
+- `data_source_populate_evidence` stores the latest evidence row per source
+- `attach_runtime_states_to_sources(...)` downgrades otherwise healthy sources to `degraded` with `contract_health_gate` when no evidence exists, no rows landed, or the latest contract status is not `pass`
+- logs and API responses use the data-source redaction boundary; tests use generated canary values and assert they do not appear in responses or logs
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `source_key` | `TEXT` | Yes | Data-source key whose storage proof was run. | source key |
+| `ts_ms` | `INTEGER` | Yes | Populate evidence write time. | ms |
+| `status` | `TEXT` | Yes | Provider/proof status: `pass`, `warn`, `fail`, or `degraded`. | enum |
+| `contract_status` | `TEXT` | Yes | Data-contract result: `pass`, `warn`, or `fail`. | enum |
+| `row_count` | `INTEGER` | Yes | Matching rows found in the contract storage table after populate. | count |
+| `storage_table` | `TEXT` | Yes | Table named by the source contract. | table name |
+| `latest_ts_ms` | `INTEGER` | No | Latest contract timestamp found for matching rows. | ms |
+| `latency_ms` | `INTEGER` | Yes | End-to-end populate and verification latency. | ms |
+| `missing_null_counts_json` | `JSON object` | Yes | Required field names mapped to missing/null counts. | count map |
+| `duplicate_drops` | `INTEGER` | Yes | Duplicate rows implied by the contract unique key. | count |
+| `stale_gap_status` | `TEXT` | Yes | Freshness result such as `fresh`, `stale`, `no_rows`, or `missing_timestamp`. | enum |
+| `provider_evidence_json` | `JSON object` | Yes | Sanitized provider evidence and endpoint/probe metadata. | JSON |
+| `contract_json` | `JSON object` | Yes | Embedded `DataSourceContract.payload()` for the proof. | JSON |
+| `error` | `TEXT` | No | Failure or warning detail. | text |
+| `actor` | `TEXT` | No | Operator or automation actor that requested populate. | actor |
+
 ## 1. Canonical Model Intent
 
 Producer:
@@ -1010,6 +1052,7 @@ Snapshot schema:
 | `job_launch_trace` | `JSON array[object]` | Yes | Job-launch breadcrumb list. | list |
 | `db_validation` | `JSON object` | Yes | DB validation details. | JSON |
 | `ingestion_state` | `JSON object` | Yes | Current persisted ingestion runtime state. | JSON |
+| `ingestion_state.children[*].restart_guard` | `JSON object` | No | Persisted ingestion child restart-storm sliding-window snapshot copied from `job_locks` accounting rows. Contains `count`, `limit`, `remaining`, `window_s`, `suppressed`, `suppressed_until_ts_ms`, `liveness_job`, and `updated_ts_ms`. | JSON |
 | `supervisor_analysis` | `JSON object` | Yes | Supervisor analysis persisted in `runtime_meta`. | JSON |
 | `failure_classification` | `JSON object` | Yes | Failure-classification payload from DB debug state. | JSON |
 | `diagnostics` | `JSON object` | Yes | Operator-oriented synthesized diagnosis. | JSON |
@@ -1028,6 +1071,16 @@ Snapshot schema:
 | `ingestion_freshness` | `JSON object` | Yes | Ingestion freshness block. | JSON |
 | `job_restart_counters` | `JSON object` | Yes | Restart counters keyed by job name. | counts |
 | `job_summary` | `JSON object` | Yes | Aggregate job summary. | JSON |
+
+Ingestion child restart-storm accounting is stored in `job_locks` with the
+reserved row-name prefix `ingestion_restart_guard/v1::`. These rows are not
+supervised-job liveness rows. Exits, feed-stall restarts, and spawn failures
+write one expiring row per restart attempt. Health and self-repair stale-lock
+scans ignore the prefix, while `ingestion_runtime` counts unexpired rows to
+enforce `INGESTION_RUNTIME_CHILD_MAX_RESTARTS` within
+`INGESTION_RUNTIME_CHILD_RESTART_WINDOW_S`. A data-source reload marker newer
+than the latest guard attempt clears the affected persisted rows during
+supervisor reconciliation.
 
 ## 17. Operator Snapshot From `boot/operator_server.js`
 
@@ -1120,7 +1173,7 @@ Failure if malformed:
 | `job_name` | `TEXT` | Yes | Ingestion job that this source feeds. | job name |
 | `enabled` | `BOOLEAN` | Yes | Whether the source is active. | boolean |
 | `settings` | `JSON object` | Yes | Structured source-specific settings. | JSON |
-| `status` | `TEXT` | Yes | Last known status such as `ok`, `tested`, `error`, or `test_failed`. | status |
+| `status` | `TEXT` | Yes | Last known status such as `ok`, `tested`, `test_failed`, `test_degraded`, or `test_unsupported`. | status |
 | `last_error` | `TEXT` | No | Most recent error message. | text |
 | `last_success_ts_ms` | `INTEGER` | No | Most recent success time. | ms |
 | `last_test_ts_ms` | `INTEGER` | No | Most recent test time. | ms |
@@ -1163,7 +1216,7 @@ Failure if malformed:
 | `ok` | `BOOLEAN` | Yes | Route success flag. | boolean |
 | `ts_ms` | `INTEGER` | Yes | Response time. | ms |
 | `sources` | `JSON array[object]` | Yes | Materialized source records. | list |
-| `templates` | `JSON array[object]` | Yes | Source template records from `list_source_templates()`. | list |
+| `templates` | `JSON array[object]` | Yes | Enriched source template records from `list_source_templates()`. The UI renders provider guidance and field metadata from this backend-owned catalog. | list |
 | `runtime` | `JSON object` | Yes | Runtime snapshot from the data-source manager. | JSON |
 | `auth` | `JSON object` | Yes | Auth requirements. | JSON |
 | `desired_ingestion_jobs` | `JSON array[string]` | Yes | Job names the manager wants the ingestion runtime to own. | list |
@@ -1179,6 +1232,14 @@ Failure if malformed:
 - `pipeline_health`
 - `updated_ts_ms`
 
+Each `templates[]` row contains identity/routing policy, mutation policy, a `guide` object, `credential_fields[]`, and `setting_fields[]`.
+
+`guide` contains `category`, `summary`, `needs`, `setup`, `when_enabled`, `docs_url`, `signup_url`, `plan_note`, and `safety_warnings`.
+
+Each field object contains `field`, `env_var`/`env_name`, `label`, `help_text`, `docs_url`, `signup_url`, `plan_note`, `required`, `required_state`, `secret`, `validation_hint`, `validation_regex`, `placeholder`, `safety_warning`, and `type`/`input_type`. Secret fields are metadata only; plaintext credential values are not returned by the route.
+
+Mutating source requests reject submitted credential, setting, or clear-field names that are not declared by the selected template. Submitted non-empty field values are checked against the optional field regex and validation failures name only the field, not the submitted value.
+
 ### Lifecycle response after create, update, delete, enable, or disable
 
 The mutating routes all return a `lifecycle` object from `services.data_source_manager.manage_lifecycle(...)`.
@@ -1192,25 +1253,47 @@ The mutating routes all return a `lifecycle` object from `services.data_source_m
 
 ### `POST /api/data_sources/test`
 
-`manager.test_connection(...)` returns one of two stable shapes.
-
-Success shape:
+`manager.test_connection(...)` returns a structured provider-test result from the explicit provider-test registry. Passing probes update the source row to `tested`; failing probes update it to `test_failed`; fallback/partial probes update it to `test_degraded`; registered non-testable sources update it to `test_unsupported`. Only `status=pass` sets `ok=true` or updates `last_success_ts_ms`.
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
-| `ok` | `BOOLEAN` | Yes | `true`. | boolean |
+| `ok` | `BOOLEAN` | Yes | Whether the registered provider probe passed. | boolean |
 | `source_key` | `TEXT` | Yes | Source under test. | key |
-| `message` | `TEXT` | Yes | Success detail. | text |
-| `...extra` | mixed | No | Provider-specific test output. | mixed |
+| `status` | `TEXT` | Yes | `pass`, `fail`, `degraded`, or `unsupported`. | enum |
+| `classification` | `TEXT` | Yes | Result class such as `success`, `missing_credentials`, `wrong_credentials`, `provider_unreachable`, `rate_limited`, `entitlement_missing`, `empty_payload`, `degraded_fallback`, `partial_success`, or `unsupported`. | enum |
+| `message` | `TEXT` | Yes | Provider-specific result code. | text |
+| `evidence` | `JSON object` | Yes | Sanitized non-secret probe evidence. Missing credentials include exact `missing_env_vars` plus catalog guidance in `missing_credentials`. | JSON |
+| `next_steps` | `JSON array[string]` | Yes | Operator remediation guidance. | list |
+| `error` | `TEXT` | No | Present when `ok=false`; mirrors `message`. | text |
 
-Failure shape:
+Before each probe the manager clears `engine.data._credentials.get_data_credential()` cache and resolves credentials through the ingestion path: projected source credentials, inherited provider-account credentials, strict runtime credential files, external `<ENV>_FILE`, `<ENV>_SECRET`, secret provider, and compatible plain env. HTTP 429 and 503 responses immediately return degraded results with retry guidance and `evidence.stop_testing=true`; composite providers do not continue to fallback probes after those statuses.
+
+### `POST /api/data_sources/test_save`
+
+The Test & Save route accepts the same source mutation payload as create/update
+plus optional `create=true`. It validates input, encrypts credentials, clears
+the credential cache, runs the registered liveness probe, and returns:
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
-| `ok` | `BOOLEAN` | Yes | `false`. | boolean |
-| `source_key` | `TEXT` | Yes | Source under test. | key |
-| `error` | `TEXT` | Yes | Failure detail. | text |
-| `...extra` | mixed | No | Provider-specific failure output. | mixed |
+| `ok` | `BOOLEAN` | Yes | Mirrors `test.ok` when save succeeded; false when save failed. | boolean |
+| `saved` | `BOOLEAN` | Yes | Whether the submitted source payload was stored. | boolean |
+| `source_key` | `TEXT` | No | Source that was saved and tested. | key |
+| `source` | `JSON object` | No | Updated source response without plaintext credentials. | JSON |
+| `test` | `JSON object` | No | Structured `/api/data_sources/test` result. | JSON |
+| `error` | `TEXT` | No | Save failure or test failure code; must not include submitted credential values. | text |
+
+### `GET /api/data_sources/logs`
+
+`manager.list_logs(...)` returns rows through `engine.runtime.telemetry_read_router.fetch_data_source_logs(...)`. The detail object is sanitized on read even though `engine.runtime.data_source_log_store` already sanitizes before persistence.
+
+| Field | Type | Req | Meaning | Units |
+| --- | --- | --- | --- | --- |
+| `ok` | `BOOLEAN` | Yes | Route success flag. | boolean |
+| `source_key` | `TEXT` | Yes | Source whose log stream was requested. | key |
+| `logs` | `JSON array[object]` | Yes | Newest-first data-source log rows. | list |
+
+Each `logs[]` row contains `ts_ms`, `source_key`, `level`, `event_type`, `message`, and `detail`. Credential-bearing keys inside `detail`, including `credentials`, `credentials_enc`, `api_key`, `api_token`, `client_secret`, `secret`, `token`, and `password`, must be returned as `[REDACTED]`. Non-secret status fields must remain unchanged.
 
 ## 21. Job Catalog API Contract
 

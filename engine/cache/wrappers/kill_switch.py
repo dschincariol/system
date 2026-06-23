@@ -11,6 +11,9 @@ from engine.cache import codec, keys, store
 from engine.cache.wrappers._common import (
     after_commit_or_now,
     dumps_json,
+    l1_get,
+    l1_invalidate,
+    l1_set,
     now_ms,
     parse_json,
     reload_after_codec_version_mismatch,
@@ -149,6 +152,41 @@ def _snapshot_is_provider_unavailable(snapshot: dict[str, Any] | None) -> bool:
     return False
 
 
+def _snapshot_has_enabled_switch(snapshot: dict[str, Any] | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    if _snapshot_is_provider_unavailable(snapshot):
+        return True
+    for row in list(snapshot.get("state") or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            if int(row.get("enabled") or 0) == 1:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _non_live_mode_explicit() -> bool:
+    mode = str(os.environ.get("ENGINE_MODE") or os.environ.get("EXECUTION_MODE") or "").strip().lower()
+    return mode in {"safe", "paper", "shadow", "backtest", "test", "testing"}
+
+
+def _l1_cacheable_snapshot(snapshot: dict[str, Any] | None) -> bool:
+    # In live-possible contexts only fail-closed/blocking snapshots enter L1.
+    # A stale blocking snapshot can only over-block; a stale clear snapshot could
+    # miss a fresh operator hold, so clear snapshots require explicit non-live mode.
+    return bool(_snapshot_has_enabled_switch(snapshot) or _non_live_mode_explicit())
+
+
+def _l1_store_snapshot(key: str, snapshot: dict[str, Any] | None) -> None:
+    if _l1_cacheable_snapshot(snapshot):
+        l1_set(key, dict(snapshot or {"state": []}))
+    else:
+        l1_invalidate(key)
+
+
 def _finalize_return_snapshot(
     snapshot: dict[str, Any] | None,
     *,
@@ -217,6 +255,7 @@ def _reload_stale_snapshot(key: str, *, reason: str) -> dict[str, Any]:
         )
     except Exception as exc:
         LOG.warning("KILL_SWITCH_CACHE_PRIME_FAILED: key=%s reason=%s error=%s", key, reason, exc, exc_info=True)
+    _l1_store_snapshot(key, snapshot)
     status = "stale_fail_closed" if _snapshot_is_provider_unavailable(snapshot) else "stale_reloaded"
     return _finalize_return_snapshot(snapshot, read_source="db_reload", cache_status=status)
 
@@ -263,6 +302,12 @@ def _load_snapshot() -> dict[str, Any]:
 
 def read_kill_switch() -> dict[str, Any]:
     key = keys.kill_switch("snapshot")
+    cached_l1 = l1_get(key)
+    if isinstance(cached_l1, dict) and _is_fresh_snapshot(cached_l1):
+        return _finalize_return_snapshot(cached_l1, read_source="l1", cache_status="fresh_l1")
+    if cached_l1 is not None:
+        l1_invalidate(key)
+
     loaded_from_loader = False
 
     def _loader() -> bytes:
@@ -308,6 +353,7 @@ def read_kill_switch() -> dict[str, Any]:
     if not _is_fresh_snapshot(snapshot):
         reason = "missing_loaded_ts_ms" if _snapshot_age_ms(snapshot) is None else "expired_loaded_ts_ms"
         return _reload_stale_snapshot(key, reason=reason)
+    _l1_store_snapshot(key, snapshot)
     return _finalize_return_snapshot(
         snapshot,
         read_source=("db_load" if loaded_from_loader else "redis"),
@@ -316,15 +362,21 @@ def read_kill_switch() -> dict[str, Any]:
 
 
 def prime_kill_switch(snapshot: dict[str, Any] | None = None) -> None:
+    key = keys.kill_switch("snapshot")
+    payload = _snapshot_for_cache(snapshot or _load_snapshot())
+    l1_invalidate(key)
     store.prime(
-        keys.kill_switch("snapshot"),
-        codec.encode(_snapshot_for_cache(snapshot or _load_snapshot()), version=KILL_SWITCH_CODEC_VERSION),
+        key,
+        codec.encode(payload, version=KILL_SWITCH_CODEC_VERSION),
         ttl_s=_configured_ttl_s(),
     )
+    _l1_store_snapshot(key, payload)
 
 
 def invalidate_kill_switch() -> None:
-    store.invalidate(keys.kill_switch("snapshot"))
+    key = keys.kill_switch("snapshot")
+    l1_invalidate(key)
+    store.invalidate(key)
 
 
 def _ensure_schema(con: Any) -> None:
@@ -430,10 +482,13 @@ def set_kill_switch(
         _persist(con)
         after_commit_or_now(con, prime_kill_switch)
     else:
+        key = keys.kill_switch("snapshot")
+        l1_invalidate(key)
         store.write_through(
-            keys.kill_switch("snapshot"),
+            key,
             _encode_loaded_snapshot,
             persist=_persist,
             ttl_s=_configured_ttl_s(),
         )
+        l1_invalidate(key)
     return row

@@ -145,7 +145,8 @@ def api_post_self_repair(_parsed=None, body=None, ctx=None):
                     """
                     SELECT job_name, owner, pid, heartbeat_ts_ms
                     FROM job_locks
-                    WHERE heartbeat_ts_ms IS NULL OR heartbeat_ts_ms < ?
+                    WHERE (heartbeat_ts_ms IS NULL OR heartbeat_ts_ms < ?)
+                      AND job_name NOT LIKE 'ingestion_restart_guard/v1::%'
                     ORDER BY job_name ASC
                     """,
                     (int(threshold_ms),),

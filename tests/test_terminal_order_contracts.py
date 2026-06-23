@@ -7,14 +7,20 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+import pytest
 
 import engine.api.http_transport as http_transport
 from engine.strategy import portfolio_execution_intents as execution_intents
 from engine.strategy.portfolio_execution_intents import _terminal_signed_qty
 from engine.terminal.api import api_terminal as terminal_api
 from engine.terminal.api import api_terminal_orders as terminal_orders
+
+
+pytestmark = pytest.mark.safety_critical
 
 
 class _TestHTTPServer(ThreadingHTTPServer):
@@ -385,6 +391,72 @@ def test_terminal_order_post_through_http_dispatcher_uses_json_body(monkeypatch,
     assert result["side"] == "SELL"
     assert result["qty"] == 3.0
     _assert_terminal_sell_contract(writes)
+
+
+def test_terminal_order_blocked_through_http_dispatcher_returns_structured_403(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "true")
+    monkeypatch.setenv("EXECUTION_PRELIVE_RECONCILE", "1")
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "live")
+    monkeypatch.setenv("EXECUTION_MODE", "live")
+    monkeypatch.setenv("TS_API_ALLOW_LOCALHOST_MUTATIONS_WITHOUT_TOKEN", "1")
+    dashboard_token = "dashboard-terminal-test-token-1234567890"
+    writes = _FakeWriteConnection()
+    gate = Mock(return_value={"real_trading_allowed": True})
+
+    monkeypatch.setattr(terminal_orders, "execution_gate_snapshot", gate)
+    monkeypatch.setattr(terminal_orders, "connect", lambda **_kwargs: _FakeReadConnection())
+    monkeypatch.setattr(terminal_orders, "_table_exists", lambda _con, table: table == "portfolio_orders")
+    monkeypatch.setattr(terminal_orders, "cache_invalidate_namespace", lambda _namespace: None)
+    monkeypatch.setattr(terminal_orders, "run_write_txn", lambda fn, **_kwargs: fn(writes))
+    _patch_dispatcher_runtime_guards(monkeypatch)
+    handler_cls = http_transport.build_handler(
+        ROUTE_SPECS=[("POST", "/api/terminal/order", "api_post_terminal_order")],
+        API_HANDLERS={"api_post_terminal_order": terminal_orders.api_post_terminal_order},
+        dashboard_api_token=dashboard_token,
+        ctx={},
+        static_dir=str(tmp_path),
+    )
+    server = _TestHTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/api/terminal/order"
+        req = Request(
+            url,
+            data=json.dumps({
+                "symbol": "spy",
+                "side": "buy",
+                "qty": 1,
+                "confirm": "TRADE",
+                "confirmation": "TRADE",
+                "consequence_ack": True,
+                "actor": "test",
+                "source": "terminal_test",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-API-Token": dashboard_token},
+            method="POST",
+        )
+        try:
+            urlopen(req, timeout=5)
+            raise AssertionError("request unexpectedly succeeded")
+        except HTTPError as exc:
+            code = exc.code
+            result = json.loads(exc.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert code == 403
+    assert result["ok"] is False
+    assert result["error"] == "execution_blocked"
+    assert result["reason_code"] == "disable_live_execution_env"
+    assert result["meta"]["status"] == 403
+    assert result["message"]
+    assert result["gate"]["real_trading_allowed"] is False
+    assert writes.statements == []
+    gate.assert_not_called()
 
 
 def test_terminal_snapshot_includes_execution_barrier(monkeypatch):

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from engine.strategy.feature_registry import expected_columns
 
@@ -70,3 +71,163 @@ def test_expected_columns_order_is_stable_across_hash_seeds(tmp_path) -> None:
 
     assert outputs[0]
     assert outputs[1:] == [outputs[0], outputs[0]]
+
+
+def test_registered_feature_ids_cache_is_ttl_bounded_and_invalidatable(monkeypatch) -> None:
+    import engine.strategy.feature_registry as feature_registry
+    from engine.strategy.discovery import registry as discovery_registry
+
+    feature_registry.invalidate_feature_registry_cache()
+    old_ttl = float(feature_registry.FEATURE_REGISTRY_CACHE_TTL_S)
+    records = [
+        SimpleNamespace(
+            feature_id="unit.live.cache_a",
+            stage=feature_registry.FEATURE_STAGE_LIVE,
+        )
+    ]
+    calls: list[str | None] = []
+
+    def _fake_list_registered_features(*, stage=None, limit=5000):
+        calls.append(stage)
+        return [
+            record
+            for record in list(records)
+            if stage is None or str(record.stage) == str(stage)
+        ][: int(limit)]
+
+    try:
+        feature_registry.FEATURE_REGISTRY_CACHE_TTL_S = 30.0
+        monkeypatch.setattr(discovery_registry, "list_registered_features", _fake_list_registered_features)
+
+        first = feature_registry.registered_feature_ids(include_shadow=False)
+        second = feature_registry.registered_feature_ids(include_shadow=False)
+
+        assert "unit.live.cache_a" in first
+        assert second == first
+        assert calls == [feature_registry.FEATURE_STAGE_LIVE]
+
+        records.append(
+            SimpleNamespace(
+                feature_id="unit.live.cache_b",
+                stage=feature_registry.FEATURE_STAGE_LIVE,
+            )
+        )
+        assert "unit.live.cache_b" not in feature_registry.registered_feature_ids(include_shadow=False)
+
+        feature_registry.invalidate_feature_registry_cache()
+        refreshed = feature_registry.registered_feature_ids(include_shadow=False)
+        assert "unit.live.cache_b" in refreshed
+        assert calls == [feature_registry.FEATURE_STAGE_LIVE, feature_registry.FEATURE_STAGE_LIVE]
+
+        allowlist = feature_registry._registered_feature_allowlist(include_shadow=False)
+        assert isinstance(allowlist, frozenset)
+        assert "unit.live.cache_b" in allowlist
+    finally:
+        feature_registry.FEATURE_REGISTRY_CACHE_TTL_S = old_ttl
+        feature_registry.invalidate_feature_registry_cache()
+
+
+def test_registered_feature_ids_cache_refreshes_after_ttl(monkeypatch) -> None:
+    import engine.strategy.feature_registry as feature_registry
+    from engine.strategy.discovery import registry as discovery_registry
+
+    feature_registry.invalidate_feature_registry_cache()
+    old_ttl = float(feature_registry.FEATURE_REGISTRY_CACHE_TTL_S)
+    now = [100.0]
+    records = [
+        SimpleNamespace(
+            feature_id="unit.live.ttl_a",
+            stage=feature_registry.FEATURE_STAGE_LIVE,
+        )
+    ]
+    calls: list[str | None] = []
+
+    def _fake_list_registered_features(*, stage=None, limit=5000):
+        calls.append(stage)
+        return [
+            record
+            for record in list(records)
+            if stage is None or str(record.stage) == str(stage)
+        ][: int(limit)]
+
+    try:
+        feature_registry.FEATURE_REGISTRY_CACHE_TTL_S = 1.0
+        monkeypatch.setattr(feature_registry.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(discovery_registry, "list_registered_features", _fake_list_registered_features)
+
+        assert "unit.live.ttl_a" in feature_registry.registered_feature_ids(include_shadow=False)
+        records.append(
+            SimpleNamespace(
+                feature_id="unit.live.ttl_b",
+                stage=feature_registry.FEATURE_STAGE_LIVE,
+            )
+        )
+        assert "unit.live.ttl_b" not in feature_registry.registered_feature_ids(include_shadow=False)
+
+        now[0] += 1.1
+        refreshed = feature_registry.registered_feature_ids(include_shadow=False)
+
+        assert "unit.live.ttl_b" in refreshed
+        assert calls == [feature_registry.FEATURE_STAGE_LIVE, feature_registry.FEATURE_STAGE_LIVE]
+    finally:
+        feature_registry.FEATURE_REGISTRY_CACHE_TTL_S = old_ttl
+        feature_registry.invalidate_feature_registry_cache()
+
+
+def test_registered_feature_ids_cache_is_separated_by_stage_and_shadow(monkeypatch) -> None:
+    import engine.strategy.feature_registry as feature_registry
+    from engine.strategy.discovery import registry as discovery_registry
+
+    feature_registry.invalidate_feature_registry_cache()
+    old_ttl = float(feature_registry.FEATURE_REGISTRY_CACHE_TTL_S)
+    shadow_builtin = feature_registry.TS_FOUNDATION_CHRONOS_FEATURE_IDS[0]
+    records = [
+        SimpleNamespace(
+            feature_id="unit.live.stage",
+            stage=feature_registry.FEATURE_STAGE_LIVE,
+        ),
+        SimpleNamespace(
+            feature_id="unit.shadow.stage",
+            stage=feature_registry.FEATURE_STAGE_SHADOW,
+        ),
+    ]
+    calls: list[str | None] = []
+
+    def _fake_list_registered_features(*, stage=None, limit=5000):
+        calls.append(stage)
+        return [
+            record
+            for record in list(records)
+            if stage is None or str(record.stage) == str(stage)
+        ][: int(limit)]
+
+    try:
+        feature_registry.FEATURE_REGISTRY_CACHE_TTL_S = 30.0
+        monkeypatch.setattr(discovery_registry, "list_registered_features", _fake_list_registered_features)
+
+        live_ids = feature_registry.registered_feature_ids(include_shadow=False)
+        shadow_ids = feature_registry.registered_feature_ids(
+            include_shadow=True,
+            stage=feature_registry.FEATURE_STAGE_SHADOW,
+        )
+        live_allowlist = feature_registry._registered_feature_allowlist(
+            include_shadow=True,
+            stage=feature_registry.FEATURE_STAGE_LIVE,
+        )
+
+        assert "unit.live.stage" in live_ids
+        assert "unit.shadow.stage" not in live_ids
+        assert shadow_builtin not in live_ids
+        assert "unit.shadow.stage" in shadow_ids
+        assert shadow_builtin in shadow_ids
+        assert "unit.live.stage" not in shadow_ids
+        assert isinstance(live_allowlist, frozenset)
+        assert "unit.live.stage" in live_allowlist
+        assert "unit.shadow.stage" not in live_allowlist
+        assert calls == [
+            feature_registry.FEATURE_STAGE_LIVE,
+            feature_registry.FEATURE_STAGE_SHADOW,
+        ]
+    finally:
+        feature_registry.FEATURE_REGISTRY_CACHE_TTL_S = old_ttl
+        feature_registry.invalidate_feature_registry_cache()

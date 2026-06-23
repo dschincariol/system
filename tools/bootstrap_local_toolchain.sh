@@ -119,7 +119,7 @@ ensure_venv() {
   fi
 
   require_python_311 "$VENV_DIR/bin/python"
-  REQ_FILE="$(bash "$ROOT/deploy/bin/resolve_python_requirements.sh" "$ROOT")"
+  REQ_FILE="$(PYTHON_BIN="$VENV_DIR/bin/python" bash "$ROOT/deploy/bin/resolve_python_requirements.sh" "$ROOT")"
   log "installing Python dependencies from $REQ_FILE"
   "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel setuptools
   "$VENV_DIR/bin/python" -m pip install -r "$REQ_FILE"

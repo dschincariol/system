@@ -59,11 +59,20 @@ def _polygon_success_contracts():
     )
 
 
+def _bulk_write_counts(_con, *, polygon_rows=None, tradier_rows=None):
+    polygon_n = len(list(polygon_rows or []))
+    tradier_n = len(list(tradier_rows or []))
+    return {"polygon_rows": polygon_n, "tradier_rows": tradier_n, "raw_rows": polygon_n + tradier_n}
+
+
 class _FakeConnection:
     def close(self) -> None:
         return None
 
     def commit(self) -> None:
+        return None
+
+    def executemany(self, _sql, _seq_of_params):
         return None
 
 
@@ -135,12 +144,11 @@ class OptionsPollProviderFailoverTests(unittest.TestCase):
             stack.enter_context(patch("engine.data.options_poll.connect", return_value=_FakeConnection()))
             stack.enter_context(patch("engine.data.options_poll.get_active_symbols", return_value=["SPY"]))
             stack.enter_context(
-                patch("engine.data.options_poll._load_symbol_state", return_value={"disabled_until_ts_ms": 0})
+                patch("engine.data.options_poll._load_symbol_states", return_value={"SPY": {"disabled_until_ts_ms": 0}})
             )
             stack.enter_context(patch("engine.data.options_poll._record_symbol_success", return_value={}))
-            stack.enter_context(patch("engine.data.options_poll._write_polygon_contracts", return_value=1))
-            stack.enter_context(patch("engine.data.options_poll._write_tradier_rows", return_value=1))
-            stack.enter_context(patch("engine.data.options_poll.put_event", return_value=None))
+            stack.enter_context(patch("engine.data.options_poll._write_options_bulk_rows", side_effect=_bulk_write_counts))
+            stack.enter_context(patch("engine.data.options_poll._write_options_snapshot_event", return_value=None))
             stack.enter_context(patch("engine.data.options_poll.checkpoint_if_due", return_value=None))
             stack.enter_context(
                 patch(

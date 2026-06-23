@@ -217,6 +217,47 @@ class RegimeDetectorTests(unittest.TestCase):
         self.assertEqual(str(row[1]), "AMD")
         self.assertEqual(tuple(str(value) for value in row[2:]), ("high", "bearish", "thin"))
 
+    def test_unknown_state_does_not_downgrade_known_regime_row(self) -> None:
+        ts_ms = 1_700_000_000_000
+        con = self.storage.connect(readonly=False)
+        try:
+            con.execute(
+                """
+                INSERT INTO regime_state(time, symbol, volatility_regime, trend_regime, liquidity_regime)
+                VALUES(?,?,?,?,?)
+                """,
+                (ts_ms, "AMD", "high", "bullish", "deep"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        self.engine_regime.DEFAULT_REGIME_DETECTOR._persist_state(
+            {
+                "time": ts_ms,
+                "symbol": "AMD",
+                "volatility_regime": "unknown",
+                "trend_regime": "unknown",
+                "liquidity_regime": "unknown",
+            }
+        )
+
+        con = self.storage.connect(readonly=True)
+        try:
+            row = con.execute(
+                """
+                SELECT volatility_regime, trend_regime, liquidity_regime
+                FROM regime_state
+                WHERE symbol='AMD' AND time=?
+                """,
+                (ts_ms,),
+            ).fetchone()
+        finally:
+            con.close()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(tuple(str(value) for value in row), ("high", "bullish", "deep"))
+
 
 if __name__ == "__main__":
     unittest.main()

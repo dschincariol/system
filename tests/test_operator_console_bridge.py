@@ -203,6 +203,8 @@ def test_operator_sidecar_status_payload_reports_bridge_metadata(monkeypatch):
     assert payload["http_proxy_prefix"] == "/operator/api/"
     assert "Start or restart" in payload["action"]
     assert payload["websocket"]["proxy_enabled"] is False
+    assert "direct_url" not in payload["websocket"]
+    assert "direct_url" not in payload
     assert seen["url"] == "http://127.0.0.1:4555/api/operator/ping"
 
 
@@ -298,7 +300,38 @@ def test_operator_status_route_reports_useful_sidecar_status(monkeypatch):
     assert payload["http_proxy_prefix"] == "/operator/api/"
     assert payload["base_url"] == f"http://127.0.0.1:{sidecar.server_port}"
     assert payload["websocket"]["proxy_enabled"] is False
-    assert payload["websocket"]["direct_url"] == f"ws://127.0.0.1:{sidecar.server_port}/ws/operator"
+    assert "direct_url" not in payload["websocket"]
+    assert any(req["path"] == "/api/operator/ping" for req in _SidecarHandler.requests)
+
+
+def test_dashboard_operator_ping_bridge_proxies_sidecar_ping(monkeypatch, tmp_path):
+    import dashboard_server
+    import engine.api.http_transport as http_transport
+
+    monkeypatch.setattr(http_transport, "emit_counter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(http_transport, "emit_timing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(http_transport, "deny_if_shutdown", lambda: None)
+    _SidecarHandler.requests = []
+
+    with _http_server(_SidecarHandler) as (_sidecar_url, sidecar):
+        monkeypatch.setenv("OPERATOR_BIND_HOST", "127.0.0.1")
+        monkeypatch.setenv("OPERATOR_PORT", str(sidecar.server_port))
+        handler_cls = http_transport.build_handler(
+            ROUTE_SPECS=[("GET", "/api/operator/ping", "api_get_operator_ping")],
+            API_HANDLERS={"api_get_operator_ping": dashboard_server.api_get_operator_ping},
+            dashboard_api_token="",
+            ctx={},
+            static_dir=str(tmp_path),
+        )
+        with _http_server(handler_cls) as (base_url, _server):
+            status, headers, payload = _read_json(f"{base_url}/api/operator/ping")
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert payload["ok"] is True
+    assert payload["service"] == "dashboard_operator_bridge"
+    assert payload["operator"]["service"] == "mock_operator"
+    assert payload["sidecar"]["reachable"] is True
     assert any(req["path"] == "/api/operator/ping" for req in _SidecarHandler.requests)
 
 
@@ -518,8 +551,8 @@ def test_operator_websocket_bridge_returns_deferred_upgrade_response(monkeypatch
     assert headers["Upgrade"] == "websocket"
     assert body["ok"] is False
     assert body["error"] == "websocket_proxy_deferred"
-    assert "direct sidecar WebSocket" in body["action"]
-    assert body["sidecar_ws_url"] == "ws://127.0.0.1:4556/ws/operator"
+    assert "dashboard HTTP polling" in body["action"]
+    assert "sidecar_ws_url" not in body
     assert "HTTP only" in body["detail"]
 
 
@@ -593,6 +626,21 @@ def test_operator_sidecar_rejects_sensitive_get_without_operator_token_and_redac
         assert code == 403
         assert body["ok"] is False
         assert body["error"] == "operator_forbidden"
+        assert body["reason_code"] == "operator_token_required"
+
+        req = Request(f"http://127.0.0.1:{port}/api/operator/support_snapshot", headers={"Accept": "application/json"})
+        try:
+            urlopen(req, timeout=5)
+            raise AssertionError("support snapshot request unexpectedly succeeded")
+        except HTTPError as exc:
+            snapshot_code = exc.code
+            snapshot_body = json.loads(exc.read().decode("utf-8"))
+
+        assert snapshot_code == 403
+        assert snapshot_body["ok"] is False
+        assert snapshot_body["error"] == "operator_forbidden"
+        assert snapshot_body["reason_code"] == "operator_token_required"
+        assert "X-Operator-Token" in snapshot_body["required_auth"]
 
         status, _headers, config = _read_json(
             f"http://127.0.0.1:{port}/api/operator/config",
@@ -689,12 +737,17 @@ def test_operator_sidecar_rejects_loopback_post_without_operator_token():
 def test_operator_sidecar_rejects_missing_structured_confirmation_with_operator_token(tmp_path):
     root = Path(__file__).resolve().parents[1]
     port = _unused_local_port()
+    operator_token = "operator-token-1234567890"
+    operator_token_file = tmp_path / "operator_api_token"
+    operator_token_file.write_text(operator_token, encoding="utf-8")
+    operator_token_file.chmod(0o600)
     env = dict(os.environ)
     env.update(
         {
             "OPERATOR_BIND_HOST": "127.0.0.1",
             "OPERATOR_PORT": str(port),
-            "OPERATOR_API_TOKEN": "operator-token-1234567890",
+            "OPERATOR_API_TOKEN": operator_token,
+            "OPERATOR_API_TOKEN_FILE": str(operator_token_file),
             "OPERATOR_DATA_DIR": str(tmp_path / "operator-data"),
             "OPERATOR_AUTO_START": "0",
             "DASHBOARD_BASE": "http://127.0.0.1:9",
@@ -733,11 +786,11 @@ def test_operator_sidecar_rejects_missing_structured_confirmation_with_operator_
         req = Request(
             f"http://127.0.0.1:{port}/api/operator/factoryReset",
             data=b"{}",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-Operator-Token": "operator-token-1234567890",
-            },
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "X-Operator-Token": operator_token,
+                },
             method="POST",
         )
         try:

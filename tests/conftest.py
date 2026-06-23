@@ -54,22 +54,6 @@ os.environ.setdefault("TS_PG_CONNECT_TIMEOUT", "1")
 
 def pytest_configure(config):
     install_socket_guard()
-    config.addinivalue_line("markers", "linux_only: test runs only on Linux")
-    config.addinivalue_line(
-        "markers",
-        "live_network: test intentionally contacts non-local live services; "
-        "deselected unless TRADING_TEST_ALLOW_LIVE_NETWORK=1",
-    )
-    config.addinivalue_line(
-        "markers",
-        "requires_postgres: test needs a reachable Postgres instance "
-        "at TS_PG_DSN; auto-skipped when unreachable",
-    )
-    config.addinivalue_line(
-        "markers",
-        "requires_redis: test needs a reachable Redis instance at "
-        "TS_REDIS_URL; auto-skipped when unreachable",
-    )
 
 
 def pytest_unconfigure(config):

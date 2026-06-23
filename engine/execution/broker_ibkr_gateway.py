@@ -827,6 +827,53 @@ def _mk_stock_contract(symbol: str):
     return c
 
 
+def _fx_pair_parts(symbol: str) -> tuple[str, str] | None:
+    try:
+        from engine.data.fx_instrument import parse_fx_symbol
+
+        parsed = parse_fx_symbol(symbol)
+        if parsed is not None and parsed.base_ccy and parsed.quote_ccy:
+            if str(parsed.instrument_kind or "") == "fx_spot":
+                return str(parsed.base_ccy), str(parsed.quote_ccy)
+    except Exception as e:
+        _warn_nonfatal("BROKER_IBKR_GATEWAY_FX_PARSE_FAILED", e, once_key=f"fx_parse:{symbol}", symbol=str(symbol))
+
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        text = str(symbol or "").upper().strip().replace("/", "").replace("_", "")
+        if asset_class_for_symbol(text) == "FX" and len(text) == 6 and text.isalpha() and text[:3] != text[3:]:
+            return text[:3], text[3:]
+    except Exception as e:
+        _warn_nonfatal("BROKER_IBKR_GATEWAY_FX_FALLBACK_FAILED", e, once_key=f"fx_fallback:{symbol}", symbol=str(symbol))
+    return None
+
+
+def _is_fx_symbol(symbol: str) -> bool:
+    return _fx_pair_parts(symbol) is not None
+
+
+def _mk_fx_contract(symbol: str):
+    from ibapi.contract import Contract
+
+    parts = _fx_pair_parts(symbol)
+    if parts is None:
+        raise ValueError(f"IBKR FX contract requires a parseable FX spot pair: {symbol!r}")
+    base_ccy, quote_ccy = parts
+    c = Contract()
+    c.symbol = str(base_ccy).upper().strip()
+    c.secType = "CASH"
+    c.exchange = "IDEALPRO"
+    c.currency = str(quote_ccy).upper().strip()
+    return c
+
+
+def _mk_contract_for_symbol(symbol: str):
+    if _is_fx_symbol(symbol):
+        return _mk_fx_contract(symbol)
+    return _mk_stock_contract(symbol)
+
+
 def _mk_market_order(qty: float):
     from ibapi.order import Order
     o = Order()
@@ -1206,7 +1253,7 @@ def apply_latest_portfolio_orders_live(
                         "audit": dict(audit or {}),
                     }
 
-                contract = _mk_stock_contract(symbol)
+                contract = _mk_contract_for_symbol(symbol)
                 limit_px = None
                 if str(order_type).upper().strip() == "LIMIT":
                     liq_offset_bps = float(order_meta.get("liquidity_limit_offset_bps") or 0.0)
@@ -1726,7 +1773,7 @@ def flatten_positions(
                 continue
             try:
                 oid = _consume_next_order_id(app)
-                contract = _mk_stock_contract(symbol)
+                contract = _mk_contract_for_symbol(symbol)
                 order = _mk_market_order(qty)
                 placed_ref = _place_order_with_order_ref(
                     app,
@@ -2046,7 +2093,7 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     app = _connect_ib()
     try:
         oid = _consume_next_order_id(app)
-        contract = _mk_stock_contract(symbol)
+        contract = _mk_contract_for_symbol(symbol)
         order = _mk_limit_order(qty, limit_price)
         ibkr_order_ref = _place_order_with_order_ref(
             app,
@@ -2109,7 +2156,7 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     app = _connect_ib()
     try:
         oid = _consume_next_order_id(app)
-        contract = _mk_stock_contract(symbol)
+        contract = _mk_contract_for_symbol(symbol)
         order = _mk_market_order(qty)
         ibkr_order_ref = _place_order_with_order_ref(
             app,

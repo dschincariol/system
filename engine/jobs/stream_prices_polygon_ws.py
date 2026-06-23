@@ -40,7 +40,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from engine.data._credentials import get_data_credential
+from engine.data.price_event_keys import compute_price_raw_event_key
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.json_codec import dumps_text as _json_dumps_text
+from engine.runtime.json_codec import loads as _json_loads
 from engine.runtime.runtime_meta import meta_set_if_missing, meta_set, meta_get
 from services.data_source_manager import get_manager
 from engine.runtime.lifecycle_state import set_state, LIVE, WARMING_UP, DEGRADED
@@ -152,7 +155,7 @@ def _now_ms() -> int:
 
 def _safe_json_loads(s: str) -> Any:
     try:
-        return json.loads(s)
+        return _json_loads(s)
     except Exception as e:
         _warn_nonfatal(
             "POLYGON_WS_JSON_PARSE_FAILED",
@@ -462,6 +465,192 @@ def _load_symbol_map() -> Dict[str, str]:
 
     return out
 
+
+def _parse_ws_event_float(
+    value: Any,
+    *,
+    code: str,
+    once_key: str,
+    symbol: str,
+    raw_field: str,
+) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception as e:
+        _warn_nonfatal(
+            code,
+            e,
+            once_key=f"{once_key}:{symbol}",
+            symbol=str(symbol),
+            raw_field=str(raw_field),
+            raw_value=value,
+        )
+        return None
+
+
+def _parse_ws_event_ts(value: Any, *, default_ts_ms: int, symbol: str, event_type: str) -> int:
+    if value is None:
+        return int(default_ts_ms)
+    try:
+        return int(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "POLYGON_WS_EVENT_TIMESTAMP_PARSE_FAILED",
+            e,
+            once_key=f"event_ts:{event_type}:{symbol}",
+            symbol=str(symbol),
+            event_type=str(event_type),
+            raw_value=value,
+        )
+        return int(default_ts_ms)
+
+
+def _normalize_legacy_ws_event(ev: Dict[str, Any], now_ms: int) -> Optional[Dict[str, Any]]:
+    et = str(ev.get("ev") or "")
+    if et == "status":
+        return None
+
+    sym = ev.get("sym") or ev.get("symbol")
+    if not sym or et not in {"T", "Q"}:
+        return None
+    sym_s = str(sym)
+    event_ts_ms = _parse_ws_event_ts(ev.get("t"), default_ts_ms=int(now_ms), symbol=sym_s, event_type=et)
+
+    if et == "T":
+        event_key = compute_price_raw_event_key(
+            ev,
+            provider=PROVIDER_NAME,
+            symbol=sym_s,
+            event_type="T",
+            event_ts_ms=event_ts_ms,
+            ts_ms=event_ts_ms,
+        )
+        price = _parse_ws_event_float(
+            ev.get("p"),
+            code="POLYGON_WS_TRADE_PRICE_PARSE_FAILED",
+            once_key="trade_price",
+            symbol=sym_s,
+            raw_field="p",
+        )
+        size = _parse_ws_event_float(
+            ev.get("s"),
+            code="POLYGON_WS_TRADE_SIZE_PARSE_FAILED",
+            once_key="trade_size",
+            symbol=sym_s,
+            raw_field="s",
+        )
+        return {
+            "symbol": sym_s,
+            "event_type": "T",
+            "event_key": event_key,
+            "event_ts_ms": int(event_ts_ms),
+            "price": price,
+            "size": size,
+        }
+
+    event_key = compute_price_raw_event_key(
+        ev,
+        provider=PROVIDER_NAME,
+        symbol=sym_s,
+        event_type="Q",
+        event_ts_ms=event_ts_ms,
+        ts_ms=event_ts_ms,
+    )
+    bid = _parse_ws_event_float(
+        ev.get("bp"),
+        code="POLYGON_WS_QUOTE_BID_PARSE_FAILED",
+        once_key="quote_bid",
+        symbol=sym_s,
+        raw_field="bp",
+    )
+    ask = _parse_ws_event_float(
+        ev.get("ap"),
+        code="POLYGON_WS_QUOTE_ASK_PARSE_FAILED",
+        once_key="quote_ask",
+        symbol=sym_s,
+        raw_field="ap",
+    )
+    bid_size = _parse_ws_event_float(
+        ev.get("bs"),
+        code="POLYGON_WS_QUOTE_BID_SIZE_PARSE_FAILED",
+        once_key="quote_bid_size",
+        symbol=sym_s,
+        raw_field="bs",
+    )
+    ask_size = _parse_ws_event_float(
+        ev.get("as"),
+        code="POLYGON_WS_QUOTE_ASK_SIZE_PARSE_FAILED",
+        once_key="quote_ask_size",
+        symbol=sym_s,
+        raw_field="as",
+    )
+    return {
+        "symbol": sym_s,
+        "event_type": "Q",
+        "event_key": event_key,
+        "event_ts_ms": int(event_ts_ms),
+        "bid": bid,
+        "ask": ask,
+        "bid_size": bid_size,
+        "ask_size": ask_size,
+    }
+
+
+def _build_legacy_ws_record(event: Dict[str, Any], base_rec: Dict[str, Any]) -> Dict[str, Any]:
+    et = str(event.get("event_type") or "")
+    sym = str(event.get("symbol") or "")
+    event_ts_ms = int(event.get("event_ts_ms") or _now_ms())
+    rec = dict(base_rec or {"ts_ms": event_ts_ms})
+    prev_ts_ms = int(rec.get("ts_ms") or 0)
+
+    if et == "T":
+        price = event.get("price")
+        if price is not None:
+            rec["last"] = float(price)
+        size = event.get("size")
+        if size is not None:
+            rec["volume"] = float(size)
+        _update_trade_microstructure(rec, price, size)
+        rec["trade_ts_ms"] = int(event_ts_ms)
+        rec["ts_ms"] = max(int(rec.get("quote_ts_ms") or 0), int(rec.get("trade_ts_ms") or 0), int(prev_ts_ms or 0))
+        return rec
+
+    if et == "Q":
+        bid = event.get("bid")
+        ask = event.get("ask")
+        bid_size = event.get("bid_size")
+        ask_size = event.get("ask_size")
+        if bid is not None:
+            rec["bid"] = float(bid)
+        if ask is not None:
+            rec["ask"] = float(ask)
+        if bid_size is not None:
+            rec["bid_sz"] = float(bid_size)
+        if ask_size is not None:
+            rec["ask_sz"] = float(ask_size)
+
+        if ("bid" in rec) and ("ask" in rec):
+            try:
+                rec["spread"] = float(rec["ask"]) - float(rec["bid"])
+            except Exception as e:
+                _warn_nonfatal(
+                    "POLYGON_WS_QUOTE_SPREAD_COMPUTE_FAILED",
+                    e,
+                    once_key=f"quote_spread:{sym}",
+                    symbol=sym,
+                    bid=rec.get("bid"),
+                    ask=rec.get("ask"),
+                )
+
+        _update_quote_microstructure(rec)
+        rec["quote_ts_ms"] = int(event_ts_ms)
+        rec["ts_ms"] = max(int(rec.get("trade_ts_ms") or 0), int(rec.get("quote_ts_ms") or 0), int(prev_ts_ms or 0))
+
+    return rec
+
+
 class _WsIngest:
     def __init__(self, api_key: str, endpoint: str, subscribe_trades: bool, subscribe_quotes: bool):
         if websocket is None:
@@ -481,6 +670,9 @@ class _WsIngest:
 
         # ticker -> latest fields
         self._last: Dict[str, Dict[str, Any]] = {}
+        self._last_event_ts_by_stream: Dict[str, int] = {}
+        self._last_event_key_by_stream: Dict[str, str] = {}
+        self._dedup_drop_count = 0
         self._last_msg_ts_ms = 0
         self._session_started_ts_ms = _now_ms()
         self._last_error: Optional[str] = None
@@ -552,7 +744,7 @@ class _WsIngest:
 
         try:
             if self._ws:
-                self._ws.send(json.dumps(msg))
+                self._ws.send(_json_dumps_text(msg))
                 with self._lock:
                     self._subscribed |= set(to_add)
         except Exception as e:
@@ -600,7 +792,7 @@ class _WsIngest:
         self._last_error = None
 
         try:
-            ws.send(json.dumps({"action": "auth", "params": self.api_key}))
+            ws.send(_json_dumps_text({"action": "auth", "params": self.api_key}))
         except Exception as e:
             self._last_error = (repr(e) or 'ws_auth_failed')[:400]
             _warn_nonfatal("POLYGON_WS_AUTH_SEND_FAILED", e, once_key="auth_send")
@@ -671,146 +863,96 @@ class _WsIngest:
         if not isinstance(payload, list):
             return
 
-        with self._lock:
-            for ev in payload:
-                if not isinstance(ev, dict):
+        events: List[Dict[str, Any]] = []
+        for ev in payload:
+            if not isinstance(ev, dict):
+                continue
+            normalized = _normalize_legacy_ws_event(ev, now_ms)
+            if normalized:
+                events.append(normalized)
+
+        for event in events:
+            rec = self._apply_normalized_legacy_event(event)
+            if not rec:
+                continue
+            try:
+                meta_set("price_provider_active", PROVIDER_NAME, best_effort=True)
+                did = meta_set_if_missing("first_price_ts_ms", str(int(rec.get("ts_ms") or now_ms)))
+                if did:
+                    set_state(LIVE, "first_market_data_tick")
+            except Exception as e:
+                log.warning("failed to update first market data lifecycle latch: %s", repr(e))
+
+    def _apply_normalized_legacy_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        sym = str(event.get("symbol") or "").strip()
+        et = str(event.get("event_type") or "").strip().upper()
+        if not sym or et not in {"T", "Q"}:
+            return None
+        event_ts_ms = int(event.get("event_ts_ms") or _now_ms())
+        event_key = str(event.get("event_key") or "")
+        stream_key = f"{et}:{sym}"
+
+        for _attempt in range(32):
+            with self._lock:
+                if not self._legacy_event_can_commit_locked(stream_key, event_ts_ms, event_key):
+                    return None
+                base_rec = dict((self._last or {}).get(sym) or {"ts_ms": event_ts_ms})
+
+            rec = _build_legacy_ws_record(event, base_rec)
+
+            with self._lock:
+                current_rec = dict((self._last or {}).get(sym) or {"ts_ms": event_ts_ms})
+                if current_rec != base_rec:
                     continue
-
-                et = str(ev.get("ev") or "")
-                if et == "status":
-                    continue
-
-                sym = ev.get("sym") or ev.get("symbol")
-                if not sym:
-                    continue
-                sym = str(sym)
-
-                rec = self._last.get(sym) or {"ts_ms": now_ms}
-
-                if et == "T":
-                    p = ev.get("p")
-                    if p is not None:
-                        try:
-                            rec["last"] = float(p)
-                        except Exception as e:
-                            _warn_nonfatal(
-                                "POLYGON_WS_TRADE_PRICE_PARSE_FAILED",
-                                e,
-                                once_key=f"trade_price:{sym}",
-                                symbol=str(sym),
-                                raw_value=p,
-                            )
-                    sz = ev.get("s")
-                    if sz is not None:
-                        try:
-                            rec["volume"] = float(sz)
-                        except Exception as e:
-                            _warn_nonfatal(
-                                "POLYGON_WS_TRADE_SIZE_PARSE_FAILED",
-                                e,
-                                once_key=f"trade_size:{sym}",
-                                symbol=str(sym),
-                                raw_value=sz,
-                            )
-
-                    _update_trade_microstructure(rec, p, sz)
-
-                    tms = ev.get("t")
-                    if tms is not None:
-                        try:
-                            rec["ts_ms"] = int(tms)
-                        except Exception:
-                            rec["ts_ms"] = now_ms
-                    else:
-                        rec["ts_ms"] = now_ms
-
-                elif et == "Q":
-                    bp = ev.get("bp")
-                    ap = ev.get("ap")
-                    bs = ev.get("bs")
-                    a_sz = ev.get("as")
-
-                    if bp is not None:
-                        try:
-                            rec["bid"] = float(bp)
-                        except Exception as e:
-                            _warn_nonfatal(
-                                "POLYGON_WS_QUOTE_BID_PARSE_FAILED",
-                                e,
-                                once_key=f"quote_bid:{sym}",
-                                symbol=str(sym),
-                                raw_value=bp,
-                            )
-                    if ap is not None:
-                        try:
-                            rec["ask"] = float(ap)
-                        except Exception as e:
-                            _warn_nonfatal(
-                                "POLYGON_WS_QUOTE_ASK_PARSE_FAILED",
-                                e,
-                                once_key=f"quote_ask:{sym}",
-                                symbol=str(sym),
-                                raw_value=ap,
-                            )
-                    if bs is not None:
-                        try:
-                            rec["bid_sz"] = float(bs)
-                        except Exception as e:
-                            _warn_nonfatal(
-                                "POLYGON_WS_QUOTE_BID_SIZE_PARSE_FAILED",
-                                e,
-                                once_key=f"quote_bid_size:{sym}",
-                                symbol=str(sym),
-                                raw_value=bs,
-                            )
-                    if a_sz is not None:
-                        try:
-                            rec["ask_sz"] = float(a_sz)
-                        except Exception as e:
-                            _warn_nonfatal(
-                                "POLYGON_WS_QUOTE_ASK_SIZE_PARSE_FAILED",
-                                e,
-                                once_key=f"quote_ask_size:{sym}",
-                                symbol=str(sym),
-                                raw_value=a_sz,
-                            )
-
-                    if ("bid" in rec) and ("ask" in rec):
-                        try:
-                            rec["spread"] = float(rec["ask"]) - float(rec["bid"])
-                        except Exception as e:
-                            _warn_nonfatal(
-                                "POLYGON_WS_QUOTE_SPREAD_COMPUTE_FAILED",
-                                e,
-                                once_key=f"quote_spread:{sym}",
-                                symbol=str(sym),
-                                bid=rec.get("bid"),
-                                ask=rec.get("ask"),
-                            )
-
-                    _update_quote_microstructure(rec)
-
-                    tms = ev.get("t")
-                    if tms is not None:
-                        try:
-                            rec["ts_ms"] = int(tms)
-                        except Exception:
-                            rec["ts_ms"] = now_ms
-                    else:
-                        rec["ts_ms"] = now_ms
-
-                else:
-                    continue
-
+                if not self._legacy_event_can_commit_locked(stream_key, event_ts_ms, event_key):
+                    return None
+                self._commit_legacy_event_order_locked(stream_key, event_ts_ms, event_key)
                 self._last[sym] = rec
+                return dict(rec)
 
-                try:
-                    meta_set("price_provider_active", PROVIDER_NAME, best_effort=True)
-                    did = meta_set_if_missing("first_price_ts_ms", str(int(rec.get("ts_ms") or now_ms)))
-                    if did:
-                        set_state(LIVE, "first_market_data_tick")
-                except Exception as e:
-                    log.warning("failed to update first market data lifecycle latch: %s", repr(e))
+        _warn_nonfatal(
+            "POLYGON_WS_LEGACY_APPLY_CONTENTION",
+            RuntimeError("polygon_ws_legacy_apply_contention"),
+            once_key=f"legacy_apply_contention:{sym}:{et}",
+            symbol=sym,
+            event_type=et,
+            event_ts_ms=event_ts_ms,
+        )
+        return None
+
+    def _legacy_event_can_commit_locked(self, stream_key: str, event_ts_ms: int, event_key: str) -> bool:
+        event_ts_by_stream = getattr(self, "_last_event_ts_by_stream", None)
+        if not isinstance(event_ts_by_stream, dict):
+            event_ts_by_stream = {}
+            self._last_event_ts_by_stream = event_ts_by_stream
+        prev_stream_ts_ms = int(event_ts_by_stream.get(stream_key) or 0)
+        if prev_stream_ts_ms > 0 and event_ts_ms < prev_stream_ts_ms:
+            return False
+
+        if event_key:
+            event_key_by_stream = getattr(self, "_last_event_key_by_stream", None)
+            if not isinstance(event_key_by_stream, dict):
+                event_key_by_stream = {}
+                self._last_event_key_by_stream = event_key_by_stream
+            if event_key_by_stream.get(stream_key) == event_key:
+                self._dedup_drop_count = int(getattr(self, "_dedup_drop_count", 0) or 0) + 1
+                return False
+        return True
+
+    def _commit_legacy_event_order_locked(self, stream_key: str, event_ts_ms: int, event_key: str) -> None:
+        event_ts_by_stream = getattr(self, "_last_event_ts_by_stream", None)
+        if not isinstance(event_ts_by_stream, dict):
+            event_ts_by_stream = {}
+            self._last_event_ts_by_stream = event_ts_by_stream
+        prev_stream_ts_ms = int(event_ts_by_stream.get(stream_key) or 0)
+        event_ts_by_stream[stream_key] = max(prev_stream_ts_ms, event_ts_ms)
+
+        if event_key:
+            event_key_by_stream = getattr(self, "_last_event_key_by_stream", None)
+            if not isinstance(event_key_by_stream, dict):
+                event_key_by_stream = {}
+                self._last_event_key_by_stream = event_key_by_stream
+            event_key_by_stream[stream_key] = event_key
 
 def _flush_to_db(
     con,
@@ -1223,7 +1365,7 @@ def _load_committed_watermarks(sym_to_poly: Dict[str, str]) -> Dict[str, Dict[st
     if not raw:
         return {}
     try:
-        payload = json.loads(raw) or {}
+        payload = _json_loads(raw) or {}
     except Exception as e:
         _warn_nonfatal(
             "POLYGON_WS_REPLAY_STATE_PARSE_FAILED",
@@ -1254,7 +1396,7 @@ def _save_committed_watermarks(current: Dict[str, Dict[str, int]], updates: Dict
                 cur[channel] = next_ts
                 changed = True
     if changed:
-        meta_set(_WATERMARK_META_KEY, json.dumps(merged, separators=(",", ":"), sort_keys=True))
+        meta_set(_WATERMARK_META_KEY, _json_dumps_text(merged, sort_keys=True))
     return merged
 
 

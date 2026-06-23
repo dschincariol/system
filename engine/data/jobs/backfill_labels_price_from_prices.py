@@ -26,6 +26,8 @@ import math
 import logging
 from typing import Optional, Tuple, List
 
+from engine.data.asset_map import asset_class_for_symbol
+from engine.data.prices.fx_clock import fx_forward_eval_ms, fx_window_spans_closed_gap
 from engine.data.universe_pit import label_window_within_symbol_lifecycle
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -107,6 +109,30 @@ def _nearest_price_at_or_after(con, symbol: str, ts_ms: int) -> Optional[Tuple[i
             warn_key="labels_price_row_parse",
         )
         return None
+
+
+def _label_price_eval_target(symbol: str, ts_pred_ms: int, horizon_s: int) -> Tuple[int, dict, bool]:
+    naive_eval_ms = int(ts_pred_ms) + int(horizon_s) * 1000
+    try:
+        asset_class = str(asset_class_for_symbol(str(symbol)) or "UNKNOWN").upper().strip()
+    except Exception as exc:
+        _warn_nonfatal(
+            "backfill_labels_price_asset_class_failed",
+            "BACKFILL_LABELS_PRICE_ASSET_CLASS_FAILED",
+            exc,
+            warn_key=f"backfill_labels_price_asset_class_failed:{symbol}",
+            symbol=str(symbol),
+        )
+        asset_class = "UNKNOWN"
+    if asset_class != "FX":
+        return int(naive_eval_ms), {}, False
+    corrected_eval_ms = fx_forward_eval_ms(int(ts_pred_ms), int(horizon_s) * 1000)
+    spans_gap = fx_window_spans_closed_gap(int(ts_pred_ms), int(naive_eval_ms))
+    return (
+        int(corrected_eval_ms),
+        {"fx_clock_corrected": True, "naive_eval_ms": int(naive_eval_ms)},
+        bool(spans_gap),
+    )
 
 
 def _rolling_z(con, symbol: str, horizon_s: int, new_ret: float) -> float:
@@ -236,7 +262,13 @@ def main():
                 if entry_px <= 0:
                     continue
 
-                ts_eval_target = ts_pred_ms + horizon_s * 1000
+                ts_eval_target, fx_clock_meta, skip_fx_gap = _label_price_eval_target(
+                    str(sym),
+                    int(ts_pred_ms),
+                    int(horizon_s),
+                )
+                if skip_fx_gap:
+                    continue
                 if not label_window_within_symbol_lifecycle(
                     con,
                     symbol=str(sym),
@@ -256,6 +288,9 @@ def main():
                 ret_z = _rolling_z(con, sym, horizon_s, float(ret))
 
                 try:
+                    meta_payload = {"entry_ts_ms": int(entry_ts), "exit_ts_ms": int(exit_ts)}
+                    if fx_clock_meta:
+                        meta_payload.update(dict(fx_clock_meta))
                     con.execute(
                         """
                         INSERT OR REPLACE INTO labels_price(
@@ -274,7 +309,7 @@ def main():
                             float(ret_z),
                             int(dir_),
                             json.dumps(
-                                {"entry_ts_ms": int(entry_ts), "exit_ts_ms": int(exit_ts)},
+                                meta_payload,
                                 separators=(",", ":"),
                                 sort_keys=True,
                             ),

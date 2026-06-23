@@ -31,7 +31,9 @@ class PortfolioStagedRebalancePipelineTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "portfolio_staged.db"
         self._prev_db_path = os.environ.get("DB_PATH")
+        self._prev_storage_backend = os.environ.get("TS_STORAGE_BACKEND")
         os.environ["DB_PATH"] = str(self.db_path)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         _reload_modules(
             "engine.runtime.db_guard",
             "engine.runtime.storage",
@@ -47,6 +49,17 @@ class PortfolioStagedRebalancePipelineTests(unittest.TestCase):
             os.environ.pop("DB_PATH", None)
         else:
             os.environ["DB_PATH"] = self._prev_db_path
+        if self._prev_storage_backend is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = self._prev_storage_backend
+        try:
+            _reload_modules(
+                "engine.runtime.storage",
+                "engine.strategy.portfolio",
+            )
+        except Exception:
+            pass
         self.tmp.cleanup()
 
     def _executescript(self, script: str) -> None:

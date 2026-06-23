@@ -24,6 +24,17 @@ def _strict_env(repo_root: Path, **extra: str) -> dict[str, str]:
     return env
 
 
+def _scrub_ambient_pg_secret_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "TS_PG_DSN",
+        "TS_PG_PASSWORD",
+        "TS_PG_PASSWORD_APP",
+        "TS_PG_APP_PASSWORD",
+        "PGPASSWORD",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def test_repo_env_inventory_reports_secret_keys_without_values(tmp_path: Path) -> None:
     from engine.runtime.secret_sources import repo_local_secret_key_inventory
 
@@ -46,6 +57,30 @@ def test_repo_env_inventory_reports_secret_keys_without_values(tmp_path: Path) -
     assert {item["key"] for item in inventory} == {"ALPACA_SECRET_KEY", "TIMESCALE_DSN"}
     assert repo_env_value not in rendered
     assert "pg-inline-secret" not in rendered
+
+
+def test_repo_env_inventory_includes_codex_sim_backup_envs_without_values(tmp_path: Path) -> None:
+    from engine.runtime.secret_sources import repo_local_secret_key_inventory
+
+    inline_value = "codex-sim-backup-inline-token"
+    (tmp_path / ".env.codex-sim-paper.bak").write_text(
+        f"DASHBOARD_API_TOKEN={inline_value}\n",
+        encoding="utf-8",
+    )
+    compose_dir = tmp_path / "deploy" / "compose"
+    compose_dir.mkdir(parents=True)
+    (compose_dir / ".env.codex-sim-paper.bak").write_text(
+        f"REDIS_PASSWORD={inline_value}\n",
+        encoding="utf-8",
+    )
+
+    inventory = repo_local_secret_key_inventory(tmp_path)
+    rendered = json.dumps(inventory, sort_keys=True)
+
+    assert {item["key"] for item in inventory} == {"DASHBOARD_API_TOKEN", "REDIS_PASSWORD"}
+    assert ".env.codex-sim-paper.bak" in rendered
+    assert "deploy/compose/.env.codex-sim-paper.bak" in rendered
+    assert inline_value not in rendered
 
 
 def test_strict_policy_rejects_inline_process_secret_without_value_leak(tmp_path: Path) -> None:
@@ -291,6 +326,7 @@ def test_config_schema_rejects_inline_secret_sources(monkeypatch: pytest.MonkeyP
     from engine.runtime.config_schema import ConfigError, validate_production_secret_sources
 
     inline_value = "inline-config-token-value"
+    _scrub_ambient_pg_secret_env(monkeypatch)
     monkeypatch.setenv("PROD_LOCK", "1")
     monkeypatch.setenv("ENGINE_MODE", "live")
     monkeypatch.setenv("TRADING_ENFORCE_SECRET_SOURCE_POLICY", "1")
@@ -309,6 +345,7 @@ def test_config_schema_accepts_file_secret_sources(monkeypatch: pytest.MonkeyPat
     from engine.runtime.config_schema import validate_production_secret_sources
 
     secret_file = _write_secret_file(tmp_path / "secrets" / "dashboard_api_token")
+    _scrub_ambient_pg_secret_env(monkeypatch)
     monkeypatch.setenv("PROD_LOCK", "1")
     monkeypatch.setenv("ENGINE_MODE", "live")
     monkeypatch.setenv("TRADING_ENFORCE_SECRET_SOURCE_POLICY", "1")
@@ -371,6 +408,7 @@ def test_live_preflight_secret_policy_fails_inline_and_passes_file(
     from engine.runtime.live_trading_preflight import production_secret_sources_snapshot
 
     inline_value = "inline-live-token-value"
+    _scrub_ambient_pg_secret_env(monkeypatch)
     monkeypatch.setenv("PROD_LOCK", "1")
     monkeypatch.setenv("ENGINE_MODE", "live")
     monkeypatch.setenv("TRADING_ENFORCE_SECRET_SOURCE_POLICY", "1")

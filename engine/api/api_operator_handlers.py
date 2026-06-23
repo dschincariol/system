@@ -390,6 +390,25 @@ def api_post_operator_restart_feeds(_parsed=None, _body=None, ctx=None):
             "errors": [],
         }
 
+    restart_guard_cleared = {"ok": False, "reason": "not_attempted"}
+    try:
+        from engine.runtime.ingestion_runtime import clear_child_restart_accounting
+
+        restart_guard_cleared = clear_child_restart_accounting(reason="operator_restart_feeds")
+    except Exception as e:
+        restart_guard_cleared = {"ok": False, "error": str(e), "reason": "operator_restart_feeds"}
+        log_failure(
+            LOG,
+            event="api_operator_handlers_restart_guard_clear_failed",
+            code="API_OPERATOR_HANDLERS_RESTART_GUARD_CLEAR_FAILED",
+            message=str(e),
+            error=e,
+            level=logging.WARNING,
+            component="engine.api.api_operator_handlers",
+            ctx=ctx,
+            persist=True,
+        )
+
     stopped = []
     errors = []
 
@@ -446,6 +465,7 @@ def api_post_operator_restart_feeds(_parsed=None, _body=None, ctx=None):
         "stopped": stopped,
         "started": started,
         "errors": errors,
+        "restart_guard_cleared": restart_guard_cleared,
     }
 
 

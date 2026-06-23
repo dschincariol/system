@@ -38,6 +38,7 @@ from engine.data.asset_map import asset_class_for_symbol
 from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.strategy.risk import realized_vol_from_prices, corr_from_prices
 from engine.strategy.har_rv import resolve_vol_forecast
+from engine.strategy.fx_sizing import _fx_instrument, clamp_fx_weight_to_leverage, fx_weight_to_notional
 from engine.runtime.risk_state import set_state, get_state_row
 from engine.runtime.event_log import record_risk_block
 from engine.runtime.storage import _table_exists
@@ -120,6 +121,8 @@ CORR_LOOKBACK = int(os.environ.get("PORTFOLIO_RISK_CORR_LOOKBACK", "240"))
 CLUSTER_CORR_TH = float(os.environ.get("PORTFOLIO_RISK_CLUSTER_CORR_TH", "0.85"))
 CLUSTER_MAX_GROSS = float(os.environ.get("PORTFOLIO_RISK_CLUSTER_MAX_GROSS", "0.45"))
 CLUSTER_MAX_COMPONENTS = int(os.environ.get("PORTFOLIO_RISK_CLUSTER_MAX_COMPONENTS", "12"))
+USE_FX_CURRENCY_CLUSTERS = os.environ.get("PORTFOLIO_RISK_FX_CURRENCY_CLUSTERS", "1") == "1"
+USE_FX_LEVERAGE_CAPS = os.environ.get("PORTFOLIO_RISK_USE_FX_LEVERAGE_CAPS", "1") == "1"
 
 # Asset-class budgets
 USE_ASSET_CLASS_BUDGETS = os.environ.get("PORTFOLIO_RISK_USE_ASSET_CLASS_BUDGETS", "1") == "1"
@@ -185,6 +188,33 @@ def _optional_float(x: Any) -> Optional[float]:
             value_type=type(x).__name__,
         )
         return None
+
+
+def _asset_class_for(con, symbol: str) -> str:
+    try:
+        instrument = _fx_instrument(con, symbol)
+        if isinstance(instrument, dict):
+            asset_class = str(instrument.get("asset_class") or "").upper().strip()
+            if asset_class:
+                return asset_class
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_FX_ASSET_CLASS_LOOKUP_FAILED",
+            e,
+            once_key=f"fx_asset_class:{symbol}",
+            symbol=str(symbol),
+        )
+    try:
+        fallback_asset_class = str(asset_class_for_symbol(str(symbol)) or "UNKNOWN").upper()
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_ASSET_CLASS_FALLBACK_FAILED",
+            e,
+            once_key=f"asset_class_fallback:{symbol}",
+            symbol=str(symbol),
+        )
+        fallback_asset_class = "UNKNOWN"
+    return fallback_asset_class
 
 
 def _is_live_risk_runtime() -> bool:
@@ -276,7 +306,7 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
         )
 
     try:
-        info = json.loads(raw or "{}")
+        info_raw = json.loads(raw or "{}")
     except Exception as e:
         _warn_nonfatal(
             "PORTFOLIO_RISK_ENGINE_MONTE_CARLO_JSON_FAILED",
@@ -292,17 +322,19 @@ def _load_monte_carlo_risk_summary(now_ms: int) -> Dict[str, Any]:
             error=str(e),
         )
 
-    if not isinstance(info, dict):
+    if not isinstance(info_raw, dict):
         return _monte_carlo_failure_summary(
             "monte_carlo_risk_state_invalid",
             now_ms=int(now_ms),
             ts_ms=int(ts_ms or 0),
             status="invalid",
-            error_type=type(info).__name__,
+            error_type=type(info_raw).__name__,
         )
 
+    info: Dict[str, Any] = dict(info_raw)
     age_ms = int(max(0, int(now_ms) - int(ts_ms or 0)))
-    drawdown_percentiles = info.get("drawdown_percentiles") if isinstance(info.get("drawdown_percentiles"), dict) else {}
+    drawdown_percentiles_raw = info.get("drawdown_percentiles")
+    drawdown_percentiles: Dict[str, Any] = dict(drawdown_percentiles_raw) if isinstance(drawdown_percentiles_raw, dict) else {}
     out: Dict[str, Any] = {
         "enabled": bool(info.get("enabled", True)),
         "required": bool(_monte_carlo_required_in_current_runtime()),
@@ -642,7 +674,7 @@ def _model_bucket_for_row(row: Optional[Dict[str, Any]]) -> str:
     return "UNKNOWN"
 
 
-def _exposure_snapshot(rows: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def _exposure_snapshot(rows: Dict[str, Dict[str, Any]], con=None) -> Dict[str, Any]:
     by_symbol: Dict[str, Dict[str, Any]] = {}
     by_asset_class: Dict[str, Dict[str, float]] = {}
     by_strategy: Dict[str, Dict[str, float]] = {}
@@ -670,10 +702,7 @@ def _exposure_snapshot(rows: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         elif sw < 0.0:
             short_gross += float(aw)
 
-        try:
-            asset_class = str(asset_class_for_symbol(s) or "UNKNOWN").upper()
-        except Exception:
-            asset_class = "UNKNOWN"
+        asset_class = _asset_class_for(con, s)
 
         ac = by_asset_class.setdefault(asset_class, {"gross": 0.0, "net": 0.0})
         ac["gross"] = float(ac.get("gross", 0.0) + aw)
@@ -699,6 +728,13 @@ def _exposure_snapshot(rows: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         "by_strategy": dict(sorted(by_strategy.items(), key=lambda kv: kv[0])),
         "by_model": dict(sorted(by_model.items(), key=lambda kv: kv[0])),
     }
+
+
+def _asset_class_lookup(con, rows: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for sym in sorted((rows or {}).keys()):
+        out[str(sym)] = _asset_class_for(con, str(sym))
+    return out
 
 
 def _delta_snapshot(
@@ -1188,12 +1224,10 @@ def _apply_asset_class_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[st
         return dict(desired or {})
 
     out = dict(desired or {})
+    lookup = dict(info.get("asset_class_by_symbol") or {}) if isinstance(info.get("asset_class_by_symbol"), dict) else {}
     by_cls: Dict[str, float] = {}
     for sym, row in (out or {}).items():
-        try:
-            cls = str(asset_class_for_symbol(str(sym)) or "UNKNOWN").upper()
-        except Exception:
-            cls = "UNKNOWN"
+        cls = str(lookup.get(str(sym)) or _asset_class_for(None, str(sym)) or "UNKNOWN").upper()
         by_cls[cls] = float(by_cls.get(cls, 0.0) + _abs_weight(row))
 
     info["asset_class_gross_pre"] = dict(sorted(by_cls.items(), key=lambda kv: kv[0]))
@@ -1205,7 +1239,7 @@ def _apply_asset_class_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[st
             scale = float(cap) / float(gross) if gross > 1e-12 else 0.0
             for sym in list(out.keys()):
                 try:
-                    cls2 = str(asset_class_for_symbol(str(sym)) or "UNKNOWN").upper()
+                    cls2 = str(lookup.get(str(sym)) or _asset_class_for(None, str(sym)) or "UNKNOWN").upper()
                     if cls2 == str(cls).upper():
                         sw = _signed_weight(out[sym])
                         sgn = 1.0 if sw >= 0.0 else -1.0
@@ -1228,13 +1262,101 @@ def _apply_asset_class_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[st
     # post
     by_cls2: Dict[str, float] = {}
     for sym, row in (out or {}).items():
-        try:
-            cls = str(asset_class_for_symbol(str(sym)) or "UNKNOWN").upper()
-        except Exception:
-            cls = "UNKNOWN"
+        cls = str(lookup.get(str(sym)) or _asset_class_for(None, str(sym)) or "UNKNOWN").upper()
         by_cls2[cls] = float(by_cls2.get(cls, 0.0) + _abs_weight(row))
     info["asset_class_gross_post"] = dict(sorted(by_cls2.items(), key=lambda kv: kv[0]))
 
+    return out
+
+
+def _apply_fx_leverage_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not USE_FX_LEVERAGE_CAPS:
+        return dict(desired or {})
+
+    out = dict(desired or {})
+    fx_rows = [
+        str(sym)
+        for sym, row in (out or {}).items()
+        if _abs_weight(row) > 0.0
+        and str((info.get("asset_class_by_symbol") or {}).get(str(sym)) or _asset_class_for(con, str(sym))).upper() == "FX"
+    ]
+    if not fx_rows:
+        return out
+
+    equity, equity_source = _equity_reference(con)
+    info["fx_leverage_equity_ref"] = float(equity or 0.0)
+    info["fx_leverage_equity_ref_source"] = str(equity_source or "unknown")
+    adjustments: Dict[str, Any] = {}
+    hard_blocks: List[Dict[str, Any]] = []
+
+    if equity <= 0.0:
+        for sym in fx_rows:
+            hard_blocks.append({"symbol": str(sym), "reason": "fx_equity_reference_unavailable"})
+        info["fx_leverage_hard_blocks"] = hard_blocks
+        return out
+
+    for sym in fx_rows:
+        row = dict(out.get(sym) or {})
+        signed_weight = _signed_weight(row)
+        instrument = _fx_instrument(con, sym)
+        if not instrument:
+            clamped, clamp_reason = clamp_fx_weight_to_leverage(sym, signed_weight, equity, instrument)
+            row.setdefault("reason", {})
+            if not isinstance(row.get("reason"), dict):
+                row["reason"] = {"raw": row.get("reason")}
+            row["reason"]["fx_leverage_cap"] = dict(clamp_reason)
+            out[sym] = row
+            adjustments[sym] = dict(clamp_reason)
+            continue
+
+        rate = _last_price(con, sym)
+        if rate is None or float(rate) <= 0.0:
+            reason = {
+                "symbol": str(sym),
+                "reason": "fx_pair_rate_unavailable",
+                "asset_class": "FX",
+            }
+            hard_blocks.append(reason)
+            row.setdefault("reason", {})
+            if not isinstance(row.get("reason"), dict):
+                row["reason"] = {"raw": row.get("reason")}
+            row["reason"]["fx_leverage_cap"] = dict(reason)
+            out[sym] = row
+            adjustments[sym] = dict(reason)
+            continue
+
+        clamped, clamp_reason = clamp_fx_weight_to_leverage(sym, signed_weight, equity, instrument)
+        fx_meta = fx_weight_to_notional(sym, clamped, equity, instrument, pair_rate=float(rate))
+        fx_meta["pre_weight"] = float(signed_weight)
+        fx_meta["post_weight"] = float(clamped)
+
+        if abs(float(clamped)) + 1e-9 < abs(float(signed_weight)):
+            row = _row_with_signed_weight(row, float(clamped), "fx_leverage_cap")
+
+        row.setdefault("reason", {})
+        if not isinstance(row.get("reason"), dict):
+            row["reason"] = {"raw": row.get("reason")}
+        row["reason"]["fx_leverage_cap"] = dict(clamp_reason)
+        row["fx"] = dict(fx_meta)
+        out[sym] = row
+        adjustments[sym] = {"clamp": dict(clamp_reason), "fx": dict(fx_meta)}
+
+        cap = float(fx_meta.get("effective_leverage_cap") or 0.0)
+        eff = abs(float(fx_meta.get("effective_leverage") or 0.0))
+        if cap <= 0.0 or eff > cap + 1e-9:
+            hard_blocks.append(
+                {
+                    "symbol": str(sym),
+                    "reason": "fx_leverage_residual_breach",
+                    "effective_leverage": float(eff),
+                    "effective_leverage_cap": float(cap),
+                }
+            )
+
+    if adjustments:
+        info["fx_leverage_adjustments"] = adjustments
+    if hard_blocks:
+        info["fx_leverage_hard_blocks"] = hard_blocks
     return out
 
 
@@ -1360,9 +1482,12 @@ def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[s
     return out
 
 
-def _corr_graph_components(con, syms: List[str]) -> Tuple[List[List[str]], Dict[str, Dict[str, float]]]:
+def _corr_graph_components(
+    con,
+    syms: List[str],
+) -> Tuple[List[List[str]], Dict[str, Dict[str, float]], List[Dict[str, Any]]]:
     if not syms or len(syms) < 2:
-        return [], {}
+        return [], {}, []
 
     # Build adjacency (undirected) for abs(corr) >= threshold
     adj: Dict[str, List[str]] = {s: [] for s in syms}
@@ -1390,6 +1515,42 @@ def _corr_graph_components(con, syms: List[str]) -> Tuple[List[List[str]], Dict[
                 )
                 continue
 
+    fx_shared_edges: List[Dict[str, Any]] = []
+    if USE_FX_CURRENCY_CLUSTERS:
+        fx_ccys: Dict[str, set[str]] = {}
+        for s in syms:
+            try:
+                inst = _fx_instrument(con, str(s))
+                if not isinstance(inst, dict) or str(inst.get("asset_class") or "").upper() != "FX":
+                    continue
+                ccys = {
+                    str(inst.get("base_ccy") or "").upper().strip(),
+                    str(inst.get("quote_ccy") or "").upper().strip(),
+                }
+                ccys.discard("")
+                if ccys:
+                    fx_ccys[str(s)] = ccys
+            except Exception as e:
+                _warn_nonfatal(
+                    "PORTFOLIO_RISK_FX_CLUSTER_INSTRUMENT_FAILED",
+                    e,
+                    once_key=f"fx_cluster_instrument:{s}",
+                    symbol=str(s),
+                )
+
+        fx_symbols = sorted(fx_ccys.keys())
+        for i in range(len(fx_symbols)):
+            for j in range(i + 1, len(fx_symbols)):
+                a, b = fx_symbols[i], fx_symbols[j]
+                shared = sorted(fx_ccys.get(a, set()) & fx_ccys.get(b, set()))
+                if not shared:
+                    continue
+                if b not in adj.get(a, []):
+                    adj[a].append(b)
+                if a not in adj.get(b, []):
+                    adj[b].append(a)
+                fx_shared_edges.append({"left": a, "right": b, "shared_currency": shared})
+
     # DFS components
     seen = set()
     comps: List[List[str]] = []
@@ -1410,7 +1571,7 @@ def _corr_graph_components(con, syms: List[str]) -> Tuple[List[List[str]], Dict[
             comps.append(sorted(comp))
 
     comps.sort(key=lambda comp: (-len(comp), ",".join(comp)))
-    return comps, matrix
+    return comps, matrix, fx_shared_edges
 
 
 def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -1419,11 +1580,13 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
 
     out = dict(desired or {})
     syms = _top_symbols_by_abs(out, int(MAX_SYMBOLS))
-    comps, corr_matrix = _corr_graph_components(con, syms)
+    comps, corr_matrix, fx_shared_edges = _corr_graph_components(con, syms)
 
     info["corr_matrix"] = corr_matrix
     info["corr_cluster_symbols"] = list(syms)
     info["corr_cluster_corr_th"] = float(CLUSTER_CORR_TH)
+    if fx_shared_edges:
+        info["corr_cluster_fx_shared_currency_edges"] = list(fx_shared_edges)
 
     cluster_exposures = []
     for comp in comps:
@@ -1432,12 +1595,19 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
         for s in comp:
             gross += _abs_weight(out.get(s))
             net += _signed_weight(out.get(s))
+        comp_set = set(comp)
+        comp_fx_edges = [
+            edge
+            for edge in fx_shared_edges
+            if str(edge.get("left")) in comp_set and str(edge.get("right")) in comp_set
+        ]
         cluster_exposures.append(
             {
                 "cluster": list(comp),
                 "gross": float(gross),
                 "net": float(net),
                 "cap": float(CLUSTER_MAX_GROSS),
+                "fx_shared_currency": comp_fx_edges,
             }
         )
     if cluster_exposures:
@@ -1457,6 +1627,12 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
         if gross <= float(CLUSTER_MAX_GROSS) + 1e-12:
             continue
 
+        comp_set = set(comp)
+        comp_fx_edges = [
+            edge
+            for edge in fx_shared_edges
+            if str(edge.get("left")) in comp_set and str(edge.get("right")) in comp_set
+        ]
         scale = float(CLUSTER_MAX_GROSS) / float(gross) if gross > 1e-12 else 0.0
         for s in comp:
             try:
@@ -1472,6 +1648,7 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
                         "cap": float(CLUSTER_MAX_GROSS),
                         "scale": float(scale),
                         "corr_th": float(CLUSTER_CORR_TH),
+                        "fx_shared_currency": comp_fx_edges,
                     }
             except Exception as e:
                 _warn_nonfatal("PORTFOLIO_RISK_CORR_CLUSTER_APPLY_FAILED", e, once_key=f"corr_cluster:{s}", symbol=str(s), cluster=list(comp))
@@ -1483,6 +1660,7 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
                 "net_pre": float(net),
                 "cap": float(CLUSTER_MAX_GROSS),
                 "scale": float(scale),
+                "fx_shared_currency": comp_fx_edges,
             }
         )
 
@@ -1798,11 +1976,11 @@ def apply_portfolio_risk_engine(
     dd = float(drawdown_diagnostic.drawdown or 0.0) if drawdown_diagnostic.ok else 0.0
     info["drawdown"] = (float(dd) if drawdown_diagnostic.ok else None)
 
-    state_snapshot = _exposure_snapshot(state or {})
+    state_snapshot = _exposure_snapshot(state or {}, con)
     info["state_exposure"] = state_snapshot
 
     live_rows, live_info = _load_live_positions(con)
-    live_snapshot = _exposure_snapshot(live_rows or {})
+    live_snapshot = _exposure_snapshot(live_rows or {}, con)
     info["live_positions"] = dict(live_info or {})
     info["live_exposure"] = live_snapshot
     info["current_exposure"] = live_snapshot if live_rows else state_snapshot
@@ -1810,11 +1988,12 @@ def apply_portfolio_risk_engine(
     info["cur_net"] = float(info["current_exposure"].get("net", 0.0) or 0.0)
 
     raw_desired = dict(desired or {})
-    info["desired_exposure_raw"] = _exposure_snapshot(raw_desired)
+    info["desired_exposure_raw"] = _exposure_snapshot(raw_desired, con)
     info["state_to_desired_delta"] = _delta_snapshot(state or {}, raw_desired)
 
     out = _project_live_plus_orders(live_rows or {}, state or {}, raw_desired)
-    info["projected_live_plus_orders_pre"] = _exposure_snapshot(out)
+    info["asset_class_by_symbol"] = _asset_class_lookup(con, out)
+    info["projected_live_plus_orders_pre"] = _exposure_snapshot(out, con)
     info["target_exposure_pre"] = dict(info["projected_live_plus_orders_pre"])
     info["target_delta_pre"] = _delta_snapshot(live_rows or {}, out)
 
@@ -1840,8 +2019,20 @@ def apply_portfolio_risk_engine(
 
     try:
         out = _apply_asset_class_budgets(out, info)
+        info["asset_class_by_symbol"] = _asset_class_lookup(con, out)
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_ASSET_CLASS_BUDGETS_FAILED", e, once_key="apply_asset_class_budgets", ts_ms=int(now_ms))
+
+    try:
+        out = _apply_fx_leverage_caps(con, out, info)
+        if bool(info.get("fx_leverage_hard_blocks")):
+            blocked = True
+            block_reason = {
+                "type": "fx_leverage_hard_block",
+                "legs": list(info.get("fx_leverage_hard_blocks") or []),
+            }
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_RISK_FX_LEVERAGE_CAPS_FAILED", e, once_key="apply_fx_leverage_caps", ts_ms=int(now_ms))
 
     try:
         out = _apply_strategy_budgets(out, info)
@@ -1893,7 +2084,8 @@ def apply_portfolio_risk_engine(
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_PORTFOLIO_CAPS_FAILED", e, once_key="apply_portfolio_caps", ts_ms=int(now_ms))
 
-    final_snapshot = _exposure_snapshot(out)
+    info["asset_class_by_symbol"] = _asset_class_lookup(con, out)
+    final_snapshot = _exposure_snapshot(out, con)
     info["projected_live_plus_orders_post"] = final_snapshot
     info["target_exposure_post"] = final_snapshot
     info["target_delta_post"] = _delta_snapshot(live_rows or {}, out)
@@ -1916,7 +2108,8 @@ def apply_portfolio_risk_engine(
         }
 
     out = _projected_to_desired_targets(out, live_rows or {}, state or {})
-    info["desired_exposure_post"] = _exposure_snapshot(out)
+    info["asset_class_by_symbol"] = _asset_class_lookup(con, out)
+    info["desired_exposure_post"] = _exposure_snapshot(out, con)
     info["allocation_reconciliation"] = _reconciliation_summary(
         dict(info.get("desired_exposure_raw") or {}),
         dict(info.get("desired_exposure_post") or {}),

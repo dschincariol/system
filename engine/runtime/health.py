@@ -1152,6 +1152,8 @@ def _required_providers_from_env() -> List[str]:
         out.append("tradier")
     if _env_flag("YFINANCE_ENABLED", False):
         out.append("yfinance")
+    if _env_flag("SIMULATED_MARKET_DATA_ENABLED", False):
+        out.append("simulated")
     if _env_flag("CCXT_ENABLED", False):
         out.append("ccxt")
     return _dedupe_strs(out)
@@ -1187,6 +1189,12 @@ def _manager_provider_sources() -> tuple[Dict[str, Dict[str, Any]], List[str], s
                 "credential_fields": fields,
                 "credentials_configured": bool(row.get("credentials_configured")),
                 "credentials_stored": bool(row.get("credentials_stored")),
+                "credential_required": bool(row.get("credential_required")),
+                "runtime_credentialed": bool(row.get("runtime_credentialed")),
+                "runtime_desired_eligible": bool(row.get("runtime_desired_eligible")),
+                "runnable_state": str(row.get("runnable_state") or ""),
+                "runnable_state_reason": str(row.get("runnable_state_reason") or ""),
+                "missing_credential_env_vars": list(row.get("missing_credential_env_vars") or []),
                 "credential_error": str(row.get("credential_error") or ""),
                 "status": str(row.get("status") or ""),
                 "last_error": str(row.get("last_error") or ""),
@@ -1204,10 +1212,14 @@ def _provider_credential_available(provider_name: str, source: Dict[str, Any]) -
     provider = str(provider_name or "").strip().lower()
     credential_fields = [str(field) for field in list(source.get("credential_fields") or []) if str(field).strip()]
     secret_names = [str(name) for name in _PROVIDER_CREDENTIAL_SECRET_NAMES.get(provider, tuple()) if str(name).strip()]
+    runnable_state = str(source.get("runnable_state") or "")
+    missing_from_manager = [str(name) for name in list(source.get("missing_credential_env_vars") or []) if str(name).strip()]
     if not credential_fields and not secret_names:
         return True, "not_required", []
     if str(source.get("credential_error") or "").strip():
         return False, "data_source_manager_error", secret_names
+    if runnable_state == "enabled-missing-credential" or missing_from_manager:
+        return False, "data_source_runnable_state", list(dict.fromkeys(secret_names + missing_from_manager))
     if bool(source.get("credentials_configured")):
         return True, "data_source_manager", secret_names
     try:
@@ -1387,13 +1399,18 @@ def provider_readiness_snapshot(
             "source_key": str(source.get("source_key") or ""),
             "source_type": str(source.get("source_type") or ""),
             "job_name": str(source.get("job_name") or ""),
+            "runnable_state": str(source.get("runnable_state") or ""),
+            "runnable_state_reason": str(source.get("runnable_state_reason") or ""),
+            "runtime_desired_eligible": bool(source.get("runtime_desired_eligible")),
             "credential_required": bool(
                 source.get("credential_fields")
                 or provider_name in _PROVIDER_CREDENTIAL_SECRET_NAMES
+                or source.get("credential_required")
             ),
             "credential_configured": bool(credential_ok),
             "credential_source": credential_source,
             "credential_secret_names": list(credential_secret_names),
+            "missing_credential_env_vars": list(source.get("missing_credential_env_vars") or []),
             "credential_error": credential_error,
             "telemetry_present": has_telemetry,
             "telemetry_ok": telemetry_ok,
@@ -1918,8 +1935,74 @@ def _build_ingestion_freshness_snapshot(
     }
 
 
+def _load_ingestion_meta_states(con) -> List[Dict[str, Any]]:
+    rows = []
+    try:
+        rows = con.execute(
+            """
+            SELECT key, value
+            FROM runtime_meta
+            WHERE key = ? OR key LIKE ?
+            ORDER BY key
+            """,
+            ("ingestion_state", "ingestion_state::shard:%"),
+        ).fetchall() or []
+    except Exception as e:
+        _warn("health.shared_ingestion_runtime.meta_state_query", e)
+        base = _json_meta_get("ingestion_state")
+        return [base] if base else []
+
+    parsed: List[tuple[str, Dict[str, Any]]] = []
+    for key, value in rows:
+        try:
+            state = json.loads(str(value or "{}"))
+            if isinstance(state, dict):
+                parsed.append((str(key or ""), state))
+        except Exception as e:
+            _warn("health.shared_ingestion_runtime.meta_state_parse", e)
+            continue
+
+    sharded = [(key, state) for key, state in parsed if str(key).startswith("ingestion_state::shard:")]
+    selected = sharded or [(key, state) for key, state in parsed if str(key) == "ingestion_state"]
+    return [dict(state) for _key, state in selected]
+
+
+def _merge_ingestion_meta_states(states: List[Dict[str, Any]]) -> Dict[str, Any]:
+    clean = [dict(state or {}) for state in list(states or []) if isinstance(state, dict)]
+    if not clean:
+        return {}
+    if len(clean) == 1:
+        state = dict(clean[0])
+        state["shards"] = [dict(state.get("shard") or {})] if isinstance(state.get("shard"), dict) else []
+        return state
+
+    latest = max(clean, key=lambda row: _int_or(row.get("ts_ms")))
+    merged = dict(latest)
+    merged["running"] = any(bool(row.get("running")) for row in clean)
+    merged["pid"] = _int_or(latest.get("pid"))
+    merged["last_event_ts_ms"] = max(_int_or(row.get("last_event_ts_ms")) for row in clean)
+    merged["ts_ms"] = max(_int_or(row.get("ts_ms")) for row in clean)
+    merged["provider_status"] = "running" if bool(merged.get("running")) else str(latest.get("provider_status") or "")
+    errors = [str(row.get("last_error") or "") for row in clean if str(row.get("last_error") or "").strip()]
+    merged["last_error"] = ";".join(errors[:4])
+    children: Dict[str, Any] = {}
+    for row in clean:
+        shard = _dict_or_empty(row.get("shard"))
+        shard_label = str(shard.get("label") or f"pid:{_int_or(row.get('pid'))}")
+        for child_name, child_state in _dict_or_empty(row.get("children")).items():
+            children[f"{shard_label}:{child_name}"] = child_state
+    merged["children"] = children
+    merged["shards"] = [
+        _dict_or_empty(row.get("shard"))
+        for row in clean
+        if isinstance(row.get("shard"), dict)
+    ]
+    return merged
+
+
 def _shared_ingestion_runtime_snapshot(con, now_ms: int, effective_prices_max_age_s: float) -> Dict[str, Any]:
-    meta_state = _json_meta_get("ingestion_state")
+    meta_states = _load_ingestion_meta_states(con)
+    meta_state = _merge_ingestion_meta_states(meta_states)
     market_state = {}
     try:
         # Reuse the caller-owned read handle here. `connect_ro()` uses a
@@ -1937,12 +2020,12 @@ def _shared_ingestion_runtime_snapshot(con, now_ms: int, effective_prices_max_ag
     try:
         hb_row = con.execute(
             """
-            SELECT ts_ms
+            SELECT MAX(ts_ms)
             FROM job_heartbeats
-            WHERE job_name = ?
+            WHERE job_name = ? OR job_name LIKE ?
             LIMIT 1
             """,
-            ("ingestion_runtime",),
+            ("ingestion_runtime", "ingestion_runtime:shard:%"),
         ).fetchone()
         hb_ts_ms = _int_or((hb_row or [0])[0])
     except Exception:
@@ -2050,6 +2133,8 @@ def _shared_ingestion_runtime_snapshot(con, now_ms: int, effective_prices_max_ag
         "providers": providers,
         "provider_status": str(meta_state.get("provider_status") or ""),
         "last_error": str(meta_state.get("last_error") or ""),
+        "writer_diagnostics": _dict_or_empty(meta_state.get("writer_diagnostics")),
+        "shards": list(meta_state.get("shards") or []),
         "source": "shared_runtime_meta+ipc",
     }
 
@@ -2063,9 +2148,9 @@ def _effective_prices_max_age_s(con) -> float:
             """
             SELECT extra_json
             FROM job_heartbeats
-            WHERE job_name != ?
+            WHERE job_name != ? AND job_name NOT LIKE ?
             """,
-            ("ingestion_runtime",),
+            ("ingestion_runtime", "ingestion_runtime:shard:%"),
         ).fetchall() or []
     except Exception:
         rows = []
@@ -2430,6 +2515,122 @@ def _check_disk_pressure(ctx: HealthSnapshotContext) -> None:
     )
 
 
+def _check_memory_pressure(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.memory_pressure import host_memory_pressure_snapshot
+
+        out["memory_pressure"] = dict(host_memory_pressure_snapshot() or {})
+    except Exception as e:
+        _warn("health.memory_pressure", e)
+        required = _env_flag("PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY", False)
+        out["memory_pressure"] = {
+            "ok": False if required else True,
+            "required": bool(required),
+            "status": "fail" if required else "warn",
+            "reason": f"memory_pressure_error:{type(e).__name__}",
+            "errors": ([f"memory_pressure_error:{type(e).__name__}"] if required else []),
+            "warnings": ([] if required else [f"memory_pressure_error:{type(e).__name__}: {e}"]),
+        }
+    _trace_section(
+        "memory_pressure",
+        section_started,
+        ok=bool((out.get("memory_pressure") or {}).get("ok", True)),
+    )
+
+
+def _check_effective_runtime_state(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.effective_runtime_state import effective_runtime_state_snapshot
+
+        out["effective_runtime_state"] = dict(effective_runtime_state_snapshot() or {})
+    except Exception as e:
+        _warn("health.effective_runtime_state", e)
+        required = _env_flag("PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE", False)
+        out["effective_runtime_state"] = {
+            "ok": False if required else True,
+            "required": bool(required),
+            "errors": ([f"effective_runtime_state_error:{type(e).__name__}"] if required else []),
+            "warnings": ([] if required else [f"effective_runtime_state_error:{type(e).__name__}: {e}"]),
+        }
+    _trace_section(
+        "effective_runtime_state",
+        section_started,
+        ok=bool((out.get("effective_runtime_state") or {}).get("ok", True)),
+    )
+
+
+def _check_storage_wal_guards(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower()
+    required_by_env = (
+        mode_name == "live"
+        or _env_flag("PREFLIGHT_REQUIRE_ZFS_STORAGE", False)
+        or _env_flag("PREFLIGHT_REQUIRE_BACKUP_EVIDENCE", False)
+        or _env_flag("PREFLIGHT_REQUIRE_WAL_ARCHIVER_STATS", False)
+        or _env_flag("PREFLIGHT_REQUIRE_PG_WAL_RISK", False)
+    )
+    try:
+        from engine.runtime.backup_evidence import pg_wal_disk_risk_snapshot, wal_archiver_runtime_snapshot
+        from engine.runtime.storage_placement import check_storage_placement
+
+        storage = dict(check_storage_placement() or {})
+        wal_archiver = dict(wal_archiver_runtime_snapshot(engine_mode=mode_name) or {})
+        pg_wal = dict(pg_wal_disk_risk_snapshot(engine_mode=mode_name) or {})
+
+        required = bool(
+            storage.get("checked")
+            or wal_archiver.get("required")
+            or pg_wal.get("required")
+            or required_by_env
+        )
+        blockers: list[str] = []
+        warnings: list[str] = []
+        if storage.get("checked") and not bool(storage.get("ok", False)):
+            blockers.append("storage_placement_invalid")
+        if bool(wal_archiver.get("required")) and not bool(wal_archiver.get("ok", False)):
+            blockers.extend([str(item) for item in list(wal_archiver.get("blockers") or []) if str(item).strip()])
+            if not wal_archiver.get("blockers"):
+                blockers.append(str(wal_archiver.get("reason") or "wal_archiver_not_ok"))
+        if bool(pg_wal.get("required")) and not bool(pg_wal.get("ok", False)):
+            blockers.extend([str(item) for item in list(pg_wal.get("blockers") or []) if str(item).strip()])
+            if not pg_wal.get("blockers"):
+                blockers.append(str(pg_wal.get("reason") or "pg_wal_disk_risk_not_ok"))
+        warnings.extend([str(item) for item in list(storage.get("warnings") or []) if str(item).strip()])
+        warnings.extend([str(item) for item in list(wal_archiver.get("warnings") or []) if str(item).strip()])
+        warnings.extend([str(item) for item in list(pg_wal.get("warnings") or []) if str(item).strip()])
+        out["storage_wal_guards"] = {
+            "ok": bool(not blockers),
+            "required": bool(required),
+            "mode": mode_name,
+            "reason": "ok" if not blockers else blockers[0],
+            "blockers": _dedupe_strs(blockers),
+            "warnings": _dedupe_strs(warnings),
+            "storage_placement": storage,
+            "wal_archiver_runtime": wal_archiver,
+            "pg_wal_disk_risk": pg_wal,
+        }
+    except Exception as e:
+        _warn("health.storage_wal_guards", e)
+        out["storage_wal_guards"] = {
+            "ok": False if required_by_env else True,
+            "required": bool(required_by_env),
+            "mode": mode_name,
+            "reason": f"storage_wal_guards_error:{type(e).__name__}",
+            "blockers": ([f"storage_wal_guards_error:{type(e).__name__}"] if required_by_env else []),
+            "warnings": ([] if required_by_env else [f"storage_wal_guards_error:{type(e).__name__}: {e}"]),
+        }
+    _trace_section(
+        "storage_wal_guards",
+        section_started,
+        ok=bool((out.get("storage_wal_guards") or {}).get("ok", True)),
+    )
+
+
 def _check_db(ctx: HealthSnapshotContext) -> None:
     con = ctx.con
     out = ctx.out
@@ -2497,30 +2698,56 @@ def _check_prices(ctx: HealthSnapshotContext) -> None:
     try:
         effective_prices_max_age_s = _effective_prices_max_age_s(con)
         ctx.scratch["effective_prices_max_age_s"] = effective_prices_max_age_s
-        row = con.execute("SELECT MAX(ts_ms) FROM prices").fetchone()
+        try:
+            row = con.execute(
+                """
+                SELECT ts_ms, source
+                FROM prices
+                WHERE price IS NOT NULL
+                ORDER BY ts_ms DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except Exception:
+            row = con.execute("SELECT MAX(ts_ms), NULL FROM prices WHERE price IS NOT NULL").fetchone()
         if row and row[0]:
-            age_s = (now_ms - int(row[0])) / 1000.0
+            last_ts_ms = int(row[0])
+            source = str(row[1] or "")
+            age_s = (now_ms - last_ts_ms) / 1000.0
+            fresh = bool(age_s < effective_prices_max_age_s)
             out["prices"] = {
-                "ok": age_s < effective_prices_max_age_s,
+                "ok": fresh,
+                "status": "fresh" if fresh else "stale",
+                "stale": not fresh,
                 "age_s": round(age_s, 1),
                 "max_age_s": round(effective_prices_max_age_s, 1),
-                "last_ts_ms": int(row[0]),
+                "last_ts_ms": last_ts_ms,
+                "source": source,
+                "simulated": source.lower() == "simulated",
             }
         else:
             out["prices"] = {
                 "ok": False,
+                "status": "missing",
+                "stale": True,
                 "age_s": None,
                 "max_age_s": round(effective_prices_max_age_s, 1),
                 "last_ts_ms": None,
+                "source": "",
+                "simulated": False,
             }
     except Exception as e:
         _warn("health.prices", e)
         ctx.scratch["effective_prices_max_age_s"] = HEALTH_PRICES_MAX_AGE_S
         out["prices"] = {
             "ok": False,
+            "status": "error",
+            "stale": True,
             "age_s": None,
             "max_age_s": HEALTH_PRICES_MAX_AGE_S,
             "last_ts_ms": None,
+            "source": "",
+            "simulated": False,
         }
     _trace_section("prices", section_started, ok=bool((out.get("prices") or {}).get("ok")))
 
@@ -2680,7 +2907,12 @@ def _check_job_heartbeats(ctx: HealthSnapshotContext) -> None:
     section_started = time.perf_counter()
     try:
         row = con.execute(
-            "SELECT job_name, MAX(heartbeat_ts_ms) FROM job_locks GROUP BY job_name"
+            """
+            SELECT job_name, MAX(heartbeat_ts_ms)
+            FROM job_locks
+            WHERE job_name NOT LIKE 'ingestion_restart_guard/v1::%'
+            GROUP BY job_name
+            """
         ).fetchall() or []
 
         jobs = {}
@@ -2914,6 +3146,7 @@ def _check_provider_health(ctx: HealthSnapshotContext) -> None:
                     if row.get("error") is None
                     else str(row.get("error"))
                 ),
+                "simulated": str(provider_name).strip().lower() == "simulated",
                 "session_last_failure": provider_meta,
                 "session_fatal": provider_fatal,
             }
@@ -2949,11 +3182,60 @@ def _check_provider_health(ctx: HealthSnapshotContext) -> None:
                     "latency_ms": (_int_or(provider_info.get("latency_ms")) if provider_info.get("latency_ms") is not None else None),
                     "n_symbols": _int_or(provider_info.get("n_symbols")),
                     "error": (None if provider_info.get("error") is None else str(provider_info.get("error"))),
+                    "simulated": str(provider_name).strip().lower() == "simulated",
                     "session_last_failure": provider_info.get("session_last_failure"),
                     "session_fatal": provider_fatal,
                 }
                 if p_ok:
                     healthy_n += 1
+
+        try:
+            manager_sources, _manager_required, manager_error = _manager_provider_sources()
+            for provider_name, source in manager_sources.items():
+                provider_name_s = str(provider_name or "").strip().lower()
+                if not provider_name_s:
+                    continue
+                runnable_state = str(source.get("runnable_state") or "")
+                runnable_reason = str(source.get("runnable_state_reason") or "")
+                missing_env = list(source.get("missing_credential_env_vars") or [])
+                if provider_name_s in providers:
+                    providers[provider_name_s]["runnable_state"] = runnable_state
+                    providers[provider_name_s]["runnable_state_reason"] = runnable_reason
+                    providers[provider_name_s]["runtime_desired_eligible"] = bool(source.get("runtime_desired_eligible"))
+                    providers[provider_name_s]["missing_credential_env_vars"] = missing_env
+                    continue
+                providers[provider_name_s] = {
+                    "ok": False,
+                    "age_s": None,
+                    "last_ts_ms": None,
+                    "last_success_ts_ms": (
+                        int(source.get("last_success_ts_ms") or 0)
+                        if int(source.get("last_success_ts_ms") or 0) > 0
+                        else None
+                    ),
+                    "last_success_age_s": None,
+                    "error_count": int(source.get("error_count") or 0),
+                    "circuit_open": False,
+                    "circuit_breaker_error_threshold": int(PROVIDER_CIRCUIT_BREAKER_ERRORS),
+                    "latency_ms": None,
+                    "n_symbols": 0,
+                    "error": (
+                        "provider_credential_missing"
+                        if runnable_state == "enabled-missing-credential"
+                        else (manager_error or "provider_health_missing")
+                    ),
+                    "simulated": provider_name_s == "simulated",
+                    "session_last_failure": None,
+                    "session_fatal": None,
+                    "source_key": str(source.get("source_key") or ""),
+                    "job_name": str(source.get("job_name") or ""),
+                    "runnable_state": runnable_state,
+                    "runnable_state_reason": runnable_reason,
+                    "runtime_desired_eligible": bool(source.get("runtime_desired_eligible")),
+                    "missing_credential_env_vars": missing_env,
+                }
+        except Exception as e:
+            _warn("health.providers.data_source_overlay", e)
 
         if healthy_n <= 0:
             try:
@@ -2970,6 +3252,7 @@ def _check_provider_health(ctx: HealthSnapshotContext) -> None:
                         "age_s": round(price_age_s, 1),
                         "last_ts_ms": int(last_price_ts_ms),
                         "synthetic": True,
+                        "simulated": str(((out.get("prices") or {}).get("source") or "")).lower() == "simulated",
                         "strict_provider_telemetry": bool(strict_provider_telemetry),
                         "latency_ms": None,
                         "n_symbols": 0,
@@ -3510,6 +3793,25 @@ def _check_timeseries_storage(ctx: HealthSnapshotContext) -> None:
     _trace_section("timeseries_storage", section_started, ok=bool((out.get("timeseries_storage") or {}).get("ok")))
 
 
+def _check_ingestion_soak(ctx: HealthSnapshotContext) -> None:
+    out = ctx.out
+    section_started = time.perf_counter()
+    try:
+        from engine.runtime.ingestion_soak import collect_ingestion_soak_report
+
+        out["ingestion_soak"] = dict(collect_ingestion_soak_report(out) or {})
+    except Exception as e:
+        _warn("health.ingestion_soak", e)
+        out["ingestion_soak"] = {
+            "ok": False,
+            "required": True,
+            "status": "degraded",
+            "errors": [f"ingestion_soak_error:{type(e).__name__}:{e}"],
+            "ts_ms": int(ctx.now_ms),
+        }
+    _trace_section("ingestion_soak", section_started, ok=bool((out.get("ingestion_soak") or {}).get("ok")))
+
+
 def _check_telemetry_migration_validation(ctx: HealthSnapshotContext) -> None:
     out = ctx.out
     section_started = time.perf_counter()
@@ -3828,6 +4130,9 @@ def _check_startup_validation(ctx: HealthSnapshotContext) -> None:
 _HEALTH_SNAPSHOT_CHECKS: tuple[HealthSnapshotCheck, ...] = (
     HealthSnapshotCheck("runtime_hardware", _check_runtime_hardware),
     HealthSnapshotCheck("disk_pressure", _check_disk_pressure),
+    HealthSnapshotCheck("memory_pressure", _check_memory_pressure),
+    HealthSnapshotCheck("effective_runtime_state", _check_effective_runtime_state),
+    HealthSnapshotCheck("storage_wal_guards", _check_storage_wal_guards),
     HealthSnapshotCheck("db", _check_db),
     HealthSnapshotCheck("event_log", _check_event_log),
     HealthSnapshotCheck("prices", _check_prices),
@@ -3858,6 +4163,7 @@ _HEALTH_SNAPSHOT_CHECKS: tuple[HealthSnapshotCheck, ...] = (
     HealthSnapshotCheck("pg_price_storage", _check_pg_price_storage),
     HealthSnapshotCheck("price_migration_validation", _check_price_migration_validation),
     HealthSnapshotCheck("timeseries_storage", _check_timeseries_storage),
+    HealthSnapshotCheck("ingestion_soak", _check_ingestion_soak),
     HealthSnapshotCheck("telemetry_migration_validation", _check_telemetry_migration_validation),
     HealthSnapshotCheck("portfolio_runtime", _check_portfolio_runtime),
     HealthSnapshotCheck("execution_degraded", _check_execution_degraded),
@@ -3895,6 +4201,18 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
     attribution_ok = bool((out.get("attribution") or {}).get("ok"))
     options_ingestion_ok = bool((out.get("options_ingestion") or {}).get("ok"))
     startup_validation_ok = bool((out.get("startup_validation") or {}).get("ok"))
+    memory_pressure = dict(out.get("memory_pressure") or {})
+    memory_pressure_required = bool(memory_pressure.get("required"))
+    memory_pressure_ok = bool((not memory_pressure_required) or memory_pressure.get("ok", True))
+    effective_runtime_state = dict(out.get("effective_runtime_state") or {})
+    effective_runtime_required = bool(effective_runtime_state.get("required"))
+    effective_runtime_ok = bool((not effective_runtime_required) or effective_runtime_state.get("ok", True))
+    storage_wal_guards = dict(out.get("storage_wal_guards") or {})
+    storage_wal_guards_required = bool(storage_wal_guards.get("required"))
+    storage_wal_guards_ok = bool((not storage_wal_guards_required) or storage_wal_guards.get("ok", True))
+    ingestion_soak = dict(out.get("ingestion_soak") or {})
+    ingestion_soak_required = bool(ingestion_soak.get("required"))
+    ingestion_soak_ok = bool((not ingestion_soak_required) or ingestion_soak.get("ok", True))
     timeseries_storage_snapshot = dict(out.get("timeseries_storage") or {})
     timescale_snapshot = dict(out.get("timescale") or {})
     feature_store_snapshot = dict(out.get("feature_store") or {})
@@ -3979,6 +4297,10 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         "position_reconcile_ok": position_reconcile_ok,
         "execution_degraded": execution_degraded_active,
         "startup_validation_ok": startup_validation_ok,
+        "memory_pressure_ok": memory_pressure_ok,
+        "effective_runtime_state_ok": effective_runtime_ok,
+        "storage_wal_guards_ok": storage_wal_guards_ok,
+        "ingestion_soak_ok": ingestion_soak_ok,
         "execution_barrier_ok": barrier_ok,
         "broker_ok": broker_ok,
         "execution_supervisor_ok": exec_sup_ok,
@@ -4043,6 +4365,18 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         out["reasons"].extend(list(position_reconcile_snapshot.get("blockers") or []))
     if not startup_validation_ok:
         out["reasons"].extend(list((out.get("startup_validation") or {}).get("reasons") or []))
+    if not memory_pressure_ok:
+        out["reasons"].append("memory_pressure_not_ok")
+        out["reasons"].extend([f"memory_pressure:{item}" for item in list(memory_pressure.get("errors") or [])])
+    if not effective_runtime_ok:
+        out["reasons"].append("effective_runtime_state_not_ok")
+        out["reasons"].extend([f"effective_runtime_state:{item}" for item in list(effective_runtime_state.get("errors") or [])])
+    if not storage_wal_guards_ok:
+        out["reasons"].append("storage_wal_guards_not_ok")
+        out["reasons"].extend([f"storage_wal_guard:{item}" for item in list(storage_wal_guards.get("blockers") or [])])
+    if not ingestion_soak_ok:
+        out["reasons"].append("ingestion_soak_not_ok")
+        out["reasons"].extend([f"ingestion_soak:{item}" for item in list(ingestion_soak.get("errors") or [])])
     if not barrier_ok and mode_name in ("shadow", "live"):
         out["reasons"].append(f"execution_barrier:{barrier.get('reason', 'blocked')}")
     if execution_degraded_active:
@@ -4091,6 +4425,10 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         out["ok"] = (
             startup_ok
             and startup_validation_ok
+            and memory_pressure_ok
+            and effective_runtime_ok
+            and storage_wal_guards_ok
+            and ingestion_soak_ok
             and events_ok
             and data_pipeline_runtime_ok
             and barrier_ok
@@ -4108,6 +4446,10 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         out["ok"] = (
             startup_ok
             and startup_validation_ok
+            and memory_pressure_ok
+            and effective_runtime_ok
+            and storage_wal_guards_ok
+            and ingestion_soak_ok
             and events_ok
             and data_pipeline_runtime_ok
             and barrier_ok
@@ -4123,6 +4465,10 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         out["ok"] = (
             startup_ok
             and startup_validation_ok
+            and memory_pressure_ok
+            and effective_runtime_ok
+            and storage_wal_guards_ok
+            and ingestion_soak_ok
             and data_pipeline_runtime_ok
             and timeseries_ok
             and portfolio_runtime_ok
@@ -4202,6 +4548,18 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         critical_blockers.append("execution_supervisor_unavailable")
     if exec_sup_critical:
         critical_blockers.append("execution_supervisor_critical")
+    if not memory_pressure_ok:
+        critical_blockers.append("memory_pressure_not_ok")
+        critical_blockers.extend([f"memory_pressure:{item}" for item in list(memory_pressure.get("errors") or [])])
+    if not effective_runtime_ok:
+        critical_blockers.append("effective_runtime_state_not_ok")
+        critical_blockers.extend([f"effective_runtime_state:{item}" for item in list(effective_runtime_state.get("errors") or [])])
+    if not storage_wal_guards_ok:
+        critical_blockers.append("storage_wal_guards_not_ok")
+        critical_blockers.extend([f"storage_wal_guard:{item}" for item in list(storage_wal_guards.get("blockers") or [])])
+    if not ingestion_soak_ok:
+        critical_blockers.append("ingestion_soak_not_ok")
+        critical_blockers.extend([f"ingestion_soak:{item}" for item in list(ingestion_soak.get("errors") or [])])
 
     if not bool((out.get("ingestion_runtime") or {}).get("running")):
         critical_blockers.append("ingestion_not_running")
@@ -4238,6 +4596,10 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         and bool(critical_ingestion_ok)
         and bool((out.get("attribution") or {}).get("ok"))
         and (mode_name not in ("shadow", "live") or bool((out.get("competition") or {}).get("ok")))
+        and memory_pressure_ok
+        and effective_runtime_ok
+        and storage_wal_guards_ok
+        and ingestion_soak_ok
         and not bool(ctx.check_failures)
     )
     out["reasons"] = _dedupe_strs(list(out.get("reasons") or []))

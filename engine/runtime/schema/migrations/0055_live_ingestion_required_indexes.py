@@ -62,9 +62,11 @@ def up(conn) -> None:
     _create_index(conn, "prices", "idx_prices_symbol_ts", "symbol, ts_ms")
     _create_index(conn, "price_quotes", "idx_price_quotes_symbol_ts", "symbol, ts_ms")
     _create_index(conn, "price_quotes", "idx_price_quotes_ts", "ts_ms")
+    _create_index(conn, "price_quotes", "idx_price_quotes_time_desc", '"time" DESC')
     _create_index(conn, "price_quotes_raw", "idx_price_quotes_raw_symbol_ts", "symbol, ts_ms")
     _create_index(conn, "price_quotes_raw", "idx_price_quotes_raw_provider_ts", "provider, ts_ms")
     _create_index(conn, "price_quotes_raw", "idx_price_quotes_raw_ts", "ts_ms")
+    _create_index(conn, "price_quotes_raw", "idx_price_quotes_raw_time_desc", '"time" DESC')
     _create_index(
         conn,
         "price_quotes_raw",
@@ -139,11 +141,16 @@ def up(conn) -> None:
     )
     _create_index(conn, "execution_fills", "idx_execution_fills_symbol_ts", "symbol, fill_ts_ms")
     _create_index(conn, "execution_fills", "idx_execution_fills_fill_id", "fill_id")
+    fill_dedupe_columns = (
+        "client_order_id, fill_id, ts_ms"
+        if _table_has_columns(conn, "execution_fills", "client_order_id", "fill_id", "ts_ms")
+        else "client_order_id, fill_id"
+    )
     _create_index(
         conn,
         "execution_fills",
         "uq_execution_fills_client_fillid",
-        "client_order_id, fill_id",
+        fill_dedupe_columns,
         unique=True,
         where_sql="fill_id IS NOT NULL",
     )

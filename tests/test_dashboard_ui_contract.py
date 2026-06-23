@@ -147,6 +147,8 @@ print("__DASHBOARD_ROUTE_SNAPSHOT__" + json.dumps({
         env.pop(key, None)
     with tempfile.TemporaryDirectory(prefix="dashboard-route-contract-") as temp_root:
         temp_path = Path(temp_root)
+        secrets_dir = temp_path / "secrets"
+        secrets_dir.mkdir()
         token_file = temp_path / "dashboard_api_token"
         token_file.write_text("dashboard-route-contract-token", encoding="utf-8")
         token_file.chmod(0o600)
@@ -154,6 +156,9 @@ print("__DASHBOARD_ROUTE_SNAPSHOT__" + json.dumps({
             env[spec.key] = ""
         env["DASHBOARD_API_TOKEN_FILE"] = str(token_file)
         env["TRADING_SECRET_POLICY_REPO_ROOT"] = str(temp_path)
+        env["TS_STORAGE_BACKEND"] = "sqlite"
+        env["TS_SECRETS_PROVIDER"] = "plaintext"
+        env["TS_DEV_SECRETS_DIR"] = str(secrets_dir)
         env.setdefault("DB_PATH", str(temp_path / "dashboard_route_contract.db"))
         result = subprocess.run(
             [sys.executable, "-c", code],
@@ -183,6 +188,20 @@ def _api_endpoint_paths(refs):
     return sorted({ref.path for ref in refs if ref.transport in {"http", "eventsource"}})
 
 
+def test_business_refusal_ui_helpers_surface_reason_codes() -> None:
+    data_sources_js = (REPO_ROOT / "ui" / "data_sources.js").read_text(encoding="utf-8")
+    terminal_js = (REPO_ROOT / "ui" / "terminal" / "terminal.js").read_text(encoding="utf-8")
+    api_client_js = (REPO_ROOT / "ui" / "api_client.js").read_text(encoding="utf-8")
+
+    assert "allowedBusinessRefusal" in data_sources_js
+    assert "payload.reason_code" in data_sources_js
+    assert "payload.message" in data_sources_js
+    assert "j.message || j.reason || j.error" in terminal_js
+    assert "j.reason_code || j.error" in terminal_js
+    assert "allowBusinessFalse" in api_client_js
+    assert "data.message || data.reason || data.reason_code || data.error" in api_client_js
+
+
 def test_dashboard_route_contract_introspection_still_enforces_security_preflight():
     code = "import dashboard_server\n"
     env = dict(os.environ)
@@ -205,8 +224,13 @@ def test_dashboard_route_contract_introspection_still_enforces_security_prefligh
 
     with tempfile.TemporaryDirectory(prefix="dashboard-route-contract-security-") as temp_root:
         temp_path = Path(temp_root)
+        secrets_dir = temp_path / "secrets"
+        secrets_dir.mkdir()
         env["DB_PATH"] = str(temp_path / "dashboard_route_contract_security.db")
         env["TRADING_SECRET_POLICY_REPO_ROOT"] = str(temp_path)
+        env["TS_STORAGE_BACKEND"] = "sqlite"
+        env["TS_SECRETS_PROVIDER"] = "plaintext"
+        env["TS_DEV_SECRETS_DIR"] = str(secrets_dir)
         result = subprocess.run(
             [sys.executable, "-c", code],
             cwd=str(REPO_ROOT),

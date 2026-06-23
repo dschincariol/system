@@ -5,6 +5,52 @@ x-trading-logging: &trading-logging
     max-file: "${DOCKER_LOG_MAX_FILE:-5}"
 
 services:
+  storage-placement-preflight:
+    image: ${APP_RUNTIME_IMAGE:?set APP_RUNTIME_IMAGE}
+    container_name: trading-storage-placement-preflight
+    restart: "no"
+    network_mode: none
+    logging: *trading-logging
+    read_only: true
+    environment:
+      ENV: ${APP_ENV:-prod}
+      PROD_LOCK: ${PROD_LOCK:-1}
+      ENGINE_SUPERVISED: "1"
+      PREFLIGHT_REQUIRE_ZFS_STORAGE: ${PREFLIGHT_REQUIRE_ZFS_STORAGE:-1}
+      PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS: ${PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS:-1}
+      TRADING_ZFS_ROOT: ${TRADING_ZFS_ROOT:?set TRADING_ZFS_ROOT to the production ZFS root}
+      TRADING_ALLOWED_STORAGE_PREFIXES: ${TRADING_ALLOWED_STORAGE_PREFIXES:-/zpool,/dbpool,/auxpool,/var/backups/trading}
+      TRADING_ALLOWED_STORAGE_FS_TYPES: ${TRADING_ALLOWED_STORAGE_FS_TYPES:-zfs}
+      TRADING_FORBIDDEN_STORAGE_PREFIXES: ${TRADING_FORBIDDEN_STORAGE_PREFIXES:-/var/lib/docker,/var/lib/containerd}
+      TRADING_TIMESCALE_DATA: ${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}
+      TRADING_REDIS_DATA: ${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}
+      TRADING_MINIO_DATA: ${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}
+      TRADING_RUNTIME_DATA: ${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}
+      TRADING_RUNTIME_LOGS: ${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}
+      TRADING_ARTIFACT_MIRROR: ${TRADING_ARTIFACT_MIRROR:?set TRADING_ARTIFACT_MIRROR to a ZFS-backed host path}
+      TRADING_TRAINING_DATASETS: ${TRADING_TRAINING_DATASETS:?set TRADING_TRAINING_DATASETS to a ZFS-backed host path}
+      TRADING_BACKUP_ROOT: ${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}
+      TRADING_BACKUP_WAL_DIR: ${TRADING_BACKUP_WAL_DIR:?set TRADING_BACKUP_WAL_DIR to the ZFS-backed backup WAL path}
+    volumes:
+      - ${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:ro
+      - ${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:/var/lib/postgresql/data:ro
+      - ${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}:${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}:ro
+      - ${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}:${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}:ro
+      - ${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:ro
+      - ${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:/app/data:ro
+      - ${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:ro
+      - ${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:/app/logs:ro
+      - ${TRADING_ARTIFACT_MIRROR:?set TRADING_ARTIFACT_MIRROR to a ZFS-backed host path}:${TRADING_ARTIFACT_MIRROR:?set TRADING_ARTIFACT_MIRROR to a ZFS-backed host path}:ro
+      - ${TRADING_ARTIFACT_MIRROR:?set TRADING_ARTIFACT_MIRROR to a ZFS-backed host path}:/app/artifact_mirror:ro
+      - ${TRADING_TRAINING_DATASETS:?set TRADING_TRAINING_DATASETS to a ZFS-backed host path}:${TRADING_TRAINING_DATASETS:?set TRADING_TRAINING_DATASETS to a ZFS-backed host path}:ro
+      - ${TRADING_TRAINING_DATASETS:?set TRADING_TRAINING_DATASETS to a ZFS-backed host path}:/app/training_datasets:ro
+      - ${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:ro
+    command:
+      - python
+      - -m
+      - engine.runtime.storage_placement
+      - --json
+
   timescaledb:
     image: ${TIMESCALE_IMAGE:?set TIMESCALE_IMAGE}
     container_name: trading-timescaledb
@@ -14,6 +60,9 @@ services:
     memswap_limit: ${TIMESCALE_MEMSWAP_LIMIT:-32g}
     shm_size: ${TIMESCALE_SHM_SIZE:-2g}
     logging: *trading-logging
+    depends_on:
+      storage-placement-preflight:
+        condition: service_completed_successfully
     environment:
       POSTGRES_DB: ${TIMESCALE_DB:-trading}
       POSTGRES_USER: ${TIMESCALE_USER:-trading}

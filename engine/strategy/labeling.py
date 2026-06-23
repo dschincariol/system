@@ -8,7 +8,9 @@ training.
 
 import time
 from typing import Dict, List
-from engine.data.prices.returns import compute_return
+from engine.data.asset_map import asset_class_for_symbol
+from engine.data.prices.fx_clock import fx_forward_eval_ms, fx_window_spans_closed_gap
+from engine.data.prices.returns import compute_return, price_at_or_after
 from engine.data.prices.volatility import compute_volatility
 from engine.runtime.storage import connect
 from engine.strategy.model_v2 import classify_regime
@@ -33,7 +35,17 @@ def label_event(
             regime = classify_regime(vol)
 
             for _, h_s in HORIZONS_S.items():
-                ret = compute_return(series, event_ts, h_s * 1000)
+                horizon_ms = int(h_s) * 1000
+                if str(asset_class_for_symbol(str(sym)) or "").upper().strip() == "FX":
+                    naive_eval_ts = int(event_ts) + int(horizon_ms)
+                    if fx_window_spans_closed_gap(int(event_ts), int(naive_eval_ts)):
+                        continue
+                    eval_ts = fx_forward_eval_ms(int(event_ts), int(horizon_ms))
+                    p0 = price_at_or_after(series, int(event_ts))
+                    p1 = price_at_or_after(series, int(eval_ts))
+                    ret = None if p0 is None or p1 is None else (float(p1) - float(p0)) / float(p0)
+                else:
+                    ret = compute_return(series, event_ts, horizon_ms)
                 if ret is None:
                     continue
 

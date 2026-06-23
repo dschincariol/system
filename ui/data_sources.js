@@ -13,12 +13,16 @@ const SESSION_STORAGE_KEY = "dataSourceControlPlaneSession";
 const state = {
   sources: [],
   templates: [],
+  providerAccounts: [],
+  providerAccountTemplates: [],
   runtime: {},
   auth: {},
   selectedKey: "",
   refreshTimer: null,
   editingKey: "",
   editingSource: null,
+  editingAccountKey: "",
+  lastTestResults: {},
   session: {
     actor: "",
     token: "",
@@ -63,8 +67,38 @@ function flash(message, isError = false) {
 function statusPill(source) {
   const status = String(source.status || "unknown").toLowerCase();
   if (status === "ok" || status === "tested") return `<span class="pill ok">${esc(status)}</span>`;
+  if (status === "test_degraded") return `<span class="pill warn">${esc(status)}</span>`;
   if (status === "error" || status === "test_failed") return `<span class="pill err">${esc(status)}</span>`;
+  if (status === "test_unsupported") return `<span class="pill dim">${esc(status)}</span>`;
   return `<span class="pill dim">${esc(status)}</span>`;
+}
+
+function runnableStateLabel(value) {
+  const runtimeState = String(value || "off").toLowerCase();
+  const labels = {
+    "off": "Off",
+    "enabled-missing-credential": "Missing Credential",
+    "enabled-credentialed-not-scheduled": "Not Scheduled",
+    "scheduled-waiting": "Scheduled",
+    "running": "Running",
+    "degraded": "Degraded",
+    "failed": "Failed",
+    "healthy": "Healthy",
+  };
+  return labels[runtimeState] || runtimeState.replace(/-/g, " ");
+}
+
+function runnableStateTone(value) {
+  const runtimeState = String(value || "off").toLowerCase();
+  if (runtimeState === "healthy" || runtimeState === "running") return "ok";
+  if (runtimeState === "failed" || runtimeState === "enabled-missing-credential") return "err";
+  if (runtimeState === "degraded" || runtimeState === "scheduled-waiting") return "warn";
+  return "dim";
+}
+
+function runnableStatePill(source) {
+  const runtimeState = String(source?.runnable_state || "off").toLowerCase();
+  return `<span class="pill ${esc(runnableStateTone(runtimeState))}">${esc(runnableStateLabel(runtimeState))}</span>`;
 }
 
 function queryParam(name) {
@@ -114,6 +148,7 @@ function captureSessionInputs() {
 
 async function request(url, options = {}) {
   captureSessionInputs();
+  const { allowApplicationError = false, ...fetchOptions } = options;
   const headers = new Headers(options.headers || {});
   headers.set("Content-Type", "application/json");
   if (state.session.token.trim()) {
@@ -121,12 +156,19 @@ async function request(url, options = {}) {
   }
   const response = await fetch(url, {
     cache: "no-store",
-    ...options,
+    ...fetchOptions,
     headers,
   });
   const payload = await response.json();
-  if (!response.ok || payload.ok === false) {
-    throw new Error(payload.error || payload.detail || `request_failed:${response.status}`);
+  const allowedBusinessRefusal = allowApplicationError
+    && response.status >= 400
+    && response.status < 500
+    && payload
+    && payload.ok === false;
+  if ((!response.ok && !allowedBusinessRefusal) || (payload.ok === false && !allowApplicationError)) {
+    const reason = payload.reason_code || payload.error || payload.detail || `request_failed:${response.status}`;
+    const message = payload.message || payload.reason || reason;
+    throw new Error(reason && reason !== message ? `${message} (${reason})` : message);
   }
   return payload;
 }
@@ -144,222 +186,62 @@ function templateForSource(source) {
   return templateByKey(source.template_key || source.source_key || "");
 }
 
-const SOURCE_GUIDES = {
-  polygon_ws: {
-    category: "Market Data",
-    summary: "Streams live market data from Polygon for the fastest price updates.",
-    needs: ["A Polygon API key with WebSocket market data access."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the Polygon API key.",
-      "Save the source, then run Test Connection.",
-      "Enable the source if you want live streaming."
-    ],
-    whenEnabled: "The runtime can stream live market data and reduce delay on price updates."
-  },
-  polygon: {
-    category: "Market Data",
-    summary: "Polls Polygon REST snapshots as a market-data source and fallback feed.",
-    needs: ["A Polygon API key with REST access."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the Polygon API key.",
-      "Save the source, then run Test Connection.",
-      "Leave this enabled if you want Polygon snapshot polling."
-    ],
-    whenEnabled: "The runtime can poll Polygon snapshot data for price and options workflows."
-  },
-  ibkr: {
-    category: "Broker Connectivity",
-    summary: "Connects to Interactive Brokers for streaming broker-backed market data.",
-    needs: ["IBKR Gateway or TWS running.", "Host, port, and client ID that match your IBKR setup."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the host, port, and client ID.",
-      "Run Test Connection to verify the socket is reachable.",
-      "Enable only when the IBKR service is running."
-    ],
-    whenEnabled: "The runtime can connect to IBKR for broker-side market data."
-  },
-  yfinance: {
-    category: "Market Data",
-    summary: "Provides Yahoo Finance polling as a low-friction backup market-data source.",
-    needs: ["No credentials are required."],
-    setup: [
-      "Enable the source if you want Yahoo polling available.",
-      "Run Test Connection if you want a quick connectivity check."
-    ],
-    whenEnabled: "The runtime can use Yahoo Finance as a backup polling source."
-  },
-  ccxt: {
-    category: "Market Data",
-    summary: "Provides crypto price polling through CCXT.",
-    needs: ["No credentials are required for the default public polling path."],
-    setup: [
-      "Enable the source if you want CCXT crypto price polling.",
-      "Use Test Connection if you want to confirm public exchange reachability."
-    ],
-    whenEnabled: "The runtime can poll public crypto market data."
-  },
-  tradier: {
-    category: "Options",
-    summary: "Provides options-chain polling through Tradier.",
-    needs: ["A Tradier API token."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the Tradier API token.",
-      "Save and run Test Connection.",
-      "Enable when you want options data from Tradier."
-    ],
-    whenEnabled: "The runtime can poll options expirations and option-chain data."
-  },
-  reddit: {
-    category: "Social Sentiment",
-    summary: "Polls Reddit to gather social sentiment from configured communities.",
-    needs: ["A Reddit client ID.", "A Reddit client secret."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the Reddit client ID and client secret.",
-      "Optional: adjust subreddits and user agent in Settings.",
-      "Save and run Test Connection."
-    ],
-    whenEnabled: "The runtime can collect Reddit sentiment and discussion signals."
-  },
-  stocktwits: {
-    category: "Social Sentiment",
-    summary: "Polls Stocktwits trending and symbol streams.",
-    needs: ["No stored credentials are required for the default public endpoint."],
-    setup: [
-      "Enable the source.",
-      "Run Test Connection.",
-      "If access is blocked, review the last error and decide whether to disable it."
-    ],
-    whenEnabled: "The runtime can gather public Stocktwits sentiment context."
-  },
-  company_news: {
-    category: "News",
-    summary: "Pulls company-specific news through Finnhub.",
-    needs: ["A Finnhub API key."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the Finnhub API key.",
-      "Optional: adjust symbol limit and lookback window.",
-      "Save and run Test Connection."
-    ],
-    whenEnabled: "The runtime can ingest company-level news for tracked symbols."
-  },
-  transcripts: {
-    category: "News",
-    summary: "Fetches company transcripts through Financial Modeling Prep.",
-    needs: ["An FMP API key."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the FMP API key.",
-      "Save and run Test Connection."
-    ],
-    whenEnabled: "The runtime can ingest transcripts for supported symbols."
-  },
-  gdelt: {
-    category: "News",
-    summary: "Queries GDELT for broad market and macro news coverage.",
-    needs: ["No credentials are required."],
-    setup: [
-      "Enable the source if you want GDELT news in the pipeline.",
-      "Run Test Connection.",
-      "If it rate limits, either wait or disable it."
-    ],
-    whenEnabled: "The runtime can pull broad market news and article references."
-  },
-  sec: {
-    category: "Filings",
-    summary: "Polls SEC filing data for tracked companies.",
-    needs: ["A proper SEC user agent and contact details in Settings if you customize the source."],
-    setup: [
-      "Review the source settings.",
-      "Run Test Connection.",
-      "Enable only if the SEC path is healthy."
-    ],
-    whenEnabled: "The runtime can ingest SEC filings and filing-related events."
-  },
-  earnings: {
-    category: "Calendar",
-    summary: "Pulls upcoming earnings events through Financial Modeling Prep.",
-    needs: ["An FMP API key."],
-    setup: [
-      "Use Edit Source.",
-      "Enter the FMP API key.",
-      "Save and run Test Connection."
-    ],
-    whenEnabled: "The runtime can ingest earnings calendar events."
-  },
-  weather_forecasts: {
-    category: "Weather",
-    summary: "Pulls weather forecasts for configured regions.",
-    needs: ["No credentials are required for the default provider."],
-    setup: [
-      "Enable the source if you want weather forecasts.",
-      "Run Test Connection."
-    ],
-    whenEnabled: "The runtime can ingest forecast data for weather-aware models."
-  },
-  weather_alerts: {
-    category: "Weather",
-    summary: "Pulls active weather alerts from the configured alerts provider.",
-    needs: ["No credentials are required for the default provider."],
-    setup: [
-      "Enable the source if you want alert ingestion.",
-      "Run Test Connection."
-    ],
-    whenEnabled: "The runtime can ingest active weather alerts."
-  },
-  macro: {
-    category: "Macro",
-    summary: "Builds macro factor snapshots used by the strategy layer.",
-    needs: ["No credentials are required."],
-    setup: [
-      "Leave enabled unless you intentionally want to stop macro ingestion."
-    ],
-    whenEnabled: "The runtime can refresh macro factor data for models and dashboards."
-  },
-  model_feature_snapshots: {
-    category: "Model Support",
-    summary: "Captures feature snapshots used for diagnostics and model analysis.",
-    needs: ["No credentials are required."],
-    setup: [
-      "Leave enabled unless you intentionally want to stop feature snapshots."
-    ],
-    whenEnabled: "The runtime can capture model feature snapshots for diagnostics."
-  },
-  rss_feed: {
-    category: "News",
-    summary: "A custom RSS feed you manage directly from this page.",
-    needs: ["A name.", "A feed URL."],
-    setup: [
-      "Use Add RSS Feed.",
-      "Enter the feed name and feed URL.",
-      "Save and then use Test Connection."
-    ],
-    whenEnabled: "The runtime can ingest articles from that RSS feed."
-  }
-};
+function providerAccountByKey(accountKey) {
+  return state.providerAccounts.find((row) => String(row.account_key) === String(accountKey)) || null;
+}
 
-function sourceGuideKey(source) {
-  const sourceKey = String(source?.source_key || "").trim().toLowerCase();
-  const providerName = String(source?.provider_name || "").trim().toLowerCase();
-  const templateKey = String(source?.template_key || "").trim().toLowerCase();
-  if (sourceKey.startsWith("rss:")) return "rss_feed";
-  return sourceKey || providerName || templateKey || "rss_feed";
+function providerAccountTemplateByKey(accountKey) {
+  return state.providerAccountTemplates.find((row) => String(row.account_key) === String(accountKey)) || null;
+}
+
+function accountStatusPill(account) {
+  const status = String(account?.status || "empty").toLowerCase();
+  if (status === "configured") return `<span class="pill ok">configured</span>`;
+  if (status === "error") return `<span class="pill err">error</span>`;
+  return `<span class="pill dim">${esc(status || "empty")}</span>`;
 }
 
 function guideForSource(source) {
-  const key = sourceGuideKey(source);
-  return SOURCE_GUIDES[key] || {
+  const guide = templateForSource(source)?.guide || null;
+  return guide || {
     category: "Source",
     summary: "This source is managed from this page.",
     needs: ["Review the source state below."],
     setup: ["Select Edit Source, adjust settings or credentials, then run Test Connection."],
-    whenEnabled: "The runtime will include this source in ingestion and health monitoring."
+    when_enabled: "The runtime will include this source in ingestion and health monitoring.",
+    safety_warnings: [],
   };
+}
+
+function isFxDataSource(source, template = null) {
+  const guide = (template && template.guide) || {};
+  const parts = [
+    source && source.source_key,
+    source && source.source_type,
+    source && source.provider_name,
+    source && source.display_name,
+    source && source.job_name,
+    source && source.asset_class,
+    template && template.template_key,
+    template && template.category,
+    guide.category,
+    guide.summary,
+    guide.when_enabled,
+  ].map((value) => String(value || "").toLowerCase());
+  return parts.some((value) => /(^|[^a-z0-9])(fx|forex|foreign exchange|oanda|currency pair)([^a-z0-9]|$)/.test(value));
+}
+
+function fxSourceBadge(source, template = null) {
+  if (!isFxDataSource(source, template)) return "";
+  return `<span class="pill fx">FX feed</span>`;
+}
+
+function fxFeedStatusPill(source) {
+  const status = String(source?.status || source?.runnable_state || "unknown").toLowerCase();
+  const tone = status === "ok" || status === "tested" || status === "healthy"
+    ? "ok"
+    : (status.includes("fail") || status === "error" ? "err" : "dim");
+  return `<span class="pill ${tone}">FX status ${esc(status || "unknown")}</span>`;
 }
 
 function deriveSourceState(source, template) {
@@ -367,6 +249,10 @@ function deriveSourceState(source, template) {
   const credentialError = String(source?.credential_error || "").trim();
   const lastError = String(source?.last_error || "").trim();
   const status = String(source?.status || "").trim().toLowerCase();
+  const runtimeState = String(source?.runnable_state || "").trim().toLowerCase();
+  const missingEnvVars = (source?.missing_credential_env_vars || [])
+    .map((name) => String(name || "").trim())
+    .filter(Boolean);
   const enabled = !!source?.enabled;
   const credentialsRequired = credentialFields.length > 0;
   const credentialsConfigured = !!source?.credentials_configured;
@@ -378,6 +264,87 @@ function deriveSourceState(source, template) {
       priority: 0,
       detail: "This page can clear the unreadable stored credential blob. Reset credentials, then enter a fresh value if you want to keep the source enabled.",
       nextStep: "Reset corrupted credentials."
+    };
+  }
+
+  if (runtimeState === "enabled-missing-credential") {
+    return {
+      label: "Missing credential",
+      tone: "err",
+      priority: 0,
+      detail: missingEnvVars.length
+        ? `Missing runtime credential: ${missingEnvVars.join(", ")}.`
+        : "A required runtime credential is missing or could not be projected.",
+      nextStep: "Enter the required credential or disable the source."
+    };
+  }
+
+  if (runtimeState === "enabled-credentialed-not-scheduled") {
+    if (template && template.runtime_runnable === false) {
+      return {
+        label: "Read-only",
+        tone: "dim",
+        priority: 4,
+        detail: "This broker-data source is enabled for read-only status visibility and is intentionally not scheduled as a runtime job.",
+        nextStep: "Use Test Connection for account/data visibility; use broker execution controls for any trading authority."
+      };
+    }
+    return {
+      label: "Not scheduled",
+      tone: "dim",
+      priority: enabled ? 3 : 6,
+      detail: "This source is enabled but is not currently part of the runnable job set.",
+      nextStep: enabled ? "Review runtime policy and desired jobs." : "Enable it only if you want this source active."
+    };
+  }
+
+  if (runtimeState === "scheduled-waiting") {
+    return {
+      label: "Scheduled",
+      tone: "warn",
+      priority: 3,
+      detail: "The job is desired and waiting for runtime startup or first health evidence.",
+      nextStep: "Wait for the supervisor to start the job or inspect runtime logs."
+    };
+  }
+
+  if (runtimeState === "running") {
+    return {
+      label: "Running",
+      tone: "ok",
+      priority: 4,
+      detail: "The supervised job is running; health evidence has not yet promoted it to healthy.",
+      nextStep: "Monitor provider and pipeline health."
+    };
+  }
+
+  if (runtimeState === "degraded") {
+    return {
+      label: "Degraded",
+      tone: "warn",
+      priority: 1,
+      detail: lastError || "Runtime health is stale or degraded.",
+      nextStep: "Inspect provider telemetry and source logs."
+    };
+  }
+
+  if (runtimeState === "failed") {
+    return {
+      label: "Failed",
+      tone: "err",
+      priority: 1,
+      detail: lastError || "Runtime health reports a failed job or pipeline.",
+      nextStep: "Review the last error, then test or adjust the source."
+    };
+  }
+
+  if (runtimeState === "healthy") {
+    return {
+      label: "Healthy",
+      tone: "ok",
+      priority: 4,
+      detail: "This source is scheduled and has fresh healthy runtime evidence.",
+      nextStep: "No action needed."
     };
   }
 
@@ -431,10 +398,30 @@ function deriveSourceState(source, template) {
     };
   }
 
+  if (status === "test_degraded") {
+    return {
+      label: "Degraded",
+      tone: "warn",
+      priority: 2,
+      detail: lastError || "The latest test reached a fallback or partial provider path and was not counted as success.",
+      nextStep: "Review the test evidence and provider guidance before enabling reliance on this source."
+    };
+  }
+
+  if (status === "test_unsupported") {
+    return {
+      label: "Unsupported",
+      tone: "dim",
+      priority: 5,
+      detail: lastError || "This source has no successful external connection probe.",
+      nextStep: "Do not treat this source as connected; use runtime health or configure a supported provider test."
+    };
+  }
+
   if (status === "error" || status === "test_failed") {
     return {
-      label: "Needs attention",
-      tone: "warn",
+      label: "Failed",
+      tone: "err",
       priority: 2,
       detail: lastError || "The source reported an error.",
       nextStep: "Review the last error, then test or adjust the source."
@@ -462,16 +449,18 @@ function runtimeForSource(source) {
   const providerName = String(source?.provider_name || "").trim().toLowerCase();
   const providerTelemetry = ((state.runtime.provider_telemetry || {}).providers || {})[providerName] || null;
   const pipelineHealth = ((state.runtime.pipeline_health || {}).pipelines || {})[String(source?.job_name || "")] || null;
-  return { providerTelemetry, pipelineHealth };
+  const jobState = source?.job_runnable_state || ((state.runtime.jobs || {})[String(source?.job_name || "")] || null);
+  return { providerTelemetry, pipelineHealth, jobState };
 }
 
 function renderMetrics(payload) {
   const sources = payload.sources || [];
   const enabled = sources.filter((row) => row.enabled).length;
   const healthy = sources.filter((row) => deriveSourceState(row, templateForSource(row)).tone === "ok").length;
+  const runnable = sources.filter((row) => ["scheduled-waiting", "running", "healthy", "degraded"].includes(String(row.runnable_state || ""))).length;
   const errors = sources.reduce((sum, row) => sum + Number(row.error_count || 0), 0);
   el("metricTotal").textContent = String(sources.length);
-  el("metricEnabled").textContent = String(enabled);
+  el("metricEnabled").textContent = `${enabled} / ${runnable}`;
   el("metricHealthy").textContent = String(healthy);
   el("metricErrors").textContent = String(errors);
 }
@@ -528,6 +517,53 @@ function renderOverview() {
   `;
 }
 
+function renderProviderAccounts() {
+  const target = el("providerAccounts");
+  if (!target) return;
+  if (!state.providerAccounts.length) {
+    target.innerHTML = `<div class="empty">No provider accounts are defined.</div>`;
+    return;
+  }
+  target.innerHTML = state.providerAccounts.map((account) => {
+    const schema = account.schema || providerAccountTemplateByKey(account.account_key) || {};
+    const guide = account.guide || schema.guide || {};
+    const configuredFields = Object.entries(account.configured_fields || {})
+      .filter(([, configured]) => !!configured)
+      .map(([field]) => field);
+    const usedBy = (account.used_by || schema.used_by || [])
+      .map((item) => item.display_name || item.source_key || item.job_name)
+      .filter(Boolean);
+    return `
+      <div class="account-card" data-account-key="${esc(account.account_key)}">
+        <div class="account-card-head">
+          <div>
+            <div class="source-card-title">${esc(account.display_name)}</div>
+            <div class="source-card-text">${esc(guide.summary || account.provider_name || "")}</div>
+          </div>
+          ${accountStatusPill(account)}
+        </div>
+        <div class="source-card-meta">
+          <span class="pill dim mono">${esc(account.provider_name)}</span>
+          <span class="pill ${configuredFields.length ? "ok" : "dim"}">${configuredFields.length ? `${configuredFields.length} fields set` : "empty"}</span>
+        </div>
+        <div class="account-used">
+          <div class="detail-label">Used By</div>
+          <div class="account-used-list">${usedBy.map((name) => `<span class="pill dim">${esc(name)}</span>`).join("") || '<span class="pill dim">none</span>'}</div>
+        </div>
+        <div class="source-card-actions">
+          <button class="btn-secondary account-edit-btn" type="button" data-account-key="${esc(account.account_key)}">Edit Account</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+  target.querySelectorAll(".account-edit-btn").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openAccountModal(button.getAttribute("data-account-key") || "");
+    });
+  });
+}
+
 function renderSourceCards() {
   const target = el("sourceCards");
   if (!target) return;
@@ -542,8 +578,9 @@ function renderSourceCards() {
     return String(a.display_name || "").localeCompare(String(b.display_name || ""));
   });
   target.innerHTML = orderedSources.map((source) => {
+    const template = templateForSource(source);
     const guide = guideForSource(source);
-    const stateInfo = deriveSourceState(source, templateForSource(source));
+    const stateInfo = deriveSourceState(source, template);
     return `
       <div class="source-card ${String(source.source_key) === String(state.selectedKey) ? "is-active" : ""}" data-key="${esc(source.source_key)}">
         <div class="source-card-head">
@@ -555,7 +592,10 @@ function renderSourceCards() {
         </div>
         <div class="source-card-text">${esc(guide.summary)}</div>
         <div class="source-card-meta">
+          ${fxSourceBadge(source, template)}
           <span class="pill dim">${source.enabled ? "Enabled" : "Disabled"}</span>
+          ${runnableStatePill(source)}
+          ${isFxDataSource(source, template) ? fxFeedStatusPill(source) : ""}
           <span class="pill dim">${esc(source.provider_name || source.source_type)}</span>
         </div>
         <div class="source-card-text">${esc(stateInfo.nextStep)}</div>
@@ -576,13 +616,13 @@ function renderTable() {
   body.innerHTML = state.sources.map((source) => `
     <tr data-key="${esc(source.source_key)}" class="${String(source.source_key) === String(state.selectedKey) ? "is-active" : ""}">
       <td>
-        <div><strong>${esc(source.display_name)}</strong> ${source.builtin ? '<span class="pill dim">builtin</span>' : '<span class="pill ok">custom</span>'}</div>
+        <div><strong>${esc(source.display_name)}</strong> ${source.builtin ? '<span class="pill dim">builtin</span>' : '<span class="pill ok">custom</span>'} ${fxSourceBadge(source, templateForSource(source))}</div>
         <div class="mono subline">${esc(source.source_key)}</div>
       </td>
       <td>${esc(source.source_type)}</td>
       <td class="mono">${esc(source.job_name)}</td>
       <td>${source.enabled ? '<span class="pill ok">enabled</span>' : '<span class="pill err">disabled</span>'}</td>
-      <td>${statePill(deriveSourceState(source, templateForSource(source)))}</td>
+      <td>${runnableStatePill(source)}</td>
       <td>${esc(source.error_count || 0)}</td>
       <td>${esc(fmtTs(source.updated_ts_ms))}</td>
     </tr>
@@ -598,7 +638,17 @@ function renderRuntimePanel(source) {
   const runtime = runtimeForSource(source);
   const provider = runtime.providerTelemetry;
   const pipeline = runtime.pipelineHealth;
+  const jobState = runtime.jobState || {};
   return `
+    <div class="detail-block">
+      <div class="detail-label">Runnable Job State</div>
+      <div class="detail-value">
+        ${runnableStatePill({ runnable_state: jobState.state || source.runnable_state })}<br>
+        Desired: ${jobState.desired ? "yes" : "no"}<br>
+        Running: ${jobState.running ? "yes" : "no"}<br>
+        Reason: ${esc(jobState.reason || source.runnable_state_reason || "n/a")}
+      </div>
+    </div>
     <div class="detail-block">
       <div class="detail-label">Provider Telemetry</div>
       <div class="detail-value">
@@ -620,6 +670,130 @@ function renderRuntimePanel(source) {
           Age: ${esc(fmtAgeMs(pipeline.age_ms))}<br>
           Failures: ${esc(pipeline.failure_count || 0)}
         ` : "No pipeline health snapshot for this job yet."}
+      </div>
+    </div>
+  `;
+}
+
+function renderCredentialResolution(source) {
+  const rows = source?.credential_resolution || [];
+  if (!rows.length) return "No account-linked credential fields for this source.";
+  return rows.map((row) => {
+    const mode = String(row.mode || "missing");
+    const tone = mode === "overridden" ? "warn" : (mode === "inherited" ? "ok" : (mode === "missing" ? "err" : "dim"));
+    const owner = mode === "inherited"
+      ? ` from ${row.account_display_name || row.account_key}`
+      : (mode === "overridden" ? " by source override" : (mode === "runtime_external" ? " from runtime" : ""));
+    return `<div class="credential-resolution-row">
+      <span class="pill ${tone}">${esc(mode)}</span>
+      <span class="mono">${esc(row.env_var)}</span>
+      <span>${esc(owner)}</span>
+    </div>`;
+  }).join("");
+}
+
+function testStatusTone(result) {
+  const status = String(result?.status || "").toLowerCase();
+  if (status === "pass") return "ok";
+  if (status === "fail") return "err";
+  if (status === "degraded") return "warn";
+  return "dim";
+}
+
+function renderEvidence(evidence) {
+  const entries = Object.entries(evidence || {});
+  if (!entries.length) return "No evidence returned.";
+  return entries.map(([key, value]) => {
+    const rendered = typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+      ? String(value)
+      : JSON.stringify(value);
+    return `<div class="evidence-row"><span class="mono">${esc(key)}</span><span>${esc(rendered)}</span></div>`;
+  }).join("");
+}
+
+function contractTone(value) {
+  const status = String(value || "").toLowerCase();
+  if (status === "pass") return "ok";
+  if (status === "warn") return "warn";
+  if (status === "fail") return "err";
+  return "dim";
+}
+
+function renderPopulateEvidencePanel(source) {
+  const evidence = source?.populate_evidence || {};
+  const contract = source?.data_contract || {};
+  const contractStatus = String(evidence.contract_status || "missing").toLowerCase();
+  const providerEvidence = evidence.provider_evidence || {};
+  return `
+    <div class="detail-block populate-evidence-block">
+      <div class="detail-label">Populate Evidence</div>
+      <div class="detail-value">
+        <span class="pill ${contractTone(contractStatus)}">${esc(contractStatus)}</span>
+        <span class="pill dim mono">${esc(contract.storage_table || evidence.storage_table || "no table")}</span><br>
+        Rows: ${esc(evidence.row_count ?? 0)}<br>
+        Latest: ${esc(fmtTs(evidence.latest_ts_ms))}<br>
+        Latency: ${esc(fmtAgeMs(evidence.latency_ms))}<br>
+        Stale/gap: ${esc(evidence.stale_gap_status || "not checked")}<br>
+        Missing/nulls: ${esc(JSON.stringify(evidence.missing_null_counts || {}))}<br>
+        Duplicate drops: ${esc(evidence.duplicate_drops || 0)}${evidence.error ? `<br>Error: ${esc(evidence.error)}` : ""}
+        <div class="evidence-list">${renderEvidence(providerEvidence)}</div>
+      </div>
+    </div>
+    <div class="detail-block">
+      <div class="detail-label">Data Contract</div>
+      <div class="detail-value">
+        Shape: ${esc(contract.normalized_shape || "not defined")}<br>
+        Required: ${esc((contract.required_fields || []).join(", ") || "none")}<br>
+        Unique key: ${esc((contract.unique_key || []).join(", ") || "none")}<br>
+        PIT: ${esc(contract.point_in_time_availability || "n/a")}<br>
+        Consumer: ${esc(contract.consumer || "n/a")}
+      </div>
+    </div>
+  `;
+}
+
+function renderTestResultPanel(source) {
+  const result = state.lastTestResults[String(source?.source_key || "")];
+  if (!result) return "";
+  if (isFxDataSource(source, templateForSource(source))) {
+    return renderFxTestResultPanel(result);
+  }
+  const tone = testStatusTone(result);
+  const nextSteps = (result.next_steps || []).map((item) => `• ${esc(item)}`).join("<br>") || "No next steps returned.";
+  return `
+    <div class="detail-block test-result-block">
+      <div class="detail-label">Latest Test Result</div>
+      <div class="detail-value">
+        <span class="pill ${tone}">${esc(result.status || "unknown")}</span>
+        <span class="pill dim">${esc(result.classification || "unclassified")}</span><br>
+        ${esc(result.message || result.error || "No message returned.")}
+        <div class="evidence-list">${renderEvidence(result.evidence || {})}</div>
+        <div class="next-steps">${nextSteps}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderFxTestResultPanel(result) {
+  const tone = testStatusTone(result);
+  const safe = {};
+  for (const key of ["status", "ok", "latency_ms", "latency", "detail", "message"]) {
+    if (result && Object.prototype.hasOwnProperty.call(result, key)) {
+      safe[key] = result[key];
+    }
+  }
+  const evidence = result && result.evidence && typeof result.evidence === "object" ? result.evidence : {};
+  for (const key of ["status", "ok", "latency_ms", "latency", "detail", "message"]) {
+    if (Object.prototype.hasOwnProperty.call(evidence, key) && !Object.prototype.hasOwnProperty.call(safe, key)) {
+      safe[key] = evidence[key];
+    }
+  }
+  return `
+    <div class="detail-block test-result-block fx-test-result">
+      <div class="detail-label">FX Feed Connectivity</div>
+      <div class="detail-value">
+        <span class="pill ${tone}">${esc(result.status || "unknown")}</span><br>
+        <div class="evidence-list">${renderEvidence(safe)}</div>
       </div>
     </div>
   `;
@@ -647,6 +821,8 @@ function renderDetail() {
       <div class="detail-summary">
         <div class="detail-banner">
           ${statePill(stateInfo)}
+          ${runnableStatePill(source)}
+          ${fxSourceBadge(source, template)}
           <span class="pill dim">${source.enabled ? "Enabled" : "Disabled"}</span>
           <span class="pill dim">${esc(guide.category)}</span>
         </div>
@@ -669,25 +845,40 @@ function renderDetail() {
       </div>
       <div class="detail-block">
         <div class="detail-label">What Happens When Enabled</div>
-        <div class="detail-value">${esc(guide.whenEnabled || "The runtime will include this source in ingestion and health monitoring.")}</div>
+        <div class="detail-value">${esc(guide.when_enabled || "The runtime will include this source in ingestion and health monitoring.")}</div>
+      </div>
+      <div class="detail-block">
+        <div class="detail-label">Provider Reference</div>
+        <div class="detail-value">
+          ${guide.docs_url ? `<a href="${esc(guide.docs_url)}" target="_blank" rel="noopener noreferrer">Docs</a><br>` : ""}
+          ${guide.signup_url ? `<a href="${esc(guide.signup_url)}" target="_blank" rel="noopener noreferrer">Signup</a><br>` : ""}
+          ${guide.plan_note ? esc(guide.plan_note) : "No provider plan note supplied."}
+          ${(guide.safety_warnings || []).length ? `<br><br>${(guide.safety_warnings || []).map((item) => `• ${esc(item)}`).join("<br>")}` : ""}
+        </div>
       </div>
       <div class="detail-block">
         <div class="detail-label">Credential State</div>
         <div class="detail-value">
           Stored value present: ${credentialsStored ? "yes" : "no"}<br>
           Readable value present: ${credentialsConfigured ? "yes" : "no"}<br>
+          Runtime credentialed: ${source.runtime_credentialed ? "yes" : "no"}<br>
+          Missing runtime env: ${(source.missing_credential_env_vars || []).length ? esc((source.missing_credential_env_vars || []).join(", ")) : "none"}<br>
           Credential fields: ${supportsCredentialReset ? esc(credentialFields.map((field) => field.field).join(", ")) : "none"}${credentialError ? `<br>Stored value problem: <span class="mono">${esc(credentialError)}</span>` : ""}
+          <div class="credential-resolution">${renderCredentialResolution(source)}</div>
         </div>
       </div>
       <div class="detail-block">
         <div class="detail-label">Recent Health</div>
         <div class="detail-value">Last success: ${esc(fmtTs(source.last_success_ts_ms))}<br>Last test: ${esc(fmtTs(source.last_test_ts_ms))}<br>Last error: ${esc(source.last_error || "none")}<br>Error count: ${esc(source.error_count || 0)}</div>
       </div>
+      ${renderPopulateEvidencePanel(source)}
+      ${renderTestResultPanel(source)}
       ${renderRuntimePanel(source)}
     </div>
     <div class="detail-actions">
       <button class="btn" id="detailEditBtn">Edit Source</button>
       <button class="btn-secondary" id="detailTestBtn">Test Connection</button>
+      <button class="btn-secondary" id="detailPopulateBtn">Populate Now</button>
       ${supportsCredentialReset
         ? `<button class="btn-secondary" id="detailResetCredsBtn"${resettableCredentials ? "" : " disabled"}>${credentialError ? "Reset Corrupted Credentials" : (resettableCredentials ? "Reset Credentials" : "No Stored Credentials")}</button>`
         : '<button class="btn-secondary" id="detailResetCredsBtn" disabled>No Credential Fields</button>'}
@@ -743,6 +934,7 @@ function renderDetail() {
 
   el("detailEditBtn").addEventListener("click", () => openModal(source));
   el("detailTestBtn").addEventListener("click", () => testSource(source.source_key));
+  el("detailPopulateBtn").addEventListener("click", () => populateSource(source.source_key));
   const resetCredsBtn = el("detailResetCredsBtn");
   if (supportsCredentialReset && resettableCredentials && resetCredsBtn) {
     resetCredsBtn.addEventListener("click", () => resetSourceCredentials(source, template));
@@ -767,7 +959,10 @@ async function loadLogs() {
       target.innerHTML = `<div class="empty">No logs for this source yet.</div>`;
       return;
     }
-    target.innerHTML = logs.map((row) => `
+    const logState = payload.runnable_state || source.runnable_state || "off";
+    target.innerHTML = `
+      <div class="log-state">${runnableStatePill({ runnable_state: logState })}</div>
+    ` + logs.map((row) => `
       <div class="log-row">
         <div class="log-top">
           <span class="pill ${String(row.level || "").toLowerCase() === "error" ? "err" : "dim"}">${esc(row.level)}</span>
@@ -786,6 +981,8 @@ async function refreshSources({ preserveSelection = true } = {}) {
   const payload = await request("/api/data_sources", { method: "GET" });
   state.sources = payload.sources || [];
   state.templates = payload.templates || [];
+  state.providerAccounts = payload.provider_accounts || [];
+  state.providerAccountTemplates = payload.provider_account_templates || [];
   state.runtime = payload.runtime || {};
   state.auth = payload.auth || {};
   renderSession();
@@ -794,6 +991,7 @@ async function refreshSources({ preserveSelection = true } = {}) {
   }
   renderMetrics(payload);
   renderOverview();
+  renderProviderAccounts();
   renderSourceCards();
   renderTable();
   renderDetail();
@@ -810,6 +1008,140 @@ function clearCredentialInputId(field) {
 
 function settingFieldInputId(field) {
   return `settingField__${field}`;
+}
+
+function accountCredentialFieldInputId(field) {
+  return `accountCredentialField__${field}`;
+}
+
+function clearAccountCredentialInputId(field) {
+  return `clearAccountCredentialField__${field}`;
+}
+
+function credentialFieldErrorId(field) {
+  return `credentialFieldError__${field}`;
+}
+
+function settingFieldErrorId(field) {
+  return `settingFieldError__${field}`;
+}
+
+function accountCredentialFieldErrorId(field) {
+  return `accountCredentialFieldError__${field}`;
+}
+
+function fieldDocsLinks(field) {
+  const links = [];
+  if (field.docs_url) {
+    links.push(`<a href="${esc(field.docs_url)}" target="_blank" rel="noopener noreferrer">Docs</a>`);
+  }
+  if (field.signup_url) {
+    links.push(`<a href="${esc(field.signup_url)}" target="_blank" rel="noopener noreferrer">Signup</a>`);
+  }
+  return links.length ? `<span class="field-links">${links.join(" ")}</span>` : "";
+}
+
+function fieldHelpHtml(field, configured = false) {
+  const parts = [];
+  if (configured) parts.push("A stored value already exists.");
+  if (field.help_text) parts.push(field.help_text);
+  if (field.env_var || field.env_name) parts.push(`Runtime env: ${field.env_var || field.env_name}.`);
+  if (field.plan_note) parts.push(field.plan_note);
+  if (field.validation_hint) parts.push(field.validation_hint);
+  if (field.safety_warning) parts.push(field.safety_warning);
+  return `
+    <span class="field-help">${esc(parts.join(" "))}</span>
+    ${fieldDocsLinks(field)}
+  `;
+}
+
+function resolutionForField(source, field) {
+  const envName = String(field?.env_var || field?.env_name || "").trim();
+  return (source?.credential_resolution || []).find((row) => String(row.env_var || "") === envName) || null;
+}
+
+function credentialModeText(source, field) {
+  const resolution = resolutionForField(source, field);
+  const mode = String(resolution?.mode || "").trim();
+  if (mode === "inherited") return `Inherited from ${resolution.account_display_name || resolution.account_key}.`;
+  if (mode === "overridden") return "Source override is active.";
+  if (mode === "runtime_external") return "Runtime external value is active.";
+  return "";
+}
+
+function setFieldError(input, errorId, message) {
+  if (!input) return;
+  const errorEl = el(errorId);
+  const hasError = !!String(message || "").trim();
+  input.classList.toggle("is-invalid", hasError);
+  input.setAttribute("aria-invalid", hasError ? "true" : "false");
+  if (errorEl) errorEl.textContent = hasError ? String(message) : "";
+  const wrapper = input.closest(".editor-field");
+  if (wrapper) wrapper.classList.toggle("has-error", hasError);
+}
+
+function validateFieldInput(field, input, errorId, { requireValue = false, honorRequired = true } = {}) {
+  if (!input) return true;
+  const value = String(input.value || "").trim();
+  const label = String(field.label || field.field || "Field");
+  const hint = String(field.validation_hint || "Review the expected format.");
+  if ((requireValue || (honorRequired && field.required)) && !value) {
+    setFieldError(input, errorId, `${label} is required.`);
+    return false;
+  }
+  const pattern = String(field.validation_regex || field.validation?.regex || "").trim();
+  if (value && pattern) {
+    try {
+      if (!new RegExp(pattern).test(value)) {
+        setFieldError(input, errorId, `${label}: ${hint}`);
+        return false;
+      }
+    } catch (_error) {
+      // Backend validation remains authoritative if a shipped regex is unsupported.
+    }
+  }
+  setFieldError(input, errorId, "");
+  return true;
+}
+
+function wireFieldValidation(template) {
+  for (const field of (template.credential_fields || [])) {
+    const input = el(credentialFieldInputId(field.field));
+    if (!input) continue;
+    input.addEventListener("input", () => {
+      validateFieldInput(field, input, credentialFieldErrorId(field.field), {
+        requireValue: false,
+        honorRequired: false,
+      });
+    });
+  }
+  for (const field of (template.setting_fields || [])) {
+    const input = el(settingFieldInputId(field.field));
+    if (!input) continue;
+    input.addEventListener("input", () => {
+      validateFieldInput(field, input, settingFieldErrorId(field.field), {
+        requireValue: !!field.required,
+      });
+    });
+  }
+}
+
+function validateEditor(template) {
+  let ok = true;
+  for (const field of (template.credential_fields || [])) {
+    const input = el(credentialFieldInputId(field.field));
+    ok = validateFieldInput(field, input, credentialFieldErrorId(field.field), {
+      requireValue: false,
+      honorRequired: false,
+    }) && ok;
+  }
+  for (const field of (template.setting_fields || [])) {
+    const input = el(settingFieldInputId(field.field));
+    ok = validateFieldInput(field, input, settingFieldErrorId(field.field), {
+      requireValue: !!field.required,
+    }) && ok;
+  }
+  return ok;
 }
 
 function schemaSummary(template, source) {
@@ -834,13 +1166,17 @@ function renderCredentialEditors(template, source) {
   }
   target.innerHTML = fields.map((field) => `
     <label class="editor-field" for="${esc(credentialFieldInputId(field.field))}">
-      <span>${esc(field.label)}</span>
+      <span>${esc(field.label)} ${field.required ? '<span class="field-required">Required</span>' : '<span class="field-optional">Optional</span>'}</span>
       <input
         id="${esc(credentialFieldInputId(field.field))}"
-        type="password"
-        placeholder="${source?.masked_credentials?.[field.field] ? "Configured; leave blank to preserve" : "Enter new secret"}"
+        type="${esc(field.input_type || field.type || "password")}"
+        autocomplete="new-password"
+        aria-describedby="${esc(credentialFieldErrorId(field.field))}"
+        placeholder="${esc(source?.masked_credentials?.[field.field] ? "Override configured; leave blank to preserve" : (resolutionForField(source, field)?.mode === "inherited" ? "Inherited; enter only to override" : (field.placeholder || "Enter new secret")))}"
       >
-      <span class="field-help">${source?.masked_credentials?.[field.field] ? "A stored value already exists." : "Stored securely in the database."}</span>
+      ${fieldHelpHtml(field, !!source?.masked_credentials?.[field.field])}
+      ${credentialModeText(source, field) ? `<span class="field-help">${esc(credentialModeText(source, field))}</span>` : ""}
+      <span class="field-error" id="${esc(credentialFieldErrorId(field.field))}" aria-live="polite"></span>
     </label>
   `).join("");
   clearTarget.innerHTML = fields.map((field) => `
@@ -849,6 +1185,62 @@ function renderCredentialEditors(template, source) {
       <span>Clear ${esc(field.label)}</span>
     </label>
   `).join("");
+}
+
+function renderAccountCredentialEditors(account, template) {
+  const fields = (template && template.credential_fields) || [];
+  const target = el("accountCredentialsFields");
+  const clearTarget = el("clearAccountCredentials");
+  if (!fields.length) {
+    target.innerHTML = `<div class="empty">No account credential fields are defined.</div>`;
+    clearTarget.innerHTML = "";
+    return;
+  }
+  target.innerHTML = fields.map((field) => `
+    <label class="editor-field" for="${esc(accountCredentialFieldInputId(field.field))}">
+      <span>${esc(field.label)} ${field.required ? '<span class="field-required">Required</span>' : '<span class="field-optional">Optional</span>'}</span>
+      <input
+        id="${esc(accountCredentialFieldInputId(field.field))}"
+        type="${esc(field.input_type || field.type || "password")}"
+        autocomplete="new-password"
+        aria-describedby="${esc(accountCredentialFieldErrorId(field.field))}"
+        placeholder="${esc(account?.masked_credentials?.[field.field] ? "Configured; leave blank to preserve" : (field.placeholder || "Enter new value"))}"
+      >
+      ${fieldHelpHtml(field, !!account?.masked_credentials?.[field.field])}
+      <span class="field-error" id="${esc(accountCredentialFieldErrorId(field.field))}" aria-live="polite"></span>
+    </label>
+  `).join("");
+  clearTarget.innerHTML = fields.map((field) => `
+    <label class="checkbox-row" for="${esc(clearAccountCredentialInputId(field.field))}">
+      <input id="${esc(clearAccountCredentialInputId(field.field))}" type="checkbox">
+      <span>Clear ${esc(field.label)}</span>
+    </label>
+  `).join("");
+}
+
+function wireAccountFieldValidation(template) {
+  for (const field of (template.credential_fields || [])) {
+    const input = el(accountCredentialFieldInputId(field.field));
+    if (!input) continue;
+    input.addEventListener("input", () => {
+      validateFieldInput(field, input, accountCredentialFieldErrorId(field.field), {
+        requireValue: false,
+        honorRequired: false,
+      });
+    });
+  }
+}
+
+function validateAccountEditor(template) {
+  let ok = true;
+  for (const field of (template.credential_fields || [])) {
+    const input = el(accountCredentialFieldInputId(field.field));
+    ok = validateFieldInput(field, input, accountCredentialFieldErrorId(field.field), {
+      requireValue: false,
+      honorRequired: false,
+    }) && ok;
+  }
+  return ok;
 }
 
 function renderSettingEditors(template, source) {
@@ -861,14 +1253,16 @@ function renderSettingEditors(template, source) {
   const sourceSettings = (source && source.settings) || {};
   target.innerHTML = fields.map((field) => `
     <label class="editor-field" for="${esc(settingFieldInputId(field.field))}">
-      <span>${esc(field.label)}</span>
+      <span>${esc(field.label)} ${field.required ? '<span class="field-required">Required</span>' : '<span class="field-optional">Optional</span>'}</span>
       <input
         id="${esc(settingFieldInputId(field.field))}"
-        type="${esc(field.type || "text")}"
+        type="${esc(field.input_type || field.type || "text")}"
         value="${esc(sourceSettings[field.field] ?? "")}"
-        placeholder="${field.required ? "Required" : "Optional"}"
+        aria-describedby="${esc(settingFieldErrorId(field.field))}"
+        placeholder="${esc(field.placeholder || (field.required ? "Required" : "Optional"))}"
       >
-      <span class="field-help">${field.required ? "Required for this source." : "Saved only for this source."}</span>
+      ${fieldHelpHtml(field)}
+      <span class="field-error" id="${esc(settingFieldErrorId(field.field))}" aria-live="polite"></span>
     </label>
   `).join("");
 }
@@ -901,6 +1295,7 @@ function applyTemplate(templateKey, source = null) {
   el("replaceCredentials").checked = false;
   renderCredentialEditors(template, source);
   renderSettingEditors(template, source);
+  wireFieldValidation(template);
   el("schemaSummary").textContent = schemaSummary(template, source);
 }
 
@@ -923,6 +1318,28 @@ function closeModal() {
   el("modalShell").classList.remove("is-open");
 }
 
+function openAccountModal(accountKey) {
+  const key = String(accountKey || "").trim();
+  const account = providerAccountByKey(key);
+  const template = providerAccountTemplateByKey(key) || account?.schema || null;
+  if (!account || !template) {
+    flash("Provider account metadata is unavailable.", true);
+    return;
+  }
+  state.editingAccountKey = key;
+  el("accountModalTitle").textContent = `Edit ${account.display_name} Account`;
+  el("accountKey").value = key;
+  el("accountProviderName").value = account.provider_name || template.provider_name || "";
+  el("accountSchemaSummary").textContent = (account.guide || template.guide || {}).summary || "Shared provider credentials for dependent feeds.";
+  renderAccountCredentialEditors(account, template);
+  wireAccountFieldValidation(template);
+  el("accountModalShell").classList.add("is-open");
+}
+
+function closeAccountModal() {
+  el("accountModalShell").classList.remove("is-open");
+}
+
 function collectCredentials(template) {
   const credentials = {};
   const clear = [];
@@ -930,6 +1347,17 @@ function collectCredentials(template) {
     const value = String(el(credentialFieldInputId(field.field)).value || "").trim();
     if (value) credentials[field.field] = value;
     if (el(clearCredentialInputId(field.field)).checked) clear.push(field.field);
+  }
+  return { credentials, clear };
+}
+
+function collectAccountCredentials(template) {
+  const credentials = {};
+  const clear = [];
+  for (const field of (template.credential_fields || [])) {
+    const value = String(el(accountCredentialFieldInputId(field.field)).value || "").trim();
+    if (value) credentials[field.field] = value;
+    if (el(clearAccountCredentialInputId(field.field)).checked) clear.push(field.field);
   }
   return { credentials, clear };
 }
@@ -943,19 +1371,22 @@ function collectSettings(template) {
   return settings;
 }
 
-async function saveSource(event) {
-  event.preventDefault();
+function buildSourceSaveRequest() {
   const template = templateByKey(el("templateKey").value);
   if (!template) {
     flash("Missing source template.", true);
-    return;
+    return null;
   }
   const sourceKey = String(el("sourceKey").value || "").trim();
   if (!state.editingKey && !sourceKey) {
     flash("Source key is required for new RSS feeds.", true);
-    return;
+    return null;
   }
   const actor = state.session.actor.trim() || "operator";
+  if (!validateEditor(template)) {
+    flash("Fix the highlighted source fields before saving.", true);
+    return null;
+  }
   const settings = collectSettings(template);
   const { credentials, clear } = collectCredentials(template);
   const replaceCredentials = !!el("replaceCredentials").checked;
@@ -973,10 +1404,68 @@ async function saveSource(event) {
   if (replaceCredentials || Object.keys(credentials).length) body.credentials = credentials;
   if (clear.length) body.clear_credential_fields = clear;
   const url = state.editingKey ? "/api/data_sources/update" : "/api/data_sources/create";
+  return { body, url };
+}
+
+async function saveSource(event) {
+  event.preventDefault();
+  const requestSpec = buildSourceSaveRequest();
+  if (!requestSpec) return;
+  const { body, url } = requestSpec;
   await request(url, { method: "POST", body: JSON.stringify(body) });
   closeModal();
   flash(state.editingKey ? "Source updated." : "Source created.");
   await refreshSources({ preserveSelection: false });
+}
+
+async function testAndSaveSource(event) {
+  event.preventDefault();
+  const requestSpec = buildSourceSaveRequest();
+  if (!requestSpec) return;
+  const body = { ...requestSpec.body, create: !state.editingKey };
+  const result = await request("/api/data_sources/test_save", {
+    method: "POST",
+    body: JSON.stringify(body),
+    allowApplicationError: true,
+  });
+  if (!result.saved) {
+    flash(result.error || "Test & Save failed before credentials were stored.", true);
+    return;
+  }
+  closeModal();
+  const test = result.test || {};
+  const testedKey = String(result.source_key || body.source_key || "");
+  if (testedKey) state.lastTestResults[testedKey] = test;
+  const status = String(test.status || (test.ok ? "pass" : "fail"));
+  flash(`${status}: ${test.message || test.error || "Test & Save completed."}`, status === "fail");
+  await refreshSources({ preserveSelection: false });
+}
+
+async function saveProviderAccount(event) {
+  event.preventDefault();
+  const accountKey = String(el("accountKey").value || state.editingAccountKey || "").trim();
+  const template = providerAccountTemplateByKey(accountKey) || providerAccountByKey(accountKey)?.schema || null;
+  if (!accountKey || !template) {
+    flash("Missing provider account template.", true);
+    return;
+  }
+  if (!validateAccountEditor(template)) {
+    flash("Fix the highlighted account fields before saving.", true);
+    return;
+  }
+  const actor = state.session.actor.trim() || "operator";
+  const { credentials, clear } = collectAccountCredentials(template);
+  const body = {
+    actor,
+    account_key: accountKey,
+    replace_credentials: !!el("replaceAccountCredentials").checked,
+  };
+  if (body.replace_credentials || Object.keys(credentials).length) body.credentials = credentials;
+  if (clear.length) body.clear_credential_fields = clear;
+  await request("/api/data_sources/accounts/update", { method: "POST", body: JSON.stringify(body) });
+  closeAccountModal();
+  flash("Provider account updated.");
+  await refreshSources();
 }
 
 async function toggleSource(sourceKey, enabled) {
@@ -992,8 +1481,24 @@ async function testSource(sourceKey) {
   const result = await request("/api/data_sources/test", {
     method: "POST",
     body: JSON.stringify({ source_key: sourceKey, actor: state.session.actor.trim() || "operator" }),
+    allowApplicationError: true,
   });
-  flash(result.message || result.error || "Test completed.");
+  state.lastTestResults[String(sourceKey)] = result;
+  const status = String(result.status || (result.ok ? "pass" : "fail"));
+  const classification = String(result.classification || "");
+  flash(`${status}: ${result.message || result.error || "Test completed."}${classification ? ` (${classification})` : ""}`, status === "fail");
+  await refreshSources();
+}
+
+async function populateSource(sourceKey) {
+  const result = await request("/api/data_sources/populate_now", {
+    method: "POST",
+    body: JSON.stringify({ source_key: sourceKey, actor: state.session.actor.trim() || "operator" }),
+    allowApplicationError: true,
+  });
+  const evidence = result.populate_evidence || {};
+  const status = String(evidence.contract_status || (result.ok ? "pass" : "fail"));
+  flash(`populate ${status}: ${evidence.storage_table || result.error || "completed"}`, status === "fail");
   await refreshSources();
 }
 
@@ -1074,8 +1579,15 @@ function wireEvents() {
   el("modalCloseBtn").addEventListener("click", closeModal);
   el("modalCancelBtn").addEventListener("click", closeModal);
   el("modalForm").addEventListener("submit", saveSource);
+  el("modalTestSaveBtn").addEventListener("click", testAndSaveSource);
+  el("accountModalCloseBtn").addEventListener("click", closeAccountModal);
+  el("accountModalCancelBtn").addEventListener("click", closeAccountModal);
+  el("accountModalForm").addEventListener("submit", saveProviderAccount);
   el("modalShell").addEventListener("click", (event) => {
     if (event.target === el("modalShell")) closeModal();
+  });
+  el("accountModalShell").addEventListener("click", (event) => {
+    if (event.target === el("accountModalShell")) closeAccountModal();
   });
   el("templateKey").addEventListener("change", (event) => {
     applyTemplate(String(event.target.value || ""), null);

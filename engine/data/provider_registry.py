@@ -71,9 +71,17 @@ def _builtin_provider_definitions() -> Dict[str, PriceProviderDefinition]:
         from engine.data.live_prices.yfinance_live import YFinancePriceProvider
         return YFinancePriceProvider()
 
+    def _build_simulated():
+        from engine.data.live_prices.simulated import SimulatedPriceProvider
+        return SimulatedPriceProvider()
+
     def _build_ibkr():
         from engine.data.live_prices.ibkr_live import IBKRPriceProvider
         return IBKRPriceProvider()
+
+    def _build_oanda():
+        from engine.data.live_prices.oanda_live import OANDAPriceProvider
+        return OANDAPriceProvider()
 
     # Built-ins define the canonical provider catalog. Dynamic plugins can
     # override or extend this catalog, but these entries are the baseline
@@ -98,7 +106,7 @@ def _builtin_provider_definitions() -> Dict[str, PriceProviderDefinition]:
             daemon_job_name="stream_prices_ibkr",
             daemon_script="engine/data/providers/ibkr/daemon_stream.py",
             priority=20,
-            supports={"asset_classes": ["equities"], "transport": "gateway"},
+            supports={"asset_classes": ["equities", "fx"], "transport": "gateway"},
             build_price_provider=_build_ibkr,
         ),
         PriceProviderDefinition(
@@ -132,6 +140,28 @@ def _builtin_provider_definitions() -> Dict[str, PriceProviderDefinition]:
             priority=40,
             supports={"asset_classes": ["equities"], "transport": "rest"},
             build_price_provider=_build_yfinance,
+        ),
+        PriceProviderDefinition(
+            provider_name="simulated",
+            mode="polling",
+            implementation_kind="live_price_provider",
+            enabled=_simulated_market_data_enabled(),
+            daemon_job_name="poll_prices",
+            daemon_script="engine/data/poll_prices.py",
+            priority=42,
+            supports={"asset_classes": ["equities", "fx", "crypto"], "transport": "local", "simulated": True},
+            build_price_provider=_build_simulated,
+        ),
+        PriceProviderDefinition(
+            provider_name="oanda",
+            mode="polling",
+            implementation_kind="live_price_provider",
+            enabled=_env_enabled("OANDA_ENABLED", False),
+            daemon_job_name="poll_prices",
+            daemon_script="engine/data/poll_prices.py",
+            priority=45,
+            supports={"asset_classes": ["fx"], "transport": "rest"},
+            build_price_provider=_build_oanda,
         ),
         PriceProviderDefinition(
             provider_name="ccxt",
@@ -314,6 +344,22 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return str(raw_value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _simulated_market_data_enabled() -> bool:
+    raw = os.environ.get("SIMULATED_MARKET_DATA_ENABLED")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    mode = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower()
+    execution_mode = str(os.environ.get("EXECUTION_MODE", "safe") or "safe").strip().lower()
+    broker = str(os.environ.get("BROKER", "sim") or "sim").strip().lower()
+    broker_name = str(os.environ.get("BROKER_NAME", broker) or broker).strip().lower()
+    return bool(
+        mode in {"safe", "sim", "simulation", "test"}
+        and execution_mode in {"safe", "sim", "simulation", "sim-paper", "sim_paper", "paper"}
+        and broker == "sim"
+        and broker_name == "sim"
+    )
+
+
 def _provider_chain() -> list[str]:
     return [
         x.strip().lower()
@@ -330,6 +376,9 @@ def _operational_market_data_job_names(candidates: list[str]) -> list[str]:
     polygon_rest_enabled = _env_enabled("POLYGON_REST_ENABLED", True)
     ibkr_enabled = _env_enabled("IBKR_ENABLED", False)
     yfinance_enabled = _env_enabled("YFINANCE_ENABLED", True)
+    simulated_enabled = _simulated_market_data_enabled()
+    oanda_enabled = _env_enabled("OANDA_ENABLED", False)
+    oanda_key = bool(get_data_credential("OANDA_ACCESS_TOKEN") or get_data_credential("OANDA_API_KEY"))
     ccxt_enabled = _env_enabled("CCXT_ENABLED", False)
     tradier_enabled = _env_enabled("TRADIER_ENABLED", False)
 
@@ -355,7 +404,9 @@ def _operational_market_data_job_names(candidates: list[str]) -> list[str]:
         if name == "poll_prices":
             if (
                 yfinance_enabled
+                or simulated_enabled
                 or ccxt_enabled
+                or (oanda_key and oanda_enabled and ((not chain) or ("oanda" in chain)))
                 or (polygon_key and polygon_rest_enabled and ((not chain) or ("polygon" in chain)))
             ):
                 out.append(name)
@@ -392,6 +443,9 @@ def get_enabled_market_data_job_names() -> List[str]:
     polygon_ws_enabled = _env_enabled("POLYGON_WS_ENABLED", True)
     polygon_rest_enabled = _env_enabled("POLYGON_REST_ENABLED", True)
     ibkr_enabled = _env_enabled("IBKR_ENABLED", False)
+    oanda_enabled = _env_enabled("OANDA_ENABLED", False)
+    oanda_key = get_data_credential("OANDA_ACCESS_TOKEN") or get_data_credential("OANDA_API_KEY")
+    simulated_enabled = _simulated_market_data_enabled()
 
     out: List[str] = []
 
@@ -404,6 +458,10 @@ def get_enabled_market_data_job_names() -> List[str]:
     if polygon_key and polygon_rest_enabled and ((not chain) or ("polygon" in chain)):
         out.append("poll_prices")
 
+    if oanda_key and oanda_enabled and ((not chain) or ("oanda" in chain)):
+        if "poll_prices" not in out:
+            out.append("poll_prices")
+
     if ibkr_enabled:
         out.append("stream_prices_ibkr")
         if "poll_prices" not in out:
@@ -411,6 +469,8 @@ def get_enabled_market_data_job_names() -> List[str]:
         return out
 
     if not out:
+        out.append("poll_prices")
+    elif simulated_enabled and "poll_prices" not in out:
         out.append("poll_prices")
 
     return out

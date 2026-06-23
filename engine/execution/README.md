@@ -33,6 +33,11 @@ The `engine/execution/` tree turns approved portfolio or strategy intents into b
 - [execution_ledger.py](execution_ledger.py)
   Shared persistence and read helpers for broker order state, fills, and lifecycle evidence.
   The ledger owns a single `_table_exists` helper for its internal schema probes. Its public `audit_execution_integrity()` payload is covered by a golden-shape regression test so downstream diagnostics can rely on stable keys during later refactors.
+- [execution_ledger_serialization.py](execution_ledger_serialization.py)
+  Pure JSON, numeric coercion, strategy/model identity, and trade-outcome label
+  helpers extracted from `execution_ledger.py`. The ledger facade still exports
+  the legacy helper names and delegates to this module; schema, idempotency,
+  fill replay, and accounting remain owned by `execution_ledger.py`.
 - [trade_attribution_ledger.py](trade_attribution_ledger.py)
   Post-trade attribution ledger.
 - [almgren_chriss.py](almgren_chriss.py)
@@ -56,6 +61,9 @@ The `engine/execution/` tree turns approved portfolio or strategy intents into b
   Alpaca adapter used for broker-side order submission and status reads.
 - [broker_ibkr_gateway.py](broker_ibkr_gateway.py)
   IBKR gateway adapter used by live broker-routing paths.
+- [fx_session.py](fx_session.py)
+  Pure FX 24/5 session and rollover-timing helper derived from the canonical
+  FX-04 clock in `engine.data.prices.fx_clock`.
 - [broker_apply_orders.py](broker_apply_orders.py)
   Main order-application path that enforces execution barriers, intent loading, shaping, and broker submission.
 - [broker_failover_policy.py](broker_failover_policy.py)
@@ -73,6 +81,15 @@ In `safe` mode, execution is intentionally blocked. If the dashboard shows execu
 
 Live broker routing has additional fail-closed constraints:
 
+- Execution modes are parsed through `mode_safety.py`. Canonical modes are
+  `safe`, `paper`, `shadow`, and `live`; known development aliases normalize to
+  `safe`, and simulation aliases normalize to `paper`. Unknown, malformed, or
+  empty non-default mode inputs are invalid and fail closed as
+  `invalid_execution_mode`.
+- `broker_router.py` enforces execution mode again at the live broker boundary
+  before any Alpaca or IBKR adapter is called. Shadow and paper modes can record
+  audit/simulation evidence, but they cannot route live broker submissions even
+  if an upstream caller forgets a mode check.
 - `BROKER`, `BROKER_NAME`, `LIVE_BROKER`, and every `BROKER_FAILOVER` entry must identify the same intended live broker.
 - Live failover chains must not include `sim`, `paper`, `sandbox`, or mixed live brokers.
 - `DISABLE_LIVE_EXECUTION` blocks real trading when it is unset or set to any value other than `0`, `false`, `no`, or `off`.
@@ -85,6 +102,29 @@ Live broker routing has additional fail-closed constraints:
   remaining headroom, suppresses orders when there is no headroom, and blocks
   fail-closed on missing or invalid exposure data.
 - Broker auth/configuration failures and unrecorded broker submissions stop failover instead of retrying into another broker.
+
+## FX Execution Path
+
+FX execution is IBKR-only in this workstream. The broker boundary constructs IBKR
+Forex `CASH` contracts on `IDEALPRO` through `broker_ibkr_gateway.py`, using
+FX-02 instrument parsing for base/quote semantics. Equity symbols continue to
+build `STK`/`SMART` contracts. OANDA execution is intentionally not implemented
+here; OANDA remains a read-only pricing/data concern until a separate execution
+workstream explicitly adds and gates it.
+
+`broker_router.py` keeps the existing failover-chain validation and execution
+gates, then prefers the FX-capable broker (`ibkr`) at the front of that already
+validated chain when the batch contains FX spot pairs. The same execution-mode,
+kill-switch, pre-live reconcile, live broker contract, options, and RL-source
+guards still run before any adapter can submit.
+
+`fx_session.py` derives weekend boundaries from `engine.data.prices.fx_clock`,
+the FX-04 canonical clock. The shared default is Sunday 17:00 ET open and Friday
+17:00 ET close, which maps to roughly 21:00 UTC during US daylight time and
+22:00 UTC during US standard time. `execution_policy_engine.py` suppresses
+weekend-closed FX orders via the existing suppression/audit path and biases
+daily-rollover FX orders toward passive limit timing with additional delay.
+Spread, swap, carry, and P&L cost accounting remain FX-07 scope.
 
 ## Broker Simulation Pipeline
 

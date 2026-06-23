@@ -84,7 +84,10 @@ system promotion-guard/cooldown approval, and promotion audit persistence.
 - [ensemble_blender.py](ensemble_blender.py)
   Family-level prediction blending, stacked-weight persistence, and ensemble telemetry.
 - [feature_store.py](feature_store.py)
-  Versioned feature snapshot sink for live serving and offline analysis.
+  Versioned feature snapshot sink for live serving and offline analysis. The
+  write path sanitizes feature maps before enqueueing and stores compact
+  JSONB-compatible text without sorting large feature dictionaries; deterministic
+  key ordering is reserved for explicit fixture-style serialization.
 - [gbm_regressor.py](gbm_regressor.py)
   LightGBM-based model family with artifact persistence and prediction helpers.
 - [hmm_regime.py](hmm_regime.py)
@@ -107,6 +110,14 @@ system promotion-guard/cooldown approval, and promotion audit persistence.
   Portfolio-construction helpers for blending model views with covariance-aware risk allocation.
 - [portfolio.py](portfolio.py)
   Core portfolio-construction layer (intent only, no broker routing). Reads quality-gated alerts and current state and produces target weights and rebalance order intents, applying the max-position cap (`PORTFOLIO_MAX_POSITIONS`, default 3), anti-flip-flop minimum hold time before reversing (`PORTFOLIO_MIN_HOLD_S`, default 30 min), capital allocation/optimization (including HRP allocation), and the portfolio risk gate.
+  It remains the compatibility facade for public imports; pure helper
+  responsibilities are split into [portfolio_normalization.py](portfolio_normalization.py),
+  [portfolio_signals.py](portfolio_signals.py), [portfolio_constraints.py](portfolio_constraints.py),
+  [portfolio_targets.py](portfolio_targets.py), and [portfolio_orders.py](portfolio_orders.py).
+  Keep database-backed rebalance stage moves behind the facade and covered by
+  target/order characterization tests.
+- [portfolio_risk_gate.py](portfolio_risk_gate.py)
+  Hard portfolio and execution exposure gates. Execution-time quantity-order checks batch missing latest prices through one latest-row query for all symbols needed by the gate evaluation, then reuse that map for candidate orders, existing broker positions, and pending broker orders.
 - [model_marketplace.py](model_marketplace.py)
   Champion/challenger marketplace scoring and shadow-evidence utilities. Records challenger shadow orders, converts their outcomes into comparable scores, validates candidates against replay data and self-critic checks, computes the capital plan, and publishes ranking/capital-allocation snapshots consumed by governance and operator surfaces.
 - [model_feature_snapshots.py](model_feature_snapshots.py)
@@ -115,6 +126,7 @@ system promotion-guard/cooldown approval, and promotion audit persistence.
   Final promotion gate. `assess_challenger` blocks or allows a candidate based on runtime safety, drift, alerts, and evaluation-quality thresholds, layering statistical, CPCV, deconfounded, net-cost-evidence, and position-reconcile checks before a model is treated as promotion-eligible.
 - [feature_registry.py](feature_registry.py)
   Schema-driven feature catalog and resolution for train/serve parity. Owns the registered `feature_ids`, feature groups, base/default serving schema, and shadow/opt-in stages, and canonicalizes feature-id order so training and online inference receive the same deterministic feature vector.
+  Registered-id and allowlist resolution uses short TTL process caches keyed by `include_shadow` and stage; discovery registration clears those caches immediately, and the discovery registry guards schema setup with a process-local readiness flag.
 
 ## Newer Model Families And Controls
 

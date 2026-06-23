@@ -8,10 +8,39 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+pytestmark = pytest.mark.safety_critical
+
+
+@pytest.fixture(autouse=True)
+def _sqlite_storage_backend(tmp_path):
+    previous_backend = os.environ.get("TS_STORAGE_BACKEND")
+    previous_db_path = os.environ.get("DB_PATH")
+    os.environ["TS_STORAGE_BACKEND"] = "sqlite"
+    os.environ["DB_PATH"] = str(tmp_path / "kill_switch_regressions.db")
+    storage = importlib.reload(importlib.import_module("engine.runtime.storage"))
+    try:
+        yield
+    finally:
+        try:
+            storage.close_pooled_connections()
+        except Exception:
+            pass
+        if previous_backend is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = str(previous_backend)
+        if previous_db_path is None:
+            os.environ.pop("DB_PATH", None)
+        else:
+            os.environ["DB_PATH"] = str(previous_db_path)
+        importlib.reload(importlib.import_module("engine.runtime.storage"))
 
 
 class ManagedConnection:

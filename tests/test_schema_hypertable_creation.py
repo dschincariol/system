@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from engine.runtime.schema.table_classification import Hypertable, TABLE_CLASS
+from engine.runtime.schema.table_classification import Hypertable, TABLE_CLASS, hypertable_chunk_interval_ms
 
 _PREPARED_STORAGE = None
 _UNAVAILABLE_REASON: str | None = None
@@ -92,6 +92,35 @@ def _existing_classified_hypertables(conn) -> dict[str, Hypertable]:
     return out
 
 
+def _dimension_interval_ms(value) -> int | None:
+    if value is None:
+        return None
+    total_seconds = getattr(value, "total_seconds", None)
+    if callable(total_seconds):
+        return int(round(float(total_seconds()) * 1000.0))
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    parts = text.split()
+    if len(parts) >= 2 and parts[0].isdigit():
+        unit = parts[1].rstrip(",").lower()
+        multiplier = {
+            "day": 86_400_000,
+            "days": 86_400_000,
+            "week": 604_800_000,
+            "weeks": 604_800_000,
+        }.get(unit)
+        if multiplier is not None:
+            return int(parts[0]) * int(multiplier)
+    return None
+
+
 def test_each_existing_classified_hypertable_is_created() -> None:
     storage_pg = _prepare_db()
     with storage_pg.connect_ro_direct(timeout_s=1) as conn:
@@ -132,3 +161,8 @@ def test_each_hypertable_has_time_dimension() -> None:
                 or row.get("time_interval")
             )
             assert interval is not None, f"{table_name} dimension has no chunk interval"
+            actual_ms = _dimension_interval_ms(interval)
+            assert actual_ms == hypertable_chunk_interval_ms(table_name), (
+                f"{table_name} chunk interval mismatch: "
+                f"actual_ms={actual_ms} expected_ms={hypertable_chunk_interval_ms(table_name)}"
+            )

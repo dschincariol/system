@@ -54,11 +54,55 @@ class CompetitionPostCommitOutboxTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _reload_runtime_modules(self) -> None:
-        self.storage, self.champion_manager = _reload_modules(
+        self.storage, _runtime_meta, self.champion_manager = _reload_modules(
             "engine.runtime.storage",
+            "engine.runtime.runtime_meta",
             "engine.strategy.champion_manager",
         )
         self.storage.init_db()
+
+    def test_post_commit_status_read_path_does_not_run_schema_ddl(self) -> None:
+        class _Cursor:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return list(self._rows)
+
+        class _Connection:
+            def __init__(self) -> None:
+                self.statements: list[str] = []
+                self.closed = False
+
+            def execute(self, sql: str, params=()):
+                self.statements.append(str(sql))
+                if "GROUP BY status" in str(sql):
+                    return _Cursor([("completed", 2), ("failed", 1)])
+                return _Cursor([(10, "audit", 3, "failed", 100, 0, "boom")])
+
+            def close(self) -> None:
+                self.closed = True
+
+        con = _Connection()
+
+        with patch.object(self.champion_manager, "connect", return_value=con), patch.object(
+            self.champion_manager,
+            "init_db",
+            side_effect=AssertionError("status read path must not run schema initialization"),
+        ):
+            status = self.champion_manager.get_competition_post_commit_status()
+
+        self.assertTrue(con.closed)
+        self.assertEqual(status["completed_count"], 2)
+        self.assertEqual(status["failed_count"], 1)
+        self.assertEqual(status["failed_actions"][0]["action_name"], "audit")
+        self.assertFalse(
+            any(
+                token in statement.upper()
+                for statement in con.statements
+                for token in ("CREATE TABLE", "CREATE INDEX", "ALTER TABLE")
+            )
+        )
 
     def _insert_marketplace_row(
         self,

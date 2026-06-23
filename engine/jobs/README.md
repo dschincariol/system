@@ -5,7 +5,7 @@ The `engine/jobs/` package holds the live price-ingestion job path consumed by t
 ## Files
 
 - [stream_prices_polygon_ws.py](stream_prices_polygon_ws.py)
-  Daemon that connects to the Polygon stocks websocket, subscribes ACTIVE/WATCH symbols routed to the `polygon` provider, and publishes live trade/quote events into the price tables via `engine/runtime/price_router.publish_price_events`. Holds the `stream_prices_polygon_ws` job lock, emits heartbeats, and drives lifecycle state (warming-up/live/degraded) with reconnect, dead-feed, and restart-cooldown handling.
+  Daemon that connects to the Polygon stocks websocket through `engine/data/provider_sessions/polygon_ws_session.py`, subscribes ACTIVE/WATCH symbols routed to the `polygon` provider, and publishes live trade/quote events into the price tables via `engine/runtime/price_router.publish_price_events`. Holds the `stream_prices_polygon_ws` job lock, emits heartbeats, and drives lifecycle state (warming-up/live/degraded) with reconnect, dead-feed, and restart-cooldown handling. The live session parses websocket payloads, validates status/events, coerces numeric fields, and computes quote spread before taking its shared state lock; the lock is reserved for ordered `_last` mutation, per-stream watermarks, duplicate keys, telemetry counters, and pending-event queue updates so flush snapshots are not blocked by per-message CPU work.
 
 ## Registration & Launch
 

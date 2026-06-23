@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from engine.runtime.dbapi_compat import sqlite3
 from engine.runtime.platform import default_local_db_dir
@@ -59,16 +59,32 @@ def _is_corruption_error(error: BaseException) -> bool:
     )
 
 
+def _json_ready_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(row or {}) for row in (rows or ())]
+
+
+def _payload_row_mappings(payload: Mapping[str, Any], key: str) -> tuple[Mapping[str, Any], ...]:
+    rows = payload.get(str(key)) or ()
+    out: list[Mapping[str, Any]] = []
+    for item in list(rows):
+        if isinstance(item, Mapping):
+            out.append(item)
+        else:
+            out.append(dict(item or {}))
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class PriceWriterSpoolRecord:
     """One valid durable spool row selected for replay."""
 
     id: int
+    shard_id: int
     source: str
     created_ts_ms: int
-    prices: tuple[dict[str, Any], ...]
-    quotes: tuple[dict[str, Any], ...]
-    raw: tuple[dict[str, Any], ...]
+    prices: tuple[Mapping[str, Any], ...]
+    quotes: tuple[Mapping[str, Any], ...]
+    raw: tuple[Mapping[str, Any], ...]
     total_rows: int
     payload_bytes: int
 
@@ -78,7 +94,9 @@ class CorruptPriceWriterSpoolRecord:
     """One durable spool row whose payload cannot be decoded."""
 
     id: int
+    shard_id: int
     created_ts_ms: int
+    total_rows: int
     payload_json: str
     error: str
     payload_bytes: int
@@ -94,15 +112,15 @@ class SQLitePriceWriterSpool:
         max_envelopes: int,
         max_bytes: int,
         busy_timeout_ms: int = 5000,
-        synchronous: str = "FULL",
+        synchronous: str = "NORMAL",
     ) -> None:
         self.path = Path(path).expanduser() if path else default_spool_path()
         self.max_envelopes = max(1, int(max_envelopes))
         self.max_bytes = max(1, int(max_bytes))
         self.busy_timeout_ms = max(1, int(busy_timeout_ms))
-        self.synchronous = str(synchronous or "FULL").strip().upper()
+        self.synchronous = str(synchronous or "NORMAL").strip().upper()
         if self.synchronous not in {"FULL", "NORMAL", "EXTRA"}:
-            self.synchronous = "FULL"
+            self.synchronous = "NORMAL"
         self._lock = threading.RLock()
         self._con: sqlite3.Connection | None = None
         self._corruption_events = 0
@@ -138,18 +156,19 @@ class SQLitePriceWriterSpool:
         *,
         source: str,
         created_ts_ms: int,
-        prices: Iterable[dict[str, Any]] = (),
-        quotes: Iterable[dict[str, Any]] = (),
-        raw: Iterable[dict[str, Any]] = (),
+        shard_id: int = 0,
+        prices: Iterable[Mapping[str, Any]] = (),
+        quotes: Iterable[Mapping[str, Any]] = (),
+        raw: Iterable[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         """Append one envelope and return updated spool stats."""
 
         payload = {
             "source": str(source or "runtime"),
             "created_ts_ms": int(created_ts_ms),
-            "prices": [dict(row or {}) for row in (prices or ())],
-            "quotes": [dict(row or {}) for row in (quotes or ())],
-            "raw": [dict(row or {}) for row in (raw or ())],
+            "prices": _json_ready_rows(prices),
+            "quotes": _json_ready_rows(quotes),
+            "raw": _json_ready_rows(raw),
         }
         payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=_json_default)
         payload_bytes = len(payload_json.encode("utf-8"))
@@ -162,6 +181,7 @@ class SQLitePriceWriterSpool:
             try:
                 return self._insert_locked(
                     created_ts_ms=int(created_ts_ms),
+                    shard_id=max(0, int(shard_id)),
                     source=str(source or "runtime"),
                     price_rows=len(payload["prices"]),
                     quote_rows=len(payload["quotes"]),
@@ -176,6 +196,7 @@ class SQLitePriceWriterSpool:
                 self._recover_from_corruption_locked()
                 return self._insert_locked(
                     created_ts_ms=int(created_ts_ms),
+                    shard_id=max(0, int(shard_id)),
                     source=str(source or "runtime"),
                     price_rows=len(payload["prices"]),
                     quote_rows=len(payload["quotes"]),
@@ -189,21 +210,34 @@ class SQLitePriceWriterSpool:
         self,
         *,
         limit: int,
+        shard_id: int | None = None,
     ) -> tuple[list[PriceWriterSpoolRecord], list[CorruptPriceWriterSpoolRecord]]:
         """Return the oldest valid and corrupt rows without deleting them."""
 
         with self._lock:
             self.open()
             try:
-                rows = self._con.execute(  # type: ignore[union-attr]
-                    """
-                    SELECT id, source, created_ts_ms, payload_json, total_rows, payload_bytes
-                    FROM async_price_writer_spool
-                    ORDER BY created_ts_ms ASC, id ASC
-                    LIMIT ?
-                    """,
-                    (max(1, int(limit)),),
-                ).fetchall()
+                if shard_id is None:
+                    rows = self._con.execute(  # type: ignore[union-attr]
+                        """
+                        SELECT id, shard_id, source, created_ts_ms, payload_json, total_rows, payload_bytes
+                        FROM async_price_writer_spool
+                        ORDER BY created_ts_ms ASC, id ASC
+                        LIMIT ?
+                        """,
+                        (max(1, int(limit)),),
+                    ).fetchall()
+                else:
+                    rows = self._con.execute(  # type: ignore[union-attr]
+                        """
+                        SELECT id, shard_id, source, created_ts_ms, payload_json, total_rows, payload_bytes
+                        FROM async_price_writer_spool
+                        WHERE shard_id = ?
+                        ORDER BY created_ts_ms ASC, id ASC
+                        LIMIT ?
+                        """,
+                        (int(shard_id), max(1, int(limit))),
+                    ).fetchall()
             except sqlite3.DatabaseError as exc:
                 raise PriceWriterSpoolUnavailableError(f"sqlite_spool_select_failed:{exc}") from exc
 
@@ -211,21 +245,24 @@ class SQLitePriceWriterSpool:
         corrupt: list[CorruptPriceWriterSpoolRecord] = []
         for row in rows:
             row_id = int(row[0])
-            created_ts_ms = int(row[2])
-            payload_json = str(row[3] or "")
-            payload_bytes = int(row[5] or len(payload_json.encode("utf-8")))
+            row_shard_id = int(row[1] or 0)
+            created_ts_ms = int(row[3])
+            payload_json = str(row[4] or "")
+            payload_bytes = int(row[6] or len(payload_json.encode("utf-8")))
             try:
                 payload = json.loads(payload_json)
-                prices = tuple(dict(item or {}) for item in list(payload.get("prices") or []))
-                quotes = tuple(dict(item or {}) for item in list(payload.get("quotes") or []))
-                raw = tuple(dict(item or {}) for item in list(payload.get("raw") or []))
+                prices = _payload_row_mappings(payload, "prices")
+                quotes = _payload_row_mappings(payload, "quotes")
+                raw = _payload_row_mappings(payload, "raw")
             except Exception as exc:
                 with self._lock:
                     self._corruption_events += 1
                 corrupt.append(
                     CorruptPriceWriterSpoolRecord(
                         id=row_id,
+                        shard_id=row_shard_id,
                         created_ts_ms=created_ts_ms,
+                        total_rows=int(row[5] or 0),
                         payload_json=payload_json,
                         error=f"{type(exc).__name__}:{exc}",
                         payload_bytes=payload_bytes,
@@ -235,12 +272,13 @@ class SQLitePriceWriterSpool:
             records.append(
                 PriceWriterSpoolRecord(
                     id=row_id,
-                    source=str(row[1] or "runtime"),
+                    shard_id=row_shard_id,
+                    source=str(row[2] or "runtime"),
                     created_ts_ms=created_ts_ms,
                     prices=prices,
                     quotes=quotes,
                     raw=raw,
-                    total_rows=int(row[4] or (len(prices) + len(quotes) + len(raw))),
+                    total_rows=int(row[5] or (len(prices) + len(quotes) + len(raw))),
                     payload_bytes=payload_bytes,
                 )
             )
@@ -265,17 +303,28 @@ class SQLitePriceWriterSpool:
                 raise PriceWriterSpoolUnavailableError(f"sqlite_spool_delete_failed:{exc}") from exc
             return int(cur.rowcount if cur.rowcount is not None else 0)
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self, *, shard_id: int | None = None) -> dict[str, Any]:
         """Return current spool depth and byte usage."""
 
         with self._lock:
             self.open()
-            return self._stats_locked()
+            return self._stats_locked(shard_id=shard_id)
+
+    def stats_by_shard(self, *, shard_count: int) -> list[dict[str, Any]]:
+        """Return depth and byte usage for every configured shard."""
+
+        with self._lock:
+            self.open()
+            return [
+                self._stats_locked(shard_id=shard_id)
+                for shard_id in range(max(1, int(shard_count)))
+            ]
 
     def _insert_locked(
         self,
         *,
         created_ts_ms: int,
+        shard_id: int,
         source: str,
         price_rows: int,
         quote_rows: int,
@@ -294,6 +343,7 @@ class SQLitePriceWriterSpool:
         self._con.execute(  # type: ignore[union-attr]
             """
             INSERT INTO async_price_writer_spool(
+                shard_id,
                 source,
                 created_ts_ms,
                 price_rows,
@@ -303,9 +353,10 @@ class SQLitePriceWriterSpool:
                 payload_bytes,
                 payload_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                max(0, int(shard_id)),
                 str(source or "runtime"),
                 int(created_ts_ms),
                 int(price_rows),
@@ -337,6 +388,7 @@ class SQLitePriceWriterSpool:
             """
             CREATE TABLE IF NOT EXISTS async_price_writer_spool (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shard_id INTEGER NOT NULL DEFAULT -1,
                 source TEXT NOT NULL,
                 created_ts_ms INTEGER NOT NULL,
                 price_rows INTEGER NOT NULL DEFAULT 0,
@@ -348,10 +400,25 @@ class SQLitePriceWriterSpool:
             )
             """
         )
+        columns = {
+            str(row[1] or "")
+            for row in con.execute("PRAGMA table_info(async_price_writer_spool)").fetchall()
+        }
+        if "shard_id" not in columns:
+            con.execute(
+                "ALTER TABLE async_price_writer_spool "
+                "ADD COLUMN shard_id INTEGER NOT NULL DEFAULT -1"
+            )
         con.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_async_price_writer_spool_created
             ON async_price_writer_spool(created_ts_ms, id)
+            """
+        )
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_async_price_writer_spool_shard_created
+            ON async_price_writer_spool(shard_id, created_ts_ms, id)
             """
         )
         con.commit()
@@ -382,19 +449,38 @@ class SQLitePriceWriterSpool:
             except OSError:
                 continue
 
-    def _stats_locked(self) -> dict[str, Any]:
+    def _stats_locked(self, *, shard_id: int | None = None) -> dict[str, Any]:
         try:
-            row = self._con.execute(  # type: ignore[union-attr]
-                """
-                SELECT
-                    COUNT(*),
-                    COALESCE(SUM(total_rows), 0),
-                    COALESCE(SUM(payload_bytes), 0),
-                    MIN(created_ts_ms),
-                    MAX(created_ts_ms)
-                FROM async_price_writer_spool
-                """
-            ).fetchone()
+            if shard_id is None:
+                row = self._con.execute(  # type: ignore[union-attr]
+                    """
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(total_rows), 0),
+                        COALESCE(SUM(payload_bytes), 0),
+                        MIN(created_ts_ms),
+                        MAX(created_ts_ms),
+                        MIN(id),
+                        MAX(id)
+                    FROM async_price_writer_spool
+                    """
+                ).fetchone()
+            else:
+                row = self._con.execute(  # type: ignore[union-attr]
+                    """
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(total_rows), 0),
+                        COALESCE(SUM(payload_bytes), 0),
+                        MIN(created_ts_ms),
+                        MAX(created_ts_ms),
+                        MIN(id),
+                        MAX(id)
+                    FROM async_price_writer_spool
+                    WHERE shard_id = ?
+                    """,
+                    (int(shard_id),),
+                ).fetchone()
         except sqlite3.DatabaseError as exc:
             raise PriceWriterSpoolUnavailableError(f"sqlite_spool_stats_failed:{exc}") from exc
         pending_batches = int(row[0] or 0)
@@ -406,7 +492,7 @@ class SQLitePriceWriterSpool:
                 file_bytes += int(Path(f"{self.path}{suffix}").stat().st_size)
             except OSError:
                 pass
-        return {
+        stats = {
             "ok": True,
             "path": str(self.path),
             "pending_batches": pending_batches,
@@ -418,9 +504,15 @@ class SQLitePriceWriterSpool:
             "bytes_fill_ratio": float(pending_bytes / float(max(1, int(self.max_bytes)))),
             "oldest_created_ts_ms": row[3],
             "newest_created_ts_ms": row[4],
+            "oldest_id": row[5],
+            "newest_id": row[6],
             "corruption_events": int(self._corruption_events),
             "last_quarantine_paths": list(self._last_quarantine_paths),
+            "synchronous": str(self.synchronous),
         }
+        if shard_id is not None:
+            stats["shard_id"] = int(shard_id)
+        return stats
 
     def _close_locked(self) -> None:
         if self._con is None:

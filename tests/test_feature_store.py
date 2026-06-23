@@ -28,7 +28,18 @@ def _reload_modules(*module_names: str):
 class FeatureStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._env_backup = {
+            key: os.environ.get(key)
+            for key in (
+                "DB_PATH",
+                "FEATURE_STORE_TTL_S",
+                "PRICE_CACHE_TTL_S",
+                "PRICE_CACHE_MAX_POINTS",
+                "TS_STORAGE_BACKEND",
+            )
+        }
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "feature_store.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         os.environ["FEATURE_STORE_TTL_S"] = "0.05"
         os.environ["PRICE_CACHE_TTL_S"] = "3600"
         os.environ["PRICE_CACHE_MAX_POINTS"] = "512"
@@ -47,6 +58,22 @@ class FeatureStoreTests(unittest.TestCase):
             storage.close_pooled_connections()
         except Exception as exc:
             sys.stderr.write(f"[test_feature_store] teardown_failed: {type(exc).__name__}: {exc}\n")
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        try:
+            storage, price_cache, feature_store = _reload_modules(
+                "engine.runtime.storage",
+                "engine.data.price_cache",
+                "engine.data.feature_store",
+            )
+            price_cache.clear_price_cache()
+            feature_store.clear_feature_cache()
+            storage.close_pooled_connections()
+        except Exception as exc:
+            sys.stderr.write(f"[test_feature_store] restore_failed: {type(exc).__name__}: {exc}\n")
         self.tmp.cleanup()
 
     def test_compute_features_is_deterministic_for_same_snapshot(self) -> None:

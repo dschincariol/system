@@ -460,7 +460,7 @@ def append_event(
     best_effort: bool = False,
 ) -> Optional[int]:
     """Append one runtime event, optionally reusing the caller's transaction."""
-    if con is None:
+    if con is None and not (bool(best_effort) and bool(_EVENT_LOG_BUFFER_ENABLED)):
         init_event_log()
 
     now = int(ts_ms if ts_ms is not None else _now_ms())

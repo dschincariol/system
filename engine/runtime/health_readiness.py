@@ -35,6 +35,7 @@ def get_readiness_snapshot(
     startup_validation = dict(health.get("startup_validation") or {}) if isinstance(health.get("startup_validation"), dict) else {}
     timeseries_storage = dict(health.get("timeseries_storage") or {}) if isinstance(health.get("timeseries_storage"), dict) else {}
     feature_store = dict(health.get("feature_store") or {}) if isinstance(health.get("feature_store"), dict) else dict(timeseries_storage.get("feature_store") or {})
+    ingestion_soak = dict(health.get("ingestion_soak") or {}) if isinstance(health.get("ingestion_soak"), dict) else {}
     portfolio_runtime = dict(health.get("portfolio_runtime") or {}) if isinstance(health.get("portfolio_runtime"), dict) else {}
     position_reconcile = dict(health.get("position_reconcile") or {}) if isinstance(health.get("position_reconcile"), dict) else {}
     execution_degraded = dict(health.get("execution_degraded") or {}) if isinstance(health.get("execution_degraded"), dict) else {}
@@ -59,6 +60,8 @@ def get_readiness_snapshot(
     jobs_running = bool(job_summary.get("total")) and jobs_ok
     require_timeseries = bool(timeseries_storage.get("enabled")) or bool(feature_store.get("enabled"))
     timeseries_ok = (not require_timeseries) or bool(timeseries_storage.get("ok"))
+    ingestion_soak_required = bool(ingestion_soak.get("required"))
+    ingestion_soak_ok = bool((not ingestion_soak_required) or ingestion_soak.get("ok"))
     portfolio_runtime_ok = not bool(portfolio_runtime.get("degraded"))
     position_reconcile_required = mode_name in ("paper", "live")
     position_reconcile_ok = bool((not position_reconcile_required) or position_reconcile.get("ok"))
@@ -178,6 +181,17 @@ def get_readiness_snapshot(
             ),
         })
 
+    if ingestion_soak_required and not ingestion_soak_ok:
+        issues.append({
+            "code": "ingestion_soak_not_ready",
+            "level": "error",
+            "message": "Ingestion soak evidence is missing or unhealthy.",
+            "detail": (
+                f"status={ingestion_soak.get('status') or 'degraded'} "
+                f"errors={list(ingestion_soak.get('errors') or [])}"
+            ),
+        })
+
     if not portfolio_runtime_ok:
         issues.append({
             "code": "portfolio_runtime_degraded",
@@ -274,6 +288,7 @@ def get_readiness_snapshot(
         and data_feed_ok
         and jobs_ok
         and timeseries_ok
+        and ingestion_soak_ok
         and portfolio_runtime_ok
         and position_reconcile_ok
         and (execution_supervisor_ok if mode_name in ("shadow", "live") else True)
@@ -349,6 +364,16 @@ def get_readiness_snapshot(
             ),
         },
         {
+            "id": "ingestion_soak",
+            "label": "Verify Ingestion Soak",
+            "ok": ingestion_soak_ok,
+            "blocked": bool(ingestion_soak_required and not ingestion_soak_ok),
+            "detail": (
+                f"required={ingestion_soak_required} status={ingestion_soak.get('status') or 'optional'} "
+                f"errors={list(ingestion_soak.get('errors') or [])}"
+            ),
+        },
+        {
             "id": "portfolio_runtime",
             "label": "Verify Portfolio Runtime",
             "ok": portfolio_runtime_ok,
@@ -404,6 +429,7 @@ def get_readiness_snapshot(
         and (risk_ok if require_risk else True)
         and (broker_ok if require_broker else True)
         and (timeseries_ok if require_timeseries else True)
+        and ingestion_soak_ok
         and portfolio_runtime_ok
         and position_reconcile_ok
         and (execution_supervisor_ok if mode_name in ("shadow", "live") else True)
@@ -429,6 +455,8 @@ def get_readiness_snapshot(
         waiting_on.append("broker")
     if require_timeseries and not timeseries_ok:
         waiting_on.append("timeseries_storage")
+    if ingestion_soak_required and not ingestion_soak_ok:
+        waiting_on.append("ingestion_soak")
     if not portfolio_runtime_ok:
         waiting_on.append("portfolio_runtime")
     if position_reconcile_blocking:

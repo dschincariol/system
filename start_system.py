@@ -180,6 +180,52 @@ _SKIP_STALE_INGESTION_CLEANUP = str(
 _SKIP_RUNTIME_GRAPH_CHECK = str(
     os.environ.get("TRADING_SKIP_RUNTIME_GRAPH_CHECK", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
+_SHARD_AWARE_INGESTION_JOBS = {"ingestion_runtime", "poll_prices", "options_poll"}
+
+
+def _current_ingestion_shard():
+    from engine.runtime.ingestion_shards import current_ingestion_shard
+
+    return current_ingestion_shard()
+
+
+def _ingestion_shard_slug() -> str:
+    shard = _current_ingestion_shard()
+    if not bool(shard.enabled):
+        return ""
+    return str(shard.label).replace(":", "-")
+
+
+def _ingestion_artifact_paths(log_dir: str) -> tuple[str, str, str]:
+    slug = _ingestion_shard_slug()
+    prefix = "ingestion" if not slug else f"ingestion.{slug}"
+    return (
+        os.path.join(log_dir, f"{prefix}.pid"),
+        os.path.join(log_dir, f"{prefix}.stdout.log"),
+        os.path.join(log_dir, f"{prefix}.stderr.log"),
+    )
+
+
+def _ingestion_runtime_liveness_job_name() -> str:
+    from engine.runtime.ingestion_shards import ingestion_shard_job_name
+
+    return ingestion_shard_job_name("ingestion_runtime", _current_ingestion_shard())
+
+
+def _current_shard_liveness_job_names(job_names: set[str]) -> set[str]:
+    from engine.runtime.ingestion_shards import ingestion_shard_job_name
+
+    shard = _current_ingestion_shard()
+    names: set[str] = set()
+    for raw_name in job_names or set():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        if bool(shard.enabled) and name in _SHARD_AWARE_INGESTION_JOBS:
+            names.add(ingestion_shard_job_name(name, shard))
+        elif not bool(shard.enabled) or int(shard.index) == 0:
+            names.add(name)
+    return names
 
 
 def _safe_print(*args, **kwargs) -> None:
@@ -234,7 +280,7 @@ def _bootstrap_start_system_env() -> None:
     try:
         from engine.runtime.hardware import apply_cpu_first_runtime_defaults
 
-        apply_cpu_first_runtime_defaults()
+        apply_cpu_first_runtime_defaults(role="runtime")
     except Exception as e:
         sys.stderr.write(f"[start_system] hardware_defaults_failed: {type(e).__name__}: {e}\n")
         sys.stderr.flush()
@@ -274,9 +320,7 @@ def _refresh_startup_settings() -> None:
         or str(default_local_db_dir())
     )
     _PID_PATH = os.path.join(_LOG_DIR, "runtime.pid")
-    _INGESTION_PID_PATH = os.path.join(_LOG_DIR, "ingestion.pid")
-    _INGESTION_STDOUT_PATH = os.path.join(_LOG_DIR, "ingestion.stdout.log")
-    _INGESTION_STDERR_PATH = os.path.join(_LOG_DIR, "ingestion.stderr.log")
+    _INGESTION_PID_PATH, _INGESTION_STDOUT_PATH, _INGESTION_STDERR_PATH = _ingestion_artifact_paths(_LOG_DIR)
     _INGESTION_ENTRY = os.path.join(_BASE_DIR, "start_ingestion.py")
     _VALIDATION_TIMEOUT_S = _env_int("TRADING_VALIDATION_TIMEOUT_S", 180, minimum=30, maximum=3600)
     _STARTUP_HEALTH_TIMEOUT_S = _env_int("TRADING_STARTUP_HEALTH_TIMEOUT_S", 180, minimum=15, maximum=3600)
@@ -607,6 +651,9 @@ def _probe_runtime_acceleration() -> None:
             "ts_ms": int(time.time() * 1000),
         }
         _STARTUP_TRACE["runtime_acceleration"] = snapshot
+        if e.__class__.__name__ == "AccelerationProfileError":
+            _record_phase("ACCELERATION", status="error", detail=str(e), extra=snapshot)
+            raise
         _record_phase("ACCELERATION", status="ok", detail="cpu", extra=snapshot)
         _log_swallowed("RUNTIME_ACCELERATION_PROBE_FAILED", error=f"{type(e).__name__}: {e}")
 
@@ -875,6 +922,8 @@ def _log_runtime_hardware_bootstrap() -> None:
         }
         _persist_startup_trace()
     except Exception as e:
+        if e.__class__.__name__ == "AccelerationProfileError":
+            raise
         _log_swallowed("START_SYSTEM_RUNTIME_HARDWARE_DIAGNOSTICS_FAILED", error=str(e))
 
 try:
@@ -1039,7 +1088,15 @@ def _read_pid_file_int(pid_path: str) -> int:
         return 0
 
 
-def _write_pid_file_record(pid_path: str, *, pid: int, label: str, entry: str, owner_pid: int = 0) -> None:
+def _write_pid_file_record(
+    pid_path: str,
+    *,
+    pid: int,
+    label: str,
+    entry: str,
+    owner_pid: int = 0,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
     payload = {
         "pid": int(pid),
         "label": str(label),
@@ -1048,6 +1105,8 @@ def _write_pid_file_record(pid_path: str, *, pid: int, label: str, entry: str, o
         "owner_pid": int(owner_pid or 0),
         "created_ts_ms": int(time.time() * 1000),
     }
+    if isinstance(extra, dict):
+        payload.update(dict(extra))
     Path(pid_path).write_text(
         json.dumps(payload, separators=(",", ":"), sort_keys=True),
         encoding="utf-8",
@@ -1115,12 +1174,14 @@ def _cleanup_pid_file() -> None:
 
 def _write_ingestion_pid(pid: int) -> None:
     try:
+        shard = _current_ingestion_shard()
         _write_pid_file_record(
             _INGESTION_PID_PATH,
             pid=int(pid),
             label="ingestion",
             entry="start_ingestion.py",
             owner_pid=int(os.getpid()),
+            extra={"shard": shard.as_dict()},
         )
     except Exception as e:
         raise RuntimeError(
@@ -1244,6 +1305,28 @@ def _looks_like_repo_ingestion_process(cmdline: str, *, markers: Optional[set[st
     return any(marker in text for marker in marker_set)
 
 
+def _process_matches_current_ingestion_shard(proc) -> bool:
+    shard = _current_ingestion_shard()
+    if not bool(shard.enabled):
+        return True
+    try:
+        environ = proc.environ()
+    except Exception as e:
+        _log_swallowed("STALE_INGESTION_PROCESS_ENV_READ_FAILED", error=str(e))
+        return False
+    try:
+        proc_index = int(str((environ or {}).get("INGESTION_SHARD_INDEX", "")).strip())
+        proc_count = int(str((environ or {}).get("INGESTION_SHARD_COUNT", "")).strip())
+    except Exception as e:
+        _log_swallowed(
+            "STALE_INGESTION_PROCESS_SHARD_ENV_PARSE_FAILED",
+            error=str(e),
+            pid=getattr(proc, "pid", None),
+        )
+        return False
+    return proc_index == int(shard.index) and proc_count == int(shard.count)
+
+
 def _discover_repo_ingestion_process_pids(*, known_jobs: Optional[set[str]] = None) -> set[int]:
     stale_pids: set[int] = set()
     if psutil is None:
@@ -1270,7 +1353,7 @@ def _discover_repo_ingestion_process_pids(*, known_jobs: Optional[set[str]] = No
             if pid <= 0 or pid == current_pid or pid == current_parent_pid:
                 continue
             cmdline = _repo_process_cmdline(proc)
-            if _looks_like_repo_ingestion_process(cmdline, markers=marker_set):
+            if _looks_like_repo_ingestion_process(cmdline, markers=marker_set) and _process_matches_current_ingestion_shard(proc):
                 stale_pids.add(pid)
         return stale_pids
     except Exception as e:
@@ -1316,6 +1399,8 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
         except Exception as e:
             _log_swallowed("STALE_INGESTION_CHILD_JOB_DISCOVERY_FAILED", error=str(e))
 
+    stale_liveness_jobs = _current_shard_liveness_job_names(stale_jobs)
+
     try:
         record = _read_pid_file_record(_INGESTION_PID_PATH, label="ingestion")
         pid_value = int(record.get("pid") or 0)
@@ -1336,27 +1421,28 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
 
     stale_pids.update(_discover_repo_ingestion_process_pids(known_jobs=stale_jobs))
     LOG.info(
-        "STALE_INGESTION_CLEANUP_DISCOVERED jobs=%s pid_count=%s budget_s=%s",
+        "STALE_INGESTION_CLEANUP_DISCOVERED jobs=%s liveness_jobs=%s pid_count=%s budget_s=%s",
         sorted(stale_jobs),
+        sorted(stale_liveness_jobs),
         len(stale_pids),
         float(time_budget_s) if time_budget_s is not None else None,
     )
 
     db_path = str(os.environ.get("DB_PATH") or "").strip()
-    if db_path and os.path.exists(db_path):
+    if db_path and os.path.exists(db_path) and stale_liveness_jobs:
         con = None
         try:
             from engine.runtime.storage import connect_ro_direct
 
             con = connect_ro_direct(timeout_s=2.0, busy_timeout_ms=5000)
-            placeholders = ",".join("?" for _ in stale_jobs)
+            placeholders = ",".join("?" for _ in stale_liveness_jobs)
             rows = con.execute(
                 f"""
                 SELECT job_name, pid
                 FROM job_heartbeats
                 WHERE job_name IN ({placeholders})
                 """,
-                tuple(sorted(stale_jobs)),
+                tuple(sorted(stale_liveness_jobs)),
             ).fetchall()
             for row in rows or []:
                 try:
@@ -1386,18 +1472,22 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
                     error=str(e),
                 )
 
+    running_stale_pids: set[int] = set()
+    unhandled_running_stale_pids: set[int] = set()
     for pid in sorted(stale_pids):
+        if pid <= 0 or pid == os.getpid():
+            continue
+        if not _pid_is_running_cross_platform(pid):
+            continue
+        running_stale_pids.add(int(pid))
         if _budget_exhausted():
+            unhandled_running_stale_pids.add(int(pid))
             _log_swallowed(
                 "STALE_INGESTION_CLEANUP_BUDGET_EXHAUSTED",
                 stage="terminate_pids",
                 remaining_pids=sorted(int(x) for x in stale_pids if int(x) >= int(pid)),
             )
             break
-        if pid <= 0 or pid == os.getpid():
-            continue
-        if not _pid_is_running_cross_platform(pid):
-            continue
 
         try:
             terminate_timeout_s = 15.0
@@ -1407,8 +1497,10 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
             if terminated:
                 LOG.warning("TERMINATING_STALE_INGESTION_PROCESS pid=%s", pid)
             else:
+                unhandled_running_stale_pids.add(int(pid))
                 _log_swallowed("TERMINATE_STALE_INGESTION_SKIPPED", pid=int(pid))
         except Exception as e:
+            unhandled_running_stale_pids.add(int(pid))
             _log_swallowed("TERMINATE_STALE_INGESTION_FAILED", pid=int(pid), error=str(e))
 
     try:
@@ -1424,17 +1516,24 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
     except Exception as e:
         _log_swallowed("FINAL_INGESTION_PID_CLEANUP_FAILED", error=str(e))
 
-    if db_path and os.path.exists(db_path):
-        if _budget_exhausted():
+    if db_path and os.path.exists(db_path) and stale_liveness_jobs:
+        if _budget_exhausted() and unhandled_running_stale_pids:
             _log_swallowed(
                 "STALE_INGESTION_CLEANUP_BUDGET_EXHAUSTED",
                 stage="lock_cleanup",
                 db_path=str(db_path),
+                unhandled_running_pids=sorted(unhandled_running_stale_pids),
             )
             return
+        if _budget_exhausted() and not running_stale_pids:
+            _log_swallowed(
+                "STALE_INGESTION_LOCK_CLEANUP_AFTER_BUDGET_EXHAUSTED",
+                db_path=str(db_path),
+                stale_pid_count=len(stale_pids),
+            )
         try:
-            placeholders = ",".join("?" for _ in stale_jobs)
-            cleanup_jobs = tuple(sorted(stale_jobs))
+            placeholders = ",".join("?" for _ in stale_liveness_jobs)
+            cleanup_jobs = tuple(sorted(stale_liveness_jobs))
 
             from engine.runtime.storage import run_write_txn
 
@@ -1447,15 +1546,17 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
                     f"DELETE FROM job_locks WHERE job_name IN ({placeholders})",
                     cleanup_jobs,
                 )
-                try:
-                    con.execute("DELETE FROM price_feed_lock")
-                except Exception as e:
-                    if "no such table" not in str(e or "").lower():
-                        LOG.warning(
-                            "STALE_INGESTION_PRICE_FEED_LOCK_DELETE_FAILED db_path=%s error=%s",
-                            db_path,
-                            e,
-                        )
+                shard = _current_ingestion_shard()
+                if (not bool(shard.enabled)) or int(shard.index) == 0:
+                    try:
+                        con.execute("DELETE FROM price_feed_lock")
+                    except Exception as e:
+                        if "no such table" not in str(e or "").lower():
+                            LOG.warning(
+                                "STALE_INGESTION_PRICE_FEED_LOCK_DELETE_FAILED db_path=%s error=%s",
+                                db_path,
+                                e,
+                            )
 
             run_write_txn(
                 _cleanup_txn,
@@ -1470,9 +1571,9 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
             )
         except Exception as e:
             LOG.warning(
-                "STALE_INGESTION_LOCK_CLEANUP_FAILED db_path=%s jobs=%s error=%s",
+                "STALE_INGESTION_LOCK_CLEANUP_FAILED db_path=%s liveness_jobs=%s error=%s",
                 db_path,
-                sorted(stale_jobs),
+                sorted(stale_liveness_jobs),
                 e,
             )
 
@@ -1484,6 +1585,7 @@ def _existing_ingestion_runtime_active() -> bool:
 
     now_ms = int(time.time() * 1000)
     max_age_ms = int(max(30.0, float(_INGESTION_RESTART_WINDOW_S), float(_INGESTION_WATCHDOG_SLEEP_S) * 4.0) * 1000)
+    liveness_job_name = _ingestion_runtime_liveness_job_name()
 
     con = None
     try:
@@ -1496,7 +1598,7 @@ def _existing_ingestion_runtime_active() -> bool:
             FROM job_heartbeats
             WHERE job_name = ?
             """,
-            ("ingestion_runtime",),
+            (liveness_job_name,),
         ).fetchone()
 
         if not row:
@@ -1525,7 +1627,8 @@ def _existing_ingestion_runtime_active() -> bool:
 
         if fresh and pid_running:
             LOG.info(
-                "INGESTION_ALREADY_ACTIVE_SKIP_SPAWN pid=%s heartbeat_age_ms=%s",
+                "INGESTION_ALREADY_ACTIVE_SKIP_SPAWN job=%s pid=%s heartbeat_age_ms=%s",
+                liveness_job_name,
                 pid,
                 max(0, now_ms - ts_ms),
             )
@@ -1547,7 +1650,8 @@ def _existing_ingestion_runtime_active() -> bool:
             )
 
         try:
-            con.execute("DELETE FROM job_heartbeats WHERE job_name = ?", ("ingestion_runtime",))
+            con.execute("DELETE FROM job_heartbeats WHERE job_name = ?", (liveness_job_name,))
+            con.execute("DELETE FROM job_locks WHERE job_name = ?", (liveness_job_name,))
             con.commit()
         except Exception as e:
             raise RuntimeError(
@@ -1642,7 +1746,18 @@ def _ingestion_storage_ready() -> tuple[bool, str]:
     if _postgres_runtime_storage_configured():
         return True, "postgres"
     db_path = str(os.environ.get("DB_PATH") or "").strip()
-    return bool(db_path and os.path.exists(db_path)), db_path
+    if not db_path:
+        return False, db_path
+    path = Path(db_path)
+    if not path.is_file():
+        return False, db_path
+    try:
+        from engine.runtime.storage_sqlite import _sqlite_schema_sentinels_ready
+
+        return bool(_sqlite_schema_sentinels_ready(path)), db_path
+    except Exception as e:
+        _log_swallowed("INGESTION_STORAGE_READY_SQLITE_CHECK_FAILED", db_path=db_path, error=str(e))
+        return False, db_path
 
 
 def _spawn_ingestion_if_enabled() -> None:
@@ -1682,6 +1797,12 @@ def _spawn_ingestion_if_enabled() -> None:
     env.setdefault("TS_PG_POOL_PROFILE", "ingestion")
     env["PYTHONPATH"] = _BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     try:
+        from engine.runtime.ingestion_shards import canonical_shard_env
+
+        env.update(canonical_shard_env(_current_ingestion_shard()))
+    except Exception:
+        raise
+    try:
         from services.data_source_manager import (
             apply_safe_no_credential_runtime_environment,
             safe_no_credential_market_data_mode,
@@ -1691,6 +1812,13 @@ def _spawn_ingestion_if_enabled() -> None:
             apply_safe_no_credential_runtime_environment(env)
     except Exception as e:
         _log_swallowed("INGESTION_SAFE_ENV_SANITIZE_FAILED", error=str(e))
+
+    try:
+        from engine.runtime.thread_policy import apply_cpu_thread_policy_to_env
+
+        apply_cpu_thread_policy_to_env(env, role="ingestion")
+    except Exception as e:
+        _log_swallowed("INGESTION_CPU_THREAD_POLICY_FAILED", error=str(e))
 
     creationflags = 0
     start_new_session = False
@@ -1984,7 +2112,17 @@ def _db_repair_lock_contention(value: Any) -> bool:
     else:
         text = str(value)
     lowered = text.lower()
-    return "database is locked" in lowered or "sqlite_busy" in lowered or "sqlite_locked" in lowered
+    return (
+        "database is locked" in lowered
+        or "sqlite_busy" in lowered
+        or "sqlite_locked" in lowered
+        or "deadlock detected" in lowered
+        or "deadlockdetected" in lowered
+        or "locknotavailable" in lowered
+        or "could not obtain lock" in lowered
+        or "canceling statement due to lock timeout" in lowered
+        or "canceling statement due to statement timeout" in lowered
+    )
 
 
 def _run_startup_db_repair() -> Any:
@@ -2086,6 +2224,18 @@ def main():
     mode = _pick_mode_from_argv_or_env()
     os.environ["ENGINE_MODE"] = mode
     os.environ["ENGINE_PRIMARY_BOOTSTRAP_DONE"] = "1"
+    # Resolve TRADING_NETWORK_MODE=lan -> DASHBOARD_HOST/OPERATOR_BIND_HOST
+    # wildcard defaults before the prebind gates inspect them. Doing this here
+    # (rather than only in dashboard_server) ensures the startup token gate sees
+    # the same non-loopback host the server will actually bind to.
+    try:
+        from engine.runtime.platform import apply_network_mode_bind_defaults
+
+        _net_applied = apply_network_mode_bind_defaults(os.environ)
+        if _net_applied:
+            LOG.warning("NETWORK_MODE_BIND_DEFAULTS_APPLIED %s", _net_applied)
+    except Exception as e:  # pragma: no cover - defensive
+        _early_log_nonfatal("NETWORK_MODE_BIND_DEFAULTS_FAILED", e)
     _log_runtime_hardware_bootstrap()
     _record_phase("BOOT", status="ok", detail=f"mode={mode}", extra={"pid": int(os.getpid()), "db_path": str(os.environ.get("DB_PATH") or "")})
     _probe_runtime_acceleration()
@@ -2282,6 +2432,7 @@ def main():
                     "ts_ms": int(__import__("time").time() * 1000),
                 },
                 ts_ms=int(__import__("time").time() * 1000),
+                best_effort=True,
             )
     except Exception as e:
         _log_swallowed("INGESTION_PREBIND_DEFER_MARK_FAILED", error=str(e))

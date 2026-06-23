@@ -126,9 +126,10 @@ def _reconcile_unresolved_rows(conw, *, allowed_symbols: List[str]) -> List[Dict
 def _run_once() -> None:
     manager = get_manager()
     symbols = list(dict.fromkeys(_load_symbols()))
-    rows = fetch_congressional_trades(
+    rows, source_statuses = fetch_congressional_trades(
         backfill_days=CONGRESSIONAL_BACKFILL_DAYS,
         allowed_symbols=symbols,
+        include_status=True,
     )
 
     def _write(conw) -> tuple[int, int, int]:
@@ -161,29 +162,40 @@ def _run_once() -> None:
         ]
         or [int(time.time() * 1000)]
     )
+    source_errors = [
+        row
+        for row in source_statuses
+        if str((row or {}).get("status") or "") in {"fail", "degraded"}
+        and str((row or {}).get("classification") or "") != "empty_payload"
+    ]
+    ok = not source_errors and bool(rows)
     status = record_pipeline_status(
         JOB_NAME,
-        ok=True,
+        ok=ok,
         raw_rows=int(len(rows)),
         event_rows=int(event_rows),
         last_ingested_ts_ms=int(last_ingested_ts_ms),
+        error=("; ".join(str(row) for row in source_errors[:3])) if source_errors else (None if rows else "congressional_trades_empty_payload"),
         meta={
             "rows": int(len(rows)),
             "written": int(written),
             "event_rows": int(event_rows),
             "reconciled_rows": int(reconciled),
             "backfill_days": int(CONGRESSIONAL_BACKFILL_DAYS),
+            "source_statuses": source_statuses,
         },
     )
     manager.record_job_status(
         JOB_NAME,
-        ok=True,
-        message="congressional trades cycle complete",
+        ok=ok,
+        message="congressional trades cycle complete" if ok else "congressional trades cycle degraded",
+        error=("; ".join(str(row) for row in source_errors[:3])) if source_errors else ("" if rows else "congressional_trades_empty_payload"),
         meta={
             "rows": int(len(rows)),
             "written": int(written),
             "event_rows": int(event_rows),
             "reconciled_rows": int(reconciled),
+            "source_statuses": source_statuses,
         },
     )
     put_job_heartbeat(JOB_NAME, OWNER, PID, extra_json=json.dumps(status, separators=(",", ":"), sort_keys=True))

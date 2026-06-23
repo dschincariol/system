@@ -162,6 +162,16 @@ check_cpu_power_policy_assets() {
   bash -n "$policy"
 }
 
+check_memory_pressure_assets() {
+  log "checking memory pressure hardening assets"
+  local policy="${APP_ROOT}/ops/server/memory_pressure_hardening.sh"
+  if [ ! -f "$policy" ]; then
+    policy="${SCRIPT_DIR}/memory_pressure_hardening.sh"
+  fi
+  [ -x "$policy" ] || fail "missing executable memory pressure hardening script ${policy}"
+  bash -n "$policy"
+}
+
 check_prod_preflight_runner() {
   log "checking production preflight runner"
   local runner="${APP_ROOT}/ops/server/run_prod_preflight.sh"
@@ -211,7 +221,7 @@ check_backup_assets() {
 check_server_ops_assets() {
   log "checking server ops scripts"
   local script
-  for script in disk_remediation.sh zfs_tuning.sh; do
+  for script in disk_remediation.sh provision_storage_pools.sh zfs_tuning.sh memory_pressure_hardening.sh; do
     [ -x "${SERVER_SCRIPT_DIR}/${script}" ] || fail "missing executable server ops script ${SERVER_SCRIPT_DIR}/${script}"
     bash -n "${SERVER_SCRIPT_DIR}/${script}"
   done
@@ -225,6 +235,7 @@ main() {
   check_credstore
   check_systemd_units
   check_cpu_power_policy_assets
+  check_memory_pressure_assets
   check_prod_preflight_runner
   check_backup_assets
   check_server_ops_assets

@@ -161,16 +161,21 @@ overrides; document overrides):
 
 ## Compression and retention defaults
 
-| Class | Chunk | Compress after | Retention |
-|---|---|---|---|
-| Tick / quote stream | 1 day | 7 days | 30 days raw, 1 y bars |
-| Time-series features | 1 week | 30 days | 3 years |
-| Audit ledgers | 1 week | 90 days | **none** |
-| `trade_attribution_ledger` | 1 week | **none** | **none** |
-| Health metrics | 1 day | 14 days | 180 days |
-| Job-history-style | regular | n/a | app-managed 90 days |
+| Class | Chunk | Compress after | Compression order | Retention |
+|---|---|---|---|---|
+| Tick / quote stream | 1 day | 7 days | real price time column DESC | 30 days raw, 1 y bars |
+| Time-series features | 1 week | 30 days | classified time column DESC | 3 years |
+| Audit ledgers | 1 week | 90 days | classified time column DESC | **none** |
+| `trade_attribution_ledger` | 1 week | **none** | n/a | **none** |
+| Health metrics | 1 day | 14 days | classified/sidecar time column DESC | 180 days |
+| Job-history-style | regular | n/a | n/a | app-managed 90 days |
 
 Override per-table in `table_classification.py` with one-line reason.
+Compression setup must preserve each table's `segmentby` policy and set
+`compress_orderby` to the table's real time column. For sidecar-owned Timescale
+tables, use the actual DDL column (`"time"` for operational telemetry and
+`"timestamp"` for price/feature/model/trade sidecar tables), even when a legacy
+classification entry uses a different storage-layer time name.
 
 ## Index plan
 
@@ -252,7 +257,7 @@ retention is consistent.
 - `tests/test_schema_hypertable_creation.py` — assert hypertable
   presence and chunk interval for each.
 - `tests/test_schema_compression_policy.py` — assert compression
-  policy presence and `compress_after`.
+  policy presence, `compress_after`, and generated `compress_orderby` options.
 - `tests/test_schema_retention_policy.py` — assert retention policy
   presence (or explicit absence for compliance tables).
 - `tests/test_schema_indexes_present.py` — query `pg_indexes`,

@@ -538,6 +538,23 @@ def _db_reachable(db_path: Path) -> Dict[str, Any]:
         }
 
 
+def _cache_codec_readiness() -> Dict[str, Any]:
+    try:
+        from engine.cache.codec import readiness_snapshot
+
+        return dict(readiness_snapshot() or {})
+    except Exception as e:
+        return {
+            "ok": False,
+            "required": True,
+            "codec": "unavailable",
+            "msgpack_available": False,
+            "json_fallback_allowed": False,
+            "blockers": [f"cache_codec_readiness_error:{type(e).__name__}:{e}"],
+            "warnings": [],
+        }
+
+
 def _gate(
     name: str,
     ok: bool,
@@ -725,6 +742,14 @@ def evaluate_runtime_startup_gates(
     model_cache = dict(health.get("model_cache") or {})
     runtime_price_cache = dict(health.get("runtime_price_cache") or {})
     event_bus = dict(health.get("event_bus") or {})
+    cache_codec = _cache_codec_readiness()
+    cache_codec_required = bool(cache_codec.get("required"))
+    cache_codec_ok = bool(cache_codec.get("ok"))
+    cache_codec_blocking = bool(cache_codec_required and not cache_codec_ok)
+    cache_codec_detail = "ok"
+    if not cache_codec_ok:
+        detail_items = list(cache_codec.get("blockers") or cache_codec.get("warnings") or [])
+        cache_codec_detail = ",".join(str(item) for item in detail_items if str(item).strip()) or "cache_codec_not_ready"
 
     post_bind_boot = dict(boot_diagnostics.get("post_bind_boot") or {})
     runtime_bootstrap = dict(boot_diagnostics.get("runtime_bootstrap") or {})
@@ -863,6 +888,16 @@ def evaluate_runtime_startup_gates(
             config_keys=["DB_PATH"],
             dependency="postgres",
             extra={"dsn": _redacted_pg_dsn()},
+        ),
+        "cache_codec_ready": _gate(
+            "cache_codec_ready",
+            cache_codec_ok,
+            blocking=cache_codec_blocking,
+            component="cache",
+            detail=cache_codec_detail,
+            config_keys=["CACHE_CODEC_ALLOW_JSON_FALLBACK", "CACHE_CODEC_REQUIRE_MSGPACK", "LIVE_CACHE_BACKEND"],
+            dependency="msgpack",
+            extra={"cache_codec": cache_codec},
         ),
         "schema_valid": _gate(
             "schema_valid",

@@ -122,10 +122,23 @@ function operatorErrorStatus(error, fallback = 500) {
   if (!code) return fallback;
   if (code.includes("timeout")) return 504;
   if (code === "unauthorized" || code.endsWith("_unauthorized")) return 401;
+  if (code === "wrong_credentials" || code.endsWith("_credentials_rejected")) return 401;
+  if (code === "entitlement_missing" || code.endsWith("_entitlement_missing")) return 403;
   if (code.includes("forbidden")) return 403;
+  if (
+    code === "execution_blocked" ||
+    code === "order_blocked" ||
+    code === "safety_gate_blocked" ||
+    code === "operator_dashboard_auth_required" ||
+    code === "operator_sidecar_token_unconfigured"
+  ) {
+    return 403;
+  }
+  if (code === "pre_trade_rejected") return 409;
   if (code.includes("not_found") || code.includes("not_registered")) return 404;
   if (code.startsWith("deprecated") || code.startsWith("gone")) return 410;
   if (code.includes("cooldown") || code.includes("rate_limit") || code.includes("too_many_requests")) return 429;
+  if (code === "missing_credentials" || code.endsWith("_credentials_missing") || code.endsWith("_account_id_missing")) return 422;
   if (
     code.startsWith("missing_") ||
     code.startsWith("invalid_") ||
@@ -263,8 +276,44 @@ function logOperatorCatch(scope, error, extra = undefined) {
   } catch {}
 }
 // Operator server
+// Network access mode mirrors the Python side (engine/runtime/platform.py):
+// TRADING_NETWORK_MODE=lan is a dashboard-entrypoint contract. The operator
+// sidecar remains loopback/internal by default and should be reached through the
+// authenticated dashboard bridge. An explicit OPERATOR_BIND_HOST always wins;
+// compose sets 0.0.0.0 only inside the private Docker network and does not
+// publish a host :4001 port.
+const LAN_MODE_ALIASES = new Set(["lan", "host", "server", "remote", "0.0.0.0", "wildcard"]);
+const NETWORK_MODE = LAN_MODE_ALIASES.has(
+  String(process.env.TRADING_NETWORK_MODE || process.env.OPERATOR_NETWORK_MODE || "").trim().toLowerCase()
+)
+  ? "lan"
+  : "local";
+const DEFAULT_LAN_ADVERTISE_IP = "192.168.0.165";
+
+function resolveOperatorBindHost() {
+  const explicit = String(process.env.OPERATOR_BIND_HOST || "").trim();
+  if (explicit) return explicit;
+  return "127.0.0.1";
+}
+
+function resolveLanAdvertiseIp() {
+  const explicit = String(process.env.TRADING_LAN_IP || "").trim();
+  if (explicit) return explicit;
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+      for (const info of ifaces[name] || []) {
+        if (info && info.family === "IPv4" && !info.internal && info.address) {
+          return info.address;
+        }
+      }
+    }
+  } catch {}
+  return DEFAULT_LAN_ADVERTISE_IP;
+}
+
 const OPERATOR_PORT = clampNumber(process.env.OPERATOR_PORT || 4001, 4001, 1, 65535);
-const OPERATOR_BIND_HOST = String(process.env.OPERATOR_BIND_HOST || "127.0.0.1");
+const OPERATOR_BIND_HOST = resolveOperatorBindHost();
 const OPERATOR_AUTO_START_DELAY_MS = clampNumber(
   process.env.OPERATOR_AUTO_START_DELAY_MS || 8000,
   8000,
@@ -283,9 +332,10 @@ const PRODUCTION_MODE = process.env.NODE_ENV === "production";
 /* -------------------------------------------------
    CORS (UI runs on :8000, Operator on :4001)
 ------------------------------------------------- */
+const DASHBOARD_UI_PORT = clampNumber(process.env.DASHBOARD_PORT || 8000, 8000, 1, 65535);
+
 app.use((req, res, next) => {
   const env = readEnv();
-  const allowed = String(env.OPERATOR_ALLOWED_ORIGIN || "http://127.0.0.1:8000").trim();
 
   // Security headers (safe defaults for local/prod)
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -297,19 +347,54 @@ app.use((req, res, next) => {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
 
+  // Derive the requesting host so CSP/CORS support explicit same-host
+  // diagnostics without hard-coding any IP. The standalone sidecar is not the
+  // preferred LAN entrypoint; normal LAN access goes through the dashboard
+  // /operator/ bridge while loopback entries preserve local development.
+  const reqScheme = req.secure ? "https" : "http";
+  const wsScheme = req.secure ? "wss" : "ws";
+  let reqHost = "127.0.0.1";
+  try {
+    reqHost = String(req.hostname || "").trim() || "127.0.0.1";
+  } catch {}
+  const sameHostDashboard = `${reqScheme}://${reqHost}:${DASHBOARD_UI_PORT}`;
+  const sameHostOperator = `${reqScheme}://${reqHost}:${OPERATOR_PORT}`;
+
   // CSP (allow local UI + inline assets used by dashboard)
+  const connectSrc = [
+    "'self'",
+    sameHostDashboard,
+    sameHostOperator,
+    `${wsScheme}://${reqHost}:*`,
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:4001",
+    "ws://127.0.0.1:*",
+  ];
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'self'; " +
     "script-src 'self' 'unsafe-inline'; " +
     "style-src 'self' 'unsafe-inline'; " +
     "img-src 'self' data:; " +
-    "connect-src 'self' http://127.0.0.1:4001 http://127.0.0.1:8000 ws://127.0.0.1:*; " +
+    `connect-src ${connectSrc.join(" ")}; ` +
     "frame-ancestors 'none'; " +
     "base-uri 'none'"
   );
 
-  // CORS (strict single origin)
+  // CORS: reflect the request Origin only when it is in the allowlist. The
+  // allowlist is OPERATOR_ALLOWED_ORIGIN (comma-separated) plus the dashboard
+  // and operator origins on the requesting host, so trusted-LAN access works
+  // without ever weakening to a wildcard (credentials are allowed).
+  const configuredOrigins = String(env.OPERATOR_ALLOWED_ORIGIN || "http://127.0.0.1:8000")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const allowOrigins = new Set([...configuredOrigins, sameHostDashboard, sameHostOperator]);
+  const requestOrigin = String(req.headers.origin || "").trim();
+  const allowed = requestOrigin && allowOrigins.has(requestOrigin)
+    ? requestOrigin
+    : (configuredOrigins[0] || "http://127.0.0.1:8000");
+
   res.setHeader("Access-Control-Allow-Origin", allowed);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
@@ -339,7 +424,13 @@ app.get("/api/operator/ping", (_req, res) => {
   return jsonOk(res, { ts: Date.now() });
 });
 
-app.use(["/api/operator", "/api/operator_summary", "/api/execution/barrier"], (req, res, next) => {
+app.use([
+  "/api/operator",
+  "/api/operator_summary",
+  "/api/execution/barrier",
+  "/api/system/kill_switches",
+  "/api/broker/config",
+], (req, res, next) => {
   if (!operatorRouteRequiresAuth(req)) {
     return next();
   }
@@ -349,7 +440,10 @@ app.use(["/api/operator", "/api/operator_summary", "/api/execution/barrier"], (r
   return res.status(403).json({
     ok: false,
     error: "operator_forbidden",
+    reason_code: "operator_token_required",
+    message: "Operator token is required for this sidecar endpoint.",
     auth_required: true,
+    required_auth: ["X-Operator-Token"],
     meta: { status: 403 }
   });
 });
@@ -729,6 +823,17 @@ function readSecretFileText(filePath) {
   }
 }
 
+function writeLocalSecretFile(filePath, value) {
+  const target = String(filePath || "").trim();
+  const text = String(value || "").trim();
+  if (!target || !text) return false;
+  atomicWrite(target, `${text}\n`);
+  try {
+    fs.chmodSync(target, 0o600);
+  } catch {}
+  return true;
+}
+
 function readCredentialSecretText(secretName) {
   const name = String(secretName || "").trim();
   if (!name || !/^[A-Za-z0-9_.@:-]+$/.test(name)) return "";
@@ -815,7 +920,7 @@ function trustedControlPlaneAuthHeaders(method, urlText) {
     if (operatorToken) headers["X-Operator-Token"] = operatorToken;
     return headers;
   }
-  if (upper === "GET" || upper === "HEAD" || upper === "OPTIONS") return {};
+  if (upper === "OPTIONS") return {};
   try {
     const parsed = new URL(String(urlText || ""));
     if (String(parsed.pathname || "").startsWith("/api/")) {
@@ -1884,6 +1989,8 @@ const ENV_SPEC = [
   { key: "DASHBOARD_HOST", type: "string", required: false, default: "127.0.0.1" },
   { key: "DASHBOARD_PORT", type: "int", required: false, min: 1, max: 65535, default: 8000 },
   { key: "DASHBOARD_API_TOKEN", type: "string", required: false, default: "" },
+  { key: "DASHBOARD_API_TOKEN_FILE", type: "string", required: false, default: "" },
+  { key: "OPERATOR_API_TOKEN_FILE", type: "string", required: false, default: "" },
 
   { key: "DB_PATH", type: "string", required: false, default: DEFAULT_LOCAL_DB_PATH },
 
@@ -1987,7 +2094,13 @@ function ensureEnvFile() {
         } catch {}
       }
 
-      envNow.DASHBOARD_API_TOKEN = token;
+      const tokenFile = path.join(OPERATOR_DATA_DIR, "dashboard_api_token");
+      if (writeLocalSecretFile(tokenFile, token)) {
+        delete envNow.DASHBOARD_API_TOKEN;
+        envNow.DASHBOARD_API_TOKEN_FILE = tokenFile;
+      } else {
+        envNow.DASHBOARD_API_TOKEN = token;
+      }
       const { sanitized, issues } = validateAndSanitizeEnv(envNow);
       if (!issues.some((i) => i.level === "error")) {
         atomicWrite(ENV_PATH, serializeEnv(sanitized));
@@ -4443,7 +4556,9 @@ function normalizeHttpProbeResult(name, result) {
     ok: !!result.ok,
     name,
     status: Number(result.status || 0),
-    error: result.ok ? null : "dashboard_unreachable",
+    error: result.ok ? null : String(result.error || "dashboard_unreachable"),
+    timed_out: !!result.timed_out,
+    duration_ms: Number(result.duration_ms || 0),
     body: (result.json && typeof result.json === "object") ? result.json : null
   };
 }
@@ -5277,6 +5392,8 @@ function buildOperatorProxyFailure(result, fallbackError, extra = {}, statusCode
   return {
     ok: false,
     error,
+    reason_code: String(extra.reason_code || error),
+    message: String(extra.message || "Operator proxy request did not complete successfully."),
     upstream_status: upstreamStatus,
     upstream_error: String((result && result.error) || ""),
     upstream_duration_ms: Number((result && result.duration_ms) || 0),
@@ -5371,10 +5488,10 @@ function operatorHealthProxyGet(path, invalidError) {
 }
 
 const OPERATOR_BARRIER_PROXY_TIMEOUT_MS = clampNumber(
-  process.env.OPERATOR_BARRIER_PROXY_TIMEOUT_MS || 60000,
-  60000,
+  process.env.OPERATOR_BARRIER_PROXY_TIMEOUT_MS || 10000,
+  10000,
   5000,
-  300000
+  60000
 );
 
 function operatorProxyGet(path, invalidError, timeoutOrOptions) {
@@ -5389,10 +5506,24 @@ function operatorProxyGet(path, invalidError, timeoutOrOptions) {
       const base = dashBaseUrlFromEnv(envObj);
       const r = await httpGetJson(`${base}${path}`, timeout);
       if (!r.ok) {
+        const failureExtra = {};
+        let failureStatus = operatorErrorStatus(r.error || "dashboard_unreachable", 503);
+        if (
+          options.authScope === "support_snapshot" &&
+          (Number(r.status || 0) === 401 || Number(r.status || 0) === 403)
+        ) {
+          failureStatus = 403;
+          failureExtra.reason_code = "operator_dashboard_auth_required";
+          failureExtra.error = "operator_dashboard_auth_required";
+          failureExtra.message = "Support snapshot proxy requires the operator sidecar token and a configured dashboard API token for the dashboard support-snapshot route.";
+          failureExtra.auth_scope = "support_snapshot";
+          failureExtra.required_auth = ["X-Operator-Token", "DASHBOARD_API_TOKEN or DASHBOARD_API_TOKEN_FILE"];
+          failureExtra.dashboard_token_configured = !!dashboardApiTokenFromConfig();
+        }
         return sendOperatorPayload(
           res,
-          buildOperatorProxyFailure(r, r.error || "dashboard_unreachable", {}, operatorErrorStatus(r.error || "dashboard_unreachable", 503)),
-          operatorErrorStatus(r.error || "dashboard_unreachable", 503)
+          buildOperatorProxyFailure(r, failureExtra.error || r.error || "dashboard_unreachable", failureExtra, failureStatus),
+          failureStatus
         );
       }
       if (!r.json || typeof r.json !== "object") {
@@ -5476,8 +5607,20 @@ app.get("/api/operator/trading_readiness",
   operatorProxyGet("/api/operator/trading_readiness", "invalid_trading_readiness_response")
 );
 
+app.get("/api/system/kill_switches",
+  operatorProxyGet("/api/system/kill_switches", "invalid_kill_switches_response")
+);
+
+app.get("/api/broker/config",
+  operatorProxyGet("/api/broker/config", "invalid_broker_config_response", { redact: true })
+);
+
 app.get("/api/execution/barrier",
   operatorProxyGet("/api/execution/barrier", "invalid_execution_barrier_response", OPERATOR_BARRIER_PROXY_TIMEOUT_MS)
+);
+
+app.get("/api/operator/readiness_evidence",
+  operatorProxyGet("/api/operator/readiness_evidence", "invalid_readiness_evidence_response", OPERATOR_BARRIER_PROXY_TIMEOUT_MS)
 );
 
 app.get("/api/operator/runtime_watchdogs",
@@ -5493,7 +5636,7 @@ app.get("/api/operator/supervisor_diagnostics",
 );
 
 app.get("/api/operator/support_snapshot",
-  operatorProxyGet("/api/operator/support_snapshot", "invalid_support_snapshot_response", { redact: true })
+  operatorProxyGet("/api/operator/support_snapshot", "invalid_support_snapshot_response", { redact: true, authScope: "support_snapshot" })
 );
 
 app.get("/api/operator/runtime_log_tail", wrapOperatorRoute(async (req, res) => {
@@ -7984,9 +8127,17 @@ _httpServer = app.listen(OPERATOR_PORT, OPERATOR_BIND_HOST, () => {
   startTelemetryWebSocket(_httpServer);
 
   ensureLogDir();
-  console.log(
-    `Operator Control Center: http://${OPERATOR_BIND_HOST}:${OPERATOR_PORT}`
-  );
+  const _wildcardBind = OPERATOR_BIND_HOST === "0.0.0.0" || OPERATOR_BIND_HOST === "::";
+  const _localHost = _wildcardBind ? "127.0.0.1" : OPERATOR_BIND_HOST;
+  const _engineMode = String(process.env.ENGINE_MODE || process.env.OPERATOR_MODE || "safe").trim() || "safe";
+  console.log(`[operator_server] network_mode=${NETWORK_MODE} engine_mode=${_engineMode}`);
+  console.log(`[operator_server] bind_host=${OPERATOR_BIND_HOST} port=${OPERATOR_PORT}`);
+  console.log(`[operator_server] local URL:  http://${_localHost}:${OPERATOR_PORT}/`);
+  if (_wildcardBind) {
+    console.log(`[operator_server] LAN URL:    http://${resolveLanAdvertiseIp()}:${OPERATOR_PORT}/`);
+    console.log("[operator_server] WARNING: direct operator LAN exposure is not the production default; use the dashboard /operator/ bridge.");
+  }
+  console.log(`Operator Control Center: http://${_localHost}:${OPERATOR_PORT}`);
 
   const autoStart = normalizeBool(process.env.OPERATOR_AUTO_START);
   if (autoStart === true && !child) {

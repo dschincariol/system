@@ -45,6 +45,11 @@ _POOL_LOCK = threading.Lock()
 _POOL: ConnectionPool | None = None
 _POOL_TRANSACTION_MODE = False
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SEARCH_PATH_SCHEMA_ATTR = "_trading_storage_search_path_schema"
+_SESSION_STATE_SQL_RE = re.compile(
+    r"^\s*(?:SET\s+(?:SESSION\s+)?search_path\b|RESET\b|DISCARD\b)",
+    flags=re.IGNORECASE,
+)
 _SCHEMA_OVERRIDE: ContextVar[str | None] = ContextVar("ts_pg_schema_override", default=None)
 _ACQUIRE_TIMEOUT_OVERRIDE: ContextVar[float | None] = ContextVar(
     "ts_pg_acquire_timeout_override",
@@ -320,6 +325,7 @@ def storage_unavailable_payload(
 ) -> dict[str, Any]:
     snapshot = dict(readiness or storage_readiness_snapshot())
     error_type, error_text = _format_storage_error(error)
+    request_unavailable = error is not None or snapshot.get("ok") is False
     detail = str(
         error_text
         or snapshot.get("error")
@@ -334,11 +340,11 @@ def storage_unavailable_payload(
         "endpoint": str(endpoint or ""),
         "storage": {
             "backend": str(snapshot.get("backend") or snapshot.get("storage") or "postgres"),
-            "status": str(snapshot.get("status") or "unavailable"),
+            "status": "unavailable" if request_unavailable else str(snapshot.get("status") or "unavailable"),
             "degraded": True,
             "required": bool(snapshot.get("required")),
-            "checked": bool(snapshot.get("checked")),
-            "detail": str(snapshot.get("detail") or detail),
+            "checked": True if request_unavailable else bool(snapshot.get("checked")),
+            "detail": detail if request_unavailable else str(snapshot.get("detail") or detail),
             "error_type": str(error_type or snapshot.get("error_type") or ""),
             "timeout_s": snapshot.get("timeout_s"),
             "last_checked_ts_ms": int(snapshot.get("ts_ms") or 0),
@@ -400,15 +406,45 @@ def _rollback_if_in_transaction(conn: psycopg.Connection[Any]) -> None:
         logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
 
 
+def _configured_search_path_schema(conn: psycopg.Connection[Any]) -> str:
+    try:
+        return str(getattr(conn, _SEARCH_PATH_SCHEMA_ATTR, "") or "")
+    except Exception:
+        return ""
+
+
+def _mark_search_path_configured(conn: psycopg.Connection[Any], schema: str) -> None:
+    try:
+        setattr(conn, _SEARCH_PATH_SCHEMA_ATTR, str(schema))
+    except Exception:
+        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+
+
+def invalidate_connection_session_state(conn: Any) -> None:
+    try:
+        setattr(conn, _SEARCH_PATH_SCHEMA_ATTR, "")
+    except Exception:
+        logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
+
+
+def note_connection_session_state_sql(conn: Any, sql: str) -> None:
+    if _SESSION_STATE_SQL_RE.match(str(sql or "")):
+        invalidate_connection_session_state(conn)
+
+
 def _configure_connection(conn: psycopg.Connection[Any]) -> None:
     if _POOL_TRANSACTION_MODE:
         return
     _rollback_if_in_transaction(conn)
+    target_schema = schema_name()
+    if _configured_search_path_schema(conn) == target_schema:
+        return
     previous_autocommit = bool(conn.autocommit)
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(f"SET search_path = {quote_ident(schema_name())}, public")
+            cur.execute(f"SET search_path = {quote_ident(target_schema)}, public")
+            _mark_search_path_configured(conn, target_schema)
     finally:
         conn.autocommit = previous_autocommit
 

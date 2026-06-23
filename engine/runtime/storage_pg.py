@@ -13,7 +13,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence, cast
 
 import psycopg
 from psycopg import errors
@@ -30,6 +30,7 @@ from engine.runtime.storage_dialect import to_pg_params
 from engine.runtime.storage_pool import (
     acquire,
     close_pool,
+    note_connection_session_state_sql,
     pool_snapshot,
     release,
     storage_readiness_snapshot,
@@ -84,6 +85,9 @@ def _sqlite_compat_row(values: Sequence[Any], json_indexes: set[int] | None = No
 
 
 class StorageRow(tuple):
+    _columns: tuple[str, ...]
+    _index: dict[str, int]
+
     def __new__(cls, values: Sequence[Any], columns: Sequence[str] = ()):
         obj = super().__new__(cls, values)
         obj._columns = tuple(str(c) for c in columns)
@@ -218,6 +222,7 @@ class StorageNativeCursor:
             self._lastrowid = int(self._synthetic.lastrowid or 0)
             return self
         normalized = _normalize_sql(sql, self._con.raw)
+        note_connection_session_state_sql(self._con.raw, normalized)
         self._cursor.execute(normalized, _normalize_params(params))
         self._lastrowid = self._con._record_lastrowid(normalized, self._cursor)
         return self
@@ -308,6 +313,7 @@ class StorageConnection:
         on_close = self._track_cursor(cur)
         try:
             normalized = _normalize_sql(sql, self._raw)
+            note_connection_session_state_sql(self._raw, normalized)
             cur.execute(normalized, _normalize_params(params))
             lastrowid = self._record_lastrowid(normalized, cur)
             return StorageCursor(cur, lastrowid=lastrowid, on_close=on_close)
@@ -414,27 +420,25 @@ class StorageConnection:
 
 
 def _normalize_sql(sql: str, raw=None) -> str:
-    text = to_pg_params(str(sql or ""))
+    raw_sql = str(sql or "")
+    cacheable = _sql_normalization_cacheable(raw_sql, raw)
+    if cacheable:
+        cached = _get_cached_normalized_sql(raw_sql)
+        if cached is not None:
+            return cached
+    text = to_pg_params(raw_sql)
     text = _rewrite_insert_or_ignore(text)
     text = _rewrite_insert_or_replace(text, raw)
     text = _rewrite_json_extract(text)
     text = re.sub(
-        r"CAST\(\s*strftime\(\s*(['\"])%s\1\s*,\s*(['\"])now\2\s*\)\s+AS\s+INTEGER\s*\)",
-        "(EXTRACT(EPOCH FROM now())::BIGINT)",
-        text,
-        flags=re.IGNORECASE,
+        r"CAST\(\s*strftime\(\s*(['\"])%s\1\s*,\s*(['\"])now\2\s*\)\s+AS\s+INTEGER\s*\)", "(EXTRACT(EPOCH FROM now())::BIGINT)", text, flags=re.IGNORECASE
     )
     text = re.sub(
-        r"strftime\(\s*(['\"])%s\1\s*,\s*(['\"])now\2\s*\)",
-        "(EXTRACT(EPOCH FROM now())::BIGINT)",
-        text,
-        flags=re.IGNORECASE,
+        r"strftime\(\s*(['\"])%s\1\s*,\s*(['\"])now\2\s*\)", "(EXTRACT(EPOCH FROM now())::BIGINT)", text, flags=re.IGNORECASE
     )
     text = re.sub(
         r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
-        "BIGSERIAL PRIMARY KEY",
-        text,
-        flags=re.IGNORECASE,
+        "BIGSERIAL PRIMARY KEY", text, flags=re.IGNORECASE
     )
     text = re.sub(r"\bAUTOINCREMENT\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bBLOB\b", "BYTEA", text, flags=re.IGNORECASE)
@@ -455,6 +459,8 @@ def _normalize_sql(sql: str, raw=None) -> str:
             columns = str(match.group("cols")).strip()
             if not re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", columns, re.IGNORECASE):
                 text = text.rstrip().rstrip(";") + f" GROUP BY {columns}"
+    if cacheable:
+        _cache_normalized_sql(raw_sql, text)
     return text
 
 
@@ -724,7 +730,7 @@ def _pg_table_info(con: StorageConnection, table: str) -> list[tuple[Any, ...]]:
 
 
 def _pg_table_lookup(con: StorageConnection, params: Any, *, object_type: str) -> list[tuple[str]]:
-    values = tuple(params or ())
+    values: tuple[Any, ...] = tuple(cast(Iterable[Any], params or ()))
     if not values:
         rows = con.raw.execute(
             """
@@ -750,7 +756,7 @@ def _pg_table_lookup(con: StorageConnection, params: Any, *, object_type: str) -
 
 
 def _pg_index_lookup(con: StorageConnection, params: Any) -> list[tuple[str]]:
-    values = tuple(params or ())
+    values: tuple[Any, ...] = tuple(cast(Iterable[Any], params or ()))
     if not values:
         rows = con.raw.execute(
             """
@@ -801,6 +807,56 @@ def _pg_index_list(con: StorageConnection, table: str) -> list[tuple[Any, ...]]:
 
 def _env_truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_PG_LIVENESS_QUEUE_ENABLED = str(os.environ.get("TS_PG_LIVENESS_QUEUE_ENABLED", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_PG_LIVENESS_FLUSH_INTERVAL_S = max(
+    0.05,
+    float(os.environ.get("TS_PG_LIVENESS_FLUSH_INTERVAL_S", "1.0") or 1.0),
+)
+_PG_LIVENESS_FLUSH_JITTER_RATIO = min(
+    1.0,
+    max(0.0, float(os.environ.get("TS_PG_LIVENESS_FLUSH_JITTER_RATIO", "0.5") or 0.5)),
+)
+_PG_LIVENESS_MIN_PERSIST_INTERVAL_MS = max(
+    0,
+    int(float(os.environ.get("TS_PG_LIVENESS_MIN_PERSIST_INTERVAL_S", "0") or 0) * 1000.0),
+)
+_PG_LIVENESS_MAX_BATCH = max(1, int(os.environ.get("TS_PG_LIVENESS_MAX_BATCH", "64") or 64))
+_PG_LIVENESS_LOCK = threading.Condition()
+_PG_LIVENESS_PENDING: dict[str, dict[str, Any]] = {}
+_PG_LIVENESS_LAST_PERSIST_MS: dict[str, int] = {}
+_PG_LIVENESS_STOP = threading.Event()
+_PG_LIVENESS_THREAD: threading.Thread | None = None
+_PG_LIVENESS_STATE: dict[str, Any] = {
+    "pending_count": 0,
+    "flush_batches": 0,
+    "flushed": 0,
+    "enqueued": 0,
+    "coalesced": 0,
+    "coalesced_unreported": 0,
+    "last_enqueue_ts_ms": 0,
+    "last_flush_ts_ms": 0,
+    "last_error": "",
+    "last_error_ts_ms": 0,
+}
+
+
+def _staggered_pg_liveness_flush_interval_s() -> float:
+    base = max(0.05, float(_PG_LIVENESS_FLUSH_INTERVAL_S))
+    jitter = min(1.0, max(0.0, float(_PG_LIVENESS_FLUSH_JITTER_RATIO)))
+    if jitter <= 0.0:
+        return float(base)
+    bucket = max(0, int(os.getpid()) % 17)
+    return float(base * (1.0 + ((float(bucket) / 16.0) * jitter)))
+
+
+_PG_LIVENESS_EFFECTIVE_FLUSH_INTERVAL_S = _staggered_pg_liveness_flush_interval_s()
 
 
 def _autoinit_schema_key(schema: str | None = None) -> str:
@@ -918,6 +974,64 @@ def _is_transient_pg_error(exc: BaseException) -> bool:
     )
 
 
+def _positive_timeout_ms(value: Any) -> int:
+    try:
+        timeout_s = float(value)
+    except Exception:
+        return 0
+    if timeout_s <= 0.0:
+        return 0
+    return max(1, int(timeout_s * 1000.0))
+
+
+def _env_timeout_ms(name: str) -> int:
+    raw = str(os.environ.get(str(name), "") or "").strip()
+    if not raw:
+        return 0
+    return _positive_timeout_ms(raw)
+
+
+def _apply_write_txn_timeouts(con: StorageConnection, *, timeout_s: float | None) -> None:
+    lock_timeout_ms = (
+        _positive_timeout_ms(timeout_s)
+        if timeout_s is not None
+        else _env_timeout_ms("TS_PG_WRITE_LOCK_TIMEOUT_S")
+    )
+    statement_timeout_ms = (
+        _positive_timeout_ms(timeout_s)
+        if timeout_s is not None
+        else _env_timeout_ms("TS_PG_WRITE_STATEMENT_TIMEOUT_S")
+    )
+    if lock_timeout_ms <= 0 and statement_timeout_ms <= 0:
+        return
+    raw = getattr(con, "raw", None)
+    if raw is None or not hasattr(raw, "cursor"):
+        return
+    with raw.cursor() as cur:
+        if lock_timeout_ms > 0:
+            cur.execute("SET LOCAL lock_timeout = %s", (f"{int(lock_timeout_ms)}ms",))
+        if statement_timeout_ms > 0:
+            cur.execute("SET LOCAL statement_timeout = %s", (f"{int(statement_timeout_ms)}ms",))
+
+
+def _safe_log_identifier(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    safe = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", text)
+    return safe[:160] or "unknown"
+
+
+def _pg_error_code(exc: BaseException) -> str:
+    for candidate in (
+        getattr(exc, "sqlstate", None),
+        getattr(getattr(exc, "diag", None), "sqlstate", None),
+    ):
+        if candidate:
+            return str(candidate)
+    return ""
+
+
 def run_write_txn(
     fn: Callable[[StorageConnection], Any],
     *,
@@ -930,12 +1044,13 @@ def run_write_txn(
     timeout_s: float | None = None,
     busy_timeout_ms: int | None = None,
 ):
-    del table, operation, context, direct, maintenance, busy_timeout_ms
+    del direct, maintenance, busy_timeout_ms
     total_attempts = max(1, int(attempts or os.environ.get("TS_PG_WRITE_RETRY_ATTEMPTS", "3") or 3))
     last_error: BaseException | None = None
     for attempt in range(total_attempts):
         con = connect(readonly=False, timeout_s=timeout_s)
         try:
+            _apply_write_txn_timeouts(con, timeout_s=timeout_s)
             result = fn(con)
             con.commit()
             return result
@@ -947,12 +1062,203 @@ def run_write_txn(
                 logging.getLogger(__name__).debug("Ignored recoverable exception.", exc_info=True)
             if (not _is_transient_pg_error(exc)) or attempt >= total_attempts - 1:
                 raise
+            LOGGER.warning(
+                "POSTGRES_WRITE_TXN_TRANSIENT_RETRY table=%s operation=%s attempt=%s/%s error_type=%s sqlstate=%s context_keys=%s",
+                _safe_log_identifier(table),
+                _safe_log_identifier(operation),
+                int(attempt + 1),
+                int(total_attempts),
+                type(exc).__name__,
+                _safe_log_identifier(_pg_error_code(exc)),
+                sorted(str(key) for key in dict(context or {}).keys())[:16],
+            )
             time.sleep(min(1.0, 0.05 * (2**attempt)))
         finally:
             con.close()
     if last_error is not None:
         raise last_error
     return None
+
+
+_SMALL_WRITE_METRICS_LOCAL = threading.local()
+
+
+def _small_write_metric_tags(
+    *,
+    operation: str,
+    table: str | None,
+    status: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    tags: dict[str, Any] = {
+        "operation": str(operation or "unknown"),
+        "status": str(status or "unknown"),
+    }
+    if table:
+        tags["table"] = str(table)
+    if reason:
+        tags["reason"] = str(reason)
+    return tags
+
+
+def _emit_small_write_counter(metric: str, value: int = 1, **tags: Any) -> None:
+    if int(value or 0) <= 0:
+        return
+    if bool(getattr(_SMALL_WRITE_METRICS_LOCAL, "active", False)):
+        return
+    _SMALL_WRITE_METRICS_LOCAL.active = True
+    try:
+        from engine.runtime.metrics import emit_counter
+
+        emit_counter(
+            str(metric),
+            int(value),
+            component="engine.runtime.storage_pg",
+            extra_tags={str(key): val for key, val in dict(tags or {}).items()},
+        )
+    except Exception:
+        LOGGER.debug("postgres_small_write_metric_emit_failed", exc_info=True)
+    finally:
+        _SMALL_WRITE_METRICS_LOCAL.active = False
+
+
+def _emit_small_write_timing(metric: str, latency_ms: float, **tags: Any) -> None:
+    if bool(getattr(_SMALL_WRITE_METRICS_LOCAL, "active", False)):
+        return
+    _SMALL_WRITE_METRICS_LOCAL.active = True
+    try:
+        from engine.runtime.metrics import emit_timing
+
+        emit_timing(
+            str(metric),
+            float(latency_ms),
+            component="engine.runtime.storage_pg",
+            extra_tags={str(key): val for key, val in dict(tags or {}).items()},
+        )
+    except Exception:
+        LOGGER.debug("postgres_small_write_metric_emit_failed", exc_info=True)
+    finally:
+        _SMALL_WRITE_METRICS_LOCAL.active = False
+
+
+def _run_explicit_small_write_txn(
+    fn: Callable[[StorageConnection], Any],
+    *,
+    operation: str,
+    table: str | None = None,
+    calls: int = 1,
+    rows: int = 1,
+    critical: bool = False,
+    attempts: int | None = None,
+    timeout_s: float | None = None,
+) -> Any:
+    if critical:
+        _emit_small_write_counter(
+            "storage_pg_small_write_coalesce_bypassed",
+            1,
+            **_small_write_metric_tags(
+                operation=operation,
+                table=table,
+                status="bypassed",
+                reason="critical",
+            ),
+        )
+        return run_write_txn(
+            fn,
+            table=table,
+            operation=operation,
+            attempts=attempts,
+            timeout_s=timeout_s,
+        )
+
+    if int(calls or 0) <= 1:
+        _emit_small_write_counter(
+            "storage_pg_small_write_coalesce_bypassed",
+            1,
+            **_small_write_metric_tags(
+                operation=operation,
+                table=table,
+                status="bypassed",
+                reason="single_call",
+            ),
+        )
+        return run_write_txn(
+            fn,
+            table=table,
+            operation=operation,
+            attempts=attempts,
+            timeout_s=timeout_s,
+        )
+
+    start = time.perf_counter()
+    attempted_tags = _small_write_metric_tags(
+        operation=operation,
+        table=table,
+        status="attempted",
+    )
+    _emit_small_write_counter("storage_pg_small_write_coalesce_attempted", 1, **attempted_tags)
+    try:
+        result = run_write_txn(
+            fn,
+            table=table,
+            operation=operation,
+            attempts=attempts,
+            timeout_s=timeout_s,
+        )
+    except Exception:
+        failed_tags = _small_write_metric_tags(
+            operation=operation,
+            table=table,
+            status="failed",
+        )
+        _emit_small_write_counter("storage_pg_small_write_coalesce_failed", 1, **failed_tags)
+        _emit_small_write_timing(
+            "storage_pg_small_write_coalesce_latency_ms",
+            (time.perf_counter() - start) * 1000.0,
+            **failed_tags,
+        )
+        raise
+
+    committed_tags = _small_write_metric_tags(
+        operation=operation,
+        table=table,
+        status="committed",
+    )
+    _emit_small_write_counter("storage_pg_small_write_coalesce_committed", 1, **committed_tags)
+    _emit_small_write_counter(
+        "storage_pg_small_write_coalesced_calls",
+        max(0, int(calls or 0)),
+        **committed_tags,
+    )
+    _emit_small_write_counter(
+        "storage_pg_small_write_coalesced_rows",
+        max(0, int(rows or 0)),
+        **committed_tags,
+    )
+    _emit_small_write_timing(
+        "storage_pg_small_write_coalesce_latency_ms",
+        (time.perf_counter() - start) * 1000.0,
+        **committed_tags,
+    )
+    return result
+
+
+def _note_small_write_coalesce_bypassed(
+    *,
+    operation: str,
+    table: str | None = None,
+    reason: str,
+) -> None:
+    _emit_small_write_counter(
+        "storage_pg_small_write_coalesce_bypassed",
+        1,
+        **_small_write_metric_tags(
+            operation=operation,
+            table=table,
+            status="bypassed",
+            reason=reason,
+        ),
+    )
 
 
 def run_refetchable_ingestion_telemetry_txn(
@@ -1055,7 +1361,14 @@ def _raise_schema_error(code: str, error: BaseException, **extra: Any) -> None:
     raise RuntimeError(f"{code}:{type(error).__name__}:{error}:{extra or {}}")
 
 
+def _connection_looks_postgres(con: Any) -> bool:
+    module = str(type(con).__module__ or "").lower()
+    return "psycopg" in module or module.endswith("storage_pg") or bool(hasattr(con, "pgconn"))
+
+
 def _table_exists(con: StorageConnection, table: str) -> bool:
+    if not _connection_looks_postgres(con):
+        return _compat_table_exists(con, table)
     row = con.execute(
         """
         SELECT 1
@@ -1099,10 +1412,50 @@ def apply_migrations() -> list[int]:
     return applied
 
 
+def _ensure_timescale_classified_tables() -> None:
+    if _env_truthy(os.environ.get("TRADING_UNIT_TEST_SCHEMA_FAST")):
+        return
+    import importlib
+
+    from engine.runtime.schema.table_classification import Hypertable, TABLE_CLASS
+
+    hypertables = importlib.import_module("engine.runtime.schema.migrations.0002_hypertables")
+    indexes = importlib.import_module("engine.runtime.schema.migrations.0003_indexes")
+    required_indexes = importlib.import_module(
+        "engine.runtime.schema.migrations.0055_live_ingestion_required_indexes"
+    )
+    with connect_rw_direct() as conn:
+        with conn.transaction():
+            conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE")
+            hypertables._create_integer_now_func(conn)
+            existing_tables = {
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = current_schema()
+                      AND table_type = 'BASE TABLE'
+                    """
+                ).fetchall()
+            }
+            for table_name, spec in sorted(TABLE_CLASS.items()):
+                if table_name in existing_tables and isinstance(spec, Hypertable):
+                    hypertables._create_hypertable(conn, table_name, spec)
+            indexes.up(conn)
+            required_indexes.up(conn)
+            for table_name, spec in sorted(TABLE_CLASS.items()):
+                if table_name in existing_tables and isinstance(spec, Hypertable):
+                    hypertables._enable_compression(conn, table_name, spec)
+                    hypertables._enable_retention(conn, table_name, spec)
+
+
 def init_db(schema: str | None = None):
     schema_key = _autoinit_schema_key(schema)
     lock = _autoinit_lock(schema_key)
     with lock:
+        if schema_key in _AUTO_INIT_SCHEMAS:
+            return []
         if schema_key in _AUTO_INIT_ACTIVE_SCHEMAS:
             return []
         _AUTO_INIT_ACTIVE_SCHEMAS.add(schema_key)
@@ -1114,6 +1467,7 @@ def init_db(schema: str | None = None):
                 from engine.execution.execution_ledger import init_execution_ledger
 
                 init_execution_ledger()
+                _ensure_timescale_classified_tables()
                 _PK_CACHE.clear()
                 _AUTO_INIT_SCHEMAS.add(schema_name())
                 return applied
@@ -1122,11 +1476,21 @@ def init_db(schema: str | None = None):
 
 
 def close_pooled_connections() -> None:
-    close_pool()
+    try:
+        shutdown_job_liveness_queue(timeout_s=2.0)
+    except Exception:
+        LOGGER.debug("postgres_liveness_shutdown_drain_failed", exc_info=True)
+    finally:
+        close_pool()
 
 
 def get_connection_debug_snapshot() -> dict[str, Any]:
-    return {"pool": pool_snapshot(), "storage": "postgres", "readiness": storage_readiness_snapshot()}
+    return {
+        "pool": pool_snapshot(),
+        "storage": "postgres",
+        "readiness": storage_readiness_snapshot(),
+        "liveness_queue": _job_liveness_queue_snapshot(),
+    }
 
 
 def _ensure_sqlite_compat_bigints() -> None:
@@ -1164,6 +1528,19 @@ def _ensure_walk_forward_registry_columns() -> None:
         con.commit()
 
 
+def _ensure_classified_hypertable(con: "StorageConnection", table_name: str) -> None:
+    import importlib
+
+    from engine.runtime.schema.table_classification import Hypertable, TABLE_CLASS
+
+    spec = TABLE_CLASS.get(str(table_name))
+    if not isinstance(spec, Hypertable):
+        return
+    hypertables = importlib.import_module("engine.runtime.schema.migrations.0002_hypertables")
+    hypertables._create_integer_now_func(con)
+    hypertables._create_hypertable(con, str(table_name), spec)
+
+
 def _ensure_backend_compat_schema() -> None:
     with connection(readonly=False) as con:
         def _ensure_index(table: str, index: str, columns: Sequence[str]) -> None:
@@ -1197,6 +1574,7 @@ def _ensure_backend_compat_schema() -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_labels_price_eval ON labels_price(ts_eval_ms)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_labels_price_symbol_eval ON labels_price(symbol, ts_eval_ms)")
+        _ensure_classified_hypertable(con, "labels_price")
 
         if _compat_table_exists(con, "model_promotion_audit"):
             con.execute("ALTER TABLE model_promotion_audit ADD COLUMN IF NOT EXISTS details_json JSONB")
@@ -1283,13 +1661,64 @@ def _expected_migration_ids() -> tuple[int, ...]:
 
 def _validation_contract() -> tuple[dict[str, tuple[str, ...]], tuple[str, ...]]:
     from engine.runtime.storage_sqlite import _REQUIRED_INDEXES, _REQUIRED_TABLE_COLUMNS
+    from engine.runtime.price_timescale_schema import PRICE_TIMESCALE_TABLE_COLUMNS
 
     required_columns = {str(table): tuple(str(col) for col in cols) for table, cols in _REQUIRED_TABLE_COLUMNS.items()}
+    for table in ("price_quotes", "price_quotes_raw"):
+        required_columns[table] = tuple(PRICE_TIMESCALE_TABLE_COLUMNS[table])
     for table, cols in _PG_REQUIRED_TABLE_COLUMNS.items():
         existing = tuple(required_columns.get(str(table), ()))
         required_columns[str(table)] = tuple(dict.fromkeys((*existing, *(str(col) for col in cols))))
     required_indexes = tuple(dict.fromkeys((*_REQUIRED_INDEXES, *_PG_REQUIRED_INDEXES)))
     return required_columns, required_indexes
+
+
+def _postgres_owned_live_table_contract() -> tuple[
+    dict[str, dict[str, dict[str, object]]],
+    dict[str, tuple[str, ...]],
+]:
+    from engine.runtime.price_timescale_schema import (
+        PRICE_TIMESCALE_PRIMARY_KEYS,
+        PRICE_TIMESCALE_TABLE_COLUMN_SPECS,
+        price_timescale_time_desc_index_name,
+    )
+    from engine.runtime.storage_live_ingestion_schema import (
+        OWNED_LIVE_TABLE_COLUMN_SPECS,
+        OWNED_LIVE_TABLE_REQUIRED_INDEXES,
+    )
+
+    specs: dict[str, dict[str, dict[str, object]]] = {
+        str(table): {str(column): dict(column_spec) for column, column_spec in dict(columns).items()}
+        for table, columns in OWNED_LIVE_TABLE_COLUMN_SPECS.items()
+    }
+    indexes: dict[str, tuple[str, ...]] = {
+        str(table): tuple(str(index) for index in table_indexes)
+        for table, table_indexes in OWNED_LIVE_TABLE_REQUIRED_INDEXES.items()
+    }
+
+    def _validation_type(sql_type: str) -> str:
+        text = str(sql_type or "").strip().upper()
+        if text.startswith("DOUBLE PRECISION"):
+            return "DOUBLE PRECISION"
+        if text.startswith("TIMESTAMP WITH TIME ZONE"):
+            return "TIMESTAMPTZ"
+        if text.startswith("TIMESTAMPTZ"):
+            return "TIMESTAMPTZ"
+        return text.split()[0] if text else ""
+
+    for table in ("price_quotes", "price_quotes_raw"):
+        if table not in specs:
+            continue
+        pk_columns = tuple(str(column) for column in PRICE_TIMESCALE_PRIMARY_KEYS[table])
+        specs[table] = {
+            str(column): {
+                "type": _validation_type(str(sql_type)),
+                "pk": (pk_columns.index(str(column)) + 1 if str(column) in pk_columns else 0),
+            }
+            for column, sql_type in PRICE_TIMESCALE_TABLE_COLUMN_SPECS[table]
+        }
+        indexes[table] = (price_timescale_time_desc_index_name(table),)
+    return specs, indexes
 
 
 def _validation_table_columns(con: StorageConnection, table: str) -> dict[str, dict[str, Any]]:
@@ -1443,9 +1872,8 @@ def get_db_validation_snapshot(*, include_quick_check: bool = True, strict: bool
                 missing_migration_ids = list(expected_ids)
                 schema_status = "missing_schema_migrations"
 
-            from engine.runtime.storage_live_ingestion_schema import (
-                OWNED_LIVE_TABLE_COLUMN_SPECS,
-                OWNED_LIVE_TABLE_REQUIRED_INDEXES,
+            OWNED_LIVE_TABLE_COLUMN_SPECS, OWNED_LIVE_TABLE_REQUIRED_INDEXES = (
+                _postgres_owned_live_table_contract()
             )
 
             for table, expected_specs in OWNED_LIVE_TABLE_COLUMN_SPECS.items():
@@ -1478,8 +1906,8 @@ def get_db_validation_snapshot(*, include_quick_check: bool = True, strict: bool
                             "expected": expected_type,
                             "actual": str(actual_spec.get("type") or ""),
                         }
-                    actual_pk = int(actual_spec.get("pk") or 0)
-                    expected_pk = int((expected_spec or {}).get("pk") or 0)
+                    actual_pk = int(cast(Any, actual_spec.get("pk") or 0))
+                    expected_pk = int(cast(Any, (expected_spec or {}).get("pk") or 0))
                     if actual_pk != expected_pk:
                         pk_diff[column_name] = {"expected": expected_pk, "actual": actual_pk}
                 if type_diff:
@@ -1811,14 +2239,21 @@ def put_normalized_event(event: dict[str, Any], con: StorageConnection | None = 
     payload = dict(event or {})
     observed_ts_ms = int(time.time() * 1000)
     source_ts_ms = int(payload.get("timestamp") or payload.get("ts_ms") or observed_ts_ms)
-    meta_payload = payload.get("meta_json") or payload
+    meta_payload: Any = payload.get("meta_json") or payload
     if isinstance(meta_payload, str):
         try:
             meta_payload = json.loads(meta_payload)
         except json.JSONDecodeError:
             meta_payload = {"raw_meta_json": meta_payload}
-    meta = dict(meta_payload or {}) if isinstance(meta_payload, dict) else {}
-    pipeline_timing = dict(meta.get("pipeline_timing") or {})
+    meta: dict[str, Any] = (
+        {str(key): value for key, value in meta_payload.items()} if isinstance(meta_payload, dict) else {}
+    )
+    pipeline_timing_payload = meta.get("pipeline_timing")
+    pipeline_timing: dict[str, Any] = (
+        {str(key): value for key, value in pipeline_timing_payload.items()}
+        if isinstance(pipeline_timing_payload, dict)
+        else {}
+    )
     pipeline_timing.setdefault("source_event_ts_ms", int(source_ts_ms))
     pipeline_timing["db_observed_ts_ms"] = int(max(observed_ts_ms, source_ts_ms))
     pipeline_timing["ingestion_to_db_latency_ms"] = int(max(0, int(pipeline_timing["db_observed_ts_ms"]) - int(source_ts_ms)))
@@ -1854,7 +2289,6 @@ def put_normalized_event(event: dict[str, Any], con: StorageConnection | None = 
                     "events",
                     row,
                     conflict_column="event_key",
-                    conflict_columns=("event_key", "ts_ms"),
                     returning_id=True,
                     con=db,
                 )
@@ -2498,22 +2932,42 @@ def record_backtest_cpcv_run(con: StorageConnection | None = None, **kwargs: Any
 
 def record_backtest_cpcv_path_result(con: StorageConnection | None = None, **kwargs: Any) -> int:
     row = dict(kwargs or {})
-    path_id = int(_insert_dict("backtest_cpcv_path_results", row, returning_id=True, con=con) or 0)
-    compat = {
-        "created_ts": int(row.get("ts") or time.time() * 1000),
-        "ts": row.get("ts"),
-        "model_id": row.get("model_id"),
-        "path_index": row.get("path_index"),
-        "sharpe": row.get("sharpe"),
-        "deflated_sharpe": row.get("deflated_sharpe"),
-        "n_trials": row.get("n_trials"),
-        "total_return": row.get("total_return"),
-        "max_drawdown": row.get("max_drawdown"),
-        "cfg": row.get("cfg"),
-        "payload": row.get("payload"),
-    }
-    _insert_dict("backtest_cpcv_runs", compat, returning_id=False, con=con)
-    return int(path_id or 0)
+
+    def _write(db: StorageConnection) -> int:
+        path_id = int(_insert_dict("backtest_cpcv_path_results", row, returning_id=True, con=db) or 0)
+        compat = {
+            "created_ts": int(row.get("ts") or time.time() * 1000),
+            "ts": row.get("ts"),
+            "model_id": row.get("model_id"),
+            "path_index": row.get("path_index"),
+            "sharpe": row.get("sharpe"),
+            "deflated_sharpe": row.get("deflated_sharpe"),
+            "n_trials": row.get("n_trials"),
+            "total_return": row.get("total_return"),
+            "max_drawdown": row.get("max_drawdown"),
+            "cfg": row.get("cfg"),
+            "payload": row.get("payload"),
+        }
+        _insert_dict("backtest_cpcv_runs", compat, returning_id=False, con=db)
+        return int(path_id or 0)
+
+    if con is not None:
+        _note_small_write_coalesce_bypassed(
+            operation="record_backtest_cpcv_path_result",
+            table="backtest_cpcv_path_results",
+            reason="caller_connection",
+        )
+        return _write(con)
+    return int(
+        _run_explicit_small_write_txn(
+            _write,
+            operation="record_backtest_cpcv_path_result",
+            table="backtest_cpcv_path_results",
+            calls=2,
+            rows=2,
+        )
+        or 0
+    )
 
 
 def record_alpha_candidate(**kwargs: Any) -> int:
@@ -3322,6 +3776,226 @@ def fetch_human_alignment_report(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return {"ok": True, "rows": []}
 
 
+def _pg_liveness_queue_enabled(*, best_effort: bool = False) -> bool:
+    return bool(_PG_LIVENESS_QUEUE_ENABLED and best_effort)
+
+
+def _pg_liveness_flush_backoff_s(consecutive_failures: int) -> float:
+    failures = max(1, min(int(consecutive_failures), 5))
+    base = max(1.0, float(_PG_LIVENESS_EFFECTIVE_FLUSH_INTERVAL_S))
+    return min(10.0, float(base * (2**failures)))
+
+
+def _merge_liveness_json_text(left: str | None, right: str | None) -> str | None:
+    if not left:
+        return right
+    if not right:
+        return left
+    try:
+        base = json.loads(str(left) or "{}")
+        update = json.loads(str(right) or "{}")
+    except Exception:
+        return right
+    if not isinstance(base, dict) or not isinstance(update, dict):
+        return right
+    for key, value in update.items():
+        if isinstance(base.get(key), dict) and isinstance(value, dict):
+            merged = dict(base.get(key) or {})
+            merged.update(value)
+            base[key] = merged
+        else:
+            base[key] = value
+    return json.dumps(base, separators=(",", ":"), sort_keys=True)
+
+
+def _enqueue_job_liveness(
+    job_name: str,
+    owner: str,
+    pid: int,
+    extra_json: str | None,
+    *,
+    heartbeat: bool,
+) -> None:
+    now_ms = int(time.time() * 1000)
+    key = str(job_name)
+    with _PG_LIVENESS_LOCK:
+        previous = _PG_LIVENESS_PENDING.get(key)
+        merged_extra = _merge_liveness_json_text(
+            str(previous.get("extra_json")) if previous and previous.get("extra_json") is not None else None,
+            extra_json,
+        )
+        _PG_LIVENESS_PENDING[key] = {
+            "job_name": key,
+            "owner": str(owner),
+            "pid": int(pid),
+            "extra_json": merged_extra,
+            "heartbeat": bool(heartbeat or (previous and previous.get("heartbeat"))),
+            "queued_ts_ms": int(now_ms),
+        }
+        _PG_LIVENESS_STATE["pending_count"] = int(len(_PG_LIVENESS_PENDING))
+        _PG_LIVENESS_STATE["enqueued"] = int(_PG_LIVENESS_STATE.get("enqueued") or 0) + 1
+        _PG_LIVENESS_STATE["last_enqueue_ts_ms"] = int(now_ms)
+        if previous is not None:
+            _PG_LIVENESS_STATE["coalesced"] = int(_PG_LIVENESS_STATE.get("coalesced") or 0) + 1
+            _PG_LIVENESS_STATE["coalesced_unreported"] = (
+                int(_PG_LIVENESS_STATE.get("coalesced_unreported") or 0) + 1
+            )
+        _PG_LIVENESS_LOCK.notify_all()
+
+
+def _drain_job_liveness_batch(*, max_rows: int | None = None, force: bool = False) -> list[dict[str, Any]]:
+    del force
+    with _PG_LIVENESS_LOCK:
+        limit = max(1, int(max_rows or _PG_LIVENESS_MAX_BATCH))
+        keys = list(_PG_LIVENESS_PENDING.keys())[:limit]
+        rows = [dict(_PG_LIVENESS_PENDING.pop(key) or {}) for key in keys]
+        _PG_LIVENESS_STATE["pending_count"] = int(len(_PG_LIVENESS_PENDING))
+        return rows
+
+
+def _requeue_job_liveness_batch(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    with _PG_LIVENESS_LOCK:
+        for row in reversed(list(rows)):
+            key = str((row or {}).get("job_name") or "")
+            if not key:
+                continue
+            existing = _PG_LIVENESS_PENDING.get(key)
+            if existing:
+                row = {
+                    **dict(row),
+                    "extra_json": _merge_liveness_json_text(
+                        str(row.get("extra_json") or "") or None,
+                        str(existing.get("extra_json") or "") or None,
+                    ),
+                    "heartbeat": bool(row.get("heartbeat") or existing.get("heartbeat")),
+                }
+            _PG_LIVENESS_PENDING[key] = dict(row)
+        _PG_LIVENESS_STATE["pending_count"] = int(len(_PG_LIVENESS_PENDING))
+        _PG_LIVENESS_LOCK.notify_all()
+
+
+def _write_job_liveness_row(con: StorageConnection, row: dict[str, Any], *, now_ms: int) -> int:
+    job_name = str((row or {}).get("job_name") or "")
+    if not job_name:
+        return 0
+    owner = str((row or {}).get("owner") or "")
+    pid = int((row or {}).get("pid") or 0)
+    if bool((row or {}).get("heartbeat")):
+        extra_json = row.get("extra_json")
+        con.execute(
+            """
+            INSERT INTO job_heartbeats(job_name, owner, pid, ts_ms, extra_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(job_name) DO UPDATE SET
+              owner=excluded.owner,
+              pid=excluded.pid,
+              ts_ms=excluded.ts_ms,
+              extra_json=excluded.extra_json
+            """,
+            (job_name, owner, pid, int(now_ms), (str(extra_json) if extra_json is not None else None)),
+        )
+    con.execute(
+        "UPDATE job_locks SET heartbeat_ts_ms=? WHERE job_name=? AND owner=? AND pid=?",
+        (int(now_ms), job_name, owner, pid),
+    )
+    _PG_LIVENESS_LAST_PERSIST_MS[job_name] = int(now_ms)
+    return 1
+
+
+def _flush_job_liveness_batch(rows: list[dict[str, Any]]) -> int:
+    writable = [dict(row or {}) for row in list(rows or []) if str((row or {}).get("job_name") or "")]
+    if not writable:
+        return 0
+    now_ms = int(time.time() * 1000)
+
+    def _write(con: StorageConnection) -> int:
+        flushed = 0
+        for row in writable:
+            flushed += int(_write_job_liveness_row(con, row, now_ms=now_ms) or 0)
+        return int(flushed)
+
+    return int(run_write_txn(_write, attempts=1, timeout_s=0.5) or 0)
+
+
+def _emit_pg_liveness_counter(metric: str, value: int, **tags: Any) -> None:
+    if int(value or 0) <= 0:
+        return
+    try:
+        from engine.runtime.metrics import emit_counter
+
+        emit_counter(
+            str(metric),
+            int(value),
+            component="engine.runtime.storage_pg",
+            extra_tags={str(key): val for key, val in dict(tags or {}).items()},
+        )
+    except Exception:
+        LOGGER.debug("postgres_liveness_metric_emit_failed", exc_info=True)
+
+
+def _note_pg_liveness_flush(flushed: int, *, batches: int = 1) -> None:
+    coalesced_to_emit = 0
+    with _PG_LIVENESS_LOCK:
+        _PG_LIVENESS_STATE["flush_batches"] = int(_PG_LIVENESS_STATE.get("flush_batches") or 0) + int(batches)
+        _PG_LIVENESS_STATE["flushed"] = int(_PG_LIVENESS_STATE.get("flushed") or 0) + int(flushed)
+        if int(flushed or 0) > 0:
+            _PG_LIVENESS_STATE["last_flush_ts_ms"] = int(time.time() * 1000)
+            coalesced_to_emit = int(_PG_LIVENESS_STATE.get("coalesced_unreported") or 0)
+            _PG_LIVENESS_STATE["coalesced_unreported"] = 0
+        _PG_LIVENESS_STATE["last_error"] = ""
+    _emit_pg_liveness_counter("storage_pg_liveness_flush_batches_total", int(batches))
+    _emit_pg_liveness_counter("storage_pg_liveness_flushed_rows_total", int(flushed))
+    _emit_pg_liveness_counter("storage_pg_liveness_coalesced_writes_total", int(coalesced_to_emit))
+
+
+def _ensure_job_liveness_writer_started() -> None:
+    global _PG_LIVENESS_THREAD
+    if not _PG_LIVENESS_QUEUE_ENABLED:
+        return None
+    thread = _PG_LIVENESS_THREAD
+    if thread is not None and thread.is_alive():
+        return None
+    with _PG_LIVENESS_LOCK:
+        thread = _PG_LIVENESS_THREAD
+        if thread is not None and thread.is_alive():
+            return None
+        _PG_LIVENESS_STOP.clear()
+        _PG_LIVENESS_THREAD = threading.Thread(
+            target=_job_liveness_writer_loop,
+            name="postgres-liveness-writer",
+            daemon=True,
+        )
+        _PG_LIVENESS_THREAD.start()
+    return None
+
+
+def _job_liveness_writer_loop() -> None:
+    consecutive_failures = 0
+    while True:
+        wait_s = (
+            _pg_liveness_flush_backoff_s(consecutive_failures)
+            if consecutive_failures > 0
+            else float(_PG_LIVENESS_EFFECTIVE_FLUSH_INTERVAL_S)
+        )
+        if _PG_LIVENESS_STOP.wait(timeout=float(wait_s)):
+            return
+        batch = _drain_job_liveness_batch(max_rows=_PG_LIVENESS_MAX_BATCH)
+        if not batch:
+            continue
+        try:
+            flushed = _flush_job_liveness_batch(batch)
+            consecutive_failures = 0
+            _note_pg_liveness_flush(flushed)
+        except Exception as exc:
+            consecutive_failures = min(consecutive_failures + 1, 5)
+            _requeue_job_liveness_batch(batch)
+            with _PG_LIVENESS_LOCK:
+                _PG_LIVENESS_STATE["last_error"] = f"{type(exc).__name__}:{exc}"
+                _PG_LIVENESS_STATE["last_error_ts_ms"] = int(time.time() * 1000)
+
+
 def acquire_job_lock(job_name: str, owner: str, pid: int, ttl_s: int = 180, stale_after_s: int | None = None) -> bool:
     ttl = int(stale_after_s if stale_after_s is not None else ttl_s)
     now_ms = int(time.time() * 1000)
@@ -3355,7 +4029,18 @@ def acquire_job_lock(job_name: str, owner: str, pid: int, ttl_s: int = 180, stal
         )
         return True
 
-    return bool(run_write_txn(_write, attempts=1, timeout_s=0.5))
+    return bool(
+        _run_explicit_small_write_txn(
+            _write,
+            operation="acquire_job_lock",
+            table="job_locks",
+            calls=2,
+            rows=1,
+            critical=True,
+            attempts=1,
+            timeout_s=0.5,
+        )
+    )
 
 
 def release_job_lock(job_name: str, owner: str, pid: int) -> None:
@@ -3369,11 +4054,23 @@ def release_job_lock(job_name: str, owner: str, pid: int) -> None:
             (str(job_name), str(owner), int(pid)),
         )
 
-    run_write_txn(_write, attempts=1, timeout_s=0.5)
+    _run_explicit_small_write_txn(
+        _write,
+        operation="release_job_lock",
+        table="job_locks",
+        calls=2,
+        rows=2,
+        critical=True,
+        attempts=1,
+        timeout_s=0.5,
+    )
 
 
 def touch_job_lock(job_name: str, owner: str, pid: int, *, best_effort: bool = False) -> None:
-    del best_effort
+    if _pg_liveness_queue_enabled(best_effort=best_effort):
+        _enqueue_job_liveness(job_name, owner, pid, None, heartbeat=False)
+        _ensure_job_liveness_writer_started()
+        return None
     now_ms = int(time.time() * 1000)
 
     def _write(con: StorageConnection) -> None:
@@ -3382,7 +4079,16 @@ def touch_job_lock(job_name: str, owner: str, pid: int, *, best_effort: bool = F
             (now_ms, str(job_name), str(owner), int(pid)),
         )
 
-    run_write_txn(_write, attempts=1, timeout_s=0.5)
+    _run_explicit_small_write_txn(
+        _write,
+        operation="touch_job_lock",
+        table="job_locks",
+        calls=1,
+        rows=1,
+        critical=True,
+        attempts=1,
+        timeout_s=0.5,
+    )
 
 
 def put_job_heartbeat(
@@ -3393,7 +4099,10 @@ def put_job_heartbeat(
     *,
     best_effort: bool = False,
 ) -> None:
-    del best_effort
+    if _pg_liveness_queue_enabled(best_effort=best_effort):
+        _enqueue_job_liveness(job_name, owner, pid, extra_json, heartbeat=True)
+        _ensure_job_liveness_writer_started()
+        return None
     now_ms = int(time.time() * 1000)
 
     def _write(con: StorageConnection) -> None:
@@ -3414,7 +4123,16 @@ def put_job_heartbeat(
             (now_ms, str(job_name), str(owner), int(pid)),
         )
 
-    run_write_txn(_write, attempts=1, timeout_s=0.5)
+    _run_explicit_small_write_txn(
+        _write,
+        operation="put_job_heartbeat",
+        table="job_heartbeats",
+        calls=2,
+        rows=2,
+        critical=True,
+        attempts=1,
+        timeout_s=0.5,
+    )
 
 
 def get_job_checkpoint(job_name: str) -> dict[str, int]:
@@ -3450,17 +4168,68 @@ def put_job_checkpoint(job_name: str, last_event_id: int, last_event_ts_ms: int,
 
 
 def flush_job_liveness_queue(*, max_batches: int = 8, force: bool = True) -> dict[str, Any]:
-    del max_batches, force
-    return {"ok": True, "enabled": False, "pending": 0}
+    total_flushed = 0
+    for _ in range(max(1, int(max_batches or 1))):
+        batch = _drain_job_liveness_batch(max_rows=_PG_LIVENESS_MAX_BATCH)
+        if not batch:
+            break
+        now_ms = int(time.time() * 1000)
+        writable: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for row in batch:
+            job_name = str((row or {}).get("job_name") or "")
+            last_ms = int(_PG_LIVENESS_LAST_PERSIST_MS.get(job_name) or 0)
+            if (
+                not bool(force)
+                and _PG_LIVENESS_MIN_PERSIST_INTERVAL_MS > 0
+                and last_ms > 0
+                and (now_ms - last_ms) < _PG_LIVENESS_MIN_PERSIST_INTERVAL_MS
+            ):
+                skipped.append(row)
+            else:
+                writable.append(row)
+        try:
+            flushed = _flush_job_liveness_batch(writable)
+        except Exception:
+            _requeue_job_liveness_batch(batch)
+            raise
+        if skipped:
+            _requeue_job_liveness_batch(skipped)
+        total_flushed += int(flushed)
+        _note_pg_liveness_flush(flushed)
+        if skipped:
+            break
+    snapshot = _job_liveness_queue_snapshot()
+    return {
+        "ok": True,
+        "enabled": bool(_PG_LIVENESS_QUEUE_ENABLED),
+        "flushed": int(total_flushed),
+        "pending": int(snapshot.get("pending_count") or 0),
+        "pending_count": int(snapshot.get("pending_count") or 0),
+    }
 
 
 def shutdown_job_liveness_queue(*, timeout_s: float = 2.0) -> dict[str, Any]:
-    del timeout_s
-    return flush_job_liveness_queue()
+    _PG_LIVENESS_STOP.set()
+    thread = _PG_LIVENESS_THREAD
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(0.0, float(timeout_s)))
+    return flush_job_liveness_queue(force=True)
 
 
 def _job_liveness_queue_snapshot() -> dict[str, Any]:
-    return {"enabled": False, "pending": 0}
+    with _PG_LIVENESS_LOCK:
+        state = dict(_PG_LIVENESS_STATE)
+        pending_count = int(len(_PG_LIVENESS_PENDING))
+    state["enabled"] = bool(_PG_LIVENESS_QUEUE_ENABLED)
+    state["pending_count"] = int(pending_count)
+    state["pending"] = int(pending_count)
+    state["flush_interval_base_s"] = float(_PG_LIVENESS_FLUSH_INTERVAL_S)
+    state["flush_jitter_ratio"] = float(_PG_LIVENESS_FLUSH_JITTER_RATIO)
+    state["flush_interval_s"] = float(_PG_LIVENESS_EFFECTIVE_FLUSH_INTERVAL_S)
+    state["min_persist_interval_ms"] = int(_PG_LIVENESS_MIN_PERSIST_INTERVAL_MS)
+    state["max_batch"] = int(_PG_LIVENESS_MAX_BATCH)
+    return state
 
 
 def _warn_nonfatal(code: str, error: Exception, **extra: Any) -> None:
@@ -3484,6 +4253,42 @@ def _ensure_price_quotes_raw_schema(con: StorageConnection) -> None:
     ensure_price_quotes_raw_schema(con, warn_nonfatal=_warn_nonfatal)
 
 
+_SQL_NORMALIZATION_CACHE_MAXSIZE = 1024
+_SQL_NORMALIZATION_CACHE_LOCK = threading.RLock()
+_SQL_NORMALIZATION_CACHE: dict[str, str] = {}
+
+
+def _clear_sql_normalization_cache() -> None:
+    with _SQL_NORMALIZATION_CACHE_LOCK:
+        _SQL_NORMALIZATION_CACHE.clear()
+
+
+def _get_cached_normalized_sql(raw_sql: str) -> str | None:
+    with _SQL_NORMALIZATION_CACHE_LOCK:
+        normalized = _SQL_NORMALIZATION_CACHE.pop(raw_sql, None)
+        if normalized is None:
+            return None
+        _SQL_NORMALIZATION_CACHE[raw_sql] = normalized
+        return normalized
+
+
+def _cache_normalized_sql(raw_sql: str, normalized_sql: str) -> None:
+    maxsize = max(0, int(_SQL_NORMALIZATION_CACHE_MAXSIZE or 0))
+    with _SQL_NORMALIZATION_CACHE_LOCK:
+        if maxsize <= 0:
+            _SQL_NORMALIZATION_CACHE.clear()
+            return
+        _SQL_NORMALIZATION_CACHE[raw_sql] = normalized_sql
+        while len(_SQL_NORMALIZATION_CACHE) > maxsize:
+            _SQL_NORMALIZATION_CACHE.pop(next(iter(_SQL_NORMALIZATION_CACHE)))
+
+
+def _sql_normalization_cacheable(raw_sql: str, raw=None) -> bool:
+    if raw is not None:
+        return True
+    return not re.search(r"\bINSERT\s+OR\s+REPLACE\s+INTO\b", raw_sql, re.IGNORECASE)
+
+
 def __getattr__(name: str):
     if name.startswith("_ensure_") and name.endswith("_schema"):
         def _ensure(*args: Any, **kwargs: Any) -> None:
@@ -3494,4 +4299,4 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
-__all__ = [name for name in globals() if not name.startswith("__")]
+__all__ = [name for name in globals() if not name.startswith("__")]  # pyright: ignore[reportUnsupportedDunderAll]

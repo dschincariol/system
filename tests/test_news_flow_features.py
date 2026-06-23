@@ -5,6 +5,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -28,6 +30,41 @@ class _NoClose:
 
     def execute(self, *args, **kwargs):
         return self._con.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._con.executemany(*args, **kwargs)
+
+    def close(self):
+        return None
+
+
+class _CountingCon:
+    def __init__(self, con):
+        self._con = con
+        self.recent_embedding_queries = 0
+        self.story_embedding_write_batches = 0
+        self.event_feature_write_batches = 0
+        self.event_feature_select_then_write_queries = 0
+
+    def execute(self, sql, params=None):
+        sql_text = " ".join(str(sql or "").split()).lower()
+        if (
+            "select event_id, symbol, dim, vector, availability_ts_ms" in sql_text
+            and "from news_story_embeddings" in sql_text
+        ):
+            self.recent_embedding_queries += 1
+        if "select 1 from news_event_features where event_id" in sql_text:
+            self.event_feature_select_then_write_queries += 1
+        return self._con.execute(sql, tuple(params or ()))
+
+    def executemany(self, sql, seq_of_params):
+        sql_text = " ".join(str(sql or "").split()).lower()
+        rows = list(seq_of_params or [])
+        if "insert into news_story_embeddings" in sql_text:
+            self.story_embedding_write_batches += 1
+        if "insert into news_event_features" in sql_text:
+            self.event_feature_write_batches += 1
+        return self._con.executemany(sql, rows)
 
     def close(self):
         return None
@@ -207,6 +244,70 @@ def test_news_flow_no_lookahead_uses_embedding_availability(monkeypatch) -> None
     assert after_meta["latest_availability_ts_ms"] == 5_000
     assert after_meta["event_count_24h"] == 2
     assert after["news_stale_share_24h"] == 0.5
+
+
+def test_news_flow_batches_recent_embedding_query_and_writes(monkeypatch) -> None:
+    (news_flow,) = _reload("engine.data.news_flow")
+    cfg = news_flow.NewsEmbeddingConfig(backend="hashing", model_name="hashing-v1")
+    con = _make_news_db(news_flow)
+    counting = _CountingCon(con)
+    _insert_event(con, 1, 2_000, "Apple repeats one acquisition headline")
+    _insert_event(con, 2, 3_000, "Apple repeats one acquisition headline")
+    _insert_event(con, 3, 4_000, "Apple announces unrelated developer tools")
+    monkeypatch.setattr(news_flow, "connect", lambda readonly=False: _NoClose(counting))
+    monkeypatch.setattr(news_flow, "run_write_txn", lambda fn, **_kwargs: fn(counting))
+
+    result = news_flow.process_news_flow_batch(limit=10, config=cfg, now_ms=5_000)
+
+    rows = con.execute(
+        """
+        SELECT event_id, stale_flag, matched_event_id
+        FROM news_story_embeddings
+        WHERE embedding_backend=?
+        ORDER BY event_id
+        """,
+        (cfg.backend,),
+    ).fetchall()
+    assert result["written"] == 3
+    assert result["batch_size"] == 3
+    assert result["recent_embedding_queries"] == 1
+    assert result["story_embedding_write_batches"] == 1
+    assert result["event_feature_write_batches"] == 1
+    assert result["write_batches"] == 2
+    assert result["embedding_db_round_trips"] == 3
+    assert counting.recent_embedding_queries == 1
+    assert counting.story_embedding_write_batches == 1
+    assert counting.event_feature_write_batches == 1
+    assert counting.event_feature_select_then_write_queries == 0
+    assert rows[0] == (1, 0, None)
+    assert rows[1] == (2, 1, 1)
+    assert rows[2][0] == 3
+
+
+def test_news_flow_one_shot_transaction_failure_is_retryable(monkeypatch) -> None:
+    (news_flow,) = _reload("engine.data.news_flow")
+    cfg = news_flow.NewsEmbeddingConfig(backend="hashing", model_name="hashing-v1")
+    con = _make_news_db(news_flow)
+    _insert_event(con, 1, 2_000, "Apple publishes a new product update")
+    monkeypatch.setattr(news_flow, "connect", lambda readonly=False: _NoClose(con))
+
+    def _failing_write_txn(_fn, **_kwargs):
+        raise RuntimeError("simulated_db_slowdown")
+
+    monkeypatch.setattr(news_flow, "run_write_txn", _failing_write_txn)
+    with pytest.raises(RuntimeError, match="simulated_db_slowdown"):
+        news_flow.process_news_flow_batch(limit=1, config=cfg, now_ms=2_500)
+
+    pending = news_flow._fetch_pending_events(con, config=cfg, limit=10)
+    assert [row["event_id"] for row in pending] == [1]
+    assert con.execute("SELECT COUNT(*) FROM news_story_embeddings").fetchone()[0] == 0
+
+    monkeypatch.setattr(news_flow, "run_write_txn", lambda fn, **_kwargs: fn(con))
+    retry = news_flow.process_news_flow_batch(limit=1, config=cfg, now_ms=3_000)
+
+    assert retry["written"] == 1
+    assert con.execute("SELECT COUNT(*) FROM news_story_embeddings WHERE event_id=1").fetchone()[0] == 1
+    assert news_flow._fetch_pending_events(con, config=cfg, limit=10) == []
 
 
 def test_news_flow_registry_round_trip_and_job_registered(monkeypatch) -> None:

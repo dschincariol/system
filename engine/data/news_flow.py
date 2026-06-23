@@ -30,10 +30,12 @@ from engine.data._credentials import get_data_credential
 from engine.nlp.cache import bytes_to_vector, vector_to_bytes
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.metrics import emit_gauge
 from engine.runtime.storage import connect, run_write_txn
 
 LOG = get_logger("engine.data.news_flow")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+NEWS_FLOW_METRIC_COMPONENT = "engine.data.news_flow"
 
 NEWS_FLOW_FEATURE_IDS = [
     "news_novelty_max_24h",
@@ -417,30 +419,173 @@ def _recent_embedding_rows(
     return out
 
 
-def _put_story_embedding(
+def _prefetch_recent_embedding_rows(
     con,
     *,
+    events: Sequence[Dict[str, Any]],
+    config: NewsEmbeddingConfig,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], int]:
+    event_rows = [dict(event or {}) for event in list(events or [])]
+    symbols = sorted({_norm_symbol(event.get("symbol")) for event in event_rows if _norm_symbol(event.get("symbol"))})
+    if not event_rows or not symbols:
+        return {}, 0
+    min_cutoff = min(
+        int(event.get("availability_ts_ms") or event.get("publish_ts_ms") or 0) - int(NEWS_NOVELTY_LOOKBACK_MS)
+        for event in event_rows
+    )
+    max_availability = max(
+        int(event.get("availability_ts_ms") or event.get("publish_ts_ms") or 0)
+        for event in event_rows
+    )
+    placeholders = ",".join("?" for _ in symbols)
+    rows = con.execute(
+        f"""
+        SELECT event_id, symbol, dim, vector, availability_ts_ms
+        FROM news_story_embeddings
+        WHERE symbol IN ({placeholders})
+          AND embedding_backend = ?
+          AND model_name = ?
+          AND availability_ts_ms <= ?
+          AND availability_ts_ms >= ?
+        ORDER BY symbol ASC, availability_ts_ms DESC, event_id DESC
+        """,
+        (
+            *symbols,
+            str(config.backend),
+            str(config.model_name),
+            int(max_availability),
+            int(min_cutoff),
+        ),
+    ).fetchall()
+    by_symbol: Dict[str, List[Dict[str, Any]]] = {symbol: [] for symbol in symbols}
+    count = 0
+    for row in rows or []:
+        dim = _safe_int(_row_get(row, "dim", 2), 0)
+        if dim <= 0:
+            continue
+        symbol = _norm_symbol(_row_get(row, "symbol", 1))
+        if not symbol:
+            continue
+        by_symbol.setdefault(symbol, []).append(
+            {
+                "event_id": _safe_int(_row_get(row, "event_id", 0), 0),
+                "vector": bytes_to_vector(_row_get(row, "vector", 3, b""), dim),
+                "availability_ts_ms": _safe_int(_row_get(row, "availability_ts_ms", 4), 0),
+            }
+        )
+        count += 1
+    return by_symbol, int(count)
+
+
+def _select_recent_embedding_rows(
+    prefetched_by_symbol: Dict[str, List[Dict[str, Any]]],
+    in_cycle_by_symbol: Dict[str, List[Dict[str, Any]]],
+    *,
     event: Dict[str, Any],
-    vector: np.ndarray,
-    novelty: float,
-    max_similarity: float,
-    stale: bool,
-    matched_event_id: Optional[int],
+    max_rows: int = NEWS_NOVELTY_MAX_COMPARISONS,
+) -> List[Dict[str, Any]]:
+    symbol = _norm_symbol(event.get("symbol"))
+    if not symbol:
+        return []
+    event_id = int(event.get("event_id") or -1)
+    availability_ts_ms = int(event.get("availability_ts_ms") or event.get("publish_ts_ms") or 0)
+    cutoff = int(availability_ts_ms) - int(NEWS_NOVELTY_LOOKBACK_MS)
+    candidates: List[Dict[str, Any]] = []
+    for row in list(prefetched_by_symbol.get(symbol) or []) + list(in_cycle_by_symbol.get(symbol) or []):
+        row_event_id = int(row.get("event_id") or -1)
+        row_availability = int(row.get("availability_ts_ms") or 0)
+        if row_event_id == event_id:
+            continue
+        if row_availability > int(availability_ts_ms) or row_availability < int(cutoff):
+            continue
+        candidates.append(row)
+    candidates.sort(key=lambda row: (int(row.get("availability_ts_ms") or 0), int(row.get("event_id") or 0)), reverse=True)
+    return candidates[: max(1, int(max_rows))]
+
+
+def _put_story_embeddings_batch(
+    con,
+    *,
+    items: Sequence[Dict[str, Any]],
     config: NewsEmbeddingConfig,
     now_ms: Optional[int] = None,
-) -> None:
-    arr = np.asarray(vector, dtype=np.float32).reshape(-1)
-    payload = {
-        "source_id": event.get("source_id"),
-        "event_key": event.get("event_key"),
-        "text_hash": text_hash(event.get("text")),
-    }
-    diagnostics = {
-        "lookback_ms": int(NEWS_NOVELTY_LOOKBACK_MS),
-        "max_comparisons": int(NEWS_NOVELTY_MAX_COMPARISONS),
-        "stale_similarity_threshold": float(NEWS_STALE_SIM_THRESHOLD),
-    }
-    con.execute(
+) -> Dict[str, int]:
+    rows = [dict(item or {}) for item in list(items or [])]
+    if not rows:
+        return {
+            "story_embedding_write_batches": 0,
+            "event_feature_write_batches": 0,
+            "write_batches": 0,
+            "story_embedding_write_rows": 0,
+            "event_feature_write_rows": 0,
+        }
+
+    story_params: List[Tuple[Any, ...]] = []
+    event_feature_params: List[Tuple[Any, ...]] = []
+    diagnostics = _json_dumps(
+        {
+            "lookback_ms": int(NEWS_NOVELTY_LOOKBACK_MS),
+            "max_comparisons": int(NEWS_NOVELTY_MAX_COMPARISONS),
+            "stale_similarity_threshold": float(NEWS_STALE_SIM_THRESHOLD),
+        }
+    )
+    event_feature_meta = _json_dumps(
+        {"news_flow": True, "embedding_backend": config.backend, "embedding_model_name": config.model_name}
+    )
+    ingested_ts_ms = int(now_ms or _now_ms())
+
+    for item in rows:
+        event = dict(item.get("event") or {})
+        arr = np.asarray(item.get("vector"), dtype=np.float32).reshape(-1)
+        novelty = float(item.get("novelty") or 0.0)
+        max_similarity = float(item.get("max_similarity") or 0.0)
+        stale = bool(item.get("stale"))
+        matched_event_id = item.get("matched_event_id")
+        payload = {
+            "source_id": event.get("source_id"),
+            "event_key": event.get("event_key"),
+            "text_hash": text_hash(event.get("text")),
+        }
+        availability_ts_ms = int(event.get("availability_ts_ms") or event.get("publish_ts_ms") or 0)
+        publish_ts_ms = int(event.get("publish_ts_ms") or availability_ts_ms or 0)
+        story_params.append(
+            (
+                int(event["event_id"]),
+                str(event["symbol"]),
+                int(publish_ts_ms),
+                int(availability_ts_ms),
+                str(event.get("source") or "news"),
+                str(config.backend),
+                str(config.model_name),
+                int(arr.size),
+                vector_to_bytes(arr),
+                str(payload["text_hash"]),
+                float(novelty),
+                float(max_similarity),
+                1 if stale else 0,
+                int(matched_event_id) if matched_event_id else None,
+                int(ingested_ts_ms),
+                _json_dumps(payload),
+                diagnostics,
+            )
+        )
+        event_feature_params.append(
+            (
+                int(event["event_id"]),
+                int(availability_ts_ms),
+                str(event["symbol"]),
+                float(novelty),
+                str(config.backend),
+                str(config.model_name),
+                float(novelty),
+                float(max_similarity),
+                1 if stale else 0,
+                int(ingested_ts_ms),
+                event_feature_meta,
+            )
+        )
+
+    con.executemany(
         """
         INSERT INTO news_story_embeddings(
           event_id, symbol, publish_ts_ms, availability_ts_ms, source,
@@ -463,75 +608,54 @@ def _put_story_embedding(
           payload_json=excluded.payload_json,
           diagnostics_json=excluded.diagnostics_json
         """,
-        (
-            int(event["event_id"]),
-            str(event["symbol"]),
-            int(event.get("publish_ts_ms") or event.get("availability_ts_ms") or 0),
-            int(event.get("availability_ts_ms") or event.get("publish_ts_ms") or 0),
-            str(event.get("source") or "news"),
-            str(config.backend),
-            str(config.model_name),
-            int(arr.size),
-            vector_to_bytes(arr),
-            str(payload["text_hash"]),
-            float(novelty),
-            float(max_similarity),
-            1 if bool(stale) else 0,
-            int(matched_event_id) if matched_event_id else None,
-            int(now_ms or _now_ms()),
-            _json_dumps(payload),
-            _json_dumps(diagnostics),
-        ),
+        story_params,
     )
-    event_feature_meta = _json_dumps(
-        {"news_flow": True, "embedding_backend": config.backend, "embedding_model_name": config.model_name}
+    con.executemany(
+        """
+        INSERT INTO news_event_features(
+          event_id, ts_ms, symbol, novelty_score,
+          embedding_backend, embedding_model_name, embedding_novelty_score,
+          embedding_max_similarity, stale_flag, novelty_computed_ts_ms, meta_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(event_id) DO UPDATE SET
+          ts_ms=COALESCE(excluded.ts_ms, news_event_features.ts_ms),
+          symbol=COALESCE(excluded.symbol, news_event_features.symbol),
+          novelty_score=excluded.novelty_score,
+          embedding_backend=excluded.embedding_backend,
+          embedding_model_name=excluded.embedding_model_name,
+          embedding_novelty_score=excluded.embedding_novelty_score,
+          embedding_max_similarity=excluded.embedding_max_similarity,
+          stale_flag=excluded.stale_flag,
+          novelty_computed_ts_ms=excluded.novelty_computed_ts_ms,
+          meta_json=COALESCE(news_event_features.meta_json, excluded.meta_json)
+        """,
+        event_feature_params,
     )
-    event_feature_params = (
-        int(event.get("availability_ts_ms") or event.get("publish_ts_ms") or 0),
-        str(event["symbol"]),
-        float(novelty),
-        str(config.backend),
-        str(config.model_name),
-        float(novelty),
-        float(max_similarity),
-        1 if bool(stale) else 0,
-        int(now_ms or _now_ms()),
-        event_feature_meta,
-        int(event["event_id"]),
-    )
-    existing_feature = con.execute(
-        "SELECT 1 FROM news_event_features WHERE event_id=? LIMIT 1",
-        (int(event["event_id"]),),
-    ).fetchone()
-    if existing_feature is not None:
-        con.execute(
-            """
-            UPDATE news_event_features
-            SET ts_ms=COALESCE(?, ts_ms),
-                symbol=COALESCE(?, symbol),
-                novelty_score=?,
-                embedding_backend=?,
-                embedding_model_name=?,
-                embedding_novelty_score=?,
-                embedding_max_similarity=?,
-                stale_flag=?,
-                novelty_computed_ts_ms=?,
-                meta_json=COALESCE(meta_json, ?)
-            WHERE event_id=?
-            """,
-            event_feature_params,
-        )
-    else:
-        con.execute(
-            """
-            INSERT INTO news_event_features(
-              ts_ms, symbol, novelty_score,
-              embedding_backend, embedding_model_name, embedding_novelty_score,
-              embedding_max_similarity, stale_flag, novelty_computed_ts_ms, meta_json,
-              event_id
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            event_feature_params,
+    return {
+        "story_embedding_write_batches": 1,
+        "event_feature_write_batches": 1,
+        "write_batches": 2,
+        "story_embedding_write_rows": int(len(story_params)),
+        "event_feature_write_rows": int(len(event_feature_params)),
+    }
+
+
+def _emit_news_flow_batch_metrics(result: Dict[str, Any], *, config: NewsEmbeddingConfig) -> None:
+    tags = {"backend": str(config.backend), "model_name": str(config.model_name)}
+    metrics = {
+        "news_flow_batch_size": result.get("batch_size", result.get("rows_seen", 0)),
+        "news_flow_recent_embedding_prefetch_rows": result.get("recent_embedding_prefetch_rows", 0),
+        "news_flow_recent_embedding_queries": result.get("recent_embedding_queries", 0),
+        "news_flow_write_batches": result.get("write_batches", 0),
+        "news_flow_embedding_db_round_trips": result.get("embedding_db_round_trips", 0),
+    }
+    for metric, value in metrics.items():
+        emit_gauge(
+            str(metric),
+            value,
+            component=NEWS_FLOW_METRIC_COMPONENT,
+            job="process_news_flow",
+            extra_tags=tags,
         )
 
 
@@ -553,25 +677,42 @@ def process_news_flow_batch(
             _warn_nonfatal("NEWS_FLOW_FETCH_CLOSE_FAILED", exc, once_key="fetch_close")
 
     if not candidates:
-        return {"rows_seen": 0, "encoded": 0, "written": 0, "backend": cfg.backend, "model_name": cfg.model_name}
+        empty_result = {
+            "rows_seen": 0,
+            "batch_size": 0,
+            "encoded": 0,
+            "written": 0,
+            "backend": cfg.backend,
+            "model_name": cfg.model_name,
+            "pending_event_queries": 1,
+            "recent_embedding_queries": 0,
+            "recent_embedding_prefetch_rows": 0,
+            "write_batches": 0,
+            "embedding_db_round_trips": 0,
+            "core_db_round_trips": 1,
+        }
+        _emit_news_flow_batch_metrics(empty_result, config=cfg)
+        return empty_result
 
     embeddings = encode_news_texts([str(row["text"]) for row in candidates], cfg)
     if embeddings.shape[0] != len(candidates):
         raise RuntimeError(f"news_embedding_count_mismatch:{embeddings.shape[0]}:{len(candidates)}")
 
-    touched_symbols: set[str] = set()
-
     def _write(db) -> Dict[str, Any]:
         ensure_news_flow_tables(db)
+        prefetched_by_symbol, prefetch_rows = _prefetch_recent_embedding_rows(db, events=candidates, config=cfg)
+        recent_embedding_queries = 1
+        in_cycle_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        write_items: List[Dict[str, Any]] = []
+        touched_symbols: set[str] = set()
         written = 0
         stale_count = 0
         for event, vector in zip(candidates, embeddings):
-            recent = _recent_embedding_rows(
-                db,
-                symbol=str(event["symbol"]),
-                availability_ts_ms=int(event["availability_ts_ms"]),
-                config=cfg,
-                exclude_event_id=int(event["event_id"]),
+            symbol = _norm_symbol(event.get("symbol"))
+            recent = _select_recent_embedding_rows(
+                prefetched_by_symbol,
+                in_cycle_by_symbol,
+                event=event,
                 max_rows=int(NEWS_NOVELTY_MAX_COMPARISONS),
             )
             novelty, max_similarity, stale = novelty_from_vector(vector, [row["vector"] for row in recent])
@@ -582,23 +723,44 @@ def process_news_flow_batch(
                     for row in recent
                 ]
                 matched_event_id = max(sims, key=lambda item: item[0])[1]
-            _put_story_embedding(
-                db,
-                event=event,
-                vector=vector,
-                novelty=float(novelty),
-                max_similarity=float(max_similarity),
-                stale=bool(stale),
-                matched_event_id=matched_event_id,
-                config=cfg,
-                now_ms=int(started),
+            write_items.append(
+                {
+                    "event": event,
+                    "vector": vector,
+                    "novelty": float(novelty),
+                    "max_similarity": float(max_similarity),
+                    "stale": bool(stale),
+                    "matched_event_id": matched_event_id,
+                }
             )
-            touched_symbols.add(str(event["symbol"]))
+            in_cycle_by_symbol.setdefault(symbol, []).append(
+                {
+                    "event_id": int(event["event_id"]),
+                    "vector": np.asarray(vector, dtype=np.float32).reshape(-1),
+                    "availability_ts_ms": int(event["availability_ts_ms"]),
+                }
+            )
+            touched_symbols.add(symbol)
             written += 1
             stale_count += 1 if stale else 0
+        write_stats = _put_story_embeddings_batch(
+            db,
+            items=write_items,
+            config=cfg,
+            now_ms=int(started),
+        )
         for symbol in sorted(touched_symbols):
             materialize_news_flow_features(db, symbol=symbol, ts_ms=int(started), config=cfg)
-        return {"written": int(written), "stale": int(stale_count), "symbols": sorted(touched_symbols)}
+        write_batches = int(write_stats.get("write_batches") or 0)
+        return {
+            "written": int(written),
+            "stale": int(stale_count),
+            "symbols": sorted(touched_symbols),
+            "recent_embedding_queries": int(recent_embedding_queries),
+            "recent_embedding_prefetch_rows": int(prefetch_rows),
+            "embedding_db_round_trips": int(recent_embedding_queries + write_batches),
+            **dict(write_stats),
+        }
 
     result = run_write_txn(
         _write,
@@ -606,13 +768,22 @@ def process_news_flow_batch(
         operation="process_news_flow_batch",
         context={"rows": int(len(candidates)), "backend": cfg.backend, "model_name": cfg.model_name},
     )
-    return {
+    final_result = {
         "rows_seen": int(len(candidates)),
+        "batch_size": int(len(candidates)),
         "encoded": int(embeddings.shape[0]),
         "backend": str(cfg.backend),
         "model_name": str(cfg.model_name),
+        "pending_event_queries": 1,
         **dict(result or {}),
     }
+    final_result["core_db_round_trips"] = int(
+        final_result.get("pending_event_queries", 0)
+        + final_result.get("recent_embedding_queries", 0)
+        + final_result.get("write_batches", 0)
+    )
+    _emit_news_flow_batch_metrics(final_result, config=cfg)
+    return final_result
 
 
 def _daily_counts(timestamps: Iterable[int], *, end_ts_ms: int, days: int) -> List[int]:

@@ -9,7 +9,7 @@ Source, docs, migrations, tests, and deploy assets stay outside this tree.
 | --- | --- |
 | `var/log/` | Runtime, ingestion, operator, soak, and validation logs. |
 | `var/db/` | Local SQLite compatibility files such as `trading.db`, liveness DBs, and Optuna studies. |
-| `var/db/async_price_writer_spool.sqlite` | Local async price-writer SQLite WAL spool when `DB_PATH`/`TS_DATA_ROOT` points into the repo-local data tree. Production deployments keep the same file under the configured runtime data root unless `ASYNC_PRICE_WRITER_SPOOL_PATH` overrides it. |
+| `var/db/async_price_writer_spool.sqlite` | Local async price-writer SQLite WAL spool when `DB_PATH`/`TS_DATA_ROOT` points into the repo-local data tree. Production deployments keep the same file under the configured runtime data root unless `ASYNC_PRICE_WRITER_SPOOL_PATH` overrides it. Spool rows carry a stable shard id so `ASYNC_PRICE_WRITER_WORKERS` can replay each symbol/event-key shard in order. Failed downstream flushes leave rows in this spool for retry and startup replay; enqueue saturation is surfaced as producer-visible backpressure with rejected-row and oldest-age metrics. The default `ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS=NORMAL` keeps WAL commits fast for re-fetchable market data; set `FULL` or `EXTRA` explicitly for stricter local spool fsync behavior. |
 | `var/tmp/` | Temporary operator state, generated patches, scratch files, and transient outputs. |
 | `var/artifacts/` | Local artifact-store objects, model caches, retraining datasets, preflight evidence, and generated reports. |
 | `var/audit/` | Local audit-run outputs that previously landed in `.run-audit/`. |
@@ -55,6 +55,13 @@ virtualenvs (`.venv/`, `venv/`, `env/`), `node_modules/`, Python caches,
 repo-local `var/` state, runtime DB/log/temp files, local secret paths, and
 local `.env*` files. The only tracked env files allowed by the guard are
 checked-in `*.env.example` templates.
+
+The ops CI lane also carries self-tests for this contract. `tests/ops`
+includes a planted-offender matrix for `tools/check_repo_artifact_hygiene.py`
+and a discovery meta-check that verifies the `Validate` workflow runs pytest by
+directory (`tests/ops`) and shell tests through `find tests/ops -name '*.sh'`.
+New `tests/ops/test_*.py` and `tests/ops/test_*.sh` files are therefore picked
+up by the same gate instead of requiring a workflow file list edit.
 
 ## Local Migration
 

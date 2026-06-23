@@ -9,6 +9,10 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping
 
 from engine.runtime import acceleration
+from engine.runtime.thread_policy import (
+    apply_cpu_thread_policy_to_env,
+    cpu_thread_policy_snapshot,
+)
 
 
 CPU_FIRST_DEVICE_ENV_KEYS = (
@@ -128,6 +132,8 @@ def accelerator_profile_error() -> str:
     dependency_profile = runtime_dependency_profile()
     if hardware_profile in _AMD_PROFILES and dependency_profile not in _AMD_DEPENDENCY_PROFILES:
         return "amd_rocm_runtime_requires_amd_rocm_dependency_profile"
+    if dependency_profile in _AMD_DEPENDENCY_PROFILES and hardware_profile not in _AMD_PROFILES:
+        return "amd_rocm_dependency_requires_amd_rocm_runtime_profile"
     if hardware_profile in _NVIDIA_PROFILES and dependency_profile not in _NVIDIA_DEPENDENCY_PROFILES:
         return "nvidia_runtime_requires_nvidia_dependency_profile"
     return ""
@@ -212,6 +218,8 @@ def _resolve_rocm_torch_device(
     legacy_cuda_flag: str | None,
 ) -> DeviceResolution:
     profile = runtime_hardware_profile()
+    if amd_dependency_profile_enabled():
+        acceleration.assert_amd_rocm_runtime_ready(torch_module=torch_module, profile=runtime_dependency_profile())
     block_reason = _rocm_profile_block_reason()
     if block_reason:
         return _base_resolution(
@@ -293,6 +301,8 @@ def resolve_torch_device(
     profile = runtime_hardware_profile()
     cuda_available = torch_cuda_available(torch_module)
     rocm_device_requested = device in {"amd", "rocm", "hip", "amd-rocm", "amd_rocm"}
+    if amd_dependency_profile_enabled():
+        acceleration.assert_amd_rocm_runtime_ready(torch_module=torch_module, profile=runtime_dependency_profile())
 
     if device in {"", "default"}:
         device = "cpu"
@@ -450,24 +460,36 @@ def nvidia_telemetry_enabled(torch_module: Any | None = None) -> bool:
     return torch_cuda_available(torch_module)
 
 
-def apply_cpu_first_runtime_defaults() -> None:
+def apply_cpu_first_runtime_defaults(
+    *,
+    role: str | None = None,
+    supervised_process_count: int | None = None,
+) -> None:
     os.environ.setdefault("TRADING_DEPENDENCY_PROFILE", DEFAULT_DEPENDENCY_PROFILE)
     os.environ.setdefault("RUNTIME_HARDWARE_PROFILE", DEFAULT_HARDWARE_PROFILE)
+    device_default = "auto" if amd_rocm_acceleration_profile_enabled() else "cpu"
     for key in CPU_FIRST_DEVICE_ENV_KEYS:
-        os.environ.setdefault(key, "cpu")
-    os.environ.setdefault("TORCH_CPU_THREADS", str(DEFAULT_CPU_THREADS))
-    os.environ.setdefault("TORCH_INTEROP_THREADS", str(DEFAULT_INTEROP_THREADS))
-    for key in CPU_THREAD_ENV_KEYS:
-        os.environ.setdefault(key, str(DEFAULT_CPU_THREADS))
+        os.environ.setdefault(key, device_default)
+    apply_cpu_thread_policy_to_env(
+        os.environ,
+        role=role,
+        supervised_process_count=supervised_process_count,
+    )
     for key, value in CUDA_FEATURE_ENV_DEFAULTS.items():
         os.environ.setdefault(key, value)
 
 
 def runtime_hardware_snapshot(torch_module: Any | None = None) -> dict[str, Any]:
+    thread_policy = cpu_thread_policy_snapshot()
     if torch_module is None:
         try:
             torch_module = importlib.import_module("torch")
         except Exception as exc:
+            if amd_dependency_profile_enabled():
+                raise acceleration.AccelerationProfileError(
+                    "amd_rocm_torch_import_failed:"
+                    f"error={type(exc).__name__}: {exc}:profile={runtime_dependency_profile()}"
+                ) from exc
             return {
                 "ok": False,
                 "profile": runtime_hardware_profile(),
@@ -489,8 +511,12 @@ def runtime_hardware_snapshot(torch_module: Any | None = None) -> dict[str, Any]
                 "threads": {
                     "cpu_threads": max(1, _env_int("TORCH_CPU_THREADS", DEFAULT_CPU_THREADS)),
                     "interop_threads": max(1, _env_int("TORCH_INTEROP_THREADS", DEFAULT_INTEROP_THREADS)),
+                    "thread_policy": thread_policy,
                 },
+                "thread_policy": thread_policy,
             }
+    if amd_dependency_profile_enabled():
+        acceleration.assert_amd_rocm_runtime_ready(torch_module=torch_module, profile=runtime_dependency_profile())
 
     devices: dict[str, Mapping[str, Any]] = {}
     for key in CPU_FIRST_DEVICE_ENV_KEYS:
@@ -549,7 +575,9 @@ def runtime_hardware_snapshot(torch_module: Any | None = None) -> dict[str, Any]
             "mkl_num_threads": max(1, _env_int("MKL_NUM_THREADS", DEFAULT_CPU_THREADS)),
             "openblas_num_threads": max(1, _env_int("OPENBLAS_NUM_THREADS", DEFAULT_CPU_THREADS)),
             "numexpr_num_threads": max(1, _env_int("NUMEXPR_NUM_THREADS", DEFAULT_CPU_THREADS)),
+            "thread_policy": thread_policy,
         },
+        "thread_policy": thread_policy,
     }
 
 

@@ -50,7 +50,7 @@ OWNED_LIVE_TABLE_COLUMN_SPECS: Dict[str, Dict[str, Dict[str, object]]] = {
         "last_update_ts_ms": {"type": "INTEGER", "pk": 0},
     },
     "price_quotes_raw": {
-        "ts_ms": {"type": "INTEGER", "pk": 0},
+        "ts_ms": {"type": "INTEGER", "pk": 4},
         "symbol": {"type": "TEXT", "pk": 1},
         "provider": {"type": "TEXT", "pk": 2},
         "event_key": {"type": "TEXT", "pk": 3},
@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS price_quotes_raw (
   quote_ts_ms INTEGER,
   ingest_ts_ms INTEGER,
   source TEXT,
-  PRIMARY KEY(symbol, provider, event_key)
+  PRIMARY KEY(symbol, provider, event_key, ts_ms)
 );
 CREATE INDEX IF NOT EXISTS idx_price_quotes_raw_symbol_ts
   ON price_quotes_raw(symbol, ts_ms);
@@ -365,6 +365,10 @@ def _has_column(con, table: str, col: str) -> bool:
     return str(col).strip().lower() in _table_column_specs(con, str(table))
 
 
+def _is_timescale_price_sidecar_table(con, table: str) -> bool:
+    return (not _is_sqlite_connection(con)) and _has_column(con, str(table), "time")
+
+
 def _execute_script(con, script: str) -> None:
     executescript = getattr(con, "executescript", None)
     if callable(executescript):
@@ -440,6 +444,8 @@ def ensure_prices_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
 
 
 def ensure_price_quotes_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
+    if _is_timescale_price_sidecar_table(con, "price_quotes"):
+        return
     con.executescript(
         """
         CREATE TABLE IF NOT EXISTS price_quotes (
@@ -480,6 +486,8 @@ def ensure_price_quotes_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
 
 
 def ensure_price_quotes_raw_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
+    if _is_timescale_price_sidecar_table(con, "price_quotes_raw"):
+        return
     needs_rebuild = False
     legacy_table = ""
     if _table_exists(con, "price_quotes_raw"):
@@ -507,7 +515,7 @@ def ensure_price_quotes_raw_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
           quote_ts_ms INTEGER,
           ingest_ts_ms INTEGER,
           source TEXT,
-          PRIMARY KEY(symbol, provider, event_key)
+          PRIMARY KEY(symbol, provider, event_key, ts_ms)
         );
 
         CREATE INDEX IF NOT EXISTS idx_price_quotes_raw_symbol_ts
@@ -531,21 +539,22 @@ def ensure_price_quotes_raw_schema(con, *, warn_nonfatal: WarnNonfatal) -> None:
         symbol_expr = "symbol" if "symbol" in legacy_columns else "''"
         provider_expr = "provider" if "provider" in legacy_columns else "''"
         ts_expr = "ts_ms" if "ts_ms" in legacy_columns else "0"
+        legacy_event_type = "event_type" if "event_type" in legacy_columns else "'legacy'"
+        legacy_event_ts = "event_ts_ms" if "event_ts_ms" in legacy_columns else ts_expr
+        legacy_trade_ts = "trade_ts_ms" if "trade_ts_ms" in legacy_columns else ts_expr
+        legacy_quote_ts = "quote_ts_ms" if "quote_ts_ms" in legacy_columns else ts_expr
+        legacy_event_key = (
+            f"'legacy:' || {symbol_expr} || ':' || {provider_expr} || ':' || "
+            f"COALESCE(CAST({legacy_event_type} AS TEXT), 'legacy') || ':' || "
+            f"COALESCE(CAST({legacy_event_ts} AS TEXT), CAST({ts_expr} AS TEXT)) || ':' || "
+            f"COALESCE(CAST({ts_expr} AS TEXT), '0') || ':' || "
+            f"COALESCE(CAST({legacy_trade_ts} AS TEXT), CAST({ts_expr} AS TEXT)) || ':' || "
+            f"COALESCE(CAST({legacy_quote_ts} AS TEXT), CAST({ts_expr} AS TEXT))"
+        )
         event_key_expr = (
-            "COALESCE(CAST(event_key AS TEXT), "
-            f"'legacy:' || {symbol_expr} || ':' || {provider_expr} || ':' || {ts_expr} || ':' || "
-            f"COALESCE(CAST({'last' if 'last' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
-            f"COALESCE(CAST({'bid' if 'bid' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
-            f"COALESCE(CAST({'ask' if 'ask' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
-            f"COALESCE(CAST({'volume' if 'volume' in legacy_columns else 'NULL'} AS TEXT), ''))"
+            f"COALESCE(NULLIF(CAST(event_key AS TEXT), ''), {legacy_event_key})"
             if "event_key" in legacy_columns
-            else (
-                f"'legacy:' || {symbol_expr} || ':' || {provider_expr} || ':' || {ts_expr} || ':' || "
-                f"COALESCE(CAST({'last' if 'last' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
-                f"COALESCE(CAST({'bid' if 'bid' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
-                f"COALESCE(CAST({'ask' if 'ask' in legacy_columns else 'NULL'} AS TEXT), '') || ':' || "
-                f"COALESCE(CAST({'volume' if 'volume' in legacy_columns else 'NULL'} AS TEXT), '')"
-            )
+            else legacy_event_key
         )
 
         def col(name: str, default: str) -> str:

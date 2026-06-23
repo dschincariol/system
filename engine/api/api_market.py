@@ -29,6 +29,7 @@ from engine.api.http_transport import StreamingResponse
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.price_read_router import fetch_quote_rows
+from engine.runtime.state_cache import cache_get_or_load
 
 LOG = get_logger("engine.api.api_market")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -205,36 +206,40 @@ def api_get_market_candles(parsed: Any, _ctx=None) -> Dict[str, Any]:
     else:
         max_points = limit
 
-    tf_ms = _tf_to_ms(tf)
+    cache_key = f"candles:{symbol}:{tf}:{limit}:{max_points}"
 
-    fetch_limit = max(200, min(50_000, limit * 10))
-    now_ms = int(time.time() * 1000)
-    lookback_ms = max(tf_ms * fetch_limit, 6 * 60 * 60_000)
-    since = max(0, now_ms - lookback_ms)
+    def _load() -> Dict[str, Any]:
+        tf_ms = _tf_to_ms(tf)
+        fetch_limit = max(200, min(50_000, limit * 10))
+        now_ms = int(time.time() * 1000)
+        lookback_ms = max(tf_ms * fetch_limit, 6 * 60 * 60_000)
+        since = max(0, now_ms - lookback_ms)
 
-    rows = _quote_rows_ascending(_rows_since(symbol=symbol, since_ts_ms=since, limit=fetch_limit))
-    candles = _build_candles_from_rows(rows, tf_ms=tf_ms)
-    if len(candles) > limit:
-        candles = candles[-limit:]
+        rows = _quote_rows_ascending(_rows_since(symbol=symbol, since_ts_ms=since, limit=fetch_limit))
+        candles = _build_candles_from_rows(rows, tf_ms=tf_ms)
+        if len(candles) > limit:
+            candles = candles[-limit:]
 
-    if max_points and len(candles) > max_points:
-        candles = _downsample_keep_latest(candles, max_points)
+        if max_points and len(candles) > max_points:
+            candles = _downsample_keep_latest(candles, max_points)
 
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "tf": tf,
-        "candles": candles,
-        "meta": {
-            "ready": bool(candles),
-            "count": int(len(candles)),
-            "tf_ms": int(tf_ms),
-            "limit": int(limit),
-            "max_points": int(max_points),
-            "fetch_limit": int(fetch_limit),
-            "order": "ascending",
-        },
-    }
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "tf": tf,
+            "candles": candles,
+            "meta": {
+                "ready": bool(candles),
+                "count": int(len(candles)),
+                "tf_ms": int(tf_ms),
+                "limit": int(limit),
+                "max_points": int(max_points),
+                "fetch_limit": int(fetch_limit),
+                "order": "ascending",
+            },
+        }
+
+    return cache_get_or_load("api_market_candles", cache_key, _load, ttl_s=0.75)
 
 
 def api_get_market_stream(parsed: Any, _ctx=None) -> StreamingResponse:

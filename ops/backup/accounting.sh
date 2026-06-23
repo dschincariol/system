@@ -14,9 +14,10 @@ runtime_container="${BACKUP_ACCOUNTING_RUNTIME_CONTAINER:-trading-runtime}"
 base_dir="${TS_BACKUP_BASE_DIR:-${backup_root}/base}"
 wal_dir="${TS_BACKUP_WAL_DIR:-${backup_root}/wal}"
 drill_dir="${TS_RESTORE_DRILL_DIR:-${backup_root}/drills}"
-keep_daily_days="${TS_BACKUP_KEEP_DAILY_DAYS:-14}"
-keep_weekly_days="${TS_BACKUP_KEEP_WEEKLY_DAYS:-365}"
-wal_cushion_days="${TS_BACKUP_WAL_CUSHION_DAYS:-7}"
+keep_recent_count="${TS_BACKUP_KEEP_RECENT_COUNT:-2}"
+keep_daily_days="${TS_BACKUP_KEEP_DAILY_DAYS:-0}"
+keep_weekly_days="${TS_BACKUP_KEEP_WEEKLY_DAYS:-0}"
+wal_cushion_days="${TS_BACKUP_WAL_CUSHION_DAYS:-10}"
 
 du_bytes() {
   local mode="$1"
@@ -118,6 +119,7 @@ log info backup_accounting \
   "wal_file_count=${wal_count}" \
   "latest_base=${latest_base:-}" \
   "latest_wal=${latest_wal:-}" \
+  "keep_recent_count=${keep_recent_count}" \
   "keep_daily_days=${keep_daily_days}" \
   "keep_weekly_days=${keep_weekly_days}" \
   "wal_cushion_days=${wal_cushion_days}" \

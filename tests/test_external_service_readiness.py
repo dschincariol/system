@@ -19,6 +19,16 @@ class ExternalServiceReadinessTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.prev_env: dict[str, str | None] = {}
         self._set_env("ARTIFACT_STORE_MIRROR_ROOT", str(Path(self.tmp.name) / "artifact_mirror"))
+        for key in (
+            "LIVE_CACHE_BACKEND",
+            "LIVE_CACHE_REDIS_URL",
+            "REDIS_URL",
+            "REDIS_CACHE_URL",
+            "PREFLIGHT_REQUIRE_REDIS",
+            "CACHE_CODEC_ALLOW_JSON_FALLBACK",
+            "CACHE_CODEC_REQUIRE_MSGPACK",
+        ):
+            self._set_env(key, None)
 
     def tearDown(self) -> None:
         for key, value in self.prev_env.items():
@@ -76,6 +86,64 @@ class ExternalServiceReadinessTests(unittest.TestCase):
         self.assertTrue(bool(redis_status.get("ok")))
         self.assertEqual(redis_status.get("target"), "cache.local:6379")
         self.assertTrue(any("ping ok" in item for item in list(redis_status.get("notes") or [])))
+
+    def test_explicit_redis_backend_fails_when_msgpack_codec_is_missing(self) -> None:
+        self._set_env("LIVE_CACHE_BACKEND", "redis")
+        self._set_env("LIVE_CACHE_REDIS_URL", "redis://cache.local:6379/0")
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_live_cache_msgpack_available", return_value=False):
+            with patch.object(readiness, "_probe_redis", return_value=(True, None)):
+                summary = readiness.check_external_service_readiness()
+
+        services = {str(item.get("name")): item for item in list(summary.get("services") or []) if isinstance(item, dict)}
+        redis_status = dict(services.get("live_cache_redis") or {})
+        self.assertFalse(bool(summary.get("ok")))
+        self.assertFalse(bool(redis_status.get("ok")))
+        self.assertTrue(any("requires msgpack" in item for item in summary.get("errors") or []))
+        self.assertTrue(bool(redis_status.get("reachable")))
+
+    def test_required_redis_fails_when_msgpack_codec_is_missing_even_with_auto_backend(self) -> None:
+        self._set_env("PREFLIGHT_REQUIRE_REDIS", "1")
+        self._set_env("LIVE_CACHE_BACKEND", "auto")
+        self._set_env("LIVE_CACHE_REDIS_URL", "redis://cache.local:6379/0")
+        readiness = self._load_module()
+
+        with patch.object(readiness, "_live_cache_msgpack_available", return_value=False):
+            with patch.object(readiness, "_probe_redis", return_value=(True, None)):
+                summary = readiness.check_external_service_readiness()
+
+        services = {str(item.get("name")): item for item in list(summary.get("services") or []) if isinstance(item, dict)}
+        redis_status = dict(services.get("live_cache_redis") or {})
+        self.assertFalse(bool(summary.get("ok")))
+        self.assertFalse(bool(redis_status.get("ok")))
+        self.assertTrue(any("requires msgpack" in item for item in summary.get("errors") or []))
+
+    def test_production_cache_codec_readiness_fails_when_msgpack_is_missing(self) -> None:
+        readiness = self._load_module()
+
+        with patch.object(
+            readiness,
+            "_cache_codec_readiness",
+            return_value={
+                "ok": False,
+                "required": True,
+                "codec": "unavailable",
+                "msgpack_available": False,
+                "json_fallback_allowed": False,
+                "require_reasons": ["strict_runtime"],
+                "blockers": ["cache_msgpack_dependency_unavailable"],
+                "warnings": [],
+            },
+        ):
+            summary = readiness.check_external_service_readiness()
+
+        services = {str(item.get("name")): item for item in list(summary.get("services") or []) if isinstance(item, dict)}
+        codec_status = dict(services.get("cache_codec") or {})
+        self.assertFalse(bool(summary.get("ok")))
+        self.assertFalse(bool(codec_status.get("ok")))
+        self.assertEqual(codec_status.get("codec"), "unavailable")
+        self.assertTrue(any("cache_msgpack_dependency_unavailable" in item for item in summary.get("errors") or []))
 
     def test_explicit_redis_backend_resolves_password_secret_before_probe(self) -> None:
         self._set_env("LIVE_CACHE_BACKEND", "redis")

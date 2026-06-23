@@ -59,3 +59,65 @@ def test_memory_pressure_install_renders_idempotent_persistent_config(tmp_path: 
     assert "TRADING_SWAPFILE_SIZE_GIB=16" in swapfile_unit.read_text(encoding="utf-8")
     assert managed_script.exists()
     assert os.access(managed_script, os.X_OK)
+
+
+def test_memory_pressure_snapshot_accepts_bart_policy() -> None:
+    from engine.runtime.memory_pressure import BYTES_IN_GIB, host_memory_pressure_snapshot
+
+    meminfo = "\n".join(
+        [
+            "MemTotal:       128974848 kB",
+            "MemAvailable:   83886080 kB",
+            "SwapTotal:      50331648 kB",
+            "SwapFree:       50331648 kB",
+        ]
+    )
+    swapon = "\n".join(
+        [
+            f"/dev/zram0 partition {32 * BYTES_IN_GIB} 0 100",
+            f"/swapfile-trading file {16 * BYTES_IN_GIB} 0 10",
+        ]
+    )
+
+    state = host_memory_pressure_snapshot(
+        {"PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY": "1"},
+        meminfo_text=meminfo,
+        swapon_text=swapon,
+        swappiness_text="10",
+        zfs_arc_max_text=str(48 * BYTES_IN_GIB),
+    )
+
+    assert state["ok"] is True
+    assert state["meets_policy"] is True
+    assert state["status"] == "pass"
+    assert state["swap"]["zram_total_gib"] == 32.0
+    assert state["swap"]["managed_swapfile_gib"] == 16.0
+
+
+def test_memory_pressure_snapshot_rejects_512m_swapfile_host() -> None:
+    from engine.runtime.memory_pressure import BYTES_IN_GIB, host_memory_pressure_snapshot
+
+    meminfo = "\n".join(
+        [
+            "MemTotal:       128974848 kB",
+            "MemAvailable:   83886080 kB",
+            "SwapTotal:      524284 kB",
+            "SwapFree:       524284 kB",
+        ]
+    )
+    swapon = "/swapfile file 536866816 0 -2"
+
+    state = host_memory_pressure_snapshot(
+        {"PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY": "1"},
+        meminfo_text=meminfo,
+        swapon_text=swapon,
+        swappiness_text="60",
+        zfs_arc_max_text=str(48 * BYTES_IN_GIB),
+    )
+
+    assert state["ok"] is False
+    assert state["status"] == "fail"
+    assert "memory_pressure_total_swap_below_policy" in state["errors"]
+    assert "memory_pressure_zram_below_policy" in state["errors"]
+    assert "memory_pressure_swapfile_below_policy" in state["errors"]
+    assert state["memory"]["swap_total_gib"] < 1

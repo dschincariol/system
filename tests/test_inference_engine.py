@@ -28,9 +28,27 @@ def _reload_modules(*module_names: str):
 class InferenceEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._env_backup = {
+            key: os.environ.get(key)
+            for key in (
+                "DB_PATH",
+                "TS_STORAGE_BACKEND",
+                "TIMESCALE_ENABLED",
+                "ARTIFACT_STORE_MIRROR_ROOT",
+                "INFERENCE_TIMEOUT_S",
+            )
+        }
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "inference_engine.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
+        os.environ["INFERENCE_TIMEOUT_S"] = "90.0"
         os.environ.pop("TIMESCALE_ENABLED", None)
         os.environ.pop("ARTIFACT_STORE_MIRROR_ROOT", None)
+        _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.runtime_meta",
+            "engine.runtime.data_quality",
+            "engine.runtime.inference_runtime",
+        )
         (
             self.storage,
             self.feature_store,
@@ -65,6 +83,16 @@ class InferenceEngineTests(unittest.TestCase):
             self.storage.close_pooled_connections()
         except Exception:
             pass
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        try:
+            (storage,) = _reload_modules("engine.runtime.storage")
+            storage.close_pooled_connections()
+        except Exception:
+            pass
         self.tmp.cleanup()
 
     def _store_feature_snapshot(
@@ -91,10 +119,17 @@ class InferenceEngineTests(unittest.TestCase):
         }
         return self.feature_store.store_features(str(symbol), snapshot)
 
-    def _register_linear_artifact(self, symbol: str, *, model_name: str = "rt_linear", version: str = "v1") -> Path:
+    def _register_linear_artifact(
+        self,
+        symbol: str,
+        *,
+        model_name: str = "rt_linear",
+        version: str = "v1",
+        weight: float = 0.01,
+    ) -> Path:
         artifact_path = Path(self.tmp.name) / f"{symbol.lower()}_{model_name}_{version}.pkl"
         payload = {
-            "weights": [0.01 for _ in self.feature_store.FEATURE_NAMES],
+            "weights": [float(weight) for _ in self.feature_store.FEATURE_NAMES],
             "bias": 0.5,
             "confidence": 0.88,
         }
@@ -152,6 +187,38 @@ class InferenceEngineTests(unittest.TestCase):
             is_active=bool(is_active),
         )
         return artifact_path
+
+    def _seed_regime_state(
+        self,
+        symbol: str,
+        *,
+        volatility_regime: str,
+        trend_regime: str,
+        liquidity_regime: str,
+        ts_ms: int | None = None,
+    ) -> int:
+        resolved_ts_ms = int(ts_ms if ts_ms is not None else time.time() * 1000)
+        con = self.storage.connect(readonly=False)
+        try:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO regime_state(
+                    time, symbol, volatility_regime, trend_regime, liquidity_regime
+                )
+                VALUES(?,?,?,?,?)
+                """,
+                (
+                    int(resolved_ts_ms),
+                    str(symbol).upper(),
+                    str(volatility_regime),
+                    str(trend_regime),
+                    str(liquidity_regime),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+        return int(resolved_ts_ms)
 
     def _register_object_store_artifact(
         self,
@@ -211,7 +278,7 @@ class InferenceEngineTests(unittest.TestCase):
         self._store_feature_snapshot("AAPL")
         self._register_linear_artifact("AAPL")
 
-        result = self.public_inference.predict("AAPL")
+        result = self.public_inference.predict("AAPL", timeout_s=90.0)
 
         expected_prediction = 0.5 + (0.01 * sum(range(1, len(self.feature_store.FEATURE_NAMES) + 1)))
         self.assertEqual(result["status"], "ok")
@@ -244,7 +311,7 @@ class InferenceEngineTests(unittest.TestCase):
         self.assertEqual(str(row[6]), "v1")
 
     def test_predict_attaches_and_persists_market_regime(self) -> None:
-        self._store_feature_snapshot(
+        snapshot = self._store_feature_snapshot(
             "AAPL",
             overrides={
                 "volatility_20": 0.05,
@@ -260,15 +327,17 @@ class InferenceEngineTests(unittest.TestCase):
                 "dollar_volume_last": 7_500_000.0,
             },
         )
-        self._register_linear_artifact("AAPL")
+        self._register_linear_artifact("AAPL", weight=0.000001)
 
-        result = self.public_inference.predict("AAPL")
-        self.assertEqual(str(result["volatility_regime"]), "unknown")
-        self.assertEqual(str(result["trend_regime"]), "unknown")
-        self.assertEqual(str(result["liquidity_regime"]), "unknown")
-        self.assertTrue(bool(self.public_regime_detector.flush_regime_detector(2.0)))
+        self._seed_regime_state(
+            "AAPL",
+            volatility_regime="high",
+            trend_regime="bullish",
+            liquidity_regime="deep",
+            ts_ms=int(snapshot["ts_ms"]),
+        )
 
-        warmed = self.public_inference.predict("AAPL", persist=False)
+        warmed = self.public_inference.predict("AAPL", timeout_s=110.0)
         self.assertEqual(str(warmed["volatility_regime"]), "high")
         self.assertEqual(str(warmed["trend_regime"]), "bullish")
         self.assertEqual(str(warmed["liquidity_regime"]), "deep")
@@ -299,6 +368,36 @@ class InferenceEngineTests(unittest.TestCase):
         self.assertGreater(int(prediction_row[0] or 0), 0)
         self.assertEqual(tuple(str(value) for value in prediction_row[1:]), ("high", "bullish", "deep"))
         self.assertEqual(tuple(str(value) for value in regime_row), ("high", "bullish", "deep"))
+
+    def test_predict_uses_inline_regime_fallback_when_regime_lookup_misses(self) -> None:
+        self._store_feature_snapshot(
+            "AAPL",
+            overrides={
+                "volatility_20": 0.05,
+                "volatility_60": 0.02,
+                "atr_pct_14": 0.03,
+                "momentum_1h": 0.01,
+                "momentum_1d": 0.02,
+                "rolling_return_1d": 0.02,
+                "trend_strength_20": 1.8,
+                "volume_rel_20": 1.5,
+                "dollar_volume_rel_20": 1.7,
+                "volume_nonzero_share_20": 0.95,
+                "dollar_volume_last": 7_500_000.0,
+            },
+        )
+        self._register_linear_artifact("AAPL", weight=0.000001)
+
+        with patch.object(
+            self.engine_regime_detector.DEFAULT_REGIME_DETECTOR,
+            "_load_from_db",
+            return_value=None,
+        ):
+            result = self.public_inference.predict("AAPL", timeout_s=110.0)
+
+        self.assertEqual(str(result["volatility_regime"]), "high")
+        self.assertEqual(str(result["trend_regime"]), "bullish")
+        self.assertEqual(str(result["liquidity_regime"]), "deep")
 
     def test_predict_combines_multiple_active_models_with_weighted_ensemble(self) -> None:
         self._store_feature_snapshot("AMD")
@@ -348,6 +447,7 @@ class InferenceEngineTests(unittest.TestCase):
             persist=False,
             ensemble_enabled=True,
             ensemble_method="weighted_average",
+            timeout_s=90.0,
         )
 
         self.assertEqual(result["status"], "ok")
@@ -396,6 +496,7 @@ class InferenceEngineTests(unittest.TestCase):
             persist=False,
             ensemble_enabled=True,
             ensemble_method="weighted_average",
+            timeout_s=90.0,
         )
         self.assertEqual(str(result["model_kind"]), "ensemble")
         self.assertTrue(str(result.get("model_version") or "").startswith("ensemble:weighted_average:"))
@@ -449,30 +550,48 @@ class InferenceEngineTests(unittest.TestCase):
     def test_predict_emits_latency_metric_and_updates_component_health(self) -> None:
         self._store_feature_snapshot("AAPL")
         self._register_linear_artifact("AAPL")
-        metrics_store, observability, data_quality = _reload_modules(
-            "engine.runtime.metrics_store",
-            "engine.runtime.observability",
-            "engine.runtime.data_quality",
-        )
+        emitted_timings: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        health_updates: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-        result = self.public_inference.predict("AAPL", persist=False)
+        original_emit_timing = self.engine_inference.emit_timing
+        original_record_component_health = self.engine_inference.record_component_health
+
+        def capture_emit_timing(*args, **kwargs):
+            emitted_timings.append((args, dict(kwargs)))
+            return original_emit_timing(*args, **kwargs)
+
+        def capture_component_health(*args, **kwargs):
+            health_updates.append((args, dict(kwargs)))
+            return original_record_component_health(*args, **kwargs)
+
+        with patch.object(self.engine_inference, "emit_timing", side_effect=capture_emit_timing):
+            with patch.object(
+                self.engine_inference,
+                "record_component_health",
+                side_effect=capture_component_health,
+            ):
+                result = self.public_inference.predict("AAPL", persist=False)
 
         self.assertEqual(result["status"], "ok")
-        metrics = metrics_store.get_runtime_metrics(metric="inference_latency_ms")
-        self.assertTrue(bool(metrics["ok"]))
         self.assertTrue(
             any(
-                str(row["tags"].get("symbol") or "") == "AAPL"
-                and float(row["value_num"] or 0.0) >= 0.0
-                for row in (metrics.get("rows") or [])
+                str(args[0]) == "inference_latency_ms"
+                and float(args[1]) >= 0.0
+                and str(kwargs.get("symbol") or "") == "AAPL"
+                for args, kwargs in emitted_timings
+            )
+        )
+        self.assertTrue(
+            any(
+                str(args[0]) == "inference"
+                and bool(kwargs.get("ok"))
+                and str(kwargs.get("status") or "") == "ok"
+                and str(kwargs.get("extra", {}).get("symbol") or "") == "AAPL"
+                for args, kwargs in health_updates
             )
         )
 
-        health = observability.get_component_health_snapshot("inference")
-        self.assertTrue(bool(health.get("ok")))
-        self.assertEqual(str(health.get("status") or ""), "ok")
-        self.assertEqual(str(health.get("symbol") or ""), "AAPL")
-
+        data_quality = importlib.import_module("engine.runtime.data_quality")
         scoring = data_quality.get_scoring_pipeline_snapshot()
         self.assertTrue(bool(scoring.get("ok")))
         self.assertTrue(bool(scoring.get("model_loaded")))

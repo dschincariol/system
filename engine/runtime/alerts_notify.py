@@ -728,6 +728,177 @@ def _send_runtime_health_webhook(payload: dict[str, Any]) -> None:
     )
 
 
+def _build_runtime_alert_notification_payload(
+    alert_payload: dict[str, Any] | None,
+    *,
+    actor: str,
+    source: str,
+) -> dict[str, Any]:
+    alert = alert_payload if isinstance(alert_payload, dict) else {}
+    ts_ms = int(alert.get("ts_ms") or int(time.time() * 1000))
+    detail = alert.get("detail") if isinstance(alert.get("detail"), dict) else {}
+    return {
+        "kind": "runtime_alert",
+        "actor": str(actor or "system"),
+        "source": str(source or alert.get("source") or "runtime"),
+        "alert_id": int(alert.get("alert_id") or 0),
+        "event_title": str(alert.get("event_title") or "Runtime alert"),
+        "symbol": str(alert.get("symbol") or "SYSTEM"),
+        "severity": str(alert.get("severity") or "WARN").upper(),
+        "rule_id": str(alert.get("rule_id") or "runtime_alert"),
+        "horizon_s": int(alert.get("horizon_s") or 0),
+        "detail": detail,
+        "ts_ms": ts_ms,
+        "ts_iso": _ts_iso(ts_ms),
+    }
+
+
+def _format_slack_runtime_alert(payload: dict[str, Any]) -> bytes:
+    title = f"*Runtime alert ({payload.get('severity', 'WARN')})*"
+    detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+    fields = [
+        {"type": "mrkdwn", "text": f"*Rule:*\n{payload.get('rule_id', 'runtime_alert')}"},
+        {"type": "mrkdwn", "text": f"*Source:*\n{payload.get('source', 'runtime')}"},
+        {"type": "mrkdwn", "text": f"*Symbol:*\n{payload.get('symbol', 'SYSTEM')}"},
+        {"type": "mrkdwn", "text": f"*Time:*\n{payload.get('ts_iso', '')}"},
+    ]
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": title}},
+        {"type": "section", "fields": fields},
+    ]
+    blockers = detail.get("blockers") if isinstance(detail.get("blockers"), list) else []
+    warnings = detail.get("warnings") if isinstance(detail.get("warnings"), list) else []
+    if blockers or warnings:
+        reasons = [str(item) for item in list(blockers or warnings)[:5]]
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*Reasons:*\n" + "\n".join(reasons)},
+            }
+        )
+    return json.dumps(
+        {"text": str(payload.get("event_title") or title.replace("*", "")), "blocks": blocks},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _format_discord_runtime_alert(payload: dict[str, Any]) -> bytes:
+    severity = str(payload.get("severity") or "WARN").upper()
+    detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+    blockers = detail.get("blockers") if isinstance(detail.get("blockers"), list) else []
+    warnings = detail.get("warnings") if isinstance(detail.get("warnings"), list) else []
+    embed: dict[str, Any] = {
+        "title": str(payload.get("event_title") or "Runtime alert"),
+        "color": 15158332 if severity == "CRIT" or severity == "CRITICAL" else 15844367,
+        "fields": [
+            {"name": "Severity", "value": severity, "inline": True},
+            {"name": "Rule", "value": str(payload.get("rule_id") or "runtime_alert"), "inline": True},
+            {"name": "Source", "value": str(payload.get("source") or "runtime"), "inline": True},
+        ],
+        "timestamp": str(payload.get("ts_iso") or ""),
+    }
+    if blockers or warnings:
+        embed["fields"].append(
+            {
+                "name": "Reasons",
+                "value": "\n".join(str(item) for item in list(blockers or warnings)[:5]),
+                "inline": False,
+            }
+        )
+    return json.dumps({"embeds": [embed]}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _send_runtime_alert_email(payload: dict[str, Any]) -> None:
+    cfg = _notification_config()
+    detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+    _smtp_send_message(
+        smtp_host=str(cfg["smtp_host"]),
+        smtp_port=int(cfg["smtp_port"]),
+        from_addr=str(cfg["email_from"]),
+        to_addrs=str(cfg["email_to"]),
+        subject=(
+            f"[ALERT {payload.get('severity', 'WARN')}] "
+            f"{payload.get('event_title', 'Runtime alert')}"
+        ),
+        body=(
+            f"{payload.get('event_title', 'Runtime alert')}\n\n"
+            f"Source: {payload.get('source', 'runtime')}\n"
+            f"Time: {payload.get('ts_iso', '')}\n"
+            f"Severity: {payload.get('severity', 'WARN')}\n"
+            f"Rule: {payload.get('rule_id', 'runtime_alert')}\n"
+            f"Symbol: {payload.get('symbol', 'SYSTEM')}\n"
+            f"Detail: {json.dumps(detail, separators=(',', ':'), sort_keys=True, default=str)}\n"
+        ),
+        timeout_s=5.0,
+    )
+
+
+def _send_runtime_alert_webhook(payload: dict[str, Any]) -> None:
+    cfg = _notification_config()
+    webhook_url = str(cfg["webhook_url"] or "")
+    provider = _webhook_provider_name(webhook_url)
+    if provider == "slack":
+        data = _format_slack_runtime_alert(payload)
+    elif provider == "discord":
+        data = _format_discord_runtime_alert(payload)
+    else:
+        data = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str).encode("utf-8")
+    _post_webhook_bytes(
+        webhook_url=webhook_url,
+        data=data,
+        timeout_s=float(cfg["webhook_timeout_s"]),
+    )
+
+
+def send_runtime_alert_notification(
+    alert_payload: dict[str, Any] | None,
+    *,
+    actor: str = "system",
+    source: str = "runtime",
+) -> dict[str, Any]:
+    payload = _build_runtime_alert_notification_payload(alert_payload, actor=actor, source=source)
+    deliveries: list[dict[str, Any]] = []
+    ok = True
+    for channel in get_notification_channel_status():
+        if not bool(channel.get("enabled")):
+            continue
+        channel_name = str(channel.get("channel") or "").strip().lower()
+        try:
+            if channel_name == "email":
+                _send_runtime_alert_email(payload)
+            elif channel_name == "webhook":
+                _send_runtime_alert_webhook(payload)
+            else:
+                continue
+            deliveries.append({"channel": channel_name, "ok": True})
+        except Exception as e:
+            ok = False
+            error = f"{type(e).__name__}: {e}"
+            deliveries.append({"channel": channel_name, "ok": False, "error": error})
+            log_failure(
+                LOG,
+                event="runtime_alerts_notify_runtime_alert_delivery_failed",
+                code="RUNTIME_ALERTS_NOTIFY_RUNTIME_ALERT_DELIVERY_FAILED",
+                message="runtime_alerts_notify_runtime_alert_delivery_failed",
+                error=e,
+                level=logging.WARNING,
+                component="engine.runtime.alerts_notify",
+                persist=False,
+                extra={
+                    "channel": channel_name,
+                    "rule_id": str(payload.get("rule_id") or ""),
+                    "source": str(source or "runtime"),
+                },
+            )
+    return {
+        "ok": bool(ok),
+        "delivered": int(sum(1 for item in deliveries if item.get("ok"))),
+        "deliveries": deliveries,
+        "payload": payload,
+    }
+
+
 def get_runtime_health_notification_status() -> dict[str, Any] | None:
     init_db()
     con = None

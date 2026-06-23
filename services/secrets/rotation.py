@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import logging
+import sqlite3
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -95,6 +96,32 @@ def _record_rotation_row_failure(
     return failure
 
 
+def _is_optional_provider_accounts_query_error(exc: BaseException) -> bool:
+    if isinstance(exc, (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn)):
+        return True
+    if isinstance(exc, sqlite3.OperationalError):
+        message = str(exc).lower()
+        if "data_source_provider_accounts" not in message:
+            return False
+        return "no such table" in message or "no such column" in message
+    return False
+
+
+def _record_provider_accounts_scan_skipped(*, exc: BaseException, phase: str) -> None:
+    error_class = type(exc).__name__
+    emit_counter(
+        "credential_rotation_provider_accounts_scan_skipped",
+        1,
+        component="services.secrets.rotation",
+        extra_tags={"phase": str(phase), "error_class": error_class},
+    )
+    LOG.warning(
+        "credential_rotation_provider_accounts_scan_skipped phase=%s error_class=%s",
+        str(phase),
+        error_class,
+    )
+
+
 def re_encrypt_blob(blob: str, *, old_key_name: str, new_key_name: str) -> str:
     payload = decrypt_credentials(str(blob or ""), key_name=str(old_key_name))
     return encrypt_credentials(payload, key_name=str(new_key_name))
@@ -166,28 +193,54 @@ def re_encrypt_data_sources(
     delete_old_key: bool = True,
     storage_module: Any | None = None,
 ) -> dict[str, int]:
-    """Re-encrypt every populated ``data_sources.credentials_enc`` row.
+    """Re-encrypt every populated data-source credential row.
 
-    Rows whose ``key_version`` does not match ``old_key_name`` are left in
-    place so an interrupted rotation can be retried safely.
+    This covers both per-source ``data_sources.credentials_enc`` blobs and
+    shared ``data_source_provider_accounts.credentials_enc`` blobs. Rows whose
+    ``key_version`` does not match ``old_key_name`` are left in place so an
+    interrupted rotation can be retried safely.
     """
     if storage_module is None:
         from engine.runtime import storage as storage_module
 
     with storage_module.connect_ro_direct() as con:
-        rows = con.execute(
+        rows = [
+            ("data_sources", row)
+            for row in (con.execute(
             """
             SELECT id, source_key, credentials_enc, key_version
             FROM data_sources
             ORDER BY id
             """
-        ).fetchall() or []
+            ).fetchall() or [])
+        ]
+        try:
+            rows.extend(
+                (
+                    "data_source_provider_accounts",
+                    row,
+                )
+                for row in (
+                    con.execute(
+                        """
+                        SELECT id, account_key AS source_key, credentials_enc, key_version
+                        FROM data_source_provider_accounts
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    or []
+                )
+            )
+        except Exception as exc:
+            if not _is_optional_provider_accounts_query_error(exc):
+                raise
+            _record_provider_accounts_scan_skipped(exc=exc, phase="rotate_scan")
 
     target_key_version = str(final_key_version or new_key_name)
-    updates: list[tuple[str, str, int]] = []
+    updates: list[tuple[str, str, str, int]] = []
     failures: list[dict[str, Any]] = []
     skipped = 0
-    for row in rows:
+    for table_name, row in rows:
         row_id = int(_row_value(row, "id", 0, 0) or 0)
         blob = str(_row_value(row, "credentials_enc", 2, "") or "")
         key_version = str(_row_value(row, "key_version", 3, old_key_name) or old_key_name)
@@ -199,22 +252,32 @@ def re_encrypt_data_sources(
         except (InvalidTag, DecryptionError) as exc:
             failures.append(_record_rotation_row_failure(row_id=row_id, exc=exc, phase="decrypt"))
             continue
-        updates.append((encrypted, target_key_version, row_id))
+        updates.append((str(table_name), encrypted, target_key_version, row_id))
 
     if failures:
         raise SecretRotationPartialFailure(failures)
 
     def _write(con) -> None:
-        for encrypted, key_version, row_id in updates:
+        for table_name, encrypted, key_version, row_id in updates:
             try:
-                con.execute(
-                    """
-                    UPDATE data_sources
-                       SET credentials_enc = ?, key_version = ?
-                     WHERE id = ?
-                    """,
-                    (encrypted, key_version, int(row_id)),
-                )
+                if table_name == "data_source_provider_accounts":
+                    con.execute(
+                        """
+                        UPDATE data_source_provider_accounts
+                           SET credentials_enc = ?, key_version = ?
+                         WHERE id = ?
+                        """,
+                        (encrypted, key_version, int(row_id)),
+                    )
+                else:
+                    con.execute(
+                        """
+                        UPDATE data_sources
+                           SET credentials_enc = ?, key_version = ?
+                         WHERE id = ?
+                        """,
+                        (encrypted, key_version, int(row_id)),
+                    )
             except psycopg.Error as exc:
                 failure = _record_rotation_row_failure(row_id=row_id, exc=exc, phase="write")
                 raise SecretRotationPartialFailure([failure]) from exc
@@ -257,18 +320,43 @@ def verify_data_sources_key(
         from engine.runtime import storage as storage_module
 
     with storage_module.connect_ro_direct() as con:
-        rows = con.execute(
+        rows = [
+            ("data_sources", row)
+            for row in (con.execute(
             """
             SELECT credentials_enc, key_version
             FROM data_sources
             WHERE COALESCE(credentials_enc, '') <> ''
             ORDER BY id
             """
-        ).fetchall() or []
+            ).fetchall() or [])
+        ]
+        try:
+            rows.extend(
+                (
+                    "data_source_provider_accounts",
+                    row,
+                )
+                for row in (
+                    con.execute(
+                        """
+                        SELECT credentials_enc, key_version
+                        FROM data_source_provider_accounts
+                        WHERE COALESCE(credentials_enc, '') <> ''
+                        ORDER BY id
+                        """
+                    ).fetchall()
+                    or []
+                )
+            )
+        except Exception as exc:
+            if not _is_optional_provider_accounts_query_error(exc):
+                raise
+            _record_provider_accounts_scan_skipped(exc=exc, phase="verify_scan")
 
     key_name = str(decrypt_key_name or new_key_name)
     verified = 0
-    for row in rows:
+    for _table_name, row in rows:
         blob = str(_row_value(row, "credentials_enc", 0, "") or "")
         key_version = str(_row_value(row, "key_version", 1, "") or "")
         if key_version != str(new_key_name):

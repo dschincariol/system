@@ -21,7 +21,7 @@ PROVIDER = {
     "priority": 20,
     "enabled": str(os.environ.get("IBKR_ENABLED", "")).strip().lower() in ("1", "true", "yes", "on"),
     "supports": {
-        "asset_classes": ["equities"],
+        "asset_classes": ["equities", "fx"],
         "transport": "gateway",
     },
 }

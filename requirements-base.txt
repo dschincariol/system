@@ -12,6 +12,7 @@ lightgbm==4.5.0
 msgpack==1.1.2
 numpy==2.1.2
 openai==2.36.0
+orjson==3.11.9
 optuna==4.8.0
 pandas==3.0.3
 praw==7.8.1
@@ -21,8 +22,6 @@ psycopg-pool==3.3.1
 pyarrow==19.0.1
 pysr==1.5.10
 python-dotenv==1.0.1
-pytest==9.0.3
-pytest-timeout==2.4.0
 redis==5.3.1
 requests==2.32.3
 scikit-learn==1.5.2

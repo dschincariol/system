@@ -50,6 +50,7 @@ class GBMRegressorTests(unittest.TestCase):
             key: os.environ.get(key)
             for key in (
                 "DB_PATH",
+                "TS_STORAGE_BACKEND",
                 "MODEL_CONFIG_JSON",
                 "USE_GBM_REGRESSOR",
                 "USE_EMBED_REGRESSOR",
@@ -88,6 +89,7 @@ class GBMRegressorTests(unittest.TestCase):
 
     def _configure_env(self, *, use_gbm: bool) -> None:
         os.environ["DB_PATH"] = str(self.db_path)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         os.environ["MODEL_CONFIG_JSON"] = json.dumps(
             [
                 {
@@ -114,6 +116,8 @@ class GBMRegressorTests(unittest.TestCase):
         os.environ["TS_ARTIFACTS_ROOT"] = str(Path(self.tmp.name) / "artifacts")
 
     def _reload_stack(self):
+        _reload_modules("engine.runtime.storage")
+        _reload_modules("engine.runtime.runtime_meta", "engine.strategy.promotion_audit")
         return _reload_modules(
             "engine.runtime.db_guard",
             "engine.runtime.storage",

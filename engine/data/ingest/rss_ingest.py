@@ -10,6 +10,7 @@ import hashlib
 import random
 import logging
 import calendar
+import os
 from typing import List, Dict, Any, Optional, Tuple
 import json
 import re
@@ -28,6 +29,8 @@ from urllib3.util.retry import Retry
 
 LOG = get_logger("data.ingest.rss_ingest")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+RSS_HTTP_UA = os.environ.get("RSS_HTTP_UA", "trading-system/1.0 rss-feed")
+RSS_HTTP_RETRY_TOTAL = max(0, int(os.environ.get("RSS_HTTP_RETRY_TOTAL", "1")))
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -141,10 +144,10 @@ def _make_session() -> requests.Session:
     # here instead of being reimplemented by each caller/source definition.
     sess = requests.Session()
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
+        total=RSS_HTTP_RETRY_TOTAL,
+        connect=RSS_HTTP_RETRY_TOTAL,
+        read=RSS_HTTP_RETRY_TOTAL,
+        status=RSS_HTTP_RETRY_TOTAL,
         backoff_factor=0.6,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "HEAD"]),
@@ -160,10 +163,34 @@ def _make_session() -> requests.Session:
 _SESSION = _make_session()
 
 
-def fetch_rss(url: str, timeout_s: int = 15, max_attempts: int = 3) -> Any:
+def _classify_rss_exception(error: BaseException) -> Dict[str, Any]:
+    response = getattr(error, "response", None)
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code == 429:
+        retry_after = 60.0
+        try:
+            retry_after = max(1.0, float((getattr(response, "headers", {}) or {}).get("Retry-After") or 60.0))
+        except Exception:
+            retry_after = 60.0
+        return {"classification": "rate_limited", "status_code": status_code, "retry_after_s": retry_after}
+    if status_code == 401:
+        return {"classification": "wrong_credentials", "status_code": status_code}
+    if status_code == 403:
+        return {"classification": "entitlement_missing", "status_code": status_code}
+    if status_code == 503:
+        return {"classification": "provider_unreachable", "status_code": status_code, "retry_after_s": 300.0}
+    if status_code >= 400:
+        return {"classification": "provider_unreachable", "status_code": status_code}
+    return {"classification": "provider_unreachable", "status_code": 0, "error_type": type(error).__name__}
+
+
+def fetch_rss(url: str, timeout_s: int = 15, max_attempts: int = 2) -> Any:
     if feedparser is None:
         raise RuntimeError(f"feedparser_unavailable:{_FEEDPARSER_IMPORT_ERROR}")
-    headers = {"User-Agent": "market-impact-dev/1.0 (+rss)"}
+    headers = {
+        "User-Agent": RSS_HTTP_UA,
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    }
 
     last_err: Optional[Exception] = None
     for attempt in range(1, int(max_attempts) + 1):
@@ -183,7 +210,9 @@ def fetch_rss(url: str, timeout_s: int = 15, max_attempts: int = 3) -> Any:
 def ingest_rss_sources(
     sources: List[Dict[str, Any]],
     max_items_per_source: int = 25,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    *,
+    include_status: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]] | Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Returns (items, errors)
 
@@ -195,18 +224,22 @@ def ingest_rss_sources(
     """
     out: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
+    statuses: List[Dict[str, Any]] = []
     now_ms = int(time.time() * 1000)
 
     for src in sources or []:
         name = _clean(src.get("name")) or "rss"
         url = _clean(src.get("url"))
         if not url:
+            row = {"source_name": name, "url": url, "status": "fail", "classification": "missing_url", "items": 0, "error": "missing_url"}
             errors.append({"source_name": name, "url": url, "error": "missing_url"})
+            statuses.append(row)
             continue
 
         try:
             feed = fetch_rss(url)
         except Exception as e:
+            classified = _classify_rss_exception(e)
             _warn_nonfatal(
                 "RSS_INGEST_FETCH_FAILED",
                 e,
@@ -214,10 +247,37 @@ def ingest_rss_sources(
                 source_name=name,
                 url=url,
             )
-            errors.append({"source_name": name, "url": url, "error": str(e)})
+            errors.append({"source_name": name, "url": url, "error": str(e), **classified})
+            statuses.append(
+                {
+                    "source_name": name,
+                    "url": url,
+                    "status": "degraded" if classified.get("classification") in {"rate_limited", "provider_unreachable"} else "fail",
+                    "classification": str(classified.get("classification") or "provider_unreachable"),
+                    "items": 0,
+                    "error": str(e),
+                    **classified,
+                }
+            )
             continue
 
         entries = list(feed.entries or [])[:max_items_per_source]
+        bozo = bool(getattr(feed, "bozo", False) or (isinstance(feed, dict) and feed.get("bozo")))
+        if not entries:
+            classification = "malformed_payload" if bozo else "empty_payload"
+            row = {
+                "source_name": name,
+                "url": url,
+                "status": "fail" if bozo else "degraded",
+                "classification": classification,
+                "items": 0,
+                "error": str(getattr(feed, "bozo_exception", "") or classification)[:240] if bozo else "",
+            }
+            statuses.append(row)
+            if bozo:
+                errors.append({"source_name": name, "url": url, "error": row["error"], "classification": classification})
+            continue
+        source_count_before = len(out)
         for ent in entries:
             title = _clean(getattr(ent, "title", "") or ent.get("title"))
             link = _clean(getattr(ent, "link", "") or ent.get("link"))
@@ -282,6 +342,19 @@ def ingest_rss_sources(
                     "meta_json": json.dumps(meta, separators=(",", ":"), sort_keys=True),
                 }
             )
+        source_items = int(len(out) - source_count_before)
+        statuses.append(
+            {
+                "source_name": name,
+                "url": url,
+                "status": "degraded" if bozo else "pass",
+                "classification": "malformed_payload" if bozo else "success",
+                "items": source_items,
+                "error": str(getattr(feed, "bozo_exception", "") or "")[:240] if bozo else "",
+            }
+        )
 
     out.sort(key=lambda x: x["ts_ms"], reverse=True)
+    if include_status:
+        return out, errors, statuses
     return out, errors

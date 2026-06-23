@@ -61,6 +61,13 @@ def test_rewrites_between_placeholders():
     assert to_pg_params(sql) == "SELECT * FROM predictions WHERE ts_ms BETWEEN %s AND %s ORDER BY ts_ms"
 
 
+def test_rewrites_like_placeholders_without_confusing_json_operator():
+    sql = "SELECT * FROM execution_policy_audit WHERE policy_json LIKE ? OR decision_json ILIKE ?"
+    assert to_pg_params(sql) == (
+        "SELECT * FROM execution_policy_audit WHERE policy_json LIKE %s OR decision_json ILIKE %s"
+    )
+
+
 def test_rewrites_limit_offset_placeholders():
     sql = "SELECT * FROM event_log ORDER BY id LIMIT ? OFFSET ?"
     assert to_pg_params(sql) == "SELECT * FROM event_log ORDER BY id LIMIT %s OFFSET %s"

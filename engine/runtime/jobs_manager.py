@@ -12,7 +12,7 @@ import time
 import threading
 import subprocess
 from collections import deque
-from typing import Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, Optional
 
 from engine.runtime.job_registry import (
     ALLOWED_JOBS,
@@ -1189,6 +1189,14 @@ class JobManager:
             env["ENGINE_LAUNCHED_BY_SUPERVISOR"] = "1"
             env["ENGINE_SUPERVISED"] = "1"
             env["ENGINE_JOB_NAME"] = str(job.name)
+            try:
+                profile = self._resource_profile(job)
+                env["ENGINE_PROCESS_ROLE"] = str(profile.get("resource_class") or "background")
+                from engine.runtime.thread_policy import apply_cpu_thread_policy_to_env
+
+                apply_cpu_thread_policy_to_env(env, role=env["ENGINE_PROCESS_ROLE"])
+            except Exception as env_err:
+                _warn_nonfatal("JOBS_MANAGER_THREAD_POLICY_FAILED", env_err, job=str(job.name))
 
             # ensure engine imports work in subprocess
             existing_pp = env.get("PYTHONPATH", "")
@@ -1609,13 +1617,119 @@ class JobManager:
         self._publish_resource_scheduler_state()
         return {"ok": True, "status": "terminate_sent"}
 
-    def stop_all(self) -> Dict:
+    def stop_all(
+        self,
+        *,
+        drain_before_kill: Optional[Callable[..., Dict[str, Any]]] = None,
+        drain_deadline_s: Optional[float] = None,
+    ) -> Dict:
         stopped = []
         errors = []
         self._stop_event.set()
 
         with self._lock:
             jobs = list(self._jobs.values())
+
+        if drain_before_kill is not None:
+            running: list[tuple[JobState, subprocess.Popen]] = []
+            for job in jobs:
+                try:
+                    with job._lock:
+                        job.stop_requested = True
+                        job.next_restart_ms = 0
+                        p = job.proc
+                    if not p or p.poll() is not None:
+                        for lock_name in _runtime_lock_candidates(job.name):
+                            try:
+                                _release_lock(lock_name)
+                            except Exception as release_err:
+                                _warn_nonfatal(
+                                    "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_FAILED",
+                                    release_err,
+                                    job=str(job.name),
+                                    lock_name=str(lock_name),
+                                    scope="stop_all_not_running",
+                                )
+                        _write_job_history(job.name, "stop", "not_running", None)
+                        stopped.append(job.name)
+                        continue
+
+                    with job._lock:
+                        job.append_log("[server] stopping...")
+                    _write_job_history(job.name, "stop", "terminate()", None)
+                    p.terminate()
+                    running.append((job, p))
+                    stopped.append(job.name)
+                except Exception as e:
+                    errors.append(f"{job.name}: terminate failed: {e}")
+                    _warn_nonfatal("JOBS_MANAGER_STOP_ALL_TERMINATE_FAILED", e, job=str(job.name))
+
+            drain_snapshot: Dict[str, Any] = {}
+            deadline = time.monotonic() + max(0.0, float(drain_deadline_s or 0.0))
+            try:
+                drain_snapshot = dict(
+                    drain_before_kill(
+                        reason="jobs_manager_stop_all_pre_sigkill",
+                        deadline_s=max(0.0, float(deadline) - time.monotonic()),
+                    )
+                    or {}
+                )
+            except Exception as e:
+                errors.append(f"drain_before_kill: {e}")
+                _warn_nonfatal("JOBS_MANAGER_STOP_ALL_DRAIN_BEFORE_KILL_FAILED", e)
+
+            for job, p in running:
+                try:
+                    if p.poll() is None:
+                        p.kill()
+                        try:
+                            p.wait(timeout=5)
+                        except Exception as kill_wait_err:
+                            _warn_nonfatal("JOBS_MANAGER_STOP_ALL_KILL_WAIT_FAILED", kill_wait_err, job=str(job.name))
+                        with job._lock:
+                            job.append_log("[server] hard-kill (kill())")
+                            _write_job_history(job.name, "stop_hard_kill", "kill()", None)
+                    with job._lock:
+                        job.exit_code = p.poll()
+                        job.exited_at_ms = int(time.time() * 1000)
+                except Exception as e:
+                    errors.append(f"{job.name}: kill failed: {e}")
+                    _warn_nonfatal("JOBS_MANAGER_STOP_ALL_KILL_FAILED", e, job=str(job.name))
+
+            for job in jobs:
+                for lock_name in _runtime_lock_candidates(job.name):
+                    try:
+                        _release_lock(lock_name)
+                    except Exception as release_err:
+                        _warn_nonfatal(
+                            "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_FAILED",
+                            release_err,
+                            job=str(job.name),
+                            lock_name=str(lock_name),
+                            scope="stop_all_completed",
+                        )
+                emit_counter(
+                    "job_stop",
+                    1,
+                    component="engine.runtime.jobs_manager",
+                    job=job.name,
+                )
+                trace_event(
+                    "job_stop",
+                    component="engine.runtime.jobs_manager",
+                    entity_type="job",
+                    entity_id=str(job.name),
+                    payload={"status": "terminate_sent"},
+                    job=job.name,
+                )
+
+            if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+                try:
+                    self._watchdog_thread.join(timeout=max(1.0, float(DAEMON_WATCHDOG_PERIOD_S) * 2.0))
+                except Exception as e:
+                    errors.append(f"watchdog_join: {e}")
+
+            return {"ok": len(errors) == 0, "stopped": stopped, "errors": errors, "drain": drain_snapshot}
 
         for job in jobs:
             try:

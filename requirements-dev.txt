@@ -1,4 +1,6 @@
--r requirements.txt
-coverage[toml]==7.14.2
-pytest-cov==7.1.0
-ruff
+# Development/test install manifest for CI and local validation.
+#
+# Keep direct dev/test tools in requirements-dev.in and regenerate
+# requirements-dev.lock.txt after dependency changes.
+-c requirements-dev.lock.txt
+-r requirements-dev.in

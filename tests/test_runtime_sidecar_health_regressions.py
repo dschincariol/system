@@ -55,7 +55,7 @@ class RuntimeSidecarHealthRegressionTests(unittest.TestCase):
         self.assertTrue(bool(degraded["metrics"]["backpressure_active"]))
         self.assertGreater(int(degraded["metrics"]["last_backpressure_ts_ms"]), 0)
 
-        client._note_flush_success("price_data", 4)
+        client._note_flush_success("price_data", 4, write_path="copy_staging")
         recovered = client.get_snapshot()
 
         self.assertTrue(bool(recovered["ok"]))

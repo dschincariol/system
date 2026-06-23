@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
+
+import pytest
 
 
 class _FakeCuda:
@@ -94,8 +97,15 @@ def test_cpu_first_defaults_and_snapshot(monkeypatch) -> None:
         "TORCH_CPU_THREADS",
         "TORCH_INTEROP_THREADS",
         "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "ENGINE_SUPERVISED_PROCESS_COUNT",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("RUNTIME_CPUS", "12")
+    monkeypatch.setenv("START_INGESTION_WITH_SERVER", "0")
+    monkeypatch.setenv("TRADING_CPU_THREAD_POLICY", "auto")
 
     from engine.runtime.hardware import apply_cpu_first_runtime_defaults, runtime_hardware_snapshot
 
@@ -105,8 +115,10 @@ def test_cpu_first_defaults_and_snapshot(monkeypatch) -> None:
     assert snapshot["dependency_profile"] == "cpu"
     assert snapshot["devices"]["TORCH_DEVICE"]["resolved"] == "cpu"
     assert snapshot["devices"]["EMBED_DEVICE"]["resolved"] == "cpu"
-    assert snapshot["threads"]["cpu_threads"] == 8
-    assert snapshot["threads"]["interop_threads"] == 4
+    assert snapshot["threads"]["cpu_threads"] == 4
+    assert snapshot["threads"]["interop_threads"] == 2
+    assert snapshot["thread_policy"]["role"] == "runtime"
+    assert snapshot["thread_policy"]["supervised_process_count"] == 1
     assert snapshot["nvidia_telemetry_enabled"] is False
 
 
@@ -163,24 +175,27 @@ def test_amd_rocm_runtime_profile_requires_matching_dependency_profile(monkeypat
     assert snapshot["accelerator_profile_error"] == "amd_rocm_runtime_requires_amd_rocm_dependency_profile"
 
 
-def test_amd_rocm_runtime_profile_is_valid_with_matching_dependency_profile(monkeypatch) -> None:
+def test_amd_rocm_dependency_profile_without_rocm_torch_raises_hard(monkeypatch) -> None:
     monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
     monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime import acceleration
     from engine.runtime.hardware import runtime_hardware_snapshot
 
-    snapshot = runtime_hardware_snapshot(_FakeTorch(available=False))
+    expected = "amd_rocm_python_runtime_unsupported" if sys.version_info[:2] < (3, 12) else "amd_rocm_torch_not_hip_build"
+    with pytest.raises(acceleration.AccelerationProfileError) as excinfo:
+        runtime_hardware_snapshot(_FakeTorch(available=False))
 
-    assert snapshot["amd_profile_selected"] is True
-    assert snapshot["amd_dependency_profile_enabled"] is True
-    assert snapshot["accelerator_profile_error"] == ""
+    assert expected in str(excinfo.value)
 
 
 def test_amd_rocm_auto_selects_hip_device_when_profile_is_enabled(monkeypatch) -> None:
     monkeypatch.setenv("TORCH_DEVICE", "auto")
     monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
     monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime import acceleration
     from engine.runtime.hardware import resolve_torch_device, runtime_hardware_snapshot
 
+    monkeypatch.setattr(acceleration, "amd_rocm_python_marker_error", lambda **_: "")
     torch = _FakeTorch(available=True, hip="7.2.4", count=1)
     resolution = resolve_torch_device(torch)
     snapshot = runtime_hardware_snapshot(torch)
@@ -197,18 +212,53 @@ def test_amd_rocm_auto_selects_hip_device_when_profile_is_enabled(monkeypatch) -
     assert snapshot["amd_rocm_acceleration_profile_enabled"] is True
 
 
-def test_explicit_rocm_device_uses_cpu_fallback_when_no_hip_device_is_visible(monkeypatch) -> None:
+def test_explicit_rocm_device_raises_when_no_hip_device_is_visible(monkeypatch) -> None:
     monkeypatch.setenv("TORCH_DEVICE", "rocm")
     monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
     monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime import acceleration
     from engine.runtime.hardware import resolve_torch_device
 
-    resolution = resolve_torch_device(_FakeTorch(available=True, hip="7.2.4", count=0))
+    monkeypatch.setattr(acceleration, "amd_rocm_python_marker_error", lambda **_: "")
+    with pytest.raises(acceleration.AccelerationProfileError) as excinfo:
+        resolve_torch_device(_FakeTorch(available=True, hip="7.2.4", count=0))
 
-    assert resolution.resolved == "cpu"
-    assert resolution.accelerator_enabled is False
-    assert resolution.disabled_accelerator_reason == "torch_cuda_device_count_zero"
-    assert not resolution.disabled_accelerator_reason.startswith("unsupported_device")
+    assert "amd_rocm_torch_device_count_zero" in str(excinfo.value)
+
+
+def test_amd_rocm_dependency_profile_under_python_lt_312_raises_hard(monkeypatch) -> None:
+    if sys.version_info[:2] >= (3, 12):
+        pytest.skip("Python <3.12 marker check is exercised by the 3.11 host/runtime path.")
+    monkeypatch.setenv("TORCH_DEVICE", "auto")
+    monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
+    monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime import acceleration
+    from engine.runtime.hardware import runtime_hardware_snapshot
+
+    with pytest.raises(acceleration.AccelerationProfileError) as excinfo:
+        runtime_hardware_snapshot(_FakeTorch(available=True, hip="7.2.4", count=1))
+
+    assert "amd_rocm_python_runtime_unsupported" in str(excinfo.value)
+    assert "required_python=>=3.12" in str(excinfo.value)
+
+
+@pytest.mark.requires_rocm
+def test_py312_rocm_torch_runtime_selects_hip_device(monkeypatch) -> None:
+    if sys.version_info[:2] < (3, 12):
+        pytest.skip("requires Python 3.12 ROCm runtime image")
+    torch = pytest.importorskip("torch")
+    monkeypatch.setenv("TORCH_DEVICE", "auto")
+    monkeypatch.setenv("RUNTIME_HARDWARE_PROFILE", "amd-rocm")
+    monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    from engine.runtime.hardware import resolve_torch_device, torch_hip_version
+
+    assert torch_hip_version(torch)
+    resolution = resolve_torch_device(torch)
+
+    assert resolution.resolved == "cuda"
+    assert resolution.accelerator_enabled is True
+    assert resolution.rocm_available is True
+    assert resolution.torch_cuda_device_count > 0
 
 
 def test_explicit_hip_device_requires_amd_rocm_dependency_profile(monkeypatch) -> None:
@@ -240,5 +290,5 @@ def test_runtime_entrypoints_apply_and_log_hardware_profile() -> None:
     repo = Path(__file__).resolve().parents[1]
     for rel in ("start_system.py", "start_ingestion.py"):
         text = (repo / rel).read_text(encoding="utf-8")
-        assert "apply_cpu_first_runtime_defaults()" in text
+        assert "apply_cpu_first_runtime_defaults(" in text
         assert "log_runtime_hardware_diagnostics" in text

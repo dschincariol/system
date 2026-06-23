@@ -69,7 +69,10 @@ _OWNED_LIVE_TABLE_OWNER_MODULES = {
         "engine/runtime/jobs/repair_schema.py",
     },
     "price_quotes": {"engine/runtime/storage_live_ingestion_schema.py"},
-    "price_quotes_raw": {"engine/runtime/storage_live_ingestion_schema.py"},
+    "price_quotes_raw": {
+        "engine/runtime/storage_live_ingestion_schema.py",
+        "engine/runtime/schema/migrations/0067_price_quotes_raw_event_key_conflict.py",
+    },
     "price_provider_health": {"engine/runtime/storage_live_ingestion_schema.py"},
     "ingestion_pipeline_health": {"engine/runtime/storage_live_ingestion_schema.py"},
     "price_feed_lock": {"engine/runtime/storage_live_ingestion_schema.py"},
@@ -201,7 +204,7 @@ _CRITICAL_TABLE_SPECS = {
         "last_update_ts_ms": {"type": "INTEGER", "pk": 0},
     },
     "price_quotes_raw": {
-        "ts_ms": {"type": "INTEGER", "pk": 0, "notnull": True},
+        "ts_ms": {"type": "INTEGER", "pk": 4, "notnull": True},
         "symbol": {"type": "TEXT", "pk": 1, "notnull": True},
         "provider": {"type": "TEXT", "pk": 2, "notnull": True},
         "event_key": {"type": "TEXT", "pk": 3, "notnull": True},
@@ -689,6 +692,7 @@ def _assert_column_contract(db_path: Path, table_name: str, expected_columns: di
 def storage_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db_path = tmp_path / "storage_contracts.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TS_STORAGE_BACKEND", "sqlite")
     monkeypatch.setenv("TIMESCALE_ENABLED", "0")
     monkeypatch.setenv("SQLITE_LIVENESS_DB_ENABLED", "0")
     monkeypatch.setenv("SQLITE_LIVENESS_QUEUE_ENABLED", "0")
@@ -1185,12 +1189,22 @@ def test_init_db_rebuilds_legacy_price_quotes_raw_schema(storage_runtime) -> Non
     with sqlite3.connect(str(db_path)) as con:
         row = con.execute(
             """
-            SELECT symbol, provider, event_type, event_ts_ms, trade_ts_ms, quote_ts_ms, ingest_ts_ms, source
+            SELECT symbol, provider, event_key, event_type, event_ts_ms, trade_ts_ms, quote_ts_ms, ingest_ts_ms, source
             FROM price_quotes_raw
             """
         ).fetchone()
 
-    assert row == ("MSFT", "polygon", "legacy", 2001, 2001, 2001, 2001, "polygon")
+    assert row == (
+        "MSFT",
+        "polygon",
+        "legacy:MSFT:polygon:legacy:2001:2001:2001:2001",
+        "legacy",
+        2001,
+        2001,
+        2001,
+        2001,
+        "polygon",
+    )
 
 
 def test_init_db_rebuilds_price_quotes_raw_pk_drift(storage_runtime) -> None:
@@ -1216,7 +1230,7 @@ def test_init_db_rebuilds_price_quotes_raw_pk_drift(storage_runtime) -> None:
                 quote_ts_ms INTEGER,
                 ingest_ts_ms INTEGER,
                 source TEXT,
-                PRIMARY KEY(symbol, provider, event_key, ts_ms)
+                PRIMARY KEY(symbol, provider, event_key)
             )
             """
         )
@@ -1236,7 +1250,7 @@ def test_init_db_rebuilds_price_quotes_raw_pk_drift(storage_runtime) -> None:
     assert actual_columns["symbol"]["pk"] == 1
     assert actual_columns["provider"]["pk"] == 2
     assert actual_columns["event_key"]["pk"] == 3
-    assert actual_columns["ts_ms"]["pk"] == 0
+    assert actual_columns["ts_ms"]["pk"] == 4
 
     with sqlite3.connect(str(db_path)) as con:
         row = con.execute(
@@ -1476,9 +1490,9 @@ def test_db_validation_snapshot_public_shape_golden(initialized_storage) -> None
         "schema_version_ok": True,
         "schema_status": "applied",
         "quick_check": "skipped",
-        "required_table_count": 39,
-        "required_index_count": 81,
-        "have_table_count": 128,
+        "required_table_count": 40,
+        "required_index_count": 82,
+        "have_table_count": 131,
         "owned_tables": [
             "prices",
             "price_quotes",

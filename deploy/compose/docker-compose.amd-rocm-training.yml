@@ -1,0 +1,78 @@
+# Opt-in ROCm TRAINING / BATCH overlay for AMD Strix Halo / gfx1151 hosts.
+#
+# This is a one-shot, non-arming batch container for OFFLINE work only:
+# model training, batch inference, and the CPU-vs-ROCm benchmark. It is
+# deliberately separate from the live runtime overlay
+# (docker-compose.amd-rocm.yml) so the latency-critical trading loop stays
+# CPU-first by default and is never coupled to a still-maturing gfx1151 GPU
+# stack.
+#
+# It does NOT start start_system.py, does NOT route to a broker, mounts no
+# secrets, and has profiles:[training] so it never starts with the normal
+# stack. Bring it up explicitly with `--profile training run`.
+#
+# Prereqs: working /dev/kfd + /dev/dri device nodes and render/video group
+# access on the host (verify with tools/validate_rocm_acceleration.py).
+#
+# Usage (defaults to the benchmark; prints hard CPU-vs-ROCm numbers):
+#
+#   export TRADING_RENDER_GID="$(getent group render | cut -d: -f3)"
+#   export TRADING_VIDEO_GID="$(getent group video | cut -d: -f3)"
+#   docker compose \
+#     --env-file deploy/compose/.env \
+#     -f deploy/compose/docker-compose.stack.yml \
+#     -f deploy/compose/docker-compose.amd-rocm-training.yml \
+#     --profile training run --rm trainer
+#
+#   # Run a real training job (production PatchTST/iTransformer .fit() path on
+#   # the GPU) instead of the benchmark:
+#   docker compose ... --profile training run --rm trainer \
+#     python tools/train_torch_models_gpu.py --require-gpu --epochs 30 --json
+#
+# Note: `run` reuses the runtime `build:` definition. Build it once with the
+# ROCm base image (see docs/ROCM_ACCELERATION.md) before running.
+
+services:
+  trainer:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.runtime
+      args:
+        PYTHON_RUNTIME_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1
+        TRADING_DEPENDENCY_PROFILE: amd-rocm
+        TRADING_REQUIREMENTS_FILE: requirements-amd-rocm.txt
+    image: ${APP_TRAINER_IMAGE:-trading-trainer-rocm:local}
+    container_name: trading-trainer-rocm
+    profiles: ["training"]
+    restart: "no"
+    environment:
+      # Non-arming batch role. No broker, no supervised live loop.
+      ENGINE_SUPERVISED: "0"
+      TRADING_ROLE: batch-training
+      TRADING_DEPENDENCY_PROFILE: amd-rocm
+      RUNTIME_HARDWARE_PROFILE: amd-rocm
+      TRADING_ACCELERATION_PROFILE: amd-rocm
+      TORCH_DEVICE: auto
+      PATCHTST_USE_CUDA: "1"
+      # Generous CPU threading for the CPU baseline arm of the benchmark.
+      TORCH_CPU_THREADS: ${TRAINER_CPU_THREADS:-16}
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+    group_add:
+      - "${TRADING_RENDER_GID:-991}"
+      - "${TRADING_VIDEO_GID:-44}"
+    # Persist trained artifacts and the HuggingFace cache (FinBERT weights)
+    # so repeated batch runs do not re-download.
+    volumes:
+      - trainer_artifacts:/app/training_datasets
+      - trainer_hf_cache:/root/.cache/huggingface
+    command:
+      - python
+      - tools/benchmark_model_acceleration.py
+      - --require-gpu
+      - --json
+
+volumes:
+  trainer_artifacts:
+  trainer_hf_cache:

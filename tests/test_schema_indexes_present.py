@@ -54,7 +54,7 @@ def test_brin_and_symbol_time_indexes_exist() -> None:
         for table_name, classification in _existing_classified_hypertables(conn).items():
             brin_name = index_migration.brin_index_name(table_name, classification.time_column)
             assert brin_name in indexes, f"{table_name} missing BRIN index {brin_name}"
-            assert "USING brin" in indexes[brin_name].lower()
+            assert "using brin" in indexes[brin_name].lower()
             if _column_exists(conn, table_name, "symbol"):
                 symbol_name = index_migration.symbol_time_index_name(table_name, classification.time_column)
                 assert symbol_name in indexes, f"{table_name} missing symbol/time index {symbol_name}"
@@ -70,7 +70,7 @@ def test_jsonb_gin_indexes_exist_for_hypertables() -> None:
             for column_name in _jsonb_columns(conn, table_name):
                 index_name = index_migration.jsonb_gin_index_name(table_name, column_name)
                 assert index_name in indexes, f"{table_name}.{column_name} missing GIN index"
-                assert "USING gin" in indexes[index_name].lower()
+                assert "using gin" in indexes[index_name].lower()
 
 
 def test_targeted_performance_indexes_exist() -> None:

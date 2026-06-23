@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import os
+import platform
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -30,10 +32,12 @@ def _requirement_names(path: Path, seen: set[Path] | None = None) -> set[str]:
     names: set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("--"):
+        if not line or line.startswith("#"):
             continue
         if line.startswith("-r "):
             names.update(_requirement_names((path.parent / line.split(maxsplit=1)[1]).resolve(), seen))
+            continue
+        if line.startswith("-"):
             continue
         name = line.split(";", 1)[0].split(" @ ", 1)[0].split("[", 1)[0]
         for marker in ("==", "~=", ">=", "<=", ">", "<", "==="):
@@ -46,10 +50,14 @@ def _requirement_lines(path: Path) -> set[str]:
     lines: set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("--") or line.startswith("-r "):
+        if not line or line.startswith("#") or line.startswith("-"):
             continue
         lines.add(line)
     return lines
+
+
+def _rocm_python_markers_supported() -> bool:
+    return sys.version_info[:2] >= (3, 12) and platform.system() == "Linux"
 
 
 def test_cpu_default_requirements_exclude_nvidia_only_packages() -> None:
@@ -95,7 +103,7 @@ def test_pyproject_amd_rocm_extra_matches_requirements_profile() -> None:
     assert extra == _requirement_lines(REPO / "requirements-amd-rocm.txt")
 
 
-def test_dependency_profile_resolver_selects_amd_rocm_profile() -> None:
+def test_dependency_profile_resolver_enforces_amd_rocm_python_markers() -> None:
     env = dict(os.environ)
     env["TRADING_DEPENDENCY_PROFILE"] = "amd-rocm"
     env.pop("TRADING_REQUIREMENTS_FILE", None)
@@ -108,8 +116,13 @@ def test_dependency_profile_resolver_selects_amd_rocm_profile() -> None:
         check=False,
     )
 
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip().endswith("requirements-amd-rocm.txt")
+    if _rocm_python_markers_supported():
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip().endswith("requirements-amd-rocm.txt")
+    else:
+        assert proc.returncode == 65
+        assert "amd_rocm_python_runtime_unsupported" in proc.stderr
+        assert "required_python=>=3.12" in proc.stderr or "required_platform=Linux" in proc.stderr
 
 
 def test_dependency_profile_resolver_rejects_unvalidated_amd_rocm_stub(tmp_path) -> None:
@@ -136,7 +149,6 @@ def test_dependency_profile_resolver_selects_cpu_and_nvidia_profiles() -> None:
     for profile, expected in (
         ("cpu", "requirements.txt"),
         ("nvidia-cuda", "requirements-nvidia-cuda.txt"),
-        ("rocm", "requirements-amd-rocm.txt"),
     ):
         env = dict(os.environ)
         env["TRADING_DEPENDENCY_PROFILE"] = profile
@@ -161,4 +173,5 @@ def test_ci_rocm_profile_job_builds_profile_and_excludes_gpu_marker_by_default()
     assert "requirements-amd-rocm.txt" in workflow
     assert "--build-arg TRADING_DEPENDENCY_PROFILE=amd-rocm" in workflow
     assert "--build-arg TRADING_REQUIREMENTS_FILE=requirements-amd-rocm.txt" in workflow
+    assert "amd_rocm_python_runtime_unsupported" in workflow
     assert '-m "not requires_rocm"' in workflow

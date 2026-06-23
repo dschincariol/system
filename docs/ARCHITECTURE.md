@@ -118,9 +118,15 @@ Important control-plane functions:
 
 - owns isolated child supervision for ingestion jobs
 - starts and stops children based on the data-source manager's desired job set
-- restarts stale children with backoff
+- restarts stale children with backoff and a DB-backed restart-storm window
 - disables restart on fatal provider-auth failures
 - publishes heartbeat and channel state into `runtime_meta["ingestion_state"]`
+
+Restart-storm accounting is persisted in namespaced `job_locks` rows so a
+supervisor process restart does not erase fast-failure history. The guard uses
+`INGESTION_RUNTIME_CHILD_MAX_RESTARTS` over
+`INGESTION_RUNTIME_CHILD_RESTART_WINDOW_S`; stable child runs and explicit
+operator feed restarts clear the accounting window.
 
 ### Structured Document/Event Extraction
 

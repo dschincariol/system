@@ -8,6 +8,7 @@ Use this harness to prove `engine/runtime/prod_preflight.py --json` against an e
 2. Fill only staging values in the local env file. Do not commit the populated file.
 3. Keep `STAGING_PREFLIGHT_TARGET_ENV=staging`, `TS_STORAGE_BACKEND=postgres`, and `TS_PG_DSN` pointed at the staging Postgres database.
 4. Keep `ENGINE_MODE=safe`, `EXECUTION_MODE=safe`, `PROD_LOCK=1`, `ALLOW_TRAINING=0`, `DISABLE_LIVE_EXECUTION=1`, and `KILL_SWITCH_GLOBAL=1` unless you are running a separate, intentionally confirmed production credential check.
+5. Leave `PREFLIGHT_REQUIRE_CPU_POWER_POLICY=0` for generic CI or database-only staging. Set it to `1` only when the staging run executes on the target host class and can see host cpufreq/power-profiles state.
 
 ## Run
 
@@ -55,5 +56,6 @@ Each artifact includes:
 - guardrail findings
 - exact `prod_preflight.py --json` command
 - subprocess exit code, stdout/stderr, and parsed prod-preflight JSON when available
+- CPU power-policy preflight state when reported by `prod_preflight.py`
 
 Secrets are redacted by key name and by DSN/URL credential patterns before the artifact is written.

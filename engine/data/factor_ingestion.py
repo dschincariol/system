@@ -65,6 +65,7 @@ _DEFAULT_MACRO_SYMBOL_MAP = {
     "gdp": ["XLI", "XLB", "XLY", "IWM", "SPY"],
     "oil": ["XLE", "USO", "OIL", "XOM", "CVX", "COP", "SLB", "HAL", "SPY"],
     "commodities": ["DBC", "GLD", "GDX", "XLB", "SPY"],
+    "fx": ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD"],
 }
 LOG = get_logger("engine.data.factor_ingestion")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -215,6 +216,78 @@ MACRO_SERIES_SPECS: List[MacroSeriesSpec] = [
         delta_lag=5,
         download_mode="fred_graph",
         symbol_topic="oil",
+    ),
+    MacroSeriesSpec(
+        factor_id="macro.us_real_yield_10y",
+        source_series_id="DFII10",
+        family="macro",
+        name="US 10Y TIPS Real Yield",
+        cadence="daily",
+        applies_to="fx",
+        units="pct",
+        transform="initial_release_level",
+        release_hour_et=23,
+        release_minute_et=59,
+        is_revisioned=False,
+        history_start="2020-01-01",
+        z_window=252,
+        delta_lag=5,
+        download_mode="fred_graph",
+        symbol_topic="fx",
+    ),
+    MacroSeriesSpec(
+        factor_id="macro.usd_broad_index",
+        source_series_id="DTWEXBGS",
+        family="macro",
+        name="Trade Weighted U.S. Dollar Broad Index",
+        cadence="daily",
+        applies_to="fx",
+        units="index",
+        transform="initial_release_level",
+        release_hour_et=23,
+        release_minute_et=59,
+        is_revisioned=False,
+        history_start="2020-01-01",
+        z_window=252,
+        delta_lag=5,
+        download_mode="fred_graph",
+        symbol_topic="fx",
+    ),
+    MacroSeriesSpec(
+        factor_id="macro.ecb_policy_rate",
+        source_series_id="ECBDFR",
+        family="macro",
+        name="ECB Deposit Facility Rate",
+        cadence="daily",
+        applies_to="fx",
+        units="pct",
+        transform="initial_release_level",
+        release_hour_et=23,
+        release_minute_et=59,
+        is_revisioned=False,
+        history_start="2020-01-01",
+        z_window=252,
+        delta_lag=5,
+        download_mode="fred_graph",
+        symbol_topic="fx",
+    ),
+    MacroSeriesSpec(
+        factor_id="macro.uk_sonia_rate",
+        source_series_id="IUDSOIA",
+        family="macro",
+        name="UK SONIA Interest Rate",
+        cadence="daily",
+        applies_to="fx",
+        units="pct",
+        transform="initial_release_level",
+        release_hour_et=23,
+        release_minute_et=59,
+        is_revisioned=False,
+        history_start="2020-01-01",
+        z_window=252,
+        delta_lag=5,
+        download_mode="fred_graph",
+        symbol_topic="fx",
     ),
 ]
 
@@ -1445,6 +1518,18 @@ def _fetch_vintage_rows_for_spec(
         else:
             lookback_days = max(1.0, float(os.environ.get("MACRO_VINTAGE_POLL_LOOKBACK_DAYS", "14")))
             realtime_start = date.fromtimestamp(max(0.0, time.time() - lookback_days * 86400.0)).isoformat()
+        fred_key_missing = not str(get_data_credential("FRED_API_KEY") or "").strip()
+        if fred_key_missing and str(os.environ.get("MACRO_ALLOW_ALFRED_DOWNLOAD_FALLBACK", "1")).strip() == "1":
+            _warn_nonfatal(
+                "FACTOR_INGESTION_FRED_KEY_MISSING_ALFRED_FALLBACK_USED",
+                RuntimeError("fred_api_key_missing_alfred_fallback_used"),
+                once_key=f"fred_key_missing_alfred_fallback:{spec.source_series_id}",
+                series_id=str(spec.source_series_id),
+                primary_provider="fred",
+                fallback_provider="alfred",
+                missing_env_var="FRED_API_KEY",
+            )
+            return _source_rows_as_vintages(spec, _load_source_rows_for_spec(spec, obs_end=str(obs_end)))
         try:
             return _fetch_fred_observation_vintages(
                 series_id=spec.source_series_id,

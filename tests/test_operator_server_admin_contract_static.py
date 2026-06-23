@@ -187,6 +187,26 @@ def test_operator_status_endpoint_stays_lightweight():
     assert "health: null" in block
 
 
+def test_operator_lan_mode_does_not_default_to_public_bind():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    bind_block = _extract_block(
+        text,
+        "function resolveOperatorBindHost() {",
+        "function resolveLanAdvertiseIp() {",
+    )
+    listen_block = _extract_block(
+        text,
+        "_httpServer = app.listen(OPERATOR_PORT, OPERATOR_BIND_HOST, () => {",
+        "  const autoStart = normalizeBool(process.env.OPERATOR_AUTO_START);",
+    )
+
+    assert 'return NETWORK_MODE === "lan" ? "0.0.0.0" : "127.0.0.1";' not in bind_block
+    assert 'return "127.0.0.1";' in bind_block
+    assert 'if (_wildcardBind) {' in listen_block
+    assert '|| NETWORK_MODE === "lan"' not in listen_block
+    assert "dashboard /operator/ bridge" in text
+
+
 def test_operator_mutations_require_operator_token_not_loopback():
     text = SERVER_PATH.read_text(encoding="utf-8")
     auth_block = _extract_block(
@@ -209,17 +229,79 @@ def test_operator_mutations_require_operator_token_not_loopback():
     assert "operator_token" in request_token_block
 
 
+def test_support_snapshot_proxy_declares_auth_scope_and_redaction():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+
+    assert 'operatorProxyGet("/api/operator/support_snapshot", "invalid_support_snapshot_response", { redact: true, authScope: "support_snapshot" })' in text
+    assert 'operator_dashboard_auth_required' in text
+    assert '"DASHBOARD_API_TOKEN or DASHBOARD_API_TOKEN_FILE"' in text
+    assert "dashboard_token_configured" in text
+
+
+def test_operator_readiness_proxy_timeout_is_bounded():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    block = _extract_block(
+        text,
+        "const OPERATOR_BARRIER_PROXY_TIMEOUT_MS = clampNumber(",
+        "function operatorProxyGet"
+    )
+
+    assert "process.env.OPERATOR_BARRIER_PROXY_TIMEOUT_MS || 10000" in block
+    assert "60000" in block
+
+
 def test_operator_sensitive_reads_require_operator_token_before_routes():
     text = SERVER_PATH.read_text(encoding="utf-8")
-    middleware_idx = text.index('app.use(["/api/operator", "/api/operator_summary", "/api/execution/barrier"]')
+    middleware_idx = text.index('app.use([\n  "/api/operator",')
     summary_idx = text.index('app.get("/api/operator_summary"')
     config_idx = text.index('app.get("/api/operator/config"')
 
     assert middleware_idx < summary_idx
     assert middleware_idx < config_idx
+    for path in [
+        '"/api/operator"',
+        '"/api/operator_summary"',
+        '"/api/execution/barrier"',
+        '"/api/system/kill_switches"',
+        '"/api/broker/config"',
+    ]:
+        assert path in text
     assert 'if (method === "GET" || method === "HEAD" || method === "OPTIONS")' not in text
     assert "operatorRouteRequiresAuth(req)" in text
     assert "verifyClient" in text
+
+
+def test_operator_safety_gate_proxy_routes_and_dashboard_get_auth():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    trusted_auth_block = _extract_block(
+        text,
+        "function trustedControlPlaneAuthHeaders(method, urlText) {",
+        "const OPERATOR_CONFIRMATION_REGISTRY = Object.freeze",
+    )
+
+    assert 'if (upper === "GET" || upper === "HEAD" || upper === "OPTIONS") return {};' not in trusted_auth_block
+    assert 'if (upper === "OPTIONS") return {};' in trusted_auth_block
+    assert 'headers["X-API-Token"] = dashboardToken;' in trusted_auth_block
+    assert 'app.get("/api/system/kill_switches",' in text
+    assert 'operatorProxyGet("/api/system/kill_switches", "invalid_kill_switches_response")' in text
+    assert 'app.get("/api/broker/config",' in text
+    assert 'operatorProxyGet("/api/broker/config", "invalid_broker_config_response", { redact: true })' in text
+    assert 'app.get("/api/operator/readiness_evidence",' in text
+    assert 'operatorProxyGet("/api/operator/readiness_evidence", "invalid_readiness_evidence_response"' in text
+
+
+def test_operator_generated_dashboard_token_is_file_backed():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+    env_block = _extract_block(
+        text,
+        "function ensureEnvFile() {",
+        "function writeEnv(obj) {",
+    )
+
+    assert 'const tokenFile = path.join(OPERATOR_DATA_DIR, "dashboard_api_token");' in env_block
+    assert "writeLocalSecretFile(tokenFile, token)" in env_block
+    assert "delete envNow.DASHBOARD_API_TOKEN;" in env_block
+    assert "envNow.DASHBOARD_API_TOKEN_FILE = tokenFile;" in env_block
 
 
 def test_operator_config_logs_and_snapshots_are_redacted():
@@ -231,7 +313,7 @@ def test_operator_config_logs_and_snapshots_are_redacted():
     assert "redactOperatorSensitiveText" in text
     assert 'return jsonOk(res, safeEnvForSnapshot(readEnv()));' in text
     assert "sanitized: safeEnvForSnapshot(sanitized)" in text
-    assert 'operatorProxyGet("/api/operator/support_snapshot", "invalid_support_snapshot_response", { redact: true })' in text
+    assert 'operatorProxyGet("/api/operator/support_snapshot", "invalid_support_snapshot_response", { redact: true, authScope: "support_snapshot" })' in text
 
 
 def test_operator_readiness_status_uses_dashboard_readiness():

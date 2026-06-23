@@ -87,6 +87,9 @@ ST_SYMBOL_URL_TMPL = os.environ.get(
 
 ST_TIMEOUT_S = float(os.environ.get("STOCKTWITS_TIMEOUT_S", "10.0"))
 ST_SLEEP_S = float(os.environ.get("SOCIAL_POLL_SLEEP_S", "30.0"))
+ST_MAX_BACKOFF_S = float(os.environ.get("STOCKTWITS_MAX_BACKOFF_S", "1800.0"))
+ST_HTTP_UA = os.environ.get("STOCKTWITS_HTTP_UA", "trading-system/1.0 stocktwits-feed")
+_STOCKTWITS_COOLDOWN_UNTIL_S = 0.0
 
 HASH_SALT = os.environ.get("SOCIAL_HASH_SALT", "social")
 
@@ -133,14 +136,48 @@ def _safe_get_msg_symbols(msg: Dict[str, Any]) -> List[str]:
     return out
 
 
-def _fetch_json(url: str) -> tuple[Optional[Dict[str, Any]], str]:
+def _retry_after_s(response: Any, default_s: float) -> float:
     try:
-        r = requests.get(url, timeout=float(ST_TIMEOUT_S))
+        raw = str((getattr(response, "headers", {}) or {}).get("Retry-After") or "").strip()
+        if raw:
+            return max(1.0, float(raw))
+    except Exception as e:
+        _warn_nonfatal(
+            "POLL_STOCKTWITS_RETRY_AFTER_PARSE_FAILED",
+            e,
+            once_key="poll_stocktwits_retry_after_parse_failed",
+        )
+        return float(default_s)
+    return float(default_s)
+
+
+def _stocktwits_cooldown_remaining_s() -> float:
+    return max(0.0, float(_STOCKTWITS_COOLDOWN_UNTIL_S) - time.time())
+
+
+def _fetch_json(url: str) -> tuple[Optional[Dict[str, Any]], str]:
+    global _STOCKTWITS_COOLDOWN_UNTIL_S
+    cooldown = _stocktwits_cooldown_remaining_s()
+    if cooldown > 0:
+        return None, f"stocktwits_rate_limited:cooldown_remaining_s={cooldown:.0f}"
+    try:
+        r = requests.get(url, headers={"User-Agent": ST_HTTP_UA, "Accept": "application/json"}, timeout=float(ST_TIMEOUT_S))
         if r.status_code != 200:
+            if int(r.status_code) == 429:
+                retry_after = _retry_after_s(r, 300.0)
+                _STOCKTWITS_COOLDOWN_UNTIL_S = max(float(_STOCKTWITS_COOLDOWN_UNTIL_S), time.time() + retry_after)
+                return None, f"stocktwits_rate_limited:retry_after_s={retry_after:.0f}"
+            if int(r.status_code) == 503:
+                retry_after = _retry_after_s(r, 300.0)
+                _STOCKTWITS_COOLDOWN_UNTIL_S = max(float(_STOCKTWITS_COOLDOWN_UNTIL_S), time.time() + retry_after)
+                return None, f"stocktwits_temporarily_unavailable:retry_after_s={retry_after:.0f}"
             detail = str(r.text or "").strip().replace("\r", " ").replace("\n", " ")
             detail = detail[:160]
             return None, f"stocktwits_http_{int(r.status_code)}:{detail or 'non_200_response'}"
-        return r.json(), ""
+        payload = r.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+            return None, "stocktwits_malformed_payload"
+        return payload, ""
     except Exception as e:
         _warn_nonfatal("POLL_STOCKTWITS_FETCH_FAILED", e, once_key=f"fetch_json:{url}", url=str(url))
         return None, f"stocktwits_request_failed:{type(e).__name__}:{e}"
@@ -360,6 +397,7 @@ def main():
 
     try:
         last_hb_s = 0.0
+        backoff_s = float(ST_SLEEP_S)
         while True:
             if not manager.is_job_enabled(JOB_NAME, default=True):
                 manager.record_job_status(JOB_NAME, ok=True, message="stocktwits disabled by data source control plane")
@@ -397,6 +435,7 @@ def main():
                 put_job_heartbeat(JOB_NAME, OWNER, PID, extra_json=json.dumps(status, separators=(",", ":"), sort_keys=True))
                 if n:
                     logging.info("ingested=%d rows symbols=%s", int(n), ",".join(touched[:20]))
+                backoff_s = float(ST_SLEEP_S)
             except Exception as e:
                 _warn_nonfatal("POLL_SOCIAL_STOCKTWITS_POLL_ERROR", e, once_key="poll_error")
                 status = record_pipeline_status(
@@ -409,8 +448,10 @@ def main():
                 )
                 manager.record_job_status(JOB_NAME, ok=False, message="stocktwits cycle failed", error=str(e))
                 put_job_heartbeat(JOB_NAME, OWNER, PID, extra_json=json.dumps(status, separators=(",", ":"), sort_keys=True))
+                cooldown = _stocktwits_cooldown_remaining_s()
+                backoff_s = max(float(ST_SLEEP_S), cooldown) if cooldown > 0 else min(float(ST_MAX_BACKOFF_S), max(float(ST_SLEEP_S), backoff_s * 2.0))
 
-            time.sleep(float(ST_SLEEP_S))
+            time.sleep(max(1.0, float(backoff_s)))
     finally:
         try:
             release_job_lock(JOB_NAME, OWNER, PID)

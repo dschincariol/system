@@ -26,12 +26,19 @@ def _reload_modules(*module_names: str):
 class MetricsEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._env_backup = {
+            "DB_PATH": os.environ.get("DB_PATH"),
+            "TS_STORAGE_BACKEND": os.environ.get("TS_STORAGE_BACKEND"),
+        }
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "metrics_engine_test.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         (
             self.storage,
             self.validation,
             self.alerts,
             self.execution_ledger,
+            self.metrics,
+            self.telemetry_read_router,
             self.metrics_store,
             self.metrics_engine,
         ) = _reload_modules(
@@ -40,6 +47,8 @@ class MetricsEngineTests(unittest.TestCase):
             "engine.strategy.validation",
             "engine.runtime.alerts",
             "engine.execution.execution_ledger",
+            "engine.runtime.metrics",
+            "engine.runtime.telemetry_read_router",
             "engine.runtime.metrics_store",
             "engine.metrics_engine",
         )[1:]
@@ -52,6 +61,21 @@ class MetricsEngineTests(unittest.TestCase):
         except Exception:
             pass
         self.tmp.cleanup()
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        _reload_modules(
+            "engine.runtime.storage",
+            "engine.strategy.validation",
+            "engine.runtime.alerts",
+            "engine.execution.execution_ledger",
+            "engine.runtime.metrics",
+            "engine.runtime.telemetry_read_router",
+            "engine.runtime.metrics_store",
+            "engine.metrics_engine",
+        )
 
     def test_refresh_feedback_loop_materializes_prediction_trade_links(self) -> None:
         con = self.storage.connect()

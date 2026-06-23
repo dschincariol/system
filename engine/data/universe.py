@@ -71,6 +71,19 @@ except Exception as e:
         return "UNKNOWN"
 
 
+try:
+    from engine.data.fx_instrument import parse_fx_symbol  # type: ignore
+except Exception as e:
+    _warn_nonfatal(
+        "DATA_UNIVERSE_FX_INSTRUMENT_IMPORT_FAILED",
+        e,
+        once_key="fx_instrument_import",
+    )
+
+    def parse_fx_symbol(symbol: object):  # type: ignore
+        return None
+
+
 # Very conservative ticker extraction:
 # - captures $TSLA or TSLA
 # - rejects too-short/too-long
@@ -83,10 +96,281 @@ _DENY = {
 }
 
 _VALID_STATUS = {"WATCH", "ACTIVE", "COOLDOWN", "DISABLED"}
+_INSTRUMENT_METADATA_COLUMNS = (
+    "instrument_kind",
+    "base_ccy",
+    "quote_ccy",
+    "pip_size",
+    "contract_size",
+    "pnl_ccy",
+    "leverage_cap",
+    "session_calendar",
+    "instrument_meta_source",
+)
+
+
+def _instrument_column_values(metadata) -> Tuple[object, ...]:
+    if metadata is None:
+        return (None,) * len(_INSTRUMENT_METADATA_COLUMNS)
+    return (
+        metadata.instrument_kind,
+        metadata.base_ccy,
+        metadata.quote_ccy,
+        float(metadata.pip_size),
+        float(metadata.contract_size),
+        metadata.pnl_ccy,
+        float(metadata.leverage_cap),
+        metadata.session_calendar,
+        metadata.source,
+    )
+
+
+def _missing_instrument_column_error(error: BaseException) -> bool:
+    message = str(error or "").lower()
+    return (
+        "instrument_kind" in message
+        or "base_ccy" in message
+        or "quote_ccy" in message
+        or "pip_size" in message
+        or "contract_size" in message
+        or "pnl_ccy" in message
+        or "leverage_cap" in message
+        or "session_calendar" in message
+        or "instrument_meta_source" in message
+        or "no such column" in message
+        or "has no column named" in message
+    )
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _metadata_dict_from_row(symbol: str, row, fallback) -> Optional[Dict]:
+    if row is None:
+        return fallback.to_dict() if fallback is not None else None
+    try:
+        instrument_kind = row[0]
+        if not instrument_kind:
+            return fallback.to_dict() if fallback is not None else None
+        base_ccy = row[1]
+        quote_ccy = row[2]
+        pip_size = row[3]
+        contract_size = row[4]
+        pnl_ccy = row[5]
+        leverage_cap = row[6]
+        session_calendar = row[7]
+        source = row[8] if len(row) > 8 else None
+        return {
+            "asset_class": "FX",
+            "base_ccy": str(base_ccy) if base_ccy is not None else None,
+            "contract_size": float(contract_size),
+            "instrument_kind": str(instrument_kind),
+            "leverage_cap": float(leverage_cap),
+            "pip_size": float(pip_size),
+            "pnl_ccy": str(pnl_ccy or ""),
+            "quote_ccy": str(quote_ccy) if quote_ccy is not None else None,
+            "session_calendar": str(session_calendar or ""),
+            "source": str(source or "parser"),
+            "symbol": str(symbol),
+        }
+    except Exception as e:
+        _warn_nonfatal(
+            "UNIVERSE_INSTRUMENT_METADATA_ROW_PARSE_FAILED",
+            e,
+            once_key=f"instrument_metadata_row:{symbol}",
+            symbol=str(symbol),
+        )
+        return fallback.to_dict() if fallback is not None else None
+
+
+def _insert_symbol_row(
+    con,
+    *,
+    sym: str,
+    ac: str,
+    st: Optional[str],
+    new_score: float,
+    last_seen_event_ts_ms: Optional[int],
+    meta_json: str,
+    now_ms: int,
+    instrument_metadata,
+) -> None:
+    try:
+        con.execute(
+            """
+            INSERT OR IGNORE INTO symbols(
+              symbol, asset_class, status, score,
+              last_seen_event_ts_ms, meta_json,
+              instrument_kind, base_ccy, quote_ccy, pip_size,
+              contract_size, pnl_ccy, leverage_cap, session_calendar,
+              instrument_meta_source,
+              created_ts_ms, updated_ts_ms
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                sym,
+                ac or "UNKNOWN",
+                (st or "WATCH"),
+                float(new_score),
+                int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
+                meta_json,
+                *_instrument_column_values(instrument_metadata),
+                now_ms,
+                now_ms,
+            ),
+        )
+    except Exception as e:
+        if not _missing_instrument_column_error(e):
+            raise
+        _warn_nonfatal(
+            "UNIVERSE_SYMBOL_INSERT_INSTRUMENT_COLUMNS_UNAVAILABLE",
+            e,
+            once_key="symbol_insert_instrument_columns_unavailable",
+            symbol=str(sym),
+        )
+        con.execute(
+            """
+            INSERT OR IGNORE INTO symbols(
+              symbol, asset_class, status, score,
+              last_seen_event_ts_ms, meta_json,
+              created_ts_ms, updated_ts_ms
+            )
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                sym,
+                ac or "UNKNOWN",
+                (st or "WATCH"),
+                float(new_score),
+                int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
+                meta_json,
+                now_ms,
+                now_ms,
+            ),
+        )
+
+
+def _update_symbol_row(
+    con,
+    *,
+    sym: str,
+    new_ac: str,
+    new_status: str,
+    new_score: float,
+    last_seen_event_ts_ms: Optional[int],
+    meta_json: str,
+    now_ms: int,
+    instrument_metadata,
+) -> None:
+    try:
+        con.execute(
+            """
+            UPDATE symbols SET
+              asset_class=?,
+              status=?,
+              score=?,
+              last_seen_event_ts_ms=COALESCE(?, last_seen_event_ts_ms),
+              meta_json=?,
+              instrument_kind=?,
+              base_ccy=?,
+              quote_ccy=?,
+              pip_size=?,
+              contract_size=?,
+              pnl_ccy=?,
+              leverage_cap=?,
+              session_calendar=?,
+              instrument_meta_source=?,
+              updated_ts_ms=?
+            WHERE symbol=?
+            """,
+            (
+                new_ac,
+                new_status,
+                float(new_score),
+                int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
+                meta_json,
+                *_instrument_column_values(instrument_metadata),
+                now_ms,
+                sym,
+            ),
+        )
+    except Exception as e:
+        if not _missing_instrument_column_error(e):
+            raise
+        _warn_nonfatal(
+            "UNIVERSE_SYMBOL_UPDATE_INSTRUMENT_COLUMNS_UNAVAILABLE",
+            e,
+            once_key="symbol_update_instrument_columns_unavailable",
+            symbol=str(sym),
+        )
+        con.execute(
+            """
+            UPDATE symbols SET
+              asset_class=?,
+              status=?,
+              score=?,
+              last_seen_event_ts_ms=COALESCE(?, last_seen_event_ts_ms),
+              meta_json=?,
+              updated_ts_ms=?
+            WHERE symbol=?
+            """,
+            (
+                new_ac,
+                new_status,
+                float(new_score),
+                int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
+                meta_json,
+                now_ms,
+                sym,
+            ),
+        )
+
+
+def get_instrument_metadata(con, symbol) -> Optional[Dict]:
+    """Return FX instrument metadata, or ``None`` for non-FX symbols.
+
+    This accessor is the FX-02 single source of truth that FX-03/04/05/06/07
+    MUST consume as ``from engine.data.universe import get_instrument_metadata``.
+    For FX spot pairs, the returned ``symbol`` is the canonical stored form:
+    uppercase 6-letter ``BASE+QUOTE`` with no separator, such as ``EURUSD``.
+    Downstream code that receives broker-style keys such as ``EUR_USD`` must
+    normalize through ``parse_fx_symbol(sym).symbol`` or this accessor before
+    keying feature, cost, risk, execution, or UI tables.
+    """
+    parsed = parse_fx_symbol(symbol)
+    if parsed is None:
+        return None
+    canonical = str(parsed.symbol)
+    try:
+        row = con.execute(
+            """
+            SELECT instrument_kind, base_ccy, quote_ccy, pip_size,
+                   contract_size, pnl_ccy, leverage_cap, session_calendar,
+                   instrument_meta_source
+            FROM symbols
+            WHERE symbol=?
+            """,
+            (canonical,),
+        ).fetchone()
+    except Exception as e:
+        if not _missing_instrument_column_error(e):
+            _warn_nonfatal(
+                "UNIVERSE_INSTRUMENT_METADATA_LOOKUP_FAILED",
+                e,
+                once_key=f"instrument_metadata_lookup:{canonical}",
+                symbol=canonical,
+            )
+        else:
+            _warn_nonfatal(
+                "UNIVERSE_INSTRUMENT_METADATA_COLUMNS_UNAVAILABLE",
+                e,
+                once_key="instrument_metadata_columns_unavailable",
+                symbol=canonical,
+            )
+        return parsed.to_dict()
+    return _metadata_dict_from_row(canonical, row, parsed)
 
 
 def extract_symbol_candidates(text: str) -> List[str]:
@@ -128,7 +412,9 @@ def upsert_symbol(
     last_seen_event_ts_ms: Optional[int] = None,
     meta: Optional[Dict] = None,
 ) -> None:
-    sym = str(symbol or "").upper().strip()
+    raw_sym = str(symbol or "").upper().strip()
+    instrument_metadata = parse_fx_symbol(raw_sym)
+    sym = str(instrument_metadata.symbol if instrument_metadata is not None else raw_sym).upper().strip()
     if not sym:
         return
 
@@ -156,27 +442,17 @@ def upsert_symbol(
         base_score = 0.0
         new_score = float(base_score + float(score_delta))
         mj = json.dumps(meta or {}, separators=(",", ":"), sort_keys=True)
-        
 
-        con.execute(
-            """
-            INSERT OR IGNORE INTO symbols(
-              symbol, asset_class, status, score,
-              last_seen_event_ts_ms, meta_json,
-              created_ts_ms, updated_ts_ms
-            )
-            VALUES (?,?,?,?,?,?,?,?)
-            """,
-            (
-                sym,
-                ac or "UNKNOWN",
-                (st or "WATCH"),
-                float(new_score),
-                int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
-                mj,
-                now_ms,
-                now_ms,
-            ),
+        _insert_symbol_row(
+            con,
+            sym=sym,
+            ac=ac,
+            st=st,
+            new_score=new_score,
+            last_seen_event_ts_ms=last_seen_event_ts_ms,
+            meta_json=mj,
+            now_ms=now_ms,
+            instrument_metadata=instrument_metadata,
         )
         return
 
@@ -207,27 +483,18 @@ def upsert_symbol(
     new_score = float(cur_score + float(score_delta))
     new_status = st or cur_status
     new_ac = ac or cur_ac
+    merged_meta_json = json.dumps(merged, separators=(",", ":"), sort_keys=True)
 
-    con.execute(
-        """
-        UPDATE symbols SET
-          asset_class=?,
-          status=?,
-          score=?,
-          last_seen_event_ts_ms=COALESCE(?, last_seen_event_ts_ms),
-          meta_json=?,
-          updated_ts_ms=?
-        WHERE symbol=?
-        """,
-        (
-            new_ac,
-            new_status,
-            float(new_score),
-            int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
-            json.dumps(merged, separators=(",", ":"), sort_keys=True),
-            now_ms,
-            sym,
-        ),
+    _update_symbol_row(
+        con,
+        sym=sym,
+        new_ac=new_ac,
+        new_status=new_status,
+        new_score=new_score,
+        last_seen_event_ts_ms=last_seen_event_ts_ms,
+        meta_json=merged_meta_json,
+        now_ms=now_ms,
+        instrument_metadata=instrument_metadata,
     )
 
 

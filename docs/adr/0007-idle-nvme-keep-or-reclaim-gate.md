@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
@@ -10,9 +10,9 @@ Proposed
 
 ## Context
 
-Host `bart` was initially believed to have a second idle NVMe at `nvme0n1` with approximately 1.9 TB of fast local storage and a Windows install layout: EFI, Microsoft reserved, a large BitLocker partition, and Windows recovery data.
+Host `bart` has a second idle NVMe at `nvme0n1` with approximately 1.9 TB of fast local storage and a Windows install layout: EFI, Microsoft reserved, a large BitLocker partition, and Windows recovery data.
 
-The first read-only smoke assessment invalidated that kernel-name assumption on this runner: `/dev/nvme0n1` is active Linux storage with `/boot/efi`, `/`, `/home`, and a `zfs_member` partition. Kernel disk names are not stable enough to be the source of truth for a destructive workflow.
+The read-only assessment on 2026-06-21 reported `/dev/nvme0n1` as the only `go_candidate`: `unused_by_linux=true`, `windows_bitlocker_layout_likely=true`, zero active references, and zero config references. The stable path reported by `/dev/disk/by-id` must be preferred over the kernel name for targeting, but the destructive confirmation token still has to match the resolved kernel disk name.
 
 Any idle Windows/BitLocker capacity is valuable, but reclaiming it is destructive. Wiping or repartitioning the selected disk destroys the Windows/BitLocker install and removes any practical dual-boot recovery path unless the Windows system has been backed up independently.
 
@@ -30,6 +30,7 @@ Required action:
 - If retaining a specific Windows disk, record the stable `/dev/disk/by-id/...` path from discovery.
 - Record why Windows is still required.
 - Do not run `ops/server/reclaim_idle_nvme.sh` in apply mode.
+- If invoking the script to document the decision, use `IDLE_NVME_DECISION=RETAIN`; the script exits before assessment or provisioning.
 
 ### Branch: RECLAIM
 
@@ -53,23 +54,24 @@ Required action:
 - Prefer the candidate's stable `/dev/disk/by-id/...` path over the kernel name when invoking the reclaim script.
 - If discovery reports multiple `go_candidate` disks, select one explicitly with `TARGET_DISK_BY_ID=/dev/disk/by-id/...` and keep a target-specific assessment JSON.
 - Confirm the backup evidence gate is fresh by running or reusing `ops/backup/backup_restore_evidence.sh`.
-- Run `ops/server/reclaim_idle_nvme.sh` first in dry-run mode.
-- Apply only with `CONFIRM_DESTROY=<resolved-kernel-disk> RECLAIM_DRY_RUN=0`, optionally paired with `TARGET_DISK_BY_ID=/dev/disk/by-id/...`.
+- Run `IDLE_NVME_DECISION=RECLAIM ops/server/reclaim_idle_nvme.sh` first in dry-run mode.
+- Apply only with `IDLE_NVME_DECISION=RECLAIM CONFIRM_DESTROY=<resolved-kernel-disk> RECLAIM_DRY_RUN=0`, optionally paired with `TARGET_DISK_BY_ID=/dev/disk/by-id/...`.
 
 The reclaim script enforces the branch gate in production ops code:
 
 - It defaults to dry-run and no-op behavior.
+- It exits without assessment or provisioning until `IDLE_NVME_DECISION=RETAIN` or `IDLE_NVME_DECISION=RECLAIM` is explicitly set.
 - Apply mode refuses to run unless `CONFIRM_DESTROY` exactly matches the resolved target kernel disk.
 - Apply mode refuses a stale assessment, a mismatched kernel target, or a mismatched `TARGET_DISK_BY_ID` stable path.
-- Apply mode refuses stale or missing backup/restore evidence.
+- Apply mode refuses stale, missing, unsigned, or otherwise invalid backup/restore evidence; the backup evidence gate cannot be disabled for apply mode.
 - The assessment must be fresh, classify the selected disk as `go_candidate`, confirm a Windows/BitLocker layout, and show no Linux references.
 - Disks with critical Linux mountpoints, Linux filesystems, or `zfs_member` partitions are hard `no_go`.
 - Destructive commands are reached only after those gates pass.
 
 ## Consequences
 
-- The idle NVMe remains untouched until a human chooses RETAIN or RECLAIM.
+- The idle NVMe remains untouched until a human chooses RETAIN or RECLAIM through `IDLE_NVME_DECISION`.
 - RECLAIM makes approximately 1.9 TB of fast NVMe available to the trading stack, but permanently destroys the Windows install.
 - The recommended Docker/PGDATA use accelerates the current compose and database-heavy path without coupling the root pool to an unmirrored special vdev.
 - If Windows must be preserved, the project accepts the opportunity cost of leaving the NVMe idle for Linux.
-- On this runner, `/dev/nvme0n1` is explicitly NO-GO for reclaim because it is active Linux/ZFS storage.
+- Current assessment evidence makes `/dev/nvme0n1` eligible only as a decision-gated RECLAIM candidate; it is not permission to wipe the disk without the explicit branch, confirmation token, and fresh backup/restore evidence.

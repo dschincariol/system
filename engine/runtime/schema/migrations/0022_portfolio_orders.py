@@ -49,5 +49,5 @@ def up(conn) -> None:
     )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_portfolio_orders_id_source_prediction_lineage "
-        "ON portfolio_orders(id, source_alert_id, prediction_id)"
+        "ON portfolio_orders(id, source_alert_id, prediction_id, ts_ms)"
     )

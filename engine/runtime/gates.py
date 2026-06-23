@@ -21,6 +21,11 @@ from engine.runtime.live_execution_control import (
 )
 from engine.runtime.live_trading_preflight import live_trading_preflight
 from engine.runtime.logging import get_logger
+from engine.execution.mode_safety import (
+    env_execution_mode_snapshot,
+    mode_rank,
+    parse_execution_mode,
+)
 
 import json
 
@@ -34,6 +39,10 @@ _EXECUTION_BLOCKED_DEGRADED_CODES_ENV = (
     "PORTFOLIO_TOTAL_RISK_FAILED"
 )
 _ENV_GLOBAL_KILL_SWITCH_KEYS = ("KILL_SWITCH_GLOBAL", "TRADING_KILL_SWITCH", "KILL_SWITCH")
+_CRASH_RECOVERY_STATE_META_KEY = "crash_recovery_state"
+_CRASH_RECOVERY_FAIL_CLOSED_ENV = "CRASH_RECOVERY_FAIL_CLOSED"
+_CRASH_RECOVERY_FAIL_CLOSED_DETAIL_ENV = "CRASH_RECOVERY_FAIL_CLOSED_DETAIL"
+_CRASH_RECOVERY_BLOCK_REASON = "critical_crash_recovery_continuity_gap"
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: object) -> None:
@@ -108,6 +117,82 @@ def _env_global_kill_switch_snapshot() -> Dict[str, Any]:
         "keys": active,
         "env": env,
     }
+
+
+def _crash_recovery_live_block(mode: str) -> Optional[Dict[str, Any]]:
+    if str(mode or "").strip().lower() != "live":
+        return None
+
+    if env_flag_truthy(_CRASH_RECOVERY_FAIL_CLOSED_ENV, False):
+        detail_raw = str(os.environ.get(_CRASH_RECOVERY_FAIL_CLOSED_DETAIL_ENV, "") or "")
+        detail: Dict[str, Any] = {"raw": detail_raw} if detail_raw else {}
+        if detail_raw:
+            try:
+                parsed = json.loads(detail_raw)
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except Exception as e:
+                _warn_nonfatal(
+                    "RUNTIME_GATES_CRASH_RECOVERY_ENV_DETAIL_PARSE_FAILED",
+                    e,
+                    once_key="runtime_gates_crash_recovery_env_detail_parse_failed",
+                )
+        reason = str(detail.get("reason") or _CRASH_RECOVERY_BLOCK_REASON)
+        return {
+            "reason": reason,
+            "state": {
+                "ok": False,
+                "status": "failed",
+                "reason": reason,
+                "critical": True,
+                "block_live_order_authority": True,
+                "source": "env",
+                "detail": detail,
+            },
+        }
+
+    try:
+        from engine.runtime.runtime_meta import meta_get  # type: ignore
+
+        raw = str(meta_get(_CRASH_RECOVERY_STATE_META_KEY, "") or "").strip()
+    except Exception as e:
+        _warn_nonfatal(
+            "RUNTIME_GATES_CRASH_RECOVERY_STATE_LOAD_FAILED",
+            e,
+            once_key="runtime_gates_crash_recovery_state_load_failed",
+        )
+        return None
+
+    if not raw:
+        return None
+    try:
+        state = json.loads(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "RUNTIME_GATES_CRASH_RECOVERY_STATE_PARSE_FAILED",
+            e,
+            once_key="runtime_gates_crash_recovery_state_parse_failed",
+        )
+        return {
+            "reason": _CRASH_RECOVERY_BLOCK_REASON,
+            "state": {
+                "ok": False,
+                "status": "unparseable",
+                "reason": _CRASH_RECOVERY_BLOCK_REASON,
+                "critical": True,
+                "block_live_order_authority": True,
+                "raw": raw[:2000],
+            },
+        }
+    if not isinstance(state, dict):
+        return None
+    if bool(state.get("block_live_order_authority")) or bool(state.get("critical")):
+        reason = str(state.get("reason") or _CRASH_RECOVERY_BLOCK_REASON)
+        return {
+            "reason": reason,
+            "state": dict(state),
+        }
+    return None
 
 
 _EXECUTION_BLOCKED_DEGRADED_CODES = {
@@ -187,15 +272,14 @@ def _normalize_severity(value: Any, default: str = "WARNING") -> str:
     return str(default or "WARNING").strip().upper() or "WARNING"
 
 
-def _env_mode_snapshot() -> tuple[str, bool]:
+def _env_mode_snapshot() -> tuple[str, bool, Optional[Dict[str, Any]]]:
     # Operator intent comes from env first; later reconciliation with DB state
     # chooses the most restrictive result rather than trusting one source blindly.
-    for name in ("EXECUTION_MODE", "ENGINE_MODE", "OPERATOR_MODE", "MODE"):
-        raw = os.environ.get(name)
-        if raw is None or str(raw).strip() == "":
-            continue
-        return str(raw).strip().lower() or "safe", True
-    return "safe", False
+    snapshot = env_execution_mode_snapshot(os.environ)
+    invalid = snapshot.get("invalid")
+    return str(snapshot.get("mode") or "safe"), bool(snapshot.get("explicit")), (
+        dict(invalid) if isinstance(invalid, dict) else None
+    )
 
 
 def _env_mode() -> str:
@@ -227,7 +311,7 @@ def _default_kill_switch_state() -> Dict[str, Any]:
     try:
         from engine.cache.wrappers.kill_switch import read_kill_switch
 
-        state = dict(read_kill_switch() or {"state": []})
+        state: Dict[str, Any] = dict(read_kill_switch() or {"state": []})
         state.setdefault("source", "engine.cache.wrappers.kill_switch")
         return state
     except Exception as e:
@@ -658,7 +742,7 @@ def execution_gate_snapshot(
 
     ts = _now_ms()
 
-    env_mode, env_mode_explicit = _env_mode_snapshot()
+    env_mode, env_mode_explicit, invalid_mode = _env_mode_snapshot()
     mode: str = env_mode
     db_mode: Optional[str] = None
     armed: Optional[int] = None
@@ -677,10 +761,30 @@ def execution_gate_snapshot(
     live_preflight_state: Optional[Dict[str, Any]] = None
 
     def _normalize_mode(value: Any, fallback: str) -> str:
-        m = str(value or fallback).strip().lower() or fallback
-        if m in ("safe", "paper", "shadow", "live"):
-            return m
-        return fallback
+        parsed = parse_execution_mode(value, default=fallback, source="runtime_gate")
+        return parsed.mode if parsed.valid else fallback
+
+    def _invalid_mode_gate(diagnostic: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "ok": False,
+            "ts_ms": ts,
+            "mode": "safe",
+            "armed": armed,
+            "armed_source": armed_source,
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "allow_simulation": False,
+            "real_trading_allowed": False,
+            "allowed": False,
+            "reason": "invalid_execution_mode",
+            "source": str(diagnostic.get("source") or source or "unknown"),
+            "invalid_mode": dict(diagnostic),
+            "runtime_state": runtime_state,
+            "runtime_detail": runtime_detail,
+            "runtime_source": runtime_source,
+            "severity": "CRITICAL",
+            "severity_reasons": ["invalid_execution_mode"],
+        }
 
     def _normalize_runtime_state(value: Any) -> str:
         s = str(value or "").strip().upper()
@@ -862,12 +966,19 @@ def execution_gate_snapshot(
         return "runtime_critical_health"
 
     def _apply_mode_state(r: Any, source_name: str) -> None:
-        nonlocal mode, db_mode, armed, armed_source, source
+        nonlocal mode, db_mode, armed, armed_source, source, invalid_mode
 
         if isinstance(r, dict):
-            if "mode" in r:
-                db_mode = _normalize_mode(r.get("mode"), mode)
-                mode = db_mode
+            if "mode" in r or "execution_mode" in r:
+                raw_mode = r.get("mode", r.get("execution_mode"))
+                parsed = parse_execution_mode(raw_mode, default=None, source=source_name)
+                if not parsed.valid:
+                    invalid_mode = parsed.diagnostic()
+                    db_mode = "safe"
+                    mode = "safe"
+                else:
+                    db_mode = parsed.mode
+                    mode = db_mode
             if "armed" in r:
                 try:
                     armed = int(r.get("armed") or 0)
@@ -883,8 +994,14 @@ def execution_gate_snapshot(
                     armed_source = source_name + ":parse_error"
             source = source_name
         elif isinstance(r, str):
-            db_mode = _normalize_mode(r, mode)
-            mode = db_mode
+            parsed = parse_execution_mode(r, default=None, source=source_name)
+            if not parsed.valid:
+                invalid_mode = parsed.diagnostic()
+                db_mode = "safe"
+                mode = "safe"
+            else:
+                db_mode = parsed.mode
+                mode = db_mode
             source = source_name + ":str"
 
     def _apply_runtime_state(r: Any, source_name: str) -> None:
@@ -942,6 +1059,9 @@ def execution_gate_snapshot(
     elif not system_state_has_mode:
         _apply_mode_state(_default_execution_mode_state(), "default_execution_mode_db")
 
+    if invalid_mode is not None:
+        return _invalid_mode_gate(invalid_mode)
+
     if runtime_state == "UNKNOWN" and callable(_get_lifecycle_state):
         try:
             _apply_runtime_state(_get_lifecycle_state(), "lifecycle_state")
@@ -958,15 +1078,8 @@ def execution_gate_snapshot(
     # Most restrictive mode wins when env and DB differ. This prevents stale DB
     # state from silently enabling execution after an operator explicitly chose
     # a safer mode for the current run.
-    # Ordering: safe > shadow > live
-    order = {
-        "safe": 3,
-        "paper": 3,
-        "shadow": 2,
-        "live": 1,
-    }
     if db_mode:
-        if env_mode_explicit and order.get(env_mode, 3) >= order.get(db_mode, 3):
+        if env_mode_explicit and mode_rank(env_mode) >= mode_rank(db_mode):
             mode = _normalize_mode(env_mode, "safe")
             source = f"{source}+env_restrictive"
         else:
@@ -1251,6 +1364,30 @@ def execution_gate_snapshot(
             "runtime_source": runtime_source,
             "severity": "CRITICAL",
             "severity_reasons": _dedupe_strs(severity_reasons + ["kill_switch_env_global"]),
+        }
+
+    crash_recovery_block = _crash_recovery_live_block(mode)
+    if crash_recovery_block is not None:
+        reason = str(crash_recovery_block.get("reason") or _CRASH_RECOVERY_BLOCK_REASON)
+        return {
+            "ok": True,
+            "ts_ms": ts,
+            "mode": mode,
+            "armed": armed,
+            "armed_source": armed_source,
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "allow_simulation": False,
+            "real_trading_allowed": False,
+            "allowed": False,
+            "reason": reason,
+            "source": source,
+            "runtime_state": runtime_state,
+            "runtime_detail": runtime_detail,
+            "runtime_source": runtime_source,
+            "severity": "CRITICAL",
+            "severity_reasons": _dedupe_strs(severity_reasons + [reason]),
+            "crash_recovery": dict(crash_recovery_block.get("state") or {}),
         }
 
     # Final mode mapping happens only after all global blocks have been checked,

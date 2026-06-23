@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.data_source_log_store import sanitize_data_source_log_detail_json
 from engine.runtime.logging import get_logger
 from engine.runtime.observability import record_component_health
 from engine.runtime.storage import connect_ro, get_timescale_client
@@ -304,6 +305,9 @@ class TelemetryMirror:
                 if not rows:
                     continue
                 payload = [dict(row) for row in rows]
+                if table_name == "data_source_logs":
+                    for item in payload:
+                        item["detail_json"] = sanitize_data_source_log_detail_json(item.get("detail_json"))
                 enqueue_name = _TABLE_ENQUEUE_METHODS[str(table_name)]
                 enqueue_fn = getattr(client, enqueue_name, None)
                 if not callable(enqueue_fn):

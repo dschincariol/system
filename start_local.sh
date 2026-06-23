@@ -3,9 +3,12 @@ set -euo pipefail
 
 mkdir -p var/log var/db var/tmp var/artifacts var/audit
 
-if [ -f .env ]; then
-  # shellcheck disable=SC2046
-  export $(grep -v '^\s*#' .env | grep -v '^\s*$' | xargs)
+ENV_FILE="${TRADING_ENV_FILE:-.env}"
+if [ -f "${ENV_FILE}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
 fi
 
 export TRADING_LOGS="${TRADING_LOGS:-$(pwd)/var/log}"

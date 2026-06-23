@@ -55,7 +55,7 @@ if [[ -d .git ]]; then
 fi
 
 "$PYTHON_VENV/bin/python" -m pip install --upgrade pip wheel setuptools
-REQ_FILE="$(bash "$TRADING_REPO/deploy/bin/resolve_python_requirements.sh" "$TRADING_REPO")"
+REQ_FILE="$(PYTHON_BIN="$PYTHON_VENV/bin/python" bash "$TRADING_REPO/deploy/bin/resolve_python_requirements.sh" "$TRADING_REPO")"
 "$PYTHON_VENV/bin/pip" install -r "$REQ_FILE"
 
 if [[ -f package.json ]]; then

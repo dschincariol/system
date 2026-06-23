@@ -28,6 +28,8 @@ The boot/operator layer now also owns the guarded repair boundary for operator A
 
 - `/api/operator/support_snapshot`
   repair-oriented evidence bundle from the dashboard/runtime API layer
+- `/api/operator/ping`
+  lightweight sidecar liveness endpoint; the Python dashboard also exposes a same-origin `GET /api/operator/ping` bridge that proxies this sidecar ping and returns `operator_sidecar_unreachable` when the sidecar is down
 - `/api/operator/runtime_watchdogs`
   summarized watchdog view for stalled runtime paths
 - `/api/operator/provider_telemetry`
@@ -62,6 +64,12 @@ typed confirmation token, hold duration when required, `consequence_ack`,
 Sidecar audit records are appended to
 `var/tmp/operator/operator_confirmation_audit.jsonl` by default, with sensitive
 values redacted or hashed.
+
+## Operator Bridge And Snapshot Auth
+
+The canonical operator control service is the Node sidecar on port `4001`; the dashboard bridge exists for same-origin browser access. Dashboard `/api/operator/ping` is intentional and public like liveness. Sensitive support snapshots are not public: direct sidecar access requires `X-Operator-Token`, and the sidecar-to-dashboard support-snapshot proxy also needs a configured dashboard API token via `DASHBOARD_API_TOKEN`, `DASHBOARD_API_TOKEN_FILE`, or the configured secret provider. Missing sidecar auth returns `operator_forbidden` with `reason_code=operator_token_required`; missing downstream dashboard auth for the snapshot proxy returns `operator_dashboard_auth_required` without printing token values.
+
+Dashboard health, readiness, barrier, and snapshot proxy calls use bounded timeouts. Dashboard unreachability is reported as degraded proxy metadata (`dashboard_unreachable`, `request_timeout`, or `timed_out=true`) rather than blocking operator readiness indefinitely.
 
 ## Maintenance Guidance
 

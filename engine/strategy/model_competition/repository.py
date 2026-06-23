@@ -265,7 +265,6 @@ class CompetitionRepository:
         return payload
 
     def get_champion_assignment(self, *, scope: str, symbol: str, horizon_s: int = 0) -> Dict[str, Any]:
-        self.ensure_champion_assignments_schema()
         row = self.con.execute(
             """
             SELECT scope, symbol, horizon_s, model_name, challenger_name, regime, state, assigned_ts_ms, updated_ts_ms, meta_json

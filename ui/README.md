@@ -27,11 +27,15 @@ The `ui/` directory contains browser assets served by the dashboard server.
 - [data_sources.html](data_sources.html)
   Standalone Data Sources Control Center and the canonical single-page source-management shell for live ingestion/provider configuration.
 - [data_sources.js](data_sources.js)
-  Browser controller for guided source inventory, plain-language setup, next-action recommendations, CRUD actions, tests, credential resets, and source-specific logs.
+  Browser controller for guided source inventory, backend-catalog setup metadata, inline field validation, next-action recommendations, CRUD actions, tests, credential resets, and source-specific logs.
 - [data_sources.css](data_sources.css)
   Styling for the standalone data-source control-plane experience.
 - [data_health.js](data_health.js)
   Data Health screen controller for the dashboard `data` route. It owns the Data Health fetch list, payload normalization, and rendering for ingestion, provider telemetry, runtime signals, and feature-visibility panels while preserving IDs declared in [dashboard.html](dashboard.html).
+- [fx_format.js](fx_format.js)
+  Pure display helpers for FX pairs. They mirror FX-02's accepted pair spellings for browser formatting only, providing pip-aware prices, pip-distance text, and lot/unit quantity rendering without DOM, network, or credential access.
+- [fx_session.js](fx_session.js)
+  Pure browser-side mirror of FX-04's 24/5 session boundary model. The default presentation calendar opens Sunday 22:00 UTC and closes Friday 22:00 UTC, with override knobs so the UI can be pinned to backend FX-clock settings.
 - [portfolio.js](portfolio.js)
   Portfolio panel rendering and portfolio-specific dashboard helpers.
 - [bullet_bars.js](bullet_bars.js)
@@ -113,10 +117,17 @@ The `ui/` directory contains browser assets served by the dashboard server.
 - `vendor/`
   Third-party bundled assets.
 
+## FX Surfacing
+
+- Data Sources marks FX or OANDA-style feeds with an `FX feed` badge and reuses the existing `/api/data_sources/test` action. The FX test-result renderer whitelists only status, ok, latency, detail, and message fields so credential-shaped payload data is not displayed.
+- The dashboard Positions & Exposure card reads FX sleeve, leverage, and sizing fields only from existing `/api/ui/metrics`, `/api/portfolio`, `/api/risk/portfolio`, `/api/broker`, and `/api/terminal/positions` payloads. If FX-05 or FX-06 has not surfaced those fields, the card renders `FX data not yet available` rather than inventing zeros.
+- The browser terminal uses `fx_format.js` for FX pair prices and lot quantities, and `fx_session.js` for the 24/5 session label. Non-FX symbols stay on the existing terminal formatting path.
+- No FX UI helper reads credentials, calls live broker mutation routes, or moves risk/session gate authority into the browser. Backend runtime gates remain authoritative.
+
 ## Maintenance Guidance
 
 - Treat [data_sources.html](data_sources.html) as the canonical UI for provider/source setup.
-  Do not reintroduce a second feed-configuration flow in the operator UI or in another dashboard panel.
+  Do not reintroduce a second feed-configuration flow in the operator UI or in another dashboard panel. Provider-specific setup copy, docs links, plan notes, field help, env-var mapping, validation hints, and safety warnings must come from the backend `templates[]` catalog returned by `/api/data_sources`, not a hardcoded JavaScript provider guide map.
 - Keep UI reads aligned with documented API handlers.
 - Keep chart accessibility aligned with visible chart data. If a chart draws multiple series, percentile bands, shaded state bands, or pro-chart overlays, wire those values through [chart_a11y.js](chart_a11y.js) `seriesFields`, explicit columns, and a plain-language summary. Do not expose only the primary price or median line when secondary visible data changes the interpretation.
 - Keep Historical Replay aligned with `/api/replay/day` OHLC candles. The replay canvas must keep high/low/open/close visible, normalize malformed high/low bounds so wicks always contain the open/close body, keep fills anchored to fill price, keep decisions/orders anchored to nearest candle close when those events have no own price, and keep selected-time/event marker alignment derived from millisecond timestamps.
@@ -144,6 +155,7 @@ The `ui/` directory contains browser assets served by the dashboard server.
   If you rename IDs or move structural regions, update the module that reads them in [dashboard.js](dashboard.js).
 - Keep client-side policy helpers advisory only.
   Execution authority still lives in backend gates and operator APIs, not in browser-local state.
+- Treat structured 4xx business refusals as displayable application responses, not transport crashes, when a panel explicitly opts into application-level failures. Data-source test/setup flows render `reason_code`/`message` from missing credentials or provider auth refusals; terminal order entry still blocks the action and shows the backend refusal reason.
 - Keep structured confirmations advisory in the UI and authoritative on the server.
   New high-impact UI mutations should use [confirmation_modal.mjs](confirmation_modal.mjs)
   or an equivalent shared helper, but the matching sidecar/API route must still

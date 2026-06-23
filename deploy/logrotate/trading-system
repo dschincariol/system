@@ -36,11 +36,11 @@
     su trading trading
 }
 
-/zpool/trading/runtime/logs/*.log
-/zpool/trading/runtime/logs/*.out
-/zpool/trading/runtime/logs/*.err
-/zpool/trading/runtime/logs/*.jsonl
-/zpool/trading/runtime/data/ai_operator_log.jsonl {
+/auxpool/trading/runtime/logs/*.log
+/auxpool/trading/runtime/logs/*.out
+/auxpool/trading/runtime/logs/*.err
+/auxpool/trading/runtime/logs/*.jsonl
+/auxpool/trading/runtime/data/ai_operator_log.jsonl {
     daily
     maxsize 50M
     rotate 10

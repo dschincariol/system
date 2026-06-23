@@ -68,11 +68,27 @@ Manual quantity orders keep portfolio-weight fields neutral: `from_weight = 0.0`
 
 Before writing an intent, terminal mutations also enforce fresh price, max quantity, max notional, optional per-symbol caps, and duplicate-recent-order controls. Rejections are persisted to `terminal_intent_rejections` with stable reason codes.
 
+Expected terminal refusals are not server crashes. Safety-gate blocks return structured 403 payloads, and pre-trade business refusals such as stale price, duplicate recent intent, max quantity, or max notional return structured 409 payloads. All refusal payloads include `ok=false`, `error`, `reason_code`, a safe human `message`, and `meta.status`. The handlers still do not submit, cancel, replace, or flatten broker orders directly.
+
+## Business Refusal Status Contract
+
+The shared HTTP transport maps expected business refusals to 4xx responses instead of allowing them to fall through to 500:
+
+- safety or execution blocks: 403
+- pre-trade/order conflicts: 409
+- missing data-source credentials or incomplete provider configuration: 422
+- rejected provider credentials: 401
+- missing provider entitlements: 403
+
+Unexpected handler exceptions still return 500 with `error=internal_server_error`, `reason_code=handler_exception`, and a safe message that does not echo exception text to the client.
+
 ## Market Candle Contract
 
 `GET /api/market/candles` is the canonical live chart history endpoint for dashboard and terminal pro charts. Query parameters are `symbol`, `tf`, `limit`, and `max_points`.
 
 `limit` is normalized to `10..5000` and caps the number of newest candles kept after tick aggregation. The storage read may fetch more raw rows than the final candle count, but bounded SQLite and Timescale quote queries apply their row limit to the newest eligible rows first and then return rows in ascending timestamp order before candle building. This preserves dense-symbol recency without changing the frontend contract.
+
+SQLite quote snapshots use `price_quotes.ts_ms`. Timescale price sidecars use canonical `price_quotes."time"` / `price_quotes_raw."time"` columns; the read router projects those values to API `ts_ms` with the shared helpers in `engine.runtime.price_timescale_schema` and keeps Timescale filters/order clauses on `"time"` for index use. Readers should not require a physical `ts_ms` column on Timescale `price_quotes`.
 
 `max_points` is an optional presentation cap. When supplied, it is normalized to `50..20000`; when omitted, it defaults to the normalized `limit`. If the post-`limit` candle array still exceeds `max_points`, the API downsamples the ascending array and always includes the newest candle. Responses keep `candles` ascending by `ts_ms`; `meta.limit`, `meta.max_points`, `meta.fetch_limit`, and `meta.order` expose the effective bounds and ordering.
 
@@ -276,6 +292,8 @@ The route is explanatory only. Live model serving still rejects shadow feature c
 `http_transport.py` classifies registered routes before dispatch. Explicit health, liveness, and readiness GET routes remain public; other registered `/api/*` GET routes are sensitive by default, including `/api/system/config`, `/api/operator/logs`, `/api/operator/support_snapshot`, and `/api/terminal/positions`.
 
 Sensitive GET routes require `X-API-Token` in production/live or remote-bind deployments, use the same rate limiter and append-only audit event path as protected mutations, and reject query-string `token` authentication in production/live. Responses from sensitive GET routes pass through the shared API redactor, which masks DSNs, tokens, passwords, API keys, Authorization header values, and broker/account identifiers.
+
+The dashboard-owned `GET /api/operator/ping` bridge is intentionally public like health/liveness and proxies the operator sidecar ping with a bounded timeout. If the sidecar is unavailable, it returns a structured 503 with `reason_code=operator_sidecar_unreachable`.
 
 Confirmed high-impact mutations are listed in the transport confirmation
 registry. Emergency stop, runtime stop/restart, guarded job starts/stops,

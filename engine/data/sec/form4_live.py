@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
 import requests
@@ -29,6 +30,23 @@ FORM4_FORMS = {"4", "4/A"}
 
 LOG = get_logger("engine.data.sec.form4_live")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+class Form4DocumentDiscoveryError(RuntimeError):
+    """Raised when a Form 4 filing cannot yield a valid ownership XML document."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str = "empty_payload",
+        status_code: int | None = None,
+        endpoint: str = "",
+    ) -> None:
+        super().__init__(str(message))
+        self.classification = str(classification)
+        self.status_code = status_code
+        self.endpoint = str(endpoint or "")
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -120,6 +138,34 @@ def _safe_float(value: Any) -> Optional[float]:
 
 def _local_name(tag: Any) -> str:
     return str(tag or "").split("}", 1)[-1]
+
+
+def _is_html_payload(text: Any) -> bool:
+    head = str(text or "").lstrip()[:500].lower()
+    return head.startswith("<!doctype html") or head.startswith("<html") or "<html" in head
+
+
+def _validate_form4_xml(text: Any) -> ET.Element:
+    payload = str(text or "").strip()
+    if not payload:
+        raise Form4DocumentDiscoveryError("form4_xml_empty", classification="empty_payload")
+    if _is_html_payload(payload):
+        raise Form4DocumentDiscoveryError("form4_primary_document_is_html", classification="malformed_payload")
+    try:
+        root = ET.fromstring(payload)
+    except Exception as exc:
+        raise Form4DocumentDiscoveryError(
+            f"form4_xml_parse_failed:{type(exc).__name__}",
+            classification="malformed_payload",
+        ) from exc
+    document_type = ""
+    for child in list(root):
+        if _local_name(child.tag) == "documentType":
+            document_type = str(child.text or "").strip().upper()
+            break
+    if _local_name(root.tag) != "ownershipDocument" or document_type not in FORM4_FORMS:
+        raise Form4DocumentDiscoveryError("form4_xml_not_ownership_document", classification="malformed_payload")
+    return root
 
 
 def _child(node: ET.Element | None, name: str) -> ET.Element | None:
@@ -507,6 +553,157 @@ def parse_form4_xml(
     return rows
 
 
+def _filing_directory_url(filing: Dict[str, Any]) -> str:
+    primary_url = str((filing or {}).get("primary_doc_url") or "").strip()
+    if primary_url:
+        return primary_url.rsplit("/", 1)[0].rstrip("/") + "/"
+    cik = str((filing or {}).get("cik") or "").strip()
+    accession = str((filing or {}).get("accession") or "").strip()
+    if cik and accession:
+        return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/"
+    return ""
+
+
+def _candidate_xml_urls_from_index(index_payload: Any, directory_url: str) -> List[str]:
+    directory = (index_payload or {}).get("directory") if isinstance(index_payload, dict) else {}
+    items = (directory or {}).get("item") if isinstance(directory, dict) else []
+    candidates: List[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        lower = name.lower()
+        if not lower.endswith(".xml"):
+            continue
+        if lower.endswith(".xsd") or "schema" in lower:
+            continue
+        candidates.append(urljoin(directory_url, name))
+
+    def _rank(url: str) -> tuple[int, str]:
+        lower_url = url.lower()
+        preferred = (
+            "form4" in lower_url
+            or "ownership" in lower_url
+            or "doc4" in lower_url
+            or lower_url.endswith("/primary_doc.xml")
+        )
+        return (0 if preferred else 1, lower_url)
+
+    return sorted(dict.fromkeys(candidates), key=_rank)
+
+
+def discover_form4_xml_document(
+    filing: Dict[str, Any],
+    *,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Locate and fetch the actual SEC ownership XML document for a Form 4 filing."""
+    session_obj = session or requests.Session()
+    primary_url = str((filing or {}).get("primary_doc_url") or "").strip()
+    urls: List[str] = []
+    if primary_url:
+        urls.append(primary_url)
+
+    directory_url = _filing_directory_url(filing)
+    if directory_url:
+        index_url = urljoin(directory_url, "index.json")
+        try:
+            index_response = session_obj.get(index_url, headers=edgar_live.HEADERS, timeout=FORM4_TIMEOUT_S)
+            if int(getattr(index_response, "status_code", 0) or 0) == 200:
+                urls.extend(_candidate_xml_urls_from_index(index_response.json(), directory_url))
+            elif int(getattr(index_response, "status_code", 0) or 0) in {401, 403, 429, 503}:
+                raise Form4DocumentDiscoveryError(
+                    f"form4_index_http_{int(index_response.status_code)}",
+                    classification=("rate_limited" if int(index_response.status_code) == 429 else "provider_unreachable"),
+                    status_code=int(index_response.status_code),
+                    endpoint=index_url,
+                )
+        except Form4DocumentDiscoveryError:
+            raise
+        except Exception as exc:
+            _warn_nonfatal(
+                "FORM4_LIVE_INDEX_DISCOVERY_FAILED",
+                exc,
+                once_key=f"form4_index:{index_url}",
+                index_url=index_url,
+            )
+
+    last_error: Form4DocumentDiscoveryError | None = None
+    for url in dict.fromkeys(urls):
+        if not url:
+            continue
+        try:
+            response = session_obj.get(url, headers=edgar_live.HEADERS, timeout=FORM4_TIMEOUT_S)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code == 429:
+                raise Form4DocumentDiscoveryError(
+                    "form4_document_rate_limited",
+                    classification="rate_limited",
+                    status_code=status_code,
+                    endpoint=url,
+                )
+            if status_code in {401, 403}:
+                raise Form4DocumentDiscoveryError(
+                    f"form4_document_http_{status_code}",
+                    classification="entitlement_missing",
+                    status_code=status_code,
+                    endpoint=url,
+                )
+            if status_code == 503:
+                raise Form4DocumentDiscoveryError(
+                    "form4_document_temporarily_unavailable",
+                    classification="provider_unreachable",
+                    status_code=status_code,
+                    endpoint=url,
+                )
+            response.raise_for_status()
+            text = str(getattr(response, "text", "") or "")
+            _validate_form4_xml(text)
+            discovered = dict(filing or {})
+            discovered["primary_doc_url"] = url
+            discovered["xml_doc_url"] = url
+            return {"url": url, "text": text, "filing": discovered}
+        except Form4DocumentDiscoveryError as exc:
+            last_error = exc
+            if exc.classification in {"rate_limited", "entitlement_missing"}:
+                raise
+        except Exception as exc:
+            last_error = Form4DocumentDiscoveryError(
+                f"form4_document_fetch_failed:{type(exc).__name__}",
+                classification="provider_unreachable",
+                endpoint=url,
+            )
+    if last_error is not None:
+        raise last_error
+    raise Form4DocumentDiscoveryError("form4_xml_document_not_found", classification="empty_payload")
+
+
+def probe_form4_xml_document(
+    *,
+    symbol: str = "AAPL",
+    filing_limit: int = 3,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    filings = edgar_live.fetch_recent_filings(str(symbol or "AAPL"), limit=max(1, int(filing_limit)))
+    for filing in filings or []:
+        if str((filing or {}).get("form") or "").strip().upper() not in FORM4_FORMS:
+            continue
+        doc = discover_form4_xml_document(dict(filing or {}), session=session)
+        rows = parse_form4_xml(
+            str(doc.get("text") or ""),
+            filing=dict(doc.get("filing") or filing or {}),
+            filing_symbol=str(symbol or ""),
+        )
+        return {
+            "url": str(doc.get("url") or ""),
+            "payload_count": int(len(rows)),
+            "filing_accession": str((filing or {}).get("accession") or ""),
+        }
+    raise Form4DocumentDiscoveryError("form4_recent_filing_not_found", classification="empty_payload")
+
+
 def fetch_form4_transactions(
     symbol: str,
     *,
@@ -534,30 +731,29 @@ def fetch_form4_transactions(
         filed_ts_ms = _parse_ts_ms(filed_date)
         if filed_ts_ms is not None and filed_ts_ms < int(cutoff_ms):
             continue
-        filing_url = str((filing or {}).get("primary_doc_url") or "").strip()
-        if not filing_url:
-            continue
         try:
-            response = session_obj.get(filing_url, headers=edgar_live.HEADERS, timeout=FORM4_TIMEOUT_S)
-            response.raise_for_status()
+            document = discover_form4_xml_document(dict(filing or {}), session=session_obj)
         except Exception as exc:
             _warn_nonfatal(
                 "FORM4_LIVE_FETCH_FAILED",
                 exc,
-                once_key=f"form4_fetch:{filing_url}",
+                once_key=f"form4_fetch:{(filing or {}).get('accession') or (filing or {}).get('primary_doc_url')}",
                 symbol=symbol_key,
-                filing_url=filing_url,
+                filing_url=str((filing or {}).get("primary_doc_url") or ""),
             )
             continue
+        filing_for_parse = dict(document.get("filing") or filing or {})
+        filing_url = str(document.get("url") or filing_for_parse.get("primary_doc_url") or "")
+        body = str(document.get("text") or "")
         filing_meta = _store_filing_body(
             symbol=symbol_key,
-            filing=dict(filing or {}),
-            body=response.text,
+            filing=filing_for_parse,
+            body=body,
             url=filing_url,
         )
         parsed_rows = parse_form4_xml(
-            response.text,
-            filing=dict(filing or {}),
+            body,
+            filing=filing_for_parse,
             filing_symbol=symbol_key,
             allowed_symbols=allowed_symbols,
         )

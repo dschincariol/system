@@ -849,6 +849,9 @@ BACKUP_EVIDENCE_RTO_S=1800
 BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S=120
 BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
 BACKUP_EVIDENCE_HMAC_KEY_FILE=${BACKUP_EVIDENCE_HMAC_KEY_FILE}
+PREFLIGHT_REQUIRE_CPU_POWER_POLICY=1
+PREFLIGHT_CPU_POWER_POLICY_TIMEOUT_S=3.0
+PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1
 TIMESCALE_ENABLED=1
 TIMESCALE_PRICES_ENABLED=1
 EOF
@@ -1067,14 +1070,16 @@ install_python_runtime() {
 
   local resolved_requirements
   if [ -n "$REQUIREMENTS_FILE" ]; then
-    if [[ "$REQUIREMENTS_FILE" = /* ]]; then
-      resolved_requirements="$REQUIREMENTS_FILE"
-    else
-      resolved_requirements="${REPO_ROOT}/${REQUIREMENTS_FILE}"
-    fi
+    resolved_requirements="$(
+      TRADING_DEPENDENCY_PROFILE="$DEPENDENCY_PROFILE" \
+        TRADING_REQUIREMENTS_FILE="$REQUIREMENTS_FILE" \
+        PYTHON_BIN="${VENV_DIR}/bin/python" \
+        bash "${REPO_ROOT}/deploy/bin/resolve_python_requirements.sh" "$REPO_ROOT"
+    )"
   else
     resolved_requirements="$(
       TRADING_DEPENDENCY_PROFILE="$DEPENDENCY_PROFILE" \
+        PYTHON_BIN="${VENV_DIR}/bin/python" \
         bash "${REPO_ROOT}/deploy/bin/resolve_python_requirements.sh" "$REPO_ROOT"
     )"
   fi
@@ -1089,6 +1094,7 @@ install_python_runtime() {
     {
       sha256sum "$resolved_requirements"
       find "$REPO_ROOT" -maxdepth 1 -name 'requirements*.txt' -type f -print0 | sort -z | xargs -0 sha256sum
+      find "$REPO_ROOT" -maxdepth 1 -name 'requirements*.in' -type f -print0 | sort -z | xargs -0 sha256sum
     } | sha256sum | awk '{print $1}'
   )"
   marker="${VENV_DIR}/.requirements.${DEPENDENCY_PROFILE}.sha256"
@@ -1159,6 +1165,7 @@ install_backup_scripts() {
     wal_archive.sh \
     wal_archive_catchup.sh \
     base_backup.sh \
+    offsite_base_backup_stub.sh \
     state_snapshot.sh \
     artifact_snapshot.sh \
     prune.sh \
@@ -1179,7 +1186,9 @@ install_server_ops_scripts() {
   local script
   for script in \
     disk_remediation.sh \
-    zfs_tuning.sh
+    provision_storage_pools.sh \
+    zfs_tuning.sh \
+    memory_pressure_hardening.sh
   do
     if install_if_changed_from_file "${SERVER_SCRIPT_SRC_DIR}/${script}" "${SERVER_SCRIPT_DST_DIR}/${script}" 0755 root "$TRADING_GROUP"; then
       :

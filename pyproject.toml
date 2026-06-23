@@ -43,8 +43,19 @@ include = ["engine*", "routes*", "services*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 required_plugins = ["pytest-timeout>=2.4"]
+addopts = "-q --strict-markers --strict-config --durations=20"
 markers = [
+  "linux_only: test runs only on Linux",
+  "live_network: test intentionally contacts non-local live services; deselected unless TRADING_TEST_ALLOW_LIVE_NETWORK=1",
+  "requires_postgres: test needs a reachable Postgres instance at TS_PG_DSN; auto-skipped when unreachable",
+  "requires_redis: test needs a reachable Redis instance at TS_REDIS_URL; auto-skipped when unreachable",
   "requires_rocm: test requires a local ROCm torch build with a visible GPU",
+  "safety_critical: money-path control test that must pass on every merge",
+]
+filterwarnings = [
+  "error",
+  "ignore:enable_nested_tensor is True.*:UserWarning:torch\\.nn\\.modules\\.transformer",
+  "ignore:TS_SECRETS_PROVIDER=plaintext reads raw secret files.*:RuntimeWarning",
 ]
 timeout = "120"
 timeout_method = "thread"
@@ -73,3 +84,24 @@ output = "artifacts/coverage/coverage.json"
 minimum_percent = 52.0
 package_roots = ["engine", "services", "routes", "ops"]
 report_dir = "artifacts/coverage"
+zero_covered_module_roots = ["engine/risk", "engine/execution", "engine/runtime"]
+zero_covered_module_allowlist = [
+  "engine/execution/circuit_breaker.py",
+  "engine/execution/exec_conf_calibration.py",
+  "engine/execution/train_rl_strategy_policy.py",
+  "engine/runtime/cache_warm.py",
+  "engine/runtime/capital_efficiency.py",
+  "engine/runtime/execution_barrier.py",
+  "engine/runtime/observability.py",
+  "engine/runtime/prod_replay_selftest.py",
+  "engine/runtime/prod_selftest.py",
+  "engine/runtime/prod_trade_attribution_selftest.py",
+  "engine/runtime/regime_stack.py",
+  "engine/runtime/rules_audit.py",
+  "engine/runtime/run_root_script.py",
+]
+
+[tool.trading_system.coverage_gate.package_minimums]
+"engine/risk" = 50.81
+"engine/execution" = 58.92
+"engine/runtime" = 58.49

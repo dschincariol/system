@@ -79,6 +79,13 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
                 )
             )
             stack.enter_context(
+                patch.object(
+                    prod_preflight,
+                    "_cpu_power_policy_gate",
+                    return_value=(["cpu power policy ok"], [], [], {"ok": True}),
+                )
+            )
+            stack.enter_context(
                 patch.object(prod_preflight, "_disk_pressure_gate", return_value=(["disk ok"], [], [], {"status": "ok"}))
             )
             stack.enter_context(
@@ -287,6 +294,48 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
         self.assertIn("operator_sidecar_public_port_forbidden", rendered)
         self.assertFalse(state["ok"])
 
+    def test_operator_sidecar_security_gate_blocks_ignored_internal_public_intent(self) -> None:
+        prod_preflight = _reload_module()
+
+        with patch.dict(
+            os.environ,
+            {
+                "ENV": "prod",
+                "ENGINE_MODE": "safe",
+                "EXECUTION_MODE": "safe",
+                "OPERATOR_API_TOKEN": "operator-token-1234567890",
+                "OPERATOR_SIDECAR_INTERNAL_ONLY": "1",
+                "OPERATOR_PUBLIC_PORT": "4001",
+                "OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND": "1",
+                "PREFLIGHT_CHECK_OPERATOR_SIDECAR_HTTP": "0",
+            },
+            clear=True,
+        ):
+            _notes, _warnings, errors, state = prod_preflight._operator_sidecar_security_gate()
+
+        rendered = "\n".join(errors)
+        self.assertIn("operator_public_port_ignored_internal_only", rendered)
+        self.assertIn("operator_public_bind_flag_ignored_internal_only", rendered)
+        self.assertFalse(state["ok"])
+
+    def test_passive_network_listener_snapshot_flags_operator_wildcard(self) -> None:
+        prod_preflight = _reload_module()
+        output = "\n".join(
+            [
+                'tcp LISTEN 0 4096 0.0.0.0:8000 0.0.0.0:* users:(("python",pid=10,fd=3))',
+                'tcp LISTEN 0 4096 0.0.0.0:4001 0.0.0.0:* users:(("node",pid=11,fd=3))',
+                'tcp LISTEN 0 4096 0.0.0.0:7002 0.0.0.0:* users:(("other",pid=12,fd=3))',
+            ]
+        )
+
+        with patch.dict(os.environ, {"DASHBOARD_PUBLIC_PORT": "8000"}, clear=True):
+            state = prod_preflight._passive_network_listener_snapshot(output)
+
+        self.assertFalse(state["ok"])
+        self.assertIn("operator_sidecar_wildcard_listener_4001_forbidden", state["errors"])
+        self.assertIn("unexpected_wildcard_listener:7002", state["warnings"])
+        self.assertEqual(state["wildcard_ports"], [4001, 7002, 8000])
+
     def test_operator_sidecar_security_gate_detects_unauthenticated_get(self) -> None:
         prod_preflight = _reload_module()
 
@@ -438,6 +487,20 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
                             "last_failed_wal": "",
                             "last_failed_at_ts": None,
                         },
+                        "wal_archive_target": {
+                            "status": "pass",
+                            "source": "filesystem_repair",
+                            "root": "/var/backups/trading",
+                            "wal_dir": "/var/backups/trading/wal",
+                            "tmp_dir": "/var/backups/trading/wal/.tmp",
+                            "expected_owner_uid": 70,
+                            "expected_group": "trading",
+                            "expected_group_gid": 70,
+                            "expected_dir_mode": "2750",
+                            "repaired": False,
+                            "issue_count": 0,
+                            "verified_at_ts": now,
+                        },
                         "restore_drill": {
                             "status": "pass",
                             "verified_at_ts": now,
@@ -517,6 +580,94 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(state["reason"], "pg_wal_free_space_critical")
         self.assertEqual(errors, ["pg_wal disk risk invalid: pg_wal_free_space_critical"])
+
+    def test_cpu_power_policy_gate_fails_closed_on_drift_even_when_not_required(self) -> None:
+        prod_preflight = _reload_module()
+
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "cpu_power_policy.sh"
+            script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        '[ "${1:-}" = "verify" ] || exit 88',
+                        "printf 'power_profile=balanced\\n'",
+                        "printf 'power_profile_degraded=no\\n'",
+                        "printf 'amd_pstate_status=active\\n'",
+                        "printf 'scaling_governor=powersave (2/2)\\n'",
+                        "printf 'energy_performance_preference=balance_performance (2/2)\\n'",
+                        "printf 'intended_state=FAIL expected profile=performance or epp=performance or governor=performance\\n'",
+                        "exit 1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "TRADING_CPU_POWER_POLICY_SCRIPT": str(script),
+                    "PREFLIGHT_CPU_POWER_POLICY_TIMEOUT_S": "2",
+                },
+                clear=True,
+            ):
+                notes, warnings, errors, state = prod_preflight._cpu_power_policy_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertFalse(state["required"])
+        self.assertEqual(state["status"], "drift")
+        self.assertEqual(state["reason"], "cpu_power_policy_drift")
+        self.assertTrue(errors)
+        self.assertIn("cpu power policy invalid: cpu_power_policy_drift", errors[0])
+        self.assertIn("intended_state=FAIL", errors[0])
+
+    def test_cpu_power_policy_gate_warns_when_policy_unavailable_and_not_required(self) -> None:
+        prod_preflight = _reload_module()
+
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "cpu_power_policy.sh"
+            script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        '[ "${1:-}" = "verify" ] || exit 88',
+                        "printf 'power_profile=unavailable\\n'",
+                        "printf 'power_profile_degraded=unknown\\n'",
+                        "printf 'amd_pstate_status=missing\\n'",
+                        "printf 'scaling_governor=missing\\n'",
+                        "printf 'energy_performance_preference=missing\\n'",
+                        "printf 'intended_state=FAIL expected profile=performance or epp=performance or governor=performance\\n'",
+                        "exit 1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "TRADING_CPU_POWER_POLICY_SCRIPT": str(script),
+                    "PREFLIGHT_CPU_POWER_POLICY_TIMEOUT_S": "2",
+                },
+                clear=True,
+            ):
+                notes, warnings, errors, state = prod_preflight._cpu_power_policy_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(errors, [])
+        self.assertFalse(state["required"])
+        self.assertEqual(state["status"], "unavailable")
+        self.assertEqual(state["reason"], "cpu_power_policy_unavailable")
+        self.assertTrue(warnings)
+        self.assertIn("cpu power policy advisory unavailable: cpu_power_policy_unavailable", warnings[0])
+        self.assertIn("intended_state=FAIL", warnings[0])
 
 
 if __name__ == "__main__":

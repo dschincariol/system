@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,6 +35,29 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
+
+      - name: Run pre-commit safety hooks on changed files
+        run: |
+          python -m pip install pre-commit==4.6.0
+
+          base_ref=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event.before }}" != "" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            base_ref="${{ github.event.before }}"
+          fi
+
+          if [ "$base_ref" != "" ]; then
+            python -m pre_commit run --from-ref "$base_ref" --to-ref "${{ github.sha }}" --show-diff-on-failure
+          else
+            mapfile -t changed_files < <(git diff-tree --no-commit-id --name-only -r "${{ github.sha }}")
+            if [ "${#changed_files[@]}" -eq 0 ]; then
+              echo "No changed files for pre-commit hooks."
+            else
+              python -m pre_commit run --files "${changed_files[@]}" --show-diff-on-failure
+            fi
+          fi
+        shell: bash
 
       - name: Install Node dependencies
         run: npm ci
@@ -69,6 +94,10 @@ jobs:
           set -euo pipefail
 
           python -m pytest -q -m "not requires_rocm" tests/ops
+          python -m pytest -q \
+            tests/test_observability_cpu_power_policy.py \
+            tests/test_prod_preflight_smoke_contracts.py::ProdPreflightSmokeContractTests::test_cpu_power_policy_gate_fails_closed_on_drift_even_when_not_required \
+            tests/test_prod_preflight_smoke_contracts.py::ProdPreflightSmokeContractTests::test_cpu_power_policy_gate_warns_when_policy_unavailable_and_not_required
 
           mapfile -t ops_shell_tests < <(find tests/ops -maxdepth 1 -type f -name '*.sh' | sort)
           if [ "${#ops_shell_tests[@]}" -eq 0 ]; then
@@ -101,12 +130,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Validate ROCm dependency profile resolver
+      - name: Validate ROCm dependency profile rejects Python 3.11
         run: |
-          resolved="$(TRADING_DEPENDENCY_PROFILE=amd-rocm bash deploy/bin/resolve_python_requirements.sh "$PWD")"
-          test "$(basename "$resolved")" = "requirements-amd-rocm.txt"
-          grep -Eq 'gfx1151|Strix Halo' "$resolved"
-          grep -Eq 'repo\.radeon\.com/rocm/.+rocm-rel-7\.2\.4' "$resolved"
+          set +e
+          output="$(TRADING_DEPENDENCY_PROFILE=amd-rocm bash deploy/bin/resolve_python_requirements.sh "$PWD" 2>&1)"
+          status="$?"
+          set -e
+          test "$status" = "65"
+          grep -F 'amd_rocm_python_runtime_unsupported' <<<"$output"
+          grep -F 'required_python=>=3.12' <<<"$output"
 
       - name: Install locked CPU test dependencies
         run: |
@@ -179,19 +211,89 @@ jobs:
           path: artifacts/coverage/*
           if-no-files-found: warn
 
+  safety-critical-money-path:
+    name: Safety-critical money path (SQLite/mocks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: .
+      APP_ENV: test
+      ENGINE_MODE: safe
+      EXECUTION_MODE: safe
+      OPERATOR_MODE: safe
+      PROD_LOCK: "0"
+      KILL_SWITCH_GLOBAL: "0"
+      AUTO_BOOT_DAEMONS: "0"
+      AUTO_PIPELINE: "0"
+      TS_STORAGE_BACKEND: sqlite
+      LIVE_CACHE_BACKEND: memory
+      IBKR_ENABLED: "0"
+      CCXT_ENABLED: "0"
+      POLYGON_WS_ENABLED: "0"
+      POLYGON_REST_ENABLED: "0"
+      TRADIER_ENABLED: "0"
+      ALPACA_ENABLED: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install locked Python dev/test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run safety-critical money-path suites without skips
+        run: |
+          python tools/run_required_backend_tests.py \
+            --label safety-critical-money-path \
+            --junitxml "$RUNNER_TEMP/pytest-safety-critical-money-path.xml" \
+            --min-selected 130 \
+            --expected-source tests/test_kill_switch_regressions.py \
+            --expected-source tests/test_broker_router_dry_run_gates.py \
+            --expected-source tests/test_broker_order_idempotency_regressions.py \
+            --expected-source tests/test_broker_apply_orders_modes.py \
+            --expected-source tests/test_drawdown_fail_closed.py \
+            --expected-source tests/test_real_capital_safety_e2e.py \
+            --expected-source tests/test_position_reconcile_safety.py \
+            --expected-source tests/test_live_prelive_reconcile_policy.py \
+            -- -q -m "safety_critical" -rs \
+              tests/test_kill_switch_regressions.py \
+              tests/test_broker_router_dry_run_gates.py \
+              tests/test_broker_order_idempotency_regressions.py \
+              tests/test_broker_apply_orders_modes.py \
+              tests/test_drawdown_fail_closed.py \
+              tests/test_real_capital_safety_e2e.py \
+              tests/test_position_reconcile_safety.py \
+              tests/test_live_prelive_reconcile_policy.py
+
+      - name: Upload safety-critical JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: safety-critical-money-path-junit
+          path: ${{ runner.temp }}/pytest-safety-critical-money-path.xml
+          if-no-files-found: warn
+
   production-backend:
     name: Production backend gate (Postgres + Redis)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     services:
       postgres:
         image: timescale/timescaledb:latest-pg16
         env:
           POSTGRES_DB: trading_ci
           POSTGRES_USER: ts_app
-          POSTGRES_PASSWORD: test-app-password
+          POSTGRES_PASSWORD: test-app-password # pragma: allowlist secret
         ports:
           - 5432:5432
         options: >-
+          --shm-size 1g
           --health-cmd "pg_isready -U ts_app -d trading_ci"
           --health-interval 10s
           --health-timeout 5s
@@ -209,8 +311,8 @@ jobs:
       PYTHONPATH: .
       TS_PRODUCTION_BACKEND_TESTS: "1"
       TS_STORAGE_BACKEND: postgres
-      TS_PG_DSN: "host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password"
-      TS_PG_PASSWORD: test-app-password
+      TS_PG_DSN: "host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password" # pragma: allowlist secret
+      TS_PG_PASSWORD: test-app-password # pragma: allowlist secret
       TS_PG_SCHEMA_PER_DB_PATH: "1"
       TS_PG_POOL_SIZE: "16"
       TS_PG_POOL_MIN_SIZE: "1"
@@ -290,6 +392,23 @@ jobs:
               tests/test_cache_wrappers_integration.py::test_real_redis_postgres_wrappers_integration \
               tests/test_live_cache.py::LiveCacheTests::test_explicit_redis_live_cache_round_trip
 
+      - name: Run full suite on Postgres and Redis
+        env:
+          TRADING_UNIT_TEST_SCHEMA_FAST: "0"
+        run: |
+          python tools/run_required_backend_tests.py \
+            --label full-postgres-redis-suite \
+            --junitxml "$RUNNER_TEMP/pytest-full-postgres-redis.xml" \
+            --min-selected 2400 \
+            --allow-skip-message-regex "PySR and Julia are required" \
+            --allow-skip-message-regex "TS_PGBOUNCER_TEST_DSN" \
+            --allow-skip-message-regex "requires Python 3\\.12 ROCm runtime image" \
+            --allow-skip-message-regex "ROCm torch GPU is unavailable" \
+            --allow-skip-message-regex "node executable is not available" \
+            --allow-skip-message-regex "node is required" \
+            --allow-skip-message-regex "dependency-free fallback" \
+            -- -q tests/ -rs
+
       - name: Run staging prod-preflight evidence harness
         run: |
           mkdir -p "$RUNNER_TEMP/trading-preflight-data" artifacts/preflight
@@ -319,9 +438,9 @@ jobs:
             echo "PREFLIGHT_REQUIRE_OBJECT_STORAGE=0"
             echo "PREFLIGHT_REQUIRE_BACKUP_EVIDENCE=0"
             echo "PREFLIGHT_CHECK_OPERATOR_SIDECAR_HTTP=0"
-            echo "DASHBOARD_API_TOKEN=github-actions-dashboard-token-1234567890"
-            echo "OPERATOR_API_TOKEN=github-actions-operator-token-1234567890"
-            echo "DATA_SOURCE_MASTER_KEY=6cJ3aBXfO5ppbWiUmmwbBBuxJmloL9GkHW0gMvr/Xv0="
+            echo "DASHBOARD_API_TOKEN=github-actions-dashboard-token-1234567890" # pragma: allowlist secret
+            echo "OPERATOR_API_TOKEN=github-actions-operator-token-1234567890" # pragma: allowlist secret
+            python -c 'import base64, os; print("DATA_SOURCE_MASTER_KEY=" + base64.b64encode(os.urandom(32)).decode("ascii"))'
             echo "DB_PATH=$RUNNER_TEMP/trading-preflight-data"
           } > "$RUNNER_TEMP/staging-prod-preflight.env"
 
@@ -373,3 +492,11 @@ jobs:
           name: staging-prod-preflight-evidence
           path: artifacts/preflight/staging/*.json
           if-no-files-found: error
+
+      - name: Upload production-backend JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-backend-junit
+          path: ${{ runner.temp }}/pytest-*.xml
+          if-no-files-found: warn

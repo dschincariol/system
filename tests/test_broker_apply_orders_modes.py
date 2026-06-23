@@ -13,11 +13,15 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 from unittest.mock import Mock, patch
 
+import pytest
+
 from engine.runtime.live_trading_preflight import DEFAULT_LIVE_CONFIRM_PHRASE
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+pytestmark = pytest.mark.safety_critical
 
 
 def _reload_modules(*module_names: str):
@@ -210,9 +214,11 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
             self.kill_switch,
             _decision_engine,
             self.portfolio_execution_intents,
+            _trade_attribution_ledger,
             self.execution_policy_engine,
             self.broker_router,
             self.broker_sim,
+            _order_command_boundary,
             self.broker_apply_orders,
         ) = _reload_modules(
             "engine.runtime.db_guard",
@@ -227,9 +233,11 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
             "engine.execution.kill_switch",
             "engine.decision_engine",
             "engine.strategy.portfolio_execution_intents",
+            "engine.execution.trade_attribution_ledger",
             "engine.execution.execution_policy_engine",
             "engine.execution.broker_router",
             "engine.execution.broker_sim",
+            "engine.execution.order_command_boundary",
             "engine.execution.broker_apply_orders",
         )
 
@@ -644,14 +652,19 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self._set_mode("shadow")
         self._seed_portfolio_order(ts_ms=now_ms)
 
-        rc, out, _ = self._run_main(
-            competition_policy={
-                "allowed": False,
-                "blocked": True,
-                "reason": "champion_mismatch",
-                "champion_model_name": "champion",
-            }
-        )
+        with patch.object(
+            self.broker_apply_orders,
+            "apply_new_portfolio_orders",
+            side_effect=AssertionError("shadow mode must not call the live broker router"),
+        ):
+            rc, out, _ = self._run_main(
+                competition_policy={
+                    "allowed": False,
+                    "blocked": True,
+                    "reason": "champion_mismatch",
+                    "champion_model_name": "champion",
+                }
+            )
 
         self.assertEqual(rc, 0)
         self.assertEqual(out["status"], "ok")
@@ -968,6 +981,40 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertAlmostEqual(sum(self._signed_weight(order) for order in routed_orders), -0.50, places=9)
         self.assertEqual({order["to_side"] for order in routed_orders}, {"SHORT"})
 
+    def test_live_net_cap_exact_boundary_is_not_resized(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "2.0"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "0.50"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.20)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.30)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 2})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertAlmostEqual(sum(self._signed_weight(order) for order in routed_orders), 0.50, places=9)
+        self.assertEqual([order["to_weight"] for order in routed_orders], [0.20, 0.30])
+
+    def test_live_net_cap_just_below_boundary_is_not_resized(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "2.0"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "0.50"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_price("MSFT", now_ms)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.199)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="MSFT", to_side="LONG", to_weight=0.300)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 2})
+
+        rc, out, _ = self._run_live_adapter_capture(adapter)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertAlmostEqual(sum(self._signed_weight(order) for order in routed_orders), 0.499, places=9)
+        self.assertEqual([order["to_weight"] for order in routed_orders], [0.199, 0.300])
+
     def test_live_gross_cap_counts_existing_positions_before_adapter(self) -> None:
         os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
         os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
@@ -1021,6 +1068,42 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         adapter.assert_not_called()
         self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
 
+    def test_live_quantity_order_counts_existing_position_and_resizes_qty_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        os.environ["EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP"] = "2.0"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_broker_position(ts_ms=now_ms, symbol="AAPL", qty=500.0, avg_px=100.0, equity=100000.0)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.10)
+        adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca", "submitted_n": 1})
+        quantity_order = {
+            "source_order_id": 1,
+            "ts_ms": now_ms,
+            "model_id": "baseline",
+            "model_name": "baseline",
+            "symbol": "AAPL",
+            "to_side": "LONG",
+            "from_weight": 0.0,
+            "to_weight": 0.0,
+            "delta_weight": 0.0,
+            "qty": 200.0,
+            "order_sizing": "quantity",
+            "execution_target": "real",
+        }
+
+        with ExitStack() as stack:
+            self._healthy_live_route_stack(stack, adapter=adapter, patch_risk_governor=False)
+            stack.enter_context(patch.object(self.broker_apply_orders, "apply_execution_policy", return_value=[quantity_order]))
+            rc, out, _ = self._run_main(competition_policy={})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "ok")
+        routed_orders = self._adapter_orders(adapter)
+        self.assertEqual(len(routed_orders), 1)
+        self.assertEqual(routed_orders[0]["symbol"], "AAPL")
+        self.assertAlmostEqual(routed_orders[0]["qty"], 100.0, places=9)
+        self.assertAlmostEqual(routed_orders[0]["to_weight"], 0.10, places=9)
+        self.assertAlmostEqual(routed_orders[0]["exposure_cap"]["scale"], 0.50, places=9)
+
     def test_live_invalid_exposure_data_blocks_before_adapter(self) -> None:
         os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
         now_ms = self._seed_live_alpaca_route_base()
@@ -1047,6 +1130,39 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         self.assertEqual(out["status"], "blocked")
         self.assertEqual(out["layer"], "risk_governor")
         self.assertEqual(out["governor"]["exposure_caps"]["status"], "blocked_invalid_exposure_data")
+        adapter.assert_not_called()
+        self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
+
+    def test_live_quantity_order_missing_price_blocks_before_adapter(self) -> None:
+        os.environ["EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP"] = "0.60"
+        now_ms = self._seed_live_alpaca_route_base()
+        self._seed_broker_position(ts_ms=now_ms, symbol="AAPL", qty=0.0, avg_px=100.0, equity=100000.0)
+        self._seed_portfolio_order(ts_ms=now_ms, symbol="AAPL", to_side="LONG", to_weight=0.10)
+        adapter = Mock(side_effect=AssertionError("adapter must not receive missing-price quantity order"))
+        missing_price_order = {
+            "source_order_id": 1,
+            "ts_ms": now_ms,
+            "model_id": "baseline",
+            "model_name": "baseline",
+            "symbol": "MSFT",
+            "to_side": "LONG",
+            "to_weight": 0.0,
+            "delta_weight": 0.0,
+            "qty": 200.0,
+            "order_sizing": "quantity",
+            "execution_target": "real",
+        }
+
+        with ExitStack() as stack:
+            self._healthy_live_route_stack(stack, adapter=adapter, patch_risk_governor=False)
+            stack.enter_context(patch.object(self.broker_apply_orders, "apply_execution_policy", return_value=[missing_price_order]))
+            rc, out, _ = self._run_main(competition_policy={})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["layer"], "risk_governor")
+        self.assertEqual(out["governor"]["exposure_caps"]["status"], "blocked_invalid_exposure_data")
+        self.assertEqual(out["governor"]["exposure_caps"]["errors"][0]["reason"], "missing_price_for_quantity_order")
         adapter.assert_not_called()
         self.assertEqual(int(self._db_fetchone("SELECT COUNT(*) FROM execution_orders") or 0), 0)
 

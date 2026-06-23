@@ -29,7 +29,28 @@ _DATA_DIR = os.path.abspath(
     os.environ.get("DATA_DIR") or
     str(default_local_db_dir())
 )
-_PID_PATH = os.path.join(_LOG_DIR, "ingestion.pid")
+
+
+def _current_ingestion_shard():
+    from engine.runtime.ingestion_shards import current_ingestion_shard
+
+    return current_ingestion_shard()
+
+
+def _ingestion_shard_slug() -> str:
+    shard = _current_ingestion_shard()
+    if not bool(shard.enabled):
+        return ""
+    return str(shard.label).replace(":", "-")
+
+
+def _ingestion_pid_path(log_dir: str) -> str:
+    slug = _ingestion_shard_slug()
+    filename = "ingestion.pid" if not slug else f"ingestion.{slug}.pid"
+    return os.path.join(log_dir, filename)
+
+
+_PID_PATH = _ingestion_pid_path(_LOG_DIR)
 LOG = get_logger("start_ingestion")
 
 
@@ -114,7 +135,7 @@ def _bootstrap_ingestion_env() -> None:
     try:
         from engine.runtime.hardware import apply_cpu_first_runtime_defaults
 
-        apply_cpu_first_runtime_defaults()
+        apply_cpu_first_runtime_defaults(role="ingestion")
     except Exception as e:
         _warn_nonfatal("START_INGESTION_HARDWARE_DEFAULTS_FAILED", e)
 
@@ -219,6 +240,7 @@ def _write_pid_file() -> None:
         "entry": "start_ingestion.py",
         "base_dir": str(_BASE_DIR),
         "created_ts_ms": int(time.time() * 1000),
+        "shard": _current_ingestion_shard().as_dict(),
     }
     Path(_PID_PATH).write_text(
         json.dumps(payload, separators=(",", ":"), sort_keys=True),
@@ -253,8 +275,16 @@ def _cleanup_pid_file() -> None:
 
 def _write_ingestion_state(payload: dict) -> None:
     try:
+        from engine.runtime.ingestion_shards import current_ingestion_shard, ingestion_state_key
         from engine.runtime.runtime_meta import meta_set
-        meta_set("ingestion_state", json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+        shard = current_ingestion_shard()
+        enriched = dict(payload or {})
+        enriched.setdefault("shard", shard.as_dict())
+        meta_set(
+            ingestion_state_key("ingestion_state", shard),
+            json.dumps(enriched, separators=(",", ":"), sort_keys=True),
+        )
     except Exception as e:
         log_failure(
             LOG,
@@ -296,6 +326,8 @@ def _log_runtime_hardware_bootstrap() -> None:
 
         log_runtime_hardware_diagnostics(LOG, component="start_ingestion")
     except Exception as e:
+        if e.__class__.__name__ == "AccelerationProfileError":
+            raise
         _warn_nonfatal("START_INGESTION_RUNTIME_HARDWARE_DIAGNOSTICS_FAILED", e)
 
 

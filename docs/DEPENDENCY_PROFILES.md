@@ -20,13 +20,21 @@ CUDNN_BENCHMARK=0
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` installs `requirements-base.txt` plus the PyTorch CPU wheel.
-It does not include `pynvml`, `nvidia-ml-py`, any `nvidia-*` package, or the
-CUDA PyTorch wheel. The CPU base profile uses `xgboost-cpu` so a normal Linux
-install does not pull `nvidia-nccl-cu12` through the default XGBoost package.
-Postgres access is standardized on psycopg 3.x (`psycopg[binary,pool]` plus
-`psycopg-pool`); do not add `psycopg2` or `psycopg2-binary` to any dependency
-profile.
+`requirements.txt` is the CPU runtime install entrypoint. It applies
+`requirements.lock.txt` as a transitive constraint file and installs the direct
+runtime roots from `requirements.in`, which includes `requirements-base.txt` plus
+the PyTorch CPU wheel. It does not include `pytest`, `pytest-timeout`,
+`pytest-cov`, `coverage`, `ruff`, `pyright`, `pynvml`, `nvidia-ml-py`, any
+`nvidia-*` package, or the CUDA PyTorch wheel. The CPU base profile uses
+`xgboost-cpu` so a normal Linux install does not pull `nvidia-nccl-cu12` through
+the default XGBoost package. Postgres access is standardized on psycopg 3.x
+(`psycopg[binary,pool]` plus `psycopg-pool`); do not add `psycopg2` or
+`psycopg2-binary` to any dependency profile.
+
+Development and CI installs use `requirements-dev.txt`. That file applies
+`requirements-dev.lock.txt` and installs direct dev/test roots from
+`requirements-dev.in`, including pinned `pytest`, `pytest-timeout`,
+`pytest-cov`, `coverage`, `ruff`, and `pyright`.
 
 ## Profiles
 
@@ -34,7 +42,7 @@ profile.
 | --- | --- | --- |
 | `cpu` | `requirements.txt` | Default live/runtime install. Uses PyTorch CPU wheels and keeps NVIDIA telemetry disabled. |
 | `nvidia-cuda` | `requirements-nvidia-cuda.txt` | Explicit NVIDIA deployment profile. Installs CUDA PyTorch plus `pynvml` and `nvidia-ml-py` for NVIDIA diagnostics. |
-| `amd-rocm` | `requirements-amd-rocm.txt` | Opt-in AMD ROCm deployment profile validated for the Strix Halo/gfx1151 host path on `bart`. Defaults remain CPU unless the dependency and runtime acceleration profiles are explicitly selected. |
+| `amd-rocm` | `requirements-amd-rocm.txt` | Opt-in AMD ROCm deployment profile validated only in the Python 3.12 ROCm container for the Strix Halo/gfx1151 host path on `bart`. The Python 3.11 host venv is CPU-only and rejects this profile before install. |
 
 Installers select a profile through `deploy/bin/resolve_python_requirements.sh`.
 Docker, `deploy/bin/install_python_env.sh`, `deploy/bin/upgrade_trading_system.sh`,
@@ -71,18 +79,77 @@ telemetry imports stay cold unless the same NVIDIA profile pair is selected and
 `CUDNN_BENCHMARK`) default to `0`; enable them only in an accelerator-specific
 runtime config that has passed preflight.
 
+## Lock Update Procedure
+
+The lock update commands require `uv`; runtime and CI installs still use
+`python -m pip install -r ...` against the checked-in manifests.
+
+Use the direct input files for human edits:
+
+- CPU runtime direct roots: `requirements.in` and `requirements-base.txt`.
+- CI/dev/test direct roots: `requirements-dev.in`.
+- Accelerator profile roots: `requirements-nvidia-cuda.txt`,
+  `requirements-amd-rocm.txt`, and the standalone ROCm host file
+  `requirements-amd-rocm-full.txt`.
+
+After changing CPU runtime roots, regenerate the runtime lock:
+
+```bash
+uv pip compile requirements.in \
+  --python-version 3.11 \
+  --python-platform x86_64-manylinux_2_36 \
+  --torch-backend cpu \
+  --index-strategy unsafe-best-match \
+  --emit-index-url \
+  --output-file requirements.lock.txt
+```
+
+After changing runtime roots or dev/test tools, regenerate the dev/test lock:
+
+```bash
+uv pip compile requirements-dev.in \
+  --python-version 3.11 \
+  --python-platform x86_64-manylinux_2_36 \
+  --torch-backend cpu \
+  --index-strategy unsafe-best-match \
+  --emit-index-url \
+  --output-file requirements-dev.lock.txt
+```
+
+The `unsafe-best-match` resolver mode is intentional here because the pip
+install path uses PyTorch's CPU wheel index as an extra index. Review dependency
+name changes carefully before regenerating locks. Do not hand-edit lock files
+except to resolve a reviewed merge conflict; regenerate them with `uv pip
+compile` afterwards.
+
+Verify dependency changes before opening a PR:
+
+```bash
+python tools/validate_dependency_lock.py --strict
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/test_dependency_lock_contract.py tests/test_dependency_profiles.py -q
+```
+
+CI runs `python tools/validate_dependency_lock.py --strict` before installing
+Python packages, then installs `requirements-dev.txt`. The install fails if a
+direct requirement no longer matches the checked-in dev lock. The full
+`python tools/validate_repo.py` gate also runs the strict dependency-lock check.
+
 ## AMD GPU/NPU
 
 Use AMD ROCm acceleration only on hosts that match the validated ROCm wheel,
 driver, device-permission, and Python runtime assumptions in
-[ROCM_ACCELERATION.md](ROCM_ACCELERATION.md). The checked-in profile is opt-in:
+[ROCM_ACCELERATION.md](ROCM_ACCELERATION.md). The supported matrix is explicit:
+the standard Python 3.11 host venv is CPU-only, and the `amd-rocm` profile is
+supported only inside the Python 3.12 ROCm 7.2.4 container. The checked-in
+profile is opt-in:
 
 ```bash
 export TRADING_DEPENDENCY_PROFILE=amd-rocm
 export RUNTIME_HARDWARE_PROFILE=amd-rocm
 export TRADING_ACCELERATION_PROFILE=amd-rocm
 export TORCH_DEVICE=auto
-python -m pip install -r requirements-amd-rocm-full.txt
+python3.12 -m pip install -r requirements-amd-rocm-full.txt
 python tools/validate_rocm_acceleration.py --json
 python engine/runtime/prod_preflight.py --json
 ```
@@ -90,20 +157,23 @@ python engine/runtime/prod_preflight.py --json
 PyTorch exposes ROCm devices through its `torch.cuda` API, so the runtime
 acceleration resolver uses HIP version, `torch.cuda.is_available()`, and device
 count checks for the `amd-rocm`, `rocm`, and `hip` profile aliases. The AMD NPU
-is not part of this profile. The
-resolver rejects placeholder ROCm requirement files: the selected file must carry
-the validated `gfx1151` / ROCm 7.2.4 wheel markers. Docker builds may select
+is not part of this profile. The resolver rejects placeholder ROCm requirement
+files and also rejects `amd-rocm` when the active installer Python cannot satisfy
+the ROCm wheel markers (`Linux` and Python `>=3.12`). Docker builds may select
 `requirements-amd-rocm.txt`; `deploy/compose/Dockerfile.runtime` expands that
-overlay to `requirements-amd-rocm-full.txt` for the actual install. Rollback is
-the same CPU reset shown below: set the dependency and runtime profiles back to
-`cpu`, reinstall `requirements.txt`, and rerun preflight.
+overlay to `requirements-amd-rocm-full.txt` for the actual install. At runtime,
+`engine.runtime.acceleration` and `engine.runtime.hardware` raise
+`AccelerationProfileError` if `amd-rocm` is selected without an importable HIP
+torch build and a visible HIP device, preventing a silent CPU fallback. Rollback
+is the same CPU reset shown below: set the dependency and runtime profiles back
+to `cpu`, reinstall `requirements.txt`, and rerun preflight.
 
 ## Verification
 
 Use these commands after any dependency profile change:
 
 ```bash
-python tools/validate_dependency_lock.py
+python tools/validate_dependency_lock.py --strict
 python -m pytest tests/test_dependency_profiles.py tests/test_runtime_hardware.py -q
 python - <<'PY'
 from engine.runtime.hardware import runtime_hardware_snapshot

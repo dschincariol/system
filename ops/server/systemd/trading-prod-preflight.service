@@ -17,6 +17,9 @@ Environment=TS_SECRETS_PROVIDER=systemd-creds
 Environment=TS_PG_ROLE=app
 Environment=ENGINE_SUPERVISED=1
 Environment=BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
+Environment=PREFLIGHT_REQUIRE_CPU_POWER_POLICY=1
+Environment=PREFLIGHT_CPU_POWER_POLICY_TIMEOUT_S=3.0
+Environment=PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1
 Environment=DASHBOARD_API_TOKEN_SECRET=dashboard_api_token
 Environment=OPERATOR_API_TOKEN_SECRET=operator_api_token
 LoadCredentialEncrypted=master_key:/etc/credstore.encrypted/master_key.cred

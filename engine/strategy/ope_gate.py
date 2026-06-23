@@ -907,9 +907,13 @@ def _execution_policy_observations(
         where.append("model_id=?")
         params.append(str(model_id))
     elif model_name:
-        where.append("(policy_json LIKE ? OR decision_json LIKE ?)")
         like = f"%{str(model_name)}%"
-        params.extend([like, like])
+        json_match_terms = ["CAST(policy_json AS TEXT) LIKE ?"]
+        params.append(like)
+        if "decision_json" in cols:
+            json_match_terms.append("CAST(decision_json AS TEXT) LIKE ?")
+            params.append(like)
+        where.append("(" + " OR ".join(json_match_terms) + ")")
     if symbol and "symbol" in cols:
         where.append("(UPPER(symbol)=UPPER(?) OR COALESCE(symbol,'')='')")
         params.append(str(symbol))

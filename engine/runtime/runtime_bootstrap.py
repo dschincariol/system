@@ -39,6 +39,7 @@ _SAFE_NO_CREDENTIAL_BOOTSTRAP_ENV = {
     "CCXT_ENABLED": "0",
     "TRADIER_ENABLED": "0",
     "YFINANCE_ENABLED": "1",
+    "SIMULATED_MARKET_DATA_ENABLED": "1",
     "LIVE_PRICE_PROVIDER_CHAIN": "yfinance",
     "OPTIONS_PROVIDER_CHAIN": "",
 }
@@ -60,6 +61,7 @@ _BOOTSTRAP_CREDENTIAL_RUNTIME_ENV_KEYS = (
     "COINBASE_SECRET",
     "FINNHUB_API_KEY",
     "FMP_API_KEY",
+    "FRED_API_KEY",
     "GROQ_API_KEY",
     "IBKR_CLIENT_ID",
     "IBKR_HOST",
@@ -76,6 +78,8 @@ _BOOTSTRAP_CREDENTIAL_RUNTIME_ENV_KEYS = (
     "QUIVER_API_KEY",
     "REDDIT_CLIENT_ID",
     "REDDIT_CLIENT_SECRET",
+    "SEC_FROM",
+    "SEC_USER_AGENT",
     "SHARADAR_API_KEY",
     "SIMFIN_API_KEY",
     "TRADIER_API_TOKEN",
@@ -247,6 +251,78 @@ def _warn_nonfatal(event: str, code: str, error: BaseException, *, warn_key: str
     )
     if warn_key:
         _WARNED_NONFATAL_KEYS.add(warn_key)
+
+
+def _mark_crash_recovery_bootstrap_failure(error: BaseException) -> None:
+    broker_name = str(os.environ.get("BROKER_NAME", os.environ.get("BROKER", "sim")) or "sim").lower().strip()
+    critical = broker_name in {"alpaca", "ibkr"}
+    reason = "critical_crash_recovery_bootstrap_failed" if critical else "crash_recovery_bootstrap_failed"
+    payload = {
+        "ok": False,
+        "status": "failed",
+        "reason": reason,
+        "broker": broker_name,
+        "critical": bool(critical),
+        "block_live_order_authority": bool(critical),
+        "continuity_proven": False,
+        "gap_count": 1,
+        "gaps": [
+            {
+                "reason": reason,
+                "broker": broker_name,
+                "component": "runtime_bootstrap.crash_recovery",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+        ],
+        "detail": {"bootstrap_step": "crash_recovery"},
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "ts_ms": int(time.time() * 1000),
+    }
+    if critical:
+        os.environ["CRASH_RECOVERY_FAIL_CLOSED"] = "1"
+        os.environ["CRASH_RECOVERY_FAIL_CLOSED_DETAIL"] = json.dumps(
+            {"reason": reason, "broker": broker_name, "gap_count": 1},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    try:
+        from engine.runtime.runtime_meta import meta_set
+
+        meta_set("crash_recovery_state", json.dumps(payload, separators=(",", ":"), sort_keys=True), best_effort=False)
+    except Exception as state_error:
+        _warn_nonfatal(
+            "runtime_bootstrap_crash_recovery_state_failed",
+            "RUNTIME_BOOTSTRAP_CRASH_RECOVERY_STATE_FAILED",
+            state_error,
+            warn_key="runtime_bootstrap_crash_recovery_state_failed",
+            recovery_state=payload,
+        )
+    try:
+        from engine.runtime.metrics import emit_counter, emit_gauge
+
+        emit_counter(
+            "crash_recovery_continuity_gap_total",
+            1,
+            component="engine.runtime.runtime_bootstrap",
+            broker=broker_name,
+            extra_tags={"status": "failed", "reason": reason, "critical": int(critical)},
+        )
+        emit_gauge(
+            "crash_recovery_continuity_proven",
+            0.0,
+            component="engine.runtime.runtime_bootstrap",
+            broker=broker_name,
+            extra_tags={"status": "failed", "reason": reason, "critical": int(critical)},
+        )
+    except Exception as metric_error:
+        _warn_nonfatal(
+            "runtime_bootstrap_crash_recovery_metric_failed",
+            "RUNTIME_BOOTSTRAP_CRASH_RECOVERY_METRIC_FAILED",
+            metric_error,
+            warn_key="runtime_bootstrap_crash_recovery_metric_failed",
+        )
 
 
 # ----------------------------------------------------------------------
@@ -609,6 +685,7 @@ def bootstrap_runtime(log=None) -> dict:
         out["crash_recovery"] = {"ok": False, "error": str(e)}
         out["errors"].append(f"crash_recovery:{e}")
         _step("crash_recovery", False, str(e))
+        _mark_crash_recovery_bootstrap_failure(e)
 
     # ---------------------------------------------------
     # STARTUP PREFLIGHT + AUTO REPAIR

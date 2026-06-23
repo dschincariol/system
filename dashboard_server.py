@@ -63,7 +63,11 @@ from engine.dashboard.serialization import (
     normalize_explain_json as _dashboard_normalize_explain_json,
     snapshot_json_default as _dashboard_snapshot_json_default,
 )
-from engine.runtime.platform import default_local_log_dir
+from engine.runtime.platform import (
+    apply_network_mode_bind_defaults as _apply_network_mode_bind_defaults,
+    default_local_log_dir,
+    network_access_banner_lines as _network_access_banner_lines,
+)
 
 # ------------------------------------------------------------------
 # Ensure imports work no matter what the working directory is.
@@ -364,6 +368,21 @@ from engine.runtime.config import (
     AUTO_PIPELINE_INCLUDE_EXECUTION,
 )
 
+# `dashboard_runtime_boot` resolves these through the dashboard module object.
+_DASHBOARD_RUNTIME_BOOT_EXPORTS = (
+    bootstrap_runtime,
+    StartupOrchestrator,
+    get_boot_jobs,
+    get_health_snapshot,
+    write_job_history,
+    auto_rollback_loop,
+    start_lifecycle_monitor,
+    BOOTING,
+    AUTO_SIZE_POLICY,
+    AUTO_PIPELINE,
+    AUTO_CHALLENGER,
+)
+
 # # ----------------------------------------
 # # STRUCTURAL SCHEMA AUDIT (tables + columns)
 # # ----------------------------------------
@@ -659,6 +678,11 @@ if _strict_db_path_runtime and not _db_path_raw.is_absolute():
 if not _db_path_raw.is_absolute():
     os.environ["DB_PATH"] = os.path.abspath(_db_path_env)
 
+# Expand TRADING_NETWORK_MODE=lan into a concrete DASHBOARD_HOST=0.0.0.0
+# default before any reader (bind, startup gates, logging) snapshots it. This
+# is idempotent and a no-op in the default local mode.
+_apply_network_mode_bind_defaults(os.environ)
+
 host = str(os.environ.get("DASHBOARD_HOST", "127.0.0.1") or "").strip() or "127.0.0.1"
 
 port = _env_int("DASHBOARD_PORT", _env_int("PORT", 8000, minimum=1, maximum=65535), minimum=1, maximum=65535)
@@ -749,6 +773,20 @@ def _operator_sidecar_api_token() -> str:
     if token:
         return token
 
+    token_file = str(os.environ.get("OPERATOR_API_TOKEN_FILE", "") or "").strip()
+    if token_file:
+        try:
+            with open(token_file, "r", encoding="utf-8") as fh:
+                value = fh.read().strip()
+            if value:
+                return value
+        except Exception as e:
+            _warn_nonfatal(
+                "DASHBOARD_SERVER_OPERATOR_TOKEN_FILE_LOAD_FAILED",
+                e,
+                token_file=token_file,
+            )
+
     secret_name = str(os.environ.get("OPERATOR_API_TOKEN_SECRET", "") or "").strip()
     if not secret_name:
         return ""
@@ -779,18 +817,16 @@ def _operator_sidecar_status_payload(timeout_s: Optional[float] = None) -> dict:
         "reachable": False,
         "service": "node_operator_sidecar",
         "base_url": base_url,
-        "direct_url": base_url + "/",
         "same_origin_url": "/operator/",
         "compatibility_routes": ["/operator/", "/operator_ui.html"],
         "http_proxy_prefix": "/operator/api/",
         "action": "Start or restart the Node operator sidecar if reachable is false.",
         "websocket": {
             "proxy_enabled": False,
-            "direct_url": _operator_sidecar_ws_url(),
             "deferred_reason": (
                 "Python SimpleHTTPRequestHandler does not safely implement "
                 "WebSocket upgrade proxying; the bridged UI uses HTTP proxy "
-                "paths plus the existing direct sidecar WebSocket when available."
+                "paths and polling through the dashboard origin."
             ),
         },
         "meta": {"status": 200},
@@ -837,6 +873,26 @@ def _operator_sidecar_status_payload(timeout_s: Optional[float] = None) -> dict:
 
 def api_get_operator_sidecar_status(_parsed=None, _ctx=None):
     return _operator_sidecar_status_payload()
+
+
+def api_get_operator_ping(_parsed=None, _ctx=None):
+    status = _operator_sidecar_status_payload(timeout_s=min(_OPERATOR_PROXY_TIMEOUT_S, 2.0))
+    if bool(status.get("reachable")):
+        return {
+            "ok": True,
+            "service": "dashboard_operator_bridge",
+            "operator": status.get("ping") if isinstance(status.get("ping"), dict) else {},
+            "sidecar": status,
+        }
+    return {
+        "ok": False,
+        "error": "operator_sidecar_unreachable",
+        "reason_code": "operator_sidecar_unreachable",
+        "message": "Dashboard operator ping bridge could not reach the operator sidecar.",
+        "sidecar": status,
+        "http_status": 503,
+        "meta": {"status": 503, "reason_code": "operator_sidecar_unreachable"},
+    }
 
 
 def _wrap_operator_console_routes(BaseHandler):
@@ -1248,11 +1304,11 @@ def _wrap_operator_console_routes(BaseHandler):
                 self._operator_send_json(426, {
                     "ok": False,
                     "error": "websocket_proxy_deferred",
-                    "sidecar_ws_url": _operator_sidecar_ws_url(),
-                    "action": "Use the direct sidecar WebSocket URL until dashboard WebSocket proxying is implemented.",
+                    "action": "Use dashboard HTTP polling until same-origin WebSocket proxying is implemented.",
                     "detail": (
-                        "Use the existing Node operator WebSocket directly; "
-                        "the Python dashboard bridge proxies HTTP only."
+                        "The Python dashboard bridge proxies HTTP only. "
+                        "The operator sidecar is not a LAN entrypoint in the "
+                        "production contract."
                     ),
                 }, headers={"Upgrade": "websocket"})
                 return True
@@ -2635,6 +2691,10 @@ try:
 except Exception:
     ROUTE_SPECS_BROKER_CONFIG = []
 
+ROUTE_SPECS_OPERATOR_BRIDGE = [
+    ("GET", "/api/operator/ping", "api_get_operator_ping"),
+]
+
 # (optional) terminal route modules are consolidated via ROUTE_SPECS_TERMINAL_ALL below
 
 # -------------------------------------------------------------------
@@ -2662,6 +2722,7 @@ _RAW_ROUTE_SPECS = _build_raw_route_specs(
     ROUTE_SPECS_DATA_SOURCES,
     ROUTE_SPECS_UI_METRICS,
     ROUTE_SPECS_BROKER_CONFIG,
+    ROUTE_SPECS_OPERATOR_BRIDGE,
     _terminal_routes,
     fallback_route_specs=_FALLBACK_ROUTE_SPECS,
 )
@@ -5166,6 +5227,7 @@ try:
         api_post_data_source_delete,
         api_post_data_source_disable,
         api_post_data_source_enable,
+        api_post_data_source_account_update,
         api_post_data_source_test,
         api_post_data_source_update,
     )
@@ -5177,6 +5239,7 @@ except Exception:
     api_post_data_source_delete = None
     api_post_data_source_enable = None
     api_post_data_source_disable = None
+    api_post_data_source_account_update = None
     api_post_data_source_test = None
 
 try:
@@ -5232,6 +5295,7 @@ API_HANDLERS = {
 
     # UI console lifecycle
     "api_get_operator_summary": api_get_operator_summary,
+    "api_get_operator_ping": api_get_operator_ping,
     "api_get_operator_sidecar_status": api_get_operator_sidecar_status,
     "api_get_operator_status": api_get_operator_status,
     "api_get_operator_bootstrap_status": api_get_operator_bootstrap_status,
@@ -5274,6 +5338,7 @@ API_HANDLERS = {
     "api_post_data_source_delete": api_post_data_source_delete,
     "api_post_data_source_enable": api_post_data_source_enable,
     "api_post_data_source_disable": api_post_data_source_disable,
+    "api_post_data_source_account_update": api_post_data_source_account_update,
     "api_post_data_source_test": api_post_data_source_test,
 
     # BROKER CONFIG
@@ -5458,6 +5523,7 @@ def _run_dashboard_control_plane():
     socket, starts runtime jobs/services, and records startup diagnostics.
     """
     _safe_print("[dashboard_server] run_server_enter")
+    _safe_print("[dashboard_server] app_init_begin")
     _update_startup_trace("JOB_REGISTRATION", status="started", detail="dashboard_server.run_server_enter")
     global _HTTPD, _DASHBOARD_HTTP_BOUND
     _DASHBOARD_HTTP_BOUND = False
@@ -5572,6 +5638,7 @@ def _run_dashboard_control_plane():
     )
     HandlerCls = _wrap_operator_console_routes(HandlerCls)
     _safe_print("[dashboard_server] build_handler_ok")
+    _safe_print("[dashboard_server] app_init_ok")
 
     if HandlerCls is None or not callable(HandlerCls):
         e = RuntimeError(
@@ -5624,6 +5691,15 @@ def _run_dashboard_control_plane():
 
     _update_startup_trace("RUNNING", status="ok", detail="dashboard_bound", extra={"host": str(host), "port": int(port)})
     log.info("dashboard socket bound at http://%s:%s/ui/dashboard.html (startup pending)", host, port)
+
+    try:
+        for _line in _network_access_banner_lines(
+            service="dashboard_server", bind_host=str(host), port=int(port)
+        ):
+            _safe_print(_line)
+            log.info("%s", _line)
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_BANNER_FAILED", e, scope="dashboard_bound")
 
     try:
         if mark_dashboard_bound and _dashboard_storage_known_ready():
@@ -5723,8 +5799,16 @@ def _run_dashboard_control_plane():
         raise RuntimeError("HTTP server failed to start")
 
     try:
+        _safe_print(f"[dashboard_server] serve_forever_enter host={host} port={port}")
+        _update_startup_trace(
+            "RUNNING",
+            status="ok",
+            detail="dashboard_serve_forever_enter",
+            extra={"host": str(host), "port": int(port)},
+        )
         log.info("dashboard_server_serve_forever_enter host=%s port=%s", host, port)
         _HTTPD.serve_forever()
+        _safe_print(f"[dashboard_server] serve_forever_returned host={host} port={port}")
         log.info("dashboard_server_serve_forever_returned host=%s port=%s", host, port)
     finally:
         _shutdown_runtime_once("serve_forever_exit")

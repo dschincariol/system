@@ -1,6 +1,6 @@
 # Database Schema
 
-Last verified against code: 2026-06-21
+Last verified against code: 2026-06-22
 
 This document records the production Postgres 16 + TimescaleDB 2.x schema classification. `engine/runtime/schema/table_classification.py` is the importable source of truth; this document is the human review record. New tables must be added there and here before shipping.
 
@@ -10,12 +10,16 @@ The register here documents more than raw base tables: it also includes continuo
 
 ## Migration Scope
 
-- `0002_hypertables.py` enables TimescaleDB, converts append-mostly tables with a real time column into hypertables, configures integer-time `now()` support for epoch-ms tables, and installs compression and retention policies.
+- `0002_hypertables.py` enables TimescaleDB, converts append-mostly tables with a real time column into hypertables, configures integer-time `now()` support for epoch-ms tables, sources chunk intervals from `engine/runtime/schema/table_classification.py`, and installs compression and retention policies.
 - `0003_indexes.py` creates BRIN indexes on hypertable time columns, `(symbol, time DESC)` indexes where a `symbol` column exists, segment/time indexes for non-symbol segment keys, JSONB GIN indexes, and targeted expression indexes for decision and audit predicates.
 - `0004_continuous_aggregates.py` creates dashboard rollups: `cagg_prices_5m`, `cagg_prices_1h`, `cagg_decision_volume`, and `cagg_runtime_metrics_5m`, with refresh and retention policies.
 - `0007_audit_chain.py` adds and backfills `prev_hash`/`row_hash` on audit-chain tables.
 - `0008_audit_findings.py` creates `audit_chain_findings` for verifier divergence reports.
 - `0063_model_scoring_indexes.py` adds the unresolved model-scoring indexes used to find the latest tracked prediction per prediction id and to anti-probe already scored rows in `model_performance`.
+- `0065_hypertable_chunk_intervals.py` reruns the classified hypertable creation path for existing deployments so tables added after `0002` are converted and all hypertables converge to the same classification-driven chunk intervals as fresh installs.
+- `0066_timescale_compression_orderby.py` reruns compression setup for existing deployments so previously-created hypertables gain the same descending real-time-column `compress_orderby` as fresh installs.
+- `0068_canonical_timescale_price_sidecar_schema.py` converts legacy deployed `price_quotes` and `price_quotes_raw` sidecars from `ts_ms`-only tables to the canonical `"time" TIMESTAMPTZ` Timescale shape without dropping existing rows.
+- `0069_data_source_provider_accounts.py` adds the shared provider-account registry and provider lookup index for deployments that already applied the baseline before the DF-04 data-source catalog expansion.
 - `0001_baseline.py` was not changed in this prompt. The baseline already uses JSONB for structured payloads and the runtime schema stores time as epoch-ms `BIGINT` columns, so `0002` uses Timescale integer hypertables instead of forcing a TIMESTAMPTZ rewrite.
 
 ## Classification Rules
@@ -36,6 +40,21 @@ The register here documents more than raw base tables: it also includes continuo
 | Audit ledgers | 1 week | 90 days | none | Forensic history retained indefinitely |
 | Execution/compliance ledgers | 1 week | 90 days unless compliance-exempt | none | Financial evidence and attribution |
 | Job-history style tables | regular | n/a | app-managed 90 days | Latest-row and job-name lookup |
+
+Fresh hypertable creation and existing-hypertable alteration both use the
+classification `chunk` value. Every compressed hypertable also sets
+`timescaledb.compress_orderby` to that table's real time column in descending
+order while preserving its configured `segmentby` columns. Tick/quote and
+price-bar tables therefore order compressed chunks by `time`, `ts_ms`, or
+`timestamp` depending on the table; feature, decision, health, audit, and
+execution tables order by their classified time column. The Postgres price
+sidecar and asyncpg Timescale sidecar also call `set_chunk_time_interval` during
+schema ensure and apply the same descending time-column compression ordering for
+their sidecar-owned hypertables. They report actual read-back values in
+`policy_status.chunk_intervals` plus `*_hypertable_chunk_interval_ms` gauges.
+Postgres compatibility tables that are created after numbered migrations, such
+as `labels_price`, rerun the same classified hypertable helper when they are
+created.
 
 ## Index Plan
 
@@ -111,7 +130,9 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `credential_access_log` | Hypertable | time=ts; chunk=1 week; compress=none; retain=1 year; segmentby=none | low | time-range credential access review | credential read audit trail; append-only and reviewed by time and credential name |
 | `crash_recovery_audit` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
 | `data_source_logs` | Hypertable | time=ts_ms; chunk=1 day; compress=14 days; retain=180 days; segmentby=none | medium | recent operational time windows | operational health metric stream; append-mostly and dashboarded by time |
+| `data_source_populate_evidence` | Regular | cleanup=one current row per source_key; replaced by later populate checks | low | source-key status lookup and recent evidence review | latest data-source population evidence keyed by source, including contract status and row-count diagnostics |
 | `data_sources` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
+| `data_source_provider_accounts` | Regular | cleanup=n/a | low | primary-key or provider lookup | shared provider-account credential registry encrypted with the data-source master key |
 | `decision_log` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `decision_views` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `domain_blacklist` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
@@ -193,7 +214,7 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `job_checkpoints` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `job_heartbeats` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `job_history` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
-| `job_locks` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
+| `job_locks` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place. Row names beginning `ingestion_restart_guard/v1::` are reserved expiring ingestion child restart-storm accounting rows, not live job ownership rows. |
 | `kill_switch_audit` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
 | `kill_switch_state` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `labels` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
@@ -272,11 +293,13 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `price_data` | Hypertable | time=timestamp; chunk=1 day; compress=7 days; retain=1 year; segmentby=symbol | high | dashboard and model windows by (symbol, time) | derived bar/price series; append-mostly and read by symbol/time ranges |
 | `price_feed_lock` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `price_provider_health` | Hypertable | time=ts_ms; chunk=1 day; compress=14 days; retain=180 days; segmentby=none | medium | recent operational time windows | operational health metric stream; append-mostly and dashboarded by time |
-| `price_quotes` | Hypertable | time=ts_ms; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
-| `price_quotes_raw` | Hypertable | time=ts_ms; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
+| `price_quotes` | Hypertable | time=time; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
+| `price_quotes_raw` | Hypertable | time=time; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
 | `price_ticks` | Hypertable | time=time; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
 | `prices` | Hypertable | time=ts_ms; chunk=1 day; compress=7 days; retain=30 days; segmentby=symbol | very high | latest and intraday ranges by (symbol, time) | high-rate market data stream; append-mostly and queried by symbol/time windows |
 | `async_price_writer_spool` | Regular | cleanup=delete-after-success; bounded by ASYNC_PRICE_WRITER_QUEUE_MAXSIZE and ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES | high | oldest-first replay batch selection by created_ts_ms and id | bounded local SQLite WAL spool for async price-writer envelopes retained only until successful downstream commit |
+| `non_price_ingestion_spool` | Regular | cleanup=delete-after-success; bounded by NON_PRICE_INGESTION_SPOOL_* | high | oldest-first replay batch selection by table_name, created_ts_ms, and id | bounded local SQLite WAL spool for non-price ingestion envelopes retained only until successful downstream commit |
+
 | `promotion_statistical_evidence` | Hypertable | time=ts; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
 | `strategy_promotion_candidates` | Regular | cleanup=n/a | low | pending candidate and operator approval lookup by strategy/status | governed shadow-strategy promotion candidates; live mutation requires approval, realized PnL, replay/OPE/statistical evidence, cooldown, and audit records |
 | `quiver_congressional_trades` | Regular | cleanup=n/a | low | source id upsert, dedupe-key lookup, and symbol/disclosure-time feature snapshot reads | Quiver congressional trade disclosures keyed by source record id and disclosure availability time |
@@ -327,7 +350,7 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `symbol_blacklist` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `symbol_universe` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `symbolic_alpha_candidates` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
-| `symbols` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
+| `symbols` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded symbol registry and FX instrument-metadata cache; primary lookup is not a time-range scan |
 | `temporal_model_eval` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `temporal_model_feature_schema` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `temporal_models` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
@@ -349,6 +372,18 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `weather_alerts` | Hypertable | time=issued_ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `weather_forecast_region_daily` | Hypertable | time=run_ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `weather_provider_health` | Hypertable | time=ts_ms; chunk=1 day; compress=14 days; retain=180 days; segmentby=none | medium | recent operational time windows | operational health metric stream; append-mostly and dashboarded by time |
+
+### `symbols` FX Instrument Metadata
+
+FX-02 makes `engine.data.fx_instrument.parse_fx_symbol` and
+`engine.data.universe.get_instrument_metadata` the source of truth for FX symbol
+semantics. FX spot pairs are stored canonically as the 6-letter uppercase
+separator-free `BASE+QUOTE` form, such as `EURUSD` or `USDJPY`; `DXY` remains a
+stored FX index symbol. The `symbols` table caches the nullable metadata columns
+`instrument_kind`, `base_ccy`, `quote_ccy`, `pip_size`, `contract_size`,
+`pnl_ccy`, `leverage_cap`, `session_calendar`, and `instrument_meta_source`.
+These columns are reference metadata only; sizing, risk, execution, feature,
+and governance enforcement remain in their existing downstream owners.
 
 ## Additional Classified Tables
 
@@ -384,3 +419,42 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `tracked_model_registry` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `tracked_predictions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `triple_barrier_labels` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
+
+## Timescale Price Sidecar
+
+`engine/runtime/price_timescale_schema.py` owns the canonical Timescale price
+sidecar table and column definitions. Fresh baseline migrations, compatibility
+migration `0068`, and `PostgresPriceStorage.ensure_schema()` all consume those
+same definitions. `price_ticks`, `price_quotes`, and `price_quotes_raw` use
+`"time" TIMESTAMPTZ` as their Timescale dimension and primary-key time column.
+The older `prices(ts_ms, symbol, price, px, source)` table is retained as the
+legacy compatibility/readiness surface and is not the sidecar write target.
+
+Postgres price sidecar writes for `price_ticks`, `price_quotes`, and
+`price_quotes_raw` use internal fixed unlogged staging tables named
+`price_ticks_write_staging`, `price_quotes_write_staging`, and
+`price_quotes_raw_write_staging`. `ensure_schema()` owns those tables and their
+`staging_session` indexes; they are cleanup-only write-path tables, not durable
+market-data history.
+
+The sidecar normalizes `write_batch` inputs once per mapping before staging or
+VALUES fallback writes. The normalized row cache shares symbol parsing,
+timestamp-to-`TIMESTAMPTZ` conversion, `_safe_float`/`_safe_int` coercions,
+provider/source text selection, and raw-event key normalization across the
+target row builders. Runtime snapshots expose cumulative normalization counters
+so production can detect repeated-conversion regressions in the hot path.
+
+`price_quotes_raw.event_key` is a producer-side `price_raw:v1` key generated from
+stable provider/symbol/event identifiers and event timestamps. It deliberately
+excludes mutable market floats. The raw-event primary/conflict key is
+`(symbol, provider, event_key, ts_ms)` for SQLite/Postgres-owned tables and
+`(symbol, provider, event_key, "time")` in the Postgres price sidecar, matching
+Timescale's requirement that hypertable unique keys include the time dimension.
+Migration `0068_canonical_timescale_price_sidecar_schema` preserves deployed
+rows by renaming legacy `price_quotes`/`price_quotes_raw` tables that only have
+`ts_ms`, including their primary-key constraints, creating the canonical
+`"time"` tables, and copying rows forward with `to_timestamp(ts_ms / 1000.0)`.
+Migration `0069_data_source_provider_accounts` separately carries
+`data_source_provider_accounts` and `idx_data_source_provider_accounts_provider`
+for already-initialized Postgres databases where `0001_baseline.py` will not run
+again.

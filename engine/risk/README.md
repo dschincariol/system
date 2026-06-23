@@ -55,14 +55,55 @@ Knob families (module-level constants read from `PORTFOLIO_RISK_*` env):
   (`USE_ALPHA_DECAY_THROTTLE`, `ALPHA_DECAY_FRESH_S`) that rescales per strategy
   from fresh `strategy_metrics`.
 
+### FX Sizing And Risk
+
+FX target weights are runtime portfolio-risk notional fractions, not equity-style
+share counts. For an FX symbol such as `EURUSD`, `engine.strategy.fx_sizing`
+records base notional, quote notional (`quote = base * pair_rate`), units, lots,
+pair rate, and effective leverage on the returned target row under `fx`, with
+the enforcement reason under `reason.fx_leverage_cap`. The broker boundary still
+owns weight-to-order conversion; the risk engine only makes the FX target
+unambiguous for that later FX execution work.
+
+FX instrument semantics come from FX-02 via
+`engine.data.universe.get_instrument_metadata`, normalized through the internal
+`_fx_instrument` adapter so field spelling differences (`base_ccy` versus
+`base_currency`, `leverage_cap` versus `max_leverage`) do not leak into risk
+logic. FX exposure bucketing prefers that instrument asset class and falls back
+to `asset_class_for_symbol`, so the existing `"FX": 0.50` sleeve binds when FX
+metadata is present.
+
+FX leverage enforcement is controlled by `PORTFOLIO_RISK_USE_FX_LEVERAGE_CAPS`
+(default `1`). The stage runs after asset-class budgets and before correlation
+cluster caps. It uses `_last_price(con, symbol)` for the pair rate and clamps each
+FX leg to the lesser of the FX-02 instrument leverage cap and the regulatory cap
+from `engine.risk.fx_leverage_caps`. That cap table is seeded from FX-00 section
+6, defaults to EU/ESMA-style major/minor/exotic caps with a US profile, and can
+be overridden with `FX_REGULATORY_LEVERAGE_CAPS_JSON` plus
+`FX_LEVERAGE_JURISDICTION`. Missing pair rates are data-unavailable and
+fail-closed with `block_reason.type="fx_leverage_hard_block"`.
+
+Currency-pair clustering is controlled by `PORTFOLIO_RISK_FX_CURRENCY_CLUSTERS`
+(default `1`). In addition to price-correlation edges, FX pairs sharing a base or
+quote currency receive structural graph edges, so pairs such as `EURUSD` and
+`GBPUSD` are capped as one cluster even with thin correlation history. Cluster
+reason blobs include `fx_shared_currency` for auditability.
+
+The detailed FX fields are stored in the existing `portfolio_risk_info` JSON
+state. `engine.api.api_system.api_get_portfolio_risk` already reads and returns
+that state, so the FX-08 read-model path can consume these fields without API,
+route, or UI changes.
+
 Broker-bound defense in depth:
 
 - `engine.strategy.portfolio_risk_gate.apply_execution_risk_governor(...)` rechecks
   gross and net caps on the final live execution payload before
   `engine.execution.broker_router` can route to Alpaca, IBKR, or any other
   broker adapter. This boundary check uses the shaped orders plus current
-  `broker_positions` and pending `broker_order_state` exposure, and blocks on
-  invalid exposure data rather than assuming zero exposure.
+  `broker_positions` and pending `broker_order_state` exposure. It resizes
+  both target-weight orders and explicit `qty` orders before broker routing,
+  suppresses orders with no remaining headroom, and blocks on invalid exposure
+  data rather than assuming zero exposure.
 - The execution-time gross cap is `EXEC_PORTFOLIO_TOTAL_EXPOSURE_CAP`, falling
   back to `PORTFOLIO_RISK_MAX_GROSS` then `PORTFOLIO_GROSS_CAP`. The execution-time
   net cap is `EXEC_PORTFOLIO_DIRECTION_CONCENTRATION_CAP`, falling back to

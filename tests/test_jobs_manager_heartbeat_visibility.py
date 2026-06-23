@@ -25,11 +25,13 @@ class JobManagerHeartbeatVisibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._prev_db_path = os.environ.get("DB_PATH")
+        self._prev_storage_backend = os.environ.get("TS_STORAGE_BACKEND")
         self._prev_queue = os.environ.get("SQLITE_LIVENESS_QUEUE_ENABLED")
         self._prev_trace = os.environ.get("SQLITE_TRACE_REPORT_EVERY_S")
         self._prev_stall_after = os.environ.get("DAEMON_STALL_AFTER_MS")
 
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "jobs_manager_heartbeat.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         os.environ["SQLITE_LIVENESS_QUEUE_ENABLED"] = "0"
         os.environ["SQLITE_TRACE_REPORT_EVERY_S"] = "0"
         os.environ["DAEMON_STALL_AFTER_MS"] = "120000"
@@ -48,6 +50,10 @@ class JobManagerHeartbeatVisibilityTests(unittest.TestCase):
             os.environ.pop("DB_PATH", None)
         else:
             os.environ["DB_PATH"] = str(self._prev_db_path)
+        if self._prev_storage_backend is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = str(self._prev_storage_backend)
         if self._prev_queue is None:
             os.environ.pop("SQLITE_LIVENESS_QUEUE_ENABLED", None)
         else:

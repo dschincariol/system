@@ -391,8 +391,32 @@ def _reset_telemetry_append_buffer_state() -> None:
                             "accepted_rows": 0,
                             "buffered_rows": 0,
                             "dropped_rows": 0,
+                            "replayed_rows": 0,
+                            "committed_rows": 0,
+                            "deleted_rows": 0,
                             "flush_batches": 0,
+                            "flush_failures": 0,
                             "flushed_rows": 0,
+                            "retry_count": 0,
+                            "shutdown_drain_attempts": 0,
+                            "shutdown_drain_failures": 0,
+                            "shutdown_drained_batches": 0,
+                            "shutdown_drained_rows": 0,
+                            "residual_spooled_rows": 0,
+                            "residual_dropped_rows": 0,
+                            "residual_loss_rows": 0,
+                            "spooled_rows": 0,
+                            "last_shutdown_drain_duration_ms": 0,
+                            "last_shutdown_drain_deadline_ms": 0,
+                            "shutdown_deadline_exhausted": False,
+                            "spool_unavailable_count": 0,
+                            "spool_corrupt_rows": 0,
+                            "spool_corrupt_payload_rows": 0,
+                            "spool_corruption_events": 0,
+                            "last_flush_latency_ms": 0,
+                            "total_flush_latency_ms": 0,
+                            "last_db_write_duration_ms": 0,
+                            "total_db_write_duration_ms": 0,
                             "last_enqueue_ts_ms": 0,
                             "last_flush_ts_ms": 0,
                             "last_error": "",
@@ -400,6 +424,15 @@ def _reset_telemetry_append_buffer_state() -> None:
                             "last_rejected_reason": "",
                             "last_rejected_table": "",
                             "last_rejected_ts_ms": 0,
+                            "oldest_age_ms": 0,
+                            "spool_oldest_age_ms": 0,
+                            "backpressure_active": False,
+                            "backpressure_events": 0,
+                            "last_backpressure_ts_ms": 0,
+                            "last_backpressure_reason": "",
+                            "backpressure_recovered_events": 0,
+                            "last_backpressure_recovered_ts_ms": 0,
+                            "last_backpressure_recovered_reason": "",
                             "accepted_by_table": dict(empty_counters),
                             "dropped_by_table": dict(empty_counters),
                             "flushed_by_table": dict(empty_counters),
@@ -502,23 +535,25 @@ def cleanup_runtime_test_state(*, timeout_s: float = 0.5) -> None:
     if not running_python_tests() or _CLEANUP_ACTIVE:
         return
     _CLEANUP_ACTIVE = True
+    writer_timeout_s = max(float(timeout_s), 2.0)
     try:
         _call_loaded_custom(
             "engine.prediction_logger",
-            lambda module: getattr(module, "_TRACKING_SINK").abort(timeout_s=timeout_s),
+            lambda module: getattr(module, "_TRACKING_SINK").abort(timeout_s=writer_timeout_s),
         )
-        _call_loaded("engine.regime_detector", "shutdown_regime_detector", timeout_s=timeout_s)
-        _call_loaded("engine.model_scoring", "stop_model_scoring_service", timeout_s=timeout_s)
-        _call_loaded("engine.runtime.async_writer", "shutdown_async_writer", timeout_s=timeout_s)
+        _call_loaded("engine.regime_detector", "shutdown_regime_detector", timeout_s=writer_timeout_s)
+        _call_loaded("engine.model_scoring", "stop_model_scoring_service", timeout_s=writer_timeout_s)
+        _call_loaded("engine.runtime.async_writer", "shutdown_async_writer", timeout_s=writer_timeout_s)
         _call_loaded("engine.runtime.event_bus", "shutdown_event_bus")
-        _call_loaded("engine.runtime.event_log", "shutdown_event_log_buffer", timeout_s=timeout_s)
-        _call_loaded("engine.runtime.telemetry_append_buffer", "shutdown_telemetry_append_buffers", timeout_s=timeout_s)
+        _call_loaded("engine.runtime.event_log", "shutdown_event_log_buffer", timeout_s=writer_timeout_s)
+        _call_loaded("engine.runtime.telemetry_append_buffer", "shutdown_telemetry_append_buffers", timeout_s=writer_timeout_s)
         _reset_telemetry_append_buffer_state()
-        _shutdown_loaded_timescale_client(timeout_s=timeout_s)
-        _call_loaded("engine.runtime.metrics_store", "shutdown_runtime_metrics_buffer", timeout_s=timeout_s)
-        _call_loaded("engine.runtime.runtime_meta", "shutdown_best_effort_runtime_meta_buffer", timeout_s=timeout_s)
-        _call_loaded("engine.strategy.feature_store", "close_feature_store", timeout_s=timeout_s)
-        _call_loaded("engine.runtime.storage", "shutdown_job_liveness_queue", timeout_s=timeout_s)
+        _call_loaded("engine.runtime.storage_pg_prices", "shutdown_pg_price_storage")
+        _shutdown_loaded_timescale_client(timeout_s=max(float(timeout_s), 0.0))
+        _call_loaded("engine.runtime.metrics_store", "shutdown_runtime_metrics_buffer", timeout_s=writer_timeout_s)
+        _call_loaded("engine.runtime.runtime_meta", "shutdown_best_effort_runtime_meta_buffer", timeout_s=writer_timeout_s)
+        _call_loaded("engine.strategy.feature_store", "close_feature_store", timeout_s=writer_timeout_s)
+        _call_loaded("engine.runtime.storage", "shutdown_job_liveness_queue", timeout_s=writer_timeout_s)
         _call_loaded("engine.runtime.storage", "close_pooled_connections")
         _reset_storage_sqlite_state()
         _clear_loaded_caches()

@@ -14,8 +14,23 @@ ROOT = Path(__file__).resolve().parents[1]
 REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
 PIN_RE = re.compile(r"(==|~=|>=|<=|<|>|===)")
 INCLUDE_RE = re.compile(r"^-r\s+(.+)$")
+CONSTRAINT_RE = re.compile(r"^(?:-c|--constraint)\s+(.+)$")
 NVIDIA_ONLY_REQUIREMENTS = {"pynvml", "nvidia-ml-py"}
 NVIDIA_REQUIREMENT_PREFIXES = ("nvidia-",)
+RUNTIME_INSTALL_MANIFESTS = {
+    "requirements.txt": ("requirements.in", "requirements.lock.txt"),
+}
+DEV_INSTALL_MANIFESTS = {
+    "requirements-dev.txt": ("requirements-dev.in", "requirements-dev.lock.txt"),
+}
+DEV_TOOL_REQUIREMENTS = {
+    "coverage",
+    "pytest",
+    "pytest-cov",
+    "pytest-timeout",
+    "pyright",
+    "ruff",
+}
 FORBIDDEN_REQUIREMENTS = {
     "psycopg2": "use psycopg 3.x via psycopg[binary,pool]",
     "psycopg2-binary": "use psycopg 3.x via psycopg[binary,pool]",
@@ -51,6 +66,38 @@ def _iter_requirement_lines(path: Path, seen: set[Path] | None = None) -> Iterab
             yield from _iter_requirement_lines(include_path, seen)
             continue
         yield path, lineno, raw
+
+
+def _manifest_refs(path: Path) -> Tuple[List[Path], List[Path]]:
+    includes: List[Path] = []
+    constraints: List[Path] = []
+    if not path.exists():
+        return includes, constraints
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        include = INCLUDE_RE.match(line)
+        if include:
+            includes.append((path.parent / include.group(1).strip()).resolve())
+            continue
+        constraint = CONSTRAINT_RE.match(line)
+        if constraint:
+            constraints.append((path.parent / constraint.group(1).strip()).resolve())
+    return includes, constraints
+
+
+def _requirements_entries(path: Path) -> Dict[str, str]:
+    entries: Dict[str, str] = {}
+    for source_path, lineno, raw in _iter_requirement_lines(path):
+        if raw == "__MISSING__":
+            continue
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        name = _normalize_req_name(line)
+        if not name:
+            continue
+        entries[name] = f"{source_path.relative_to(ROOT)}:{lineno}:{line}"
+    return entries
 
 
 def _requirements_report(path: Path, *, strict: bool) -> Tuple[List[str], List[str]]:
@@ -94,6 +141,112 @@ def _requirements_report(path: Path, *, strict: bool) -> Tuple[List[str], List[s
     return errors, warnings
 
 
+def _install_manifest_report(
+    manifests: Dict[str, Tuple[str, str]],
+) -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    for manifest_name, (input_name, lock_name) in manifests.items():
+        manifest_path = ROOT / manifest_name
+        input_path = (ROOT / input_name).resolve()
+        lock_path = (ROOT / lock_name).resolve()
+        if not manifest_path.exists():
+            errors.append(f"requirements_install_manifest_missing:{manifest_name}")
+            continue
+        if not input_path.exists():
+            errors.append(f"requirements_input_missing:{input_name}")
+        if not lock_path.exists():
+            errors.append(f"requirements_lock_missing:{lock_name}")
+
+        includes, constraints = _manifest_refs(manifest_path)
+        if input_path not in includes:
+            errors.append(f"requirements_install_manifest_missing_include:{manifest_name}:{input_name}")
+        if lock_path not in constraints:
+            errors.append(f"requirements_install_manifest_missing_constraint:{manifest_name}:{lock_name}")
+
+        unexpected_includes = sorted(
+            str(path.relative_to(ROOT))
+            for path in includes
+            if path != input_path and path.is_relative_to(ROOT)
+        )
+        if unexpected_includes:
+            warnings.append(
+                f"requirements_install_manifest_unexpected_include:{manifest_name}:"
+                + ",".join(unexpected_includes)
+            )
+        unexpected_constraints = sorted(
+            str(path.relative_to(ROOT))
+            for path in constraints
+            if path != lock_path and path.is_relative_to(ROOT)
+        )
+        if unexpected_constraints:
+            warnings.append(
+                f"requirements_install_manifest_unexpected_constraint:{manifest_name}:"
+                + ",".join(unexpected_constraints)
+            )
+    return errors, warnings
+
+
+def _lock_file_report(lock_path: Path, input_path: Path) -> Tuple[List[str], List[str]]:
+    errors, warnings = _requirements_report(lock_path, strict=True)
+    if not lock_path.exists() or not input_path.exists():
+        return errors, warnings
+
+    includes, constraints = _manifest_refs(lock_path)
+    if includes:
+        errors.append(f"requirements_lock_contains_include:{lock_path.relative_to(ROOT)}")
+    if constraints:
+        errors.append(f"requirements_lock_contains_constraint:{lock_path.relative_to(ROOT)}")
+
+    input_names = set(_requirements_entries(input_path))
+    lock_names = set(_requirements_entries(lock_path))
+    missing = sorted(input_names - lock_names)
+    if missing:
+        errors.append(
+            f"requirements_lock_missing_direct_pins:{lock_path.relative_to(ROOT)}:"
+            + ",".join(missing)
+        )
+    return errors, warnings
+
+
+def _dev_runtime_separation_report() -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    runtime_paths = [
+        ROOT / "requirements.in",
+        ROOT / "requirements-base.txt",
+        ROOT / "requirements.txt",
+        ROOT / "requirements.lock.txt",
+        ROOT / "requirements-nvidia-cuda.txt",
+        ROOT / "requirements-amd-rocm.txt",
+        ROOT / "requirements-amd-rocm-full.txt",
+    ]
+    for path in runtime_paths:
+        if not path.exists():
+            continue
+        names = set(_requirements_entries(path))
+        dev_tools = sorted(names & DEV_TOOL_REQUIREMENTS)
+        if dev_tools:
+            errors.append(
+                f"runtime_requirements_contain_dev_tools:{path.relative_to(ROOT)}:"
+                + ",".join(dev_tools)
+            )
+
+    dev_entries = _requirements_entries(ROOT / "requirements-dev.in")
+    dev_lock_entries = _requirements_entries(ROOT / "requirements-dev.lock.txt")
+    for tool in sorted(DEV_TOOL_REQUIREMENTS):
+        line = dev_entries.get(tool)
+        if line is None:
+            errors.append(f"requirements_dev_missing_tool:{tool}")
+        elif "==" not in line and "===" not in line:
+            errors.append(f"requirements_dev_tool_not_exactly_pinned:{tool}:{line}")
+        if tool not in dev_lock_entries:
+            errors.append(f"requirements_dev_lock_missing_tool:{tool}")
+    return errors, warnings
+
+
 def _nvidia_requirements(names: Iterable[str]) -> List[str]:
     return sorted(
         name
@@ -133,6 +286,29 @@ def _profile_requirements_report() -> Tuple[List[str], List[str]]:
 
     if not amd_path.exists():
         warnings.append("requirements_amd_rocm_marker_missing")
+    return errors, warnings
+
+
+def _ci_workflow_report(path: Path) -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    if not path.exists():
+        warnings.append("ci_validate_workflow_missing")
+        return errors, warnings
+
+    text = path.read_text(encoding="utf-8")
+    if "python tools/validate_dependency_lock.py --strict" not in text:
+        errors.append("ci_missing_strict_dependency_lock_validation")
+    if "python -m pip install -r requirements-dev.txt" not in text:
+        errors.append("ci_missing_dev_requirements_install")
+    forbidden_installs = [
+        line.strip()
+        for line in text.splitlines()
+        if "python -m pip install -r requirements.txt" in line
+        or "python -m pip install -r requirements-base.txt" in line
+    ]
+    if forbidden_installs:
+        errors.append("ci_installs_runtime_requirements_for_tests:" + ",".join(forbidden_installs))
     return errors, warnings
 
 
@@ -216,17 +392,42 @@ def main(argv: list[str] | None = None) -> int:
     errors: List[str] = []
     warnings: List[str] = []
     req_errors, req_warnings = _requirements_report(ROOT / "requirements.txt", strict=bool(args.strict))
+    dev_errors, dev_warnings = _requirements_report(ROOT / "requirements-dev.txt", strict=True)
+    runtime_manifest_errors, runtime_manifest_warnings = _install_manifest_report(RUNTIME_INSTALL_MANIFESTS)
+    dev_manifest_errors, dev_manifest_warnings = _install_manifest_report(DEV_INSTALL_MANIFESTS)
+    runtime_lock_errors, runtime_lock_warnings = _lock_file_report(
+        ROOT / "requirements.lock.txt", ROOT / "requirements.in"
+    )
+    dev_lock_errors, dev_lock_warnings = _lock_file_report(
+        ROOT / "requirements-dev.lock.txt", ROOT / "requirements-dev.in"
+    )
+    separation_errors, separation_warnings = _dev_runtime_separation_report()
     profile_errors, profile_warnings = _profile_requirements_report()
     pyproject_errors, pyproject_warnings = _pyproject_report(ROOT / "pyproject.toml")
     npm_errors, npm_warnings = _npm_lock_report(ROOT / "package.json", ROOT / "package-lock.json")
+    ci_errors, ci_warnings = _ci_workflow_report(ROOT / ".github" / "workflows" / "validate.yml")
     errors.extend(req_errors)
+    errors.extend(dev_errors)
+    errors.extend(runtime_manifest_errors)
+    errors.extend(dev_manifest_errors)
+    errors.extend(runtime_lock_errors)
+    errors.extend(dev_lock_errors)
+    errors.extend(separation_errors)
     errors.extend(profile_errors)
     errors.extend(pyproject_errors)
     errors.extend(npm_errors)
+    errors.extend(ci_errors)
     warnings.extend(req_warnings)
+    warnings.extend(dev_warnings)
+    warnings.extend(runtime_manifest_warnings)
+    warnings.extend(dev_manifest_warnings)
+    warnings.extend(runtime_lock_warnings)
+    warnings.extend(dev_lock_warnings)
+    warnings.extend(separation_warnings)
     warnings.extend(profile_warnings)
     warnings.extend(pyproject_warnings)
     warnings.extend(npm_warnings)
+    warnings.extend(ci_warnings)
 
     payload = {"ok": not errors, "errors": errors, "warnings": warnings, "strict": bool(args.strict)}
     if args.json:

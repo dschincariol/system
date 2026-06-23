@@ -26,8 +26,10 @@ class CompetitionPreSubmitRevalidationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.prev_db_path = os.environ.get("DB_PATH")
+        self.prev_storage_backend = os.environ.get("TS_STORAGE_BACKEND")
         self.prev_capital_plan_age_ms = os.environ.get("COMPETITION_CAPITAL_PLAN_MAX_AGE_MS")
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "competition_pre_submit_revalidation.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         os.environ["COMPETITION_CAPITAL_PLAN_MAX_AGE_MS"] = "60000"
         self._reload_runtime_modules()
 
@@ -36,6 +38,10 @@ class CompetitionPreSubmitRevalidationTests(unittest.TestCase):
             os.environ.pop("DB_PATH", None)
         else:
             os.environ["DB_PATH"] = str(self.prev_db_path)
+        if self.prev_storage_backend is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = str(self.prev_storage_backend)
         if self.prev_capital_plan_age_ms is None:
             os.environ.pop("COMPETITION_CAPITAL_PLAN_MAX_AGE_MS", None)
         else:

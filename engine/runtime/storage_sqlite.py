@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from engine.runtime.platform import default_data_root
 from engine.runtime.pg_durability import validate_runtime_refetchable_ingestion_telemetry_write
+from engine.runtime import storage_sqlite_normalization as _sqlite_normalization
 
 LOGGER = logging.getLogger(__name__)
 STORAGE_BACKEND_NAME = "sqlite"
@@ -29,7 +30,7 @@ sqlite3 = importlib.import_module("sqlite3")
 
 
 def _env_truthy(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+    return _sqlite_normalization.env_truthy(value)
 
 
 def _warn_nonfatal(code: str, error: Exception, **extra: Any) -> None:
@@ -217,9 +218,7 @@ _CRYPTO_FUNDING_RATE_COLUMNS = (
 
 
 def _adapt_json(value: Any) -> str:
-    import json
-
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+    return _sqlite_normalization.adapt_json(value)
 
 
 sqlite3.register_adapter(dict, _adapt_json)
@@ -264,6 +263,19 @@ def _current_liveness_db_path() -> Path:
 
 def _column_type(name: str, *, for_alter: bool = False) -> str:
     text = str(name or "").lower()
+    explicit_text_columns = {
+        "instrument_kind",
+        "base_ccy",
+        "quote_ccy",
+        "pnl_ccy",
+        "session_calendar",
+        "instrument_meta_source",
+    }
+    explicit_real_columns = {"pip_size", "contract_size", "leverage_cap"}
+    if text in explicit_text_columns or text.endswith("_ccy"):
+        return "TEXT"
+    if text in explicit_real_columns:
+        return "REAL"
     if text == "id":
         return "INTEGER" if for_alter else "INTEGER PRIMARY KEY AUTOINCREMENT"
     if text.startswith("is_") or text.startswith("use_") or text.endswith("_enabled") or text in {
@@ -370,11 +382,11 @@ def _clear_active_write_connection(con: "StorageConnection") -> None:
 
 
 def _is_read_statement(sql: str) -> bool:
-    return bool(re.match(r"^\s*(?:SELECT|WITH|PRAGMA)\b", str(sql or ""), flags=re.IGNORECASE))
+    return _sqlite_normalization.is_read_statement(sql)
 
 
 def _is_auto_write_statement(sql: str) -> bool:
-    return bool(re.match(r"^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", str(sql or ""), flags=re.IGNORECASE))
+    return _sqlite_normalization.is_auto_write_statement(sql)
 
 
 def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
@@ -396,7 +408,7 @@ def _table_sql(con: sqlite3.Connection, table: str) -> str:
 
 
 def _normalized_sql_signature(sql: str) -> str:
-    return re.sub(r"\s+", "", str(sql or "")).upper()
+    return _sqlite_normalization.normalized_sql_signature(sql)
 
 
 def _next_legacy_table_name(con: sqlite3.Connection, table: str) -> str:
@@ -865,21 +877,11 @@ def _prepare_sql(con: sqlite3.Connection, sql: str) -> str:
 
 
 def _normalize_param(value: Any) -> Any:
-    if isinstance(value, (dict, list, tuple)):
-        return _adapt_json(value)
-    if isinstance(value, memoryview):
-        return bytes(value)
-    return value
+    return _sqlite_normalization.normalize_param(value)
 
 
 def _normalize_params(params: Any) -> Any:
-    if params is None:
-        return None
-    if isinstance(params, dict):
-        return {str(key): _normalize_param(value) for key, value in params.items()}
-    if isinstance(params, (tuple, list)):
-        return tuple(_normalize_param(value) for value in params)
-    return _normalize_param(params)
+    return _sqlite_normalization.normalize_params(params)
 
 
 def _execute_with_repair(con: sqlite3.Connection, sql: str, params: Any = None):
@@ -1622,7 +1624,26 @@ def run_write_txn(
     del table, operation, maintenance, kwargs
     last_error: BaseException | None = None
     for attempt in range(max(1, int(attempts or 1))):
-        with _WRITE_LOCK:
+        lock_timeout_s = None
+        if timeout_s is not None:
+            lock_timeout_s = max(0.0, float(timeout_s))
+        acquired = (
+            _WRITE_LOCK.acquire()
+            if lock_timeout_s is None
+            else _WRITE_LOCK.acquire(timeout=float(lock_timeout_s))
+        )
+        if not acquired:
+            last_error = sqlite3.OperationalError(
+                f"sqlite_write_lock_timeout:timeout_s={lock_timeout_s}"
+            )
+            if attempt >= max(1, int(attempts or 1)) - 1:
+                raise last_error
+            with _SQLITE_TRACE_LOCK:
+                _SQLITE_TRACE_TOTALS["busy_retry_count"] = int(_SQLITE_TRACE_TOTALS.get("busy_retry_count") or 0) + 1
+                _SQLITE_TRACE_TOTALS["retries"] = int(_SQLITE_TRACE_TOTALS.get("retries") or 0) + 1
+            time.sleep(min(0.25, 0.02 * (attempt + 1)))
+            continue
+        try:
             if _active_write_connection() is not None:
                 raise sqlite3.OperationalError("write_transaction_already_active")
             connector = connect_rw_direct if bool(direct) else connect
@@ -1653,6 +1674,8 @@ def run_write_txn(
                 if hasattr(con, "_suppress_manual_transaction_control"):
                     con._suppress_manual_transaction_control = False
                 con.close()
+        finally:
+            _WRITE_LOCK.release()
     if last_error is not None:
         raise last_error
     return None
@@ -2217,6 +2240,27 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
           updated_ts_ms INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS model_promotion_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL DEFAULT 0,
+          actor TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL DEFAULT 'audit_chain_append',
+          model_name TEXT NOT NULL DEFAULT '',
+          from_model_kind TEXT,
+          from_model_ts_ms INTEGER,
+          to_model_kind TEXT,
+          to_model_ts_ms INTEGER,
+          reason_json TEXT,
+          details_json TEXT,
+          regime TEXT,
+          prev_hash BLOB,
+          row_hash BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_promo_audit_name_regime_ts
+          ON model_promotion_audit(model_name, regime, ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_model_promo_audit_ts
+          ON model_promotion_audit(ts_ms);
+
         CREATE TABLE IF NOT EXISTS model_marketplace_scores (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           model_id TEXT NOT NULL DEFAULT 'baseline',
@@ -2679,7 +2723,31 @@ def _ensure_universe_audit_schema(con: sqlite3.Connection) -> None:
     CREATE TABLE IF NOT EXISTS symbols (...);
     CREATE TABLE IF NOT EXISTS symbol_universe (...);
     """
-    _create_table(con, "symbols", ("symbol", "score", "status", "asset_class", "meta_json", "updated_ts_ms"), (("symbol",),))
+    _create_table(
+        con,
+        "symbols",
+        (
+            "symbol",
+            "asset_class",
+            "status",
+            "score",
+            "last_seen_event_ts_ms",
+            "last_traded_ts_ms",
+            "meta_json",
+            "instrument_kind",
+            "base_ccy",
+            "quote_ccy",
+            "pip_size",
+            "contract_size",
+            "pnl_ccy",
+            "leverage_cap",
+            "session_calendar",
+            "instrument_meta_source",
+            "created_ts_ms",
+            "updated_ts_ms",
+        ),
+        (("symbol",),),
+    )
     _create_table(con, "symbol_universe", ("symbol", "status", "first_seen_ms", "last_seen_ms", "seen_n", "meta_json"), (("symbol",),))
 
 
@@ -3234,7 +3302,7 @@ _EXACT_TABLE_PK: dict[str, dict[str, int]] = {
     "job_checkpoints": {"job_name": 1},
     "prices": {"symbol": 1, "ts_ms": 2},
     "price_quotes": {"symbol": 1, "ts_ms": 2},
-    "price_quotes_raw": {"symbol": 1, "provider": 2, "event_key": 3},
+    "price_quotes_raw": {"symbol": 1, "provider": 2, "event_key": 3, "ts_ms": 4},
     "price_provider_health": {"provider": 1, "ts_ms": 2},
     "ingestion_pipeline_health": {"pipeline": 1, "ts_ms": 2},
     "price_feed_lock": {"id": 1},
@@ -4140,6 +4208,23 @@ def _ensure_runtime_baseline_schema(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_data_sources_type
           ON data_sources(source_type);
 
+        CREATE TABLE IF NOT EXISTS data_source_provider_accounts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          account_key TEXT NOT NULL UNIQUE,
+          display_name TEXT NOT NULL,
+          provider_name TEXT,
+          credentials_enc TEXT,
+          key_version TEXT DEFAULT 'master_key',
+          status TEXT,
+          last_error TEXT,
+          last_test_ts_ms INTEGER,
+          config_hash TEXT,
+          created_ts_ms INTEGER NOT NULL,
+          updated_ts_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_data_source_provider_accounts_provider
+          ON data_source_provider_accounts(provider_name);
+
         CREATE TABLE IF NOT EXISTS data_source_audit (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts_ms INTEGER NOT NULL,
@@ -4158,6 +4243,28 @@ def _ensure_runtime_baseline_schema(con: sqlite3.Connection) -> None:
           ON data_source_audit(source_key, ts_ms DESC);
         CREATE INDEX IF NOT EXISTS idx_data_source_audit_actor_ts
           ON data_source_audit(actor, ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS data_source_populate_evidence (
+          source_key TEXT PRIMARY KEY,
+          ts_ms INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          contract_status TEXT NOT NULL,
+          row_count INTEGER NOT NULL DEFAULT 0,
+          storage_table TEXT NOT NULL,
+          latest_ts_ms INTEGER,
+          latency_ms INTEGER,
+          missing_null_counts_json TEXT,
+          duplicate_drops INTEGER NOT NULL DEFAULT 0,
+          stale_gap_status TEXT,
+          provider_evidence_json TEXT,
+          contract_json TEXT,
+          error TEXT,
+          actor TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_data_source_populate_evidence_status
+          ON data_source_populate_evidence(status, contract_status);
+        CREATE INDEX IF NOT EXISTS idx_data_source_populate_evidence_ts
+          ON data_source_populate_evidence(ts_ms DESC);
 
         CREATE TABLE IF NOT EXISTS data_source_logs (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4964,6 +5071,20 @@ _REQUIRED_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "created_ts_ms",
         "updated_ts_ms",
     ),
+    "data_source_provider_accounts": (
+        "id",
+        "account_key",
+        "display_name",
+        "provider_name",
+        "credentials_enc",
+        "key_version",
+        "status",
+        "last_error",
+        "last_test_ts_ms",
+        "config_hash",
+        "created_ts_ms",
+        "updated_ts_ms",
+    ),
     "strategy_metrics": ("strategy_name", "window_days", "ts_ms", "metrics_json", "is_active"),
     "strategy_promotion_candidates": (
         "id",
@@ -5031,6 +5152,7 @@ _REQUIRED_INDEXES: tuple[str, ...] = (
     "idx_execution_health_state_ts",
     "idx_msreg_sym",
     "idx_data_sources_enabled",
+    "idx_data_source_provider_accounts_provider",
     "idx_data_sources_job_name",
     "idx_data_sources_type",
     "idx_strategy_metrics_ts",

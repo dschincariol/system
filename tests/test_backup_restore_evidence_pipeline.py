@@ -90,6 +90,25 @@ def _fresh_evidence_payload(now_ts: float | None = None) -> dict:
             "last_failed_wal": "",
             "last_failed_at_ts": None,
         },
+        "wal_archive_target": {
+            "status": "pass",
+            "source": "filesystem_repair",
+            "root": "/var/backups/trading",
+            "wal_dir": "/var/backups/trading/wal",
+            "tmp_dir": "/var/backups/trading/wal/.tmp",
+            "expected_owner_uid": 70,
+            "expected_group": "trading",
+            "expected_group_gid": 70,
+            "expected_dir_mode": "2750",
+            "repaired": False,
+            "issue_count": 0,
+            "verified_at_ts": now,
+            "diagnosis": {
+                "archive_command_failure_signature": "",
+                "archive_command_exit_code": None,
+                "fix": "",
+            },
+        },
         "restore_drill": {
             "status": "pass",
             "report": "/var/backups/trading/drills/restore_drill_20260617.txt",
@@ -116,6 +135,10 @@ def test_backup_restore_evidence_script_writes_signed_component_evidence(monkeyp
     drill_dir = backup_root / "drills"
     latest_json = evidence_dir / "latest_backup_restore_evidence.json"
     wal_dir.mkdir(parents=True)
+    (wal_dir / ".tmp").mkdir()
+    backup_root.chmod(0o700)
+    wal_dir.chmod(0o550)
+    (wal_dir / ".tmp").chmod(0o550)
 
     _write_executable(
         scripts_dir / "base_backup.sh",
@@ -184,7 +207,7 @@ exit 97
             "PATH": f"{bin_dir}:{env.get('PATH', '')}",
             "TS_BACKUP_EVIDENCE_SKIP_SYSTEMD": "1",
             "TS_BASE_BACKUP_SCRIPT": str(scripts_dir / "base_backup.sh"),
-            "TS_WAL_ARCHIVE_SCRIPT": str(scripts_dir / "wal_archive.sh"),
+            "TS_WAL_ARCHIVE_SCRIPT": str(REPO_ROOT / "ops" / "backup" / "wal_archive.sh"),
             "TS_WAL_ARCHIVE_CATCHUP_SCRIPT": str(scripts_dir / "wal_archive_catchup.sh"),
             "TS_RESTORE_SCRIPT": str(scripts_dir / "restore.sh"),
             "TS_RESTORE_DRILL_SCRIPT": str(scripts_dir / "restore_drill.sh"),
@@ -227,6 +250,27 @@ exit 97
     assert payload["wal_archiver"]["archive_mode"] == "on"
     assert payload["wal_archiver"]["archive_command"].endswith('wal_archive.sh "%p" "%f"')
     assert payload["wal_archiver"]["last_archived_wal"] == "0000000100000000000000AA"
+    assert payload["wal_archive_target"]["status"] == "pass"
+    assert payload["wal_archive_target"]["expected_owner_uid"] == os.getuid()
+    assert payload["wal_archive_target"]["expected_group_gid"] == os.getgid()
+    assert payload["wal_archive_target"]["expected_dir_mode"] == "2750"
+    assert payload["wal_archive_target"]["repaired"] is True
+    assert payload["wal_archive_target"]["issue_count"] >= 1
+    assert payload["wal_archive_target"]["verified_at"]
+    assert payload["wal_archive_target"]["diagnosis"]["source"] == "wal_archive_probe"
+    assert payload["wal_archive_target"]["diagnosis"]["archive_command_probe_status"] == "observed_failure"
+    assert payload["wal_archive_target"]["diagnosis"]["archive_command_probe_wal_name"].endswith(
+        ".diagnosis.2026-06-17T120000Z"
+    )
+    assert payload["wal_archive_target"]["diagnosis"]["archive_command_failure_signature"] == "archive_dir_not_writable"
+    assert payload["wal_archive_target"]["diagnosis"]["archive_command_exit_code"] == 1
+    assert payload["wal_archive_target"]["diagnosis"]["original_archive_command_failure_signature"] == "archive_dir_not_writable"
+    assert payload["wal_archive_target"]["diagnosis"]["original_archive_command_exit_code"] == 1
+    assert "event=archive_dir_not_writable" in payload["wal_archive_target"]["diagnosis"]["archive_command_probe_output"]
+    assert "chmod 2750" in payload["wal_archive_target"]["diagnosis"]["fix"]
+    assert stat.S_IMODE(backup_root.stat().st_mode) == 0o2750
+    assert stat.S_IMODE(wal_dir.stat().st_mode) == 0o2750
+    assert stat.S_IMODE((wal_dir / ".tmp").stat().st_mode) == 0o2750
     assert payload["restore_drill"]["status"] == "pass"
     assert payload["restore_drill"]["time_to_recover_s"] == 42
     assert payload["restore_drill"]["verified_at"]
@@ -383,6 +427,29 @@ def test_backup_evidence_blocks_stale_wal_archiver(monkeypatch, tmp_path):
     assert "backup_evidence_wal_archiver_stale" in state["blockers"]
 
 
+def test_backup_evidence_blocks_repaired_wal_target_without_diagnosis(monkeypatch, tmp_path):
+    now = time.time()
+    evidence_path = tmp_path / "latest_backup_restore_evidence.json"
+    payload = _fresh_evidence_payload(now)
+    payload["wal_archive_target"]["repaired"] = True
+    payload["wal_archive_target"]["issue_count"] = 1
+    payload["wal_archive_target"]["diagnosis"] = {}
+    evidence_path.write_text(
+        json.dumps(_sign_payload(payload, "test-signing-key"), separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BACKUP_EVIDENCE_PATH", str(evidence_path))
+    monkeypatch.setenv("BACKUP_EVIDENCE_HMAC_KEY", "test-signing-key")
+    monkeypatch.setenv("BACKUP_EVIDENCE_RPO_S", "120")
+
+    from engine.runtime.backup_evidence import backup_restore_evidence_snapshot
+
+    state = backup_restore_evidence_snapshot(engine_mode="live", now_ts=now)
+    assert state["ok"] is False
+    assert "backup_evidence_wal_archive_target_diagnosis_fix_missing" in state["blockers"]
+    assert "backup_evidence_wal_archive_target_archive_command_exit_code_missing" in state["blockers"]
+
+
 def test_backup_accounting_snapshot_reports_sizes_mount_and_retention(monkeypatch, tmp_path):
     backup_root = tmp_path / "trading"
     base_dir = backup_root / "base"
@@ -401,6 +468,7 @@ def test_backup_accounting_snapshot_reports_sizes_mount_and_retention(monkeypatc
     monkeypatch.setenv("TS_BACKUP_BASE_DIR", str(base_dir))
     monkeypatch.setenv("TS_BACKUP_WAL_DIR", str(wal_dir))
     monkeypatch.setenv("TS_RESTORE_DRILL_DIR", str(drill_dir))
+    monkeypatch.setenv("TS_BACKUP_KEEP_RECENT_COUNT", "2")
     monkeypatch.setenv("TS_BACKUP_KEEP_DAILY_DAYS", "9")
     monkeypatch.setenv("TS_BACKUP_KEEP_WEEKLY_DAYS", "90")
     monkeypatch.setenv("TS_BACKUP_WAL_CUSHION_DAYS", "3")
@@ -421,6 +489,7 @@ def test_backup_accounting_snapshot_reports_sizes_mount_and_retention(monkeypatc
     )
     assert state["retention_status"] == "configured"
     assert state["retention"]["status"] == "configured"
+    assert state["retention"]["keep_recent_count"] == 2
     assert state["retention"]["keep_daily_days"] == 9
     assert state["retention"]["keep_weekly_days"] == 90
     assert state["retention"]["wal_cushion_days"] == 3
@@ -700,6 +769,101 @@ def test_pg_wal_disk_risk_snapshot_blocks_large_ready_backlog(monkeypatch, tmp_p
     assert state["ready_count"] == 4
     assert "pg_wal_bytes_exceeds_budget" in state["blockers"]
     assert "pg_wal_ready_backlog_critical" in state["blockers"]
+
+
+def test_pg_wal_disk_risk_snapshot_derives_local_wal_from_timescale_data(monkeypatch, tmp_path):
+    class _Cursor:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql):
+            text = " ".join(str(sql).lower().split())
+            if "from pg_ls_waldir()" in text:
+                return _Cursor((0, 0))
+            if "from pg_ls_dir('pg_wal/archive_status')" in text:
+                return _Cursor((0,))
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+    class _FakePsycopg:
+        @staticmethod
+        def connect(*args, **kwargs):
+            return _FakeConnection()
+
+    timescale_data = tmp_path / "timescaledb" / "data"
+    pg_wal = timescale_data / "pg_wal"
+    pg_wal.mkdir(parents=True)
+    monkeypatch.setitem(sys.modules, "psycopg", _FakePsycopg)
+    monkeypatch.setenv("TS_PG_DSN", "dbname=trading user=trading password=test")
+    monkeypatch.delenv("TS_PG_WAL_DIR", raising=False)
+    monkeypatch.setenv("TRADING_TIMESCALE_DATA", str(timescale_data))
+    monkeypatch.setenv("PREFLIGHT_PG_WAL_CRITICAL_BYTES", str(1024 * 1024 * 1024))
+    monkeypatch.setenv("PREFLIGHT_PG_WAL_READY_CRITICAL_COUNT", "100")
+    monkeypatch.setenv("PREFLIGHT_PG_WAL_CRITICAL_FREE_BYTES", "0")
+    monkeypatch.setenv("PREFLIGHT_PG_WAL_WARN_FREE_BYTES", "0")
+
+    from engine.runtime.backup_evidence import pg_wal_disk_risk_snapshot
+
+    state = pg_wal_disk_risk_snapshot(engine_mode="live")
+
+    assert state["ok"] is True
+    assert state["local_space"]["path"] == str(pg_wal)
+    assert state["local_space"]["path_source"] == "TRADING_TIMESCALE_DATA"
+    assert state["local_space"]["visible"] is True
+
+
+def test_pg_wal_disk_risk_snapshot_blocks_missing_required_local_wal_evidence(monkeypatch):
+    class _Cursor:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql):
+            text = " ".join(str(sql).lower().split())
+            if "from pg_ls_waldir()" in text:
+                return _Cursor((0, 0))
+            if "from pg_ls_dir('pg_wal/archive_status')" in text:
+                return _Cursor((0,))
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+    class _FakePsycopg:
+        @staticmethod
+        def connect(*args, **kwargs):
+            return _FakeConnection()
+
+    monkeypatch.setitem(sys.modules, "psycopg", _FakePsycopg)
+    monkeypatch.setenv("TS_PG_DSN", "dbname=trading user=trading password=test")
+    monkeypatch.delenv("TS_PG_WAL_DIR", raising=False)
+    monkeypatch.setenv("TRADING_TIMESCALE_DATA", "/not-visible/timescaledb/data")
+    monkeypatch.setenv("PREFLIGHT_PG_WAL_CRITICAL_BYTES", str(1024 * 1024 * 1024))
+    monkeypatch.setenv("PREFLIGHT_PG_WAL_READY_CRITICAL_COUNT", "100")
+
+    from engine.runtime.backup_evidence import pg_wal_disk_risk_snapshot
+
+    state = pg_wal_disk_risk_snapshot(engine_mode="live")
+
+    assert state["ok"] is False
+    assert state["local_space"]["path"] == "/not-visible/timescaledb/data/pg_wal"
+    assert state["local_space"]["path_source"] == "TRADING_TIMESCALE_DATA"
+    assert "pg_wal_free_space_not_visible" in state["blockers"]
 
 
 def test_backup_evidence_rejects_incomplete_json(monkeypatch, tmp_path):

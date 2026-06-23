@@ -370,6 +370,7 @@ def operator_sidecar_security_snapshot(
     ).strip()
     if internal_only is None:
         internal_only = _env_bool("OPERATOR_SIDECAR_INTERNAL_ONLY", False)
+    allow_public_bind = _env_bool("OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND", False)
 
     blockers: list[str] = []
     exposure: Dict[str, Any] = {}
@@ -391,11 +392,17 @@ def operator_sidecar_security_snapshot(
     token_issue = operator_api_token_issue(token)
     if token_issue:
         blockers.append(token_issue)
+    if bool(internal_only):
+        if public_port:
+            blockers.append("operator_public_port_ignored_internal_only")
+        if allow_public_bind:
+            blockers.append("operator_public_bind_flag_ignored_internal_only")
     if bind_host and _operator_bind_host_is_unsafe(bind_host) and not bool(internal_only) and not operator_public_approved:
         blockers.append("operator_bind_host_public_without_internal_only")
     if public_port:
-        if bool(operator_state.get("public_host_bind")) and not bool(operator_state.get("approved")):
+        if not bool(internal_only):
             blockers.append("operator_sidecar_public_port_forbidden")
+        if bool(operator_state.get("public_host_bind")) and not bool(operator_state.get("approved")):
             blockers.append("operator_sidecar_public_port_forbidden_without_approved_exposure")
 
     blockers = list(dict.fromkeys(blockers))
@@ -410,6 +417,7 @@ def operator_sidecar_security_snapshot(
         "operator_api_token_configured": bool(token),
         "operator_api_token_issue": token_issue,
         "internal_only": bool(internal_only),
+        "operator_allow_dangerous_public_bind": bool(allow_public_bind),
     }
 
 
@@ -496,6 +504,25 @@ def production_secret_sources_snapshot() -> Dict[str, Any]:
             "reason": f"secret_source_policy_unavailable:{type(exc).__name__}",
             "blockers": [f"secret_source_policy_unavailable:{type(exc).__name__}"],
             "error": str(exc),
+        }
+
+
+def dsn_context_preflight_snapshot() -> Dict[str, Any]:
+    """Return redacted host/container DSN context validation state."""
+
+    try:
+        from engine.runtime.dsn_context import dsn_context_snapshot
+
+        return dict(dsn_context_snapshot() or {})
+    except Exception as exc:
+        return {
+            "ok": False,
+            "required": True,
+            "context": "unknown",
+            "reason": f"dsn_context_preflight_unavailable:{type(exc).__name__}",
+            "blockers": [f"dsn_context_preflight_unavailable:{type(exc).__name__}"],
+            "warnings": [],
+            "entries": [],
         }
 
 
@@ -997,6 +1024,9 @@ def live_environment_contract_snapshot(
     secret_sources = production_secret_sources_snapshot()
     if bool(secret_sources.get("required")) and not bool(secret_sources.get("ok")):
         blockers.extend(str(item) for item in list(secret_sources.get("blockers") or []))
+    dsn_context = dsn_context_preflight_snapshot()
+    if bool(dsn_context.get("required")) and not bool(dsn_context.get("ok")):
+        blockers.extend(str(item) for item in list(dsn_context.get("blockers") or []))
     phrase = _confirmation_phrase()
 
     blockers = list(dict.fromkeys(blockers))
@@ -1019,6 +1049,7 @@ def live_environment_contract_snapshot(
         "operator_sidecar_security": dict(operator_sidecar_security or {}),
         "public_network_exposure": dict(public_network_exposure or {}),
         "secret_sources": dict(secret_sources or {}),
+        "dsn_context": dict(dsn_context or {}),
     }
 
 
@@ -1148,6 +1179,7 @@ def live_trading_preflight(
         "operator_sidecar_security": dict(contract.get("operator_sidecar_security") or {}),
         "public_network_exposure": dict(contract.get("public_network_exposure") or {}),
         "secret_sources": dict(contract.get("secret_sources") or {}),
+        "dsn_context": dict(contract.get("dsn_context") or {}),
         "backup_restore_evidence": dict(backup_restore_evidence or {}),
         "wal_archiver_runtime": dict(wal_archiver_runtime or {}),
         "clock_health": dict(clock_health or {}),
@@ -1190,6 +1222,7 @@ __all__ = [
     "live_trading_preflight",
     "lob_deeplob_shadow_readiness_snapshot",
     "operator_api_token_issue",
+    "dsn_context_preflight_snapshot",
     "operator_sidecar_security_snapshot",
     "production_secret_sources_snapshot",
     "public_network_exposure_ack_snapshot",

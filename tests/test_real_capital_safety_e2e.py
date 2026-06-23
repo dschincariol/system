@@ -16,12 +16,16 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from engine.runtime.live_trading_preflight import DEFAULT_LIVE_CONFIRM_PHRASE
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+pytestmark = pytest.mark.safety_critical
 
 
 def _sign_backup_evidence(
@@ -94,6 +98,7 @@ def _reload_runtime_modules() -> SimpleNamespace:
         kill_switch,
         position_reconcile,
         order_idempotency,
+        order_command_boundary,
         portfolio_execution_intents,
         broker_router,
         broker_apply_orders,
@@ -108,6 +113,7 @@ def _reload_runtime_modules() -> SimpleNamespace:
         "engine.execution.kill_switch",
         "engine.execution.position_reconcile",
         "engine.execution.order_idempotency",
+        "engine.execution.order_command_boundary",
         "engine.strategy.portfolio_execution_intents",
         "engine.execution.broker_router",
         "engine.execution.broker_apply_orders",
@@ -123,6 +129,7 @@ def _reload_runtime_modules() -> SimpleNamespace:
         kill_switch=kill_switch,
         position_reconcile=position_reconcile,
         order_idempotency=order_idempotency,
+        order_command_boundary=order_command_boundary,
         portfolio_execution_intents=portfolio_execution_intents,
         broker_router=broker_router,
         broker_apply_orders=broker_apply_orders,
@@ -270,6 +277,12 @@ def _configure_live_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OOD_SUPPRESS_THRESHOLD", "1.50")
     monkeypatch.setenv("OOD_HARD_THRESHOLD", "3.00")
     monkeypatch.setenv("MODEL_NAME", "baseline")
+    import engine.runtime.storage as runtime_storage
+
+    # The imported live preflight module can bind storage before this fixture
+    # switches to its tmp SQLite DB. Reload before writing artifact aliases so
+    # live-model preflight resolves the same DB the test later uses.
+    importlib.reload(runtime_storage)
     from engine.artifacts.store import LocalArtifactStore
 
     artifact_alias = "model:baseline:current"
@@ -376,6 +389,20 @@ def _configure_live_env(monkeypatch, tmp_path: Path) -> None:
                         "failed_count": 0,
                         "last_failed_wal": "",
                         "last_failed_at_ts": None,
+                    },
+                    "wal_archive_target": {
+                        "status": "pass",
+                        "source": "filesystem_repair",
+                        "root": "/var/backups/trading",
+                        "wal_dir": "/var/backups/trading/wal",
+                        "tmp_dir": "/var/backups/trading/wal/.tmp",
+                        "expected_owner_uid": 70,
+                        "expected_group": "trading",
+                        "expected_group_gid": 70,
+                        "expected_dir_mode": "2750",
+                        "repaired": False,
+                        "issue_count": 0,
+                        "verified_at_ts": now,
                     },
                     "restore_drill": {
                         "status": "pass",

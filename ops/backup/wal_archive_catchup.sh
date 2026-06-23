@@ -106,7 +106,12 @@ while IFS= read -r wal_name; do
   fi
   src="${pg_wal_dir}/${wal_name}"
   "$archive_script" "$src" "$wal_name"
+  ready_marker="${status_dir}/${wal_name}.ready"
+  done_marker="${status_dir}/${wal_name}.done"
+  if [ -f "$ready_marker" ]; then
+    mv -f -- "$ready_marker" "$done_marker"
+  fi
   processed="$((processed + 1))"
 done < "$ready_list"
 
-log info catchup_complete "ready_count=${ready_count} processed=${processed} backlog_bytes=${total_bytes} wal_dir=${wal_dir} postgres_archiver_will_mark_done=1"
+log info catchup_complete "ready_count=${ready_count} processed=${processed} backlog_bytes=${total_bytes} wal_dir=${wal_dir} ready_markers_moved_to_done=1"

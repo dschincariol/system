@@ -11,6 +11,7 @@ if [ -z "$TARGET_DISK" ] && [ -z "$TARGET_DISK_BY_ID" ]; then
   TARGET_DISK="$DEFAULT_TARGET_DISK"
 fi
 CONFIRM_DESTROY="${CONFIRM_DESTROY:-}"
+IDLE_NVME_DECISION="${IDLE_NVME_DECISION:-}"
 RECLAIM_DRY_RUN="${RECLAIM_DRY_RUN:-1}"
 RECLAIM_ROLE="${RECLAIM_ROLE:-docker-pgdata}"
 RECLAIM_FS_TYPE="${RECLAIM_FS_TYPE:-ext4}"
@@ -99,15 +100,52 @@ run_cmd() {
 
 require_supported_role() {
   case "$RECLAIM_ROLE" in
-    docker-pgdata) ;;
+    docker-pgdata|zfs-pool) ;;
     *) die unsupported_reclaim_role "role=${RECLAIM_ROLE}" ;;
   esac
 }
 
 require_supported_fs() {
+  if [ "$RECLAIM_ROLE" = "zfs-pool" ]; then
+    [ "$RECLAIM_FS_TYPE" = "none" ] || die unsupported_filesystem "role=${RECLAIM_ROLE} fs_type=${RECLAIM_FS_TYPE} expected=none"
+    return 0
+  fi
   case "$RECLAIM_FS_TYPE" in
     ext4|xfs) ;;
     *) die unsupported_filesystem "fs_type=${RECLAIM_FS_TYPE}" ;;
+  esac
+}
+
+normalized_idle_nvme_decision() {
+  case "$IDLE_NVME_DECISION" in
+    RETAIN|retain|Retain) printf 'retain\n' ;;
+    RECLAIM|reclaim|Reclaim) printf 'reclaim\n' ;;
+    "") printf '\n' ;;
+    *) printf 'invalid\n' ;;
+  esac
+}
+
+require_decision_branch() {
+  local decision
+  decision="$(normalized_idle_nvme_decision)"
+  case "$decision" in
+    retain)
+      log info retain_selected_noop "IDLE_NVME_DECISION=RETAIN; Windows/BitLocker install is left untouched"
+      exit 0
+      ;;
+    reclaim)
+      return 0
+      ;;
+    "")
+      if is_dry_run; then
+        log warn decision_required_noop "set IDLE_NVME_DECISION=RETAIN or IDLE_NVME_DECISION=RECLAIM; no assessment or provisioning commands will run"
+        exit 0
+      fi
+      die decision_required "set IDLE_NVME_DECISION=RECLAIM before apply; RETAIN leaves Windows/BitLocker untouched"
+      ;;
+    *)
+      die invalid_decision "IDLE_NVME_DECISION=${IDLE_NVME_DECISION}; expected RETAIN or RECLAIM"
+      ;;
   esac
 }
 
@@ -207,8 +245,7 @@ PY
 
 check_backup_evidence() {
   if ! is_truthy "$RECLAIM_BACKUP_REQUIRED"; then
-    log warn backup_evidence_gate_disabled "RECLAIM_BACKUP_REQUIRED=${RECLAIM_BACKUP_REQUIRED}"
-    return 0
+    die backup_evidence_required "RECLAIM_BACKUP_REQUIRED cannot disable apply-mode backup/restore evidence"
   fi
   PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python - <<'PY'
 from __future__ import annotations
@@ -254,10 +291,12 @@ require_apply_commands() {
   fi
   local command_name
   local required=(blkid findmnt grep install lsblk mount partprobe sgdisk wipefs)
-  case "$RECLAIM_FS_TYPE" in
-    ext4) required+=(mkfs.ext4) ;;
-    xfs) required+=(mkfs.xfs) ;;
-  esac
+  if [ "$RECLAIM_ROLE" != "zfs-pool" ]; then
+    case "$RECLAIM_FS_TYPE" in
+      ext4) required+=(mkfs.ext4) ;;
+      xfs) required+=(mkfs.xfs) ;;
+    esac
+  fi
   for command_name in "${required[@]}"; do
     command -v "$command_name" >/dev/null 2>&1 || die required_command_missing "command=${command_name}"
   done
@@ -339,6 +378,14 @@ provision_device() {
 
   run_cmd wipefs --all "$disk"
   run_cmd sgdisk --zap-all "$disk"
+  if [ "$RECLAIM_ROLE" = "zfs-pool" ]; then
+    run_cmd partprobe "$disk"
+    if command -v udevadm >/dev/null 2>&1; then
+      run_cmd udevadm settle
+    fi
+    log info zfs_pool_reclaim_complete "disk=${disk}; ready for guarded zpool create by caller"
+    return 0
+  fi
   run_cmd sgdisk --clear "--new=1:0:0" "--typecode=1:8300" "--change-name=1:${RECLAIM_FS_LABEL}" "$disk"
   run_cmd partprobe "$disk"
   if command -v udevadm >/dev/null 2>&1; then
@@ -359,6 +406,7 @@ provision_device() {
 
 handle_existing_reclaim() {
   local existing parent
+  [ "$RECLAIM_ROLE" != "zfs-pool" ] || return 1
   existing="$(already_reclaimed_device)"
   [ -n "$existing" ] || return 1
   parent="$(lsblk -no PKNAME "$existing" 2>/dev/null | head -n 1 || true)"
@@ -377,6 +425,15 @@ handle_existing_reclaim() {
 }
 
 print_next_steps() {
+  if [ "$RECLAIM_ROLE" = "zfs-pool" ]; then
+    cat <<EOF
+Next steps after apply:
+- This script destroyed the Windows/BitLocker install on $(disk_path) only after the RECLAIM gates passed.
+- Create the intended ZFS pool on the same stable by-id path; do not create an ext4/xfs filesystem first.
+- For auxpool on host bart, continue with ops/server/provision_storage_pools.sh apply --no-dry-run.
+EOF
+    return 0
+  fi
   cat <<EOF
 Next steps after apply:
 - This script destroys the Windows/BitLocker install on $(disk_path). Do not apply unless RETAIN was rejected.
@@ -388,6 +445,7 @@ EOF
 
 main() {
   resolve_target_identity
+  require_decision_branch
   require_supported_role
   require_supported_fs
   log warn destructive_warning "RECLAIM destroys the Windows/BitLocker install on $(disk_path); default is dry-run/no-op"

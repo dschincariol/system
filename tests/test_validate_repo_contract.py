@@ -46,6 +46,7 @@ class ValidateRepoContractTests(unittest.TestCase):
             "pytest-collection": [
                 "repo-artifact-hygiene",
                 "syntax",
+                "pyright-money-path",
                 "ruff-static-release-gate",
                 "docs",
                 "ui-asset-refs",
@@ -58,6 +59,7 @@ class ValidateRepoContractTests(unittest.TestCase):
             "pytest-tests": [
                 "repo-artifact-hygiene",
                 "syntax",
+                "pyright-money-path",
                 "ruff-static-release-gate",
                 "docs",
                 "ui-asset-refs",
@@ -98,6 +100,24 @@ class ValidateRepoContractTests(unittest.TestCase):
         )
         self.assertEqual(runtime_graph_call[2]["PYTHONPATH"], str(root))
         self.assertEqual(runtime_graph_call[2]["TRADING_VALIDATE_REPO_LIVE"], "0")
+
+    def test_validate_repo_runs_dependency_lock_in_strict_mode(self) -> None:
+        exit_code, calls, _, _ = self._run_main()
+
+        self.assertEqual(exit_code, 0)
+        dependency_call = next(call for call in calls if call[0] == "dependency-lock")
+        self.assertEqual(
+            dependency_call[1],
+            ["python-bin", "tools/validate_dependency_lock.py", "--strict"],
+        )
+
+    def test_validate_repo_runs_pyright_money_path_gate(self) -> None:
+        exit_code, calls, _, root = self._run_main()
+
+        self.assertEqual(exit_code, 0)
+        pyright_call = next(call for call in calls if call[0] == "pyright-money-path")
+        self.assertEqual(pyright_call[1], ["python-bin", "tools/pyright_money_path_gate.py"])
+        self.assertEqual(pyright_call[2]["PYTHONPATH"], str(root))
 
     def test_runtime_graph_startup_env_is_hermetic_by_default(self) -> None:
         run_env = validate_repo._runtime_graph_startup_env(
@@ -389,6 +409,7 @@ class ValidateRepoContractTests(unittest.TestCase):
         self.assertNotIn("OBJECT_STORE_SECRET_KEY", run_env)
         self.assertNotIn("TS_SECRETS_PROVIDER", run_env)
         self.assertIn("/var/tmp/trading-system-tests-", run_env["TMPDIR"].replace("\\", "/"))
+        self.assertTrue(Path(run_env["TRADING_TEST_TMPDIR"]).name.startswith("validate-repo-"))
         self.assertEqual(run_env["TMPDIR"], run_env["PYTEST_DEBUG_TEMPROOT"])
         self.assertEqual(run_env["TMPDIR"], run_env["TRADING_TEST_TMPDIR"])
         self.assertEqual(
@@ -399,6 +420,17 @@ class ValidateRepoContractTests(unittest.TestCase):
             Path(run_env["SQLITE_LIVENESS_DB_PATH"]),
             Path(run_env["TRADING_TEST_TMPDIR"]) / "validate_repo_unit" / "runtime-test.liveness.sqlite",
         )
+
+    def test_unit_test_env_preserves_explicit_test_tmp_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_env = validate_repo._unit_test_env({"TRADING_TEST_TMPDIR": tmp})
+
+            self.assertEqual(Path(run_env["TRADING_TEST_TMPDIR"]), Path(tmp))
+            self.assertEqual(Path(run_env["TMPDIR"]), Path(tmp))
+            self.assertEqual(
+                Path(run_env["DB_PATH"]),
+                Path(tmp) / "validate_repo_unit" / "runtime-test.sqlite",
+            )
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, cast
 
 try:
     import psutil
@@ -26,6 +26,12 @@ else:
     _PSUTIL_IMPORT_ERROR = None
 
 from engine.data.provider_registry import get_enabled_market_data_job_names
+from engine.runtime.ingestion_shards import (
+    canonical_shard_env,
+    current_ingestion_shard,
+    ingestion_shard_job_name,
+    ingestion_state_key,
+)
 from engine.runtime.ipc import publish_channel_state, publish_message
 from engine.runtime.job_registry import ALLOWED_JOBS, INGESTION_DAEMON_JOBS
 from engine.runtime.platform import default_local_log_dir
@@ -36,6 +42,7 @@ from engine.runtime.storage import (
     init_db,
     put_job_heartbeat,
     release_job_lock,
+    run_write_txn,
     touch_job_lock,
 )
 from services.data_source_manager import desired_ingestion_jobs, get_manager
@@ -54,11 +61,16 @@ OWNER = os.environ.get(
     os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "unknown")),
 )
 PID = os.getpid()
+INGESTION_SHARD = current_ingestion_shard()
+INGESTION_RUNTIME_JOB_LOCK_NAME = ingestion_shard_job_name(JOB_NAME, INGESTION_SHARD)
+INGESTION_STATE_KEY = ingestion_state_key("ingestion_state", INGESTION_SHARD)
+_SHARD_AWARE_CHILD_JOBS = {"poll_prices", "options_poll"}
 
 CHILD_JOBS_CSV = str(os.environ.get("INGESTION_CHILD_JOBS", "")).strip()
 _SAFE_NO_CREDENTIAL_CHILD_JOBS = {"poll_prices"}
 CHILD_MAX_RESTARTS = int(os.environ.get("INGESTION_RUNTIME_CHILD_MAX_RESTARTS", "10"))
 CHILD_RESTART_WINDOW_S = float(os.environ.get("INGESTION_RUNTIME_CHILD_RESTART_WINDOW_S", "300.0"))
+_RESTART_GUARD_JOB_LOCK_PREFIX = "ingestion_restart_guard/v1"
 LOCK_STALE_AFTER_S = int(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180"))
 RESTART_BASE_S = float(os.environ.get("INGESTION_RUNTIME_RESTART_BASE_S", "2.0"))
 RESTART_MAX_S = float(os.environ.get("INGESTION_RUNTIME_RESTART_MAX_S", "60.0"))
@@ -85,6 +97,26 @@ log = get_logger("engine.runtime.ingestion_runtime")
 _STOP = False
 _PROVIDER_ALERT_STATE = {}
 _CHILDREN_LOCK = threading.RLock()
+_SUPERVISOR_SNAPSHOT_CACHE_LOCK = threading.RLock()
+_SUPERVISOR_SNAPSHOT_CACHE: Dict[str, Dict[str, object]] = {}
+_DATA_SOURCE_CONFIG_SNAPSHOT_NAMES = ("child_control_plane", "enabled_price_providers")
+_LAST_DATA_SOURCES_RELOAD_TS_MS: Optional[int] = None
+
+
+def _env_float_clamped(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(str(name), str(default)) or default)
+    except Exception:
+        value = float(default)
+    return max(float(minimum), min(float(maximum), float(value)))
+
+
+SUPERVISOR_SNAPSHOT_CACHE_TTL_S = _env_float_clamped(
+    "INGESTION_RUNTIME_SNAPSHOT_CACHE_TTL_S",
+    1.0,
+    0.0,
+    5.0,
+)
 
 # GLOBAL SNAPSHOT STATE (REQUIRED)
 _INGESTION_STATE = {
@@ -94,6 +126,91 @@ _INGESTION_STATE = {
     "running": False,
     "stale": True,
 }
+
+
+def _snapshot_copy(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _snapshot_copy(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_snapshot_copy(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_snapshot_copy(v) for v in value)
+    if isinstance(value, set):
+        return {str(v) for v in value}
+    return value
+
+
+def invalidate_supervisor_snapshot_cache(*names: str) -> None:
+    """Clear ingestion-supervisor process caches after local control-plane writes."""
+
+    with _SUPERVISOR_SNAPSHOT_CACHE_LOCK:
+        if not names:
+            _SUPERVISOR_SNAPSHOT_CACHE.clear()
+            return
+        for name in names:
+            _SUPERVISOR_SNAPSHOT_CACHE.pop(str(name), None)
+
+
+def _supervisor_snapshot_cache_has_any(names: tuple[str, ...]) -> bool:
+    with _SUPERVISOR_SNAPSHOT_CACHE_LOCK:
+        return any(str(name) in _SUPERVISOR_SNAPSHOT_CACHE for name in names)
+
+
+def _supervisor_snapshot_get_or_load(name: str, loader: Callable[[], Any]) -> Any:
+    ttl_s = float(SUPERVISOR_SNAPSHOT_CACHE_TTL_S)
+    if ttl_s <= 0.0:
+        return loader()
+
+    now = time.monotonic()
+    key = str(name)
+    with _SUPERVISOR_SNAPSHOT_CACHE_LOCK:
+        entry = _SUPERVISOR_SNAPSHOT_CACHE.get(key)
+        if entry and now < float(entry.get("expires_at") or 0.0):
+            return _snapshot_copy(entry.get("value"))
+
+    value = loader()
+    with _SUPERVISOR_SNAPSHOT_CACHE_LOCK:
+        _SUPERVISOR_SNAPSHOT_CACHE[key] = {
+            "expires_at": float(now + ttl_s),
+            "value": _snapshot_copy(value),
+        }
+    return _snapshot_copy(value)
+
+
+def _read_data_sources_reload_ts_ms_uncached() -> int:
+    con = None
+    try:
+        con = connect_ro()
+        row = con.execute(
+            "SELECT value FROM runtime_meta WHERE key=?",
+            ("data_sources_reload_ts_ms",),
+        ).fetchone()
+        return _safe_int(_row_first_value(row), 0)
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_DATA_SOURCES_RELOAD_MARKER_LOOKUP_FAILED", e)
+        return 0
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception as e:
+            _warn_failure("INGESTION_RUNTIME_DATA_SOURCES_RELOAD_MARKER_CLOSE_FAILED", e)
+
+
+def _invalidate_supervisor_snapshots_if_data_sources_changed() -> None:
+    global _LAST_DATA_SOURCES_RELOAD_TS_MS
+
+    marker_ts_ms = int(_read_data_sources_reload_ts_ms_uncached())
+    if marker_ts_ms <= 0:
+        return
+
+    previous = _LAST_DATA_SOURCES_RELOAD_TS_MS
+    _LAST_DATA_SOURCES_RELOAD_TS_MS = int(marker_ts_ms)
+    if previous == int(marker_ts_ms):
+        return
+
+    if previous is not None or _supervisor_snapshot_cache_has_any(_DATA_SOURCE_CONFIG_SNAPSHOT_NAMES):
+        invalidate_supervisor_snapshot_cache(*_DATA_SOURCE_CONFIG_SNAPSHOT_NAMES)
 
 
 def _row_first_value(row: object) -> object:
@@ -246,19 +363,20 @@ def _terminate_stale_child_processes(child_jobs: List[str]) -> None:
     child_names = [str(name).strip() for name in (child_jobs or []) if str(name).strip()]
     if not child_names:
         return
+    liveness_names = list(dict.fromkeys(_child_liveness_job_name(name) for name in child_names if _child_liveness_job_name(name)))
 
     con = None
     stale_pids = set()
     try:
         con = connect_ro()
-        placeholders = ",".join("?" for _ in child_names)
+        placeholders = ",".join("?" for _ in liveness_names)
         hb_rows = con.execute(
             f"""
             SELECT pid
             FROM job_heartbeats
             WHERE job_name IN ({placeholders})
             """,
-            tuple(child_names),
+            tuple(liveness_names),
         ).fetchall() or []
         lock_rows = con.execute(
             f"""
@@ -266,7 +384,7 @@ def _terminate_stale_child_processes(child_jobs: List[str]) -> None:
             FROM job_locks
             WHERE job_name IN ({placeholders})
             """,
-            tuple(child_names),
+            tuple(liveness_names),
         ).fetchall() or []
         for row in list(hb_rows) + list(lock_rows):
             try:
@@ -276,7 +394,12 @@ def _terminate_stale_child_processes(child_jobs: List[str]) -> None:
                 continue
     except Exception as e:
         stale_pids = set()
-        _warn_failure("INGESTION_RUNTIME_STALE_CHILDREN_LOOKUP_FAILED", e, jobs=[str(name) for name in child_names])
+        _warn_failure(
+            "INGESTION_RUNTIME_STALE_CHILDREN_LOOKUP_FAILED",
+            e,
+            jobs=[str(name) for name in child_names],
+            liveness_jobs=[str(name) for name in liveness_names],
+        )
     finally:
         try:
             if con is not None:
@@ -340,6 +463,7 @@ def _existing_child_process_state(job_name: str) -> Dict[str, object]:
     # Heartbeat state is treated as authoritative only when it is both fresh and
     # tied to a currently running PID.
     con = None
+    liveness_job_name = _child_liveness_job_name(job_name)
     try:
         con = connect_ro()
         row = con.execute(
@@ -348,17 +472,27 @@ def _existing_child_process_state(job_name: str) -> Dict[str, object]:
             FROM job_heartbeats
             WHERE job_name = ?
             """,
-            (str(job_name),),
+            (str(liveness_job_name),),
         ).fetchone()
     except Exception as e:
         row = None
-        _warn_failure("INGESTION_RUNTIME_EXISTING_CHILD_STATE_LOOKUP_FAILED", e, job=str(job_name))
+        _warn_failure(
+            "INGESTION_RUNTIME_EXISTING_CHILD_STATE_LOOKUP_FAILED",
+            e,
+            job=str(job_name),
+            liveness_job=str(liveness_job_name),
+        )
     finally:
         try:
             if con is not None:
                 con.close()
         except Exception as e:
-            _warn_failure("INGESTION_RUNTIME_EXISTING_CHILD_STATE_CLOSE_FAILED", e, job=str(job_name))
+            _warn_failure(
+                "INGESTION_RUNTIME_EXISTING_CHILD_STATE_CLOSE_FAILED",
+                e,
+                job=str(job_name),
+                liveness_job=str(liveness_job_name),
+            )
 
     if not row:
         return {"active": False, "pid": 0, "ts_ms": 0, "age_ms": 10**12}
@@ -394,12 +528,18 @@ def _children_snapshot(children: Optional[Dict[str, Dict[str, object]]]) -> Dict
         for name, info in (children or {}).items():
             snapshot[str(name)] = {
                 "job": str(info.get("job") or name),
+                "liveness_job": _child_liveness_job_name(str(info.get("job") or name)),
                 "pid": _safe_int(info.get("pid"), 0),
                 "running": bool(info.get("running")),
                 "last_exit_rc": info.get("last_exit_rc"),
                 "last_error": info.get("last_error"),
                 "last_start_ts": info.get("last_start_ts"),
                 "restart_disabled": bool(info.get("restart_disabled")),
+                "restart_guard": dict(
+                    info.get("restart_guard")
+                    if isinstance(info.get("restart_guard"), dict)
+                    else _restart_guard_snapshot(str(info.get("job") or name))
+                ),
             }
     return snapshot
 
@@ -412,14 +552,16 @@ def _emit_ingestion_heartbeat(children: Optional[Dict[str, Dict[str, object]]]) 
         {
             "children": _children_snapshot(children),
             "market_state": dict(_INGESTION_STATE),
+            "shard": INGESTION_SHARD.as_dict(),
+            "liveness_job_name": str(INGESTION_RUNTIME_JOB_LOCK_NAME),
             "writer_diagnostics": writer_diagnostics,
             "heartbeat_every_s": float(HEARTBEAT_EVERY_S),
         },
         separators=(",", ":"),
         sort_keys=True,
     )
-    touch_job_lock(JOB_NAME, OWNER, PID, best_effort=True)
-    put_job_heartbeat(JOB_NAME, OWNER, PID, extra_json=extra_json, best_effort=True)
+    touch_job_lock(INGESTION_RUNTIME_JOB_LOCK_NAME, OWNER, PID, best_effort=True)
+    put_job_heartbeat(INGESTION_RUNTIME_JOB_LOCK_NAME, OWNER, PID, extra_json=extra_json, best_effort=True)
     emit_gauge(
         "ingestion_running_children",
         int(
@@ -498,8 +640,12 @@ def _ingestion_writer_diagnostics() -> Dict[str, object]:
                 reasons.append("async_price_writer_backpressure")
             if _safe_int(async_snapshot.get("dropped_rows"), 0) > 0:
                 reasons.append("async_price_writer_dropped_rows")
-            if _safe_int(async_snapshot.get("residual_dropped_rows"), 0) > 0:
-                reasons.append("async_price_writer_residual_dropped_rows")
+            residual_loss_rows = _safe_int(
+                async_snapshot.get("residual_loss_rows", async_snapshot.get("residual_dropped_rows")),
+                0,
+            )
+            if residual_loss_rows > 0:
+                reasons.append("async_price_writer_residual_loss_rows")
             if _safe_int(async_snapshot.get("dead_letters"), 0) > 0:
                 reasons.append("async_price_writer_dead_letters")
             if _safe_int(async_snapshot.get("spool_corruption_events"), 0) > 0:
@@ -531,8 +677,16 @@ def _ingestion_writer_diagnostics() -> Dict[str, object]:
                 component="engine.runtime.ingestion_runtime",
                 job=JOB_NAME,
             )
+            emit_gauge(
+                "ingestion_telemetry_append_buffer_oldest_age_ms",
+                _safe_int(telemetry.get("oldest_age_ms"), 0),
+                component="engine.runtime.ingestion_runtime",
+                job=JOB_NAME,
+            )
             if _queue_pressure(telemetry, depth_key="buffered_rows", max_key="buffer_max_rows"):
                 reasons.append("telemetry_append_buffer_pressure")
+            if bool(telemetry.get("backpressure_active")):
+                reasons.append("telemetry_append_buffer_backpressure")
             if _safe_int(telemetry.get("dropped_rows"), 0) > 0:
                 reasons.append("telemetry_append_buffer_dropped_rows")
             if _safe_int(telemetry.get("flush_failures"), 0) > 0:
@@ -540,6 +694,62 @@ def _ingestion_writer_diagnostics() -> Dict[str, object]:
     except Exception as e:
         _warn_failure("INGESTION_RUNTIME_TELEMETRY_BUFFER_SNAPSHOT_FAILED", e)
         diagnostics["telemetry_append_buffer"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+
+    try:
+        from engine.runtime.ingestion_status import get_pipeline_status
+
+        options_status = dict(get_pipeline_status("options_poll") or {})
+        options_meta = _dict_or_empty(options_status.get("meta"))
+        options_buffer = {
+            "ok": bool(options_status.get("ok", True)),
+            "updated_ts_ms": _safe_int(options_status.get("updated_ts_ms"), 0),
+            "pending_rows": _safe_int(options_meta.get("durable_buffer_pending_rows"), 0),
+            "pending_bytes": _safe_int(options_meta.get("durable_buffer_pending_bytes"), 0),
+            "oldest_age_ms": _safe_int(options_meta.get("durable_buffer_oldest_age_ms"), 0),
+            "rows_fill_ratio": float(options_meta.get("durable_buffer_rows_fill_ratio") or 0.0),
+            "bytes_fill_ratio": float(options_meta.get("durable_buffer_bytes_fill_ratio") or 0.0),
+            "backpressure_active": bool(options_meta.get("durable_buffer_backpressure_active")),
+            "backpressure_events": _safe_int(options_meta.get("durable_buffer_backpressure_events"), 0),
+            "rejected_rows": _safe_int(options_meta.get("durable_buffer_rejected_rows"), 0),
+            "dropped_rows": _safe_int(options_meta.get("durable_buffer_dropped_rows"), 0),
+            "enqueue_failures": _safe_int(options_meta.get("durable_buffer_enqueue_failures"), 0),
+            "replay_failures": _safe_int(options_meta.get("durable_buffer_replay_failures"), 0),
+            "delete_failures": _safe_int(options_meta.get("durable_buffer_delete_failures"), 0),
+            "corrupt_payload_rows": _safe_int(options_meta.get("durable_buffer_corrupt_payload_rows"), 0),
+            "last_error": str(options_meta.get("durable_buffer_last_error") or ""),
+        }
+        diagnostics["options_poll_durable_buffer"] = options_buffer
+        emit_gauge(
+            "ingestion_options_poll_durable_buffer_pending_rows",
+            int(options_buffer["pending_rows"]),
+            component="engine.runtime.ingestion_runtime",
+            job=JOB_NAME,
+        )
+        emit_gauge(
+            "ingestion_options_poll_durable_buffer_oldest_age_ms",
+            int(options_buffer["oldest_age_ms"]),
+            component="engine.runtime.ingestion_runtime",
+            job=JOB_NAME,
+        )
+        if max(float(options_buffer["rows_fill_ratio"]), float(options_buffer["bytes_fill_ratio"])) >= 0.80:
+            reasons.append("options_poll_durable_buffer_pressure")
+        if bool(options_buffer["backpressure_active"]):
+            reasons.append("options_poll_durable_buffer_backpressure")
+        if _safe_int(options_buffer.get("rejected_rows"), 0) > 0:
+            reasons.append("options_poll_durable_buffer_rejected_rows")
+        if _safe_int(options_buffer.get("dropped_rows"), 0) > 0:
+            reasons.append("options_poll_durable_buffer_dropped_rows")
+        if _safe_int(options_buffer.get("enqueue_failures"), 0) > 0:
+            reasons.append("options_poll_durable_buffer_enqueue_failures")
+        if _safe_int(options_buffer.get("replay_failures"), 0) > 0:
+            reasons.append("options_poll_durable_buffer_replay_failures")
+        if _safe_int(options_buffer.get("delete_failures"), 0) > 0:
+            reasons.append("options_poll_durable_buffer_delete_failures")
+        if _safe_int(options_buffer.get("corrupt_payload_rows"), 0) > 0:
+            reasons.append("options_poll_durable_buffer_corruption")
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_OPTIONS_DURABLE_BUFFER_SNAPSHOT_FAILED", e)
+        diagnostics["options_poll_durable_buffer"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
 
     try:
         from engine.runtime.timescale_client import get_timescale_snapshot
@@ -600,7 +810,7 @@ if _PSUTIL_IMPORT_ERROR is not None:
     )
 
 
-def _enabled_price_providers() -> set[str]:
+def _load_enabled_price_providers() -> set[str]:
     try:
         manager = get_manager()
         manager.initialize()
@@ -615,6 +825,16 @@ def _enabled_price_providers() -> set[str]:
     except Exception as e:
         _warn_failure("INGESTION_RUNTIME_ENABLED_PRICE_PROVIDERS_FAILED", e)
         return set()
+
+
+def _enabled_price_providers() -> set[str]:
+    return set(
+        _supervisor_snapshot_get_or_load(
+            "enabled_price_providers",
+            _load_enabled_price_providers,
+        )
+        or set()
+    )
 
 
 def _heartbeat_loop(children: Dict[str, Dict[str, object]]) -> None:
@@ -632,19 +852,19 @@ def _heartbeat_loop(children: Dict[str, Dict[str, object]]) -> None:
         time.sleep(0.25)
 
 
-def _polling_price_max_age_ms() -> int:
-    base_ms = int(PRICE_MAX_AGE_S * 1000.0)
+def _load_child_heartbeat_rows() -> Dict[str, Dict[str, object]]:
+    child_heartbeat_rows: Dict[str, Dict[str, object]] = {}
     con = None
     try:
         con = connect_ro()
         rows = con.execute(
             """
-            SELECT extra_json
+            SELECT job_name, ts_ms, extra_json
             FROM job_heartbeats
             WHERE job_name != ?
             """
             ,
-            (JOB_NAME,),
+            (INGESTION_RUNTIME_JOB_LOCK_NAME,),
         ).fetchall() or []
     except Exception as e:
         rows = []
@@ -654,13 +874,41 @@ def _polling_price_max_age_ms() -> int:
             if con is not None:
                 con.close()
         except Exception as e:
-            _warn_failure("INGESTION_RUNTIME_POLLING_PRICE_MAX_AGE_CLOSE_FAILED", e)
+            _warn_failure("INGESTION_RUNTIME_CHILD_HEARTBEAT_CLOSE_FAILED", e)
+
+    for job_name, ts_ms, extra_json in rows:
+        parsed_extra = {}
+        try:
+            parsed_extra = _safe_json_dict(extra_json)
+        except Exception:
+            parsed_extra = {}
+        child_heartbeat_rows[str(job_name)] = {
+            "ts_ms": _safe_int(ts_ms, 0),
+            "extra": parsed_extra,
+        }
+
+    return child_heartbeat_rows
+
+
+def _child_heartbeat_rows_snapshot() -> Dict[str, Dict[str, object]]:
+    cached = _supervisor_snapshot_get_or_load(
+        "child_heartbeat_rows",
+        _load_child_heartbeat_rows,
+    )
+    return {
+        str(name): _dict_or_empty(row)
+        for name, row in _dict_or_empty(cached).items()
+    }
+
+
+def _compute_polling_price_max_age_ms() -> int:
+    base_ms = int(PRICE_MAX_AGE_S * 1000.0)
 
     derived_max_ms: int | None = None
-    for row in rows:
-        extra_json = _row_first_value(row)
+    for row in _child_heartbeat_rows_snapshot().values():
+        extra_json = _dict_or_empty(row).get("extra")
         try:
-            extra = _safe_json_dict(extra_json)
+            extra = _dict_or_empty(extra_json)
             if not extra:
                 continue
         except Exception as e:
@@ -681,6 +929,16 @@ def _polling_price_max_age_ms() -> int:
             derived_max_ms = max(int(derived_max_ms or 0), int(derived_value))
 
     return int(derived_max_ms) if derived_max_ms is not None else int(base_ms)
+
+
+def _polling_price_max_age_ms() -> int:
+    return int(
+        _supervisor_snapshot_get_or_load(
+            "polling_price_max_age_ms",
+            _compute_polling_price_max_age_ms,
+        )
+        or int(PRICE_MAX_AGE_S * 1000.0)
+    )
 
 
 def _handle_stop(signum, frame) -> None:
@@ -721,7 +979,379 @@ def _child_log_paths(job_name: str) -> tuple[str, str]:
     )
 
 
-def _child_candidates() -> List[str]:
+def _child_liveness_job_name(job_name: str) -> str:
+    name = str(job_name or "").strip()
+    if name in _SHARD_AWARE_CHILD_JOBS:
+        return ingestion_shard_job_name(name, INGESTION_SHARD)
+    return name
+
+
+def _restart_guard_limit() -> int:
+    return max(1, int(CHILD_MAX_RESTARTS))
+
+
+def _restart_guard_window_ms() -> int:
+    return max(1, int(float(CHILD_RESTART_WINDOW_S) * 1000.0))
+
+
+def _restart_guard_row_prefix(job_name: str) -> str:
+    liveness_name = str(_child_liveness_job_name(job_name) or job_name or "").strip()
+    safe_job = "".join(c if c.isalnum() or c in ("-", "_", ".", ":") else "_" for c in liveness_name)
+    return f"{_RESTART_GUARD_JOB_LOCK_PREFIX}::{safe_job}::"
+
+
+def _restart_guard_status_from_expires(
+    job_name: str,
+    *,
+    now_ms: int,
+    expires_values: List[int],
+    accounting_error: str = "",
+) -> Dict[str, object]:
+    active_expires = sorted(int(value) for value in expires_values if int(value or 0) > int(now_ms))
+    count = int(len(active_expires))
+    limit = int(_restart_guard_limit())
+    suppressed = bool(count >= limit)
+    suppressed_until_ts_ms = 0
+    if suppressed and active_expires:
+        expire_index = min(len(active_expires) - 1, max(0, count - limit))
+        suppressed_until_ts_ms = int(active_expires[expire_index])
+    status: Dict[str, object] = {
+        "job": str(job_name),
+        "liveness_job": _child_liveness_job_name(job_name),
+        "count": int(count),
+        "limit": int(limit),
+        "remaining": max(0, int(limit - count)),
+        "window_s": float(CHILD_RESTART_WINDOW_S),
+        "suppressed": bool(suppressed),
+        "suppressed_until_ts_ms": int(suppressed_until_ts_ms),
+        "updated_ts_ms": int(now_ms),
+    }
+    if accounting_error:
+        status["accounting_error"] = str(accounting_error)
+    return status
+
+
+def _restart_guard_snapshot(job_name: str, *, now: Optional[float] = None) -> Dict[str, object]:
+    now_s = float(now if now is not None else time.time())
+    now_ms = int(now_s * 1000.0)
+    prefix = _restart_guard_row_prefix(job_name)
+    con = None
+    try:
+        con = connect_ro()
+        rows = con.execute(
+            """
+            SELECT expires_ms
+            FROM job_locks
+            WHERE job_name LIKE ?
+              AND COALESCE(expires_ms, 0) > ?
+            ORDER BY expires_ms ASC
+            """,
+            (prefix + "%", int(now_ms)),
+        ).fetchall() or []
+        return _restart_guard_status_from_expires(
+            job_name,
+            now_ms=int(now_ms),
+            expires_values=[_safe_int(_row_first_value(row), 0) for row in rows],
+        )
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_RESTART_GUARD_SNAPSHOT_FAILED", e, job=str(job_name))
+        return _restart_guard_status_from_expires(
+            job_name,
+            now_ms=int(now_ms),
+            expires_values=[],
+            accounting_error=f"{type(e).__name__}: {e}",
+        )
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception as e:
+            _warn_failure("INGESTION_RUNTIME_RESTART_GUARD_SNAPSHOT_CLOSE_FAILED", e, job=str(job_name))
+
+
+def _restart_guard_latest_attempt_ts_ms(job_name: str) -> int:
+    prefix = _restart_guard_row_prefix(job_name)
+    con = None
+    try:
+        con = connect_ro()
+        row = con.execute(
+            """
+            SELECT MAX(acquired_ts_ms)
+            FROM job_locks
+            WHERE job_name LIKE ?
+            """,
+            (prefix + "%",),
+        ).fetchone()
+        return _safe_int(_row_first_value(row), 0)
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_RESTART_GUARD_LATEST_ATTEMPT_FAILED", e, job=str(job_name))
+        return 0
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception as e:
+            _warn_failure("INGESTION_RUNTIME_RESTART_GUARD_LATEST_ATTEMPT_CLOSE_FAILED", e, job=str(job_name))
+
+
+def _record_child_restart_attempt(
+    job_name: str,
+    *,
+    now: float,
+    reason: str,
+) -> Dict[str, object]:
+    now_ms = int(float(now) * 1000.0)
+    window_ms = int(_restart_guard_window_ms())
+    prefix = _restart_guard_row_prefix(job_name)
+    row_name = f"{prefix}{now_ms}:{time.time_ns()}:{int(PID)}"
+    owner = f"{JOB_NAME}:{OWNER}"
+
+    def _write(con) -> List[int]:
+        con.execute(
+            """
+            DELETE FROM job_locks
+            WHERE job_name LIKE ?
+              AND COALESCE(expires_ms, 0) <= ?
+            """,
+            (prefix + "%", int(now_ms)),
+        )
+        con.execute(
+            """
+            INSERT INTO job_locks(job_name, owner, pid, acquired_ts_ms, heartbeat_ts_ms, expires_ms)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(row_name),
+                str(owner),
+                int(PID),
+                int(now_ms),
+                int(now_ms),
+                int(now_ms + window_ms),
+            ),
+        )
+        rows = con.execute(
+            """
+            SELECT expires_ms
+            FROM job_locks
+            WHERE job_name LIKE ?
+              AND COALESCE(expires_ms, 0) > ?
+            ORDER BY expires_ms ASC
+            """,
+            (prefix + "%", int(now_ms)),
+        ).fetchall() or []
+        return [_safe_int(_row_first_value(row), 0) for row in rows]
+
+    try:
+        expires_values = run_write_txn(
+            _write,
+            attempts=1,
+            table="job_locks",
+            operation="record_ingestion_restart_guard",
+            direct=True,
+            maintenance=False,
+            timeout_s=0.5,
+            busy_timeout_ms=500,
+        ) or []
+        status = _restart_guard_status_from_expires(
+            job_name,
+            now_ms=int(now_ms),
+            expires_values=list(expires_values),
+        )
+    except Exception as e:
+        _warn_failure(
+            "INGESTION_RUNTIME_RESTART_GUARD_RECORD_FAILED",
+            e,
+            job=str(job_name),
+            reason=str(reason),
+        )
+        status = _restart_guard_status_from_expires(
+            job_name,
+            now_ms=int(now_ms),
+            expires_values=[],
+            accounting_error=f"{type(e).__name__}: {e}",
+        )
+
+    _emit_restart_guard_metrics(job_name, status, reason=str(reason))
+    return status
+
+
+def _clear_child_restart_accounting(
+    job_names: Optional[List[str]] = None,
+    *,
+    reason: str = "manual_override",
+) -> Dict[str, object]:
+    names = [str(name).strip() for name in list(job_names or []) if str(name).strip()]
+    prefixes = [_restart_guard_row_prefix(name) for name in names] if names else [f"{_RESTART_GUARD_JOB_LOCK_PREFIX}::"]
+
+    def _write(con) -> int:
+        deleted = 0
+        for prefix in prefixes:
+            cur = con.execute(
+                "DELETE FROM job_locks WHERE job_name LIKE ?",
+                (str(prefix) + "%",),
+            )
+            deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
+        return int(deleted)
+
+    try:
+        deleted_rows = int(
+            run_write_txn(
+                _write,
+                attempts=1,
+                table="job_locks",
+                operation="clear_ingestion_restart_guard",
+                direct=True,
+                maintenance=False,
+                timeout_s=0.5,
+                busy_timeout_ms=500,
+            )
+            or 0
+        )
+        emit_counter(
+            "ingestion_child_restart_guard_cleared_total",
+            1,
+            component="engine.runtime.ingestion_runtime",
+            job=JOB_NAME,
+            extra_tags={"reason": str(reason), "scope": "selected" if names else "all"},
+        )
+        return {
+            "ok": True,
+            "deleted_rows": int(deleted_rows),
+            "job_names": names,
+            "reason": str(reason),
+        }
+    except Exception as e:
+        _warn_failure(
+            "INGESTION_RUNTIME_RESTART_GUARD_CLEAR_FAILED",
+            e,
+            jobs=names,
+            reason=str(reason),
+        )
+        return {
+            "ok": False,
+            "deleted_rows": 0,
+            "job_names": names,
+            "reason": str(reason),
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def clear_child_restart_accounting(
+    job_names: Optional[List[str]] = None,
+    *,
+    reason: str = "manual_override",
+) -> Dict[str, object]:
+    """Clear persisted ingestion child restart-storm accounting for operator overrides."""
+
+    return _clear_child_restart_accounting(job_names, reason=reason)
+
+
+def _emit_restart_guard_metrics(job_name: str, status: Dict[str, object], *, reason: str) -> None:
+    try:
+        emit_counter(
+            "ingestion_child_restart_attempts_total",
+            1,
+            component="engine.runtime.ingestion_runtime",
+            job=str(job_name),
+            extra_tags={
+                "reason": str(reason),
+                "suppressed": str(bool(status.get("suppressed"))).lower(),
+                "liveness_job": str(status.get("liveness_job") or ""),
+            },
+        )
+        emit_gauge(
+            "ingestion_child_restart_window_count",
+            int(status.get("count") or 0),
+            component="engine.runtime.ingestion_runtime",
+            job=str(job_name),
+            extra_tags={
+                "liveness_job": str(status.get("liveness_job") or ""),
+                "window_s": str(status.get("window_s") or ""),
+            },
+        )
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_RESTART_GUARD_METRICS_FAILED", e, job=str(job_name))
+
+
+def _publish_child_restart_suppressed(
+    job_name: str,
+    status: Dict[str, object],
+    *,
+    reason: str,
+    detail: Dict[str, object],
+) -> None:
+    payload = {
+        "job": str(job_name),
+        "liveness_job": str(status.get("liveness_job") or _child_liveness_job_name(job_name)),
+        "reason": str(reason),
+        "restarts": int(status.get("count") or 0),
+        "limit": int(status.get("limit") or _restart_guard_limit()),
+        "window_s": float(status.get("window_s") or CHILD_RESTART_WINDOW_S),
+        "suppressed_until_ts_ms": int(status.get("suppressed_until_ts_ms") or 0),
+        "shard": INGESTION_SHARD.as_dict(),
+        **dict(detail or {}),
+    }
+    try:
+        emit_counter(
+            "ingestion_child_restart_suppressed_total",
+            1,
+            component="engine.runtime.ingestion_runtime",
+            job=str(job_name),
+            extra_tags={
+                "reason": str(reason),
+                "liveness_job": str(payload.get("liveness_job") or ""),
+            },
+        )
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_RESTART_SUPPRESSED_METRIC_FAILED", e, job=str(job_name))
+    try:
+        from engine.runtime.event_log import append_event
+
+        append_event(
+            event_type="ingestion_child_restart_suppressed",
+            event_source=JOB_NAME,
+            entity_type="ingestion_child",
+            entity_id=str(payload.get("liveness_job") or job_name),
+            payload=payload,
+            best_effort=True,
+        )
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_RESTART_SUPPRESSED_EVENT_FAILED", e, job=str(job_name))
+    publish_message(
+        "market_data",
+        "child_restart_guard_triggered",
+        payload,
+        sender=JOB_NAME,
+        best_effort=True,
+    )
+
+
+def _filter_child_candidates_for_shard(requested: List[str]) -> List[str]:
+    if not INGESTION_SHARD.enabled:
+        return list(requested or [])
+    out: List[str] = []
+    skipped: List[str] = []
+    for raw_name in requested or []:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        if name in _SHARD_AWARE_CHILD_JOBS or int(INGESTION_SHARD.index) == 0:
+            out.append(name)
+        else:
+            skipped.append(name)
+    if skipped:
+        try:
+            log.info(
+                "ingestion shard %s filtered singleton child jobs: %s",
+                INGESTION_SHARD.label,
+                sorted(set(skipped)),
+            )
+        except Exception as e:
+            _warn_failure("INGESTION_RUNTIME_SHARD_CHILD_FILTER_LOG_FAILED", e)
+    return list(dict.fromkeys(out))
+
+
+def _compute_child_candidates() -> List[str]:
     requested: List[str] = []
     if CHILD_JOBS_CSV:
         requested = [str(x).strip() for x in CHILD_JOBS_CSV.split(",") if str(x).strip()]
@@ -741,7 +1371,7 @@ def _child_candidates() -> List[str]:
             _warn_failure("INGESTION_RUNTIME_DESIRED_CHILDREN_LOOKUP_FAILED", e)
             requested = list(dict.fromkeys(list(INGESTION_DAEMON_JOBS or []) + list(get_enabled_market_data_job_names() or [])))
 
-    requested = _safe_no_credential_child_candidates(requested)
+    requested = _filter_child_candidates_for_shard(_safe_no_credential_child_candidates(requested))
 
     out: List[str] = []
     seen = set()
@@ -772,6 +1402,42 @@ def _child_candidates() -> List[str]:
     return out
 
 
+def _load_child_control_plane_snapshot() -> Dict[str, object]:
+    desired = _compute_child_candidates()
+    config_hashes: Dict[str, str] = {}
+    manager = None
+    for job_name in desired:
+        try:
+            if manager is None:
+                manager = get_manager()
+            config_hashes[str(job_name)] = str(manager.config_hash_for_job(job_name) or "")
+        except Exception as e:
+            config_hashes[str(job_name)] = ""
+            _warn_failure("INGESTION_RUNTIME_CHILD_CONFIG_HASH_LOOKUP_FAILED", e, job=str(job_name))
+    return {
+        "desired": [str(name) for name in desired],
+        "config_hashes": config_hashes,
+    }
+
+
+def _child_control_plane_snapshot() -> Dict[str, object]:
+    return _dict_or_empty(
+        _supervisor_snapshot_get_or_load(
+            "child_control_plane",
+            _load_child_control_plane_snapshot,
+        )
+    )
+
+
+def _child_candidates() -> List[str]:
+    snapshot = _child_control_plane_snapshot()
+    return [
+        str(name)
+        for name in _list_or_empty(snapshot.get("desired"))
+        if str(name or "").strip()
+    ]
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(str(name), "")
     if raw is None or str(raw).strip() == "":
@@ -784,7 +1450,10 @@ def _safe_no_credential_ingestion_mode() -> bool:
         from services.data_source_manager import safe_no_credential_market_data_mode
 
         if safe_no_credential_market_data_mode():
-            return bool(_env_flag("YFINANCE_ENABLED", True))
+            return bool(
+                _env_flag("YFINANCE_ENABLED", True)
+                or _env_flag("SIMULATED_MARKET_DATA_ENABLED", True)
+            )
     except Exception as e:
         _warn_failure(
             "INGESTION_RUNTIME_SAFE_NO_CREDENTIAL_MODE_CHECK_FAILED",
@@ -806,7 +1475,10 @@ def _safe_no_credential_ingestion_mode() -> bool:
             ("TRADIER_ENABLED", False),
         )
     )
-    return bool(_env_flag("YFINANCE_ENABLED", True) and not paid_or_credentialed_enabled)
+    return bool(
+        (_env_flag("YFINANCE_ENABLED", True) or _env_flag("SIMULATED_MARKET_DATA_ENABLED", False))
+        and not paid_or_credentialed_enabled
+    )
 
 
 def _safe_no_credential_child_candidates(requested: List[str]) -> List[str]:
@@ -818,7 +1490,10 @@ def _safe_no_credential_child_candidates(requested: List[str]) -> List[str]:
         for name in (requested or [])
         if str(name or "").strip() in _SAFE_NO_CREDENTIAL_CHILD_JOBS
     ]
-    if _env_flag("YFINANCE_ENABLED", True) and "poll_prices" not in filtered:
+    if (
+        _env_flag("YFINANCE_ENABLED", True)
+        or _env_flag("SIMULATED_MARKET_DATA_ENABLED", False)
+    ) and "poll_prices" not in filtered:
         filtered.append("poll_prices")
     skipped = [
         str(name)
@@ -894,6 +1569,10 @@ def _child_pg_pool_env() -> Dict[str, str]:
         )
         timescale_pool_max = tuned_int("INGESTION_CHILD_TIMESCALE_POOL_MAX_SIZE", 2, 1, 8)
         price_pool_max = tuned_int("INGESTION_CHILD_TIMESCALE_PRICES_POOL_MAX_SIZE", 2, 1, 8)
+        async_workers = min(
+            int(price_pool_max),
+            tuned_int("ASYNC_PRICE_WRITER_WORKERS", 4, 1, 16),
+        )
         return {
             "ENGINE_PROCESS_ROLE": "ingestion_child",
             "TS_PROCESS_ROLE": "jobs",
@@ -904,6 +1583,7 @@ def _child_pg_pool_env() -> Dict[str, str]:
             "TIMESCALE_POOL_MAX_SIZE": str(int(timescale_pool_max)),
             "TIMESCALE_PRICES_POOL_MIN_SIZE": "1",
             "TIMESCALE_PRICES_POOL_MAX_SIZE": str(int(price_pool_max)),
+            "ASYNC_PRICE_WRITER_WORKERS": str(int(async_workers)),
         }
     except Exception as e:
         _warn_failure("INGESTION_RUNTIME_CHILD_POOL_ENV_FAILED", e)
@@ -917,6 +1597,7 @@ def _child_pg_pool_env() -> Dict[str, str]:
             "TIMESCALE_POOL_MAX_SIZE": "2",
             "TIMESCALE_PRICES_POOL_MIN_SIZE": "1",
             "TIMESCALE_PRICES_POOL_MAX_SIZE": "2",
+            "ASYNC_PRICE_WRITER_WORKERS": "2",
         }
 
 
@@ -952,6 +1633,18 @@ def _spawn_child_once(job_name: str) -> subprocess.Popen:
         _warn_failure("INGESTION_RUNTIME_SAFE_ENV_SANITIZE_FAILED", e, job=str(job_name))
 
     env.update(_child_pg_pool_env())
+    env.update(canonical_shard_env(INGESTION_SHARD))
+    env["ENGINE_LIVENESS_JOB_NAME"] = _child_liveness_job_name(job_name)
+    try:
+        from engine.runtime.thread_policy import apply_cpu_thread_policy_to_env
+
+        apply_cpu_thread_policy_to_env(
+            env,
+            role="ingestion_child",
+            supervised_process_count=max(1, len(_child_candidates()) + 1),
+        )
+    except Exception as e:
+        _warn_failure("INGESTION_RUNTIME_CHILD_THREAD_POLICY_FAILED", e, job=str(job_name))
 
     module_name = _script_module_name(script_path)
     if module_name:
@@ -959,7 +1652,7 @@ def _spawn_child_once(job_name: str) -> subprocess.Popen:
     else:
         args = [sys.executable, "-u", str(script_path)]
 
-    stdout_path, stderr_path = _child_log_paths(job_name)
+    stdout_path, stderr_path = _child_log_paths(_child_liveness_job_name(job_name))
     rotate_log_if_needed(stdout_path)
     rotate_log_if_needed(stderr_path)
     stdout_fh = open(stdout_path, "ab")
@@ -971,6 +1664,8 @@ def _spawn_child_once(job_name: str) -> subprocess.Popen:
         component="engine.runtime.ingestion_runtime",
         extra={
             "job": str(job_name),
+            "liveness_job": _child_liveness_job_name(job_name),
+            "shard": INGESTION_SHARD.as_dict(),
             "args": list(args),
             "stdout_log": str(stdout_path),
             "stderr_log": str(stderr_path),
@@ -1071,11 +1766,12 @@ def _spawn_child(job_name: str) -> subprocess.Popen:
     raise RuntimeError(f"ingestion_child_spawn_failed:{job_name}")
 
 
-def _latest_prices_state() -> Dict[str, object]:
+def _load_latest_price_source_rows() -> Dict[str, object]:
     effective_max_age_ms = _polling_price_max_age_ms()
-    enabled_price_providers = _enabled_price_providers()
     cutoff_ms = int(time.time() * 1000 - effective_max_age_ms)
     con = connect_ro()
+    row = (0, 0, 0)
+    provider_rows: List[Dict[str, object]] = []
     try:
         row = con.execute(
             """
@@ -1088,7 +1784,7 @@ def _latest_prices_state() -> Dict[str, object]:
         ).fetchone() or (0, 0, 0)
 
         try:
-            prow = con.execute(
+            raw_provider_rows = con.execute(
                 """
                 SELECT p.provider, p.ts_ms, p.ok, p.latency_ms, p.n_symbols, p.error
                 FROM price_provider_health p
@@ -1101,27 +1797,81 @@ def _latest_prices_state() -> Dict[str, object]:
                  AND latest.max_ts_ms = p.ts_ms
                 """
             ).fetchall() or []
+            provider_rows = [
+                {
+                    "provider": str(provider or ""),
+                    "ts_ms": _safe_int(ts_ms, 0),
+                    "ok": _safe_int(ok, 0),
+                    "latency_ms": None if latency_ms is None else _safe_int(latency_ms, 0),
+                    "n_symbols": _safe_int(n_symbols, 0),
+                    "error": None if error is None else str(error),
+                }
+                for provider, ts_ms, ok, latency_ms, n_symbols, error in raw_provider_rows
+            ]
         except Exception:
-            prow = []
+            provider_rows = []
     except Exception:
         row = (0, 0, 0)
-        prow = []
+        provider_rows = []
     finally:
         try:
             con.close()
         except Exception as e:
             _warn_failure("INGESTION_RUNTIME_LATEST_PRICES_CLOSE_FAILED", e)
 
+    return {
+        "effective_max_age_ms": int(effective_max_age_ms),
+        "cutoff_ms": int(cutoff_ms),
+        "price_row": (
+            _safe_int(row[0], 0),
+            _safe_int(row[1], 0),
+            _safe_int(row[2], 0),
+        ),
+        "provider_rows": provider_rows,
+    }
+
+
+def _latest_price_source_rows_snapshot() -> Dict[str, object]:
+    return _dict_or_empty(
+        _supervisor_snapshot_get_or_load(
+            "latest_price_source_rows",
+            _load_latest_price_source_rows,
+        )
+    )
+
+
+def _latest_provider_health_rows() -> List[Dict[str, object]]:
+    return [
+        _dict_or_empty(row)
+        for row in _list_or_empty(
+            _latest_price_source_rows_snapshot().get("provider_rows")
+        )
+    ]
+
+
+def _latest_prices_state() -> Dict[str, object]:
+    snapshot_rows = _latest_price_source_rows_snapshot()
+    effective_max_age_ms = _safe_int(
+        snapshot_rows.get("effective_max_age_ms"),
+        _polling_price_max_age_ms(),
+    )
+    enabled_price_providers = _enabled_price_providers()
+    raw_price_row = snapshot_rows.get("price_row")
+    row = tuple(raw_price_row) if isinstance(raw_price_row, (list, tuple)) else (0, 0, 0)
+
     providers = {}
     healthy = 0
     now_ms = int(time.time() * 1000)
-    for provider, ts_ms, ok, latency_ms, n_symbols, error in prow:
-        provider_name = str(provider)
+    for provider_row in _latest_provider_health_rows():
+        provider_name = str(provider_row.get("provider") or "").strip()
+        if not provider_name:
+            continue
         if enabled_price_providers and provider_name not in enabled_price_providers:
             continue
-        provider_ts_ms = int(ts_ms or 0)
+        provider_ts_ms = _safe_int(provider_row.get("ts_ms"), 0)
         provider_age_ms = max(0, now_ms - provider_ts_ms) if provider_ts_ms > 0 else 10**12
-        provider_ok = bool(int(ok or 0) == 1 and provider_age_ms < effective_max_age_ms)
+        provider_health_ok = bool(_safe_int(provider_row.get("ok"), 0) == 1)
+        provider_ok = bool(provider_health_ok and provider_age_ms < effective_max_age_ms)
         session_last_failure = {}
         session_fatal = {}
         try:
@@ -1135,10 +1885,11 @@ def _latest_prices_state() -> Dict[str, object]:
         providers[provider_name] = {
             "last_ts_ms": provider_ts_ms,
             "age_ms": int(provider_age_ms),
-            "latency_ms": (None if latency_ms is None else int(latency_ms)),
-            "n_symbols": int(n_symbols or 0),
+            "latency_ms": provider_row.get("latency_ms"),
+            "n_symbols": _safe_int(provider_row.get("n_symbols"), 0),
             "ok": provider_ok,
-            "error": (None if error is None else str(error)),
+            "health_ok": provider_health_ok,
+            "error": provider_row.get("error"),
             "session_last_failure": session_last_failure,
             "session_fatal": session_fatal,
             "failure_kind": str((session_last_failure or {}).get("failure_kind") or ""),
@@ -1146,10 +1897,13 @@ def _latest_prices_state() -> Dict[str, object]:
         if provider_ok:
             healthy += 1
 
-    last_price_ts_ms = int(row[2] or 0)
+    last_price_ts_ms = _safe_int(row[2] if len(row) > 2 else 0, 0)
     age_ms = max(0, now_ms - last_price_ts_ms) if last_price_ts_ms > 0 else 10**12
 
-    if healthy <= 0 and int(row[0] or 0) > 0 and last_price_ts_ms > 0 and age_ms < effective_max_age_ms:
+    fresh_rows = _safe_int(row[0] if len(row) > 0 else 0, 0)
+    fresh_symbols = _safe_int(row[1] if len(row) > 1 else 0, 0)
+
+    if healthy <= 0 and fresh_rows > 0 and last_price_ts_ms > 0 and age_ms < effective_max_age_ms:
         providers["derived_from_prices"] = {"last_ts_ms": int(last_price_ts_ms), "ok": True}
         healthy = 1
 
@@ -1160,8 +1914,8 @@ def _latest_prices_state() -> Dict[str, object]:
     }
 
     return {
-        "fresh_rows": int(row[0] or 0),
-        "fresh_symbols": int(row[1] or 0),
+        "fresh_rows": int(fresh_rows),
+        "fresh_symbols": int(fresh_symbols),
         "last_price_ts_ms": int(last_price_ts_ms),
         "price_age_ms": int(age_ms),
         "providers": providers,
@@ -1176,32 +1930,12 @@ def _check_provider_health(now_ts_ms: int) -> None:
     cutoff_ms = int(now_ts_ms - _polling_price_max_age_ms())
     enabled_price_providers = _enabled_price_providers()
 
-    con = connect_ro()
-    try:
-        rows = con.execute(
-            """
-            SELECT p.provider, p.ts_ms, p.ok
-            FROM price_provider_health p
-            INNER JOIN (
-                SELECT provider, MAX(ts_ms) AS max_ts_ms
-                FROM price_provider_health
-                GROUP BY provider
-            ) latest
-              ON latest.provider = p.provider
-             AND latest.max_ts_ms = p.ts_ms
-            """
-        ).fetchall() or []
-    except Exception:
-        rows = []
-    finally:
-        try:
-            con.close()
-        except Exception as e:
-            _warn_failure("INGESTION_RUNTIME_PROVIDER_HEALTH_CLOSE_FAILED", e)
-
     healthy = False
 
-    for provider, ts_ms, ok in rows:
+    for row in _latest_provider_health_rows():
+        provider = row.get("provider")
+        ts_ms = row.get("ts_ms")
+        ok = row.get("ok")
         if ts_ms is None:
             continue
 
@@ -1294,35 +2028,57 @@ def _new_child_info(job_name: str) -> Dict[str, object]:
         "last_start_ts": 0.0,
         "last_exit_rc": None,
         "last_error": None,
-        "restart_times": [],
         "restart_disabled": False,
+        "restart_guard": _restart_guard_snapshot(job_name),
         "config_hash": "",
     }
 
 
 def _reconcile_child_control_plane(children: Dict[str, Dict[str, object]], now: float) -> List[str]:
-    desired = _child_candidates()
+    _invalidate_supervisor_snapshots_if_data_sources_changed()
+    control_plane = _child_control_plane_snapshot()
+    desired = [
+        str(name)
+        for name in _list_or_empty(control_plane.get("desired"))
+        if str(name or "").strip()
+    ]
     desired_set = set(desired)
-    manager = get_manager()
+    config_hashes = _dict_or_empty(control_plane.get("config_hashes"))
+    config_reload_ts_ms = int(_LAST_DATA_SOURCES_RELOAD_TS_MS or 0)
 
     for job_name in desired:
         if job_name not in children:
             children[job_name] = _new_child_info(job_name)
-        try:
-            next_hash = str(manager.config_hash_for_job(job_name) or "")
-        except Exception:
-            next_hash = ""
+        next_hash = str(config_hashes.get(str(job_name)) or "")
         current_hash = str(children[job_name].get("config_hash") or "")
-        if next_hash and next_hash != current_hash:
+        hash_changed = bool(next_hash and next_hash != current_hash)
+        config_changed = bool(hash_changed and current_hash)
+        persisted_attempt_ts_ms = (
+            _restart_guard_latest_attempt_ts_ms(job_name)
+            if config_reload_ts_ms > 0 and not config_changed
+            else 0
+        )
+        persisted_config_changed = bool(
+            config_reload_ts_ms > 0
+            and persisted_attempt_ts_ms > 0
+            and config_reload_ts_ms > persisted_attempt_ts_ms
+        )
+        if hash_changed:
             children[job_name]["config_hash"] = next_hash
+        if config_changed or persisted_config_changed:
             if bool(children[job_name].get("running")):
                 _terminate_child(job_name, _child_proc(children[job_name]))
                 children[job_name]["proc"] = None
                 children[job_name]["running"] = False
                 children[job_name]["pid"] = 0
-                children[job_name]["restart_disabled"] = False
-                children[job_name]["next_spawn_ts"] = float(now)
-                children[job_name]["last_error"] = "config_changed_restart_requested"
+            children[job_name]["restart_disabled"] = False
+            _clear_child_restart_accounting(
+                [job_name],
+                reason="config_changed" if config_changed else "config_reload_marker",
+            )
+            children[job_name]["restart_guard"] = _restart_guard_snapshot(job_name, now=now)
+            children[job_name]["next_spawn_ts"] = float(now)
+            children[job_name]["last_error"] = "config_changed_restart_requested"
 
     for job_name in [name for name in list(children.keys()) if name not in desired_set]:
         _terminate_child(job_name, _child_proc(children[job_name]))
@@ -1366,6 +2122,54 @@ def _terminate_child(child_job: Optional[str], child_proc: Optional[subprocess.P
                     _warn_failure("INGESTION_RUNTIME_CHILD_KILL_WAIT_FAILED", wait_err, job=str(child_job), pid=int(child_proc.pid or 0))
     except Exception as e:
         _warn_failure("INGESTION_RUNTIME_TERMINATE_CHILD_FAILED", e, job=str(child_job))
+
+
+def _restart_guard_disabled_child_still_suppressed(
+    job_name: str,
+    info: Dict[str, object],
+    now: float,
+) -> bool:
+    if not bool(info.get("restart_disabled")):
+        return False
+    if not str(info.get("last_error") or "").startswith("restart_guard_triggered"):
+        return True
+
+    restart_guard = _restart_guard_snapshot(str(job_name), now=now)
+    info["restart_guard"] = restart_guard
+    if bool(restart_guard.get("suppressed")):
+        return True
+
+    info["restart_disabled"] = False
+    info["last_error"] = None
+    info["next_spawn_ts"] = float(now)
+    return False
+
+
+def _suppress_inactive_child_if_restart_guard_active(
+    job_name: str,
+    info: Dict[str, object],
+    now: float,
+) -> bool:
+    if bool(info.get("running")):
+        return False
+
+    restart_guard = _restart_guard_snapshot(str(job_name), now=now)
+    info["restart_guard"] = restart_guard
+    if not bool(restart_guard.get("suppressed")):
+        return False
+
+    info["restart_disabled"] = True
+    info["last_error"] = (
+        "restart_guard_triggered "
+        f"suppressed_until_ts_ms={int(restart_guard.get('suppressed_until_ts_ms') or 0)}"
+    )
+    _publish_child_restart_suppressed(
+        str(job_name),
+        restart_guard,
+        reason="restart_window_active",
+        detail={"action": "spawn_suppressed"},
+    )
+    return True
 
 
 def _child_telemetry_from_heartbeat_extra(hb_extra: Dict[str, object]) -> Dict[str, object]:
@@ -1444,39 +2248,9 @@ def _restart_children_for_feed_stall(children: Dict[str, Dict[str, object]], lat
     if not isinstance(provider_errors, dict):
         provider_errors = {}
 
-    child_heartbeat_rows: Dict[str, Dict[str, object]] = {}
-    con = connect_ro()
-    try:
-        hb_rows = con.execute(
-            """
-            SELECT job_name, ts_ms, extra_json
-            FROM job_heartbeats
-            WHERE job_name != ?
-            """
-            ,
-            (JOB_NAME,),
-        ).fetchall() or []
-    except Exception as e:
-        hb_rows = []
-        _warn_failure("INGESTION_RUNTIME_CHILD_HEARTBEAT_LOOKUP_FAILED", e)
-    finally:
-        try:
-            con.close()
-        except Exception as e:
-            _warn_failure("INGESTION_RUNTIME_CHILD_HEARTBEAT_CLOSE_FAILED", e)
+    child_heartbeat_rows = _child_heartbeat_rows_snapshot()
 
     now_ts_ms = int(now * 1000)
-
-    for job_name, ts_ms, extra_json in hb_rows:
-        parsed_extra = {}
-        try:
-            parsed_extra = _safe_json_dict(extra_json)
-        except Exception:
-            parsed_extra = {}
-        child_heartbeat_rows[str(job_name)] = {
-            "ts_ms": _safe_int(ts_ms, 0),
-            "extra": parsed_extra,
-        }
 
     global_restart_reason = None
     global_price_max_age_ms = _polling_price_max_age_ms()
@@ -1499,7 +2273,7 @@ def _restart_children_for_feed_stall(children: Dict[str, Dict[str, object]], lat
         if not isinstance(proc, subprocess.Popen):
             continue
 
-        hb = child_heartbeat_rows.get(str(job_name)) or {}
+        hb = child_heartbeat_rows.get(_child_liveness_job_name(str(job_name))) or {}
         hb_ts_ms = _safe_int(hb.get("ts_ms"), 0)
         hb_age_ms = max(0, now_ts_ms - hb_ts_ms) if hb_ts_ms > 0 else 10**12
         hb_extra = _dict_or_empty(hb.get("extra"))
@@ -1549,31 +2323,53 @@ def _restart_children_for_feed_stall(children: Dict[str, Dict[str, object]], lat
             continue
 
         err = str(provider_errors)[:400] if provider_errors else restart_reason
+        if child_age_s >= 5.0:
+            _clear_child_restart_accounting([str(job_name)], reason="stable_child_feed_stall")
+        restart_guard = _record_child_restart_attempt(
+            str(job_name),
+            now=now,
+            reason="feed_stall",
+        )
+        detail = {
+            "restart_reason": restart_reason,
+            "provider_errors": provider_errors,
+            "heartbeat_age_ms": int(hb_age_ms),
+            "manager_state": manager_state,
+            "last_msg_age_ms": int(last_msg_age_ms),
+            "child_age_s": float(child_age_s),
+        }
         info["last_error"] = err
         info["running"] = False
         info["proc"] = None
         info["pid"] = 0
         info["last_exit_rc"] = None
-        info["next_spawn_ts"] = now + _safe_float(info.get("restart_delay_s"), RESTART_BASE_S)
-        info["restart_delay_s"] = min(
-            RESTART_MAX_S,
-            max(RESTART_BASE_S, _safe_float(info.get("restart_delay_s"), RESTART_BASE_S) * 2.0),
-        )
-        publish_message(
-            "market_data",
-            "child_restart_for_feed_stall",
-            {
-                "job": str(job_name),
-                "reason": restart_reason,
-                "provider_errors": provider_errors,
-                "heartbeat_age_ms": int(hb_age_ms),
-                "manager_state": manager_state,
-                "last_msg_age_ms": int(last_msg_age_ms),
-                "child_age_s": float(child_age_s),
-            },
-            sender=JOB_NAME,
-            best_effort=True,
-        )
+        info["restart_guard"] = restart_guard
+        if bool(restart_guard.get("suppressed")):
+            info["restart_disabled"] = True
+            info["last_error"] = f"restart_guard_triggered {restart_reason}"
+            _publish_child_restart_suppressed(
+                str(job_name),
+                restart_guard,
+                reason="feed_stall",
+                detail=detail,
+            )
+        else:
+            info["next_spawn_ts"] = now + _safe_float(info.get("restart_delay_s"), RESTART_BASE_S)
+            info["restart_delay_s"] = min(
+                RESTART_MAX_S,
+                max(RESTART_BASE_S, _safe_float(info.get("restart_delay_s"), RESTART_BASE_S) * 2.0),
+            )
+            publish_message(
+                "market_data",
+                "child_restart_for_feed_stall",
+                {
+                    "job": str(job_name),
+                    "reason": restart_reason,
+                    **detail,
+                },
+                sender=JOB_NAME,
+                best_effort=True,
+            )
         _terminate_child(job_name, proc)
 
 
@@ -1663,6 +2459,9 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
         payload = {
             "running": bool(_INGESTION_STATE.get("running")),
             "pid": int(PID),
+            "job": str(INGESTION_RUNTIME_JOB_LOCK_NAME),
+            "base_job": str(JOB_NAME),
+            "shard": INGESTION_SHARD.as_dict(),
             "provider_status": str(provider_status or market_state.get("status") or "unknown"),
             "last_event_ts_ms": _safe_int(market_state.get("last_ts_ms"), now_ms),
             "lag_ms": max(0, now_ms - _safe_int(market_state.get("last_ts_ms"), now_ms)),
@@ -1672,10 +2471,16 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
             "children": {
                 name: {
                     "pid": _safe_int(info.get("pid"), 0),
+                    "liveness_job": _child_liveness_job_name(str(name)),
                     "running": bool(info.get("running")),
                     "last_exit_rc": info.get("last_exit_rc"),
                     "last_error": info.get("last_error"),
                     "restart_disabled": bool(info.get("restart_disabled")),
+                    "restart_guard": dict(
+                        info.get("restart_guard")
+                        if isinstance(info.get("restart_guard"), dict)
+                        else _restart_guard_snapshot(str(name))
+                    ),
                 }
                 for name, info in (children or {}).items()
             },
@@ -1684,7 +2489,7 @@ def _write_ingestion_state(children: Optional[Dict[str, Dict[str, object]]] = No
         }
         from engine.runtime.runtime_meta import meta_set
         meta_set(
-            "ingestion_state",
+            INGESTION_STATE_KEY,
             json.dumps(payload, separators=(",", ":"), sort_keys=True),
             best_effort=True,
         )
@@ -1751,7 +2556,12 @@ def main() -> None:
         logging.INFO,
         "ingestion_runtime_boot_start",
         component="engine.runtime.ingestion_runtime",
-        extra={"pid": int(PID), "owner": str(OWNER)},
+        extra={
+            "pid": int(PID),
+            "owner": str(OWNER),
+            "job": str(INGESTION_RUNTIME_JOB_LOCK_NAME),
+            "shard": INGESTION_SHARD.as_dict(),
+        },
     )
 
     init_db()
@@ -1761,13 +2571,19 @@ def main() -> None:
     except Exception as e:
         log.warning("data source manager init failed: %s", e)
 
-    if not acquire_job_lock(JOB_NAME, OWNER, PID, ttl_s=LOCK_STALE_AFTER_S):
+    if not acquire_job_lock(INGESTION_RUNTIME_JOB_LOCK_NAME, OWNER, PID, ttl_s=LOCK_STALE_AFTER_S):
         log_event(
             log,
             logging.ERROR,
             "ingestion_runtime_lock_unavailable",
             component="engine.runtime.ingestion_runtime",
-            extra={"job": str(JOB_NAME), "owner": str(OWNER), "pid": int(PID)},
+            extra={
+                "job": str(INGESTION_RUNTIME_JOB_LOCK_NAME),
+                "base_job": str(JOB_NAME),
+                "owner": str(OWNER),
+                "pid": int(PID),
+                "shard": INGESTION_SHARD.as_dict(),
+            },
         )
         raise SystemExit(2)
 
@@ -1785,7 +2601,12 @@ def main() -> None:
         publish_message(
             "market_data",
             "ingestion_runtime_started",
-            {"pid": int(PID), "candidates": child_candidates},
+            {
+                "pid": int(PID),
+                "candidates": child_candidates,
+                "job": str(INGESTION_RUNTIME_JOB_LOCK_NAME),
+                "shard": INGESTION_SHARD.as_dict(),
+            },
             sender=JOB_NAME,
             best_effort=True,
         )
@@ -1825,17 +2646,14 @@ def main() -> None:
                     rc = proc.poll()
                     if rc is not None:
                         child_age_s = max(0.0, now - _safe_float(info.get("last_start_ts"), 0.0))
-                        restart_times = [
-                            float(ts)
-                            for ts in _list_or_empty(info.get("restart_times"))
-                            if (now - float(ts)) < float(CHILD_RESTART_WINDOW_S)
-                        ]
-
                         if child_age_s >= 5.0:
-                            restart_times = []
-
-                        restart_times.append(now)
-                        info["restart_times"] = restart_times
+                            _clear_child_restart_accounting([job_name], reason="stable_child_exit")
+                        restart_guard = _record_child_restart_attempt(
+                            job_name,
+                            now=now,
+                            reason="exit",
+                        )
+                        info["restart_guard"] = restart_guard
 
                         with _CHILDREN_LOCK:
                             info["proc"] = None
@@ -1874,22 +2692,15 @@ def main() -> None:
                             )
                             continue
 
-                        if len(restart_times) >= int(CHILD_MAX_RESTARTS):
+                        if bool(restart_guard.get("suppressed")):
                             with _CHILDREN_LOCK:
                                 info["restart_disabled"] = True
                                 info["last_error"] = f"restart_guard_triggered rc={int(rc)} age_s={child_age_s:.3f}"
-                            publish_message(
-                                "market_data",
-                                "child_restart_guard_triggered",
-                                {
-                                    "job": str(job_name),
-                                    "rc": int(rc),
-                                    "age_s": float(child_age_s),
-                                    "restarts": len(restart_times),
-                                    "window_s": float(CHILD_RESTART_WINDOW_S),
-                                },
-                                sender=JOB_NAME,
-                                best_effort=True,
+                            _publish_child_restart_suppressed(
+                                job_name,
+                                restart_guard,
+                                reason="exit",
+                                detail={"rc": int(rc), "age_s": float(child_age_s)},
                             )
                         else:
                             with _CHILDREN_LOCK:
@@ -1903,10 +2714,12 @@ def main() -> None:
                                 best_effort=True,
                             )
 
-                if bool(info.get("restart_disabled")):
+                if _restart_guard_disabled_child_still_suppressed(job_name, info, now):
                     continue
 
                 if not bool(info.get("running")) and now >= _safe_float(info.get("next_spawn_ts"), 0.0):
+                    if _suppress_inactive_child_if_restart_guard_active(job_name, info, now):
+                        continue
                     if _should_defer_child_start(job_name, startup_ts=float(startup_started_at), now_ts=float(now)):
                         continue
                     existing = _existing_child_process_state(job_name)
@@ -1948,14 +2761,13 @@ def main() -> None:
                             best_effort=True,
                         )
                     except Exception as e:
-                        restart_times = [
-                            float(ts)
-                            for ts in _list_or_empty(info.get("restart_times"))
-                            if (now - float(ts)) < float(CHILD_RESTART_WINDOW_S)
-                        ]
-                        restart_times.append(now)
+                        restart_guard = _record_child_restart_attempt(
+                            job_name,
+                            now=now,
+                            reason="start_failed",
+                        )
                         with _CHILDREN_LOCK:
-                            info["restart_times"] = restart_times
+                            info["restart_guard"] = restart_guard
 
                         err = f"{type(e).__name__}: {e}"
                         with _CHILDREN_LOCK:
@@ -1971,7 +2783,7 @@ def main() -> None:
                             extra={
                                 "job": str(job_name),
                                 "error": str(err),
-                                "restart_count": int(len(restart_times)),
+                                "restart_count": int(restart_guard.get("count") or 0),
                             },
                         )
                         _write_ingestion_state(children, provider_status="child_start_failed", last_error=f"{job_name}:{err}")
@@ -1989,20 +2801,14 @@ def main() -> None:
                         except Exception as publish_err:
                             _warn_failure("INGESTION_RUNTIME_CHILD_ERROR_PUBLISH_FAILED", publish_err, job=str(job_name))
 
-                        if len(restart_times) >= int(CHILD_MAX_RESTARTS):
+                        if bool(restart_guard.get("suppressed")):
                             with _CHILDREN_LOCK:
                                 info["restart_disabled"] = True
-                            publish_message(
-                                "market_data",
-                                "child_restart_guard_triggered",
-                                {
-                                    "job": str(job_name),
-                                    "error": err,
-                                    "restarts": len(restart_times),
-                                    "window_s": float(CHILD_RESTART_WINDOW_S),
-                                },
-                                sender=JOB_NAME,
-                                best_effort=True,
+                            _publish_child_restart_suppressed(
+                                job_name,
+                                restart_guard,
+                                reason="start_failed",
+                                detail={"error": err},
                             )
                         else:
                             with _CHILDREN_LOCK:
@@ -2111,9 +2917,15 @@ def main() -> None:
         for job_name, info in children.items():
             _terminate_child(job_name, _child_proc(info))
         try:
-            release_job_lock(JOB_NAME, OWNER, PID)
+            release_job_lock(INGESTION_RUNTIME_JOB_LOCK_NAME, OWNER, PID)
         except Exception as e:
-            _warn_failure("INGESTION_RUNTIME_RELEASE_JOB_LOCK_FAILED", e, job=JOB_NAME, pid=int(PID))
+            _warn_failure(
+                "INGESTION_RUNTIME_RELEASE_JOB_LOCK_FAILED",
+                e,
+                job=INGESTION_RUNTIME_JOB_LOCK_NAME,
+                base_job=JOB_NAME,
+                pid=int(PID),
+            )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from engine.runtime.logging import get_logger
 
 CONGRESSIONAL_BACKFILL_DAYS = max(1, int(CONFIG_CONGRESSIONAL_BACKFILL_DAYS))
 CONGRESSIONAL_TIMEOUT_S = max(5.0, float(os.environ.get("CONGRESSIONAL_TIMEOUT_S", "20")))
+CONGRESSIONAL_HTTP_UA = os.environ.get("CONGRESSIONAL_HTTP_UA", "trading-system/1.0 congressional-feed")
 
 DEFAULT_SOURCE_SPECS = (
     {
@@ -258,6 +259,31 @@ def _iter_records(payload: Any) -> List[Dict[str, Any]]:
     return [dict(value) for value in payload.values() if isinstance(value, dict)]
 
 
+def _retry_after_s(response: Any, default_s: float) -> float:
+    try:
+        raw = str((getattr(response, "headers", {}) or {}).get("Retry-After") or "").strip()
+        if raw:
+            return max(1.0, float(raw))
+    except Exception:
+        return float(default_s)
+    return float(default_s)
+
+
+def _status_from_response(response: Any) -> Dict[str, Any] | None:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code == 429:
+        return {"status": "degraded", "classification": "rate_limited", "status_code": status_code, "retry_after_s": _retry_after_s(response, 300.0)}
+    if status_code == 401:
+        return {"status": "fail", "classification": "wrong_credentials", "status_code": status_code}
+    if status_code == 403:
+        return {"status": "fail", "classification": "entitlement_missing", "status_code": status_code}
+    if status_code == 503:
+        return {"status": "degraded", "classification": "provider_unreachable", "status_code": status_code, "retry_after_s": _retry_after_s(response, 300.0)}
+    if status_code >= 400:
+        return {"status": "fail", "classification": "provider_unreachable", "status_code": status_code}
+    return None
+
+
 def normalize_congressional_trade_record(
     raw: Dict[str, Any],
     *,
@@ -392,23 +418,37 @@ def fetch_congressional_trades(
     allowed_symbols: Optional[Sequence[str]] = None,
     session: Optional[requests.Session] = None,
     source_specs: Optional[Sequence[Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
+    include_status: bool = False,
+) -> List[Dict[str, Any]] | tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Fetch and normalize congressional-trade disclosures from configured sources."""
     lookback_days = max(1, int(backfill_days or CONGRESSIONAL_BACKFILL_DAYS))
     cutoff_ms = int(time.time() * 1000) - int(lookback_days * 24 * 3600 * 1000)
     session_obj = session or requests.Session()
     rows: List[Dict[str, Any]] = []
+    statuses: List[Dict[str, Any]] = []
 
     for spec in source_specs or DEFAULT_SOURCE_SPECS:
         source_name = str((spec or {}).get("name") or "congressional_trade").strip()
         source_url = str((spec or {}).get("url") or "").strip()
         default_chamber = str((spec or {}).get("chamber") or "").strip()
         if not source_url:
+            statuses.append({"source_name": source_name, "url": source_url, "status": "fail", "classification": "missing_url", "rows": 0})
             continue
         try:
-            response = session_obj.get(source_url, timeout=CONGRESSIONAL_TIMEOUT_S)
+            response = session_obj.get(
+                source_url,
+                headers={"User-Agent": CONGRESSIONAL_HTTP_UA, "Accept": "application/json"},
+                timeout=CONGRESSIONAL_TIMEOUT_S,
+            )
+            problem = _status_from_response(response)
+            if problem is not None:
+                statuses.append({"source_name": source_name, "url": source_url, "rows": 0, **problem})
+                continue
             response.raise_for_status()
             payload = response.json()
+            if not isinstance(payload, (dict, list)):
+                statuses.append({"source_name": source_name, "url": source_url, "status": "fail", "classification": "malformed_payload", "rows": 0})
+                continue
         except Exception as exc:
             _warn_nonfatal(
                 "CONGRESSIONAL_TRADES_FETCH_FAILED",
@@ -416,6 +456,16 @@ def fetch_congressional_trades(
                 once_key=f"congressional_fetch:{source_name}:{source_url}",
                 source_name=source_name,
                 source_url=source_url,
+            )
+            statuses.append(
+                {
+                    "source_name": source_name,
+                    "url": source_url,
+                    "status": "fail",
+                    "classification": "provider_unreachable",
+                    "rows": 0,
+                    "error_type": type(exc).__name__,
+                }
             )
             continue
         source_rows = normalize_congressional_payload(
@@ -430,4 +480,15 @@ def fetch_congressional_trades(
             if event_ts_ms is not None and int(event_ts_ms) < int(cutoff_ms):
                 continue
             rows.append(row)
+        statuses.append(
+            {
+                "source_name": source_name,
+                "url": source_url,
+                "status": "pass" if source_rows else "degraded",
+                "classification": "success" if source_rows else "empty_payload",
+                "rows": int(len(source_rows)),
+            }
+        )
+    if include_status:
+        return rows, statuses
     return rows

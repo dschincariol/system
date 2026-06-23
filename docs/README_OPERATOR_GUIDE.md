@@ -35,6 +35,41 @@ In short, the operator is supervising an automated workflow, not manually tradin
 | `ui/data_sources.html` | Single-page Data Sources Control Center for provider setup, credential resets, tests, and enable/disable actions |
 | `services/operator_ai/agent.js` | Bounded AI analysis layer for operator diagnostics and guarded repair flows |
 
+### Local Safe/Sim Boot Smoke
+
+Use the safe/sim smoke before any execution testing on a clean local checkout:
+
+```bash
+python tools/safe_sim_boot_smoke.py
+```
+
+The smoke derives a temporary env from `.env.codex-sim-paper.bak`, writes
+secret-shaped values to local `*_FILE` references under `var/tmp/safe_sim_boot`,
+forces `ENGINE_MODE=safe`, `EXECUTION_MODE=safe`,
+`DISABLE_LIVE_EXECUTION=1`, `KILL_SWITCH_GLOBAL=1`,
+`LIVE_TRADING_CONFIRM=`, `LIVE_TRADING_REQUIRE_CONFIRMATION=1`, and
+`BROKER/BROKER_NAME=sim`. For reproducibility it also forces local dev storage
+with `TS_STORAGE_BACKEND=sqlite`, `PRICE_READ_BACKEND=sqlite`, and
+`TELEMETRY_READ_BACKEND=sqlite`, so the smoke does not depend on an already
+running Docker/Postgres stack. It then starts `start_system.py` and the operator
+sidecar. It checks `/api/health`, `/api/system/kill_switches`,
+`/api/broker/config`, `/api/execution/barrier`, and
+`/api/operator/readiness_evidence` through the dashboard with `X-API-Token`
+read from `DASHBOARD_API_TOKEN_FILE`. It also checks the same safety gates
+through direct `:4001` operator proxy routes with `X-Operator-Token` read from
+`OPERATOR_API_TOKEN_FILE`. In this safe/sim profile the execution barrier is
+expected to return HTTP 200 with a populated payload and `allowed=false`; that
+is the proof that execution is blocked. The script reports only token source
+metadata, never token values, and shuts the processes down before verifying that
+`:8000` and `:4001` are closed.
+
+To generate the sanitized env without starting processes:
+
+```bash
+python tools/safe_sim_boot_smoke.py --prepare-only
+TRADING_ENV_FILE=var/tmp/safe_sim_boot/.env.safe-sim ./start_local.sh
+```
+
 ## 3. What The Dashboard Is Meant To Show
 
 The dashboard is the operator's control tower.
@@ -77,9 +112,19 @@ The exact UI may evolve, but the important panels now include the following.
 | Governance | Model/promotion/safety state | stale replay, blocked promotion, critic failures |
 | Portfolio/Execution panels | Current exposure and execution condition | concentration, exposure drift, execution degradation |
 
+> **Accessing the UI from another computer (LAN):** by default the dashboard
+> (:8000) binds to loopback and the operator sidecar (:4001) remains
+> loopback/internal. To open the UI from another machine on a trusted LAN (e.g.
+> a Windows desktop at `http://192.168.0.165:8000`), follow
+> [LAN_ACCESS.md](LAN_ACCESS.md) — set `TRADING_NETWORK_MODE=lan` plus a
+> `DASHBOARD_API_TOKEN`, open only dashboard port `:8000`, and use
+> `/operator/` through the dashboard for operator workflows. Do not use
+> NoMachine for normal UI viewing.
+
 ## 5.1 Where To Manage Data Sources
 
-Use one page only for provider and feed setup:
+Use one page only for provider and feed setup (when viewing over the LAN,
+substitute the host with your server's LAN IP, e.g. `http://192.168.0.165:8000`):
 
 - `http://127.0.0.1:8000/ui/data_sources.html`
 
@@ -92,6 +137,16 @@ That page is the single source of truth for:
 - reading plain-language setup instructions and recommended next actions
 
 Operators should not need to edit `.env` for provider credentials and should not need to bounce between the dashboard site and the operator site for this functional area.
+
+### FX Operator Surfaces
+
+FX surfacing is read-only in the browser. The UI displays data that upstream FX workstreams have already placed in existing read-model payloads; it does not create FX prices, positions, sleeve exposure, leverage, or order authority.
+
+- Data Sources: FX or OANDA-style feeds are marked with an `FX feed` badge. Use the existing Test Connection action to check connectivity. The test-result panel displays only status, ok, latency, detail, and message fields, never credential values.
+- Positions & Exposure: the dashboard shows FX position count, sleeve gross/net exposure, effective leverage, and lot/unit sizing when those fields are present in `/api/ui/metrics`, `/api/portfolio`, `/api/risk/portfolio`, `/api/broker`, or `/api/terminal/positions`. If FX-05 or FX-06 has not surfaced those fields yet, the tile says `FX data not yet available`.
+- Browser Terminal: FX pairs use pip-aware price formatting, lot-aware quantities, and a 24/5 session label. The session label mirrors FX-04's FX clock defaults: Sunday 22:00 UTC open and Friday 22:00 UTC close unless configured otherwise.
+
+The UI must not be used as proof of profitability. Profitability remains a backend governance and backtest-gate question, net of realistic costs.
 
 ## 6. Operator-Facing Features
 

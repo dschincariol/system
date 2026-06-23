@@ -157,7 +157,9 @@ class PredictionExplanationStorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._env_backup = os.environ.get("DB_PATH")
+        self._storage_backend_backup = os.environ.get("TS_STORAGE_BACKEND")
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "prediction_explanations.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         (self.storage,) = _reload_modules("engine.runtime.storage")
         self.storage.init_db()
 
@@ -166,6 +168,10 @@ class PredictionExplanationStorageTests(unittest.TestCase):
             os.environ.pop("DB_PATH", None)
         else:
             os.environ["DB_PATH"] = self._env_backup
+        if self._storage_backend_backup is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = self._storage_backend_backup
         try:
             (storage,) = _reload_modules("engine.runtime.storage")
             storage.close_pooled_connections()
@@ -211,14 +217,20 @@ class PredictionExplanationLegacyMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._env_backup = os.environ.get("DB_PATH")
+        self._storage_backend_backup = os.environ.get("TS_STORAGE_BACKEND")
         self.db_path = Path(self.tmp.name) / "prediction_explanations_legacy.db"
         os.environ["DB_PATH"] = str(self.db_path)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
 
     def tearDown(self) -> None:
         if self._env_backup is None:
             os.environ.pop("DB_PATH", None)
         else:
             os.environ["DB_PATH"] = self._env_backup
+        if self._storage_backend_backup is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = self._storage_backend_backup
         try:
             (storage,) = _reload_modules("engine.runtime.storage")
             storage.close_pooled_connections()

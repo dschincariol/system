@@ -7,11 +7,11 @@ raising cleanup-time exceptions back into the caller.
 
 from __future__ import annotations
 
-import time
 import os
 import threading
+import time
 from contextlib import nullcontext
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from engine.runtime.logging import flush_logging_handlers, get_logger
 
@@ -42,6 +42,205 @@ def _broker_shutdown_timeout_s() -> float:
         return max(0.1, min(120.0, float(os.environ.get("BROKER_SHUTDOWN_TIMEOUT_S", "10") or 10.0)))
     except Exception:
         return 10.0
+
+
+def _runtime_shutdown_drain_deadline_s() -> float:
+    try:
+        return max(0.0, min(120.0, float(os.environ.get("RUNTIME_SHUTDOWN_DRAIN_DEADLINE_S", "5.0") or 5.0)))
+    except Exception:
+        return 5.0
+
+
+def _remaining_s(deadline: float) -> float:
+    return max(0.0, float(deadline) - time.monotonic())
+
+
+def _snapshot_int(snapshot: Dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        try:
+            value = snapshot.get(str(key))
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            return int(value or 0)
+        except Exception:
+            continue
+    return 0
+
+
+def _drain_async_price_writer(timeout_s: float) -> Dict[str, Any]:
+    from engine.runtime.async_writer import shutdown_async_writer
+
+    return dict(shutdown_async_writer(timeout_s=max(0.0, float(timeout_s))) or {})
+
+
+def _drain_telemetry_append_buffers(timeout_s: float) -> Dict[str, Any]:
+    from engine.runtime.telemetry_append_buffer import shutdown_telemetry_append_buffers
+
+    return dict(shutdown_telemetry_append_buffers(timeout_s=max(0.0, float(timeout_s))) or {})
+
+
+def _runtime_shutdown_residual_risk(
+    *,
+    async_price_writer: Dict[str, Any],
+    telemetry_append_buffer: Dict[str, Any],
+    deadline_exhausted: bool,
+    errors: list[str],
+) -> Dict[str, Any]:
+    async_pending_rows = _snapshot_int(async_price_writer, "queue_rows", "spool_pending_rows")
+    async_residual_spooled_rows = _snapshot_int(async_price_writer, "residual_spooled_rows")
+    async_residual_dropped_rows = _snapshot_int(async_price_writer, "residual_loss_rows", "residual_dropped_rows")
+    telemetry_pending_rows = _snapshot_int(telemetry_append_buffer, "buffered_rows", "queue_rows", "spool_pending_rows")
+    telemetry_residual_spooled_rows = _snapshot_int(telemetry_append_buffer, "residual_spooled_rows")
+    telemetry_residual_dropped_rows = _snapshot_int(telemetry_append_buffer, "residual_loss_rows", "residual_dropped_rows")
+    residual_spooled_rows = int(async_residual_spooled_rows) + int(telemetry_residual_spooled_rows)
+    residual_dropped_rows = int(async_residual_dropped_rows) + int(telemetry_residual_dropped_rows)
+    pending_rows = int(async_pending_rows) + int(telemetry_pending_rows)
+    loss_possible = bool(residual_dropped_rows > 0 or telemetry_residual_dropped_rows > 0)
+    degraded = bool(deadline_exhausted or errors or pending_rows > 0 or residual_spooled_rows > 0 or loss_possible)
+    if loss_possible:
+        status = "residual_loss_possible"
+    elif residual_spooled_rows > 0 or pending_rows > 0:
+        status = "residual_retained_for_replay"
+    elif deadline_exhausted:
+        status = "deadline_exhausted"
+    elif errors:
+        status = "drain_errors"
+    else:
+        status = "drained"
+    return {
+        "ok": not degraded,
+        "status": status,
+        "deadline_exhausted": bool(deadline_exhausted),
+        "pending_rows": int(pending_rows),
+        "residual_spooled_rows": int(residual_spooled_rows),
+        "residual_dropped_rows": int(residual_dropped_rows),
+        "loss_possible": bool(loss_possible),
+        "async_price_writer": {
+            "pending_rows": int(async_pending_rows),
+            "residual_spooled_rows": int(async_residual_spooled_rows),
+            "residual_dropped_rows": int(async_residual_dropped_rows),
+        },
+        "telemetry_append_buffer": {
+            "pending_rows": int(telemetry_pending_rows),
+            "residual_spooled_rows": int(telemetry_residual_spooled_rows),
+            "residual_dropped_rows": int(telemetry_residual_dropped_rows),
+        },
+        "errors": list(errors or []),
+    }
+
+
+def _record_runtime_shutdown_drain(payload: Dict[str, Any]) -> None:
+    try:
+        from engine.runtime.event_log import append_event
+
+        with _storage_timeout_ctx():
+            append_event(
+                event_type="runtime_shutdown_drain",
+                event_source="runtime.shutdown",
+                entity_type="runtime",
+                entity_id="shutdown",
+                payload=dict(payload or {}),
+                ts_ms=int(time.time() * 1000),
+                best_effort=True,
+            )
+    except Exception:
+        LOG.exception("runtime_shutdown_drain_event_failed")
+    try:
+        from engine.runtime.observability import record_component_health
+
+        residual = dict((payload or {}).get("residual_risk") or {})
+        ok = bool((payload or {}).get("ok")) and not bool(residual.get("loss_possible"))
+        record_component_health(
+            "runtime_shutdown_drain",
+            ok=ok,
+            status=("ok" if ok else "degraded"),
+            detail=str(residual.get("status") or "runtime_shutdown_drain"),
+            observed_ts_ms=int(time.time() * 1000),
+            extra=dict(payload or {}),
+        )
+    except Exception:
+        LOG.exception("runtime_shutdown_drain_health_failed")
+
+
+def run_runtime_shutdown_drain(
+    *,
+    deadline_s: float | None = None,
+    reason: str = "runtime_shutdown",
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    budget_s = _runtime_shutdown_drain_deadline_s() if deadline_s is None else max(0.0, float(deadline_s))
+    deadline = time.monotonic() + float(budget_s)
+    errors: list[str] = []
+    async_snapshot: Dict[str, Any] = {}
+    telemetry_snapshot: Dict[str, Any] = {}
+
+    try:
+        async_snapshot = _drain_async_price_writer(_remaining_s(deadline))
+    except Exception as exc:
+        LOG.exception("runtime_shutdown_async_writer_failed")
+        errors.append(f"async_price_writer:{type(exc).__name__}:{exc}")
+
+    try:
+        telemetry_snapshot = _drain_telemetry_append_buffers(_remaining_s(deadline))
+    except Exception as exc:
+        LOG.exception("runtime_shutdown_telemetry_append_buffer_failed")
+        errors.append(f"telemetry_append_buffer:{type(exc).__name__}:{exc}")
+
+    deadline_exhausted = bool(_remaining_s(deadline) <= 0.0)
+    residual_risk = _runtime_shutdown_residual_risk(
+        async_price_writer=async_snapshot,
+        telemetry_append_buffer=telemetry_snapshot,
+        deadline_exhausted=deadline_exhausted,
+        errors=errors,
+    )
+    duration_ms = int(round((time.perf_counter() - started) * 1000.0))
+    payload = {
+        "ok": bool(residual_risk.get("ok")) and not errors,
+        "reason": str(reason or "runtime_shutdown"),
+        "deadline_s": float(budget_s),
+        "duration_ms": int(duration_ms),
+        "residual_risk": residual_risk,
+        "async_price_writer": dict(async_snapshot or {}),
+        "telemetry_append_buffer": dict(telemetry_snapshot or {}),
+        "errors": list(errors),
+        "ts_ms": int(time.time() * 1000),
+    }
+    _record_runtime_shutdown_drain(payload)
+    return payload
+
+
+def _call_stop_all(
+    owner: Any,
+    *,
+    drain_before_kill: Callable[..., Dict[str, Any]],
+    drain_deadline_s: float,
+) -> Dict[str, Any]:
+    stop_all = getattr(owner, "stop_all", None)
+    if not callable(stop_all):
+        return {"ok": True, "status": "stop_all_missing"}
+    try:
+        return dict(
+            stop_all(
+                drain_before_kill=drain_before_kill,
+                drain_deadline_s=float(drain_deadline_s),
+            )
+            or {}
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if (
+            "drain_before_kill" not in message
+            and "drain_deadline_s" not in message
+            and "unexpected keyword" not in message
+            and "got an unexpected" not in message
+        ):
+            raise
+        # Older/test doubles without the drain hook still stop; the caller runs
+        # the drain afterwards so residual risk is still recorded.
+        return dict(stop_all() or {})
 
 
 def _run_broker_shutdown_risk(*, shutdown_reason: str) -> Dict[str, Any]:
@@ -86,6 +285,21 @@ def runtime_shutdown(
     shutdown_reason: str = "runtime_shutdown",
 ) -> None:
     shutdown_ts_ms = int(time.time() * 1000)
+    drain_deadline_s = _runtime_shutdown_drain_deadline_s()
+    drain_result: Dict[str, Any] = {}
+
+    def _drain_once(
+        *,
+        reason: str = "runtime_shutdown_pre_sigkill",
+        deadline_s: float | None = None,
+    ) -> Dict[str, Any]:
+        nonlocal drain_result
+        if not drain_result:
+            drain_result = run_runtime_shutdown_drain(
+                deadline_s=(float(drain_deadline_s) if deadline_s is None else max(0.0, float(deadline_s))),
+                reason=str(reason or shutdown_reason or "runtime_shutdown_pre_sigkill"),
+            )
+        return dict(drain_result or {})
 
     lifecycle = {}
     try:
@@ -142,11 +356,16 @@ def runtime_shutdown(
 
     # Stop jobs first so child processes release DB handles and background
     # activity before the storage layer is asked to checkpoint and close.
-    # Stop process jobs first (best-effort)
+    # Whole-runtime stop paths accept a pre-SIGKILL drain hook. Generic older
+    # owners still stop, then the post-stop drain below records residual risk.
     try:
         if JOBS is not None:
             try:
-                JOBS.stop_all()
+                _call_stop_all(
+                    JOBS,
+                    drain_before_kill=_drain_once,
+                    drain_deadline_s=float(drain_deadline_s),
+                )
             except Exception:
                 LOG.exception("runtime_shutdown_jobs_stop_all_failed")
     except Exception:
@@ -155,7 +374,11 @@ def runtime_shutdown(
     try:
         if SUPERVISOR is not None:
             try:
-                SUPERVISOR.stop_all()
+                _call_stop_all(
+                    SUPERVISOR,
+                    drain_before_kill=_drain_once,
+                    drain_deadline_s=float(drain_deadline_s),
+                )
             except Exception:
                 LOG.exception("runtime_shutdown_supervisor_stop_all_failed")
     except Exception:
@@ -181,16 +404,23 @@ def runtime_shutdown(
             LOG.exception("runtime_shutdown_event_runtime_stop_failed")
 
     try:
-        from engine.runtime.async_writer import shutdown_async_writer
+        from engine.runtime.event_bus import shutdown_event_bus
     except Exception:
-        LOG.exception("runtime_shutdown_async_writer_import_failed")
-        shutdown_async_writer = None  # type: ignore
+        LOG.exception("runtime_shutdown_event_bus_import_failed")
+        shutdown_event_bus = None  # type: ignore
 
-    if shutdown_async_writer is not None:
+    if shutdown_event_bus is not None:
         try:
-            shutdown_async_writer(timeout_s=5.0)
+            shutdown_event_bus()
         except Exception:
-            LOG.exception("runtime_shutdown_async_writer_failed")
+            LOG.exception("runtime_shutdown_event_bus_failed")
+
+    # Drain buffered persistence before storage pools close. Supported stop_all
+    # paths invoke this hook before SIGKILL; older owners rely on this fallback.
+    try:
+        _drain_once(reason="runtime_shutdown_post_stop")
+    except Exception:
+        LOG.exception("runtime_shutdown_drain_failed")
 
     try:
         from engine.runtime.storage_pg_prices import shutdown_pg_price_storage
@@ -203,32 +433,6 @@ def runtime_shutdown(
             shutdown_pg_price_storage()
         except Exception:
             LOG.exception("runtime_shutdown_pg_price_storage_failed")
-
-    try:
-        from engine.runtime.event_bus import shutdown_event_bus
-    except Exception:
-        LOG.exception("runtime_shutdown_event_bus_import_failed")
-        shutdown_event_bus = None  # type: ignore
-
-    if shutdown_event_bus is not None:
-        try:
-            shutdown_event_bus()
-        except Exception:
-            LOG.exception("runtime_shutdown_event_bus_failed")
-
-    # Give children a moment to exit before DB flush so WAL checkpointing is
-    # less likely to race with active writers.
-    try:
-        time.sleep(0.10)
-    except Exception:
-        LOG.exception("runtime_shutdown_sleep_failed")
-
-    try:
-        from engine.runtime.telemetry_append_buffer import shutdown_telemetry_append_buffers
-
-        shutdown_telemetry_append_buffers(timeout_s=2.0)
-    except Exception:
-        LOG.exception("runtime_shutdown_telemetry_append_buffer_failed")
 
     # Flush SQLite WAL + close pooled connections because runtime owns the
     # storage lifecycle. Postgres-backed storage does not understand SQLite
@@ -299,6 +503,7 @@ def runtime_shutdown(
                 payload={
                     "ts_ms": int(time.time() * 1000),
                     "duration_ms": int(time.time() * 1000) - int(shutdown_ts_ms),
+                    "drain": dict(drain_result or {}),
                 },
                 ts_ms=int(time.time() * 1000),
                 best_effort=True,

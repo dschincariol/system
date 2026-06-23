@@ -92,6 +92,8 @@ def _fetch_rows() -> tuple[List[Dict[str, Any]], List[str]]:
                 once_key=f"short_volume_fetch:{day}",
                 trade_date=str(day),
             )
+            if bool(getattr(exc, "stop_cycle", False)):
+                break
     return rows, errors
 
 
@@ -117,7 +119,7 @@ def _run_once() -> bool:
             or 0
         )
 
-    ok = not bool(errors)
+    ok = bool(rows) and not bool(errors)
     last_ts = max([int(row.get("availability_ts_ms") or row.get("ingested_ts_ms") or 0) for row in rows] or [int(time.time() * 1000)])
     status = record_pipeline_status(
         JOB_NAME,
@@ -131,6 +133,7 @@ def _run_once() -> bool:
             "written": int(written),
             "backfill_days": int(BACKFILL_DAYS),
             "poll_seconds": float(POLL_SECONDS),
+            "degraded": bool(not ok),
         },
     )
     manager.record_job_status(

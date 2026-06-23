@@ -27,6 +27,11 @@ try:
 except Exception:  # pragma: no cover - optional at runtime
     asyncpg = None  # type: ignore[assignment]
 
+try:
+    import orjson as _orjson
+except Exception:  # pragma: no cover - optional acceleration dependency
+    _orjson = None  # type: ignore[assignment]
+
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.config import (
@@ -193,8 +198,21 @@ def _sanitize_feature_mapping(feature_dict: Mapping[str, Any] | None) -> dict[st
     return sanitized
 
 
-def _json_dumps(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+def _json_default(value: Any) -> str:
+    return str(value)
+
+
+def _json_dumps(value: Any, *, deterministic: bool = False) -> str:
+    if _orjson is not None:
+        option = _orjson.OPT_SORT_KEYS if deterministic else 0
+        return _orjson.dumps(value, option=option, default=_json_default).decode("utf-8")
+    return json.dumps(
+        value,
+        separators=(",", ":"),
+        sort_keys=bool(deterministic),
+        default=str,
+        allow_nan=False,
+    )
 
 
 @dataclass(frozen=True)

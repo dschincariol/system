@@ -97,6 +97,9 @@ If the change also alters operator setup, update `.env.example` in the same chan
 
 ## Validation Expectations
 
+- Install pre-commit locally with `python -m pip install pre-commit==4.6.0`, then run `pre-commit install` from the repository root. Use `pre-commit run` for staged files before committing, or `pre-commit run --files <path> [<path> ...]` for a targeted local check. `pre-commit run --all-files` is useful for broad cleanup, but it can surface legacy Ruff findings outside a narrow change.
+- The local pre-commit set is intentionally fast and formatting-neutral: Ruff check, Python AST syntax, YAML/TOML/JSON parsing, merge/case-conflict checks, private-key and token/entropy secret detection, check-only trailing-whitespace/final-newline guards, and the tracked artifact hygiene guard.
+- CI runs the same pre-commit hooks on files changed by each pull request or push. Repository-wide safety gates that are broader than changed-file pre-commit, including dependency-lock validation, artifact hygiene, UI validation, pyright money-path validation, production-backend checks, and staging preflight evidence, remain in `.github/workflows/validate.yml`.
 - Run `npm run test:py` or `python -m pytest tests/ -v --tb=short` for the canonical Python test suite. Avoid the stdlib discovery runner; pytest collects the repository's `unittest.TestCase` tests.
 - Run `python tools/validate_repo.py` before merging. It runs `python tools/validate_docs.py` as its `docs` sub-validator and runs pytest collection before pytest execution, so documentation and Python test gates also run in CI.
 - Run `python tools/check_repo_artifact_hygiene.py --report` when broad local-output or dependency directories are present. The same guard runs in CI and fails if generated caches, virtualenvs, `node_modules/`, repo-local `var/` state, local `.env*`, or secret paths are tracked.
@@ -105,6 +108,12 @@ If the change also alters operator setup, update `.env.example` in the same chan
 - Keep local Markdown links valid.
 - Keep `docs/adr/` numbering sequential and update `docs/adr/README.md` when adding a new ADR.
 - Do not backfill speculative historical changelog or ADR entries. Record the decision or change from the point where it becomes grounded.
+
+## High-Risk Review Ownership
+
+`.github/CODEOWNERS` requests review for the money-path and repository-governance areas where a silent regression has high blast radius: execution and broker routing, runtime control plane and migrations, portfolio/risk modules, CI workflows, pre-commit policy, and security/secret/configuration templates. The rules deliberately avoid general documentation and low-risk utility paths so normal maintenance is not code-owned by default.
+
+When changing a CODEOWNERS-covered path, include the relevant local validator output in the change summary and wait for the code-owner review before merge. Branch protection must enable required code-owner reviews for GitHub to enforce this as a merge gate; until then, CODEOWNERS still provides automatic review routing.
 
 In addition to link, ADR-numbering, required-file, OpenAPI, and changelog checks, `tools/validate_docs.py` enforces three documentation-governance gates (see [docs/adr/0006-documentation-governance-gates.md](docs/adr/0006-documentation-governance-gates.md)):
 

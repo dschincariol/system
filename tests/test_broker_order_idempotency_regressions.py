@@ -11,10 +11,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+pytestmark = pytest.mark.safety_critical
 
 
 def _reload_modules(*module_names: str):
@@ -402,8 +406,13 @@ class BrokerRouterIdempotencyRegressionTests(unittest.TestCase):
 
     def test_ambiguous_submit_stops_failover_chain(self) -> None:
         env = {
-            "BROKER_FAILOVER": "alpaca,sim",
+            "BROKER_FAILOVER": "alpaca,alpaca",
+            "BROKER": "alpaca",
+            "BROKER_NAME": "alpaca",
+            "LIVE_BROKER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "2",
+            "ENGINE_MODE": "live",
+            "EXECUTION_MODE": "live",
             "EXEC_ADAPTIVE_SLICING": "0",
         }
         orders = [{"symbol": "AAPL", "qty": 1.0, "action": "BUY"}]
@@ -424,6 +433,7 @@ class BrokerRouterIdempotencyRegressionTests(unittest.TestCase):
                 _mute_router_side_effects(stack, broker_router)
                 stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", return_value=None))
                 stack.enter_context(patch.object(broker_router, "_real_trading_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", Mock(return_value={"mode": "live", "armed": 1})))
                 stack.enter_context(patch.object(broker_router, "_prelive_reconcile", return_value={"ok": True}))
                 stack.enter_context(patch.object(broker_router, "_alpaca_apply", Mock(return_value=ambiguous)))
                 stack.enter_context(patch.object(broker_router, "_sim_apply", sim_adapter))
@@ -445,8 +455,13 @@ class BrokerRouterIdempotencyRegressionTests(unittest.TestCase):
 
     def test_submission_unrecorded_status_stops_failover_chain(self) -> None:
         env = {
-            "BROKER_FAILOVER": "alpaca,sim",
+            "BROKER_FAILOVER": "alpaca,alpaca",
+            "BROKER": "alpaca",
+            "BROKER_NAME": "alpaca",
+            "LIVE_BROKER": "alpaca",
             "BROKER_ROUTER_RETRY_ATTEMPTS": "2",
+            "ENGINE_MODE": "live",
+            "EXECUTION_MODE": "live",
             "EXEC_ADAPTIVE_SLICING": "0",
         }
         orders = [{"symbol": "AAPL", "qty": 1.0, "action": "BUY"}]
@@ -466,6 +481,7 @@ class BrokerRouterIdempotencyRegressionTests(unittest.TestCase):
                 _mute_router_side_effects(stack, broker_router)
                 stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", return_value=None))
                 stack.enter_context(patch.object(broker_router, "_real_trading_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", Mock(return_value={"mode": "live", "armed": 1})))
                 stack.enter_context(patch.object(broker_router, "_prelive_reconcile", return_value={"ok": True}))
                 stack.enter_context(patch.object(broker_router, "_alpaca_apply", Mock(return_value=unrecorded)))
                 stack.enter_context(patch.object(broker_router, "_sim_apply", sim_adapter))

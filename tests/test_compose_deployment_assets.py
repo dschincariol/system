@@ -15,6 +15,7 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
     def test_compose_stack_defines_runtime_and_operator(self) -> None:
         compose_path = REPO_ROOT / "deploy" / "compose" / "docker-compose.stack.yml"
         text = compose_path.read_text(encoding="utf-8")
+        env_example_text = (REPO_ROOT / "deploy" / "compose" / ".env.example").read_text(encoding="utf-8")
 
         self.assertIn("runtime:", text)
         self.assertIn("offline-worker:", text)
@@ -31,6 +32,8 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("TSFRESH_SNAPSHOT_SYMBOL_LIMIT: ${TSFRESH_SNAPSHOT_SYMBOL_LIMIT:-100}", text)
         self.assertIn("TSFRESH_SNAPSHOT_BATCH_SIZE: ${TSFRESH_SNAPSHOT_BATCH_SIZE:-25}", text)
         self.assertIn("TUNE_N_TRIALS: ${TUNE_N_TRIALS:-10}", text)
+        self.assertIn("TRADING_REFETCHABLE_PG_DURABILITY_TIER: ${TRADING_REFETCHABLE_PG_DURABILITY_TIER:-relaxed}", text)
+        self.assertIn("TRADING_REFETCHABLE_PG_DURABILITY_TIER=relaxed", env_example_text)
         self.assertIn("TRADING_IMPORT_SMOKE_IMPORT_JOBS: ${TRADING_IMPORT_SMOKE_IMPORT_JOBS:-0}", text)
         self.assertIn("OPERATOR_DISABLE_INTERNAL_ENGINE_START: \"1\"", text)
         self.assertIn("OPERATOR_API_TOKEN_FILE: /run/secrets/operator_api_token", text)
@@ -41,13 +44,32 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("OPERATOR_SIDECAR_INTERNAL_ONLY: \"1\"", text)
         self.assertIn("cpus: ${RUNTIME_CPUS:-12}", text)
         self.assertIn("mem_limit: ${RUNTIME_MEM_LIMIT:-48g}", text)
+        self.assertIn("memswap_limit: ${RUNTIME_MEMSWAP_LIMIT:-48g}", text)
         self.assertIn("shm_size: ${RUNTIME_SHM_SIZE:-8g}", text)
         self.assertIn("PREFLIGHT_CHECK_RESOURCE_LIMITS: ${PREFLIGHT_CHECK_RESOURCE_LIMITS:-1}", text)
+        self.assertIn("PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE: ${PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE:-1}", text)
+        self.assertIn(
+            "PREFLIGHT_DOCKER_INSPECT_JSON: ${PREFLIGHT_DOCKER_INSPECT_JSON:-/var/backups/trading/evidence/docker_runtime_inspect.json}",
+            text,
+        )
+        self.assertIn(
+            "PREFLIGHT_REDIS_CONFIG_EVIDENCE: ${PREFLIGHT_REDIS_CONFIG_EVIDENCE:-/var/backups/trading/evidence/redis_config_get.txt}",
+            text,
+        )
+        self.assertIn(
+            "PREFLIGHT_POSTGRES_SETTINGS_JSON: ${PREFLIGHT_POSTGRES_SETTINGS_JSON:-/var/backups/trading/evidence/postgres_pg_settings.json}",
+            text,
+        )
+        self.assertIn("DOCKER_LOG_DRIVER: ${DOCKER_LOG_DRIVER:-local}", text)
+        self.assertIn("DOCKER_LOG_MAX_SIZE: ${DOCKER_LOG_MAX_SIZE:-50m}", text)
+        self.assertIn("DOCKER_LOG_MAX_FILE: ${DOCKER_LOG_MAX_FILE:-5}", text)
         self.assertIn("TRADING_RESOURCE_MIN_HEADROOM_MEMORY: ${TRADING_RESOURCE_MIN_HEADROOM_MEMORY:-24g}", text)
         self.assertIn("POSTGRES_SHARED_BUFFERS: ${TIMESCALE_SHARED_BUFFERS:-8GB}", text)
         self.assertIn("POSTGRES_MAX_CONNECTIONS: ${TIMESCALE_MAX_CONNECTIONS:-100}", text)
         self.assertIn("OMP_NUM_THREADS: ${RUNTIME_OMP_NUM_THREADS:-8}", text)
         self.assertIn("TORCH_CPU_THREADS: ${TORCH_CPU_THREADS:-8}", text)
+        self.assertIn("TRADING_CPU_THREAD_POLICY: ${TRADING_CPU_THREAD_POLICY:-auto}", text)
+        self.assertIn("TRADING_CPU_THREAD_POLICY=auto", env_example_text)
         self.assertIn("RUNTIME_HARDWARE_PROFILE: ${RUNTIME_HARDWARE_PROFILE:-cpu}", text)
         self.assertIn("TORCH_DEVICE: ${TORCH_DEVICE:-cpu}", text)
         self.assertIn("EMBED_DEVICE: ${EMBED_DEVICE:-cpu}", text)
@@ -134,8 +156,10 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
     def test_timescaledb_compose_archives_wal_to_host_backup_dir(self) -> None:
         external_compose = REPO_ROOT / "deploy" / "compose" / "docker-compose.external-services.yml"
         env_example = REPO_ROOT / "deploy" / "compose" / ".env.example"
+        active_env = REPO_ROOT / "deploy" / "compose" / ".env"
         text = external_compose.read_text(encoding="utf-8")
         env_text = env_example.read_text(encoding="utf-8")
+        active_env_text = active_env.read_text(encoding="utf-8") if active_env.exists() else ""
 
         self.assertIn("${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:/var/lib/postgresql/data", text)
         self.assertIn("${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:/var/backups/trading", text)
@@ -145,7 +169,24 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertNotIn("redis-data:/data", text)
         self.assertNotIn("minio-data:/data", text)
         self.assertIn("x-trading-logging:", text)
-        self.assertEqual(text.count("logging: *trading-logging"), 4)
+        self.assertEqual(text.count("logging: *trading-logging"), 5)
+        self.assertIn("storage-placement-preflight:", text)
+        self.assertIn("container_name: trading-storage-placement-preflight", text)
+        self.assertIn("network_mode: none", text)
+        self.assertIn("python", text)
+        self.assertIn("engine.runtime.storage_placement", text)
+        self.assertIn("storage-placement-preflight:\n        condition: service_completed_successfully", text)
+        self.assertIn("${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:/var/lib/postgresql/data:ro", text)
+        self.assertIn("${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:/app/data:ro", text)
+        self.assertIn("${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:/app/logs:ro", text)
+        self.assertIn(
+            "${TRADING_ARTIFACT_MIRROR:?set TRADING_ARTIFACT_MIRROR to a ZFS-backed host path}:/app/artifact_mirror:ro",
+            text,
+        )
+        self.assertIn(
+            "${TRADING_TRAINING_DATASETS:?set TRADING_TRAINING_DATASETS to a ZFS-backed host path}:/app/training_datasets:ro",
+            text,
+        )
         self.assertIn("archive_mode=${TIMESCALE_ARCHIVE_MODE:-on}", text)
         self.assertIn("TS_BACKUP_ROOT: /var/backups/trading", text)
         self.assertIn('TS_WAL_ARCHIVE_REQUIRE_MOUNT: "1"', text)
@@ -167,11 +208,24 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("TRADING_BACKUP_ROOT=/var/backups/trading", env_text)
         self.assertIn("TRADING_BACKUP_WAL_DIR=/var/backups/trading/wal", env_text)
         self.assertIn("PREFLIGHT_REQUIRE_ZFS_STORAGE=1", env_text)
+        self.assertIn("PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1", env_text)
+        self.assertIn("TRADING_SWAPFILE_SIZE_GIB=16", env_text)
+        self.assertIn("TRADING_ZRAM_SIZE_GIB=32", env_text)
+        self.assertIn("TRADING_ZFS_ARC_MAX_GIB=48", env_text)
         self.assertIn("PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS=1", env_text)
         self.assertIn("TRADING_ZFS_ROOT=/zpool", env_text)
-        self.assertIn("TRADING_TIMESCALE_DATA=/zpool/trading/timescaledb/data", env_text)
-        self.assertIn("TRADING_REDIS_DATA=/zpool/trading/redis/data", env_text)
-        self.assertIn("TRADING_MINIO_DATA=/zpool/trading/minio/data", env_text)
+        self.assertIn("TRADING_ALLOWED_STORAGE_PREFIXES=/zpool,/dbpool,/auxpool,/var/backups/trading", env_text)
+        self.assertIn("TRADING_TIMESCALE_DATA=/dbpool/trading/timescaledb/data", env_text)
+        self.assertIn("TRADING_REDIS_DATA=/auxpool/trading/redis", env_text)
+        self.assertIn("TRADING_MINIO_DATA=/auxpool/trading/minio", env_text)
+        if active_env_text:
+            self.assertIn("TRADING_ALLOWED_STORAGE_PREFIXES=/zpool,/dbpool,/auxpool,/var/backups/trading", active_env_text)
+            self.assertIn("TRADING_TIMESCALE_DATA=/dbpool/trading/timescaledb/data", active_env_text)
+            self.assertIn("TRADING_REDIS_DATA=/auxpool/trading/redis", active_env_text)
+            self.assertIn("TRADING_MINIO_DATA=/auxpool/trading/minio", active_env_text)
+            self.assertNotIn("TRADING_TIMESCALE_DATA=/var/lib/docker", active_env_text)
+            self.assertNotIn("TRADING_REDIS_DATA=/var/lib/docker", active_env_text)
+            self.assertNotIn("TRADING_MINIO_DATA=/var/lib/docker", active_env_text)
         self.assertIn("TRADING_WAL_ARCHIVE_SCRIPT=../../ops/backup/wal_archive.sh", env_text)
         self.assertIn("TRADING_WAL_ARCHIVE_CATCHUP_SCRIPT=../../ops/backup/wal_archive_catchup.sh", env_text)
         self.assertIn('TIMESCALE_ARCHIVE_COMMAND=/opt/trading/ops/backup/wal_archive.sh "%p" "%f"', env_text)
@@ -219,9 +273,17 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         for expected in (
             "TRADING_RESOURCE_HOST_CPUS=32",
             "TRADING_RESOURCE_HOST_MEMORY=123g",
+            "PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1",
+            "PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE=1",
+            "PREFLIGHT_CHECK_NETWORK_LISTENERS=1",
+            "PREFLIGHT_DOCKER_INSPECT_JSON=/var/backups/trading/evidence/docker_runtime_inspect.json",
+            "PREFLIGHT_REDIS_CONFIG_EVIDENCE=/var/backups/trading/evidence/redis_config_get.txt",
+            "PREFLIGHT_POSTGRES_SETTINGS_JSON=/var/backups/trading/evidence/postgres_pg_settings.json",
             "RUNTIME_MEM_LIMIT=48g",
+            "RUNTIME_MEMSWAP_LIMIT=48g",
             "RUNTIME_SHM_SIZE=8g",
             "REDIS_MAXMEMORY=6gb",
+            "REDIS_MAXMEMORY_POLICY=allkeys-lru",
             "REDIS_PASSWORD_FILE=../../data/secrets/redis_password",
             "REDIS_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
             "REDIS_ALLOW_DANGEROUS_PUBLIC_BIND=0",
@@ -233,9 +295,11 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
             "MINIO_CONSOLE_ALLOW_DANGEROUS_PUBLIC_BIND=0",
             "OPERATOR_MEM_LIMIT=2g",
+            "OPERATOR_SIDECAR_INTERNAL_ONLY=1",
             "DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
             "DASHBOARD_ALLOW_DANGEROUS_PUBLIC_BIND=0",
             "OPERATOR_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1",
+            "OPERATOR_PUBLIC_PORT=",
             "OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND=0",
         ):
             with self.subTest(expected=expected):
@@ -248,9 +312,23 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("${TRADING_RUNTIME_DATA:?set TRADING_RUNTIME_DATA to a ZFS-backed host path}:/app/data", stack_text)
         self.assertIn("${TRADING_RUNTIME_LOGS:?set TRADING_RUNTIME_LOGS to a ZFS-backed host path}:/app/logs", stack_text)
         self.assertIn("${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}:/var/backups/trading:ro", stack_text)
+        self.assertIn(
+            "${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:${TRADING_TIMESCALE_DATA:?set TRADING_TIMESCALE_DATA to a ZFS-backed host path}:ro",
+            stack_text,
+        )
+        self.assertIn(
+            "${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}:${TRADING_REDIS_DATA:?set TRADING_REDIS_DATA to a ZFS-backed host path}:ro",
+            stack_text,
+        )
+        self.assertIn(
+            "${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}:${TRADING_MINIO_DATA:?set TRADING_MINIO_DATA to a ZFS-backed host path}:ro",
+            stack_text,
+        )
         self.assertIn("TRADING_BACKUP_ROOT: ${TRADING_BACKUP_ROOT:?set TRADING_BACKUP_ROOT to the ZFS-backed backup mount}", stack_text)
         self.assertIn("TRADING_BACKUP_WAL_DIR: ${TRADING_BACKUP_WAL_DIR:?set TRADING_BACKUP_WAL_DIR to the ZFS-backed backup WAL path}", stack_text)
         self.assertIn("PREFLIGHT_REQUIRE_ZFS_STORAGE: ${PREFLIGHT_REQUIRE_ZFS_STORAGE:-1}", stack_text)
+        self.assertIn("PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY: ${PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY:-1}", stack_text)
+        self.assertIn("TRADING_SWAPFILE_PATH: ${TRADING_SWAPFILE_PATH:-/swapfile-trading}", stack_text)
         self.assertIn("PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS: ${PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS:-1}", stack_text)
         self.assertNotIn("trading-data:/app/data", stack_text)
         self.assertNotIn("trading-logs:/app/logs", stack_text)
@@ -294,6 +372,10 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "DOCKER_LOG_DRIVER=local",
             "DOCKER_LOG_MAX_SIZE=50m",
             "DOCKER_LOG_MAX_FILE=5",
+            "PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE=1",
+            "PREFLIGHT_DOCKER_INSPECT_JSON=/var/backups/trading/evidence/docker_runtime_inspect.json",
+            "PREFLIGHT_REDIS_CONFIG_EVIDENCE=/var/backups/trading/evidence/redis_config_get.txt",
+            "PREFLIGHT_POSTGRES_SETTINGS_JSON=/var/backups/trading/evidence/postgres_pg_settings.json",
             "DISK_PRESSURE_WARN_FREE_PCT=15",
             "DISK_PRESSURE_WARN_FREE_BYTES=21474836480",
             "DISK_PRESSURE_CRITICAL_FREE_PCT=5",
@@ -306,8 +388,14 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "PREFLIGHT_PG_WAL_WARN_FREE_BYTES=21474836480",
             "PREFLIGHT_PG_WAL_CRITICAL_FREE_BYTES=5368709120",
             "BACKUP_ACCOUNTING_DU_TIMEOUT_S=8",
-            "TRADING_RUNTIME_DATA=/zpool/trading/runtime/data",
-            "TRADING_RUNTIME_LOGS=/zpool/trading/runtime/logs",
+            "TRADING_RUNTIME_DATA=/auxpool/trading/runtime/data",
+            "TRADING_RUNTIME_LOGS=/auxpool/trading/runtime/logs",
+            "TS_BACKUP_KEEP_RECENT_COUNT=2",
+            "TS_BACKUP_KEEP_DAILY_DAYS=0",
+            "TS_BACKUP_KEEP_WEEKLY_DAYS=0",
+            "TS_BACKUP_WAL_CUSHION_DAYS=10",
+            "TS_BASE_BACKUP_OFFSITE_CMD=",
+            "TS_OFFSITE_BACKUP_DEST=",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, env_example_text)
@@ -321,8 +409,8 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("/opt/trading/app/logs/*.log", logrotate)
         self.assertIn("/opt/trading/app/var/log/*.log", logrotate)
         self.assertIn("/opt/trading/app/boot/*.log", logrotate)
-        self.assertIn("/zpool/trading/runtime/logs/*.log", logrotate)
-        self.assertIn("/zpool/trading/runtime/data/ai_operator_log.jsonl", logrotate)
+        self.assertIn("/auxpool/trading/runtime/logs/*.log", logrotate)
+        self.assertIn("/auxpool/trading/runtime/data/ai_operator_log.jsonl", logrotate)
         self.assertNotIn("/var/lib/docker/volumes/*trading-logs*/_data/*.log", logrotate)
         self.assertIn("ingestion.stdout.log", logrotate)
         self.assertIn("data/ai_operator_log.jsonl", logrotate)
@@ -353,15 +441,19 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("TS_BACKUP_DOCKER_IMAGE", base_backup)
         self.assertIn("TS_BACKUP_DOCKER_EXEC_CONTAINER", base_backup)
         self.assertIn("TS_BACKUP_READ_GROUP", base_backup)
+        self.assertIn("TS_BASE_BACKUP_OFFSITE_CMD", base_backup)
         self.assertIn('chown -R "${pg_uid_gid%%:*}:${TS_BACKUP_READ_GROUP}" "$work_dir"', base_backup)
         self.assertIn("TS_RESTORE_DOCKER_IMAGE", restore_drill)
+        self.assertTrue((REPO_ROOT / "ops" / "backup" / "offsite_base_backup_stub.sh").exists())
         self.assertTrue((REPO_ROOT / "ops" / "backup" / "accounting.sh").exists())
         accounting = (REPO_ROOT / "ops" / "backup" / "accounting.sh").read_text(encoding="utf-8")
         self.assertIn("backup_accounting", accounting)
         self.assertIn("TRADING_BACKUP_ROOT", accounting)
+        self.assertIn("TS_BACKUP_KEEP_RECENT_COUNT", accounting)
         self.assertIn("docker inspect", accounting)
         self.assertIn("retention_status=configured", accounting)
         self.assertIn("--compose", installer)
+        self.assertIn("offsite_base_backup_stub.sh", installer)
         self.assertIn("install_compose_systemd_overrides", installer)
         self.assertIn("ensure_backup_evidence_hmac_key", installer)
         self.assertIn("normalize_compose_storage_env", installer)
@@ -383,10 +475,18 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("run_compose_archive_selftest", installer)
         self.assertIn("run_compose_wal_catchup", installer)
         self.assertIn("up -d --no-deps --force-recreate timescaledb", installer)
-        self.assertIn('chown -R "${pg_uid}:${TRADING_GROUP}" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"', installer)
+        self.assertIn("load_compose_postgres_identity", installer)
+        self.assertIn('set_env_var TS_BACKUP_WAL_TARGET_OWNER_UID "$COMPOSE_POSTGRES_UID"', installer)
+        self.assertIn('set_env_var TS_BACKUP_WAL_TARGET_GROUP "$TRADING_GROUP"', installer)
+        self.assertIn('set_env_var TS_BACKUP_WAL_TARGET_DIR_MODE "2750"', installer)
+        self.assertIn('chown -R "${COMPOSE_POSTGRES_UID}:${TRADING_GROUP}" "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR"', installer)
         self.assertIn('find "$BACKUP_BASE_DIR" "$BACKUP_WAL_DIR" "$BACKUP_DRILL_DIR" -type f -exec chmod 0640 {} +', installer)
         self.assertIn("set_env_var TS_BACKUP_READ_GROUP", installer)
         self.assertIn("Environment=TS_BACKUP_READ_GROUP=${TRADING_GROUP}", installer)
+        self.assertIn("Environment=TS_BACKUP_WAL_TARGET_OWNER_UID=${COMPOSE_POSTGRES_UID}", installer)
+        self.assertIn("Environment=TS_BACKUP_WAL_TARGET_GROUP=${TRADING_GROUP}", installer)
+        self.assertIn("Environment=TS_BACKUP_WAL_TARGET_DIR_MODE=2750", installer)
+        self.assertIn("Deliberately check-only: backlog drain stays operator-triggered", installer)
         self.assertIn("Environment=TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0", installer)
         self.assertIn("Environment=TS_BACKUP_EVIDENCE_WAL_CATCHUP_TIMEOUT_S=300", installer)
         self.assertIn("Restart=no", installer)

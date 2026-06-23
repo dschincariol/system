@@ -41,10 +41,71 @@ FINRA_SHORT_INTEREST_API_URL = os.environ.get(
 FINRA_REQUEST_TIMEOUT_S = float(os.environ.get("FINRA_REQUEST_TIMEOUT_S", "20"))
 FINRA_SHORT_VOLUME_PUBLISH_HOUR_ET = int(os.environ.get("FINRA_SHORT_VOLUME_PUBLISH_HOUR_ET", "18"))
 FINRA_SHORT_VOLUME_PUBLISH_MINUTE_ET = int(os.environ.get("FINRA_SHORT_VOLUME_PUBLISH_MINUTE_ET", "0"))
+FINRA_HTTP_UA = os.environ.get("FINRA_HTTP_UA", "trading-system/1.0 finra-short-feed")
 
 _EASTERN = ZoneInfo("America/New_York")
 _UTC = timezone.utc
 _KEY_NORMALIZER = re.compile(r"[^a-z0-9]+", re.IGNORECASE)
+
+
+class FinraFeedError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str,
+        status_code: int = 0,
+        retry_after_s: float = 0.0,
+        stop_cycle: bool = False,
+    ) -> None:
+        super().__init__(str(message))
+        self.classification = str(classification)
+        self.status_code = int(status_code or 0)
+        self.retry_after_s = float(retry_after_s or 0.0)
+        self.stop_cycle = bool(stop_cycle)
+
+
+def _retry_after_s(response: Any, default_s: float) -> float:
+    try:
+        raw = str((getattr(response, "headers", {}) or {}).get("Retry-After") or "").strip()
+        if raw:
+            return max(1.0, float(raw))
+    except Exception:
+        return float(default_s)
+    return float(default_s)
+
+
+def _raise_for_finra_status(response: Any, *, provider: str) -> None:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code < 400:
+        return
+    if status_code == 429:
+        retry_after = _retry_after_s(response, 300.0)
+        raise FinraFeedError(
+            f"{provider}_rate_limited status_code=429 retry_after_s={retry_after:.0f}",
+            classification="rate_limited",
+            status_code=status_code,
+            retry_after_s=retry_after,
+            stop_cycle=True,
+        )
+    if status_code == 503:
+        retry_after = _retry_after_s(response, 300.0)
+        raise FinraFeedError(
+            f"{provider}_temporarily_unavailable status_code=503 retry_after_s={retry_after:.0f}",
+            classification="provider_unreachable",
+            status_code=status_code,
+            retry_after_s=retry_after,
+            stop_cycle=True,
+        )
+    if status_code == 401:
+        raise FinraFeedError(f"{provider}_credentials_rejected status_code=401", classification="wrong_credentials", status_code=status_code, stop_cycle=True)
+    if status_code == 403:
+        raise FinraFeedError(f"{provider}_entitlement_missing status_code=403", classification="entitlement_missing", status_code=status_code, stop_cycle=True)
+    raise FinraFeedError(f"{provider}_http_error status_code={status_code}", classification="provider_unreachable", status_code=status_code)
+
+
+def _finra_headers(*, accept: str) -> Dict[str, str]:
+    return {"User-Agent": FINRA_HTTP_UA, "Accept": accept}
 
 
 def utc_now_ms() -> int:
@@ -210,9 +271,13 @@ def short_volume_url(day: date | str) -> str:
 
 def fetch_short_volume_file(day: date | str) -> List[Dict[str, Any]]:
     url = short_volume_url(day)
-    response = requests.get(url, timeout=float(FINRA_REQUEST_TIMEOUT_S))
+    response = requests.get(url, headers=_finra_headers(accept="text/plain,*/*"), timeout=float(FINRA_REQUEST_TIMEOUT_S))
+    _raise_for_finra_status(response, provider="finra_short_volume")
     response.raise_for_status()
-    return parse_short_volume_file(response.text, source_url=url)
+    rows = parse_short_volume_file(response.text, source_url=url)
+    if not rows:
+        raise FinraFeedError("finra_short_volume_empty_payload", classification="empty_payload", status_code=int(getattr(response, "status_code", 0) or 0))
+    return rows
 
 
 def _extract_records(payload: Any) -> List[Dict[str, Any]]:
@@ -327,7 +392,7 @@ def fetch_short_interest_records(
     limit: int = 5000,
     max_pages: int = 20,
 ) -> List[Dict[str, Any]]:
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    headers = {**_finra_headers(accept="application/json"), "Content-Type": "application/json"}
     cleaned_symbols = [_clean_symbol(sym) for sym in list(symbols or []) if _clean_symbol(sym)]
     out: List[Dict[str, Any]] = []
     page_size = max(1, int(limit))
@@ -345,8 +410,12 @@ def fetch_short_interest_records(
         )
         if response.status_code in {404, 405} and offset == 0:
             response = requests.get(FINRA_SHORT_INTEREST_API_URL, headers=headers, timeout=float(FINRA_REQUEST_TIMEOUT_S))
+        _raise_for_finra_status(response, provider="finra_short_interest")
         response.raise_for_status()
-        records = _extract_records(response.json())
+        payload_json = response.json()
+        if not isinstance(payload_json, (dict, list)):
+            raise FinraFeedError("finra_short_interest_malformed_payload", classification="malformed_payload", status_code=int(getattr(response, "status_code", 0) or 0))
+        records = _extract_records(payload_json)
         normalized = [row for row in (normalize_short_interest_record(record) for record in records) if row]
         out.extend(normalized)
         if len(records) < page_size:

@@ -161,6 +161,117 @@ class TelemetryReadRoutingTests(unittest.TestCase):
 
         self.assertEqual(backend, "timescale")
 
+    def test_timescale_reader_reuses_pool_until_dsn_or_schema_changes(self) -> None:
+        self._set_env("TIMESCALE_ENABLED", "1")
+        self._set_env("TIMESCALE_DSN", "postgres://unit-test")
+        self._set_env("TIMESCALE_SCHEMA", "public")
+        self._set_env("TIMESCALE_POOL_MIN_SIZE", "1")
+        self._set_env("TIMESCALE_POOL_MAX_SIZE", "3")
+        self._set_env("TIMESCALE_CONNECT_TIMEOUT_S", "0.2")
+        (router,) = _reload_modules("engine.runtime.telemetry_read_router")
+        created = []
+
+        class FakeCursor:
+            def __init__(self) -> None:
+                self.executed = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return None
+
+            def execute(self, sql, params=None):
+                self.executed.append((str(sql), params))
+
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.cursor_obj = FakeCursor()
+                self.autocommit = False
+                self.closed = False
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        class FakePool:
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = dict(kwargs)
+                self.open_calls = []
+                self.close_calls = []
+                self.getconn_calls = []
+                self.putconn_calls = []
+                self.connection = FakeConnection()
+                created.append(self)
+
+            def open(self, *, wait, timeout):
+                self.open_calls.append((bool(wait), float(timeout)))
+
+            def close(self, *, timeout):
+                self.close_calls.append(float(timeout))
+
+            def getconn(self, *, timeout):
+                self.getconn_calls.append(float(timeout))
+                return self.connection
+
+            def putconn(self, con):
+                self.putconn_calls.append(con)
+
+        with patch.object(router, "psycopg", object()):
+            with patch.object(router, "ConnectionPool", FakePool):
+                real_from_env = router.TimescaleConfig.from_env
+                with patch.object(router.TimescaleConfig, "from_env", side_effect=real_from_env) as from_env_mock:
+                    with router._timescale_connection() as (_con, schema):
+                        self.assertEqual(schema, "public")
+                    with router._timescale_connection() as (_con, schema):
+                        self.assertEqual(schema, "public")
+                    self.assertEqual(from_env_mock.call_count, 1)
+                    self.assertTrue(all(pool_key[0] == "telemetry_read" for pool_key in router._POOLS))
+
+                    self._set_env("TIMESCALE_SCHEMA", "alt")
+                    with router._timescale_connection() as (_con, schema):
+                        self.assertEqual(schema, "alt")
+                    self.assertEqual(from_env_mock.call_count, 2)
+                    self.assertTrue(all(pool_key[0] == "telemetry_read" for pool_key in router._POOLS))
+                    router.close_timescale_read_pool()
+
+        self.assertEqual(len(created), 2)
+        self.assertIn("unit-test", str(created[0].kwargs["conninfo"]))
+        self.assertEqual(created[0].kwargs["min_size"], 1)
+        self.assertEqual(created[0].kwargs["max_size"], 3)
+        self.assertEqual(created[0].open_calls, [(True, 0.2)])
+        self.assertEqual(created[0].getconn_calls, [0.2, 0.2])
+        self.assertEqual(len(created[0].putconn_calls), 2)
+        self.assertEqual(created[0].close_calls, [0.2])
+        self.assertEqual(created[1].getconn_calls, [0.2])
+        self.assertEqual(created[1].close_calls, [0.2])
+
+    def test_telemetry_fetches_use_short_state_cache(self) -> None:
+        self._set_env("TELEMETRY_READ_BACKEND", "sqlite")
+        (router,) = _reload_modules("engine.runtime.telemetry_read_router")
+        calls = {"count": 0}
+
+        def fake_fetch(*, metric, since_ms, limit):
+            calls["count"] += 1
+            return {
+                "ok": True,
+                "metric": metric,
+                "since_ms": since_ms,
+                "rows": [{"ts_ms": calls["count"], "metric": metric}],
+            }
+
+        with patch.object(router, "_fetch_sqlite_runtime_metrics", side_effect=fake_fetch):
+            first = router.fetch_runtime_metrics(metric="unit.cached", since_ms=123, limit=5)
+            second = router.fetch_runtime_metrics(metric="unit.cached", since_ms=123, limit=5)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first, second)
+
     def test_router_sqlite_override_keeps_sqlite_primary(self) -> None:
         self._set_env("TIMESCALE_ENABLED", "1")
         self._set_env("TIMESCALE_DSN", "postgres://unit-test")

@@ -17,6 +17,7 @@ Canonical production-prep procedure for enabling real trading: see [PRODUCTION_C
 - `DISABLE_LIVE_EXECUTION` is explicitly false (`0`, `false`, `no`, or `off`) only after approved live-enablement signoff. Unset, truthy, and unknown non-empty values are treated as enabled and block live execution.
 - `KILL_SWITCH_GLOBAL=1` remains armed for the initial live deployment hold until operator signoff. Real execution still requires audited DB arming through `execution_mode`/`execution_mode_audit`; environment variables must not arm execution. Live preflight recomputes the canonical `execution_mode_audit` row hashes and previous-hash chain before accepting DB arming, and blocks on missing latest signoff rows, missing `prev_hash`, row-hash mismatches, actor/reason/mode/armed tampering, or timestamp order breaks.
 - `RULES_AUTO_RESUME` is unset or `0` unless the deployment has explicitly accepted audited automatic recovery for rules-owned rows. Rules auto-resume never clears operator/manual/emergency/startup/preflight/break-glass holds; those require `POST /api/operator/clear_manual_halt` with `CLEAR_MANUAL_HALT` confirmation, actor, source, acknowledgement, and reason.
+- Boot crash recovery has completed with `runtime_meta.crash_recovery_state.status=ok` for the intended live broker. Any `critical_crash_recovery_*` state blocks live order authority through `/api/execution/barrier`; do not clear the block manually unless broker open orders, recent fills, positions, and pre-live reconciliation continuity have been independently proven and a successful recovery run has written a fresh `ok` state.
 - `DASHBOARD_HOST` is loopback unless remote access is intentional and token-protected. Token-protected remote access includes the same-origin operator bridge: browsers must supply `X-API-Token` for protected `/operator/api/*` reads and mutations, and the dashboard must forward only the server-side `OPERATOR_API_TOKEN` to the sidecar.
 - Alpaca live deployments use `ALPACA_BASE_URL=https://api.alpaca.markets`; the paper endpoint is rejected in live mode. IBKR live deployments set `IBKR_HOST`, `IBKR_PORT`, and `IBKR_CLIENT_ID` explicitly.
 - Live AI safety is explicit: `DECISION_ENGINE_ENABLED=1`, `DECISION_MIN_CONFIDENCE`, `DECISION_MIN_ABS_PREDICTION`, `UNCERTAINTY_SIZING_PRODUCTION_POLICY`, `UNCERTAINTY_HIGH_THRESHOLD`, `UNCERTAINTY_HARD_THRESHOLD`, `UNCERTAINTY_MAX_AGE_MS`, `OOD_SUPPRESS_THRESHOLD`, and `OOD_HARD_THRESHOLD` are set before live sizing. Missing values fail live preflight and block risk-increasing live orders.
@@ -42,6 +43,7 @@ Canonical production-prep procedure for enabling real trading: see [PRODUCTION_C
 - Confirm terminal order, flatten, and rollback actions work in paper mode.
 - Confirm any options intents or hedging overlays remain `execution_target=shadow` or paper-only and never reach a live broker adapter.
 - Confirm kill switch activation blocks execution and recovery stays audited.
+- Confirm `crash_recovery_continuity_proven=1`, `crash_recovery_gap_count=0`, and no active `critical_crash_recovery_*` barrier reason after restart.
 - Confirm automatic rules recovery clears only `actor=rules_engine` rows with matching `meta_json.trigger`; operator/manual rows remain active until the explicit manual clear endpoint is used.
 - Confirm kill-switch cache diagnostics show a fresh bounded snapshot: `cache_fresh=true`, `cache_age_ms <= max_age_ms`, and `source`/`cache_status` present. Stale cache plus unavailable storage must block order flow as `provider_unavailable`, not clear the switch state.
 - Confirm broker reconciliation has no stale or orphan positions.
@@ -50,7 +52,7 @@ Canonical production-prep procedure for enabling real trading: see [PRODUCTION_C
 ## Validation
 
 - `python tools/validate_repo.py`
-- `python tools/validate_dependency_lock.py`
+- `python tools/validate_dependency_lock.py --strict`
 - `python tools/git_worktree_triage.py`
 - Targeted execution-gate, dashboard-route, terminal-order, and storage-policy tests pass.
 

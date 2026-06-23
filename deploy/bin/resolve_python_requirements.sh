@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_DIR="${1:-$(pwd)}"
 PROFILE_RAW="${TRADING_DEPENDENCY_PROFILE:-cpu}"
 OVERRIDE_RAW="${TRADING_REQUIREMENTS_FILE:-}"
+PYTHON_MARKER_BIN="${PYTHON_BIN:-${TRADING_PYTHON_BIN:-${PYTHON:-python}}}"
 
 normalize_profile() {
   printf '%s' "${1:-cpu}" | tr '[:upper:]_' '[:lower:]-'
@@ -34,6 +35,36 @@ validate_amd_rocm_profile_file() {
   fi
 }
 
+validate_amd_rocm_python_runtime() {
+  local python_bin="$PYTHON_MARKER_BIN"
+  if ! command -v "$python_bin" >/dev/null 2>&1; then
+    echo "amd_rocm_python_runtime_unsupported:python_bin=$python_bin:reason=python_not_found" >&2
+    exit 65
+  fi
+  if ! "$python_bin" - <<'PY'
+import platform
+import sys
+
+version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+system = platform.system()
+if system != "Linux":
+    raise SystemExit(
+        "amd_rocm_python_runtime_unsupported:"
+        f"platform={system}:required_platform=Linux:"
+        "reason=rocm_7_2_4_wheels_are_linux_cp312"
+    )
+if sys.version_info[:2] < (3, 12):
+    raise SystemExit(
+        "amd_rocm_python_runtime_unsupported:"
+        f"python={version}:required_python=>=3.12:"
+        "reason=rocm_7_2_4_wheels_are_cp312"
+    )
+PY
+  then
+    exit 65
+  fi
+}
+
 is_amd_rocm_profile() {
   case "$(normalize_profile "$1")" in
     amd|rocm|amd-rocm) return 0 ;;
@@ -56,6 +87,7 @@ if [[ -n "$OVERRIDE_RAW" ]]; then
   fi
   if is_amd_rocm_profile "$PROFILE_RAW" || is_amd_rocm_requirements_file "$resolved"; then
     validate_amd_rocm_profile_file "$resolved"
+    validate_amd_rocm_python_runtime
   fi
   printf '%s\n' "$resolved"
   exit 0
@@ -85,6 +117,7 @@ if [[ ! -f "$resolved" ]]; then
 fi
 if is_amd_rocm_profile "$profile"; then
   validate_amd_rocm_profile_file "$resolved"
+  validate_amd_rocm_python_runtime
 fi
 
 printf '%s\n' "$resolved"

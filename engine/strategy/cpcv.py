@@ -12,6 +12,7 @@ import numpy as np
 
 from engine.backtest.deflated_sharpe import deflated_sharpe_ratio
 from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
+from engine.execution.fx_costs import is_fx_asset_class, normalize_fx_symbol, pip_spread_bps, swap_bps, weekend_gap_bps
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect_ro, init_db, record_backtest_cpcv_run
 from engine.strategy.gated_backtest import run_gated_backtest
@@ -167,6 +168,8 @@ def _default_commission_bps(asset_class: str) -> float:
     if explicit not in (None, ""):
         return max(0.0, _safe_float_env("CPCV_COMMISSION_BPS", 0.0))
     asset = str(asset_class or "").upper().strip()
+    if is_fx_asset_class(asset):
+        return max(0.0, _safe_float_env("CPCV_FX_COMMISSION_BPS", 0.10))
     if "CRYPTO" in asset:
         default = _safe_float_env(
             "CPCV_CRYPTO_COMMISSION_BPS",
@@ -182,17 +185,33 @@ def cpcv_cost_config_from_env(config: Mapping[str, Any] | None = None) -> Dict[s
     asset_class = str(cfg.get("asset_class") or os.environ.get("CPCV_ASSET_CLASS") or "US_EQUITY").strip().upper()
     if not asset_class:
         asset_class = "US_EQUITY"
+    is_fx = is_fx_asset_class(asset_class)
+    fx_symbol = normalize_fx_symbol(str(cfg.get("symbol") or cfg.get("pair") or os.environ.get("CPCV_FX_SYMBOL") or "EUR_USD"))
+    default_half_spread = (
+        float(pip_spread_bps(fx_symbol, half=True))
+        if is_fx
+        else _safe_float_env("CPCV_HALF_SPREAD_BPS", 1.0)
+    )
     sigma_default = _safe_float_env("CPCV_SIGMA_DAILY_BPS", _safe_float_env("CPCV_SIGMA_DAILY", 200.0))
+    fx_nights_raw = cfg.get("nights", _safe_int_env("CPCV_FX_NIGHTS", 1))
+    try:
+        fx_nights = int(fx_nights_raw)
+    except Exception:
+        fx_nights = _safe_int_env("CPCV_FX_NIGHTS", 1)
     out = {
         "enabled": bool(cfg.get("enabled", _safe_bool_env("CPCV_COSTS_ENABLED", True))),
         "asset_class": asset_class,
         "commission_bps": float(cfg.get("commission_bps", _default_commission_bps(asset_class))),
-        "half_spread_bps": float(cfg.get("half_spread_bps", _safe_float_env("CPCV_HALF_SPREAD_BPS", 1.0))),
+        "half_spread_bps": float(cfg.get("half_spread_bps", default_half_spread)),
         "notional": float(cfg.get("notional", _safe_float_env("CPCV_TRADE_NOTIONAL", 100_000.0))),
         "adv": float(cfg.get("adv", _safe_float_env("CPCV_ADV", 10_000_000.0))),
         "sigma_daily": float(cfg.get("sigma_daily", sigma_default)),
         "participation": float(cfg.get("participation", _safe_float_env("CPCV_PARTICIPATION", 0.10))),
     }
+    if is_fx:
+        out["symbol"] = str(fx_symbol or "EUR_USD")
+        out["nights"] = int(max(0, fx_nights))
+        out["crosses_weekend"] = bool(cfg.get("crosses_weekend", _safe_bool_env("CPCV_FX_CROSSES_WEEKEND", False)))
     out["commission_bps"] = max(0.0, float(out["commission_bps"]))
     out["half_spread_bps"] = max(0.0, float(out["half_spread_bps"]))
     out["notional"] = max(0.0, float(out["notional"]))
@@ -233,8 +252,28 @@ def _cost_components_for_turnover(
     commission_bps = max(0.0, float(cost_config.get("commission_bps") or 0.0))
     half_spread_bps = max(0.0, float(cost_config.get("half_spread_bps") or 0.0))
     temporary_bps = max(0.0, float(components.get("temporary_impact_bps") or 0.0))
-    total_bps = float(commission_bps + half_spread_bps + temporary_bps)
-    return {
+    swap_carry_bps = 0.0
+    weekend_gap_cost_bps = 0.0
+    is_fx = is_fx_asset_class(str(cost_config.get("asset_class") or ""))
+    if is_fx:
+        symbol = str(cost_config.get("symbol") or cost_config.get("pair") or "EUR_USD")
+        nights_raw = cost_config.get("nights", 1)
+        try:
+            nights = int(nights_raw)
+        except Exception:
+            nights = 1
+        swap_carry_bps = float(
+            swap_bps(
+                symbol,
+                float(cost_config.get("side_sign") or 1.0),
+                int(max(0, nights)),
+            )
+        )
+        weekend_gap_cost_bps = float(
+            weekend_gap_bps(symbol, crosses_weekend=bool(cost_config.get("crosses_weekend", False)))
+        )
+    total_bps = max(0.0, float(commission_bps + half_spread_bps + temporary_bps + swap_carry_bps + weekend_gap_cost_bps))
+    result = {
         "turnover": float(turnover_f),
         "commission_bps": float(commission_bps),
         "half_spread_bps": float(half_spread_bps),
@@ -243,6 +282,15 @@ def _cost_components_for_turnover(
         "total_cost_bps": float(total_bps),
         "cost_return": float(turnover_f * total_bps / 10000.0),
     }
+    if is_fx:
+        result.update(
+            {
+                "fx_pip_spread_bps": float(pip_spread_bps(str(cost_config.get("symbol") or "EUR_USD"), half=False)),
+                "swap_carry_bps": float(swap_carry_bps),
+                "weekend_gap_bps": float(weekend_gap_cost_bps),
+            }
+        )
+    return result
 
 
 def _apply_transaction_costs_to_returns(
@@ -266,7 +314,10 @@ def _apply_transaction_costs_to_returns(
     previous = float(np.sign(initial_position))
     for idx, position in enumerate(positions):
         turnover = abs(float(position) - float(previous))
-        components = _cost_components_for_turnover(turnover, cost_config=cfg)
+        row_cfg = dict(cfg)
+        if is_fx_asset_class(str(row_cfg.get("asset_class") or "")):
+            row_cfg["side_sign"] = float(position)
+        components = _cost_components_for_turnover(turnover, cost_config=row_cfg)
         cost_return = float(components.get("cost_return") or 0.0)
         adjusted[idx] = float(adjusted[idx]) - float(cost_return)
         turnovers.append(float(turnover))

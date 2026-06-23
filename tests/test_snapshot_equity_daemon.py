@@ -26,10 +26,12 @@ def _reload_modules(*module_names):
 def daemon_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db_path = tmp_path / "snapshot_equity_daemon.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TS_STORAGE_BACKEND", "sqlite")
     monkeypatch.setenv("TIMESCALE_ENABLED", "0")
     monkeypatch.delenv("TIMESCALE_DSN", raising=False)
     monkeypatch.delenv("TIMESCALE_URL", raising=False)
     monkeypatch.delenv("TIMESCALE_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TS_PG_DSN", raising=False)
     monkeypatch.setenv("FEATURE_STORE_ENABLED", "0")
     monkeypatch.setenv("FEATURE_STORE_INIT_ON_STARTUP", "0")
 

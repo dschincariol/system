@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.hardware import resolve_torch_device
 from engine.runtime.logging import get_logger
+from engine.runtime.npu import NPU_BACKEND_NAME, resolve_nlp_backend
 
 LOG = get_logger("engine.data.finbert_sentiment")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -234,9 +235,41 @@ def load_finbert_model(
         return bundle
 
 
+def _try_npu_probabilities(texts: Sequence[str]) -> Optional[List[Dict[str, float]]]:
+    """Opt-in, fail-closed NPU (ONNX/VitisAI) inference path.
+
+    Returns ``None`` to fall back to the torch CPU/ROCm path whenever the NPU is
+    not both explicitly selected AND fully installed, or if NPU scoring errors.
+    The default runtime never reaches the NPU branch.
+    """
+    try:
+        if resolve_nlp_backend().get("backend") != NPU_BACKEND_NAME:
+            return None
+        from engine.data.finbert_onnx_backend import score_texts_onnx
+
+        raw = score_texts_onnx(list(texts))
+    except Exception as exc:
+        _warn_nonfatal("finbert_npu_backend_fallback", exc, once_key="finbert_npu_backend")
+        return None
+    if len(raw) != len(list(texts)):
+        return None
+    normalized: List[Dict[str, float]] = []
+    for row in raw:
+        probs_by_label = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+        for label, value in dict(row or {}).items():
+            key = _label_key(label)
+            if key in probs_by_label:
+                probs_by_label[key] = _round_float(value, 0.0)
+        normalized.append(probs_by_label)
+    return normalized
+
+
 def _probabilities_for_texts(texts: Sequence[str], *, model_name: Optional[str] = None) -> List[Dict[str, float]]:
     if not texts:
         return []
+    npu_rows = _try_npu_probabilities(texts)
+    if npu_rows is not None:
+        return npu_rows
     bundle = load_finbert_model(model_name=model_name)
     torch = bundle["torch"]
     tokenizer = bundle["tokenizer"]

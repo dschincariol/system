@@ -11,7 +11,7 @@ from typing import Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.storage import connect, init_db, run_write_txn
+from engine.runtime.storage import connect, get_active_backend_name, init_db, run_write_txn
 from engine.runtime.state_cache import cache_get, cache_set
 from engine.runtime.metrics import emit_gauge
 from engine.runtime.tracing import trace_event
@@ -153,6 +153,26 @@ def _active_write_txn_connection():
     return None
 
 
+def _read_connection():
+    try:
+        backend_name = str(get_active_backend_name() or "").strip().lower()
+    except Exception as e:
+        _warn_nonfatal("RISK_STATE_BACKEND_NAME_LOOKUP_FAILED", e)
+        backend_name = ""
+    if backend_name == "postgres":
+        return connect(readonly=True, _skip_autoinit=True)
+    return connect(readonly=True)
+
+
+def _is_missing_risk_state_table_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "risk_state" in text and (
+        "undefinedtable" in text
+        or "no such table" in text
+        or "does not exist" in text
+    )
+
+
 def set_state(key: str, value: str):
     from engine.runtime.state_cache import cache_invalidate_namespace
 
@@ -192,14 +212,13 @@ def set_state(key: str, value: str):
 
 
 def get_state(key: str, default: str = "") -> str:
-    init_db()
     key_s = str(key)
     cache_key = _cache_key(key_s)
     cached = cache_get("risk_state", cache_key)
     if cached is not None:
         return str(cached)
 
-    con = connect()
+    con = _read_connection()
     try:
         r = con.execute(
             "SELECT value FROM risk_state WHERE key=?",
@@ -208,6 +227,12 @@ def get_state(key: str, default: str = "") -> str:
         value = str(r[0]) if r else str(default)
         cache_set("risk_state", cache_key, value, ttl_s=3600.0)
         return value
+    except Exception as e:
+        if _is_missing_risk_state_table_error(e):
+            value = str(default)
+            cache_set("risk_state", cache_key, value, ttl_s=3600.0)
+            return value
+        raise
     finally:
         con.close()
 
@@ -217,7 +242,6 @@ def get_state_row(key: str, default: str = "") -> Tuple[str, int]:
     Returns (value, updated_ts_ms).
     Callers that need freshness checks should prefer this over get_state().
     """
-    init_db()
     key_s = str(key)
     cache_key = _cache_key(key_s)
     cached = cache_get("risk_state_row", cache_key)
@@ -227,7 +251,7 @@ def get_state_row(key: str, default: str = "") -> Tuple[str, int]:
         except Exception as e:
             _warn_nonfatal("RISK_STATE_CACHE_ROW_PARSE_FAILED", e, key=key_s)
 
-    con = connect()
+    con = _read_connection()
     try:
         r = con.execute(
             "SELECT value, updated_ts_ms FROM risk_state WHERE key=?",
@@ -241,6 +265,13 @@ def get_state_row(key: str, default: str = "") -> Tuple[str, int]:
         cache_set("risk_state_row", cache_key, out, ttl_s=3600.0)
         cache_set("risk_state", cache_key, out[0], ttl_s=3600.0)
         return out
+    except Exception as e:
+        if _is_missing_risk_state_table_error(e):
+            out = (str(default), 0)
+            cache_set("risk_state_row", cache_key, out, ttl_s=3600.0)
+            cache_set("risk_state", cache_key, out[0], ttl_s=3600.0)
+            return out
+        raise
     finally:
         con.close()
 

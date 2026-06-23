@@ -91,7 +91,7 @@ _LIVE_STREAM = None
 _SHADOW_STREAM = None
 
 # CPU-first runtime defaults. CUDA/NVIDIA behavior is opt-in via explicit env.
-apply_cpu_first_runtime_defaults()
+apply_cpu_first_runtime_defaults(role="inference")
 _TORCH_DEVICE_RESOLUTION = resolve_torch_device(torch, env_var="TORCH_DEVICE")
 _CUDA_RUNTIME_ENABLED = torch_device_is_cuda(torch, _TORCH_DEVICE_RESOLUTION)
 _NVIDIA_TELEMETRY_ENABLED = nvidia_telemetry_enabled(torch)

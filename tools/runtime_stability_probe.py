@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -17,7 +18,23 @@ import psutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 LOG_DIR = ROOT / "var" / "log"
+
+
+def _load_repo_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError as exc:
+        if exc.name == "dotenv":
+            return
+        raise
+    load_dotenv(ROOT / ".env", override=False)
+
+
+_load_repo_dotenv()
+
 DEFAULT_OUT = LOG_DIR / "runtime_stability_probe.ndjson"
 DEFAULT_DB_PATH = Path(os.environ.get("DB_PATH") or str(ROOT / "var" / "db" / "trading.db"))
 DEFAULT_DASHBOARD_URL = str(os.environ.get("PIPELINE_SMOKE_BASE") or "http://127.0.0.1:8000").rstrip("/")
@@ -51,14 +68,10 @@ def _http_json(url: str, timeout: float) -> Tuple[bool, float, object]:
     started = time.time()
     try:
         headers = {"Accept": "application/json"}
-        dashboard_token = str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip()
+        dashboard_token = _dashboard_api_token()
         if dashboard_token:
             headers["X-API-Token"] = dashboard_token
-        operator_token = str(
-            os.environ.get("PIPELINE_SMOKE_OPERATOR_TOKEN")
-            or os.environ.get("OPERATOR_API_TOKEN")
-            or ""
-        ).strip()
+        operator_token = _operator_api_token()
         if operator_token and ":4001/" in str(url):
             headers["X-Operator-Token"] = operator_token
         req = urllib.request.Request(str(url), headers=headers, method="GET")
@@ -70,6 +83,62 @@ def _http_json(url: str, timeout: float) -> Tuple[bool, float, object]:
         sys.stderr.write(f"[runtime_stability_probe] http_json_failed url={url!r}: {type(exc).__name__}: {exc}\n")
         sys.stderr.flush()
         return False, (time.time() - started) * 1000.0, {"error": str(exc)}
+
+
+def _dashboard_api_token() -> str:
+    try:
+        from engine.api.auth_config import dashboard_api_token_from_env
+
+        return dashboard_api_token_from_env()
+    except Exception:
+        return str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip()
+
+
+def _operator_api_token() -> str:
+    direct_token = str(os.environ.get("PIPELINE_SMOKE_OPERATOR_TOKEN") or "").strip()
+    if direct_token:
+        return direct_token
+    operator_token = str(os.environ.get("OPERATOR_API_TOKEN") or "").strip()
+    if operator_token:
+        return operator_token
+    try:
+        from engine.runtime.secret_sources import read_secret_text_from_env
+
+        smoke_token = read_secret_text_from_env(
+            "PIPELINE_SMOKE_OPERATOR_TOKEN",
+            file_envs=("PIPELINE_SMOKE_OPERATOR_TOKEN_FILE",),
+            secret_envs=("PIPELINE_SMOKE_OPERATOR_TOKEN_SECRET",),
+            provider_secret_names=(),
+        )
+        if smoke_token:
+            return str(smoke_token).strip()
+        return read_secret_text_from_env("OPERATOR_API_TOKEN")
+    except Exception:
+        return str(os.environ.get("OPERATOR_API_TOKEN") or "").strip()
+
+
+def _is_operator_bridge_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(str(url))
+    path = parsed.path.rstrip("/")
+    return path == "/operator" or path.startswith("/operator/")
+
+
+def _is_direct_operator_sidecar_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(str(url))
+    return parsed.port == 4001
+
+
+def _operator_probe_has_auth(operator_url: str) -> bool:
+    if _is_operator_bridge_url(operator_url):
+        return bool(_dashboard_api_token())
+    if _is_direct_operator_sidecar_url(operator_url):
+        return bool(_operator_api_token())
+    return bool(_dashboard_api_token() or _operator_api_token())
+
+
+def _arg_supplied(name: str, argv: Iterable[str]) -> bool:
+    prefix = f"{name}="
+    return any(arg == name or arg.startswith(prefix) for arg in argv)
 
 
 def _payload_body(payload: object) -> Dict[str, Any]:
@@ -439,6 +508,7 @@ def main() -> int:
     parser.add_argument("--base-url", default=DEFAULT_DASHBOARD_URL)
     parser.add_argument("--operator-url", default=DEFAULT_OPERATOR_URL)
     parser.add_argument("--skip-operator", action="store_true")
+    parser.add_argument("--require-operator", action="store_true")
     parser.add_argument("--launch-command", default="")
     parser.add_argument("--launch-cwd", default=str(ROOT))
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH))
@@ -475,6 +545,35 @@ def main() -> int:
             pass
 
     operator_url = None if args.skip_operator else str(args.operator_url)
+    operator_configured = bool(str(os.environ.get("PIPELINE_SMOKE_OPERATOR_BASE") or "").strip()) or _arg_supplied(
+        "--operator-url",
+        sys.argv[1:],
+    )
+    operator_requested = bool(args.require_operator or operator_configured)
+    if operator_url and not _operator_probe_has_auth(operator_url):
+        if args.require_operator or operator_configured:
+            sys.stderr.write(
+                "[runtime_stability_probe] operator_probe_auth_missing "
+                f"url={operator_url!r}; set DASHBOARD_API_TOKEN for the dashboard bridge "
+                "or PIPELINE_SMOKE_OPERATOR_TOKEN/OPERATOR_API_TOKEN for the direct sidecar\n"
+            )
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(
+                "[runtime_stability_probe] operator_probe_skipped reason=missing_auth "
+                f"url={operator_url!r}; use --require-operator with DASHBOARD_API_TOKEN "
+                "or PIPELINE_SMOKE_OPERATOR_TOKEN/OPERATOR_API_TOKEN to make this a hard check\n"
+            )
+            sys.stderr.flush()
+            operator_url = None
+    elif operator_url and not operator_requested:
+        sys.stderr.write(
+            "[runtime_stability_probe] operator_probe_skipped reason=not_required "
+            f"url={operator_url!r}; use --require-operator or set PIPELINE_SMOKE_OPERATOR_BASE "
+            "to make this a hard check\n"
+        )
+        sys.stderr.flush()
+        operator_url = None
     if not _wait_for_runtime(str(args.base_url), float(args.warmup_s), operator_url=operator_url):
         if launched_proc is not None and launched_proc.poll() is not None:
             return int(launched_proc.returncode or 1) or 1

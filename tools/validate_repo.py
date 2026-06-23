@@ -234,10 +234,7 @@ def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
     run_env = dict(env)
     _scrub_local_runtime_external_service_env(run_env)
     _scrub_unit_test_secret_env(run_env)
-    test_tmp_root = Path(
-        run_env.get("TRADING_TEST_TMPDIR")
-        or (Path("/var/tmp") / f"trading-system-tests-{os.getuid()}" / "pytest")
-    )
+    test_tmp_root = Path(run_env.get("TRADING_TEST_TMPDIR") or _default_validation_test_tmp_root())
     if not test_tmp_root.is_absolute():
         test_tmp_root = ROOT / test_tmp_root
     test_tmp_root.mkdir(parents=True, exist_ok=True)
@@ -310,6 +307,10 @@ def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
     ):
         run_env.pop(key, None)
     return run_env
+
+
+def _default_validation_test_tmp_root() -> Path:
+    return Path("/var/tmp") / f"trading-system-tests-{os.getuid()}" / "pytest" / f"validate-repo-{os.getpid()}"
 
 
 def _telemetry_dual_write_burnin_required(env: dict[str, str]) -> bool:
@@ -465,10 +466,11 @@ def main(argv: list[str] | None = None) -> int:
     checks: list[tuple[str, list[str]]] = [
         ("repo-artifact-hygiene", [python, "tools/check_repo_artifact_hygiene.py"]),
         ("syntax", [python, "tools/syntax_check_workspace.py"]),
+        ("pyright-money-path", [python, "tools/pyright_money_path_gate.py"]),
         ("ruff-static-release-gate", [python, "-m", "ruff", "check", "engine/", "routes/", "services/", "tests/"]),
         ("docs", [python, "tools/validate_docs.py"]),
         ("ui-asset-refs", [python, "tools/check_local_asset_refs.py"]),
-        ("dependency-lock", [python, "tools/validate_dependency_lock.py"]),
+        ("dependency-lock", [python, "tools/validate_dependency_lock.py", "--strict"]),
         ("noop-guard", [python, "tools/noop_guard.py"]),
         ("storage-route-audit", [python, "tools/storage_route_audit.py"]),
         ("runtime-graph-startup", [python, "tools/runtime_graph_check.py", "--mode", "startup"]),

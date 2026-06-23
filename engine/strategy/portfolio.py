@@ -48,6 +48,11 @@ from engine.risk.monte_carlo_risk_engine import request_monte_carlo_refresh
 from engine.runtime.risk_state import get_state
 from engine.runtime.factor_universe import _get_feature_asof as _get_factor_feature_asof
 from engine.strategy.model_intent import is_canonical_model_intent
+from engine.strategy import portfolio_constraints as _portfolio_constraints
+from engine.strategy import portfolio_normalization as _portfolio_normalization
+from engine.strategy import portfolio_orders as _portfolio_orders
+from engine.strategy import portfolio_signals as _portfolio_signals
+from engine.strategy import portfolio_targets as _portfolio_targets
 
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -441,7 +446,7 @@ def _apply_portfolio_db_schema(con) -> None:
         "CREATE INDEX IF NOT EXISTS idx_portfolio_orders_source_alert_prediction_ts ON portfolio_orders(source_alert_id, prediction_id, ts_ms)"
     )
     con.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_portfolio_orders_id_source_prediction_lineage ON portfolio_orders(id, source_alert_id, prediction_id)"
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_portfolio_orders_id_source_prediction_lineage ON portfolio_orders(id, source_alert_id, prediction_id, ts_ms)"
     )
     _backfill_portfolio_order_prediction_ids(con)
 
@@ -584,16 +589,11 @@ def apply_max_position_constraint(
     max_positions: int | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Keep the live max-position rule reusable for gated backtests."""
-    desired_map = dict(desired or {})
-    eff_max_pos = int(_eff_max_positions() if max_positions is None else max_positions)
-    if eff_max_pos >= 0 and len(desired_map) > int(eff_max_pos):
-        items = sorted(
-            desired_map.items(),
-            key=lambda kv: abs(float((kv[1] or {}).get("weight", 0.0))),
-            reverse=True,
-        )
-        desired_map = dict(items[: int(eff_max_pos)])
-    return desired_map
+    return _portfolio_constraints.apply_max_position_constraint(
+        desired,
+        max_positions=max_positions,
+        eff_max_positions_fn=_eff_max_positions,
+    )
 
 
 def _eff_gross_cap() -> float:
@@ -1143,64 +1143,27 @@ def _now_ms() -> int:
 
 
 def _normalize_model_id(model_id: Any) -> str:
-    mid = str(model_id or "").strip()
-    return mid or "baseline"
+    return _portfolio_normalization.normalize_model_id(model_id)
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(float(lo), min(float(hi), float(x)))
+    return _portfolio_normalization.clamp(x, lo, hi)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        out = float(value)
-    except Exception as e:
-        _warn_nonfatal(
-            "PORTFOLIO_SAFE_FLOAT_FAILED",
-            e,
-            once_key="safe_float_failed",
-            value_type=type(value).__name__,
-        )
-        fallback = float(default)
-        return fallback
-    return float(out) if math.isfinite(out) else float(default)
+    return _portfolio_normalization.safe_float(value, default, warn_nonfatal=_warn_nonfatal)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    if value in (None, ""):
-        return int(default)
-    try:
-        return int(value)
-    except Exception as e:
-        _warn_nonfatal(
-            "PORTFOLIO_SAFE_INT_FAILED",
-            e,
-            once_key=f"safe_int:{type(value).__name__}:{str(value)[:64]}",
-            value_type=type(value).__name__,
-        )
-        return int(default)
+    return _portfolio_normalization.safe_int(value, default, warn_nonfatal=_warn_nonfatal)
 
 
 def _dict_str_any(value: Any) -> Dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    out: Dict[str, Any] = {}
-    for key, item in value.items():
-        out[str(key)] = item
-    return out
+    return _portfolio_normalization.dict_str_any(value)
 
 
 def _signed_weight(row: Optional[Dict[str, Any]]) -> float:
-    row = row or {}
-    w = _safe_float(row.get("weight", 0.0), 0.0)
-    side = str(row.get("side", "") or "").upper().strip()
-    if side == "SHORT":
-        return -abs(float(w))
-    if side == "LONG":
-        return abs(float(w))
-    if side == "FLAT":
-        return 0.0
-    return float(w)
+    return _portfolio_normalization.signed_weight(row, safe_float_fn=_safe_float)
 
 
 def _corr_lookup_factory(con, lookback: int):
@@ -1251,21 +1214,11 @@ def _collect_position_items(desired: Dict[str, Dict[str, Any]]) -> List[Dict[str
 
 
 def _ensure_reason_dict(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    row = target or {}
-    reason = row.get("reason")
-    if isinstance(reason, dict):
-        return reason
-    row["reason"] = {"raw": reason} if reason not in (None, "") else {}
-    return row["reason"]
+    return _portfolio_normalization.ensure_reason_dict(target)
 
 
 def _normalize_nonnegative_weights(weights: List[float]) -> List[float]:
-    cleaned = [max(0.0, _safe_float(weight, 0.0)) for weight in (weights or [])]
-    total = sum(cleaned)
-    if total <= 1e-12:
-        n = len(cleaned)
-        return [1.0 / float(n) for _ in range(n)] if n > 0 else []
-    return [float(weight) / float(total) for weight in cleaned]
+    return _portfolio_normalization.normalize_nonnegative_weights(weights, safe_float_fn=_safe_float)
 
 
 def _sample_variance(xs: List[float]) -> Optional[float]:
@@ -1621,45 +1574,13 @@ def _build_covariance_matrix_from_returns(returns, corr_matrix: List[List[float]
 
 
 def _apply_weight_caps(raw_weights: List[float], caps: List[float], target_total: float) -> List[float]:
-    n = len(raw_weights or [])
-    if n <= 0:
-        return []
-
-    target_left = max(0.0, float(target_total))
-    normalized = _normalize_nonnegative_weights(list(raw_weights or []))
-    out = [0.0 for _ in range(n)]
-    remaining = {idx for idx in range(n)}
-    safe_caps = [max(0.0, _safe_float(cap, 0.0)) for cap in caps]
-
-    while remaining and target_left > 1e-12:
-        remaining_total = sum(float(normalized[idx]) for idx in remaining)
-        if remaining_total <= 1e-12:
-            equal_share = float(target_left) / float(len(remaining))
-            for idx in list(remaining):
-                out[idx] += min(float(safe_caps[idx]), float(equal_share))
-            break
-
-        clipped: List[int] = []
-        assigned = 0.0
-        for idx in list(remaining):
-            desired = float(target_left) * (float(normalized[idx]) / float(remaining_total))
-            cap = float(safe_caps[idx])
-            if desired >= cap - 1e-12:
-                out[idx] += float(cap)
-                assigned += float(cap)
-                clipped.append(int(idx))
-
-        if not clipped:
-            for idx in list(remaining):
-                desired = float(target_left) * (float(normalized[idx]) / float(remaining_total))
-                out[idx] += min(float(safe_caps[idx]), float(desired))
-            break
-
-        target_left = max(0.0, float(target_left) - float(assigned))
-        for idx in clipped:
-            remaining.discard(int(idx))
-
-    return [float(weight) for weight in out]
+    return _portfolio_constraints.apply_weight_caps(
+        raw_weights,
+        caps,
+        target_total,
+        normalize_nonnegative_weights_fn=_normalize_nonnegative_weights,
+        safe_float_fn=_safe_float,
+    )
 
 
 def _allocate_hrp_side(
@@ -2507,20 +2428,12 @@ def _stress_factor_from_vix_z(z: float) -> float:
 
 
 def _symbol_cap(symbol: str) -> float:
-    # symbol-specific cap if provided, else global cap
-    if symbol in PORTFOLIO_SYMBOL_CAPS:
-        try:
-            return float(PORTFOLIO_SYMBOL_CAPS[symbol])
-        except Exception as e:
-            _warn_nonfatal(
-                "PORTFOLIO_SYMBOL_CAP_FAILED",
-                e,
-                once_key=f"symbol_cap:{symbol}",
-                symbol=str(symbol),
-            )
-            fallback_cap = float(PORTFOLIO_MAX_W_PER_SYMBOL)
-            return fallback_cap
-    return float(PORTFOLIO_MAX_W_PER_SYMBOL)
+    return _portfolio_constraints.symbol_cap(
+        symbol,
+        symbol_caps=PORTFOLIO_SYMBOL_CAPS,
+        max_weight_per_symbol=PORTFOLIO_MAX_W_PER_SYMBOL,
+        warn_nonfatal=_warn_nonfatal,
+    )
 
 
 def _last_price_age_s(con, symbol: str, now_ms: int) -> Optional[float]:
@@ -2687,297 +2600,77 @@ SHADOW_PROMOTION_MIN_RUNS = int(os.environ.get("SHADOW_PROMOTION_MIN_RUNS", "30"
 # =========================
 
 def _novelty_from_explain(explain_json: str) -> float:
-    try:
-        x = json.loads(explain_json or "{}")
-        meta = x.get("event_meta") if isinstance(x, dict) else None
-        if not isinstance(meta, dict):
-            return 0.0
-        v = float(meta.get("novelty", 0.0))
-        if v != v:
-            return 0.0
-        return max(0.0, min(1.0, v))
-    except Exception as e:
-        _warn_nonfatal("PORTFOLIO_EXPLAIN_NOVELTY_FAILED", e, once_key="explain_novelty")
-        novelty = 0.0
-        return novelty
+    return _portfolio_signals.novelty_from_explain(explain_json, warn_nonfatal=_warn_nonfatal)
 
 
 def _safe_json_obj(raw: Any) -> Dict[str, Any]:
-    if isinstance(raw, dict):
-        return dict(raw)
-    if not isinstance(raw, str):
-        return {}
-    try:
-        parsed = json.loads(raw or "{}")
-    except Exception as e:
-        _warn_nonfatal(
-            "PORTFOLIO_SAFE_JSON_OBJ_FAILED",
-            e,
-            once_key="safe_json_obj",
-            raw_type=type(raw).__name__,
-        )
-        fallback_obj: Dict[str, Any] = {}
-        return fallback_obj
-    return dict(parsed) if isinstance(parsed, dict) else {}
+    return _portfolio_signals.safe_json_obj(raw, warn_nonfatal=_warn_nonfatal)
 
 
 def _coerce_bool(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return bool(value)
-    s = str(value).strip().lower()
-    if s in ("1", "true", "yes", "y", "on", "enter", "trade", "buy", "sell", "long", "short"):
-        return True
-    if s in ("0", "false", "no", "n", "off", "hold", "flat", "skip", "none"):
-        return False
-    return None
+    return _portfolio_signals.coerce_bool(value)
 
 
 def _coerce_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        out = float(value)
-    except Exception as e:
-        _warn_nonfatal(
-            "PORTFOLIO_COERCE_FLOAT_FAILED",
-            e,
-            once_key="coerce_float_failed",
-            value_type=type(value).__name__,
-        )
-        coerced = None
-        return coerced
-    return out if math.isfinite(out) else None
+    return _portfolio_signals.coerce_float(value, warn_nonfatal=_warn_nonfatal)
 
 
 def _intent_container_candidates(explain: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not isinstance(explain, dict):
-        return []
-    out: List[Dict[str, Any]] = []
-    canonical = explain.get("model_intent")
-    if is_canonical_model_intent(canonical):
-        return [_dict_str_any(canonical)]
-    keys = (
-        "model_intent",
-        "model_output",
-        "portfolio_decision",
-        "trade_decision",
-        "decision",
-        "signal",
-        "strategy_output",
-        "portfolio",
-        "execution",
+    return _portfolio_signals.intent_container_candidates(
+        explain,
+        is_canonical_model_intent_fn=is_canonical_model_intent,
+        dict_str_any_fn=_dict_str_any,
     )
-    for key in keys:
-        val = explain.get(key)
-        if isinstance(val, dict):
-            out.append(dict(val))
-    direct_keys = {
-        "should_trade",
-        "trade",
-        "action",
-        "target_weight",
-        "portfolio_weight",
-        "position_size",
-        "size_mult",
-        "selection_score",
-        "trade_score",
-        "include_in_universe",
-        "universe_score",
-        "selected_features",
-        "features_used",
-    }
-    if any(k in explain for k in direct_keys):
-        out.append(dict(explain))
-    return out
 
 
 def _extract_model_intent_from_explain(explain_json: str) -> Dict[str, Any]:
-    explain = _safe_json_obj(explain_json)
-    canonical = explain.get("model_intent")
-    if is_canonical_model_intent(canonical):
-        return _dict_str_any(canonical)
-    intent: Dict[str, Any] = {}
-
-    for container in _intent_container_candidates(explain):
-        if not isinstance(container, dict):
-            continue
-
-        for key in ("selection_score", "trade_score", "score", "prediction_strength", "priority", "rank_score"):
-            val = _coerce_float(container.get(key))
-            if val is not None:
-                intent["score"] = float(val)
-                break
-
-        for key in ("target_weight", "portfolio_weight", "target_exposure", "notional_frac", "size", "position_size"):
-            val = _coerce_float(container.get(key))
-            if val is not None:
-                intent["target_weight"] = float(val)
-                break
-
-        for key in ("size_mult", "size_factor", "allocation_multiplier", "weight_multiplier"):
-            val = _coerce_float(container.get(key))
-            if val is not None:
-                intent["size_mult"] = float(val)
-                break
-
-        for key in ("confidence", "signal_confidence", "trade_confidence", "probability"):
-            val = _coerce_float(container.get(key))
-            if val is not None:
-                intent["confidence"] = float(val)
-                break
-
-        for key in ("prediction_strength", "signal_strength", "strength"):
-            val = _coerce_float(container.get(key))
-            if val is not None:
-                intent["prediction_strength"] = float(val)
-                intent.setdefault("score", float(val))
-                break
-
-        for key in ("expected_z", "predicted_z", "signal_z"):
-            val = _coerce_float(container.get(key))
-            if val is not None:
-                intent["expected_z"] = float(val)
-                break
-
-        for key in ("side", "direction", "action"):
-            raw = container.get(key)
-            if raw is None:
-                continue
-            side = str(raw).strip().upper()
-            if side in ("BUY", "LONG"):
-                intent["side"] = "LONG"
-                break
-            if side in ("SELL", "SHORT"):
-                intent["side"] = "SHORT"
-                break
-            if side in ("FLAT", "HOLD", "SKIP", "NONE"):
-                intent["side"] = "FLAT"
-                break
-
-        for key in ("should_trade", "trade", "enter", "allow_trade"):
-            val = _coerce_bool(container.get(key))
-            if val is not None:
-                intent["should_trade"] = bool(val)
-                break
-
-        for key in ("timing", "entry_timing", "trade_timing", "when"):
-            raw = container.get(key)
-            if raw is None:
-                continue
-            timing = str(raw).strip().lower()
-            if timing:
-                intent["timing"] = timing
-                break
-
-        for key in ("selected_features", "features_used", "feature_ids", "feature_set"):
-            raw = container.get(key)
-            if isinstance(raw, list):
-                feats = [str(v).strip() for v in raw if str(v or "").strip()]
-                if feats:
-                    intent["selected_features"] = feats
-                    break
-
-        for key in ("include_in_universe", "universe_include", "promote_symbol"):
-            val = _coerce_bool(container.get(key))
-            if val is not None:
-                intent["include_in_universe"] = bool(val)
-                break
-
-        for key in ("universe_score", "universe_rank", "rank"):
-            val = _coerce_float(container.get(key))
-            if val is not None:
-                intent["universe_score"] = float(val)
-                break
-
-    return intent
-
+    return _portfolio_signals.extract_model_intent_from_explain(
+        explain_json,
+        safe_json_obj_fn=_safe_json_obj,
+        intent_container_candidates_fn=_intent_container_candidates,
+        is_canonical_model_intent_fn=is_canonical_model_intent,
+        dict_str_any_fn=_dict_str_any,
+        coerce_float_fn=_coerce_float,
+        coerce_bool_fn=_coerce_bool,
+    )
 
 def _has_explicit_model_trade_intent(intent: Optional[Dict[str, Any]]) -> bool:
-    intent = intent or {}
-    return any(
-        key in intent
-        for key in ("should_trade", "target_weight", "score", "side", "timing", "selected_features")
-    )
+    return _portfolio_signals.has_explicit_model_trade_intent(intent)
 
 
 def _has_canonical_model_trade_intent(intent: Optional[Dict[str, Any]]) -> bool:
-    return is_canonical_model_intent(intent) and _has_explicit_model_trade_intent(intent)
+    return _portfolio_signals.has_canonical_model_trade_intent(
+        intent,
+        is_canonical_model_intent_fn=is_canonical_model_intent,
+        has_explicit_model_trade_intent_fn=_has_explicit_model_trade_intent,
+    )
 
 
 def _model_intent_allows_symbol(intent: Optional[Dict[str, Any]]) -> bool:
-    intent = intent or {}
-    if bool(intent.get("include_in_universe")):
-        return True
-    if _coerce_float(intent.get("universe_score")) is not None:
-        return True
-    if bool(intent.get("should_trade")):
-        return True
-    if _coerce_float(intent.get("target_weight")) is not None:
-        return True
-    return False
+    return _portfolio_signals.model_intent_allows_symbol(intent, coerce_float_fn=_coerce_float)
 
 
 def _alert_effective_signal(a: Dict[str, Any]) -> Tuple[float, float]:
-    intent = (a or {}).get("_model_intent")
-    z = _coerce_float((intent or {}).get("expected_z"))
-    c = _coerce_float((intent or {}).get("confidence"))
-    if z is None:
-        z = _coerce_float((a or {}).get("expected_z"))
-    if c is None:
-        c = _coerce_float((a or {}).get("confidence"))
-    return float(z or 0.0), float(c or 0.0)
+    return _portfolio_signals.alert_effective_signal(a, coerce_float_fn=_coerce_float)
 
 
 def _model_intent_trade_allowed(a: Dict[str, Any]) -> bool:
-    intent = ((a or {}).get("_model_intent") or {})
-    should_trade = _coerce_bool(intent.get("should_trade"))
-    if should_trade is False:
-        return False
-    timing = str(intent.get("timing") or "").strip().lower()
-    if timing in ("hold", "skip", "wait", "defer", "flat"):
-        return False
-    side = str(intent.get("side") or "").strip().upper()
-    if side == "FLAT":
-        return False
-    return True
+    return _portfolio_signals.model_intent_trade_allowed(a, coerce_bool_fn=_coerce_bool)
 
 
 def _score_from_alert(z: float, conf: float, severity: str, explain_json: str) -> float:
-    # core score: abs(z)*conf
-    # small severity bump (already gated by rules)
-    s = abs(float(z)) * float(conf)
-    sev = (severity or "").upper()
-    if sev == "CRIT":
-        s *= 1.15
-    elif sev == "HIGH":
-        s *= 1.08
-
-    novelty = _novelty_from_explain(explain_json)
-    s *= (1.0 + float(PORTFOLIO_NOVELTY_ALPHA) * float(novelty))
-    return float(s)
+    return _portfolio_signals.score_from_alert(
+        z,
+        conf,
+        severity,
+        explain_json,
+        novelty_alpha=PORTFOLIO_NOVELTY_ALPHA,
+        novelty_from_explain_fn=_novelty_from_explain,
+    )
 
 
 def _tradability_from_explain(explain_json: str) -> Dict[str, float]:
-    try:
-        ex = json.loads(explain_json or "{}")
-        tr = ex.get("tradability") or {}
-        return {
-            "expected_ret_net": float(tr.get("expected_ret_net", 0.0)),
-            "p_win": float(tr.get("p_win", 0.5)),
-            "expected_dd": float(tr.get("expected_dd", 0.0)),
-        }
-    except Exception as e:
-        _warn_nonfatal("PORTFOLIO_TRADABILITY_PARSE_FAILED", e, once_key="tradability_from_explain")
-        tradability = {
-            "expected_ret_net": 0.0,
-            "p_win": 0.5,
-            "expected_dd": 0.0,
-        }
-        return tradability
+    return _portfolio_signals.tradability_from_explain(explain_json, warn_nonfatal=_warn_nonfatal)
 
 
 def _black_litterman_reason_from_target(tgt: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3288,72 +2981,40 @@ def _is_price_fresh(con, symbol: str, now_ms: int) -> bool:
 
 
 def _desired_weight(score: float, symbol: str) -> float:
-    # weight proportional to score, capped by symbol cap and gross cap later
-    w = (float(score) / float(PORTFOLIO_SCORE_NORM)) * float(PORTFOLIO_GROSS_CAP)
-    w = _clamp(w, 0.0, _symbol_cap(symbol))
-    return float(w)
+    return _portfolio_targets.desired_weight(
+        score,
+        symbol,
+        score_norm=PORTFOLIO_SCORE_NORM,
+        gross_cap=PORTFOLIO_GROSS_CAP,
+        symbol_cap_fn=_symbol_cap,
+        clamp_fn=_clamp,
+    )
 
 
 def _resolve_desired_weight(alert: Dict[str, Any], score: float, symbol: str) -> float:
-    intent = ((alert or {}).get("_model_intent") or {})
-    target_weight = _coerce_float(intent.get("target_weight"))
-    size_mult = _coerce_float(intent.get("size_mult"))
-
-    if target_weight is not None:
-        w = abs(float(target_weight))
-    else:
-        w = _desired_weight(score, symbol)
-
-    if size_mult is not None:
-        w = float(w) * max(0.0, float(size_mult))
-
-    w = _clamp(w, 0.0, _symbol_cap(symbol))
-    return float(w)
+    return _portfolio_targets.resolve_desired_weight(
+        alert,
+        score,
+        symbol,
+        coerce_float_fn=_coerce_float,
+        desired_weight_fn=_desired_weight,
+        symbol_cap_fn=_symbol_cap,
+        clamp_fn=_clamp,
+    )
 
 
 def _strategy_candidate_limit(alerts: List[Dict], default_limit: int) -> int:
-    default_n = max(1, int(default_limit or 1))
-    canonical_count = 0
-    for alert in alerts or []:
-        intent = (alert or {}).get("_model_intent")
-        if not _has_canonical_model_trade_intent(intent):
-            continue
-        if not _model_intent_trade_allowed(alert):
-            continue
-        canonical_count += 1
-
-    if canonical_count <= 0:
-        return int(default_n)
-
-    explicit_cap = int(PORTFOLIO_MODEL_INTENT_MAX_POSITIONS)
-    if explicit_cap > 0:
-        return max(1, min(int(canonical_count), explicit_cap))
-    return max(int(default_n), int(canonical_count))
+    return _portfolio_signals.strategy_candidate_limit(
+        alerts,
+        default_limit,
+        model_intent_max_positions=PORTFOLIO_MODEL_INTENT_MAX_POSITIONS,
+        has_canonical_model_trade_intent_fn=_has_canonical_model_trade_intent,
+        model_intent_trade_allowed_fn=_model_intent_trade_allowed,
+    )
 
 
 def _merge_model_intent_reason(reason: Dict[str, Any], alert: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(reason or {})
-    intent = ((alert or {}).get("_model_intent") or {})
-    if not intent:
-        return out
-    out["model_intent"] = dict(intent)
-    if intent.get("selected_features"):
-        out["selected_features"] = list(intent.get("selected_features") or [])
-    if intent.get("timing"):
-        out["trade_timing"] = str(intent.get("timing"))
-    if intent.get("target_weight") is not None:
-        out["model_target_weight"] = _safe_float(intent.get("target_weight"))
-    if intent.get("size_mult") is not None:
-        out["model_size_mult"] = _safe_float(intent.get("size_mult"))
-    if intent.get("score") is not None:
-        out["model_score"] = _safe_float(intent.get("score"))
-    if intent.get("prediction_strength") is not None:
-        out["prediction_strength"] = _safe_float(intent.get("prediction_strength"))
-    if intent.get("include_in_universe") is not None:
-        out["model_universe_include"] = bool(intent.get("include_in_universe"))
-    if intent.get("universe_score") is not None:
-        out["model_universe_score"] = _safe_float(intent.get("universe_score"))
-    return out
+    return _portfolio_signals.merge_model_intent_reason(reason, alert, safe_float_fn=_safe_float)
 
 
 def _conformal_size_multiplier_from_reason(reason: Dict[str, Any]) -> Optional[float]:
@@ -3607,18 +3268,11 @@ def _expire_stale_unconsumed_alerts(con, now_ms: int, lookback_s: int) -> int:
 
 
 def _selected_alert_ids_from_desired(desired: Dict[str, Dict[str, Any]]) -> List[int]:
-    out = set()
-    for tgt in (desired or {}).values():
-        if not isinstance(tgt, dict):
-            continue
-        side = str(tgt.get("side") or "FLAT").upper().strip()
-        weight = abs(_safe_float(tgt.get("weight", 0.0), 0.0))
-        if side not in {"LONG", "SHORT"} or weight <= 0.0:
-            continue
-        alert_id = _safe_int(tgt.get("source_alert_id"), 0)
-        if alert_id > 0:
-            out.add(int(alert_id))
-    return sorted(out)
+    return _portfolio_orders.selected_alert_ids_from_desired(
+        desired,
+        safe_float_fn=_safe_float,
+        safe_int_fn=_safe_int,
+    )
 
 
 def _pick_best_per_symbol(alerts: List[Dict]) -> Dict[str, Dict]:
@@ -3626,55 +3280,17 @@ def _pick_best_per_symbol(alerts: List[Dict]) -> Dict[str, Dict]:
     Choose best candidate per symbol across horizons.
     Criteria: max score (abs(z)*conf with severity bump).
     """
-    best = {}
-    for a in alerts:
-        if not _model_intent_trade_allowed(a):
-            continue
-        sym = a["symbol"]
-        z, conf = _alert_effective_signal(a)
-        model_intent = (a.get("_model_intent") or {})
-        if conf < _eff_min_conf():
-            continue
-        explicit_trade_intent = _has_explicit_model_trade_intent(model_intent)
-        if (not explicit_trade_intent) and abs(z) < _eff_min_abs_z():
-            continue
-
-        model_score = _coerce_float(model_intent.get("score"))
-        if model_score is not None:
-            base_score = float(model_score)
-        else:
-            # Base score from signal strength
-            base_score = _score_from_alert(z, conf, str(a.get("severity") or ""), str(a.get("explain_json") or "{}"))
-
-        # Tradability adjustment (from explain_json)
-        tr = _tradability_from_explain(a.get("explain_json", "{}"))
-        net = float(tr.get("expected_ret_net", 0.0))
-        pwin = float(tr.get("p_win", 0.5))
-        dd = float(tr.get("expected_dd", 0.0))
-
-        # Penalize negative expectancy, reward positive
-        tradability_mult = 1.0
-        if net < 0.0:
-            tradability_mult *= 0.5
-        else:
-            tradability_mult *= (1.0 + min(0.5, net * 10.0))
-
-        # Modest p(win) influence (kept conservative)
-        tradability_mult *= (0.75 + 0.5 * max(0.0, min(1.0, pwin)))
-
-        # Drawdown penalty (soft)
-        tradability_mult *= (1.0 / (1.0 + dd * 10.0))
-
-        score = base_score * tradability_mult
-        cur = best.get(sym)
-        if (cur is None) or (score > float(cur.get("_score", 0.0))):
-            b = dict(a)
-            b["expected_z"] = float(z)
-            b["confidence"] = float(conf)
-            b["_score"] = float(score)
-            best[sym] = b
-    return best
-
+    return _portfolio_signals.pick_best_per_symbol(
+        alerts,
+        model_intent_trade_allowed_fn=_model_intent_trade_allowed,
+        alert_effective_signal_fn=_alert_effective_signal,
+        eff_min_conf_fn=_eff_min_conf,
+        eff_min_abs_z_fn=_eff_min_abs_z,
+        has_explicit_model_trade_intent_fn=_has_explicit_model_trade_intent,
+        coerce_float_fn=_coerce_float,
+        score_from_alert_fn=_score_from_alert,
+        tradability_from_explain_fn=_tradability_from_explain,
+    )
 
 def _apply_temporal_dampener(con, desired: Dict[str, Dict], now_ms: int) -> Dict[str, Dict]:
     """
@@ -4728,15 +4344,7 @@ def _portfolio_flip_lambda() -> float:
 
 
 def _side_signed_weight(side: Any, weight: Any) -> float:
-    side_s = str(side or "").strip().upper()
-    magnitude = abs(float(_safe_float(weight, 0.0)))
-    if magnitude <= 1e-12 or side_s in {"", "FLAT", "NONE"}:
-        return 0.0
-    if side_s == "SHORT":
-        return -magnitude
-    if side_s == "LONG":
-        return magnitude
-    return float(_safe_float(weight, 0.0))
+    return _portfolio_normalization.side_signed_weight(side, weight, safe_float_fn=_safe_float)
 
 
 def _apply_flip_flop_penalty(
@@ -4744,65 +4352,18 @@ def _apply_flip_flop_penalty(
     desired: Dict[str, Dict],
     state: Dict[str, Dict],
 ) -> Tuple[Dict[str, Dict], Dict[str, Any]]:
-    lambda_flip = _portfolio_flip_lambda()
-    normalized_state: Dict[str, Dict] = {}
-    for prev in (state or {}).values():
-        if not isinstance(prev, dict):
-            continue
-        prev_key = f"{_normalize_model_id(prev.get('model_id'))}:{str(prev.get('symbol') or '').strip().upper()}"
-        normalized_state[prev_key] = prev
-
-    flips: List[Dict[str, Any]] = []
-    total_delta = 0.0
-    for item_key, tgt in list((desired or {}).items()):
-        if not isinstance(tgt, dict):
-            continue
-        symbol = _desired_symbol(item_key, tgt)
-        if not symbol:
-            continue
-        model_id = _normalize_model_id(tgt.get("model_id"))
-        prev = normalized_state.get(f"{model_id}:{str(symbol).strip().upper()}")
-        if not prev:
-            continue
-        prev_signed = _side_signed_weight(prev.get("side"), prev.get("weight"))
-        target_signed = _side_signed_weight(tgt.get("side"), tgt.get("weight"))
-        if prev_signed * target_signed >= 0.0:
-            continue
-        delta_weight = abs(float(target_signed) - float(prev_signed))
-        penalty = float(lambda_flip) * float(delta_weight)
-        total_delta += float(delta_weight)
-        detail = {
-            "model_id": str(model_id),
-            "symbol": str(symbol),
-            "prev_side": str(prev.get("side") or ""),
-            "target_side": str(tgt.get("side") or ""),
-            "prev_weight": float(prev_signed),
-            "target_weight": float(target_signed),
-            "delta_weight": float(delta_weight),
-            "lambda_flip": float(lambda_flip),
-            "penalty": float(penalty),
-        }
-        flips.append(detail)
-        reason = _ensure_reason_dict(tgt)
-        reason["flip_flop_penalty"] = dict(detail)
-
-    meta = {
-        "enabled": True,
-        "lambda_flip": float(lambda_flip),
-        "flip_count": int(len(flips)),
-        "turnover": float(total_delta),
-        "penalty": float(lambda_flip) * float(total_delta),
-        "flips": flips,
-    }
-    _put_meta(con, "last_flip_flop_penalty", json.dumps(meta, separators=(",", ":"), sort_keys=True))
-    if flips:
-        LOGGER.warning(
-            "portfolio_flip_flop_penalty flip_count=%s penalty=%s lambda_flip=%s",
-            len(flips),
-            meta["penalty"],
-            lambda_flip,
-        )
-    return desired, meta
+    return _portfolio_orders.apply_flip_flop_penalty(
+        con,
+        desired,
+        state,
+        portfolio_flip_lambda_fn=_portfolio_flip_lambda,
+        normalize_model_id_fn=_normalize_model_id,
+        desired_symbol_fn=_desired_symbol,
+        side_signed_weight_fn=_side_signed_weight,
+        ensure_reason_dict_fn=_ensure_reason_dict,
+        put_meta_fn=_put_meta,
+        logger=LOGGER,
+    )
 # =========================
 # SECTION 5 / ~200 lines
 # =========================
@@ -4812,82 +4373,15 @@ def _apply_capital_at_risk_gate(desired: Dict[str, Dict]) -> Tuple[Dict[str, Dic
     Enforce portfolio and per-symbol tail-risk budgets using expected_dd from tradability.
     risk_i = |w_i| * expected_dd_i
     """
-    meta = {
-        "car_enabled": True,
-        "car_max": float(PORTFOLIO_CAR_MAX),
-        "car_max_per_symbol": float(PORTFOLIO_CAR_MAX_PER_SYMBOL),
-    }
-    if not desired:
-        meta["car_scaled"] = False
-        return desired, meta
-
-    # Compute per-symbol expected_dd (fallback to 0)
-    risks = {}
-    total_risk = 0.0
-
-    for desired_key, tgt in desired.items():
-        sym = _desired_symbol(desired_key, tgt)
-        if not sym:
-            continue
-        w = abs(float(tgt.get("weight", 0.0) or 0.0))
-        tr = _tradability_from_explain(tgt.get("explain_json", "{}"))
-        dd = float(tr.get("expected_dd", 0.0) or 0.0)
-        dd = max(0.0, min(1.0, dd))
-
-        # Per-symbol cap first
-        max_w = None
-        if float(PORTFOLIO_CAR_MAX_PER_SYMBOL) > 0.0:
-            denom = dd if dd > 0 else 1.0
-            max_w = float(PORTFOLIO_CAR_MAX_PER_SYMBOL) / max(1e-9, denom)
-
-        if max_w is not None and w > max_w:
-            new_w = float(max_w)
-            if str(tgt.get("side")).upper() == "SHORT":
-                tgt["weight"] = -float(new_w)
-            else:
-                tgt["weight"] = float(new_w)
-
-            tgt.setdefault("reason", {})
-            tgt["reason"]["car_symbol_cap"] = True
-            tgt["reason"]["car_expected_dd"] = float(dd)
-            tgt["reason"]["car_symbol_max_w"] = float(max_w)
-
-        w2 = abs(float(tgt.get("weight", 0.0) or 0.0))
-        r = w2 * dd
-        risks[str(desired_key)] = {"symbol": str(sym), "w": w2, "expected_dd": dd, "risk": r}
-        total_risk += float(r)
-
-    meta["car_total_risk_before"] = float(total_risk)
-
-    # Portfolio cap via scaling if needed
-    if float(PORTFOLIO_CAR_MAX) > 0.0 and total_risk > float(PORTFOLIO_CAR_MAX) and total_risk > 1e-9:
-        scale = float(PORTFOLIO_CAR_MAX) / float(total_risk)
-        for sym in list(desired.keys()):
-            try:
-                desired[sym]["weight"] = float(desired[sym].get("weight", 0.0) or 0.0) * float(scale)
-                desired[sym].setdefault("reason", {})
-                desired[sym]["reason"]["car_scale"] = float(scale)
-            except Exception as e:
-                _warn_nonfatal("PORTFOLIO_CAPITAL_AT_RISK_REASON_FAILED", e, once_key="capital_at_risk_reason")
-        meta["car_scaled"] = True
-        meta["car_scale"] = float(scale)
-    else:
-        meta["car_scaled"] = False
-
-    # Renormalize gross after CAR scaling (safety)
-    grossC = sum(abs(float((v or {}).get("weight", 0.0) or 0.0)) for v in desired.values())
-    if grossC > float(PORTFOLIO_GROSS_CAP) and grossC > 1e-9:
-        scaleC = float(PORTFOLIO_GROSS_CAP) / float(grossC)
-        for sym in list(desired.keys()):
-            w0 = float(desired[sym].get("weight", 0.0) or 0.0)
-            sign = -1.0 if w0 < 0 else 1.0
-            desired[sym]["weight"] = sign * abs(float(w0) * float(scaleC))
-        meta["gross_renorm_after_car"] = True
-        meta["gross_scale_after_car"] = float(scaleC)
-
-    meta["car_by_symbol"] = risks
-    return desired, meta
-
+    return _portfolio_constraints.apply_capital_at_risk_gate(
+        desired,
+        car_max=PORTFOLIO_CAR_MAX,
+        car_max_per_symbol=PORTFOLIO_CAR_MAX_PER_SYMBOL,
+        gross_cap=PORTFOLIO_GROSS_CAP,
+        desired_symbol_fn=_desired_symbol,
+        tradability_from_explain_fn=_tradability_from_explain,
+        warn_nonfatal=_warn_nonfatal,
+    )
 
 def _emit_order(
     con,
@@ -6469,27 +5963,11 @@ def _build_rebalance_result(
     execution_blocked: bool,
     execution_blocked_codes: List[str],
 ) -> Dict[str, Any]:
-    desired = ctx.desired
-    portfolio_diag = ctx.portfolio_diag
-    return {
-        "ok": True,
-        "strategy": "multi_strategy",
-        "changed": [] if execution_blocked else list(ctx.changed),
-        "orders_n": 0 if execution_blocked else int(ctx.orders_n),
-        "selected": [str((v or {}).get("symbol") or k) for k, v in desired.items()],
-        "execution_blocked": bool(execution_blocked),
-        "execution_blocked_codes": list(execution_blocked_codes),
-        "portfolio_diagnostics": {
-            "degraded": bool(ctx.degraded_reasons),
-            "degraded_reasons": list(ctx.degraded_reasons),
-            "execution_blocked": bool(execution_blocked),
-            "execution_blocked_codes": list(execution_blocked_codes),
-            "position_summary": dict((portfolio_diag or {}).get("position_summary") or {}),
-            "model_summary": dict((portfolio_diag or {}).get("model_summary") or {}),
-            "flip_flop_penalty": dict(ctx.flip_penalty or {}),
-        },
-    }
-
+    return _portfolio_orders.build_rebalance_result(
+        ctx,
+        execution_blocked=execution_blocked,
+        execution_blocked_codes=execution_blocked_codes,
+    )
 
 def _apply_rebalance_execution_block_stage(ctx: _RebalanceContext) -> Optional[Dict[str, Any]]:
     con = ctx.con

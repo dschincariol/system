@@ -49,13 +49,17 @@ Run the memory-pressure hardening installer on `bart` and equivalent ZFS
 single-server hosts:
 
 ```bash
+python -m engine.runtime.memory_pressure --json --required
 sudo bash ops/server/memory_pressure_hardening.sh install
 sudo bash ops/server/memory_pressure_hardening.sh verify
 ```
 
-The installer persists `vm.swappiness=10`, creates managed zram and disk
-swapfile systemd units, and caps ZFS ARC at 48 GiB for the 128 GiB host class.
-It is idempotent and reversible with
+The Python command is read-only and should pass before live promotion. It
+reports RAM, total swap, zram, the managed `/swapfile-trading`, swappiness, ZFS
+ARC max, and container memory headroom; a 512 MiB legacy `/swapfile` is a
+production failure. The installer persists `vm.swappiness=10`, creates managed
+zram and disk swapfile systemd units, and caps ZFS ARC at 48 GiB for the 128 GiB
+host class. It is idempotent and reversible with
 `sudo bash ops/server/memory_pressure_hardening.sh remove`. See
 [MEMORY_PRESSURE_RUNBOOK.md](../../docs/MEMORY_PRESSURE_RUNBOOK.md) for the
 size rationale, verifier contract, deleted `/tmp` file detector, and reclaim
@@ -170,7 +174,11 @@ Timescale image used by this host that is expected to look like
 `2750 70:trading` on the backup root and WAL target directories. The installer
 writes `TS_BACKUP_WAL_TARGET_OWNER_UID`, `TS_BACKUP_WAL_TARGET_GROUP`, and
 `TS_BACKUP_WAL_TARGET_DIR_MODE=2750` so the recurring evidence gate repairs
-wrong owner/mode drift and records the `wal_archive_target` diagnosis artifact.
+wrong owner/mode drift and records the signed `wal_archive_target` diagnosis
+artifact. For drift that can break archiving, the diagnosis includes a
+pre-repair `wal_archive.sh` probe as the expected archive owner, the observed
+failure event/exit code, the current `pg_stat_archiver` failure fields, and the
+`chown ...; chmod 2750 ...` fix applied by the gate.
 Generated Compose systemd overrides run the evidence service as `root` with
 primary group `trading`, set `TS_BACKUP_READ_GROUP=trading`, and publish
 evidence as `0640`, so the service can enumerate the `0750 70:trading` backup

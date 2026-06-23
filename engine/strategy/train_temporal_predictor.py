@@ -59,7 +59,7 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
 # Training defaults to the same CPU-first runtime contract as live serving.
 # TEMPORAL_USE_CUDA remains a legacy request flag, but validated profiles and
 # torch support are still required before CUDA can be selected.
-apply_cpu_first_runtime_defaults()
+apply_cpu_first_runtime_defaults(role="training")
 _TEMPORAL_DEVICE_RESOLUTION = resolve_torch_device(
     torch,
     env_var="TEMPORAL_DEVICE",

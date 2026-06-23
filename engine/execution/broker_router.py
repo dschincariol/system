@@ -33,6 +33,7 @@ from engine.execution.execution_slicing_engine import build_order_slices
 from engine.execution.contextual_bandit_slicer import validate_routed_learned_orders
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
 from engine.execution.options_readiness import live_options_order_block
+from engine.execution.mode_safety import live_broker_mode_boundary_block
 from engine.execution.broker_failover_policy import (
     broker_exception_terminal_failure,
     configured_failover_chain,
@@ -718,6 +719,55 @@ def _parse_failover_chain() -> List[str]:
     return configured_failover_chain()
 
 
+def _is_fx_order_symbol(symbol: str) -> bool:
+    try:
+        from engine.data.fx_instrument import parse_fx_symbol
+
+        parsed = parse_fx_symbol(symbol)
+        return bool(parsed is not None and parsed.base_ccy and parsed.quote_ccy and str(parsed.instrument_kind or "") == "fx_spot")
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_FX_PARSE_FAILED", e, once_key=f"fx_parse:{symbol}", symbol=str(symbol))
+
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        text = str(symbol or "").upper().strip().replace("/", "").replace("_", "")
+        return bool(asset_class_for_symbol(text) == "FX" and len(text) == 6 and text.isalpha() and text[:3] != text[3:])
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_FX_FALLBACK_FAILED", e, once_key=f"fx_fallback:{symbol}", symbol=str(symbol))
+    return False
+
+
+def _batch_has_fx(orders: Optional[List[dict]]) -> bool:
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        if _is_fx_order_symbol(str(order.get("symbol") or "")):
+            return True
+    return False
+
+
+def _fx_capable_broker(chain: List[str]) -> Optional[str]:
+    from engine.execution.broker_failover_policy import IBKR_BROKERS, canonical_broker_name
+
+    for name in list(chain or []):
+        if canonical_broker_name(name) in IBKR_BROKERS:
+            return "ibkr"
+    return None
+
+
+def _prefer_fx_capable_broker(chain: List[str], orders: Optional[List[dict]]) -> List[str]:
+    from engine.execution.broker_failover_policy import canonical_broker_name
+
+    ordered = [canonical_broker_name(name) for name in list(chain or [])]
+    if not _batch_has_fx(orders):
+        return ordered
+    fx_broker = _fx_capable_broker(ordered)
+    if not fx_broker or (ordered and ordered[0] == fx_broker):
+        return ordered
+    return [fx_broker] + [name for name in ordered if canonical_broker_name(name) != fx_broker]
+
+
 def list_open_orders_router(*, broker: Optional[str] = None, timeout_s: float = 10.0) -> Dict[str, Any]:
     from engine.execution.broker_shutdown_risk import list_open_orders_for_broker
 
@@ -1012,6 +1062,10 @@ def _is_retryable_result(res: Optional[Dict[str, Any]]) -> bool:
         "execution_blocked_gate_unavailable",
         "execution_blocked_gate_providers_missing",
         "real_trading_blocked",
+        "execution_mode_blocked",
+        "execution_mode_invalid",
+        "execution_mode_provider_missing",
+        "execution_mode_unavailable",
         "prelive_reconcile_unavailable",
         "prelive_reconcile_exception",
         "prelive_reconcile_block",
@@ -1159,6 +1213,14 @@ def _apply_one(
         gate_block = _real_trading_gate_or_block(broker_name=name, dry_run=bool(dry_run))
         if gate_block is not None:
             return gate_block
+        if not bool(dry_run):
+            mode_block = live_broker_mode_boundary_block(
+                broker=name,
+                get_execution_mode_fn=_get_execution_mode,
+                environ=os.environ,
+            )
+            if mode_block is not None:
+                return mode_block
         options_block = live_options_order_block(
             override_orders,
             broker=name,
@@ -1371,6 +1433,7 @@ def apply_new_portfolio_orders_router(
     if options_block is not None:
         return options_block
 
+    chain = _prefer_fx_capable_broker(chain, override_orders)
     attempts: List[Dict[str, Any]] = []
 
     for name in chain:

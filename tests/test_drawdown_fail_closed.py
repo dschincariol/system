@@ -5,6 +5,10 @@ import json
 import sqlite3
 import time
 
+import pytest
+
+pytestmark = pytest.mark.safety_critical
+
 
 def _con() -> sqlite3.Connection:
     return sqlite3.connect(":memory:")

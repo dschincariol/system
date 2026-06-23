@@ -1,0 +1,48 @@
+minimum_pre_commit_version: "3.5.0"
+
+default_language_version:
+  python: python3.11
+
+repos:
+  - repo: local
+    hooks:
+      - id: text-file-whitespace
+        name: check trailing whitespace and final newline
+        entry: python tools/precommit_text_guards.py
+        language: system
+        types: [text]
+
+      - id: repo-artifact-hygiene
+        name: check tracked generated/runtime/secret artifacts
+        entry: python tools/check_repo_artifact_hygiene.py
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-ast
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args:
+          - --base64-limit
+          - "5.0"
+          - --exclude-files
+          - ^package-lock\.json$
+          - --exclude-secrets
+          - ^(test-app-password|github-actions-dashboard-token-1234567890|github-actions-operator-token-1234567890)$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.13
+    hooks:
+      - id: ruff
+        args: [--config=ruff.toml]

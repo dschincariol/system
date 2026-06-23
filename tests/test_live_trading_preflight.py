@@ -109,6 +109,20 @@ def fresh_backup_restore_evidence(monkeypatch, tmp_path):
                         "last_failed_wal": "",
                         "last_failed_at_ts": None,
                     },
+                    "wal_archive_target": {
+                        "status": "pass",
+                        "source": "filesystem_repair",
+                        "root": "/var/backups/trading",
+                        "wal_dir": "/var/backups/trading/wal",
+                        "tmp_dir": "/var/backups/trading/wal/.tmp",
+                        "expected_owner_uid": 70,
+                        "expected_group": "trading",
+                        "expected_group_gid": 70,
+                        "expected_dir_mode": "2750",
+                        "repaired": False,
+                        "issue_count": 0,
+                        "verified_at_ts": now,
+                    },
                     "restore_drill": {
                         "status": "pass",
                         "report": "/var/backups/trading/drills/restore_drill_20260617.txt",
@@ -357,6 +371,28 @@ def test_live_trading_preflight_blocks_public_operator_sidecar(monkeypatch):
     assert state["ok"] is False
     assert "operator_bind_host_public_without_internal_only" in state["blockers"]
     assert "operator_sidecar_public_port_forbidden" in state["blockers"]
+
+
+def test_live_trading_preflight_blocks_ignored_internal_operator_public_intent(monkeypatch):
+    _set_live_arming_contract(monkeypatch)
+    monkeypatch.setenv("OPERATOR_SIDECAR_INTERNAL_ONLY", "1")
+    monkeypatch.setenv("OPERATOR_PUBLIC_PORT", "4001")
+    monkeypatch.setenv("OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND", "1")
+
+    state = live_trading_preflight(
+        engine_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="live-token-1234567890",
+        live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
+    )
+
+    assert state["ok"] is False
+    blockers = set(state["blockers"])
+    assert "operator_public_port_ignored_internal_only" in blockers
+    assert "operator_public_bind_flag_ignored_internal_only" in blockers
+    sidecar = state["operator_sidecar_security"]
+    assert sidecar["internal_only"] is True
+    assert sidecar["operator_public_port_configured"] is True
 
 
 def test_live_trading_preflight_accepts_explicit_live_acknowledgement(monkeypatch):

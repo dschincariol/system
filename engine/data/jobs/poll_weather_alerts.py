@@ -52,6 +52,7 @@ LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
 
 UA = os.environ.get("WEATHER_HTTP_UA", "trading-system/1.0 (admin@example.com)")
+_NWS_COOLDOWN_UNTIL_S = 0.0
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -119,7 +120,8 @@ def _heartbeat_payload(phase: str, **extra: Any) -> str:
 
 
 def _sleep_with_heartbeat(manager) -> bool:
-    deadline = time.time() + float(max(30, int(POLL_SECONDS)))
+    cooldown = max(0.0, float(_NWS_COOLDOWN_UNTIL_S) - time.time())
+    deadline = time.time() + float(max(30, int(POLL_SECONDS), int(cooldown)))
     while True:
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -141,14 +143,42 @@ def _sleep_with_heartbeat(manager) -> bool:
 
 
 def _fetch_nws_active(area: str) -> Dict[str, Any]:
+    global _NWS_COOLDOWN_UNTIL_S
+    cooldown = max(0.0, float(_NWS_COOLDOWN_UNTIL_S) - time.time())
+    if cooldown > 0:
+        raise RuntimeError(f"nws_rate_limited:cooldown_remaining_s={cooldown:.0f}")
     url = "https://api.weather.gov/alerts/active"
     params = {}
     if area:
         params["area"] = str(area).upper()
     headers = {"User-Agent": UA, "Accept": "application/geo+json"}
     response = requests.get(url, params=params, headers=headers, timeout=20)
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code == 429:
+        retry_after = 300.0
+        try:
+            retry_after = max(1.0, float((getattr(response, "headers", {}) or {}).get("Retry-After") or 300.0))
+        except Exception:
+            retry_after = 300.0
+        _NWS_COOLDOWN_UNTIL_S = max(float(_NWS_COOLDOWN_UNTIL_S), time.time() + retry_after)
+        raise RuntimeError(f"nws_rate_limited:retry_after_s={retry_after:.0f}")
+    if status_code == 503:
+        retry_after = 300.0
+        try:
+            retry_after = max(1.0, float((getattr(response, "headers", {}) or {}).get("Retry-After") or 300.0))
+        except Exception:
+            retry_after = 300.0
+        _NWS_COOLDOWN_UNTIL_S = max(float(_NWS_COOLDOWN_UNTIL_S), time.time() + retry_after)
+        raise RuntimeError(f"nws_temporarily_unavailable:retry_after_s={retry_after:.0f}")
+    if status_code == 401:
+        raise RuntimeError("nws_credentials_rejected:status_code=401")
+    if status_code == 403:
+        raise RuntimeError("nws_entitlement_missing:status_code=403")
     response.raise_for_status()
-    return response.json() or {}
+    payload = response.json() or {}
+    if not isinstance(payload, dict) or str(payload.get("type") or "") != "FeatureCollection" or not isinstance(payload.get("features"), list):
+        raise RuntimeError("nws_alerts_malformed_payload")
+    return payload
 
 
 def _ts_to_ms(value: Any) -> int:

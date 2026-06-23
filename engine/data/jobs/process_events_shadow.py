@@ -39,7 +39,7 @@ from engine.runtime.torch_threads import configure_torch_thread_pools
 # -----------------------------------------------------------------------------
 # ENV defaults
 # -----------------------------------------------------------------------------
-apply_cpu_first_runtime_defaults()
+apply_cpu_first_runtime_defaults(role="inference")
 _TORCH_DEVICE_RESOLUTION = resolve_torch_device(torch, env_var="TORCH_DEVICE")
 _CUDA_RUNTIME_ENABLED = torch_device_is_cuda(torch, _TORCH_DEVICE_RESOLUTION)
 

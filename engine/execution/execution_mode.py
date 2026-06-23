@@ -35,6 +35,11 @@ from engine.runtime.storage import DB_PATH, _table_exists, connect, init_db, run
 from engine.runtime.state_cache import cache_get, cache_set, cache_invalidate_namespace
 from engine.runtime.event_log import append_event
 from engine.runtime.live_trading_preflight import assert_live_execution_arming_preflight, live_trading_preflight
+from engine.execution.mode_safety import (
+    CANONICAL_EXECUTION_MODES,
+    coerce_execution_mode,
+    parse_execution_mode,
+)
 from engine.execution.execution_costs import (
     DEFAULT_FEES_BPS,
     DEFAULT_SLIPPAGE_BPS,
@@ -45,7 +50,7 @@ from engine.execution.execution_costs import (
 # Constants
 # ============================================================
 
-MODES = ("paper", "shadow", "live")
+MODES = CANONICAL_EXECUTION_MODES
 LOG = get_logger("engine.execution.execution_mode")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 _EXECUTION_MODE_SCHEMA_READY_LOCK = threading.Lock()
@@ -107,9 +112,12 @@ def _schema_ready_for_reads(con) -> bool:
         )
     return False
 
-DEFAULT_MODE = os.environ.get("EXECUTION_MODE_DEFAULT", "paper").strip().lower()
-if DEFAULT_MODE not in MODES:
-    DEFAULT_MODE = "paper"
+_DEFAULT_MODE_PARSE = parse_execution_mode(
+    os.environ.get("EXECUTION_MODE_DEFAULT"),
+    default="paper",
+    source="EXECUTION_MODE_DEFAULT",
+)
+DEFAULT_MODE = _DEFAULT_MODE_PARSE.mode if _DEFAULT_MODE_PARSE.valid else "safe"
 
 DEFAULT_ARMED = 0
 
@@ -131,8 +139,7 @@ def _now_ms() -> int:
 
 
 def _norm_mode(mode: str) -> str:
-    m = str(mode or "").strip().lower()
-    return m if m in MODES else "paper"
+    return coerce_execution_mode(mode, source="execution_mode")
 
 
 def _has_column(con, table: str, col: str) -> bool:

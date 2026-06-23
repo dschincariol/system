@@ -1389,6 +1389,12 @@ paths:
     get:
       tags: [data-sources]
       summary: Return the data-source catalog, templates, and runtime snapshot.
+      description: >
+        Returns source rows, shared provider-account rows, and backend-owned
+        template metadata. Template rows include provider setup guidance,
+        docs/signup links, plan notes, credential and setting field schemas,
+        validation hints, used-by references, inheritance status, and safety
+        warnings used by the data-source UI.
       operationId: getDataSources
       responses:
         '200':
@@ -1595,11 +1601,15 @@ paths:
       operationId: postDataSourceTest
       description: |
         `source_key` may be supplied in the request body or query string. The
-        response shape is provider-specific but always includes `ok` and
-        `source_key`. When `DASHBOARD_API_TOKEN` is configured, the transport
-        layer requires `X-API-Token` on this mutating route. Query-string
-        `token` is legacy local-development compatibility and is rejected in
-        production/live.
+        response shape is provider-specific but always includes `ok`,
+        `source_key`, `status`, `classification`, `message`, sanitized
+        `evidence`, and `next_steps`. `status` is one of `pass`, `fail`,
+        `degraded`, or `unsupported`; only `pass` is counted as a successful
+        connection test. HTTP 429 and 503 responses return degraded payloads
+        with retry guidance and stop composite fallback probes. When
+        `DASHBOARD_API_TOKEN` is configured, the transport layer requires
+        `X-API-Token` on this mutating route. Query-string `token` is legacy
+        local-development compatibility and is rejected in production/live.
       security:
         - DashboardApiToken: []
       parameters:
@@ -1617,6 +1627,118 @@ paths:
       responses:
         '200':
           description: Provider-specific test result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/populate_now:
+    post:
+      tags: [data-sources]
+      summary: Run a bounded provider populate and storage-contract proof for one source.
+      operationId: postDataSourcePopulateNow
+      description: |
+        `source_key` may be supplied in the request body or query string.
+        Populate Now runs the smallest provider-specific one-shot ingestion
+        proof needed to verify rows land in the source contract's storage
+        table. It does not broadly backfill. It obeys provider rate limits,
+        stops on HTTP 429 or 503 responses, and broker data-source handlers are
+        read-only only. Alpaca broker data permits account and positions reads
+        only; order, cancel, replace, and flatten paths are rejected before any
+        HTTP call. Successful responses include sanitized provider evidence,
+        row count, storage table, latest timestamp, latency, missing/null
+        counts, duplicate drops, stale/gap status, the embedded data contract,
+        and contract pass/warn/fail status.
+      security:
+        - DashboardApiToken: []
+      parameters:
+        - name: source_key
+          in: query
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Populate evidence result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/test_save:
+    post:
+      tags: [data-sources]
+      summary: Save source input and immediately run the provider-specific connectivity test.
+      operationId: postDataSourceTestSave
+      description: |
+        Validates the submitted source payload, stores encrypted credentials,
+        clears the ingestion credential cache, resolves effective credentials
+        through the same `_FILE`, `_SECRET`, secret-provider, and env path used
+        by ingestion, then runs the registered provider liveness probe. Save
+        failures return `saved=false`; non-passing probes after a successful
+        save leave the source in `test_failed`, `test_degraded`, or
+        `test_unsupported` rather than a misleading healthy state.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Save and provider-specific test result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FreeformObject'
+        '403':
+          description: Mutation auth failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/data_sources/accounts/update:
+    post:
+      tags: [data-sources]
+      summary: Update shared provider-account credentials.
+      operationId: postDataSourceAccountUpdate
+      description: |
+        Updates the encrypted credential set for one seeded provider account.
+        Exact masked values returned by `GET /api/data_sources` are ignored by
+        the server rather than persisted as literal credential text. When
+        `DASHBOARD_API_TOKEN` is configured, the transport layer requires
+        `X-API-Token` on this mutating route. Clearing account credentials uses
+        the same `RESET_CREDENTIALS` confirmation policy as source credential
+        resets.
+      security:
+        - DashboardApiToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FreeformObject'
+      responses:
+        '200':
+          description: Provider-account update result plus lifecycle reconciliation summary.
           content:
             application/json:
               schema:

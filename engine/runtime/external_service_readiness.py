@@ -83,6 +83,32 @@ def _timescale_backend_requires_service(value: Any) -> bool:
     return backend in {"postgres", "postgresql", "pg", "timescale", "timescaledb"}
 
 
+def _live_cache_msgpack_available() -> bool:
+    try:
+        from engine.cache.codec import msgpack_available
+
+        return bool(msgpack_available())
+    except Exception:
+        return False
+
+
+def _cache_codec_readiness() -> dict[str, Any]:
+    try:
+        from engine.cache.codec import readiness_snapshot
+
+        return dict(readiness_snapshot() or {})
+    except Exception as exc:
+        return {
+            "ok": False,
+            "required": True,
+            "codec": "unavailable",
+            "msgpack_available": False,
+            "json_fallback_allowed": False,
+            "blockers": [f"cache_codec_readiness_error:{type(exc).__name__}:{exc}"],
+            "warnings": [],
+        }
+
+
 def _probe_socket(host: str, port: int, *, timeout_s: float) -> tuple[bool, str | None]:
     try:
         with socket.create_connection((str(host), int(port)), timeout=float(timeout_s)):
@@ -393,6 +419,8 @@ def _check_redis_service(*, required: bool, timeout_s: float) -> dict[str, Any] 
 
     host, port, target = _network_target(redis_url, default_scheme="redis", default_port=6379)
     status = _service_status(name="live_cache_redis", required=(required or backend == "redis"), configured=bool(host and port), target=target)
+    if status["required"] and not _live_cache_msgpack_available():
+        status["errors"].append("live_cache_redis requires msgpack for the binary live-cache codec")
     if not redis_url:
         status["errors"].append("live_cache_redis required but URL is missing")
         return status
@@ -417,7 +445,7 @@ def _check_redis_service(*, required: bool, timeout_s: float) -> dict[str, Any] 
     reachable, error = _probe_redis(probe_url, timeout_s=timeout_s)
     status["reachable"] = bool(reachable)
     if reachable:
-        status["ok"] = True
+        status["ok"] = not bool(status["errors"])
         status["notes"].append(f"live_cache_redis ping ok target={target} backend={backend}")
         if backend == "auto":
             status["warnings"].append("live_cache_redis configured while backend=auto; runtime can still fall back to memory")
@@ -427,6 +455,42 @@ def _check_redis_service(*, required: bool, timeout_s: float) -> dict[str, Any] 
             status["errors"].append(message)
         else:
             status["warnings"].append(message)
+    return status
+
+
+def _check_cache_codec_readiness() -> dict[str, Any] | None:
+    snapshot = _cache_codec_readiness()
+    required = bool(snapshot.get("required"))
+    ok = bool(snapshot.get("ok"))
+    msgpack_ok = bool(snapshot.get("msgpack_available"))
+    fallback_allowed = bool(snapshot.get("json_fallback_allowed"))
+    if ok and not required and msgpack_ok:
+        return None
+
+    status = _service_status(
+        name="cache_codec",
+        required=required,
+        configured=bool(msgpack_ok or fallback_allowed),
+        target=str(snapshot.get("codec") or "unavailable"),
+    )
+    status["reachable"] = msgpack_ok
+    status["ok"] = ok
+    status["notes"].append(
+        "cache codec ready "
+        f"codec={snapshot.get('codec')} required={required} "
+        f"json_fallback_allowed={fallback_allowed}"
+    )
+    status["warnings"].extend(str(item) for item in list(snapshot.get("warnings") or []) if str(item).strip())
+    blockers = [str(item) for item in list(snapshot.get("blockers") or []) if str(item).strip()]
+    if blockers:
+        if required:
+            status["errors"].extend(blockers)
+        else:
+            status["warnings"].extend(blockers)
+    status["codec"] = str(snapshot.get("codec") or "")
+    status["msgpack_available"] = msgpack_ok
+    status["json_fallback_allowed"] = fallback_allowed
+    status["require_reasons"] = list(snapshot.get("require_reasons") or [])
     return status
 
 
@@ -571,6 +635,7 @@ def check_external_service_readiness() -> dict[str, Any]:
     )
 
     for status in (
+        _check_cache_codec_readiness(),
         _check_timescale_service(
             name="timescale_primary",
             dsn=os.environ.get("TIMESCALE_DSN"),

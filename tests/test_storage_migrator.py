@@ -201,7 +201,7 @@ def test_expected_schema_version_tracks_latest_migration_module():
 
     assert ids
     assert ids[-1] == expected_schema_version()
-    assert expected_schema_version() == 64
+    assert expected_schema_version() == 71
 
 
 def test_model_scoring_indexes_migration_covers_unresolved_query_contract():
@@ -362,8 +362,8 @@ def test_live_ingestion_required_indexes_migration_covers_contract():
     statements = []
     available_columns = {
         "prices": {"symbol", "ts_ms"},
-        "price_quotes": {"symbol", "ts_ms"},
-        "price_quotes_raw": {"symbol", "provider", "ts_ms", "event_ts_ms"},
+        "price_quotes": {"symbol", "ts_ms", "time"},
+        "price_quotes_raw": {"symbol", "provider", "ts_ms", "time", "event_ts_ms"},
         "price_provider_health": {"provider", "ts_ms"},
         "ingestion_pipeline_health": {"pipeline", "ts_ms"},
         "options_symbol_ingestion_state": {"disabled_until_ts_ms"},
@@ -387,6 +387,7 @@ def test_live_ingestion_required_indexes_migration_covers_contract():
             "portfolio_orders_id",
             "source_alert_id",
             "prediction_id",
+            "ts_ms",
             "fill_ts_ms",
         },
         "pnl_attribution": {"prediction_id", "model_id", "ts_ms"},
@@ -413,7 +414,9 @@ def test_live_ingestion_required_indexes_migration_covers_contract():
     for index_name in (
         "idx_prices_symbol_ts",
         "idx_price_quotes_symbol_ts",
+        "idx_price_quotes_time_desc",
         "idx_price_quotes_raw_provider_event_ts",
+        "idx_price_quotes_raw_time_desc",
         "idx_price_provider_health_ts",
         "idx_ingestion_pipeline_health_pipeline",
         "idx_options_symbol_ingestion_disabled",

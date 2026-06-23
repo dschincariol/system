@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from typing import Any, Dict
 
 from engine.api.http_parsing import qs as _qs
 from engine.api.auth_config import safe_dev_localhost_fallback_enabled
@@ -25,6 +26,9 @@ ROUTE_SPECS_DATA_SOURCES = [
     ("POST", "/api/data_sources/enable", "api_post_data_source_enable"),
     ("POST", "/api/data_sources/disable", "api_post_data_source_disable"),
     ("POST", "/api/data_sources/test", "api_post_data_source_test"),
+    ("POST", "/api/data_sources/populate_now", "api_post_data_source_populate_now"),
+    ("POST", "/api/data_sources/test_save", "api_post_data_source_test_save"),
+    ("POST", "/api/data_sources/accounts/update", "api_post_data_source_account_update"),
 ]
 
 
@@ -59,6 +63,71 @@ def _body_client_ip(body) -> str:
     return ""
 
 
+def _data_source_refusal_status(payload: Dict[str, Any]) -> int:
+    classification = str(payload.get("classification") or "").strip().lower()
+    error = str(payload.get("error") or payload.get("message") or "").strip().lower()
+    status_code = None
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict):
+        try:
+            status_code = int(evidence.get("status_code") or 0) or None
+        except Exception:
+            status_code = None
+
+    if classification == "wrong_credentials" or error.endswith("_credentials_rejected"):
+        return 401
+    if classification == "entitlement_missing" or error.endswith("_entitlement_missing"):
+        return 403
+    if classification == "rate_limited":
+        return 429
+    if classification in {"missing_credentials", "missing_settings"} or error.endswith("_credentials_missing"):
+        return 422
+    if classification == "unsupported":
+        return 422
+    if classification in {"empty_payload", "malformed_payload"}:
+        return 502
+    if classification == "provider_unreachable":
+        if status_code and 400 <= status_code < 500:
+            return 422
+        return 503
+    if error in {"source_not_found"}:
+        return 404
+    if error.startswith("missing_") or error.startswith("invalid_") or error.startswith("masked_"):
+        return 400
+    return 422
+
+
+def _with_refusal_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(payload or {})
+    if bool(out.get("ok", True)):
+        return out
+
+    nested_test = out.get("test")
+    status_payload = nested_test if isinstance(nested_test, dict) and not bool(nested_test.get("ok", True)) else out
+    status = _data_source_refusal_status(status_payload)
+    reason_code = str(
+        status_payload.get("classification")
+        or status_payload.get("reason_code")
+        or status_payload.get("error")
+        or out.get("error")
+        or "data_source_refused"
+    )
+    provider_reason = str(status_payload.get("error") or status_payload.get("message") or reason_code)
+    message = str(out.get("message") or status_payload.get("message") or provider_reason)
+
+    out.setdefault("reason_code", reason_code)
+    out.setdefault("provider_reason_code", provider_reason)
+    out.setdefault("message", message)
+    out.setdefault("http_status", int(status))
+    meta = out.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault("status", int(status))
+    meta.setdefault("reason_code", reason_code)
+    out["meta"] = meta
+    return out
+
+
 def api_get_data_sources(parsed, _body=None, ctx=None):
     """Return source catalog, templates, runtime status, and auth requirements.
 
@@ -80,18 +149,29 @@ def api_get_data_sources(parsed, _body=None, ctx=None):
     """
     manager = get_manager()
     manager.initialize()
+    runtime = manager.get_runtime_snapshot()
+    desired_jobs = list(runtime.get("desired_ingestion_jobs") or manager.get_desired_ingestion_jobs())
+    job_states = dict(runtime.get("jobs") or {})
+    sources = manager.attach_runtime_states_to_sources(
+        manager.list_sources(),
+        runtime_snapshot=runtime,
+        desired_jobs=desired_jobs,
+        job_states=job_states,
+    )
     return {
         "ok": True,
         "ts_ms": int(time.time() * 1000),
-        "sources": manager.list_sources(),
+        "sources": sources,
         "templates": manager.list_source_templates(),
-        "runtime": manager.get_runtime_snapshot(),
+        "provider_accounts": manager.list_provider_accounts(),
+        "provider_account_templates": manager.list_provider_account_templates(),
+        "runtime": runtime,
         "auth": {
             "token_required": bool(str(os.environ.get("DASHBOARD_API_TOKEN") or "").strip())
             or not safe_dev_localhost_fallback_enabled(),
             "actor_required": True,
         },
-        "desired_ingestion_jobs": manager.get_desired_ingestion_jobs(),
+        "desired_ingestion_jobs": desired_jobs,
     }
 
 
@@ -123,9 +203,13 @@ def api_get_data_source_logs(parsed, _body=None, _ctx=None):
         limit = max(1, min(int(query.get("limit") or 100), 1000))
     except Exception:
         limit = 100
+    source = manager.get_source(source_key)
     return {
         "ok": True,
         "source_key": source_key,
+        "source": source,
+        "runnable_state": str((source or {}).get("runnable_state") or ""),
+        "job_name": str((source or {}).get("job_name") or ""),
         "logs": manager.list_logs(source_key, limit=limit),
     }
 
@@ -325,12 +409,77 @@ def api_post_data_source_test(parsed, body=None, _ctx=None):
     manager = get_manager()
     source_key = _body_source_key(parsed, body)
     if not source_key:
-        return {"ok": False, "error": "missing_source_key"}
+        return _with_refusal_status({"ok": False, "error": "missing_source_key"})
     try:
-        return manager.test_connection(
+        return _with_refusal_status(
+            manager.test_connection(
+                source_key,
+                actor=_body_actor(body),
+                client_ip=_body_client_ip(body),
+            )
+        )
+    except ValueError as exc:
+        return _with_refusal_status({"ok": False, "error": str(exc)})
+
+
+def api_post_data_source_populate_now(parsed, body=None, _ctx=None):
+    """Run a bounded one-shot provider populate and storage-contract check."""
+    manager = get_manager()
+    source_key = _body_source_key(parsed, body)
+    if not source_key:
+        return _with_refusal_status({"ok": False, "error": "missing_source_key"})
+    try:
+        return manager.populate_now(
             source_key,
             actor=_body_actor(body),
             client_ip=_body_client_ip(body),
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def api_post_data_source_test_save(parsed, body=None, ctx=None):
+    """Save source input and immediately run the provider liveness test."""
+    if not isinstance(body, dict):
+        return _with_refusal_status({"ok": False, "error": "invalid_body"})
+    manager = get_manager()
+    try:
+        result = manager.test_and_save_source(
+            body,
+            actor=_body_actor(body),
+            client_ip=_body_client_ip(body),
+        )
+    except ValueError as exc:
+        return _with_refusal_status({"ok": False, "saved": False, "error": str(exc)})
+    except Exception as exc:
+        return {
+            "ok": False,
+            "saved": False,
+            "error": f"test_save_failed:{type(exc).__name__}",
+            "reason_code": "data_source_test_save_failed",
+            "message": "Data-source test-and-save failed unexpectedly.",
+            "detail": type(exc).__name__,
+            "http_status": 500,
+            "meta": {"status": 500, "reason_code": "data_source_test_save_failed"},
+        }
+    lifecycle = manager.manage_lifecycle(
+        reason=f"api_test_save:{result.get('source_key')}",
+        jobs_manager=_jobs_from(ctx),
+    )
+    return _with_refusal_status({**result, "lifecycle": lifecycle})
+
+
+def api_post_data_source_account_update(parsed, body=None, ctx=None):
+    """Update a shared provider-account credential set and reconcile runtime."""
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "invalid_body"}
+    manager = get_manager()
+    try:
+        account = manager.update_provider_account(body)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    lifecycle = manager.manage_lifecycle(
+        reason=f"api_provider_account_update:{account.get('account_key')}",
+        jobs_manager=_jobs_from(ctx),
+    )
+    return {"ok": True, "provider_account": account, "lifecycle": lifecycle}

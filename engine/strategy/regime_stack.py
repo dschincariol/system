@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from engine.data.asset_map import asset_class_for_symbol
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import connect
@@ -385,6 +386,10 @@ def _cot_features_enabled() -> bool:
     return str(os.environ.get("USE_COT_FEATURES", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _fx_regime_enabled() -> bool:
+    return str(os.environ.get("USE_FX_REGIME", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _load_cot_regime(con, symbol: str, ts_ms: int) -> Dict[str, float]:
     if not _cot_features_enabled():
         return {}
@@ -412,6 +417,103 @@ def _load_cot_regime(con, symbol: str, ts_ms: int) -> Dict[str, float]:
         "cot_noncomm_net_z": float(max(-10.0, min(10.0, _safe_f((features or {}).get("cot_noncomm_net_z"), 0.0)))),
         "cot_noncomm_extreme_flag": float(_clamp01(_safe_f((features or {}).get("cot_noncomm_extreme_flag"), 0.0))),
         "cot_open_interest_z": float(max(-10.0, min(10.0, _safe_f((features or {}).get("cot_open_interest_z"), 0.0)))),
+    }
+
+
+def _clamp_signed(x: float, bound: float = 10.0) -> float:
+    value = _safe_f(x, 0.0)
+    limit = abs(float(bound or 1.0))
+    return float(max(-limit, min(limit, value)))
+
+
+def _factor_asof_safe(con, feature_id: str, ts_ms: int) -> float:
+    try:
+        return _safe_f(_get_factor_feature_asof(con, str(feature_id), int(ts_ms)), 0.0)
+    except Exception as exc:
+        _warn_nonfatal(
+            "regime_stack_fx_factor_lookup_failed",
+            "REGIME_STACK_FX_FACTOR_LOOKUP_FAILED",
+            exc,
+            warn_key=f"regime_stack_fx_factor_lookup_failed:{feature_id}",
+            feature_id=str(feature_id),
+            ts_ms=int(ts_ms),
+        )
+        return 0.0
+
+
+def _load_dxy_price_proxy(con, ts_ms: int) -> tuple[float, float]:
+    try:
+        rows = con.execute(
+            """
+            SELECT price
+            FROM prices
+            WHERE symbol=?
+              AND ts_ms <= ?
+            ORDER BY ts_ms DESC
+            LIMIT 80
+            """,
+            ("DXY", int(ts_ms)),
+        ).fetchall()
+    except Exception as exc:
+        _warn_nonfatal(
+            "regime_stack_fx_dxy_price_lookup_failed",
+            "REGIME_STACK_FX_DXY_PRICE_LOOKUP_FAILED",
+            exc,
+            warn_key="regime_stack_fx_dxy_price_lookup_failed",
+            ts_ms=int(ts_ms),
+        )
+        return 0.0, 0.0
+    prices: List[float] = []
+    for row in rows or []:
+        try:
+            value = float(row[0]) if row and row[0] is not None else 0.0
+        except Exception:
+            value = 0.0
+        if value > 0.0:
+            prices.append(value)
+    prices.reverse()
+    if len(prices) < 2:
+        return 0.0, 0.0
+    recent = prices[-20:] if len(prices) >= 20 else prices
+    mean = float(np.mean(recent)) if recent else 0.0
+    std = float(np.std(recent)) if len(recent) > 1 else 0.0
+    z = ((prices[-1] - mean) / std) if std > 0.0 else 0.0
+    lookback = min(5, len(prices) - 1)
+    ret = (prices[-1] / prices[-1 - lookback] - 1.0) if lookback > 0 and prices[-1 - lookback] > 0.0 else 0.0
+    return _clamp_signed(z, 10.0), _clamp_signed(ret * 50.0, 1.0)
+
+
+def _load_fx_regime(con, symbol: str, ts_ms: int) -> Dict[str, float]:
+    if not _fx_regime_enabled():
+        return {}
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return {}
+
+    usd_strength_z = _clamp_signed(
+        _factor_asof_safe(con, "fx.dxy_level_z", int(ts_ms))
+        or _factor_asof_safe(con, "macro.usd_broad_index_z", int(ts_ms)),
+        10.0,
+    )
+    usd_strength_dir = _clamp_signed(
+        _factor_asof_safe(con, "fx.dxy_ret_5d", int(ts_ms))
+        or _factor_asof_safe(con, "macro.usd_broad_index_d5", int(ts_ms)),
+        1.0,
+    )
+    if usd_strength_z == 0.0 and usd_strength_dir == 0.0:
+        usd_strength_z, usd_strength_dir = _load_dxy_price_proxy(con, int(ts_ms))
+
+    carry_raw = (
+        _factor_asof_safe(con, "fx.carry_to_vol", int(ts_ms))
+        or _factor_asof_safe(con, "fx.carry_z_60d", int(ts_ms))
+        or _factor_asof_safe(con, "fx.carry_annualized", int(ts_ms))
+        or _factor_asof_safe(con, "fx.rate_diff_2y", int(ts_ms))
+    )
+    carry_pressure = _clamp01(abs(float(carry_raw)) / 3.0)
+    return {
+        "fx_usd_strength_z": float(_clamp_signed(usd_strength_z, 10.0)),
+        "fx_usd_strength_dir": float(_clamp_signed(usd_strength_dir, 1.0)),
+        "fx_carry_pressure": float(carry_pressure),
     }
 
 
@@ -654,6 +756,31 @@ def compute_regime_vector(
             macro["cot_positioning_extreme"] = float(cot_macro_pressure)
 
 
+        try:
+            asset_class = str(asset_class_for_symbol(sym or "SPY") or "UNKNOWN").upper().strip()
+        except Exception as exc:
+            _warn_nonfatal(
+                "regime_stack_asset_class_lookup_failed",
+                "REGIME_STACK_ASSET_CLASS_LOOKUP_FAILED",
+                exc,
+                warn_key=f"regime_stack_asset_class_lookup_failed:{sym or 'SPY'}",
+                symbol=str(sym or "SPY"),
+            )
+            asset_class = "UNKNOWN"
+        fx_regime = _load_fx_regime(con, sym or "SPY", int(t)) if asset_class == "FX" else {}
+        fx_macro_pressure = 0.0
+        if fx_regime:
+            macro["fx_usd_strength_z"] = float(fx_regime.get("fx_usd_strength_z", 0.0))
+            macro["fx_usd_strength_dir"] = float(fx_regime.get("fx_usd_strength_dir", 0.0))
+            macro["fx_carry_pressure"] = float(_clamp01(fx_regime.get("fx_carry_pressure", 0.0)))
+            fx_macro_pressure = float(
+                max(
+                    min(1.0, abs(float(macro["fx_usd_strength_dir"]))),
+                    float(macro["fx_carry_pressure"]),
+                )
+            )
+
+
         options_gex = _load_options_gex_regime(con, sym or "SPY", int(t))
 
         micro = {
@@ -681,7 +808,12 @@ def compute_regime_vector(
         # CONFIDENCE
         # ------------------------------
 
-        macro_conf = _clamp01((abs(vix_z) + abs(rv20_z) + abs(credit_z) + cot_macro_pressure) / 6.0)
+        macro_conf_numerator = abs(vix_z) + abs(rv20_z) + abs(credit_z) + cot_macro_pressure
+        macro_conf_denominator = 6.0
+        if fx_regime:
+            macro_conf_numerator += fx_macro_pressure
+            macro_conf_denominator += 1.0
+        macro_conf = _clamp01(macro_conf_numerator / macro_conf_denominator)
 
         micro_conf = _clamp01(
             vol_cluster * 0.5 +

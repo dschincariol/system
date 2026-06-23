@@ -140,6 +140,96 @@ Characterization coverage starts in
 existing startup health, provider readiness, and health snapshot registry
 tests.
 
+## Strategy Portfolio Slice
+
+The portfolio slice applies the same facade pattern to
+`engine/strategy/portfolio.py` while preserving `engine.strategy.portfolio` as
+the import surface for strategy jobs, tests, broker handoff contracts, and
+operator diagnostics.
+
+Current split:
+
+- `engine/strategy/portfolio_normalization.py` owns pure coercion,
+  normalization, signed-weight, and reason-dictionary helper behavior.
+- `engine/strategy/portfolio_signals.py` owns model-intent extraction,
+  tradability parsing, score shaping, candidate-limit calculation, and
+  best-candidate-per-symbol ranking.
+- `engine/strategy/portfolio_constraints.py` owns max-position pruning,
+  symbol-cap lookup, weight-cap redistribution, and the capital-at-risk gate
+  helper.
+- `engine/strategy/portfolio_targets.py` owns desired-weight sizing and
+  model-intent target-weight resolution.
+- `engine/strategy/portfolio_orders.py` owns selected-alert-id serialization,
+  anti-flip-flop metadata shaping, and rebalance result serialization.
+- `engine/strategy/portfolio.py` remains the compatibility facade and
+  continues to publish the existing helper names/signatures, staged rebalance
+  context types, database schema/init logic, strategy loading, runtime
+  metadata writes, and top-level `compute_rebalance()`/snapshot entrypoints.
+  Facade wrappers delegate to the new modules so production execution uses the
+  split implementation.
+- The full database-backed rebalance stages remain in the facade for now. They
+  already run through explicit staged functions and should only be moved one
+  stage at a time with broader target/order fixture coverage.
+
+Characterization coverage starts in
+`tests/test_portfolio_decomposition_contract.py` and is backed by the existing
+portfolio staged-rebalance, shadow-promotion governance, and runtime reliability
+contract tests.
+
+## Execution Ledger Slice
+
+The execution-ledger slice applies the same facade pattern to
+`engine/execution/execution_ledger.py` while treating durable execution state as
+high blast radius.
+
+Current split:
+
+- `engine/execution/execution_ledger_serialization.py` owns pure JSON
+  coercion, numeric coercion, strategy-name extraction, model-identity
+  extraction, model-id normalization, float selection, and trade-outcome label
+  helpers.
+- `engine/execution/execution_ledger.py` remains the compatibility facade and
+  continues to publish the existing public functions and private helper names
+  used by tests/operators. Its helper wrappers delegate to the extracted
+  serialization module, so production execution uses the split implementation.
+- `engine/execution/execution_ledger.py` still owns schema initialization,
+  durable writes, idempotency/upsert semantics, fill replay/recovery,
+  position-state accounting, attribution side effects, integrity audits, and
+  metrics/PnL snapshot computation. Future slices must not move any of those
+  responsibilities without broader replay and accounting equivalence coverage.
+
+Characterization coverage starts in
+`tests/test_execution_ledger_decomposition_contract.py` and is backed by the
+existing execution-ledger, trade-lifecycle, runtime-reliability, and storage
+contract regression tests.
+
+## SQLite Storage Slice
+
+The SQLite storage slice applies the same facade pattern to
+`engine/runtime/storage_sqlite.py` while treating runtime storage as the highest
+blast-radius decomposition target.
+
+Current split:
+
+- `engine/runtime/storage_sqlite_normalization.py` owns pure environment
+  truthiness, JSON adapter serialization, read/write SQL statement
+  classification, SQL signature normalization, and SQLite parameter
+  normalization helpers.
+- `engine/runtime/storage_sqlite.py` remains the compatibility facade and
+  continues to publish the existing helper names/signatures. Its wrappers
+  delegate to the extracted module, so storage connection and parameter paths
+  use the split implementation in production test-backend code.
+- `engine/runtime/storage_sqlite.py` still owns DB path resolution, connection
+  lifecycle, write-locking, transaction boundaries, SQL repair, schema
+  initialization, schema validation, migrations/compatibility shims, table
+  ownership, and all read/write behavior. Future slices must not move schema
+  mutation or write paths without storage contract, migration, and fallback
+  equivalence coverage.
+
+Characterization coverage starts in
+`tests/test_storage_sqlite_decomposition_contract.py` and is backed by the
+existing storage contract, storage pool, and runtime graph validation tests.
+
 ## Follow-Up Priority
 
 Recommended next decomposition targets:
@@ -150,10 +240,13 @@ Recommended next decomposition targets:
 2. `start_system.py` - future slices should be limited to additional helper
    extraction behind the facade; keep top-level `main()` boot sequencing in the
    executable entrypoint.
-3. `engine/strategy/portfolio.py` - split portfolio construction stages only
-   after locking target/order equivalence with fixture-based tests.
-4. `engine/execution/execution_ledger.py` - high blast radius durable execution
-   state; decompose only after ledger replay/compatibility tests are in place.
-5. `engine/runtime/storage_sqlite.py` - highest blast radius storage core; keep
-   last and require migration/storage contract coverage before any structural
-   move.
+3. `engine/strategy/portfolio.py` - future slices should move one
+   database-backed rebalance stage at a time after expanding fixture coverage
+   for target/order equivalence and persisted side effects.
+4. `engine/execution/execution_ledger.py` - future slices remain high blast
+   radius; move only one read-only query-shaping or pure helper responsibility
+   at a time after expanding ledger replay/compatibility tests.
+5. `engine/runtime/storage_sqlite.py` - future slices remain the highest blast
+   radius; move only pure helpers or read-only classification utilities until
+   broader migration/storage contract coverage is added for write and schema
+   paths.

@@ -1,0 +1,439 @@
+{
+  "schema_version": 1,
+  "tool": "pyright",
+  "pyright_version": "1.1.410",
+  "ratchet": "Default gate requires exact diagnostic equality. Fixes must update this baseline so resolved diagnostics cannot reappear unnoticed.",
+  "scope": {
+    "target_paths": [
+      "engine/data/live_prices/ccxt_live.py",
+      "engine/data/live_prices/yfinance_live.py",
+      "engine/data/options_poll.py",
+      "engine/data/poll_prices.py",
+      "engine/data/price_cache.py",
+      "engine/data/provider_router.py",
+      "engine/execution/broker_router.py",
+      "engine/execution/broker_apply_orders.py",
+      "engine/execution/execution_mode.py",
+      "engine/execution/order_idempotency.py",
+      "engine/execution/order_command_boundary.py",
+      "engine/execution/position_reconcile.py",
+      "engine/execution/kill_switch.py",
+      "engine/execution/execution_ledger.py",
+      "engine/risk/portfolio_risk_engine.py",
+      "engine/risk/monte_carlo_risk_engine.py",
+      "engine/strategy/portfolio.py",
+      "engine/strategy/portfolio_risk_gate.py",
+      "engine/strategy/predictor.py",
+      "engine/strategy/champion_manager.py",
+      "engine/runtime/gates.py",
+      "engine/runtime/live_trading_preflight.py",
+      "engine/runtime/live_execution_control.py",
+      "engine/runtime/prod_preflight.py",
+      "engine/runtime/staging_prod_preflight.py",
+      "engine/runtime/price_read_router.py",
+      "engine/runtime/telemetry_read_router.py",
+      "engine/runtime/storage_pg.py",
+      "engine/runtime/storage_pg_prices.py",
+      "engine/runtime/timescale_client.py"
+    ],
+    "high_risk_roots": [
+      "engine/data",
+      "engine/execution",
+      "engine/risk",
+      "engine/runtime",
+      "engine/strategy"
+    ],
+    "staged_inclusion": [
+      {
+        "path": "engine/data",
+        "current_gate": "Live price/provider polling files are included now.",
+        "full_package_target": "2026-09-30",
+        "justification": "Remaining historical, research, and alternative ingestion jobs need type cleanup before full-package gating."
+      },
+      {
+        "path": "engine/execution",
+        "current_gate": "Broker routing, order apply, idempotency, kill-switch, reconciliation, and ledger files are included now.",
+        "full_package_target": "2026-09-30",
+        "justification": "Remaining analytics, training, and broker-adapter files are staged after the live order path."
+      },
+      {
+        "path": "engine/risk",
+        "current_gate": "The full risk package is included now.",
+        "full_package_target": null,
+        "justification": "Risk contains the portfolio and Monte Carlo engines that directly size capital."
+      },
+      {
+        "path": "engine/runtime",
+        "current_gate": "Live gates, preflight, read routers, Postgres storage, and Timescale client files are included now.",
+        "full_package_target": "2026-10-31",
+        "justification": "Remaining runtime modules include broad startup, health, and operator support surfaces with legacy typing debt."
+      },
+      {
+        "path": "engine/strategy",
+        "current_gate": "Portfolio, portfolio risk gate, predictor, and champion manager files are included now.",
+        "full_package_target": "2026-10-31",
+        "justification": "Remaining strategy modules include research-only model families and feature discovery surfaces."
+      }
+    ]
+  },
+  "summary": {
+    "error_count": 44,
+    "warning_count": 0,
+    "information_count": 0,
+    "diagnostic_count": 44
+  },
+  "diagnostics": [
+    {
+      "file": "engine/execution/broker_apply_orders.py",
+      "severity": "error",
+      "rule": "reportGeneralTypeIssues",
+      "line": 1190,
+      "character": 5,
+      "message": "Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing conditional code paths"
+    },
+    {
+      "file": "engine/execution/broker_router.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 475,
+      "character": 28,
+      "message": "Argument of type \"Dict[str, Any]\" cannot be assigned to parameter \"execution_degraded\" of type \"bool\" in function \"execution_gate_snapshot\"\n  \"Dict[str, Any]\" is not assignable to \"bool\""
+    },
+    {
+      "file": "engine/execution/broker_router.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 509,
+      "character": 28,
+      "message": "Argument of type \"Dict[str, Any]\" cannot be assigned to parameter \"execution_degraded\" of type \"bool\" in function \"execution_gate_snapshot\"\n  \"Dict[str, Any]\" is not assignable to \"bool\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 1119,
+      "character": 18,
+      "message": "Argument of type \"int | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"int | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 1119,
+      "character": 18,
+      "message": "Argument of type \"int | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"int | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 1133,
+      "character": 45,
+      "message": "Argument of type \"int | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"int | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 1133,
+      "character": 45,
+      "message": "Argument of type \"int | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"int | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 5285,
+      "character": 22,
+      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 5285,
+      "character": 22,
+      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 5300,
+      "character": 47,
+      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 5300,
+      "character": 47,
+      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportOptionalMemberAccess",
+      "line": 2450,
+      "character": 13,
+      "message": "\"execute\" is not a known attribute of \"None\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportOptionalMemberAccess",
+      "line": 2531,
+      "character": 17,
+      "message": "\"execute\" is not a known attribute of \"None\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportOptionalMemberAccess",
+      "line": 3275,
+      "character": 21,
+      "message": "\"execute\" is not a known attribute of \"None\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportOptionalMemberAccess",
+      "line": 3360,
+      "character": 19,
+      "message": "\"execute\" is not a known attribute of \"None\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportOptionalMemberAccess",
+      "line": 3667,
+      "character": 21,
+      "message": "\"execute\" is not a known attribute of \"None\""
+    },
+    {
+      "file": "engine/execution/execution_ledger.py",
+      "severity": "error",
+      "rule": "reportOptionalMemberAccess",
+      "line": 3758,
+      "character": 19,
+      "message": "\"execute\" is not a known attribute of \"None\""
+    },
+    {
+      "file": "engine/execution/kill_switch.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 2325,
+      "character": 29,
+      "message": "Argument of type \"dict[Unknown, Unknown]\" cannot be assigned to parameter \"value\" of type \"str\" in function \"__setitem__\"\n  \"dict[Unknown, Unknown]\" is not assignable to \"str\""
+    },
+    {
+      "file": "engine/execution/kill_switch.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 2554,
+      "character": 13,
+      "message": "Argument of type \"dict[str, Any]\" cannot be assigned to parameter \"value\" of type \"list[Any]\" in function \"__setitem__\"\n  \"dict[str, Any]\" is not assignable to \"list[Any]\""
+    },
+    {
+      "file": "engine/execution/order_idempotency.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 170,
+      "character": 37,
+      "message": "Argument of type \"((...) -> Any) | None\" cannot be assigned to parameter \"connect_fn\" of type \"(...) -> Any\" in function \"_connect_fn_accepts_readonly\"\n  Type \"((...) -> Any) | None\" is not assignable to type \"(...) -> Any\"\n    Type \"None\" is not assignable to type \"(...) -> Any\""
+    },
+    {
+      "file": "engine/execution/order_idempotency.py",
+      "severity": "error",
+      "rule": "reportOptionalCall",
+      "line": 171,
+      "character": 16,
+      "message": "Object of type \"None\" cannot be called"
+    },
+    {
+      "file": "engine/execution/order_idempotency.py",
+      "severity": "error",
+      "rule": "reportOptionalCall",
+      "line": 178,
+      "character": 12,
+      "message": "Object of type \"None\" cannot be called"
+    },
+    {
+      "file": "engine/execution/position_reconcile.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 660,
+      "character": 13,
+      "message": "Argument of type \"dict[str, str | float]\" cannot be assigned to parameter \"object\" of type \"Dict[str, float]\" in function \"append\"\n  \"str\" is not assignable to \"float\"\n  Type \"Literal['broker_orphan', 'expected_orphan', 'quantity_mismatch']\" is not assignable to type \"float\"\n    \"Literal['broker_orphan']\" is not assignable to \"float\""
+    },
+    {
+      "file": "engine/risk/monte_carlo_risk_engine.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 119,
+      "character": 27,
+      "message": "Argument of type \"dict[str, str | float | int]\" cannot be assigned to parameter \"object\" of type \"Dict[str, float]\" in function \"append\"\n  \"str\" is not assignable to \"float\""
+    },
+    {
+      "file": "engine/risk/monte_carlo_risk_engine.py",
+      "severity": "error",
+      "rule": "reportReturnType",
+      "line": 95,
+      "character": 27,
+      "message": "Type \"list[dict[str, str | float | int]]\" is not assignable to return type \"List[Dict[str, float]]\"\n  \"str\" is not assignable to \"float\""
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 466,
+      "character": 30,
+      "message": "Argument of type \"object | dict[list[bytes], _VT@dict]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[list[bytes]]\" in function \"__init__\"\n  Type \"object | dict[list[bytes], _VT@dict]\" is not assignable to type \"Iterable[list[bytes]]\"\n    \"object\" is incompatible with protocol \"Iterable[list[bytes]]\"\n      \"__iter__\" is not present"
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 469,
+      "character": 37,
+      "message": "Argument of type \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_ID']\" cannot be assigned to parameter \"key\" of type \"bytes\" in function \"get\"\n  \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_ID']\" is not assignable to \"bytes\""
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 470,
+      "character": 40,
+      "message": "Argument of type \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER']\" cannot be assigned to parameter \"key\" of type \"bytes\" in function \"get\"\n  \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER']\" is not assignable to \"bytes\""
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 471,
+      "character": 40,
+      "message": "Argument of type \"object | list[_T@list]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[_T@list]\" in function \"__init__\"\n  Type \"object | list[_T@list]\" is not assignable to type \"Iterable[_T@list]\"\n    \"object\" is incompatible with protocol \"Iterable[_T@list]\"\n      \"__iter__\" is not present"
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 476,
+      "character": 44,
+      "message": "Argument of type \"object | list[_T@list]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[_T@list]\" in function \"__init__\"\n  Type \"object | list[_T@list]\" is not assignable to type \"Iterable[_T@list]\"\n    \"object\" is incompatible with protocol \"Iterable[_T@list]\"\n      \"__iter__\" is not present"
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 477,
+      "character": 47,
+      "message": "Argument of type \"object | list[_T@list]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[_T@list]\" in function \"__init__\"\n  Type \"object | list[_T@list]\" is not assignable to type \"Iterable[_T@list]\"\n    \"object\" is incompatible with protocol \"Iterable[_T@list]\"\n      \"__iter__\" is not present"
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 488,
+      "character": 25,
+      "message": "Argument of type \"object | None\" cannot be assigned to parameter \"engine_mode\" of type \"str | None\" in function \"live_trading_preflight\"\n  Type \"object | None\" is not assignable to type \"str | None\"\n    Type \"object\" is not assignable to type \"str | None\"\n      \"object\" is not assignable to \"str\"\n      \"object\" is not assignable to \"None\""
+    },
+    {
+      "file": "engine/runtime/prod_preflight.py",
+      "severity": "error",
+      "rule": "reportCallIssue",
+      "line": 466,
+      "character": 25,
+      "message": "No overloads for \"__init__\" match the provided arguments"
+    },
+    {
+      "file": "engine/strategy/champion_manager.py",
+      "severity": "error",
+      "rule": "reportGeneralTypeIssues",
+      "line": 2635,
+      "character": 5,
+      "message": "Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing conditional code paths"
+    },
+    {
+      "file": "engine/strategy/champion_manager.py",
+      "severity": "error",
+      "rule": "reportOptionalIterable",
+      "line": 1873,
+      "character": 37,
+      "message": "Object of type \"None\" cannot be used as iterable value"
+    },
+    {
+      "file": "engine/strategy/champion_manager.py",
+      "severity": "error",
+      "rule": "reportOptionalMemberAccess",
+      "line": 1196,
+      "character": 66,
+      "message": "\"get\" is not a known attribute of \"None\""
+    },
+    {
+      "file": "engine/strategy/portfolio.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 1341,
+      "character": 43,
+      "message": "Argument of type \"float | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToFloat\" in function \"__new__\"\n  Type \"float | None\" is not assignable to type \"ConvertibleToFloat\"\n    Type \"None\" is not assignable to type \"ConvertibleToFloat\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsFloat\"\n        \"__float__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
+    },
+    {
+      "file": "engine/strategy/portfolio.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 1341,
+      "character": 43,
+      "message": "Argument of type \"float | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToFloat\" in function \"__new__\"\n  Type \"float | None\" is not assignable to type \"ConvertibleToFloat\"\n    Type \"None\" is not assignable to type \"ConvertibleToFloat\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsFloat\"\n        \"__float__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
+    },
+    {
+      "file": "engine/strategy/portfolio.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 6053,
+      "character": 42,
+      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
+    },
+    {
+      "file": "engine/strategy/portfolio.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 6053,
+      "character": 42,
+      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
+    },
+    {
+      "file": "engine/strategy/predictor.py",
+      "severity": "error",
+      "rule": "reportArgumentType",
+      "line": 3514,
+      "character": 54,
+      "message": "Argument of type \"ndarray[Unknown, Unknown]\" cannot be assigned to parameter \"scores\" of type \"Sequence[Any]\" in function \"ranker_scores_to_signals\"\n  \"ndarray[Unknown, Unknown]\" is not assignable to \"Sequence[Any]\""
+    },
+    {
+      "file": "engine/strategy/predictor.py",
+      "severity": "error",
+      "rule": "reportOperatorIssue",
+      "line": 2227,
+      "character": 12,
+      "message": "Operator \"not in\" not supported for types \"tuple[int, str, int]\" and \"Unknown | dict[Unknown, Unknown] | None\"\n  Operator \"not in\" not supported for types \"tuple[int, str, int]\" and \"None\""
+    },
+    {
+      "file": "engine/strategy/predictor.py",
+      "severity": "error",
+      "rule": "reportOptionalSubscript",
+      "line": 2238,
+      "character": 13,
+      "message": "Object of type \"None\" is not subscriptable"
+    },
+    {
+      "file": "engine/strategy/predictor.py",
+      "severity": "error",
+      "rule": "reportReturnType",
+      "line": 892,
+      "character": 16,
+      "message": "Type \"object\" is not assignable to return type \"Dict[str, Any] | None\"\n  Type \"object\" is not assignable to type \"Dict[str, Any] | None\"\n    \"object\" is not assignable to \"Dict[str, Any]\"\n    \"object\" is not assignable to \"None\""
+    }
+  ]
+}

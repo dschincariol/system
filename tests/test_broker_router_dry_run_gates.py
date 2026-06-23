@@ -9,9 +9,13 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+pytestmark = pytest.mark.safety_critical
 
 
 def _reload_modules(*module_names: str):
@@ -640,6 +644,165 @@ class BrokerRouterDryRunGateTests(unittest.TestCase):
         self.assertEqual(result["gate"]["reason"], "kill_switch_cache_stale")
         self.assertFalse(bool(result["gate"]["real_trading_allowed"]))
         sim_adapter.assert_not_called()
+
+    def test_live_broker_boundary_blocks_shadow_even_when_upstream_gate_allows(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "BROKER_FAILOVER": "alpaca",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
+            "ENGINE_MODE": "shadow",
+            "EXECUTION_MODE": "shadow",
+            **_live_broker_contract_env("alpaca"),
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            live_adapter = Mock(side_effect=AssertionError("shadow mode must not reach live adapter"))
+            prelive_reconcile = Mock(side_effect=AssertionError("shadow mode must block before pre-live reconcile"))
+            get_execution_mode = Mock(return_value={"mode": "shadow", "armed": 0})
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_real_trading_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                stack.enter_context(patch.object(broker_router, "_alpaca_apply", live_adapter))
+                stack.enter_context(patch.object(broker_router, "_prelive_reconcile", prelive_reconcile))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                    override_order_id=505,
+                )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "execution_mode_blocked")
+        self.assertEqual(result["reason"], "mode_not_live")
+        self.assertEqual(result["mode"], "shadow")
+        self.assertTrue(bool(result["stop_failover"]))
+        live_adapter.assert_not_called()
+        prelive_reconcile.assert_not_called()
+
+    def test_live_broker_boundary_blocks_invalid_mode_strings(self) -> None:
+        orders = _sample_orders()
+        invalid_values = ["production", "live now", "liv e"]
+
+        for raw_mode in invalid_values:
+            env = {
+                "BROKER_FAILOVER": "alpaca",
+                "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+                "DISABLE_LIVE_EXECUTION": "0",
+                "ENGINE_MODE": "live",
+                "EXECUTION_MODE": raw_mode,
+                **_live_broker_contract_env("alpaca"),
+            }
+            with self.subTest(raw_mode=raw_mode):
+                with patch.dict(os.environ, env, clear=False):
+                    (broker_router,) = _reload_modules("engine.execution.broker_router")
+                    live_adapter = Mock(side_effect=AssertionError("invalid mode must not reach live adapter"))
+                    get_execution_mode = Mock(return_value={"mode": "live", "armed": 1})
+
+                    with ExitStack() as stack:
+                        _mute_router_side_effects(stack, broker_router)
+                        stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", return_value=None))
+                        stack.enter_context(patch.object(broker_router, "_real_trading_gate_or_block", return_value=None))
+                        stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                        stack.enter_context(patch.object(broker_router, "_alpaca_apply", live_adapter))
+
+                        result = broker_router.apply_new_portfolio_orders_router(
+                            dry_run=False,
+                            override_orders=orders,
+                            override_order_id=606,
+                        )
+
+                self.assertFalse(bool(result["ok"]))
+                self.assertEqual(result["status"], "execution_mode_invalid")
+                self.assertEqual(result["reason"], "invalid_execution_mode")
+                self.assertEqual(result["invalid_mode"]["source"], "EXECUTION_MODE")
+                self.assertTrue(bool(result["stop_failover"]))
+                live_adapter.assert_not_called()
+
+    def test_live_broker_boundary_accepts_whitespace_padded_mixed_case_live(self) -> None:
+        orders = _sample_orders()
+        env = {
+            "BROKER_FAILOVER": "alpaca",
+            "BROKER_ROUTER_RETRY_ATTEMPTS": "1",
+            "DISABLE_LIVE_EXECUTION": "0",
+            "ENGINE_MODE": " LiVe ",
+            "EXECUTION_MODE": " LiVe ",
+            "EXEC_ADAPTIVE_SLICING": "0",
+            **_live_broker_contract_env("alpaca"),
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (broker_router,) = _reload_modules("engine.execution.broker_router")
+            live_adapter = Mock(return_value={"ok": True, "status": "adapter_called", "broker": "alpaca"})
+            get_execution_mode = Mock(return_value={"mode": " LiVe ", "armed": 1})
+
+            with ExitStack() as stack:
+                _mute_router_side_effects(stack, broker_router)
+                stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_real_trading_gate_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_get_execution_mode", get_execution_mode))
+                stack.enter_context(patch.object(broker_router, "_prelive_reconcile_or_block", return_value=None))
+                stack.enter_context(patch.object(broker_router, "_alpaca_apply", live_adapter))
+
+                result = broker_router.apply_new_portfolio_orders_router(
+                    dry_run=False,
+                    override_orders=orders,
+                    override_order_id=707,
+                )
+
+        self.assertTrue(bool(result["ok"]))
+        self.assertEqual(result["status"], "adapter_called")
+        live_adapter.assert_called_once()
+        self.assertFalse(bool(live_adapter.call_args.kwargs["dry_run"]))
+
+    def test_execution_gate_invalid_mode_from_env_fails_closed(self) -> None:
+        env = {
+            "ENGINE_MODE": "live",
+            "EXECUTION_MODE": "production",
+            "DISABLE_LIVE_EXECUTION": "0",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (gates,) = _reload_modules("engine.runtime.gates")
+            result = gates.execution_gate_snapshot(
+                get_execution_mode_fn=lambda: {"mode": "live", "armed": 1},
+                system_state={"state": "LIVE"},
+                kill_switches={"state": []},
+                risk_state_getter=lambda _key, default=None: default,
+            )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertFalse(bool(result["allowed"]))
+        self.assertFalse(bool(result["allow_execution_pipeline"]))
+        self.assertFalse(bool(result["real_trading_allowed"]))
+        self.assertEqual(result["reason"], "invalid_execution_mode")
+        self.assertEqual(result["invalid_mode"]["source"], "EXECUTION_MODE")
+
+    def test_execution_gate_invalid_callback_mode_fails_closed(self) -> None:
+        env = {
+            "ENGINE_MODE": "live",
+            "EXECUTION_MODE": "live",
+            "DISABLE_LIVE_EXECUTION": "0",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            (gates,) = _reload_modules("engine.runtime.gates")
+            result = gates.execution_gate_snapshot(
+                get_execution_mode_fn=lambda: {"mode": "live-ish", "armed": 1},
+                system_state={"state": "LIVE"},
+                kill_switches={"state": []},
+                risk_state_getter=lambda _key, default=None: default,
+            )
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertFalse(bool(result["allowed"]))
+        self.assertFalse(bool(result["real_trading_allowed"]))
+        self.assertEqual(result["reason"], "invalid_execution_mode")
+        self.assertEqual(result["invalid_mode"]["source"], "get_execution_mode_fn")
 
 
 if __name__ == "__main__":

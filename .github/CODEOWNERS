@@ -1,0 +1,49 @@
+# High-risk trading and repository-governance ownership.
+# Branch protection must enable "Require review from Code Owners" for these
+# entries to become required review gates. The current repository owner is used
+# because no team aliases are defined in this repo yet; replace or expand this
+# handle with organization team aliases when they exist.
+
+# CI, local guardrails, and ownership policy.
+/.github/CODEOWNERS @dschincariol
+/.github/workflows/ @dschincariol
+/.pre-commit-config.yaml @dschincariol
+/tools/precommit_text_guards.py @dschincariol
+/ruff.toml @dschincariol
+
+# Money-path execution, broker routing, order handling, and terminal order entry.
+/engine/execution/ @dschincariol
+/engine/api/api_broker_config.py @dschincariol
+/engine/cache/wrappers/broker_order_state.py @dschincariol
+/engine/terminal/api/api_terminal_orders.py @dschincariol
+
+# Runtime control plane, storage, gates, and migrations.
+/engine/runtime/ @dschincariol
+/engine/runtime/schema/migrations/ @dschincariol
+
+# Portfolio-risk and portfolio-intent modules outside the execution/runtime trees.
+/engine/risk/ @dschincariol
+/engine/strategy/*allocation*.py @dschincariol
+/engine/strategy/*allocator*.py @dschincariol
+/engine/strategy/capital_*.py @dschincariol
+/engine/strategy/portfolio*.py @dschincariol
+/engine/strategy/*risk*.py @dschincariol
+/engine/strategy/*Risk*.py @dschincariol
+/engine/strategy/position_sizing.py @dschincariol
+/engine/strategy/size_policy.py @dschincariol
+/engine/strategy/uncertainty_sizing.py @dschincariol
+/engine/strategy/jobs/portfolio*.py @dschincariol
+
+# Secrets, auth, configuration, and production deployment templates.
+/.env.example @dschincariol
+/deploy/env/ @dschincariol
+/deploy/compose/.env.example @dschincariol
+/deploy/compose/docker-compose*.yml @dschincariol
+/docs/config_env_allowlist.txt @dschincariol
+/engine/api/auth_config.py @dschincariol
+/engine/runtime/config.py @dschincariol
+/engine/runtime/config_schema.py @dschincariol
+/engine/runtime/secret_sources.py @dschincariol
+/ops/server/config/ @dschincariol
+/services/credential_encryption.py @dschincariol
+/services/secrets/ @dschincariol

@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -277,7 +278,12 @@ def _install_isolated_sqlite_storage(monkeypatch: pytest.MonkeyPatch, db_path: P
         }
 
     def _blocked_postgres_acquire(*_args, **_kwargs):
-        postgres_attempts.append({"path": str(db_path)})
+        postgres_attempts.append(
+            {
+                "path": str(db_path),
+                "caller": "".join(traceback.format_stack(limit=8)),
+            }
+        )
         raise AssertionError("route-contract tests must use isolated sqlite storage, not postgres")
 
     monkeypatch.setattr(storage, "DB_PATH", db_path, raising=False)
@@ -414,6 +420,7 @@ def route_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db_path = tmp_path / "dashboard_route_contracts.db"
 
     monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TS_STORAGE_BACKEND", "sqlite")
     monkeypatch.setenv("ENGINE_MODE", "safe")
     monkeypatch.setenv("TIMESCALE_ENABLED", "0")
     monkeypatch.delenv("TIMESCALE_DSN", raising=False)
@@ -434,16 +441,25 @@ def route_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _ensure_market_quote_fixture(Path(storage.DB_PATH))
 
     (
+        _startup_write_gate,
         _telemetry_read_router,
         _price_read_router,
         _metrics_store,
         _metrics,
         _observability,
         _model_registry,
+        _champion_manager,
+        _predictor,
         _model_cache,
+        _ingestion_status,
         _health,
         _runtime_meta,
         _data_source_log_store,
+        _backup_evidence,
+        _broker_shutdown_risk,
+        _position_reconcile,
+        _live_trading_preflight,
+        _ipc,
         data_source_manager,
         _data_source_routes,
         api_jobs,
@@ -452,16 +468,25 @@ def route_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         _api_market,
         dashboard_server,
     ) = _reload_modules(
+        "engine.runtime.startup_write_gate",
         "engine.runtime.telemetry_read_router",
         "engine.runtime.price_read_router",
         "engine.runtime.metrics_store",
         "engine.runtime.metrics",
         "engine.runtime.observability",
         "engine.model_registry",
+        "engine.strategy.champion_manager",
+        "engine.strategy.predictor",
         "engine.runtime.model_cache",
+        "engine.runtime.ingestion_status",
         "engine.runtime.health",
         "engine.runtime.runtime_meta",
         "engine.runtime.data_source_log_store",
+        "engine.runtime.backup_evidence",
+        "engine.execution.broker_shutdown_risk",
+        "engine.execution.position_reconcile",
+        "engine.runtime.live_trading_preflight",
+        "engine.runtime.ipc",
         "services.data_source_manager",
         "routes.data_sources_routes",
         "engine.api.api_jobs",

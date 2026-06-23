@@ -77,6 +77,9 @@ Each part below gets a one-line analogy, what it does, why it matters, and one s
 - **Clever bit:** it carefully tracks **point-in-time** — "what did we actually know, and *when*" —
   so that when we test a model on history, it can't cheat by peeking at information that didn't
   exist yet.
+- **Scaling note:** price and options polling can be split across supervisors with
+  `INGESTION_SHARD_COUNT=N` and a unique `INGESTION_SHARD_INDEX` per supervisor. The default is still
+  one shard, so ordinary local and single-host production runs behave as before.
 - **Watch-out:** this is the system's **biggest reliability weakness today** (see [§12](#12-where-its-weak-the-honest-risks)).
 
 ```mermaid
@@ -348,20 +351,32 @@ This is the #1 thing holding the system back.
 
 ```mermaid
 flowchart TD
-    PROV["Providers<br/>(one HTTP call per symbol, in series)"] --> POLL["Price poller / websocket<br/>(single thread)"]
-    POLL --> AW["Async writer<br/>(ONE background thread)"]
-    AW --> UP["Row-by-row database upsert<br/>(no bulk COPY → 50–200× slower than possible)"]
+    PROV["Providers<br/>(bounded-parallel REST snapshots)"] --> POLL["Price poller / websocket<br/>(ordered merge + writes)"]
+    POLL --> AW["Async writer<br/>(sharded workers + durable SQLite WAL spool)"]
+    AW --> UP["Bulk database upsert<br/>(binary COPY → fixed staging → set-based ON CONFLICT)"]
     UP --> WAL["Write-ahead-log fsync on every flush"]
     WAL --> PG[("Postgres / Timescale<br/>data + log on the ROOT disk")]
-    AW -. queue full .-> DROP["❌ newest data dropped<br/>(silent gaps)"]
+    AW -. bounded spool full/corrupt .-> DROP["rejected/dead-lettered rows<br/>(visible gaps)"]
     PG -. log archiver failing .-> FULL["❌ disk fills → outage"]
 ```
 
-In plain terms: imagine a busy restaurant where **only one waiter** carries **one plate at a time**,
-and when the kitchen gets backed up they **throw food away** instead of asking diners to wait. That
-caps how many symbols the system can follow and quietly creates holes in the data — and the database
-sitting on a too-small, mismanaged disk risks a **full outage**. Good news: the audit says these are
-**localized fixes, not a rewrite.**
+In plain terms: the price sidecar now removes the avoidable "one row per database call" bottleneck by
+bulk-loading each flush with binary `COPY` into fixed unlogged staging tables, then doing one
+deduplicated set-based upsert per target table. `poll_prices` also keeps normal heartbeat/status
+cycles from tearing down DB pooled connections, and yfinance/polygon/ccxt REST snapshots now run
+concurrently with bounded provider isolation before the existing ordered merge/write path. yfinance
+itself now uses chunked `yf.download(..., period="1d", interval="1m", threads=False)` batches when available,
+with v8 chart requests reserved for observable batch misses or no-yfinance fallback; CCXT keeps one exchange
+session/rate limiter hot per exchange id and uses native `fetchTickers` batches before safe per-symbol
+fallback. The broader ingestion spine
+still has fragile disk/WAL placement, one-shot feature jobs that rely on bounded transactional retry rather
+than the hot-path durable buffer, and shard coverage that is limited to price/options polling. High-volume
+refetchable telemetry writes now use a bounded SQLite WAL spool and replay after restart. The remaining
+weaknesses can still cap how many symbols the system can follow, create visible backpressure when bounded
+spools are exhausted or corrupt, or
+leave the database exposed to a **full outage** if disk
+placement and archiving are wrong. Good news: the audit says these are **localized fixes, not a
+rewrite.**
 
 ---
 
@@ -371,7 +386,7 @@ sitting on a too-small, mismanaged disk risks a **full outage**. Good news: the 
 
 | # | Risk | Why it matters |
 |---|---|---|
-| 1 | **Ingestion can't scale & silently drops data** | No bulk-load (`COPY`), a single writer thread, ~500K rows can be lost on a hard crash, and no horizontal scaling. Caps the system at "a few dozen symbols, lossy under bursts." |
+| 1 | **Ingestion can still bottleneck or visibly reject data under pressure** | The Postgres price sidecar now uses binary `COPY` into fixed staging tables plus set-based upserts, with a visible multi-row VALUES fallback only when COPY is unavailable. Polling REST providers are collected with bounded parallel snapshots and per-provider latency/failure telemetry, while DB writes remain ordered. Price/options polling has first-stage horizontal sharding with shard-specific supervisor locks and stable symbol partitions. The async price writer and high-volume refetchable telemetry buffer now persist accepted rows to bounded SQLite WAL spools and replay them after restart; remaining scale risks are bounded-spool exhaustion/corruption, one-shot feature jobs that depend on transactional retry instead of hot-path buffering, other write paths that may not use COPY yet, and no streaming-log ingestion spine. |
 | 2 | **Infrastructure / outage risk** | The database files and transaction log sit on the root Docker disk while the log archiver is failing → the disk can fill and take the whole system down; point-in-time backups are broken. (A recurring, known issue.) |
 | 3 | **The test *gate* is broken (not the tests)** | The highest-value safety tests (kill switch, broker failover, drawdown) aren't run at merge time; there's no coverage measurement (~24% of modules untested and invisible); the full suite only runs against SQLite, never production Postgres; and the advertised local test command silently runs ~42% of tests and still reports green. *"Tests exist, but they don't certify."* |
 | 4 | **Single database = single point of failure** | Nearly everything is synchronous on one Postgres instance. If it's slow, the system is slow; if it's down, the system stalls. |
@@ -381,8 +396,10 @@ sitting on a too-small, mismanaged disk risks a **full outage**. Good news: the 
 > **Fair framing for newcomers:** none of these are "the system is broken." It *works* and it's
 > *carefully built*. The weaknesses are about **scale, reliability plumbing, and proving correctness
 > automatically** — exactly the things that matter most before trusting it with more capital. Some
-> interim mitigations are already in the code (e.g., the data writer now drains more gracefully on
-> shutdown).
+> mitigations are already in the code (e.g., the price sidecar now uses COPY/staging upserts
+> with an explicit fallback mode, the async price writer uses a bounded durable WAL spool with
+> startup replay and a hard-deadline shutdown drain, and refetchable telemetry append writes use
+> the same commit-then-delete durable spool pattern).
 
 ---
 
@@ -410,22 +427,25 @@ flowchart LR
 ```
 
 - **🔴 P0 — money and reliability are at risk right now:**
-  1. **Fix the ingestion spine** — switch to bulk database loading (`COPY`), use a small pool of
-     writer threads, relax durability on the (re-fetchable) price path, and add a durable buffer so a
-     crash doesn't lose data. This is the difference between "a few dozen symbols, lossy" and "the
-     full universe, durable, fast."
+  1. **Fix the ingestion spine** — keep the new price-sidecar `COPY`/staging hot path healthy, extend
+     the same bulk-write pattern to remaining eligible time-series paths, operate shard-aware polling
+     supervisors where needed, keep the writer pool and durable spools healthy, relax Postgres durability on the
+     (re-fetchable) price/telemetry path where explicitly accepted, and keep one-shot non-price jobs covered by
+     bounded transactional retry tests. This is the
+     difference between "a few dozen symbols, lossy" and "the full universe, durable, fast."
   2. **Fix the infrastructure** — move the database files and transaction log off the root disk onto
      the proper storage volume, make the system refuse to start if they're misplaced, and alert on
      disk/archiver health *before* it fills.
   3. **Fix the test gate** — run the *real* test suite (including the safety/money-path tests) against
      production Postgres in CI, add coverage measurement with minimum floors on the risk/execution/
      runtime code, and repoint the advertised local test command so it stops lying about being green.
-- **🟠 P1 — close the correctness gaps:** add automated type-checking and property-based tests on the
-  numeric core (risk math, sizing, idempotency); write direct tests for the currently-untested
+- **🟠 P1 — close the correctness gaps:** expand the ratcheted pyright gate beyond the first
+  money-path slice and add property-based tests on the numeric core (risk math, sizing,
+  idempotency); write direct tests for the currently-untested
   money-path modules (broker failover, price storage, sizing, cap/drawdown, the panic circuit
   breaker); and start breaking the giant files into smaller, testable pieces.
-- **🟡 P2 — scale and self-tuning:** give ingestion a horizontal-scaling path (sharding now, a
-  streaming log like Kafka/Redpanda later); speed up hot reads (batched/cached/pooled); pin
+- **🟡 P2 — scale and self-tuning:** build on the shard-aware ingestion path with broader job coverage
+  and a streaming log like Kafka/Redpanda later; speed up hot reads (batched/cached/pooled); pin
   dependencies with a hashed lockfile and wire the existing soak/chaos tools into a nightly run; and,
   in line with the team's roadmap, replace hand-tuned settings with learned parameters over time.
 

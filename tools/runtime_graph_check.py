@@ -100,6 +100,13 @@ _LOCAL_VALIDATION_FILE_SECRETS = {
     "DASHBOARD_API_TOKEN_FILE": "validation-dashboard-token-0000000000000000",
     "OPERATOR_API_TOKEN_FILE": "validation-operator-token-0000000000000000",
 }
+_LOCAL_FULL_PG_PASSWORD_FILE_KEYS = (
+    "TS_PG_PASSWORD_FILE",
+    "TIMESCALE_PASSWORD_FILE",
+    "PGPASSWORD_FILE",
+    "TS_PG_PASSWORD_APP_FILE",
+    "TS_PG_APP_PASSWORD_FILE",
+)
 
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -166,6 +173,17 @@ def _local_secret_source_env_keys() -> Tuple[str, ...]:
 def _configure_local_secret_source_policy(env: MutableMapping[str, str], root_dir: Path) -> None:
     if _production_validation_profile(dict(env)):
         return
+    configured_pg_dsn = str(env.get("TS_PG_DSN") or "").strip()
+    preserve_pg_password_files = (
+        not _startup_validation_mode(env)
+        and bool(configured_pg_dsn)
+        and "password=" not in configured_pg_dsn.lower()
+    )
+    preserved_pg_password_files = {
+        key: str(env.get(key) or "").strip()
+        for key in _LOCAL_FULL_PG_PASSWORD_FILE_KEYS
+        if str(env.get(key) or "").strip()
+    }
     for key in _local_secret_source_env_keys():
         env[key] = ""
     for key in ("TS_SECRETS_PROVIDER", "CREDENTIALS_DIRECTORY", "TS_DEV_SECRETS_DIR"):
@@ -179,6 +197,10 @@ def _configure_local_secret_source_policy(env: MutableMapping[str, str], root_di
         path = secret_dir / env_name.lower()
         _write_validation_secret_file(path, value)
         env[env_name] = str(path)
+    if preserve_pg_password_files:
+        env["TS_PG_DSN"] = configured_pg_dsn
+        for key, value in preserved_pg_password_files.items():
+            env[key] = value
 
 
 def _is_missing_optional_module(error: ModuleNotFoundError, module_name: str) -> bool:

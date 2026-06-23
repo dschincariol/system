@@ -76,6 +76,8 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertIn("Environment=TS_SECRETS_PROVIDER=systemd-creds", unit)
         self.assertIn("Environment=DASHBOARD_API_TOKEN_SECRET=dashboard_api_token", unit)
         self.assertIn("Environment=OPERATOR_API_TOKEN_SECRET=operator_api_token", unit)
+        self.assertIn("Environment=PREFLIGHT_REQUIRE_CPU_POWER_POLICY=1", unit)
+        self.assertIn("Environment=PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1", unit)
         self.assertIn(
             "LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred",
             unit,
@@ -107,6 +109,10 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
 
         self.assertIn("trading-prod-preflight.service", bootstrap)
         self.assertIn("trading-prod-preflight.service", verify)
+        self.assertIn("PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1", bootstrap)
+        self.assertIn("memory_pressure_hardening.sh", bootstrap)
+        self.assertIn("memory_pressure_hardening.sh", verify)
+        self.assertIn("check_memory_pressure_assets", verify)
         self.assertIn("check_prod_preflight_runner", verify)
         self.assertIn(
             "redis_password object_store_secret_key dashboard_api_token operator_api_token",
@@ -299,6 +305,27 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["wal_budget"]["configured_retained_wal_ceiling_bytes"], 25 * BYTES_IN_GIB)
 
+    def test_memory_pressure_gate_fails_closed_when_required(self) -> None:
+        with patch.dict(os.environ, {"PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY": "1"}, clear=True):
+            prod_preflight = _reload_module()
+            with patch(
+                "engine.runtime.memory_pressure.host_memory_pressure_snapshot",
+                return_value={
+                    "required": True,
+                    "ok": False,
+                    "meets_policy": False,
+                    "reason": "memory_pressure_total_swap_below_policy",
+                    "errors": ["memory_pressure_total_swap_below_policy"],
+                    "warnings": [],
+                },
+            ):
+                notes, warnings, errors, snapshot = prod_preflight._memory_pressure_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(errors, ["memory_pressure_total_swap_below_policy"])
+        self.assertFalse(snapshot["ok"])
+
     def test_compose_postgres_tuning_rejects_insufficient_host_headroom(self) -> None:
         from engine.runtime.postgres_tuning import docker_postgres_tuning_snapshot
 
@@ -377,6 +404,43 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertEqual(notes, [])
         self.assertEqual(warnings, [])
         self.assertTrue(any("effective_cache_size exceeds service memory limit" in error for error in errors), errors)
+        self.assertFalse(snapshot["ok"])
+
+    def test_required_postgres_tuning_gate_requires_effective_pg_settings_evidence(self) -> None:
+        env = _compose_postgres_tuning_env()
+        with patch.dict(os.environ, env, clear=True):
+            prod_preflight = _reload_module()
+            with patch.object(
+                prod_preflight,
+                "_postgres_tuning_effective_settings",
+                side_effect=RuntimeError("pg unavailable"),
+            ):
+                notes, warnings, errors, snapshot = prod_preflight._postgres_tuning_gate()
+
+        self.assertEqual(notes, [])
+        self.assertTrue(any("effective settings unavailable" in error for error in errors), errors)
+        self.assertEqual(warnings, [])
+        self.assertFalse(snapshot["ok"])
+        self.assertEqual(snapshot["effective_query"]["source"], "pg_settings")
+
+    def test_effective_runtime_state_gate_fails_when_required_evidence_missing(self) -> None:
+        with patch.dict(os.environ, {"PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE": "1"}, clear=True):
+            prod_preflight = _reload_module()
+            with patch(
+                "engine.runtime.effective_runtime_state.effective_runtime_state_snapshot",
+                return_value={
+                    "ok": False,
+                    "required": True,
+                    "errors": ["docker_runtime_evidence_missing"],
+                    "warnings": [],
+                    "operator_commands": [{"command": "sudo docker inspect ...", "proves": "docker state"}],
+                },
+            ):
+                notes, warnings, errors, snapshot = prod_preflight._effective_runtime_state_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(errors, ["docker_runtime_evidence_missing"])
         self.assertFalse(snapshot["ok"])
 
     def test_compile_files_uses_temp_cache_for_read_only_source_tree(self) -> None:

@@ -13,17 +13,16 @@ Writes canonical price events through engine.runtime.price_router.
 import os
 import sys
 import time
-import json
 import random
 import statistics
-import importlib
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, List, Optional
 
 from engine.runtime import dbapi_compat as dbapi
 from engine.runtime.storage import (
     _pid_is_running,
     connect,
-    close_pooled_connections,
     get_timescale_client,
     init_db,
     acquire_job_lock,
@@ -34,35 +33,21 @@ from engine.runtime.storage import (
     run_write_txn,
 )
 
-_CCXT_FETCHER = None
-_CCXT_IMPORT_ERROR = None
-
-
-def _fetch_last_prices_ccxt(*args, **kwargs):
-    global _CCXT_FETCHER, _CCXT_IMPORT_ERROR
-    if _CCXT_FETCHER is None and _CCXT_IMPORT_ERROR is None:
-        try:
-            module = importlib.import_module("engine.data.live_prices.ccxt_live")
-            _CCXT_FETCHER = getattr(module, "fetch_last_prices_ccxt")
-        except Exception as e:
-            _CCXT_IMPORT_ERROR = e
-    if _CCXT_IMPORT_ERROR is not None:
-        _log_nonfatal(
-            "poll_prices_ccxt_import_failed",
-            RuntimeError(f"{type(_CCXT_IMPORT_ERROR).__name__}: {_CCXT_IMPORT_ERROR}"),
-            warn_key="ccxt_import_failed",
-        )
-        return {}
-    return _CCXT_FETCHER(*args, **kwargs)
-
 from engine.data.live_prices.provider import get_price_provider_by_name
-from engine.data.default_symbols import load_default_symbols
+from engine.data.default_symbols import fx_pair_to_oanda_instrument, is_fx_major_symbol, load_default_symbols
 from engine.data.provider_registry import get_polling_provider_names
 from engine.data.provider_router import compute_provider_health, detect_cross_provider_anomalies, select_best_quotes_from_snapshots
 from engine.data.provider_sessions import BaseProviderSession, ProviderSessionManager
 from engine.data.price_hygiene import is_split_like_price_jump, log_split_like_price_row
 from engine.runtime.alerts import emit_alert
+from engine.runtime.ingestion_shards import (
+    current_ingestion_shard,
+    filter_symbol_mapping_for_shard,
+    ingestion_shard_job_name,
+)
 from engine.runtime.ingestion_status import record_pipeline_status
+from engine.runtime.json_codec import dumps_text as _json_dumps_text
+from engine.runtime.json_codec import loads as _json_loads
 from engine.runtime.logging import get_logger, log_event
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.runtime_meta import meta_get, meta_set, meta_set_if_missing
@@ -85,7 +70,7 @@ if os.environ.get("ENGINE_SUPERVISED") != "1":
     print("WARN: poll_prices running without ENGINE_SUPERVISED=1 (continuing)", flush=True)
 
 
-def _log_nonfatal(event: str, error: Exception, **context: Any) -> None:
+def _log_nonfatal(event: str, exc: BaseException, **context: Any) -> None:
     try:
         warn_key = context.pop("warn_key", None)
         if warn_key and warn_key in _WARNED_NONFATAL_KEYS:
@@ -95,7 +80,7 @@ def _log_nonfatal(event: str, error: Exception, **context: Any) -> None:
             event=str(event),
             code=str(event).upper(),
             message=str(event),
-            error=error,
+            error=exc,
             level=30,
             component="engine.data.poll_prices",
             extra=context or None,
@@ -105,7 +90,7 @@ def _log_nonfatal(event: str, error: Exception, **context: Any) -> None:
             _WARNED_NONFATAL_KEYS.add(str(warn_key))
     except Exception as log_error:
         print(
-            f"poll_prices_nonfatal_log_failed event={event} error={type(error).__name__}: {error} "
+            f"poll_prices_nonfatal_log_failed event={event} error={type(exc).__name__}: {exc} "
             f"log_error={type(log_error).__name__}: {log_error} context={context or {}}",
             file=sys.stderr,
             flush=True,
@@ -162,11 +147,24 @@ OWNER = os.environ.get(
     os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "unknown")),
 )
 PID = os.getpid()
+INGESTION_SHARD = current_ingestion_shard()
+JOB_LIVENESS_NAME = ingestion_shard_job_name(JOB_NAME, INGESTION_SHARD)
 
 FAIL_BASE_S = float(os.environ.get("POLL_FAIL_BASE_S", "2.0"))
 FAIL_MAX_S = float(os.environ.get("POLL_FAIL_MAX_S", "60.0"))
 PROVIDER_HEALTH_EVERY_S = float(os.environ.get("STREAM_PRICES_PROVIDER_HEALTH_EVERY_S", "15.0"))
 POLL_PROVIDER_DEAD_AFTER_MS = int(os.environ.get("POLL_PROVIDER_DEAD_AFTER_MS", str(max(POLL_SECONDS * 3000, 30000))))
+POLL_PRICES_PROVIDER_MAX_WORKERS = max(
+    1,
+    int(float(os.environ.get("POLL_PRICES_PROVIDER_MAX_WORKERS", "3") or 3.0)),
+)
+POLL_PRICES_PROVIDER_TIMEOUT_S = max(
+    0.25,
+    float(
+        os.environ.get("POLL_PRICES_PROVIDER_TIMEOUT_S", str(max(float(POLL_SECONDS), 1.0)))
+        or max(float(POLL_SECONDS), 1.0)
+    ),
+)
 
 HEARTBEAT_EVERY_S = float(os.environ.get("HEARTBEAT_EVERY_S", "15.0"))
 LOCK_STALE_AFTER_S = int(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180"))
@@ -324,8 +322,26 @@ def _persist_provider_auxiliary_rows_sync(
         timeout_s=0.5,
         busy_timeout_ms=500,
     )
-def _is_sqlite_busy_error(error: Exception) -> bool:
-    return dbapi.is_transient_write_error(error)
+
+
+def _is_database_slowdown_error(error: Exception) -> bool:
+    if dbapi.is_transient_write_error(error):
+        return True
+    text = str(error or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "pool timeout",
+            "pooltimeout",
+            "connection pool timeout",
+            "couldn't get a connection",
+            "could not get a connection",
+            "postgres_recently_unavailable",
+            "statement timeout",
+            "canceling statement due to statement timeout",
+            "too many connections",
+        )
+    )
 
 
 def _run_write_txn_allow_busy(
@@ -356,7 +372,7 @@ def _run_write_txn_allow_busy(
         )
         return True, result
     except Exception as e:
-        if _is_sqlite_busy_error(e):
+        if _is_database_slowdown_error(e):
             _log_nonfatal(
                 busy_event,
                 e,
@@ -444,6 +460,16 @@ def _sleep_with_jitter(seconds: float) -> None:
         return
     j = seconds * 0.2
     time.sleep(max(0.05, seconds + random.uniform(-j, j)))
+
+
+def _next_fail_backoff_s(current_s: float) -> float:
+    return min(float(FAIL_MAX_S), float(current_s) * 2.0 if float(current_s) > 0.0 else float(FAIL_BASE_S))
+
+
+def _successful_price_cycle_backoff_s(*, current_fail_s: float, producer_backpressure: bool) -> float:
+    if producer_backpressure:
+        return _next_fail_backoff_s(float(current_fail_s))
+    return 0.0
 
 
 def _ensure_price_feed_lock_table(con) -> None:
@@ -688,30 +714,80 @@ class PollingProviderSession(BaseProviderSession):
         return int(self._last_latency_ms)
 
 
-def _load_symbol_providers() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+@dataclass(frozen=True)
+class ActiveSymbolUniverse:
+    active_symbol_rows: Tuple[Tuple[str, Any], ...]
+    provider_symbol_rows: Tuple[Tuple[str, Any], ...]
+    yf_map: Dict[str, str]
+    ccxt_map: Dict[str, str]
+    polygon_map: Dict[str, str]
+    oanda_map: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def assigned_symbol_count(self) -> int:
+        return int(len(set(self.yf_map) | set(self.ccxt_map) | set(self.polygon_map) | set(self.oanda_map)))
+
+
+@dataclass(frozen=True)
+class PollPriceCycleSymbolPlan:
+    universe: ActiveSymbolUniverse
+    provider_symbol_maps: Dict[str, Dict[str, str]]
+
+    @property
+    def assigned_symbol_count(self) -> int:
+        return int(self.universe.assigned_symbol_count)
+
+
+def _normalize_symbol_rows(rows) -> Tuple[Tuple[str, Any], ...]:
+    out: List[Tuple[str, Any]] = []
+    for row in rows or []:
+        try:
+            raw_symbol = row[0]
+            meta_json = row[1] if len(row) > 1 else None
+        except Exception:
+            continue
+        sym_s = str(raw_symbol or "").strip().upper()
+        if not sym_s:
+            continue
+        out.append((sym_s, meta_json))
+    return tuple(out)
+
+
+def _fetch_active_symbol_rows(con) -> Tuple[Tuple[str, Any], ...]:
+    rows = con.execute(
+        """
+        SELECT symbol, meta_json
+        FROM symbols
+        WHERE status IN ('ACTIVE','WATCH')
+        """
+    ).fetchall() or []
+    return _normalize_symbol_rows(rows)
+
+
+def _fetch_fallback_symbol_rows(con) -> Tuple[Tuple[str, Any], ...]:
+    rows = con.execute(
+        """
+        SELECT symbol, meta_json
+        FROM symbols
+        ORDER BY updated_ts_ms DESC, created_ts_ms DESC, symbol
+        LIMIT 250
+        """
+    ).fetchall() or []
+    return _normalize_symbol_rows(rows)
+
+
+def _load_active_symbol_universe() -> ActiveSymbolUniverse:
     con = None
     owns = False
-    rows = []
+    active_rows: Tuple[Tuple[str, Any], ...] = tuple()
+    provider_rows: Tuple[Tuple[str, Any], ...] = tuple()
     try:
         con = connect()
         owns = True
-        rows = con.execute(
-            """
-            SELECT symbol, meta_json
-            FROM symbols
-            WHERE status IN ('ACTIVE','WATCH')
-            """
-        ).fetchall() or []
-
-        if not rows:
-            rows = con.execute(
-                """
-                SELECT symbol, meta_json
-                FROM symbols
-                ORDER BY updated_ts_ms DESC, created_ts_ms DESC, symbol
-                LIMIT 250
-                """
-            ).fetchall() or []
+        active_rows = _fetch_active_symbol_rows(con)
+        provider_rows = active_rows
+        if not provider_rows:
+            provider_rows = _fetch_fallback_symbol_rows(con)
     finally:
         if owns and con is not None:
             try:
@@ -726,10 +802,11 @@ def _load_symbol_providers() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, 
     yf_map: Dict[str, str] = {}
     ccxt_map: Dict[str, str] = {}
     polygon_map: Dict[str, str] = {}
+    oanda_map: Dict[str, str] = {}
 
-    for sym, meta_json in rows:
+    for sym, meta_json in provider_rows:
         try:
-            meta = json.loads(meta_json) if meta_json else {}
+            meta = _json_loads(meta_json) if meta_json else {}
         except Exception:
             meta = {}
 
@@ -738,6 +815,13 @@ def _load_symbol_providers() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, 
             continue
 
         provider = str(meta.get("price_provider") or "").strip().lower()
+
+        if provider == "oanda" or str(meta.get("oanda_instrument") or "").strip():
+            try:
+                oanda_map[sym_s] = str(meta.get("oanda_instrument") or fx_pair_to_oanda_instrument(sym_s))
+            except ValueError as e:
+                _log_nonfatal("poll_prices_oanda_symbol_map_failed", e, symbol=sym_s)
+            continue
 
         if provider == "ccxt":
             mkt = meta.get("ccxt_market")
@@ -754,6 +838,12 @@ def _load_symbol_providers() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, 
 
     env_symbols = load_default_symbols()
     for sym in env_symbols:
+        if is_fx_major_symbol(sym):
+            try:
+                oanda_map.setdefault(sym, fx_pair_to_oanda_instrument(sym))
+            except ValueError as e:
+                _log_nonfatal("poll_prices_oanda_env_symbol_map_failed", e, symbol=str(sym))
+            continue
         yf_map.setdefault(sym, sym)
         polygon_map.setdefault(sym, sym)
 
@@ -771,7 +861,90 @@ def _load_symbol_providers() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, 
     if not polygon_map:
         polygon_map["SPY"] = "SPY"
 
-    return yf_map, ccxt_map, polygon_map
+    yf_map = filter_symbol_mapping_for_shard(yf_map, INGESTION_SHARD)
+    ccxt_map = filter_symbol_mapping_for_shard(ccxt_map, INGESTION_SHARD)
+    polygon_map = filter_symbol_mapping_for_shard(polygon_map, INGESTION_SHARD)
+    oanda_map = filter_symbol_mapping_for_shard(oanda_map, INGESTION_SHARD)
+    return ActiveSymbolUniverse(
+        active_symbol_rows=active_rows,
+        provider_symbol_rows=provider_rows,
+        yf_map=yf_map,
+        ccxt_map=ccxt_map,
+        polygon_map=polygon_map,
+        oanda_map=oanda_map,
+    )
+
+
+def _load_symbol_providers() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    universe = _load_active_symbol_universe()
+    return universe.yf_map, universe.ccxt_map, universe.polygon_map
+
+
+def _provider_symbol_map_for_cycle(provider_name: str, universe: ActiveSymbolUniverse) -> Dict[str, str]:
+    provider = str(provider_name or "").strip().lower()
+    if provider in {"polygon", "polygon_ws"}:
+        return dict(universe.polygon_map)
+    if provider == "simulated":
+        symbol_map = dict(universe.yf_map)
+        if not symbol_map:
+            try:
+                from engine.data.live_prices.simulated import configured_simulated_symbols
+
+                symbol_map = {sym: sym for sym in configured_simulated_symbols()}
+            except Exception as e:
+                _log_nonfatal(
+                    "poll_prices_simulated_symbol_map_failed",
+                    e,
+                    warn_key="poll_prices_simulated_symbol_map_failed",
+                )
+                symbol_map = {"SPY": "SPY", "AAPL": "AAPL"}
+        return symbol_map
+    if provider == "oanda":
+        return dict(universe.oanda_map)
+    if provider == "ccxt":
+        return dict(universe.ccxt_map)
+    return dict(universe.yf_map)
+
+
+def _simulated_market_data_enabled() -> bool:
+    try:
+        from engine.data.live_prices.simulated import simulated_market_data_enabled
+
+        return bool(simulated_market_data_enabled())
+    except Exception as e:
+        _log_nonfatal(
+            "poll_prices_simulated_enabled_check_failed",
+            e,
+            warn_key="poll_prices_simulated_enabled_check_failed",
+        )
+        return False
+
+
+def _append_simulated_provider_fallback(chain: List[str]) -> List[str]:
+    out = [str(p or "").strip().lower() for p in (chain or []) if str(p or "").strip()]
+    if _simulated_market_data_enabled() and "simulated" not in out:
+        out.append("simulated")
+    return list(dict.fromkeys(out))
+
+
+def _build_cycle_symbol_plan(
+    provider_names: List[str],
+    *,
+    universe: Optional[ActiveSymbolUniverse] = None,
+) -> PollPriceCycleSymbolPlan:
+    cycle_universe = universe if universe is not None else _load_active_symbol_universe()
+    provider_symbol_maps: Dict[str, Dict[str, str]] = {}
+    for provider_name in provider_names or []:
+        name = str(provider_name or "").strip()
+        if not name:
+            continue
+        symbol_map = _provider_symbol_map_for_cycle(name, cycle_universe)
+        if symbol_map:
+            provider_symbol_maps[name] = symbol_map
+    return PollPriceCycleSymbolPlan(
+        universe=cycle_universe,
+        provider_symbol_maps=provider_symbol_maps,
+    )
 
 
 def _detect_outlier(prices: List[float], latest: float) -> bool:
@@ -800,42 +973,97 @@ def _detect_outlier(prices: List[float], latest: float) -> bool:
         return False
 
 
-def _recent_prices(con, symbol: str, limit_n: int) -> List[float]:
-    rows = con.execute(
-        """
-        SELECT price
-        FROM prices
-        WHERE symbol=?
-        ORDER BY ts_ms DESC
-        LIMIT ?
-        """,
-        (str(symbol), int(limit_n)),
-    ).fetchall() or []
-    out: List[float] = []
-    for (p,) in rows:
-        try:
-            if p is None:
-                continue
-            out.append(float(p))
-        except Exception as e:
-            _log_nonfatal(
-                "poll_prices_recent_price_parse_failed",
-                e,
-                symbol=str(symbol),
-                raw_price=p,
-            )
+def _normalized_recent_price_symbols(symbols: List[str]) -> List[str]:
+    names: List[str] = []
+    seen: set[str] = set()
+    for sym in symbols or []:
+        name = str(sym).strip().upper()
+        if not name or name in seen:
             continue
-    out.reverse()
-    return out
+        names.append(name)
+        seen.add(name)
+    return names
+
+
+def _recent_price_rows(con, symbols: List[str], limit_n: int):
+    if dbapi.is_sqlite_connection(con):
+        placeholders = ",".join("?" for _ in symbols)
+        return con.execute(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    symbol,
+                    ts_ms,
+                    price,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY ts_ms DESC
+                    ) AS rn
+                FROM prices
+                WHERE symbol IN ({placeholders})
+                  AND price IS NOT NULL
+            )
+            SELECT symbol, price
+            FROM ranked
+            WHERE rn <= ?
+            ORDER BY symbol ASC, ts_ms ASC
+            """,
+            tuple(symbols) + (int(limit_n),),
+        ).fetchall() or []
+
+    values_sql = ",".join("(?)" for _ in symbols)
+    return con.execute(
+        f"""
+        WITH requested(symbol) AS (
+            VALUES {values_sql}
+        )
+        SELECT requested.symbol, recent.price
+        FROM requested
+        JOIN LATERAL (
+            SELECT ts_ms, price
+            FROM prices
+            WHERE prices.symbol = requested.symbol
+              AND price IS NOT NULL
+            ORDER BY ts_ms DESC
+            LIMIT ?
+        ) AS recent ON TRUE
+        ORDER BY requested.symbol ASC, recent.ts_ms ASC
+        """,
+        tuple(symbols) + (int(limit_n),),
+    ).fetchall() or []
 
 
 def _recent_prices_map(symbols: List[str], limit_n: int) -> Dict[str, List[float]]:
-    names = [str(sym).strip().upper() for sym in (symbols or []) if str(sym).strip()]
+    names = _normalized_recent_price_symbols(symbols)
     if not names:
         return {}
+    histories: Dict[str, List[float]] = {str(sym): [] for sym in names}
+    limit_value = max(0, int(limit_n))
+    if limit_value <= 0:
+        return histories
     con = connect(readonly=True)
     try:
-        return {str(sym): _recent_prices(con, str(sym), int(limit_n)) for sym in names}
+        rows = _recent_price_rows(con, names, limit_value)
+        for row in rows:
+            if not row or len(row) < 2:
+                continue
+            sym = str(row[0] or "").strip().upper()
+            if not sym or sym not in histories:
+                continue
+            p = row[1]
+            try:
+                if p is None:
+                    continue
+                histories[sym].append(float(p))
+            except Exception as e:
+                _log_nonfatal(
+                    "poll_prices_recent_price_parse_failed",
+                    e,
+                    symbol=str(sym),
+                    raw_price=p,
+                )
+                continue
+        return histories
     finally:
         try:
             con.close()
@@ -845,6 +1073,29 @@ def _recent_prices_map(symbols: List[str], limit_n: int) -> Dict[str, List[float
                 e,
                 warn_key="poll_prices_recent_prices_map_close_failed",
             )
+
+
+def _reject_split_like_price_row(
+    *,
+    symbol: str,
+    ts_ms: int,
+    current_price: float,
+    price_payload: Dict[str, Any],
+    hist: List[float],
+) -> bool:
+    if not hist:
+        return False
+    previous_price = float(hist[-1])
+    if not is_split_like_price_jump(previous_price, current_price):
+        return False
+    log_split_like_price_row(
+        symbol=str(symbol),
+        ts_ms=int(ts_ms),
+        previous_price=float(previous_price),
+        current_price=float(current_price),
+        source=str(price_payload.get("source") or price_payload.get("provider") or "poll_prices"),
+    )
+    return True
 
 
 def _compute_provider_weights(con, provider_names, now_ts_ms: int) -> Dict[str, float]:
@@ -918,26 +1169,49 @@ def _compute_provider_weights(con, provider_names, now_ts_ms: int) -> Dict[str, 
         return {p: 1.0 / s for p in names}
 
 
-def _mark_stale(now_ts_ms: int) -> None:
+def _mark_stale(
+    now_ts_ms: int,
+    *,
+    active_symbol_rows: Optional[Tuple[Tuple[str, Any], ...]] = None,
+    fresh_symbols: Optional[List[str]] = None,
+    fresh_symbol_ts_ms: Optional[Dict[str, int]] = None,
+) -> None:
     if not _has_first_price_tick():
         return
     cutoff = now_ts_ms - PRICE_STALE_AFTER_S * 1000
+    fresh_symbol_set = {str(sym or "").strip().upper() for sym in (fresh_symbols or []) if str(sym or "").strip()}
+    fresh_ts_by_symbol = {
+        str(sym or "").strip().upper(): int(ts_ms)
+        for sym, ts_ms in (fresh_symbol_ts_ms or {}).items()
+        if str(sym or "").strip()
+    }
     stale_alerts: List[Dict[str, Any]] = []
-    def _write(con) -> None:
 
-        rows = con.execute(
-            "SELECT symbol, meta_json FROM symbols WHERE status IN ('ACTIVE','WATCH')"
-        ).fetchall() or []
+    def _write(con) -> None:
+        rows = active_symbol_rows if active_symbol_rows is not None else _fetch_active_symbol_rows(con)
 
         for sym, meta_json in rows:
+            sym_s = str(sym or "").strip().upper()
+            if not sym_s:
+                continue
             try:
-                meta = json.loads(meta_json) if meta_json else {}
+                meta = _json_loads(meta_json) if meta_json else {}
             except Exception:
                 meta = {}
 
             ps = meta.get("price_status", {}) or {}
             last_seen = ps.get("last_seen_ts_ms")
             already_stale = bool(ps.get("stale"))
+            if sym_s in fresh_symbol_set:
+                if already_stale:
+                    meta.setdefault("price_status", {})
+                    meta["price_status"]["stale"] = False
+                    meta["price_status"]["last_seen_ts_ms"] = int(fresh_ts_by_symbol.get(sym_s) or now_ts_ms)
+                    con.execute(
+                        "UPDATE symbols SET meta_json=?, updated_ts_ms=? WHERE symbol=?",
+                        (_json_dumps_text(meta), int(now_ts_ms), str(sym_s)),
+                    )
+                continue
 
             if last_seen and int(last_seen) < cutoff:
                 if not already_stale:
@@ -947,7 +1221,7 @@ def _mark_stale(now_ts_ms: int) -> None:
                     stale_alerts.append(
                         {
                             "event_title": f"Price stale: {sym}",
-                            "symbol": str(sym),
+                            "symbol": str(sym_s),
                             "horizon_s": 0,
                             "expected_z": 0.0,
                             "confidence": 1.0,
@@ -961,7 +1235,7 @@ def _mark_stale(now_ts_ms: int) -> None:
 
                     con.execute(
                         "UPDATE symbols SET meta_json=?, updated_ts_ms=? WHERE symbol=?",
-                        (json.dumps(meta, separators=(",", ":")), int(now_ts_ms), str(sym)),
+                        (_json_dumps_text(meta), int(now_ts_ms), str(sym_s)),
                     )
             else:
                 if already_stale:
@@ -969,7 +1243,7 @@ def _mark_stale(now_ts_ms: int) -> None:
                     meta["price_status"]["stale"] = False
                     con.execute(
                         "UPDATE symbols SET meta_json=?, updated_ts_ms=? WHERE symbol=?",
-                        (json.dumps(meta, separators=(",", ":")), int(now_ts_ms), str(sym)),
+                        (_json_dumps_text(meta), int(now_ts_ms), str(sym_s)),
                     )
 
     write_ok, _ = _run_write_txn_allow_busy(
@@ -1011,11 +1285,6 @@ def _finalize_post_commit_price_cycle(
         except Exception as e:
             _log_nonfatal("poll_prices_outlier_alert_emit_failed", e)
 
-    # Standalone post-commit helpers may leave thread-local pooled handles open.
-    # Reset them before the runtime_meta writes so leaked helper state cannot
-    # contaminate the next standalone transaction boundary.
-    close_pooled_connections()
-
     first_provider = str(post_commit_first_tick.get("provider") or "").strip()
     first_ts_ms = int(post_commit_first_tick.get("first_ts_ms") or 0)
 
@@ -1046,6 +1315,9 @@ def _record_poll_prices_status(
     last_ingested_ts_ms: Optional[int] = None,
     error: Optional[str] = None,
     providers: Optional[List[str]] = None,
+    provider_errors: Optional[Dict[str, str]] = None,
+    provider_latencies_ms: Optional[Dict[str, int]] = None,
+    provider_result_counts: Optional[Dict[str, int]] = None,
     have_price_feed_lock: bool = False,
     fail_backoff_s: float = 0.0,
     latency_ms: Optional[int] = None,
@@ -1053,7 +1325,25 @@ def _record_poll_prices_status(
     message: str = "",
 ) -> Dict[str, Any]:
     provider_names = sorted({str(name).strip() for name in (providers or []) if str(name).strip()})
-    close_pooled_connections()
+    clean_provider_errors = {
+        str(name).strip(): str(value or "")[:500]
+        for name, value in (provider_errors or {}).items()
+        if str(name).strip() and str(value or "").strip()
+    }
+    clean_provider_latencies_ms = {
+        str(name).strip(): max(0, int(value or 0))
+        for name, value in (provider_latencies_ms or {}).items()
+        if str(name).strip()
+    }
+    clean_provider_result_counts = {
+        str(name).strip(): max(0, int(value or 0))
+        for name, value in (provider_result_counts or {}).items()
+        if str(name).strip()
+    }
+    provider_error_classifications = {
+        name: _classify_provider_error(error)
+        for name, error in clean_provider_errors.items()
+    }
     status: Dict[str, Any] = {
         "pipeline_name": JOB_NAME,
         "ok": bool(ok),
@@ -1066,10 +1356,16 @@ def _record_poll_prices_status(
             "disabled": bool(disabled),
             "fail_backoff_s": float(fail_backoff_s or 0.0),
             "have_price_feed_lock": bool(have_price_feed_lock),
+            "liveness_job_name": str(JOB_LIVENESS_NAME),
+            "shard": INGESTION_SHARD.as_dict(),
             "dedup_drops": int(dedup_drops or 0),
             "gap_events": int(gap_events or 0),
             "normalization_failures": int(normalization_failures or 0),
             "price_rows": int(price_rows or 0),
+            "provider_errors": clean_provider_errors,
+            "provider_error_classifications": provider_error_classifications,
+            "provider_latencies_ms": clean_provider_latencies_ms,
+            "provider_result_counts": clean_provider_result_counts,
             "providers": provider_names,
             "quote_rows": int(quote_rows or 0),
         },
@@ -1087,10 +1383,16 @@ def _record_poll_prices_status(
                 "disabled": bool(disabled),
                 "fail_backoff_s": float(fail_backoff_s or 0.0),
                 "have_price_feed_lock": bool(have_price_feed_lock),
+                "liveness_job_name": str(JOB_LIVENESS_NAME),
+                "shard": INGESTION_SHARD.as_dict(),
                 "dedup_drops": int(dedup_drops or 0),
                 "gap_events": int(gap_events or 0),
                 "normalization_failures": int(normalization_failures or 0),
                 "price_rows": int(price_rows or 0),
+                "provider_errors": clean_provider_errors,
+                "provider_error_classifications": provider_error_classifications,
+                "provider_latencies_ms": clean_provider_latencies_ms,
+                "provider_result_counts": clean_provider_result_counts,
                 "providers": provider_names,
                 "quote_rows": int(quote_rows or 0),
             },
@@ -1114,11 +1416,17 @@ def _record_poll_prices_status(
                 "disabled": bool(disabled),
                 "fail_backoff_s": float(fail_backoff_s or 0.0),
                 "have_price_feed_lock": bool(have_price_feed_lock),
+                "liveness_job_name": str(JOB_LIVENESS_NAME),
+                "shard": INGESTION_SHARD.as_dict(),
                 "dedup_drops": int(dedup_drops or 0),
                 "gap_events": int(gap_events or 0),
                 "normalization_failures": int(normalization_failures or 0),
                 "latency_ms": (None if latency_ms is None else int(latency_ms)),
                 "price_rows": int(price_rows or 0),
+                "provider_errors": clean_provider_errors,
+                "provider_error_classifications": provider_error_classifications,
+                "provider_latencies_ms": clean_provider_latencies_ms,
+                "provider_result_counts": clean_provider_result_counts,
                 "providers": provider_names,
                 "quote_rows": int(quote_rows or 0),
                 "raw_rows": int(raw_rows or 0),
@@ -1134,6 +1442,19 @@ def _record_poll_prices_status(
             providers=provider_names,
         )
     return status
+
+
+def _classify_provider_error(error: object) -> str:
+    text = str(error or "").strip().lower()
+    if not text:
+        return ""
+    if any(token in text for token in ("api_key", "api key", "access_token", "token", "credential", "not set", "missing")):
+        return "missing_credentials"
+    if "429" in text or ("rate" in text and "limit" in text):
+        return "rate_limited"
+    if any(token in text for token in ("timeout", "timed out", "connection", "network", "temporarily", "503", "502", "504")):
+        return "transient_network"
+    return "provider_error"
 
 
 def _record_provider_health_telemetry(
@@ -1205,7 +1526,7 @@ def _record_provider_health_telemetry(
             ok=bool(ok),
             latency_ms=latency_ms_value,
             n_symbols=symbol_count,
-            error=(str(error or "") or None),
+            provider_error=(str(error or "") or None),
             telemetry_append_buffer=snapshot,
         )
 
@@ -1231,6 +1552,207 @@ def _record_provider_health_telemetry(
             ok=bool(ok),
         )
     return bool(buffered)
+
+
+def _snapshot_rest_provider(
+    provider_name: str,
+    manager: ProviderSessionManager,
+    session: PollingProviderSession,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    got: Dict[str, Any] = {}
+    error: Optional[str] = None
+    telemetry: Dict[str, Any] = {}
+    manager_ok = False
+
+    try:
+        got = manager.snapshot() or {}
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        try:
+            session.note_error(error)
+        except Exception as note_error:
+            _log_nonfatal(
+                "poll_prices_provider_snapshot_note_error_failed",
+                note_error,
+                provider=str(provider_name),
+            )
+
+    try:
+        telemetry = manager.provider_telemetry() or {}
+    except Exception as e:
+        if error is None:
+            error = f"{type(e).__name__}: {e}"
+        _log_nonfatal(
+            "poll_prices_provider_snapshot_telemetry_failed",
+            e,
+            provider=str(provider_name),
+        )
+        telemetry = {}
+
+    try:
+        manager_ok = bool(manager.ok())
+    except Exception as e:
+        if error is None:
+            error = f"{type(e).__name__}: {e}"
+        _log_nonfatal(
+            "poll_prices_provider_snapshot_ok_check_failed",
+            e,
+            provider=str(provider_name),
+        )
+        manager_ok = False
+
+    try:
+        latency_ms = int(session.latency_ms())
+    except Exception as e:
+        _log_nonfatal(
+            "poll_prices_provider_snapshot_latency_read_failed",
+            e,
+            provider=str(provider_name),
+        )
+        latency_ms = 0
+    if latency_ms <= 0:
+        latency_ms = max(0, int((time.perf_counter() - started) * 1000.0))
+
+    ok = bool(got or manager_ok)
+    if error is None and not got and not ok:
+        last_error = str(telemetry.get("last_error") or "").strip()
+        error = last_error or "provider_snapshot_empty"
+
+    return {
+        "provider": str(provider_name),
+        "got": got,
+        "ok": bool(ok),
+        "error": (str(error)[:500] if error else None),
+        "latency_ms": int(latency_ms),
+        "telemetry": telemetry,
+    }
+
+
+def _collect_rest_provider_snapshots(
+    jobs: List[Tuple[str, ProviderSessionManager, PollingProviderSession]],
+    *,
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Dict[str, Any]]:
+    clean_jobs = [
+        (str(provider_name), manager, session)
+        for provider_name, manager, session in (jobs or [])
+        if str(provider_name).strip()
+    ]
+    if not clean_jobs:
+        return {}
+
+    worker_count = max(
+        1,
+        min(int(POLL_PRICES_PROVIDER_MAX_WORKERS), int(len(clean_jobs))),
+    )
+    if worker_count <= 1:
+        return {
+            provider_name: _snapshot_rest_provider(provider_name, manager, session)
+            for provider_name, manager, session in clean_jobs
+        }
+
+    collection_timeout_s = max(
+        0.25 if timeout_s is None else 0.01,
+        float(POLL_PRICES_PROVIDER_TIMEOUT_S if timeout_s is None else timeout_s),
+    )
+    results: Dict[str, Dict[str, Any]] = {}
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="poll-prices-provider",
+    )
+    try:
+        futures = {
+            executor.submit(_snapshot_rest_provider, provider_name, manager, session): provider_name
+            for provider_name, manager, session in clean_jobs
+        }
+        completed = set()
+        try:
+            for future in as_completed(futures, timeout=collection_timeout_s):
+                provider_name = futures[future]
+                completed.add(future)
+                try:
+                    results[provider_name] = future.result()
+                except Exception as e:
+                    # _snapshot_rest_provider isolates provider exceptions; this
+                    # is a final guard for executor/runtime failures.
+                    error = f"{type(e).__name__}: {e}"
+                    _log_nonfatal(
+                        "poll_prices_provider_snapshot_executor_failed",
+                        e,
+                        provider=str(provider_name),
+                    )
+                    results[provider_name] = {
+                        "provider": str(provider_name),
+                        "got": {},
+                        "ok": False,
+                        "error": error[:500],
+                        "latency_ms": 0,
+                        "telemetry": {},
+                    }
+        except FutureTimeoutError:
+            timed_out_providers = len(futures) - len(completed)
+            _log_nonfatal(
+                "poll_prices_provider_snapshot_collection_timeout",
+                TimeoutError(f"provider_snapshot_collection_timeout_after_{collection_timeout_s:.3f}s"),
+                timed_out_providers=int(max(0, timed_out_providers)),
+                timeout_s=float(collection_timeout_s),
+            )
+
+        session_by_provider = {provider_name: session for provider_name, _manager, session in clean_jobs}
+        for future, provider_name in futures.items():
+            if future in completed:
+                continue
+            timed_out = False
+            if future.done():
+                try:
+                    results[provider_name] = future.result()
+                    continue
+                except Exception as e:
+                    error = f"{type(e).__name__}: {e}"
+            else:
+                future.cancel()
+                error = f"provider_snapshot_timeout_after_{collection_timeout_s:.3f}s"
+                timed_out = True
+
+            try:
+                session_by_provider[provider_name].note_error(error)
+            except Exception as note_error:
+                _log_nonfatal(
+                    (
+                        "poll_prices_provider_snapshot_timeout_note_error_failed"
+                        if timed_out
+                        else "poll_prices_provider_snapshot_executor_note_error_failed"
+                    ),
+                    note_error,
+                    provider=str(provider_name),
+                )
+            _log_nonfatal(
+                (
+                    "poll_prices_provider_snapshot_timeout"
+                    if timed_out
+                    else "poll_prices_provider_snapshot_executor_failed"
+                ),
+                TimeoutError(error),
+                provider=str(provider_name),
+                **({"timeout_s": float(collection_timeout_s)} if timed_out else {}),
+            )
+            results[provider_name] = {
+                "provider": str(provider_name),
+                "got": {},
+                "ok": False,
+                "error": error[:500],
+                "latency_ms": int(collection_timeout_s * 1000.0),
+                "telemetry": {},
+            }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return {
+        provider_name: results[provider_name]
+        for provider_name, _manager, _session in clean_jobs
+        if provider_name in results
+    }
 
 
 def _init_db_with_retry() -> None:
@@ -1301,6 +1823,38 @@ def _uses_child_job_lock() -> bool:
     return not _is_supervised_ingestion_child()
 
 
+def _write_liveness_heartbeat(
+    *,
+    now_ts_ms: int,
+    fail_s: float,
+    have_price_feed_lock: bool,
+    rest_managers: Dict[str, ProviderSessionManager],
+) -> None:
+    if _uses_child_job_lock():
+        touch_job_lock(JOB_LIVENESS_NAME, OWNER, PID, best_effort=True)
+    if _uses_price_feed_lock():
+        _touch_price_feed_lock(now_ts_ms)
+    put_job_heartbeat(
+        JOB_LIVENESS_NAME,
+        OWNER,
+        PID,
+        extra_json=_json_dumps_text(
+            {
+                "job_name": JOB_NAME,
+                "liveness_job_name": JOB_LIVENESS_NAME,
+                "shard": INGESTION_SHARD.as_dict(),
+                "poll_seconds": POLL_SECONDS,
+                "heartbeat_every_s": HEARTBEAT_EVERY_S,
+                "fail_backoff_s": fail_s,
+                "have_price_feed_lock": bool(have_price_feed_lock),
+                "providers": {k: v.provider_telemetry() for k, v in rest_managers.items()},
+            },
+            sort_keys=True,
+        ),
+        best_effort=True,
+    )
+
+
 # ------------------------------------------------------
 # Main loop
 # ------------------------------------------------------
@@ -1328,7 +1882,7 @@ def main() -> None:
         have_price_feed_lock = _acquire_price_feed_lock()
 
     if _uses_child_job_lock():
-        if not acquire_job_lock(JOB_NAME, OWNER, PID, ttl_s=LOCK_STALE_AFTER_S):
+        if not acquire_job_lock(JOB_LIVENESS_NAME, OWNER, PID, ttl_s=LOCK_STALE_AFTER_S):
             raise SystemExit(2)
         have_job_lock = True
 
@@ -1345,16 +1899,16 @@ def main() -> None:
     if not chain:
         chain = [os.environ.get("LIVE_PRICE_PROVIDER", "yfinance").lower().strip()]
 
-    chain = [p for p in chain if p]
+    chain = _append_simulated_provider_fallback([p for p in chain if p])
     if not chain:
         chain = ["yfinance"]
 
-    # Instantiate non-CCXT providers behind provider sessions; ccxt stays on its own helper path.
+    # Instantiate REST snapshot providers behind provider sessions so the poll
+    # loop can fetch them concurrently while keeping DB writes ordered.
     rest_sessions: Dict[str, PollingProviderSession] = {}
     rest_managers: Dict[str, ProviderSessionManager] = {}
+    provider_init_errors: Dict[str, str] = {}
     for name in chain:
-        if name == "ccxt":
-            continue
         try:
             provider_obj = get_price_provider_by_name(name)
             session = PollingProviderSession(name, provider_obj, poll_interval_s=float(POLL_SECONDS))
@@ -1370,13 +1924,12 @@ def main() -> None:
             rest_sessions[name] = session
             rest_managers[name] = session_manager
         except Exception as e:
+            provider_init_errors[str(name)] = f"{type(e).__name__}: {e}"[:500]
             _log_nonfatal("poll_prices_provider_init_failed", e, provider=name)
             continue
 
     if not rest_managers:
         for name in list(get_polling_provider_names()) or ["yfinance"]:
-            if name == "ccxt":
-                continue
             try:
                 provider_obj = get_price_provider_by_name(name)
                 session = PollingProviderSession(name, provider_obj, poll_interval_s=float(POLL_SECONDS))
@@ -1393,6 +1946,7 @@ def main() -> None:
                 rest_managers[name] = session_manager
                 break
             except Exception as e:
+                provider_init_errors[str(name)] = f"{type(e).__name__}: {e}"[:500]
                 _log_nonfatal("poll_prices_provider_init_failed", e, provider=name)
                 continue
 
@@ -1419,6 +1973,7 @@ def main() -> None:
             rest_sessions["yfinance"] = session
             rest_managers["yfinance"] = session_manager
         except Exception as e:
+            provider_init_errors["yfinance"] = f"{type(e).__name__}: {e}"[:500]
             _log_nonfatal("poll_prices_fallback_provider_init_failed", e, provider="yfinance")
 
     fail_s = 0.0
@@ -1450,31 +2005,23 @@ def main() -> None:
             pipeline_gap_events = 0
             pipeline_normalization_failures = 0
             pipeline_ok = False
+            producer_backpressure = False
+            provider_errors: Dict[str, str] = {}
+            provider_latencies_ms: Dict[str, int] = {}
+            provider_result_counts: Dict[str, int] = {}
+            if provider_init_errors:
+                provider_errors.update(provider_init_errors)
+                provider_result_counts.update({name: 0 for name in provider_init_errors})
+            cycle_fresh_symbol_ts_ms: Dict[str, int] = {}
             persist_provider_health = (now_s - last_provider_health_s) >= PROVIDER_HEALTH_EVERY_S
 
             if now_s - last_hb_s >= HEARTBEAT_EVERY_S:
                 try:
-                    close_pooled_connections()
-                    if _uses_child_job_lock():
-                        touch_job_lock(JOB_NAME, OWNER, PID, best_effort=True)
-                    if _uses_price_feed_lock():
-                        _touch_price_feed_lock(now_ts_ms)
-                    put_job_heartbeat(
-                        JOB_NAME,
-                        OWNER,
-                        PID,
-                        extra_json=json.dumps(
-                            {
-                                "poll_seconds": POLL_SECONDS,
-                                "heartbeat_every_s": HEARTBEAT_EVERY_S,
-                                "fail_backoff_s": fail_s,
-                                "have_price_feed_lock": bool(have_price_feed_lock),
-                                "providers": {k: v.provider_telemetry() for k, v in rest_managers.items()},
-                            },
-                            separators=(",", ":"),
-                            sort_keys=True,
-                        ),
-                        best_effort=True,
+                    _write_liveness_heartbeat(
+                        now_ts_ms=now_ts_ms,
+                        fail_s=fail_s,
+                        have_price_feed_lock=bool(have_price_feed_lock),
+                        rest_managers=rest_managers,
                     )
                 except Exception as e:
                     _log_nonfatal(
@@ -1491,7 +2038,22 @@ def main() -> None:
                     _sleep_with_jitter(min(float(POLL_SECONDS), 5.0))
                     continue
 
-            yf_map, ccxt_map, polygon_map = _load_symbol_providers()
+            cycle_symbols = _build_cycle_symbol_plan(list(rest_managers.keys()))
+            cycle_universe = cycle_symbols.universe
+            assigned_symbol_count = cycle_symbols.assigned_symbol_count
+            if INGESTION_SHARD.enabled and assigned_symbol_count <= 0:
+                fail_s = 0.0
+                _record_poll_prices_status(
+                    source_manager,
+                    ok=True,
+                    providers=list(rest_managers.keys()),
+                    provider_result_counts={name: 0 for name in rest_managers.keys()},
+                    have_price_feed_lock=bool(have_price_feed_lock),
+                    fail_backoff_s=fail_s,
+                    message="poll_prices shard has no assigned symbols",
+                )
+                _sleep_with_jitter(float(POLL_SECONDS))
+                continue
 
             merged: Dict[str, Dict[str, Any]] = {}
             got_by_provider: Dict[str, Dict[str, Any]] = {}
@@ -1502,32 +2064,71 @@ def main() -> None:
             # REST / snapshot providers
             # -----------------------------
             if rest_managers:
+                provider_symbol_maps: Dict[str, Dict[str, str]] = {}
+                provider_order: List[str] = []
+                provider_jobs: List[Tuple[str, ProviderSessionManager, PollingProviderSession]] = []
+                snapshot_results: Dict[str, Dict[str, Any]] = {}
+
                 for pname, manager in rest_managers.items():
                     session = rest_sessions[pname]
-                    provider_symbol_map = dict(yf_map)
-                    if pname == "polygon":
-                        provider_symbol_map = dict(polygon_map)
+                    provider_symbol_map = dict(cycle_symbols.provider_symbol_maps.get(str(pname)) or {})
                     if not provider_symbol_map:
                         continue
+                    provider_order.append(str(pname))
+                    provider_symbol_maps[pname] = provider_symbol_map
                     session.set_symbol_map(provider_symbol_map)
-                    manager.ensure_subscriptions(sorted(provider_symbol_map.keys()))
-
-                    t0 = time.time()
-                    got: Dict[str, Any] = {}
                     try:
-                        got = manager.snapshot() or {}
-                    except Exception:
-                        got = {}
+                        manager.ensure_subscriptions(sorted(provider_symbol_map.keys()))
+                        provider_jobs.append((str(pname), manager, session))
+                    except Exception as e:
+                        err = f"{type(e).__name__}: {e}"
+                        try:
+                            session.note_error(err)
+                        except Exception as note_error:
+                            _log_nonfatal(
+                                "poll_prices_provider_subscription_note_error_failed",
+                                note_error,
+                                provider=str(pname),
+                            )
+                        snapshot_results[str(pname)] = {
+                            "provider": str(pname),
+                            "got": {},
+                            "ok": False,
+                            "error": err[:500],
+                            "latency_ms": 0,
+                            "telemetry": {},
+                        }
 
-                    telemetry = manager.provider_telemetry() or {}
-                    ok = 1 if (got or manager.ok()) else 0
-                    err = None if got else (telemetry.get("last_error") if not ok else None)
-                    latency_ms = int(getattr(session, "latency_ms")())
-                    if latency_ms <= 0:
-                        latency_ms = int((time.time() - t0) * 1000)
+                snapshot_results.update(_collect_rest_provider_snapshots(provider_jobs))
+
+                snapshot_success_count = sum(
+                    1
+                    for result in snapshot_results.values()
+                    if bool((result or {}).get("got")) or bool((result or {}).get("ok"))
+                )
+
+                for pname in provider_order:
+                    provider_symbol_map = dict(provider_symbol_maps.get(pname) or {})
+                    result = dict(snapshot_results.get(pname) or {})
+                    got = dict(result.get("got") or {})
+                    ok = bool(result.get("ok"))
+                    err = str(result.get("error") or "").strip() or None
+                    latency_ms = max(0, int(result.get("latency_ms") or 0))
+
+                    provider_latencies_ms[str(pname)] = int(latency_ms)
+                    provider_result_counts[str(pname)] = int(len(got))
+                    if err:
+                        provider_errors[str(pname)] = str(err)[:500]
 
                     emit_timing(
                         "market_data_latency_ms",
+                        latency_ms,
+                        component="engine.data.poll_prices",
+                        job=JOB_NAME,
+                        provider=pname,
+                    )
+                    emit_timing(
+                        "provider_snapshot_latency_ms",
                         latency_ms,
                         component="engine.data.poll_prices",
                         job=JOB_NAME,
@@ -1541,13 +2142,35 @@ def main() -> None:
                         provider=pname,
                     )
                     got_by_provider[pname] = got
+                    if err:
+                        emit_counter(
+                            "provider_snapshot_failure",
+                            1,
+                            component="engine.data.poll_prices",
+                            job=JOB_NAME,
+                            provider=pname,
+                        )
+                        log_event(
+                            LOG,
+                            30,
+                            "poll_prices_provider_snapshot_failed",
+                            component="engine.data.poll_prices",
+                            extra={
+                                "job": JOB_NAME,
+                                "provider": str(pname),
+                                "latency_ms": int(latency_ms),
+                                "n_symbols": int(len(provider_symbol_map)),
+                                "error": str(err)[:500],
+                                "partial_failure": bool(snapshot_success_count > 0),
+                            },
+                        )
 
                     if persist_provider_health:
                         try:
                             _record_provider_health_telemetry(
-                                get_manager(),
+                                source_manager,
                                 provider=str(pname),
-                                ok=bool(int(ok) == 1),
+                                ok=bool(ok),
                                 latency_ms=(None if latency_ms is None else int(latency_ms)),
                                 n_symbols=int(len(provider_symbol_map)),
                                 error=err,
@@ -1627,27 +2250,21 @@ def main() -> None:
 
                         got_by_provider[pname] = got
 
+                if provider_errors:
+                    emit_gauge(
+                        "provider_snapshot_partial_failures",
+                        len(provider_errors),
+                        component="engine.data.poll_prices",
+                        job=JOB_NAME,
+                    )
+
                 if persist_provider_health:
                     last_provider_health_s = now_s
 
             # -----------------------------
-            # CCXT (kept separate)
-            # -----------------------------
-            if ccxt_map and ("ccxt" in chain):
-                try:
-                    merged.update(_fetch_last_prices_ccxt("binance", ccxt_map) or {})
-                except Exception as e:
-                    _log_nonfatal(
-                        "poll_prices_ccxt_fetch_failed",
-                        e,
-                        warn_key="poll_prices_ccxt_fetch_failed",
-                        symbol_count=int(len(ccxt_map or {})),
-                    )
-
-            # -----------------------------
             # Router-based arbitration for overlapping REST providers
             # -----------------------------
-            if got_by_provider and yf_map:
+            if got_by_provider:
                 normalized_snapshots: Dict[str, Dict[str, Any]] = {}
                 for pname, got in got_by_provider.items():
                     provider_rows: Dict[str, Any] = {}
@@ -1737,7 +2354,7 @@ def main() -> None:
                         )
                         meta_set(
                             "price_provider_health_snapshot",
-                            json.dumps(
+                            _json_dumps_text(
                                 {
                                     str(k): {
                                         "ok": bool(v.get("ok")),
@@ -1748,7 +2365,6 @@ def main() -> None:
                                     }
                                     for k, v in (provider_health or {}).items()
                                 },
-                                separators=(",", ":"),
                                 sort_keys=True,
                             ),
                             best_effort=True,
@@ -1833,14 +2449,13 @@ def main() -> None:
                             if PRICE_OUTLIER_REJECT_ENABLED:
                                 continue
 
-                        if hist and is_split_like_price_jump(hist[-1], px_f):
-                            log_split_like_price_row(
-                                symbol=str(sym),
-                                ts_ms=int(ts_ms),
-                                previous_price=float(hist[-1]),
-                                current_price=float(px_f),
-                                source=str(p.get("source") or p.get("provider") or "poll_prices"),
-                            )
+                        if _reject_split_like_price_row(
+                            symbol=str(sym),
+                            ts_ms=int(ts_ms),
+                            current_price=float(px_f),
+                            price_payload=p,
+                            hist=hist,
+                        ):
                             continue
 
                         price_rows.append((int(ts_ms), str(sym), float(px_f)))
@@ -1938,6 +2553,20 @@ def main() -> None:
                     busy_timeout_ms=int(merged_write_budget["busy_timeout_ms"]),
                 )
                 price_rows, quote_rows = merged_write_result
+                for row in price_rows or []:
+                    if len(row) <= 1:
+                        continue
+                    sym_s = str(row[1] or "").strip().upper()
+                    if not sym_s:
+                        continue
+                    try:
+                        row_ts_ms = int(row[0])
+                    except Exception:
+                        row_ts_ms = int(now_ts_ms)
+                    cycle_fresh_symbol_ts_ms[sym_s] = max(
+                        int(cycle_fresh_symbol_ts_ms.get(sym_s) or 0),
+                        int(row_ts_ms),
+                    )
                 if merged_write_ok:
                     _finalize_post_commit_price_cycle(
                         pending_outlier_alerts,
@@ -1956,11 +2585,13 @@ def main() -> None:
                             )
                         if not provider_rows_ok and not pipeline_error:
                             pipeline_error = "provider_rows_write_busy"
+                        if not provider_rows_ok:
+                            producer_backpressure = True
                 else:
                     pipeline_raw_rows = int(len(raw_quote_rows))
                     pipeline_last_ingested_ts_ms = max((int(row[0]) for row in raw_quote_rows), default=None)
                     pipeline_error = "price_write_busy"
-                    fail_s = min(FAIL_MAX_S, fail_s * 2.0 if fail_s else FAIL_BASE_S)
+                    fail_s = _next_fail_backoff_s(fail_s)
 
                 pipeline_price_rows = int(len(price_rows))
                 pipeline_quote_rows = int(len(quote_rows))
@@ -1973,7 +2604,7 @@ def main() -> None:
                 if merged_write_ok and async_backpressure:
                     if not pipeline_error:
                         pipeline_error = str(async_status.get("reason") or "async_price_writer_backpressure")
-                    fail_s = min(FAIL_MAX_S, fail_s * 2.0 if fail_s else FAIL_BASE_S)
+                    producer_backpressure = True
                 pipeline_ok = bool(
                     merged_write_ok and (pipeline_price_rows > 0 or pipeline_quote_rows > 0 or pipeline_raw_rows > 0)
                     and not async_backpressure
@@ -2024,7 +2655,10 @@ def main() -> None:
                     elif raw_quote_rows:
                         pipeline_last_ingested_ts_ms = max(int(row[0]) for row in raw_quote_rows)
 
-                    fail_s = 0.0
+                    fail_s = _successful_price_cycle_backoff_s(
+                        current_fail_s=fail_s,
+                        producer_backpressure=producer_backpressure,
+                    )
             else:
                 # fallback: write minimal heartbeat price if possible
                 if "SPY" not in merged:
@@ -2043,7 +2677,7 @@ def main() -> None:
                 pipeline_last_ingested_ts_ms = max((int(row[0]) for row in raw_quote_rows), default=None)
                 if not pipeline_ok:
                     pipeline_error = "no_live_quotes_merged"
-                fail_s = min(FAIL_MAX_S, fail_s * 2.0 if fail_s else FAIL_BASE_S)
+                fail_s = _next_fail_backoff_s(fail_s)
 
             _record_poll_prices_status(
                 source_manager,
@@ -2057,12 +2691,20 @@ def main() -> None:
                 last_ingested_ts_ms=pipeline_last_ingested_ts_ms,
                 error=(pipeline_error or None),
                 providers=list(rest_managers.keys()),
+                provider_errors=provider_errors,
+                provider_latencies_ms=provider_latencies_ms,
+                provider_result_counts=provider_result_counts,
                 have_price_feed_lock=bool(have_price_feed_lock),
                 fail_backoff_s=fail_s,
                 latency_ms=pipeline_latency_ms,
                 message=("poll_prices cycle complete" if pipeline_ok else "poll_prices awaiting live quotes"),
             )
-            _mark_stale(now_ts_ms)
+            _mark_stale(
+                now_ts_ms,
+                active_symbol_rows=cycle_universe.active_symbol_rows,
+                fresh_symbols=sorted(cycle_fresh_symbol_ts_ms.keys()),
+                fresh_symbol_ts_ms=cycle_fresh_symbol_ts_ms,
+            )
             _sleep_with_jitter(fail_s or float(POLL_SECONDS))
 
     finally:
@@ -2089,7 +2731,7 @@ def main() -> None:
                 _log_nonfatal("poll_prices_release_feed_lock_failed", e)
 
         if _uses_child_job_lock() and have_job_lock:
-            release_job_lock(JOB_NAME, OWNER, PID)
+            release_job_lock(JOB_LIVENESS_NAME, OWNER, PID)
 
 
 if __name__ == "__main__":
@@ -2109,7 +2751,7 @@ if __name__ == "__main__":
             )
             _log_nonfatal(
                 "poll_prices_unhandled_exception",
-                e,
+                RuntimeError(f"{type(e).__name__}: {e}"),
                 error_type=type(e).__name__,
                 error_message=str(e),
             )

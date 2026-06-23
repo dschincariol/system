@@ -159,6 +159,7 @@ pyright_report.json
 pyright-report.json
 pyright_workspace.txt
 *-pyright.json
+!tools/pyright_money_path_baseline.json
 ruff_*.json
 ruff-*.json
 ruff_report.json

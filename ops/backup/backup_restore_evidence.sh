@@ -84,6 +84,10 @@ wal_target_expected_group_gid=""
 wal_target_expected_dir_mode="${TS_BACKUP_WAL_TARGET_DIR_MODE:-2750}"
 wal_target_repaired="false"
 wal_target_issue_count="0"
+wal_target_diagnosis_source=""
+wal_target_diagnosis_probe_status=""
+wal_target_diagnosis_probe_wal_name=""
+wal_target_diagnosis_probe_output=""
 wal_target_diagnosis_signature=""
 wal_target_diagnosis_exit_code=""
 wal_target_diagnosis_fix=""
@@ -303,6 +307,112 @@ append_wal_target_state() {
     >> "${work_dir}/wal_archive_target.out"
 }
 
+archive_command_event_from_output() {
+  awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^event=/) {
+          sub(/^event=/, "", $i)
+          print $i
+          exit
+        }
+      }
+    }
+  ' "$@" 2>/dev/null || true
+}
+
+one_line_tail() {
+  tail -n 8 "$@" 2>/dev/null \
+    | tr '\n' ' ' \
+    | awk '{$1=$1; print substr($0, 1, 700)}' 2>/dev/null || true
+}
+
+run_wal_archive_target_diagnosis_probe() {
+  local uid="$1"
+  local gid="$2"
+  local current_uid probe_src probe_stdout probe_stderr probe_rc event probe_cmd_rc
+  local probe_name
+
+  current_uid="$(id -u)"
+  probe_name="0000000100000000000000FD.diagnosis.${stamp//[^A-Za-z0-9._-]/_}"
+  probe_src="${work_dir}/${probe_name}.src"
+  probe_stdout="${work_dir}/wal_archive_target_probe.out"
+  probe_stderr="${work_dir}/wal_archive_target_probe.err"
+  wal_target_diagnosis_source="wal_archive_probe"
+  wal_target_diagnosis_probe_wal_name="$probe_name"
+  printf 'wal archive target diagnosis probe\n' > "$probe_src"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "${uid}:${gid}" "$probe_src" 2>/dev/null || true
+  else
+    chgrp "$gid" "$probe_src" 2>/dev/null || true
+  fi
+  chmod 0640 "$probe_src" 2>/dev/null || true
+
+  : > "$probe_stdout"
+  : > "$probe_stderr"
+  printf 'diagnosis_probe_wal_name=%s\n' "$probe_name" >> "${work_dir}/wal_archive_target.out"
+  printf 'diagnosis_probe_uid=%s\n' "$uid" >> "${work_dir}/wal_archive_target.out"
+  printf 'diagnosis_probe_gid=%s\n' "$gid" >> "${work_dir}/wal_archive_target.out"
+
+  set +e
+  if [ "$current_uid" -eq 0 ]; then
+    if command -v setpriv >/dev/null 2>&1; then
+      setpriv --reuid "$uid" --regid "$gid" --clear-groups \
+        env \
+          TS_BACKUP_ROOT="$wal_target_root" \
+          TS_BACKUP_WAL_DIR="$wal_target_dir" \
+          TS_WAL_OFFSITE_CMD= \
+          bash "$wal_archive_script" "$probe_src" "$probe_name" \
+        > "$probe_stdout" 2> "$probe_stderr"
+      probe_cmd_rc=$?
+    else
+      printf 'setpriv_missing=1\n' >> "$probe_stderr"
+      probe_cmd_rc=126
+    fi
+  elif [ "$current_uid" = "$uid" ]; then
+    env \
+      TS_BACKUP_ROOT="$wal_target_root" \
+      TS_BACKUP_WAL_DIR="$wal_target_dir" \
+      TS_WAL_OFFSITE_CMD= \
+      bash "$wal_archive_script" "$probe_src" "$probe_name" \
+      > "$probe_stdout" 2> "$probe_stderr"
+    probe_cmd_rc=$?
+  else
+    printf 'current_uid_mismatch current_uid=%s expected_uid=%s\n' "$current_uid" "$uid" >> "$probe_stderr"
+    probe_cmd_rc=126
+  fi
+  set -e
+
+  probe_rc="$probe_cmd_rc"
+  wal_target_diagnosis_exit_code="$probe_rc"
+  event="$(archive_command_event_from_output "$probe_stdout" "$probe_stderr")"
+  if [ -z "$event" ]; then
+    case "$probe_rc" in
+      0) event="" ;;
+      126) event="archive_command_probe_unavailable" ;;
+      *) event="archive_command_probe_failed" ;;
+    esac
+  fi
+  wal_target_diagnosis_signature="$event"
+  wal_target_diagnosis_probe_output="$(one_line_tail "$probe_stdout" "$probe_stderr")"
+
+  if [ "$probe_rc" -eq 0 ]; then
+    wal_target_diagnosis_probe_status="unexpected_success"
+    rm -f "${wal_target_dir}/${probe_name}" "${wal_target_tmp_dir}/${probe_name}"* 2>/dev/null || true
+  elif [ "$probe_rc" -eq 126 ] && [ "$event" = "archive_command_probe_unavailable" ]; then
+    wal_target_diagnosis_probe_status="unavailable"
+  else
+    wal_target_diagnosis_probe_status="observed_failure"
+  fi
+
+  printf 'diagnosis_probe_status=%s\n' "$wal_target_diagnosis_probe_status" >> "${work_dir}/wal_archive_target.out"
+  printf 'diagnosis_probe_exit_code=%s\n' "$wal_target_diagnosis_exit_code" >> "${work_dir}/wal_archive_target.out"
+  printf 'diagnosis_probe_failure_signature=%s\n' "$wal_target_diagnosis_signature" >> "${work_dir}/wal_archive_target.out"
+  printf 'diagnosis_probe_output=%s\n' "$wal_target_diagnosis_probe_output" >> "${work_dir}/wal_archive_target.out"
+
+  [ "$wal_target_diagnosis_probe_status" != "unavailable" ]
+}
+
 repair_wal_archive_target() {
   local rc=0
   local uid group gid mode current_uid path actual_uid actual_gid actual_mode
@@ -391,9 +501,10 @@ repair_wal_archive_target() {
 
   if [ "$wal_target_issue_count" -gt 0 ]; then
     wal_target_repaired="true"
-    wal_target_diagnosis_signature="archive_dir_not_writable"
-    wal_target_diagnosis_exit_code="1"
+    run_wal_archive_target_diagnosis_probe "$uid" "$gid" || rc=1
     wal_target_diagnosis_fix="chown ${uid}:${group} ${wal_target_root} ${wal_target_dir} ${wal_target_tmp_dir}; chmod ${mode} ${wal_target_root} ${wal_target_dir} ${wal_target_tmp_dir}"
+    printf 'diagnosis_source=%s\n' "$wal_target_diagnosis_source" >> "${work_dir}/wal_archive_target.out"
+    printf 'diagnosis_probe_status=%s\n' "$wal_target_diagnosis_probe_status" >> "${work_dir}/wal_archive_target.out"
     printf 'diagnosis_original_archive_command_failure_signature=%s\n' "$wal_target_diagnosis_signature" >> "${work_dir}/wal_archive_target.out"
     printf 'diagnosis_original_archive_command_exit_code=%s\n' "$wal_target_diagnosis_exit_code" >> "${work_dir}/wal_archive_target.out"
     printf 'diagnosis_failure_signature=%s\n' "$wal_target_diagnosis_signature" >> "${work_dir}/wal_archive_target.out"
@@ -1083,9 +1194,13 @@ write_reports() {
 	    printf 'wal_archive_target_expected_dir_mode=%s\n' "$wal_target_expected_dir_mode"
 	    printf 'wal_archive_target_repaired=%s\n' "$wal_target_repaired"
 	    printf 'wal_archive_target_issue_count=%s\n' "$wal_target_issue_count"
+	    printf 'wal_archive_target_diagnosis_source=%s\n' "$wal_target_diagnosis_source"
+	    printf 'wal_archive_target_diagnosis_probe_status=%s\n' "$wal_target_diagnosis_probe_status"
+	    printf 'wal_archive_target_diagnosis_probe_wal_name=%s\n' "$wal_target_diagnosis_probe_wal_name"
 	    printf 'wal_archive_target_diagnosis_signature=%s\n' "$wal_target_diagnosis_signature"
 	    printf 'wal_archive_target_diagnosis_exit_code=%s\n' "$wal_target_diagnosis_exit_code"
 	    printf 'wal_archive_target_diagnosis_fix=%s\n' "$wal_target_diagnosis_fix"
+	    printf 'wal_archive_target_diagnosis_probe_output=%s\n' "$wal_target_diagnosis_probe_output"
 	    printf 'restore_drill_status=%s\n' "$restore_drill_status"
 	    printf 'restore_drill_report=%s\n' "$restore_drill_report"
 	    printf 'restore_drill_verified_at=%s\n' "$restore_drill_verified_at"
@@ -1165,9 +1280,13 @@ write_reports() {
 	  WAL_TARGET_EXPECTED_DIR_MODE="$wal_target_expected_dir_mode" \
 	  WAL_TARGET_REPAIRED="$wal_target_repaired" \
 	  WAL_TARGET_ISSUE_COUNT="$wal_target_issue_count" \
+	  WAL_TARGET_DIAGNOSIS_SOURCE="$wal_target_diagnosis_source" \
+	  WAL_TARGET_DIAGNOSIS_PROBE_STATUS="$wal_target_diagnosis_probe_status" \
+	  WAL_TARGET_DIAGNOSIS_PROBE_WAL_NAME="$wal_target_diagnosis_probe_wal_name" \
 	  WAL_TARGET_DIAGNOSIS_SIGNATURE="$wal_target_diagnosis_signature" \
 	  WAL_TARGET_DIAGNOSIS_EXIT_CODE="$wal_target_diagnosis_exit_code" \
 	  WAL_TARGET_DIAGNOSIS_FIX="$wal_target_diagnosis_fix" \
+	  WAL_TARGET_DIAGNOSIS_PROBE_OUTPUT="$wal_target_diagnosis_probe_output" \
 	  RESTORE_DRILL_STATUS="$restore_drill_status" \
 	  RESTORE_DRILL_REPORT="$restore_drill_report" \
 	  RESTORE_DRILL_VERIFIED_AT="$restore_drill_verified_at" \
@@ -1349,6 +1468,9 @@ payload = {
 	        "verified_at": os.environ["WAL_TARGET_VERIFIED_AT"],
 	        "verified_at_ts": ts(os.environ["WAL_TARGET_VERIFIED_AT"]),
 	        "diagnosis": {
+	            "source": os.environ["WAL_TARGET_DIAGNOSIS_SOURCE"],
+	            "archive_command_probe_status": os.environ["WAL_TARGET_DIAGNOSIS_PROBE_STATUS"],
+	            "archive_command_probe_wal_name": os.environ["WAL_TARGET_DIAGNOSIS_PROBE_WAL_NAME"],
 	            "observed_pg_stat_archiver_failed_count": maybe_int(os.environ["WAL_ARCHIVER_FAILED_COUNT"]),
 	            "observed_pg_stat_archiver_last_failed_wal": os.environ["WAL_ARCHIVER_LAST_FAILED_WAL"],
 	            "observed_pg_stat_archiver_last_failed_at": os.environ["WAL_ARCHIVER_LAST_FAILED_AT"],
@@ -1357,6 +1479,7 @@ payload = {
 	            "original_archive_command_exit_code": maybe_int(os.environ["WAL_TARGET_DIAGNOSIS_EXIT_CODE"]),
 	            "archive_command_failure_signature": os.environ["WAL_TARGET_DIAGNOSIS_SIGNATURE"],
 	            "archive_command_exit_code": maybe_int(os.environ["WAL_TARGET_DIAGNOSIS_EXIT_CODE"]),
+	            "archive_command_probe_output": os.environ["WAL_TARGET_DIAGNOSIS_PROBE_OUTPUT"],
 	            "fix": os.environ["WAL_TARGET_DIAGNOSIS_FIX"],
 	        },
 	    },

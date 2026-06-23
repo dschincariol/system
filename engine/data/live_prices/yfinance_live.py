@@ -11,11 +11,13 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from typing import Dict
+from typing import Any, Dict, cast
 import requests
+from requests.adapters import HTTPAdapter
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.metrics import emit_counter, emit_gauge
 
 try:
     import yfinance as yf
@@ -24,7 +26,6 @@ except Exception as _yfinance_import_error:
     yf = None  # type: ignore
     _YFINANCE_IMPORT_ERROR = _yfinance_import_error
 
-_THREAD_LOCAL = threading.local()
 LOG = get_logger("engine.data.live_prices.yfinance_live")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 _YFINANCE_TIMEOUT_S = float(os.environ.get("YFINANCE_TIMEOUT_S", "15"))
@@ -82,7 +83,7 @@ def _finite_float_or_none(value: object) -> float | None:
     if value is None:
         return None
     try:
-        out = float(value)
+        out = float(cast(Any, value))
     except Exception:
         return None
     if not math.isfinite(out):
@@ -90,15 +91,97 @@ def _finite_float_or_none(value: object) -> float | None:
     return float(out)
 
 
+_HTTP_SESSION: requests.Session | None = None
+_HTTP_SESSION_LOCK = threading.Lock()
+_HTTP_SESSION_POOL_SIZE: int | None = None
+_YFINANCE_EXECUTOR: ThreadPoolExecutor | None = None
+_YFINANCE_EXECUTOR_MAX_WORKERS: int | None = None
+_YFINANCE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _configured_executor_max_workers() -> int:
+    raw = os.environ.get("YFINANCE_LIVE_MAX_WORKERS", "12")
+    try:
+        parsed = int(float(str(raw).strip()))
+    except Exception:
+        parsed = 12
+    return max(1, int(parsed))
+
+
+def _configured_http_pool_size() -> int:
+    return max(32, _configured_executor_max_workers())
+
+
 def _get_http_session() -> requests.Session:
-    session = getattr(_THREAD_LOCAL, "session", None)
+    global _HTTP_SESSION, _HTTP_SESSION_POOL_SIZE
+
+    session = _HTTP_SESSION
     if isinstance(session, requests.Session):
         return session
-    session = requests.Session()
-    session.trust_env = False
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
-    _THREAD_LOCAL.session = session
-    return session
+    with _HTTP_SESSION_LOCK:
+        session = _HTTP_SESSION
+        if isinstance(session, requests.Session):
+            return session
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+        pool_size = _configured_http_pool_size()
+        try:
+            adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        except Exception as e:
+            _warn_nonfatal("YFINANCE_SESSION_POOL_CONFIG_FAILED", e, once_key="yfinance_session_pool_config")
+        _HTTP_SESSION = session
+        _HTTP_SESSION_POOL_SIZE = int(pool_size)
+        return session
+
+
+def _get_yfinance_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
+    global _YFINANCE_EXECUTOR, _YFINANCE_EXECUTOR_MAX_WORKERS
+
+    configured_workers = _configured_executor_max_workers()
+    desired_workers = int(max_workers) if max_workers is not None else configured_workers
+    desired_workers = max(1, min(desired_workers, configured_workers))
+    executor = _YFINANCE_EXECUTOR
+    if executor is not None and int(_YFINANCE_EXECUTOR_MAX_WORKERS or 0) >= desired_workers:
+        return executor
+
+    with _YFINANCE_EXECUTOR_LOCK:
+        executor = _YFINANCE_EXECUTOR
+        if executor is not None and int(_YFINANCE_EXECUTOR_MAX_WORKERS or 0) >= desired_workers:
+            return executor
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        _YFINANCE_EXECUTOR = ThreadPoolExecutor(max_workers=desired_workers, thread_name_prefix="yf-live")
+        _YFINANCE_EXECUTOR_MAX_WORKERS = int(desired_workers)
+        return _YFINANCE_EXECUTOR
+
+
+def shutdown_yfinance_resources(*, wait: bool = True, cancel_futures: bool = True) -> None:
+    global _HTTP_SESSION, _HTTP_SESSION_POOL_SIZE, _YFINANCE_EXECUTOR, _YFINANCE_EXECUTOR_MAX_WORKERS
+
+    with _YFINANCE_EXECUTOR_LOCK:
+        executor = _YFINANCE_EXECUTOR
+        _YFINANCE_EXECUTOR = None
+        _YFINANCE_EXECUTOR_MAX_WORKERS = None
+    if executor is not None:
+        executor.shutdown(wait=bool(wait), cancel_futures=bool(cancel_futures))
+
+    with _HTTP_SESSION_LOCK:
+        session = _HTTP_SESSION
+        _HTTP_SESSION = None
+        _HTTP_SESSION_POOL_SIZE = None
+    if session is not None:
+        session.close()
+
+
+def reset_yfinance_resources_for_tests() -> None:
+    global _YFINANCE_BATCH_CURSOR
+
+    shutdown_yfinance_resources(wait=True, cancel_futures=True)
+    with _YFINANCE_BATCH_LOCK:
+        _YFINANCE_BATCH_CURSOR = 0
 
 
 def _remaining_budget_s(deadline_monotonic: float | None) -> float | None:
@@ -113,7 +196,174 @@ def _bounded_request_timeout_s(deadline_monotonic: float | None) -> float:
         return float(_YFINANCE_TIMEOUT_S)
     if remaining_s <= 0.0:
         return 0.0
-    return max(0.25, min(float(_YFINANCE_TIMEOUT_S), float(remaining_s)))
+    return max(0.001, min(float(_YFINANCE_TIMEOUT_S), float(remaining_s)))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_positive_int(names: tuple[str, ...], default: int | None = None) -> int | None:
+    for name in names:
+        raw = os.environ.get(str(name))
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            parsed = int(float(str(raw).strip()))
+        except Exception:
+            parsed = 0
+        return int(parsed) if parsed > 0 else None
+    return default
+
+
+def _yf_download_batch_enabled() -> bool:
+    return bool(
+        yf is not None
+        and hasattr(yf, "download")
+        and _env_bool("YFINANCE_LIVE_BATCH_ENABLED", True)
+    )
+
+
+def _configured_symbol_limit(*, batch_path_active: bool) -> int | None:
+    if batch_path_active:
+        return None
+    return _env_positive_int(
+        ("YFINANCE_LIVE_FALLBACK_SYMBOL_LIMIT", "YFINANCE_LIVE_BATCH_SIZE"),
+        default=64,
+    )
+
+
+def _configured_batch_chunk_size() -> int:
+    return max(
+        1,
+        int(
+            _env_positive_int(
+                ("YFINANCE_LIVE_BATCH_CHUNK_SIZE", "YFINANCE_LIVE_BATCH_SIZE"),
+                default=128,
+            )
+            or 128
+        ),
+    )
+
+
+def _eligible_ticker_items(ticker_map: Dict[str, str]) -> list[tuple[str, str]]:
+    return [
+        (str(sym), _normalize_ticker(tkr))
+        for sym, tkr in (ticker_map or {}).items()
+        if str(sym).strip() and _normalize_ticker(tkr)
+    ]
+
+
+def _iter_chunks(items: list[str], chunk_size: int) -> list[list[str]]:
+    size = max(1, int(chunk_size))
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _log_partial_batch_failure(
+    *,
+    configured: int,
+    requested: int,
+    returned: int,
+    missing: int,
+    timed_out: bool,
+    chunk_size: int,
+    missing_symbols: list[str],
+) -> None:
+    LOG.log(
+        logging.WARNING,
+        "yfinance_download_batch_partial configured=%d requested=%d returned=%d missing=%d timed_out=%s chunk_size=%d missing_symbols=%s",
+        int(configured),
+        int(requested),
+        int(returned),
+        int(missing),
+        bool(timed_out),
+        int(chunk_size),
+        ",".join(str(sym) for sym in missing_symbols[:20]),
+        extra={
+            "event": "yfinance_download_batch_partial",
+            "configured": int(configured),
+            "requested": int(requested),
+            "returned": int(returned),
+            "missing": int(missing),
+            "timed_out": bool(timed_out),
+            "chunk_size": int(chunk_size),
+            "missing_symbols": list(missing_symbols[:20]),
+        },
+    )
+
+
+def _emit_symbol_limit_metrics(
+    *,
+    skipped: int,
+    limit: int | None,
+    batch_path_active: bool,
+) -> None:
+    if skipped <= 0:
+        return
+    tags = {
+        "batch_active": bool(batch_path_active),
+        "degraded": True,
+        "reason": "configured_fallback_symbol_limit",
+    }
+    if limit is not None:
+        tags["limit"] = int(limit)
+    emit_counter(
+        "yfinance_live_symbol_limit_skipped",
+        int(skipped),
+        component="engine.data.live_prices.yfinance_live",
+        provider="yfinance",
+        extra_tags=tags,
+    )
+    emit_gauge(
+        "yfinance_live_degraded",
+        1,
+        component="engine.data.live_prices.yfinance_live",
+        provider="yfinance",
+        extra_tags=tags,
+    )
+
+
+def _log_symbol_selection_limited(
+    *,
+    configured: int,
+    requested: int,
+    limit: int | None,
+    batch_path_active: bool,
+    skipped_symbols: list[str],
+) -> None:
+    skipped = int(len(skipped_symbols))
+    if skipped <= 0:
+        return
+    LOG.log(
+        logging.WARNING,
+        "yfinance_live_symbol_selection_limited configured=%d requested=%d skipped=%d limit=%s batch_active=%s degraded=%s skipped_symbols=%s",
+        int(configured),
+        int(requested),
+        int(skipped),
+        "" if limit is None else str(int(limit)),
+        bool(batch_path_active),
+        True,
+        ",".join(str(sym) for sym in skipped_symbols),
+        extra={
+            "event": "yfinance_live_symbol_selection_limited",
+            "configured": int(configured),
+            "requested": int(requested),
+            "skipped": int(skipped),
+            "limit": None if limit is None else int(limit),
+            "batch_active": bool(batch_path_active),
+            "degraded": True,
+            "degraded_reason": "configured_fallback_symbol_limit",
+            "skipped_symbols": list(skipped_symbols),
+        },
+    )
+    _emit_symbol_limit_metrics(
+        skipped=int(skipped),
+        limit=limit,
+        batch_path_active=bool(batch_path_active),
+    )
 
 
 def _fetch_chart_json(
@@ -189,6 +439,232 @@ def _extract_latest_from_chart(chart: dict | None) -> tuple[float | None, float 
     return px, vol
 
 
+def _field_matches(value: object, field: str) -> bool:
+    return str(value or "").strip().lower().replace("_", " ") == str(field or "").strip().lower().replace("_", " ")
+
+
+def _download_field_series(frame: Any, ticker_symbol: str, field: str) -> Any | None:
+    columns = getattr(frame, "columns", None)
+    if columns is None:
+        return None
+
+    ticker = _normalize_ticker(ticker_symbol)
+    try:
+        column_items = list(columns)
+    except Exception:
+        column_items = []
+
+    for col in column_items:
+        parts = col if isinstance(col, tuple) else (col,)
+        if len(parts) < 2:
+            continue
+        first = parts[0]
+        second = parts[1]
+        try:
+            if _field_matches(first, field) and _normalize_ticker(second) == ticker:
+                return frame[col]
+            if _normalize_ticker(first) == ticker and _field_matches(second, field):
+                return frame[col]
+        except Exception:
+            continue
+
+    for col in column_items:
+        if isinstance(col, tuple):
+            continue
+        if not _field_matches(col, field):
+            continue
+        try:
+            candidate = frame[col]
+            if int(getattr(candidate, "ndim", 1) or 1) == 1:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _latest_finite_from_series(series: Any) -> float | None:
+    if series is None:
+        return None
+    parsed = _finite_float_or_none(series)
+    if parsed is not None:
+        return parsed
+
+    values: list[Any] = []
+    try:
+        clean = series.dropna()
+        if bool(getattr(clean, "empty", False)):
+            return None
+        values = list(clean)
+    except Exception:
+        try:
+            values = list(series)
+        except Exception:
+            values = []
+
+    for value in reversed(values):
+        parsed = _finite_float_or_none(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_latest_from_download_frame(frame: Any, ticker_symbol: str) -> tuple[float | None, float | None]:
+    close_series = _download_field_series(frame, ticker_symbol, "Close")
+    px = _latest_finite_from_series(close_series)
+    if px is None:
+        adj_close_series = _download_field_series(frame, ticker_symbol, "Adj Close")
+        px = _latest_finite_from_series(adj_close_series)
+
+    volume_series = _download_field_series(frame, ticker_symbol, "Volume")
+    vol = _latest_finite_from_series(volume_series)
+    return px, vol
+
+
+def _download_yf_frame(
+    ticker_symbols: list[str],
+    *,
+    timeout_s: float,
+    session: requests.Session | None = None,
+) -> Any | None:
+    if yf is None:
+        return None
+    kwargs: dict[str, Any] = {
+        "tickers": list(ticker_symbols),
+        "period": "1d",
+        "interval": "1m",
+        "threads": False,
+        "progress": False,
+        "auto_adjust": False,
+    }
+    if timeout_s > 0.0:
+        kwargs["timeout"] = float(timeout_s)
+    if session is not None:
+        kwargs["session"] = session
+
+    while True:
+        try:
+            return yf.download(**kwargs)
+        except TypeError as e:
+            message = str(e).lower()
+            changed = False
+            if "timeout" in kwargs and "timeout" in message:
+                kwargs.pop("timeout", None)
+                changed = True
+            if "session" in kwargs and "session" in message:
+                kwargs.pop("session", None)
+                changed = True
+            if not changed:
+                raise
+        except Exception as e:
+            if "session" in kwargs and "session" in str(e).lower():
+                kwargs.pop("session", None)
+                continue
+            raise
+
+
+def _fetch_yf_download_batch_prices(
+    selected_items: list[tuple[str, str]],
+    *,
+    now_ms: int,
+    deadline_monotonic: float,
+) -> tuple[Dict[str, dict], bool, bool]:
+    out: Dict[str, dict] = {}
+    if not selected_items or not _yf_download_batch_enabled():
+        return out, False, False
+
+    ticker_symbols: list[str] = []
+    seen: set[str] = set()
+    for _sym, ticker_symbol in selected_items:
+        ticker = _normalize_ticker(ticker_symbol)
+        if ticker and ticker not in seen:
+            ticker_symbols.append(ticker)
+            seen.add(ticker)
+    if not ticker_symbols:
+        return out, False, False
+
+    chunk_size = _configured_batch_chunk_size()
+    chunks = _iter_chunks(ticker_symbols, chunk_size)
+    items_by_ticker: dict[str, list[tuple[str, str]]] = {}
+    for sym, ticker_symbol in selected_items:
+        items_by_ticker.setdefault(_normalize_ticker(ticker_symbol), []).append((str(sym), ticker_symbol))
+
+    if _bounded_request_timeout_s(deadline_monotonic) <= 0.0:
+        return out, True, True
+
+    session = _get_http_session()
+    pool = _get_yfinance_executor()
+    for chunk_index, chunk_tickers in enumerate(chunks):
+        timeout_s = _bounded_request_timeout_s(deadline_monotonic)
+        if timeout_s <= 0.0:
+            return out, True, True
+
+        future = pool.submit(
+            _download_yf_frame,
+            list(chunk_tickers),
+            timeout_s=float(timeout_s),
+            session=session,
+        )
+        done, not_done = wait((future,), timeout=float(timeout_s))
+        if not_done:
+            future.cancel()
+            _warn_nonfatal(
+                "YFINANCE_DOWNLOAD_BATCH_CHUNK_TIMEOUT",
+                TimeoutError("yfinance_download_batch_chunk_timeout"),
+                requested_symbols=len(chunk_tickers),
+                chunk_index=int(chunk_index),
+                chunk_count=int(len(chunks)),
+            )
+            return out, True, True
+
+        try:
+            frame = next(iter(done)).result()
+        except Exception as e:
+            _warn_nonfatal(
+                "YFINANCE_DOWNLOAD_BATCH_CHUNK_FAILED",
+                e,
+                requested_symbols=len(chunk_tickers),
+                chunk_index=int(chunk_index),
+                chunk_count=int(len(chunks)),
+            )
+            continue
+
+        if frame is None or bool(getattr(frame, "empty", False)):
+            _warn_nonfatal(
+                "YFINANCE_DOWNLOAD_BATCH_CHUNK_EMPTY",
+                RuntimeError("yfinance_download_batch_chunk_empty"),
+                requested_symbols=len(chunk_tickers),
+                chunk_index=int(chunk_index),
+                chunk_count=int(len(chunks)),
+            )
+            continue
+
+        for ticker in chunk_tickers:
+            for sym, ticker_symbol in items_by_ticker.get(ticker, []):
+                try:
+                    px, vol = _extract_latest_from_download_frame(frame, ticker_symbol)
+                except Exception as e:
+                    _warn_nonfatal(
+                        "YFINANCE_DOWNLOAD_BATCH_PARSE_FAILED",
+                        e,
+                        once_key="yfinance_download_batch_parse",
+                        ticker_symbol=str(ticker_symbol),
+                    )
+                    continue
+                if px is None:
+                    continue
+                out[str(sym)] = {
+                    "ts_ms": int(now_ms),
+                    "price": float(px),
+                    "bid": None,
+                    "ask": None,
+                    "spread": None,
+                    "volume": (float(vol) if vol is not None else None),
+                    "source": "yfinance",
+                }
+
+    return out, False, True
+
+
 def _priority_tickers() -> set[str]:
     raw = str(
         os.environ.get(
@@ -204,19 +680,15 @@ def _priority_tickers() -> set[str]:
     }
 
 
-def _select_batch_items(ticker_map: Dict[str, str]) -> list[tuple[str, str]]:
+def _select_batch_items(ticker_map: Dict[str, str], *, batch_path_active: bool = False) -> list[tuple[str, str]]:
     global _YFINANCE_BATCH_CURSOR
 
-    items = [
-        (str(sym), _normalize_ticker(tkr))
-        for sym, tkr in (ticker_map or {}).items()
-        if str(sym).strip() and _normalize_ticker(tkr)
-    ]
+    items = _eligible_ticker_items(ticker_map)
     if not items:
         return []
 
-    max_batch = max(1, int(os.environ.get("YFINANCE_LIVE_BATCH_SIZE", "64")))
-    if len(items) <= max_batch:
+    max_batch = _configured_symbol_limit(batch_path_active=bool(batch_path_active))
+    if max_batch is None or len(items) <= max_batch:
         return items
 
     priority = _priority_tickers()
@@ -246,6 +718,15 @@ def _select_batch_items(ticker_map: Dict[str, str]) -> list[tuple[str, str]]:
     return selected
 
 
+def _skipped_symbols_for_selection(ticker_map: Dict[str, str], selected_items: list[tuple[str, str]]) -> list[str]:
+    selected_symbols = {str(sym) for sym, _ticker in selected_items}
+    return [
+        str(sym)
+        for sym, _ticker in _eligible_ticker_items(ticker_map)
+        if str(sym) not in selected_symbols
+    ]
+
+
 def _fetch_symbol_last_price(
     sym: str,
     ticker_symbol: str,
@@ -262,7 +743,7 @@ def _fetch_symbol_last_price(
     chart = _fetch_chart_json(
         ticker_symbol,
         interval="1m",
-        range_="5d",
+        range_="1d",
         deadline_monotonic=deadline_monotonic,
     )
     px, vol = _extract_latest_from_chart(chart)
@@ -301,6 +782,64 @@ def _fetch_symbol_last_price(
         "source": "yfinance",
     }
 
+
+def _fetch_chart_fallback_prices(
+    selected_items: list[tuple[str, str]],
+    *,
+    now_ms: int,
+    deadline_monotonic: float,
+) -> tuple[Dict[str, dict], int, int]:
+    out: Dict[str, dict] = {}
+    if not selected_items:
+        return out, 0, 0
+
+    remaining_s = _remaining_budget_s(deadline_monotonic)
+    if remaining_s is not None and remaining_s <= 0.0:
+        return out, int(len(selected_items)), int(len(selected_items))
+
+    requested = int(len(selected_items))
+    max_workers = max(1, min(requested, _configured_executor_max_workers()))
+    timeout_s = remaining_s
+    if timeout_s is None:
+        timeout_s = max(0.25, float(os.environ.get("YFINANCE_LIVE_BATCH_TIMEOUT_S", str(_YFINANCE_BATCH_TIMEOUT_S))))
+    timeout_s = max(0.0, float(timeout_s))
+    if timeout_s <= 0.0:
+        return out, requested, requested
+
+    skipped = 0
+    pending = 0
+    pool = _get_yfinance_executor(max_workers=max_workers)
+    futures = {
+        pool.submit(_fetch_symbol_last_price, sym, ticker_symbol, now_ms, deadline_monotonic): (sym, ticker_symbol)
+        for sym, ticker_symbol in selected_items
+    }
+    done, not_done = wait(tuple(futures.keys()), timeout=float(timeout_s))
+    pending = int(len(not_done))
+    for future in not_done:
+        future.cancel()
+    for future in done:
+        sym, ticker_symbol = futures[future]
+        try:
+            result = future.result()
+        except Exception as e:
+            skipped += 1
+            _warn_nonfatal(
+                "YFINANCE_LIVE_WORKER_FAILED",
+                e,
+                once_key=f"worker_failed:{sym}",
+                symbol=str(sym),
+                ticker_symbol=str(ticker_symbol),
+            )
+            continue
+        if result is None:
+            skipped += 1
+            continue
+        out[str(result[0])] = dict(result[1])
+    skipped += pending
+
+    return out, int(skipped), int(pending)
+
+
 def fetch_last_prices_yf(ticker_map: Dict[str, str]) -> Dict[str, dict]:
     """
     Contract-compatible with poll_prices.py
@@ -312,51 +851,70 @@ def fetch_last_prices_yf(ticker_map: Dict[str, str]) -> Dict[str, dict]:
         return out
 
     now_ms = int(time.time() * 1000)
-    selected_items = _select_batch_items(ticker_map)
+    batch_path_active = _yf_download_batch_enabled()
+    selected_items = _select_batch_items(ticker_map, batch_path_active=bool(batch_path_active))
     if not selected_items:
         return out
 
+    symbol_limit = _configured_symbol_limit(batch_path_active=bool(batch_path_active))
+    skipped_symbols = _skipped_symbols_for_selection(ticker_map, selected_items)
     requested = int(len(selected_items))
-    configured = int(len(ticker_map or {}))
+    configured = int(requested + len(skipped_symbols))
     skipped = 0
+    degraded_reasons: list[str] = []
+    if skipped_symbols:
+        skipped += int(len(skipped_symbols))
+        degraded_reasons.append("configured_fallback_symbol_limit")
+        _log_symbol_selection_limited(
+            configured=int(configured),
+            requested=int(requested),
+            limit=symbol_limit,
+            batch_path_active=bool(batch_path_active),
+            skipped_symbols=list(skipped_symbols),
+        )
 
-    max_workers = max(1, min(requested, int(os.environ.get("YFINANCE_LIVE_MAX_WORKERS", "12"))))
     batch_timeout_s = max(0.25, float(os.environ.get("YFINANCE_LIVE_BATCH_TIMEOUT_S", str(_YFINANCE_BATCH_TIMEOUT_S))))
     deadline_monotonic = float(time.monotonic() + batch_timeout_s)
-    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="yf-live")
     pending = 0
-    try:
-        futures = {
-            pool.submit(_fetch_symbol_last_price, sym, ticker_symbol, now_ms, deadline_monotonic): (sym, ticker_symbol)
-            for sym, ticker_symbol in selected_items
-        }
-        done, not_done = wait(tuple(futures.keys()), timeout=float(batch_timeout_s))
-        pending = int(len(not_done))
-        for future in not_done:
-            future.cancel()
-        for future in done:
-            sym, ticker_symbol = futures[future]
-            try:
-                result = future.result()
-            except Exception as e:
-                skipped += 1
-                _warn_nonfatal(
-                    "YFINANCE_LIVE_WORKER_FAILED",
-                    e,
-                    once_key=f"worker_failed:{sym}",
-                    symbol=str(sym),
-                    ticker_symbol=str(ticker_symbol),
-                )
-                continue
-            if result is None:
-                skipped += 1
-                continue
-            out[str(result[0])] = dict(result[1])
-        skipped += pending
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+    batch_attempted = False
+    batch_timed_out = False
+
+    if batch_path_active:
+        batch_out, batch_timed_out, batch_attempted = _fetch_yf_download_batch_prices(
+            selected_items,
+            now_ms=int(now_ms),
+            deadline_monotonic=float(deadline_monotonic),
+        )
+        out.update(batch_out)
+
+    missing_items = [(sym, ticker_symbol) for sym, ticker_symbol in selected_items if str(sym) not in out]
+    if batch_attempted and missing_items:
+        _log_partial_batch_failure(
+            configured=int(configured),
+            requested=int(requested),
+            returned=int(len(out)),
+            missing=int(len(missing_items)),
+            timed_out=bool(batch_timed_out),
+            chunk_size=int(_configured_batch_chunk_size()),
+            missing_symbols=[str(sym) for sym, _ticker_symbol in missing_items],
+        )
+    if missing_items:
+        remaining_s = _remaining_budget_s(deadline_monotonic)
+        if batch_timed_out or (remaining_s is not None and remaining_s <= 0.0):
+            skipped += int(len(missing_items))
+            pending += int(len(missing_items))
+        else:
+            fallback_out, fallback_skipped, fallback_pending = _fetch_chart_fallback_prices(
+                missing_items,
+                now_ms=int(now_ms),
+                deadline_monotonic=float(deadline_monotonic),
+            )
+            out.update(fallback_out)
+            skipped += int(fallback_skipped)
+            pending += int(fallback_pending)
 
     if pending:
+        degraded_reasons.append("fetch_timeout")
         _log_partial_fetch_timeout(
             configured=int(configured),
             requested=int(requested),
@@ -365,12 +923,17 @@ def fetch_last_prices_yf(ticker_map: Dict[str, str]) -> Dict[str, dict]:
             batch_timeout_s=float(batch_timeout_s),
         )
 
+    degraded_reasons = list(dict.fromkeys(degraded_reasons))
     LOG.info(
-        "fetch_complete provider=yfinance configured=%d requested=%d returned=%d skipped=%d",
+        "fetch_complete provider=yfinance configured=%d requested=%d returned=%d skipped=%d batch_active=%s batch_attempted=%s degraded=%s degraded_reasons=%s",
         configured,
         requested,
         len(out),
         skipped,
+        bool(batch_path_active),
+        bool(batch_attempted),
+        bool(degraded_reasons),
+        ",".join(degraded_reasons),
     )
     return out
 
@@ -401,7 +964,7 @@ def fetch_latest_ohlcv_yf(ticker_map: Dict[str, str], interval: str = "1m") -> D
         ticker_symbol = _normalize_ticker(tkr)
         if not ticker_symbol:
             continue
-        chart = _fetch_chart_json(ticker_symbol, interval=interval, range_="5d")
+        chart = _fetch_chart_json(ticker_symbol, interval=interval, range_="1d")
         if isinstance(chart, dict):
             try:
                 timestamps = chart.get("timestamp") or []

@@ -58,7 +58,30 @@ sudo env \
 
 ## Verify
 
-Run the active verifier after install, after reboot, and before live promotion:
+Run the read-only Python policy check first. It does not require `sudo`; it
+reads `/proc/meminfo`, `/proc/sys/vm/swappiness`, `swapon --show`,
+`/proc/swaps`, and ZFS ARC sysfs/kstat files when available:
+
+```bash
+python -m engine.runtime.memory_pressure --json --required | jq '{status,reason,errors,warnings,memory,swap,vm,zfs}'
+```
+
+Expected PASS on `bart`:
+
+- `memory.mem_total_gib` is about `123`
+- `memory.swap_total_gib >= 48`
+- `swap.zram_total_gib >= 32` with `swap.zram_priority >= 100`
+- `swap.managed_swapfile_path=/swapfile-trading`
+- `swap.managed_swapfile_gib >= 16` with `swap.managed_swapfile_priority >= 10`
+- `vm.swappiness=10`
+- `zfs.arc_max_gib=48`
+
+A legacy `SwapTotal` around `0.5 GiB` or an active `/swapfile` without the
+managed `/swapfile-trading` is not production-ready and must block live
+promotion when `PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1`.
+
+Run the privileged active verifier after install, after reboot, and before live
+promotion:
 
 ```bash
 sudo bash ops/server/memory_pressure_hardening.sh verify
@@ -75,6 +98,7 @@ active host has:
 Useful manual inspection commands:
 
 ```bash
+awk '/MemTotal|MemAvailable|SwapTotal|SwapFree/ {print}' /proc/meminfo
 sysctl -n vm.swappiness
 cat /sys/module/zfs/parameters/zfs_arc_max
 swapon --show=NAME,TYPE,SIZE,USED,PRIO
@@ -131,8 +155,10 @@ The pytest suite no longer defaults to `/tmp`. `tests/conftest.py` sets
 `TMPDIR`, `TEMP`, `TMP`, and `PYTEST_DEBUG_TEMPROOT` to
 `/var/tmp/trading-system-tests-<uid>/pytest` before pytest creates `tmp_path`
 directories. `tools/validate_repo.py` sets the same environment for its pytest
-collection and execution lanes. Override with `TRADING_TEST_TMPDIR=/disk/path`
-when a different disk-backed scratch root is needed.
+collection and execution lanes, with a `validate-repo-<pid>` child directory so
+parallel validators do not share the same SQLite/cache scratch files. Override
+with `TRADING_TEST_TMPDIR=/disk/path` when a different disk-backed scratch root is
+needed.
 
 The default scratch tree should be removed with ordinary local cleanup when it
 grows too large:

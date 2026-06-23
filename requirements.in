@@ -1,0 +1,5 @@
+# Direct CPU runtime requirements. Install through requirements.txt so pip
+# applies the generated transitive lock in requirements.lock.txt.
+-r requirements-base.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1+cpu

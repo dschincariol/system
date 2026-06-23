@@ -25,7 +25,7 @@ from engine.runtime.storage import (
 
 from engine.data.event_normalization import normalize_news_event
 from engine.data.universe import get_active_symbols
-from engine.data.ingest.gdelt_ingest import ingest_gdelt_doc
+from engine.data.ingest.gdelt_ingest import gdelt_cooldown_remaining_s, ingest_gdelt_doc
 from services.data_source_manager import get_manager
 
 JOB_NAME = "poll_gdelt"
@@ -84,8 +84,9 @@ def _emit_heartbeat(payload: dict) -> None:
         _warn_nonfatal("GDELT_POLL_HEARTBEAT_FAILED", e, once_key="heartbeat")
 
 
-def _sleep_with_heartbeat(manager, status: dict) -> bool:
-    deadline = time.time() + max(float(HEARTBEAT_EVERY_S), float(POLL_SECONDS))
+def _sleep_with_heartbeat(manager, status: dict, *, sleep_seconds: float | None = None) -> bool:
+    requested_sleep = float(sleep_seconds) if sleep_seconds is not None else float(POLL_SECONDS)
+    deadline = time.time() + max(float(HEARTBEAT_EVERY_S), requested_sleep)
     base_status = dict(status or {})
     while True:
         remaining = deadline - time.time()
@@ -98,6 +99,7 @@ def _sleep_with_heartbeat(manager, status: dict) -> bool:
         payload["phase"] = "sleep"
         payload["remaining_s"] = max(0.0, float(remaining))
         payload["poll_seconds"] = float(POLL_SECONDS)
+        payload["sleep_seconds"] = float(requested_sleep)
         payload["heartbeat_every_s"] = float(HEARTBEAT_EVERY_S)
         _emit_heartbeat(payload)
         time.sleep(min(float(HEARTBEAT_EVERY_S), max(1.0, remaining)))
@@ -161,6 +163,7 @@ def _run_once() -> dict:
             "maxrecords": int(MAXRECORDS),
             "symbol_limit": int(SYMBOL_LIMIT or 0),
             "symbols_n": len(syms),
+            "cooldown_remaining_s": float(gdelt_cooldown_remaining_s()),
         },
     )
     logging.info(
@@ -223,7 +226,8 @@ def main() -> None:
                 )
                 manager.record_job_status(JOB_NAME, ok=False, message="gdelt cycle failed", error=str(e), meta={"poll_seconds": float(POLL_SECONDS)})
             _emit_heartbeat(status)
-            if not _sleep_with_heartbeat(manager, status):
+            sleep_seconds = max(float(POLL_SECONDS), float(gdelt_cooldown_remaining_s()))
+            if not _sleep_with_heartbeat(manager, status, sleep_seconds=sleep_seconds):
                 break
     finally:
         try:

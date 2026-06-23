@@ -20,6 +20,7 @@ from engine.api.internal_access import db_connect
 from engine.api.sql_identifiers import require_allowed_table_name
 from engine.runtime.failure_diagnostics import failure_response, log_failure
 from engine.runtime.price_read_router import fetch_price_rows
+from engine.runtime.state_cache import cache_get_or_load
 
 from engine.api.api_read_advanced import (
     get_audit_records,
@@ -241,32 +242,36 @@ def api_get_prices(parsed, _ctx=None):
     qs = _qs(parsed)
     symbol = str(qs.get("symbol", "") or "").strip().upper()
     limit = _parse_int(qs.get("limit", "200") or "200", 200, 1, 5000)
-    data = fetch_price_rows(symbol=symbol, limit=int(limit))
-    # The chart layer expects OHLCV-shaped rows even when only last-price
-    # snapshots are available, so we synthesize flat candles here.
-    candles = [
-        {
-            "ts": int(d["ts_ms"] or 0),
-            "ts_ms": int(d["ts_ms"] or 0),
-            "open": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
-            "high": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
-            "low": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
-            "close": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
-            "volume": 0.0,
+
+    def _load():
+        data = fetch_price_rows(symbol=symbol, limit=int(limit))
+        # The chart layer expects OHLCV-shaped rows even when only last-price
+        # snapshots are available, so we synthesize flat candles here.
+        candles = [
+            {
+                "ts": int(d["ts_ms"] or 0),
+                "ts_ms": int(d["ts_ms"] or 0),
+                "open": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
+                "high": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
+                "low": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
+                "close": float(d["price"] if d["price"] is not None else d["px"] or 0.0),
+                "volume": 0.0,
+            }
+            for d in reversed(data)
+            if d.get("ts_ms")
+            and (d.get("price") is not None or d.get("px") is not None)
+        ]
+        return {
+            "ok": True,
+            "error": None,
+            "symbol": symbol or None,
+            "meta": {"ready": bool(data), "count": int(len(data))},
+            "candles": candles,
+            "data": data,
+            "rows": data,
         }
-        for d in reversed(data)
-        if d.get("ts_ms")
-        and (d.get("price") is not None or d.get("px") is not None)
-    ]
-    return {
-        "ok": True,
-        "error": None,
-        "symbol": symbol or None,
-        "meta": {"ready": bool(data), "count": int(len(data))},
-        "candles": candles,
-        "data": data,
-        "rows": data,
-    }
+
+    return cache_get_or_load("api_dashboard_prices", f"{symbol}:{int(limit)}", _load, ttl_s=0.75)
 
 
 def api_get_trades(parsed, _ctx=None):

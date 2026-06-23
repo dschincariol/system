@@ -16,6 +16,27 @@ DEFAULT_DASHBOARD_HOST = LOOPBACK_HOST
 DEFAULT_DASHBOARD_DEV_PORT = 8000
 DEFAULT_IBKR_HOST = LOOPBACK_HOST
 
+# ------------------------------------------------------------------
+# Network access mode (loopback-only local vs. trusted-LAN exposure)
+# ------------------------------------------------------------------
+# A single opt-in toggle (``TRADING_NETWORK_MODE``) drives the dashboard
+# bind-host default. The operator sidecar remains an internal service by
+# default and is reached through the authenticated same-origin dashboard
+# bridge; LAN mode must not silently publish the sidecar's :4001 control
+# plane. Local mode is unchanged (loopback). LAN mode only changes the
+# dashboard default bind host; explicit DASHBOARD_HOST still wins, and the
+# existing startup gates (which require DASHBOARD_API_TOKEN for any
+# non-loopback bind, plus the live/prod public-exposure ACK) still apply.
+WILDCARD_BIND_HOST = "0.0.0.0"
+NETWORK_MODE_LOCAL = "local"
+NETWORK_MODE_LAN = "lan"
+_LAN_MODE_ALIASES = frozenset({"lan", "host", "server", "remote", "0.0.0.0", "wildcard"})
+# Documented fallback used ONLY for human-facing startup banners/logs. It is
+# never injected into browser application logic (clients derive URLs from
+# window.location). Override with TRADING_LAN_IP.
+DEFAULT_LAN_ADVERTISE_IP = "192.168.0.165"
+DEFAULT_OPERATOR_PORT = 4001
+
 
 def is_linux() -> bool:
     return sys.platform.startswith("linux")
@@ -52,6 +73,131 @@ def default_dashboard_dev_port() -> int:
 
 def default_ibkr_host() -> str:
     return DEFAULT_IBKR_HOST
+
+
+def is_wildcard_host(host: str | None) -> bool:
+    text = str(host or "").strip().strip("[]").lower()
+    return text in {"0.0.0.0", "::", "0:0:0:0:0:0:0:0"}
+
+
+def resolve_network_mode(environ: dict | None = None) -> str:
+    """Return ``"lan"`` when LAN exposure is requested, else ``"local"``.
+
+    Driven by ``TRADING_NETWORK_MODE``. Unknown/empty values stay ``local`` so
+    the default is always loopback-only.
+    """
+    env = environ if environ is not None else os.environ
+    raw = str(env.get("TRADING_NETWORK_MODE") or "").strip().lower()
+    if raw in _LAN_MODE_ALIASES:
+        return NETWORK_MODE_LAN
+    return NETWORK_MODE_LOCAL
+
+
+def apply_network_mode_bind_defaults(environ: dict | None = None) -> dict:
+    """Expand ``TRADING_NETWORK_MODE=lan`` into concrete bind-host defaults.
+
+    Mutates ``environ`` in place so every downstream dashboard reader --
+    startup gates, the dashboard bind, and logging -- observes the same
+    resolved ``DASHBOARD_HOST``. This is what keeps the security gate honest:
+    setting the wildcard bind here means ``startup_gates`` will (correctly)
+    require ``DASHBOARD_API_TOKEN``.
+
+    The operator sidecar is deliberately excluded. Compose may bind the
+    sidecar to 0.0.0.0 inside the private Docker network, but host LAN access
+    must go through the dashboard bridge unless an explicit reviewed design
+    publishes the sidecar. Explicit, non-empty host values are never
+    overwritten, and local mode is a no-op. Returns the mapping of keys this
+    call set (empty when nothing changed), so callers can log precisely what
+    was applied. Idempotent.
+    """
+    env = environ if environ is not None else os.environ
+    applied: dict[str, str] = {}
+    if resolve_network_mode(env) != NETWORK_MODE_LAN:
+        return applied
+    if not str(env.get("DASHBOARD_HOST") or "").strip():
+        env["DASHBOARD_HOST"] = WILDCARD_BIND_HOST
+        applied["DASHBOARD_HOST"] = WILDCARD_BIND_HOST
+    return applied
+
+
+def _detect_primary_lan_ip() -> str:
+    """Best-effort primary outbound IPv4 address; ``""`` when undeterminable.
+
+    Uses a connect-less UDP socket trick (no packets are sent) to ask the OS
+    which local interface would route off-box. Loopback results are rejected.
+    """
+    import socket
+
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.25)
+        sock.connect((DEFAULT_LAN_ADVERTISE_IP, 9))
+        ip = str(sock.getsockname()[0] or "").strip()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        return ""
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            # no-op-guard: allow - best-effort cleanup during LAN IP detection.
+            pass
+    return ""
+
+
+def resolve_lan_advertise_ip(environ: dict | None = None) -> str:
+    """LAN IP for human-facing startup banners/logs only (never browser logic).
+
+    Resolution order: explicit ``TRADING_LAN_IP`` -> auto-detected primary
+    interface IP -> documented fallback (``192.168.0.165``).
+    """
+    env = environ if environ is not None else os.environ
+    explicit = str(env.get("TRADING_LAN_IP") or "").strip()
+    if explicit:
+        return explicit
+    detected = _detect_primary_lan_ip()
+    if detected:
+        return detected
+    return DEFAULT_LAN_ADVERTISE_IP
+
+
+def network_access_banner_lines(
+    *,
+    service: str,
+    bind_host: str,
+    port: int,
+    environ: dict | None = None,
+) -> list[str]:
+    """Build operator-facing startup banner lines for a bound HTTP service.
+
+    Prints the bind host, port, environment mode, the loopback URL, and -- when
+    the service is bound to a wildcard/non-loopback host -- the LAN URL plus a
+    security reminder when no dashboard API token is configured.
+    """
+    env = environ if environ is not None else os.environ
+    mode = resolve_network_mode(env)
+    engine_mode = str(env.get("ENGINE_MODE") or "safe").strip() or "safe"
+    wildcard = is_wildcard_host(bind_host)
+    non_loopback = wildcard or not is_loopback_host(bind_host)
+    local_host = LOOPBACK_HOST if wildcard else (bind_host or LOOPBACK_HOST)
+    lines = [
+        f"[{service}] network_mode={mode} engine_mode={engine_mode}",
+        f"[{service}] bind_host={bind_host} port={int(port)}",
+        f"[{service}] local URL:  http://{local_host}:{int(port)}/",
+    ]
+    if non_loopback:
+        lan_ip = resolve_lan_advertise_ip(env)
+        lines.append(f"[{service}] LAN URL:    http://{lan_ip}:{int(port)}/")
+        token_present = bool(str(env.get("DASHBOARD_API_TOKEN") or "").strip())
+        if not token_present:
+            lines.append(
+                f"[{service}] WARNING: bound for LAN access without DASHBOARD_API_TOKEN; "
+                "set it to enable authenticated mutations (startup gate enforces this)."
+            )
+    return lines
 
 
 def default_backup_evidence_path() -> str:

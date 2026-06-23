@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -90,6 +91,7 @@ USE_13F_FEATURES = _env_bool("USE_13F_FEATURES", False)
 USE_GOV_FEATURES = _env_bool("USE_GOV_FEATURES", False)
 USE_FUNDAMENTALS_PIT_FEATURES = _env_bool("USE_FUNDAMENTALS_PIT_FEATURES", False)
 USE_BOCPD_FEATURES = _env_bool("USE_BOCPD_FEATURES", False)
+USE_FX_FEATURES = _env_bool("USE_FX_FEATURES", False)
 
 BASE_FEATURE_IDS = [
     "base.source_credibility",
@@ -354,6 +356,71 @@ PRICE_FEATURE_IDS = [
     "price.trend_strength_20",
 ]
 
+FX_RATE_FEATURE_IDS = [
+    "fx.rate_diff_2y",
+    "fx.rate_diff_10y",
+    "fx.rate_diff_2y_mom_20d",
+    "fx.rate_diff_10y_mom_20d",
+    "fx.real_yield_spread_2y",
+    "fx.real_yield_spread_10y",
+]
+
+FX_CARRY_FEATURE_IDS = [
+    "fx.carry_annualized",
+    "fx.carry_z_60d",
+    "fx.carry_to_vol",
+]
+
+FX_DXY_FEATURE_IDS = [
+    "fx.dxy_level_z",
+    "fx.dxy_ret_5d",
+    "fx.dollar_beta_60d",
+    "fx.dollar_corr_20d",
+]
+
+FX_CROSS_FEATURE_IDS = [
+    "fx.cross_corr_eurusd_20d",
+    "fx.cross_corr_usdjpy_20d",
+    "fx.cross_corr_basket_20d",
+    "fx.cross_beta_basket_60d",
+]
+
+FX_COT_FEATURE_IDS = [
+    "fx.cot_commercial_net_pctile_3y",
+    "fx.cot_noncomm_net_z",
+    "fx.cot_noncomm_extreme_flag",
+    "fx.cot_open_interest_z",
+]
+
+FX_MOMENTUM_FEATURE_IDS = [
+    "fx.tsmom_20d",
+    "fx.tsmom_60d",
+    "fx.tsmom_120d",
+    "fx.trend_strength_60d",
+    "fx.breakout_flag_55d",
+]
+
+# Permanent stub until an upstream economic-calendar feed owns central-bank and
+# macro event timestamps. FX-03 defines the schema and resolves these to 0.0.
+FX_EVENT_FEATURE_IDS = [
+    "fx.event_fomc_window",
+    "fx.event_ecb_window",
+    "fx.event_boj_window",
+    "fx.event_nfp_window",
+    "fx.event_cpi_window",
+    "fx.hours_to_next_cb_event",
+]
+
+FX_FEATURE_IDS = (
+    list(FX_RATE_FEATURE_IDS)
+    + list(FX_CARRY_FEATURE_IDS)
+    + list(FX_DXY_FEATURE_IDS)
+    + list(FX_CROSS_FEATURE_IDS)
+    + list(FX_COT_FEATURE_IDS)
+    + list(FX_MOMENTUM_FEATURE_IDS)
+    + list(FX_EVENT_FEATURE_IDS)
+)
+
 EVENT_FEATURE_IDS = [
     "events.count_1h",
     "events.count_6h",
@@ -455,6 +522,14 @@ UNIFIED_SYMBOL_FEATURE_IDS = (
 FEATURE_GROUPS = {
     "base": list(BASE_FEATURE_IDS),
     "price": list(PRICE_FEATURE_IDS),
+    "fx_rate": list(FX_RATE_FEATURE_IDS),
+    "fx_carry": list(FX_CARRY_FEATURE_IDS),
+    "fx_dxy": list(FX_DXY_FEATURE_IDS),
+    "fx_cross": list(FX_CROSS_FEATURE_IDS),
+    "fx_cot": list(FX_COT_FEATURE_IDS),
+    "fx_momentum": list(FX_MOMENTUM_FEATURE_IDS),
+    "fx_event": list(FX_EVENT_FEATURE_IDS),
+    "fx": list(FX_FEATURE_IDS),
     "events": list(EVENT_FEATURE_IDS),
     "macro": list(UNIFIED_MACRO_FEATURE_IDS),
     "hmm_regime": list(HMM_REGIME_FEATURE_IDS),
@@ -604,6 +679,7 @@ _SOURCE_CRED = {
 
 _SNAPSHOT_PREFIXES = (
     "price.",
+    "fx.",
     "events.",
     "macro.",
     "options_symbol.",
@@ -639,6 +715,104 @@ _SNAPSHOT_PREFIXES = (
 )
 LOG = get_logger("engine.strategy.feature_registry")
 _WARNED_NONFATAL_KEYS: set[str] = set()
+
+
+def _env_float_clamped(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(str(name), str(default)) or default)
+    except Exception:
+        value = float(default)
+    return max(float(minimum), min(float(maximum), float(value)))
+
+
+FEATURE_REGISTRY_CACHE_TTL_S = _env_float_clamped(
+    "FEATURE_REGISTRY_CACHE_TTL_S",
+    15.0,
+    0.0,
+    30.0,
+)
+_FEATURE_REGISTRY_CACHE_MAX_ENTRIES = 64
+_FEATURE_REGISTRY_CACHE_LOCK = threading.RLock()
+_FEATURE_REGISTRY_CACHE: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+
+
+def invalidate_feature_registry_cache() -> None:
+    """Clear process-local registry caches after discovery registration changes."""
+
+    with _FEATURE_REGISTRY_CACHE_LOCK:
+        _FEATURE_REGISTRY_CACHE.clear()
+
+
+def _feature_cache_get(key: tuple[Any, ...]) -> Any:
+    ttl_s = float(FEATURE_REGISTRY_CACHE_TTL_S)
+    if ttl_s <= 0.0:
+        return None
+    now = time.monotonic()
+    with _FEATURE_REGISTRY_CACHE_LOCK:
+        entry = _FEATURE_REGISTRY_CACHE.get(tuple(key))
+        if not entry or now >= float(entry.get("expires_at") or 0.0):
+            return None
+        value = entry.get("value")
+    if isinstance(value, tuple):
+        return tuple(value)
+    if isinstance(value, frozenset):
+        return frozenset(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
+def _feature_cache_set(key: tuple[Any, ...], value: Any) -> Any:
+    ttl_s = float(FEATURE_REGISTRY_CACHE_TTL_S)
+    if ttl_s <= 0.0:
+        return value
+    now = time.monotonic()
+    with _FEATURE_REGISTRY_CACHE_LOCK:
+        expired_keys = [
+            cache_key
+            for cache_key, entry in _FEATURE_REGISTRY_CACHE.items()
+            if now >= float(entry.get("expires_at") or 0.0)
+        ]
+        for cache_key in expired_keys:
+            _FEATURE_REGISTRY_CACHE.pop(cache_key, None)
+        while len(_FEATURE_REGISTRY_CACHE) >= _FEATURE_REGISTRY_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                _FEATURE_REGISTRY_CACHE,
+                key=lambda cache_key: float(_FEATURE_REGISTRY_CACHE[cache_key].get("expires_at") or 0.0),
+            )
+            _FEATURE_REGISTRY_CACHE.pop(oldest_key, None)
+        _FEATURE_REGISTRY_CACHE[tuple(key)] = {
+            "expires_at": float(now + ttl_s),
+            "value": value,
+        }
+    return value
+
+
+def _normalize_registry_stage(stage: str | None) -> str | None:
+    stage_key = None if stage is None else str(stage).strip().lower()
+    return stage_key or None
+
+
+def _feature_matches_stage_request(
+    feature_id: str,
+    *,
+    include_shadow: bool,
+    stage: str | None,
+) -> bool:
+    stage_key = _normalize_registry_stage(stage)
+    feature_stage_name = str(FEATURE_STAGES.get(str(feature_id), FEATURE_STAGE_LIVE)).strip().lower()
+    if stage_key is not None and feature_stage_name != stage_key:
+        return False
+    if not bool(include_shadow) and feature_stage_name == FEATURE_STAGE_SHADOW:
+        return False
+    return True
+
+
+def _discovered_stage_for_request(*, include_shadow: bool, stage: str | None) -> str | None:
+    stage_key = _normalize_registry_stage(stage)
+    if stage_key is not None:
+        return stage_key
+    return None if bool(include_shadow) else FEATURE_STAGE_LIVE
 
 
 def validate_lexical_sentiment_deprecation_marker(value: str | None = None) -> bool:
@@ -685,24 +859,52 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
 
 
 def _load_discovered_feature_records(stage: str | None = None) -> List[Any]:
+    stage_key = None if stage is None else str(stage).strip().lower()
+    cache_key = ("discovered_feature_records", stage_key)
+    cached = _feature_cache_get(cache_key)
+    if cached is not None:
+        return list(cached)
     try:
         from engine.strategy.discovery.registry import list_registered_features
 
-        return list(list_registered_features(stage=stage, limit=5000) or [])
+        records = tuple(list_registered_features(stage=stage_key, limit=5000) or [])
     except Exception:
         return []
+    _feature_cache_set(cache_key, records)
+    return list(records)
 
 
 def _discovered_feature_ids(*, stage: str | None = None) -> List[str]:
+    stage_key = None if stage is None else str(stage).strip().lower()
+    cache_key = ("discovered_feature_ids", stage_key)
+    cached = _feature_cache_get(cache_key)
+    if cached is not None:
+        return list(cached)
     out: List[str] = []
     seen = set()
-    for record in _load_discovered_feature_records(stage=stage):
+    for record in _load_discovered_feature_records(stage=stage_key):
         fid = str(getattr(record, "feature_id", "") or "").strip()
         if not fid or fid in seen:
             continue
         seen.add(fid)
         out.append(fid)
+    _feature_cache_set(cache_key, tuple(out))
     return out
+
+
+def _discovered_feature_stage_map() -> Dict[str, str]:
+    cache_key = ("discovered_feature_stage_map", None)
+    cached = _feature_cache_get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    stage_map: Dict[str, str] = {}
+    for record in _load_discovered_feature_records(stage=None):
+        fid = str(getattr(record, "feature_id", "") or "").strip()
+        if not fid:
+            continue
+        stage_map[fid] = str(getattr(record, "stage", "") or FEATURE_STAGE_SHADOW)
+    _feature_cache_set(cache_key, dict(stage_map))
+    return stage_map
 
 
 def feature_stage(feature_id: str) -> str | None:
@@ -713,10 +915,7 @@ def feature_stage(feature_id: str) -> str | None:
         return None
     if fid in FEATURE_STAGES:
         return str(FEATURE_STAGES[fid])
-    for record in _load_discovered_feature_records(stage=None):
-        if str(getattr(record, "feature_id", "") or "").strip() == fid:
-            return str(getattr(record, "stage", "") or FEATURE_STAGE_SHADOW)
-    return None
+    return _discovered_feature_stage_map().get(fid)
 
 
 def shadow_feature_ids(feature_ids: List[str] | tuple[str, ...] | None) -> List[str]:
@@ -878,7 +1077,7 @@ def _load_tsfresh(symbol: str, ts_ms: int) -> Dict[str, float]:
         return {}
 
 
-def default_feature_ids() -> List[str]:
+def _build_default_feature_ids() -> List[str]:
     out = list(BASE_FEATURE_IDS)
     if USE_SYMBOL_SNAPSHOT_FEATURES:
         out.extend(UNIFIED_SYMBOL_FEATURE_IDS)
@@ -937,7 +1136,22 @@ def default_feature_ids() -> List[str]:
     return out
 
 
-def registered_feature_ids(*, include_shadow: bool = True) -> List[str]:
+def default_feature_ids() -> List[str]:
+    cache_key = ("default_feature_ids", False, FEATURE_STAGE_LIVE)
+    cached = _feature_cache_get(cache_key)
+    if cached is not None:
+        return list(cached)
+    ids = tuple(_build_default_feature_ids())
+    _feature_cache_set(cache_key, ids)
+    return list(ids)
+
+
+def _build_registered_feature_ids(
+    *,
+    include_shadow: bool = True,
+    stage: str | None = None,
+) -> List[str]:
+    stage_key = _normalize_registry_stage(stage)
     out: List[str] = []
     seen = set()
     for ids in FEATURE_GROUPS.values():
@@ -945,32 +1159,87 @@ def registered_feature_ids(*, include_shadow: bool = True) -> List[str]:
             key = str(fid or "").strip()
             if not key or key in seen:
                 continue
+            if not _feature_matches_stage_request(
+                key,
+                include_shadow=bool(include_shadow),
+                stage=stage_key,
+            ):
+                continue
             seen.add(key)
             out.append(key)
     if USE_FACTOR_UNIVERSE:
         try:
             from engine.runtime.factor_universe import FACTOR_FEATURE_ORDER
 
-            for fid in list(FACTOR_FEATURE_ORDER or []):
-                key = f"factor.{str(fid or '').strip()}"
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                out.append(key)
+            if stage_key in (None, FEATURE_STAGE_LIVE):
+                for fid in list(FACTOR_FEATURE_ORDER or []):
+                    factor_name = str(fid or "").strip()
+                    if not factor_name:
+                        continue
+                    key = f"factor.{factor_name}"
+                    if not key or key in seen:
+                        continue
+                    if not _feature_matches_stage_request(
+                        key,
+                        include_shadow=bool(include_shadow),
+                        stage=stage_key,
+                    ):
+                        continue
+                    seen.add(key)
+                    out.append(key)
         except Exception as e:
             _warn_nonfatal(
                 "FEATURE_REGISTRY_FACTOR_ORDER_FAILED",
                 e,
                 once_key="registered_feature_ids_factor_order",
             )
-    discovered_stage = None if bool(include_shadow) else FEATURE_STAGE_LIVE
-    for fid in _discovered_feature_ids(stage=discovered_stage):
-        key = str(fid or "").strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(key)
+    discovered_stage = _discovered_stage_for_request(include_shadow=bool(include_shadow), stage=stage_key)
+    if bool(include_shadow) or discovered_stage != FEATURE_STAGE_SHADOW:
+        for fid in _discovered_feature_ids(stage=discovered_stage):
+            key = str(fid or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
     return out
+
+
+def registered_feature_ids(
+    *,
+    include_shadow: bool = True,
+    stage: str | None = None,
+) -> List[str]:
+    shadow_enabled = bool(include_shadow)
+    stage_key = _normalize_registry_stage(stage)
+    cache_key = ("registered_feature_ids", shadow_enabled, stage_key)
+    cached = _feature_cache_get(cache_key)
+    if cached is not None:
+        return list(cached)
+    ids = tuple(_build_registered_feature_ids(include_shadow=shadow_enabled, stage=stage_key))
+    _feature_cache_set(cache_key, ids)
+    return list(ids)
+
+
+def _registered_feature_allowlist(
+    *,
+    include_shadow: bool = True,
+    stage: str | None = None,
+) -> frozenset[str]:
+    stage_key = _normalize_registry_stage(stage)
+    cache_key = ("registered_feature_allowlist", bool(include_shadow), stage_key)
+    cached = _feature_cache_get(cache_key)
+    if cached is not None:
+        return frozenset(cached)
+
+    allowed = frozenset(
+        registered_feature_ids(
+            include_shadow=bool(include_shadow),
+            stage=stage_key,
+        )
+    )
+
+    _feature_cache_set(cache_key, allowed)
+    return allowed
 
 
 def _parse_feature_ids(value: Any) -> List[str]:
@@ -1008,12 +1277,84 @@ def _feature_env_candidates(model_name: Optional[str]) -> List[str]:
     return out
 
 
+def _is_fx_feature(fid: str) -> bool:
+    return str(fid or "").startswith("fx.")
+
+
+def _is_equity_only_feature(fid: str) -> bool:
+    text = str(fid or "").strip()
+    return (
+        text.startswith("options_symbol.")
+        or text.startswith("options.")
+        or text.startswith("social.")
+        or text.startswith("social_regime.")
+        or text.startswith("insider.")
+        or text.startswith("insider_")
+        or text.startswith("short_")
+        or text.startswith("si_")
+        or text.startswith("days_to_cover_")
+        or text.startswith("13f_")
+        or text.startswith("congress_")
+        or text.startswith("congressional.")
+        or text.startswith("gov_")
+        or text.startswith("lobbying_")
+        or text.startswith("fund_")
+        or text.startswith("nlp.")
+        or text.startswith("sentiment.finbert.")
+    )
+
+
+def _apply_asset_class_feature_gating(
+    feature_ids: List[str],
+    *,
+    asset_class: Optional[str],
+    requested_had_fx: bool,
+) -> List[str]:
+    if asset_class is None:
+        return list(feature_ids or [])
+    asset_class_key = str(asset_class or "").upper().strip()
+    if not asset_class_key:
+        return list(feature_ids or [])
+
+    out: List[str] = []
+    seen = set()
+    if asset_class_key == "FX":
+        for fid in list(feature_ids or []):
+            if _is_equity_only_feature(str(fid)):
+                continue
+            if _is_fx_feature(str(fid)):
+                continue
+            if fid not in seen:
+                seen.add(fid)
+                out.append(fid)
+        if bool(USE_FX_FEATURES) or bool(requested_had_fx):
+            allowed = _registered_feature_allowlist(include_shadow=True)
+            for fid in FX_FEATURE_IDS:
+                if fid not in allowed:
+                    continue
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                out.append(fid)
+        return out
+
+    for fid in list(feature_ids or []):
+        if _is_fx_feature(str(fid)):
+            continue
+        if fid in seen:
+            continue
+        seen.add(fid)
+        out.append(fid)
+    return out
+
+
 def resolve_feature_ids(
     feature_ids: Optional[List[str]] = None,
     *,
     model_name: Optional[str] = None,
     model_spec: Optional[Dict[str, Any]] = None,
     fallback_to_default: bool = True,
+    asset_class: Optional[str] = None,
 ) -> List[str]:
     requested = _parse_feature_ids(feature_ids)
     if not requested and isinstance(model_spec, dict):
@@ -1027,8 +1368,9 @@ def resolve_feature_ids(
                 break
     if not requested and fallback_to_default:
         requested = list(default_feature_ids())
+    requested_had_fx = any(_is_fx_feature(str(fid)) for fid in requested)
 
-    allowed = dict.fromkeys(registered_feature_ids())
+    allowed = _registered_feature_allowlist(include_shadow=True)
     out: List[str] = []
     seen = set()
     for fid in requested:
@@ -1051,8 +1393,16 @@ def resolve_feature_ids(
                 )
 
     if out or not fallback_to_default:
-        return out
-    return list(default_feature_ids())
+        return _apply_asset_class_feature_gating(
+            out,
+            asset_class=asset_class,
+            requested_had_fx=bool(requested_had_fx),
+        )
+    return _apply_asset_class_feature_gating(
+        list(default_feature_ids()),
+        asset_class=asset_class,
+        requested_had_fx=bool(requested_had_fx),
+    )
 
 
 def expected_columns(
@@ -1061,6 +1411,7 @@ def expected_columns(
     model_name: Optional[str] = None,
     model_spec: Optional[Dict[str, Any]] = None,
     fallback_to_default: bool = True,
+    asset_class: Optional[str] = None,
 ) -> List[str]:
     """Return the canonical ordered feature columns for model train/serve."""
     return resolve_feature_ids(
@@ -1068,6 +1419,7 @@ def expected_columns(
         model_name=model_name,
         model_spec=model_spec,
         fallback_to_default=bool(fallback_to_default),
+        asset_class=asset_class,
     )
 
 
@@ -1078,6 +1430,8 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
     parts = ["base"]
     if any(_feature_uses_symbol_snapshot(fid) for fid in ids):
         parts.append("symbol_snapshot")
+    if any(str(fid or "").startswith("fx.") for fid in ids):
+        parts.append("fx")
     if any(fid.startswith("macro.") for fid in ids):
         parts.append("macro")
     if any(fid.startswith("tech.") for fid in ids):
@@ -1235,6 +1589,466 @@ def _load_macro(ts_ms: int) -> Dict[str, float]:
             ts_ms=int(ts_ms),
         )
         return {}
+
+
+_FX_DAY_MS = 86_400_000
+_FX_POLICY_RATE_FEATURE_BY_CCY = {
+    # FX-01 raw macro rows: USD policy, ECB deposit facility, UK SONIA.
+    "USD": "macro.policy_rate_upper",
+    "EUR": "macro.ecb_policy_rate",
+    "GBP": "macro.uk_sonia_rate",
+}
+_FX_REAL_YIELD_10Y_FEATURE_BY_CCY = {
+    # FX-01 raw FRED row: DFII10 materialized as macro.us_real_yield_10y.
+    "USD": "macro.us_real_yield_10y",
+}
+_FX_DXY_MACRO_FEATURE = "macro.usd_broad_index"  # FX-01 FRED DTWEXBGS row.
+
+
+def _safe_feature_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    if not math.isfinite(out):
+        return float(default)
+    return float(out)
+
+
+def _fx_pair_ccys(symbol: str) -> tuple[str, str] | None:
+    try:
+        from engine.data.fx_instrument import parse_fx_symbol
+
+        meta = parse_fx_symbol(str(symbol))
+        if meta is None or str(getattr(meta, "instrument_kind", "") or "") != "fx_spot":
+            return None
+        base = str(getattr(meta, "base_ccy", "") or "").upper().strip()
+        quote = str(getattr(meta, "quote_ccy", "") or "").upper().strip()
+        return (base, quote) if base and quote else None
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FX_PARSE_FAILED",
+            e,
+            once_key="fx_parse",
+            symbol=str(symbol),
+        )
+        return None
+
+
+def _fx_canonical_symbol(symbol: str) -> str:
+    try:
+        from engine.data.fx_instrument import parse_fx_symbol
+
+        meta = parse_fx_symbol(str(symbol))
+        if meta is not None:
+            return str(getattr(meta, "symbol", "") or symbol).upper().strip()
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FX_CANONICALIZE_FAILED",
+            e,
+            once_key="fx_canonicalize",
+            symbol=str(symbol),
+        )
+    return str(symbol or "").upper().replace("/", "").replace("_", "").strip()
+
+
+def _fx_macro_value(macro_feature_row_asof: Any, con: Any, feature_id: str | None, ts_ms: int) -> float:
+    if not feature_id:
+        return 0.0
+    value, _asof_ts, _effective_ts = macro_feature_row_asof(con, feature_id=str(feature_id), ts_ms=int(ts_ms))
+    return _safe_feature_float(value)
+
+
+def _fx_macro_rate(macro_feature_row_asof: Any, con: Any, ccy: str, ts_ms: int) -> float:
+    return _fx_macro_value(
+        macro_feature_row_asof,
+        con,
+        _FX_POLICY_RATE_FEATURE_BY_CCY.get(str(ccy or "").upper()),
+        int(ts_ms),
+    )
+
+
+def _fx_macro_real_yield_10y(macro_feature_row_asof: Any, con: Any, ccy: str, ts_ms: int) -> float:
+    return _fx_macro_value(
+        macro_feature_row_asof,
+        con,
+        _FX_REAL_YIELD_10Y_FEATURE_BY_CCY.get(str(ccy or "").upper()),
+        int(ts_ms),
+    )
+
+
+def _load_fx_rate_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    pair = _fx_pair_ccys(str(symbol))
+    if pair is None:
+        return {}
+    base, quote = pair
+    try:
+        from engine.data.factor_ingestion import macro_feature_row_asof
+        from engine.runtime.storage import connect
+
+        con = connect()
+        try:
+            base_rate = _fx_macro_rate(macro_feature_row_asof, con, base, int(ts_ms))
+            quote_rate = _fx_macro_rate(macro_feature_row_asof, con, quote, int(ts_ms))
+            rate_diff = base_rate - quote_rate
+            prev_ts = int(ts_ms) - 20 * _FX_DAY_MS
+            prev_rate_diff = (
+                _fx_macro_rate(macro_feature_row_asof, con, base, prev_ts)
+                - _fx_macro_rate(macro_feature_row_asof, con, quote, prev_ts)
+            )
+            base_real_10y = _fx_macro_real_yield_10y(macro_feature_row_asof, con, base, int(ts_ms))
+            quote_real_10y = _fx_macro_real_yield_10y(macro_feature_row_asof, con, quote, int(ts_ms))
+            real_10y = base_real_10y - quote_real_10y
+            prev_real_10y = (
+                _fx_macro_real_yield_10y(macro_feature_row_asof, con, base, prev_ts)
+                - _fx_macro_real_yield_10y(macro_feature_row_asof, con, quote, prev_ts)
+            )
+            return {
+                "fx.rate_diff_2y": float(rate_diff),
+                "fx.rate_diff_10y": float(real_10y),
+                "fx.rate_diff_2y_mom_20d": float(rate_diff - prev_rate_diff),
+                "fx.rate_diff_10y_mom_20d": float(real_10y - prev_real_10y),
+                "fx.real_yield_spread_2y": float(rate_diff),
+                "fx.real_yield_spread_10y": float(real_10y),
+            }
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_FX_RATE_CLOSE_FAILED",
+                    e,
+                    once_key="load_fx_rate_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FX_RATE_LOAD_FAILED",
+            e,
+            once_key="load_fx_rate",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return {}
+
+
+def _load_fx_price_points(symbol: str, ts_ms: int, *, limit: int = 240) -> list[tuple[int, float]]:
+    canonical = _fx_canonical_symbol(str(symbol))
+    try:
+        from engine.runtime.price_read_router import fetch_price_rows
+
+        rows = fetch_price_rows(symbol=str(canonical), limit=int(limit)) or []
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FX_PRICE_LOAD_FAILED",
+            e,
+            once_key=f"load_fx_price:{canonical}",
+            symbol=str(canonical),
+            ts_ms=int(ts_ms),
+        )
+        return []
+    out: list[tuple[int, float]] = []
+    for row in list(rows or []):
+        try:
+            row_ts = int(dict(row).get("ts_ms") or 0)
+            if int(ts_ms or 0) > 0 and row_ts > int(ts_ms):
+                continue
+            raw_price = dict(row).get("price")
+            if raw_price is None:
+                raw_price = dict(row).get("px")
+            price = float(raw_price)
+            if row_ts > 0 and price > 0.0 and math.isfinite(price):
+                out.append((row_ts, price))
+        except Exception:
+            continue
+    return sorted(out, key=lambda item: int(item[0]))
+
+
+def _fx_returns(points: list[tuple[int, float]]) -> list[float]:
+    values: list[float] = []
+    for left, right in zip(list(points or [])[:-1], list(points or [])[1:]):
+        prev_price = float(left[1] or 0.0)
+        price = float(right[1] or 0.0)
+        if prev_price > 0.0 and price > 0.0:
+            values.append(float(math.log(price / prev_price)))
+    return values
+
+
+def _tail(values: list[float], size: int) -> list[float]:
+    bounded = max(1, int(size or 1))
+    return list(values or [])[-bounded:]
+
+
+def _mean(values: list[float]) -> float:
+    vals = [_safe_feature_float(v) for v in list(values or [])]
+    return float(sum(vals) / len(vals)) if vals else 0.0
+
+
+def _stdev(values: list[float]) -> float:
+    vals = [_safe_feature_float(v) for v in list(values or [])]
+    if len(vals) < 2:
+        return 0.0
+    avg = _mean(vals)
+    return float(math.sqrt(sum((v - avg) ** 2 for v in vals) / (len(vals) - 1)))
+
+
+def _corr(xs: list[float], ys: list[float]) -> float:
+    n = min(len(xs or []), len(ys or []))
+    if n < 2:
+        return 0.0
+    x = list(xs)[-n:]
+    y = list(ys)[-n:]
+    sx = _stdev(x)
+    sy = _stdev(y)
+    if sx <= 0.0 or sy <= 0.0:
+        return 0.0
+    mx = _mean(x)
+    my = _mean(y)
+    return float(sum((a - mx) * (b - my) for a, b in zip(x, y)) / ((n - 1) * sx * sy))
+
+
+def _beta(xs: list[float], ys: list[float]) -> float:
+    n = min(len(xs or []), len(ys or []))
+    if n < 2:
+        return 0.0
+    x = list(xs)[-n:]
+    y = list(ys)[-n:]
+    sy = _stdev(y)
+    if sy <= 0.0:
+        return 0.0
+    my = _mean(y)
+    mx = _mean(x)
+    var_y = sum((b - my) ** 2 for b in y)
+    if var_y <= 0.0:
+        return 0.0
+    cov = sum((a - mx) * (b - my) for a, b in zip(x, y))
+    return float(cov / var_y)
+
+
+def _return_over(points: list[tuple[int, float]], periods: int) -> float:
+    values = list(points or [])
+    lookback = int(periods or 0)
+    if lookback <= 0 or len(values) <= lookback:
+        return 0.0
+    start = float(values[-lookback - 1][1] or 0.0)
+    end = float(values[-1][1] or 0.0)
+    if start <= 0.0 or end <= 0.0:
+        return 0.0
+    return float(math.log(end / start))
+
+
+def _zscore_last(values: list[float], window: int = 60) -> float:
+    vals = _tail(list(values or []), int(window))
+    if len(vals) < 2:
+        return 0.0
+    sd = _stdev(vals)
+    if sd <= 0.0:
+        return 0.0
+    return float((vals[-1] - _mean(vals)) / sd)
+
+
+def _basket_returns(symbols: list[str], ts_ms: int, *, limit: int = 120) -> list[float]:
+    series = [
+        _fx_returns(_load_fx_price_points(symbol, int(ts_ms), limit=int(limit)))
+        for symbol in list(symbols or [])
+    ]
+    usable = [list(items or []) for items in series if items]
+    if not usable:
+        return []
+    n = min(len(items) for items in usable)
+    if n <= 0:
+        return []
+    aligned = [items[-n:] for items in usable]
+    return [float(sum(items[i] for items in aligned) / len(aligned)) for i in range(n)]
+
+
+def _load_fx_carry_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    pair = _fx_pair_ccys(str(symbol))
+    if pair is None:
+        return {}
+    base, quote = pair
+    try:
+        from engine.data.factor_ingestion import macro_feature_row_asof
+        from engine.runtime.storage import connect
+
+        con = connect()
+        try:
+            diff_pct = (
+                _fx_macro_rate(macro_feature_row_asof, con, base, int(ts_ms))
+                - _fx_macro_rate(macro_feature_row_asof, con, quote, int(ts_ms))
+            )
+            carry = float(diff_pct / 100.0)
+            prev_ts = int(ts_ms) - 60 * _FX_DAY_MS
+            prev_diff_pct = (
+                _fx_macro_rate(macro_feature_row_asof, con, base, prev_ts)
+                - _fx_macro_rate(macro_feature_row_asof, con, quote, prev_ts)
+            )
+            carry_z = float((diff_pct - prev_diff_pct) / 100.0)
+            returns = _fx_returns(_load_fx_price_points(str(symbol), int(ts_ms), limit=90))
+            vol = _stdev(_tail(returns, 60)) * math.sqrt(252.0) if len(returns) >= 2 else 0.0
+            return {
+                "fx.carry_annualized": float(carry),
+                "fx.carry_z_60d": float(carry_z),
+                "fx.carry_to_vol": float(carry / vol) if vol > 0.0 else 0.0,
+            }
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_FX_CARRY_CLOSE_FAILED",
+                    e,
+                    once_key="load_fx_carry_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FX_CARRY_LOAD_FAILED",
+            e,
+            once_key="load_fx_carry",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return {}
+
+
+def _load_fx_dxy_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    try:
+        from engine.data.factor_ingestion import macro_feature_row_asof
+        from engine.runtime.storage import connect
+
+        con = connect()
+        try:
+            dxy_level = _fx_macro_value(macro_feature_row_asof, con, _FX_DXY_MACRO_FEATURE, int(ts_ms))
+            prev_dxy = _fx_macro_value(
+                macro_feature_row_asof,
+                con,
+                _FX_DXY_MACRO_FEATURE,
+                int(ts_ms) - 5 * _FX_DAY_MS,
+            )
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_FX_DXY_CLOSE_FAILED",
+                    e,
+                    once_key="load_fx_dxy_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FX_DXY_MACRO_LOAD_FAILED",
+            e,
+            once_key="load_fx_dxy_macro",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        dxy_level = 0.0
+        prev_dxy = 0.0
+
+    dxy_points = _load_fx_price_points("DXY", int(ts_ms), limit=120)
+    target_returns = _fx_returns(_load_fx_price_points(str(symbol), int(ts_ms), limit=90))
+    dxy_returns = _fx_returns(dxy_points)
+    dxy_prices = [float(point[1]) for point in dxy_points]
+    dxy_level_z = _zscore_last(dxy_prices, 60)
+    if dxy_level_z == 0.0 and dxy_level:
+        dxy_level_z = float(dxy_level / 100.0)
+    dxy_ret_5d = _return_over(dxy_points, 5)
+    if dxy_ret_5d == 0.0 and dxy_level > 0.0 and prev_dxy > 0.0:
+        dxy_ret_5d = float(math.log(dxy_level / prev_dxy))
+    return {
+        "fx.dxy_level_z": float(dxy_level_z),
+        "fx.dxy_ret_5d": float(dxy_ret_5d),
+        "fx.dollar_beta_60d": float(_beta(_tail(target_returns, 60), _tail(dxy_returns, 60))),
+        "fx.dollar_corr_20d": float(_corr(_tail(target_returns, 20), _tail(dxy_returns, 20))),
+    }
+
+
+def _load_fx_cross_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    target_returns = _fx_returns(_load_fx_price_points(str(symbol), int(ts_ms), limit=120))
+    eurusd_returns = _fx_returns(_load_fx_price_points("EURUSD", int(ts_ms), limit=60))
+    usdjpy_returns = _fx_returns(_load_fx_price_points("USDJPY", int(ts_ms), limit=60))
+    basket = _basket_returns(["EURUSD", "USDJPY", "GBPUSD"], int(ts_ms), limit=120)
+    return {
+        "fx.cross_corr_eurusd_20d": float(_corr(_tail(target_returns, 20), _tail(eurusd_returns, 20))),
+        "fx.cross_corr_usdjpy_20d": float(_corr(_tail(target_returns, 20), _tail(usdjpy_returns, 20))),
+        "fx.cross_corr_basket_20d": float(_corr(_tail(target_returns, 20), _tail(basket, 20))),
+        "fx.cross_beta_basket_60d": float(_beta(_tail(target_returns, 60), _tail(basket, 60))),
+    }
+
+
+def _load_fx_cot_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    try:
+        from engine.data.cftc_cot import resolve_cot_features
+        from engine.runtime.storage import connect
+
+        con = connect()
+        try:
+            raw_features, _meta, _available = resolve_cot_features(
+                con,
+                symbol=_fx_canonical_symbol(str(symbol)),
+                ts_ms=int(ts_ms),
+            )
+            raw = dict(raw_features or {})
+            return {
+                "fx.cot_commercial_net_pctile_3y": _safe_feature_float(
+                    raw.get("cot_commercial_net_pctile_3y")
+                ),
+                "fx.cot_noncomm_net_z": _safe_feature_float(raw.get("cot_noncomm_net_z")),
+                "fx.cot_noncomm_extreme_flag": _safe_feature_float(raw.get("cot_noncomm_extreme_flag")),
+                "fx.cot_open_interest_z": _safe_feature_float(raw.get("cot_open_interest_z")),
+            }
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_FX_COT_CLOSE_FAILED",
+                    e,
+                    once_key="load_fx_cot_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FX_COT_LOAD_FAILED",
+            e,
+            once_key="load_fx_cot",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return {}
+
+
+def _load_fx_momentum_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    points = _load_fx_price_points(str(symbol), int(ts_ms), limit=150)
+    returns = _fx_returns(points)
+    trend_returns = _tail(returns, 60)
+    trend_vol = _stdev(trend_returns)
+    trend_strength = float(_mean(trend_returns) / trend_vol) if trend_vol > 0.0 else 0.0
+    breakout = 0.0
+    if len(points) >= 56:
+        latest = float(points[-1][1])
+        prior = [float(point[1]) for point in points[-56:-1]]
+        if prior and (latest > max(prior) or latest < min(prior)):
+            breakout = 1.0
+    return {
+        "fx.tsmom_20d": float(_return_over(points, 20)),
+        "fx.tsmom_60d": float(_return_over(points, 60)),
+        "fx.tsmom_120d": float(_return_over(points, 120)),
+        "fx.trend_strength_60d": float(trend_strength),
+        "fx.breakout_flag_55d": float(breakout),
+    }
+
+
+def _load_fx_event_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    # Permanent FX-03 stub: no upstream economic-calendar feed owns CB/NFP/CPI event timestamps yet.
+    _ = (symbol, ts_ms)
+    return {}
 
 
 def _load_social(symbol: str, ts_ms: int) -> Dict[str, Any]:
@@ -1710,10 +2524,12 @@ def _requires_event_scoped_resolution(*, event: Dict[str, Any], feature_ids: Lis
 
 
 def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids: Optional[List[str]] = None) -> Dict[str, float]:
-    ids = resolve_feature_ids(feature_ids)
+    asset_class_key = asset_class_for_symbol(str(symbol))
+    ids = resolve_feature_ids(feature_ids, asset_class=asset_class_key)
     ctx = _build_context(event=event, symbol=str(symbol))
     snap: Dict[str, float] = {}
     tech = stress = macro = social = weather = options = social_regime = hmm_regime = bocpd_regime = tsfresh = factors = finbert = nlp = None
+    fx_rate = fx_carry = fx_dxy = fx_cross = fx_cot = fx_momentum = fx_event = None
     snapshot = None
     event_scoped_resolution = _requires_event_scoped_resolution(event=dict(event or {}), feature_ids=list(ids))
     snapshot_ids = [
@@ -1747,6 +2563,34 @@ def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids:
             snap[fid] = float(ctx["us"])
         elif fid == "base.asset_class_match":
             snap[fid] = float(ctx["asset_match"])
+        elif fid in FX_RATE_FEATURE_IDS:
+            if fx_rate is None:
+                fx_rate = _load_fx_rate_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fx_rate or {}).get(fid, 0.0) or 0.0)
+        elif fid in FX_CARRY_FEATURE_IDS:
+            if fx_carry is None:
+                fx_carry = _load_fx_carry_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fx_carry or {}).get(fid, 0.0) or 0.0)
+        elif fid in FX_DXY_FEATURE_IDS:
+            if fx_dxy is None:
+                fx_dxy = _load_fx_dxy_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fx_dxy or {}).get(fid, 0.0) or 0.0)
+        elif fid in FX_CROSS_FEATURE_IDS:
+            if fx_cross is None:
+                fx_cross = _load_fx_cross_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fx_cross or {}).get(fid, 0.0) or 0.0)
+        elif fid in FX_COT_FEATURE_IDS:
+            if fx_cot is None:
+                fx_cot = _load_fx_cot_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fx_cot or {}).get(fid, 0.0) or 0.0)
+        elif fid in FX_MOMENTUM_FEATURE_IDS:
+            if fx_momentum is None:
+                fx_momentum = _load_fx_momentum_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fx_momentum or {}).get(fid, 0.0) or 0.0)
+        elif fid in FX_EVENT_FEATURE_IDS:
+            if fx_event is None:
+                fx_event = _load_fx_event_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fx_event or {}).get(fid, 0.0) or 0.0)
         elif fid.startswith("macro."):
             if macro is None:
                 macro = _load_macro(int(ctx["ts_ms"]))
@@ -1865,7 +2709,8 @@ def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids:
 
 
 def build_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids: Optional[List[str]] = None) -> Dict[str, float]:
-    ids = resolve_feature_ids(feature_ids)
+    asset_class_key = asset_class_for_symbol(str(symbol))
+    ids = resolve_feature_ids(feature_ids, asset_class=asset_class_key)
     try:
         ts_ms = int((event or {}).get("ts_ms", 0) or 0)
     except Exception:

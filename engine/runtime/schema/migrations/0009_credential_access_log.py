@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from engine.runtime.schema.table_classification import hypertable_chunk_interval
+
 id = 9
 description = "credential access audit log"
 
@@ -91,11 +93,16 @@ def up(conn) -> None:
         SELECT create_hypertable(
           'credential_access_log'::regclass,
           'ts',
-          chunk_time_interval => '1 week'::interval,
+          chunk_time_interval => ?::interval,
           if_not_exists => TRUE,
           migrate_data => TRUE
         )
-        """
+        """,
+        (hypertable_chunk_interval("credential_access_log"),),
+    )
+    conn.execute(
+        "SELECT set_chunk_time_interval('credential_access_log'::regclass, ?::interval)",
+        (hypertable_chunk_interval("credential_access_log"),),
     )
     conn.execute(
         """

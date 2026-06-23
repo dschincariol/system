@@ -115,27 +115,31 @@ def _run_once() -> bool:
         )
 
     last_ts = max([int(row.get("availability_ts_ms") or row.get("ingested_ts_ms") or 0) for row in rows] or [int(time.time() * 1000)])
+    ok = bool(rows)
     status = record_pipeline_status(
         JOB_NAME,
-        ok=True,
+        ok=ok,
         raw_rows=int(len(rows)),
         event_rows=0,
         last_ingested_ts_ms=int(last_ts),
+        error=None if ok else "finra_short_interest_empty_payload",
         meta={
             "rows": int(len(rows)),
             "written": int(written),
             "symbols": int(len(symbols)),
             "poll_seconds": float(POLL_SECONDS),
+            "degraded": bool(not ok),
         },
     )
     manager.record_job_status(
         JOB_NAME,
-        ok=True,
-        message="FINRA short-interest cycle complete",
-        meta={"rows": int(len(rows)), "written": int(written), "symbols": int(len(symbols))},
+        ok=ok,
+        message="FINRA short-interest cycle complete" if ok else "FINRA short-interest cycle degraded",
+        error="" if ok else "finra_short_interest_empty_payload",
+        meta={"rows": int(len(rows)), "written": int(written), "symbols": int(len(symbols)), "degraded": bool(not ok)},
     )
     put_job_heartbeat(JOB_NAME, OWNER, PID, extra_json=json.dumps(status, separators=(",", ":"), sort_keys=True))
-    return True
+    return bool(ok)
 
 
 def main() -> None:

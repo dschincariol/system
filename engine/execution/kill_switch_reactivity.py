@@ -20,6 +20,7 @@ from engine.runtime.storage import connect
 LOG = get_logger("engine.execution.kill_switch_reactivity")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 _WAKE_EVENT = threading.Event()
+_LOCAL_KILL_ACTIVE = False
 _LAST_KILL_EVENT_TS_MS = 0
 _LAST_REACTION_METRIC: Dict[Tuple[str, str, str, str], int] = {}
 _REACTION_METRIC_LOCK = threading.Lock()
@@ -56,10 +57,40 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
 
 def notify_kill_switch_state_changed(*, enabled: bool, ts_ms: Optional[int] = None) -> None:
     """Wake local slice sleeps after a kill-switch state change."""
-    global _LAST_KILL_EVENT_TS_MS
+    global _LAST_KILL_EVENT_TS_MS, _LOCAL_KILL_ACTIVE
+    _LOCAL_KILL_ACTIVE = bool(enabled)
     if bool(enabled):
         _LAST_KILL_EVENT_TS_MS = int(ts_ms or _now_ms())
     _WAKE_EVENT.set()
+
+
+def _local_kill_block(
+    *,
+    symbol: Optional[str] = None,
+    broker: str = "",
+    component: str = "engine.execution",
+    stage: str = "slice_boundary",
+) -> Tuple[bool, str, Dict[str, Any]] | None:
+    """Return a local fail-closed block after an in-process kill notification."""
+
+    if not bool(_LOCAL_KILL_ACTIVE) or int(_LAST_KILL_EVENT_TS_MS or 0) <= 0:
+        return None
+    latency_ms = emit_kill_reaction_latency(
+        activation_ts_ms=int(_LAST_KILL_EVENT_TS_MS),
+        broker=str(broker or ""),
+        symbol=str(symbol or ""),
+        component=str(component or "engine.execution"),
+        stage=str(stage or "slice_boundary"),
+    )
+    meta: Dict[str, Any] = {
+        "scope": "global",
+        "key": "global",
+        "kill_activation_ts_ms": int(_LAST_KILL_EVENT_TS_MS),
+        "local_kill_notification": True,
+    }
+    if latency_ms is not None:
+        meta["kill_reaction_latency_ms"] = int(latency_ms)
+    return False, "kill_switch_local_notification", meta
 
 
 def _latest_active_kill_ts_ms(*, con=None, symbol: Optional[str] = None, model_id: Optional[str] = None) -> int:
@@ -193,6 +224,14 @@ def wait_with_kill_interrupt(
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """Sleep up to ``delay_s`` but re-check kill state within the configured bound."""
     delay = max(0.0, float(delay_s or 0.0))
+    local_block = _local_kill_block(
+        symbol=symbol,
+        broker=broker,
+        component=component,
+        stage=stage,
+    )
+    if local_block is not None:
+        return local_block
     allowed, reason, meta = execution_allowed_with_reaction(
         con=con,
         symbol=symbol,
@@ -214,6 +253,14 @@ def wait_with_kill_interrupt(
         woke = _WAKE_EVENT.wait(timeout=min(float(bound), max(0.0, remaining)))
         if woke:
             _WAKE_EVENT.clear()
+            local_block = _local_kill_block(
+                symbol=symbol,
+                broker=broker,
+                component=component,
+                stage=stage,
+            )
+            if local_block is not None:
+                return local_block
         allowed, reason, meta = execution_allowed_with_reaction(
             con=con,
             symbol=symbol,

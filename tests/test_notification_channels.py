@@ -210,6 +210,54 @@ class NotificationChannelsTests(unittest.TestCase):
         self.assertEqual(latest["state"], "healthy")
         self.assertEqual(latest["state_value"], "healthy")
 
+    def test_runtime_alert_notification_uses_configured_email_channel(self):
+        os.environ["EQ_CRIT_EMAIL_TO"] = "ops@example.com"
+        os.environ["EQ_CRIT_EMAIL_FROM"] = "alerts@example.com"
+        os.environ["EQ_CRIT_SMTP_HOST"] = "smtp.example.com"
+        os.environ["EQ_CRIT_SMTP_PORT"] = "2525"
+
+        sent = {}
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                sent["host"] = host
+                sent["port"] = port
+                sent["timeout"] = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def send_message(self, message):
+                sent["subject"] = str(message["Subject"])
+                sent["to"] = str(message["To"])
+                sent["body"] = message.get_content()
+
+        with patch("smtplib.SMTP", FakeSMTP):
+            result = self.alerts_notify.send_runtime_alert_notification(
+                {
+                    "alert_id": 42,
+                    "event_title": "pg_wal disk risk",
+                    "symbol": "SYSTEM",
+                    "severity": "CRIT",
+                    "rule_id": "PG_WAL_DISK_RISK",
+                    "detail": {"blockers": ["pg_wal_free_space_critical"]},
+                    "ts_ms": 1_700_000_000_000,
+                },
+                actor="system",
+                source="unit",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual(sent["host"], "smtp.example.com")
+        self.assertEqual(sent["port"], 2525)
+        self.assertEqual(sent["to"], "ops@example.com")
+        self.assertIn("[ALERT CRIT] pg_wal disk risk", sent["subject"])
+        self.assertIn("PG_WAL_DISK_RISK", sent["body"])
+
     def test_notification_status_handler_includes_runtime_health_alert(self):
         degraded_health = {
             "ok": False,

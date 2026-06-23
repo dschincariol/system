@@ -138,6 +138,7 @@ def run_validation(args: argparse.Namespace) -> Dict[str, Any]:
         persist_env=False,
         emit_log=False,
         profile=str(args.profile or "amd-rocm"),
+        strict_profile=bool(args.require_gpu),
     )
     gpu_available = bool(torch_status.get("rocm_available"))
     benchmarks: Dict[str, Any] = {

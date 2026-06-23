@@ -26,6 +26,8 @@ const NODE_TESTS = [
   "tests/test_news_sentiment_ui.mjs",
   "tests/test_data_health_ui.mjs",
   "tests/test_table_helpers.mjs",
+  "tests/test_fx_format.mjs",
+  "tests/test_fx_session.mjs",
 ];
 const PYTEST_UI_TESTS = [
   "tests/test_dashboard_ui_contract.py",
@@ -36,6 +38,8 @@ const PYTEST_UI_TESTS = [
   "tests/test_risk_chart_ui_helpers.py",
   "tests/test_portfolio_backtest_contract.py",
   "tests/test_model_performance_divergence.py",
+  "tests/test_fx_ui_contract.py",
+  "tests/test_fx_ui_no_secret_leak.py",
 ];
 const PYTEST_FAST_CHART_CONTRACT_TESTS = [
   "tests/test_risk_chart_api_shapes.py",

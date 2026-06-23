@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, cast
 
 from engine.runtime.db_guard import resolve_db_path
 from engine.runtime.failure_diagnostics import log_failure
@@ -216,6 +216,29 @@ def _get_cached_price_snapshot(symbol: str) -> PriceSnapshot | None:
         return None
 
 
+def _get_cached_price_snapshots(symbols: Iterable[str]) -> dict[str, PriceSnapshot | None]:
+    symbol_keys = [_normalize_symbol(symbol) for symbol in list(symbols or [])]
+    symbol_keys = [symbol for symbol in symbol_keys if symbol]
+    if not symbol_keys:
+        return {}
+    backend = _cache_backend()
+    getter = getattr(backend, "get_price_snapshots", None)
+    if callable(getter):
+        try:
+            batch_getter = cast(Callable[[list[str]], Mapping[str, Mapping[str, Any] | None]], getter)
+            payloads = batch_getter(symbol_keys) or {}
+            return {symbol: _snapshot_from_payload(payloads.get(symbol)) for symbol in symbol_keys}
+        except Exception as exc:
+            _warn_nonfatal(
+                "PRICE_CACHE_BACKEND_MGET_FAILED",
+                exc,
+                once_key="price_cache_backend_mget_failed",
+                symbols=symbol_keys,
+            )
+            return {symbol: None for symbol in symbol_keys}
+    return {symbol: _get_cached_price_snapshot(symbol) for symbol in symbol_keys}
+
+
 def _set_cached_price_snapshot(snapshot: PriceSnapshot) -> PriceSnapshot:
     payload = _snapshot_to_payload(snapshot)
     try:
@@ -232,8 +255,40 @@ def _set_cached_price_snapshot(snapshot: PriceSnapshot) -> PriceSnapshot:
             once_key=f"price_cache_backend_set_failed:{snapshot.symbol}",
             symbol=str(snapshot.symbol),
         )
-    cached = _get_cached_price_snapshot(str(snapshot.symbol))
-    return cached if cached is not None else snapshot
+    return snapshot
+
+
+def _set_cached_price_snapshots(snapshots: Iterable[PriceSnapshot]) -> dict[str, bool]:
+    snapshot_list = [snapshot for snapshot in list(snapshots or []) if _normalize_symbol(getattr(snapshot, "symbol", ""))]
+    if not snapshot_list:
+        return {}
+    payloads = {str(snapshot.symbol): _snapshot_to_payload(snapshot) for snapshot in snapshot_list}
+    snapshot_ts_ms_by_symbol = {str(snapshot.symbol): int(snapshot.asof_ts_ms) for snapshot in snapshot_list}
+    backend = _cache_backend()
+    setter = getattr(backend, "set_price_snapshots", None)
+    if callable(setter):
+        try:
+            batch_setter = cast(Callable[..., Mapping[str, bool]], setter)
+            return dict(
+                batch_setter(
+                    payloads,
+                    ttl_s=float(PRICE_CACHE_TTL_S),
+                    snapshot_ts_ms_by_symbol=snapshot_ts_ms_by_symbol,
+                )
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "PRICE_CACHE_BACKEND_MSET_FAILED",
+                exc,
+                once_key="price_cache_backend_mset_failed",
+                symbols=list(payloads),
+            )
+            return {str(snapshot.symbol): False for snapshot in snapshot_list}
+    results: dict[str, bool] = {}
+    for snapshot in snapshot_list:
+        _set_cached_price_snapshot(snapshot)
+        results[str(snapshot.symbol)] = True
+    return results
 
 
 def _find_point_index(points: list[PricePoint], ts_ms: int) -> int:
@@ -331,8 +386,10 @@ def record_price_rows(rows: Iterable[Mapping[str, Any]]) -> int:
 
     latest_ts_ms = 0
     last_symbol = ""
+    cached_by_symbol = _get_cached_price_snapshots(grouped.keys())
+    snapshots_to_write: list[PriceSnapshot] = []
     for symbol, points in grouped.items():
-        cached = _get_cached_price_snapshot(symbol)
+        cached = cached_by_symbol.get(str(symbol))
         entry = _SymbolCacheEntry(source=str((cached.source if cached is not None else "") or "memory"))
         if cached is not None:
             for point in list(cached.points or ()):
@@ -343,7 +400,9 @@ def record_price_rows(rows: Iterable[Mapping[str, Any]]) -> int:
             _upsert_point(entry, point)
             latest_ts_ms = max(int(latest_ts_ms), int(point.ts_ms))
             last_symbol = str(symbol)
-        _set_cached_price_snapshot(_snapshot_from_entry(symbol, entry, recovered_from_db=False))
+        snapshots_to_write.append(_snapshot_from_entry(symbol, entry, recovered_from_db=False))
+
+    _set_cached_price_snapshots(snapshots_to_write)
 
     with _CACHE_LOCK:
         _CACHE_METRICS["last_update_ts_ms"] = int(max(int(_CACHE_METRICS.get("last_update_ts_ms") or 0), int(latest_ts_ms)))
@@ -368,8 +427,9 @@ def load_symbol_snapshot(
     owns = con is None
     if con is None:
         con = connect(readonly=True)
+    assert con is not None
     row_limit = max(1, int(limit or PRICE_CACHE_MAX_POINTS))
-    params = [str(symbol_key)]
+    params: list[Any] = [str(symbol_key)]
     ts_filter_sql = ""
     if asof_ts_ms is not None:
         ts_filter_sql = " AND p.ts_ms <= ?"
@@ -400,7 +460,7 @@ def load_symbol_snapshot(
         except Exception as exc:
             if "no such table: price_quotes" not in str(exc).lower():
                 raise
-            fallback_params = [str(symbol_key)]
+            fallback_params: list[Any] = [str(symbol_key)]
             fallback_filter_sql = ""
             if asof_ts_ms is not None:
                 fallback_filter_sql = " AND ts_ms <= ?"
@@ -489,15 +549,7 @@ def _recover_symbol_from_db(symbol: str) -> PriceSnapshot:
             for point in list(snapshot.points or ())
         ]
     )
-    cached = _get_cached_price_snapshot(str(snapshot.symbol))
-    if cached is None:
-        return snapshot
-    return PriceSnapshot(
-        symbol=str(cached.symbol),
-        points=tuple(cached.points or ()),
-        source="sqlite",
-        recovered_from_db=True,
-    )
+    return snapshot
 
 
 def get_symbol_snapshot(symbol: str, *, allow_db_recovery: bool = True) -> PriceSnapshot:

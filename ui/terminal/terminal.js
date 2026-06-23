@@ -16,6 +16,12 @@ import {
   initSelectedSymbolContextFromUrl,
   updateSelectedSymbolContext
 } from "../symbol_context.mjs";
+import {
+  formatFxPrice,
+  formatLotQty,
+  isFxSymbol,
+} from "../fx_format.js";
+import { fxSessionStatus } from "../fx_session.js";
 import { renderChartAccessibility } from "../chart_a11y.js";
 import {
   buildIndicatorAccessibilitySummary,
@@ -50,9 +56,20 @@ async function _readJsonResponse(r, url) {
   try {
     j = raw ? JSON.parse(raw) : null;
   } catch {}
-  if (!r.ok) throw new Error(String((j && j.error) || r.statusText || "request_failed"));
+  if (!r.ok) {
+    const reason = j && (j.reason_code || j.error || j.detail);
+    const message = j && (j.message || j.reason || j.error);
+    const text = message && reason && String(reason) !== String(message)
+      ? `${message} (${reason})`
+      : (message || reason || r.statusText || "request_failed");
+    throw new Error(String(text));
+  }
   if (!j || typeof j !== "object") throw new Error(`invalid_json_response: ${url}`);
-  if (j.ok === false) throw new Error(String(j.error || `api_error: ${url}`));
+  if (j.ok === false) {
+    const reason = j.reason_code || j.error || `api_error: ${url}`;
+    const message = j.message || j.reason || j.error;
+    throw new Error(String(message && reason && String(reason) !== String(message) ? `${message} (${reason})` : (message || reason)));
+  }
   return j;
 }
 
@@ -92,6 +109,19 @@ function fmtNum(x, d = 2) {
   const n = Number(x);
   if (!Number.isFinite(n)) return "—";
   return n.toFixed(d);
+}
+
+function fmtSymbolPrice(symbol, value, fallbackDigits = 4) {
+  return isFxSymbol(symbol) ? formatFxPrice(symbol, value) : fmtNum(value, fallbackDigits);
+}
+
+function fmtSymbolQty(symbol, value, lotSize = 100000) {
+  return isFxSymbol(symbol) ? formatLotQty(symbol, value, lotSize) : fmtNum(value, 4);
+}
+
+function fxSessionLabel(symbol, nowMs = Date.now()) {
+  if (!isFxSymbol(symbol)) return "";
+  return fxSessionStatus(nowMs).label;
 }
 
 function fmtTs(tsMs) {
@@ -356,8 +386,8 @@ function renderTerminalTables(emptyMessages = {}) {
     _terminalTableRows.positions,
     (r) => ([
       esc((r && r.symbol || "").toUpperCase()),
-      `<span class="mono">${esc(fmtNum(r && r.qty, 4))}</span>`,
-      `<span class="mono">${esc(fmtNum(r && r.avg_px, 4))}</span>`,
+      `<span class="mono">${esc(fmtSymbolQty(r && r.symbol, r && r.qty, r && r.fx && (r.fx.lot_size || r.fx.contract_size)))}</span>`,
+      `<span class="mono">${esc(fmtSymbolPrice(r && r.symbol, r && r.avg_px, 4))}</span>`,
       `<span class="mono">${esc(fmtTs(r && r.updated_ts_ms))}</span>`,
     ]),
     emptyMessages.positions || "No live broker positions are currently available.",
@@ -385,8 +415,8 @@ function renderTerminalTables(emptyMessages = {}) {
     (r) => ([
       `<span class="mono">${esc(fmtTs(r && r.ts_ms))}</span>`,
       esc((r && r.symbol || "").toUpperCase()),
-      `<span class="mono">${esc(fmtNum(r && r.qty, 4))}</span>`,
-      `<span class="mono">${esc(fmtNum(r && r.px, 4))}</span>`,
+      `<span class="mono">${esc(fmtSymbolQty(r && r.symbol, r && r.qty, r && r.fx && (r.fx.lot_size || r.fx.contract_size)))}</span>`,
+      `<span class="mono">${esc(fmtSymbolPrice(r && r.symbol, r && r.px, 4))}</span>`,
     ]),
     emptyMessages.fills || "No live fills are currently available.",
     "No fills match the current filter."
@@ -566,9 +596,10 @@ function renderOrderPreview(side = "") {
   const gate = _executionBarrier.realTradingAllowed
     ? `gate open (${_executionBarrier.mode})`
     : `blocked: ${_executionBarrier.blockingReasons[0] || _executionBarrier.reason || "execution barrier"}`;
-  const priceText = Number.isFinite(px) && px > 0 ? `price ref ${fmtNum(px, 2)}` : "price ref unavailable";
+  const priceText = Number.isFinite(px) && px > 0 ? `price ref ${fmtSymbolPrice(STATE.symbol, px, 2)}` : "price ref unavailable";
   const notionalText = notional == null ? "notional unavailable" : `est notional ${fmtNum(notional, 2)}`;
-  el.orderPreview.textContent = `${side || "Order"} ${STATE.symbol} qty ${fmtNum(qty, 4)} | ${priceText} | ${notionalText} | ${gate}`;
+  const sessionText = fxSessionLabel(STATE.symbol);
+  el.orderPreview.textContent = `${side || "Order"} ${STATE.symbol} qty ${fmtSymbolQty(STATE.symbol, qty)} | ${priceText} | ${notionalText} | ${gate}${sessionText ? ` | ${sessionText}` : ""}`;
 }
 
 function canSubmitRealTrade(label) {
@@ -705,6 +736,7 @@ async function refreshSnapshot() {
       _executionBarrier.realTradingAllowed
         ? `real trading allowed (${_executionBarrier.mode})`
         : `real trading blocked (${_executionBarrier.blockingReasons[0] || _executionBarrier.reason || _executionBarrier.mode})`,
+      fxSessionLabel(STATE.symbol),
       liveDataAgeMs == null ? "no live data timestamps" : `live data ${fmtAgeMs(liveDataAgeMs)} old`,
       Number.isFinite(Number(j.latency_ms)) ? `latency ${Math.round(Number(j.latency_ms))}ms` : "",
       acct ? "" : "account snapshot unavailable",
@@ -733,9 +765,10 @@ function renderWatch() {
 
   el.watchList.innerHTML = list.map(s => {
     const active = (String(s).toUpperCase() === String(STATE.symbol).toUpperCase());
+    const fxBadge = isFxSymbol(s) ? "FX" : "chart";
     return `<div class="item ${active ? "active" : ""}" data-sym="${esc(s)}">
       <div class="mono">${esc(s)}</div>
-      <div class="badge">chart</div>
+      <div class="badge">${esc(fxBadge)}</div>
     </div>`;
   }).join("");
 
@@ -793,8 +826,9 @@ async function bootChart() {
   const sym = String(STATE.symbol || "").trim().toUpperCase();
   if (!sym) return;
 
-  if (el.chartTitle) el.chartTitle.textContent = `${sym} • ${STATE.tf} • ${STATE.type}`;
-  if (el.chartHealth) el.chartHealth.textContent = "boot…";
+  const sessionText = fxSessionLabel(sym);
+  if (el.chartTitle) el.chartTitle.textContent = `${sym} • ${STATE.tf} • ${STATE.type}${sessionText ? " • FX" : ""}`;
+  if (el.chartHealth) el.chartHealth.textContent = sessionText ? `boot… • ${sessionText}` : "boot…";
 
   setProChartsState({ enabled: true, tf: STATE.tf, type: STATE.type });
 
@@ -867,7 +901,7 @@ async function bootChart() {
   });
   renderOverlayLegend(overlays.markers ? (decisionOverlay || { markers }) : { markers: [] }, overlays);
 
-  if (el.chartHealth) el.chartHealth.textContent = "live";
+  if (el.chartHealth) el.chartHealth.textContent = sessionText ? `live • ${sessionText}` : "live";
 }
 
 function stopSnapshotTimer() {

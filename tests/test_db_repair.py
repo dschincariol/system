@@ -32,9 +32,11 @@ class DBRepairTests(unittest.TestCase):
             for key in (
                 "DB_PATH",
                 "DB_REPAIR_AUTO_REINDEX_EVENT_LOG_INDEXES",
+                "TS_STORAGE_BACKEND",
             )
         }
         os.environ["DB_PATH"] = str(self.db_path)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         os.environ.pop("DB_REPAIR_AUTO_REINDEX_EVENT_LOG_INDEXES", None)
         _, self.storage, self.db_repair = _reload_modules(
             "engine.runtime.db_guard",
@@ -122,11 +124,24 @@ class DBRepairTests(unittest.TestCase):
             "schema_version_ok": True,
         }
 
+        events: list[str] = []
+
+        def _init_db() -> None:
+            events.append("init_db")
+
+        def _apply_migrations() -> list[int]:
+            events.append("apply_migrations")
+            return [56]
+
+        def _validate(*, include_quick_check: bool = True) -> dict:
+            events.append(f"validate:{include_quick_check}")
+            return validation
+
         with patch.object(repair_schema, "load_runtime_config", return_value=SimpleNamespace(db_path="/var/lib/trading")):
             with patch.object(storage, "_SQLITE_TEST_BACKEND", False, create=True):
-                with patch.object(storage, "init_db") as init_db:
-                    with patch.object(storage, "get_db_validation_snapshot", return_value=validation) as validate:
-                        with patch.object(migrator, "apply_migrations", return_value=[56]) as apply:
+                with patch.object(storage, "init_db", side_effect=_init_db) as init_db:
+                    with patch.object(storage, "get_db_validation_snapshot", side_effect=_validate) as validate:
+                        with patch.object(migrator, "apply_migrations", side_effect=_apply_migrations) as apply:
                             with patch.object(migrator, "expected_schema_version", return_value=56):
                                 result = repair_schema.run(include_quick_check=False)
 
@@ -135,9 +150,44 @@ class DBRepairTests(unittest.TestCase):
         self.assertEqual(result.get("applied_migrations"), [56])
         self.assertEqual(int(result.get("schema_version") or 0), 56)
         self.assertEqual(int(result.get("expected_schema_version") or 0), 56)
-        self.assertEqual(init_db.call_count, 2)
+        self.assertFalse(bool(result.get("post_repair_init_db_required")))
+        self.assertEqual(events, ["apply_migrations", "validate:False"])
+        self.assertEqual(init_db.call_count, 0)
         apply.assert_called_once_with()
         validate.assert_called_once_with(include_quick_check=False)
+
+    def test_db_repair_skips_post_repair_init_when_schema_is_validated(self) -> None:
+        validation = {
+            "ok": True,
+            "owned_schema_ok": True,
+            "owned_drift_tables": [],
+            "schema_version": 69,
+            "expected_schema_version": 69,
+        }
+        with patch.object(self.db_repair, "ensure_db_ok", return_value={"ok": True}), patch.object(
+            self.db_repair,
+            "repair_schema",
+            return_value={
+                "ok": True,
+                "backend": "postgres",
+                "schema_version": 69,
+                "expected_schema_version": 69,
+                "post_repair_init_db_required": False,
+            },
+        ), patch.object(
+            self.db_repair, "init_db", return_value=None
+        ) as init_db, patch.object(
+            self.db_repair, "get_db_validation_snapshot", return_value=validation
+        ), patch.object(
+            self.db_repair, "_integrity_check_rows", return_value=["ok"]
+        ) as integrity_check:
+            out = self.db_repair.repair()
+
+        self.assertTrue(bool(out.get("ok")), out)
+        self.assertEqual(out.get("init_db"), "skipped_schema_valid")
+        self.assertEqual((out.get("integrity_check") or {}).get("mode"), "postgres_not_applicable")
+        init_db.assert_not_called()
+        integrity_check.assert_not_called()
 
     def test_storage_validation_skips_missing_schema_table_warnings_on_empty_db(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir, patch.dict(

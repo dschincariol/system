@@ -14,6 +14,7 @@ def test_job_history_write_is_best_effort(monkeypatch) -> None:
         raise TimeoutError("history pool timeout")
 
     monkeypatch.setattr(jobs_manager, "_write_job_history_impl", fail_history)
+    monkeypatch.setattr(jobs_manager, "log_failure", lambda *args, **kwargs: None)
 
     jobs_manager._write_job_history("poll_prices", "exit", "process exited", 1)
 

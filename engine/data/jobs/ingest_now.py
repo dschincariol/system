@@ -91,7 +91,16 @@ def _run_once() -> None:
         if not cfg_path.exists():
             raise RuntimeError(f"rss_sources_missing:{cfg_path}")
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    items, raw_errors = ingest_rss_sources(cfg.get("sources", []), max_items_per_source=MAX_ITEMS_PER_SOURCE)
+    rss_result = ingest_rss_sources(
+        cfg.get("sources", []),
+        max_items_per_source=MAX_ITEMS_PER_SOURCE,
+        include_status=True,
+    )
+    if isinstance(rss_result, tuple) and len(rss_result) == 3:
+        items, raw_errors, rss_feed_statuses = rss_result
+    else:
+        items, raw_errors = rss_result
+        rss_feed_statuses = []
     errors: list[dict[str, Any] | str] = [
         dict(item) if isinstance(item, dict) else str(item)
         for item in (raw_errors or [])
@@ -229,6 +238,7 @@ def _run_once() -> None:
             "sources_file": str(cfg_path),
             "max_items_per_source": int(MAX_ITEMS_PER_SOURCE),
             "source_errors": len(errors),
+            "rss_feed_statuses": rss_feed_statuses[:50],
             "gdelt_enabled": bool(ENABLE_GDELT),
             "company_news_enabled": bool(ENABLE_COMPANY_NEWS),
             "transcripts_enabled": bool(ENABLE_TRANSCRIPTS),
@@ -260,6 +270,7 @@ def _run_once() -> None:
             "raw_rows": int(raw_rows),
             "event_rows": int(event_rows),
             "source_errors": len(errors),
+            "rss_feed_statuses": rss_feed_statuses[:50],
             "dropped_enrichment": int(dropped_enrichment),
         },
     )

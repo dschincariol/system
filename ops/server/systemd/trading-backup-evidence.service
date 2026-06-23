@@ -14,6 +14,8 @@ Environment=BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
 Environment=PGHOST=/var/run/postgresql
 Environment=PGPORT=5432
 Environment=PGUSER=postgres
+# Deliberately check-only: WAL catch-up is operator-triggered after the archive
+# target and backup dataset are corrected, because backlog drain can be large.
 Environment=TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=0
 Environment=TS_BACKUP_EVIDENCE_RUN_RESTORE_DRILL=0
 Environment=TS_BACKUP_EVIDENCE_RUN_WAL_CATCHUP=0

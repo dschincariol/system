@@ -46,8 +46,10 @@ Closest current substitutes:
 | Document | Status | Use When |
 | --- | --- | --- |
 | [README_OPERATOR_GUIDE.md](README_OPERATOR_GUIDE.md) | Canonical | You need the operator mental model for daily supervision, incident triage, or dashboard interpretation. |
+| [LAN_ACCESS.md](LAN_ACCESS.md) | Canonical | You need to reach the dashboard (:8000) from another computer on a trusted LAN (e.g. a Windows desktop), use the same-origin `/operator/` bridge, and verify that the operator sidecar (:4001) is not directly exposed. |
 | [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md) | Canonical | You are preparing a host, validating a deployment, or checking readiness before enabling higher-risk runtime modes. |
 | [PRODUCTION_BACKEND_CI.md](PRODUCTION_BACKEND_CI.md) | Canonical | You need to reproduce or audit the Postgres/Redis production-backend CI gate and staging preflight evidence. |
+| [PYRIGHT_TYPE_GATE.md](PYRIGHT_TYPE_GATE.md) | Canonical | You need to run, audit, or expand the ratcheted pyright gate for trading money paths. |
 | [LIVE_READINESS_CHECKLIST.md](LIVE_READINESS_CHECKLIST.md) | Canonical | You are moving from safe or paper operation toward live trading. |
 | [STAGING_PROD_PREFLIGHT_EVIDENCE.md](STAGING_PROD_PREFLIGHT_EVIDENCE.md) | Canonical | You need to run the staging prod-preflight harness or review redacted preflight evidence. |
 | [DISK_RETENTION_RUNBOOK.md](DISK_RETENTION_RUNBOOK.md) | Canonical | You need to inspect root/Docker disk pressure, relocate Docker data-root to ZFS, run backup accounting, or use safe cleanup commands without deleting live state. |

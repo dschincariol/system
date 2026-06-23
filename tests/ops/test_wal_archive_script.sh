@@ -74,6 +74,15 @@ PGDATA="$pgdata" \
 TS_WAL_ARCHIVE_SCRIPT="${REPO_ROOT}/ops/backup/wal_archive.sh" \
   bash "${REPO_ROOT}/ops/backup/wal_archive_catchup.sh"
 cmp "$src" "${catchup_wal_dir}/${wal_name}"
-test -f "${pgdata}/pg_wal/archive_status/${wal_name}.ready"
+test ! -f "${pgdata}/pg_wal/archive_status/${wal_name}.ready"
+test -f "${pgdata}/pg_wal/archive_status/${wal_name}.done"
+
+PYTHONPATH="$REPO_ROOT" python3 - <<'PY'
+from engine.runtime.postgres_tuning import archive_command_uses_audited_script
+
+assert archive_command_uses_audited_script('/opt/trading/ops/backup/wal_archive.sh "%p" "%f"')
+assert not archive_command_uses_audited_script("/bin/true")
+assert not archive_command_uses_audited_script("mkdir -p /var/backups/trading/wal && cp %p /var/backups/trading/wal/%f")
+PY
 
 echo "[test_wal_archive_script] ok"

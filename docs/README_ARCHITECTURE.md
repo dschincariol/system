@@ -269,13 +269,23 @@ In practical terms, training now writes a feature contract and serving reads tha
 Current groups visible in the registry include:
 
 - base, price, events, macro, HMM regime, tech, stress, social, weather, options-symbol, and availability
+- FX groups under the shared `fx.` prefix: rate/real-yield spreads, carry, DXY/dollar beta, cross-pair correlation, COT positioning, trend/time-series momentum, and central-bank/event-window flags
 - tsfresh and discovery-backed features
 - NLP/FinBERT/news, filings, and transcript feature groups
 - shadow-only `tsfm.chronos_v2.*` embeddings from the frozen Chronos encoder path when `USE_TS_FOUNDATION_FEATURES=1` and optional dependencies are installed
 - optional insider/Form 4, congressional, sentiment, and symbolic feature paths when their flags and dependencies are enabled
 
 Every new feature still needs an explicit feature id and must round-trip through the persisted feature schema.
+FX feature groups are registered in the catalog but only enter an FX model schema when `USE_FX_FEATURES=1` or an FX model explicitly requests an `fx.*` id. `resolve_feature_ids(..., asset_class="FX")` and `expected_columns(..., asset_class="FX")` drop equity-only options/social/insider/filing-style ids and append the canonical FX ids in registry order; non-FX asset classes drop `fx.*` ids; `asset_class=None` preserves the legacy ungated behavior. The `fx.event_*` ids are a deliberate structural-zero stub until an upstream economic-calendar feed owns central-bank, NFP, and CPI event timestamps.
 The Chronos foundation-model path is a feature generator only: it stores model-family provenance, artifact manifest hashes, and PIT source timestamps in the feature snapshot metadata, and live model serving rejects contracts that include shadow-stage feature ids.
+
+### FX clock, labels, and regime context
+
+`engine/data/prices/fx_clock.py` is the canonical FX session-boundary helper for this workstream. It defines the 24/5 FX week in `America/New_York` time, with the default weekend close at Friday 17:00 ET and reopen at Sunday 17:00 ET. FX execution/session and UI surfaces should derive from that module or use the same env knobs so ET boundaries and their DST-dependent UTC equivalents stay aligned.
+
+FX label construction uses that clock only for symbols classified as `FX`. Non-FX labels still use the legacy fixed millisecond horizon. FX forward-return windows that would naively span the Friday-to-Sunday market-closed gap are skipped instead of being paired with stale post-gap prices; price-backfill labels that use the FX clock record `meta_json.fx_clock_corrected` and `meta_json.naive_eval_ms` on the sqlite-side `labels_price` enrichment path.
+
+The regime stack can add a default-off `USE_FX_REGIME=1` USD-strength/carry layer for FX symbols. Those signals are merged into the existing `macro` regime layer as `fx_usd_strength_z`, `fx_usd_strength_dir`, and `fx_carry_pressure`, so `regime_compatibility` sees them without changing the persisted HMM training input keys. Predictor routing uses an FX symbol as the regime anchor for FX predictions; equities and other asset classes keep the existing `SPY` regime anchor.
 
 ### Current model families
 

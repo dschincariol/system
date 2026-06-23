@@ -665,6 +665,43 @@ def _postgres_tuning_effective_settings(names: List[str]) -> Dict[str, Dict[str,
     }
 
 
+def _postgres_tuning_effective_settings_from_file(names: List[str]) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    path = str(
+        os.environ.get("PREFLIGHT_POSTGRES_SETTINGS_JSON")
+        or os.environ.get("TRADING_POSTGRES_SETTINGS_JSON")
+        or ""
+    ).strip()
+    if not path:
+        return {}, ""
+    evidence_path = Path(path).expanduser()
+    raw = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if isinstance(raw, list):
+        rows = {
+            str(item.get("name")): {
+                "setting": item.get("setting"),
+                "unit": item.get("unit"),
+            }
+            for item in raw
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
+    elif isinstance(raw, dict):
+        if all(isinstance(value, dict) for value in raw.values()):
+            rows = {str(key): dict(value) for key, value in raw.items() if isinstance(value, dict)}
+        else:
+            rows = {
+                str(item.get("name")): {
+                    "setting": item.get("setting"),
+                    "unit": item.get("unit"),
+                }
+                for item in list(raw.get("settings") or [])
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            }
+    else:
+        rows = {}
+    allowed = {str(name) for name in names}
+    return {name: dict(row) for name, row in rows.items() if name in allowed}, str(evidence_path)
+
+
 def _postgres_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
     notes: List[str] = []
     warnings: List[str] = []
@@ -675,20 +712,46 @@ def _postgres_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, 
 
     effective_settings: Dict[str, Dict[str, Any]] = {}
     effective_query: Dict[str, Any] = {"attempted": False, "ok": None}
-    if str(os.environ.get("PREFLIGHT_POSTGRES_TUNING_QUERY_EFFECTIVE", "1")).strip().lower() not in {
+    try:
+        from engine.runtime.postgres_tuning import PG_SETTING_SPECS
+
+        names = [str(spec.pg_name) for spec in PG_SETTING_SPECS]
+        effective_settings, evidence_path = _postgres_tuning_effective_settings_from_file(names)
+        if evidence_path:
+            effective_query = {
+                "attempted": False,
+                "ok": bool(effective_settings),
+                "source": "file",
+                "path": evidence_path,
+                "settings": len(effective_settings),
+            }
+            if required and not effective_settings:
+                errors.append(f"postgres tuning effective settings evidence file empty or missing rows: {evidence_path}")
+    except Exception as exc:
+        effective_query = {
+            "attempted": False,
+            "ok": False,
+            "source": "file",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        if required:
+            errors.append(f"postgres tuning effective settings evidence file failed: {type(exc).__name__}: {exc}")
+        else:
+            warnings.append(f"postgres tuning effective settings evidence file unavailable: {type(exc).__name__}: {exc}")
+
+    should_query = str(os.environ.get("PREFLIGHT_POSTGRES_TUNING_QUERY_EFFECTIVE", "1")).strip().lower() not in {
         "0",
         "false",
         "no",
         "off",
-    }:
+    }
+    if not effective_settings and should_query:
         try:
-            from engine.runtime.postgres_tuning import PG_SETTING_SPECS
-
-            names = [str(spec.pg_name) for spec in PG_SETTING_SPECS]
             effective_settings = _postgres_tuning_effective_settings(names)
             effective_query = {
                 "attempted": True,
                 "ok": True,
+                "source": "pg_settings",
                 "settings": len(effective_settings),
             }
         except Exception as exc:
@@ -700,9 +763,16 @@ def _postgres_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, 
             effective_query = {
                 "attempted": True,
                 "ok": False,
+                "source": "pg_settings",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-            warnings.append(f"postgres tuning effective settings unavailable: {type(exc).__name__}: {exc}")
+            message = f"postgres tuning effective settings unavailable: {type(exc).__name__}: {exc}"
+            if required:
+                errors.append(message)
+            else:
+                warnings.append(message)
+    elif required and not effective_settings and not should_query:
+        errors.append("postgres tuning effective settings evidence missing: enable query or set PREFLIGHT_POSTGRES_SETTINGS_JSON")
 
     try:
         from engine.runtime.postgres_tuning import docker_postgres_tuning_snapshot, format_bytes
@@ -728,6 +798,7 @@ def _postgres_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, 
     snapshot["effective_query"] = effective_query
     warnings.extend(str(item) for item in list(snapshot.get("warnings") or []))
     errors.extend(str(item) for item in list(snapshot.get("errors") or []))
+    snapshot["ok"] = not errors
     if not errors:
         derivation = dict(snapshot.get("derivation") or {})
         memory_budget = dict(snapshot.get("memory_budget") or {})
@@ -742,6 +813,37 @@ def _postgres_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str, 
         )
         if effective_settings:
             notes.append(f"postgres effective settings ok count={len(effective_settings)}")
+    return notes, warnings, errors, snapshot
+
+
+def _effective_runtime_state_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    required = _env_truthy("PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE")
+    if not required and not _env_truthy("PREFLIGHT_CHECK_DOCKER_RUNTIME_EVIDENCE"):
+        return [], [], [], {"required": False, "skipped": True}
+    try:
+        from engine.runtime.effective_runtime_state import effective_runtime_state_snapshot
+
+        snapshot = dict(effective_runtime_state_snapshot(os.environ, required=required) or {})
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_EFFECTIVE_RUNTIME_STATE_FAILED",
+            exc,
+            once_key="effective_runtime_state_gate",
+        )
+        return [], [], [f"effective runtime state validation failed: {type(exc).__name__}: {exc}"], {
+            "required": required,
+        }
+
+    warnings = [str(item) for item in list(snapshot.get("warnings") or [])]
+    errors = [str(item) for item in list(snapshot.get("errors") or [])]
+    notes: List[str] = []
+    if not errors:
+        docker = dict(snapshot.get("docker") or {})
+        redis = dict(snapshot.get("redis") or {})
+        notes.append(
+            "effective runtime state ok "
+            f"docker_source={docker.get('source')} redis_source={redis.get('source')}"
+        )
     return notes, warnings, errors, snapshot
 
 
@@ -841,6 +943,146 @@ def _ingestion_tuning_gate() -> Tuple[List[str], List[str], List[str], Dict[str,
     return notes, warnings, errors, snapshot
 
 
+def _ingestion_soak_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.ingestion_soak import (
+            collect_ingestion_soak_report,
+            collect_ingestion_soak_report_from_file,
+        )
+
+        evidence_path = str(
+            os.environ.get("PREFLIGHT_INGESTION_SOAK_JSON")
+            or os.environ.get("INGESTION_SOAK_JSON")
+            or ""
+        ).strip()
+        if evidence_path:
+            snapshot = dict(collect_ingestion_soak_report_from_file(evidence_path) or {})
+            snapshot["evidence_source"] = evidence_path
+        else:
+            snapshot = dict(collect_ingestion_soak_report({}, query_policy=None) or {})
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_INGESTION_SOAK_FAILED",
+            exc,
+            once_key="ingestion_soak",
+        )
+        return notes, warnings, [f"ingestion soak validation failed: {type(exc).__name__}: {exc}"], {}
+
+    warnings.extend(str(item) for item in list(snapshot.get("warnings") or []) if str(item).strip())
+    if bool(snapshot.get("required")) and not bool(snapshot.get("ok")):
+        detail = ",".join(str(item) for item in list(snapshot.get("errors") or []) if str(item).strip())
+        errors.append(f"ingestion soak invalid: {detail or snapshot.get('status') or 'not_ready'}")
+    elif bool(snapshot.get("ok")):
+        summary = dict(snapshot.get("summary") or {})
+        notes.append(
+            "ingestion soak ok "
+            f"policy_evidence={int(bool(summary.get('policy_evidence_available')))} "
+            f"timescale_queue={summary.get('timescale_queue_depth')} "
+            f"price_copy_fallbacks={summary.get('price_copy_fallbacks')}"
+        )
+    else:
+        notes.append("ingestion soak evidence not required")
+    return notes, warnings, errors, snapshot
+
+
+def _refetchable_pg_durability_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.pg_durability import refetchable_pg_durability_snapshot
+
+        snapshot = dict(refetchable_pg_durability_snapshot() or {})
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_REFETCHABLE_PG_DURABILITY_FAILED",
+            exc,
+            once_key="refetchable_pg_durability",
+        )
+        return (
+            notes,
+            warnings,
+            [f"refetchable pg durability invalid: {type(exc).__name__}: {exc}"],
+            {},
+        )
+
+    notes.append(
+        "refetchable pg durability ok "
+        f"tier={snapshot.get('tier')} "
+        f"relaxed={int(bool(snapshot.get('relaxed')))} "
+        f"approved_scopes={len(list(snapshot.get('approved_scopes') or []))} "
+        f"protected_tables={len(list(snapshot.get('protected_tables') or []))}"
+    )
+    return notes, warnings, errors, snapshot
+
+
+def _ingestion_shard_gate() -> Tuple[List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.ingestion_shards import parse_ingestion_shard_env
+
+        shard = parse_ingestion_shard_env(os.environ)
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_INGESTION_SHARD_FAILED",
+            exc,
+            once_key="ingestion_shard",
+        )
+        return notes, [f"ingestion shard validation failed: {type(exc).__name__}: {exc}"], {}
+    notes.append(
+        "ingestion shard ok "
+        f"index={int(shard.index)} "
+        f"count={int(shard.count)} "
+        f"enabled={int(bool(shard.enabled))}"
+    )
+    return notes, errors, shard.as_dict()
+
+
+def _cpu_power_policy_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    try:
+        from engine.runtime.cpu_power_policy import verify_cpu_power_policy
+
+        state = dict(verify_cpu_power_policy() or {})
+    except Exception as exc:
+        state = {
+            "required": True,
+            "ok": False,
+            "status": "error",
+            "reason": f"cpu_power_policy_probe_error:{type(exc).__name__}:{exc}",
+        }
+
+    required = bool(state.get("required"))
+    if bool(state.get("ok")):
+        notes.append(
+            "cpu power policy ok "
+            f"required={int(required)} "
+            f"{state.get('summary') or 'intended_state=PASS'}"
+        )
+        return notes, warnings, errors, state
+
+    reason = str(state.get("reason") or state.get("status") or "cpu_power_policy_invalid")
+    summary = str(state.get("summary") or "").strip()
+    rendered = f"{reason}: {summary}" if summary else reason
+    status = str(state.get("status") or "").strip()
+    drifted = reason == "cpu_power_policy_drift" or status == "drift"
+    if drifted:
+        errors.append(f"cpu power policy invalid: {rendered}")
+    elif required:
+        errors.append(f"cpu power policy invalid: {rendered}")
+    elif reason == "cpu_power_policy_unavailable":
+        warnings.append(f"cpu power policy advisory unavailable: {rendered}")
+    else:
+        warnings.append(f"cpu power policy advisory failed: {rendered}")
+    return notes, warnings, errors, state
+
+
 def _compose_operator_service_block() -> str:
     compose_path = Path(REPO_ROOT) / "deploy" / "compose" / "docker-compose.stack.yml"
     try:
@@ -928,6 +1170,152 @@ def _operator_sensitive_get_denied(base_url: str, timeout_s: float) -> Tuple[boo
         status = 0
         detail = f"{type(exc).__name__}: {exc}"
     return denied, status, detail
+
+
+def _listener_probe_enabled() -> bool:
+    return str(os.environ.get("PREFLIGHT_CHECK_NETWORK_LISTENERS", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _split_listener_endpoint(endpoint: str) -> Tuple[str, int | None]:
+    text = str(endpoint or "").strip()
+    if not text:
+        return "", None
+    if text.startswith("[") and "]:" in text:
+        host, _, port_text = text[1:].partition("]:")
+        port = int(port_text) if port_text.isdigit() else None
+        return host, port
+    if ":" not in text:
+        return text, None
+    host, _, port_text = text.rpartition(":")
+    port = int(port_text) if port_text.isdigit() else None
+    return host.strip("[]"), port
+
+
+def _parse_ss_listener_line(line: str) -> Dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    parts = text.split()
+    if len(parts) < 5:
+        return None
+    netid = parts[0].lower()
+    state = parts[1].lower()
+    if netid not in {"tcp", "tcp4", "tcp6"} or state != "listen":
+        return None
+    local = parts[4]
+    host, port = _split_listener_endpoint(local)
+    if port is None:
+        return None
+    host_text = str(host or "").strip()
+    wildcard = host_text in {"", "*", "0.0.0.0", "::", "0:0:0:0:0:0:0:0"}
+    return {
+        "netid": parts[0],
+        "state": parts[1],
+        "local": local,
+        "host": host_text,
+        "port": int(port),
+        "wildcard": bool(wildcard),
+        "line": text,
+    }
+
+
+def _network_listener_review_ports() -> set[int]:
+    ports = {8000, 4001, 4000, 7002, 5201}
+    for name in (
+        "DASHBOARD_PUBLIC_PORT",
+        "DASHBOARD_PORT",
+        "OPERATOR_PUBLIC_PORT",
+        "OPERATOR_PORT",
+        "TIMESCALE_PORT",
+        "REDIS_PORT",
+        "MINIO_PORT",
+        "MINIO_CONSOLE_PORT",
+    ):
+        raw = str(os.environ.get(name, "") or "").strip()
+        if not raw:
+            continue
+        if raw.isdigit():
+            ports.add(int(raw))
+    return ports
+
+
+def _passive_network_listener_snapshot(ss_output: str | None = None) -> Dict[str, Any]:
+    command = ["ss", "-H", "-ltnp"]
+    errors: list[str] = []
+    warnings: list[str] = []
+    source = "provided"
+    raw = str(ss_output or "")
+    if ss_output is None:
+        source = "ss"
+        if shutil.which("ss") is None:
+            return {
+                "ok": True,
+                "checked": False,
+                "source": "missing_ss",
+                "command": "ss -H -ltnp",
+                "listeners": [],
+                "warnings": ["ss command unavailable; listener diagnostic skipped"],
+                "errors": [],
+            }
+        try:
+            proc = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            raw = str(proc.stdout or "")
+            if int(proc.returncode) != 0:
+                warnings.append(f"ss listener probe exited rc={int(proc.returncode)}")
+                stderr = str(proc.stderr or "").strip()
+                if stderr:
+                    warnings.append(stderr[:240])
+        except Exception as exc:
+            _warn_nonfatal(
+                "network_listener_probe_failed",
+                exc,
+                once_key="network_listener_probe_failed",
+                command="ss -H -ltnp",
+            )
+            return {
+                "ok": True,
+                "checked": False,
+                "source": "ss_failed",
+                "command": "ss -H -ltnp",
+                "listeners": [],
+                "warnings": [f"ss listener probe failed: {type(exc).__name__}: {exc}"],
+                "errors": [],
+            }
+
+    review_ports = _network_listener_review_ports()
+    listeners = [
+        parsed
+        for parsed in (_parse_ss_listener_line(line) for line in raw.splitlines())
+        if parsed is not None and int(parsed.get("port") or 0) in review_ports
+    ]
+    wildcard_ports = sorted({int(item["port"]) for item in listeners if bool(item.get("wildcard"))})
+    if 4001 in wildcard_ports:
+        errors.append("operator_sidecar_wildcard_listener_4001_forbidden")
+    for port in (4000, 7002, 5201):
+        if port in wildcard_ports:
+            warnings.append(f"unexpected_wildcard_listener:{port}")
+
+    return {
+        "ok": not errors,
+        "checked": True,
+        "source": source,
+        "command": "ss -H -ltnp",
+        "listeners": listeners,
+        "wildcard_ports": wildcard_ports,
+        "warnings": warnings,
+        "errors": errors,
+    }
 
 
 def _operator_sidecar_security_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
@@ -1035,6 +1423,18 @@ def _network_exposure_gate() -> Tuple[List[str], List[str], List[str], Dict[str,
         )
     else:
         notes.append("network exposure ok public_services=0")
+
+    listener_state: Dict[str, Any] = {"checked": False, "reason": "disabled"}
+    if _listener_probe_enabled():
+        listener_state = _passive_network_listener_snapshot()
+        state["passive_listeners"] = dict(listener_state or {})
+        warnings.extend(str(item) for item in list(listener_state.get("warnings") or []))
+        errors.extend(str(item) for item in list(listener_state.get("errors") or []))
+        if bool(listener_state.get("checked")) and not errors:
+            wildcard_ports = ",".join(str(item) for item in list(listener_state.get("wildcard_ports") or []))
+            notes.append(f"network listener diagnostic checked wildcard_ports={wildcard_ports or 'none'}")
+    else:
+        state["passive_listeners"] = listener_state
     return notes, warnings, errors, state
 
 
@@ -1238,6 +1638,39 @@ def _resource_isolation_gate() -> Tuple[List[str], List[str], Dict[str, Any]]:
         list(summary.get("warnings") or []),
         summary,
     )
+
+
+def _memory_pressure_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    try:
+        from engine.runtime.memory_pressure import host_memory_pressure_snapshot
+
+        summary = dict(host_memory_pressure_snapshot() or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_MEMORY_PRESSURE_FAILED",
+            e,
+            once_key="memory_pressure_gate",
+        )
+        return [], [], [f"memory pressure validation failed: {type(e).__name__}: {e}"], {}
+
+    notes: List[str] = []
+    warnings = list(summary.get("warnings") or [])
+    errors = list(summary.get("errors") or [])
+    if bool(summary.get("meets_policy")):
+        memory = dict(summary.get("memory") or {})
+        swap = dict(summary.get("swap") or {})
+        zfs = dict(summary.get("zfs") or {})
+        notes.append(
+            "memory pressure policy ok "
+            f"ram_gib={memory.get('mem_total_gib')} "
+            f"swap_gib={memory.get('swap_total_gib')} "
+            f"zram_gib={swap.get('zram_total_gib')} "
+            f"swapfile_gib={swap.get('managed_swapfile_gib')} "
+            f"arc_max_gib={zfs.get('arc_max_gib')}"
+        )
+    elif not bool(summary.get("required")):
+        warnings.append(f"memory pressure policy advisory: {summary.get('reason') or 'not_ready'}")
+    return notes, warnings, errors, summary
 
 
 def _storage_placement_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
@@ -1722,14 +2155,19 @@ def main() -> int:
         "external_services": [],
         "backup_restore_evidence": {},
         "disk_pressure": {},
+        "memory_pressure": {},
         "storage_placement": {},
         "lob_deeplob_shadow": {},
         "resource_isolation": {},
         "provisioning": {},
         "postgres_tuning": {},
+        "effective_runtime_state": {},
         "wal_archiver_runtime": {},
         "pg_wal_disk_risk": {},
         "ingestion_tuning": {},
+        "ingestion_soak": {},
+        "refetchable_pg_durability": {},
+        "cpu_power_policy": {},
         "operator_sidecar_security": {},
         "network_exposure": {},
         "capital_equity_freshness": {},
@@ -1749,6 +2187,19 @@ def main() -> int:
                 print("[provisioning]", error)
         return 3
 
+    cpu_power_notes, cpu_power_warnings, cpu_power_errors, cpu_power_policy = _cpu_power_policy_gate()
+    result["steps"].extend(cpu_power_notes)
+    result["warnings"].extend(cpu_power_warnings)
+    result["cpu_power_policy"] = dict(cpu_power_policy or {})
+    if cpu_power_errors:
+        result["errors"].extend(cpu_power_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in cpu_power_errors:
+                print("[cpu-power]", error)
+        return 3
+
     disk_notes, disk_warnings, disk_errors, disk_pressure = _disk_pressure_gate()
     result["steps"].extend(disk_notes)
     result["warnings"].extend(disk_warnings)
@@ -1760,6 +2211,19 @@ def main() -> int:
         else:
             for error in disk_errors:
                 print("[disk]", error)
+        return 3
+
+    memory_notes, memory_warnings, memory_errors, memory_pressure = _memory_pressure_gate()
+    result["steps"].extend(memory_notes)
+    result["warnings"].extend(memory_warnings)
+    result["memory_pressure"] = dict(memory_pressure or {})
+    if memory_errors:
+        result["errors"].extend(memory_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in memory_errors:
+                print("[memory-pressure]", error)
         return 3
 
     storage_notes, storage_warnings, storage_errors, storage_placement = _storage_placement_gate()
@@ -1786,6 +2250,21 @@ def main() -> int:
         else:
             for error in tuning_errors:
                 print("[postgres-tuning]", error)
+        return 3
+
+    effective_runtime_notes, effective_runtime_warnings, effective_runtime_errors, effective_runtime_state = (
+        _effective_runtime_state_gate()
+    )
+    result["steps"].extend(effective_runtime_notes)
+    result["warnings"].extend(effective_runtime_warnings)
+    result["effective_runtime_state"] = dict(effective_runtime_state or {})
+    if effective_runtime_errors:
+        result["errors"].extend(effective_runtime_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in effective_runtime_errors:
+                print("[effective-runtime]", error)
         return 3
 
     wal_archiver_notes, wal_archiver_warnings, wal_archiver_errors, wal_archiver_runtime = _wal_archiver_runtime_gate()
@@ -1825,6 +2304,44 @@ def main() -> int:
         else:
             for error in ingestion_tuning_errors:
                 print("[ingestion-tuning]", error)
+        return 3
+
+    ingestion_soak_notes, ingestion_soak_warnings, ingestion_soak_errors, ingestion_soak = _ingestion_soak_gate()
+    result["steps"].extend(ingestion_soak_notes)
+    result["warnings"].extend(ingestion_soak_warnings)
+    result["ingestion_soak"] = dict(ingestion_soak or {})
+    if ingestion_soak_errors:
+        result["errors"].extend(ingestion_soak_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in ingestion_soak_errors:
+                print("[ingestion-soak]", error)
+        return 3
+
+    durability_notes, durability_warnings, durability_errors, durability_state = _refetchable_pg_durability_gate()
+    result["steps"].extend(durability_notes)
+    result["warnings"].extend(durability_warnings)
+    result["refetchable_pg_durability"] = dict(durability_state or {})
+    if durability_errors:
+        result["errors"].extend(durability_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in durability_errors:
+                print("[pg-durability]", error)
+        return 3
+
+    ingestion_shard_notes, ingestion_shard_errors, ingestion_shard = _ingestion_shard_gate()
+    result["steps"].extend(ingestion_shard_notes)
+    result["ingestion_shard"] = dict(ingestion_shard or {})
+    if ingestion_shard_errors:
+        result["errors"].extend(ingestion_shard_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in ingestion_shard_errors:
+                print("[ingestion-shard]", error)
         return 3
 
     config_notes, config_errors = _runtime_config_gate()

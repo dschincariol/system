@@ -42,6 +42,19 @@ def _warn_nonfatal(code: str, error: BaseException, **extra: object) -> None:
         persist=False,
     )
 
+
+try:
+    from engine.data.fx_instrument import is_fx_symbol  # type: ignore
+except Exception as e:
+    _warn_nonfatal(
+        "DATA_ASSET_MAP_FX_INSTRUMENT_IMPORT_FAILED",
+        e,
+    )
+
+    def is_fx_symbol(symbol: object) -> bool:
+        return False
+
+
 def _load_override():
     raw = os.environ.get("ASSET_CLASS_MAP_JSON", "").strip()
     if not raw:
@@ -78,7 +91,7 @@ def asset_class_for_symbol(symbol: str) -> str:
         return "CRYPTO"
     if s in ("GC", "GOLD", "SI", "SILVER", "CL", "OIL", "NG"):
         return "COMMODITY"
-    if s in ("DXY", "EURUSD", "USDJPY", "GBPUSD"):
+    if is_fx_symbol(s):
         return "FX"
     if s in ("TLT", "IEF", "ZB", "ZN"):
         return "RATES"

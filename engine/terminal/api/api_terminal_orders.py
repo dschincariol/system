@@ -289,6 +289,32 @@ def _record_terminal_rejection(
         _warn_nonfatal("API_TERMINAL_REJECTION_RECORD_FAILED", e, symbol=symbol, side=side, reason_code=reason_code)
 
 
+def _refusal_payload(
+    *,
+    error: str,
+    reason_code: str,
+    message: str,
+    http_status: int,
+    **fields: Any,
+) -> Dict[str, Any]:
+    meta = fields.pop("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault("status", int(http_status))
+    meta.setdefault("reason_code", str(reason_code))
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "error": str(error),
+        "reason_code": str(reason_code),
+        "message": str(message),
+        "reason": str(message),
+        "http_status": int(http_status),
+        "meta": meta,
+    }
+    payload.update(fields)
+    return payload
+
+
 def _rejected(symbol: str, side: str, qty: float, reason_code: str, reason: str, detail: Dict[str, Any] | None = None) -> Dict[str, Any]:
     _record_terminal_rejection(
         symbol=symbol,
@@ -298,13 +324,13 @@ def _rejected(symbol: str, side: str, qty: float, reason_code: str, reason: str,
         reason=reason,
         detail=detail,
     )
-    return {
-        "ok": False,
-        "error": "pre_trade_rejected",
-        "reason_code": str(reason_code),
-        "reason": str(reason),
-        "detail": dict(detail or {}),
-    }
+    return _refusal_payload(
+        error="pre_trade_rejected",
+        reason_code=str(reason_code),
+        message=str(reason),
+        http_status=409,
+        detail=dict(detail or {}),
+    )
 
 
 def _pre_trade_controls(con, *, symbol: str, side: str, qty: float) -> Dict[str, Any]:
@@ -352,10 +378,16 @@ def _terminal_explain(symbol: str, side: str, qty: float, *, flatten: bool = Fal
 def _disabled_live_execution_response() -> Dict[str, Any] | None:
     if not live_execution_disabled():
         return None
+    gate = disabled_live_execution_gate(source="engine.terminal.api.api_terminal_orders")
+    reason_code = str(gate.get("reason") or gate.get("status") or "live_execution_disabled")
     return {
-        "ok": False,
-        "error": "execution_blocked",
-        "gate": disabled_live_execution_gate(source="engine.terminal.api.api_terminal_orders"),
+        **_refusal_payload(
+            error="execution_blocked",
+            reason_code=reason_code,
+            message="Terminal order entry is blocked by the live-execution safety gate.",
+            http_status=403,
+        ),
+        "gate": gate,
     }
 
 
@@ -367,7 +399,16 @@ def _prelive_reconcile_policy_response() -> Dict[str, Any] | None:
     )
     if policy_block is None:
         return None
-    return {"ok": False, "error": "execution_blocked", "gate": policy_block}
+    reason_code = str(policy_block.get("status") or policy_block.get("reason") or "prelive_reconcile_blocked")
+    return {
+        **_refusal_payload(
+            error="execution_blocked",
+            reason_code=reason_code,
+            message="Terminal order entry is blocked until pre-live reconciliation is enabled and passing.",
+            http_status=403,
+        ),
+        "gate": policy_block,
+    }
 
 
 def _terminal_intent_allowed(gate: Dict[str, Any]) -> bool:
@@ -415,7 +456,12 @@ def api_post_terminal_order(_parsed=None, body=None, _ctx=None):
     qty = _positive_qty(body.get("qty"))
 
     if not symbol or qty <= 0 or side not in ("BUY", "SELL"):
-        return {"ok": False, "error": "invalid_order"}
+        return _refusal_payload(
+            error="invalid_order",
+            reason_code="invalid_terminal_order",
+            message="Terminal order requires a symbol, BUY or SELL side, and a positive quantity.",
+            http_status=400,
+        )
 
     disabled = _disabled_live_execution_response()
     if disabled is not None:
@@ -428,12 +474,26 @@ def api_post_terminal_order(_parsed=None, body=None, _ctx=None):
     # execution gate as the rest of the system. The route does not bypass policy.
     gate = _execution_gate_for_terminal_order()
     if not _terminal_intent_allowed(gate):
-        return {"ok": False, "error": "execution_blocked", "gate": gate}
+        reason_code = str(gate.get("reason") or gate.get("status") or "execution_gate_blocked")
+        return {
+            **_refusal_payload(
+                error="execution_blocked",
+                reason_code=reason_code,
+                message="Terminal order entry is blocked by the execution gate.",
+                http_status=403,
+            ),
+            "gate": gate,
+        }
 
     con = connect(readonly=True)
     try:
         if not _table_exists(con, "portfolio_orders"):
-            return {"ok": False, "error": "portfolio_orders_missing"}
+            return _refusal_payload(
+                error="portfolio_orders_missing",
+                reason_code="portfolio_orders_missing",
+                message="Terminal order entry cannot record intents because portfolio_orders is unavailable.",
+                http_status=503,
+            )
         pre_trade = _pre_trade_controls(con, symbol=symbol, side=side, qty=qty)
         if not bool(pre_trade.get("ok")):
             return pre_trade
@@ -472,7 +532,13 @@ def api_post_terminal_order(_parsed=None, body=None, _ctx=None):
         cache_invalidate_namespace("portfolio_snapshot")
     except Exception as e:
         _warn_nonfatal("API_TERMINAL_ORDER_WRITE_FAILED", e, symbol=str(symbol), side=str(side), qty=qty)
-        return {"ok": False, "error": str(e)}
+        return _refusal_payload(
+            error="internal_server_error",
+            reason_code="terminal_order_write_failed",
+            message="Terminal order intent could not be recorded.",
+            http_status=500,
+            detail=type(e).__name__,
+        )
 
     return {
         "ok": True,
@@ -514,7 +580,12 @@ def api_post_terminal_flatten(_parsed=None, body=None, _ctx=None):
     body = _request_body(_parsed, body)
     symbol = str(body.get("symbol") or "").strip().upper()
     if not symbol:
-        return {"ok": False, "error": "missing_symbol"}
+        return _refusal_payload(
+            error="missing_symbol",
+            reason_code="missing_symbol",
+            message="Terminal flatten requires a symbol.",
+            http_status=400,
+        )
 
     disabled = _disabled_live_execution_response()
     if disabled is not None:
@@ -525,14 +596,33 @@ def api_post_terminal_flatten(_parsed=None, body=None, _ctx=None):
 
     gate = _execution_gate_for_terminal_order()
     if not _terminal_intent_allowed(gate):
-        return {"ok": False, "error": "execution_blocked", "gate": gate}
+        reason_code = str(gate.get("reason") or gate.get("status") or "execution_gate_blocked")
+        return {
+            **_refusal_payload(
+                error="execution_blocked",
+                reason_code=reason_code,
+                message="Terminal flatten is blocked by the execution gate.",
+                http_status=403,
+            ),
+            "gate": gate,
+        }
 
     con = connect(readonly=True)
     try:
         if not _table_exists(con, "broker_positions"):
-            return {"ok": False, "error": "broker_positions_missing"}
+            return _refusal_payload(
+                error="broker_positions_missing",
+                reason_code="broker_positions_missing",
+                message="Terminal flatten cannot inspect broker positions because broker_positions is unavailable.",
+                http_status=503,
+            )
         if not _table_exists(con, "portfolio_orders"):
-            return {"ok": False, "error": "portfolio_orders_missing"}
+            return _refusal_payload(
+                error="portfolio_orders_missing",
+                reason_code="portfolio_orders_missing",
+                message="Terminal flatten cannot record intents because portfolio_orders is unavailable.",
+                http_status=503,
+            )
 
         row = con.execute(
             "SELECT qty FROM broker_positions WHERE symbol=? LIMIT 1",
@@ -588,7 +678,13 @@ def api_post_terminal_flatten(_parsed=None, body=None, _ctx=None):
         cache_invalidate_namespace("portfolio_snapshot")
     except Exception as e:
         _warn_nonfatal("API_TERMINAL_FLATTEN_WRITE_FAILED", e, symbol=str(symbol), flatten_qty=abs(qty))
-        return {"ok": False, "error": str(e)}
+        return _refusal_payload(
+            error="internal_server_error",
+            reason_code="terminal_flatten_write_failed",
+            message="Terminal flatten intent could not be recorded.",
+            http_status=500,
+            detail=type(e).__name__,
+        )
 
     return {
         "ok": True,

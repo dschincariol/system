@@ -47,6 +47,7 @@ from engine.execution.execution_decision_engine import (
     decide_execution_strategy,
     load_execution_feedback_snapshot,
 )
+from engine.execution.fx_session import fx_timing_adjustment
 from engine.execution.lob_simulation import (
     deeplob_shadow_enabled,
     shadow_deeplob_execution_signal,
@@ -134,6 +135,13 @@ TSE_MIN_ABS_QTY = float(os.environ.get("TSE_MIN_ABS_QTY", "1e-9"))
 TSE_MAX_SLICES = int(os.environ.get("TSE_MAX_SLICES", "25"))
 EPE_MAX_FUTURE_SIGNAL_TS_MS = int(os.environ.get("EPE_MAX_FUTURE_SIGNAL_TS_MS", "30000"))
 EPE_MIN_REGIME_COMPAT_SCALE = float(os.environ.get("EPE_MIN_REGIME_COMPAT_SCALE", "0.35"))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _now_ms() -> int:
@@ -584,6 +592,18 @@ def _log_suppression_event(
         _warn_nonfatal("EXECUTION_POLICY_ENGINE_SUPPRESSION_LOG_FAILED", e, once_key="log_suppression")
 
 
+def _attach_fx_session_metadata(row: Dict[str, Any], execution_decision: Dict[str, Any]) -> None:
+    fx_session = execution_decision.get("fx_session")
+    if not isinstance(fx_session, dict):
+        return
+    row["fx_session"] = dict(fx_session)
+    row["fx_session_blocked"] = bool(execution_decision.get("fx_session_blocked", False))
+    if "fx_rollover_timing_bias" in execution_decision:
+        row["fx_rollover_timing_bias"] = bool(execution_decision.get("fx_rollover_timing_bias"))
+    if execution_decision.get("fx_session_reason"):
+        row["fx_session_reason"] = str(execution_decision.get("fx_session_reason"))
+
+
 def apply_execution_policy(
     orders: Optional[List[Dict[str, Any]]] = None,
     *,
@@ -1002,6 +1022,33 @@ def apply_execution_policy(
                 default_extra_slippage_bps=float(sim_extra_slip),
                 feedback=feedback_snapshot,
             )
+
+            if _env_bool("EPE_FX_SESSION_ENFORCE", True):
+                try:
+                    execution_decision = fx_timing_adjustment(str(symbol), int(now_ms), dict(execution_decision or {}))
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_FX_SESSION_ADJUSTMENT_FAILED",
+                        e,
+                        once_key=f"fx_session:{symbol}",
+                        symbol=str(symbol),
+                    )
+                if bool((execution_decision or {}).get("fx_session_blocked")):
+                    fx_session = dict((execution_decision or {}).get("fx_session") or {})
+                    _log_suppression_event(
+                        o=o,
+                        reason=str((execution_decision or {}).get("fx_session_reason") or "fx_session_closed"),
+                        decision_json={
+                            "blocked_by": "fx_session",
+                            "fx_session": fx_session,
+                            "execution_decision": dict(execution_decision or {}),
+                        },
+                        execution_policy_json={
+                            "fx_session": fx_session,
+                            "execution_decision": dict(execution_decision or {}),
+                        },
+                    )
+                    continue
 
             order_type = str(execution_decision.get("order_type") or order_type)
             aggressiveness = str(execution_decision.get("aggressiveness") or aggressiveness)
@@ -1589,6 +1636,7 @@ def apply_execution_policy(
                         "extra_slippage_bps": float(sim_extra_slip),
                     }
                     row["learned_execution"] = dict(learned_execution)
+                    _attach_fx_session_metadata(row, dict(execution_decision or {}))
                     if learned_decision is not None and learned_constraints is not None:
                         row.update(
                             learned_execution_metadata_for_order(
@@ -1682,6 +1730,7 @@ def apply_execution_policy(
                 "chunk_pct": float(sim_chunk_pct),
                 "extra_slippage_bps": float(sim_extra_slip),
             }
+            _attach_fx_session_metadata(row, dict(execution_decision or {}))
             shaped.append(row)
 
             policy_json = dict(decision_blob)

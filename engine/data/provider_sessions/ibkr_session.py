@@ -20,6 +20,7 @@ import queue
 import threading
 import time
 from typing import Any, Dict, Iterable, Optional
+from engine.data.price_event_keys import compute_price_raw_event_key
 from engine.runtime.failure_diagnostics import log_failure
 
 try:
@@ -129,10 +130,13 @@ class _IBKRWrapper(EWrapper):
         # Normalize IBKR's tick-type vocabulary into the generic bid/ask/last
         # schema expected by the provider-session manager and downstream router.
         if tt == 1:
+            evt["tick_type"] = "bid"
             evt["bid"] = px
         elif tt == 2:
+            evt["tick_type"] = "ask"
             evt["ask"] = px
         elif tt == 4:
+            evt["tick_type"] = "last"
             evt["last"] = px
         else:
             return
@@ -172,6 +176,7 @@ class _IBKRWrapper(EWrapper):
             return
 
         if tt == 5:
+            evt["tick_type"] = "volume"
             evt["volume"] = sz
         else:
             return
@@ -590,7 +595,14 @@ class IBKRSession(BaseProviderSession):
             sym = str(sym)
 
             ts = int(evt.get("ts_ms") or ts_now)
-            event_key = f"{sym}|{ts}|{evt.get('last')}|{evt.get('bid')}|{evt.get('ask')}|{evt.get('volume')}"
+            event_key = compute_price_raw_event_key(
+                evt,
+                provider=self.provider_name,
+                symbol=sym,
+                event_type="U",
+                event_ts_ms=ts,
+                ts_ms=ts,
+            )
             if self.should_drop_duplicate_event(sym, event_key):
                 continue
             self.note_message(ts)

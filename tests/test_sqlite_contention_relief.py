@@ -15,6 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+VALID_DATA_SOURCE_MASTER_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
 
 def _reload_modules(*module_names: str):
     modules = []
@@ -56,7 +58,10 @@ class SQLiteContentionReliefTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.prev_env = {}
         self._set_env("DB_PATH", str(Path(self.tmp.name) / "contention_relief.db"))
+        self._set_env("TS_STORAGE_BACKEND", "sqlite")
         self._set_env("ENGINE_SUPERVISED", "1")
+        self._set_env("DATA_SOURCE_MASTER_KEY", VALID_DATA_SOURCE_MASTER_KEY)
+        self._set_env("DATA_SOURCE_MASTER_KEY_FILE", None)
 
     def tearDown(self) -> None:
         try:
@@ -1726,6 +1731,27 @@ class SQLiteContentionReliefTests(unittest.TestCase):
                 with patch.object(telemetry_append_buffer._BUFFER_STOP, "wait", side_effect=SystemExit):
                     with self.assertRaises(SystemExit):
                         telemetry_append_buffer._buffer_writer_loop()
+
+    def test_telemetry_append_buffer_count_uses_memory_pending_without_spool_stat(self) -> None:
+        (_, _, telemetry_append_buffer) = _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.ingestion_status",
+            "engine.runtime.telemetry_append_buffer",
+        )
+        for rows in telemetry_append_buffer._BUFFER_PENDING.values():
+            rows.clear()
+        telemetry_append_buffer._BUFFER_STATE["spooled_rows"] = 0
+        telemetry_append_buffer._BUFFER_PENDING["price_provider_health"].append(
+            (1, "polygon", 1, 12, 5, None, 1, 0)
+        )
+
+        with telemetry_append_buffer._BUFFER_LOCK:
+            with patch.object(
+                telemetry_append_buffer,
+                "_spool_stats",
+                side_effect=AssertionError("memory-pending counts must not stat durable spool"),
+            ):
+                self.assertEqual(telemetry_append_buffer._buffered_row_count_locked(), 1)
 
     def test_telemetry_append_writer_coalesces_burst_before_first_flush(self) -> None:
         self._set_env("TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S", "0.1")

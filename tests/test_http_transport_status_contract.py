@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
 import sys
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -10,7 +15,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+from engine.api import http_transport
 from engine.api.http_transport import _derive_response_status
+
+
+class _TestHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 class HttpTransportStatusContractTests(unittest.TestCase):
@@ -51,6 +62,50 @@ class HttpTransportStatusContractTests(unittest.TestCase):
             "meta": {"status": 422},
         }
         self.assertEqual(_derive_response_status(payload, default_status=200), 422)
+
+    def test_expected_business_refusals_map_to_4xx(self) -> None:
+        cases = [
+            ({"ok": False, "error": "execution_blocked"}, 403),
+            ({"ok": False, "error": "pre_trade_rejected"}, 409),
+            ({"ok": False, "error": "polygon_credentials_missing"}, 422),
+            ({"ok": False, "error": "polygon_credentials_rejected"}, 401),
+            ({"ok": False, "error": "polygon_entitlement_missing"}, 403),
+        ]
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(_derive_response_status(payload, default_status=200), expected)
+
+    def test_unexpected_handler_exception_still_returns_500(self) -> None:
+        def _boom(_parsed=None, _body=None, _ctx=None):
+            raise RuntimeError("secret-like-value-must-not-be-returned")
+
+        handler_cls = http_transport.build_handler(
+            ROUTE_SPECS=[("GET", "/boom", "api_boom")],
+            API_HANDLERS={"api_boom": _boom},
+            dashboard_api_token="",
+            ctx={},
+            static_dir=str(REPO_ROOT / "ui"),
+        )
+        server = _TestHTTPServer(("127.0.0.1", 0), handler_cls)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            try:
+                urlopen(f"http://127.0.0.1:{server.server_port}/boom", timeout=5)
+                raise AssertionError("request unexpectedly succeeded")
+            except HTTPError as exc:
+                code = exc.code
+                payload = json.loads(exc.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(code, 500)
+        self.assertEqual(payload["error"], "internal_server_error")
+        self.assertEqual(payload["reason_code"], "handler_exception")
+        self.assertEqual(payload["detail"], "RuntimeError")
+        self.assertNotIn("secret-like-value", json.dumps(payload, sort_keys=True))
 
 
 if __name__ == "__main__":

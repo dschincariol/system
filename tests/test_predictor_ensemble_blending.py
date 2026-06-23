@@ -83,6 +83,83 @@ class PredictorEnsembleBlendingTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_predict_event_prefetches_feature_snapshots_with_batch_cache(self) -> None:
+        event = {"ts_ms": 123_000}
+        latest_many_calls: list[tuple[list[str], str]] = []
+
+        class FakeCon:
+            def close(self) -> None:
+                pass
+
+        def fake_latest_many(symbols, feature_group):
+            latest_many_calls.append((list(symbols), str(feature_group)))
+            return {
+                str(symbol).upper().strip(): {
+                    "symbol": str(symbol).upper().strip(),
+                    "ts_ms": 122_000,
+                    "feature_set_tag": str(feature_group),
+                    "features": {"cached": str(symbol).upper().strip()},
+                }
+                for symbol in symbols
+            }
+
+        def fake_features_from_cached_snapshot(_symbol, _group, snap, *, decision_ts_ms=None):
+            if isinstance(snap, dict):
+                return dict(snap.get("features") or {})
+            return None
+
+        def fake_predict_single_model(_query_vec, sym, h, *, top_k, event=None):
+            feature_snapshot = self.predictor._cached_or_build_feature_snapshot(
+                event=event,
+                symbol=str(sym),
+                feature_ids=["unit_feature"],
+            )
+            return (
+                0.10,
+                0.20,
+                {
+                    "model_name": "unit_model",
+                    "feature_ids": ["unit_feature"],
+                    "feature_snapshot": dict(feature_snapshot or {}),
+                },
+            )
+
+        def fake_describe_signal_confidence(**kwargs):
+            return {"confidence": float(kwargs.get("confidence") or 0.0)}
+
+        with patch("engine.cache.wrappers.feature_snapshots.latest_many", side_effect=fake_latest_many), \
+            patch.object(self.predictor, "_resolve_active_model", return_value={
+                "model_name": "unit_model",
+                "feature_ids": ["unit_feature"],
+                "feature_set_tag": "fg",
+            }), \
+            patch.object(self.predictor, "_registry_feature_set_tag", return_value="fg"), \
+            patch.object(self.predictor, "_features_from_cached_snapshot", side_effect=fake_features_from_cached_snapshot), \
+            patch.object(self.predictor, "build_feature_snapshot", side_effect=AssertionError("batch cache not used")), \
+            patch.object(self.predictor, "_predict_single_model", side_effect=fake_predict_single_model), \
+            patch.object(self.predictor, "_maybe_apply_lgbm_ranker_batch", side_effect=lambda out, **_kwargs: out), \
+            patch.object(self.predictor, "get_spillover_betas", return_value=[]), \
+            patch.object(self.predictor, "neutralize_mode", return_value="off"), \
+            patch.object(self.predictor, "connect", return_value=FakeCon()), \
+            patch.object(self.predictor, "calibrate_confidence_score", side_effect=lambda **kwargs: (kwargs["confidence_raw"], {})), \
+            patch.object(self.predictor, "describe_signal_confidence", side_effect=fake_describe_signal_confidence), \
+            patch.object(self.predictor, "apply_confidence_payload", side_effect=lambda explain, _payload: explain), \
+            patch.object(self.predictor, "apply_conformal_to_explain", side_effect=lambda **kwargs: (kwargs["confidence"], kwargs["explain"], None)), \
+            patch.object(self.predictor, "_maybe_attach_prediction_explanation", side_effect=lambda **kwargs: kwargs["explain"]), \
+            patch.object(self.predictor, "_apply_model_serving_diagnostics", side_effect=lambda explain, _active: explain), \
+            patch.object(self.predictor, "_track_prediction_output", return_value=None), \
+            patch.object(self.predictor, "resolve_feature_ids", return_value=["unit_feature"]):
+            out = self.predictor.predict_event(
+                np.array([0.0]),
+                ["AAPL", "MSFT"],
+                [60],
+                event=event,
+            )
+
+        self.assertEqual(latest_many_calls, [(["AAPL", "MSFT"], "fg")])
+        self.assertEqual(out[("AAPL", 60)][2]["feature_snapshot"], {"cached": "AAPL"})
+        self.assertEqual(out[("MSFT", 60)][2]["feature_snapshot"], {"cached": "MSFT"})
+
     def test_equal_weighting(self) -> None:
         weights = self.ensemble_blender.compute_blend_weights(
             {

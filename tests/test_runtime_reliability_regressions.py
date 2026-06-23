@@ -169,10 +169,12 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._prev_allow_training = os.environ.get("ALLOW_TRAINING")
+        self._prev_storage_backend = os.environ.get("TS_STORAGE_BACKEND")
         self._prev_sqlite_liveness_queue_enabled = os.environ.get("SQLITE_LIVENESS_QUEUE_ENABLED")
         self._prev_sqlite_trace_report_every_s = os.environ.get("SQLITE_TRACE_REPORT_EVERY_S")
         self._prev_runtime_env = {key: os.environ.get(key) for key in self.RUNTIME_ENV_KEYS}
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "runtime_reliability.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         os.environ["ENGINE_SUPERVISED"] = "1"
         os.environ["ALLOW_TRAINING"] = "0"
         os.environ["SQLITE_LIVENESS_QUEUE_ENABLED"] = "0"
@@ -212,6 +214,10 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
             os.environ.pop("ALLOW_TRAINING", None)
         else:
             os.environ["ALLOW_TRAINING"] = str(self._prev_allow_training)
+        if self._prev_storage_backend is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = str(self._prev_storage_backend)
         if self._prev_sqlite_liveness_queue_enabled is None:
             os.environ.pop("SQLITE_LIVENESS_QUEUE_ENABLED", None)
         else:

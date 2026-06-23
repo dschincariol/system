@@ -1,4 +1,5 @@
 import importlib
+import os
 import sqlite3
 import sys
 import time
@@ -25,7 +26,9 @@ def _reload_modules(*module_names):
 @pytest.fixture()
 def runtime_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db_path = tmp_path / "guard_contracts.db"
+    previous_backend = os.environ.get("TS_STORAGE_BACKEND")
     monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TS_STORAGE_BACKEND", "sqlite")
     monkeypatch.setenv("TIMESCALE_ENABLED", "0")
     monkeypatch.delenv("TIMESCALE_DSN", raising=False)
     monkeypatch.delenv("TIMESCALE_URL", raising=False)
@@ -36,6 +39,10 @@ def runtime_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _, storage = _reload_modules(
         "engine.runtime.db_guard",
         "engine.runtime.storage",
+    )
+    _reload_modules(
+        "engine.runtime.guards",
+        "engine.strategy.promotion_guard",
     )
     storage.init_db()
 
@@ -50,6 +57,15 @@ def runtime_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             storage.close_pooled_connections()
         except Exception:
             pass
+        if previous_backend is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = previous_backend
+        _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.guards",
+            "engine.strategy.promotion_guard",
+        )
 
 
 def test_detect_sustained_equity_drift_ignores_missing_table(runtime_modules) -> None:

@@ -19,6 +19,10 @@ import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Mapping, Sequence
 
+from engine.runtime.hardware import apply_cpu_first_runtime_defaults
+
+apply_cpu_first_runtime_defaults(role="inference")
+
 import numpy as np
 
 try:
@@ -113,6 +117,20 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
     )
     if once_key:
         _WARNED_NONFATAL_KEYS.add(once_key)
+
+
+def _record_model_input_validation_nonfatal(payload: Mapping[str, Any]) -> None:
+    try:
+        record_model_input_validation(payload)
+    except Exception as exc:
+        _warn_nonfatal(
+            "INFERENCE_MODEL_INPUT_VALIDATION_HEALTH_FAILED",
+            exc,
+            once_key=None,
+            symbol=str(payload.get("symbol") or ""),
+            model_name=str(payload.get("model_name") or ""),
+            model_version=str(payload.get("model_version") or ""),
+        )
 
 
 def _now_ms() -> int:
@@ -1287,7 +1305,7 @@ def _predict_record_output(
         feature_ids=feature_ids,
         coverage=coverage,
     )
-    record_model_input_validation(input_validation)
+    _record_model_input_validation_nonfatal(input_validation)
     if not bool(input_validation.get("ok")):
         raise ValueError(str(input_validation.get("detail") or "model_input_invalid"))
     artifact = preloaded_artifact if preloaded_artifact is not None else _load_model_artifact(record)
@@ -1560,7 +1578,7 @@ def _predict_blocking(
 
     feature_snapshot = read_online_feature_snapshot(symbol_key)
     if int(feature_snapshot.get("ts_ms") or 0) <= 0:
-        record_model_input_validation(
+        _record_model_input_validation_nonfatal(
             {
                 "ok": False,
                 "status": "empty",
@@ -1581,7 +1599,7 @@ def _predict_blocking(
         )
     feature_validation = validate_online_feature_snapshot(feature_snapshot)
     if not bool(feature_validation.get("ok")):
-        record_model_input_validation(
+        _record_model_input_validation_nonfatal(
             {
                 "ok": False,
                 "status": str(feature_validation.get("status") or "invalid"),
@@ -1607,7 +1625,7 @@ def _predict_blocking(
         feature_snapshot=feature_snapshot,
         target_time_ms=int(feature_snapshot.get("ts_ms") or 0),
         enqueue_refresh=True,
-        allow_inline_fallback=False,
+        allow_inline_fallback=True,
         source="inference_engine",
     )
 

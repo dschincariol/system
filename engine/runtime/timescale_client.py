@@ -21,12 +21,15 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 from engine.runtime.ingestion_tuning import env_bool, tuned_float, tuned_int
+from engine.runtime.data_source_log_store import sanitize_data_source_log_detail_json
 from engine.runtime.metrics import emit_counter, emit_gauge, emit_timing
 from engine.runtime.platform import connection_info_with_pg_password
 from engine.runtime.pg_durability import (
     maybe_apply_async_refetchable_pg_durability,
     refetchable_pg_durability_snapshot,
+    should_relax_timescale_price_telemetry_write,
 )
+from engine.runtime.schema.table_classification import hypertable_chunk_interval, hypertable_chunk_interval_ms
 
 try:
     import asyncpg
@@ -35,7 +38,7 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 
 
 LOGGER = logging.getLogger(__name__)
-TIMESCALE_SCHEMA_VERSION = 4
+TIMESCALE_SCHEMA_VERSION = 5
 _CLIENT_LOCK = threading.Lock()
 _CLIENT: "TimescaleClient | None" = None
 _SCHEMA_LOCK_KEY = 761_112_019
@@ -143,6 +146,32 @@ _TIMESCALE_REQUIRED_INDEXES: tuple[str, ...] = (
     "idx_runtime_metrics_time",
     "idx_weather_provider_health_time",
 )
+_TIMESCALE_HYPERTABLE_TABLES: tuple[str, ...] = (
+    "data_source_logs",
+    "event_log",
+    "feature_data",
+    "ingestion_pipeline_health",
+    "model_predictions",
+    "predictions",
+    "price_data",
+    "price_provider_health",
+    "runtime_metrics",
+    "trade_outcomes",
+    "weather_provider_health",
+)
+_TIMESCALE_HYPERTABLE_TIME_COLUMNS: dict[str, str] = {
+    "data_source_logs": "time",
+    "event_log": "time",
+    "feature_data": "timestamp",
+    "ingestion_pipeline_health": "time",
+    "model_predictions": "timestamp",
+    "predictions": "time",
+    "price_data": "timestamp",
+    "price_provider_health": "time",
+    "runtime_metrics": "time",
+    "trade_outcomes": "timestamp",
+    "weather_provider_health": "time",
+}
 
 
 class TimescaleError(RuntimeError):
@@ -177,17 +206,41 @@ def _quote_ident(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
+def _timescale_chunk_policy_status() -> dict[str, dict[str, Any]]:
+    return {
+        table_name: {
+            "desired_interval": hypertable_chunk_interval(table_name),
+            "desired_interval_ms": int(hypertable_chunk_interval_ms(table_name)),
+            "actual_interval": "",
+            "actual_interval_ms": None,
+        }
+        for table_name in _TIMESCALE_HYPERTABLE_TABLES
+    }
+
+
+def _timescale_compress_orderby(table_name: str) -> str:
+    time_column = _TIMESCALE_HYPERTABLE_TIME_COLUMNS.get(str(table_name), "timestamp")
+    return f'{_quote_ident(time_column)} DESC'
+
+
 def _chunked(items: list[tuple[Any, ...]], chunk_size: int) -> Iterable[tuple[tuple[Any, ...], ...]]:
     step = max(1, int(chunk_size))
     for idx in range(0, len(items), step):
         yield tuple(items[idx : idx + step])
 
 
-def _coalesce(row: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
+def _coalesce(row: Mapping[str, Any], *keys: object) -> Any:
+    default: Any = None
+    lookup_keys = keys
+    if keys and not isinstance(keys[-1], str):
+        default = keys[-1]
+        lookup_keys = keys[:-1]
+    for key in lookup_keys:
+        if not isinstance(key, str):
+            continue
         if key in row and row.get(key) is not None:
             return row.get(key)
-    return None
+    return default
 
 
 def _normalize_text(value: Any, *, field: str) -> str:
@@ -272,6 +325,8 @@ class TimescaleConfig:
     command_timeout_s: float
     idle_in_txn_timeout_s: float
     application_name: str
+    copy_staging_enabled: bool = True
+    copy_staging_fallback_enabled: bool = True
     retention_days: int = 0
     compression_after_days: int = 0
 
@@ -295,9 +350,9 @@ class TimescaleConfig:
             schema_name=str(os.environ.get("TIMESCALE_SCHEMA", "public")).strip() or "public",
             pool_min_size=int(pool_min_size),
             pool_max_size=int(pool_max_size),
-            batch_size=tuned_int("TIMESCALE_BATCH_SIZE", 500, 1, 5000),
+            batch_size=tuned_int("TIMESCALE_BATCH_SIZE", 2000, 1, 5000),
             flush_interval_s=tuned_float("TIMESCALE_FLUSH_INTERVAL_S", 1.0, 0.05, 10.0),
-            queue_maxsize=tuned_int("TIMESCALE_QUEUE_MAXSIZE", 1024, 1, 32768),
+            queue_maxsize=tuned_int("TIMESCALE_QUEUE_MAXSIZE", 256, 1, 32768),
             retry_attempts=tuned_int("TIMESCALE_RETRY_ATTEMPTS", 5, 1, 10),
             retry_base_s=tuned_float("TIMESCALE_RETRY_BASE_S", 0.25, 0.01, 5.0),
             retry_max_s=tuned_float("TIMESCALE_RETRY_MAX_S", 5.0, 0.1, 30.0),
@@ -309,6 +364,8 @@ class TimescaleConfig:
             idle_in_txn_timeout_s=tuned_float("TIMESCALE_IDLE_IN_TXN_TIMEOUT_S", 60.0, 1.0, 300.0),
             application_name=str(os.environ.get("TIMESCALE_APPLICATION_NAME", "trading-system")).strip()
             or "trading-system",
+            copy_staging_enabled=_env_bool("TIMESCALE_COPY_STAGING_ENABLED", True),
+            copy_staging_fallback_enabled=_env_bool("TIMESCALE_COPY_STAGING_FALLBACK_ENABLED", True),
             retention_days=max(0, _env_int("TIMESCALE_RETENTION_DAYS", 0)),
             compression_after_days=max(0, _env_int("TIMESCALE_COMPRESSION_AFTER_DAYS", 0)),
         )
@@ -320,6 +377,208 @@ class _WriteEnvelope:
     rows: tuple[tuple[Any, ...], ...]
     row_count: int
     enqueued_at: float
+
+
+@dataclass(frozen=True)
+class _CopyWriteSpec:
+    columns: tuple[str, ...]
+    column_types: tuple[str, ...]
+    conflict_columns: tuple[str, ...]
+    update_columns: tuple[str, ...]
+
+
+class _TimescaleCopyFallbackRequired(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = str(reason)
+
+
+_COPY_WRITE_SPECS: dict[str, _CopyWriteSpec] = {
+    "data_source_logs": _CopyWriteSpec(
+        columns=("sqlite_rowid", "time", "source_key", "level", "event_type", "message", "detail_json"),
+        column_types=("BIGINT", "TIMESTAMPTZ", "TEXT", "TEXT", "TEXT", "TEXT", "JSONB"),
+        conflict_columns=("sqlite_rowid", "time"),
+        update_columns=("source_key", "level", "event_type", "message", "detail_json"),
+    ),
+    "event_log": _CopyWriteSpec(
+        columns=(
+            "sqlite_rowid",
+            "time",
+            "event_type",
+            "event_source",
+            "event_version",
+            "entity_type",
+            "entity_id",
+            "correlation_id",
+            "payload_json",
+        ),
+        column_types=(
+            "BIGINT",
+            "TIMESTAMPTZ",
+            "TEXT",
+            "TEXT",
+            "INTEGER",
+            "TEXT",
+            "TEXT",
+            "TEXT",
+            "JSONB",
+        ),
+        conflict_columns=("sqlite_rowid", "time"),
+        update_columns=(
+            "event_type",
+            "event_source",
+            "event_version",
+            "entity_type",
+            "entity_id",
+            "correlation_id",
+            "payload_json",
+        ),
+    ),
+    "price_data": _CopyWriteSpec(
+        columns=("symbol", "timestamp", "open", "high", "low", "close", "volume"),
+        column_types=(
+            "TEXT",
+            "TIMESTAMPTZ",
+            "DOUBLE PRECISION",
+            "DOUBLE PRECISION",
+            "DOUBLE PRECISION",
+            "DOUBLE PRECISION",
+            "DOUBLE PRECISION",
+        ),
+        conflict_columns=("symbol", "timestamp"),
+        update_columns=("open", "high", "low", "close", "volume"),
+    ),
+    "feature_data": _CopyWriteSpec(
+        columns=("symbol", "timestamp", "feature_vector"),
+        column_types=("TEXT", "TIMESTAMPTZ", "JSONB"),
+        conflict_columns=("symbol", "timestamp"),
+        update_columns=("feature_vector",),
+    ),
+    "model_predictions": _CopyWriteSpec(
+        columns=("model_id", "symbol", "timestamp", "prediction", "confidence"),
+        column_types=("TEXT", "TEXT", "TIMESTAMPTZ", "DOUBLE PRECISION", "DOUBLE PRECISION"),
+        conflict_columns=("model_id", "symbol", "timestamp"),
+        update_columns=("prediction", "confidence"),
+    ),
+    "predictions": _CopyWriteSpec(
+        columns=(
+            "time",
+            "symbol",
+            "model_name",
+            "model_version",
+            "prediction",
+            "confidence",
+            "features_version",
+            "model_id",
+            "event_id",
+            "horizon_s",
+            "prediction_id",
+            "source_alert_id",
+            "tracking_source",
+            "metadata",
+        ),
+        column_types=(
+            "TIMESTAMPTZ",
+            "TEXT",
+            "TEXT",
+            "TEXT",
+            "DOUBLE PRECISION",
+            "DOUBLE PRECISION",
+            "TEXT",
+            "TEXT",
+            "BIGINT",
+            "INTEGER",
+            "BIGINT",
+            "BIGINT",
+            "TEXT",
+            "JSONB",
+        ),
+        conflict_columns=("model_name", "model_version", "symbol", "time"),
+        update_columns=(
+            "prediction",
+            "confidence",
+            "features_version",
+            "model_id",
+            "event_id",
+            "horizon_s",
+            "prediction_id",
+            "source_alert_id",
+            "tracking_source",
+            "metadata",
+        ),
+    ),
+    "runtime_metrics": _CopyWriteSpec(
+        columns=("sqlite_rowid", "time", "metric", "value_num", "value_text", "tags_json"),
+        column_types=("BIGINT", "TIMESTAMPTZ", "TEXT", "DOUBLE PRECISION", "TEXT", "JSONB"),
+        conflict_columns=("sqlite_rowid", "time"),
+        update_columns=("metric", "value_num", "value_text", "tags_json"),
+    ),
+    "ingestion_pipeline_health": _CopyWriteSpec(
+        columns=(
+            "sqlite_rowid",
+            "time",
+            "pipeline",
+            "ok",
+            "latency_ms",
+            "raw_rows",
+            "event_rows",
+            "last_ingested_ts_ms",
+            "error",
+            "meta_json",
+        ),
+        column_types=(
+            "BIGINT",
+            "TIMESTAMPTZ",
+            "TEXT",
+            "SMALLINT",
+            "INTEGER",
+            "BIGINT",
+            "BIGINT",
+            "BIGINT",
+            "TEXT",
+            "JSONB",
+        ),
+        conflict_columns=("sqlite_rowid", "time"),
+        update_columns=(
+            "pipeline",
+            "ok",
+            "latency_ms",
+            "raw_rows",
+            "event_rows",
+            "last_ingested_ts_ms",
+            "error",
+            "meta_json",
+        ),
+    ),
+    "price_provider_health": _CopyWriteSpec(
+        columns=(
+            "sqlite_rowid",
+            "time",
+            "provider",
+            "ok",
+            "latency_ms",
+            "n_symbols",
+            "error",
+            "last_success_ts_ms",
+            "error_count",
+        ),
+        column_types=("BIGINT", "TIMESTAMPTZ", "TEXT", "SMALLINT", "INTEGER", "INTEGER", "TEXT", "BIGINT", "INTEGER"),
+        conflict_columns=("sqlite_rowid", "time"),
+        update_columns=("provider", "ok", "latency_ms", "n_symbols", "error", "last_success_ts_ms", "error_count"),
+    ),
+    "weather_provider_health": _CopyWriteSpec(
+        columns=("sqlite_rowid", "time", "provider", "ok", "latency_ms", "error"),
+        column_types=("BIGINT", "TIMESTAMPTZ", "TEXT", "SMALLINT", "INTEGER", "TEXT"),
+        conflict_columns=("sqlite_rowid", "time"),
+        update_columns=("provider", "ok", "latency_ms", "error"),
+    ),
+    "trade_outcomes": _CopyWriteSpec(
+        columns=("trade_id", "timestamp", "pnl", "outcome"),
+        column_types=("TEXT", "TIMESTAMPTZ", "DOUBLE PRECISION", "TEXT"),
+        conflict_columns=("trade_id", "timestamp"),
+        update_columns=("pnl", "outcome"),
+    ),
+}
 
 
 class TimescaleClient:
@@ -336,6 +595,7 @@ class TimescaleClient:
         self._pool: Any = None
         self._pool_lock: asyncio.Lock | None = None
         self._schema_lock: asyncio.Lock | None = None
+        self._copy_staging_prepared: dict[int, set[str]] = {}
         self._stop_event: asyncio.Event | None = None
         self._schema_ready = False
         self._schema_error: str | None = None
@@ -349,6 +609,7 @@ class TimescaleClient:
         self._policy_status: dict[str, Any] = {
             "retention_days": int(self._config.retention_days),
             "compression_after_days": int(self._config.compression_after_days),
+            "chunk_intervals": _timescale_chunk_policy_status(),
             "applied": False,
             "last_error": "",
         }
@@ -360,17 +621,25 @@ class TimescaleClient:
             "backpressure_active": False,
             "buffered_rows": 0,
             "consecutive_flush_failures": 0,
+            "copy_batches": 0,
+            "copy_fallback_count": 0,
+            "copy_rows": 0,
+            "deduped_rows": 0,
             "enqueue_failure_count": 0,
             "enqueued_rows": 0,
+            "executemany_batches": 0,
+            "executemany_rows": 0,
             "flush_failure_count": 0,
             "flushed_batches": 0,
             "flushed_rows": 0,
             "inflight_rows": 0,
             "last_backpressure_ts_ms": 0,
+            "last_copy_fallback_reason": "",
             "last_db_write_duration_ms": 0,
             "last_flush_failure_ts_ms": 0,
             "last_flush_latency_ms": 0,
             "last_flush_ts_ms": 0,
+            "last_write_path": "",
             "retry_count": 0,
             "total_db_write_duration_ms": 0,
             "total_flush_latency_ms": 0,
@@ -542,6 +811,9 @@ class TimescaleClient:
             "batch_size": int(self._config.batch_size),
             "flush_interval_s": float(self._config.flush_interval_s),
             "backpressure_timeout_s": float(self._config.backpressure_timeout_s),
+            "copy_staging_enabled": bool(self._config.copy_staging_enabled),
+            "copy_staging_fallback_enabled": bool(self._config.copy_staging_fallback_enabled),
+            "copy_staging_tables": sorted(_COPY_WRITE_SPECS),
             "schema_name": str(self._config.schema_name),
             "schema_ready": bool(self._schema_ready),
             "schema_ok": bool(schema_ok),
@@ -725,9 +997,12 @@ class TimescaleClient:
                 return self._pool
             if not _asyncpg_pool_available():
                 raise RuntimeError("asyncpg_not_available")
+            asyncpg_module = asyncpg
+            if asyncpg_module is None:
+                raise RuntimeError("asyncpg_not_available")
             if not self._config.dsn:
                 raise RuntimeError("timescale_dsn_not_configured")
-            self._pool = await asyncpg.create_pool(
+            self._pool = await asyncpg_module.create_pool(
                 dsn=self._config.dsn,
                 min_size=int(self._config.pool_min_size),
                 max_size=int(max(self._config.pool_min_size, self._config.pool_max_size)),
@@ -749,6 +1024,7 @@ class TimescaleClient:
     async def _close_pool(self) -> None:
         pool = self._pool
         self._pool = None
+        self._copy_staging_prepared.clear()
         if pool is not None:
             try:
                 await pool.close()
@@ -822,6 +1098,14 @@ class TimescaleClient:
                                     version=4,
                                     notes="telemetry_shadow_tables",
                                 )
+                        if current_version < 5:
+                            async with conn.transaction():
+                                await self._apply_migration_v5(conn)
+                                await self._record_schema_version(
+                                    conn,
+                                    version=5,
+                                    notes="hypertable_chunk_interval_policy",
+                                )
                         async with conn.transaction():
                             await self._apply_table_policies(conn, "data_source_logs")
                             await self._apply_table_policies(conn, "event_log")
@@ -834,6 +1118,7 @@ class TimescaleClient:
                             await self._apply_table_policies(conn, "predictions")
                             await self._apply_table_policies(conn, "runtime_metrics")
                             await self._apply_table_policies(conn, "weather_provider_health")
+                            await self._record_actual_chunk_intervals(conn)
                         self._record_policy_status(applied=True)
                         await self._validate_schema(conn)
                         self._schema_ready = True
@@ -1131,6 +1416,10 @@ class TimescaleClient:
             f'CREATE INDEX IF NOT EXISTS idx_data_source_logs_source_time ON {self._table_ref("data_source_logs")} (source_key, "time" DESC)'
         )
 
+    async def _apply_migration_v5(self, conn: Any) -> None:
+        for table_name in _TIMESCALE_HYPERTABLE_TABLES:
+            await self._set_chunk_interval(conn, table_name)
+
     async def _record_schema_version(self, conn: Any, *, version: int, notes: str) -> None:
         await conn.execute(
             f"""
@@ -1157,19 +1446,69 @@ class TimescaleClient:
             SELECT create_hypertable(
               $1::regclass,
               $2,
+              chunk_time_interval => $3::interval,
               if_not_exists => TRUE,
               migrate_data => TRUE
             )
             """,
             relation_name,
             str(time_column),
+            hypertable_chunk_interval(table_name),
         )
+        await self._set_chunk_interval(conn, table_name)
+
+    async def _set_chunk_interval(self, conn: Any, table_name: str) -> None:
+        await conn.execute(
+            "SELECT set_chunk_time_interval($1::regclass, $2::interval)",
+            f"{self._config.schema_name}.{table_name}",
+            hypertable_chunk_interval(table_name),
+        )
+
+    async def _record_actual_chunk_intervals(self, conn: Any) -> None:
+        chunk_intervals = _timescale_chunk_policy_status()
+        for table_name in _TIMESCALE_HYPERTABLE_TABLES:
+            row = await conn.fetchrow(
+                """
+                SELECT time_interval::text AS time_interval,
+                       (EXTRACT(EPOCH FROM time_interval) * 1000)::bigint AS time_interval_ms
+                FROM timescaledb_information.dimensions
+                WHERE hypertable_schema = $1
+                  AND hypertable_name = $2
+                LIMIT 1
+                """,
+                str(self._config.schema_name),
+                str(table_name),
+            )
+            if not row:
+                continue
+            actual_interval = str(row["time_interval"] or "")
+            actual_interval_ms = (
+                int(row["time_interval_ms"]) if row["time_interval_ms"] is not None else None
+            )
+            chunk_intervals[table_name]["actual_interval"] = actual_interval
+            chunk_intervals[table_name]["actual_interval_ms"] = actual_interval_ms
+            if actual_interval_ms is not None:
+                emit_gauge(
+                    "timescale_hypertable_chunk_interval_ms",
+                    int(actual_interval_ms),
+                    component="engine.runtime.timescale_client",
+                    extra_tags={
+                        "table": str(table_name),
+                        "desired_interval": hypertable_chunk_interval(table_name),
+                    },
+                )
+        with self._state_lock:
+            previous = dict(self._policy_status)
+            previous["chunk_intervals"] = chunk_intervals
+            self._policy_status = previous
 
     def _record_policy_status(self, *, applied: bool, last_error: str = "") -> None:
         with self._state_lock:
+            previous = dict(self._policy_status)
             self._policy_status = {
                 "retention_days": int(self._config.retention_days),
                 "compression_after_days": int(self._config.compression_after_days),
+                "chunk_intervals": dict(previous.get("chunk_intervals") or _timescale_chunk_policy_status()),
                 "applied": bool(applied),
                 "last_error": str(last_error or ""),
             }
@@ -1191,8 +1530,13 @@ class TimescaleClient:
                 "weather_provider_health": "provider",
             }.get(str(table_name), "symbol")
         if int(self._config.compression_after_days) > 0:
+            compress_orderby = _timescale_compress_orderby(table_name)
             await conn.execute(
-                f"ALTER TABLE {self._table_ref(table_name)} SET (timescaledb.compress, timescaledb.compress_segmentby = '{segment_by}')"
+                f"ALTER TABLE {self._table_ref(table_name)} SET ("
+                f"timescaledb.compress, "
+                f"timescaledb.compress_orderby = '{compress_orderby}', "
+                f"timescaledb.compress_segmentby = '{segment_by}'"
+                f")"
             )
             await conn.execute(
                 "SELECT add_compression_policy($1::regclass, $2::interval, if_not_exists => TRUE)",
@@ -1305,19 +1649,44 @@ class TimescaleClient:
                     await self._ensure_schema()
                     db_started = time.perf_counter()
                     pool = await self._ensure_pool()
-                    async with pool.acquire() as conn:
-                        async with conn.transaction():
-                            await maybe_apply_async_refetchable_pg_durability(
-                                conn,
-                                scope="timescale_price_telemetry",
-                                table=table_name,
-                            )
-                            await conn.executemany(sql, rows)
+                    write_path = "executemany"
+                    deduped_rows = 0
+                    try:
+                        async with pool.acquire() as conn:
+                            staging_name = await self._prepare_copy_staging_for_write(conn, table_name, rows)
+                            async with conn.transaction():
+                                if should_relax_timescale_price_telemetry_write(table=table_name):
+                                    await maybe_apply_async_refetchable_pg_durability(
+                                        conn,
+                                        scope="timescale_price_telemetry",
+                                        table=table_name,
+                                    )
+                                write_path, deduped_rows = await self._write_rows_once(
+                                    conn,
+                                    table_name,
+                                    sql,
+                                    rows,
+                                    staging_name=staging_name,
+                                )
+                    except _TimescaleCopyFallbackRequired:
+                        write_path = "executemany_fallback"
+                        deduped_rows = 0
+                        async with pool.acquire() as conn:
+                            async with conn.transaction():
+                                if should_relax_timescale_price_telemetry_write(table=table_name):
+                                    await maybe_apply_async_refetchable_pg_durability(
+                                        conn,
+                                        scope="timescale_price_telemetry",
+                                        table=table_name,
+                                    )
+                                await conn.executemany(sql, rows)
                     db_write_duration_ms = float((time.perf_counter() - db_started) * 1000.0)
                     flush_latency_ms = float((time.perf_counter() - flush_started) * 1000.0)
                     self._note_flush_success(
                         table_name,
                         len(rows),
+                        write_path=write_path,
+                        deduped_rows=deduped_rows,
                         flush_latency_ms=flush_latency_ms,
                         db_write_duration_ms=db_write_duration_ms,
                     )
@@ -1325,14 +1694,21 @@ class TimescaleClient:
                         "timescale_flush_latency_ms",
                         float(flush_latency_ms),
                         component="engine.runtime.timescale_client",
-                        extra_tags={"table": str(table_name)},
+                        extra_tags={"table": str(table_name), "path": str(write_path)},
                     )
                     emit_timing(
                         "timescale_db_write_duration_ms",
                         float(db_write_duration_ms),
                         component="engine.runtime.timescale_client",
-                        extra_tags={"table": str(table_name)},
+                        extra_tags={"table": str(table_name), "path": str(write_path)},
                     )
+                    if deduped_rows > 0:
+                        emit_counter(
+                            "timescale_deduped_rows",
+                            int(deduped_rows),
+                            component="engine.runtime.timescale_client",
+                            extra_tags={"table": str(table_name), "path": str(write_path)},
+                        )
                     emit_gauge(
                         "timescale_queue_depth",
                         int(self._queue.qsize()) if self._queue is not None else 0,
@@ -1367,8 +1743,147 @@ class TimescaleClient:
                     )
                     delay_s += random.uniform(0.0, min(0.25, float(self._config.retry_base_s)))
                     await asyncio.sleep(delay_s)
+            return False
         finally:
             self._clear_inflight(len(rows))
+
+    async def _write_rows_once(
+        self,
+        conn: Any,
+        table_name: str,
+        fallback_sql: str,
+        rows: list[tuple[Any, ...]],
+        *,
+        staging_name: str | None = None,
+    ) -> tuple[str, int]:
+        spec = _COPY_WRITE_SPECS.get(str(table_name))
+        if spec is None:
+            if bool(self._config.copy_staging_enabled):
+                self._note_copy_fallback(table_name, len(rows), "unsupported_table")
+            await conn.executemany(fallback_sql, rows)
+            return "executemany_unsupported", 0
+        if not bool(self._config.copy_staging_enabled):
+            await conn.executemany(fallback_sql, rows)
+            return "executemany_disabled", 0
+        copy_records = getattr(conn, "copy_records_to_table", None)
+        if not callable(copy_records):
+            self._note_copy_fallback(table_name, len(rows), "copy_records_to_table_unavailable")
+            await conn.executemany(fallback_sql, rows)
+            return "executemany_fallback", 0
+        try:
+            stage_name = staging_name or await self._ensure_copy_staging_table(conn, table_name, spec)
+            deduped_rows = await self._copy_staging_upsert(conn, table_name, spec, stage_name, rows)
+            return "copy_staging", int(deduped_rows)
+        except Exception as exc:
+            self._note_copy_fallback(table_name, len(rows), f"copy_staging_error:{type(exc).__name__}")
+            if bool(self._config.copy_staging_fallback_enabled):
+                raise _TimescaleCopyFallbackRequired(f"copy_staging_error:{type(exc).__name__}") from exc
+            raise
+
+    async def _prepare_copy_staging_for_write(
+        self,
+        conn: Any,
+        table_name: str,
+        rows: list[tuple[Any, ...]],
+    ) -> str | None:
+        spec = _COPY_WRITE_SPECS.get(str(table_name))
+        if spec is None or not rows or not bool(self._config.copy_staging_enabled):
+            return None
+        copy_records = getattr(conn, "copy_records_to_table", None)
+        if not callable(copy_records):
+            return None
+        try:
+            return await self._ensure_copy_staging_table(conn, table_name, spec)
+        except Exception as exc:
+            reason = f"copy_staging_prepare_error:{type(exc).__name__}"
+            self._note_copy_fallback(table_name, len(rows), reason)
+            if bool(self._config.copy_staging_fallback_enabled):
+                raise _TimescaleCopyFallbackRequired(reason) from exc
+            raise
+
+    async def _ensure_copy_staging_table(
+        self,
+        conn: Any,
+        table_name: str,
+        spec: _CopyWriteSpec,
+    ) -> str:
+        staging_name = self._copy_staging_table_name(table_name)
+        prepared_tables = self._copy_staging_prepared.setdefault(self._copy_staging_connection_key(conn), set())
+        if staging_name in prepared_tables:
+            return staging_name
+        staging_columns_sql = ", ".join(
+            [f"{_quote_ident('_ordinal')} BIGINT NOT NULL"]
+            + [
+                f"{_quote_ident(column)} {column_type}"
+                for column, column_type in zip(spec.columns, spec.column_types)
+            ]
+        )
+        await conn.execute(
+            f"CREATE TEMP TABLE IF NOT EXISTS {_quote_ident(staging_name)} "
+            f"({staging_columns_sql}) ON COMMIT DELETE ROWS"
+        )
+        prepared_tables.add(staging_name)
+        return staging_name
+
+    async def _copy_staging_upsert(
+        self,
+        conn: Any,
+        table_name: str,
+        spec: _CopyWriteSpec,
+        staging_name: str,
+        rows: list[tuple[Any, ...]],
+    ) -> int:
+        copy_records = getattr(conn, "copy_records_to_table")
+        await copy_records(
+            staging_name,
+            records=((idx, *row) for idx, row in enumerate(rows)),
+            columns=("_ordinal", *spec.columns),
+            timeout=float(self._config.command_timeout_s),
+        )
+        await conn.execute(self._copy_upsert_sql(table_name, staging_name, spec))
+        return self._deduped_row_count(spec, rows)
+
+    def _copy_staging_table_name(self, table_name: str) -> str:
+        return f"__ts_stage_{table_name}"
+
+    def _copy_staging_connection_key(self, conn: Any) -> int:
+        holder = getattr(conn, "_holder", None)
+        raw_conn = getattr(conn, "_con", None) or getattr(holder, "_con", None) or conn
+        return id(raw_conn)
+
+    def _copy_upsert_sql(self, table_name: str, staging_name: str, spec: _CopyWriteSpec) -> str:
+        column_list = self._column_list(spec.columns)
+        conflict_list = self._column_list(spec.conflict_columns)
+        order_list = ", ".join(
+            [
+                *(_quote_ident(column) for column in spec.conflict_columns),
+                _quote_ident("_ordinal") + " DESC",
+            ]
+        )
+        update_sql = ", ".join(
+            f"{_quote_ident(column)} = EXCLUDED.{_quote_ident(column)}"
+            for column in spec.update_columns
+        )
+        return (
+            f"INSERT INTO {self._table_ref(table_name)}({column_list}) "
+            f"SELECT {column_list} "
+            f"FROM ("
+            f"SELECT DISTINCT ON ({conflict_list}) {column_list} "
+            f"FROM {_quote_ident(staging_name)} "
+            f"ORDER BY {order_list}"
+            f") AS deduped "
+            f"ON CONFLICT ({conflict_list}) DO UPDATE SET {update_sql}"
+        )
+
+    def _column_list(self, columns: tuple[str, ...]) -> str:
+        return ", ".join(_quote_ident(column) for column in columns)
+
+    def _deduped_row_count(self, spec: _CopyWriteSpec, rows: list[tuple[Any, ...]]) -> int:
+        if not rows:
+            return 0
+        key_indexes = tuple(spec.columns.index(column) for column in spec.conflict_columns)
+        unique_keys = {tuple(row[idx] for idx in key_indexes) for row in rows}
+        return max(0, int(len(rows) - len(unique_keys)))
 
     def _insert_sql(self, table_name: str) -> str:
         if table_name == "runtime_metrics":
@@ -1595,7 +2110,9 @@ class TimescaleClient:
                         _normalize_text(_coalesce(row, "level"), field="level"),
                         _normalize_text(_coalesce(row, "event_type"), field="event_type"),
                         (str(_coalesce(row, "message")) if _coalesce(row, "message") not in (None, "") else None),
-                        _normalize_jsonb_or_empty(_coalesce(row, "detail_json", "detail", "payload")),
+                        sanitize_data_source_log_detail_json(
+                            _normalize_jsonb_or_empty(_coalesce(row, "detail_json", "detail", "payload"))
+                        ),
                     )
                 )
                 continue
@@ -1768,6 +2285,8 @@ class TimescaleClient:
         table_name: str,
         row_count: int,
         *,
+        write_path: str,
+        deduped_rows: int = 0,
         flush_latency_ms: float | int | None = None,
         db_write_duration_ms: float | int | None = None,
     ) -> None:
@@ -1778,6 +2297,15 @@ class TimescaleClient:
             self._metrics["flushed_batches"] = int(self._metrics.get("flushed_batches") or 0) + 1
             self._metrics["flushed_rows"] = int(self._metrics.get("flushed_rows") or 0) + int(row_count)
             self._metrics["last_flush_ts_ms"] = _now_ms()
+            self._metrics["last_write_path"] = str(write_path)
+            if str(write_path) == "copy_staging":
+                self._metrics["copy_batches"] = int(self._metrics.get("copy_batches") or 0) + 1
+                self._metrics["copy_rows"] = int(self._metrics.get("copy_rows") or 0) + int(row_count)
+            else:
+                self._metrics["executemany_batches"] = int(self._metrics.get("executemany_batches") or 0) + 1
+                self._metrics["executemany_rows"] = int(self._metrics.get("executemany_rows") or 0) + int(row_count)
+            if int(deduped_rows) > 0:
+                self._metrics["deduped_rows"] = int(self._metrics.get("deduped_rows") or 0) + int(deduped_rows)
             if flush_latency_ms is not None:
                 latency_i = int(round(float(flush_latency_ms)))
                 self._metrics["last_flush_latency_ms"] = latency_i
@@ -1789,6 +2317,15 @@ class TimescaleClient:
             table_stats = dict(self._metrics.get("table_stats") or {})
             table = dict(table_stats.get(table_name) or {})
             table["flushed_rows"] = int(table.get("flushed_rows") or 0) + int(row_count)
+            table["last_write_path"] = str(write_path)
+            if str(write_path) == "copy_staging":
+                table["copy_batches"] = int(table.get("copy_batches") or 0) + 1
+                table["copy_rows"] = int(table.get("copy_rows") or 0) + int(row_count)
+            else:
+                table["executemany_batches"] = int(table.get("executemany_batches") or 0) + 1
+                table["executemany_rows"] = int(table.get("executemany_rows") or 0) + int(row_count)
+            if int(deduped_rows) > 0:
+                table["deduped_rows"] = int(table.get("deduped_rows") or 0) + int(deduped_rows)
             if flush_latency_ms is not None:
                 table["last_flush_latency_ms"] = int(round(float(flush_latency_ms)))
             if db_write_duration_ms is not None:
@@ -1807,6 +2344,24 @@ class TimescaleClient:
     def _note_retry(self) -> None:
         with self._metrics_lock:
             self._metrics["retry_count"] = int(self._metrics.get("retry_count") or 0) + 1
+
+    def _note_copy_fallback(self, table_name: str, row_count: int, reason: str) -> None:
+        with self._metrics_lock:
+            self._metrics["copy_fallback_count"] = int(self._metrics.get("copy_fallback_count") or 0) + 1
+            self._metrics["last_copy_fallback_reason"] = str(reason)
+            table_stats = dict(self._metrics.get("table_stats") or {})
+            table = dict(table_stats.get(table_name) or {})
+            table["copy_fallback_count"] = int(table.get("copy_fallback_count") or 0) + 1
+            table["last_copy_fallback_reason"] = str(reason)
+            table["last_copy_fallback_rows"] = int(row_count)
+            table_stats[table_name] = table
+            self._metrics["table_stats"] = table_stats
+        emit_counter(
+            "timescale_copy_fallbacks",
+            1,
+            component="engine.runtime.timescale_client",
+            extra_tags={"table": str(table_name), "reason": str(reason)},
+        )
 
     def _note_backpressure(self) -> None:
         with self._metrics_lock:

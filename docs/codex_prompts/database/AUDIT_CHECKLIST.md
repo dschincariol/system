@@ -71,11 +71,13 @@ syntactically correct and operationally wrong. Walk the live DB.
       No surprise misses.
 - [ ] Run:
       ```sql
-      SELECT hypertable_name, segmentby
+      SELECT hypertable_name, attname, segmentby_column_index,
+             orderby_column_index, orderby_asc
       FROM timescaledb_information.compression_settings;
       ```
       Every compressed hypertable has a sensible `segmentby` (usually
-      `symbol`) — not empty, not the wrong column.
+      `symbol`) — not empty, not the wrong column — and an order-by entry on the
+      table's real time column with descending order.
 - [ ] Run:
       ```sql
       SELECT job_id, application_name, schedule_interval, hypertable_name

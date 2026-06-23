@@ -24,7 +24,7 @@ import os
 import time
 from typing import Dict, Iterable, List, Tuple
 
-from engine.data.default_symbols import load_default_symbols, parse_symbol_limit
+from engine.data.default_symbols import default_symbol_metadata, load_default_symbols, parse_symbol_limit
 from engine.data.universe import extract_symbol_candidates, upsert_symbol
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import (
@@ -150,6 +150,47 @@ def _freshness_multiplier(age_ms: int, half_life_s: int) -> float:
 def _seed_baseline(con) -> None:
     now_ms = _now_ms()
     for symbol in BASELINE_SYMBOLS:
+        sym = str(symbol or "").upper().strip()
+        seed_meta = default_symbol_metadata(sym)
+        if seed_meta:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO symbols(
+                  symbol, asset_class, status, score,
+                  meta_json, created_ts_ms, updated_ts_ms
+                )
+                VALUES (?, ?, 'WATCH', 0.5, ?, ?, ?)
+                """,
+                (
+                    sym,
+                    "FX",
+                    json.dumps(seed_meta, separators=(",", ":"), sort_keys=True),
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            existing = con.execute(
+                "SELECT meta_json FROM symbols WHERE symbol=?",
+                (sym,),
+            ).fetchone()
+            existing_meta = _safe_load_meta(str(existing[0] if existing else ""))
+            merged_meta = {**existing_meta, **seed_meta}
+            con.execute(
+                """
+                UPDATE symbols
+                SET asset_class='FX',
+                    status=CASE WHEN status='DISABLED' THEN 'WATCH' ELSE status END,
+                    meta_json=?,
+                    updated_ts_ms=?
+                WHERE symbol=?
+                """,
+                (
+                    json.dumps(merged_meta, separators=(",", ":"), sort_keys=True),
+                    int(now_ms),
+                    sym,
+                ),
+            )
+            continue
         try:
             con.execute(
                 """

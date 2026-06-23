@@ -111,6 +111,8 @@ _calib_cache = {
     "curves": {},  # (horizon_s, model_kind) -> (xs, ys)
 }
 _CALIB_LOCK = threading.Lock()
+_FEATURE_SNAPSHOT_PREFETCH = threading.local()
+_PREFETCH_UNSET = object()
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
 
@@ -881,6 +883,13 @@ def _latest_feature_snapshot_features(
     group = _registry_feature_set_tag(feature_ids)
     if not group:
         return None
+    prefetched = _prefetched_feature_snapshot_features(
+        str(symbol),
+        str(group),
+        decision_ts_ms=decision_ts_ms,
+    )
+    if prefetched is not _PREFETCH_UNSET:
+        return prefetched
     try:
         from engine.cache.wrappers.feature_snapshots import latest
 
@@ -895,6 +904,21 @@ def _latest_feature_snapshot_features(
             feature_set_tag=str(group),
         )
         return None
+    return _features_from_cached_snapshot(
+        str(symbol),
+        str(group),
+        snap,
+        decision_ts_ms=decision_ts_ms,
+    )
+
+
+def _features_from_cached_snapshot(
+    symbol: str,
+    group: str,
+    snap: Any,
+    *,
+    decision_ts_ms: int | None = None,
+) -> Optional[Dict[str, Any]]:
     if not isinstance(snap, dict):
         return None
     decision_ts = int(decision_ts_ms or 0)
@@ -923,6 +947,168 @@ def _latest_feature_snapshot_features(
     if isinstance(features, dict):
         return dict(features)
     return dict(snap)
+
+
+def _prefetched_feature_snapshot_features(
+    symbol: str,
+    group: str,
+    *,
+    decision_ts_ms: int | None = None,
+) -> object:
+    state = getattr(_FEATURE_SNAPSHOT_PREFETCH, "state", None)
+    if not isinstance(state, dict):
+        return _PREFETCH_UNSET
+    expected_ts_ms = int(state.get("decision_ts_ms") or 0)
+    if expected_ts_ms <= 0 or expected_ts_ms != int(decision_ts_ms or 0):
+        return _PREFETCH_UNSET
+    features_by_key = state.get("features_by_key")
+    if not isinstance(features_by_key, dict):
+        return _PREFETCH_UNSET
+    cache_key = (str(symbol or "").upper().strip(), str(group or "").strip())
+    if cache_key not in features_by_key:
+        return _PREFETCH_UNSET
+    features = features_by_key.get(cache_key)
+    return dict(features) if isinstance(features, dict) else None
+
+
+def _clear_feature_snapshot_prefetch() -> None:
+    if hasattr(_FEATURE_SNAPSHOT_PREFETCH, "state"):
+        delattr(_FEATURE_SNAPSHOT_PREFETCH, "state")
+
+
+def _install_feature_snapshot_prefetch(state: Dict[str, Any]) -> None:
+    _FEATURE_SNAPSHOT_PREFETCH.state = dict(state or {})
+
+
+def _latest_feature_snapshot_features_many(
+    symbols: List[str],
+    feature_ids: List[str],
+    *,
+    decision_ts_ms: int | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    group = _registry_feature_set_tag(feature_ids)
+    if not group:
+        return {}
+    symbol_keys = list(
+        dict.fromkeys(
+            str(symbol or "").upper().strip()
+            for symbol in list(symbols or [])
+            if str(symbol or "").strip()
+        )
+    )
+    if not symbol_keys:
+        return {}
+    try:
+        from engine.cache.wrappers.feature_snapshots import latest_many
+
+        snapshots = latest_many(symbol_keys, str(group))
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_feature_snapshot_cache_batch_read_failed",
+            "PREDICTOR_FEATURE_SNAPSHOT_CACHE_BATCH_READ_FAILED",
+            e,
+            warn_key=f"predictor_feature_snapshot_cache_batch_read_failed:{group}",
+            feature_set_tag=str(group),
+            symbol_count=int(len(symbol_keys)),
+        )
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for symbol_key in symbol_keys:
+        features = _features_from_cached_snapshot(
+            symbol_key,
+            str(group),
+            (snapshots or {}).get(symbol_key),
+            decision_ts_ms=decision_ts_ms,
+        )
+        if isinstance(features, dict) and features:
+            out[symbol_key] = dict(features)
+    return out
+
+
+def _prefetch_feature_snapshot_features_for_event(
+    symbols: List[str],
+    horizons: List[int],
+    event: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if event is None:
+        return {}
+    decision_ts_ms = int((event or {}).get("ts_ms", 0) or time.time() * 1000)
+    symbols_by_group: Dict[str, List[str]] = {}
+    for h in list(horizons or []):
+        for raw_symbol in list(symbols or []):
+            symbol_key = str(raw_symbol or "").upper().strip()
+            if not symbol_key:
+                continue
+            try:
+                active = _resolve_active_model(str(raw_symbol), int(h))
+                feature_ids = list(active.get("feature_ids") or [])
+                model_name = str(active.get("model_name") or "")
+                group = str(
+                    active.get("feature_set_tag")
+                    or _registry_feature_set_tag(
+                        feature_ids,
+                        model_name=model_name,
+                        model_spec=dict(active or {}),
+                    )
+                ).strip()
+            except Exception as e:
+                _warn_nonfatal(
+                    "predictor_feature_snapshot_prefetch_resolution_failed",
+                    "PREDICTOR_FEATURE_SNAPSHOT_PREFETCH_RESOLUTION_FAILED",
+                    e,
+                    warn_key=f"predictor_feature_snapshot_prefetch_resolution_failed:{symbol_key}:{h}",
+                    symbol=str(symbol_key),
+                    horizon_s=int(h),
+                )
+                group = ""
+            if not group:
+                continue
+            symbols_by_group.setdefault(group, []).append(symbol_key)
+
+    if not symbols_by_group:
+        return {}
+
+    try:
+        from engine.cache.wrappers.feature_snapshots import latest_many
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_feature_snapshot_prefetch_import_failed",
+            "PREDICTOR_FEATURE_SNAPSHOT_PREFETCH_IMPORT_FAILED",
+            e,
+            warn_key="predictor_feature_snapshot_prefetch_import_failed",
+        )
+        return {}
+
+    features_by_key: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+    for group, group_symbols in symbols_by_group.items():
+        symbol_keys = list(dict.fromkeys(group_symbols))
+        try:
+            snapshots = latest_many(symbol_keys, str(group))
+        except Exception as e:
+            _warn_nonfatal(
+                "predictor_feature_snapshot_prefetch_failed",
+                "PREDICTOR_FEATURE_SNAPSHOT_PREFETCH_FAILED",
+                e,
+                warn_key=f"predictor_feature_snapshot_prefetch_failed:{group}",
+                feature_set_tag=str(group),
+                symbol_count=int(len(symbol_keys)),
+            )
+            continue
+        for symbol_key in symbol_keys:
+            features = _features_from_cached_snapshot(
+                symbol_key,
+                str(group),
+                (snapshots or {}).get(symbol_key),
+                decision_ts_ms=int(decision_ts_ms),
+            )
+            features_by_key[(symbol_key, str(group))] = (
+                dict(features) if isinstance(features, dict) and features else None
+            )
+
+    if not features_by_key:
+        return {}
+    return {"decision_ts_ms": int(decision_ts_ms), "features_by_key": features_by_key}
 
 
 def _cached_or_build_feature_snapshot(
@@ -2138,6 +2324,88 @@ def _confidence_collapse(confs: list[float]) -> bool:
     return (len(low) / max(1, len(confs))) >= CONF_COLLAPSE_FRAC
 
 
+def _prediction_asset_class(symbol: str) -> str:
+    try:
+        return str(asset_class_for_symbol(symbol) or "UNKNOWN").upper().strip()
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_asset_class_lookup_failed",
+            "PREDICTOR_ASSET_CLASS_LOOKUP_FAILED",
+            e,
+            warn_key=f"predictor_asset_class_lookup_failed:{symbol}",
+            symbol=str(symbol),
+        )
+    return "UNKNOWN"
+
+
+def _regime_anchor_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip()
+    if _prediction_asset_class(sym) != "FX":
+        return "SPY"
+    try:
+        from engine.data.fx_instrument import parse_fx_symbol
+
+        meta = parse_fx_symbol(sym)
+        if meta is not None and str(getattr(meta, "symbol", "") or "").strip():
+            return str(meta.symbol).upper().strip()
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_fx_regime_anchor_normalization_failed",
+            "PREDICTOR_FX_REGIME_ANCHOR_NORMALIZATION_FAILED",
+            e,
+            warn_key=f"predictor_fx_regime_anchor_normalization_failed:{sym}",
+            symbol=str(sym),
+        )
+    return sym or "DXY"
+
+
+def _prediction_regime_context(symbol: str, event: Optional[Mapping[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+    sym = str(symbol or "").upper().strip()
+    asset_class = _prediction_asset_class(sym)
+    anchor = _regime_anchor_symbol(sym)
+    default_regime = "FX_MID" if asset_class == "FX" else "MID"
+    try:
+        regime_at_trade = str(get_current_regime(anchor) or default_regime).upper()
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_current_regime_lookup_failed",
+            "PREDICTOR_CURRENT_REGIME_LOOKUP_FAILED",
+            e,
+            warn_key=f"predictor_current_regime_lookup_failed:{anchor}",
+            symbol=str(sym),
+            anchor_symbol=str(anchor),
+        )
+        regime_at_trade = default_regime
+
+    if asset_class != "FX":
+        return regime_at_trade, {}
+
+    context: Dict[str, Any] = {"anchor_symbol": str(anchor), "asset_class": "FX"}
+    try:
+        from engine.strategy.regime_stack import compute_regime_vector
+
+        ts_ms = _safe_int((event or {}).get("ts_ms"), int(time.time() * 1000))
+        vector = compute_regime_vector(symbol=str(anchor), ts_ms=int(ts_ms), con=None, include_hmm=False)
+        macro = dict((vector or {}).get("macro") or {})
+        fx_macro = {
+            key: float(macro.get(key) or 0.0)
+            for key in ("fx_usd_strength_z", "fx_usd_strength_dir", "fx_carry_pressure")
+            if key in macro
+        }
+        if fx_macro:
+            context["macro"] = fx_macro
+    except Exception as e:
+        _warn_nonfatal(
+            "predictor_fx_regime_context_failed",
+            "PREDICTOR_FX_REGIME_CONTEXT_FAILED",
+            e,
+            warn_key=f"predictor_fx_regime_context_failed:{sym}",
+            symbol=str(sym),
+            anchor_symbol=str(anchor),
+        )
+    return regime_at_trade, context
+
+
 def _predict_resolved_model(
     query_vec: np.ndarray,
     sym: str,
@@ -2164,10 +2432,7 @@ def _predict_resolved_model(
     as_of_ts_ms = _safe_int((event or {}).get("ts_ms"), int(time.time() * 1000))
     knn_z, wsum, knn_ex = _knn_raw(qv_knn, sym, int(h), top_k, as_of_ts_ms=int(as_of_ts_ms))
 
-    try:
-        regime_at_trade = str(get_current_regime("SPY") or "MID").upper()
-    except Exception:
-        regime_at_trade = "MID"
+    regime_at_trade, fx_regime_context = _prediction_regime_context(sym, event)
 
     served = _adapter_predict(
         active_family,
@@ -2225,6 +2490,10 @@ def _predict_resolved_model(
                 explain_served["training_window_days"] = int(active_model.get("training_window_days") or 0)
             if feature_schema:
                 explain_served["feature_schema"] = dict(feature_schema)
+            explain_served.setdefault("regime_at_trade", str(regime_at_trade))
+            if fx_regime_context:
+                explain_served["regime_anchor_symbol"] = str(fx_regime_context.get("anchor_symbol") or "")
+                explain_served["fx_regime_context"] = dict(fx_regime_context)
             explain_served = _apply_model_serving_diagnostics(explain_served, active_model)
             return float(z_served), float(conf_served), explain_served
         except Exception as e:
@@ -2238,6 +2507,10 @@ def _predict_resolved_model(
             )
             z_served, conf_served, explain_served = served
             explain_dict = _apply_model_serving_diagnostics(dict(explain_served or {}), active_model)
+            explain_dict.setdefault("regime_at_trade", str(regime_at_trade))
+            if fx_regime_context:
+                explain_dict["regime_anchor_symbol"] = str(fx_regime_context.get("anchor_symbol") or "")
+                explain_dict["fx_regime_context"] = dict(fx_regime_context)
             return float(z_served), float(conf_served), explain_dict
 
     z, conf, prior_ex = _blend_with_priors(sym, int(h), knn_z, wsum)
@@ -2268,6 +2541,9 @@ def _predict_resolved_model(
         explain["training_window_days"] = int(active_model.get("training_window_days") or 0)
     if feature_schema:
         explain["feature_schema"] = feature_schema
+    if fx_regime_context:
+        explain["regime_anchor_symbol"] = str(fx_regime_context.get("anchor_symbol") or "")
+        explain["fx_regime_context"] = dict(fx_regime_context)
     if active_family != "embed_regressor":
         explain["serve_fallback"] = {
             "requested_model_name": str(active_model_name),
@@ -3193,15 +3469,24 @@ def _maybe_apply_lgbm_ranker_batch(
                 path=(str(loc.get("path") or "") or None),
             )
             feature_ids = [str(feature_id) for feature_id in list(getattr(model, "feature_ids", None) or bucket.get("feature_ids") or [])]
+            decision_ts_ms = int(event_payload.get("ts_ms") or time.time() * 1000)
+            cached_feature_maps = _latest_feature_snapshot_features_many(
+                syms,
+                list(feature_ids),
+                decision_ts_ms=int(decision_ts_ms),
+            )
             feature_maps = []
             for sym in syms:
                 symbol_key = str(sym).upper().strip()
-                feature_map = _cached_or_build_feature_snapshot(
-                    event=event_payload,
-                    symbol=str(sym),
-                    feature_ids=list(feature_ids),
-                )
+                feature_map = dict(cached_feature_maps.get(symbol_key) or {})
                 missing_feature_ids = [str(feature_id) for feature_id in feature_ids if str(feature_id) not in feature_map]
+                if not feature_map or missing_feature_ids:
+                    feature_map = _cached_or_build_feature_snapshot(
+                        event=event_payload,
+                        symbol=str(sym),
+                        feature_ids=list(feature_ids),
+                    )
+                    missing_feature_ids = [str(feature_id) for feature_id in feature_ids if str(feature_id) not in feature_map]
                 if missing_feature_ids:
                     feature_map = build_feature_snapshot(
                         event=event_payload,
@@ -3337,6 +3622,16 @@ def predict_event(
         except Exception:
             learned = None
 
+    _clear_feature_snapshot_prefetch()
+    if event is not None:
+        prefetch_state = _prefetch_feature_snapshot_features_for_event(
+            list(symbols or []),
+            list(horizons or []),
+            event,
+        )
+        if prefetch_state:
+            _install_feature_snapshot_prefetch(prefetch_state)
+
     base: Dict[Tuple[str, int], Tuple[float, float, Dict]] = {}
 
     for h in horizons:
@@ -3357,7 +3652,7 @@ def predict_event(
                 feature_ids = resolve_feature_ids(model_name=str(explain.get("model_name") or ""))
             if event is not None and not isinstance(explain.get("feature_snapshot"), dict):
                 try:
-                    explain["feature_snapshot"] = build_feature_snapshot(
+                    explain["feature_snapshot"] = _cached_or_build_feature_snapshot(
                         event=event,
                         symbol=str(sym),
                         feature_ids=feature_ids,
@@ -3539,6 +3834,7 @@ def predict_event(
                 warn_key="predictor_confidence_connection_close_failed",
             )
 
+    _clear_feature_snapshot_prefetch()
     return out
 
 

@@ -119,6 +119,11 @@ import { renderDecisionAttribution } from "./decision_attribution.js";
 import { renderFeatureVisibility } from "./feature_visibility.js";
 import { loadDataHealthScreen as loadDataHealthScreenModule } from "./data_health.js";
 import { requestConfirmation } from "./confirmation_modal.mjs";
+import {
+  formatFxPrice,
+  formatLotQty,
+  isFxSymbol,
+} from "./fx_format.js";
 
 import {
   closeIncidentDrawer,
@@ -2182,6 +2187,14 @@ function wireDashboardSymbolContext() {
   }, { emit: true });
 }
 
+function _operatorBridgeUrlForClient(sameOriginUrl) {
+  try {
+    return new URL(sameOriginUrl || "/operator/", window.location.origin).toString();
+  } catch {
+    return "/operator/";
+  }
+}
+
 async function loadOperatorSidecarStatus() {
   const pill = document.getElementById("operatorSidecarPill");
   const wsPill = document.getElementById("operatorSidecarWsPill");
@@ -2194,26 +2207,31 @@ async function loadOperatorSidecarStatus() {
   try {
     const payload = await fetchJSON("/api/operator/sidecar_status", { allowBusinessFalse: true });
     const reachable = payload && payload.reachable === true;
-    const directUrl = String(payload.direct_url || "http://127.0.0.1:4001/");
     const sameOriginUrl = String(payload.same_origin_url || "/operator/");
+    const bridgeUrl = _operatorBridgeUrlForClient(sameOriginUrl);
+    const internalTarget = String(payload.base_url || "operator:4001");
     const ws = payload.websocket && typeof payload.websocket === "object" ? payload.websocket : {};
 
     if (pill) {
       pill.textContent = reachable ? "Sidecar: reachable" : "Sidecar: unavailable";
       pill.className = buildPillClassName(pill, reachable ? "ok" : "warn");
-      pill.title = reachable ? `Node operator sidecar responded at ${directUrl}` : String(payload.detail || payload.error || "sidecar unavailable");
+      pill.title = reachable ? `Node operator sidecar responded through the dashboard bridge (${internalTarget})` : String(payload.detail || payload.error || "sidecar unavailable");
     }
     if (wsPill) {
-      wsPill.textContent = ws.proxy_enabled ? "Realtime: proxied" : "Realtime: direct WS";
+      wsPill.textContent = ws.proxy_enabled ? "Realtime: proxied" : "Realtime: HTTP bridge";
       wsPill.className = buildPillClassName(wsPill, ws.proxy_enabled ? "ok" : "neutral");
-      wsPill.title = String(ws.deferred_reason || ws.direct_url || "Operator realtime channel");
+      wsPill.title = String(ws.deferred_reason || "Operator realtime channel");
     }
     if (detail) {
       detail.textContent = reachable
-        ? `Same-origin console is available at ${sameOriginUrl}; direct port 4001 remains available.`
-        : `Same-origin console shell is available, but Node sidecar calls will report unavailable until ${directUrl} responds.`;
+        ? `Same-origin operator console is available at ${sameOriginUrl}; direct port 4001 is not published.`
+        : `Same-origin operator console shell is available, but sidecar calls will report unavailable until ${internalTarget} responds inside the runtime network.`;
     }
-    if (directLink) directLink.href = directUrl;
+    if (directLink) {
+      directLink.href = bridgeUrl;
+      directLink.textContent = "Open Operator Bridge";
+      directLink.title = "Open the operator console through the authenticated dashboard origin";
+    }
     if (consoleLink) consoleLink.href = _buildOperatorUrl({ source: "operate_card" });
   } catch (e) {
     if (pill) {
@@ -2222,11 +2240,15 @@ async function loadOperatorSidecarStatus() {
       pill.title = describeUiError(e);
     }
     if (wsPill) {
-      wsPill.textContent = "Realtime: direct WS";
+      wsPill.textContent = "Realtime: HTTP bridge";
       wsPill.className = buildPillClassName(wsPill, "neutral");
     }
     if (detail) {
       detail.textContent = `Could not check Node operator sidecar: ${describeUiError(e)}`;
+    }
+    if (directLink) {
+      directLink.href = _operatorBridgeUrlForClient("/operator/");
+      directLink.textContent = "Open Operator Bridge";
     }
   }
 }
@@ -5038,6 +5060,110 @@ async function loadDataHealthScreen() {
   });
 }
 
+function fxAssetClass(value) {
+  return String(value || "").trim().toUpperCase().startsWith("FX");
+}
+
+function maybeJsonObject(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_error) {
+    return {};
+  }
+}
+
+function pathValue(root, path) {
+  let cur = root;
+  for (const part of String(path || "").split(".")) {
+    if (!part) continue;
+    if (!cur || typeof cur !== "object") return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+function firstNumberAt(objects, paths) {
+  for (const obj of objects) {
+    for (const path of paths) {
+      const n = numOrNull(pathValue(obj, path));
+      if (n != null) return n;
+    }
+  }
+  return null;
+}
+
+function positionRowIsFx(row) {
+  if (!row || typeof row !== "object") return false;
+  return isFxSymbol(row.symbol)
+    || fxAssetClass(row.asset_class)
+    || fxAssetClass(row.instrument_class)
+    || fxAssetClass(pathValue(row, "fx.asset_class"));
+}
+
+function buildFxExposureView({ uiMetrics, portfolio, riskPortfolio, brokerPositions, terminalRows }) {
+  const info = asObject(riskPortfolio && riskPortfolio.info);
+  const infoJson = maybeJsonObject(riskPortfolio && (riskPortfolio.info_json || riskPortfolio.infoJson));
+  const riskSummary = asObject(riskPortfolio && riskPortfolio.summary);
+  const portfolioInfo = asObject(portfolio && portfolio.info);
+  const metricsRisk = asObject(pathValue(uiMetrics, "risk"));
+  const metricsFx = asObject(pathValue(uiMetrics, "fx"));
+  const roots = [metricsFx, metricsRisk, info, infoJson, riskSummary, portfolioInfo, riskPortfolio, portfolio, uiMetrics].filter(Boolean);
+  const positions = [...asArray(brokerPositions), ...asArray(terminalRows)].filter(positionRowIsFx);
+  const gross = firstNumberAt(roots, [
+    "fx_gross_exposure",
+    "fx_gross",
+    "fx.sleeve.gross",
+    "fx.sleeve.gross_exposure",
+    "asset_class_gross_post.FX",
+    "asset_class_gross.FX",
+    "sleeves.FX.gross",
+    "sleeves.fx.gross",
+  ]);
+  const net = firstNumberAt(roots, [
+    "fx_net_exposure",
+    "fx_net",
+    "fx.sleeve.net",
+    "fx.sleeve.net_exposure",
+    "asset_class_net_post.FX",
+    "asset_class_net.FX",
+    "sleeves.FX.net",
+    "sleeves.fx.net",
+  ]);
+  const leverage = firstNumberAt(roots, [
+    "fx_leverage",
+    "fx.effective_leverage",
+    "fx.max_effective_leverage",
+    "fx.leverage",
+    "leverage.FX",
+    "asset_class_leverage.FX",
+  ]);
+  const sample = positions.find((row) => numOrNull(pathValue(row, "fx.units")) != null || numOrNull(row.qty) != null) || null;
+  const sampleSymbol = String(sample && sample.symbol || "").trim().toUpperCase();
+  const sampleUnits = numOrNull(pathValue(sample, "fx.units")) ?? numOrNull(sample && sample.qty);
+  const sampleLotSize = numOrNull(pathValue(sample, "fx.lot_size")) ?? numOrNull(pathValue(sample, "fx.contract_size"));
+  const samplePx = numOrNull(sample && (sample.market_px ?? sample.avg_px ?? sample.price ?? pathValue(sample, "fx.pair_rate")));
+  const missing = [];
+  if (gross == null && net == null) missing.push("FX sleeve exposure");
+  if (leverage == null) missing.push("FX leverage");
+  if (!positions.length) missing.push("FX broker/terminal positions");
+  return {
+    positions,
+    gross,
+    net,
+    leverage,
+    missing,
+    sizingText: sample && sampleUnits != null
+      ? `${sampleSymbol || "FX"} ${formatLotQty(sampleSymbol, sampleUnits, sampleLotSize || 100000)}`
+      : "FX data not yet available",
+    sizingMeta: sample && samplePx != null
+      ? `avg/ref ${formatFxPrice(sampleSymbol, samplePx)}`
+      : "waiting on FX-06 position sizing fields",
+  };
+}
+
 async function loadPositionsExposureScreen() {
   const exposureGrid = document.getElementById("positionsExposureGrid");
   if (!exposureGrid) return;
@@ -5069,6 +5195,7 @@ async function loadPositionsExposureScreen() {
   const riskLatest = latestRiskRow(riskPortfolio);
   const brokerPositions = asArray(broker && broker.positions);
   const terminalRows = asArray(terminal && terminal.rows);
+  const fxView = buildFxExposureView({ uiMetrics, portfolio, riskPortfolio, brokerPositions, terminalRows });
   const liveSymbolCount = new Set(
     [...brokerPositions, ...terminalRows]
       .map((row) => String((row || {}).symbol || "").trim().toUpperCase())
@@ -5235,6 +5362,33 @@ async function loadPositionsExposureScreen() {
         ? String((canonicalExposure.accountSource && canonicalExposure.accountSource.endpoint) || "/api/broker")
         : "legacy broker account",
     },
+    {
+      label: "FX Positions",
+      value: fxView.positions.length ? formatDecimal(fxView.positions.length, 0) : "FX data not yet available",
+      meta: fxView.positions.length ? "broker/terminal FX rows" : "waiting on FX-06 position payloads",
+    },
+    {
+      label: "FX Sleeve",
+      value: fxView.gross == null && fxView.net == null
+        ? "FX data not yet available"
+        : safeJoin([
+          fxView.gross == null ? "" : `gross ${formatPercent(fxView.gross)}`,
+          fxView.net == null ? "" : `net ${formatSigned(fxView.net * 100, 2, "%")}`,
+        ]),
+      meta: fxView.gross == null && fxView.net == null
+        ? "waiting on FX-05 risk read-model fields"
+        : "FX risk sleeve",
+    },
+    {
+      label: "FX Leverage",
+      value: fxView.leverage == null ? "FX data not yet available" : `${formatDecimal(fxView.leverage, 2)}x`,
+      meta: fxView.leverage == null ? "waiting on FX-05 leverage serialization" : "effective FX leverage",
+    },
+    {
+      label: "FX Pip/Lot Sizing",
+      value: fxView.sizingText,
+      meta: fxView.sizingMeta,
+    },
   ]);
 
   const exposureNotes = [];
@@ -5258,6 +5412,11 @@ async function loadPositionsExposureScreen() {
   }
   if (brokerRes.status !== "fulfilled" || terminalRes.status !== "fulfilled") {
     exposureNotes.push("live broker inventory is partially unavailable");
+  }
+  if (fxView.missing.length) {
+    exposureNotes.push(`FX exposure: data not yet available (${fxView.missing.join(", ")}). FX-05/FX-06 read-model payloads must supply these fields.`);
+  } else {
+    exposureNotes.push("FX exposure fields are present in the existing read-model payloads.");
   }
   const selectedPositionsHint = _symbolContextEmptyHint(
     [...stateRows, ...orderRows, ...brokerPositions, ...terminalRows],
@@ -5291,7 +5450,9 @@ async function loadPositionsExposureScreen() {
         const size = numOrNull(row.size);
         const unrealizedPnl = numOrNull(row.unrealized_pnl);
         const realizedPnl = numOrNull(row.realized_pnl);
-        const sizeText = size == null ? "—" : formatDecimal(size, Math.abs(size) >= 100 ? 2 : 6);
+        const sizeText = size == null
+          ? "—"
+          : (isFxSymbol(row.symbol) ? formatLotQty(row.symbol, size, numOrNull(pathValue(row, "fx.contract_size")) || 100000) : formatDecimal(size, Math.abs(size) >= 100 ? 2 : 6));
         const unrealizedTone = pnlToneClass(unrealizedPnl);
         const realizedTone = pnlToneClass(realizedPnl);
         return `
@@ -5383,9 +5544,9 @@ async function loadPositionsExposureScreen() {
       liveBody.innerHTML = liveRows.map((row) => `
         <tr class="${_tableRowClassForSymbol(row.symbol)}">
           <td class="mono">${escapeHTML(String(row.symbol || ""))}</td>
-          <td class="mono table-cell-num">${escapeHTML(row.brokerQty == null ? "—" : formatDecimal(row.brokerQty, 6))}</td>
-          <td class="mono table-cell-num">${escapeHTML(row.terminalQty == null ? "—" : formatDecimal(row.terminalQty, 6))}</td>
-          <td class="mono table-cell-num">${escapeHTML(row.avgPx == null ? "—" : formatDecimal(row.avgPx, 4))}</td>
+          <td class="mono table-cell-num">${escapeHTML(row.brokerQty == null ? "—" : (isFxSymbol(row.symbol) ? formatLotQty(row.symbol, row.brokerQty) : formatDecimal(row.brokerQty, 6)))}</td>
+          <td class="mono table-cell-num">${escapeHTML(row.terminalQty == null ? "—" : (isFxSymbol(row.symbol) ? formatLotQty(row.symbol, row.terminalQty) : formatDecimal(row.terminalQty, 6)))}</td>
+          <td class="mono table-cell-num">${escapeHTML(row.avgPx == null ? "—" : (isFxSymbol(row.symbol) ? formatFxPrice(row.symbol, row.avgPx) : formatDecimal(row.avgPx, 4)))}</td>
           <td class="mono metric-meta">${row.updatedTs ? escapeHTML(fmtTime(row.updatedTs)) : "—"}</td>
         </tr>
       `).join("");

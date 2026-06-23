@@ -36,6 +36,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from engine.runtime import dbapi_compat as dbapi
+from engine.execution.fx_costs import is_fx_asset_class, pip_spread_bps, swap_bps, weekend_gap_bps
 from engine.runtime.failure_diagnostics import log_failure
 from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
 from engine.runtime.storage import connect, connect_rw_direct, run_write_txn
@@ -1295,6 +1296,27 @@ def _fee(notional: float) -> float:
     return abs(float(notional or 0.0)) * (BROKER_FEE_BPS / 10000.0)
 
 
+def _offline_fx_crosses_weekend(cfg: Dict[str, Any]) -> bool:
+    if "crosses_weekend" in cfg:
+        return bool(cfg.get("crosses_weekend"))
+    start = cfg.get("entry_ts_ms", cfg.get("start_ts_ms", cfg.get("ts_ms")))
+    end = cfg.get("exit_ts_ms", cfg.get("end_ts_ms", cfg.get("next_ts_ms")))
+    if start in (None, "") or end in (None, ""):
+        return False
+    try:
+        from engine.data.prices.fx_clock import fx_window_spans_closed_gap
+
+        return bool(fx_window_spans_closed_gap(int(float(start)), int(float(end))))
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_offline_fx_weekend_gap_check_failed",
+            "BROKER_SIM_OFFLINE_FX_WEEKEND_GAP_CHECK_FAILED",
+            e,
+            warn_key="offline_fx_crosses_weekend",
+        )
+        return False
+
+
 def _offline_ac_cost_components(
     turnover: float,
     *,
@@ -1315,19 +1337,41 @@ def _offline_ac_cost_components(
 
     model = cost_model if cost_model is not None else AlmgrenChrissCost()
     base_notional = max(0.0, _safe_f(cfg.get("notional"), 100_000.0))
-    half_spread_bps = max(0.0, _safe_f(cfg.get("half_spread_bps"), 1.0))
+    asset_class = str(cfg.get("asset_class") or "US_EQUITY")
+    is_fx = is_fx_asset_class(asset_class)
+    symbol = str(cfg.get("symbol") or cfg.get("pair") or "EUR_USD")
+    fx_full_spread_bps = 0.0
+    if is_fx:
+        fx_full_spread_bps = max(0.0, float(pip_spread_bps(symbol, half=False)))
+        if "half_spread_bps" in cfg and cfg.get("half_spread_bps") not in (None, ""):
+            half_spread_bps = max(0.0, _safe_f(cfg.get("half_spread_bps"), fx_full_spread_bps / 2.0))
+        else:
+            half_spread_bps = max(0.0, float(pip_spread_bps(symbol, half=True)))
+    else:
+        half_spread_bps = max(0.0, _safe_f(cfg.get("half_spread_bps"), 1.0))
     components = model.components_bps(
         notional=float(base_notional) * float(turnover_f),
         adv=max(1e-12, _safe_f(cfg.get("adv"), 10_000_000.0)),
         sigma_daily=max(0.0, _safe_f(cfg.get("sigma_daily"), 200.0)),
         participation=max(0.0, min(1.0, _safe_f(cfg.get("participation"), 0.10))),
         half_spread_bps=0.0,
-        asset_class=str(cfg.get("asset_class") or "US_EQUITY"),
+        asset_class=asset_class,
     )
     commission_bps = max(0.0, _safe_f(cfg.get("commission_bps"), float(BROKER_FEE_BPS)))
     temporary_bps = max(0.0, _safe_f(components.get("temporary_impact_bps"), 0.0))
-    total_bps = float(commission_bps + half_spread_bps + temporary_bps)
-    return {
+    swap_carry_bps = 0.0
+    weekend_gap_cost_bps = 0.0
+    if is_fx:
+        swap_carry_bps = float(
+            swap_bps(
+                symbol,
+                _safe_f(cfg.get("side_sign"), _safe_f(cfg.get("direction"), 1.0)),
+                int(max(0.0, _safe_f(cfg.get("nights"), 1.0))),
+            )
+        )
+        weekend_gap_cost_bps = float(weekend_gap_bps(symbol, crosses_weekend=_offline_fx_crosses_weekend(cfg)))
+    total_bps = max(0.0, float(commission_bps + half_spread_bps + temporary_bps + swap_carry_bps + weekend_gap_cost_bps))
+    result = {
         "turnover": float(turnover_f),
         "commission_bps": float(commission_bps),
         "half_spread_bps": float(half_spread_bps),
@@ -1335,6 +1379,15 @@ def _offline_ac_cost_components(
         "total_cost_bps": float(total_bps),
         "cost_return": float(turnover_f * total_bps / 10000.0),
     }
+    if is_fx:
+        result.update(
+            {
+                "fx_pip_spread_bps": float(fx_full_spread_bps),
+                "swap_carry_bps": float(swap_carry_bps),
+                "weekend_gap_bps": float(weekend_gap_cost_bps),
+            }
+        )
+    return result
 
 
 def simulate_weight_order_batch(

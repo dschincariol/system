@@ -67,6 +67,7 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._prev_allow_training = os.environ.get("ALLOW_TRAINING")
         self._prev_schema_per_db_path = os.environ.get("TS_PG_SCHEMA_PER_DB_PATH")
+        self._prev_storage_backend = os.environ.get("TS_STORAGE_BACKEND")
         tmp_root = Path(self.tmp.name)
         (tmp_root / "logs").mkdir(parents=True, exist_ok=True)
         (tmp_root / "data").mkdir(parents=True, exist_ok=True)
@@ -81,6 +82,7 @@ class StartupHealthValidationTests(unittest.TestCase):
         os.environ["TRADING_STARTUP_HEALTH_ASYNC_BIND"] = "1"
         os.environ["TRADING_STARTUP_HEALTH_FAIL_OPEN"] = "0"
         os.environ["TS_PG_SCHEMA_PER_DB_PATH"] = "1"
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         _reload_modules("engine.runtime.db_guard", "engine.runtime.storage")
 
     def test_startup_db_repair_retries_transient_sqlite_lock(self) -> None:
@@ -126,6 +128,17 @@ class StartupHealthValidationTests(unittest.TestCase):
         (start_system,) = _reload_modules("start_system")
 
         self.assertEqual(start_system._ingestion_storage_ready(), (False, str(missing_db)))
+
+    def test_ingestion_storage_ready_rejects_uninitialized_sqlite_file(self) -> None:
+        empty_db = Path(self.tmp.name) / "empty_runtime.sqlite"
+        empty_db.touch()
+        os.environ["DB_PATH"] = str(empty_db)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
+        os.environ.pop("TS_PG_DSN", None)
+
+        (start_system,) = _reload_modules("start_system")
+
+        self.assertEqual(start_system._ingestion_storage_ready(), (False, str(empty_db)))
 
     def test_startup_import_smoke_compiles_jobs_without_importing_them_by_default(self) -> None:
         (start_system,) = _reload_modules("start_system")
@@ -267,6 +280,10 @@ class StartupHealthValidationTests(unittest.TestCase):
             os.environ.pop("TS_PG_SCHEMA_PER_DB_PATH", None)
         else:
             os.environ["TS_PG_SCHEMA_PER_DB_PATH"] = str(self._prev_schema_per_db_path)
+        if self._prev_storage_backend is None:
+            os.environ.pop("TS_STORAGE_BACKEND", None)
+        else:
+            os.environ["TS_STORAGE_BACKEND"] = str(self._prev_storage_backend)
         self.tmp.cleanup()
 
     def test_startup_validation_accepts_healthy_runtime(self) -> None:
@@ -319,6 +336,79 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertTrue(bool(snapshot["gates"]["disk_headroom_available"]["ok"]))
         self.assertTrue(bool(snapshot["gates"]["ui_static_assets_present"]["ok"]))
         self.assertTrue(bool(snapshot["gates"]["no_port_binding_conflict"]["ok"]))
+
+    def test_startup_validation_blocks_production_when_cache_msgpack_is_missing(self) -> None:
+        storage, health, startup_gates, codec = _reload_modules(
+            "engine.runtime.storage",
+            "engine.runtime.health",
+            "engine.runtime.startup_gates",
+            "engine.cache.codec",
+        )
+        storage.init_db()
+
+        healthy_payload = {
+            "db": {"ok": True, "initialized": True, "db_path": os.environ["DB_PATH"]},
+            "ingestion_runtime": {"running": True, "stale": False, "last_publish_ts_ms": 123},
+            "ingestion_freshness": {
+                "critical_ok": True,
+                "stale_critical_sources": [],
+                "runtime_reason_codes": [],
+            },
+            "job_summary": {"ok": True, "required_missing": [], "required_stale": []},
+            "predictions": {
+                "ok": True,
+                "detail": "ok",
+                "count": 5,
+                "recent_count": 2,
+                "history_count": 8,
+                "history_recent_count": 2,
+                "last_ts_ms": 123,
+                "age_s": 1.0,
+                "max_age_s": 600.0,
+            },
+            "execution_barrier": {"ok": True, "reason": "health_fast_path", "allowed": False},
+            "execution_supervisor": {"state": "ok"},
+            "broker_connection": {"ok": False, "state": "disconnected", "broker": "sim"},
+        }
+        config_snapshot = {
+            "ok": True,
+            "parsed": {
+                "dashboard_host": "127.0.0.1",
+                "dashboard_port": int(os.environ["DASHBOARD_PORT"]),
+            },
+            "config_contract": {},
+            "errors": [],
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "ENV": "prod",
+                "ENGINE_MODE": "safe",
+                "CACHE_CODEC_ALLOW_JSON_FALLBACK": "0",
+            },
+            clear=False,
+        ):
+            with patch.object(codec, "_msgpack", None):
+                with patch.object(startup_gates, "get_startup_config_snapshot", return_value=config_snapshot):
+                    snapshot = health.get_startup_validation_snapshot(
+                        health=healthy_payload,
+                        db_validation={
+                            "ok": True,
+                            "quick_check": "ok",
+                            "missing_tables": [],
+                            "schema_version": 1,
+                            "schema_status": "applied",
+                        },
+                    )
+
+        self.assertFalse(snapshot["ok"])
+        self.assertIn("cache_codec_ready", snapshot["blocking_gates"])
+        self.assertIn("cache", snapshot["critical_systems_missing"])
+        codec_gate = dict(snapshot["gates"]["cache_codec_ready"])
+        self.assertFalse(bool(codec_gate.get("ok")))
+        self.assertIn("cache_msgpack_dependency_unavailable", str(codec_gate.get("detail") or ""))
+        self.assertEqual(dict(codec_gate.get("cache_codec") or {}).get("codec"), "unavailable")
 
     def test_startup_validation_blocks_critical_disk_pressure(self) -> None:
         storage, health = _reload_modules("engine.runtime.storage", "engine.runtime.health")

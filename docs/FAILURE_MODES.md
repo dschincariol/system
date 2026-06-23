@@ -19,9 +19,69 @@ The runtime is intentionally conservative in safety-critical paths:
 | Ingestion runtime not running or stale | `/api/ingestion/status`, `/api/operator/runtime_watchdogs`, `/api/operator/provider_telemetry` | `start_ingestion.py`, `engine/runtime/ingestion_runtime.py`, `engine/runtime/ingestion_status.py` |
 | Provider auth or source configuration failure | Data Sources Control Center, `data_source_logs`, `/api/data_sources/logs` | `services/data_source_manager.py`, `routes/data_sources_routes.py`, `services/credential_encryption.py` |
 | Execution barrier block | `/api/execution/barrier`, `/api/readiness`, dashboard safety panels | `engine/runtime/gates.py`, `engine/execution/kill_switch.py`, `engine/execution/broker_apply_orders.py` |
+| Crash recovery continuity gap | `/api/execution/barrier`, `runtime_meta.crash_recovery_state`, `runtime_metrics` rows for `crash_recovery_*` | `engine/runtime/crash_recovery.py`, `engine/runtime/runtime_bootstrap.py`, `engine/runtime/gates.py` |
 | Portfolio risk block | `/api/risk/portfolio`, `/api/risk/monte_carlo`, `/api/execution/barrier` | `engine/risk/portfolio_risk_engine.py`, `engine/risk/monte_carlo_risk_engine.py`, `engine/runtime/risk_state.py` |
 | Broker connection or execution-quality degradation | `/api/operator/runtime_watchdogs`, execution metrics APIs, execution barrier reasons | `engine/execution/execution_broker_watchdog.py`, `engine/execution/execution_quality_supervisor.py`, `engine/execution/broker_router.py` |
 | Post-trade attribution or reconciliation failure | Attribution quality APIs, `pnl_attribution`, `trade_attribution_ledger`, recent errors | `engine/execution/execution_poll_and_attrib.py`, `engine/execution/execution_ledger.py`, `engine/runtime/trade_lifecycle.py` |
+| WAL archive or storage placement failure | `alerts`, `component_health.storage_wal_guards`, `postgres.wal.alert_state`, production preflight, Timescale compose startup | `deploy/compose/docker-compose.external-services.yml`, `engine/runtime/storage_placement.py`, `engine/strategy/jobs/observability_snapshot.py`, `ops/backup/wal_archive.sh`, `ops/backup/wal_archive_catchup.sh` |
+
+## WAL Archive And Storage Placement
+
+Production Compose blocks `timescaledb` behind the one-shot
+`storage-placement-preflight` service. That service mounts the same host paths
+read-only and runs `engine.runtime.storage_placement`; a root-backed,
+`/var/lib/docker`/`/var/lib/containerd`, or non-`zfs` PGDATA, `pg_wal`, Redis,
+MinIO, runtime, or backup target exits non-zero before Postgres starts.
+
+`archive_mode` stays `on`, `archive_command` must invoke
+`/opt/trading/ops/backup/wal_archive.sh "%p" "%f"`, and
+`TS_WAL_ARCHIVE_REQUIRE_MOUNT=1` makes the archive script fail closed if
+`/var/backups/trading` is missing or only backed by `/`. Do not replace the
+command with `/bin/true` or an inline `cp`; production preflight rejects that as
+unaudited PITR.
+
+During runtime, `observability_snapshot` evaluates the same WAL budgets every
+cycle. It records `postgres.wal.alert_state`, writes
+`component_health.storage_wal_guards`, and emits runtime alerts for rising
+`pg_stat_archiver.failed_count`, recent or unrecovered `last_failed_wal`,
+excessive `pg_wal` bytes, `.ready` backlog, or low WAL/backup free space. Stable
+payloads are fingerprinted so the job does not page every 60s, but changed
+segments, backlog, free bytes, or recovery followed by recurrence emit again.
+
+Recovery after restoring the archive mount:
+
+```bash
+# operator-run: privileged host-side moves and monitor install
+sudo bash ops/server/disk_remediation.sh relocate-backups
+sudo bash ops/server/disk_remediation.sh relocate-docker
+sudo bash ops/server/disk_remediation.sh install-monitor
+
+# operator-run or container shell: drain already-ready WAL after the mount is healthy
+docker compose --env-file deploy/compose/.env -f deploy/compose/docker-compose.external-services.yml \
+  exec -u postgres timescaledb /opt/trading/ops/backup/wal_archive_catchup.sh
+```
+
+The agent shell may not have `sudo`; privileged ZFS dataset creation, Docker
+data-root relocation, mount changes, and host monitor installation are
+operator-run steps.
+
+## Crash Recovery Continuity
+
+Boot-time crash recovery writes `runtime_meta.crash_recovery_state` after every
+run. For `alpaca` and `ibkr`, recovery must prove broker open orders, recent
+broker fills, broker positions, and pre-live reconciliation continuity before
+live order authority can be enabled. If any of those reads or reconciliations
+fails, `engine/runtime/crash_recovery.py` records a critical gap, emits
+`crash_recovery_continuity_gap_total`, `crash_recovery_gap_count`, and
+`crash_recovery_continuity_proven=0`, and sets the in-process
+`CRASH_RECOVERY_FAIL_CLOSED` fallback.
+
+`engine/runtime/gates.py` consumes that state directly. In live mode it returns
+`real_trading_allowed=false`, `allow_execution_pipeline=false`, and a
+`critical_crash_recovery_*` reason until a later successful recovery run writes
+an `ok` state. Event-log/audit append failures during recovery remain
+best-effort telemetry: they are logged, but they do not erase the durable
+`crash_recovery_audit` row or hide live-blocking continuity gaps.
 
 ## What The Operator APIs Already Provide
 

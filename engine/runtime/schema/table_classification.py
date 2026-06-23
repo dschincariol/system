@@ -10,6 +10,24 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Union
 
+_INTERVAL_MS_BY_UNIT = {
+    "millisecond": 1,
+    "milliseconds": 1,
+    "ms": 1,
+    "second": 1_000,
+    "seconds": 1_000,
+    "minute": 60_000,
+    "minutes": 60_000,
+    "hour": 3_600_000,
+    "hours": 3_600_000,
+    "day": 86_400_000,
+    "days": 86_400_000,
+    "week": 604_800_000,
+    "weeks": 604_800_000,
+    "year": 31_536_000_000,
+    "years": 31_536_000_000,
+}
+
 
 @dataclass(frozen=True)
 class Hypertable:
@@ -34,6 +52,40 @@ class Regular:
 
 
 TableClass = Union[Hypertable, Regular]
+
+
+def interval_to_ms(interval: str) -> int:
+    """Convert table policy interval strings such as ``1 day`` to milliseconds."""
+
+    parts = str(interval or "").strip().split()
+    if len(parts) != 2:
+        raise ValueError(f"unsupported policy interval: {interval!r}")
+    count_text, unit = parts
+    try:
+        count = int(count_text)
+    except Exception as exc:
+        raise ValueError(f"unsupported policy interval: {interval!r}") from exc
+    unit_key = str(unit).lower()
+    if unit_key not in _INTERVAL_MS_BY_UNIT:
+        raise ValueError(f"unsupported policy interval unit: {interval!r}")
+    return int(count) * int(_INTERVAL_MS_BY_UNIT[unit_key])
+
+
+def hypertable_chunk_interval(table_name: str, *, default: str = "1 week") -> str:
+    """Return the configured Timescale chunk interval for a classified table."""
+
+    raw_name = str(table_name or "").strip()
+    bare_name = raw_name.rsplit(".", 1)[-1].strip('"')
+    classification = TABLE_CLASS.get(bare_name)
+    if isinstance(classification, Hypertable):
+        return str(classification.chunk)
+    return str(default)
+
+
+def hypertable_chunk_interval_ms(table_name: str, *, default: str = "1 week") -> int:
+    """Return a classified table's chunk interval in milliseconds for telemetry/tests."""
+
+    return int(interval_to_ms(hypertable_chunk_interval(table_name, default=default)))
 
 
 def _h(
@@ -87,6 +139,7 @@ TICK_QUOTE = _h(
     write_rate="very high",
     read_pattern="latest and intraday ranges by (symbol, time)",
 )
+TIMESCALE_PRICE_SIDECAR = replace(TICK_QUOTE, time_column="time")
 BAR_SERIES = _h(
     chunk="1 day",
     compress_after="7 days",
@@ -159,14 +212,18 @@ def _add(names: tuple[str, ...], cls: TableClass) -> None:
 
 _add(
     (
-        "price_quotes_raw",
-        "price_quotes",
         "prices",
-        "price_ticks",
     ),
     TICK_QUOTE,
 )
-TABLE_CLASS["price_ticks"] = _h(**{**TICK_QUOTE.__dict__, "time_column": "time"})
+_add(
+    (
+        "price_ticks",
+        "price_quotes",
+        "price_quotes_raw",
+    ),
+    TIMESCALE_PRICE_SIDECAR,
+)
 _add(("price_bars",), BAR_SERIES)
 TABLE_CLASS["price_data"] = _h(**{**BAR_SERIES.__dict__, "time_column": "timestamp"})
 
@@ -521,6 +578,18 @@ TABLE_CLASS["async_price_writer_spool"] = _r(
     read_pattern="oldest-first replay batch selection by created_ts_ms and id",
     cleanup="delete-after-success; bounded by ASYNC_PRICE_WRITER_QUEUE_MAXSIZE and ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES",
 )
+TABLE_CLASS["non_price_ingestion_spool"] = _r(
+    "bounded local SQLite WAL spool for non-price ingestion envelopes retained only until successful downstream commit",
+    write_rate="high",
+    read_pattern="oldest-first replay batch selection by table_name, created_ts_ms, and id",
+    cleanup="delete-after-success; bounded by NON_PRICE_INGESTION_SPOOL_*",
+)
+TABLE_CLASS["data_source_populate_evidence"] = _r(
+    "latest data-source population evidence keyed by source, including contract status and row-count diagnostics",
+    write_rate="low",
+    read_pattern="source-key status lookup and recent evidence review",
+    cleanup="one current row per source_key; replaced by later populate checks",
+)
 
 _add(
     (
@@ -705,6 +774,7 @@ _add(
         "strategy_registry",
         "sleeve_registry",
         "data_sources",
+        "data_source_provider_accounts",
         "factor_registry",
         "models",
         "model_versions",
@@ -938,7 +1008,10 @@ __all__ = [
     "TABLE_CLASS",
     "TableClass",
     "audit_tables",
+    "hypertable_chunk_interval",
+    "hypertable_chunk_interval_ms",
     "hypertables",
+    "interval_to_ms",
     "is_hypertable",
     "regular_tables",
 ]

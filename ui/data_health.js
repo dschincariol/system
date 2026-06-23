@@ -31,6 +31,7 @@ export const DATA_HEALTH_FEATURE_VISIBILITY_TARGETS = Object.freeze({
 
 export const DATA_HEALTH_ENDPOINTS = Object.freeze({
   ingestion: Object.freeze({ path: "/api/ingestion/status" }),
+  feedStatus: Object.freeze({ path: "/api/feeds" }),
   telemetry: Object.freeze({ path: "/api/telemetry" }),
   barrier: Object.freeze({
     path: "/api/execution/barrier",
@@ -224,12 +225,14 @@ export async function fetchDataHealthScreen(fetchJSON) {
   const endpoints = DATA_HEALTH_ENDPOINTS;
   const [
     ingestion,
+    feedStatus,
     telemetry,
     barrier,
     provider,
     featureVisibility,
   ] = await Promise.allSettled([
     fetchJSON(endpoints.ingestion.path),
+    fetchJSON(endpoints.feedStatus.path),
     fetchJSON(endpoints.telemetry.path),
     fetchJSON(endpoints.barrier.path, endpoints.barrier.options),
     fetchJSON(endpoints.provider.path),
@@ -238,6 +241,7 @@ export async function fetchDataHealthScreen(fetchJSON) {
 
   return {
     ingestion,
+    feedStatus,
     telemetry,
     barrier,
     provider,
@@ -248,6 +252,7 @@ export async function fetchDataHealthScreen(fetchJSON) {
 export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } = {}) {
   const settled = {
     ingestion: results.ingestion || buildSettled(results.ingestionPayload),
+    feedStatus: results.feedStatus || buildSettled(results.feedStatusPayload),
     telemetry: results.telemetry || buildSettled(results.telemetryPayload),
     barrier: results.barrier || buildSettled(results.barrierPayload),
     provider: results.provider || buildSettled(results.providerPayload),
@@ -255,6 +260,7 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
   };
 
   const ingestionPayload = fulfilledValue(settled.ingestion);
+  const feedStatus = fulfilledValue(settled.feedStatus);
   const telemetry = fulfilledValue(settled.telemetry);
   const barrier = fulfilledValue(settled.barrier);
   const providerPayload = fulfilledValue(settled.provider);
@@ -266,6 +272,17 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
   const providerTelemetry = extractDataHealthProviderTelemetry(providerPayload);
   const telemetryProviders = asObject(telemetry && telemetry.providers);
   const providerEntries = normalizeProviderEntries({ providerTelemetry, ingestion, nowMs });
+  const priceFreshness = asObject(feedStatus && feedStatus.price_freshness);
+  const priceFreshnessAgeMs = numOrNull(priceFreshness.age_s) == null
+    ? null
+    : Math.max(0, Number(priceFreshness.age_s) * 1000);
+  const priceFreshnessSource = String(priceFreshness.source || "").trim();
+  const priceFreshnessStatus = String(priceFreshness.status || "").trim();
+  const priceFreshnessLabel = safeJoin([
+    priceFreshnessStatus || (priceFreshness.ok === true ? "fresh" : priceFreshness.ok === false ? "stale" : ""),
+    priceFreshnessSource ? `source ${priceFreshnessSource}` : "",
+    priceFreshness.simulated ? "simulated" : "",
+  ]);
 
   const healthyProviders = numOrNull(providerTelemetry.healthy_providers)
     ?? numOrNull(ingestion.healthy_providers)
@@ -275,8 +292,12 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
     numOrNull(telemetryProviders.total) ?? 0,
     numOrNull(healthyProviders) ?? 0
   );
-  const priceAgeMs = numOrNull(providerTelemetry.price_age_ms) ?? numOrNull(ingestion.price_age_ms);
-  const latestPriceTs = pickTimestamp(providerTelemetry.last_price_ts_ms, ingestion.last_price_ts_ms);
+  const priceAgeMs = priceFreshnessAgeMs ?? numOrNull(providerTelemetry.price_age_ms) ?? numOrNull(ingestion.price_age_ms);
+  const latestPriceTs = pickTimestamp(
+    priceFreshness.last_ts_ms,
+    providerTelemetry.last_price_ts_ms,
+    ingestion.last_price_ts_ms
+  );
   const updatedTs = pickTimestamp(
     providerTelemetry.updated_ts_ms,
     ingestion.updated_ts_ms,
@@ -382,7 +403,10 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
       {
         label: "Price Age",
         value: formatAgeMs(priceAgeMs),
-        meta: latestPriceTs ? `last price ${fmtTime(latestPriceTs)}` : "last price —",
+        meta: safeJoin([
+          priceFreshnessLabel,
+          latestPriceTs ? `last price ${fmtTime(latestPriceTs)}` : "last price —",
+        ]),
       },
       {
         label: "Providers",
@@ -414,8 +438,17 @@ export function normalizeDataHealthScreen(results = {}, { nowMs = Date.now() } =
       },
       {
         id: "dataFreshnessPill",
-        tone: freshnessTone(priceAgeMs, 30_000, 120_000),
-        text: `price age ${formatAgeMs(priceAgeMs)}`,
+        tone: priceFreshnessStatus === "stale"
+          ? "warn"
+          : priceFreshnessStatus === "missing" || priceFreshnessStatus === "error"
+            ? "bad"
+            : freshnessTone(priceAgeMs, 30_000, 120_000),
+        text: safeJoin([
+          priceFreshnessStatus ? `prices ${priceFreshnessStatus}` : "price age",
+          priceFreshnessSource ? `source ${priceFreshnessSource}` : "",
+          priceFreshness.simulated ? "sim" : "",
+          formatAgeMs(priceAgeMs),
+        ]),
         staleAgeMs: priceAgeMs,
         staleWarnMs: 30_000,
         staleCritMs: 120_000,

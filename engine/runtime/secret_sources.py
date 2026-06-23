@@ -177,7 +177,10 @@ OPTIONAL_PROVIDER_SECRET_KEYS = frozenset(
 REPO_LOCAL_ENV_RELATIVE_PATHS = (
     ".env",
     ".env.local",
+    ".env.codex-sim-paper.bak",
+    ".env.codex-sim-paper-db.bak",
     "deploy/compose/.env",
+    "deploy/compose/.env.codex-sim-paper.bak",
     "deploy/env/trading.env",
 )
 

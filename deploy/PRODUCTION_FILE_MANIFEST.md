@@ -11,7 +11,8 @@ This is the copy policy for a Linux deployment mirror.
 - Browser/operator assets: `ui/`, `boot/`, `package.json`, and
   `package-lock.json`.
 - Deployment assets: `ops/server/`, `ops/backup/`, `deploy/`, `.dockerignore`,
-  `.env.example`, `requirements.txt`, `pyproject.toml`, and `ruff.toml`.
+  `.env.example`, Python requirement manifests/locks (`requirements*.txt` and
+  `requirements*.in`), `pyproject.toml`, and `ruff.toml`.
 - Static seed/reference data that is not runtime state, including
   `data/model_configs.json`, `data/sec_company_tickers_exchange.json`, and
   `sources_rss.json`.

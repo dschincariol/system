@@ -35,8 +35,14 @@ export async function fetchJSON(path, options = {}) {
     data = null;
   }
 
-  if (!res.ok) {
-    const msg = (data && data.error) ? data.error : txt;
+  const allowedBusinessRefusal = allowBusinessFalse
+    && res.status >= 400
+    && res.status < 500
+    && data
+    && typeof data === "object"
+    && data.ok === false;
+  if (!res.ok && !allowedBusinessRefusal) {
+    const msg = (data && (data.message || data.reason || data.reason_code || data.error)) ? (data.message || data.reason || data.reason_code || data.error) : txt;
     throw new Error(`${res.status} ${res.statusText}: ${msg}`);
   }
 

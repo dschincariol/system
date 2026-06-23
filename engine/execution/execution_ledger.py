@@ -33,6 +33,7 @@ from engine.runtime.state_cache import cache_get_or_load, cache_set, cache_inval
 from engine.runtime.tracing import trace_event
 from engine.strategy.model_marketplace import record_live_fill_attribution
 from engine.execution.order_command_boundary import record_order_event as record_execution_boundary_event
+from engine.execution import execution_ledger_serialization as _ledger_serialization
 
 # Back-compat: some deployments reference this import elsewhere.
 # Keep the import optional so the ledger remains usable in narrower setups.
@@ -172,11 +173,7 @@ def _mark_execution_ledger_schema_ready(con) -> None:
 
 
 def _trade_outcome_label(pnl_value: float) -> str:
-    if float(pnl_value) > 0.0:
-        return "win"
-    if float(pnl_value) < 0.0:
-        return "loss"
-    return "flat"
+    return _ledger_serialization.trade_outcome_label(pnl_value)
 
 
 def _register_timescale_trade_outcomes_after_commit(con, rows: List[Dict[str, Any]]) -> None:
@@ -497,249 +494,41 @@ def now_ms() -> int:
 
 
 def _safe_json_dict(v: Any) -> Dict[str, Any]:
-    if isinstance(v, dict):
-        return dict(v)
-    if isinstance(v, str) and v.strip():
-        try:
-            obj = json.loads(v)
-            return dict(obj) if isinstance(obj, dict) else {}
-        except Exception as e:
-            _warn_nonfatal(
-                "EXECUTION_LEDGER_SAFE_JSON_DICT_FAILED",
-                e,
-                once_key=f"safe_json_dict:{str(v)[:80]}",
-                raw_preview=str(v)[:200],
-            )
-            return {}
-    return {}
+    return _ledger_serialization.safe_json_dict(v, warn_nonfatal=_warn_nonfatal)
 
 
 def _safe_json_obj(v: Any) -> Dict[str, Any]:
-    return _safe_json_dict(v)
+    return _ledger_serialization.safe_json_obj(v, warn_nonfatal=_warn_nonfatal)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
+    return _ledger_serialization.safe_float(value, default)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
+    return _ledger_serialization.safe_int(value, default)
 
 
 def _pick_float(*vals: Any) -> Optional[float]:
-    for v in vals:
-        try:
-            if v is None or v == "":
-                continue
-            return float(v)
-        except Exception as e:
-            _warn_nonfatal(
-                "EXECUTION_LEDGER_PICK_FLOAT_FAILED",
-                e,
-                once_key=f"pick_float:{v}",
-                raw_value=v,
-            )
-            continue
-    return None
+    return _ledger_serialization.pick_float(*vals, warn_nonfatal=_warn_nonfatal)
 
 
 def _extract_strategy_name(extra_payload: Any) -> Optional[str]:
-    obj = _safe_json_dict(extra_payload) if isinstance(extra_payload, dict) else _safe_json_obj(extra_payload)
-
-    try:
-        v = obj.get("strategy_name")
-        if v:
-            return str(v)
-    except Exception as e:
-        _warn_nonfatal("EXECUTION_LEDGER_STRATEGY_NAME_EXTRACT_FAILED", e, once_key="strategy_name_extract:strategy_name")
-
-    try:
-        v = obj.get("model_name")
-        if v:
-            return str(v)
-    except Exception as e:
-        _warn_nonfatal("EXECUTION_LEDGER_STRATEGY_NAME_EXTRACT_FAILED", e, once_key="strategy_name_extract:model_name")
-
-    try:
-        strategy_obj = obj.get("strategy")
-        if isinstance(strategy_obj, dict):
-            v = strategy_obj.get("name")
-            if v:
-                return str(v)
-        elif isinstance(strategy_obj, str) and strategy_obj.strip():
-            return str(strategy_obj).strip()
-    except Exception as e:
-        _warn_nonfatal("EXECUTION_LEDGER_STRATEGY_NAME_EXTRACT_FAILED", e, once_key="strategy_name_extract:strategy")
-
-    try:
-        ex = obj.get("explain")
-        if isinstance(ex, dict):
-            st = ex.get("strategy")
-            if isinstance(st, dict) and st.get("name"):
-                return str(st.get("name"))
-            if isinstance(st, str) and st.strip():
-                return str(st).strip()
-    except Exception as e:
-        _warn_nonfatal("EXECUTION_LEDGER_STRATEGY_NAME_EXTRACT_FAILED", e, once_key="strategy_name_extract:explain")
-
-    try:
-        ex = obj.get("explain")
-        if isinstance(ex, dict):
-            reason = ex.get("reason")
-            if isinstance(reason, dict):
-                v = reason.get("strategy")
-                if v:
-                    return str(v)
-
-                sa = reason.get("strategy_alloc")
-                if isinstance(sa, dict) and len(sa) == 1:
-                    only_key = next(iter(sa.keys()), None)
-                    if only_key:
-                        return str(only_key)
-    except Exception as e:
-        _warn_nonfatal("EXECUTION_LEDGER_STRATEGY_NAME_EXTRACT_FAILED", e, once_key="strategy_name_extract:explain_reason")
-
-    try:
-        ex = obj.get("execution")
-        if isinstance(ex, dict):
-            sa = ex.get("strategy_alloc")
-            if isinstance(sa, dict) and len(sa) == 1:
-                only_key = next(iter(sa.keys()), None)
-                if only_key:
-                    return str(only_key)
-    except Exception as e:
-        _warn_nonfatal("EXECUTION_LEDGER_STRATEGY_NAME_EXTRACT_FAILED", e, once_key="strategy_name_extract:execution")
-
-    return None
+    return _ledger_serialization.extract_strategy_name(
+        extra_payload,
+        warn_nonfatal=_warn_nonfatal,
+    )
 
 
 def _normalize_model_id(model_id: Any) -> str:
-    mid = str(model_id or "").strip()
-    return mid or "baseline"
+    return _ledger_serialization.normalize_model_id(model_id)
 
 
 def _extract_model_identity(extra_payload: Any) -> Dict[str, Any]:
-    obj = _safe_json_dict(extra_payload) if isinstance(extra_payload, dict) else _safe_json_obj(extra_payload)
-    candidates = []
-    seen = set()
-
-    def _walk(candidate: Any, depth: int = 0) -> None:
-        if not isinstance(candidate, dict) or depth > 4:
-            return
-        key = id(candidate)
-        if key in seen:
-            return
-        seen.add(key)
-        candidates.append(dict(candidate))
-        for nested_key in ("meta", "original_order", "order", "intent", "signal", "explain", "model", "strategy"):
-            nested = candidate.get(nested_key)
-            if isinstance(nested, dict):
-                _walk(nested, depth + 1)
-
-    _walk(obj, 0)
-
-    out: Dict[str, Any] = {}
-
-    for candidate in candidates:
-        if not out.get("model_id"):
-            for key in ("model_id", "agent_id"):
-                val = candidate.get(key)
-                if isinstance(val, str) and val.strip():
-                    out["model_id"] = _normalize_model_id(val)
-                    break
-
-        if not out.get("model_name"):
-            for key in ("model_name", "strategy_name", "strategy", "model"):
-                val = candidate.get(key)
-                if isinstance(val, str) and val.strip():
-                    out["model_name"] = str(val).strip()
-                    break
-
-        if not out.get("model_kind"):
-            for key in ("model_kind", "kind", "type"):
-                val = candidate.get(key)
-                if isinstance(val, str) and val.strip():
-                    out["model_kind"] = str(val).strip()
-                    break
-
-        if out.get("model_ts_ms") is None:
-            for key in ("model_ts_ms", "ts_ms", "trained_ts_ms"):
-                val = candidate.get(key)
-                if val is not None:
-                    try:
-                        out["model_ts_ms"] = int(val)
-                        break
-                    except Exception as e:
-                        _warn_nonfatal("EXECUTION_LEDGER_MODEL_TS_PARSE_FAILED", e, once_key=f"model_ts_parse:{key}", field=str(key), raw_value=val)
-
-        if not out.get("model_version"):
-            for key in ("model_version", "version"):
-                val = candidate.get(key)
-                if isinstance(val, str) and val.strip():
-                    out["model_version"] = str(val).strip()
-                    break
-
-        if not out.get("regime"):
-            for key in ("regime", "current_regime", "regime_label", "market_regime", "market_regime_label"):
-                val = candidate.get(key)
-                if isinstance(val, str) and val.strip():
-                    out["regime"] = str(val).strip()
-                    break
-
-        if out.get("horizon_s") is None:
-            for key in ("horizon_s", "horizon"):
-                val = candidate.get(key)
-                if val is not None:
-                    try:
-                        out["horizon_s"] = int(val)
-                        break
-                    except Exception as e:
-                        _warn_nonfatal("EXECUTION_LEDGER_HORIZON_PARSE_FAILED", e, once_key=f"horizon_parse:{key}", field=str(key), raw_value=val)
-
-        strategy_obj = candidate.get("strategy")
-        if isinstance(strategy_obj, dict) and not out.get("model_name"):
-            val = strategy_obj.get("name")
-            if isinstance(val, str) and val.strip():
-                out["model_name"] = str(val).strip()
-
-        model_obj = candidate.get("model")
-        if isinstance(model_obj, dict):
-            if not out.get("model_id"):
-                for key in ("model_id", "id", "agent_id"):
-                    val = model_obj.get(key)
-                    if isinstance(val, str) and val.strip():
-                        out["model_id"] = _normalize_model_id(val)
-                        break
-            if not out.get("model_name"):
-                for key in ("model_name", "name", "id"):
-                    val = model_obj.get(key)
-                    if isinstance(val, str) and val.strip():
-                        out["model_name"] = str(val).strip()
-                        break
-            if not out.get("model_kind"):
-                for key in ("model_kind", "kind", "type"):
-                    val = model_obj.get(key)
-                    if isinstance(val, str) and val.strip():
-                        out["model_kind"] = str(val).strip()
-                        break
-            if out.get("model_ts_ms") is None:
-                for key in ("model_ts_ms", "ts_ms", "trained_ts_ms"):
-                    val = model_obj.get(key)
-                    if val is not None:
-                        try:
-                            out["model_ts_ms"] = int(val)
-                            break
-                        except Exception as e:
-                            _warn_nonfatal("EXECUTION_LEDGER_MODEL_TS_PARSE_FAILED", e, once_key=f"model_obj_ts_parse:{key}", field=str(key), raw_value=val)
-
-    out["model_id"] = _normalize_model_id(out.get("model_id"))
-    return out
+    return _ledger_serialization.extract_model_identity(
+        extra_payload,
+        warn_nonfatal=_warn_nonfatal,
+    )
 
 
 def _table_exists(con, table_name: str) -> bool:
@@ -1440,7 +1229,7 @@ def _rebuild_execution_orders_if_needed(con) -> None:
         con.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS uq_portfolio_orders_id_source_prediction_lineage
-              ON portfolio_orders(id, source_alert_id, prediction_id)
+              ON portfolio_orders(id, source_alert_id, prediction_id, ts_ms)
             """
         )
     portfolio_orders_fk_available = portfolio_orders_available and _table_has_unique_key(con, "portfolio_orders", ("id",))
@@ -1756,7 +1545,7 @@ def _rebuild_execution_fills_if_needed(con) -> None:
         con.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS uq_portfolio_orders_id_source_prediction_lineage
-              ON portfolio_orders(id, source_alert_id, prediction_id)
+              ON portfolio_orders(id, source_alert_id, prediction_id, ts_ms)
             """
         )
     portfolio_orders_fk_available = portfolio_orders_available and _table_has_unique_key(con, "portfolio_orders", ("id",))
@@ -2136,7 +1925,7 @@ def _rebuild_execution_fills_if_needed(con) -> None:
           ON execution_fills(fill_id);
 
         CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_fills_client_fillid
-        ON execution_fills(client_order_id, fill_id)
+        ON execution_fills(client_order_id, fill_id, ts_ms)
         WHERE fill_id IS NOT NULL;
         """
     )
@@ -2267,7 +2056,7 @@ def _init_execution_ledger_schema(con) -> None:
         con.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS uq_portfolio_orders_id_source_prediction_lineage
-              ON portfolio_orders(id, source_alert_id, prediction_id)
+              ON portfolio_orders(id, source_alert_id, prediction_id, ts_ms)
             """
         )
     if _table_exists(con, "execution_orders"):
@@ -2361,7 +2150,7 @@ def _init_execution_ledger_schema(con) -> None:
     con.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_fills_client_fillid
-          ON execution_fills(client_order_id, fill_id)
+          ON execution_fills(client_order_id, fill_id, ts_ms)
           WHERE fill_id IS NOT NULL
         """
     )
@@ -2855,6 +2644,7 @@ def log_submit(
                 strategy=extra_norm.get("strategy_name"),
                 broker=str(broker),
                 ts_ms=int(submit_ts_ms),
+                con=con,
             )
     finally:
         cache_invalidate_namespace("execution_metrics")
@@ -3797,6 +3587,7 @@ def _log_fill_v1(
                 symbol=(str(symbol) if symbol else None),
                 broker=(str(broker) if broker else None),
                 ts_ms=int(fill_ts_ms),
+                con=con,
             )
     finally:
         cache_invalidate_namespace("execution_metrics")
@@ -4202,6 +3993,7 @@ def _log_fill_v2(
                 symbol=str(symbol),
                 broker=(str(broker) if broker else None),
                 ts_ms=int(fill_ts_ms),
+                con=con,
             )
     finally:
         cache_invalidate_namespace("execution_metrics")

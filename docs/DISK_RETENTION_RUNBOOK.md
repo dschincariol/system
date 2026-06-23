@@ -14,29 +14,45 @@ Docker storage is under pressure.
   `TRADING_LOCAL_LOG_BACKUP_COUNT=5` before opening a new append handle.
 - Compose service stdout/stderr uses the Docker `local` log driver by default
   with `DOCKER_LOG_MAX_SIZE=50m` and `DOCKER_LOG_MAX_FILE=5`.
-- Runtime file logs under `/app/logs`, `/zpool/trading/runtime/logs`,
+- Runtime file logs under `/app/logs`, `/auxpool/trading/runtime/logs`,
   `/opt/trading-system/logs`,
   `/opt/trading/app/logs`, boot stderr logs, the diagnostics-only
   operator-AI JSONL log, and the ZFS runtime log bind mount rotate
   daily, rotate early at `maxsize 50M`, keep 10 rotations, delete rotations
   older than 21 days, and compress old logs.
 - Production compose must use explicit ZFS bind mounts for high-growth state:
-  `TRADING_TIMESCALE_DATA=/zpool/trading/timescaledb/data`,
-  `TRADING_REDIS_DATA=/zpool/trading/redis/data`,
-  `TRADING_MINIO_DATA=/zpool/trading/minio/data`,
-  `TRADING_RUNTIME_DATA=/zpool/trading/runtime/data`,
-  `TRADING_RUNTIME_LOGS=/zpool/trading/runtime/logs`, and
+  `TRADING_TIMESCALE_DATA=/dbpool/trading/timescaledb/data`,
+  `TRADING_REDIS_DATA=/auxpool/trading/redis`,
+  `TRADING_MINIO_DATA=/auxpool/trading/minio`,
+  `TRADING_RUNTIME_DATA=/auxpool/trading/runtime/data`,
+  `TRADING_RUNTIME_LOGS=/auxpool/trading/runtime/logs`, and
   `TRADING_BACKUP_ROOT=/var/backups/trading`.
+- `docker-compose.external-services.yml` runs `storage-placement-preflight`
+  before TimescaleDB. That gate uses `engine.runtime.storage_placement` and
+  exits non-zero if PGDATA, `pg_wal`, Redis, MinIO, runtime state, or backups
+  are under `/var/lib/docker`/`/var/lib/containerd`, off the approved prefixes,
+  root-backed, or visible on a non-ZFS mount.
 - TimescaleDB WAL archiving treats `/var/backups/trading` as a required mount,
   not a directory to create opportunistically. If the ZFS dataset is absent or
   unwritable by the container `postgres` UID, `ops/backup/wal_archive.sh` fails
   the archive command loudly instead of writing WAL into Docker/root storage.
+  The recurring backup-evidence gate reasserts the archive target directories to
+  the configured container `postgres` UID, `trading` group, and `2750` mode and
+  records a signed `wal_archive_target` diagnosis artifact when it repairs a
+  wrong-owner or wrong-mode condition. That diagnosis includes the pre-repair
+  `wal_archive.sh` probe status, failure event/exit code when the drift blocks
+  archiving, `pg_stat_archiver` failure fields, and the applied ownership/mode
+  fix.
 - Disk pressure diagnostics warn at `DISK_PRESSURE_WARN_FREE_PCT=15` or
   `DISK_PRESSURE_WARN_FREE_BYTES=21474836480`; they fail critical preflight at
   `DISK_PRESSURE_CRITICAL_FREE_PCT=5` or
   `DISK_PRESSURE_CRITICAL_FREE_BYTES=5368709120`.
-- Backup retention defaults are `TS_BACKUP_KEEP_DAILY_DAYS=14`,
-  `TS_BACKUP_KEEP_WEEKLY_DAYS=365`, and `TS_BACKUP_WAL_CUSHION_DAYS=7`.
+- Backup retention defaults are local-only PITR retention for a database that
+  may exceed 1.5 TB: `TS_BACKUP_KEEP_RECENT_COUNT=2`,
+  `TS_BACKUP_KEEP_DAILY_DAYS=0`, `TS_BACKUP_KEEP_WEEKLY_DAYS=0`, and
+  `TS_BACKUP_WAL_CUSHION_DAYS=10`. A year of local weekly full backups does
+  not fit on the 2.9 TiB Crucial backup pool; archival base backups must be
+  pushed off host through `TS_BASE_BACKUP_OFFSITE_CMD`.
 
 ## Local Log Writers Covered
 
@@ -85,44 +101,66 @@ backup retention status.
 `prod_preflight.py` also reports `storage_placement` and `disk_pressure`.
 Production is not ready if any critical state path resolves to
 `/var/lib/docker`, `/var/lib/containerd`, a non-ZFS visible mount, or a host
-path outside `/zpool` and `/var/backups/trading`.
+path outside `/zpool`, `/dbpool`, `/auxpool`, and `/var/backups/trading`.
 
-## Tune ZFS Pool And PGDATA Dataset
+## Provision 3-NVMe Storage Pools
 
-Run T2.5 before or during the T1.3c Docker data-root move. The automation is
-idempotent and captures before/after state under
-`TRADING_ZFS_CAPTURE_DIR` (default `/var/tmp/trading-zfs-tuning`):
+Host-run only. The repo-tracked entry point is
+`ops/server/provision_storage_pools.sh`. It is idempotent, defaults to dry-run,
+uses the confirmed `/dev/disk/by-id/...` selectors, and captures state under
+`TRADING_STORAGE_CAPTURE_DIR` (default
+`/var/tmp/trading-storage-provision`).
+
+The target layout is:
+
+| Pool | Device | Role |
+| --- | --- | --- |
+| `dbpool` | Samsung 990 EVO Plus 4TB, `/dev/disk/by-id/nvme-Samsung_SSD_990_EVO_Plus_4TB_S7U8NU0YA01981P` | Timescale PGDATA and `pg_wal` at `/dbpool/trading/timescaledb/data` |
+| `zpool` | Existing Crucial pool on the boot drive | Backups at `/var/backups/trading`; keep `zpool/trading-backups compression=zstd` |
+| `auxpool` | Kingston OM8TAP4 2TB, `/dev/disk/by-id/nvme-KINGSTON_OM8TAP42048K1-A00_50026B73842ACAC7` | Redis, MinIO, runtime data/logs, artifact caches, training/offline scratch |
+
+First inspect the dry-run:
 
 ```bash
 cd /home/david/gitsandbox/system/system
-sudo bash ops/server/zfs_tuning.sh apply --dry-run
-sudo bash ops/server/zfs_tuning.sh apply
-bash ops/server/zfs_tuning.sh verify
+bash ops/server/provision_storage_pools.sh spec
+sudo bash ops/server/provision_storage_pools.sh apply --dry-run
 ```
 
-The apply action enforces the pool and general dataset policy:
+Apply mode has explicit destructive gates. The Samsung wipe requires
+`CONFIRM_WIPE_SAMSUNG=nvme2n1`. The Kingston Windows/BitLocker reclaim is
+delegated to `reclaim_idle_nvme.sh`; it requires `IDLE_NVME_DECISION=RECLAIM`,
+`TARGET_DISK_BY_ID`, `CONFIRM_DESTROY=nvme0n1`, `RECLAIM_DRY_RUN=0`, fresh
+idle-NVMe assessment evidence, and fresh backup/restore evidence. Do not set
+those variables unless Windows reclaim is intentional.
 
-- `zpool set autotrim=on zpool` for the NVMe-backed pool.
-- `atime=off` on every existing dataset under `zpool`, with the root dataset
-  set so future children inherit the policy unless deliberately overridden.
-- `compression=lz4` on every existing dataset under `zpool`, replacing the old
-  `gzip-4` data default and catching child datasets that drift to a higher-CPU
-  compression policy.
-- If the dedicated PGDATA dataset already exists, the same PGDATA properties
-  listed below are applied in place.
+```bash
+sudo CONFIRM_WIPE_SAMSUNG=nvme2n1 \
+  IDLE_NVME_DECISION=RECLAIM \
+  TARGET_DISK_BY_ID=/dev/disk/by-id/nvme-KINGSTON_OM8TAP42048K1-A00_50026B73842ACAC7 \
+  CONFIRM_DESTROY=nvme0n1 \
+  RECLAIM_DRY_RUN=0 \
+  bash ops/server/provision_storage_pools.sh apply --no-dry-run
+```
 
-The verifier is read-only and uses `zdb -C zpool` for actual on-disk ashift
-because `zpool get ashift` can report default `0`. It fails unless every vdev
-reports `ashift=12`; ashift is immutable on existing vdevs, so a mismatch means
-a maintenance-window migration to a newly created `ashift=12` pool, followed by
-Docker/backups restore evidence, not an in-place repair. The script never
-destroys or recreates the pool. It also walks every existing dataset under
-`zpool` and fails if any child has `atime` or `compression` outside the T2.5
-policy.
+The provisioner never destroys `zpool`. It only sets `zpool autotrim=on`,
+sets `atime=off` on existing `zpool` datasets, and refuses to proceed if
+`zpool/trading-backups` is not still `compression=zstd`.
 
-T1.3c consumes the PGDATA dataset spec through the deployed
-`/opt/trading/ops/server/disk_remediation.sh` tool when it creates
-`zpool/docker/timescaledb-pgdata`:
+Verify after apply:
+
+```bash
+bash ops/server/provision_storage_pools.sh verify
+TRADING_ZFS_POOL=dbpool \
+  TRADING_ZFS_DATA_DATASET=dbpool/data \
+  TRADING_ZFS_PGDATA_DATASET=dbpool/trading/timescaledb/data \
+  bash ops/server/zfs_tuning.sh verify
+```
+
+Both verifiers are read-only. They use `zdb -C` for actual on-disk `ashift`;
+`zpool get ashift` can report default `0` and is not sufficient.
+
+The PGDATA dataset spec is:
 
 | Property | Value | Reason |
 | --- | --- | --- |
@@ -138,7 +176,6 @@ caching when choosing `TIMESCALE_EFFECTIVE_CACHE_SIZE`. T1.4 caps ARC at
 48 GiB for this host class; under the metadata-only PGDATA policy that ARC is
 reserved for ZFS metadata and non-PGDATA datasets instead of becoming a second
 copy of Postgres shared buffers.
-
 
 ## Move Backup Root To ZFS
 
@@ -174,68 +211,35 @@ sudo docker exec -u postgres trading-timescaledb \
   /opt/trading/ops/backup/wal_archive_catchup.sh
 ```
 
-## Move Existing Docker State To ZFS
+## Migrate PGDATA To dbpool
 
-Use this sequence for a live host that still has named Docker volumes on root
-ext4. Do not prune or delete Docker volumes until the restore drill has passed.
+Host-run only. Do not migrate PGDATA while TimescaleDB is running. The compose
+target remains an explicit bind mount, not a Docker named volume:
+`TRADING_TIMESCALE_DATA=/dbpool/trading/timescaledb/data`.
 
-### Preferred: relocate Docker data-root
+### Fresh initdb path
 
-For host `bart`, where the live `compose_timescaledb-data` volume still resides
-under `/var/lib/docker` on the root ext4 filesystem, use the installed
-remediation tool. The command moves Docker's whole data-root to the dedicated
-`zpool/docker` dataset, creates a tuned child dataset for Timescale PGDATA, and
-keeps a rollback copy before root space is reclaimed.
+Use this when there is no production data to preserve:
 
 ```bash
-sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker --dry-run
-sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker
+docker compose --env-file deploy/compose/.env \
+  -f deploy/compose/docker-compose.external-services.yml \
+  -f deploy/compose/docker-compose.stack.yml down
+
+sudo install -d -m 0700 /dbpool/trading/timescaledb/data
+sudo chown -R 70:70 /dbpool/trading/timescaledb/data
+
+docker compose --env-file deploy/compose/.env \
+  -f deploy/compose/docker-compose.external-services.yml \
+  -f deploy/compose/docker-compose.stack.yml up -d timescaledb
 ```
 
-The command enforces these gates in production code:
+After the first container boot, verify that `pg_wal` exists under
+`/dbpool/trading/timescaledb/data` and run production preflight.
 
-- Refuses to run while backup, prune, restore-drill, or backup-evidence services
-  are active.
-- Stops backup timers, the Compose stack, Docker, and the Docker socket before
-  copying.
-- Requires enough ZFS free space for both the new Docker data-root and a
-  rollback archive.
-- Creates `zpool/docker` with container-safe ZFS properties
-  (`compression=zstd`, `atime=off`, `xattr=sa`, `acltype=posixacl`,
-  `dnodesize=auto`, `recordsize=128K`, `logbias=latency`).
-- Creates `zpool/docker/timescaledb-pgdata` mounted at the Timescale volume's
-  `_data` directory with the T2.5 PGDATA tuning:
-  `recordsize=16K`, `logbias=throughput`, `compression=lz4`, `atime=off`, and
-  `primarycache=metadata`. `pg_wal` remains under that tuned PGDATA dataset
-  unless a later change splits it explicitly.
-- Merges `"data-root": "/zpool/docker"` into `/etc/docker/daemon.json` while
-  preserving existing settings, and backs up the previous file.
-- Copies with `rsync -aHAX --numeric-ids --info=progress2`.
-- Restarts Docker and Compose, then waits for all Compose containers to be
-  running and healthy or to have no healthcheck.
-- Verifies Docker reports `/zpool/docker`, verifies the Timescale volume
-  mountpoint is on ZFS, and verifies `pg_wal` exists under PGDATA.
-- After those checks pass, archives the old root copy to
-  `/zpool/docker-rollback/var-lib-docker.<timestamp>`, removes the root copy,
-  recreates an empty `/var/lib/docker`, and asserts root free space increased.
+### Existing data: backup/restore path
 
-Rollback is guarded by the state directory written during relocation:
-
-```bash
-sudo bash /opt/trading/ops/server/disk_remediation.sh relocate-docker --rollback
-```
-
-Rollback stops the stack and Docker, restores the archived Docker tree to the
-previous data-root, restores the prior `daemon.json` or removes it if it did not
-exist, restarts Docker and Compose, and reruns container health checks. Do not
-delete `/zpool/docker-rollback/var-lib-docker.<timestamp>` until the maintenance
-window, postflight preflight, and restore-drill evidence have passed. The
-relocation command prints the exact `sudo rm -rf ...` cleanup command for that
-rollback archive.
-
-### Manual bind-mount migration fallback
-
-1. Stop writers and take recovery evidence:
+Use this when the database already contains state:
 
 ```bash
 docker compose --env-file deploy/compose/.env \
@@ -248,34 +252,32 @@ sudo cp -a /var/backups/trading/evidence/latest_backup_restore_evidence.json \
   "/var/backups/trading/evidence/pre-zfs-migration.$(date -u +%Y%m%dT%H%M%SZ).json"
 ```
 
-2. Create ZFS destinations and copy with ownership, modes, xattrs, and hard
-links preserved. Confirm exact volume names with `docker volume ls` first:
+Restore the latest verified base backup into the dbpool dataset:
 
 ```bash
-sudo install -d -m 0750 /zpool/trading/timescaledb/data /zpool/trading/redis/data /zpool/trading/minio/data
-sudo install -d -m 0750 /zpool/trading/runtime/data /zpool/trading/runtime/logs
-sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_timescaledb-data/_data/ /zpool/trading/timescaledb/data/
-sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_redis-data/_data/ /zpool/trading/redis/data/
-sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_minio-data/_data/ /zpool/trading/minio/data/
-sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_trading-data/_data/ /zpool/trading/runtime/data/
-sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_trading-logs/_data/ /zpool/trading/runtime/logs/
-sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_timescaledb-data/_data/ /zpool/trading/timescaledb/data/
-sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_redis-data/_data/ /zpool/trading/redis/data/
-sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_minio-data/_data/ /zpool/trading/minio/data/
-sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_trading-data/_data/ /zpool/trading/runtime/data/
-sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_trading-logs/_data/ /zpool/trading/runtime/logs/
+sudo /opt/trading/ops/backup/restore.sh \
+  --target-time latest \
+  --into /dbpool/trading/timescaledb/data \
+  --force
+sudo chown -R 70:70 /dbpool/trading/timescaledb/data
+sudo chmod 0700 /dbpool/trading/timescaledb/data
 ```
 
-3. Verify before switching mounts:
+If the current source is a cleanly stopped PGDATA directory and backup/restore
+has already been proven, a direct copy is also acceptable:
 
 ```bash
-sudo find /zpool/trading -xdev -type f -printf '%P\0' | sort -z | sudo xargs -0 sha256sum > /tmp/zpool-trading.sha256
-sudo find /zpool/trading/timescaledb/data -maxdepth 2 -printf '%u:%g %m %p\n' | head -80
-sudo du -sh /zpool/trading/timescaledb/data /zpool/trading/redis/data /zpool/trading/minio/data /zpool/trading/runtime/data /zpool/trading/runtime/logs
+sudo rsync -aHX --numeric-ids --info=progress2 \
+  /path/to/stopped/old-pgdata/ \
+  /dbpool/trading/timescaledb/data/
+sudo rsync -aHXn --checksum --numeric-ids --delete \
+  /path/to/stopped/old-pgdata/ \
+  /dbpool/trading/timescaledb/data/
+sudo chown -R 70:70 /dbpool/trading/timescaledb/data
+sudo chmod 0700 /dbpool/trading/timescaledb/data
 ```
 
-4. Update `deploy/compose/.env` to the ZFS paths from `.env.example`, then
-start and verify:
+Then start and verify:
 
 ```bash
 docker compose --env-file deploy/compose/.env \
@@ -290,9 +292,48 @@ sudo docker exec -u postgres trading-timescaledb /opt/trading/ops/backup/wal_arc
 ```
 
 Expected result: `storage_placement.ok=true`, disk pressure is not critical for
-`root`, `zfs_pool`, `backup_wal`, or Docker volume roots, and signed backup
-evidence plus restore-drill evidence is fresh. Only then may old Docker named
-volumes be archived or removed under a separate change ticket.
+`root`, `zfs_pool`, `backup_wal`, or Docker volume roots, `pg_wal` exists under
+dbpool PGDATA, and signed backup evidence plus restore-drill evidence is fresh.
+Only then may old Docker named volumes be archived or removed under a separate
+change ticket.
+
+## Migrate Aux State To auxpool
+
+Redis, MinIO, runtime data/logs, artifact mirrors, and training/offline caches
+are rebuildable or less critical than PGDATA, but they must still leave
+`/var/lib/docker` before production bring-up. If old Docker named volumes
+exist, stop the stack and copy with ownership, modes, xattrs, and hard links
+preserved. Confirm exact volume names with `docker volume ls` first.
+
+```bash
+sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_redis-data/_data/ /auxpool/trading/redis/
+sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_minio-data/_data/ /auxpool/trading/minio/
+sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_trading-data/_data/ /auxpool/trading/runtime/data/
+sudo rsync -aHAX --numeric-ids --info=progress2 /var/lib/docker/volumes/system_trading-logs/_data/ /auxpool/trading/runtime/logs/
+sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_redis-data/_data/ /auxpool/trading/redis/
+sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_minio-data/_data/ /auxpool/trading/minio/
+sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_trading-data/_data/ /auxpool/trading/runtime/data/
+sudo rsync -aHAXn --checksum --numeric-ids --delete /var/lib/docker/volumes/system_trading-logs/_data/ /auxpool/trading/runtime/logs/
+```
+
+Use the compose `.env` paths already committed for `/auxpool/trading/...`.
+Production preflight must show verified ZFS mounts, not prefix-only evidence.
+
+## Offsite Base Backup Requirement
+
+Local retention is intentionally short: two base backups plus the WAL cushion.
+Configure an off-host archival copy before relying on local pruning:
+
+```bash
+TS_OFFSITE_BACKUP_DEST=/mnt/backup-nas/trading-base \
+TS_BASE_BACKUP_OFFSITE_CMD='bash /opt/trading/ops/backup/offsite_base_backup_stub.sh' \
+sudo -E /opt/trading/ops/backup/base_backup.sh
+```
+
+For S3-compatible destinations, install/configure the AWS CLI for the service
+user and set `TS_OFFSITE_BACKUP_DEST=s3://bucket/prefix`. WAL archiving remains
+fail-closed through `archive_mode=on`, `TS_WAL_ARCHIVE_REQUIRE_MOUNT=1`, and
+`ops/backup/wal_archive.sh`.
 
 ## Safe Cleanup
 

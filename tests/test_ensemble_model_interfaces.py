@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -216,6 +217,37 @@ class EnsembleModelInterfaceTests(unittest.TestCase):
             int(self.inference._resolve_ensemble_parallel_workers()),
             int(self.inference.ENSEMBLE_PARALLEL_WORKERS),
         )
+
+    def test_ensemble_prediction_survives_model_input_health_write_timeout(self) -> None:
+        self._store_feature_snapshot("NVDA", scale=1.2)
+        gbm = self._fit_gbm_wrapper(model_name="gbm_health_timeout", default_confidence=0.8)
+        online = self._fit_online_wrapper(model_name="online_health_timeout", default_confidence=0.66)
+
+        gbm.register(
+            symbol="NVDA",
+            version="v1",
+            artifact_uri=Path(self.tmp.name) / "nvda_gbm_health_timeout.pkl",
+            performance_metrics={"quality_score": 0.8},
+            is_active=True,
+        )
+        online.register(
+            symbol="NVDA",
+            version="v1",
+            artifact_uri=Path(self.tmp.name) / "nvda_online_health_timeout.pkl",
+            performance_metrics={"quality_score": 0.66},
+            is_active=True,
+        )
+
+        with patch.object(
+            self.inference,
+            "record_model_input_validation",
+            side_effect=sqlite3.OperationalError("sqlite_write_lock_timeout:timeout_s=0.25"),
+        ):
+            result = self.inference.predict("NVDA", persist=False, ensemble_method="weighted_average")
+
+        self.assertEqual(str(result.get("status") or ""), "ok")
+        self.assertFalse(bool(result.get("safe_output")))
+        self.assertEqual(int(result.get("ensemble_size") or 0), 2)
 
     def test_ensemble_member_predictions_execute_in_parallel(self) -> None:
         self._store_feature_snapshot("NVDA", scale=1.2)

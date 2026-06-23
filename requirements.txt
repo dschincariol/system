@@ -1,3 +1,6 @@
--r requirements-base.txt
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1+cpu
+# CPU runtime install manifest.
+#
+# Keep direct runtime requirements in requirements.in and regenerate
+# requirements.lock.txt after dependency changes.
+-c requirements.lock.txt
+-r requirements.in

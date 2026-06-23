@@ -1,0 +1,65 @@
+# Opt-in AMD XDNA2 NPU (Ryzen AI) inference overlay for Strix Halo / bart.
+#
+# Non-arming batch container for INT8 NLP inference (FinBERT) on the NPU via
+# ONNX Runtime + the VitisAI execution provider. Like the ROCm training overlay,
+# it has profiles:[npu] so it never starts with the normal stack, runs no
+# supervised loop, routes to no broker, and mounts no secrets.
+#
+# Prereqs (verify first): kernel amdxdna driver + /dev/accel/accel0 (already
+# present on bart) AND the XRT/xdna userspace + onnxruntime-vitisai installed in
+# the image. See docs/NPU_ACCELERATION.md for the build/runbook. The base image
+# must carry XRT + the VitisAI EP; the stock python:3.11-slim runtime image does
+# NOT, so build this against an image that does (NPU_RUNTIME_IMAGE).
+#
+# Usage (defaults to the NPU readiness validator):
+#
+#   docker compose \
+#     -f deploy/compose/docker-compose.amd-npu.yml \
+#     --profile npu run --rm npu-inference
+#
+#   # Run real INT8 FinBERT scoring once a quantized model exists:
+#   docker compose ... --profile npu run --rm npu-inference \
+#     python -c "from engine.data.finbert_onnx_backend import score_texts_onnx as s; print(s(['earnings beat expectations']))"
+
+services:
+  npu-inference:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.runtime
+      args:
+        # Override with an image that bundles XRT + onnxruntime-vitisai.
+        PYTHON_RUNTIME_IMAGE: ${NPU_RUNTIME_IMAGE:?set NPU_RUNTIME_IMAGE to an XRT+VitisAI base image}
+        TRADING_DEPENDENCY_PROFILE: amd-npu
+        TRADING_REQUIREMENTS_FILE: requirements-amd-npu.txt
+    image: ${APP_NPU_IMAGE:-trading-npu-inference:local}
+    container_name: trading-npu-inference
+    profiles: ["npu"]
+    restart: "no"
+    environment:
+      ENGINE_SUPERVISED: "0"
+      TRADING_ROLE: batch-npu-inference
+      TRADING_NPU_INFERENCE: "1"
+      FINBERT_BACKEND: onnx-vitisai
+      FINBERT_ONNX_PATH: ${FINBERT_ONNX_PATH:-/app/artifacts/finbert_onnx/model.int8.onnx}
+      VITISAI_CONFIG: ${VITISAI_CONFIG:-}
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${TRADING_RENDER_GID:-991}"
+      - "${TRADING_VIDEO_GID:-44}"
+    # The NPU pins memory for the device; the default 8MB RLIMIT_MEMLOCK makes
+    # XRT/onnxruntime mmap fail with EAGAIN (-11). Lift it for the container.
+    ulimits:
+      memlock: -1
+    volumes:
+      - npu_artifacts:/app/artifacts
+      - npu_hf_cache:/root/.cache/huggingface
+    command:
+      - python
+      - tools/validate_npu_acceleration.py
+      - --json
+
+volumes:
+  npu_artifacts:
+  npu_hf_cache:

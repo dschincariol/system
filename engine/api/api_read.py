@@ -771,6 +771,45 @@ def get_feed_status():
 
             healthy_providers = len([p for p in providers if p.get("ok")])
             stale_providers = len([p for p in providers if (p.get("age_s") is not None and p.get("age_s") > 120.0)])
+            price_freshness = {
+                "ok": False,
+                "status": "missing",
+                "stale": True,
+                "last_ts_ms": None,
+                "age_s": None,
+                "max_age_s": float(os.environ.get("HEALTH_PRICES_MAX_AGE_S", "120") or 120.0),
+                "source": "",
+                "simulated": False,
+            }
+            if _table_exists(con, "prices"):
+                try:
+                    row = con.execute(
+                        """
+                        SELECT ts_ms, source
+                        FROM prices
+                        WHERE price IS NOT NULL
+                        ORDER BY ts_ms DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                except Exception:
+                    row = con.execute("SELECT MAX(ts_ms), NULL FROM prices WHERE price IS NOT NULL").fetchone()
+                if row and row[0]:
+                    max_age_s = float(os.environ.get("HEALTH_PRICES_MAX_AGE_S", "120") or 120.0)
+                    last_ts_ms = int(row[0])
+                    source = str(row[1] or "")
+                    age_s = round((now_ms - last_ts_ms) / 1000.0, 1)
+                    fresh = bool(age_s < max_age_s)
+                    price_freshness = {
+                        "ok": fresh,
+                        "status": "fresh" if fresh else "stale",
+                        "stale": not fresh,
+                        "last_ts_ms": last_ts_ms,
+                        "age_s": age_s,
+                        "max_age_s": max_age_s,
+                        "source": source,
+                        "simulated": source.lower() == "simulated",
+                    }
 
             return {
                 "ok": True,
@@ -780,7 +819,10 @@ def get_feed_status():
                     "providers_healthy": healthy_providers,
                     "providers_stale": stale_providers,
                     "jobs_total": len(feed_jobs),
+                    "price_status": price_freshness["status"],
+                    "price_source": price_freshness["source"],
                 },
+                "price_freshness": price_freshness,
                 "providers": providers,
                 "jobs": feed_jobs,
             }

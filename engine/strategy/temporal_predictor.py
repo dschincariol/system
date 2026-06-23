@@ -52,7 +52,7 @@ def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, 
 # Prediction uses the same CPU-first device resolver as live event processing.
 # TEMPORAL_USE_CUDA remains a legacy request flag, but it cannot select CUDA
 # unless the explicit runtime/dependency profiles and torch support validate it.
-apply_cpu_first_runtime_defaults()
+apply_cpu_first_runtime_defaults(role="inference")
 _TEMPORAL_DEVICE_RESOLUTION = resolve_torch_device(
     torch,
     env_var="TEMPORAL_DEVICE",

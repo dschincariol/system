@@ -209,6 +209,10 @@ body {
   color: #ffd4db;
 }
 
+.populate-evidence-block .evidence-list {
+  margin-top: 10px;
+}
+
 .guide-shell {
   margin-bottom: 18px;
 }
@@ -255,7 +259,8 @@ body {
 }
 
 .action-item-head,
-.source-card-head {
+.source-card-head,
+.account-card-head {
   display: flex;
   justify-content: space-between;
   gap: 10px;
@@ -283,6 +288,12 @@ body {
   gap: 14px;
 }
 
+.account-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
 .source-card {
   border: 1px solid var(--line);
   border-radius: 18px;
@@ -292,6 +303,15 @@ body {
   gap: 12px;
   cursor: pointer;
   transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.account-card {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 16px;
+  display: grid;
+  gap: 12px;
 }
 
 .source-card:hover {
@@ -320,6 +340,33 @@ body {
 .source-card-actions .btn-secondary {
   padding: 9px 12px;
   font-size: 12px;
+}
+
+.account-used {
+  display: grid;
+  gap: 8px;
+}
+
+.account-used-list,
+.credential-resolution {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.credential-resolution-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+.log-state {
+  margin-bottom: 10px;
 }
 
 .layout {
@@ -398,6 +445,16 @@ tbody tr.is-active {
   border-color: var(--line);
 }
 
+.pill.fx {
+  color: #d9f4ff;
+  background: rgba(71, 193, 255, 0.12);
+  border-color: rgba(71, 193, 255, 0.30);
+}
+
+.fx-test-result .evidence-list {
+  margin-top: 10px;
+}
+
 .detail-pane {
   min-height: 720px;
 }
@@ -455,6 +512,24 @@ tbody tr.is-active {
 .detail-value {
   font-size: 13px;
   line-height: 1.5;
+}
+
+.test-result-block {
+  grid-column: 1 / -1;
+}
+
+.evidence-list,
+.next-steps {
+  margin-top: 10px;
+}
+
+.evidence-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.35fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
 }
 
 .card-inline {
@@ -623,6 +698,51 @@ input[type="checkbox"] {
 .field-help {
   color: var(--muted);
   font-size: 11px;
+  line-height: 1.45;
+}
+
+.field-links {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+
+.field-links a,
+.detail-value a {
+  color: var(--accent-2);
+}
+
+.field-required,
+.field-optional {
+  margin-left: 8px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.field-required {
+  color: var(--warn);
+}
+
+.field-optional {
+  color: var(--muted);
+}
+
+.field-error {
+  min-height: 15px;
+  color: #ffd4db;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.editor-field.has-error {
+  border-color: rgba(255, 107, 125, 0.46);
+}
+
+input.is-invalid {
+  border-color: rgba(255, 107, 125, 0.66);
+  box-shadow: 0 0 0 2px rgba(255, 107, 125, 0.12);
 }
 
 .schema-note {
@@ -670,6 +790,7 @@ input[type="checkbox"] {
   .editor-grid,
   .session-grid,
   .guide-grid,
+  .account-cards,
   .source-cards {
     grid-template-columns: 1fr;
   }

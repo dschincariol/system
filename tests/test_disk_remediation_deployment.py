@@ -43,12 +43,13 @@ def test_bootstrap_installs_and_verify_checks_server_ops_scripts() -> None:
     assert 'SERVER_SCRIPT_DST_DIR="${INSTALL_ROOT}/ops/server"' in bootstrap
     assert "install_server_ops_scripts()" in bootstrap
     assert "disk_remediation.sh" in bootstrap
+    assert "provision_storage_pools.sh" in bootstrap
     assert "zfs_tuning.sh" in bootstrap
     assert "install_server_ops_scripts" in bootstrap.split("main() {", 1)[1]
 
     assert 'SERVER_SCRIPT_DIR="${TRADING_SERVER_SCRIPT_DIR:-${INSTALL_ROOT}/ops/server}"' in verify
     assert "check_server_ops_assets()" in verify
-    assert "disk_remediation.sh zfs_tuning.sh" in verify
+    assert "disk_remediation.sh provision_storage_pools.sh zfs_tuning.sh" in verify
     assert 'bash -n "${SERVER_SCRIPT_DIR}/${script}"' in verify
 
 

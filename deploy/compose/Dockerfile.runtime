@@ -17,7 +17,7 @@ ARG TRADING_REQUIREMENTS_FILE=
 ENV TRADING_DEPENDENCY_PROFILE=${TRADING_DEPENDENCY_PROFILE}
 ENV TRADING_REQUIREMENTS_FILE=${TRADING_REQUIREMENTS_FILE}
 
-COPY requirements*.txt /app/
+COPY requirements*.txt requirements*.in /app/
 COPY deploy/bin/resolve_python_requirements.sh /app/deploy/bin/resolve_python_requirements.sh
 
 RUN python -m pip install --upgrade pip setuptools wheel \

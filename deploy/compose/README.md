@@ -18,7 +18,7 @@ Use these compose assets when you want a containerized staging or production-lik
 ## Bring Up
 
 1. Copy `.env.example` to `.env` in this directory.
-2. Set approved image tags, non-secret runtime values, and secret file paths. `deploy/compose/.env` must point to files such as `TIMESCALE_PASSWORD_FILE`, `REDIS_PASSWORD_FILE`, `MINIO_ROOT_USER_FILE`, `MINIO_ROOT_PASSWORD_FILE`, `DASHBOARD_API_TOKEN_FILE`, `OPERATOR_API_TOKEN_FILE`, `DATA_SOURCE_MASTER_KEY_FILE`, `BACKUP_EVIDENCE_HMAC_KEY_FILE`, and optional provider/broker files such as `POLYGON_API_KEY_FILE`, `TRADIER_API_TOKEN_FILE`, `ALPACA_KEY_ID_FILE`, and `ALPACA_SECRET_KEY_FILE`. Do not paste live secret values into the compose `.env`. Keep `TRADING_DATA_ROOT=/app/data`; it is the container path, while `TRADING_RUNTIME_DATA` is the ZFS host source mounted there. Dashboard and operator token files must contain generated secrets, not placeholders. The operator sidecar is internal-only by default and does not publish port 4001. Keep host publish binds on loopback: `TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`, `REDIS_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`, `MINIO_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`, `MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`, and `DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`. Keep `DOCKER_LOG_DRIVER=local`, `DOCKER_LOG_MAX_SIZE=50m`, and `DOCKER_LOG_MAX_FILE=5` unless the target host has a reviewed reason to change them; these cap Docker stdout/stderr while file logs under `/app/logs` are handled by host logrotate.
+2. Set approved image tags, non-secret runtime values, and secret file paths. `deploy/compose/.env` must point to files such as `TIMESCALE_PASSWORD_FILE`, `REDIS_PASSWORD_FILE`, `MINIO_ROOT_USER_FILE`, `MINIO_ROOT_PASSWORD_FILE`, `DASHBOARD_API_TOKEN_FILE`, `OPERATOR_API_TOKEN_FILE`, `DATA_SOURCE_MASTER_KEY_FILE`, `BACKUP_EVIDENCE_HMAC_KEY_FILE`, and optional provider/broker files such as `POLYGON_API_KEY_FILE`, `TRADIER_API_TOKEN_FILE`, `ALPACA_KEY_ID_FILE`, and `ALPACA_SECRET_KEY_FILE`. Do not paste live secret values into the compose `.env`. Keep `TRADING_DATA_ROOT=/app/data`; it is the container path, while `TRADING_RUNTIME_DATA` is the ZFS host source mounted there. Dashboard and operator token files must contain generated secrets, not placeholders. The operator sidecar is internal-only by default and does not publish port 4001; LAN operators use the authenticated dashboard `/operator/` bridge on `:8000`. Keep data-service host publish binds on loopback: `TIMESCALE_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`, `REDIS_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`, `MINIO_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`, and `MINIO_CONSOLE_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1`. Keep `DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST=127.0.0.1` unless you are enabling the reviewed dashboard-only LAN mode with dashboard token, service flag, and exposure acknowledgement. Keep `DOCKER_LOG_DRIVER=local`, `DOCKER_LOG_MAX_SIZE=50m`, and `DOCKER_LOG_MAX_FILE=5` unless the target host has a reviewed reason to change them; these cap Docker stdout/stderr while file logs under `/app/logs` are handled by host logrotate.
    Create the backup evidence HMAC key before `docker compose up` because the runtime mounts it as a Compose secret:
 
 ```bash
@@ -50,18 +50,47 @@ openssl rand -base64 32 > ../../data/.data_source_master_key
 ```
 
 Production/live preflight rejects raw text, placeholders, short or low-entropy values, malformed base64, and empty key files.
-5. Create the ZFS-backed host directories before first start. The production compose path uses explicit bind mounts rather than Docker named volumes:
+5. Create the ZFS-backed host directories before first start. On host `bart`,
+   prefer `sudo bash ops/server/provision_storage_pools.sh apply --dry-run`
+   followed by the gated real apply from `docs/DISK_RETENTION_RUNBOOK.md`.
+   The production compose path uses explicit bind mounts rather than Docker
+   named volumes:
 
 ```bash
-sudo install -d -m 0750 /zpool/trading/timescaledb/data
-sudo install -d -m 0750 /zpool/trading/redis/data
-sudo install -d -m 0750 /zpool/trading/minio/data
-sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0750 /zpool/trading/runtime/data /zpool/trading/runtime/logs
-sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0750 /zpool/trading/runtime/artifact_mirror /zpool/trading/runtime/training_datasets
+sudo install -d -m 0700 /dbpool/trading/timescaledb/data
+sudo chown -R 70:70 /dbpool/trading/timescaledb/data
+sudo install -d -m 0750 /auxpool/trading/redis /auxpool/trading/minio
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0750 /auxpool/trading/runtime/data /auxpool/trading/runtime/logs
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0750 /auxpool/trading/runtime/artifact_mirror /auxpool/trading/runtime/training_datasets
 sudo install -d -m 0750 /var/backups/trading/wal /var/backups/trading/evidence
 ```
 
-Confirm `.env` keeps `PREFLIGHT_REQUIRE_ZFS_STORAGE=1`, `PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS=1`, `TRADING_ALLOWED_STORAGE_FS_TYPES=zfs`, and every `TRADING_*_DATA`/`TRADING_*_LOGS` source under `/zpool` or `/var/backups/trading`. Production preflight must report verified ZFS mounts, not `approved_prefix_unverified` prefix-only evidence.
+Confirm `.env` keeps `PREFLIGHT_REQUIRE_ZFS_STORAGE=1`,
+`PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS=1`,
+`TRADING_ALLOWED_STORAGE_FS_TYPES=zfs`, and every `TRADING_*_DATA`/
+`TRADING_*_LOGS` source under `/dbpool`, `/auxpool`, `/zpool`, or
+`/var/backups/trading`. Production preflight must report verified ZFS mounts,
+not `approved_prefix_unverified` prefix-only evidence. In `/api/health`, the
+`storage_wal_guards.storage_placement.targets[*]` rows must show
+`evidence_status=satisfied`, `evidence_level=verified_mount`,
+`filesystem_type=zfs`, and the expected `host_source`, `container_destination`,
+`mount_source`, `mount_point`, and `mount_options`.
+The external-services compose file also runs `storage-placement-preflight` before TimescaleDB; TimescaleDB has a `service_completed_successfully` dependency on that gate, so bad `/var/lib/docker` placement for PGDATA, `pg_wal`, Redis, MinIO, runtime state, or backups prevents the database container from starting.
+Operator proof commands for the storage gate:
+
+```bash
+sudo zpool status -v
+sudo zfs list -o name,mountpoint,used,avail,compression,recordsize,primarycache -r dbpool auxpool zpool
+findmnt -T /dbpool/trading/timescaledb/data -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /dbpool/trading/timescaledb/data/pg_wal -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /auxpool/trading/redis -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /auxpool/trading/minio -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /auxpool/trading/runtime/data -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /auxpool/trading/runtime/logs -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /var/backups/trading -o TARGET,SOURCE,FSTYPE,OPTIONS
+docker inspect trading-timescaledb trading-redis trading-minio trading-runtime \
+  --format '{{.Name}} {{range .Mounts}}{{.Source}} -> {{.Destination}} {{end}}'
+```
 6. Build and start the stack:
 
 ```bash
@@ -86,7 +115,16 @@ trading-runtime       127.0.0.1:8000->8000/tcp
 trading-operator      4001/tcp
 ```
 
-If any service shows `0.0.0.0:` or `:::`, stop and fix `.env` before live mode. A reviewed LAN exposure must use VPN or a TLS/authenticated reverse proxy for dashboard access, firewall rules that restrict data services to named management hosts, the service-specific `*_ALLOW_DANGEROUS_PUBLIC_BIND=1` flag, and `TRADING_PUBLIC_NETWORK_EXPOSURE_ACK=I_UNDERSTAND_THIS_EXPOSES_TRADING_SERVICES` with non-placeholder owner and reason fields. Production preflight fails without that acknowledgement.
+If any data service shows `0.0.0.0:` or `:::`, stop and fix `.env` before live mode. The only normal LAN host publish is the dashboard `:8000`, and only after dashboard token enforcement, `DASHBOARD_ALLOW_DANGEROUS_PUBLIC_BIND=1`, and the global `TRADING_PUBLIC_NETWORK_EXPOSURE_ACK=I_UNDERSTAND_THIS_EXPOSES_TRADING_SERVICES` owner/reason fields are set. The operator sidecar must still show only `4001/tcp`; `4001->4001`, `0.0.0.0:4001`, or `*:4001` is not the preferred production contract.
+
+Passive listener check after bring-up:
+
+```bash
+ss -H -ltnp | grep -E '(:8000|:4001|:4000|:7002|:5201)\b' || true
+PREFLIGHT_CHECK_NETWORK_LISTENERS=1 python engine/runtime/prod_preflight.py --json
+```
+
+`prod_preflight.py` fails on wildcard/direct `:4001` and warns on unexpected wildcard listeners for `:4000`, `:7002`, and `:5201`.
 
 The external TimescaleDB service archives WAL to
 `${TRADING_BACKUP_WAL_DIR:-/var/backups/trading/wal}` by invoking the audited
@@ -101,6 +139,15 @@ read-only and sets `TS_WAL_ARCHIVE_REQUIRE_MOUNT=1`, so a missing
 fails loudly instead of creating WAL files in the container root filesystem.
 The archive script does not require `python3`; it uses `sync -f`/`sync` when
 the Timescale image lacks Python.
+After restoring a broken backup mount or archive target, run the catch-up helper
+inside the Timescale container as the `postgres` user so already-ready segments
+are copied through the same audited archive script and processed `.ready`
+markers move to `.done`:
+
+```bash
+docker compose --env-file deploy/compose/.env -f deploy/compose/docker-compose.external-services.yml \
+  exec -u postgres timescaledb /opt/trading/ops/backup/wal_archive_catchup.sh
+```
 
 On a production host, install the backup evidence gate after the stack env is
 populated:
@@ -129,7 +176,9 @@ docker compose \
     -X -v ON_ERROR_STOP=1 \
     -c "SHOW archive_mode;" \
     -c "SHOW archive_command;" \
-    -c "SELECT archived_count,last_archived_wal,last_archived_time,failed_count,last_failed_wal,last_failed_time FROM pg_stat_archiver;"'
+    -c "SELECT archived_count,last_archived_wal,last_archived_time,failed_count,last_failed_wal,last_failed_time FROM pg_stat_archiver;" \
+    -c "SELECT COALESCE(SUM(size),0)::bigint AS wal_bytes, COUNT(*)::bigint AS wal_files FROM pg_ls_waldir() WHERE name ~ '\''^[0-9A-F]{24}(\\.[A-Za-z0-9]+)?$'\'';" \
+    -c "SELECT COUNT(*)::bigint AS ready_count FROM pg_ls_dir('\''pg_wal/archive_status'\'') AS status(name) WHERE name LIKE '\''%.ready'\'';"'
 ```
 
 Expected result: `archive_mode` is `on`, `archive_command` names
@@ -206,24 +255,33 @@ volumes for high-growth state. The selected production layout is:
 
 | State | Container path | Host source |
 | --- | --- | --- |
-| Timescale PGDATA and `pg_wal` | `/var/lib/postgresql/data` | `TRADING_TIMESCALE_DATA=/zpool/trading/timescaledb/data` |
-| Redis appendonly/RDB data | `/data` | `TRADING_REDIS_DATA=/zpool/trading/redis/data` |
-| MinIO object data | `/data` | `TRADING_MINIO_DATA=/zpool/trading/minio/data` |
-| Runtime data | `/app/data` | `TRADING_RUNTIME_DATA=/zpool/trading/runtime/data` |
-| Runtime/operator logs | `/app/logs` | `TRADING_RUNTIME_LOGS=/zpool/trading/runtime/logs` |
-| Artifact mirror/cache | `/app/artifact_mirror` | `TRADING_ARTIFACT_MIRROR=/zpool/trading/runtime/artifact_mirror` |
-| Training dataset cache | `/app/training_datasets` | `TRADING_TRAINING_DATASETS=/zpool/trading/runtime/training_datasets` |
+| Timescale PGDATA and `pg_wal` | `/var/lib/postgresql/data` | `TRADING_TIMESCALE_DATA=/dbpool/trading/timescaledb/data` |
+| Redis appendonly/RDB data | `/data` | `TRADING_REDIS_DATA=/auxpool/trading/redis` |
+| MinIO object data | `/data` | `TRADING_MINIO_DATA=/auxpool/trading/minio` |
+| Runtime data | `/app/data` | `TRADING_RUNTIME_DATA=/auxpool/trading/runtime/data` |
+| Runtime/operator logs | `/app/logs` | `TRADING_RUNTIME_LOGS=/auxpool/trading/runtime/logs` |
+| Artifact mirror/cache | `/app/artifact_mirror` | `TRADING_ARTIFACT_MIRROR=/auxpool/trading/runtime/artifact_mirror` |
+| Training dataset cache | `/app/training_datasets` | `TRADING_TRAINING_DATASETS=/auxpool/trading/runtime/training_datasets` |
 | Backups, WAL archive, evidence | `/var/backups/trading` | `TRADING_BACKUP_ROOT=/var/backups/trading` |
 
-`engine/runtime/prod_preflight.py` enforces this through
+`docker-compose.external-services.yml` enforces this before database startup
+through the one-shot `storage-placement-preflight` service, and
+`engine/runtime/prod_preflight.py` repeats the same check through
 `engine.runtime.storage_placement`: production-like runs require explicit host
 paths, reject `/var/lib/docker` and `/var/lib/containerd`, and require visible
 non-root mounts to be on `zfs` and under the approved storage prefixes. Keep
 `PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS=1` in compose so a target cannot
-pass from path-prefix-only evidence. Disk-pressure preflight also covers `/`,
-`/zpool`, backup WAL, the explicit state paths, and Docker data/volume roots;
-`PREFLIGHT_REQUIRE_PG_WAL_RISK=1` adds database-backed checks for `pg_wal`
-bytes and `.ready` archive backlog before smoke jobs run.
+pass from path-prefix-only evidence. The runtime service also mounts the
+Timescale, Redis, and MinIO host paths read-only at their host paths so
+production preflight can verify mount identity from inside the container.
+Disk-pressure preflight also covers `/`, `/zpool`, backup WAL, the explicit
+state paths, and Docker data/volume roots; `PREFLIGHT_REQUIRE_PG_WAL_RISK=1`
+adds database-backed checks for `pg_wal` bytes and `.ready` archive backlog
+before smoke jobs run.
+Runtime observability repeats those checks continuously through
+`observability_snapshot`, writes `postgres.wal.alert_state`, and emits runtime
+alerts on storage placement drift, WAL archiver failure, `pg_wal` growth,
+archive backlog, or low WAL/free-space thresholds before the root disk fills.
 
 For an existing named-volume deployment, migrate while services are stopped.
 Canonical step-by-step migration: see [../../docs/DISK_RETENTION_RUNBOOK.md](../../docs/DISK_RETENTION_RUNBOOK.md)
@@ -232,6 +290,11 @@ data-root relocation on host `bart` and the manual bind-mount fallback (stop
 writers, take recovery evidence, `rsync -aHAX --numeric-ids` copy, checksum and
 ownership verification, switch `.env` to the ZFS paths, then run production
 preflight and a restore drill before pruning any old Docker volumes).
+The privileged host-side companion is `ops/server/disk_remediation.sh`; commands
+such as `sudo bash ops/server/disk_remediation.sh relocate-backups`,
+`sudo bash ops/server/disk_remediation.sh relocate-docker`, and
+`sudo bash ops/server/disk_remediation.sh install-monitor` are operator-run
+steps and must not be attempted from a restricted agent shell.
 
 Deploy-specific note: the `.env` ZFS paths to switch to are the
 `TRADING_*_DATA`/`TRADING_*_LOGS` sources in the ZFS Storage Layout table above,
@@ -270,6 +333,34 @@ same `TIMESCALE_*` values passed to `postgres -c`, validates them against
 `TRADING_RESOURCE_MIN_HEADROOM_MEMORY`, and compares reachable `pg_settings`
 values to catch drift after the container starts.
 
+Keep `PREFLIGHT_REQUIRE_DOCKER_RUNTIME_EVIDENCE=1` for the compose production
+path. `prod_preflight.py` and `/api/health.effective_runtime_state` compare the
+intended env contract with operator-collected effective state from Docker
+inspect, Redis `CONFIG GET`, and Postgres `pg_settings`. Missing evidence,
+unbounded containers, missing memswap or `/dev/shm`, missing Docker log caps,
+port/mount drift, Redis maxmemory drift, and Postgres effective-setting drift
+are production blockers.
+
+Collect the required evidence from the host before running production preflight:
+
+```bash
+sudo install -d -m 0750 -o root -g trading /var/backups/trading/evidence
+sudo docker inspect trading-runtime trading-timescaledb trading-redis trading-minio trading-operator \
+  > /var/backups/trading/evidence/docker_runtime_inspect.json
+sudo docker stats --no-stream --format '{{json .}}' \
+  trading-runtime trading-timescaledb trading-redis trading-minio trading-operator \
+  > /var/backups/trading/evidence/docker_runtime_stats.json
+sudo docker exec trading-redis sh -lc \
+  'redis-cli -a "$(cat /run/secrets/redis_password)" --raw CONFIG GET maxmemory maxmemory-policy' \
+  > /var/backups/trading/evidence/redis_config_get.txt
+sudo docker exec -u postgres trading-timescaledb psql -d "${TIMESCALE_DB:-trading}" -tA -c \
+  "SELECT jsonb_object_agg(name, jsonb_build_object('setting', setting, 'unit', unit)) FROM pg_catalog.pg_settings;" \
+  > /var/backups/trading/evidence/postgres_pg_settings.json
+```
+
+These commands do not print secret values. The runtime reads the files through
+the existing read-only backup mount at `/var/backups/trading/evidence`.
+
 Recommended Timescale/Postgres settings for this 123 GiB host profile:
 
 | Setting family | Values |
@@ -307,6 +398,16 @@ worker/thread caps (`RESOURCE_SCHEDULER_*`, `MODEL_TRAIN_*`,
 `RUNTIME_OPENBLAS_NUM_THREADS`, `RUNTIME_NUMEXPR_NUM_THREADS`,
 `TORCH_CPU_THREADS`, and `TORCH_INTEROP_THREADS`) at or below
 `RUNTIME_CPUS`.
+
+The runtime also applies `TRADING_CPU_THREAD_POLICY=auto` before supervised
+Python processes import NumPy/BLAS/NumExpr/torch. Auto mode recomputes
+`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+`NUMEXPR_NUM_THREADS`, `TORCH_CPU_THREADS`, and `TORCH_INTEROP_THREADS` from the
+process role and `ENGINE_SUPERVISED_PROCESS_COUNT`/ingestion child count. Set
+`TRADING_CPU_THREADS_PER_PROCESS` and
+`TRADING_TORCH_INTEROP_THREADS_PER_PROCESS` for an explicit uniform cap, or set
+`TRADING_CPU_THREAD_POLICY=manual` only when the fixed thread env vars are
+intentional operator overrides.
 
 The committed `.env.example` also enables the bounded ingestion host profile:
 `INGESTION_TUNING_PROFILE=host_32t_123g`, parent Timescale/price pools of 8,
@@ -426,7 +527,7 @@ The operator container runs with `OPERATOR_DISABLE_INTERNAL_ENGINE_START=1`.
 
 That is intentional. In the compose deployment path, the operator is a UI/proxy sidecar and not the lifecycle owner of the Python runtime process. Runtime lifecycle belongs to the container orchestrator, not to a sibling process trying to spawn `start_system.py` across containers.
 
-Operator sidecar endpoints require the token loaded from `OPERATOR_API_TOKEN_FILE` or `OPERATOR_API_TOKEN_SECRET` for protected GET, HEAD, POST, and WebSocket access. Only `/api/operator/ping` is intentionally unauthenticated as a liveness probe. Loopback alone is not authorization. In compose, the sidecar is reachable on the internal Docker network as `operator:4001`; the runtime dashboard bridge forwards `X-Operator-Token` from server-side configuration after dashboard auth passes. If you intentionally publish the sidecar for a controlled local diagnostic, pass `X-Operator-Token` on every request and do not carry that override into production.
+Operator sidecar endpoints require the token loaded from `OPERATOR_API_TOKEN_FILE` or `OPERATOR_API_TOKEN_SECRET` for protected GET, HEAD, POST, and WebSocket access. Only `/api/operator/ping` is intentionally unauthenticated as a liveness probe. Loopback alone is not authorization. In compose, the sidecar is reachable on the internal Docker network as `operator:4001`; the runtime dashboard bridge forwards `X-Operator-Token` from server-side configuration after dashboard auth passes. Leave `OPERATOR_SIDECAR_INTERNAL_ONLY=1`, `OPERATOR_PUBLIC_PORT=`, and `OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND=0`. A direct sidecar diagnostic must stay loopback/internal, pass `X-Operator-Token` on every request, and must not be carried into production.
 
 ## Production Threshold
 

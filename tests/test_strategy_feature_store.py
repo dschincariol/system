@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import timeit
 import types
 import unittest
 from datetime import datetime, timezone
@@ -68,9 +70,107 @@ class StrategyFeatureStoreTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row.symbol, "AAPL")
         self.assertEqual(row.feature_version, 3)
+        self.assertEqual(
+            json.loads(row.features_json),
+            {
+                "good": 1.25,
+                "nan_value": 0.0,
+                "inf_value": 0.0,
+                "nested": {"x": 0.0},
+            },
+        )
         self.assertIn('"nan_value":0.0', row.features_json)
         self.assertIn('"inf_value":0.0', row.features_json)
         self.assertIn('"nested":{"x":0.0}', row.features_json)
+
+    def test_feature_json_serialization_preserves_jsonb_validity_without_sorting(self) -> None:
+        import engine.strategy.feature_store as feature_store_module
+
+        payload = {"z_feature": 1.0, "a_feature": {"nested": 2}, "list_feature": [3, 4]}
+        real_dumps = json.dumps
+        calls: list[dict[str, object]] = []
+
+        def recording_dumps(value, *args, **kwargs):
+            calls.append(dict(kwargs))
+            return real_dumps(value, *args, **kwargs)
+
+        with patch.object(feature_store_module, "_orjson", None):
+            with patch.object(feature_store_module.json, "dumps", side_effect=recording_dumps):
+                rendered = feature_store_module._json_dumps(payload)
+
+        self.assertEqual(json.loads(rendered), payload)
+        self.assertEqual(rendered, '{"z_feature":1.0,"a_feature":{"nested":2},"list_feature":[3,4]}')
+        self.assertEqual([call.get("sort_keys") for call in calls], [False])
+        self.assertEqual([call.get("allow_nan") for call in calls], [False])
+
+        with patch.object(feature_store_module, "_orjson", None):
+            self.assertEqual(
+                feature_store_module._json_dumps({"z_feature": 1, "a_feature": 2}, deterministic=True),
+                '{"a_feature":2,"z_feature":1}',
+            )
+
+    def test_feature_json_orjson_fast_path_keeps_jsonb_text_contract(self) -> None:
+        import engine.strategy.feature_store as feature_store_module
+
+        class _FakeOrjson:
+            OPT_SORT_KEYS = 1
+
+            def __init__(self) -> None:
+                self.options: list[int] = []
+
+            def dumps(self, value, *, option=0, default=None):
+                self.options.append(int(option))
+                rendered = json.dumps(
+                    value,
+                    separators=(",", ":"),
+                    sort_keys=bool(option & self.OPT_SORT_KEYS),
+                    default=default,
+                )
+                return rendered.encode("utf-8")
+
+        fake_orjson = _FakeOrjson()
+        with patch.object(feature_store_module, "_orjson", fake_orjson):
+            rendered = feature_store_module._json_dumps({"z_feature": 1, "a_feature": 2})
+            deterministic = feature_store_module._json_dumps(
+                {"z_feature": 1, "a_feature": 2},
+                deterministic=True,
+            )
+
+        self.assertEqual(rendered, '{"z_feature":1,"a_feature":2}')
+        self.assertEqual(json.loads(rendered), {"z_feature": 1, "a_feature": 2})
+        self.assertEqual(deterministic, '{"a_feature":2,"z_feature":1}')
+        self.assertEqual(fake_orjson.options, [0, _FakeOrjson.OPT_SORT_KEYS])
+
+    def test_unsorted_feature_json_benchmark_beats_sorted_baseline(self) -> None:
+        import engine.strategy.feature_store as feature_store_module
+
+        payload = {
+            f"feature_{(idx * 7919) % 5003:05d}_{idx:05d}": idx * 0.125
+            for idx in range(5000)
+        }
+
+        with patch.object(feature_store_module, "_orjson", None):
+            self.assertEqual(json.loads(feature_store_module._json_dumps(payload)), payload)
+            sorted_best = min(
+                timeit.repeat(
+                    lambda: feature_store_module._json_dumps(payload, deterministic=True),
+                    number=5,
+                    repeat=5,
+                )
+            )
+            unsorted_best = min(
+                timeit.repeat(
+                    lambda: feature_store_module._json_dumps(payload),
+                    number=5,
+                    repeat=5,
+                )
+            )
+
+        self.assertLess(
+            unsorted_best,
+            sorted_best * 0.90,
+            f"unsorted={unsorted_best:.6f}s sorted={sorted_best:.6f}s",
+        )
 
     def test_build_feature_snapshot_degrades_open_when_feature_store_enqueue_fails(self) -> None:
         from engine.strategy import feature_registry

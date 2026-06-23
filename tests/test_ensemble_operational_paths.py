@@ -26,10 +26,22 @@ class EnsembleOperationalPathsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_path = Path(self.tmp.name) / "ensemble_operational_paths.db"
+        self._env_backup = {
+            key: os.environ.get(key)
+            for key in (
+                "DB_PATH",
+                "ENSEMBLE_META_MIN_ROWS",
+                "ENSEMBLE_META_LOOKBACK_DAYS",
+                "ENSEMBLE_META_MIN_FAMILIES",
+                "TS_STORAGE_BACKEND",
+            )
+        }
         os.environ["DB_PATH"] = str(self.db_path)
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         (self.storage,) = _reload_modules(
             "engine.runtime.storage",
         )
+        _reload_modules("engine.strategy.ensemble_blender")
         _, _, self.api_read_advanced = _reload_modules(
             "engine.api.internal_access",
             "engine.api.api_read",
@@ -38,15 +50,18 @@ class EnsembleOperationalPathsTests(unittest.TestCase):
         self.storage.init_db()
 
     def tearDown(self) -> None:
-        for key in (
-            "DB_PATH",
-            "ENSEMBLE_META_MIN_ROWS",
-            "ENSEMBLE_META_LOOKBACK_DAYS",
-            "ENSEMBLE_META_MIN_FAMILIES",
-        ):
-            os.environ.pop(key, None)
+        try:
+            self.storage.close_pooled_connections()
+        except Exception:
+            pass
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         try:
             (storage,) = _reload_modules("engine.runtime.storage")
+            _reload_modules("engine.strategy.ensemble_blender")
             storage.close_pooled_connections()
         except Exception:
             pass
@@ -100,7 +115,10 @@ class EnsembleOperationalPathsTests(unittest.TestCase):
         os.environ["ENSEMBLE_META_MIN_ROWS"] = "2"
         os.environ["ENSEMBLE_META_LOOKBACK_DAYS"] = "5000"
         os.environ["ENSEMBLE_META_MIN_FAMILIES"] = "2"
-        (train_ensemble_meta,) = _reload_modules("engine.strategy.jobs.train_ensemble_meta")
+        _, train_ensemble_meta = _reload_modules(
+            "engine.strategy.ensemble_blender",
+            "engine.strategy.jobs.train_ensemble_meta",
+        )
         now_ts = int(time.time() * 1000)
 
         con = self.storage.connect(readonly=False)

@@ -5,9 +5,13 @@ import sys
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+pytestmark = pytest.mark.safety_critical
 
 
 def _live_disabled_reconcile_env() -> dict[str, str]:

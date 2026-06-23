@@ -281,8 +281,11 @@ class _RuntimeMetricsBuffer:
             snapshot = self.flush(max_batches=64)
         except Exception:
             snapshot = self.snapshot()
+        thread_alive = bool(thread is not None and thread.is_alive())
         with self._condition:
-            self._thread = None
+            if not thread_alive:
+                self._thread = None
+        snapshot["thread_alive"] = bool(thread_alive)
         return dict(snapshot or {})
 
 

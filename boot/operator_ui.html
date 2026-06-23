@@ -700,7 +700,7 @@
               </div>
               <div class="muted" style="margin-top:12px;">This operator page no longer acts as a second configuration system for feed setup.</div>
               <div class="row tight" style="margin-top:12px;">
-                <a class="ghost" id="sourceControlLink" href="http://127.0.0.1:8000/ui/data_sources.html" target="_blank" rel="noopener">Open Data Sources Control Center</a>
+                <a class="ghost" id="sourceControlLink" href="/ui/data_sources.html" target="_blank" rel="noopener">Open Data Sources Control Center</a>
               </div>
               <div class="muted" id="feedConfigMsg" style="margin-top:10px;">Use that page as the single source of truth for this functional area.</div>
             </div>
@@ -869,14 +869,6 @@ const OPERATOR_BRIDGE_PREFIX = (() => {
   return "";
 })();
 
-const OPERATOR_DIRECT_ORIGIN = (() => {
-  try {
-    const explicit = String(window.OPERATOR_DIRECT_ORIGIN || "").trim();
-    if (explicit) return new URL(explicit).origin;
-  } catch {}
-  return "http://127.0.0.1:4001";
-})();
-
 const OPERATOR_AUTH_STORAGE_KEYS = {
   dashboard: "trading_dashboard_api_token",
   operator: "trading_operator_api_token"
@@ -944,19 +936,13 @@ function operatorBridgeUrl(url){
 }
 
 function operatorTelemetryWsUrl(){
-  if(OPERATOR_BRIDGE_PREFIX){
-    const direct = new URL(OPERATOR_DIRECT_ORIGIN);
-    direct.protocol = direct.protocol === "https:" ? "wss:" : "ws:";
-    direct.pathname = "/ws/operator";
-    direct.search = "";
-    const operatorToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.operator);
-    if(operatorToken) direct.searchParams.set("operator_token", operatorToken);
-    direct.hash = "";
-    return direct.toString();
-  }
-
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const direct = new URL(`${proto}://${location.host}/ws/operator`);
+  const direct = new URL(`${proto}://${location.host}`);
+  if(OPERATOR_BRIDGE_PREFIX){
+    direct.pathname = `${OPERATOR_BRIDGE_PREFIX}/ws/operator`;
+  }else{
+    direct.pathname = "/ws/operator";
+  }
   const operatorToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.operator);
   if(operatorToken) direct.searchParams.set("operator_token", operatorToken);
   return direct.toString();
@@ -1459,13 +1445,16 @@ function setMode(mode){
 async function updateDashboardLink(){
   try{
     const cfg = await jget("/api/operator/config");
-    let host = cfg.DASHBOARD_HOST || "127.0.0.1";
     const port = cfg.DASHBOARD_PORT || 8000;
 
-    host = String(host || "").trim() || "127.0.0.1";
+    // Always build the link against the host the browser actually used to
+    // reach this page (window.location.hostname). The server-reported
+    // DASHBOARD_HOST can be 0.0.0.0/127.0.0.1/localhost, none of which are
+    // reachable from a remote LAN browser -- so we never trust it for links.
+    let host = String(location.hostname || "").trim() || "127.0.0.1";
     if(host === "0.0.0.0") host = "127.0.0.1";
-    if(host.toLowerCase() === "localhost") host = "127.0.0.1";
-    const url = new URL(`http://${host}:${port}/ui/dashboard.html`);
+    const scheme = location.protocol === "https:" ? "https" : "http";
+    const url = new URL(`${scheme}://${host}:${port}/ui/dashboard.html`);
     const params = new URLSearchParams(window.location.search || "");
     const symbol = String(params.get("symbol") || "").trim().toUpperCase();
     const screen = String(params.get("screen") || "").trim().toLowerCase();
@@ -1476,12 +1465,19 @@ async function updateDashboardLink(){
     if(decisionId) url.searchParams.set("decision_id", decisionId);
     if(advisoryId) url.searchParams.set("advisory_id", advisoryId);
     document.getElementById("dashLink").href = url.toString();
-    const sourceControl = new URL(`http://${host}:${port}/ui/data_sources.html`);
+    const sourceControl = new URL(`${scheme}://${host}:${port}/ui/data_sources.html`);
     document.getElementById("sourceControlLink").href = sourceControl.toString();
   }catch{
     document.getElementById("dashLink").href = "#";
     const sourceLink = document.getElementById("sourceControlLink");
-    if(sourceLink) sourceLink.href = "http://127.0.0.1:8000/ui/data_sources.html";
+    if(sourceLink){
+      // Same-origin fallback so the link works from any LAN host.
+      try{
+        sourceLink.href = new URL("/ui/data_sources.html", window.location.origin).toString();
+      }catch{
+        sourceLink.href = "/ui/data_sources.html";
+      }
+    }
   }
 }
 

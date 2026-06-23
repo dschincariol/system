@@ -32,6 +32,7 @@ class AltDataIngestionTests(unittest.TestCase):
             key: os.environ.get(key)
             for key in (
                 "DB_PATH",
+                "TS_STORAGE_BACKEND",
                 "USE_FORM4_DATA",
                 "USE_INSIDER_FEATURES",
                 "USE_CONGRESSIONAL_TRADE_DATA",
@@ -43,9 +44,15 @@ class AltDataIngestionTests(unittest.TestCase):
             )
         }
         os.environ["DB_PATH"] = str(Path(self.tmp.name) / "alt_data.db")
+        os.environ["TS_STORAGE_BACKEND"] = "sqlite"
         os.environ["USE_SYMBOL_SNAPSHOT_FEATURES"] = "1"
         os.environ["INGEST_FORM4_ENABLED"] = "0"
         os.environ["INGEST_CONGRESSIONAL_ENABLED"] = "0"
+        try:
+            (storage,) = _reload_modules("engine.runtime.storage")
+            storage.close_pooled_connections()
+        except Exception:
+            pass
 
     def tearDown(self) -> None:
         try:
@@ -58,6 +65,11 @@ class AltDataIngestionTests(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        try:
+            (storage,) = _reload_modules("engine.runtime.storage")
+            storage.close_pooled_connections()
+        except Exception:
+            pass
         self.tmp.cleanup()
 
     def _init_storage(self):

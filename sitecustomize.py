@@ -12,6 +12,18 @@ import sys
 from pathlib import Path
 
 
+def _truthy_env(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _early_supervised_thread_policy_enabled() -> bool:
+    return bool(
+        _truthy_env("ENGINE_SUPERVISED")
+        or _truthy_env("ENGINE_LAUNCHED_BY_SUPERVISOR")
+        or _truthy_env("TRADING_CPU_THREAD_POLICY_EARLY")
+    )
+
+
 def _running_python_tests() -> bool:
     argv = " ".join(str(part or "") for part in sys.argv).lower()
     executable = Path(str(sys.argv[0] or "")).name.lower()
@@ -38,3 +50,13 @@ if _running_python_tests():
         os.environ.setdefault("TS_PG_POOL_TIMEOUT", "0.1")
         os.environ.setdefault("TS_PG_CONNECT_TIMEOUT", "1")
         os.environ.setdefault("TS_CREDENTIAL_AUDIT_TIMEOUT_S", "0.05")
+
+if _early_supervised_thread_policy_enabled():
+    try:
+        from engine.runtime.thread_policy import apply_cpu_thread_policy_to_env
+
+        apply_cpu_thread_policy_to_env(os.environ)
+    except Exception:
+        # sitecustomize must never make Python startup fail. Entry-point
+        # bootstrap applies the same policy again and can report diagnostics.
+        pass

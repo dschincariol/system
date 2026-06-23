@@ -37,6 +37,7 @@ def _sequence_dataset(n: int = 10, seq_len: int = 8, n_features: int = 3, n_hori
 
 def _configure_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DB_PATH", str(tmp_path / "itransformer.db"))
+    monkeypatch.setenv("TS_STORAGE_BACKEND", "sqlite")
     monkeypatch.setenv("TS_ARTIFACTS_ROOT", str(tmp_path / "artifacts"))
     monkeypatch.setenv("RUNTIME_METRICS_BUFFER_ENABLED", "0")
 
@@ -80,11 +81,12 @@ def test_itransformer_default_device_is_cpu_first(monkeypatch) -> None:
 
 def test_itransformer_shadow_registration_oos_and_champion_visibility(monkeypatch, tmp_path):
     _configure_env(monkeypatch, tmp_path)
-    storage, registry, lifecycle, champion_manager, module = _reload_modules(
+    storage, registry, lifecycle, champion_manager, _oos_store, module = _reload_modules(
         "engine.runtime.storage",
         "engine.model_registry",
         "engine.strategy.model_lifecycle",
         "engine.strategy.champion_manager",
+        "engine.strategy.ensemble.oos_store",
         "engine.strategy.models.itransformer",
     )
     storage.init_db()
@@ -188,8 +190,9 @@ def test_itransformer_load_rejects_feature_schema_mismatch(monkeypatch, tmp_path
 
 def test_itransformer_shadow_stage_cannot_serve_via_predictor(monkeypatch, tmp_path):
     _configure_env(monkeypatch, tmp_path)
-    storage, module, predictor = _reload_modules(
+    storage, _oos_store, module, predictor = _reload_modules(
         "engine.runtime.storage",
+        "engine.strategy.ensemble.oos_store",
         "engine.strategy.models.itransformer",
         "engine.strategy.predictor",
     )

@@ -1,0 +1,28 @@
+# Opt-in AMD XDNA2 NPU (Ryzen AI) inference profile for Strix Halo on bart.
+#
+# The NPU is an INT8 inference accelerator reached through ONNX Runtime + the
+# VitisAI execution provider, NOT through torch. This profile is therefore
+# additive to (not a replacement for) the CPU or ROCm profile: torch/sklearn etc.
+# still come from the base profile; this file adds only the ONNX export,
+# quantization, and runtime pieces.
+#
+# Host kernel state (verified 2026-06-23): amdxdna driver loaded, firmware at
+# /lib/firmware/amdnpu/17f0_11, /dev/accel/accel0 present, render/video access OK.
+# Confirm with: python tools/validate_npu_acceleration.py
+#
+# IMPORTANT: the VitisAI execution provider for ONNX Runtime is NOT on PyPI. On
+# Linux it ships with AMD's Ryzen AI / xdna-driver release (the `voe` /
+# onnxruntime-vitisai packages) and must be installed from there AFTER XRT is in
+# place. The PyPI pins below cover model export + INT8 quantization and a CPU
+# ONNX Runtime fallback so the backend degrades safely when the EP is absent.
+#
+# See docs/NPU_ACCELERATION.md for the full enablement runbook.
+
+onnx>=1.17                    # ONNX graph IR
+onnxruntime>=1.20             # CPU EP: export/quantize validation + fail-closed fallback
+optimum>=2.0                  # HF model tooling
+optimum-onnx>=0.1             # optimum 2.x split the ONNX Runtime exporter into this package
+
+# Installed separately from AMD's Ryzen AI Linux release once XRT is present:
+#   onnxruntime-vitisai   (provides VitisAIExecutionProvider)
+#   voe                    (Vitis ONNX EP config + xclbin assets)

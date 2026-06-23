@@ -107,7 +107,7 @@ def test_probe_persists_effective_cpu_env_for_missing_rocm(monkeypatch: pytest.M
     torch = _FakeTorch(hip="", cuda_available=False, count=0)
     monkeypatch.setenv("TRADING_ACCELERATION_PROFILE", "amd-rocm")
 
-    snapshot = acceleration.probe_torch_acceleration(torch_module=torch)
+    snapshot = acceleration.probe_torch_acceleration(torch_module=torch, strict_profile=False)
 
     assert snapshot["effective_device"] == "cpu"
     assert snapshot["rocm_available"] is False
@@ -115,6 +115,17 @@ def test_probe_persists_effective_cpu_env_for_missing_rocm(monkeypatch: pytest.M
     assert snapshot["torch_cuda_is_available"] is False
     assert snapshot["torch_cuda_device_count"] == 0
     assert snapshot["torch_imported"] is True
+
+
+def test_probe_strict_amd_rocm_profile_raises_for_cpu_torch(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch = _FakeTorch(hip="", cuda_available=False, count=0)
+    monkeypatch.setenv("TRADING_DEPENDENCY_PROFILE", "amd-rocm")
+    monkeypatch.setattr(acceleration, "amd_rocm_python_marker_error", lambda **_: "")
+
+    with pytest.raises(acceleration.AccelerationProfileError) as excinfo:
+        acceleration.probe_torch_acceleration(torch_module=torch)
+
+    assert "amd_rocm_torch_not_hip_build" in str(excinfo.value)
 
 
 @pytest.mark.linux_only

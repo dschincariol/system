@@ -90,6 +90,44 @@ def test_repository_migrates_legacy_assignment_table_and_enforces_state_path() -
     assert loaded["state"] == "champion"
 
 
+def test_repository_champion_assignment_read_path_does_not_run_schema_ddl() -> None:
+    class _Cursor:
+        def fetchone(self):
+            return (
+                "global",
+                "AAPL",
+                300,
+                "candidate_a",
+                "",
+                "global",
+                "champion",
+                100,
+                101,
+                "{}",
+            )
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        def execute(self, sql: str, params=()):
+            self.statements.append(str(sql))
+            return _Cursor()
+
+    con = _Connection()
+    repo = CompetitionRepository(con)
+
+    loaded = repo.get_champion_assignment(scope="global", symbol="AAPL", horizon_s=300)
+
+    assert loaded["model_name"] == "candidate_a"
+    assert con.statements
+    assert not any(
+        token in statement.upper()
+        for statement in con.statements
+        for token in ("CREATE TABLE", "ALTER TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX")
+    )
+
+
 def test_repository_marketplace_upsert_controls_pnl_conflict_updates() -> None:
     con = sqlite3.connect(":memory:")
     _create_marketplace_table(con)

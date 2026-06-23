@@ -442,6 +442,7 @@ class RegimeDetector:
         state = normalize_regime_state(regime)
         if not state["symbol"]:
             return
+        state_has_known_regime = has_known_regime(state)
         init_db()
 
         def _write(con) -> None:
@@ -453,6 +454,9 @@ class RegimeDetector:
                   volatility_regime=excluded.volatility_regime,
                   trend_regime=excluded.trend_regime,
                   liquidity_regime=excluded.liquidity_regime
+                WHERE excluded.volatility_regime != 'unknown'
+                   OR excluded.trend_regime != 'unknown'
+                   OR excluded.liquidity_regime != 'unknown'
                 """,
                 (
                     int(state["time"]),
@@ -462,6 +466,8 @@ class RegimeDetector:
                     str(state["liquidity_regime"]),
                 ),
             )
+            if not state_has_known_regime:
+                return
             con.execute(
                 """
                 UPDATE predictions

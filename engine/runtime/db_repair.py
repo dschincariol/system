@@ -128,46 +128,60 @@ def repair(*, startup_fast_path: bool = False):
     if not isinstance(result, dict) or not result.get("ok"):
         return result
 
-    try:
-        # init_db() re-applies runtime-side table/index creation after repair
-        # so the full schema surface is present before boot continues.
-        started_ts_ms = int(__import__("time").time() * 1000)
-        init_db()
+    post_repair_init_db_required = bool(result.get("post_repair_init_db_required", True))
+    if not post_repair_init_db_required:
+        result = dict(result)
+        result["db_guard"] = db_guard
+        result["init_db"] = "skipped_schema_valid"
+        result["startup_fast_path"] = bool(startup_fast_path)
         _log_repair_step(
             "init_db",
-            "ok",
-            started_ts_ms,
+            "skipped",
+            int(__import__("time").time() * 1000),
             startup_fast_path=bool(startup_fast_path),
+            reason="schema_valid_after_repair",
         )
-    except Exception as e:
-        _log_repair_step(
-            "init_db",
-            "failed",
-            started_ts_ms,
-            startup_fast_path=bool(startup_fast_path),
-            error=str(e),
-        )
-        log_failure(
-            LOG,
-            event="runtime_db_repair_init_db_failed",
-            code="RUNTIME_DB_REPAIR_INIT_DB_FAILED",
-            message="runtime_db_repair_init_db_failed",
-            error=e,
-            level=logging.WARNING,
-            component="engine.runtime.db_repair",
-            persist=False,
-        )
-        return {
-            "ok": False,
-            "error": f"init_db_failed: {e}",
-            "schema": result,
-            "db_guard": db_guard,
-        }
+    else:
+        try:
+            # init_db() re-applies runtime-side table/index creation after repair
+            # so the full schema surface is present before boot continues.
+            started_ts_ms = int(__import__("time").time() * 1000)
+            init_db()
+            _log_repair_step(
+                "init_db",
+                "ok",
+                started_ts_ms,
+                startup_fast_path=bool(startup_fast_path),
+            )
+        except Exception as e:
+            _log_repair_step(
+                "init_db",
+                "failed",
+                started_ts_ms,
+                startup_fast_path=bool(startup_fast_path),
+                error=str(e),
+            )
+            log_failure(
+                LOG,
+                event="runtime_db_repair_init_db_failed",
+                code="RUNTIME_DB_REPAIR_INIT_DB_FAILED",
+                message="runtime_db_repair_init_db_failed",
+                error=e,
+                level=logging.WARNING,
+                component="engine.runtime.db_repair",
+                persist=False,
+            )
+            return {
+                "ok": False,
+                "error": f"init_db_failed: {e}",
+                "schema": result,
+                "db_guard": db_guard,
+            }
 
-    result = dict(result)
-    result["db_guard"] = db_guard
-    result["init_db"] = True
-    result["startup_fast_path"] = bool(startup_fast_path)
+        result = dict(result)
+        result["db_guard"] = db_guard
+        result["init_db"] = True
+        result["startup_fast_path"] = bool(startup_fast_path)
     started_ts_ms = int(__import__("time").time() * 1000)
     try:
         storage_validation = dict(get_db_validation_snapshot(include_quick_check=False) or {})
@@ -235,6 +249,32 @@ def repair(*, startup_fast_path: bool = False):
             deferred=True,
             verified=False,
             reason="startup_fast_path",
+        )
+        return result
+
+    backend_name = str(
+        storage_validation.get("backend")
+        or storage_validation.get("storage")
+        or result.get("backend")
+        or ""
+    ).strip().lower()
+    if backend_name == "postgres":
+        result["integrity_check"] = {
+            "ok": True,
+            "verified": False,
+            "deferred": True,
+            "mode": "postgres_not_applicable",
+            "findings": [],
+            "repairable_indexes": [],
+        }
+        _log_repair_step(
+            "integrity_check",
+            "skipped",
+            started_ts_ms,
+            startup_fast_path=False,
+            deferred=True,
+            verified=False,
+            reason="postgres_not_applicable",
         )
         return result
 

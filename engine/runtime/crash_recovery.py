@@ -23,9 +23,48 @@ from engine.execution.execution_microstructure import record_open_order
 from engine.runtime.event_log import append_event
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.runtime.metrics import emit_counter, emit_gauge
 
 
 log = get_logger("runtime.crash_recovery")
+RECOVERY_STATE_META_KEY = "crash_recovery_state"
+RECOVERY_BLOCK_REASON = "critical_crash_recovery_continuity_gap"
+RECOVERY_STATE_ENV = "CRASH_RECOVERY_FAIL_CLOSED"
+RECOVERY_STATE_DETAIL_ENV = "CRASH_RECOVERY_FAIL_CLOSED_DETAIL"
+_LIVE_AUTHORITY_BROKERS = {"alpaca", "ibkr"}
+
+
+class CrashRecoveryContinuityError(RuntimeError):
+    """Raised when recovery cannot prove broker/order continuity."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        broker: str,
+        component: str,
+        error: Optional[BaseException] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(str(reason))
+        self.reason = str(reason)
+        self.broker = str(broker or "")
+        self.component = str(component or "")
+        self.error = error
+        self.detail = dict(detail or {})
+
+    def gap(self) -> Dict[str, Any]:
+        out = {
+            "reason": self.reason,
+            "broker": self.broker,
+            "component": self.component,
+        }
+        if self.error is not None:
+            out["error_type"] = type(self.error).__name__
+            out["error"] = str(self.error)
+        if self.detail:
+            out["detail"] = dict(self.detail)
+        return out
 
 
 def _now_ms() -> int:
@@ -48,6 +87,152 @@ def _warn(scope: str, err: Exception, **extra) -> None:
 
 def _broker() -> str:
     return str(os.environ.get("BROKER_NAME", os.environ.get("BROKER", "sim"))).lower().strip()
+
+
+def _live_authority_recovery_required(broker_name: Optional[str] = None) -> bool:
+    return str(broker_name or _broker()).lower().strip() in _LIVE_AUTHORITY_BROKERS
+
+
+def _continuity_error(
+    reason: str,
+    *,
+    broker_name: Optional[str] = None,
+    component: str,
+    error: Optional[BaseException] = None,
+    detail: Optional[Dict[str, Any]] = None,
+) -> CrashRecoveryContinuityError:
+    broker_s = str(broker_name or _broker()).lower().strip()
+    return CrashRecoveryContinuityError(
+        str(reason),
+        broker=broker_s,
+        component=str(component),
+        error=error,
+        detail=detail,
+    )
+
+
+def _emit_recovery_metrics(payload: Dict[str, Any]) -> None:
+    broker_name = str(payload.get("broker") or "")
+    status = str(payload.get("status") or "")
+    reason = str(payload.get("reason") or "")
+    critical = bool(payload.get("critical"))
+    gap_count = int(payload.get("gap_count") or 0)
+    emit_gauge(
+        "crash_recovery_continuity_proven",
+        1.0 if status == "ok" else 0.0,
+        component="engine.runtime.crash_recovery",
+        broker=broker_name,
+        extra_tags={"status": status, "reason": reason, "critical": int(critical)},
+    )
+    emit_gauge(
+        "crash_recovery_gap_count",
+        gap_count,
+        component="engine.runtime.crash_recovery",
+        broker=broker_name,
+        extra_tags={"status": status, "reason": reason, "critical": int(critical)},
+    )
+    if gap_count > 0 or critical or status not in {"ok", "disabled_noncritical"}:
+        emit_counter(
+            "crash_recovery_continuity_gap_total",
+            max(1, gap_count),
+            component="engine.runtime.crash_recovery",
+            broker=broker_name,
+            extra_tags={"status": status, "reason": reason, "critical": int(critical)},
+        )
+
+
+def _record_recovery_state(
+    *,
+    status: str,
+    reason: str,
+    broker_name: Optional[str] = None,
+    critical: bool = False,
+    gaps: Optional[List[Dict[str, Any]]] = None,
+    detail: Optional[Dict[str, Any]] = None,
+    error: Optional[BaseException] = None,
+) -> Dict[str, Any]:
+    broker_s = str(broker_name or _broker()).lower().strip()
+    gap_list = [dict(item or {}) for item in list(gaps or [])]
+    payload = {
+        "ok": bool(status == "ok"),
+        "status": str(status),
+        "reason": str(reason or ("ok" if status == "ok" else RECOVERY_BLOCK_REASON)),
+        "broker": broker_s,
+        "critical": bool(critical),
+        "block_live_order_authority": bool(critical),
+        "continuity_proven": bool(status == "ok"),
+        "gap_count": int(len(gap_list)),
+        "gaps": gap_list,
+        "detail": dict(detail or {}),
+        "ts_ms": int(_now_ms()),
+    }
+    if error is not None:
+        payload["error_type"] = type(error).__name__
+        payload["error"] = str(error)
+
+    if bool(critical):
+        os.environ[RECOVERY_STATE_ENV] = "1"
+        os.environ[RECOVERY_STATE_DETAIL_ENV] = json.dumps(
+            {
+                "reason": payload["reason"],
+                "broker": broker_s,
+                "gap_count": int(payload["gap_count"]),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    elif str(status) == "ok":
+        os.environ.pop(RECOVERY_STATE_ENV, None)
+        os.environ.pop(RECOVERY_STATE_DETAIL_ENV, None)
+
+    try:
+        from engine.runtime.runtime_meta import meta_set
+
+        meta_set(
+            RECOVERY_STATE_META_KEY,
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            best_effort=False,
+        )
+    except Exception as state_error:
+        log_failure(
+            log,
+            event="runtime_crash_recovery_state_persist_failed",
+            code="CRASH_RECOVERY_STATE_PERSIST_FAILED",
+            message="crash recovery state persist failed",
+            error=state_error,
+            level=logging.ERROR if critical else logging.WARNING,
+            component="engine.runtime.crash_recovery",
+            extra={"recovery_state": payload},
+            persist=False,
+        )
+
+    try:
+        _emit_recovery_metrics(payload)
+    except Exception as metric_error:
+        _warn("crash_recovery.record_recovery_state.metrics", metric_error, broker=broker_s, status=str(status))
+
+    if bool(critical) or str(status) not in {"ok", "disabled_noncritical"}:
+        log_failure(
+            log,
+            event="runtime_crash_recovery_continuity_gap",
+            code=str(payload["reason"]).upper().replace(":", "_"),
+            message=str(payload["reason"]),
+            error=error,
+            level=logging.ERROR if critical else logging.WARNING,
+            component="engine.runtime.crash_recovery",
+            extra={"recovery_state": payload},
+            persist=True,
+        )
+    else:
+        log.info(
+            "runtime_crash_recovery_state",
+            extra={
+                "event": "runtime_crash_recovery_state",
+                "component": "engine.runtime.crash_recovery",
+                "extra_json": payload,
+            },
+        )
+    return payload
 
 
 def _enabled() -> bool:
@@ -710,6 +895,13 @@ def _restore_open_orders(con) -> Dict[str, Any]:
             broker_rows = list_open_orders(limit=int(limit_n))
         except Exception as e:
             _warn("crash_recovery.restore_open_orders.alpaca", e)
+            if _live_authority_recovery_required(broker_name):
+                raise _continuity_error(
+                    "critical_crash_recovery_open_orders_unavailable",
+                    broker_name=broker_name,
+                    component="restore_open_orders.alpaca",
+                    error=e,
+                ) from e
             broker_rows = []
     elif broker_name == "ibkr":
         try:
@@ -717,6 +909,13 @@ def _restore_open_orders(con) -> Dict[str, Any]:
             broker_rows = list_open_orders_live()
         except Exception as e:
             _warn("crash_recovery.restore_open_orders.ibkr", e)
+            if _live_authority_recovery_required(broker_name):
+                raise _continuity_error(
+                    "critical_crash_recovery_open_orders_unavailable",
+                    broker_name=broker_name,
+                    component="restore_open_orders.ibkr",
+                    error=e,
+                ) from e
             broker_rows = []
     else:
         broker_rows = []
@@ -818,9 +1017,27 @@ def _recover_ibkr_fills(con) -> Dict[str, Any]:
         from engine.execution.broker_ibkr_gateway import list_recent_executions_live
     except Exception as e:
         _warn("crash_recovery.recover_ibkr_fills.import", e)
+        if _live_authority_recovery_required("ibkr"):
+            raise _continuity_error(
+                "critical_crash_recovery_fills_unavailable",
+                broker_name="ibkr",
+                component="recover_ibkr_fills.import",
+                error=e,
+            ) from e
         return {"fills": 0}
 
-    rows = list_recent_executions_live(_now_ms() - (_lookback_hours() * 3600 * 1000))
+    try:
+        rows = list_recent_executions_live(_now_ms() - (_lookback_hours() * 3600 * 1000))
+    except Exception as e:
+        _warn("crash_recovery.recover_ibkr_fills.list_recent_executions", e)
+        if _live_authority_recovery_required("ibkr"):
+            raise _continuity_error(
+                "critical_crash_recovery_fills_unavailable",
+                broker_name="ibkr",
+                component="recover_ibkr_fills.list_recent_executions",
+                error=e,
+            ) from e
+        rows = []
 
     logged = 0
     orphan = 0
@@ -904,10 +1121,28 @@ def _recover_alpaca_fills(con) -> Dict[str, Any]:
         from engine.execution.broker_alpaca_rest import list_orders_after
     except Exception as e:
         _warn("crash_recovery.recover_alpaca_fills.import", e)
+        if _live_authority_recovery_required("alpaca"):
+            raise _continuity_error(
+                "critical_crash_recovery_fills_unavailable",
+                broker_name="alpaca",
+                component="recover_alpaca_fills.import",
+                error=e,
+            ) from e
         return {"fills": 0}
 
     after_ts_ms = _now_ms() - (_lookback_hours() * 3600 * 1000)
-    rows = list_orders_after(after_ts_ms=after_ts_ms, status="all", limit=500)
+    try:
+        rows = list_orders_after(after_ts_ms=after_ts_ms, status="all", limit=500)
+    except Exception as e:
+        _warn("crash_recovery.recover_alpaca_fills.list_orders_after", e)
+        if _live_authority_recovery_required("alpaca"):
+            raise _continuity_error(
+                "critical_crash_recovery_fills_unavailable",
+                broker_name="alpaca",
+                component="recover_alpaca_fills.list_orders_after",
+                error=e,
+            ) from e
+        rows = []
 
     logged = 0
     orphan = 0
@@ -1037,6 +1272,13 @@ def _reconcile_broker_state(con) -> Dict[str, Any]:
             broker_positions = list(get_positions() or [])
         except Exception as e:
             _warn("crash_recovery.reconcile_broker_state.alpaca_positions", e)
+            if _live_authority_recovery_required(broker_name):
+                raise _continuity_error(
+                    "critical_crash_recovery_positions_unavailable",
+                    broker_name=broker_name,
+                    component="reconcile_broker_state.alpaca_positions",
+                    error=e,
+                ) from e
             broker_positions = []
     elif broker_name == "ibkr":
         try:
@@ -1044,6 +1286,13 @@ def _reconcile_broker_state(con) -> Dict[str, Any]:
             broker_positions = list(get_positions_live() or [])
         except Exception as e:
             _warn("crash_recovery.reconcile_broker_state.ibkr_positions", e)
+            if _live_authority_recovery_required(broker_name):
+                raise _continuity_error(
+                    "critical_crash_recovery_positions_unavailable",
+                    broker_name=broker_name,
+                    component="reconcile_broker_state.ibkr_positions",
+                    error=e,
+                ) from e
             broker_positions = []
     else:
         broker_positions = []
@@ -1130,16 +1379,47 @@ def _reconcile_broker_state(con) -> Dict[str, Any]:
 
 
 def replay_boot_recovery(log=None) -> Dict[str, Any]:
+    broker_name = _broker()
+    recovery_required = _live_authority_recovery_required(broker_name)
     out = {
         "ok": True,
         "enabled": _enabled(),
+        "broker": broker_name,
+        "fail_closed_required": bool(recovery_required),
         "restore_open_orders": None,
         "broker_fills": None,
         "orphans": None,
         "reconcile": None,
+        "gaps": [],
+        "recovery_state": None,
     }
 
     if not _enabled():
+        if recovery_required:
+            gap = {
+                "reason": "critical_crash_recovery_disabled",
+                "broker": broker_name,
+                "component": "replay_boot_recovery.enabled",
+            }
+            state = _record_recovery_state(
+                status="disabled",
+                reason="critical_crash_recovery_disabled",
+                broker_name=broker_name,
+                critical=True,
+                gaps=[gap],
+                detail={"enabled": False},
+            )
+            out["ok"] = False
+            out["gaps"] = [gap]
+            out["recovery_state"] = state
+        else:
+            out["recovery_state"] = _record_recovery_state(
+                status="disabled_noncritical",
+                reason="crash_recovery_disabled_noncritical",
+                broker_name=broker_name,
+                critical=False,
+                detail={"enabled": False},
+            )
         return out
 
     con = connect()
@@ -1149,7 +1429,6 @@ def replay_boot_recovery(log=None) -> Dict[str, Any]:
 
         out["restore_open_orders"] = _restore_open_orders(con)
 
-        broker_name = _broker()
         if broker_name == "ibkr":
             out["broker_fills"] = _recover_ibkr_fills(con)
         elif broker_name == "alpaca":
@@ -1169,29 +1448,104 @@ def replay_boot_recovery(log=None) -> Dict[str, Any]:
                 reconcile_out["pre_live"] = pre_live_position_reconcile(broker=broker_name)
             except Exception as e:
                 _warn("crash_recovery.replay_boot_recovery.pre_live_reconcile", e, broker=broker_name)
+                if recovery_required:
+                    raise _continuity_error(
+                        "critical_crash_recovery_prelive_reconcile_failed",
+                        broker_name=broker_name,
+                        component="replay_boot_recovery.pre_live_reconcile",
+                        error=e,
+                    ) from e
                 reconcile_out["pre_live"] = {"ok": False, "error": str(e)}
+            if recovery_required and (
+                not isinstance(reconcile_out.get("pre_live"), dict)
+                or not bool(reconcile_out["pre_live"].get("ok", False))
+            ):
+                raise _continuity_error(
+                    "critical_crash_recovery_prelive_reconcile_block",
+                    broker_name=broker_name,
+                    component="replay_boot_recovery.pre_live_reconcile",
+                    detail=(
+                        dict(reconcile_out.get("pre_live") or {})
+                        if isinstance(reconcile_out.get("pre_live"), dict)
+                        else {"pre_live": repr(reconcile_out.get("pre_live"))}
+                    ),
+                )
             reconcile_out["state"] = _reconcile_broker_state(con)
+            if recovery_required and int((reconcile_out.get("state") or {}).get("mismatched_n") or 0) > 0:
+                raise _continuity_error(
+                    "critical_crash_recovery_state_mismatch",
+                    broker_name=broker_name,
+                    component="reconcile_broker_state",
+                    detail=dict(reconcile_out.get("state") or {}),
+                )
             out["reconcile"] = reconcile_out
         else:
             out["reconcile"] = {"status": "skipped_disabled"}
+            if recovery_required:
+                raise _continuity_error(
+                    "critical_crash_recovery_reconcile_disabled",
+                    broker_name=broker_name,
+                    component="replay_boot_recovery.reconcile_on_boot",
+                    detail={"CRASH_RECOVERY_RECONCILE_ON_BOOT": os.environ.get("CRASH_RECOVERY_RECONCILE_ON_BOOT", "1")},
+                )
 
+        out["recovery_state"] = _record_recovery_state(
+            status="ok",
+            reason="ok",
+            broker_name=broker_name,
+            critical=False,
+            detail={
+                "restore_open_orders": dict(out.get("restore_open_orders") or {}),
+                "broker_fills": dict(out.get("broker_fills") or {}),
+                "orphans": dict(out.get("orphans") or {}),
+                "reconcile": dict(out.get("reconcile") or {}),
+            },
+        )
         return out
 
     except Exception as e:
+        gap = e.gap() if isinstance(e, CrashRecoveryContinuityError) else {
+            "reason": RECOVERY_BLOCK_REASON if recovery_required else "crash_recovery_exception",
+            "broker": broker_name,
+            "component": "replay_boot_recovery",
+            "error_type": type(e).__name__,
+            "error": str(e),
+        }
+        critical = bool(recovery_required)
+        if isinstance(e, CrashRecoveryContinuityError):
+            critical = bool(_live_authority_recovery_required(e.broker))
+        state = _record_recovery_state(
+            status="failed",
+            reason=str(gap.get("reason") or RECOVERY_BLOCK_REASON),
+            broker_name=broker_name,
+            critical=critical,
+            gaps=[gap],
+            detail={
+                "restore_open_orders": dict(out.get("restore_open_orders") or {}),
+                "broker_fills": dict(out.get("broker_fills") or {}),
+                "orphans": dict(out.get("orphans") or {}),
+                "reconcile": dict(out.get("reconcile") or {}),
+            },
+            error=e,
+        )
         out["ok"] = False
         out["error"] = str(e)
+        out["gaps"] = [gap]
+        out["recovery_state"] = state
         try:
             append_event(
                 event_type="crash_recovery_failed",
                 event_source="engine.runtime.crash_recovery",
                 entity_type="crash_recovery",
-                entity_id=str(_broker() or "unknown"),
+                entity_id=str(broker_name or "unknown"),
                 correlation_id=str(int(_now_ms())),
                 payload={
                     "ts_ms": int(_now_ms()),
-                    "broker": str(_broker() or "unknown"),
+                    "broker": str(broker_name or "unknown"),
                     "status": "failed",
-                    "reason": "crash_recovery_exception",
+                    "reason": str(gap.get("reason") or "crash_recovery_exception"),
+                    "gaps": [gap],
+                    "critical": bool(critical),
                     "restore_open_orders": dict(out.get("restore_open_orders") or {}),
                     "broker_fills": dict(out.get("broker_fills") or {}),
                     "orphans": dict(out.get("orphans") or {}),
@@ -1201,7 +1555,7 @@ def replay_boot_recovery(log=None) -> Dict[str, Any]:
                 ts_ms=int(_now_ms()),
             )
         except Exception as event_error:
-            _warn("crash_recovery.replay_boot_recovery.append_event", event_error, broker=_broker(), error=str(e))
+            _warn("crash_recovery.replay_boot_recovery.append_event", event_error, broker=broker_name, error=str(e))
 
         if log:
             try:

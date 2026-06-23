@@ -38,6 +38,35 @@ LOG = get_logger("engine.data.sec.edgar_live")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 
 
+def _placeholder_sec_identity(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "example.com",
+            "example.invalid",
+            "ops@example",
+            "admin@example",
+            "market-impact-dev",
+            "trading-system-data-source-test",
+        )
+    )
+
+
+def sec_identity_configured() -> bool:
+    return not _placeholder_sec_identity(os.environ.get("SEC_USER_AGENT", ""))
+
+
+def _require_sec_identity() -> None:
+    if sec_identity_configured():
+        return
+    if str(os.environ.get("SEC_ALLOW_PLACEHOLDER_USER_AGENT", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    raise RuntimeError("sec_identity_missing: configure SEC_USER_AGENT with a real operator contact before SEC EDGAR requests")
+
+
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: object) -> None:
     if once_key and once_key in _WARNED_NONFATAL_KEYS:
         return
@@ -57,6 +86,7 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
 
 
 def _download_ticker_map() -> dict:
+    _require_sec_identity()
     r = requests.get(TICKER_MAP_URL, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return r.json()
@@ -165,6 +195,7 @@ def fetch_recent_filings(ticker: str, limit: int = 25) -> list:
     Returns list of dicts:
       { accession, form, filed_date, report_date, cik, company_name, primary_doc_url }
     """
+    _require_sec_identity()
     cik = ticker_to_cik(ticker)
     if not cik:
         return []

@@ -45,7 +45,7 @@ import time
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.job_registry import (
@@ -195,6 +195,12 @@ def _job_log_paths(name: str) -> tuple[str, str]:
         str((log_dir / f"{safe}.stdout.log").resolve()),
         str((log_dir / f"{safe}.stderr.log").resolve()),
     )
+
+
+def _apply_ingestion_shard_env(env: Dict[str, str]) -> None:
+    from engine.runtime.ingestion_shards import canonical_shard_env, current_ingestion_shard
+
+    env.update(canonical_shard_env(current_ingestion_shard()))
 
 
 class RuntimeSupervisor:
@@ -354,7 +360,14 @@ class RuntimeSupervisor:
                 return self.start_with_deps(name, strict=True)
             try:
                 old = os.environ.get("ENGINE_SUPERVISED")
+                old_shard = {
+                    "INGESTION_SHARD_INDEX": os.environ.get("INGESTION_SHARD_INDEX"),
+                    "INGESTION_SHARD_COUNT": os.environ.get("INGESTION_SHARD_COUNT"),
+                }
                 os.environ["ENGINE_SUPERVISED"] = "1"
+                shard_env: Dict[str, str] = {}
+                _apply_ingestion_shard_env(shard_env)
+                os.environ.update(shard_env)
                 try:
                     return self._delegate.start(name)
                 finally:
@@ -372,6 +385,21 @@ class RuntimeSupervisor:
                             )
                     else:
                         os.environ["ENGINE_SUPERVISED"] = old
+                    for key, value in old_shard.items():
+                        if value is None:
+                            try:
+                                del os.environ[key]
+                            except Exception as e:
+                                _warn_nonfatal(
+                                    "supervisor_delegate_env_cleanup_failed",
+                                    "SUPERVISOR_DELEGATE_ENV_CLEANUP_FAILED",
+                                    e,
+                                    warn_key=f"supervisor_delegate_env_cleanup_failed:{key}",
+                                    env_key=str(key),
+                                    job=str(name),
+                                )
+                        else:
+                            os.environ[key] = value
             except Exception as e:
                 _warn_nonfatal(
                     "supervisor_delegate_start_failed",
@@ -397,6 +425,22 @@ class RuntimeSupervisor:
             env["ENGINE_SUPERVISED"] = "1"
             env["ENGINE_LAUNCHED_BY_SUPERVISOR"] = "1"
             env["ENGINE_JOB_NAME"] = str(name)
+            _apply_ingestion_shard_env(env)
+            try:
+                spec = ALLOWED_JOBS.get(str(name))
+                meta = dict(spec[3] if isinstance(spec, (tuple, list)) and len(spec) >= 4 and isinstance(spec[3], dict) else {})
+                env["ENGINE_PROCESS_ROLE"] = str(meta.get("resource_class") or "")
+                from engine.runtime.thread_policy import apply_cpu_thread_policy_to_env
+
+                apply_cpu_thread_policy_to_env(env, role=env.get("ENGINE_PROCESS_ROLE") or None)
+            except Exception as e:
+                _warn_nonfatal(
+                    "supervisor_thread_policy_failed",
+                    "SUPERVISOR_THREAD_POLICY_FAILED",
+                    e,
+                    warn_key=f"supervisor_thread_policy_failed:{name}",
+                    job=str(name),
+                )
 
             repo_root = str(_repo_root())
             existing_pp = env.get("PYTHONPATH", "")
@@ -521,10 +565,29 @@ class RuntimeSupervisor:
             return stop_result
         return self.start(name)
 
-    def stop_all(self) -> Dict[str, Any]:
+    def stop_all(
+        self,
+        *,
+        drain_before_kill: Optional[Callable[..., Dict[str, Any]]] = None,
+        drain_deadline_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
         if self._delegate is not None:
             try:
-                result = self._delegate.stop_all()
+                try:
+                    result = self._delegate.stop_all(
+                        drain_before_kill=drain_before_kill,
+                        drain_deadline_s=drain_deadline_s,
+                    )
+                except TypeError as exc:
+                    message = str(exc)
+                    if (
+                        "drain_before_kill" not in message
+                        and "drain_deadline_s" not in message
+                        and "unexpected keyword" not in message
+                        and "got an unexpected" not in message
+                    ):
+                        raise
+                    result = self._delegate.stop_all()
                 if isinstance(result, dict):
                     return result
                 return {"ok": True}
@@ -543,6 +606,79 @@ class RuntimeSupervisor:
         errors: List[str] = []
         with self._lock:
             names = list(self._jobs.keys())
+
+        if drain_before_kill is not None:
+            states: list[tuple[str, JobState, subprocess.Popen[Any]]] = []
+            with self._lock:
+                for name in names:
+                    state = self._jobs.get(name)
+                    proc = state.process if state is not None else None
+                    if state is not None and proc is not None and proc.poll() is None:
+                        states.append((name, state, proc))
+
+            for name, state, proc in states:
+                try:
+                    proc.terminate()
+                    LOG.info(
+                        "SUPERVISOR_JOB_TERMINATE_SENT",
+                        extra={"job": str(name), "pid": int(getattr(proc, "pid", 0) or 0)},
+                    )
+                except Exception as e:
+                    errors.append(f"{name}:terminate:{e}")
+                    state.failed_reason = f"terminate_failed:{e}"
+
+            drain_snapshot: Dict[str, Any] = {}
+            deadline = time.monotonic() + max(0.0, float(drain_deadline_s or 0.0))
+            try:
+                drain_snapshot = dict(
+                    drain_before_kill(
+                        reason="runtime_supervisor_stop_all_pre_sigkill",
+                        deadline_s=max(0.0, float(deadline) - time.monotonic()),
+                    )
+                    or {}
+                )
+            except Exception as e:
+                errors.append(f"drain_before_kill:{e}")
+                _warn_nonfatal(
+                    "supervisor_stop_all_drain_before_kill_failed",
+                    "SUPERVISOR_STOP_ALL_DRAIN_BEFORE_KILL_FAILED",
+                    e,
+                    warn_key="supervisor_stop_all_drain_before_kill_failed",
+                )
+
+            for name, state, proc in states:
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception as kill_wait_err:
+                            _warn_nonfatal(
+                                "supervisor_stop_all_wait_after_kill_failed",
+                                "SUPERVISOR_STOP_ALL_WAIT_AFTER_KILL_FAILED",
+                                kill_wait_err,
+                                warn_key=f"supervisor_stop_all_wait_after_kill_failed:{name}",
+                                job=str(name),
+                            )
+                    state.last_exit_code = proc.poll()
+                    state.process = None
+                except Exception as e:
+                    errors.append(f"{name}:kill:{e}")
+                    _warn_nonfatal(
+                        "supervisor_stop_all_kill_failed",
+                        "SUPERVISOR_STOP_ALL_KILL_FAILED",
+                        e,
+                        warn_key=f"supervisor_stop_all_kill_failed:{name}",
+                        job=str(name),
+                    )
+
+            if self._monitor_thread is not None and self._monitor_thread.is_alive():
+                try:
+                    self._monitor_thread.join(timeout=max(1.0, float(self._monitor_period_s) * 2.0))
+                except Exception as e:
+                    errors.append(f"monitor_join:{e}")
+
+            return {"ok": len(errors) == 0, "errors": errors, "drain": drain_snapshot}
 
         for name in names:
             try:
@@ -849,6 +985,28 @@ class RuntimeSupervisor:
                                 env["ENGINE_SUPERVISED"] = "1"
                                 env["ENGINE_LAUNCHED_BY_SUPERVISOR"] = "1"
                                 env["ENGINE_JOB_NAME"] = str(job_name)
+                                _apply_ingestion_shard_env(env)
+                                try:
+                                    spec = ALLOWED_JOBS.get(str(job_name))
+                                    meta = dict(
+                                        spec[3]
+                                        if isinstance(spec, (tuple, list))
+                                        and len(spec) >= 4
+                                        and isinstance(spec[3], dict)
+                                        else {}
+                                    )
+                                    env["ENGINE_PROCESS_ROLE"] = str(meta.get("resource_class") or "")
+                                    from engine.runtime.thread_policy import apply_cpu_thread_policy_to_env
+
+                                    apply_cpu_thread_policy_to_env(env, role=env.get("ENGINE_PROCESS_ROLE") or None)
+                                except Exception as e:
+                                    _warn_nonfatal(
+                                        "supervisor_restart_thread_policy_failed",
+                                        "SUPERVISOR_RESTART_THREAD_POLICY_FAILED",
+                                        e,
+                                        warn_key=f"supervisor_restart_thread_policy_failed:{job_name}",
+                                        job=str(job_name),
+                                    )
 
                                 repo_root = str(_repo_root())
                                 existing_pp = env.get("PYTHONPATH", "")

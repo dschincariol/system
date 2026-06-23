@@ -1213,27 +1213,17 @@ def run(*, include_quick_check: bool = True):
     db_path_obj = Path(db_path).expanduser().resolve()
     db_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        from engine.runtime import storage as storage_mod
-
-        storage_mod.init_db()
-    except Exception as e:
-        sys.stderr.write(
-            f"[repair_schema] init_db_failed:{type(e).__name__}:{e} db_path={db_path_obj}\n"
-        )
-        return {
-            "ok": False,
-            "error": f"init_db_failed: {e}",
-            "db_path": str(db_path_obj),
-        }
+    from engine.runtime import storage as storage_mod
 
     if not bool(getattr(storage_mod, "_SQLITE_TEST_BACKEND", False)):
         try:
             from engine.runtime.schema.migrator import apply_migrations, expected_schema_version
 
             applied = apply_migrations()
-            storage_mod.init_db()
             validation = dict(storage_mod.get_db_validation_snapshot(include_quick_check=include_quick_check) or {})
+            if not bool(validation.get("ok")):
+                storage_mod.init_db()
+                validation = dict(storage_mod.get_db_validation_snapshot(include_quick_check=include_quick_check) or {})
             ok = bool(validation.get("ok"))
             return {
                 "ok": ok,
@@ -1244,6 +1234,7 @@ def run(*, include_quick_check: bool = True):
                 "expected_schema_version": validation.get("expected_schema_version") or expected_schema_version(),
                 "schema_version_ok": bool(validation.get("schema_version_ok")),
                 "validation": validation,
+                "post_repair_init_db_required": not ok,
                 "error": "" if ok else str(validation.get("error") or "postgres_schema_validation_failed"),
             }
         except Exception as e:
@@ -1256,6 +1247,18 @@ def run(*, include_quick_check: bool = True):
                 "error": f"postgres_repair_failed: {e}",
                 "db_path": str(db_path_obj),
             }
+
+    try:
+        storage_mod.init_db()
+    except Exception as e:
+        sys.stderr.write(
+            f"[repair_schema] init_db_failed:{type(e).__name__}:{e} db_path={db_path_obj}\n"
+        )
+        return {
+            "ok": False,
+            "error": f"init_db_failed: {e}",
+            "db_path": str(db_path_obj),
+        }
 
     from engine.runtime.storage import connect_rw_direct
 

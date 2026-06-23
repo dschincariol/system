@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -13,6 +14,8 @@ FEATURE_STAGE_SHADOW = "shadow"
 FEATURE_STAGE_LIVE = "live"
 ACCEPTED_DECISION = "accepted"
 REJECTION_DECISIONS = frozenset({"fdr_failed", "tstat_failed", "degenerate"})
+_SCHEMA_READY_LOCK = threading.RLock()
+_SCHEMA_READY_KEYS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -39,66 +42,91 @@ class FeatureRegistryRecord:
 
 
 def ensure_discovery_schema(con) -> None:
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS feature_candidates (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts INTEGER NOT NULL,
-          source TEXT NOT NULL,
-          symbol TEXT NOT NULL,
-          expression TEXT NOT NULL,
-          params_json TEXT NOT NULL,
-          hash TEXT NOT NULL UNIQUE
+    schema_key = _schema_ready_key(con)
+    with _SCHEMA_READY_LOCK:
+        if schema_key and schema_key in _SCHEMA_READY_KEYS:
+            return
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_candidates (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts INTEGER NOT NULL,
+              source TEXT NOT NULL,
+              symbol TEXT NOT NULL,
+              expression TEXT NOT NULL,
+              params_json TEXT NOT NULL,
+              hash TEXT NOT NULL UNIQUE
+            )
+            """
         )
-        """
-    )
-    con.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_feature_candidates_source_symbol
-          ON feature_candidates(source, symbol, ts)
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS feature_evaluation (
-          candidate_id INTEGER NOT NULL,
-          ts INTEGER NOT NULL,
-          t_stat REAL,
-          p_value REAL,
-          q_value REAL,
-          oos_ic REAL,
-          decision TEXT NOT NULL,
-          PRIMARY KEY(candidate_id, ts)
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_feature_candidates_source_symbol
+              ON feature_candidates(source, symbol, ts)
+            """
         )
-        """
-    )
-    con.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_feature_evaluation_decision_ts
-          ON feature_evaluation(decision, ts)
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS feature_registry (
-          feature_id TEXT PRIMARY KEY,
-          stage TEXT NOT NULL DEFAULT 'shadow' CHECK(stage IN ('shadow', 'live')),
-          source TEXT NOT NULL,
-          expression TEXT NOT NULL,
-          params_json TEXT NOT NULL,
-          hash TEXT NOT NULL UNIQUE,
-          created_ts INTEGER NOT NULL,
-          accepted_candidate_id INTEGER,
-          metadata_json TEXT
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_evaluation (
+              candidate_id INTEGER NOT NULL,
+              ts INTEGER NOT NULL,
+              t_stat REAL,
+              p_value REAL,
+              q_value REAL,
+              oos_ic REAL,
+              decision TEXT NOT NULL,
+              PRIMARY KEY(candidate_id, ts)
+            )
+            """
         )
-        """
-    )
-    con.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_feature_registry_stage_source
-          ON feature_registry(stage, source)
-        """
-    )
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_feature_evaluation_decision_ts
+              ON feature_evaluation(decision, ts)
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_registry (
+              feature_id TEXT PRIMARY KEY,
+              stage TEXT NOT NULL DEFAULT 'shadow' CHECK(stage IN ('shadow', 'live')),
+              source TEXT NOT NULL,
+              expression TEXT NOT NULL,
+              params_json TEXT NOT NULL,
+              hash TEXT NOT NULL UNIQUE,
+              created_ts INTEGER NOT NULL,
+              accepted_candidate_id INTEGER,
+              metadata_json TEXT
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_feature_registry_stage_source
+              ON feature_registry(stage, source)
+            """
+        )
+        if schema_key:
+            _SCHEMA_READY_KEYS.add(schema_key)
+
+
+def invalidate_discovery_schema_cache() -> None:
+    with _SCHEMA_READY_LOCK:
+        _SCHEMA_READY_KEYS.clear()
+
+
+def _schema_ready_key(con) -> str:
+    try:
+        rows = con.execute("PRAGMA database_list").fetchall() or []
+        for row in rows:
+            name = str(row[1] if len(row) > 1 else "")
+            path = str(row[2] if len(row) > 2 else "").strip()
+            if name == "main" and path:
+                return f"sqlite:{path}"
+    except Exception:
+        # no-op-guard: allow - non-SQLite/unknown connections keep legacy per-call schema checks.
+        pass
+    return ""
 
 
 def record_candidate(candidate: CandidateFeature, *, con=None, ts: int | None = None) -> CandidateRecord:
@@ -313,6 +341,7 @@ def register_feature(
             db.commit()
         if not row:
             raise RuntimeError("feature_registry_insert_failed")
+        _invalidate_feature_registry_process_cache()
         return _feature_registry_record(row)
     finally:
         if owns:
@@ -358,6 +387,18 @@ def _connection(con, *, readonly: bool) -> tuple[bool, Any]:
 
     init_db()
     return True, connect(readonly=bool(readonly))
+
+
+def _invalidate_feature_registry_process_cache() -> None:
+    try:
+        from engine.strategy import feature_registry
+
+        invalidate = getattr(feature_registry, "invalidate_feature_registry_cache", None)
+        if callable(invalidate):
+            invalidate()
+    except Exception:
+        # no-op-guard: allow - feature registration must not fail if a cache hook is unavailable.
+        pass
 
 
 def _candidate_record(row) -> CandidateRecord:
@@ -567,6 +608,7 @@ __all__ = [
     "ensure_discovery_schema",
     "fetch_candidate_by_hash",
     "has_evaluation",
+    "invalidate_discovery_schema_cache",
     "list_evaluations",
     "list_registered_features",
     "record_candidate",

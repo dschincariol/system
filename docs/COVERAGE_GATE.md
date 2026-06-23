@@ -14,6 +14,15 @@ written to `artifacts/coverage/coverage.xml` and
 `artifacts/coverage/coverage.json`; those files are build artifacts and are not
 version-controlled.
 
+The custom gate enforces three hard checks from the same coverage JSON:
+
+- total line+branch coverage must meet `minimum_percent`
+- configured nested package floors must pass for `engine/risk`,
+  `engine/execution`, and `engine/runtime`
+- no new zero-covered Python module may appear under
+  `engine/risk`, `engine/execution`, or `engine/runtime` outside the committed
+  zero-covered burndown allowlist
+
 ## Local Command
 
 Run the same coverage gate that CI runs:
@@ -28,37 +37,49 @@ To debug a focused subset while preserving the same coverage settings:
 python tools/coverage_gate.py run -- tests/test_storage_contracts.py -q
 ```
 
-The command runs `pytest` with `pytest-cov`, enables branch coverage, prints a
-terminal missing-line report, writes XML/JSON reports, prints package-level
-coverage for the four money-path roots, and fails when total line+branch
-coverage drops below the configured threshold. It also inherits the canonical
-`pytest-timeout` configuration from `pyproject.toml`, including the 120 second
-per-test default timeout.
+The command runs `pytest` with `pytest-cov`, enables branch coverage, suppresses
+the heavyweight terminal missing-line report, writes XML/JSON reports, prints
+package-level coverage for the four money-path roots, prints PASS/FAIL rows for
+the nested package floors, prints the zero-covered burndown count and
+importer-priority list, and fails on any threshold or ratchet breach. It also
+inherits the canonical `pytest-timeout` configuration from `pyproject.toml`,
+including the 120 second per-test default timeout.
 
-## Initial Threshold
+## Current Baseline
 
-The initial gate is `52.0%`, based on a full local baseline on 2026-06-21:
+The global gate is `52.0%`, based on a full local baseline originally taken on
+2026-06-21 and rechecked after the per-package ratchet was added:
 
 - Command:
-  `python -m pytest tests/ -q --tb=short --disable-warnings --cov=engine --cov=services --cov=routes --cov=ops --cov-branch --cov-report=term --cov-report=json:/tmp/trading-prelim-coverage.json --cov-fail-under=0`
-- Result: `2069 passed, 101 skipped`
-- Measured total line+branch coverage: `52.94%`
-- Root-level baseline: `engine 53.22%`, `services 66.73%`,
-  `routes 27.69%`, `ops 17.06%`
+  `python tools/coverage_gate.py run`
+- Latest measured total line+branch coverage: `54.39%`
+- Root-level baseline: `engine 54.65%`, `services 71.00%`,
+  `routes 27.69%`, `ops 17.53%`
+- Nested hard floors, rounded down to avoid display-rounding false failures:
+  `engine/risk 50.81%`, `engine/execution 58.92%`,
+  `engine/runtime 58.49%`
+- Zero-covered critical-root burndown: `13` allowlisted modules, with no new
+  zero-covered modules allowed under `engine/risk`, `engine/execution`, or
+  `engine/runtime`
 
 The threshold is intentionally just below the measured baseline to avoid
 rounding noise while still blocking real regressions.
 
 ## Ratchet Process
 
-Coverage owners raise the threshold after coverage improvements land and remain
-stable on the default branch. The normal ratchet is one percentage point at a
-time in `pyproject.toml`.
+Coverage owners raise thresholds after coverage improvements land and remain
+stable on the default branch. The normal global ratchet is one percentage point
+at a time in `pyproject.toml`; nested money-path floors should be raised to the
+new measured value when tests improve `engine/risk`, `engine/execution`, or
+`engine/runtime`.
 
-Do not lower the threshold or add omit rules to pass CI unless the pull request
+Do not lower the global threshold, lower a nested floor, expand the
+zero-covered allowlist, or add omit rules to pass CI unless the pull request
 also explains the production-risk tradeoff and has maintainer approval.
 Money-path runtime modules must stay visible in the report even when their
-coverage is low.
+coverage is low. The zero-covered burndown is prioritized by production importer
+count in the coverage-gate output so the highest-reach uncovered modules are
+visible first.
 
 Acceptable exclusions are limited to non-runtime constructs such as
 `TYPE_CHECKING` branches. Tests, generated reports, docs, and frontend assets
@@ -68,6 +89,7 @@ are outside the measured source roots rather than hidden with broad omit rules.
 
 GitHub Actions runs the `coverage` job on every push and pull request. The job
 installs dev dependencies, runs `python tools/coverage_gate.py run`, emits the
-terminal summary, uploads XML/JSON coverage artifacts, and fails the workflow on
-test failure or threshold breach. Branch protection should require this status
+gate summary, uploads XML/JSON coverage artifacts, and fails the workflow on
+test failure, global threshold breach, nested package floor breach, or a new
+zero-covered critical module. Branch protection should require this status
 before merging.

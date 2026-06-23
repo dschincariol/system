@@ -154,6 +154,10 @@ def trading_allowed(con=None) -> bool:
     diagnostic = evaluate_current_drawdown(con)
     _persist_drawdown_diagnostic(diagnostic)
     if not diagnostic.ok:
+        reason_code = str(getattr(diagnostic, "reason_code", "") or "")
+        if reason_code.endswith("_READ_ERROR"):
+            _stop_for_untrusted_drawdown(diagnostic)
+            return False
         live_mode = _live_mode_requested(con)
         if live_mode is not False:
             _stop_for_untrusted_drawdown(diagnostic)

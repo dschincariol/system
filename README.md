@@ -71,7 +71,7 @@ Data-source configuration has one canonical contract:
 
 - provider credentials and source-specific settings live in the `data_sources` table
 - stored credentials are encrypted at rest by [services/credential_encryption.py](services/credential_encryption.py)
-- [services/data_source_manager.py](services/data_source_manager.py) is the source-of-truth manager
+- [services/data_source_manager.py](services/data_source_manager.py) is the source-of-truth manager and owns provider guidance, field metadata, env-var mapping, and update validation
 - [routes/data_sources_routes.py](routes/data_sources_routes.py) is the HTTP control-plane surface
 - `.env` is bootstrap and system configuration, not the long-lived source of truth for provider credentials
 
@@ -138,7 +138,7 @@ Supplementary but useful:
 
 - Copy [.env.example](.env.example) to `.env` for a new workstation.
 - On Linux/macOS development machines, run `bash tools/bootstrap_local_toolchain.sh` from the repo root. It creates or updates `.venv` with Python 3.11, installs the selected Python dependency profile (`TRADING_DEPENDENCY_PROFILE=cpu` by default), installs Node.js 20.19.4 with npm 10.8.2 inside `.venv` when needed, runs `npm ci`, and links the `python`, `python3`, `node`, `npm`, and `npx` command names into `$HOME/.local/bin` by default.
-- Install CPU/default Python dependencies with `TRADING_DEPENDENCY_PROFILE=cpu python -m pip install -r requirements.txt`. Use [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md) before selecting NVIDIA CUDA or AMD/ROCm profiles.
+- Install locked CPU/default Python dependencies with `TRADING_DEPENDENCY_PROFILE=cpu python -m pip install -r requirements.txt`. Use [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md) before selecting NVIDIA CUDA or AMD/ROCm profiles or updating Python locks.
 - Use Node.js 20 LTS (`>=20.17.0 <21`) with npm 10.x for the operator UI. The checked-in `.npmrc` enforces this during `npm ci`.
 - Install Node dependencies reproducibly with `npm ci`; do not edit or vendor `node_modules/`.
 - Prefer `ENGINE_MODE=safe` and `EXECUTION_MODE=safe` until the environment, providers, and operator controls are verified.
@@ -146,7 +146,8 @@ Supplementary but useful:
 - Run `npm run check:ui` after `npm ci` to validate local asset references, dashboard JS syntax, browser-helper tests, and the fast chart contract pytest lane before shipping UI changes. The chart lane covers risk chart API shapes, risk chart UI helpers, portfolio backtest chart contracts, and model performance divergence frontend behavior.
 - Run `npm run test:ui` when a UI change needs the broader UI pytest allowlist in addition to the browser-helper tests.
 - Run `npm run test:py` for the canonical Python test suite. It runs `python -m pytest tests/ -v --tb=short`; `unittest.TestCase` tests are collected and executed by pytest.
-- Run `python tools/validate_repo.py` before merging. The validator runs pytest collection before pytest execution and the default startup graph gate is hermetic even when local `.env` points at Postgres, Timescale, or Redis.
+- Run `python tools/pyright_money_path_gate.py` when changing live data, execution, risk, runtime gate/storage, or portfolio/model-governance paths. See [docs/PYRIGHT_TYPE_GATE.md](docs/PYRIGHT_TYPE_GATE.md) for the ratcheted baseline and staged package coverage.
+- Run `python tools/validate_repo.py` before merging. The validator runs the pyright money-path gate, pytest collection before pytest execution, and the default startup graph gate is hermetic even when local `.env` points at Postgres, Timescale, or Redis.
 - Pytest uses the canonical timeout policy in `pyproject.toml`: every test has a 120 second default timeout through `pytest-timeout` with `timeout_method=thread`. Intentionally slow tests must use a local `@pytest.mark.timeout(<seconds>)` override with a short reason near the test; do not disable timeouts through broad markers or suite-wide command flags.
 - Pytest blocks DNS and non-local sockets by default. Local test servers, Postgres, and Redis must bind to loopback or Unix-domain sockets; live broker or market-data tests must be marked `@pytest.mark.live_network` and run explicitly with `TRADING_TEST_ALLOW_LIVE_NETWORK=1`.
 - Reproduce the Postgres/Redis production-backend CI gate with [docs/PRODUCTION_BACKEND_CI.md](docs/PRODUCTION_BACKEND_CI.md) when changing runtime storage, Redis cache wrappers, migrations, audit-chain behavior, execution arming, or promotion evidence.
@@ -158,13 +159,14 @@ Deterministic local gate commands after bootstrap:
 python --version
 python tools/git_worktree_triage.py
 python tools/check_repo_artifact_hygiene.py
+python tools/pyright_money_path_gate.py
 python -m pytest --version
 npm run test:py
 node --version
 npm --version
 npm run check:ui
 npm run test:ui
-python tools/validate_dependency_lock.py
+python tools/validate_dependency_lock.py --strict
 ```
 
 Useful supporting checks:

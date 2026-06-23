@@ -10,10 +10,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+pytestmark = pytest.mark.safety_critical
 
 
 def _reload_modules(*module_names: str):
@@ -98,6 +102,8 @@ class PositionReconcileSafetyTests(unittest.TestCase):
             "BROKER_FAILOVER",
             "BROKER_ROUTER_RETRY_ATTEMPTS",
             "EXEC_ADAPTIVE_SLICING",
+            "EXECUTION_MODE",
+            "ENGINE_MODE",
         ]
         self._env_backup = {key: os.environ.get(key) for key in self._env_keys}
         os.environ["ENGINE_SUPERVISED"] = "1"
@@ -114,6 +120,8 @@ class PositionReconcileSafetyTests(unittest.TestCase):
         os.environ["BROKER_FAILOVER"] = "alpaca"
         os.environ["BROKER_ROUTER_RETRY_ATTEMPTS"] = "1"
         os.environ["EXEC_ADAPTIVE_SLICING"] = "0"
+        os.environ["EXECUTION_MODE"] = "live"
+        os.environ["ENGINE_MODE"] = ""
         self.kill_switch, self.position_reconcile, self.broker_router = _reload_modules(
             "engine.execution.kill_switch",
             "engine.execution.position_reconcile",
@@ -159,8 +167,22 @@ class PositionReconcileSafetyTests(unittest.TestCase):
             self.assertTrue(bool(bootstrap.get("re_reconcile_pending")))
 
             _mute_router_side_effects(stack, self.broker_router)
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {
+                        "BROKER": "alpaca",
+                        "BROKER_NAME": "alpaca",
+                        "LIVE_BROKER": "alpaca",
+                        "ENGINE_MODE": "live",
+                        "EXECUTION_MODE": "live",
+                    },
+                    clear=False,
+                )
+            )
             stack.enter_context(patch.object(self.broker_router, "_execution_gate_or_block", return_value=None))
             stack.enter_context(patch.object(self.broker_router, "_real_trading_gate_or_block", return_value=None))
+            stack.enter_context(patch.object(self.broker_router, "_get_execution_mode", Mock(return_value={"mode": "live", "armed": 1})))
             stack.enter_context(patch.object(self.broker_router, "_prelive_reconcile", _prelive_with_shared_connection))
             stack.enter_context(patch.object(self.broker_router, "_alpaca_apply", adapter))
 

@@ -179,6 +179,12 @@ def _status_passed(value: Any) -> bool:
     return str(value if value is not None else "").strip().lower() in _PASS_STATUSES
 
 
+def _truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    return str(value if value is not None else "").strip().lower() in _TRUTHY
+
+
 def _archive_mode_enabled(value: Any) -> bool:
     return str(value if value is not None else "").strip().lower() in {"on", "always", "true", "1"}
 
@@ -640,10 +646,11 @@ def _env_int_for_accounting(name: str, default: int, warnings: list[str]) -> int
 
 
 def _backup_retention_status(retention: Mapping[str, Any], warnings: list[str]) -> str:
+    keep_recent = int(retention.get("keep_recent_count") or 0)
     keep_daily = int(retention.get("keep_daily_days") or 0)
     keep_weekly = int(retention.get("keep_weekly_days") or 0)
     wal_cushion = int(retention.get("wal_cushion_days") or 0)
-    if keep_daily <= 0 and keep_weekly <= 0:
+    if keep_recent <= 0 and keep_daily <= 0 and keep_weekly <= 0:
         warnings.append("backup_accounting_retention_disabled")
         return "disabled"
     if keep_weekly > 0 and keep_weekly < keep_daily:
@@ -699,9 +706,10 @@ def backup_accounting_snapshot(*, timeout_s: float | None = None) -> Dict[str, A
         warnings.append("backup_accounting_root_missing")
 
     retention = {
-        "keep_daily_days": _env_int_for_accounting("TS_BACKUP_KEEP_DAILY_DAYS", 14, warnings),
-        "keep_weekly_days": _env_int_for_accounting("TS_BACKUP_KEEP_WEEKLY_DAYS", 365, warnings),
-        "wal_cushion_days": _env_int_for_accounting("TS_BACKUP_WAL_CUSHION_DAYS", 7, warnings),
+        "keep_recent_count": _env_int_for_accounting("TS_BACKUP_KEEP_RECENT_COUNT", 2, warnings),
+        "keep_daily_days": _env_int_for_accounting("TS_BACKUP_KEEP_DAILY_DAYS", 0, warnings),
+        "keep_weekly_days": _env_int_for_accounting("TS_BACKUP_KEEP_WEEKLY_DAYS", 0, warnings),
+        "wal_cushion_days": _env_int_for_accounting("TS_BACKUP_WAL_CUSHION_DAYS", 10, warnings),
         "prune_script": "ops/backup/prune.sh",
     }
     retention_status = _backup_retention_status(retention, warnings)
@@ -902,6 +910,59 @@ def _assess_wal_archiver_component(
     return age_s
 
 
+def _assess_wal_archive_target_component(
+    blockers: list[str],
+    component: Mapping[str, Any],
+    *,
+    max_age_s: float,
+    now_ts: float,
+) -> float | None:
+    status = str(component.get("status") or "missing").strip().lower()
+    ts = _component_ts(component, ("verified_at_ts", "verified_at", "generated_at_ts", "generated_at"))
+    if not status or status == "missing":
+        blockers.append("backup_evidence_wal_archive_target_missing")
+        return None
+    if not _status_passed(status):
+        blockers.append("backup_evidence_wal_archive_target_failed")
+    elif ts is None:
+        blockers.append("backup_evidence_wal_archive_target_missing")
+        return None
+
+    for key in ("root", "wal_dir", "tmp_dir", "expected_group", "expected_dir_mode"):
+        if not _text_present(component.get(key)):
+            blockers.append(f"backup_evidence_wal_archive_target_{key}_missing")
+    if _safe_float(component.get("expected_owner_uid")) is None:
+        blockers.append("backup_evidence_wal_archive_target_owner_uid_missing")
+    if _safe_float(component.get("expected_group_gid")) is None:
+        blockers.append("backup_evidence_wal_archive_target_group_gid_missing")
+
+    if _truthy_value(component.get("repaired")):
+        diagnosis = component.get("diagnosis")
+        if not isinstance(diagnosis, Mapping):
+            blockers.append("backup_evidence_wal_archive_target_diagnosis_missing")
+        else:
+            exit_code = _safe_float(
+                diagnosis.get("original_archive_command_exit_code", diagnosis.get("archive_command_exit_code"))
+            )
+            failure_signature = diagnosis.get(
+                "original_archive_command_failure_signature",
+                diagnosis.get("archive_command_failure_signature"),
+            )
+            if not _text_present(diagnosis.get("fix")):
+                blockers.append("backup_evidence_wal_archive_target_diagnosis_fix_missing")
+            if exit_code is None:
+                blockers.append("backup_evidence_wal_archive_target_archive_command_exit_code_missing")
+            elif exit_code != 0 and not _text_present(failure_signature):
+                blockers.append("backup_evidence_wal_archive_target_archive_command_failure_signature_missing")
+
+    if ts is None:
+        return None
+    age_s = max(0.0, float(now_ts) - float(ts))
+    if age_s > float(max_age_s):
+        blockers.append("backup_evidence_wal_archive_target_stale")
+    return age_s
+
+
 def _runtime_wal_archiver_required(engine_mode: str | None, required: bool | None) -> bool:
     if required is not None:
         return bool(required)
@@ -1095,14 +1156,23 @@ def _pg_wal_risk_policy() -> Dict[str, Any]:
     }
 
 
-def _local_pg_wal_path() -> Path:
-    raw = str(os.environ.get("TS_PG_WAL_DIR") or "").strip()
-    if raw:
-        return Path(raw).expanduser()
+def _local_pg_wal_path_info() -> tuple[Path, str]:
+    for env_name in ("TS_PG_WAL_DIR", "TRADING_TIMESCALE_WAL"):
+        raw = str(os.environ.get(env_name) or "").strip()
+        if raw:
+            return Path(raw).expanduser(), env_name
+    timescale_data = str(os.environ.get("TRADING_TIMESCALE_DATA") or "").strip()
+    if timescale_data:
+        return Path(timescale_data).expanduser() / "pg_wal", "TRADING_TIMESCALE_DATA"
     pgdata = str(os.environ.get("PGDATA") or "").strip()
     if pgdata:
-        return Path(pgdata).expanduser() / "pg_wal"
-    return Path(os.sep).joinpath("var", "lib", "postgresql", "data", "pg_wal")
+        return Path(pgdata).expanduser() / "pg_wal", "PGDATA"
+    return Path(os.sep).joinpath("var", "lib", "postgresql", "data", "pg_wal"), "container_default"
+
+
+def _local_pg_wal_path() -> Path:
+    path, _source = _local_pg_wal_path_info()
+    return path
 
 
 def _pg_wal_local_space(path: Path, policy: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1167,6 +1237,20 @@ def pg_wal_disk_risk_snapshot(
     policy = _pg_wal_risk_policy()
     blockers: list[str] = []
     warnings: list[str] = []
+    local_wal_path, local_wal_path_source = _local_pg_wal_path_info()
+    local_space = _pg_wal_local_space(local_wal_path, policy)
+    local_space["path_source"] = local_wal_path_source
+    local_space_blockers: list[str] = []
+    local_space_warnings: list[str] = []
+    if local_space.get("status") == "critical":
+        local_space_blockers.append("pg_wal_free_space_critical")
+    elif local_space.get("status") == "warning":
+        local_space_warnings.append("pg_wal_free_space_warning")
+    elif not bool(local_space.get("visible")):
+        if required_flag:
+            local_space_blockers.append("pg_wal_free_space_not_visible")
+        else:
+            local_space_warnings.append("pg_wal_free_space_not_visible")
     try:
         import math
 
@@ -1213,6 +1297,10 @@ def pg_wal_disk_risk_snapshot(
                 warnings.append(f"pg_wal_archive_status_unavailable:{type(exc).__name__}: {exc}")
     except Exception as exc:
         blockers.append("pg_wal_stats_unavailable")
+        if required_flag:
+            blockers.extend(local_space_blockers)
+        else:
+            warnings.extend(local_space_warnings)
         return {
             "ok": False if required_flag else True,
             "required": bool(required_flag),
@@ -1222,6 +1310,7 @@ def pg_wal_disk_risk_snapshot(
             "warnings": warnings + ([] if required_flag else [f"pg_wal_stats_unavailable:{type(exc).__name__}: {exc}"]),
             "source": "pg_ls_waldir",
             "policy": policy,
+            "local_space": local_space,
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -1236,13 +1325,8 @@ def pg_wal_disk_risk_snapshot(
     elif ready_count >= int(policy["warning_ready_count"]):
         warnings.append("pg_wal_ready_backlog_warning")
 
-    local_space = _pg_wal_local_space(_local_pg_wal_path(), policy)
-    if local_space.get("status") == "critical":
-        blockers.append("pg_wal_free_space_critical")
-    elif local_space.get("status") == "warning":
-        warnings.append("pg_wal_free_space_warning")
-    elif not bool(local_space.get("visible")):
-        warnings.append("pg_wal_free_space_not_visible")
+    blockers.extend(local_space_blockers)
+    warnings.extend(local_space_warnings)
 
     if not required_flag:
         warnings.extend(blockers)
@@ -1305,6 +1389,7 @@ def _assess_required_json_shape(
     base_backup: Mapping[str, Any],
     wal_archive: Mapping[str, Any],
     wal_archiver: Mapping[str, Any],
+    wal_archive_target: Mapping[str, Any],
     restore_drill: Mapping[str, Any],
 ) -> None:
     schema_version = raw.get("schema_version")
@@ -1328,6 +1413,16 @@ def _assess_required_json_shape(
             blockers.append("backup_evidence_wal_archiver_count_missing")
         if not _text_present(wal_archiver.get("last_archived_wal")):
             blockers.append("backup_evidence_wal_archiver_last_wal_missing")
+
+    if _status_passed(wal_archive_target.get("status")):
+        if not _text_present(wal_archive_target.get("wal_dir")):
+            blockers.append("backup_evidence_wal_archive_target_wal_dir_missing")
+        if _safe_float(wal_archive_target.get("expected_owner_uid")) is None:
+            blockers.append("backup_evidence_wal_archive_target_owner_uid_missing")
+        if not _text_present(wal_archive_target.get("expected_group")):
+            blockers.append("backup_evidence_wal_archive_target_group_missing")
+        if not _text_present(wal_archive_target.get("expected_dir_mode")):
+            blockers.append("backup_evidence_wal_archive_target_mode_missing")
 
     if _status_passed(restore_drill.get("status")) and not _text_present(restore_drill.get("report")):
         blockers.append("backup_evidence_restore_drill_report_missing")
@@ -1411,6 +1506,13 @@ def backup_restore_evidence_snapshot(
         ),
         allow_fallback=False,
     )
+    wal_archive_target = _normalize_component(
+        raw=raw,
+        key="wal_archive_target",
+        fallback={"status": "missing", "source": "filesystem_repair"},
+        timestamp_keys=("verified_at_ts", "verified_at", "generated_at_ts", "generated_at"),
+        allow_fallback=False,
+    )
     restore_drill = _normalize_component(
         raw=raw,
         key="restore_drill",
@@ -1426,6 +1528,7 @@ def backup_restore_evidence_snapshot(
             base_backup=base_backup,
             wal_archive=wal_archive,
             wal_archiver=wal_archiver,
+            wal_archive_target=wal_archive_target,
             restore_drill=restore_drill,
         )
 
@@ -1447,6 +1550,12 @@ def backup_restore_evidence_snapshot(
         blockers,
         wal_archiver,
         prefix="backup_evidence_wal_archiver",
+        max_age_s=policy["wal_archive_max_age_s"],
+        now_ts=now,
+    )
+    wal_archive_target_age = _assess_wal_archive_target_component(
+        blockers,
+        wal_archive_target,
         max_age_s=policy["wal_archive_max_age_s"],
         now_ts=now,
     )
@@ -1487,6 +1596,7 @@ def backup_restore_evidence_snapshot(
         "base_backup": dict(base_backup, age_s=base_age),
         "wal_archive": dict(wal_archive, age_s=wal_age),
         "wal_archiver": dict(wal_archiver, age_s=wal_archiver_age),
+        "wal_archive_target": dict(wal_archive_target, age_s=wal_archive_target_age),
         "restore_drill": dict(restore_drill, age_s=drill_age, time_to_recover_s=restore_elapsed),
     }
 

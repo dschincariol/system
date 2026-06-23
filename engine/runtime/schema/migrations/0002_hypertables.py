@@ -8,7 +8,7 @@ import re
 from typing import Iterable
 
 from engine.runtime.storage_pool import quote_ident, schema_name
-from engine.runtime.schema.table_classification import Hypertable, TABLE_CLASS
+from engine.runtime.schema.table_classification import Hypertable, TABLE_CLASS, interval_to_ms
 
 id = 2
 description = "timescale hypertables and lifecycle policies"
@@ -16,23 +16,6 @@ description = "timescale hypertables and lifecycle policies"
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _INTERVAL_RE = re.compile(r"^\s*(?P<count>\d+)\s*(?P<unit>[A-Za-z]+)\s*$")
-_MS_BY_UNIT = {
-    "millisecond": 1,
-    "milliseconds": 1,
-    "ms": 1,
-    "second": 1_000,
-    "seconds": 1_000,
-    "minute": 60_000,
-    "minutes": 60_000,
-    "hour": 3_600_000,
-    "hours": 3_600_000,
-    "day": 86_400_000,
-    "days": 86_400_000,
-    "week": 604_800_000,
-    "weeks": 604_800_000,
-    "year": 31_536_000_000,
-    "years": 31_536_000_000,
-}
 _INTEGER_TIME_TYPES = {"int2", "int4", "int8", "smallint", "integer", "bigint"}
 
 
@@ -56,14 +39,53 @@ def _index_name(*parts: str) -> str:
     return f"{raw[:51]}_{suffix}"
 
 
+def _relation_owner_table(conn, relation_name: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT relation_cls.relkind, table_cls.relname
+        FROM pg_class relation_cls
+        JOIN pg_namespace ns
+          ON ns.oid = relation_cls.relnamespace
+        LEFT JOIN pg_index idx
+          ON idx.indexrelid = relation_cls.oid
+        LEFT JOIN pg_class table_cls
+          ON table_cls.oid = idx.indrelid
+        WHERE ns.nspname = ANY (current_schemas(false))
+          AND relation_cls.relname = ?
+        LIMIT 1
+        """,
+        (str(relation_name),),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        value = row["relname"]
+    except Exception:
+        value = row[1]
+    return "" if value is None else str(value)
+
+
+def _available_relation_name(
+    conn,
+    table_name: str,
+    base_name: str,
+    *,
+    allow_current_table: bool = True,
+) -> str:
+    candidate = str(base_name)
+    for suffix in range(0, 100):
+        if suffix:
+            candidate = _index_name(base_name, str(suffix + 1))
+        owner = _relation_owner_table(conn, candidate)
+        if owner is None or (allow_current_table and owner == str(table_name)):
+            return candidate
+    return _index_name(base_name, "replacement", hashlib.sha1(base_name.encode("utf-8")).hexdigest()[:8])
+
+
 def _interval_to_ms(interval: str) -> int:
-    match = _INTERVAL_RE.match(str(interval or ""))
-    if not match:
+    if not _INTERVAL_RE.match(str(interval or "")):
         raise ValueError(f"unsupported policy interval: {interval!r}")
-    unit = match.group("unit").lower()
-    if unit not in _MS_BY_UNIT:
-        raise ValueError(f"unsupported policy interval unit: {interval!r}")
-    return int(match.group("count")) * int(_MS_BY_UNIT[unit])
+    return int(interval_to_ms(str(interval)))
 
 
 def _table_exists(conn, table_name: str) -> bool:
@@ -189,7 +211,7 @@ def _unique_indexes(conn, table_name: str) -> list[tuple[str, tuple[str, ...]]]:
 def _create_lookup_index(conn, table_name: str, columns: tuple[str, ...]) -> None:
     if not columns:
         return
-    index_name = _index_name("idx", table_name, *columns, "lookup")
+    index_name = _available_relation_name(conn, table_name, _index_name("idx", table_name, *columns, "lookup"))
     column_sql = ", ".join(_ident(col) for col in columns)
     conn.execute(f"CREATE INDEX IF NOT EXISTS {_ident(index_name)} ON {_ident(table_name)} ({column_sql})")
 
@@ -203,7 +225,7 @@ def _create_timescale_unique_index(
     if not columns:
         return
     index_columns = tuple(dict.fromkeys((*columns, time_column)))
-    index_name = _index_name("uq", table_name, *index_columns)
+    index_name = _available_relation_name(conn, table_name, _index_name("uq", table_name, *index_columns))
     column_sql = ", ".join(_ident(col) for col in index_columns)
     conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {_ident(index_name)} ON {_ident(table_name)} ({column_sql})")
 
@@ -233,12 +255,35 @@ def _normalize_constraints_for_hypertable(conn, table_name: str, time_column: st
 
     if dropped_primary and primary_key:
         new_columns = tuple(dict.fromkeys((*primary_key, time_column)))
-        pk_name = _index_name("pk", table_name, time_column)
+        pk_name = _available_relation_name(
+            conn,
+            table_name,
+            _index_name("pk", table_name, *new_columns),
+            allow_current_table=False,
+        )
         column_sql = ", ".join(_ident(col) for col in new_columns)
         conn.execute(
             f"ALTER TABLE {_ident(table_name)} "
             f"ADD CONSTRAINT {_ident(pk_name)} PRIMARY KEY ({column_sql})"
         )
+
+
+def _set_chunk_interval(conn, table_name: str, spec: Hypertable) -> None:
+    if not _table_exists(conn, table_name) or not _is_hypertable(conn, table_name):
+        return
+    time_column = spec.time_column
+    if not _column_exists(conn, table_name, time_column):
+        return
+    if _is_integer_time(conn, table_name, time_column):
+        conn.execute(
+            "SELECT set_chunk_time_interval(?::regclass, ?::bigint)",
+            (str(table_name), int(_interval_to_ms(spec.chunk))),
+        )
+        return
+    conn.execute(
+        "SELECT set_chunk_time_interval(?::regclass, ?::interval)",
+        (str(table_name), str(spec.chunk)),
+    )
 
 
 def _create_hypertable(conn, table_name: str, spec: Hypertable) -> None:
@@ -248,6 +293,7 @@ def _create_hypertable(conn, table_name: str, spec: Hypertable) -> None:
     if not _column_exists(conn, table_name, time_column):
         return
     if _is_hypertable(conn, table_name):
+        _set_chunk_interval(conn, table_name, spec)
         return
 
     integer_time = _is_integer_time(conn, table_name, time_column)
@@ -269,6 +315,7 @@ def _create_hypertable(conn, table_name: str, spec: Hypertable) -> None:
             "SELECT set_integer_now_func(?::regclass, ?)",
             (str(table_name), f"{schema_name()}.unix_ms_now"),
         )
+        _set_chunk_interval(conn, table_name, spec)
         return
 
     conn.execute(
@@ -283,6 +330,7 @@ def _create_hypertable(conn, table_name: str, spec: Hypertable) -> None:
         """,
         (str(table_name), str(time_column), str(spec.chunk)),
     )
+    _set_chunk_interval(conn, table_name, spec)
 
 
 def _enable_compression(conn, table_name: str, spec: Hypertable) -> None:

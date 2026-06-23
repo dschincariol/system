@@ -924,6 +924,7 @@ def assess_challenger(
     challenger_predictions: Any = None,
     realized_returns: Any = None,
     neutralization_features: Any = None,
+    candidate_symbols: Any = None,
     candidate_features: Any = None,
     deconfounded_validation: Any = None,
     deconfounded_config: Dict[str, Any] | None = None,
@@ -974,6 +975,12 @@ def assess_challenger(
         "evidence_ts": int(evidence_ts),
         "passed": False,
     }
+    if candidate_symbols is not None:
+        diagnostics["candidate_symbols"] = [
+            str(symbol or "").upper().strip()
+            for symbol in list(candidate_symbols or [])
+            if str(symbol or "").strip()
+        ]
 
     challenger_series = _clean_numeric_series(challenger_returns)
     champion_series = _clean_numeric_series(champion_returns)

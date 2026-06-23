@@ -9,7 +9,7 @@ training job has persisted policy points.
 import json
 from typing import Optional, Dict, Any, List
 
-from engine.runtime.storage import connect, init_db
+from engine.runtime.storage import connect, get_active_backend_name
 from engine.strategy.ope_gate import evaluate_policy_ope_gate
 
 
@@ -42,14 +42,35 @@ def _size_policy_ope_passed(con, policy: Dict[str, Any]) -> tuple[bool, Dict[str
     )
 
 
+def _read_connection():
+    try:
+        backend_name = str(get_active_backend_name() or "").strip().lower()
+    except Exception:
+        backend_name = ""
+    if backend_name == "postgres":
+        return connect(readonly=True, _skip_autoinit=True)
+    return connect(readonly=True)
+
+
+def _is_missing_size_policy_table_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        ("size_policy" in text or "size_policy_points" in text)
+        and (
+            "undefinedtable" in text
+            or "no such table" in text
+            or "does not exist" in text
+        )
+    )
+
+
 def load_latest_size_policy(con=None, *, require_ope: bool = True) -> Optional[Dict[str, Any]]:
     """
     Returns the latest size policy blob with decoded bucket points.
     """
-    init_db()
     owns = False
     if con is None:
-        con = connect()
+        con = _read_connection()
         owns = True
     try:
         columns = set()
@@ -135,6 +156,10 @@ def load_latest_size_policy(con=None, *, require_ope: bool = True) -> Optional[D
                 return None
             policy["ope_gate"] = dict(ope_reason or {})
         return policy
+    except Exception as e:
+        if _is_missing_size_policy_table_error(e):
+            return None
+        raise
     finally:
         if owns:
             con.close()

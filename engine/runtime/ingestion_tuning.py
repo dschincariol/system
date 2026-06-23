@@ -10,6 +10,8 @@ from typing import Any, Mapping
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
 HOST_32T_123G_PROFILE = "host_32t_123g"
+ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS_MODES = {"NORMAL", "FULL", "EXTRA"}
+TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS_MODES = {"NORMAL", "FULL", "EXTRA"}
 
 _PROFILE_ALIASES = {
     "": "safe",
@@ -28,6 +30,7 @@ _HOST_32T_123G_DEFAULTS: dict[str, int | float | str] = {
     "INGESTION_CHILD_TS_PG_POOL_MIN_SIZE": 1,
     "INGESTION_CHILD_TIMESCALE_POOL_MAX_SIZE": 4,
     "INGESTION_CHILD_TIMESCALE_PRICES_POOL_MAX_SIZE": 4,
+    "ASYNC_PRICE_WRITER_WORKERS": 8,
     "ASYNC_PRICE_WRITER_QUEUE_MAXSIZE": 1024,
     "ASYNC_PRICE_WRITER_BATCH_SIZE": 512,
     "ASYNC_PRICE_WRITER_FLUSH_INTERVAL_S": 0.25,
@@ -35,9 +38,9 @@ _HOST_32T_123G_DEFAULTS: dict[str, int | float | str] = {
     "TELEMETRY_APPEND_BUFFER_MAX_ROWS": 4096,
     "TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S": 0.25,
     "TIMESCALE_POOL_MAX_SIZE": 8,
-    "TIMESCALE_BATCH_SIZE": 1000,
+    "TIMESCALE_BATCH_SIZE": 4000,
     "TIMESCALE_FLUSH_INTERVAL_S": 0.5,
-    "TIMESCALE_QUEUE_MAXSIZE": 512,
+    "TIMESCALE_QUEUE_MAXSIZE": 128,
     "TIMESCALE_BACKPRESSURE_TIMEOUT_S": 3.0,
     "TIMESCALE_PRICES_POOL_MAX_SIZE": 8,
     "TS_REDIS_POOL_SIZE": 32,
@@ -68,17 +71,20 @@ BOUNDS: dict[str, Bound] = {
     "ASYNC_PRICE_WRITER_RETRY_BASE_S": Bound("ASYNC_PRICE_WRITER_RETRY_BASE_S", 0.25, 0.01, 5.0, "float"),
     "ASYNC_PRICE_WRITER_RETRY_MAX_S": Bound("ASYNC_PRICE_WRITER_RETRY_MAX_S", 5.0, 0.1, 30.0, "float"),
     "ASYNC_PRICE_WRITER_ENQUEUE_TIMEOUT_S": Bound("ASYNC_PRICE_WRITER_ENQUEUE_TIMEOUT_S", 0.05, 0.0, 5.0, "float"),
+    "ASYNC_PRICE_WRITER_WORKERS": Bound("ASYNC_PRICE_WRITER_WORKERS", 4, 1, 16, "int"),
     "ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES": Bound("ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES", 268435456, 1048576, 8589934592, "int"),
     "ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS": Bound("ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS", 50, 10, 60000, "int"),
     "TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S": Bound("TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0, "float"),
     "TELEMETRY_APPEND_BUFFER_FLUSH_JITTER_RATIO": Bound("TELEMETRY_APPEND_BUFFER_FLUSH_JITTER_RATIO", 0.25, 0.0, 1.0, "float"),
     "TELEMETRY_APPEND_BUFFER_MAX_BATCH": Bound("TELEMETRY_APPEND_BUFFER_MAX_BATCH", 128, 1, 4096, "int"),
     "TELEMETRY_APPEND_BUFFER_MAX_ROWS": Bound("TELEMETRY_APPEND_BUFFER_MAX_ROWS", 4096, 1, 65536, "int"),
+    "TELEMETRY_APPEND_BUFFER_SPOOL_MAX_BYTES": Bound("TELEMETRY_APPEND_BUFFER_SPOOL_MAX_BYTES", 67108864, 1048576, 2147483648, "int"),
+    "TELEMETRY_APPEND_BUFFER_SPOOL_BUSY_TIMEOUT_MS": Bound("TELEMETRY_APPEND_BUFFER_SPOOL_BUSY_TIMEOUT_MS", 50, 10, 60000, "int"),
     "TIMESCALE_POOL_MIN_SIZE": Bound("TIMESCALE_POOL_MIN_SIZE", 1, 1, 16, "int"),
     "TIMESCALE_POOL_MAX_SIZE": Bound("TIMESCALE_POOL_MAX_SIZE", 4, 1, 16, "int"),
-    "TIMESCALE_BATCH_SIZE": Bound("TIMESCALE_BATCH_SIZE", 500, 1, 5000, "int"),
+    "TIMESCALE_BATCH_SIZE": Bound("TIMESCALE_BATCH_SIZE", 2000, 1, 5000, "int"),
     "TIMESCALE_FLUSH_INTERVAL_S": Bound("TIMESCALE_FLUSH_INTERVAL_S", 1.0, 0.05, 10.0, "float"),
-    "TIMESCALE_QUEUE_MAXSIZE": Bound("TIMESCALE_QUEUE_MAXSIZE", 1024, 1, 32768, "int"),
+    "TIMESCALE_QUEUE_MAXSIZE": Bound("TIMESCALE_QUEUE_MAXSIZE", 256, 1, 32768, "int"),
     "TIMESCALE_RETRY_ATTEMPTS": Bound("TIMESCALE_RETRY_ATTEMPTS", 5, 1, 10, "int"),
     "TIMESCALE_RETRY_BASE_S": Bound("TIMESCALE_RETRY_BASE_S", 0.25, 0.01, 5.0, "float"),
     "TIMESCALE_RETRY_MAX_S": Bound("TIMESCALE_RETRY_MAX_S", 5.0, 0.1, 30.0, "float"),
@@ -97,6 +103,10 @@ BOUNDS: dict[str, Bound] = {
     "TIMESCALE_PRICES_RETRY_ATTEMPTS": Bound("TIMESCALE_PRICES_RETRY_ATTEMPTS", 3, 1, 10, "int"),
     "TIMESCALE_PRICES_RETRY_BASE_S": Bound("TIMESCALE_PRICES_RETRY_BASE_S", 0.25, 0.01, 5.0, "float"),
     "TIMESCALE_PRICES_RETRY_MAX_S": Bound("TIMESCALE_PRICES_RETRY_MAX_S", 5.0, 0.1, 30.0, "float"),
+    "TIMESCALE_PRICES_CIRCUIT_FAILURE_THRESHOLD": Bound(
+        "TIMESCALE_PRICES_CIRCUIT_FAILURE_THRESHOLD", 3, 1, 100, "int"
+    ),
+    "TIMESCALE_PRICES_CIRCUIT_OPEN_S": Bound("TIMESCALE_PRICES_CIRCUIT_OPEN_S", 5.0, 0.1, 300.0, "float"),
     "TS_PG_POOL_SIZE": Bound("TS_PG_POOL_SIZE", 4, 1, 32, "int"),
     "TS_PG_POOL_MIN_SIZE": Bound("TS_PG_POOL_MIN_SIZE", 2, 1, 16, "int"),
     "INGESTION_CHILD_TS_PG_POOL_SIZE": Bound("INGESTION_CHILD_TS_PG_POOL_SIZE", 2, 1, 8, "int"),
@@ -255,8 +265,10 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
         child_pg_pool_size,
         tuned_int("INGESTION_CHILD_TS_PG_POOL_MIN_SIZE", 1, 1, 8, env=source),
     )
+    async_workers = tuned_int("ASYNC_PRICE_WRITER_WORKERS", 4, 1, 16, env=source)
     child_timescale_pool_max = tuned_int("INGESTION_CHILD_TIMESCALE_POOL_MAX_SIZE", 2, 1, 8, env=source)
     child_prices_pool_max = tuned_int("INGESTION_CHILD_TIMESCALE_PRICES_POOL_MAX_SIZE", 2, 1, 8, env=source)
+    child_async_workers = min(async_workers, child_prices_pool_max)
     timescale_enabled = _bool_from_env_or_dsn(
         "TIMESCALE_ENABLED",
         dsn_keys=("TIMESCALE_DSN", "TIMESCALE_URL", "TIMESCALE_DATABASE_URL"),
@@ -274,17 +286,35 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
     timescale_pool_min = min(timescale_pool_max, tuned_int("TIMESCALE_POOL_MIN_SIZE", 1, 1, 16, env=source))
     price_pool_max = tuned_int("TIMESCALE_PRICES_POOL_MAX_SIZE", 4, 1, 16, env=source)
     price_pool_min = min(price_pool_max, tuned_int("TIMESCALE_PRICES_POOL_MIN_SIZE", 1, 1, 16, env=source))
-    timescale_queue = tuned_int("TIMESCALE_QUEUE_MAXSIZE", 1024, 1, 32768, env=source)
-    timescale_batch = tuned_int("TIMESCALE_BATCH_SIZE", 500, 1, 5000, env=source)
+    timescale_queue = tuned_int("TIMESCALE_QUEUE_MAXSIZE", 256, 1, 32768, env=source)
+    timescale_batch = tuned_int("TIMESCALE_BATCH_SIZE", 2000, 1, 5000, env=source)
     async_queue = tuned_int("ASYNC_PRICE_WRITER_QUEUE_MAXSIZE", 2048, 32, 32768, env=source)
     async_batch = tuned_int("ASYNC_PRICE_WRITER_BATCH_SIZE", 256, 1, 4096, env=source)
     async_spool_max_bytes = tuned_int("ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES", 268435456, 1048576, 8589934592, env=source)
     async_spool_busy_timeout_ms = tuned_int("ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS", 50, 10, 60000, env=source)
+    async_spool_synchronous = str(source.get("ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS") or "NORMAL").strip().upper()
     telemetry_batch = tuned_int("TELEMETRY_APPEND_BUFFER_MAX_BATCH", 128, 1, 4096, env=source)
     telemetry_rows = max(
         telemetry_batch,
         tuned_int("TELEMETRY_APPEND_BUFFER_MAX_ROWS", 4096, 1, 65536, env=source),
     )
+    telemetry_spool_max_bytes = tuned_int(
+        "TELEMETRY_APPEND_BUFFER_SPOOL_MAX_BYTES",
+        67108864,
+        1048576,
+        2147483648,
+        env=source,
+    )
+    telemetry_spool_busy_timeout_ms = tuned_int(
+        "TELEMETRY_APPEND_BUFFER_SPOOL_BUSY_TIMEOUT_MS",
+        50,
+        10,
+        60000,
+        env=source,
+    )
+    telemetry_spool_synchronous = str(
+        source.get("TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS") or "NORMAL"
+    ).strip().upper()
     event_log_batch = tuned_int("EVENT_LOG_BUFFER_MAX_BATCH", 128, 1, 4096, env=source)
     event_log_rows = max(event_log_batch, tuned_int("EVENT_LOG_BUFFER_MAX_ROWS", 2048, 1, 65536, env=source))
     runtime_metrics_batch = tuned_int("RUNTIME_METRICS_BUFFER_MAX_BATCH", 256, 1, 4096, env=source)
@@ -307,9 +337,10 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
     if prices_enabled:
         total_db_connections += int(price_pool_max)
 
+    timescale_row_window = int(timescale_queue * timescale_batch) if timescale_enabled else 0
     queue_risk_rows = 0
     if timescale_enabled:
-        queue_risk_rows += int(timescale_queue * timescale_batch)
+        queue_risk_rows += int(timescale_row_window)
     if async_enabled:
         queue_risk_rows += int(async_queue * async_batch)
     if telemetry_enabled:
@@ -337,6 +368,11 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
         errors.append("TIMESCALE_ENABLED is true but no TIMESCALE_DSN/TIMESCALE_URL/TIMESCALE_DATABASE_URL is configured")
     if prices_enabled and not prices_dsn_configured:
         errors.append("TIMESCALE_PRICES_ENABLED is true but no TIMESCALE_PRICES_DSN or TIMESCALE_DSN is configured")
+    if prices_enabled and async_enabled and price_pool_max < async_workers:
+        errors.append(
+            "TIMESCALE_PRICES_POOL_MAX_SIZE must be >= ASYNC_PRICE_WRITER_WORKERS: "
+            f"{price_pool_max}<{async_workers}"
+        )
     if total_db_connections > max_total_db:
         errors.append(
             "total ingestion DB pool budget exceeded: "
@@ -348,12 +384,22 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
             "ingestion buffered-row risk budget exceeded: "
             f"{queue_risk_rows}>{max_buffered_rows}"
         )
-    if timescale_enabled and timescale_batch > max(1, timescale_queue * 4):
-        warnings.append("TIMESCALE_BATCH_SIZE is large relative to TIMESCALE_QUEUE_MAXSIZE")
+    if timescale_enabled and timescale_row_window > int(max_buffered_rows * 0.75):
+        warnings.append("TIMESCALE queue row window is large relative to INGESTION_TUNING_MAX_BUFFERED_ROWS")
     if async_enabled and not prices_enabled:
         warnings.append("ASYNC_PRICE_WRITER_ENABLED is on while TIMESCALE_PRICES storage is disabled")
+    if async_spool_synchronous not in ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS_MODES:
+        errors.append(
+            "ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS must be one of "
+            f"{','.join(sorted(ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS_MODES))}: {async_spool_synchronous}"
+        )
     if telemetry_enabled and telemetry_rows < telemetry_batch:
         warnings.append("TELEMETRY_APPEND_BUFFER_MAX_ROWS is below TELEMETRY_APPEND_BUFFER_MAX_BATCH after parsing")
+    if telemetry_spool_synchronous not in TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS_MODES:
+        errors.append(
+            "TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS must be one of "
+            f"{','.join(sorted(TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS_MODES))}: {telemetry_spool_synchronous}"
+        )
 
     snapshot = {
         "ok": not bool(errors),
@@ -385,6 +431,7 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
             "timescale_pool_max_size": int(child_timescale_pool_max),
             "price_storage_pool_min_size": 1,
             "price_storage_pool_max_size": int(child_prices_pool_max),
+            "async_price_writer_workers": int(child_async_workers),
         },
         "redis_pool": {
             "pool_max_size": int(redis_pool),
@@ -406,9 +453,14 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
             "pool_min_size": int(price_pool_min),
             "pool_max_size": int(price_pool_max),
             "retry_attempts": tuned_int("TIMESCALE_PRICES_RETRY_ATTEMPTS", 3, 1, 10, env=source),
+            "circuit_failure_threshold": tuned_int(
+                "TIMESCALE_PRICES_CIRCUIT_FAILURE_THRESHOLD", 3, 1, 100, env=source
+            ),
+            "circuit_open_s": tuned_float("TIMESCALE_PRICES_CIRCUIT_OPEN_S", 5.0, 0.1, 300.0, env=source),
         },
         "async_price_writer": {
             "enabled": bool(async_enabled),
+            "workers": int(async_workers),
             "queue_maxsize": int(async_queue),
             "batch_size": int(async_batch),
             "flush_interval_s": tuned_float("ASYNC_PRICE_WRITER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0, env=source),
@@ -417,11 +469,15 @@ def ingestion_tuning_snapshot(env: Mapping[str, str] | None = None, *, pg_pool_r
             "spool_max_envelopes": int(async_queue),
             "spool_max_bytes": int(async_spool_max_bytes),
             "spool_busy_timeout_ms": int(async_spool_busy_timeout_ms),
+            "spool_synchronous": str(async_spool_synchronous),
         },
         "telemetry_append_buffer": {
             "enabled": bool(telemetry_enabled),
             "max_batch": int(telemetry_batch),
             "max_rows": int(telemetry_rows),
+            "spool_max_bytes": int(telemetry_spool_max_bytes),
+            "spool_busy_timeout_ms": int(telemetry_spool_busy_timeout_ms),
+            "spool_synchronous": str(telemetry_spool_synchronous),
             "flush_interval_s": tuned_float("TELEMETRY_APPEND_BUFFER_FLUSH_INTERVAL_S", 0.5, 0.05, 5.0, env=source),
             "flush_jitter_ratio": tuned_float("TELEMETRY_APPEND_BUFFER_FLUSH_JITTER_RATIO", 0.25, 0.0, 1.0, env=source),
         },
@@ -473,6 +529,7 @@ def assert_ingestion_tuning_safe(env: Mapping[str, str] | None = None, *, pg_poo
 __all__ = [
     "BOUNDS",
     "HOST_32T_123G_PROFILE",
+    "TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS_MODES",
     "active_profile",
     "assert_ingestion_tuning_safe",
     "env_bool",

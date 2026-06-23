@@ -20,12 +20,53 @@ def test_safe_defaults_are_bounded_and_preflight_clean() -> None:
     assert snapshot["runtime_postgres_pool"]["pool_max_size"] == 8
     assert snapshot["ingestion_child_postgres_pool"]["pool_max_size"] == 2
     assert snapshot["redis_pool"]["pool_max_size"] == 16
+    assert snapshot["timescale"]["batch_size"] == 2000
+    assert snapshot["timescale"]["queue_maxsize"] == 256
+    assert snapshot["async_price_writer"]["spool_synchronous"] == "NORMAL"
     assert snapshot["telemetry_append_buffer"]["max_rows"] == 4096
+    assert snapshot["telemetry_append_buffer"]["spool_max_bytes"] == 67108864
+    assert snapshot["telemetry_append_buffer"]["spool_synchronous"] == "NORMAL"
     assert snapshot["event_log_buffer"]["max_rows"] == 2048
     assert snapshot["runtime_metrics_buffer"]["max_rows"] == 4096
     assert snapshot["runtime_meta_buffer"]["max_keys"] == 512
     assert snapshot["capacity"]["total_db_pool_connections"] <= snapshot["capacity"]["max_total_db_connections"]
     assert snapshot["errors"] == []
+
+
+def test_async_spool_synchronous_mode_is_explicitly_validated() -> None:
+    from engine.runtime.ingestion_tuning import ingestion_tuning_snapshot
+
+    strict = ingestion_tuning_snapshot(
+        {"ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS": "FULL"},
+        pg_pool_role="ingestion",
+    )
+    invalid = ingestion_tuning_snapshot(
+        {"ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS": "FAST"},
+        pg_pool_role="ingestion",
+    )
+
+    assert strict["ok"] is True
+    assert strict["async_price_writer"]["spool_synchronous"] == "FULL"
+    rendered = "\n".join(str(item) for item in list(invalid.get("errors") or []))
+    assert "ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS must be one of" in rendered
+
+
+def test_telemetry_spool_synchronous_mode_is_explicitly_validated() -> None:
+    from engine.runtime.ingestion_tuning import ingestion_tuning_snapshot
+
+    strict = ingestion_tuning_snapshot(
+        {"TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS": "FULL"},
+        pg_pool_role="ingestion",
+    )
+    invalid = ingestion_tuning_snapshot(
+        {"TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS": "FAST"},
+        pg_pool_role="ingestion",
+    )
+
+    assert strict["ok"] is True
+    assert strict["telemetry_append_buffer"]["spool_synchronous"] == "FULL"
+    rendered = "\n".join(str(item) for item in list(invalid.get("errors") or []))
+    assert "TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS must be one of" in rendered
 
 
 def test_32_thread_123g_profile_increases_throughput_without_expanding_row_window() -> None:
@@ -50,9 +91,13 @@ def test_32_thread_123g_profile_increases_throughput_without_expanding_row_windo
     assert host["ingestion_child_postgres_pool"]["pool_max_size"] == 3
     assert host["ingestion_child_sidecar_pools"]["timescale_pool_max_size"] == 4
     assert host["ingestion_child_sidecar_pools"]["price_storage_pool_max_size"] == 4
+    assert host["ingestion_child_sidecar_pools"]["async_price_writer_workers"] == 4
     assert host["timescale"]["pool_max_size"] == 8
+    assert host["timescale"]["batch_size"] == 4000
+    assert host["timescale"]["queue_maxsize"] == 128
     assert host["timescale"]["batch_size"] > safe["timescale"]["batch_size"]
     assert host["timescale"]["queue_maxsize"] < safe["timescale"]["queue_maxsize"]
+    assert host["async_price_writer"]["workers"] == 8
     assert host["async_price_writer"]["batch_size"] > safe["async_price_writer"]["batch_size"]
     assert host["async_price_writer"]["queue_maxsize"] < safe["async_price_writer"]["queue_maxsize"]
     assert host["capacity"]["buffered_row_risk_estimate"] <= safe["capacity"]["buffered_row_risk_estimate"]
@@ -111,6 +156,38 @@ def test_unsafe_pool_combination_fails_assertion() -> None:
 
     with pytest.raises(RuntimeError, match="total ingestion DB pool budget exceeded"):
         assert_ingestion_tuning_safe(env, pg_pool_role="ingestion")
+
+
+def test_async_price_writer_workers_require_matching_price_pool() -> None:
+    from engine.runtime.ingestion_tuning import assert_ingestion_tuning_safe, ingestion_tuning_snapshot
+
+    env = {
+        "TIMESCALE_PRICES_ENABLED": "1",
+        "TIMESCALE_PRICES_DSN": "postgres://example",
+        "ASYNC_PRICE_WRITER_ENABLED": "1",
+        "ASYNC_PRICE_WRITER_WORKERS": "8",
+        "TIMESCALE_PRICES_POOL_MAX_SIZE": "4",
+    }
+
+    snapshot = ingestion_tuning_snapshot(env, pg_pool_role="ingestion")
+    rendered = "\n".join(str(item) for item in list(snapshot.get("errors") or []))
+    assert "TIMESCALE_PRICES_POOL_MAX_SIZE must be >= ASYNC_PRICE_WRITER_WORKERS: 4<8" in rendered
+
+    with pytest.raises(RuntimeError, match="TIMESCALE_PRICES_POOL_MAX_SIZE must be >= ASYNC_PRICE_WRITER_WORKERS"):
+        assert_ingestion_tuning_safe(env, pg_pool_role="ingestion")
+
+
+def test_price_storage_config_rejects_pool_smaller_than_async_workers(monkeypatch) -> None:
+    monkeypatch.setenv("TIMESCALE_PRICES_ENABLED", "1")
+    monkeypatch.setenv("TIMESCALE_PRICES_DSN", "postgres://user:pw@example/db")
+    monkeypatch.setenv("ASYNC_PRICE_WRITER_ENABLED", "1")
+    monkeypatch.setenv("ASYNC_PRICE_WRITER_WORKERS", "8")
+    monkeypatch.setenv("TIMESCALE_PRICES_POOL_MAX_SIZE", "4")
+
+    from engine.runtime.storage_pg_prices import PostgresPriceStorageConfig
+
+    with pytest.raises(RuntimeError, match="timescale_prices_pool_too_small_for_async_writer"):
+        PostgresPriceStorageConfig.from_env()
 
 
 def test_prod_preflight_ingestion_tuning_gate_reports_errors(monkeypatch) -> None:
@@ -173,11 +250,23 @@ def test_timescale_flush_metric_fields_are_recorded_without_external_db() -> Non
         )
     )
 
-    client._note_flush_success("price_data", 3, flush_latency_ms=12.4, db_write_duration_ms=7.6)
+    client._note_flush_success(
+        "price_data",
+        3,
+        write_path="copy_staging",
+        deduped_rows=1,
+        flush_latency_ms=12.4,
+        db_write_duration_ms=7.6,
+    )
     snapshot = client.get_snapshot()
     metrics = snapshot["metrics"]
 
     assert metrics["last_flush_latency_ms"] == 12
     assert metrics["last_db_write_duration_ms"] == 8
+    assert metrics["last_write_path"] == "copy_staging"
+    assert metrics["copy_batches"] == 1
+    assert metrics["copy_rows"] == 3
+    assert metrics["deduped_rows"] == 1
     assert metrics["table_stats"]["price_data"]["last_flush_latency_ms"] == 12
     assert metrics["table_stats"]["price_data"]["last_db_write_duration_ms"] == 8
+    assert metrics["table_stats"]["price_data"]["last_write_path"] == "copy_staging"

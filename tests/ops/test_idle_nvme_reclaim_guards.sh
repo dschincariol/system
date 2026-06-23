@@ -113,6 +113,16 @@ grep -q 'event=dry_run_default' <<<"$output"
 grep -q '\[dry-run\] wipefs' <<<"$output"
 grep -q 'RECLAIM destroys the Windows/BitLocker install' <<<"$output"
 
+output="$(run_reclaim IDLE_NVME_DECISION=RECLAIM RECLAIM_ROLE=zfs-pool RECLAIM_FS_TYPE=none BACKUP_EVIDENCE_PATH="$fresh_evidence_json")"
+grep -q 'event=dry_run_default' <<<"$output"
+grep -q '\[dry-run\] wipefs --all /dev/nvme0n1' <<<"$output"
+grep -q '\[dry-run\] sgdisk --zap-all /dev/nvme0n1' <<<"$output"
+grep -q 'event=zfs_pool_reclaim_complete' <<<"$output"
+if grep -Eq 'mkfs|--new=1:0:0|append to /etc/fstab' <<<"$output"; then
+  echo "zfs-pool reclaim role unexpectedly formatted or configured a filesystem" >&2
+  exit 1
+fi
+
 set +e
 output="$(run_reclaim IDLE_NVME_DECISION=RECLAIM RECLAIM_DRY_RUN=0 BACKUP_EVIDENCE_PATH="$fresh_evidence_json" 2>&1)"
 rc=$?
