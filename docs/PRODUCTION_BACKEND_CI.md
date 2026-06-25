@@ -52,6 +52,13 @@ before the gate can silently shrink. A repository meta-test also checks that the
 workflow names exactly those eight files and that each carries the module-level
 marker.
 
+Safety-critical tests in the SQLite/mocks lane must not inherit an ambient host
+Redis service. Tests that need real Redis must use `@pytest.mark.requires_redis`
+and run in the production-backend gate. Boot-level SQLite/mocks tests should pin
+cache settings to memory or a deliberately unreachable local Redis endpoint with
+short timeouts so Redis outages, authentication policy, or a developer's local
+Redis socket cannot change the safety-critical result.
+
 ## Local Reproduction
 
 Start local services on the same ports used by CI. The Postgres container uses the TimescaleDB image because the production migration path creates Timescale extension objects.

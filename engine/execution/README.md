@@ -126,6 +126,97 @@ weekend-closed FX orders via the existing suppression/audit path and biases
 daily-rollover FX orders toward passive limit timing with additional delay.
 Spread, swap, carry, and P&L cost accounting remain FX-07 scope.
 
+## Equity Market Session
+
+`equity_session.py` is the pure US equity regular-trading-hours clock used by
+the execution policy layer. It mirrors the `engine.data.prices.fx_clock`
+structure: all boundaries are anchored in `ZoneInfo("America/New_York")`, with
+a fixed-offset ET fallback only if zoneinfo is unavailable. The default regular
+session is 9:30 a.m. ET inclusive through 4:00 p.m. ET exclusive, and seeded
+half-days close at 1:00 p.m. ET.
+
+The policy engine applies this clock only when `asset_map.asset_class_for_symbol`
+returns `EQUITY` and `EPE_EQUITY_SESSION_ENFORCE=1` (default on). Closed seeded
+sessions, holidays, and weekends are suppressed through the existing
+`_log_suppression_event` / `log_suppression` / `execution_policy_audit` path;
+there is no new table or `storage.py` schema change. Near-close and half-day
+equity orders that remain in-session are biased toward passive limit timing by
+adjusting the already-computed execution decision before broker-bound fields are
+read. Non-equity symbols, `UNKNOWN` symbols, and `EPE_EQUITY_SESSION_ENFORCE=0`
+keep the legacy shape and audit behavior.
+
+Operator knobs are `EPE_EQUITY_SESSION_ENFORCE`, `EQUITY_RTH_OPEN_HOUR_ET`,
+`EQUITY_RTH_OPEN_MIN_ET`, `EQUITY_RTH_CLOSE_HOUR_ET`,
+`EQUITY_RTH_CLOSE_MIN_ET`, `EQUITY_HALFDAY_CLOSE_HOUR_ET`,
+`EQUITY_HALFDAY_CLOSE_MIN_ET`, `EQUITY_MARKET_HOLIDAYS_JSON`,
+`EQUITY_MARKET_HALFDAYS_JSON`, `EQUITY_NEAR_CLOSE_BIAS_MIN`, and
+`EQUITY_SESSION_UNKNOWN_YEAR_POLICY`. The JSON override variables accept ISO
+date arrays such as `["2029-07-03"]` so operators can extend calendars without
+code changes.
+
+The hand-rolled holiday and half-day seed covers the NYSE/ICE published
+2025-2028 calendars from the NYSE holidays/hours page and ICE NYSE Group
+holiday-calendar releases. For years outside the seeded or overridden table,
+the session state reports `holiday_table_covered=false`. The default unknown-year
+policy is `open_rth` to preserve permissive legacy behavior; setting
+`EQUITY_SESSION_UNKNOWN_YEAR_POLICY=fail_closed` blocks such equity orders until
+the calendar is extended.
+
+Residual: the US equity Almgren-Chriss coefficients in
+`cost_models/almgren_chriss.py` are still calibrated for regular-hours trading.
+EQ-04 prevents or annotates out-of-session emission; recalibrating those
+coefficients outside RTH is separately owned.
+
+### Per-Broker Share Rounding And Minimum Notional
+
+`share_rounding.py` owns the runtime-only equity share-count normalization at
+the broker boundary. It is opt-in through `EXEC_USE_SHARE_ROUNDING=1`; with the
+flag unset or false, the adapters keep the legacy quantity exactly unchanged.
+
+When enabled, IBKR defaults to whole-share equity orders
+(`EXEC_IBKR_SHARE_INCREMENT=1`) because fractional share support is limited by
+venue/order type, while Alpaca defaults to fractional quantities
+(`EXEC_ALPACA_SHARE_INCREMENT=0`). The simulator uses
+`EXEC_SIM_ROUNDING_BROKER` (default `ibkr`) so paper fills mirror the selected
+live broker policy. `EXEC_EQUITY_MIN_NOTIONAL_USD` defaults to `1.0`, and
+`EXEC_SHARE_ROUNDING_DROP_SUB_MIN_NOTIONAL=1` drops sub-minimum equity orders by
+returning zero so the existing zero-delta guards skip submission/fill.
+
+Rounding truncates toward zero to avoid increasing exposure beyond the model's
+intent. The decision is written into existing order metadata, broker-action
+audit payloads, and simulator fill `explain_json`; there is no storage schema
+change. Symbols classified `UNKNOWN` at an equity broker boundary are treated
+as equity by default (`EXEC_SHARE_ROUNDING_UNKNOWN_AS_EQUITY=1`) so real stocks
+not yet present in the asset map still use broker-realistic share conventions.
+
+FX is an explicit pass-through. This layer does not implement the still-unowned
+FX weight-to-lots conversion at the same weight-to-quantity seam; a future FX
+owner should convert FX weights to lots before this helper and continue passing
+`asset_class="FX"` so equity share rounding remains a no-op for FX quantities.
+
+## Crypto Execution Path
+
+Crypto execution support in this workstream is an IBKR-PAXOS contract path, not
+a new exchange adapter. `broker_ibkr_gateway.py` constructs IBKR `CRYPTO`
+contracts on exchange `PAXOS` from bare-root crypto symbols such as `BTC`, with
+`symbol=BTC` and `currency=USD`. The local normalization fallback keeps the
+stored symbol convention aligned with `asset_map.py` and `crypto_funding_rates`
+until a canonical `crypto_instrument.py` owner exists.
+
+`broker_router.py` keeps the existing failover-chain validation and global
+execution gates, then prefers the crypto-capable broker (`ibkr`) at the front of
+that already validated chain when a dry-run/sim/paper batch contains crypto
+orders. No live order, cancel, replace, flatten, pre-live reconcile,
+kill-switch, execution-mode, options-block, or live broker contract mechanics
+are changed by this path.
+
+`crypto_session.py` models crypto as 24/7 open by default, including weekends.
+The execution policy engine applies this asset-class-aware clock behind
+`EPE_CRYPTO_SESSION_ENFORCE` (default on) and suppresses only during an
+explicitly configured `CRYPTO_MAINTENANCE_*` UTC window. Equity and FX session
+logic remain unchanged; crypto feature rows use always-on base session flags so
+fixed equity/FX UTC windows do not label crypto as out of session.
+
 ## Broker Simulation Pipeline
 
 `broker_sim.py::apply_new_portfolio_orders(...)` keeps its public signature stable
@@ -143,6 +234,22 @@ Dry-run override orders still return `dry_run_preview` with the supplied orders 
 do not write broker fills, positions, order state, or execution-ledger rows. Live
 paper-sim override orders still write the broker and execution-ledger evidence
 used by attribution, idempotency, and operator diagnostics.
+
+### Broker Simulation Options
+
+`broker_sim.py` treats canonical OCC option symbols as option contracts only when
+`engine.data.options_instrument.parse_option_symbol(...)` can parse valid
+metadata. Unparseable symbols stay on the existing non-option path.
+
+Option fills fail closed on missing, stale, or invalid `options_chain_v2`
+bid/ask rows; the simulator never prices an option from the underlying `prices`
+row. Weight sizing and notional accounting use option midpoint times the
+metadata multiplier, contract quantities round to whole contracts, and execution
+prices walk from midpoint toward the chain ask for buys or bid for sells. Short
+option fills record a reference-only margin debit in `broker_fills` under
+`option_margin_debit` and annotate fills with `option_sim_margin_reference`.
+Broker mark-to-market uses the latest valid option-chain midpoint times
+multiplier; missing option quotes appear in `broker_equity_at(...).missing_prices`.
 
 ## Learned Execution Slicing
 

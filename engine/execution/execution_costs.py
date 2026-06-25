@@ -6,6 +6,7 @@ Execution subsystem module for `execution_costs`.
 
 # dev_core/execution_costs.py
 import logging
+import math
 import os
 from typing import Dict, Optional
 
@@ -44,6 +45,9 @@ def estimate_cost_bps(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     spread_bps_override: Optional[float] = None,
     extra_cost_bps: float = 0.0,
+    contract_multiplier: Optional[float] = None,
+    tick_size: Optional[float] = None,
+    tick_value: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Cost model (bps):
@@ -72,7 +76,18 @@ def estimate_cost_bps(
             spr = max(0.0, float(ask) - float(bid))
             if px > 0:
                 # expected crossing cost approx half spread (entry)
-                spread_bps = min(DEFAULT_SPREAD_BPS_CAP, _bps(0.5 * spr / float(px)))
+                multiplier = float(contract_multiplier or 0.0)
+                tick = float(tick_size or 0.0)
+                tick_val = float(tick_value or 0.0)
+                notional_per_contract = float(px) * float(multiplier)
+                if multiplier > 0.0 and tick > 0.0 and tick_val > 0.0 and notional_per_contract > 0.0:
+                    half_spread_ticks = math.ceil(max(0.0, 0.5 * spr) / float(tick))
+                    spread_bps = min(
+                        DEFAULT_SPREAD_BPS_CAP,
+                        float(max(0, half_spread_ticks)) * float(tick_val) / float(notional_per_contract) * 10000.0,
+                    )
+                else:
+                    spread_bps = min(DEFAULT_SPREAD_BPS_CAP, _bps(0.5 * spr / float(px)))
         except (TypeError, ValueError) as e:
             _warn_nonfatal(
                 "EXECUTION_COST_SPREAD_PARSE_FAILED",

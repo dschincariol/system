@@ -17,7 +17,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
@@ -92,6 +92,7 @@ USE_GOV_FEATURES = _env_bool("USE_GOV_FEATURES", False)
 USE_FUNDAMENTALS_PIT_FEATURES = _env_bool("USE_FUNDAMENTALS_PIT_FEATURES", False)
 USE_BOCPD_FEATURES = _env_bool("USE_BOCPD_FEATURES", False)
 USE_FX_FEATURES = _env_bool("USE_FX_FEATURES", False)
+USE_FUTURES_FEATURES = _env_bool("USE_FUTURES_FEATURES", False)
 
 BASE_FEATURE_IDS = [
     "base.source_credibility",
@@ -293,6 +294,77 @@ GOV_FEATURE_IDS = list(_ALL_GOV_FEATURE_IDS) if USE_GOV_FEATURES else []
 FUNDAMENTALS_PIT_FEATURE_IDS = list(_ALL_FUNDAMENTALS_PIT_FEATURE_IDS) if USE_FUNDAMENTALS_PIT_FEATURES else []
 CONGRESSIONAL_FEATURE_IDS = list(_ALL_CONGRESSIONAL_FEATURE_IDS) if USE_CONGRESSIONAL_TRADE_DATA else []
 
+
+def _feature_id_is_crypto_positioning(feature_id: Any) -> bool:
+    text = str(feature_id or "").strip()
+    return bool(text and (text in _ALL_CRYPTO_POSITIONING_FEATURE_IDS or text.startswith(("funding_", "perp_", "basis_"))))
+
+
+def feature_schema_flags(feature_ids: Sequence[Any] | None = None) -> Dict[str, Any]:
+    """Return import-time feature toggles that materially affect feature schemas."""
+
+    ids = [str(item).strip() for item in list(feature_ids or []) if str(item or "").strip()]
+    return {
+        "USE_FUNDING_FEATURES": bool(USE_FUNDING_FEATURES),
+        "crypto_positioning_features_present": any(_feature_id_is_crypto_positioning(fid) for fid in ids),
+    }
+
+
+def _schema_flag_value(schema: Mapping[str, Any], flag_name: str) -> Optional[bool]:
+    flags = schema.get("feature_flags")
+    if not isinstance(flags, Mapping):
+        flags = schema.get("runtime_feature_flags")
+    if isinstance(flags, Mapping) and flag_name in flags:
+        return bool(flags.get(flag_name))
+    return None
+
+
+def _schema_feature_ids(schema: Mapping[str, Any]) -> List[str]:
+    return [
+        str(item).strip()
+        for item in list(schema.get("feature_ids") or [])
+        if str(item or "").strip()
+    ]
+
+
+def assert_feature_schema_runtime_parity(
+    artifact_schema: Mapping[str, Any] | None,
+    *,
+    current_schema: Mapping[str, Any] | None = None,
+    context: str = "feature_schema",
+    model_name: str = "",
+) -> None:
+    """Fail closed when import-time feature toggles differ between train and serve."""
+
+    schema = dict(artifact_schema or {})
+    if not schema:
+        return
+    current = dict(current_schema or {})
+    current_flags = feature_schema_flags(current.get("feature_ids") or schema.get("feature_ids") or [])
+    artifact_value = _schema_flag_value(schema, "USE_FUNDING_FEATURES")
+    artifact_has_crypto = any(_feature_id_is_crypto_positioning(fid) for fid in _schema_feature_ids(schema)) or (
+        "crypto_positioning" in str(schema.get("feature_set_tag") or "")
+    )
+    if artifact_value is None:
+        if artifact_has_crypto:
+            artifact_value = True
+        elif bool(current_flags.get("USE_FUNDING_FEATURES")):
+            model_part = f" model_name={str(model_name).strip()}" if str(model_name or "").strip() else ""
+            raise ValueError(
+                f"{str(context or 'feature_schema')}_runtime_feature_flag_mismatch:"
+                " flag=USE_FUNDING_FEATURES artifact=<missing>"
+                f" current={bool(current_flags.get('USE_FUNDING_FEATURES'))}{model_part}"
+            )
+        else:
+            artifact_value = False
+    current_value = bool(current_flags.get("USE_FUNDING_FEATURES"))
+    if bool(artifact_value) != current_value:
+        model_part = f" model_name={str(model_name).strip()}" if str(model_name or "").strip() else ""
+        raise ValueError(
+            f"{str(context or 'feature_schema')}_runtime_feature_flag_mismatch:"
+            f" flag=USE_FUNDING_FEATURES artifact={bool(artifact_value)} current={current_value}{model_part}"
+        )
+
 SOCIAL_REGIME_FEATURE_IDS = [
     "social_regime.mania_score",
     "social_regime.fear_score",
@@ -421,6 +493,24 @@ FX_FEATURE_IDS = (
     + list(FX_EVENT_FEATURE_IDS)
 )
 
+FUT_BASE_FEATURE_IDS = [
+    "fut.term_structure_slope",
+    "fut.carry",
+    "fut.roll_yield",
+    "fut.basis",
+    "fut.tsmom_3m",
+    "fut.tsmom_12m",
+]
+
+FUTURES_COT_FEATURE_IDS = [
+    "fut.cot_commercial_net_pctile_3y",
+    "fut.cot_noncomm_net_z",
+    "fut.cot_noncomm_extreme_flag",
+    "fut.cot_open_interest_z",
+]
+
+FUT_FEATURE_IDS = list(FUT_BASE_FEATURE_IDS) + list(FUTURES_COT_FEATURE_IDS)
+
 EVENT_FEATURE_IDS = [
     "events.count_1h",
     "events.count_6h",
@@ -507,6 +597,7 @@ UNIFIED_SYMBOL_FEATURE_IDS = (
     + list(NEWS_FLOW_FEATURE_IDS)
     + list(ETF_FLOW_FEATURE_IDS)
     + list(COT_FEATURE_IDS)
+    + (list(FUT_FEATURE_IDS) if USE_FUTURES_FEATURES else [])
     + list(INST_13F_FEATURE_IDS)
     + list(GOV_FEATURE_IDS)
     + list(FUNDAMENTALS_PIT_FEATURE_IDS)
@@ -566,6 +657,9 @@ if ETF_FLOW_FEATURE_IDS:
     FEATURE_GROUPS["etf_flow"] = list(ETF_FLOW_FEATURE_IDS)
 if COT_FEATURE_IDS:
     FEATURE_GROUPS["cot"] = list(COT_FEATURE_IDS)
+if USE_FUTURES_FEATURES:
+    FEATURE_GROUPS["futures"] = list(FUT_FEATURE_IDS)
+    FEATURE_GROUPS["futures_cot"] = list(FUTURES_COT_FEATURE_IDS)
 if INST_13F_FEATURE_IDS:
     FEATURE_GROUPS["inst_13f"] = list(INST_13F_FEATURE_IDS)
 if GOV_FEATURE_IDS:
@@ -1100,6 +1194,8 @@ def _build_default_feature_ids() -> List[str]:
             out.extend(ETF_FLOW_FEATURE_IDS)
         if USE_COT_FEATURES:
             out.extend(COT_FEATURE_IDS)
+        if USE_FUTURES_FEATURES:
+            out.extend(FUT_FEATURE_IDS)
         if USE_13F_FEATURES:
             out.extend(INST_13F_FEATURE_IDS)
         if USE_GOV_FEATURES:
@@ -1281,6 +1377,10 @@ def _is_fx_feature(fid: str) -> bool:
     return str(fid or "").startswith("fx.")
 
 
+def _is_futures_feature(fid: str) -> bool:
+    return str(fid or "").startswith("fut.")
+
+
 def _is_equity_only_feature(fid: str) -> bool:
     text = str(fid or "").strip()
     return (
@@ -1309,6 +1409,7 @@ def _apply_asset_class_feature_gating(
     *,
     asset_class: Optional[str],
     requested_had_fx: bool,
+    requested_had_futures: bool,
 ) -> List[str]:
     if asset_class is None:
         return list(feature_ids or [])
@@ -1324,6 +1425,8 @@ def _apply_asset_class_feature_gating(
                 continue
             if _is_fx_feature(str(fid)):
                 continue
+            if _is_futures_feature(str(fid)):
+                continue
             if fid not in seen:
                 seen.add(fid)
                 out.append(fid)
@@ -1338,8 +1441,32 @@ def _apply_asset_class_feature_gating(
                 out.append(fid)
         return out
 
+    if asset_class_key == "FUTURES":
+        for fid in list(feature_ids or []):
+            if _is_equity_only_feature(str(fid)):
+                continue
+            if _is_fx_feature(str(fid)):
+                continue
+            if _is_futures_feature(str(fid)):
+                continue
+            if fid not in seen:
+                seen.add(fid)
+                out.append(fid)
+        if bool(USE_FUTURES_FEATURES) or bool(requested_had_futures):
+            allowed = _registered_feature_allowlist(include_shadow=True)
+            for fid in FUT_FEATURE_IDS:
+                if fid not in allowed:
+                    continue
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                out.append(fid)
+        return out
+
     for fid in list(feature_ids or []):
         if _is_fx_feature(str(fid)):
+            continue
+        if _is_futures_feature(str(fid)):
             continue
         if fid in seen:
             continue
@@ -1369,6 +1496,7 @@ def resolve_feature_ids(
     if not requested and fallback_to_default:
         requested = list(default_feature_ids())
     requested_had_fx = any(_is_fx_feature(str(fid)) for fid in requested)
+    requested_had_futures = any(_is_futures_feature(str(fid)) for fid in requested)
 
     allowed = _registered_feature_allowlist(include_shadow=True)
     out: List[str] = []
@@ -1397,11 +1525,13 @@ def resolve_feature_ids(
             out,
             asset_class=asset_class,
             requested_had_fx=bool(requested_had_fx),
+            requested_had_futures=bool(requested_had_futures),
         )
     return _apply_asset_class_feature_gating(
         list(default_feature_ids()),
         asset_class=asset_class,
         requested_had_fx=bool(requested_had_fx),
+        requested_had_futures=bool(requested_had_futures),
     )
 
 
@@ -1432,6 +1562,8 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
         parts.append("symbol_snapshot")
     if any(str(fid or "").startswith("fx.") for fid in ids):
         parts.append("fx")
+    if any(str(fid or "").startswith("fut.") for fid in ids):
+        parts.append("futures")
     if any(fid.startswith("macro.") for fid in ids):
         parts.append("macro")
     if any(fid.startswith("tech.") for fid in ids):
@@ -1499,7 +1631,21 @@ def _source_credibility(source: str) -> float:
     return 0.5
 
 
-def _session_flags(ts_ms: int):
+def _session_flags(ts_ms: int, *, asset_class: Optional[str] = None):
+    asset_class_key = str(asset_class or "").upper().strip()
+    if asset_class_key == "CRYPTO":
+        return (1.0, 1.0, 1.0)
+    if asset_class_key == "FUTURES":
+        try:
+            from engine.data.calendar.futures_sessions import futures_session_flags
+
+            return futures_session_flags(int(ts_ms))
+        except Exception as e:
+            _warn_nonfatal(
+                "FEATURE_REGISTRY_FUTURES_SESSION_FLAGS_FAILED",
+                e,
+                once_key="futures_session_flags_failed",
+            )
     h = time.gmtime(ts_ms / 1000).tm_hour
     return (
         1.0 if 0 <= h < 7 else 0.0,
@@ -1514,8 +1660,8 @@ def _build_context(*, event: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     title = str(event.get("title", "") or "")
     body = str(event.get("body", "") or "")
     source = str(event.get("source", "") or "")
-    asia, eu, us = _session_flags(ts_ms)
     asset_class = asset_class_for_symbol(symbol)
+    asia, eu, us = _session_flags(ts_ms, asset_class=asset_class)
     ctx: Dict[str, Any] = {
         "ts_ms": ts_ms,
         "ref_ts_ms": ref_ts_ms,
@@ -2018,6 +2164,213 @@ def _load_fx_cot_features(symbol: str, ts_ms: int) -> Dict[str, float]:
             "FEATURE_REGISTRY_FX_COT_LOAD_FAILED",
             e,
             once_key="load_fx_cot",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return {}
+
+
+def _bounded_feature_float(value: Any, *, limit: float = 10.0) -> float:
+    bounded = abs(float(limit or 0.0))
+    if bounded <= 0.0:
+        bounded = 10.0
+    out = _safe_feature_float(value)
+    if out > bounded:
+        return float(bounded)
+    if out < -bounded:
+        return float(-bounded)
+    return float(out)
+
+
+def _futures_metadata(symbol: str):
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+
+        return parse_futures_symbol(str(symbol))
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FUTURES_METADATA_FAILED",
+            e,
+            once_key=f"futures_metadata:{symbol}",
+            symbol=str(symbol),
+        )
+        return None
+
+
+def _futures_root(symbol: str) -> str:
+    meta = _futures_metadata(str(symbol))
+    root = str(getattr(meta, "root", "") or "").upper().strip()
+    if root:
+        return root
+    text = str(symbol or "").upper().strip()
+    if ".C." in text:
+        return text.split(".C.", 1)[0]
+    match = re.match(r"^([A-Z0-9]+)[FGHJKMNQUVXZ]\d{2}$", text)
+    return str(match.group(1) if match else "")
+
+
+def _futures_continuous_symbol(symbol: str) -> str:
+    meta = _futures_metadata(str(symbol))
+    continuous = str(getattr(meta, "continuous_alias", "") or "").strip()
+    if continuous:
+        return continuous
+    root = str(getattr(meta, "root", "") or _futures_root(str(symbol))).upper().strip()
+    return f"{root}.c.0" if root else str(symbol or "").upper().strip()
+
+
+def _load_futures_continuous_points(symbol: str, ts_ms: int, *, limit: int = 300) -> list[tuple[int, float]]:
+    continuous_symbol = _futures_continuous_symbol(str(symbol))
+    if not continuous_symbol:
+        return []
+    try:
+        from engine.runtime.storage import connect
+
+        con = connect()
+        try:
+            rows = con.execute(
+                """
+                SELECT ts_ms, close
+                FROM futures_continuous_bars
+                WHERE continuous_symbol = ?
+                  AND adj_method = 'ratio'
+                  AND (? <= 0 OR ts_ms <= ?)
+                ORDER BY ts_ms DESC
+                LIMIT ?
+                """,
+                (str(continuous_symbol), int(ts_ms or 0), int(ts_ms or 0), max(1, int(limit or 1))),
+            ).fetchall()
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_FUTURES_CONTINUOUS_CLOSE_FAILED",
+                    e,
+                    once_key="load_futures_continuous_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FUTURES_CONTINUOUS_LOAD_FAILED",
+            e,
+            once_key=f"load_futures_continuous:{continuous_symbol}",
+            symbol=str(continuous_symbol),
+            ts_ms=int(ts_ms),
+        )
+        return []
+
+    out: list[tuple[int, float]] = []
+    for row in list(rows or []):
+        try:
+            row_ts = int(row[0] or 0)
+            close = float(row[1] or 0.0)
+            if row_ts > 0 and close > 0.0 and math.isfinite(close):
+                out.append((row_ts, close))
+        except Exception:
+            continue
+    return sorted(out, key=lambda item: int(item[0]))
+
+
+def _load_futures_latest_roll_yield(symbol: str, ts_ms: int) -> float:
+    root = _futures_root(str(symbol))
+    if not root:
+        return 0.0
+    try:
+        from engine.runtime.storage import connect
+
+        con = connect()
+        try:
+            row = con.execute(
+                """
+                SELECT roll_yield
+                FROM futures_roll_yield
+                WHERE root = ?
+                  AND (? <= 0 OR ts_ms <= ?)
+                ORDER BY ts_ms DESC
+                LIMIT 1
+                """,
+                (str(root), int(ts_ms or 0), int(ts_ms or 0)),
+            ).fetchone()
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_FUTURES_ROLL_YIELD_CLOSE_FAILED",
+                    e,
+                    once_key="load_futures_roll_yield_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FUTURES_ROLL_YIELD_LOAD_FAILED",
+            e,
+            once_key=f"load_futures_roll_yield:{root}",
+            symbol=str(symbol),
+            ts_ms=int(ts_ms),
+        )
+        return 0.0
+    if not row:
+        return 0.0
+    return _bounded_feature_float(row[0], limit=10.0)
+
+
+def _load_futures_feature_values(symbol: str, ts_ms: int) -> Dict[str, float]:
+    points = _load_futures_continuous_points(str(symbol), int(ts_ms), limit=300)
+    roll_yield = _load_futures_latest_roll_yield(str(symbol), int(ts_ms))
+    return {
+        "fut.term_structure_slope": _bounded_feature_float(roll_yield, limit=10.0),
+        "fut.carry": _bounded_feature_float(roll_yield, limit=10.0),
+        "fut.roll_yield": _bounded_feature_float(roll_yield, limit=10.0),
+        "fut.basis": 0.0,
+        "fut.tsmom_3m": _bounded_feature_float(_return_over(points, 63), limit=5.0),
+        "fut.tsmom_12m": _bounded_feature_float(_return_over(points, 252), limit=5.0),
+    }
+
+
+def _load_futures_cot_features(symbol: str, ts_ms: int) -> Dict[str, float]:
+    try:
+        from engine.data.cftc_cot import resolve_cot_features
+        from engine.runtime.storage import connect
+
+        con = connect()
+        try:
+            raw_features, _meta, _available = resolve_cot_features(
+                con,
+                symbol=_futures_continuous_symbol(str(symbol)),
+                ts_ms=int(ts_ms),
+            )
+            raw = dict(raw_features or {})
+            return {
+                "fut.cot_commercial_net_pctile_3y": _bounded_feature_float(
+                    raw.get("cot_commercial_net_pctile_3y"),
+                    limit=10.0,
+                ),
+                "fut.cot_noncomm_net_z": _bounded_feature_float(raw.get("cot_noncomm_net_z"), limit=10.0),
+                "fut.cot_noncomm_extreme_flag": _bounded_feature_float(
+                    raw.get("cot_noncomm_extreme_flag"),
+                    limit=1.0,
+                ),
+                "fut.cot_open_interest_z": _bounded_feature_float(raw.get("cot_open_interest_z"), limit=10.0),
+            }
+        finally:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "FEATURE_REGISTRY_FUTURES_COT_CLOSE_FAILED",
+                    e,
+                    once_key="load_futures_cot_close",
+                    symbol=str(symbol),
+                    ts_ms=int(ts_ms),
+                )
+    except Exception as e:
+        _warn_nonfatal(
+            "FEATURE_REGISTRY_FUTURES_COT_LOAD_FAILED",
+            e,
+            once_key="load_futures_cot",
             symbol=str(symbol),
             ts_ms=int(ts_ms),
         )
@@ -2530,6 +2883,7 @@ def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids:
     snap: Dict[str, float] = {}
     tech = stress = macro = social = weather = options = social_regime = hmm_regime = bocpd_regime = tsfresh = factors = finbert = nlp = None
     fx_rate = fx_carry = fx_dxy = fx_cross = fx_cot = fx_momentum = fx_event = None
+    fut_features = fut_cot = None
     snapshot = None
     event_scoped_resolution = _requires_event_scoped_resolution(event=dict(event or {}), feature_ids=list(ids))
     snapshot_ids = [
@@ -2591,6 +2945,14 @@ def compute_feature_snapshot(*, event: Dict[str, Any], symbol: str, feature_ids:
             if fx_event is None:
                 fx_event = _load_fx_event_features(str(symbol), int(ctx["ts_ms"]))
             snap[fid] = float((fx_event or {}).get(fid, 0.0) or 0.0)
+        elif fid in FUT_BASE_FEATURE_IDS:
+            if fut_features is None:
+                fut_features = _load_futures_feature_values(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fut_features or {}).get(fid, 0.0) or 0.0)
+        elif fid in FUTURES_COT_FEATURE_IDS:
+            if fut_cot is None:
+                fut_cot = _load_futures_cot_features(str(symbol), int(ctx["ts_ms"]))
+            snap[fid] = float((fut_cot or {}).get(fid, 0.0) or 0.0)
         elif fid.startswith("macro."):
             if macro is None:
                 macro = _load_macro(int(ctx["ts_ms"]))

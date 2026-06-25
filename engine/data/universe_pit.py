@@ -130,6 +130,13 @@ def _table_exists(con, table: str) -> bool:
         return False
 
 
+def _table_columns(con, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall() or []}
+    except Exception:
+        return set()
+
+
 def _query_source_bounds(
     con,
     *,
@@ -198,9 +205,15 @@ def _merge_bounds(dest: Dict[str, Dict[str, Any]], rows: Sequence[tuple[str, int
             sources.append(str(source))
 
 
-def _load_symbol_registry_rows(con, symbols: Sequence[str] | None = None) -> List[tuple[str, int, int, str]]:
+def _load_symbol_registry_rows(con, symbols: Sequence[str] | None = None) -> List[tuple[str, int, int, str, int, Dict[str, Any]]]:
     if not _table_exists(con, "symbols"):
         return []
+    columns = _table_columns(con, "symbols")
+    created_expr = "created_ts_ms" if "created_ts_ms" in columns else "NULL"
+    updated_expr = "updated_ts_ms" if "updated_ts_ms" in columns else "NULL"
+    status_expr = "status" if "status" in columns else "NULL"
+    last_traded_expr = "last_traded_ts_ms" if "last_traded_ts_ms" in columns else "NULL"
+    meta_expr = "meta_json" if "meta_json" in columns else "NULL"
     filters = ["symbol IS NOT NULL", "TRIM(symbol) <> ''"]
     params: List[Any] = []
     normalized = _normalize_symbols(symbols)
@@ -208,24 +221,24 @@ def _load_symbol_registry_rows(con, symbols: Sequence[str] | None = None) -> Lis
         filters.append("UPPER(TRIM(symbol)) IN (" + ",".join("?" for _ in normalized) + ")")
         params.extend(normalized)
     try:
+        rows = con.execute(
+            f"""
+            SELECT symbol, {created_expr}, {updated_expr}, {status_expr}, {last_traded_expr}, {meta_expr}
+            FROM symbols
+            WHERE {" AND ".join(filters)}
+            """,
+            tuple(params),
+        ).fetchall()
         return [
             (
                 str(symbol or "").upper().strip(),
                 _safe_int(created_ts_ms),
                 _safe_int(updated_ts_ms),
                 str(status or "").upper().strip(),
+                _safe_int(last_traded_ts_ms),
+                _safe_json_loads(meta_json),
             )
-            for symbol, created_ts_ms, updated_ts_ms, status in (
-                con.execute(
-                    f"""
-                    SELECT symbol, created_ts_ms, updated_ts_ms, status
-                    FROM symbols
-                    WHERE {" AND ".join(filters)}
-                    """,
-                    tuple(params),
-                ).fetchall()
-                or []
-            )
+            for symbol, created_ts_ms, updated_ts_ms, status, last_traded_ts_ms, meta_json in (rows or [])
             if str(symbol or "").strip()
         ]
     except Exception as e:
@@ -288,7 +301,7 @@ def _collect_lifecycle_evidence(con, *, symbols: Sequence[str] | None = None) ->
         rows = _query_source_bounds(con, table=table, symbol_col=symbol_col, ts_col=ts_col, symbols=symbols)
         _merge_bounds(evidence, rows, source=table)
 
-    for symbol, created_ts_ms, updated_ts_ms, status in _load_symbol_registry_rows(con, symbols=symbols):
+    for symbol, created_ts_ms, updated_ts_ms, status, last_traded_ts_ms, meta in _load_symbol_registry_rows(con, symbols=symbols):
         rec = evidence.setdefault(
             symbol,
             {
@@ -300,7 +313,13 @@ def _collect_lifecycle_evidence(con, *, symbols: Sequence[str] | None = None) ->
         )
         if int(created_ts_ms or 0) > 0:
             rec["first_candidates"].append(int(created_ts_ms))
-        if int(updated_ts_ms or 0) > 0:
+        lifecycle = dict((meta or {}).get("lifecycle") or {}) if isinstance(meta, dict) else {}
+        lifecycle_delist_ts = _safe_int(lifecycle.get("delist_ts_ms"))
+        lifecycle_last_ts = max(_safe_int(last_traded_ts_ms), int(lifecycle_delist_ts or 0))
+        if str(status or "").upper().strip() == "DISABLED" and int(lifecycle_last_ts or 0) > 0:
+            rec["last_candidates"].append(int(lifecycle_last_ts))
+            rec["lifecycle_delist_ts"] = int(lifecycle_last_ts)
+        elif int(updated_ts_ms or 0) > 0:
             rec["last_candidates"].append(int(updated_ts_ms))
         rec["symbol_status"] = str(status or "").upper().strip()
         sources = rec.setdefault("sources", [])
@@ -374,6 +393,9 @@ def _infer_lifecycle_row(symbol: str, rec: Dict[str, Any], *, now_ts_ms: int) ->
         "last_market_ts": (int(last_market_ts) if last_market_ts > 0 else None),
         "last_price_ts": (int(rec.get("last_price_ts") or 0) if int(rec.get("last_price_ts") or 0) > 0 else None),
         "last_quote_ts": (int(rec.get("last_quote_ts") or 0) if int(rec.get("last_quote_ts") or 0) > 0 else None),
+        "lifecycle_delist_ts": (
+            int(rec.get("lifecycle_delist_ts") or 0) if int(rec.get("lifecycle_delist_ts") or 0) > 0 else None
+        ),
         "delisted_inferred": bool(delisted_inferred),
         "derived_from_ingestion": True,
     }

@@ -792,6 +792,7 @@ Important semantic detail:
 
 - `allowed` is the same concept as `allow_execution_pipeline`.
 - `real_trading_allowed` is stricter and only becomes true in live mode when the runtime is armed and not otherwise blocked.
+- `mode` is the reported effective execution mode after reconciling `ENGINE_MODE`, `EXECUTION_MODE`, and persisted execution-mode state. Safety policies such as `disable_live_execution_env` may still be the applied block while `mode` remains `safe`, `paper`, or `shadow`.
 - When `DISABLE_LIVE_EXECUTION` is unset or not explicitly false (`0`, `false`, `no`, or `off`), live-mode snapshots return `reason=disable_live_execution_env`, `allowed=false`, and `real_trading_allowed=false` even if runtime state is `LIVE` and armed.
 
 | Field | Type | Req | Meaning | Units |

@@ -32,10 +32,20 @@ import {
   normalizeDecisionOverlayPayload
 } from "../decision_overlays.js";
 import { buildTableView } from "../utils.js";
+import { requestConfirmation } from "../confirmation_modal.mjs";
 
 const LS_KEY = "terminal.state.v1";
 const FETCH_TIMEOUT_MS = 15000;
 const FLATTEN_HOLD_MS = 1500;
+
+function requestId(prefix = "terminal") {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch {}
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 async function _fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
@@ -62,13 +72,21 @@ async function _readJsonResponse(r, url) {
     const text = message && reason && String(reason) !== String(message)
       ? `${message} (${reason})`
       : (message || reason || r.statusText || "request_failed");
-    throw new Error(String(text));
+    const error = new Error(String(text));
+    error.payload = j;
+    error.status = r.status;
+    error.reasonCode = reason;
+    throw error;
   }
   if (!j || typeof j !== "object") throw new Error(`invalid_json_response: ${url}`);
   if (j.ok === false) {
     const reason = j.reason_code || j.error || `api_error: ${url}`;
     const message = j.message || j.reason || j.error;
-    throw new Error(String(message && reason && String(reason) !== String(message) ? `${message} (${reason})` : (message || reason)));
+    const error = new Error(String(message && reason && String(reason) !== String(message) ? `${message} (${reason})` : (message || reason)));
+    error.payload = j;
+    error.status = Number(j.http_status || (j.meta && j.meta.status) || 0);
+    error.reasonCode = reason;
+    throw error;
   }
   return j;
 }
@@ -139,6 +157,47 @@ function fmtAgeMs(ms) {
   return `${(n / 3_600_000).toFixed(n < 36_000_000 ? 1 : 0)}h`;
 }
 
+function fmtBps(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  return `${n.toFixed(Math.abs(n) >= 100 ? 0 : 1)} bps`;
+}
+
+function reasonText(row) {
+  if (!row || typeof row !== "object") return "";
+  return String(
+    row.reason
+    || row.rejection_reason
+    || row.suppression_reason
+    || row.reason_code
+    || row.rejection_reason_code
+    || row.suppression_reason_code
+    || ""
+  ).trim();
+}
+
+function statusLabel(row) {
+  if (!row || typeof row !== "object") return "—";
+  const bucket = String(row.status_bucket || "").trim().toUpperCase();
+  const label = String(row.status_label || row.state || row.action || bucket || "—").trim();
+  return bucket && !label.toUpperCase().includes(bucket) ? `${bucket}: ${label}` : label;
+}
+
+function statusClass(row) {
+  const bucket = String(row && row.status_bucket || "").trim().toLowerCase();
+  if (bucket === "rejected" || bucket === "canceled" || bucket === "stale") return "crit";
+  if (bucket === "suppressed" || bucket === "partial") return "warn";
+  if (bucket === "filled") return "ok";
+  return "info";
+}
+
+function fillDetailText(row) {
+  const count = Number(row && (row.child_fill_count || row.fill_count || 1));
+  const id = String(row && (row.client_order_id || row.source_order_id || "") || "").trim();
+  const label = count > 1 ? `${count} child fills` : "1 fill";
+  return id ? `${label} | ${id}` : label;
+}
+
 async function fetchJson(url) {
   const r = await _fetchWithTimeout(url, { cache: "no-store" });
   return _readJsonResponse(r, url);
@@ -168,10 +227,14 @@ function initEls() {
   el.posFilter = document.getElementById("posFilter");
   el.posTbl = document.getElementById("posTbl");
   el.ordFilter = document.getElementById("ordFilter");
+  el.ordStatusFilter = document.getElementById("ordStatusFilter");
   el.ordTbl = document.getElementById("ordTbl");
+  el.ordersMeta = document.getElementById("ordersMeta");
   el.fillsFilter = document.getElementById("fillsFilter");
+  el.fillsStatusFilter = document.getElementById("fillsStatusFilter");
   el.fillsTbl = document.getElementById("fillsTbl");
   el.fillsMeta = document.getElementById("fillsMeta");
+  el.terminalTcaSummary = document.getElementById("terminalTcaSummary");
   el.statusBanner = document.getElementById("terminalStatusBanner");
   el.safetyStatus = document.getElementById("tradingSafetyStatus");
   el.terminalArmChk = document.getElementById("terminalArmChk");
@@ -189,6 +252,7 @@ let STATE = {
   ov: { vwap: true, ema: true, markers: true, equity: true },
   watchFilter: "",
   tableFilters: { positions: "", orders: "", fills: "" },
+  tableStatusFilters: { orders: "all", fills: "all" },
 };
 
 const saved = lsGet();
@@ -198,6 +262,7 @@ if (saved && typeof saved === "object") {
     ...saved,
     ov: { ...STATE.ov, ...(saved.ov || {}) },
     tableFilters: { ...STATE.tableFilters, ...(saved.tableFilters || {}) },
+    tableStatusFilters: { ...STATE.tableStatusFilters, ...(saved.tableStatusFilters || {}) },
   };
 }
 
@@ -247,7 +312,9 @@ function syncStateToDom() {
   if (el.watchFilter) el.watchFilter.value = STATE.watchFilter || "";
   if (el.posFilter) el.posFilter.value = STATE.tableFilters.positions || "";
   if (el.ordFilter) el.ordFilter.value = STATE.tableFilters.orders || "";
+  if (el.ordStatusFilter) el.ordStatusFilter.value = STATE.tableStatusFilters.orders || "all";
   if (el.fillsFilter) el.fillsFilter.value = STATE.tableFilters.fills || "";
+  if (el.fillsStatusFilter) el.fillsStatusFilter.value = STATE.tableStatusFilters.fills || "all";
 }
 
 function persist() { lsSet(STATE); }
@@ -295,22 +362,31 @@ const TERMINAL_TABLE_STATE = {
   fills: { sortKey: "ts_ms", sortDir: "desc" },
 };
 const TERMINAL_POSITION_COLUMNS = Object.freeze([
-  { key: "symbol", label: "Symbol", accessor: (row) => row && String(row.symbol || "").toUpperCase() },
-  { key: "qty", label: "Qty", accessor: (row) => row && row.qty },
-  { key: "avg_px", label: "AvgPx", accessor: (row) => row && row.avg_px },
-  { key: "updated_ts_ms", label: "Updated", accessor: (row) => row && row.updated_ts_ms, searchable: false },
+  { key: "symbol", label: "Symbol", width: "1fr", accessor: (row) => row && String(row.symbol || "").toUpperCase() },
+  { key: "qty", label: "Qty", width: "1fr", accessor: (row) => row && row.qty },
+  { key: "avg_px", label: "AvgPx", width: "1fr", accessor: (row) => row && row.avg_px },
+  { key: "updated_ts_ms", label: "Updated", width: "1.2fr", accessor: (row) => row && row.updated_ts_ms, searchable: false },
 ]);
 const TERMINAL_ORDER_COLUMNS = Object.freeze([
-  { key: "kind", label: "Kind", accessor: (row) => row && row.kind },
-  { key: "symbol", label: "Symbol", accessor: (row) => row && String(row.symbol || "").toUpperCase() },
-  { key: "state", label: "State/Action", accessor: (row) => row && (row.state || row.action) },
-  { key: "updatedTs", label: "Updated", accessor: (row) => row && (row.updated_ts_ms || row.ts_ms), searchable: false },
+  { key: "kind", label: "Kind", width: "0.8fr", accessor: (row) => row && row.kind },
+  { key: "symbol", label: "Symbol", width: "0.9fr", accessor: (row) => row && String(row.symbol || "").toUpperCase() },
+  { key: "status_bucket", label: "Status", width: "1.1fr", accessor: (row) => row && `${row.status_bucket || ""} ${row.status_label || ""} ${row.state || row.action || ""}` },
+  { key: "qty", label: "Qty", width: "0.8fr", accessor: (row) => row && row.qty },
+  { key: "reasonText", label: "Reason", width: "1.6fr", accessor: (row) => row && reasonText(row) },
+  { key: "expected_price", label: "Expected", width: "0.9fr", accessor: (row) => row && (row.expected_price ?? row.expected_px), searchable: false },
+  { key: "slippage_bps", label: "Slip", width: "0.8fr", accessor: (row) => row && row.slippage_bps, searchable: false },
+  { key: "updatedTs", label: "Updated", width: "1.2fr", accessor: (row) => row && (row.updated_ts_ms || row.ts_ms), searchable: false },
 ]);
 const TERMINAL_FILL_COLUMNS = Object.freeze([
-  { key: "ts_ms", label: "Time", accessor: (row) => row && row.ts_ms, searchable: false },
-  { key: "symbol", label: "Symbol", accessor: (row) => row && String(row.symbol || "").toUpperCase() },
-  { key: "qty", label: "Qty", accessor: (row) => row && row.qty },
-  { key: "px", label: "Px", accessor: (row) => row && row.px },
+  { key: "ts_ms", label: "Time", width: "1.2fr", accessor: (row) => row && row.ts_ms, searchable: false },
+  { key: "symbol", label: "Symbol", width: "0.9fr", accessor: (row) => row && String(row.symbol || "").toUpperCase() },
+  { key: "status_bucket", label: "Status", width: "1fr", accessor: (row) => row && `${row.status_bucket || ""} ${row.status_label || ""} ${row.state || ""}` },
+  { key: "qty", label: "Qty", width: "0.9fr", accessor: (row) => row && row.qty },
+  { key: "fill_vwap", label: "VWAP", width: "0.9fr", accessor: (row) => row && (row.fill_vwap ?? row.px), searchable: false },
+  { key: "expected_price", label: "Expected", width: "0.9fr", accessor: (row) => row && (row.expected_price ?? row.expected_px), searchable: false },
+  { key: "slippage_bps", label: "Slip bps", width: "0.8fr", accessor: (row) => row && row.slippage_bps, searchable: false },
+  { key: "implementation_shortfall_bps", label: "IS bps", width: "0.8fr", accessor: (row) => row && row.implementation_shortfall_bps, searchable: false },
+  { key: "child_fill_count", label: "Detail", width: "1fr", accessor: (row) => row && `${row.child_fill_count || row.fill_count || 1} ${row.client_order_id || ""}` },
 ]);
 
 let _terminalTableRows = {
@@ -318,6 +394,8 @@ let _terminalTableRows = {
   orders: [],
   fills: [],
 };
+let _terminalOrdersSummary = {};
+let _terminalFillsSummary = {};
 
 function getTerminalTableState(tableId) {
   const key = String(tableId || "").trim();
@@ -334,6 +412,14 @@ function getTerminalTableState(tableId) {
 function setTerminalTableQuery(tableId, query) {
   STATE.tableFilters = STATE.tableFilters || {};
   STATE.tableFilters[tableId] = String(query || "");
+  persist();
+  renderTerminalTables();
+}
+
+function setTerminalStatusFilter(tableId, value) {
+  STATE.tableStatusFilters = STATE.tableStatusFilters || {};
+  const normalized = String(value || "all").trim().toLowerCase() || "all";
+  STATE.tableStatusFilters[tableId] = normalized;
   persist();
   renderTerminalTables();
 }
@@ -356,13 +442,19 @@ function renderTerminalTable(container, tableId, columns, rows, rowColsFn, empty
   const state = getTerminalTableState(tableId);
   const defaults = TERMINAL_TABLE_DEFAULTS[tableId] || {};
   const query = STATE.tableFilters && STATE.tableFilters[tableId] || "";
-  const view = buildTableView(rows, columns, {
+  const statusFilter = String(STATE.tableStatusFilters && STATE.tableStatusFilters[tableId] || "all").toLowerCase();
+  const sourceRows = statusFilter && statusFilter !== "all"
+    ? (Array.isArray(rows) ? rows : []).filter((row) => String(row && row.status_bucket || "").toLowerCase() === statusFilter)
+    : rows;
+  const view = buildTableView(sourceRows, columns, {
     query,
     sortKey: state.sortKey || defaults.sortKey,
     sortDir: state.sortDir || defaults.sortDir,
     maxRows: defaults.maxRows,
   });
-  const header = `<div class="row h" role="row">${columns.map((column) => {
+  const template = columns.map((column) => column.width || "minmax(90px, 1fr)").join(" ");
+  const rowStyle = ` style="grid-template-columns:${esc(template)}"`;
+  const header = `<div class="row h" role="row"${rowStyle}>${columns.map((column) => {
     const active = column.key === state.sortKey;
     const sortDir = active ? (state.sortDir === "desc" ? "descending" : "ascending") : "none";
     const indicator = active ? (state.sortDir === "desc" ? "v" : "^") : "";
@@ -371,11 +463,32 @@ function renderTerminalTable(container, tableId, columns, rows, rowColsFn, empty
   const body = view.visibleRows.length
     ? view.visibleRows.map((row) => {
       const cols = rowColsFn(row);
-      return `<div class="row" role="row">${cols.map((col) => `<div class="c" role="cell">${col}</div>`).join("")}</div>`;
+      return `<div class="row" role="row"${rowStyle}>${cols.map((col) => `<div class="c" role="cell">${col}</div>`).join("")}</div>`;
     }).join("")
     : `<div class="tableEmpty">${esc(view.totalRows > 0 ? (filteredEmptyText || "No rows match the current filter.") : emptyText)}</div>`;
   container.innerHTML = header + body;
   return view;
+}
+
+function renderTerminalTcaSummary(fills, summary = {}) {
+  if (!el.terminalTcaSummary) return;
+  const rows = Array.isArray(fills) ? fills : [];
+  const partial = Number(summary.partial_orders ?? rows.filter((row) => String(row && row.status_bucket) === "partial").length);
+  const orders = Number(summary.orders ?? rows.length);
+  const slip = Number(summary.avg_slippage_bps);
+  const shortfall = Number(summary.avg_implementation_shortfall_bps);
+  const fees = Number(summary.total_fees);
+  el.terminalTcaSummary.innerHTML = `
+    <div class="tcaCell"><span class="k">Orders</span><span class="v mono">${esc(Number.isFinite(orders) ? String(orders) : "0")}</span></div>
+    <div class="tcaCell"><span class="k">Partial</span><span class="v mono">${esc(Number.isFinite(partial) ? String(partial) : "0")}</span></div>
+    <div class="tcaCell"><span class="k">Avg slip</span><span class="v mono">${esc(Number.isFinite(slip) ? fmtBps(slip) : "—")}</span></div>
+    <div class="tcaCell"><span class="k">Avg IS</span><span class="v mono">${esc(Number.isFinite(shortfall) ? fmtBps(shortfall) : "—")}</span></div>
+    <div class="tcaCell"><span class="k">Fees</span><span class="v mono">${esc(Number.isFinite(fees) ? fmtNum(fees, 2) : "—")}</span></div>
+  `;
+  el.terminalTcaSummary.setAttribute(
+    "aria-label",
+    `Execution cost summary. ${orders || 0} aggregated orders. ${partial || 0} partial orders. Average slippage ${Number.isFinite(slip) ? fmtBps(slip) : "unavailable"}. Average implementation shortfall ${Number.isFinite(shortfall) ? fmtBps(shortfall) : "unavailable"}.`
+  );
 }
 
 function renderTerminalTables(emptyMessages = {}) {
@@ -401,12 +514,27 @@ function renderTerminalTables(emptyMessages = {}) {
     (r) => ([
       esc(r && r.kind || "—"),
       esc((r && r.symbol || "").toUpperCase()),
-      esc(r && (r.state || r.action) || "—"),
+      `<span class="statusMini statusMini-${esc(statusClass(r))}">${esc(statusLabel(r))}</span>`,
+      `<span class="mono">${esc(r && r.qty != null ? fmtSymbolQty(r && r.symbol, r && r.qty, r && r.fx && (r.fx.lot_size || r.fx.contract_size)) : "—")}</span>`,
+      esc(reasonText(r) || "—"),
+      `<span class="mono">${esc(fmtSymbolPrice(r && r.symbol, r && (r.expected_price ?? r.expected_px), 4))}</span>`,
+      `<span class="mono">${esc(fmtBps(r && r.slippage_bps))}</span>`,
       `<span class="mono">${esc(fmtTs(r && (r.updated_ts_ms || r.ts_ms)))}</span>`,
     ]),
     emptyMessages.orders || "No live broker or portfolio orders are currently available.",
     "No orders match the current filter."
   );
+  if (el.ordersMeta) {
+    const summary = _terminalOrdersSummary || {};
+    const parts = [
+      `${Number(summary.total ?? _terminalTableRows.orders.length)} rows`,
+      `${Number(summary.rejected || 0)} rejected`,
+      `${Number(summary.suppressed || 0)} suppressed`,
+      `${Number(summary.partial || 0)} partial`,
+      `${Number(summary.stale || 0)} stale`,
+    ];
+    el.ordersMeta.textContent = parts.join(" | ");
+  }
   const fillsView = renderTerminalTable(
     el.fillsTbl,
     "fills",
@@ -415,8 +543,13 @@ function renderTerminalTables(emptyMessages = {}) {
     (r) => ([
       `<span class="mono">${esc(fmtTs(r && r.ts_ms))}</span>`,
       esc((r && r.symbol || "").toUpperCase()),
+      `<span class="statusMini statusMini-${esc(statusClass(r))}">${esc(statusLabel(r))}</span>`,
       `<span class="mono">${esc(fmtSymbolQty(r && r.symbol, r && r.qty, r && r.fx && (r.fx.lot_size || r.fx.contract_size)))}</span>`,
-      `<span class="mono">${esc(fmtSymbolPrice(r && r.symbol, r && r.px, 4))}</span>`,
+      `<span class="mono">${esc(fmtSymbolPrice(r && r.symbol, r && (r.fill_vwap ?? r.px), 4))}</span>`,
+      `<span class="mono">${esc(fmtSymbolPrice(r && r.symbol, r && (r.expected_price ?? r.expected_px), 4))}</span>`,
+      `<span class="mono">${esc(fmtBps(r && r.slippage_bps))}</span>`,
+      `<span class="mono">${esc(fmtBps(r && r.implementation_shortfall_bps))}</span>`,
+      `<span class="mono" title="${esc(JSON.stringify((r && r.child_fills) || []))}">${esc(fillDetailText(r))}</span>`,
     ]),
     emptyMessages.fills || "No live fills are currently available.",
     "No fills match the current filter."
@@ -426,6 +559,7 @@ function renderTerminalTables(emptyMessages = {}) {
       ? `${fillsView.visibleRowsCount}/${fillsView.totalRows} rows`
       : `${fillsView.totalRows} rows`;
   }
+  renderTerminalTcaSummary(_terminalTableRows.fills, _terminalFillsSummary);
   return { positionsView, fillsView };
 }
 
@@ -441,7 +575,7 @@ let _flattenHoldTimer = null;
 let _flattenHoldCompletedAt = 0;
 let _executionBarrier = normalizeExecutionBarrier(null);
 let _accountSnapshotAvailable = false;
-let _latestPositions = [];
+let _latestPriceReference = null;
 
 function setTerminalBanner(level, message) {
   if (!el.statusBanner) return;
@@ -571,35 +705,53 @@ function currentOrderQty() {
   return Number.isFinite(qty) ? qty : 0;
 }
 
-function latestPositionForSymbol(symbol) {
+function latestPriceReferenceForSymbol(symbol) {
   const sym = String(symbol || "").trim().toUpperCase();
-  return (_latestPositions || []).find((row) => String(row && row.symbol || "").trim().toUpperCase() === sym) || null;
+  const ref = (_latestPriceReference && typeof _latestPriceReference === "object") ? _latestPriceReference : null;
+  if (!ref) return null;
+  const refSymbol = String(ref.symbol || sym).trim().toUpperCase();
+  return refSymbol === sym ? ref : null;
 }
 
 function orderConfirmationPayload(token, holdMs = 0) {
+  const normalizedToken = String(token || "").trim();
+  const normalizedHoldMs = Math.max(0, Number(holdMs || 0));
+  const actionId = normalizedToken === "FLATTEN" ? "terminal.flatten" : "terminal.order";
   return {
-    confirm: token,
-    confirmation: token,
-    confirmation_hold_ms: Math.max(0, Number(holdMs || 0)),
+    confirm: normalizedToken,
+    confirmation: normalizedToken,
+    confirmation_token: normalizedToken,
+    confirmation_method: normalizedHoldMs > 0 ? "typed_phrase_hold" : "typed_phrase",
+    confirmation_hold_ms: normalizedHoldMs,
     consequence_ack: true,
+    action_id: actionId,
     actor: "terminal_operator",
     source: "terminal",
+    source_surface: "terminal",
+    request_id: requestId(actionId.replace(".", "-")),
+    target: STATE.symbol,
   };
 }
 
 function renderOrderPreview(side = "") {
   if (!el.orderPreview) return;
   const qty = currentOrderQty();
-  const pos = latestPositionForSymbol(STATE.symbol);
-  const px = Number(pos && (pos.market_px ?? pos.avg_px));
+  const priceRef = latestPriceReferenceForSymbol(STATE.symbol);
+  const px = Number(priceRef && priceRef.ok !== false && priceRef.price);
+  const pxAgeMs = Number(priceRef && priceRef.age_ms);
   const notional = Number.isFinite(px) && px > 0 && qty > 0 ? qty * px : null;
   const gate = _executionBarrier.realTradingAllowed
     ? `gate open (${_executionBarrier.mode})`
     : `blocked: ${_executionBarrier.blockingReasons[0] || _executionBarrier.reason || "execution barrier"}`;
-  const priceText = Number.isFinite(px) && px > 0 ? `price ref ${fmtSymbolPrice(STATE.symbol, px, 2)}` : "price ref unavailable";
+  const priceSource = String(priceRef && priceRef.source || "prices").trim() || "prices";
+  const priceError = String(priceRef && (priceRef.error || priceRef.reason) || "").trim();
+  const priceText = Number.isFinite(px) && px > 0
+    ? `price ref ${fmtSymbolPrice(STATE.symbol, px, 2)} (${priceSource})`
+    : `price ref unavailable${priceError ? `: ${priceError}` : ""}`;
+  const priceAgeText = Number.isFinite(pxAgeMs) && pxAgeMs >= 0 ? `price age ${fmtAgeMs(pxAgeMs)}` : "price age unavailable";
   const notionalText = notional == null ? "notional unavailable" : `est notional ${fmtNum(notional, 2)}`;
   const sessionText = fxSessionLabel(STATE.symbol);
-  el.orderPreview.textContent = `${side || "Order"} ${STATE.symbol} qty ${fmtSymbolQty(STATE.symbol, qty)} | ${priceText} | ${notionalText} | ${gate}${sessionText ? ` | ${sessionText}` : ""}`;
+  el.orderPreview.textContent = `${side || "Order"} ${STATE.symbol} qty ${fmtSymbolQty(STATE.symbol, qty)} | ${priceText} | ${priceAgeText} | ${notionalText} | ${gate}${sessionText ? ` | ${sessionText}` : ""}`;
 }
 
 function canSubmitRealTrade(label) {
@@ -651,6 +803,8 @@ function renderSnapshotFailure(error) {
   }
 
   _terminalTableRows = { positions: [], orders: [], fills: [] };
+  _terminalOrdersSummary = {};
+  _terminalFillsSummary = {};
   renderTerminalTables({
     positions: "Terminal snapshot unavailable. Live positions cleared until a fresh snapshot succeeds.",
     orders: "Terminal snapshot unavailable. Open-order state cleared until a fresh snapshot succeeds.",
@@ -664,6 +818,7 @@ function renderSnapshotFailure(error) {
 
   _accountSnapshotAvailable = false;
   _executionBarrier = normalizeExecutionBarrier(null);
+  _latestPriceReference = null;
   renderTradingSafetyStatus();
   setOrderEntryEnabled(false, "Order entry is disabled while the terminal snapshot is unavailable.");
   setFlattenEnabled(false, "Flatten is disabled while the terminal snapshot and execution barrier are unavailable.");
@@ -679,7 +834,7 @@ async function refreshSnapshot() {
   if (document.hidden) return;
 
   try {
-    const j = await fetchJson("/api/terminal/snapshot");
+    const j = await fetchJson(`/api/terminal/snapshot?symbol=${encodeURIComponent(STATE.symbol)}`);
     if (!j || !j.ok) return;
     _snapshotHealth.lastSuccessTs = Number(j.ts_ms || Date.now());
     _snapshotHealth.lastError = "";
@@ -697,22 +852,40 @@ async function refreshSnapshot() {
     if (el.acctMeta) el.acctMeta.textContent = `snapshot latency ${Number(j.latency_ms || 0)}ms`;
 
     const pos = Array.isArray(j.positions) ? j.positions : [];
-    _latestPositions = pos;
+    _latestPriceReference = (j.price_reference && typeof j.price_reference === "object") ? j.price_reference : null;
+    _terminalOrdersSummary = (j.orders_summary && typeof j.orders_summary === "object") ? j.orders_summary : {};
+    _terminalFillsSummary = (j.fills_summary && typeof j.fills_summary === "object") ? j.fills_summary : {};
 
     const ords = (j.orders && typeof j.orders === "object") ? j.orders : { broker: [], portfolio: [] };
     const bro = Array.isArray(ords.broker) ? ords.broker : [];
     const por = Array.isArray(ords.portfolio) ? ords.portfolio : [];
     const rej = Array.isArray(ords.rejected) ? ords.rejected : [];
-    const merged = [
+    const sup = Array.isArray(ords.suppressed) ? ords.suppressed : [];
+    const merged = (Array.isArray(ords.all) && ords.all.length ? ords.all : [
       ...bro.slice(0, 150).map(r => ({ kind: "broker", ...r })),
       ...por.slice(0, 150).map(r => ({ kind: "portfolio", ...r })),
       ...rej.slice(0, 150).map(r => ({
         ...r,
         kind: "rejected",
-        state: `REJECTED ${String(r && (r.reason_code || r.reason) || "rejected")}`,
-        action: r && (r.reason_code || r.reason || "rejected"),
+        status_bucket: r && r.status_bucket || "rejected",
+        status_label: r && r.status_label || "Rejected",
+        state: r && r.state || `REJECTED ${String(r && (r.reason_code || r.reason) || "rejected")}`,
+        action: r && (r.action || r.reason_code || r.reason || "rejected"),
       })),
-    ].sort((a, b) => Number(b.updated_ts_ms || b.ts_ms || 0) - Number(a.updated_ts_ms || a.ts_ms || 0));
+      ...sup.slice(0, 150).map(r => ({
+        ...r,
+        kind: "suppressed",
+        status_bucket: r && r.status_bucket || "suppressed",
+        status_label: r && r.status_label || "Suppressed",
+        state: r && r.state || `SUPPRESSED ${String(r && (r.reason_code || r.reason) || "suppressed")}`,
+        action: r && (r.action || r.reason_code || r.reason || "suppressed"),
+      })),
+    ]).map((row) => ({
+      ...row,
+      kind: row && row.kind || "order",
+      status_bucket: row && row.status_bucket || "active",
+      status_label: row && row.status_label || row && (row.state || row.action) || "Active",
+    })).sort((a, b) => Number(b.updated_ts_ms || b.ts_ms || 0) - Number(a.updated_ts_ms || a.ts_ms || 0));
 
     const fills = Array.isArray(j.fills) ? j.fills : [];
     _terminalTableRows = {
@@ -934,26 +1107,96 @@ function canUseKeyboardTradingShortcut(label) {
   return canSubmitRealTrade(label);
 }
 
+function isThresholdConfirmationError(error) {
+  const payload = error && error.payload;
+  const reason = String(payload && payload.reason_code || "");
+  return !!(
+    payload
+    && payload.error === "confirmation_required"
+    && reason.startsWith("threshold_")
+    && (payload.required_confirm || payload.required_confirmation)
+  );
+}
+
+async function requestTerminalThresholdPayload(error, { side = "", qty = 0, intent = "order" } = {}) {
+  const payload = error && error.payload ? error.payload : {};
+  const token = String(payload.required_confirm || payload.required_confirmation || "").trim();
+  if (!token) return null;
+  const actionId = intent === "flatten" ? "terminal.flatten.threshold" : "terminal.order.threshold";
+  const target = intent === "flatten"
+    ? `${STATE.symbol} flatten`
+    : `${String(side || "").toUpperCase()} ${STATE.symbol} qty ${fmtSymbolQty(STATE.symbol, qty)}`;
+  const confirmation = await requestConfirmation({
+    title: "Confirm terminal threshold",
+    action: "Terminal pre-trade threshold",
+    actionId,
+    target,
+    consequence: String(payload.message || payload.reason || "This request exceeds a configured terminal review threshold."),
+    confirmText: token,
+    submitLabel: "Confirm Threshold",
+    actor: "terminal_operator",
+    sourceSurface: "terminal",
+  });
+  if (!confirmation || !confirmation.ok) return null;
+  const confirmedPayload = confirmation.payload || {};
+  return {
+    threshold_confirm: token,
+    threshold_confirmation: token,
+    threshold_confirmation_method: confirmedPayload.confirmation_method || "typed_phrase",
+    threshold_confirmation_hold_ms: Number(confirmedPayload.confirmation_hold_ms || 0),
+    threshold_consequence_ack: true,
+    threshold_actor: confirmedPayload.actor || "terminal_operator",
+    threshold_source: "terminal",
+    threshold_source_surface: "terminal",
+    threshold_request_id: confirmedPayload.request_id || requestId("terminal-threshold"),
+    threshold_reason: confirmedPayload.reason || "",
+  };
+}
+
 async function submitTerminalOrder(side, qty, label) {
   if (!canSubmitDirectionalOrder(label || side)) return;
   const cleanQty = Number(qty || 0);
   if (!Number.isFinite(cleanQty) || cleanQty <= 0) throw new Error("enter a positive quantity");
   renderOrderPreview(side);
-  const j = await postJson("/api/terminal/order", {
+  const body = {
     symbol: STATE.symbol,
     side,
     qty: cleanQty,
     ...orderConfirmationPayload("TRADE"),
-  });
+  };
+  let j;
+  try {
+    j = await postJson("/api/terminal/order", body);
+  } catch (error) {
+    if (!isThresholdConfirmationError(error)) throw error;
+    const thresholdPayload = await requestTerminalThresholdPayload(error, { side, qty: cleanQty, intent: "order" });
+    if (!thresholdPayload) {
+      setTerminalBanner("warn", `${label || side} threshold confirmation cancelled.`);
+      return;
+    }
+    j = await postJson("/api/terminal/order", { ...body, ...thresholdPayload });
+  }
   if (j.ok) await refreshSnapshot();
 }
 
 async function submitTerminalFlatten() {
   if (!canSubmitRealTrade("Flatten")) return;
-  const j = await postJson("/api/terminal/flatten", {
+  const body = {
     symbol: STATE.symbol,
     ...orderConfirmationPayload("FLATTEN", FLATTEN_HOLD_MS),
-  });
+  };
+  let j;
+  try {
+    j = await postJson("/api/terminal/flatten", body);
+  } catch (error) {
+    if (!isThresholdConfirmationError(error)) throw error;
+    const thresholdPayload = await requestTerminalThresholdPayload(error, { intent: "flatten" });
+    if (!thresholdPayload) {
+      setTerminalBanner("warn", "Flatten threshold confirmation cancelled.");
+      return;
+    }
+    j = await postJson("/api/terminal/flatten", { ...body, ...thresholdPayload });
+  }
   if (j.ok) await refreshSnapshot();
 }
 
@@ -1004,6 +1247,8 @@ function wire() {
   el.posFilter.addEventListener("input", () => setTerminalTableQuery("positions", el.posFilter.value));
   el.ordFilter.addEventListener("input", () => setTerminalTableQuery("orders", el.ordFilter.value));
   el.fillsFilter.addEventListener("input", () => setTerminalTableQuery("fills", el.fillsFilter.value));
+  if (el.ordStatusFilter) el.ordStatusFilter.addEventListener("change", () => setTerminalStatusFilter("orders", el.ordStatusFilter.value));
+  if (el.fillsStatusFilter) el.fillsStatusFilter.addEventListener("change", () => setTerminalStatusFilter("fills", el.fillsStatusFilter.value));
 
   document.addEventListener("click", (event) => {
     const target = event && event.target;

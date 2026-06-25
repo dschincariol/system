@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +19,10 @@ SCANNABLE_SUFFIXES = {".html", ".js", ".mjs", ".cjs", ".css"}
 EXTERNAL_PREFIXES = ("http://", "https://", "//", "data:", "blob:", "mailto:", "tel:", "javascript:", "node:")
 IGNORED_LOCAL_PREFIXES = ("/api/", "/ws/", "/socket/")
 TEMPLATE_TOKENS = ("${", "{{", "}}", "<%", "%>")
+CHARTJS_VENDOR_BUNDLE_RE = re.compile(
+    r"""(?:^chart(?:\.(?:umd|esm|cjs))?(?:\.min)?\.js$|(?:^|[-_.])chartjs(?:[-_.]|$))""",
+    re.IGNORECASE,
+)
 
 HTML_REF_RE = re.compile(
     r"""<(?:script|link|img|source|audio|video)\b[^>]*?\b(?:src|href)=["']([^"']+)["']""",
@@ -77,6 +80,19 @@ def iter_scannable_paths(tracked_paths: set[str]) -> list[str]:
         for rel in tracked_paths
         if Path(rel).suffix.lower() in SCANNABLE_SUFFIXES
     )
+
+
+def is_disallowed_vendor_asset(rel_path: str | Path) -> bool:
+    rel = _normalize_repo_rel(rel_path)
+    path = Path(rel)
+    if path.parent.as_posix() != "ui/vendor":
+        return False
+    return bool(CHARTJS_VENDOR_BUNDLE_RE.search(path.name))
+
+
+def find_disallowed_vendor_assets(tracked_paths: set[str] | None = None, root: Path = ROOT) -> list[str]:
+    tracked = {_normalize_repo_rel(item) for item in (tracked_paths or load_tracked_paths(root))}
+    return sorted(rel_path for rel_path in tracked if is_disallowed_vendor_asset(rel_path))
 
 
 def _match_line(text: str, start_index: int) -> int:
@@ -209,6 +225,13 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(str(args.root)).resolve()
     issues = find_local_asset_reference_issues(root=root)
+    disallowed_assets = find_disallowed_vendor_assets(root=root)
+    if disallowed_assets:
+        print("Disallowed vendored asset validation failed.")
+        for rel_path in disallowed_assets:
+            print(f"{rel_path}: Chart.js is not a supported vendored charting runtime")
+        return 1
+
     if issues:
         print("Local asset reference validation failed.")
         for issue in issues:

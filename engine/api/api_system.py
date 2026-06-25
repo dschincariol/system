@@ -4654,7 +4654,7 @@ def api_get_drift_explainer(_parsed, ctx=None):
 
 
 def api_get_execution_barrier(_parsed, ctx=None):
-    """Return the current execution barrier extracted from the system snapshot.
+    """Return the current execution barrier without blocking on the full snapshot.
 
     Parameters
     ----------
@@ -4670,21 +4670,143 @@ def api_get_execution_barrier(_parsed, ctx=None):
         ``allowed``, and the selected block ``reason``. ``ok`` mirrors
         ``allowed`` to keep the endpoint fail-closed.
     """
-    snapshot = _build_system_state_snapshot(_parsed, ctx)
-    barrier = dict(snapshot.get("execution_barrier") or {})
-    timestamps = dict(snapshot.get("timestamps") or {})
+    ts_ms = _ts_ms()
+    try:
+        snapshot = _build_system_state_snapshot(_parsed, ctx)
+    except Exception as e:
+        _warn("api_system.execution_barrier.light_snapshot", e)
+        snapshot = {}
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("execution_barrier"), dict):
+        barrier = dict(snapshot.get("execution_barrier") or {})
+        mode = str(
+            barrier.get("mode")
+            or snapshot.get("execution_mode")
+            or snapshot.get("mode")
+            or os.environ.get("ENGINE_MODE")
+            or os.environ.get("EXECUTION_MODE")
+            or "unknown"
+        ).strip().lower()
+        state_name = str(
+            barrier.get("runtime_state")
+            or snapshot.get("state")
+            or ((snapshot.get("system_state_detail") or {}).get("state") if isinstance(snapshot.get("system_state_detail"), dict) else "")
+            or "UNKNOWN"
+        ).strip().upper()
+        barrier.setdefault("ok", True)
+        barrier.setdefault("mode", mode)
+        barrier.setdefault("runtime_state", state_name)
+        barrier.setdefault("real_trading_allowed", False)
+        barrier.setdefault("allow_simulation", False)
+        barrier.setdefault("allowed", False)
+        barrier.setdefault("fast_path", True)
+        timestamps = dict(snapshot.get("timestamps") or {})
+        timestamps.setdefault("ts_ms", snapshot.get("ts_ms") or ts_ms)
+        timestamps.setdefault("snapshot_ts_ms", snapshot.get("ts_ms") or ts_ms)
+        return {
+            "ok": bool(barrier.get("allowed")),
+            "status": "FAST_PATH",
+            "state": state_name,
+            "mode": mode,
+            "execution_mode": mode,
+            "execution_allowed": bool(barrier.get("allowed")),
+            "execution_barrier": barrier,
+            "allowed": bool(barrier.get("allowed")),
+            "reason": str(barrier.get("reason") or ""),
+            "reasons": _dedupe_reasons(snapshot.get("reasons"), [barrier.get("reason")]),
+            "ts_ms": timestamps.get("ts_ms") or ts_ms,
+            "timestamps": timestamps,
+        }
+
+    try:
+        health_raw = _cached_health_snapshot(allow_sync_on_miss=False)
+    except Exception as e:
+        _warn("api_system.execution_barrier.health_cache", e)
+        health_raw = {"ok": False, "reasons": [f"health_snapshot_error:{type(e).__name__}"]}
+    if not isinstance(health_raw, dict):
+        health_raw = {"ok": False, "reasons": ["health_snapshot_invalid"]}
+
+    lifecycle = dict((health_raw or {}).get("lifecycle") or {})
+    startup = dict((health_raw or {}).get("startup") or {})
+    state_name = str(lifecycle.get("state") or "").strip().upper()
+    if not state_name:
+        mode_hint = str(
+            startup.get("mode")
+            or os.environ.get("ENGINE_MODE")
+            or os.environ.get("EXECUTION_MODE")
+            or os.environ.get("MODE")
+            or ""
+        ).strip().lower()
+        state_name = "WARMING_UP" if mode_hint in {"safe", "sim", "paper", "shadow"} else "UNKNOWN"
+    system_state_detail = {
+        "ok": bool((health_raw or {}).get("ok")) or state_name in {"LIVE", "WARMING_UP", "DEGRADED", "KILL_SWITCH"},
+        "ts_ms": ts_ms,
+        "state": state_name,
+        "detail": str(lifecycle.get("detail") or ""),
+        "reasons": list((health_raw or {}).get("reasons") or []),
+    }
+    kill_switches = dict((health_raw or {}).get("kill_switches") or {})
+    try:
+        from engine.api.internal_access import get_execution_mode as _get_execution_mode
+
+        get_execution_mode_fn = _get_execution_mode
+    except Exception:
+        get_execution_mode_fn = None
+    explicit_mode = str(
+        os.environ.get("ENGINE_MODE") or os.environ.get("EXECUTION_MODE") or os.environ.get("MODE") or ""
+    ).strip().lower()
+    if explicit_mode in {"safe", "paper", "shadow"}:
+        def _explicit_non_live_mode_state():
+            return {"mode": explicit_mode, "armed": 0, "source": "api_env_explicit"}
+
+        get_execution_mode_fn = _explicit_non_live_mode_state
+
+    try:
+        barrier = dict(
+            execution_gate_snapshot(
+                get_execution_mode_fn=get_execution_mode_fn,
+                system_state=system_state_detail,
+                kill_switches=kill_switches,
+                execution_degraded=dict((health_raw or {}).get("execution_degraded") or {}),
+                portfolio_risk_gate=None,
+                readiness={},
+            )
+        )
+    except Exception as e:
+        _warn("api_system.execution_barrier.fast_path", e)
+        barrier = {
+            "ok": True,
+            "ts_ms": ts_ms,
+            "mode": str(os.environ.get("ENGINE_MODE") or os.environ.get("EXECUTION_MODE") or "unknown").lower(),
+            "allowed": False,
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "allow_simulation": False,
+            "real_trading_allowed": False,
+            "runtime_state": state_name,
+            "reason": f"execution_barrier_error:{type(e).__name__}",
+            "fast_path": True,
+        }
+    mode = str(barrier.get("mode") or os.environ.get("ENGINE_MODE") or os.environ.get("EXECUTION_MODE") or "unknown").strip().lower()
+    barrier.setdefault("ok", True)
+    barrier.setdefault("mode", mode)
+    barrier.setdefault("runtime_state", state_name)
+    barrier.setdefault("real_trading_allowed", False)
+    barrier.setdefault("allow_simulation", False)
+    barrier.setdefault("allowed", False)
+    barrier.setdefault("fast_path", True)
+    timestamps = {"ts_ms": ts_ms, "snapshot_ts_ms": ts_ms}
     return {
         "ok": bool(barrier.get("allowed")),
-        "status": str(snapshot.get("status") or "UNKNOWN"),
-        "state": str(snapshot.get("state") or "UNKNOWN"),
-        "mode": str(snapshot.get("mode") or barrier.get("mode") or "unknown"),
-        "execution_mode": str(snapshot.get("execution_mode") or snapshot.get("mode") or barrier.get("mode") or "unknown"),
-        "execution_allowed": bool(snapshot.get("execution_allowed")),
+        "status": "FAST_PATH",
+        "state": state_name,
+        "mode": mode,
+        "execution_mode": mode,
+        "execution_allowed": bool(barrier.get("allowed")),
         "execution_barrier": barrier,
         "allowed": bool(barrier.get("allowed")),
         "reason": str(barrier.get("reason") or ""),
-        "reasons": _dedupe_reasons(snapshot.get("reasons"), [barrier.get("reason")]),
-        "ts_ms": int(snapshot.get("ts_ms") or _ts_ms()),
+        "reasons": _dedupe_reasons((health_raw or {}).get("reasons"), [barrier.get("reason")]),
+        "ts_ms": ts_ms,
         "timestamps": timestamps,
     }
     

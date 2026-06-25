@@ -7,7 +7,7 @@
   alpha-decay history, and regime-stack history.
 */
 
-import { renderChartAccessibility } from "./chart_a11y.js";
+import { installChartPointInspector, renderChartAccessibility } from "./chart_a11y.js";
 
 const RISK_SERIES = Object.freeze([
   Object.freeze({ key: "gross", label: "Gross", color: "#56B4E9", formatter: formatPercent }),
@@ -108,6 +108,11 @@ function drawEmpty(canvas, title, message) {
     emptyMessage: message || "No chart data is available.",
     chartType: "canvas-line",
   });
+  installChartPointInspector(canvas, [], {
+    title,
+    kind: "canvas-line",
+    emptyMessage: message || "No chart data is available.",
+  });
 }
 
 function setHidden(el, hidden) {
@@ -145,6 +150,11 @@ function renderCanvasUnavailable(canvas, title, message) {
     series: [],
     emptyMessage: message || "No chart data is available.",
     chartType: "canvas-line",
+  });
+  installChartPointInspector(canvas, [], {
+    title,
+    kind: "canvas-line",
+    emptyMessage: message || "No chart data is available.",
   });
 }
 
@@ -288,6 +298,8 @@ export function renderRiskHistoryChart(canvas, vm) {
   ctx.fillText(fmtTime(rows[0].ts_ms), padL, h - 8);
   const lastLabel = fmtTime(rows[rows.length - 1].ts_ms);
   ctx.fillText(lastLabel, Math.max(padL, w - padR - ctx.measureText(lastLabel).width), h - 8);
+  ctx.fillText("time", Math.max(padL, w - padR - 28), h - 20);
+  ctx.fillText("exposure / drawdown", 8, padT + 20);
 
   for (const def of RISK_SERIES) {
     ctx.strokeStyle = def.color;
@@ -328,6 +340,24 @@ export function renderRiskHistoryChart(canvas, vm) {
     ],
     maxRows: 120,
   });
+  installChartPointInspector(
+    canvas,
+    rows.map((row, index) => ({
+      label: fmtTime(row.ts_ms),
+      x: xFor(index),
+      values: RISK_SERIES.map((def) => ({
+        label: def.label,
+        value: numOrNull(row[def.key]),
+        valueText: def.formatter(numOrNull(row[def.key]), 2),
+      })),
+      note: row.blocked ? "blocked context" : "within risk limits",
+    })),
+    {
+      title: "Portfolio risk history",
+      kind: "canvas-multi-line",
+      emptyMessage: "Risk history needs at least two timestamped rows.",
+    },
+  );
 }
 
 function positiveLoss(value) {
@@ -551,6 +581,20 @@ export function renderMonteCarloFanChart(canvas, vm) {
     else ctx.lineTo(xFor(index), yFor(value));
   });
   ctx.stroke();
+  if (typeof ctx.fillRect === "function") {
+    ctx.fillStyle = "rgba(86,180,233,0.18)";
+    ctx.fillRect(padL, 8, 14, 7);
+  }
+  ctx.fillStyle = "#9da7b1";
+  ctx.font = "11px Consolas, monospace";
+  ctx.fillText("P05-P95 band", padL + 18, 15);
+  if (typeof ctx.fillRect === "function") {
+    ctx.fillStyle = "#56B4E9";
+    ctx.fillRect(padL + 118, 12, 14, 3);
+  }
+  ctx.fillStyle = "#9da7b1";
+  ctx.fillText("P50 median", padL + 136, 15);
+  ctx.fillText("step", Math.max(padL, w - padR - 28), h - 7);
 
   renderChartAccessibility(canvas, {
     title: "Monte-Carlo fan",
@@ -572,6 +616,24 @@ export function renderMonteCarloFanChart(canvas, vm) {
       { label: "P95", value: (row) => formatSignedPercent(row.raw && row.raw.p95, 2) },
     ],
   });
+  installChartPointInspector(
+    canvas,
+    rows.map((row, index) => ({
+      label: `Step ${row.step ?? index + 1}`,
+      x: xFor(index),
+      values: [
+        { label: "P05", value: numOrNull(row.p05), valueText: formatSignedPercent(row.p05, 2) },
+        { label: "P50", value: numOrNull(row.p50), valueText: formatSignedPercent(row.p50, 2) },
+        { label: "P95", value: numOrNull(row.p95), valueText: formatSignedPercent(row.p95, 2) },
+      ],
+      note: "shaded band spans p05 to p95",
+    })),
+    {
+      title: "Monte-Carlo fan",
+      kind: "canvas-fan",
+      emptyMessage: "Fan chart unavailable: no simulated path percentile rows were returned.",
+    },
+  );
 }
 
 export function renderMonteCarloDistributionChart(canvas, vm) {
@@ -624,6 +686,8 @@ export function renderMonteCarloDistributionChart(canvas, vm) {
   ctx.fillText(String(maxCount), 8, padT + 8);
   ctx.fillText(formatSignedPercent(xMin, 1), padL, h - 8);
   ctx.fillText(formatSignedPercent(xMax, 1), Math.max(padL + 80, w - padR - 82), h - 8);
+  ctx.fillText("path count", 8, padT + 22);
+  ctx.fillText("final return", Math.max(padL, w - padR - 70), h - 20);
 
   renderChartAccessibility(canvas, {
     title: "Monte-Carlo return distribution",
@@ -641,6 +705,26 @@ export function renderMonteCarloDistributionChart(canvas, vm) {
     ],
     maxRows: 80,
   });
+  installChartPointInspector(
+    canvas,
+    rows.map((row, index) => {
+      const x = padL + index * (plotW / Math.max(1, rows.length)) + (barGap / 2) + (barW / 2);
+      return {
+        label: row.bucket || formatSignedPercent(row.value, 1),
+        x,
+        values: [
+          { label: "Return", value: numOrNull(row.value), valueText: formatSignedPercent(row.value, 2) },
+          { label: "Count", value: numOrNull(row.count), valueText: formatNumber(row.count, 0) },
+          { label: "Probability", value: numOrNull(row.probability), valueText: formatPercent(row.probability, 2) },
+        ],
+      };
+    }),
+    {
+      title: "Monte-Carlo return distribution",
+      kind: "canvas-histogram",
+      emptyMessage: "Return distribution unavailable: no simulated final-return buckets were returned.",
+    },
+  );
 }
 
 function severityRank(value) {
@@ -882,6 +966,23 @@ export function renderAlphaDecayChart(canvas, vm) {
     ],
     maxRows: 120,
   });
+  installChartPointInspector(
+    canvas,
+    rows.map((row, index) => ({
+      label: fmtTime(row.ts_ms),
+      x: xFor(index),
+      values: [
+        { label: "Rolling Sharpe", value: numOrNull(row.rolling_sharpe), valueText: formatNumber(row.rolling_sharpe, 3) },
+        { label: "Half-life Buckets", value: numOrNull(row.half_life_buckets), valueText: row.half_life_buckets == null ? "unavailable" : formatNumber(row.half_life_buckets, 2) },
+      ],
+      note: row.severity ? `severity ${row.severity}` : "",
+    })),
+    {
+      title: "Alpha-decay rolling Sharpe and half-life",
+      kind: "canvas-two-pane-line",
+      emptyMessage: "Alpha-decay history needs at least two points for one strategy.",
+    },
+  );
 }
 
 function layerLabel(row, layer) {

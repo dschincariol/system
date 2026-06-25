@@ -255,6 +255,9 @@ export async function loadEquityDrift(fetchJSON) {
         return String(index + 1);
       },
       topLabel: "equity drift (%)",
+      seriesLabel: "Equity drift",
+      xAxisLabel: "time",
+      yAxisLabel: "drift",
       a11yTitle: "Equity drift",
       a11ySeries: series,
       a11yTimeKey: "time",

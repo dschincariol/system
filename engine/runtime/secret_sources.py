@@ -35,6 +35,43 @@ class SecretEnvSpec:
     value_shape: str = "plain"
 
 
+@dataclass(frozen=True)
+class SecretTextFileResult:
+    """Structured result for file-backed secret reads.
+
+    The default repr intentionally omits the secret value so accidental logging
+    of this object does not disclose credentials.
+    """
+
+    ok: bool
+    value: str = ""
+    path: str = ""
+    reason: str = ""
+    missing: bool = False
+    empty: bool = False
+    error_type: str = ""
+
+    def __bool__(self) -> bool:
+        return bool(self.ok and self.value)
+
+    def __repr__(self) -> str:
+        return (
+            "SecretTextFileResult("
+            f"ok={self.ok!r}, path={self.path!r}, reason={self.reason!r}, "
+            f"missing={self.missing!r}, empty={self.empty!r}, error_type={self.error_type!r})"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ok": bool(self.ok),
+            "path": self.path,
+            "reason": self.reason,
+            "missing": bool(self.missing),
+            "empty": bool(self.empty),
+            "error_type": self.error_type,
+        }
+
+
 def _alts(key: str, *provider_names: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     return (
         (f"{key}_FILE",),
@@ -624,8 +661,44 @@ def validate_secret_source_policy(
     return snapshot
 
 
-def read_secret_text_file(path: str | Path) -> str:
-    return Path(path).expanduser().read_text(encoding="utf-8").strip()
+def read_secret_text_file(path: str | Path) -> SecretTextFileResult:
+    candidate = Path(path).expanduser()
+    path_text = str(candidate)
+    try:
+        st = candidate.stat()
+    except FileNotFoundError:
+        return SecretTextFileResult(
+            ok=False,
+            path=path_text,
+            reason="missing",
+            missing=True,
+            error_type="FileNotFoundError",
+        )
+    except OSError as exc:
+        return SecretTextFileResult(
+            ok=False,
+            path=path_text,
+            reason="stat_failed",
+            error_type=type(exc).__name__,
+        )
+    if not candidate.is_file():
+        return SecretTextFileResult(ok=False, path=path_text, reason="not_regular")
+    if st.st_size <= 0:
+        return SecretTextFileResult(ok=False, path=path_text, reason="empty", missing=True, empty=True)
+    if not os.access(candidate, os.R_OK):
+        return SecretTextFileResult(ok=False, path=path_text, reason="not_readable")
+    try:
+        value = candidate.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return SecretTextFileResult(
+            ok=False,
+            path=path_text,
+            reason="read_failed",
+            error_type=type(exc).__name__,
+        )
+    if not value:
+        return SecretTextFileResult(ok=False, path=path_text, reason="empty", missing=True, empty=True)
+    return SecretTextFileResult(ok=True, value=value, path=path_text, reason="ok")
 
 
 def read_secret_text_from_env(
@@ -648,7 +721,7 @@ def read_secret_text_from_env(
     for env_name in file_names:
         path = _env_text(env, env_name)
         if path:
-            return read_secret_text_file(path)
+            return read_secret_text_file(path).value
     if env is not os.environ:
         return ""
     import importlib
@@ -695,6 +768,7 @@ __all__ = [
     "SECRET_ENV_SPECS",
     "SECRET_ENV_SPEC_BY_KEY",
     "SecretEnvSpec",
+    "SecretTextFileResult",
     "format_secret_source_policy_error",
     "read_secret_text_file",
     "read_secret_text_from_env",

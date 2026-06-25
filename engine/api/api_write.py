@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+from typing import Any
 
 from engine.runtime.failure_diagnostics import failure_response, log_failure
 from engine.runtime.logging import get_logger
@@ -39,6 +40,57 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     except Exception:
         value = int(default)
     return max(int(minimum), int(value))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_ALERT_SEVERITY_ORDER = {"INFO": 1, "WARN": 2, "HIGH": 3, "CRIT": 4}
+
+
+def _normalize_alert_severity(value: str) -> str:
+    raw = str(value or "").strip().upper()
+    if raw == "WARNING":
+        raw = "WARN"
+    if raw == "CRITICAL":
+        raw = "CRIT"
+    return raw if raw in _ALERT_SEVERITY_ORDER else "INFO"
+
+
+def _alert_shelve_max_ms(severity: str) -> int:
+    sev = _normalize_alert_severity(severity)
+    defaults = {
+        "INFO": 24 * 60 * 60 * 1000,
+        "WARN": 12 * 60 * 60 * 1000,
+        "HIGH": 4 * 60 * 60 * 1000,
+        "CRIT": 0,
+    }
+    env_name = f"ALERT_SHELVE_MAX_{sev}_MS"
+    severity_max = _env_int(env_name, defaults[sev], minimum=0)
+    global_max = _env_int("ALERT_SHELVE_MAX_MS", 24 * 60 * 60 * 1000, minimum=60_000)
+    return min(severity_max, global_max)
+
+
+def _alert_effective_severity(con, alert_id: int, submitted: str = "") -> str:
+    submitted_severity = _normalize_alert_severity(submitted)
+    if str(submitted or "").strip():
+        return submitted_severity
+    try:
+        row = con.execute("SELECT severity FROM alerts WHERE id = ? LIMIT 1", (int(alert_id),)).fetchone()
+        if row and row[0] is not None:
+            return _normalize_alert_severity(row[0])
+    except Exception as e:
+        _warn_nonfatal(
+            "API_WRITE_ALERT_SEVERITY_LOOKUP_FAILED",
+            e,
+            warn_key="alert_severity_lookup_failed",
+            alert_id=int(alert_id or 0),
+        )
+    return "HIGH"
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, warn_key: str | None = None, **extra) -> None:
@@ -133,6 +185,17 @@ def _ensure_alert_lifecycle_schema(con) -> None:
         """
     )
     con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_resolutions (
+          alert_id BIGINT PRIMARY KEY,
+          resolved_ts_ms BIGINT NOT NULL,
+          resolved_by TEXT,
+          reason TEXT,
+          source TEXT
+        )
+        """
+    )
+    con.execute(
         "CREATE INDEX IF NOT EXISTS idx_alert_lifecycle_events_alert_ts ON alert_lifecycle_events(alert_id, ts_ms DESC)"
     )
 
@@ -213,15 +276,36 @@ def shelve_alert(
     if not str(reason or "").strip():
         return {"ok": False, "error": "shelve_reason_required", "meta": {"status": 422}}
     now_ms = _now_ms()
+    if expires_ts_ms is None and duration_ms is None:
+        return {"ok": False, "error": "shelve_expiry_required", "meta": {"status": 422}}
     expiry = int(expires_ts_ms or 0)
     if expiry <= now_ms:
-        expiry = now_ms + int(duration_ms or _env_int("ALERT_SHELVE_DEFAULT_MS", 30 * 60 * 1000, minimum=60_000))
-    max_ms = _env_int("ALERT_SHELVE_MAX_MS", 24 * 60 * 60 * 1000, minimum=60_000)
-    if expiry - now_ms > max_ms:
-        return {"ok": False, "error": "shelve_expiry_too_long", "max_duration_ms": max_ms, "meta": {"status": 422}}
+        requested_duration = int(duration_ms or 0)
+        if requested_duration <= 0:
+            return {"ok": False, "error": "shelve_expiry_required", "meta": {"status": 422}}
+        expiry = now_ms + requested_duration
+    result: dict[str, Any] = {}
 
     def _txn(con):
+        nonlocal result
         _ensure_alert_lifecycle_schema(con)
+        normalized_severity = _alert_effective_severity(con, int(alert_id), severity)
+        if normalized_severity == "CRIT" and not _env_bool("ALERT_SHELVE_ALLOW_CRIT", False):
+            result = {"ok": False, "error": "critical_shelving_blocked", "severity": normalized_severity, "meta": {"status": 422}}
+            return
+        max_ms = _alert_shelve_max_ms(normalized_severity)
+        if max_ms <= 0:
+            result = {"ok": False, "error": "shelve_severity_blocked", "severity": normalized_severity, "meta": {"status": 422}}
+            return
+        if expiry - now_ms > max_ms:
+            result = {
+                "ok": False,
+                "error": "shelve_expiry_too_long",
+                "severity": normalized_severity,
+                "max_duration_ms": max_ms,
+                "meta": {"status": 422},
+            }
+            return
         con.execute(
             """
             INSERT INTO alert_shelves
@@ -243,7 +327,7 @@ def shelve_alert(
                 str(who or ""),
                 str(reason or ""),
                 str(source or ""),
-                str(severity or ""),
+                normalized_severity,
                 json.dumps({"duration_ms": int(expiry - now_ms)}, separators=(",", ":"), sort_keys=True),
             ),
         )
@@ -254,11 +338,18 @@ def shelve_alert(
             actor=str(who or ""),
             reason=str(reason or ""),
             source=str(source or ""),
-            detail={"expires_ts_ms": int(expiry)},
+            detail={"expires_ts_ms": int(expiry), "severity": normalized_severity},
         )
+        result = {
+            "ok": True,
+            "alert_id": int(alert_id),
+            "shelved_ts_ms": now_ms,
+            "expires_ts_ms": int(expiry),
+            "severity": normalized_severity,
+        }
 
     run_write_txn(_txn)
-    return {"ok": True, "alert_id": int(alert_id), "shelved_ts_ms": now_ms, "expires_ts_ms": int(expiry)}
+    return result
 
 
 def resolve_alert(alert_id: int, who: str = "", reason: str = "", source: str = ""):

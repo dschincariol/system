@@ -618,6 +618,36 @@ def _resolve_active_model(symbol: str, horizon_s: int, forced_model_name: Option
     feature_schema = dict(spec.get("feature_schema") or config.get("feature_schema") or {})
     if feature_ids and not isinstance(feature_schema.get("feature_ids"), list):
         feature_schema["feature_ids"] = list(feature_ids)
+    metadata = {}
+    try:
+        metadata = {
+            **dict(config.get("metadata") or {}),
+            **dict(spec.get("metadata") or {}),
+            **dict(config.get("meta") or {}),
+            **dict(spec.get("meta") or {}),
+        }
+    except Exception:
+        metadata = {}
+    learning_scope = str(
+        spec.get("learning_scope")
+        or config.get("learning_scope")
+        or metadata.get("learning_scope")
+        or feature_schema.get("learning_scope")
+        or ""
+    ).strip()
+    asset_scope = str(
+        spec.get("asset_scope")
+        or spec.get("ranker_asset_scope")
+        or spec.get("training_asset_scope")
+        or config.get("asset_scope")
+        or config.get("ranker_asset_scope")
+        or config.get("training_asset_scope")
+        or metadata.get("asset_scope")
+        or metadata.get("ranker_asset_scope")
+        or metadata.get("training_asset_scope")
+        or feature_schema.get("asset_scope")
+        or ""
+    ).strip()
     feature_set = str(
         spec.get("feature_set_tag")
         or config.get("feature_set_tag")
@@ -647,6 +677,9 @@ def _resolve_active_model(symbol: str, horizon_s: int, forced_model_name: Option
         "artifact_sha256": str(spec.get("artifact_sha256") or config.get("artifact_sha256") or ""),
         "artifact_path": str(spec.get("artifact_path") or config.get("artifact_path") or ""),
         "spec_source_stage": str(spec.get("source_stage") or ""),
+        "asset_scope": str(asset_scope),
+        "ranker_asset_scope": str(asset_scope),
+        "learning_scope": str(learning_scope),
         "risk_profile": str(spec.get("risk_profile") or config.get("risk_profile") or ""),
         "symbol_universe": list(spec.get("symbol_universe") or config.get("symbol_universe") or []),
         "horizon_s": int(spec.get("horizon_s") or config.get("horizon_s") or 0),
@@ -889,7 +922,7 @@ def _latest_feature_snapshot_features(
         decision_ts_ms=decision_ts_ms,
     )
     if prefetched is not _PREFETCH_UNSET:
-        return prefetched
+        return dict(prefetched) if isinstance(prefetched, dict) else None
     try:
         from engine.cache.wrappers.feature_snapshots import latest
 
@@ -2142,14 +2175,16 @@ def _knn_raw(
     Returns:
       knn_z, weight_sum, explain_knn
     """
-    events, labels, vecs, event_ids, event_ts = _load_labeled_event_vectors_cached()
+    events, labels_raw, vecs, event_ids, event_ts = _load_labeled_event_vectors_cached()
+    labels = dict(labels_raw or {})
     label_created_at = dict(_cached.get("label_created_at") or {})
     now_ms = int(as_of_ts_ms) if as_of_ts_ms is not None else int(time.time() * 1000)
     if not events or vecs is None:
         if not events:
             return 0.0, 0.0, {"fallback_reason": "no_cached_labeled_events"}
 
-        events2, labels2 = load_labeled_event_vectors(as_of_ts_ms=as_of_ts_ms)
+        events2, labels2_raw = load_labeled_event_vectors(as_of_ts_ms=as_of_ts_ms)
+        labels2 = dict(labels2_raw or {})
         if not events2:
             return 0.0, 0.0, {"fallback_reason": "no_labeled_events_after_reload"}
 
@@ -2325,8 +2360,9 @@ def _confidence_collapse(confs: list[float]) -> bool:
 
 
 def _prediction_asset_class(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip()
     try:
-        return str(asset_class_for_symbol(symbol) or "UNKNOWN").upper().strip()
+        asset_class = str(asset_class_for_symbol(sym) or "UNKNOWN").upper().strip()
     except Exception as e:
         _warn_nonfatal(
             "predictor_asset_class_lookup_failed",
@@ -2335,12 +2371,57 @@ def _prediction_asset_class(symbol: str) -> str:
             warn_key=f"predictor_asset_class_lookup_failed:{symbol}",
             symbol=str(symbol),
         )
-    return "UNKNOWN"
+        asset_class = "UNKNOWN"
+    if asset_class == "UNKNOWN":
+        base = _crypto_base_symbol(sym)
+        if base and base != sym:
+            try:
+                base_asset_class = str(asset_class_for_symbol(base) or "UNKNOWN").upper().strip()
+            except Exception:
+                base_asset_class = "UNKNOWN"
+            if base_asset_class in _CRYPTO_ASSET_CLASSES:
+                return base_asset_class
+    return asset_class
+
+
+_CRYPTO_ASSET_CLASSES = {"CRYPTO", "CRYPTOCURRENCY", "DIGITAL_ASSET", "DIGITAL_ASSETS"}
+_RANKER_EQUITY_ASSET_CLASSES = {"EQUITY", "EQUITIES", "US_EQUITY", "STOCK", "STOCKS"}
+_RANKER_DEFAULT_EXCLUDED_ASSET_CLASSES = {
+    "CRYPTO",
+    "CRYPTOCURRENCY",
+    "DIGITAL_ASSET",
+    "DIGITAL_ASSETS",
+    "COMMODITY",
+    "FX",
+    "RATES",
+    "OPTION",
+    "OPTIONS",
+    "FUTURES",
+}
+_CRYPTO_QUOTE_SUFFIXES = ("USDT", "USD", "USDC", "EUR", "GBP")
+
+
+def _crypto_base_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip().replace("/", "").replace("-", "")
+    if not sym:
+        return ""
+    for suffix in _CRYPTO_QUOTE_SUFFIXES:
+        if sym.endswith(suffix) and len(sym) > len(suffix):
+            return sym[: -len(suffix)]
+    return sym
+
+
+def _crypto_regime_anchor_symbol() -> str:
+    anchor = str(os.environ.get("CRYPTO_REGIME_ANCHOR_SYMBOL", "BTCUSD") or "BTCUSD").upper().strip()
+    return anchor or "BTCUSD"
 
 
 def _regime_anchor_symbol(symbol: str) -> str:
     sym = str(symbol or "").upper().strip()
-    if _prediction_asset_class(sym) != "FX":
+    asset_class = _prediction_asset_class(sym)
+    if asset_class in _CRYPTO_ASSET_CLASSES:
+        return _crypto_regime_anchor_symbol()
+    if asset_class != "FX":
         return "SPY"
     try:
         from engine.data.fx_instrument import parse_fx_symbol
@@ -2363,7 +2444,12 @@ def _prediction_regime_context(symbol: str, event: Optional[Mapping[str, Any]]) 
     sym = str(symbol or "").upper().strip()
     asset_class = _prediction_asset_class(sym)
     anchor = _regime_anchor_symbol(sym)
-    default_regime = "FX_MID" if asset_class == "FX" else "MID"
+    if asset_class == "FX":
+        default_regime = "FX_MID"
+    elif asset_class in _CRYPTO_ASSET_CLASSES:
+        default_regime = "CRYPTO_MID"
+    else:
+        default_regime = "MID"
     try:
         regime_at_trade = str(get_current_regime(anchor) or default_regime).upper()
     except Exception as e:
@@ -2377,6 +2463,8 @@ def _prediction_regime_context(symbol: str, event: Optional[Mapping[str, Any]]) 
         )
         regime_at_trade = default_regime
 
+    if asset_class in _CRYPTO_ASSET_CLASSES:
+        return regime_at_trade, {"anchor_symbol": str(anchor), "asset_class": "CRYPTO"}
     if asset_class != "FX":
         return regime_at_trade, {}
 
@@ -2406,6 +2494,19 @@ def _prediction_regime_context(symbol: str, event: Optional[Mapping[str, Any]]) 
     return regime_at_trade, context
 
 
+def _attach_prediction_regime_context(explain: Dict[str, Any], context: Mapping[str, Any]) -> Dict[str, Any]:
+    context_dict = dict(context or {})
+    if not context_dict:
+        return explain
+    explain["regime_anchor_symbol"] = str(context_dict.get("anchor_symbol") or "")
+    asset_class = str(context_dict.get("asset_class") or "").upper().strip()
+    if asset_class in _CRYPTO_ASSET_CLASSES:
+        explain["crypto_regime_context"] = dict(context_dict)
+    else:
+        explain["fx_regime_context"] = dict(context_dict)
+    return explain
+
+
 def _predict_resolved_model(
     query_vec: np.ndarray,
     sym: str,
@@ -2432,7 +2533,7 @@ def _predict_resolved_model(
     as_of_ts_ms = _safe_int((event or {}).get("ts_ms"), int(time.time() * 1000))
     knn_z, wsum, knn_ex = _knn_raw(qv_knn, sym, int(h), top_k, as_of_ts_ms=int(as_of_ts_ms))
 
-    regime_at_trade, fx_regime_context = _prediction_regime_context(sym, event)
+    regime_at_trade, regime_context = _prediction_regime_context(sym, event)
 
     served = _adapter_predict(
         active_family,
@@ -2491,9 +2592,7 @@ def _predict_resolved_model(
             if feature_schema:
                 explain_served["feature_schema"] = dict(feature_schema)
             explain_served.setdefault("regime_at_trade", str(regime_at_trade))
-            if fx_regime_context:
-                explain_served["regime_anchor_symbol"] = str(fx_regime_context.get("anchor_symbol") or "")
-                explain_served["fx_regime_context"] = dict(fx_regime_context)
+            explain_served = _attach_prediction_regime_context(explain_served, regime_context)
             explain_served = _apply_model_serving_diagnostics(explain_served, active_model)
             return float(z_served), float(conf_served), explain_served
         except Exception as e:
@@ -2508,9 +2607,7 @@ def _predict_resolved_model(
             z_served, conf_served, explain_served = served
             explain_dict = _apply_model_serving_diagnostics(dict(explain_served or {}), active_model)
             explain_dict.setdefault("regime_at_trade", str(regime_at_trade))
-            if fx_regime_context:
-                explain_dict["regime_anchor_symbol"] = str(fx_regime_context.get("anchor_symbol") or "")
-                explain_dict["fx_regime_context"] = dict(fx_regime_context)
+            explain_dict = _attach_prediction_regime_context(explain_dict, regime_context)
             return float(z_served), float(conf_served), explain_dict
 
     z, conf, prior_ex = _blend_with_priors(sym, int(h), knn_z, wsum)
@@ -2541,9 +2638,7 @@ def _predict_resolved_model(
         explain["training_window_days"] = int(active_model.get("training_window_days") or 0)
     if feature_schema:
         explain["feature_schema"] = feature_schema
-    if fx_regime_context:
-        explain["regime_anchor_symbol"] = str(fx_regime_context.get("anchor_symbol") or "")
-        explain["fx_regime_context"] = dict(fx_regime_context)
+    explain = _attach_prediction_regime_context(explain, regime_context)
     if active_family != "embed_regressor":
         explain["serve_fallback"] = {
             "requested_model_name": str(active_model_name),
@@ -3364,14 +3459,70 @@ def _ranker_equity_scope_symbol(symbol: str) -> bool:
     if not sym:
         return False
     try:
-        asset_class = str(asset_class_for_symbol(sym) or "UNKNOWN").upper().strip()
+        asset_class = _prediction_asset_class(sym)
     except Exception:
         asset_class = "UNKNOWN"
-    if asset_class in {"EQUITY", "EQUITIES", "US_EQUITY", "STOCK", "STOCKS"}:
+    if asset_class in _RANKER_EQUITY_ASSET_CLASSES:
         return True
-    if asset_class in {"CRYPTO", "COMMODITY", "FX", "RATES", "OPTION", "OPTIONS"}:
+    if asset_class in _RANKER_DEFAULT_EXCLUDED_ASSET_CLASSES:
         return False
     return bool(sym.replace(".", "").isalnum()) and not sym.endswith(("USD", "USDT"))
+
+
+def _ranker_active_asset_scope(active_model: Mapping[str, Any]) -> str:
+    active = dict(active_model or {})
+    metadata = {}
+    try:
+        metadata = {**dict(active.get("metadata") or {}), **dict(active.get("meta") or {})}
+    except Exception:
+        metadata = {}
+    feature_schema = {}
+    try:
+        feature_schema = dict(active.get("feature_schema") or {})
+    except Exception:
+        feature_schema = {}
+    raw = str(
+        active.get("asset_scope")
+        or active.get("ranker_asset_scope")
+        or active.get("training_asset_scope")
+        or metadata.get("asset_scope")
+        or metadata.get("ranker_asset_scope")
+        or metadata.get("training_asset_scope")
+        or feature_schema.get("asset_scope")
+        or active.get("learning_scope")
+        or metadata.get("learning_scope")
+        or feature_schema.get("learning_scope")
+        or "EQUITY"
+    ).upper().strip()
+    if "CRYPTO" in raw or "DIGITAL_ASSET" in raw:
+        return "CRYPTO"
+    if raw in {
+        "EQUITY",
+        "EQUITIES",
+        "US_EQUITY",
+        "STOCK",
+        "STOCKS",
+        "CROSS_SECTIONAL_EQUITIES",
+        "CROSS_SECTIONAL_EQUITY",
+    }:
+        return "EQUITY"
+    return raw or "EQUITY"
+
+
+def _ranker_symbol_in_asset_scope(symbol: str, active_model: Mapping[str, Any]) -> bool:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return False
+    scope = _ranker_active_asset_scope(active_model)
+    if scope == "CRYPTO":
+        return _prediction_asset_class(sym) in _CRYPTO_ASSET_CLASSES
+    if scope == "EQUITY":
+        return _ranker_equity_scope_symbol(sym)
+    if scope in _CRYPTO_ASSET_CLASSES:
+        return _prediction_asset_class(sym) in _CRYPTO_ASSET_CLASSES
+    if scope in _RANKER_EQUITY_ASSET_CLASSES:
+        return _ranker_equity_scope_symbol(sym)
+    return False
 
 
 def _ranker_selection_count(env_name: str, default_value: int, universe_n: int) -> int:
@@ -3411,10 +3562,10 @@ def _maybe_apply_lgbm_ranker_batch(
     top_k: int,
     event: Optional[Dict],
 ) -> Dict[Tuple[str, int], Tuple[float, float, Dict]]:
-    groups: Dict[Tuple[str, str, str, str, Tuple[str, ...]], Dict[str, Any]] = {}
+    groups: Dict[Tuple[str, str, str, str, str, Tuple[str, ...]], Dict[str, Any]] = {}
     for sym_raw in list(symbols or []):
         sym = str(sym_raw or "").upper().strip()
-        if not sym or not _ranker_equity_scope_symbol(sym):
+        if not sym:
             continue
         try:
             active = _resolve_active_model(sym, int(horizon_s))
@@ -3430,6 +3581,8 @@ def _maybe_apply_lgbm_ranker_batch(
             continue
         if not _active_model_is_lgbm_ranker(active):
             continue
+        if not _ranker_symbol_in_asset_scope(sym, active):
+            continue
         loc = _ranker_artifact_location(active)
         if not any(str(loc.get(k) or "").strip() for k in ("alias", "sha256", "path")):
             continue
@@ -3443,6 +3596,7 @@ def _maybe_apply_lgbm_ranker_batch(
             str(loc.get("alias") or ""),
             str(loc.get("sha256") or ""),
             str(loc.get("path") or ""),
+            str(_ranker_active_asset_scope(active)),
             tuple(str(fid) for fid in list(feature_ids or [])),
         )
         bucket = groups.setdefault(key, {"active": dict(active), "location": dict(loc), "symbols": [], "feature_ids": list(feature_ids)})
@@ -3461,6 +3615,7 @@ def _maybe_apply_lgbm_ranker_batch(
         if len(syms) < 2:
             continue
         active = dict(bucket.get("active") or {})
+        asset_scope = _ranker_active_asset_scope(active)
         loc = dict(bucket.get("location") or {})
         try:
             model = load_lgbm_ranker_model_from_artifact(
@@ -3511,7 +3666,7 @@ def _maybe_apply_lgbm_ranker_batch(
             default_leg = max(1, min(3, int(top_k or 3), len(syms) // 2 if len(syms) > 2 else 1))
             top_n = _ranker_selection_count("LGBM_RANKER_TOP_K", default_leg, len(syms))
             bottom_n = _ranker_selection_count("LGBM_RANKER_BOTTOM_K", default_leg, max(0, len(syms) - top_n))
-            signals = ranker_scores_to_signals(syms, scores, top_k=int(top_n), bottom_k=int(bottom_n))
+            signals = ranker_scores_to_signals(syms, list(scores), top_k=int(top_n), bottom_k=int(bottom_n))
         except Exception as e:
             _warn_nonfatal(
                 "predictor_lgbm_ranker_batch_failed",
@@ -3548,6 +3703,7 @@ def _maybe_apply_lgbm_ranker_batch(
                     "model_version": str(active.get("model_version") or ""),
                     "model_ts_ms": int(active.get("model_ts_ms") or 0),
                     "model_spec_source_stage": str(active.get("spec_source_stage") or ""),
+                    "ranker_asset_scope": str(asset_scope),
                     "feature_ids": list(feature_ids),
                     "feature_set_tag": _registry_feature_set_tag(
                         list(feature_ids),
@@ -3572,6 +3728,7 @@ def _maybe_apply_lgbm_ranker_batch(
                         "bottom_k": int(bottom_n),
                         "raw_fallback_expected_z": float(z0),
                         "raw_fallback_confidence": float(conf0),
+                        "asset_scope": str(asset_scope),
                     },
                 }
             )

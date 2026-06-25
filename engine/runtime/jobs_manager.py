@@ -72,7 +72,7 @@ log_event(
 )
 
 
-def _warn_nonfatal(code: str, error: Exception, **extra) -> None:
+def _warn_nonfatal(code: str, error: Exception, *, persist: bool = True, **extra) -> None:
     log_failure(
         LOG,
         event=str(code).lower(),
@@ -82,7 +82,7 @@ def _warn_nonfatal(code: str, error: Exception, **extra) -> None:
         level=30,
         component="engine.runtime.jobs_manager",
         include_health=False,
-        persist=True,
+        persist=bool(persist),
         extra=extra or None,
     )
 
@@ -92,6 +92,92 @@ def _append_job_log_safe(job: "JobState", message: str, *, code: str, **extra) -
         job.append_log(str(message))
     except Exception as append_err:
         _warn_nonfatal(code, append_err, job=str(getattr(job, "name", "")), message=str(message), **extra)
+
+
+def _lock_release_timeout_s() -> float:
+    try:
+        return max(0.01, min(5.0, float(os.environ.get("JOBS_MANAGER_LOCK_RELEASE_TIMEOUT_S", "0.25") or 0.25)))
+    except Exception as e:
+        _warn_nonfatal("JOBS_MANAGER_LOCK_RELEASE_TIMEOUT_PARSE_FAILED", e)
+        return 0.25
+
+
+def _release_lock_best_effort(
+    lock_name: str,
+    *,
+    job: str,
+    scope: str,
+    deadline: Optional[float] = None,
+) -> bool:
+    """Release a runtime lock without letting lock-storage failures block shutdown."""
+    remaining_s = _lock_release_timeout_s()
+    if deadline is not None:
+        remaining_s = min(remaining_s, max(0.0, float(deadline) - time.monotonic()))
+    if remaining_s <= 0.0:
+        _warn_nonfatal(
+            "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_SKIPPED",
+            TimeoutError("lock release deadline exhausted"),
+            persist=False,
+            job=str(job),
+            lock_name=str(lock_name),
+            scope=str(scope),
+        )
+        return False
+
+    done = threading.Event()
+    result: Dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            _release_lock(lock_name)
+            result["ok"] = True
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(
+        target=_runner,
+        name=f"job_lock_release_{str(job)}",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except Exception as exc:
+        _warn_nonfatal(
+            "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_THREAD_FAILED",
+            exc,
+            persist=False,
+            job=str(job),
+            lock_name=str(lock_name),
+            scope=str(scope),
+        )
+        return False
+
+    if not done.wait(timeout=max(0.0, float(remaining_s))):
+        _warn_nonfatal(
+            "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_TIMEOUT",
+            TimeoutError(f"lock release timed out after {remaining_s:.3f}s"),
+            persist=False,
+            job=str(job),
+            lock_name=str(lock_name),
+            scope=str(scope),
+            timeout_s=float(remaining_s),
+        )
+        return False
+
+    error = result.get("error")
+    if isinstance(error, Exception):
+        _warn_nonfatal(
+            "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_FAILED",
+            error,
+            persist=False,
+            job=str(job),
+            lock_name=str(lock_name),
+            scope=str(scope),
+        )
+        return False
+    return True
 
 # ---------------------------------------------------
 # PATHS (robust against wrong CWD)
@@ -1631,6 +1717,8 @@ class JobManager:
             jobs = list(self._jobs.values())
 
         if drain_before_kill is not None:
+            stop_budget_s = float(drain_deadline_s) if drain_deadline_s is not None else 5.0
+            stop_deadline = time.monotonic() + max(0.0, stop_budget_s)
             running: list[tuple[JobState, subprocess.Popen]] = []
             for job in jobs:
                 try:
@@ -1640,16 +1728,12 @@ class JobManager:
                         p = job.proc
                     if not p or p.poll() is not None:
                         for lock_name in _runtime_lock_candidates(job.name):
-                            try:
-                                _release_lock(lock_name)
-                            except Exception as release_err:
-                                _warn_nonfatal(
-                                    "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_FAILED",
-                                    release_err,
-                                    job=str(job.name),
-                                    lock_name=str(lock_name),
-                                    scope="stop_all_not_running",
-                                )
+                            _release_lock_best_effort(
+                                lock_name,
+                                job=str(job.name),
+                                scope="stop_all_not_running",
+                                deadline=stop_deadline,
+                            )
                         _write_job_history(job.name, "stop", "not_running", None)
                         stopped.append(job.name)
                         continue
@@ -1665,12 +1749,11 @@ class JobManager:
                     _warn_nonfatal("JOBS_MANAGER_STOP_ALL_TERMINATE_FAILED", e, job=str(job.name))
 
             drain_snapshot: Dict[str, Any] = {}
-            deadline = time.monotonic() + max(0.0, float(drain_deadline_s or 0.0))
             try:
                 drain_snapshot = dict(
                     drain_before_kill(
                         reason="jobs_manager_stop_all_pre_sigkill",
-                        deadline_s=max(0.0, float(deadline) - time.monotonic()),
+                        deadline_s=max(0.0, float(stop_deadline) - time.monotonic()),
                     )
                     or {}
                 )
@@ -1683,7 +1766,7 @@ class JobManager:
                     if p.poll() is None:
                         p.kill()
                         try:
-                            p.wait(timeout=5)
+                            p.wait(timeout=min(5.0, max(0.0, float(stop_deadline) - time.monotonic())))
                         except Exception as kill_wait_err:
                             _warn_nonfatal("JOBS_MANAGER_STOP_ALL_KILL_WAIT_FAILED", kill_wait_err, job=str(job.name))
                         with job._lock:
@@ -1698,16 +1781,12 @@ class JobManager:
 
             for job in jobs:
                 for lock_name in _runtime_lock_candidates(job.name):
-                    try:
-                        _release_lock(lock_name)
-                    except Exception as release_err:
-                        _warn_nonfatal(
-                            "JOBS_MANAGER_RUNTIME_LOCK_RELEASE_FAILED",
-                            release_err,
-                            job=str(job.name),
-                            lock_name=str(lock_name),
-                            scope="stop_all_completed",
-                        )
+                    _release_lock_best_effort(
+                        lock_name,
+                        job=str(job.name),
+                        scope="stop_all_completed",
+                        deadline=stop_deadline,
+                    )
                 emit_counter(
                     "job_stop",
                     1,
@@ -1725,7 +1804,12 @@ class JobManager:
 
             if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
                 try:
-                    self._watchdog_thread.join(timeout=max(1.0, float(DAEMON_WATCHDOG_PERIOD_S) * 2.0))
+                    self._watchdog_thread.join(
+                        timeout=min(
+                            max(1.0, float(DAEMON_WATCHDOG_PERIOD_S) * 2.0),
+                            max(0.0, float(stop_deadline) - time.monotonic()),
+                        )
+                    )
                 except Exception as e:
                     errors.append(f"watchdog_join: {e}")
 

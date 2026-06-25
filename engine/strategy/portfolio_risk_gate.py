@@ -12,10 +12,12 @@ import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from engine.data.asset_map import asset_class_for_symbol
+from engine.data.futures_instrument import parse_futures_symbol
 from engine.data.weather_features import get_weather_feature_snapshot
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import table_exists
 from engine.strategy.drawdown_state import evaluate_current_drawdown
+from engine.strategy.crypto_sizing import normalize_crypto_symbol
 
 LOGGER = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -112,6 +114,23 @@ def _sleeve(sym: str) -> str:
         return "UNKNOWN"
 
 
+def _futures_weight_factor(sym: str) -> float:
+    try:
+        parsed = parse_futures_symbol(sym)
+        if parsed is None:
+            return 1.0
+        multiplier = float(parsed.multiplier)
+        return float(multiplier) if multiplier > 0.0 else 1.0
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_FUTURES_FACTOR_FAILED",
+            e,
+            once_key=f"futures_factor:{sym}",
+            symbol=str(sym),
+        )
+        return 1.0
+
+
 def _sleeve_gross(out: Dict[str, Dict[str, Any]], sleeve_name: str) -> float:
     g = 0.0
     sn = str(sleeve_name or "").upper().strip()
@@ -119,7 +138,7 @@ def _sleeve_gross(out: Dict[str, Dict[str, Any]], sleeve_name: str) -> float:
         if _sleeve(s) != sn:
             continue
         try:
-            g += abs(float(tgt.get("weight", 0.0) or 0.0))
+            g += abs(float(tgt.get("weight", 0.0) or 0.0)) * _futures_weight_factor(str(s))
         except Exception as e:
             _warn_nonfatal("PORTFOLIO_RISK_GATE_SLEEVE_GROSS_WEIGHT_FAILED", e, once_key=f"sleeve_gross:{s}", symbol=str(s))
     return float(g)
@@ -134,6 +153,7 @@ def _sleeve_net(out: Dict[str, Dict[str, Any]], sleeve_name: str) -> float:
         try:
             side = str(tgt.get("side", "FLAT")).upper()
             w = float(tgt.get("weight", 0.0) or 0.0)
+            w *= _futures_weight_factor(str(s))
             if side == "SHORT":
                 n -= abs(w)
             elif side == "LONG":
@@ -186,7 +206,7 @@ def _apply_sleeve_caps(out: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> 
                     continue
                 side = str(tgt.get("side", "FLAT")).upper()
                 if side == side_to_scale:
-                    denom += abs(float(tgt.get("weight", 0.0) or 0.0))
+                    denom += abs(float(tgt.get("weight", 0.0) or 0.0)) * _futures_weight_factor(str(s))
             if denom > 1e-12:
                 # reduce overweight side by excess
                 target_sum = float(denom) - (abs(float(n)) - float(mn))
@@ -256,9 +276,9 @@ def _tgt_signed_weight(tgt_row: Dict[str, Any]) -> float:
 
 def _gross(desired: Dict[str, Dict[str, Any]]) -> float:
     g = 0.0
-    for v in (desired or {}).values():
+    for sym, v in (desired or {}).items():
         try:
-            g += abs(float(v.get("weight", 0.0) or 0.0))
+            g += abs(float(v.get("weight", 0.0) or 0.0)) * _futures_weight_factor(str(sym))
         except Exception as e:
             _warn_nonfatal("PORTFOLIO_RISK_GATE_GROSS_ACCUMULATION_FAILED", e, once_key="gross_accumulation")
     return float(g)
@@ -266,9 +286,9 @@ def _gross(desired: Dict[str, Dict[str, Any]]) -> float:
 
 def _net(desired: Dict[str, Dict[str, Any]]) -> float:
     n = 0.0
-    for v in (desired or {}).values():
+    for sym, v in (desired or {}).items():
         try:
-            n += _tgt_signed_weight(v)
+            n += _tgt_signed_weight(v) * _futures_weight_factor(str(sym))
         except Exception as e:
             _warn_nonfatal("PORTFOLIO_RISK_GATE_NET_ACCUMULATION_FAILED", e, once_key="net_accumulation")
     return float(n)
@@ -293,6 +313,177 @@ def _env_float(*keys: str, default: float) -> float:
         if parsed is not None:
             return float(parsed)
     return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_crypto_symbol(sym: str) -> bool:
+    text = str(sym or "").strip().upper()
+    if not text:
+        return False
+    try:
+        if str(asset_class_for_symbol(text) or "").upper().strip() in {"CRYPTO", "CRYPTOCURRENCY"}:
+            return True
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_CRYPTO_CLASSIFY_FAILED",
+            e,
+            once_key=f"crypto_classify_raw:{text}",
+            symbol=str(text),
+        )
+    root = normalize_crypto_symbol(text)
+    if not root or root == text:
+        return False
+    try:
+        return str(asset_class_for_symbol(root) or "").upper().strip() in {"CRYPTO", "CRYPTOCURRENCY"}
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_GATE_CRYPTO_CLASSIFY_FAILED",
+            e,
+            once_key=f"crypto_classify_root:{text}",
+            symbol=str(text),
+            root=str(root),
+        )
+    return False
+
+
+def _crypto_order_notional_usd(
+    con: Any,
+    order: Dict[str, Any],
+    equity: Optional[float],
+    latest_prices: Mapping[str, Optional[float]] | None = None,
+) -> Tuple[Optional[float], Optional[str]]:
+    for key in ("notional_usd", "notional", "target_notional_usd", "order_notional_usd"):
+        if order.get(key) in (None, ""):
+            continue
+        parsed = _finite_float(order.get(key))
+        if parsed is not None and parsed >= 0.0:
+            return float(abs(parsed)), None
+
+    signed, reason = _order_signed_target_weight(con, order, equity, latest_prices=latest_prices)
+    if signed is None:
+        return None, str(reason or "invalid_crypto_exposure")
+    eq = _finite_float(equity)
+    if eq is None or eq <= 0.0:
+        return None, "missing_equity_for_crypto_notional"
+    return float(abs(float(signed)) * float(eq)), None
+
+
+def _apply_crypto_live_order_gate(
+    con: Any,
+    orders: List[Dict[str, Any]],
+    *,
+    mode: str,
+    equity_usd: Optional[float],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    info: Dict[str, Any] = {
+        "enabled": True,
+        "mode": str(mode or "").strip().lower(),
+        "live_enabled": bool(_env_bool("CRYPTO_LIVE_TRADING_ENABLED", False)),
+        "notional_cap_usd": float(_env_float("CRYPTO_NOTIONAL_CAP_USD", default=10_000.0)),
+        "crypto_order_n": 0,
+    }
+    if str(mode or "").strip().lower() != "live":
+        info["status"] = "not_live_mode"
+        return list(orders or []), info
+
+    crypto_orders = [
+        dict(order)
+        for order in list(orders or [])
+        if isinstance(order, dict) and _is_crypto_symbol(str(order.get("symbol") or ""))
+    ]
+    info["crypto_order_n"] = int(len(crypto_orders))
+    if not crypto_orders:
+        info["status"] = "no_crypto_orders"
+        return list(orders or []), info
+
+    if not bool(info["live_enabled"]):
+        info.update(
+            {
+                "ok": False,
+                "status": "blocked_crypto_live_trading_disabled",
+                "reason": "crypto_live_trading_disabled_by_default",
+                "env": {"CRYPTO_LIVE_TRADING_ENABLED": str(os.environ.get("CRYPTO_LIVE_TRADING_ENABLED", "0") or "0")},
+            }
+        )
+        return [], info
+
+    cap = float(info["notional_cap_usd"])
+    if cap <= 0.0:
+        info["status"] = "crypto_live_enabled_notional_cap_disabled"
+        return list(orders or []), info
+
+    equity, equity_error = _read_execution_equity(con, equity_usd)
+    if equity_error:
+        info["equity_error"] = str(equity_error)
+    info["equity_usd"] = (float(equity) if equity is not None else None)
+
+    price_symbols = [
+        str(order.get("symbol") or "").strip().upper()
+        for order in crypto_orders
+        if _explicit_signed_qty(order) is not None and _order_reference_price(order) is None
+    ]
+    latest_prices: Dict[str, Optional[float]] = {}
+    _ensure_latest_prices(con, latest_prices, price_symbols)
+
+    checked: List[Dict[str, Any]] = []
+    breaches: List[Dict[str, Any]] = []
+    by_symbol: Dict[str, float] = {}
+    total_notional = 0.0
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        symbol = str(order.get("symbol") or "").strip().upper()
+        if not _is_crypto_symbol(symbol):
+            checked.append(order)
+            continue
+        notional, reason = _crypto_order_notional_usd(con, order, equity, latest_prices=latest_prices)
+        if notional is None:
+            breaches.append({"symbol": symbol, "reason": str(reason or "crypto_notional_unavailable")})
+            continue
+        total_notional += float(notional)
+        by_symbol[symbol] = float(by_symbol.get(symbol, 0.0) + float(notional))
+        if float(notional) > cap + 1e-9:
+            breaches.append(
+                {
+                    "symbol": symbol,
+                    "reason": "crypto_notional_cap_exceeded",
+                    "notional_usd": float(notional),
+                    "cap_usd": float(cap),
+                }
+            )
+            continue
+        checked.append(order)
+
+    info["by_symbol_notional_usd"] = dict(sorted(by_symbol.items(), key=lambda kv: kv[0]))
+    info["total_crypto_notional_usd"] = float(total_notional)
+    if not breaches and float(total_notional) > cap + 1e-9:
+        breaches.append(
+            {
+                "symbol": "BATCH",
+                "reason": "crypto_notional_cap_exceeded",
+                "notional_usd": float(total_notional),
+                "cap_usd": float(cap),
+            }
+        )
+    if breaches:
+        info.update(
+            {
+                "ok": False,
+                "status": "blocked_crypto_notional_cap",
+                "breaches": breaches,
+            }
+        )
+        return [], info
+
+    info["ok"] = True
+    info["status"] = "crypto_live_gate_clear"
+    return checked, info
 
 
 def _table_columns(con: Any, table_name: str) -> set[str]:
@@ -1049,8 +1240,9 @@ def _turnover(desired: Dict[str, Dict[str, Any]], state: Dict[str, Dict[str, Any
     for sym in syms:
         cur = dict((state or {}).get(sym) or {})
         tgt = dict((desired or {}).get(sym) or {})
-        cur_w = abs(_cur_signed_weight(cur))
-        tgt_w = abs(_tgt_signed_weight(tgt))
+        factor = _futures_weight_factor(str(sym))
+        cur_w = abs(_cur_signed_weight(cur)) * factor
+        tgt_w = abs(_tgt_signed_weight(tgt)) * factor
         tot += abs(float(tgt_w) - float(cur_w))
     return float(tot)
 
@@ -1219,7 +1411,7 @@ def apply_portfolio_risk_gate(
     cur_gross = 0.0
     try:
         for _sym, cur in (state or {}).items():
-            cur_gross += abs(_cur_signed_weight(cur))
+            cur_gross += abs(_cur_signed_weight(cur)) * _futures_weight_factor(str(_sym))
     except Exception:
         cur_gross = 0.0
     info["cur_gross"] = float(cur_gross)
@@ -1285,7 +1477,7 @@ def apply_portfolio_risk_gate(
             denom = 0.0
             for _sym, tgt in out.items():
                 if str(tgt.get("side", "FLAT")).upper() == "LONG":
-                    denom += float(tgt.get("weight", 0.0) or 0.0)
+                    denom += float(tgt.get("weight", 0.0) or 0.0) * _futures_weight_factor(str(_sym))
             if denom > 1e-12:
                 target_long_sum = denom - (abs(net) - float(MAX_NET))
                 scale = max(0.0, float(target_long_sum) / float(denom))
@@ -1299,7 +1491,7 @@ def apply_portfolio_risk_gate(
             denom = 0.0
             for _sym, tgt in out.items():
                 if str(tgt.get("side", "FLAT")).upper() == "SHORT":
-                    denom += float(tgt.get("weight", 0.0) or 0.0)
+                    denom += float(tgt.get("weight", 0.0) or 0.0) * _futures_weight_factor(str(_sym))
             if denom > 1e-12:
                 target_short_sum = denom - (abs(net) - float(MAX_NET))
                 scale = max(0.0, float(target_short_sum) / float(denom))
@@ -1401,10 +1593,25 @@ def apply_execution_risk_governor(
     except Exception:
         max_abs_w, max_abs_dw, max_n = 0.35, 0.15, 50
 
+    scoped_orders, crypto_gate_info = _apply_crypto_live_order_gate(
+        con,
+        list(orders or []),
+        mode=str(mode),
+        equity_usd=equity_usd,
+    )
+    if isinstance(crypto_gate_info, dict) and crypto_gate_info.get("ok") is False:
+        return [], {
+            "ok": False,
+            "status": str(crypto_gate_info.get("status") or "blocked_crypto_live_gate"),
+            "broker": broker,
+            "mode": mode,
+            "crypto_live_gate": dict(crypto_gate_info),
+        }
+
     out: List[Dict[str, Any]] = []
     dropped = 0
 
-    for o in list(orders or [])[: int(max_n)]:
+    for o in list(scoped_orders or [])[: int(max_n)]:
         if not isinstance(o, dict):
             continue
         sym = str(o.get("symbol") or "").strip()
@@ -1461,6 +1668,7 @@ def apply_execution_risk_governor(
         "max_abs_weight": float(max_abs_w),
         "max_abs_delta_weight": float(max_abs_dw),
         "max_orders_per_pass": int(max_n),
+        "crypto_live_gate": dict(crypto_gate_info or {}),
         "exposure_caps": dict(exposure_info or {}),
     }
     return out, info

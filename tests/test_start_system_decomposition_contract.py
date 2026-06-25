@@ -356,6 +356,18 @@ def test_start_system_shutdown_helpers_preserve_signal_and_bootstrap_side_effect
     lifecycle_calls = []
     shutdown_calls = []
     terminate_calls = []
+    original_startup_handle_signal = start_system._startup_handle_signal
+
+    class ForcedExit(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(code)
+            self.code = int(code)
+
+    def _safe_startup_handle_signal(*args, **kwargs):
+        kwargs["force_exit"] = lambda code: (_ for _ in ()).throw(ForcedExit(int(code)))
+        return original_startup_handle_signal(*args, **kwargs)
+
+    monkeypatch.setattr(start_system, "_startup_handle_signal", _safe_startup_handle_signal)
     monkeypatch.setattr("engine.runtime.lifecycle_state.mark_clean_shutdown", lambda: lifecycle_calls.append("clean"))
     monkeypatch.setattr(start_system, "_terminate_ingestion", lambda: terminate_calls.append("terminate"))
     monkeypatch.setattr(
@@ -365,10 +377,10 @@ def test_start_system_shutdown_helpers_preserve_signal_and_bootstrap_side_effect
     )
     start_system._INGESTION_WATCHDOG_STOP.clear()
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises((SystemExit, ForcedExit)) as exc_info:
         start_system._handle_signal(15, None)
 
-    assert exc_info.value.code == 0
+    assert int(getattr(exc_info.value, "code", 0)) == 0
     assert start_system._INGESTION_WATCHDOG_STOP.is_set()
     assert lifecycle_calls == ["clean"]
     assert terminate_calls == ["terminate"]

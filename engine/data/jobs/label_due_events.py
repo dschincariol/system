@@ -7,7 +7,8 @@ Job entrypoint or scheduled task for `label_due_events`.
 # label_due_events.py
 """
 Creates labels for events where the horizon has passed and price data exists.
-Reads from prices table (live polled).
+Reads raw prices for non-futures symbols. Futures symbols read the
+ratio-adjusted continuous series and require roll-calendar coverage.
 
 Writes to labels table.
 - Stores vol_proxy + regime at label-time (required for true regime-aware training).
@@ -25,6 +26,12 @@ import logging
 import random
 from typing import Optional
 
+from engine.data.asset_map import asset_class_for_symbol
+from engine.data.futures_instrument import parse_futures_symbol
+from engine.data.futures_roll import (
+    futures_label_window_block_reason,
+    read_ratio_adjusted_continuous_close_at_or_after,
+)
 from engine.runtime.failure_diagnostics import log_failure
 from engine.data.universe_pit import label_window_within_symbol_lifecycle
 from engine.runtime.logging import get_logger
@@ -122,7 +129,56 @@ def price_at_or_after(con, symbol: str, ts_ms: int) -> Optional[float]:
     return float(row[0]) if row and row[0] is not None else None
 
 
+def _is_futures_label_symbol(symbol: str) -> bool:
+    text = str(symbol or "").upper().strip()
+    if parse_futures_symbol(text) is not None:
+        return True
+    try:
+        return str(asset_class_for_symbol(text) or "").upper().strip() == "FUTURES"
+    except Exception:
+        return False
+
+
+def _compute_futures_return(con, symbol: str, event_ts: int, horizon_ms: int) -> Optional[float]:
+    eval_ts = int(event_ts) + int(horizon_ms)
+    if not label_window_within_symbol_lifecycle(
+        con,
+        symbol=str(symbol),
+        start_ts_ms=int(event_ts),
+        end_ts_ms=int(eval_ts),
+    ):
+        return None
+    block_reason = futures_label_window_block_reason(con, symbol, int(event_ts), int(eval_ts))
+    if block_reason is not None:
+        if block_reason == "roll_calendar_unavailable":
+            _warn_nonfatal(
+                "FUTURES_LABEL_ROLL_CALENDAR_MISSING",
+                RuntimeError("futures_roll_calendar_unavailable"),
+                symbol=str(symbol),
+                event_ts_ms=int(event_ts),
+                eval_ts_ms=int(eval_ts),
+            )
+        return None
+
+    p0 = read_ratio_adjusted_continuous_close_at_or_after(con, symbol, int(event_ts))
+    p1 = read_ratio_adjusted_continuous_close_at_or_after(con, symbol, int(eval_ts))
+    if p0 is None or p1 is None:
+        _warn_nonfatal(
+            "FUTURES_LABEL_CONTINUOUS_BARS_MISSING",
+            RuntimeError("ratio_adjusted_continuous_bars_missing"),
+            symbol=str(symbol),
+            event_ts_ms=int(event_ts),
+            eval_ts_ms=int(eval_ts),
+        )
+        return None
+    if float(p0) <= 0.0:
+        return None
+    return (float(p1) - float(p0)) / float(p0)
+
+
 def compute_return(con, symbol: str, event_ts: int, horizon_ms: int) -> Optional[float]:
+    if _is_futures_label_symbol(symbol):
+        return _compute_futures_return(con, symbol, event_ts, horizon_ms)
     if not label_window_within_symbol_lifecycle(
         con,
         symbol=str(symbol),

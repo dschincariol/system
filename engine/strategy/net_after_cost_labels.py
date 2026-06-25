@@ -14,6 +14,15 @@ import math
 import time
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+from engine.data.asset_map import asset_class_for_symbol
+from engine.strategy.borrow_cost_model import (
+    annual_borrow_bps,
+    borrow_bps_for_period,
+    borrow_cost_enabled,
+    borrow_difficulty_bucket,
+    is_borrowable_short_equity,
+)
+
 
 TABLE_NAME = "net_after_cost_labels"
 
@@ -55,6 +64,45 @@ def _json_dict(value: Any) -> Dict[str, Any]:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+
+
+def _is_futures_symbol(symbol: str) -> bool:
+    return str(asset_class_for_symbol(str(symbol)) or "").upper().strip() == "FUTURES"
+
+
+def _instrument_metadata(con, symbol: str) -> Dict[str, Any]:
+    try:
+        from engine.data.universe import get_instrument_metadata
+
+        return dict(get_instrument_metadata(con, str(symbol)) or {})
+    except Exception:
+        return {}
+
+
+def _futures_contract_specs(con, symbol: str) -> Dict[str, float]:
+    meta = _instrument_metadata(con, str(symbol))
+    multiplier = _safe_float(meta.get("multiplier", meta.get("fut_multiplier")), 1.0)
+    tick_size = _safe_float(meta.get("tick_size", meta.get("fut_tick_size")), 0.0)
+    tick_value = _safe_float(meta.get("tick_value", meta.get("fut_tick_value")), 0.0)
+    return {
+        "multiplier": float(multiplier if multiplier > 0.0 else 1.0),
+        "tick_size": float(tick_size if tick_size > 0.0 else 0.0),
+        "tick_value": float(tick_value if tick_value > 0.0 else 0.0),
+    }
+
+
+def _artifact_symbol(symbol: str) -> str:
+    if _is_futures_symbol(str(symbol)):
+        try:
+            from engine.data.futures_instrument import parse_futures_symbol
+
+            parsed = parse_futures_symbol(str(symbol))
+            canonical = str(getattr(parsed, "symbol", "") or "").strip()
+            if canonical:
+                return canonical
+        except Exception:  # no-op-guard: allow - fallback to legacy symbol normalization below.
+            pass
+    return str(symbol or "").upper().strip()
 
 
 def _looks_like_sqlite(con) -> bool:
@@ -155,6 +203,8 @@ def ensure_net_after_cost_labels_schema(con) -> None:
           spread_bps DOUBLE PRECISION NOT NULL DEFAULT 0,
           borrow_bps DOUBLE PRECISION NOT NULL DEFAULT 0,
           financing_bps DOUBLE PRECISION NOT NULL DEFAULT 0,
+          roll_cost_bps DOUBLE PRECISION NOT NULL DEFAULT 0,
+          carry_bps DOUBLE PRECISION NOT NULL DEFAULT 0,
           total_cost_bps DOUBLE PRECISION NOT NULL DEFAULT 0,
           fees_cost DOUBLE PRECISION,
           slippage_cost DOUBLE PRECISION,
@@ -180,6 +230,8 @@ def ensure_net_after_cost_labels_schema(con) -> None:
         ("execution_cost_return", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
         ("borrow_bps", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
         ("financing_bps", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+        ("roll_cost_bps", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+        ("carry_bps", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
         ("borrow_cost", "DOUBLE PRECISION"),
         ("financing_cost", "DOUBLE PRECISION"),
         ("order_count", "BIGINT NOT NULL DEFAULT 0"),
@@ -271,7 +323,7 @@ def load_prediction_label_context(
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "event_id": int(event_id),
-        "symbol": str(symbol or "").upper().strip(),
+        "symbol": _artifact_symbol(str(symbol)),
         "horizon_s": int(horizon_s),
     }
     if _table_exists(con, "predictions"):
@@ -411,6 +463,149 @@ def extract_borrow_financing_costs(payloads: Iterable[Any], *, notional: float =
     }
 
 
+def _first_positive_payload_value(payloads: Iterable[Any], keys: Iterable[str]) -> Optional[float]:
+    wanted = {str(key).strip() for key in keys}
+    for obj in _iter_json_dicts(payloads):
+        for key in wanted:
+            if obj.get(key) in (None, ""):
+                continue
+            value = _safe_float(obj.get(key), 0.0)
+            if value > 0.0:
+                return float(value)
+    return None
+
+
+def _holding_days_for_borrow(
+    *,
+    entry_ts_ms: Optional[int],
+    exit_ts_ms: Optional[int],
+    horizon_s: int,
+) -> float:
+    if entry_ts_ms is not None and exit_ts_ms is not None:
+        delta_ms = max(0, int(exit_ts_ms) - int(entry_ts_ms))
+        if delta_ms > 0:
+            return float(delta_ms) / 86_400_000.0
+    return max(0.0, _safe_float(horizon_s, 0.0) / 86_400.0)
+
+
+def _synthesize_short_equity_borrow(
+    *,
+    symbol: str,
+    side: int,
+    entry_ts_ms: Optional[int],
+    exit_ts_ms: Optional[int],
+    horizon_s: int,
+    notional: float,
+    payloads: Iterable[Any],
+) -> Dict[str, Any]:
+    asset_class = str(asset_class_for_symbol(str(symbol)) or "UNKNOWN").upper().strip()
+    if not borrow_cost_enabled() or not is_borrowable_short_equity(side=side, asset_class=asset_class):
+        return {
+            "borrow_bps": 0.0,
+            "borrow_cost": 0.0,
+            "source": "",
+            "asset_class": asset_class,
+        }
+
+    payload_list = list(payloads or [])
+    days_to_cover = _first_positive_payload_value(payload_list, ("days_to_cover", "dtc"))
+    short_interest_shares = _first_positive_payload_value(
+        payload_list,
+        ("short_interest_shares", "short_interest", "si_shares"),
+    )
+    float_shares = _first_positive_payload_value(payload_list, ("float_shares", "shares_float"))
+    holding_days = _holding_days_for_borrow(
+        entry_ts_ms=entry_ts_ms,
+        exit_ts_ms=exit_ts_ms,
+        horizon_s=int(horizon_s),
+    )
+    bucket = borrow_difficulty_bucket(
+        days_to_cover=days_to_cover,
+        short_interest_shares=short_interest_shares,
+        float_shares=float_shares,
+    )
+    borrow_bps = borrow_bps_for_period(
+        str(symbol),
+        holding_days=float(holding_days),
+        bucket=bucket,
+        days_to_cover=days_to_cover,
+        short_interest_shares=short_interest_shares,
+        float_shares=float_shares,
+    )
+    notional_value = max(0.0, _safe_float(notional, 0.0))
+    return {
+        "borrow_bps": float(borrow_bps),
+        "borrow_cost": float(notional_value * float(borrow_bps) / 10000.0) if notional_value > 0.0 else 0.0,
+        "source": "synthesized_short_equity" if borrow_bps > 0.0 else "",
+        "asset_class": asset_class,
+        "bucket": bucket,
+        "annual_bps": annual_borrow_bps(str(symbol), bucket=bucket),
+        "holding_days": float(holding_days),
+        "days_to_cover": days_to_cover,
+    }
+
+
+def extract_futures_costs(
+    payloads: Iterable[Any],
+    *,
+    notional: float = 0.0,
+    contracts: float = 0.0,
+    tick_value: float = 0.0,
+) -> Dict[str, Any]:
+    roll_cost = 0.0
+    roll_cost_bps = 0.0
+    carry_bps = 0.0
+    available = False
+    for obj in _iter_json_dicts(payloads):
+        roll_bps_value = None
+        for key in ("roll_cost_bps", "roll_bps", "futures_roll_cost_bps"):
+            if key in obj:
+                roll_bps_value = obj.get(key)
+                break
+        if roll_bps_value is not None:
+            roll_cost_bps = max(float(roll_cost_bps), max(0.0, _safe_float(roll_bps_value, 0.0)))
+            available = True
+
+        roll_cost_value = None
+        for key in ("roll_cost", "futures_roll_cost"):
+            if key in obj:
+                roll_cost_value = obj.get(key)
+                break
+        if roll_cost_value is not None:
+            roll_cost = max(float(roll_cost), max(0.0, _safe_float(roll_cost_value, 0.0)))
+            available = True
+
+        roll_ticks_value = None
+        for key in ("roll_ticks", "futures_roll_ticks"):
+            if key in obj:
+                roll_ticks_value = obj.get(key)
+                break
+        if roll_ticks_value is not None and tick_value > 0.0 and contracts > 0.0:
+            # A roll is two legs: exit the expiring contract and enter the next.
+            roll_cost = max(float(roll_cost), abs(_safe_float(roll_ticks_value, 0.0)) * float(tick_value) * float(contracts) * 2.0)
+            available = True
+
+        carry_value = None
+        for key in ("carry_bps", "futures_carry_bps", "margin_carry_bps"):
+            if key in obj:
+                carry_value = obj.get(key)
+                break
+        if carry_value is not None:
+            carry_bps = max(float(carry_bps), max(0.0, _safe_float(carry_value, 0.0)))
+            available = True
+
+    if notional > 0.0 and roll_cost > 0.0:
+        roll_cost_bps = max(float(roll_cost_bps), float(roll_cost) / float(notional) * 10000.0)
+    elif notional > 0.0 and roll_cost_bps > 0.0:
+        roll_cost = float(roll_cost_bps) / 10000.0 * float(notional)
+    return {
+        "roll_cost": float(roll_cost),
+        "roll_cost_bps": float(roll_cost_bps),
+        "carry_bps": float(carry_bps),
+        "available": bool(available),
+    }
+
+
 def load_execution_trace(
     con,
     *,
@@ -424,6 +619,11 @@ def load_execution_trace(
 ) -> Dict[str, Any]:
     del event_id, horizon_s
     sym = str(symbol or "").upper().strip()
+    is_futures = _is_futures_symbol(sym)
+    futures_specs = _futures_contract_specs(con, sym) if is_futures else {"multiplier": 1.0, "tick_size": 0.0, "tick_value": 0.0}
+    contract_multiplier = float(futures_specs.get("multiplier") or 1.0)
+    tick_size = float(futures_specs.get("tick_size") or 0.0)
+    tick_value = float(futures_specs.get("tick_value") or 0.0)
     trace: Dict[str, Any] = {
         "order_count": 0,
         "fill_count": 0,
@@ -436,7 +636,12 @@ def load_execution_trace(
         "fees_bps": None,
         "slippage_bps": None,
         "spread_bps": None,
+        "roll_cost_bps": 0.0,
+        "carry_bps": 0.0,
         "json_payloads": [],
+        "contract_multiplier": float(contract_multiplier),
+        "tick_size": float(tick_size),
+        "tick_value": float(tick_value),
     }
     order_ids: list[str] = []
     order_payloads: list[Any] = []
@@ -511,26 +716,36 @@ def load_execution_trace(
         except Exception:
             rows = []
         notional = 0.0
+        contracts = 0.0
         fees = 0.0
         slippage_weighted = 0.0
         slippage_weight = 0.0
         spread_weighted = 0.0
         spread_weight = 0.0
+        futures_tick_slippage_cost = 0.0
         for fill_id, client_order_id, _fill_ts, qty, px, _expected_px, _mid_px, _bid_px, _ask_px, spread_bps, slippage_bps, fee, raw_json, extra_json in rows:
             q = abs(_safe_float(qty, 0.0))
             p = abs(_safe_float(px, 0.0))
-            fill_notional = q * p
+            contracts += q
+            fill_notional = q * p * (contract_multiplier if is_futures else 1.0)
             notional += fill_notional
             fees += max(0.0, _safe_float(fee, 0.0))
             if fill_id not in (None, ""):
                 trace["fill_ids"].append(str(fill_id))
             elif client_order_id not in (None, ""):
                 trace["fill_ids"].append(str(client_order_id))
-            if slippage_bps is not None:
+            if is_futures and tick_size > 0.0 and tick_value > 0.0 and _expected_px not in (None, ""):
+                expected_px = abs(_safe_float(_expected_px, 0.0))
+                if expected_px > 0.0:
+                    tick_cost = abs(float(p) - float(expected_px)) / float(tick_size) * float(tick_value) * q
+                    futures_tick_slippage_cost += float(tick_cost)
+                    trace["slippage_cost"] += float(tick_cost)
+            elif slippage_bps is not None:
                 sl = max(0.0, _safe_float(slippage_bps, 0.0))
-                slippage_weighted += sl * max(1e-12, q)
-                slippage_weight += max(1e-12, q)
-                trace["slippage_cost"] += fill_notional * sl / 10000.0
+                if not is_futures or sl > 0.0:
+                    slippage_weighted += sl * max(1e-12, q)
+                    slippage_weight += max(1e-12, q)
+                    trace["slippage_cost"] += fill_notional * sl / 10000.0
             if spread_bps is not None:
                 sp = max(0.0, _safe_float(spread_bps, 0.0))
                 spread_weighted += sp * max(1e-12, q)
@@ -543,9 +758,13 @@ def load_execution_trace(
             trace["fees_bps"] = float(fees) / float(notional) * 10000.0
         if slippage_weight > 0.0:
             trace["slippage_bps"] = float(slippage_weighted) / float(slippage_weight)
+        if is_futures and notional > 0.0 and futures_tick_slippage_cost > 0.0:
+            trace["slippage_bps"] = float(futures_tick_slippage_cost) / float(notional) * 10000.0
         if spread_weight > 0.0:
             trace["spread_bps"] = float(spread_weighted) / float(spread_weight)
         trace["notional"] = float(notional)
+        trace["contracts"] = float(contracts)
+        trace["futures_tick_slippage_cost"] = float(futures_tick_slippage_cost)
 
     pnl_payloads: list[Any] = []
     if _table_exists(con, "pnl_attribution"):
@@ -614,11 +833,35 @@ def build_net_after_cost_label(
     ctx = dict(context or {})
     cost = dict(costs or {})
     trace = dict(execution_trace or {})
-    cost_return = max(0.0, _safe_float(gross_return, 0.0) - _safe_float(net_return, 0.0))
+    is_futures = _is_futures_symbol(str(symbol))
+    gross_value = _safe_float(gross_return, 0.0)
+    net_value = _safe_float(net_return, 0.0)
+    cost_return = max(0.0, gross_value - net_value)
     trace_payloads = list(trace.get("json_payloads") or [])
+    side_value = int(1 if int(side or 0) >= 0 else -1)
+    borrow_payloads = [ctx.get("alert_explain_json"), ctx.get("alert_detail_json"), dict(metadata or {})] + trace_payloads
     borrow_financing = extract_borrow_financing_costs(
-        [ctx.get("alert_explain_json"), ctx.get("alert_detail_json"), dict(metadata or {})] + trace_payloads,
+        borrow_payloads,
         notional=_safe_float(trace.get("notional"), 0.0),
+    )
+    synthesized_borrow = _synthesize_short_equity_borrow(
+        symbol=str(symbol),
+        side=int(side_value),
+        entry_ts_ms=entry_ts_ms,
+        exit_ts_ms=exit_ts_ms,
+        horizon_s=int(horizon_s),
+        notional=_safe_float(trace.get("notional"), 0.0),
+        payloads=borrow_payloads,
+    )
+    futures_costs = (
+        extract_futures_costs(
+            [dict(cost), dict(trace), dict(metadata or {}), ctx.get("alert_explain_json"), ctx.get("alert_detail_json")] + trace_payloads,
+            notional=_safe_float(trace.get("notional"), 0.0),
+            contracts=_safe_float(trace.get("contracts"), 0.0),
+            tick_value=_safe_float(trace.get("tick_value"), 0.0),
+        )
+        if is_futures
+        else {"roll_cost": 0.0, "roll_cost_bps": 0.0, "carry_bps": 0.0, "available": False}
     )
     total_cost_bps = max(
         _safe_float(cost.get("total_cost_bps"), 0.0),
@@ -629,9 +872,35 @@ def build_net_after_cost_label(
     slippage_bps = max(_safe_float(cost.get("slippage_bps"), 0.0), _safe_float(trace.get("slippage_bps"), 0.0))
     spread_bps = max(_safe_float(cost.get("spread_bps"), 0.0), _safe_float(trace.get("spread_bps"), 0.0))
     borrow_bps = _safe_float(borrow_financing.get("borrow_bps"), 0.0)
+    borrow_cost = _safe_float(borrow_financing.get("borrow_cost"), 0.0)
+    borrow_source = "upstream" if borrow_bps > 0.0 or borrow_cost > 0.0 else ""
+    if borrow_bps <= 0.0 and _safe_float(synthesized_borrow.get("borrow_bps"), 0.0) > 0.0:
+        borrow_bps = _safe_float(synthesized_borrow.get("borrow_bps"), 0.0)
+        borrow_cost = _safe_float(synthesized_borrow.get("borrow_cost"), 0.0)
+        borrow_source = str(synthesized_borrow.get("source") or "")
+        borrow_financing = {**borrow_financing, "borrow_bps": borrow_bps, "borrow_cost": borrow_cost, "available": True}
+    elif borrow_cost <= 0.0 and borrow_bps > 0.0 and _safe_float(trace.get("notional"), 0.0) > 0.0:
+        borrow_cost = _safe_float(trace.get("notional"), 0.0) * float(borrow_bps) / 10000.0
     financing_bps = _safe_float(borrow_financing.get("financing_bps"), 0.0)
-    if borrow_bps > 0.0 or financing_bps > 0.0:
-        total_cost_bps = max(float(total_cost_bps), fees_bps + slippage_bps + spread_bps + borrow_bps + financing_bps)
+    roll_cost_bps = _safe_float(futures_costs.get("roll_cost_bps"), 0.0)
+    carry_bps = _safe_float(futures_costs.get("carry_bps"), 0.0)
+    component_total_bps = fees_bps + slippage_bps + spread_bps + borrow_bps + financing_bps
+    if is_futures:
+        component_total_bps += roll_cost_bps + carry_bps
+    if borrow_bps > 0.0 or financing_bps > 0.0 or is_futures:
+        total_cost_bps = max(float(total_cost_bps), float(component_total_bps))
+    borrow_return = 0.0
+    if borrow_cost_enabled() and borrow_bps > 0.0 and is_borrowable_short_equity(
+        side=int(side_value),
+        asset_class=str(synthesized_borrow.get("asset_class") or asset_class_for_symbol(str(symbol)) or "UNKNOWN"),
+    ):
+        borrow_return = float(borrow_bps) / 10000.0
+        net_value = float(net_value) - float(borrow_return)
+        cost_return = max(0.0, float(gross_value) - float(net_value))
+        total_cost_bps = max(float(total_cost_bps), float(cost_return) * 10000.0)
+    if is_futures:
+        cost_return = max(float(cost_return), float(total_cost_bps) / 10000.0)
+        net_value = min(float(net_value), float(gross_value) - float(cost_return))
 
     confidence = ctx.get("confidence")
     confidence_raw = ctx.get("confidence_raw")
@@ -651,10 +920,37 @@ def build_net_after_cost_label(
         "timestamp_safe": True,
         "cost_evidence": {
             "borrow_financing_available": bool(borrow_financing.get("available")),
+            "borrow_source": borrow_source,
+            "borrow_return": float(borrow_return),
             "execution_trace_available": bool(trace.get("order_count") or trace.get("fill_count")),
+            "futures_cost_available": bool(futures_costs.get("available")),
             "order_count": _safe_int(trace.get("order_count"), 0),
             "fill_count": _safe_int(trace.get("fill_count"), 0),
         },
+        "borrow_costs": (
+            {
+                "source": borrow_source,
+                "bucket": synthesized_borrow.get("bucket"),
+                "annual_bps": synthesized_borrow.get("annual_bps"),
+                "holding_days": synthesized_borrow.get("holding_days"),
+                "days_to_cover": synthesized_borrow.get("days_to_cover"),
+            }
+            if borrow_source == "synthesized_short_equity"
+            else {}
+        ),
+        "futures_costs": (
+            {
+                "tick_value": trace.get("tick_value"),
+                "tick_size": trace.get("tick_size"),
+                "contract_multiplier": trace.get("contract_multiplier"),
+                "tick_slippage_cost": trace.get("futures_tick_slippage_cost"),
+                "roll_cost": futures_costs.get("roll_cost"),
+                "roll_cost_bps": roll_cost_bps,
+                "carry_bps": carry_bps,
+            }
+            if is_futures
+            else {}
+        ),
         "execution_trace": {
             "order_ids": list(trace.get("order_ids") or [])[:50],
             "fill_ids": list(trace.get("fill_ids") or [])[:50],
@@ -666,7 +962,7 @@ def build_net_after_cost_label(
         "event_id": int(event_id),
         "prediction_id": ctx.get("prediction_id"),
         "source_alert_id": ctx.get("source_alert_id"),
-        "symbol": str(symbol or "").upper().strip(),
+        "symbol": _artifact_symbol(str(symbol)),
         "horizon_s": int(horizon_s),
         "label_ts_ms": int(label_ts_ms),
         "entry_ts_ms": (None if entry_ts_ms is None else int(entry_ts_ms)),
@@ -680,27 +976,30 @@ def build_net_after_cost_label(
         "confidence": (None if confidence is None else _safe_float(confidence, 0.0)),
         "confidence_raw": (None if confidence_raw is None else _safe_float(confidence_raw, 0.0)),
         "confidence_metadata_json": _json_dumps(confidence_metadata),
-        "side": int(1 if int(side or 0) >= 0 else -1),
+        "side": int(side_value),
         "realized": int(1 if int(realized or 0) else 0),
-        "gross_return": _safe_float(gross_return, 0.0),
+        "gross_return": float(gross_value),
         "realized_forward_return": _safe_float(realized_forward_return, 0.0),
         "execution_cost_return": float(cost_return),
-        "net_return": _safe_float(net_return, 0.0),
+        "net_return": float(net_value),
         "fees_bps": float(fees_bps),
         "slippage_bps": float(slippage_bps),
         "spread_bps": float(spread_bps),
         "borrow_bps": float(borrow_bps),
         "financing_bps": float(financing_bps),
+        "roll_cost_bps": float(roll_cost_bps),
+        "carry_bps": float(carry_bps),
         "total_cost_bps": float(total_cost_bps),
         "fees_cost": trace.get("fees_cost"),
         "slippage_cost": trace.get("slippage_cost"),
         "spread_cost": trace.get("spread_cost"),
-        "borrow_cost": float(borrow_financing.get("borrow_cost") or 0.0),
+        "borrow_cost": float(borrow_cost),
         "financing_cost": float(borrow_financing.get("financing_cost") or 0.0),
         "total_cost": (
             _safe_float(trace.get("total_cost"), 0.0)
-            + float(borrow_financing.get("borrow_cost") or 0.0)
+            + float(borrow_cost)
             + float(borrow_financing.get("financing_cost") or 0.0)
+            + float(futures_costs.get("roll_cost") or 0.0)
         ),
         "source": str(source or "unknown"),
         "order_count": _safe_int(trace.get("order_count"), 0),
@@ -738,6 +1037,8 @@ _UPSERT_COLUMNS = (
     "spread_bps",
     "borrow_bps",
     "financing_bps",
+    "roll_cost_bps",
+    "carry_bps",
     "total_cost_bps",
     "fees_cost",
     "slippage_cost",

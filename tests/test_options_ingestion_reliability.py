@@ -1101,6 +1101,69 @@ class OptionsIngestionReliabilityTests(unittest.TestCase):
         self.assertEqual(state["state"], lifecycle_state.DEGRADED)
         self.assertEqual(state["detail"], "critical_source_stale:options")
 
+    def test_lifecycle_warmup_timeout_degrades_feedless_safe_runtime(self) -> None:
+        prev_timeout = os.environ.get("WARMUP_TIMEOUT_S")
+        prev_engine_mode = os.environ.get("ENGINE_MODE")
+        prev_execution_mode = os.environ.get("EXECUTION_MODE")
+        try:
+            os.environ["WARMUP_TIMEOUT_S"] = "1"
+            os.environ["ENGINE_MODE"] = "safe"
+            os.environ["EXECUTION_MODE"] = "safe"
+            storage, runtime_meta, lifecycle_state, lifecycle = _reload_modules(
+                "engine.runtime.storage",
+                "engine.runtime.runtime_meta",
+                "engine.runtime.lifecycle_state",
+                "engine.runtime.lifecycle",
+            )
+            storage.init_db()
+            lifecycle_state.set_state(lifecycle_state.WARMING_UP, "awaiting_first_price_tick")
+            runtime_meta.meta_set("first_price_ts_ms", "")
+
+            stop_event = threading.Event()
+            thread = lifecycle.start_lifecycle_monitor(
+                get_health=lambda: {
+                    "prices": {"ok": False},
+                    "ingestion_runtime": {"running": False, "stale": False},
+                    "ingestion_freshness": {
+                        "degraded": False,
+                        "runtime_reason_codes": [],
+                    },
+                },
+                get_jobs=lambda: [],
+                get_kill_switches=lambda: {},
+                interval_s=0.05,
+                stop_event=stop_event,
+                claim_booting=False,
+            )
+            try:
+                time.sleep(1.35)
+                state = lifecycle_state.get_state()
+            finally:
+                stop_event.set()
+                thread.join(timeout=1.0)
+
+            self.assertEqual(state["state"], lifecycle_state.DEGRADED)
+            self.assertEqual(state["detail"], "warmup_timeout_awaiting_first_price_tick")
+
+            lifecycle_state.set_state(
+                lifecycle_state.WARMING_UP,
+                "ingestion_runtime_running_awaiting_first_price_tick",
+            )
+            self.assertEqual(lifecycle_state.get_state()["state"], lifecycle_state.DEGRADED)
+        finally:
+            if prev_timeout is None:
+                os.environ.pop("WARMUP_TIMEOUT_S", None)
+            else:
+                os.environ["WARMUP_TIMEOUT_S"] = prev_timeout
+            if prev_engine_mode is None:
+                os.environ.pop("ENGINE_MODE", None)
+            else:
+                os.environ["ENGINE_MODE"] = prev_engine_mode
+            if prev_execution_mode is None:
+                os.environ.pop("EXECUTION_MODE", None)
+            else:
+                os.environ["EXECUTION_MODE"] = prev_execution_mode
+
     def test_options_source_not_critical_when_options_job_disabled(self) -> None:
         prev_tradier_enabled = os.environ.get("TRADIER_ENABLED")
         prev_critical_sources = os.environ.get("CRITICAL_INGESTION_SOURCES")

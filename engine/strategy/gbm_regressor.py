@@ -27,6 +27,7 @@ from engine.runtime.storage import (
 )
 from engine.strategy.feature_registry import (
     build_feature_snapshot,
+    feature_schema_flags,
     feature_set_tag_from_ids,
     resolve_feature_ids,
 )
@@ -204,6 +205,7 @@ def _feature_schema(feature_ids: Sequence[Any], *, ts_ms: int | None = None) -> 
         "feature_ids": list(ids),
         "feature_set_tag": str(feature_set_tag_from_ids(list(ids))),
         "feature_count": int(len(ids)),
+        "feature_flags": feature_schema_flags(list(ids)),
     }
     if ts_ms is not None and int(ts_ms) > 0:
         schema["ts_ms"] = int(ts_ms)

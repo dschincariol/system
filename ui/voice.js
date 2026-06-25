@@ -22,6 +22,8 @@
     - window._lastAlerts array exists (you have it)
 */
 
+import { normalizeSeverity } from "./alerts.js";
+
 const VOICE_CAPS = {
   synth: typeof window !== "undefined" && "speechSynthesis" in window,
   recog:
@@ -197,7 +199,7 @@ async function _askLLMFallback(userText) {
 // These functions are expected in your earlier patch notes; if missing, we fall back to simple outputs.
 function _recommendedPosture(r) {
   if (!r) return "Monitor.";
-  const sev = String(r.severity || "INFO").toUpperCase();
+  const sev = normalizeSeverity(r.severity);
   const ageMin = Math.max(0, Math.floor((Date.now() - Number(r.ts_ms)) / 60000));
 
   if (sev === "CRIT") {
@@ -205,19 +207,21 @@ function _recommendedPosture(r) {
       ? "Stop and assess now. Open the incident and confirm data + execution health before any actions."
       : "Escalate. If still CRIT, investigate root cause and consider pausing risky ops.";
   }
+  if (sev === "HIGH") return "Validate before acting. Open the incident and confirm model, data, and execution context.";
   if (sev === "WARN") return "Investigate briefly. Confirm if escalating; monitor closely.";
   return "Observe. Likely informational unless it repeats.";
 }
 
 function _decisionConfidence(r) {
   if (!r) return "unknown";
-  const sev = String(r.severity || "INFO").toUpperCase();
+  const sev = normalizeSeverity(r.severity);
   const conf = Number(r.confidence);
   const z = Math.abs(Number(r.expected_z));
 
   // “Decision confidence” framing != model confidence
   // Conservative heuristic: severity + strength + data freshness (unknown here) => lean cautious
   if (sev === "CRIT") return "low — treat as high risk until verified";
+  if (sev === "HIGH") return "low to medium — elevated severity needs verification";
   if (sev === "WARN") {
     if (Number.isFinite(z) && z >= 2.0 && Number.isFinite(conf) && conf >= 0.75) return "medium";
     return "low to medium";
@@ -228,17 +232,19 @@ function _decisionConfidence(r) {
 
 function _safeToIgnore(r) {
   if (!r) return "No — open an incident first.";
-  const sev = String(r.severity || "INFO").toUpperCase();
+  const sev = normalizeSeverity(r.severity);
   const ageMin = Math.max(0, Math.floor((Date.now() - Number(r.ts_ms)) / 60000));
   if (sev === "CRIT") return "No — not safe to ignore.";
+  if (sev === "HIGH") return "No — validate first.";
   if (sev === "WARN") return ageMin > 30 ? "Maybe — monitor for repeat." : "No — check quickly first.";
   return "Yes — safe to monitor unless it repeats.";
 }
 
 function _ifNothingChanges(r) {
   if (!r) return "Open an incident first.";
-  const sev = String(r.severity || "INFO").toUpperCase();
+  const sev = normalizeSeverity(r.severity);
   if (sev === "CRIT") return "If nothing changes, this may cascade. Expect more alerts or degraded performance. Investigate now.";
+  if (sev === "HIGH") return "If nothing changes, elevated risk can compound. Validate before increasing exposure.";
   if (sev === "WARN") return "If nothing changes, this may either resolve or escalate. Monitor for repeat within the next hour.";
   return "If nothing changes, this likely stays informational. Watch for recurrence.";
 }

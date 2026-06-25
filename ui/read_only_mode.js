@@ -64,11 +64,25 @@ export function hardBlockIfReadOnly({
   actionName,
   toastFn
 }) {
-  if (!isReadOnlyMode()) return false;
+  let freshnessBlock = null;
+  try {
+    freshnessBlock = window.__DASHBOARD_CONNECTION_SUMMARY__;
+  } catch {
+    freshnessBlock = null;
+  }
+  const blockedByFreshness = !!(freshnessBlock && freshnessBlock.safetyGuardActive);
+  if (!isReadOnlyMode() && !blockedByFreshness) return false;
+
+  const freshnessReasons = Array.isArray(freshnessBlock && freshnessBlock.safetyProblems)
+    ? freshnessBlock.safetyProblems.map((row) => row && row.label).filter(Boolean).slice(0, 3)
+    : [];
+  const blockLabel = blockedByFreshness
+    ? `Fresh safety data required${freshnessReasons.length ? `: ${freshnessReasons.join(", ")}` : ""}`
+    : "Demo / Read-only mode";
 
   if (typeof toastFn === "function") {
     toastFn(
-      `Blocked "${actionName}" — Demo / Read-only mode`,
+      `Blocked "${actionName}" — ${blockLabel}`,
       "warn",
       3500
     );

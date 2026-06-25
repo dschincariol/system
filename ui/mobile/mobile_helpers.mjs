@@ -1,3 +1,5 @@
+import { normalizeSeverity, severityRank } from "../alerts.js";
+
 export const KILL_SWITCH_CONFIRM_PHRASE = "KILL";
 export const KILL_SWITCH_HOLD_MS = 3000;
 
@@ -201,11 +203,10 @@ export function normalizeAlertRows(payload = {}) {
     .concat(asArray(payload.data))
     .concat(asArray(payload.alerts))
     .concat(asArray(payload.items));
-  const severityScore = { CRIT: 4, CRITICAL: 4, WARN: 3, WARNING: 3, INFO: 2, OK: 1 };
   return rows
     .filter((row) => row && typeof row === "object")
     .map((row) => {
-      const severity = cleanText(row.severity || row.level || row.kind, "INFO").toUpperCase();
+      const severity = normalizeSeverity(row.severity || row.level || row.kind);
       const status = cleanText(row.status, "active").toLowerCase();
       return {
         id: row.id ?? row.alert_id ?? "",
@@ -214,7 +215,7 @@ export function normalizeAlertRows(payload = {}) {
         symbol: cleanText(row.symbol || row.asset, ""),
         title: cleanText(row.title || row.message || row.reason || row.alert_type, "Alert"),
         tsMs: numberOrNull(row.ts_ms ?? row.created_ts_ms ?? row.updated_ts_ms),
-        score: severityScore[severity] || 0,
+        score: severityRank(severity),
       };
     })
     .filter((row) => row.status !== "resolved")

@@ -45,6 +45,23 @@ importer-priority list, and fails on any threshold or ratchet breach. It also
 inherits the canonical `pytest-timeout` configuration from `pyproject.toml`,
 including the 120 second per-test default timeout.
 
+`run` also stamps `artifacts/coverage/coverage_gate_metadata.json` with the
+coverage JSON hash, pytest args, gate config, pytest exit code, and source/test
+freshness data. `python tools/coverage_gate.py check` now requires that stamp
+and rejects reports from focused pytest runs, failed pytest runs, changed gate
+config, changed report bytes, or source/test files newer than the report. This
+prevents a partial local report from being reused as wider-repo acceptance
+evidence.
+
+To inspect an old report without treating it as release evidence:
+
+```bash
+python tools/coverage_gate.py check --allow-unstamped artifacts/coverage/coverage.json
+```
+
+That forensic mode still evaluates thresholds, but a merge or acceptance gate
+must use the stamped full-run path above.
+
 ## Current Baseline
 
 The global gate is `52.0%`, based on a full local baseline originally taken on
@@ -64,6 +81,13 @@ The global gate is `52.0%`, based on a full local baseline originally taken on
 
 The threshold is intentionally just below the measured baseline to avoid
 rounding noise while still blocking real regressions.
+
+If `check` reports `stale or partial coverage report`, do not lower floors or
+expand allowlists. Regenerate with `python tools/coverage_gate.py run` and use
+the fresh stamped result. If the stamped full run is genuinely below a floor,
+document the measured values, affected packages, owner, remediation plan, and
+temporary baseline approval in the release handoff before treating the gate as
+baselined.
 
 ## Ratchet Process
 

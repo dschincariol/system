@@ -40,6 +40,15 @@ const ENDPOINTS = Object.freeze({
 const POLL_MS = 5000;
 const FETCH_TIMEOUT_MS = 10000;
 
+function requestId(prefix = "mobile") {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch {}
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 const state = {
   endpoints: {},
   snapshot: {},
@@ -474,9 +483,16 @@ async function fireEmergencyStop() {
     body: JSON.stringify({
       actor: "mobile_operator",
       source: "mobile_pwa",
+      source_surface: "mobile_pwa",
       confirmation: "KILL",
+      confirm: "KILL",
+      confirmation_token: "KILL",
+      confirmation_method: "typed_phrase_hold",
       confirmation_hold_ms: KILL_SWITCH_HOLD_MS,
       consequence_ack: true,
+      action_id: "operator.emergency_stop",
+      request_id: requestId("mobile-emergency-stop"),
+      target: "global",
       requested_at_ms: Date.now(),
     }),
   });

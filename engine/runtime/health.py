@@ -109,6 +109,7 @@ _PROVIDER_CREDENTIAL_SECRET_NAMES: Dict[str, tuple[str, ...]] = {
     "polygon_ws": ("POLYGON_API_KEY",),
     "tradier": ("TRADIER_API_TOKEN",),
 }
+_OPTIONS_CREDENTIAL_SECRET_NAMES = ("POLYGON_API_KEY", "TRADIER_API_TOKEN")
 _PROVIDER_READINESS_ENFORCED_MODES = {"paper", "live"}
 
 HEALTH_MIN_LABELS = int(os.environ.get("HEALTH_MIN_LABELS", "10"))
@@ -366,6 +367,15 @@ def _refresh_execution_barrier_snapshot(
 def _read_kill_switch_snapshot_readonly(con=None) -> Dict[str, Any]:
     owns_con = con is None
     db = con or _db_connect()
+    def _with_effective_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            from engine.cache.wrappers.kill_switch import annotate_effective_state  # type: ignore
+
+            return annotate_effective_state(payload, persisted_read_source="db_readonly")
+        except Exception as e:
+            _warn("health.kill_switch_effective_state", e)
+            return dict(payload or {"state": []})
+
     try:
         cache_meta: Dict[str, Any] = {}
         cache_diag_allowed = owns_con
@@ -416,7 +426,7 @@ def _read_kill_switch_snapshot_readonly(con=None) -> Dict[str, Any]:
             payload = {"state": [], **dict(cache_meta)}
             if bool(activation_failure.get("active")):
                 payload["activation_failure"] = dict(activation_failure)
-            return payload
+            return _with_effective_state(payload)
 
         rows = db.execute(
             """
@@ -448,7 +458,7 @@ def _read_kill_switch_snapshot_readonly(con=None) -> Dict[str, Any]:
         payload = {"state": out, **dict(cache_meta)}
         if bool(activation_failure.get("active")):
             payload["activation_failure"] = dict(activation_failure)
-        return payload
+        return _with_effective_state(payload)
     finally:
         if owns_con:
             db.close()
@@ -989,17 +999,110 @@ def _alert_lifecycle_snapshot(con, now_ms: int) -> Dict[str, Any]:
     return out
 
 
+def _options_credentials_configured() -> tuple[bool, List[str]]:
+    from engine.data._credentials import get_data_credential
+
+    present: List[str] = []
+    for secret_name in _OPTIONS_CREDENTIAL_SECRET_NAMES:
+        if str(get_data_credential(secret_name) or "").strip():
+            present.append(str(secret_name))
+    return bool(present), present
+
+
+def _options_unconfigured_snapshot(
+    *,
+    last_ingested_ts_ms: int | None = None,
+    age_s: float | None = None,
+    fresh_symbols: List[str] | None = None,
+    cached_symbols: List[str] | None = None,
+    failed_symbols: List[str] | None = None,
+    disabled_symbols: List[str] | None = None,
+    critical_symbols: List[str] | None = None,
+    critical_unavailable_symbols: List[str] | None = None,
+    symbol_status: Dict[str, Any] | None = None,
+    configured_credentials: List[str] | None = None,
+    data_quality: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "available": False,
+        "degraded": False,
+        "critical": False,
+        "status": "unavailable",
+        "detail": "options_provider_unconfigured",
+        "credentials_configured": False,
+        "configured_credentials": list(configured_credentials or []),
+        "stale": False,
+        "failed": False,
+        "last_ingested_ts_ms": (int(last_ingested_ts_ms) if int(last_ingested_ts_ms or 0) > 0 else None),
+        "age_s": age_s,
+        "max_age_s": float(HEALTH_OPTIONS_MAX_AGE_S),
+        "fresh_symbols": list(fresh_symbols or []),
+        "cached_symbols": list(cached_symbols or []),
+        "failed_symbols": list(failed_symbols or []),
+        "disabled_symbols": list(disabled_symbols or []),
+        "critical_symbols": list(critical_symbols or []),
+        "critical_unavailable_symbols": list(critical_unavailable_symbols or []),
+        "symbol_status": dict(symbol_status or {}),
+        "data_quality": dict(data_quality or _options_data_quality_unavailable()),
+    }
+
+
+def _options_data_quality_unavailable(*, error: str | None = None) -> Dict[str, Any]:
+    reason_codes = ["options_data_quality_unavailable"]
+    if error:
+        reason_codes.append("options_data_quality_error")
+    return {
+        "available": False,
+        "ok": False,
+        "degraded": True,
+        "detail": "options_data_quality_error" if error else "options_data_quality_unavailable",
+        "reason_codes": reason_codes,
+        **({"error": str(error)} if error else {}),
+    }
+
+
+def _options_data_quality_snapshot(now_ms: int) -> Dict[str, Any]:
+    try:
+        from engine.data.options_data_quality import (
+            compute_options_data_quality,
+            record_options_data_quality_observability,
+        )
+
+        with _db_connect() as con:
+            report = dict(compute_options_data_quality(con, now_ms=int(now_ms)) or {})
+        try:
+            record_options_data_quality_observability(report, now_ms=int(now_ms))
+        except Exception as e:
+            _warn("health.options_data_quality_observability", e)
+        return report
+    except Exception as e:
+        _warn("health.options_data_quality", e)
+        return _options_data_quality_unavailable(error=type(e).__name__)
+
+
 def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
     status = get_pipeline_status("options_poll")
     mode_name = str(os.environ.get("ENGINE_MODE", "safe") or "safe").strip().lower() or "safe"
+    credentials_configured, configured_credentials = _options_credentials_configured()
+    data_quality = _options_data_quality_snapshot(now_ms)
     if not status:
+        if not credentials_configured:
+            return _options_unconfigured_snapshot(
+                configured_credentials=configured_credentials,
+                data_quality=data_quality,
+            )
         return {
-            "ok": True,
+            "ok": False,
             "available": False,
-            "degraded": False,
+            "degraded": True,
             "critical": False,
-            "status": "unknown",
-            "detail": "",
+            "status": "degraded",
+            "detail": "options_credentials_configured_but_chain_stale",
+            "credentials_configured": True,
+            "configured_credentials": configured_credentials,
+            "stale": True,
+            "failed": True,
             "last_ingested_ts_ms": None,
             "age_s": None,
             "max_age_s": float(HEALTH_OPTIONS_MAX_AGE_S),
@@ -1009,6 +1112,8 @@ def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
             "disabled_symbols": [],
             "critical_symbols": [],
             "critical_unavailable_symbols": [],
+            "symbol_status": {},
+            "data_quality": data_quality,
         }
 
     meta = _dict_or_empty(status.get("meta"))
@@ -1039,26 +1144,36 @@ def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
                 break
 
     if config_unavailable and mode_name == "safe":
-        return {
-            "ok": True,
-            "available": False,
-            "degraded": False,
-            "critical": False,
-            "status": "unavailable",
-            "detail": "options_provider_unconfigured",
-            "stale": False,
-            "failed": False,
-            "last_ingested_ts_ms": (int(last_ingested_ts_ms) if last_ingested_ts_ms > 0 else None),
-            "age_s": age_s,
-            "max_age_s": float(HEALTH_OPTIONS_MAX_AGE_S),
-            "fresh_symbols": fresh_symbols,
-            "cached_symbols": cached_symbols,
-            "failed_symbols": failed_symbols,
-            "disabled_symbols": disabled_symbols,
-            "critical_symbols": critical_symbols,
-            "critical_unavailable_symbols": critical_unavailable,
-            "symbol_status": symbol_status,
-        }
+        out = _options_unconfigured_snapshot(
+            last_ingested_ts_ms=last_ingested_ts_ms,
+            age_s=age_s,
+            fresh_symbols=fresh_symbols,
+            cached_symbols=cached_symbols,
+            failed_symbols=failed_symbols,
+            disabled_symbols=disabled_symbols,
+            critical_symbols=critical_symbols,
+            critical_unavailable_symbols=critical_unavailable,
+            symbol_status=symbol_status,
+            configured_credentials=configured_credentials,
+            data_quality=data_quality,
+        )
+        out["credentials_configured"] = bool(credentials_configured)
+        return out
+
+    if not credentials_configured:
+        return _options_unconfigured_snapshot(
+            last_ingested_ts_ms=last_ingested_ts_ms,
+            age_s=age_s,
+            fresh_symbols=fresh_symbols,
+            cached_symbols=cached_symbols,
+            failed_symbols=failed_symbols,
+            disabled_symbols=disabled_symbols,
+            critical_symbols=critical_symbols,
+            critical_unavailable_symbols=critical_unavailable,
+            symbol_status=symbol_status,
+            configured_credentials=configured_credentials,
+            data_quality=data_quality,
+        )
 
     detail = ""
     if critical_unavailable:
@@ -1071,7 +1186,9 @@ def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
         detail = "options_ingestion_failed"
 
     failed = bool(not status.get("ok"))
-    degraded = bool(critical_unavailable or stale or meta_critical)
+    degraded = bool(critical_unavailable or stale or meta_critical or failed)
+    if degraded:
+        detail = "options_credentials_configured_but_chain_stale"
     ok = bool(status.get("ok")) and not degraded
 
     return {
@@ -1081,6 +1198,8 @@ def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
         "critical": bool(critical_unavailable or meta_critical),
         "status": ("degraded" if degraded else ("ok" if bool(status.get("ok")) else "failed")),
         "detail": detail,
+        "credentials_configured": True,
+        "configured_credentials": configured_credentials,
         "stale": bool(stale),
         "failed": bool(failed),
         "last_ingested_ts_ms": (int(last_ingested_ts_ms) if last_ingested_ts_ms > 0 else None),
@@ -1093,6 +1212,7 @@ def _options_ingestion_snapshot(now_ms: int) -> Dict[str, Any]:
         "critical_symbols": critical_symbols,
         "critical_unavailable_symbols": critical_unavailable,
         "symbol_status": symbol_status,
+        "data_quality": data_quality,
     }
 
 
@@ -1932,6 +2052,92 @@ def _build_ingestion_freshness_snapshot(
         "advisory_reason_codes": _dedupe_strs(advisory_reason_codes),
         "reason_codes": _dedupe_strs(reason_codes + runtime_reason_codes + advisory_reason_codes),
         "sources": sources,
+    }
+
+
+def _crypto_data_readiness_snapshot(
+    con,
+    *,
+    now_ms: int,
+    pipeline_statuses: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    job_name = "ingest_crypto_funding"
+    max_age_s = max(3600.0, _float_or(os.environ.get("CRYPTO_FUNDING_POLL_SECONDS"), 28800.0) * 3.0)
+    ccxt_enabled = _env_flag("CCXT_ENABLED", False)
+    ingest_env_enabled = _env_flag("INGEST_CRYPTO_FUNDING_ENABLED", False)
+    funding_features_enabled = _env_flag("USE_FUNDING_FEATURES", False)
+    desired_enabled = False
+    manager_source_enabled = False
+    manager_error = ""
+    try:
+        from services.data_source_manager import desired_ingestion_jobs, load_sources_from_db
+
+        desired_enabled = job_name in {
+            str(name or "").strip()
+            for name in (desired_ingestion_jobs(read_only=True, project_credentials=False) or [])
+            if str(name or "").strip()
+        }
+        for row in load_sources_from_db(include_credentials=False):
+            if str(row.get("source_key") or "") == "crypto_funding":
+                manager_source_enabled = bool(row.get("enabled"))
+                break
+    except Exception as exc:
+        manager_error = f"{type(exc).__name__}: {exc}"[:240]
+
+    table_exists = False
+    row_count = 0
+    last_row_ts_ms = 0
+    storage_error = ""
+    try:
+        rows = con.execute("SELECT COUNT(*), MAX(COALESCE(availability_ts_ms, funding_ts_ms, ts_ms)) FROM crypto_funding_rates").fetchone()
+        table_exists = True
+        row_count = int((rows or [0, 0])[0] or 0)
+        last_row_ts_ms = _int_or((rows or [0, 0])[1])
+    except Exception as exc:
+        storage_error = f"{type(exc).__name__}: {exc}"[:240]
+
+    status = dict((pipeline_statuses or {}).get(job_name) or {})
+    pipeline_last_ts_ms = max(_int_or(status.get("last_ingested_ts_ms")), _int_or(status.get("updated_ts_ms")))
+    effective_last_ts_ms = max(int(last_row_ts_ms), int(pipeline_last_ts_ms))
+    last_row_age_s = None if last_row_ts_ms <= 0 else round(max(0, int(now_ms) - int(last_row_ts_ms)) / 1000.0, 1)
+    freshness_age_s = None if effective_last_ts_ms <= 0 else round(max(0, int(now_ms) - int(effective_last_ts_ms)) / 1000.0, 1)
+    enabled = bool(ccxt_enabled or ingest_env_enabled or desired_enabled or manager_source_enabled)
+    stale = bool(enabled and (effective_last_ts_ms <= 0 or freshness_age_s is None or float(freshness_age_s) > float(max_age_s)))
+    failed = bool(enabled and status and status.get("ok") is False and not stale)
+    reason_codes: List[str] = []
+    if not table_exists:
+        reason_codes.append("crypto_funding_storage_table_missing")
+    if manager_error:
+        reason_codes.append("crypto_funding_manager_state_unavailable")
+    if stale:
+        reason_codes.append("crypto_funding_last_row_stale" if row_count > 0 else "crypto_funding_no_rows")
+    if failed:
+        reason_codes.append("crypto_funding_pipeline_failed")
+
+    return {
+        "ok": bool((not enabled) or (table_exists and not stale and not failed)),
+        "status": "disabled" if not enabled else ("stale" if stale else ("degraded" if failed else "ok")),
+        "wired": bool(table_exists),
+        "enabled": bool(enabled),
+        "ccxt_enabled": bool(ccxt_enabled),
+        "ingest_env_enabled": bool(ingest_env_enabled),
+        "manager_source_enabled": bool(manager_source_enabled),
+        "job_enabled": bool(desired_enabled),
+        "use_funding_features": bool(funding_features_enabled),
+        "job_name": job_name,
+        "storage_table": "crypto_funding_rates",
+        "row_count": int(row_count),
+        "last_row_ts_ms": int(last_row_ts_ms) if last_row_ts_ms > 0 else None,
+        "last_row_age_s": last_row_age_s,
+        "last_update_ts_ms": int(effective_last_ts_ms) if effective_last_ts_ms > 0 else None,
+        "freshness_lag_s": freshness_age_s,
+        "max_age_s": float(max_age_s),
+        "stale": bool(stale),
+        "failed": bool(failed),
+        "pipeline_status": status,
+        "reason_codes": _dedupe_strs(reason_codes),
+        "manager_error": manager_error,
+        "storage_error": storage_error,
     }
 
 
@@ -2979,6 +3185,11 @@ def _check_ingestion_runtime_and_sources(ctx: HealthSnapshotContext) -> None:
             "critical": True,
             "status": "error",
             "detail": "options_ingestion_health_error",
+            "credentials_configured": False,
+            "configured_credentials": [],
+            "stale": False,
+            "failed": True,
+            "data_quality": _options_data_quality_unavailable(),
         }
     _trace_section("options_ingestion", section_started, ok=bool((out.get("options_ingestion") or {}).get("ok")))
     section_started = time.perf_counter()
@@ -3020,6 +3231,49 @@ def _check_ingestion_runtime_and_sources(ctx: HealthSnapshotContext) -> None:
         ok=bool((out.get("ingestion_freshness") or {}).get("ok")),
         critical_ok=bool((out.get("ingestion_freshness") or {}).get("critical_ok")),
     )
+    section_started = time.perf_counter()
+    try:
+        crypto_data = _crypto_data_readiness_snapshot(ctx.con, now_ms=now_ms, pipeline_statuses=dict(pipeline_statuses or {}))
+        out["crypto_data"] = crypto_data
+        out.setdefault("ingestion_sources", {})
+        out["ingestion_sources"]["crypto_funding"] = {
+            "source": "crypto_funding",
+            "critical": False,
+            "policy": "data_only_readiness",
+            "ok": bool(crypto_data.get("ok")),
+            "status": str(crypto_data.get("status") or ""),
+            "expected_cadence_s": float(_float_or(os.environ.get("CRYPTO_FUNDING_POLL_SECONDS"), 28800.0)),
+            "stale_after_s": float(crypto_data.get("max_age_s") or 0.0),
+            "last_update_ts_ms": crypto_data.get("last_update_ts_ms"),
+            "latest_update_ts_ms": crypto_data.get("last_update_ts_ms"),
+            "freshness_lag_s": crypto_data.get("freshness_lag_s"),
+            "stale_threshold_breach": bool(crypto_data.get("stale")),
+            "stale": bool(crypto_data.get("stale")),
+            "failed": bool(crypto_data.get("failed")),
+            "reason_codes": list(crypto_data.get("reason_codes") or []),
+            "pipeline_names": ["ingest_crypto_funding"],
+            "pipelines": {"ingest_crypto_funding": dict(crypto_data.get("pipeline_status") or {})},
+            "wired": bool(crypto_data.get("wired")),
+            "enabled": bool(crypto_data.get("enabled")),
+            "storage_table": str(crypto_data.get("storage_table") or "crypto_funding_rates"),
+            "row_count": int(crypto_data.get("row_count") or 0),
+            "last_row_age_s": crypto_data.get("last_row_age_s"),
+        }
+        if isinstance((out.get("ingestion_freshness") or {}).get("sources"), dict):
+            out["ingestion_freshness"]["sources"]["crypto_funding"] = dict(out["ingestion_sources"]["crypto_funding"])
+    except Exception as e:
+        _warn("health.crypto_data", e)
+        out["crypto_data"] = {
+            "ok": False,
+            "status": "error",
+            "wired": False,
+            "enabled": _env_flag("CCXT_ENABLED", False) or _env_flag("INGEST_CRYPTO_FUNDING_ENABLED", False),
+            "storage_table": "crypto_funding_rates",
+            "row_count": 0,
+            "last_row_age_s": None,
+            "reason_codes": ["crypto_data_readiness_error"],
+        }
+    _trace_section("crypto_data", section_started, ok=bool((out.get("crypto_data") or {}).get("ok")))
     try:
         jobs = dict(out.get("jobs") or {})
         ingestion_runtime = dict(out.get("ingestion_runtime") or {})

@@ -264,7 +264,7 @@ In practical terms, training now writes a feature contract and serving reads tha
 
 ### Current feature inventory
 
-`engine/strategy/feature_registry.py` is the source of truth. The default serving set is about 111 feature ids. The full registered catalog is larger because optional and shadow groups include NLP embeddings, filings, transcripts, tsfresh, symbolic/discovered features, time-series foundation-model embeddings, and other opt-in surfaces.
+`engine/strategy/feature_registry.py` is the source of truth. The default serving set is exactly 111 feature ids: 8 base ids plus 103 unified symbol-snapshot ids when `USE_SYMBOL_SNAPSHOT_FEATURES=1` (the default). The full registered catalog is larger, about 1,762 ids without shadow groups and about 1,802 with shadow groups, because optional and shadow groups include NLP embeddings, filings, transcripts, tsfresh, symbolic/discovered features, time-series foundation-model embeddings, and other opt-in surfaces. The larger catalog is the opt-in/shadow superset, not the default serving surface; `tests/test_feature_default_count_parity.py` pins the 111-id serving count.
 
 Current groups visible in the registry include:
 
@@ -287,6 +287,12 @@ FX label construction uses that clock only for symbols classified as `FX`. Non-F
 
 The regime stack can add a default-off `USE_FX_REGIME=1` USD-strength/carry layer for FX symbols. Those signals are merged into the existing `macro` regime layer as `fx_usd_strength_z`, `fx_usd_strength_dir`, and `fx_carry_pressure`, so `regime_compatibility` sees them without changing the persisted HMM training input keys. Predictor routing uses an FX symbol as the regime anchor for FX predictions; equities and other asset classes keep the existing `SPY` regime anchor.
 
+### Futures continuous labels and roll-aware validation
+
+Production futures labels must be computed from ratio-adjusted front continuous bars in `futures_continuous_bars`, not raw front-month rows in `prices`. `engine/data/jobs/label_due_events.py` branches only for symbols recognized by the futures instrument parser or `asset_class_for_symbol(...)=FUTURES`; those windows use the shared futures label-window guard in `engine/data/futures_roll.py` to skip known futures session gaps and any label window crossing a stored `futures_roll_calendar` boundary. Missing continuous bars or missing roll-calendar rows for the futures root are fail-closed: the label is not written instead of falling back to raw prices.
+
+CPCV/model-validation paths consume the same roll calendar. `engine/data/futures_roll.py` exposes the read helpers for canonical continuous aliases and roll-boundary loading; `engine/strategy/jobs/backtest_cpcv.py` and the model-v2/meta-label CPCV calibration paths pass those roll timestamps into `CombinatorialPurgedKFold`, which purges train samples whose label windows straddle a futures roll. Equity/FX/crypto validation remains unchanged when no roll boundaries are supplied.
+
 ### Current model families
 
 The current code centers on:
@@ -306,7 +312,7 @@ Promotion evidence now flows through the existing champion/challenger path rathe
 
 - `engine/strategy/promotion_guard.py` applies White's Reality Check, BH-FDR/Harvey-Liu-Zhu statistical gates, pool-correlation and marginal-portfolio-contribution gates, and era/regime robustness checks.
 - `engine/strategy/cpcv.py` provides CPCV/PBO, deflated Sharpe, cost-adjusted metrics, retrain-cadence replay, and an option to route evaluation through gated backtests.
-- `engine/strategy/gated_backtest.py` replays intents through the live portfolio/execution-policy/broker-sim path for promotion-grade evaluation.
+- `engine/strategy/gated_backtest.py` replays intents through the live portfolio/execution-policy/broker-sim path for promotion-grade evaluation. Futures symbols additionally reuse the existing `portfolio_backtest` point-value transition-cost estimator, so the series passed to the statistical promotion gate is net of futures tick slippage and roll costs when those futures cost controls and runtime price/roll rows are available.
 - `engine/strategy/optuna_tuner.py` integrates Optuna tuning and parameter-surface robustness checks.
 
 ### How machine learning works end to end

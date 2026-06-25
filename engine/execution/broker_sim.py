@@ -34,8 +34,15 @@ import hashlib
 import logging
 import threading
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 from engine.runtime import dbapi_compat as dbapi
+from engine.execution.crypto_costs import (
+    fee_bps as crypto_fee_bps,
+    funding_carry_bps as crypto_funding_carry_bps,
+    is_crypto_asset_class,
+    spread_bps as crypto_spread_bps,
+)
 from engine.execution.fx_costs import is_fx_asset_class, pip_spread_bps, swap_bps, weekend_gap_bps
 from engine.runtime.failure_diagnostics import log_failure
 from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
@@ -44,6 +51,7 @@ from engine.execution.almgren_chriss import estimate_almgren_chriss_costs  # noq
 from engine.execution.deployable_capital import compute_deployable_equity
 from engine.execution.execution_liquidity_model import get_execution_liquidity_snapshot
 from engine.execution.lob_simulation import build_reactive_lob_simulation
+from engine.execution.share_rounding import round_equity_qty
 from engine.execution.order_idempotency import (
     claim_order_submission,
     mark_order_submission_submitted,
@@ -105,6 +113,22 @@ def _safe_i(x, default: int = 0) -> int:
         )
         fallback = int(default)
         return fallback
+
+
+def _share_rounding_asset_class(symbol: str) -> str:
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        return str(asset_class_for_symbol(symbol) or "UNKNOWN").upper().strip() or "UNKNOWN"
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_share_rounding_asset_class_failed",
+            "BROKER_SIM_SHARE_ROUNDING_ASSET_CLASS_FAILED",
+            e,
+            warn_key=f"share_rounding_asset_class:{symbol}",
+            symbol=str(symbol),
+        )
+        return "UNKNOWN"
 
 
 def _begin_managed_write(con: Any) -> None:
@@ -391,6 +415,8 @@ BROKER_FEE_BPS = float(os.environ.get("BROKER_FEE_BPS", "0.5"))  # commission/fe
 BROKER_MAX_TRADE_PCT_EQUITY = float(os.environ.get("BROKER_MAX_TRADE_PCT_EQUITY", "0.35"))  # cap per apply pass
 BROKER_CHUNK_PCT = float(os.environ.get("BROKER_CHUNK_PCT", "0.33"))  # split into chunks
 BROKER_LATENCY_MS = int(os.environ.get("BROKER_LATENCY_MS", "120"))  # per chunk latency
+BROKER_OPTION_MAX_QUOTE_AGE_MS = int(os.environ.get("BROKER_OPTION_MAX_QUOTE_AGE_MS", os.environ.get("BROKER_MAX_PRICE_AGE_MS", "300000")))
+OPTIONS_SIM_MARGIN_UNDERLYING_FRACTION = float(os.environ.get("OPTIONS_SIM_MARGIN_UNDERLYING_FRACTION", "0.20"))
 
 # Starting capital / cash baseline (additive; preserves existing behavior if not set)
 BROKER_START_CASH = float(os.environ.get("BROKER_START_CASH", "0.0"))
@@ -430,6 +456,9 @@ CREATE TABLE IF NOT EXISTS broker_fills (
   source_order_id INTEGER,
   source TEXT NOT NULL DEFAULT 'sim',
   book_key TEXT,
+  contract_multiplier REAL,
+  option_quote_source TEXT,
+  option_margin_debit REAL,
   note TEXT,
   explain_json TEXT
 );
@@ -640,6 +669,12 @@ def _ensure_broker_fill_provenance_columns(con) -> None:
         con.execute("ALTER TABLE broker_fills ADD COLUMN source TEXT NOT NULL DEFAULT 'sim'")
     if "book_key" not in columns:
         con.execute("ALTER TABLE broker_fills ADD COLUMN book_key TEXT")
+    if "contract_multiplier" not in columns:
+        con.execute("ALTER TABLE broker_fills ADD COLUMN contract_multiplier REAL")
+    if "option_quote_source" not in columns:
+        con.execute("ALTER TABLE broker_fills ADD COLUMN option_quote_source TEXT")
+    if "option_margin_debit" not in columns:
+        con.execute("ALTER TABLE broker_fills ADD COLUMN option_margin_debit REAL")
     con.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_broker_fills_source_book_ts
@@ -716,10 +751,17 @@ def _broker_account_seeded(con) -> bool:
 
 
 def _broker_schema_ready(con) -> bool:
+    fill_columns = _broker_fills_columns(con)
     return (
         all(_table_exists(con, table_name) for table_name in _BROKER_SCHEMA_TABLES)
         and all(_index_exists(con, index_name) for index_name in _BROKER_SCHEMA_INDEXES)
-        and {"source", "book_key"}.issubset(_broker_fills_columns(con))
+        and {
+            "source",
+            "book_key",
+            "contract_multiplier",
+            "option_quote_source",
+            "option_margin_debit",
+        }.issubset(fill_columns)
         and _broker_account_seeded(con)
     )
 
@@ -1040,6 +1082,150 @@ def _get_price_at_or_before(con, symbol: str, ts_ms: int):
         return price_result
 
 
+@lru_cache(maxsize=4096)
+def _option_contract_meta(symbol: str):
+    try:
+        from engine.data.options_instrument import parse_option_symbol
+
+        meta = parse_option_symbol(symbol)
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_option_instrument_import_failed",
+            "BROKER_SIM_OPTION_INSTRUMENT_IMPORT_FAILED",
+            e,
+            warn_key="broker_sim_option_instrument_import_failed",
+        )
+        return None
+    if meta is None:
+        return None
+    try:
+        multiplier = float(getattr(meta, "multiplier"))
+        contract = str(getattr(meta, "occ_symbol"))
+        underlying = str(getattr(meta, "underlying"))
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_option_contract_meta_invalid",
+            "BROKER_SIM_OPTION_CONTRACT_META_INVALID",
+            e,
+            warn_key=f"broker_sim_option_contract_meta_invalid:{symbol}",
+            symbol=str(symbol),
+        )
+        return None
+    if multiplier <= 0.0 or not contract.strip() or not underlying.strip():
+        return None
+    return meta
+
+
+def _is_option_symbol(symbol: str) -> bool:
+    return _option_contract_meta(str(symbol or "").upper().strip()) is not None
+
+
+def _option_contract_key(meta) -> Optional[str]:
+    try:
+        contract = str(getattr(meta, "occ_symbol") or "").upper().strip()
+    except Exception:
+        contract = ""
+    return contract or None
+
+
+def _option_multiplier(meta) -> Optional[float]:
+    try:
+        multiplier = float(getattr(meta, "multiplier"))
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_option_multiplier_parse_failed",
+            "BROKER_SIM_OPTION_MULTIPLIER_PARSE_FAILED",
+            e,
+            warn_key="broker_sim_option_multiplier_parse_failed",
+        )
+        return None
+    if multiplier <= 0.0 or not math.isfinite(multiplier):
+        return None
+    return float(multiplier)
+
+
+def _get_option_quote_at_or_before(con, contract: str, ts_ms: int):
+    contract_key = str(contract or "").upper().strip()
+    if not contract_key:
+        return None, None, None, None
+    try:
+        row = con.execute(
+            """
+            SELECT bid, ask, ts_ms
+            FROM options_chain_v2
+            WHERE contract = ? AND ts_ms <= ?
+            ORDER BY ts_ms DESC
+            LIMIT 1
+            """,
+            (contract_key, int(ts_ms)),
+        ).fetchone()
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_option_quote_lookup_failed",
+            "BROKER_SIM_OPTION_QUOTE_LOOKUP_FAILED",
+            e,
+            warn_key=f"broker_sim_option_quote_lookup_failed:{contract_key}",
+            contract=str(contract_key),
+        )
+        return None, None, None, None
+    if not row:
+        return None, None, None, None
+    try:
+        bid = float(row[0] or 0.0)
+        ask = float(row[1] or 0.0)
+        quote_ts = int(row[2])
+        if int(ts_ms) - int(quote_ts) > int(BROKER_OPTION_MAX_QUOTE_AGE_MS):
+            return None, None, None, None
+        if bid <= 0.0 or ask <= 0.0:
+            return None, None, None, None
+        mid = (float(bid) + float(ask)) / 2.0
+        if mid <= 0.0:
+            return None, None, None, None
+        return float(bid), float(ask), float(mid), int(quote_ts)
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_option_quote_parse_failed",
+            "BROKER_SIM_OPTION_QUOTE_PARSE_FAILED",
+            e,
+            warn_key=f"broker_sim_option_quote_parse_failed:{contract_key}",
+            contract=str(contract_key),
+        )
+        return None, None, None, None
+
+
+def _option_spread_bps(bid: float, ask: float, mid: float) -> float:
+    mid_f = float(mid or 0.0)
+    if mid_f <= 0.0:
+        return float(BROKER_SPREAD_BPS)
+    return max(0.0, ((float(ask) - float(bid)) / mid_f) * 10000.0)
+
+
+def _option_short_margin(meta, qty: float, mid: float, underlying_px: float) -> float:
+    """Reference-grade short-option margin proxy for paper simulation only."""
+
+    multiplier = _option_multiplier(meta)
+    if multiplier is None:
+        return 0.0
+    contracts = abs(float(qty or 0.0))
+    if contracts <= 0.0:
+        return 0.0
+    fraction = max(0.0, _safe_f(OPTIONS_SIM_MARGIN_UNDERLYING_FRACTION, 0.20))
+    return float(contracts) * float(multiplier) * (float(mid) + float(fraction) * max(0.0, float(underlying_px or 0.0)))
+
+
+def _option_underlying_px(con, meta, ts_ms: int) -> Optional[float]:
+    try:
+        underlying = str(getattr(meta, "underlying") or "").upper().strip()
+    except Exception:
+        underlying = ""
+    if not underlying:
+        return None
+    px, _ = _get_price_at_or_before(con, underlying, int(ts_ms))
+    if px is None or float(px) <= 0.0:
+        return None
+    return float(px)
+
+
 def _read_position(con, symbol: str, book_key: Optional[str] = None):
     if _is_shadow_book(book_key):
         r = con.execute(
@@ -1339,14 +1525,23 @@ def _offline_ac_cost_components(
     base_notional = max(0.0, _safe_f(cfg.get("notional"), 100_000.0))
     asset_class = str(cfg.get("asset_class") or "US_EQUITY")
     is_fx = is_fx_asset_class(asset_class)
+    is_crypto = is_crypto_asset_class(asset_class)
     symbol = str(cfg.get("symbol") or cfg.get("pair") or "EUR_USD")
     fx_full_spread_bps = 0.0
+    crypto_full_spread_bps = 0.0
     if is_fx:
         fx_full_spread_bps = max(0.0, float(pip_spread_bps(symbol, half=False)))
         if "half_spread_bps" in cfg and cfg.get("half_spread_bps") not in (None, ""):
             half_spread_bps = max(0.0, _safe_f(cfg.get("half_spread_bps"), fx_full_spread_bps / 2.0))
         else:
             half_spread_bps = max(0.0, float(pip_spread_bps(symbol, half=True)))
+    elif is_crypto:
+        crypto_symbol = str(cfg.get("symbol") or cfg.get("pair") or "BTC")
+        crypto_full_spread_bps = max(0.0, float(crypto_spread_bps(crypto_symbol, half=False)))
+        if "half_spread_bps" in cfg and cfg.get("half_spread_bps") not in (None, ""):
+            half_spread_bps = max(0.0, _safe_f(cfg.get("half_spread_bps"), crypto_full_spread_bps / 2.0))
+        else:
+            half_spread_bps = max(0.0, float(crypto_spread_bps(crypto_symbol, half=True)))
     else:
         half_spread_bps = max(0.0, _safe_f(cfg.get("half_spread_bps"), 1.0))
     components = model.components_bps(
@@ -1357,10 +1552,21 @@ def _offline_ac_cost_components(
         half_spread_bps=0.0,
         asset_class=asset_class,
     )
-    commission_bps = max(0.0, _safe_f(cfg.get("commission_bps"), float(BROKER_FEE_BPS)))
+    if is_crypto:
+        crypto_symbol = str(cfg.get("symbol") or cfg.get("pair") or "BTC")
+        default_fee_bps = float(
+            crypto_fee_bps(
+                crypto_symbol,
+                taker=str(cfg.get("liquidity") or "taker").lower().strip() != "maker",
+            )
+        )
+        commission_bps = max(0.0, _safe_f(cfg.get("commission_bps"), default_fee_bps))
+    else:
+        commission_bps = max(0.0, _safe_f(cfg.get("commission_bps"), float(BROKER_FEE_BPS)))
     temporary_bps = max(0.0, _safe_f(components.get("temporary_impact_bps"), 0.0))
     swap_carry_bps = 0.0
     weekend_gap_cost_bps = 0.0
+    crypto_funding_bps = 0.0
     if is_fx:
         swap_carry_bps = float(
             swap_bps(
@@ -1370,7 +1576,18 @@ def _offline_ac_cost_components(
             )
         )
         weekend_gap_cost_bps = float(weekend_gap_bps(symbol, crosses_weekend=_offline_fx_crosses_weekend(cfg)))
-    total_bps = max(0.0, float(commission_bps + half_spread_bps + temporary_bps + swap_carry_bps + weekend_gap_cost_bps))
+    if is_crypto:
+        crypto_funding_bps = float(
+            crypto_funding_carry_bps(
+                str(cfg.get("symbol") or cfg.get("pair") or "BTC"),
+                _safe_f(cfg.get("side_sign"), _safe_f(cfg.get("direction"), 1.0)),
+                int(max(0.0, _safe_f(cfg.get("nights"), 1.0))),
+            )
+        )
+    total_bps = max(
+        0.0,
+        float(commission_bps + half_spread_bps + temporary_bps + swap_carry_bps + weekend_gap_cost_bps + crypto_funding_bps),
+    )
     result = {
         "turnover": float(turnover_f),
         "commission_bps": float(commission_bps),
@@ -1385,6 +1602,14 @@ def _offline_ac_cost_components(
                 "fx_pip_spread_bps": float(fx_full_spread_bps),
                 "swap_carry_bps": float(swap_carry_bps),
                 "weekend_gap_bps": float(weekend_gap_cost_bps),
+            }
+        )
+    if is_crypto:
+        result.update(
+            {
+                "crypto_spread_bps": float(crypto_full_spread_bps),
+                "crypto_fee_bps": float(commission_bps),
+                "funding_carry_bps": float(crypto_funding_bps),
             }
         )
     return result
@@ -1448,13 +1673,41 @@ def _write_fill(
     client_order_id: Optional[str] = None,
     book_key: Optional[str] = None,
     source: Optional[str] = None,
+    contract_multiplier: Optional[float] = None,
+    option_quote_source: Optional[str] = None,
+    option_margin_debit: Optional[float] = None,
 ):
     from engine.runtime.state_cache import cache_invalidate_namespace
 
     fill_book_key = _book_key(book_key)
     fill_source = str(source or ("shadow" if fill_book_key else "sim")).strip() or "sim"
     columns = _broker_fills_columns(con)
-    if {"source", "book_key"}.issubset(columns):
+    if {"source", "book_key", "contract_multiplier", "option_quote_source", "option_margin_debit"}.issubset(columns):
+        con.execute(
+            """
+            INSERT INTO broker_fills(
+              ts_ms, symbol, qty, px, source_order_id, source, book_key,
+              contract_multiplier, option_quote_source, option_margin_debit,
+              note, explain_json
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(ts_ms),
+                str(symbol),
+                float(qty),
+                float(px),
+                source_order_id,
+                str(fill_source),
+                fill_book_key,
+                (float(contract_multiplier) if contract_multiplier is not None else None),
+                (str(option_quote_source) if option_quote_source is not None else None),
+                (float(option_margin_debit) if option_margin_debit is not None else None),
+                str(note or ""),
+                explain_json,
+            ),
+        )
+    elif {"source", "book_key"}.issubset(columns):
         con.execute(
             """
             INSERT INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, source, book_key, note, explain_json)
@@ -1560,7 +1813,19 @@ def _mark_to_market(
     else:
         rows = con.execute("SELECT symbol, qty FROM broker_positions").fetchall()
     for sym, qty in rows or []:
-        px, _ = _get_price_at_or_before(con, str(sym), int(ts_ms))
+        sym_text = str(sym)
+        meta = _option_contract_meta(sym_text)
+        if meta is not None:
+            multiplier = _option_multiplier(meta)
+            contract = _option_contract_key(meta)
+            if multiplier is None or not contract:
+                continue
+            _bid, _ask, option_mid, _quote_ts = _get_option_quote_at_or_before(con, contract, int(ts_ms))
+            if option_mid is None:
+                continue
+            eq += float(qty) * float(option_mid) * float(multiplier)
+            continue
+        px, _ = _get_price_at_or_before(con, sym_text, int(ts_ms))
         if px is None:
             continue
         eq += float(qty) * float(px)
@@ -1621,10 +1886,345 @@ def _position_price_map(con, positions: Dict[str, float], ts_ms: int) -> Dict[st
         sym_u = str(sym or "").upper().strip()
         if not sym_u:
             continue
+        meta = _option_contract_meta(sym_u)
+        if meta is not None:
+            multiplier = _option_multiplier(meta)
+            contract = _option_contract_key(meta)
+            if multiplier is None or not contract:
+                continue
+            _bid, _ask, option_mid, _quote_ts = _get_option_quote_at_or_before(con, contract, int(ts_ms))
+            if option_mid is not None and float(option_mid) > 0.0:
+                out[sym_u] = float(option_mid) * float(multiplier)
+            continue
         px, _ = _get_price_at_or_before(con, sym_u, int(ts_ms))
         if px is not None and float(px) > 0.0:
             out[sym_u] = float(px)
     return out
+
+
+def _options_lifecycle_enabled() -> bool:
+    return str(os.environ.get("OPTIONS_LIFECYCLE_ENABLED", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def _lifecycle_position_rows(con, book_key: Optional[str] = None) -> List[Tuple[str, float, float]]:
+    if _is_shadow_book(book_key):
+        rows = con.execute(
+            """
+            SELECT symbol, qty, avg_px
+            FROM broker_shadow_positions
+            WHERE book_key=?
+            ORDER BY symbol
+            """,
+            (str(_book_key(book_key)),),
+        ).fetchall()
+    elif _broker_positions_use_timeseries(con):
+        rows = con.execute(
+            """
+            SELECT p.symbol, p.qty, p.avg_px
+            FROM broker_positions p
+            JOIN (
+              SELECT symbol, MAX(COALESCE(updated_ts_ms, ts_ms, 0)) AS latest_ts
+              FROM broker_positions
+              GROUP BY symbol
+            ) latest
+              ON latest.symbol=p.symbol
+             AND latest.latest_ts=COALESCE(p.updated_ts_ms, p.ts_ms, 0)
+            ORDER BY p.symbol
+            """
+        ).fetchall()
+    else:
+        rows = con.execute(
+            """
+            SELECT symbol, qty, avg_px
+            FROM broker_positions
+            ORDER BY symbol
+            """
+        ).fetchall()
+
+    out: List[Tuple[str, float, float]] = []
+    for symbol, qty, avg_px in rows or []:
+        sym = str(symbol or "").upper().strip()
+        qty_f = _safe_f(qty, 0.0)
+        if not sym or abs(float(qty_f)) <= 1e-12:
+            continue
+        if _option_contract_meta(sym) is None:
+            continue
+        out.append((sym, float(qty_f), _safe_f(avg_px, 0.0)))
+    return out
+
+
+def _lifecycle_underlying_prices(con, positions: List[Tuple[str, float, float]], now_ms: int) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for symbol, _qty, _avg_px in positions or []:
+        meta = _option_contract_meta(str(symbol))
+        if meta is None:
+            continue
+        try:
+            underlying = str(getattr(meta, "underlying") or "").upper().strip()
+        except Exception:
+            underlying = ""
+        if not underlying or underlying in out:
+            continue
+        px, px_ts = _get_price_at_or_before(con, underlying, int(now_ms))
+        if px is None or float(px) <= 0.0:
+            continue
+        out[underlying] = {"price": float(px), "ts_ms": int(px_ts) if px_ts is not None else None}
+    return out
+
+
+def _lifecycle_quote_mid(con, symbol: str, now_ms: int) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    meta = _option_contract_meta(str(symbol))
+    if meta is None:
+        return None, None, None
+    multiplier = _option_multiplier(meta)
+    contract = _option_contract_key(meta)
+    if multiplier is None or not contract:
+        return None, None, None
+    _bid, _ask, mid, quote_ts = _get_option_quote_at_or_before(con, str(contract), int(now_ms))
+    if mid is None or float(mid) < 0.0:
+        return None, None, None
+    return float(mid), f"options_chain_v2:{contract}:{int(quote_ts)}", float(multiplier)
+
+
+def _lifecycle_close_price(con, event: Any, now_ms: int) -> Tuple[Optional[float], str]:
+    event_type = str(getattr(event, "event_type", "") or "")
+    if event_type in {"EXERCISE", "ASSIGN", "CASH_SETTLE"}:
+        return max(0.0, _safe_f(getattr(event, "intrinsic_per_contract", 0.0), 0.0)), "options_lifecycle:intrinsic"
+    if event_type in {"EXPIRE_WORTHLESS", "PIN_RISK"}:
+        return 0.0, "options_lifecycle:zero_settlement"
+    if event_type in {"DTE_AUTOCLOSE", "DTE_ROLL"}:
+        mid, quote_source, _multiplier = _lifecycle_quote_mid(con, str(getattr(event, "symbol", "")), int(now_ms))
+        if mid is None:
+            return None, "options_lifecycle:missing_quote"
+        return float(mid), str(quote_source or "options_lifecycle:quote")
+    return None, "options_lifecycle:unsupported_event"
+
+
+def _avg_after_lifecycle_fill(cur_qty: float, cur_avg: float, fill_qty: float, fill_px: float) -> float:
+    new_qty = float(cur_qty) + float(fill_qty)
+    if abs(new_qty) <= 1e-12:
+        return 0.0
+    if (
+        abs(float(cur_qty)) <= 1e-12
+        or (float(cur_qty) > 0.0 and float(fill_qty) > 0.0)
+        or (float(cur_qty) < 0.0 and float(fill_qty) < 0.0)
+    ):
+        denom = abs(float(cur_qty)) + abs(float(fill_qty))
+        if denom <= 1e-12:
+            return float(fill_px)
+        return ((abs(float(cur_qty)) * float(cur_avg)) + (abs(float(fill_qty)) * float(fill_px))) / denom
+    return float(cur_avg) if (float(cur_qty) * float(new_qty)) > 0.0 else float(fill_px)
+
+
+def _lifecycle_event_payload(event: Any, *, cash_delta: float, close_px: float) -> str:
+    if hasattr(event, "to_dict"):
+        try:
+            payload = dict(event.to_dict())
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+    payload["cash_delta"] = float(cash_delta)
+    payload["settlement_px"] = float(close_px)
+    payload["settlement_model"] = "broker_sim_cash_settled_reference"
+    payload["live_order_authority"] = False
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _apply_lifecycle_close(con, event: Any, *, cash: float, now_ms: int, book_key: Optional[str]) -> Tuple[float, bool, str]:
+    symbol = str(getattr(event, "symbol", "") or "").upper().strip()
+    qty = _safe_f(getattr(event, "qty", 0.0), 0.0)
+    multiplier = _safe_f(getattr(event, "multiplier", 0.0), 0.0)
+    if not symbol or abs(float(qty)) <= 1e-12 or multiplier <= 0.0:
+        return float(cash), False, "invalid_event"
+
+    close_px, quote_source = _lifecycle_close_price(con, event, int(now_ms))
+    if close_px is None:
+        return float(cash), False, str(quote_source)
+
+    fill_qty = -float(qty)
+    cash_delta = -float(fill_qty) * float(close_px) * float(multiplier)
+    _write_position(con, symbol, qty=0.0, avg_px=0.0, ts_ms=int(now_ms), book_key=book_key)
+    _write_fill(
+        con,
+        ts_ms=int(now_ms),
+        source_order_id=None,
+        symbol=symbol,
+        qty=float(fill_qty),
+        px=float(close_px),
+        fees=0.0,
+        note=f"options_lifecycle:{str(getattr(event, 'event_type', '') or 'UNKNOWN')}",
+        explain_json=_lifecycle_event_payload(event, cash_delta=float(cash_delta), close_px=float(close_px)),
+        client_order_id=f"options_lifecycle:{symbol}:{int(now_ms)}",
+        book_key=book_key,
+        source=("shadow" if _is_shadow_book(book_key) else "sim"),
+        contract_multiplier=float(multiplier),
+        option_quote_source=str(quote_source),
+        option_margin_debit=None,
+    )
+    return float(cash) + float(cash_delta), True, "applied"
+
+
+def _apply_lifecycle_roll_open(con, event: Any, *, cash: float, now_ms: int, book_key: Optional[str]) -> Tuple[float, bool, str]:
+    target_symbol = str(getattr(event, "target_symbol", "") or "").upper().strip()
+    qty = _safe_f(getattr(event, "qty", 0.0), 0.0)
+    if not target_symbol or abs(float(qty)) <= 1e-12:
+        return float(cash), False, "roll_target_unavailable"
+
+    mid, quote_source, multiplier = _lifecycle_quote_mid(con, target_symbol, int(now_ms))
+    if mid is None or multiplier is None:
+        return float(cash), False, "roll_target_quote_unavailable"
+
+    cur_qty, cur_avg = _read_position(con, target_symbol, book_key=book_key)
+    new_qty = float(cur_qty) + float(qty)
+    new_avg = _avg_after_lifecycle_fill(float(cur_qty), float(cur_avg), float(qty), float(mid))
+    cash_delta = -float(qty) * float(mid) * float(multiplier)
+
+    _write_position(con, target_symbol, qty=float(new_qty), avg_px=float(new_avg), ts_ms=int(now_ms), book_key=book_key)
+    _write_fill(
+        con,
+        ts_ms=int(now_ms),
+        source_order_id=None,
+        symbol=target_symbol,
+        qty=float(qty),
+        px=float(mid),
+        fees=0.0,
+        note="options_lifecycle:DTE_ROLL_OPEN",
+        explain_json=json.dumps(
+            {
+                "source_event": (event.to_dict() if hasattr(event, "to_dict") else {}),
+                "cash_delta": float(cash_delta),
+                "settlement_px": float(mid),
+                "settlement_model": "broker_sim_roll_target_open",
+                "live_order_authority": False,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        client_order_id=f"options_lifecycle_roll:{target_symbol}:{int(now_ms)}",
+        book_key=book_key,
+        source=("shadow" if _is_shadow_book(book_key) else "sim"),
+        contract_multiplier=float(multiplier),
+        option_quote_source=str(quote_source or ""),
+        option_margin_debit=None,
+    )
+    return float(cash) + float(cash_delta), True, "applied"
+
+
+def apply_option_lifecycle(con, *, book_key: Optional[str] = None, now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Apply opt-in shadow option lifecycle events through broker-sim helpers."""
+
+    if not _options_lifecycle_enabled():
+        return {"ok": True, "processed": 0, "skipped_disabled": True}
+
+    ts_ms = int(now_ms if now_ms is not None else _now_ms())
+    summary: Dict[str, Any] = {
+        "ok": True,
+        "processed": 0,
+        "fills_written": 0,
+        "skipped_disabled": False,
+        "book_key": _book_key(book_key),
+        "events": [],
+        "skipped": [],
+    }
+
+    try:
+        _ensure_tables(con)
+        from engine.execution.options_lifecycle import plan_option_lifecycle_events
+
+        positions = _lifecycle_position_rows(con, book_key=book_key)
+        if not positions:
+            return summary
+        underlying_prices = _lifecycle_underlying_prices(con, positions, int(ts_ms))
+        events = plan_option_lifecycle_events(
+            list(positions),
+            underlying_prices=underlying_prices,
+            now_ms=int(ts_ms),
+            metadata_for=lambda symbol: _option_contract_meta(str(symbol)),
+            env=os.environ,
+        )
+        summary["planned"] = int(len(events))
+        if not events:
+            return summary
+
+        account = _read_account(con, book_key=book_key)
+        cash = float(account.get("cash") or 0.0)
+        for event in events:
+            event_type = str(getattr(event, "event_type", "") or "")
+            cash, applied, reason = _apply_lifecycle_close(con, event, cash=float(cash), now_ms=int(ts_ms), book_key=book_key)
+            if not applied:
+                summary["skipped"].append({"symbol": str(getattr(event, "symbol", "")), "event_type": event_type, "reason": reason})
+                continue
+            summary["processed"] = int(summary.get("processed", 0) or 0) + 1
+            summary["fills_written"] = int(summary.get("fills_written", 0) or 0) + 1
+            summary["events"].append(event.to_dict() if hasattr(event, "to_dict") else {"event_type": event_type})
+
+            if event_type == "DTE_ROLL" and str(getattr(event, "target_symbol", "") or "").strip():
+                cash, opened, open_reason = _apply_lifecycle_roll_open(
+                    con,
+                    event,
+                    cash=float(cash),
+                    now_ms=int(ts_ms),
+                    book_key=book_key,
+                )
+                if opened:
+                    summary["fills_written"] = int(summary.get("fills_written", 0) or 0) + 1
+                    summary.setdefault("roll_opens", []).append(
+                        {
+                            "source_symbol": str(getattr(event, "symbol", "")),
+                            "target_symbol": str(getattr(event, "target_symbol", "")),
+                        }
+                    )
+                else:
+                    summary["skipped"].append(
+                        {
+                            "symbol": str(getattr(event, "symbol", "")),
+                            "event_type": "DTE_ROLL_OPEN",
+                            "reason": open_reason,
+                        }
+                    )
+
+        if int(summary.get("processed", 0) or 0) <= 0:
+            return summary
+
+        _write_account(
+            con,
+            cash=float(cash),
+            equity=float(_read_account(con, book_key=book_key).get("equity", cash) or cash),
+            ts_ms=int(ts_ms),
+            book_key=book_key,
+        )
+        con.commit()
+        summary["account"] = _mark_to_market(con, int(ts_ms), book_key=book_key)
+        con.commit()
+        return summary
+    except Exception as e:
+        try:
+            con.rollback()
+        except Exception as rollback_error:
+            _warn_nonfatal(
+                "broker_sim_options_lifecycle_rollback_failed",
+                "BROKER_SIM_OPTIONS_LIFECYCLE_ROLLBACK_FAILED",
+                rollback_error,
+                warn_key="broker_sim_options_lifecycle_rollback_failed",
+                book_key=str(_book_key(book_key) or ""),
+            )
+        _warn_nonfatal(
+            "broker_sim_options_lifecycle_apply_failed",
+            "BROKER_SIM_OPTIONS_LIFECYCLE_APPLY_FAILED",
+            e,
+            warn_key="broker_sim_options_lifecycle_apply_failed",
+            book_key=str(_book_key(book_key) or ""),
+        )
+        summary["ok"] = False
+        summary["error"] = str(e)
+        return summary
 
 
 def _book_exposure_notional(
@@ -2042,6 +2642,9 @@ def _broker_sim_phase_persist_fill_effects(
     client_order_id: str,
     order_ttl_ms: int,
     state_meta: Dict[str, Any],
+    contract_multiplier: Optional[float] = None,
+    option_quote_source: Optional[str] = None,
+    option_margin_debit: Optional[float] = None,
 ) -> None:
     _write_position(con, symbol, qty=float(new_qty), avg_px=float(new_avg), ts_ms=int(fill_ts), book_key=book_key)
 
@@ -2060,11 +2663,15 @@ def _broker_sim_phase_persist_fill_effects(
             f"lob_impact_bps={float(lob_impact_bps):.4f} "
             f"ac_bps={float(almgren_chriss.get('execution_cost_bps') or 0.0):.4f} "
             f"fee_bps={BROKER_FEE_BPS}"
+            + (" option_sim_margin_reference" if option_margin_debit is not None else "")
         ),
         explain_json=json.dumps(explain),
         client_order_id=client_order_id,
         book_key=book_key,
         source=("shadow" if _is_shadow_book(book_key) else "sim"),
+        contract_multiplier=contract_multiplier,
+        option_quote_source=option_quote_source,
+        option_margin_debit=option_margin_debit,
     )
 
     if not _is_shadow_book(book_key):
@@ -2288,6 +2895,7 @@ def apply_new_portfolio_orders(
         wrote_fills = False
         fills_written = 0
         submitted_count = min(len(orders or []), int(max_rows))
+        share_rounding_skipped: List[Dict[str, Any]] = []
 
         # Phase 4: simulate fills. Per-fill persistence and ledger effects are
         # delegated to named phase helpers so the write path stays auditable.
@@ -2428,26 +3036,68 @@ def apply_new_portfolio_orders(
             if (not has_explicit_qty) and (not _is_finite(to_w)):
                 continue
 
-            px_mid, _ = _get_price_at_or_before(con, symbol, ts_ms)
-            if px_mid is None or float(px_mid) <= 0.0:
-                continue
+            option_meta = _option_contract_meta(str(symbol))
+            option_contract = _option_contract_key(option_meta) if option_meta is not None else None
+            option_multiplier = _option_multiplier(option_meta) if option_meta is not None else None
+            option_bid = None
+            option_ask = None
+            option_quote_ts = None
+            option_underlying_px = None
+            option_quote_source = None
+            option_exec_spread_bps = None
+            if option_meta is not None:
+                if option_multiplier is None or not option_contract:
+                    continue
+                option_bid, option_ask, px_mid, option_quote_ts = _get_option_quote_at_or_before(con, option_contract, ts_ms)
+                if px_mid is None or float(px_mid) <= 0.0:
+                    continue
+                option_underlying_px = _option_underlying_px(con, option_meta, int(ts_ms))
+                option_quote_source = f"options_chain_v2:{option_contract}:{int(option_quote_ts)}"
+                option_exec_spread_bps = _option_spread_bps(float(option_bid), float(option_ask), float(px_mid))
+                sizing_px = float(px_mid) * float(option_multiplier)
+            else:
+                px_mid, _ = _get_price_at_or_before(con, symbol, ts_ms)
+                if px_mid is None or float(px_mid) <= 0.0:
+                    continue
+                sizing_px = float(px_mid)
 
             cur_qty, cur_avg = _read_position(con, symbol, book_key=book_key)
 
+            share_rounding_audit: Optional[Dict[str, Any]] = None
             if has_explicit_qty:
-                delta = float(raw_qty)
+                delta = float(round(raw_qty)) if option_meta is not None else float(raw_qty)
                 target_qty = float(cur_qty) + float(delta)
             else:
-                target_qty = (to_w * equity) / float(px_mid)
+                if option_meta is not None:
+                    target_qty = (to_w * equity) / float(sizing_px)
+                else:
+                    # NO-GO-pending-owner: FX weight-to-lots conversion is deliberately
+                    # unowned here. This generic seam remains target_weight * equity / px.
+                    target_qty = (to_w * equity) / float(px_mid)
                 if to_side == "SHORT":
                     target_qty = -abs(target_qty)
                 elif to_side == "LONG":
                     target_qty = abs(target_qty)
                 else:
                     target_qty = 0.0
+                if option_meta is not None:
+                    target_qty = float(round(target_qty))
                 delta = float(target_qty) - float(cur_qty)
 
             if abs(delta) < 1e-9:
+                if (
+                    share_rounding_audit is not None
+                    and bool(share_rounding_audit.get("enabled"))
+                    and bool(share_rounding_audit.get("eligible"))
+                    and bool(share_rounding_audit.get("changed"))
+                ):
+                    share_rounding_skipped.append(
+                        {
+                            "symbol": str(symbol),
+                            "reason": str(share_rounding_audit.get("reason") or "share_rounding_zero_delta"),
+                            "share_rounding": dict(share_rounding_audit),
+                        }
+                    )
                 continue
 
             delta, risk_cap_audit = _apply_execution_risk_caps(
@@ -2456,11 +3106,35 @@ def apply_new_portfolio_orders(
                 symbol=symbol,
                 current_qty=cur_qty,
                 delta_qty=delta,
-                px=float(px_mid),
+                px=float(sizing_px),
                 equity=float(equity),
             )
+            if option_meta is None:
+                # EQ-07 owns equity share rounding only. Mirror the live adapters
+                # by rounding the broker order delta, not the absolute target.
+                # FX weight-to-lots conversion remains the unowned FX-06 seam and
+                # passes through via round_equity_qty's asset-class guard.
+                delta, share_rounding_audit = round_equity_qty(
+                    float(delta),
+                    float(sizing_px),
+                    broker="sim",
+                    asset_class=_share_rounding_asset_class(symbol),
+                )
             if abs(delta) < 1e-9:
                 position_qty_map[str(symbol).upper().strip()] = float(cur_qty)
+                if (
+                    share_rounding_audit is not None
+                    and bool(share_rounding_audit.get("enabled"))
+                    and bool(share_rounding_audit.get("eligible"))
+                    and bool(share_rounding_audit.get("changed"))
+                ):
+                    share_rounding_skipped.append(
+                        {
+                            "symbol": str(symbol),
+                            "reason": str(share_rounding_audit.get("reason") or "share_rounding_zero_delta"),
+                            "share_rounding": dict(share_rounding_audit),
+                        }
+                    )
                 continue
 
             client_order_id = None
@@ -2501,7 +3175,15 @@ def apply_new_portfolio_orders(
 
             client_order_id = str(guard.get("client_order_id") or "")
             order_uid = str(guard.get("order_uid") or "")
-            state_meta = dict(o or {})
+            record_share_rounding = bool(
+                share_rounding_audit is not None
+                and share_rounding_audit.get("enabled")
+                and share_rounding_audit.get("eligible")
+            )
+            order_for_audit = dict(o or {})
+            if record_share_rounding and share_rounding_audit is not None:
+                order_for_audit["share_rounding"] = dict(share_rounding_audit)
+            state_meta = dict(order_for_audit or {})
             state_meta["order_uid"] = str(order_uid)
             state_meta["client_order_id"] = str(client_order_id)
 
@@ -2555,7 +3237,7 @@ def apply_new_portfolio_orders(
 
             _broker_sim_phase_log_ledger_effects(
                 con,
-                order=o,
+                order=order_for_audit,
                 symbol=str(symbol),
                 delta=float(delta),
                 px_mid=float(px_mid),
@@ -2569,7 +3251,7 @@ def apply_new_portfolio_orders(
 
             remaining = float(delta)
             position_qty_map[str(symbol).upper().strip()] = float(cur_qty) + float(delta)
-            position_price_map[str(symbol).upper().strip()] = float(px_mid)
+            position_price_map[str(symbol).upper().strip()] = float(sizing_px)
             chunk_idx = 0
 
             # per-order chunk cap (regime/vol adjusted) + earnings proximity conditioning
@@ -2624,8 +3306,22 @@ def apply_new_portfolio_orders(
                 # Use price at this chunk's simulated fill time (latency-aware), not the parent ts_ms
                 fill_ts = int(int(ts_ms) + (int(chunk_idx) * int(local_latency_ms)))
 
-                px_mid_chunk, _ = _get_price_at_or_before(con, symbol, int(fill_ts))
-                px_mid_use = px_mid_chunk if (px_mid_chunk is not None and float(px_mid_chunk) > 0.0) else px_mid
+                if option_meta is not None:
+                    option_bid, option_ask, px_mid_chunk, option_quote_ts = _get_option_quote_at_or_before(
+                        con,
+                        str(option_contract),
+                        int(fill_ts),
+                    )
+                    if px_mid_chunk is None or float(px_mid_chunk) <= 0.0:
+                        break
+                    px_mid_use = float(px_mid_chunk)
+                    option_quote_source = f"options_chain_v2:{option_contract}:{int(option_quote_ts)}"
+                    option_exec_spread_bps = _option_spread_bps(float(option_bid), float(option_ask), float(px_mid_use))
+                    if option_underlying_px is None:
+                        option_underlying_px = _option_underlying_px(con, option_meta, int(fill_ts))
+                else:
+                    px_mid_chunk, _ = _get_price_at_or_before(con, symbol, int(fill_ts))
+                    px_mid_use = px_mid_chunk if (px_mid_chunk is not None and float(px_mid_chunk) > 0.0) else px_mid
 
                 # ------------------------------------------------------------
                 # PHASE 4: Order type + aggressiveness shaping (MARKET vs LIMIT)
@@ -2633,6 +3329,7 @@ def apply_new_portfolio_orders(
                 # - LIMIT: improved price but partial fills; cancel/replace escalates to MARKET
                 # ------------------------------------------------------------
                 px_exec = 0.0
+                trade_multiplier = float(option_multiplier) if option_multiplier is not None else 1.0
 
                 # provisional px for sizing (MARKET-like baseline)
                 px_mkt = _exec_px(
@@ -2641,6 +3338,7 @@ def apply_new_portfolio_orders(
                     trade_notional=0.0,
                     equity=equity,
                     slip_bps_override=float(local_slip_bps),
+                    spread_bps_override=(float(option_exec_spread_bps) if option_exec_spread_bps is not None else None),
                 )
                 if px_mkt <= 0.0:
                     break
@@ -2648,15 +3346,20 @@ def apply_new_portfolio_orders(
                 # cap by remaining and notional budget using provisional px
                 effective_budget = float(min(float(local_max_notional_budget), float(max_notional_budget)))
 
-                remaining_notional = abs(remaining) * px_mkt
+                remaining_notional = abs(remaining) * px_mkt * float(trade_multiplier)
                 if remaining_notional > effective_budget:
-                    qty_cap = (effective_budget / px_mkt) * (1.0 if remaining > 0 else -1.0)
+                    qty_cap = (effective_budget / (px_mkt * float(trade_multiplier))) * (1.0 if remaining > 0 else -1.0)
                 else:
                     qty_cap = remaining
 
                 # chunk cap using provisional px
-                if abs(qty_cap) * px_mkt > chunk_cap_notional:
-                    qty_cap = (chunk_cap_notional / px_mkt) * (1.0 if remaining > 0 else -1.0)
+                if abs(qty_cap) * px_mkt * float(trade_multiplier) > chunk_cap_notional:
+                    qty_cap = (chunk_cap_notional / (px_mkt * float(trade_multiplier))) * (1.0 if remaining > 0 else -1.0)
+
+                if option_meta is not None:
+                    qty_cap = float(round(qty_cap))
+                    if abs(qty_cap) > abs(remaining):
+                        qty_cap = float(remaining)
 
                 if abs(qty_cap) < 1e-9:
                     break
@@ -2687,6 +3390,8 @@ def apply_new_portfolio_orders(
                         warn_key=f"broker_sim_liquidity_snapshot_failed:{symbol}",
                         symbol=str(symbol),
                     )
+                if option_meta is not None and option_exec_spread_bps is not None:
+                    exec_spread_bps = float(option_exec_spread_bps)
 
                 lob_simulation = build_reactive_lob_simulation(
                     con,
@@ -2768,6 +3473,10 @@ def apply_new_portfolio_orders(
 
                     # apply partial fill
                     qty_cap = float(qty_cap) * float(fill_frac)
+                    if option_meta is not None:
+                        qty_cap = float(round(qty_cap))
+                        if abs(qty_cap) > abs(remaining):
+                            qty_cap = float(remaining)
 
                     if abs(qty_cap) < 1e-9:
                         # no fill at this price => cancel/replace attempt
@@ -2798,7 +3507,7 @@ def apply_new_portfolio_orders(
                         liquidity_snapshot=liquidity_snapshot,
                     )
                     ac_exec_bps = float(almgren_chriss.get("execution_cost_bps") or 0.0)
-                    notional_est = float(qty_cap) * float(px_mid_use)
+                    notional_est = float(qty_cap) * float(px_mid_use) * float(trade_multiplier)
                     px_exec = _exec_px(
                         px_mid_use,
                         chunk_side,
@@ -2830,24 +3539,54 @@ def apply_new_portfolio_orders(
                     break
 
                 # execute
-                notional = float(qty_cap) * float(px_exec)
+                notional = float(qty_cap) * float(px_exec) * float(trade_multiplier)
                 fee = _fee(notional)
+                option_margin_debit = None
 
                 # Optional no-margin mode: prevent cash from going negative on buys
                 if (not BROKER_ALLOW_MARGIN) and (notional > 0.0):
                     max_afford = max(0.0, float(cash) - float(fee))
                     if max_afford <= 0.0:
                         break
-                    max_qty = max_afford / float(px_exec)
+                    max_qty = max_afford / (float(px_exec) * float(trade_multiplier))
                     if max_qty < abs(float(qty_cap)):
                         qty_cap = (max_qty * (1.0 if qty_cap > 0 else -1.0))
+                        if option_meta is not None:
+                            qty_cap = math.floor(abs(float(max_qty))) * (1.0 if qty_cap > 0 else -1.0)
                         if abs(qty_cap) < 1e-9:
                             break
-                        notional = float(qty_cap) * float(px_exec)
+                        notional = float(qty_cap) * float(px_exec) * float(trade_multiplier)
                         fee = _fee(notional)
+                if option_meta is not None and qty_cap < 0.0:
+                    if option_underlying_px is None:
+                        break
+                    option_margin_debit = _option_short_margin(
+                        option_meta,
+                        qty=float(qty_cap),
+                        mid=float(px_mid_use),
+                        underlying_px=float(option_underlying_px),
+                    )
+                    if (not BROKER_ALLOW_MARGIN) and option_margin_debit is not None and option_margin_debit > 0.0:
+                        per_contract_margin = float(option_margin_debit) / max(1.0, abs(float(qty_cap)))
+                        max_afford = max(0.0, float(cash) - float(fee))
+                        max_qty = math.floor(max_afford / float(per_contract_margin)) if per_contract_margin > 0.0 else 0
+                        if max_qty < abs(float(qty_cap)):
+                            qty_cap = -float(max_qty)
+                            if abs(qty_cap) < 1e-9:
+                                break
+                            notional = float(qty_cap) * float(px_exec) * float(trade_multiplier)
+                            fee = _fee(notional)
+                            option_margin_debit = _option_short_margin(
+                                option_meta,
+                                qty=float(qty_cap),
+                                mid=float(px_mid_use),
+                                underlying_px=float(option_underlying_px),
+                            )
 
                 # cash: BUY spends (negative), SELL receives (positive). fees always reduce cash.
                 cash += (-notional - fee)
+                if option_margin_debit is not None:
+                    cash -= float(option_margin_debit)
 
                 new_qty = float(cur_qty) + float(qty_cap)
 
@@ -2922,15 +3661,35 @@ def apply_new_portfolio_orders(
 
                     "chunk_idx": int(chunk_idx),
                 }
+                if record_share_rounding and share_rounding_audit is not None:
+                    explain["share_rounding"] = dict(share_rounding_audit)
                 if liquidity_snapshot:
                     explain["liquidity_snapshot"] = dict(liquidity_snapshot)
+                if option_meta is not None:
+                    explain["option"] = {
+                        "contract": str(option_contract),
+                        "underlying": str(getattr(option_meta, "underlying", "")),
+                        "contract_multiplier": float(option_multiplier),
+                        "quote_source": str(option_quote_source or ""),
+                        "quote_ts_ms": int(option_quote_ts) if option_quote_ts is not None else None,
+                        "bid": float(option_bid) if option_bid is not None else None,
+                        "ask": float(option_ask) if option_ask is not None else None,
+                        "mid": float(px_mid_use),
+                        "notional_multiplier_applied": True,
+                        "option_margin_debit": (
+                            float(option_margin_debit) if option_margin_debit is not None else None
+                        ),
+                        "margin_model": (
+                            "option_sim_margin_reference" if option_margin_debit is not None else None
+                        ),
+                    }
                 if _is_shadow_book(book_key):
                     explain["shadow_book_key"] = str(_book_key(book_key))
                     explain["shadow_model_id"] = str(o.get("model_id") or "")
 
                 _broker_sim_phase_persist_fill_effects(
                     con,
-                    order=o,
+                    order=order_for_audit,
                     symbol=symbol,
                     order_id=(int(order_id) if order_id is not None else None),
                     ts_ms=int(ts_ms),
@@ -2952,6 +3711,11 @@ def apply_new_portfolio_orders(
                     client_order_id=str(client_order_id),
                     order_ttl_ms=int(order_ttl_ms),
                     state_meta=state_meta,
+                    contract_multiplier=(float(option_multiplier) if option_multiplier is not None else None),
+                    option_quote_source=(str(option_quote_source) if option_quote_source is not None else None),
+                    option_margin_debit=(
+                        float(option_margin_debit) if option_margin_debit is not None else None
+                    ),
                 )
 
                 wrote_fills = True
@@ -2991,14 +3755,25 @@ def apply_new_portfolio_orders(
             _set_meta(con, "last_portfolio_orders_id", str(order_id), book_key=book_key)
             con.commit()
 
+        lifecycle_summary = None
+        if _options_lifecycle_enabled():
+            lifecycle_summary = apply_option_lifecycle(con, book_key=book_key, now_ms=int(now_ms))
+            if isinstance(lifecycle_summary, dict) and lifecycle_summary.get("account"):
+                acct2 = dict(lifecycle_summary.get("account") or acct2)
+
         # Phase 6: return summary.
-        return _broker_sim_phase_return_summary(
+        summary = _broker_sim_phase_return_summary(
             book_key=book_key,
             order_id=(int(order_id) if order_id is not None else None),
             wrote_fills=bool(wrote_fills),
             fills_written=int(fills_written),
             account=acct2,
         )
+        if lifecycle_summary is not None:
+            summary["options_lifecycle"] = dict(lifecycle_summary)
+        if share_rounding_skipped:
+            summary["share_rounding_skipped"] = list(share_rounding_skipped)
+        return summary
     finally:
         con.close()
 
@@ -3028,6 +3803,34 @@ def broker_equity_at(ts_ms: int, include_prices: bool = False) -> dict:
         for sym, qty in rows or []:
             sym = str(sym)
             qty = float(qty or 0.0)
+
+            meta = _option_contract_meta(sym)
+            multiplier = _option_multiplier(meta) if meta is not None else None
+            contract = _option_contract_key(meta) if meta is not None else None
+            if meta is not None:
+                if multiplier is None or not contract:
+                    missing.append(sym)
+                    continue
+                _bid, _ask, px, px_ts = _get_option_quote_at_or_before(con, contract, int(ts_ms))
+                if px is None or float(px) <= 0.0:
+                    missing.append(sym)
+                    continue
+                notional = float(qty) * float(px) * float(multiplier)
+                eq += notional
+
+                if include_prices:
+                    out_positions.append(
+                        {
+                            "symbol": sym,
+                            "qty": float(qty),
+                            "px": float(px),
+                            "px_ts_ms": (int(px_ts) if px_ts is not None else None),
+                            "notional": float(notional),
+                            "contract_multiplier": float(multiplier),
+                            "option_quote_source": f"options_chain_v2:{contract}:{int(px_ts)}",
+                        }
+                    )
+                continue
 
             px, px_ts = _get_price_at_or_before(con, sym, int(ts_ms))
             if px is None or float(px) <= 0.0:

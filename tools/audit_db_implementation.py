@@ -27,7 +27,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXCLUDE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__",

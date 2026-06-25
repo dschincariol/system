@@ -378,6 +378,11 @@ TABLE_CLASS["etf_shares_outstanding"] = _r(
     write_rate="low",
     read_pattern="source id upsert and symbol/availability-time feature snapshot reads",
 )
+TABLE_CLASS["corporate_actions"] = _r(
+    "append-only PIT split and cash-dividend calendar keyed by source record id",
+    write_rate="low",
+    read_pattern="source id upsert and symbol/ex-date availability-time label and hygiene reads",
+)
 TABLE_CLASS["etf_flow_features"] = _h(
     chunk="1 week",
     compress_after="30 days",
@@ -539,6 +544,47 @@ TABLE_CLASS["options_surface_agg"] = _h(
     rationale="global options surface aggregate stream; append-mostly and read by time",
     write_rate="medium",
     read_pattern="dashboard scans by time",
+)
+TABLE_CLASS["options_predictor_shadow"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("underlying",),
+    rationale="shadow options predictor forecasts and gated structure-intent evidence",
+    write_rate="medium",
+    read_pattern="underlying/time scans for shadow options forecast review and promotion evidence",
+)
+TABLE_CLASS["futures_contract_bars"] = _h(
+    chunk="1 day",
+    compress_after="7 days",
+    retain="3 years",
+    segmentby=("contract",),
+    rationale="raw futures per-contract OHLCV and open-interest bars consumed by roll construction",
+    write_rate="high",
+    read_pattern="contract/time scans for roll detection, continuous-series construction, and dashboard curves",
+)
+TABLE_CLASS["futures_roll_calendar"] = _r(
+    "derived futures roll calendar keyed by root and roll timestamp",
+    write_rate="low",
+    read_pattern="root/time lookup for roll-aware labels, execution blocking, and dashboard display",
+)
+TABLE_CLASS["futures_continuous_bars"] = _h(
+    chunk="1 day",
+    compress_after="7 days",
+    retain="3 years",
+    segmentby=("continuous_symbol",),
+    rationale="ratio-adjusted futures continuous bars used by labels, features, and backtests",
+    write_rate="medium",
+    read_pattern="continuous-symbol/time scans for return-safe model inputs and dashboard views",
+)
+TABLE_CLASS["futures_roll_yield"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("root",),
+    rationale="derived futures roll-yield feature series keyed by root and time",
+    write_rate="medium",
+    read_pattern="latest and historical root/time scans for futures features and dashboard views",
 )
 
 _add(

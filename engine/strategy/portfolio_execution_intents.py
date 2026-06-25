@@ -1865,12 +1865,19 @@ def load_latest_execution_intents(
             except Exception:
                 base_to_w = 0.0
 
-            competition_policy = _competition_policy(
-                symbol=sym,
-                horizon_s=int(intent.get("horizon_s") or 0),
-                model_name=str(intent.get("model_name") or ""),
-                regime=str(intent.get("regime") or "global"),
-            )
+            if bool(intent.get("terminal_order")):
+                competition_policy = {
+                    "allowed": True,
+                    "blocked": False,
+                    "reason": "terminal_operator_intent",
+                }
+            else:
+                competition_policy = _competition_policy(
+                    symbol=sym,
+                    horizon_s=int(intent.get("horizon_s") or 0),
+                    model_name=str(intent.get("model_name") or ""),
+                    regime=str(intent.get("regime") or "global"),
+                )
             explain_signal = dict(((intent.get("explain") or {}).get("signal") or {}))
             explain_competition = dict(explain_signal.get("competition") or {})
             explain_competition_policy = dict(explain_competition.get("policy") or {})

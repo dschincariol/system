@@ -3,8 +3,7 @@
 FX-04 owns ``engine.data.prices.fx_clock`` as the session-boundary source of
 truth. This module derives weekend-open/closed state from that clock and only
 adds execution-specific rollover timing annotations. The default FX week opens
-Sunday 17:00 America/New_York and closes Friday 17:00 America/New_York, roughly
-21:00 UTC during US daylight time and 22:00 UTC during US standard time.
+Sunday 17:00 America/New_York and closes Friday 17:00 America/New_York.
 
 No broker, database, network, order, swap, or P&L operation is performed here.
 FX-07 owns spread/swap/carry cost accounting.
@@ -17,19 +16,11 @@ import os
 from typing import Any, Dict
 from zoneinfo import ZoneInfo
 
-try:
-    from engine.data.prices.fx_clock import (
-        DEFAULT_FX_WEEK_CLOSE_HOUR_ET,
-        fx_forward_eval_ms as _fx_forward_eval_ms,
-        fx_market_closed as _fx_market_closed,
-    )
-
-    _HAS_CANONICAL_FX_CLOCK = True
-except Exception:  # pragma: no cover - only used if FX-04 is absent.
-    DEFAULT_FX_WEEK_CLOSE_HOUR_ET = 17
-    _fx_forward_eval_ms = None
-    _fx_market_closed = None
-    _HAS_CANONICAL_FX_CLOCK = False
+from engine.data.prices.fx_clock import (
+    DEFAULT_FX_WEEK_CLOSE_HOUR_ET,
+    fx_forward_eval_ms as _fx_forward_eval_ms,
+    fx_market_closed as _fx_market_closed,
+)
 
 _UTC = timezone.utc
 _FALLBACK_ET = timezone(timedelta(hours=-5), name="ET_FIXED")
@@ -77,48 +68,14 @@ def _is_fx_pair(symbol: str) -> bool:
         return False
 
 
-def _fallback_closed_utc(ts_ms: int) -> bool:
-    dt = _dt_from_ms(ts_ms)
-    close_day = _env_int("FX_WEEK_CLOSE_DAY_UTC", 4, 0, 6)
-    open_day = _env_int("FX_WEEK_OPEN_DAY_UTC", 6, 0, 6)
-    close_hour = _env_int("FX_WEEK_CLOSE_HOUR_UTC", 22, 0, 23)
-    open_hour = _env_int("FX_WEEK_OPEN_HOUR_UTC", 22, 0, 23)
-    weekday = int(dt.weekday())
-    hour = int(dt.hour)
-    if weekday == close_day and hour >= close_hour:
-        return True
-    if close_day < open_day and close_day < weekday < open_day:
-        return True
-    if weekday == open_day and hour < open_hour:
-        return True
-    return False
-
-
-def _fallback_next_open_utc(ts_ms: int) -> int | None:
-    if not _fallback_closed_utc(ts_ms):
-        return None
-    dt = _dt_from_ms(ts_ms)
-    open_day = _env_int("FX_WEEK_OPEN_DAY_UTC", 6, 0, 6)
-    open_hour = _env_int("FX_WEEK_OPEN_HOUR_UTC", 22, 0, 23)
-    days = (open_day - int(dt.weekday())) % 7
-    candidate = datetime.combine((dt + timedelta(days=days)).date(), dt_time(hour=open_hour, tzinfo=_UTC))
-    if candidate <= dt:
-        candidate += timedelta(days=7)
-    return _ms_from_dt(candidate)
-
-
 def _market_closed(ts_ms: int) -> bool:
-    if _HAS_CANONICAL_FX_CLOCK and _fx_market_closed is not None:
-        return bool(_fx_market_closed(int(ts_ms)))
-    return _fallback_closed_utc(int(ts_ms))
+    return bool(_fx_market_closed(int(ts_ms)))
 
 
 def _next_open_ms(ts_ms: int) -> int | None:
     if not _market_closed(ts_ms):
         return None
-    if _HAS_CANONICAL_FX_CLOCK and _fx_forward_eval_ms is not None:
-        return int(_fx_forward_eval_ms(int(ts_ms), 0))
-    return _fallback_next_open_utc(int(ts_ms))
+    return int(_fx_forward_eval_ms(int(ts_ms), 0))
 
 
 def _rollover_window(now_ms: int) -> tuple[bool, int, int]:
@@ -144,7 +101,7 @@ def fx_session_state(symbol: str, now_ms: int) -> Dict[str, Any]:
             "is_open": True,
             "in_rollover_window": False,
             "next_open_ms": None,
-            "canonical_clock": bool(_HAS_CANONICAL_FX_CLOCK),
+            "canonical_clock": True,
         }
 
     closed = _market_closed(int(now_ms))
@@ -156,7 +113,7 @@ def fx_session_state(symbol: str, now_ms: int) -> Dict[str, Any]:
             "is_open": False,
             "in_rollover_window": False,
             "next_open_ms": _next_open_ms(int(now_ms)),
-            "canonical_clock": bool(_HAS_CANONICAL_FX_CLOCK),
+            "canonical_clock": True,
         }
     return {
         "is_fx": True,
@@ -166,7 +123,7 @@ def fx_session_state(symbol: str, now_ms: int) -> Dict[str, Any]:
         "next_open_ms": None,
         "rollover_start_ms": int(rollover_start_ms),
         "rollover_end_ms": int(rollover_end_ms),
-        "canonical_clock": bool(_HAS_CANONICAL_FX_CLOCK),
+        "canonical_clock": True,
     }
 
 

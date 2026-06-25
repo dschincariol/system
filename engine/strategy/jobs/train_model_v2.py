@@ -16,6 +16,7 @@ import numpy as np
 from sklearn.model_selection import TimeSeriesSplit
 
 from engine.backtest.cpcv import CombinatorialPurgedKFold
+from engine.data.futures_roll import load_futures_roll_boundaries
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import (
     acquire_job_lock,
@@ -110,7 +111,14 @@ def _infer_holding_horizon_bars(horizons) -> int:
     return 1
 
 
-def _select_cv_splitter(*, holding_horizon_bars: int, n_samples: int):
+def _select_cv_splitter(
+    *,
+    holding_horizon_bars: int,
+    n_samples: int,
+    roll_times=None,
+    label_start_times=None,
+    label_end_times=None,
+):
     splits = max(2, min(int(MODEL_V2_CV_SPLITS), max(2, int(n_samples) // 2)))
     if int(holding_horizon_bars or 1) > 1:
         return CombinatorialPurgedKFold(
@@ -118,6 +126,9 @@ def _select_cv_splitter(*, holding_horizon_bars: int, n_samples: int):
             n_test_splits=max(1, min(int(MODEL_V2_CPCV_TEST_SPLITS), splits - 1)),
             embargo=float(MODEL_V2_CPCV_EMBARGO),
             label_horizon=int(holding_horizon_bars),
+            label_start_times=label_start_times,
+            label_end_times=label_end_times,
+            roll_times=roll_times,
         )
     return TimeSeriesSplit(n_splits=splits)
 
@@ -175,6 +186,7 @@ def _load_oos_return_series(*, symbols, horizons, lookback_days: int, holdout_fr
     symset = {str(symbol or "").upper().strip() for symbol in list(symbols or []) if str(symbol or "").strip()}
     hset = {int(horizon) for horizon in list(horizons or [])}
     con = connect()
+    roll_times: list[int] = []
     try:
         rows = con.execute(
             """
@@ -192,6 +204,16 @@ def _load_oos_return_series(*, symbols, horizons, lookback_days: int, holdout_fr
             """,
             (int(cutoff_ms),),
         ).fetchall()
+        if rows:
+            row_symbols = [str(row[1] or "").upper().strip() for row in rows or []]
+            starts = [int(row[0] or 0) for row in rows or []]
+            ends = [int(row[0] or 0) + int(row[2] or 0) * 1000 for row in rows or []]
+            roll_times = load_futures_roll_boundaries(
+                con,
+                symbols=row_symbols,
+                start_ts_ms=min(starts) if starts else None,
+                end_ts_ms=max(ends) if ends else None,
+            )
     except Exception as e:
         _warn_nonfatal("TRAIN_MODEL_V2_OOS_RETURNS_LOAD_FAILED", e, once_key="oos_returns_load")
         return {"oos_returns": [], "oos_return_count": 0, "oos_holdout_fraction": float(holdout_fraction)}
@@ -202,6 +224,8 @@ def _load_oos_return_series(*, symbols, horizons, lookback_days: int, holdout_fr
             _warn_nonfatal("TRAIN_MODEL_V2_CLOSE_FAILED", e, once_key="oos_returns_close")
 
     values = []
+    label_starts = []
+    label_ends = []
     for _ts_ms, symbol, horizon_s, impact_z in rows or []:
         sym = str(symbol or "").upper().strip()
         try:
@@ -214,13 +238,21 @@ def _load_oos_return_series(*, symbols, horizons, lookback_days: int, holdout_fr
         if hset and horizon not in hset:
             continue
         values.append(float(value))
+        label_starts.append(float(int(_ts_ms or 0)))
+        label_ends.append(float(int(_ts_ms or 0) + int(horizon) * 1000))
 
     if not values:
         return {"oos_returns": [], "oos_return_count": 0, "oos_holdout_fraction": float(holdout_fraction)}
 
     cv_method = "time_series_holdout"
     if int(holding_horizon_bars or 1) > 1 and len(values) >= 6:
-        splitter = _select_cv_splitter(holding_horizon_bars=int(holding_horizon_bars), n_samples=len(values))
+        splitter = _select_cv_splitter(
+            holding_horizon_bars=int(holding_horizon_bars),
+            n_samples=len(values),
+            roll_times=roll_times,
+            label_start_times=np.asarray(label_starts, dtype=float),
+            label_end_times=np.asarray(label_ends, dtype=float),
+        )
         arr = np.asarray(values, dtype=float)
         oos_values: list[float] = []
         for _train_idx, test_idx in splitter.split(np.arange(len(values), dtype=float)):

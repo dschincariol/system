@@ -21,7 +21,12 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from engine.runtime.platform import default_local_db_dir, default_local_db_path, default_local_log_dir
+from engine.runtime.platform import (
+    default_local_db_dir,
+    default_local_db_path,
+    default_local_log_dir,
+    resolve_runtime_paths,
+)
 from engine.startup.env import (
     append_env_line as _startup_append_env_line,
     ensure_local_env_file as _startup_ensure_local_env_file,
@@ -181,6 +186,7 @@ _SKIP_RUNTIME_GRAPH_CHECK = str(
     os.environ.get("TRADING_SKIP_RUNTIME_GRAPH_CHECK", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
 _SHARD_AWARE_INGESTION_JOBS = {"ingestion_runtime", "poll_prices", "options_poll"}
+_RUNTIME_OWNER_PID_ENV_KEYS = ("ENGINE_RUNTIME_OWNER_PID", "TRADING_RUNTIME_OWNER_PID")
 
 
 def _current_ingestion_shard():
@@ -248,9 +254,19 @@ def _bootstrap_start_system_env() -> None:
     try:
         _ensure_local_env_file()
         from dotenv import load_dotenv
-        load_dotenv(os.path.join(_BASE_DIR, ".env"))
+        env_file_raw = str(os.environ.get("TRADING_ENV_FILE") or ".env").strip() or ".env"
+        env_file = Path(env_file_raw).expanduser()
+        if not env_file.is_absolute():
+            env_file = Path(_BASE_DIR) / env_file
+        load_dotenv(env_file, override=False)
     except Exception as e:
         sys.stderr.write(f"[start_system] dotenv_load_failed: {type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+
+    try:
+        resolve_runtime_paths(os.environ, project_root=Path(_BASE_DIR))
+    except Exception as e:
+        sys.stderr.write(f"[start_system] runtime_path_resolve_failed: {type(e).__name__}: {e}\n")
         sys.stderr.flush()
 
     # Ignore the known-dead local proxy sentinel if present so outbound market-data HTTP works.
@@ -1219,6 +1235,30 @@ def _pid_is_running_cross_platform(pid: int) -> bool:
         return False
 
 
+def _pid_exists_quiet(pid: int) -> bool:
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError) as e:
+        _log_swallowed("PID_EXISTS_INT_PARSE_FAILED", error=str(e))
+        pid = 0
+    if pid <= 0:
+        return False
+    exists = False
+    try:
+        os.kill(int(pid), 0)
+        exists = True
+    except ProcessLookupError as e:
+        _log_swallowed("PID_EXISTS_PROCESS_MISSING", pid=int(pid), error=str(e))
+        exists = False
+    except PermissionError as e:
+        _log_swallowed("PID_EXISTS_PERMISSION_DENIED", pid=int(pid), error=str(e))
+        exists = True
+    except OSError as e:
+        _log_swallowed("PID_EXISTS_CHECK_FAILED", pid=int(pid), error=str(e))
+        exists = False
+    return bool(exists)
+
+
 def _terminate_pid_tree_cross_platform(pid: int, *, timeout_s: float = 15.0) -> bool:
     try:
         pid = int(pid or 0)
@@ -1249,6 +1289,144 @@ def _repo_process_cmdline(proc) -> str:
     except Exception as e:
         _log_swallowed("REPO_PROCESS_CMDLINE_BUILD_FAILED", error=str(e))
         return ""
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None or str(value).strip() == "":
+        return int(default)
+    result = int(default)
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as e:
+        _log_swallowed("SAFE_INT_PARSE_FAILED", error=str(e), value_type=type(value).__name__)
+        result = int(default)
+    return int(result)
+
+
+def _process_env_owner_pid(proc) -> int:
+    try:
+        environ = proc.environ()
+    except Exception as e:
+        _log_swallowed(
+            "STALE_INGESTION_PROCESS_ENV_READ_FAILED",
+            error=str(e),
+            pid=getattr(proc, "pid", None),
+        )
+        return 0
+    if not isinstance(environ, dict):
+        return 0
+    for key in _RUNTIME_OWNER_PID_ENV_KEYS:
+        owner_pid = _safe_int(environ.get(key), 0)
+        if owner_pid > 0:
+            return int(owner_pid)
+    return 0
+
+
+def _process_parent_chain_contains_pid(proc, owner_pid: int) -> bool:
+    owner_pid = _safe_int(owner_pid, 0)
+    if owner_pid <= 0:
+        return False
+    try:
+        if _safe_int(proc.ppid(), 0) == owner_pid:
+            return True
+    except Exception as e:
+        _log_swallowed(
+            "STALE_INGESTION_PROCESS_PARENT_READ_FAILED",
+            error=str(e),
+            pid=getattr(proc, "pid", None),
+        )
+    try:
+        for parent in proc.parents():
+            try:
+                if _safe_int(getattr(parent, "pid", 0), 0) == owner_pid:
+                    return True
+            except Exception as e:
+                _log_swallowed(
+                    "STALE_INGESTION_PROCESS_PARENT_PID_READ_FAILED",
+                    error=str(e),
+                    pid=getattr(proc, "pid", None),
+                    owner_pid=int(owner_pid),
+                )
+                continue
+    except Exception as e:
+        _log_swallowed(
+            "STALE_INGESTION_PROCESS_PARENT_CHAIN_READ_FAILED",
+            error=str(e),
+            pid=getattr(proc, "pid", None),
+        )
+    return False
+
+
+def _process_owned_by_current_runtime(proc) -> bool:
+    current_pid = int(os.getpid())
+    env_owner_pid = _process_env_owner_pid(proc)
+    if env_owner_pid > 0:
+        return env_owner_pid == current_pid
+    return _process_parent_chain_contains_pid(proc, current_pid)
+
+
+def _pid_record_current_or_orphaned(record: dict, *, label: str) -> bool:
+    if not _pid_record_belongs_here(record, label=label):
+        return False
+    current_pid = int(os.getpid())
+    owner_pid = _safe_int((record or {}).get("owner_pid"), 0)
+    if owner_pid <= 0 or owner_pid == current_pid:
+        return True
+    if _pid_exists_quiet(owner_pid):
+        return False
+    return True
+
+
+def _row_value(row: Any, key: str, index: int, default: Any = None) -> Any:
+    try:
+        if hasattr(row, "keys") and key in row.keys():
+            return row[key]
+    except Exception as e:
+        _log_swallowed("ROW_VALUE_KEY_READ_FAILED", error=str(e), key=str(key), index=int(index))
+    try:
+        return row[index]
+    except Exception as e:
+        _log_swallowed("ROW_VALUE_INDEX_READ_FAILED", error=str(e), key=str(key), index=int(index))
+        return default
+
+
+def _json_dict_from_text(raw: Any) -> dict:
+    try:
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        _log_swallowed("JSON_DICT_FROM_TEXT_FAILED", error=str(e))
+        return {}
+
+
+def _liveness_row_current_or_orphaned(row: Any, *, now_ms: int, max_age_ms: int) -> tuple[bool, int, str, str]:
+    job_name = str(_row_value(row, "job_name", 0, "") or "").strip()
+    pid = _safe_int(_row_value(row, "pid", 1, 0), 0)
+    ts_ms = _safe_int(_row_value(row, "ts_ms", 2, 0), 0)
+    extra_json = _row_value(row, "extra_json", 4, "")
+    extra = _json_dict_from_text(extra_json)
+    current_pid = int(os.getpid())
+    owner_pid = 0
+    for key in ("supervisor_owner_pid", "runtime_owner_pid", "owner_pid"):
+        owner_pid = _safe_int(extra.get(key), 0)
+        if owner_pid > 0:
+            break
+    stale = ts_ms <= 0 or (int(now_ms) - int(ts_ms)) > int(max_age_ms)
+    pid_running = pid > 0 and _pid_exists_quiet(pid)
+    if pid > 0 and not pid_running:
+        return True, pid, job_name, "dead_liveness_pid"
+    if owner_pid == current_pid:
+        return True, pid, job_name, "current_owner"
+    if owner_pid > 0:
+        if _pid_exists_quiet(owner_pid):
+            return False, pid, job_name, "active_other_owner"
+        return True, pid, job_name, "orphaned_owner"
+    if stale:
+        return True, pid, job_name, "stale_unowned_liveness"
+    return False, pid, job_name, "fresh_unowned_liveness"
 
 
 def _build_repo_ingestion_process_markers(job_names: Optional[set[str]] = None) -> set[str]:
@@ -1353,7 +1531,11 @@ def _discover_repo_ingestion_process_pids(*, known_jobs: Optional[set[str]] = No
             if pid <= 0 or pid == current_pid or pid == current_parent_pid:
                 continue
             cmdline = _repo_process_cmdline(proc)
-            if _looks_like_repo_ingestion_process(cmdline, markers=marker_set) and _process_matches_current_ingestion_shard(proc):
+            if (
+                _looks_like_repo_ingestion_process(cmdline, markers=marker_set)
+                and _process_matches_current_ingestion_shard(proc)
+                and _process_owned_by_current_runtime(proc)
+            ):
                 stale_pids.add(pid)
         return stale_pids
     except Exception as e:
@@ -1364,6 +1546,7 @@ def _discover_repo_ingestion_process_pids(*, known_jobs: Optional[set[str]] = No
 def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = None) -> None:
     cleanup_started_ms = int(time.time() * 1000)
     stale_pids = set()
+    cleanup_liveness_jobs: set[str] = set()
     stale_jobs = {"ingestion_runtime", "poll_prices", "options_poll"}
     deadline = None
     if time_budget_s is not None:
@@ -1404,8 +1587,14 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
     try:
         record = _read_pid_file_record(_INGESTION_PID_PATH, label="ingestion")
         pid_value = int(record.get("pid") or 0)
-        if pid_value > 0:
+        if pid_value > 0 and _pid_record_current_or_orphaned(record, label="ingestion"):
             stale_pids.add(pid_value)
+        elif pid_value > 0:
+            LOG.info(
+                "STALE_INGESTION_PID_FILE_SKIPPED_ACTIVE_OWNER pid=%s owner_pid=%s",
+                pid_value,
+                int(record.get("owner_pid") or 0),
+            )
     except FileNotFoundError as e:
         _log_swallowed(
             "READ_INGESTION_PID_FILE_MISSING",
@@ -1434,11 +1623,20 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
         try:
             from engine.runtime.storage import connect_ro_direct
 
+            now_ms = int(time.time() * 1000)
+            max_age_ms = int(
+                max(
+                    30.0,
+                    float(_INGESTION_RESTART_WINDOW_S),
+                    float(_INGESTION_WATCHDOG_SLEEP_S) * 4.0,
+                )
+                * 1000
+            )
             con = connect_ro_direct(timeout_s=2.0, busy_timeout_ms=5000)
             placeholders = ",".join("?" for _ in stale_liveness_jobs)
             rows = con.execute(
                 f"""
-                SELECT job_name, pid
+                SELECT job_name, pid, ts_ms, owner, extra_json
                 FROM job_heartbeats
                 WHERE job_name IN ({placeholders})
                 """,
@@ -1446,11 +1644,60 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
             ).fetchall()
             for row in rows or []:
                 try:
-                    if row and row[1]:
-                        stale_pids.add(int(row[1]))
+                    eligible, pid_value, job_name, reason = _liveness_row_current_or_orphaned(
+                        row,
+                        now_ms=now_ms,
+                        max_age_ms=max_age_ms,
+                    )
+                    if eligible:
+                        if pid_value > 0:
+                            stale_pids.add(int(pid_value))
+                        if job_name:
+                            cleanup_liveness_jobs.add(str(job_name))
+                    else:
+                        LOG.info(
+                            "STALE_INGESTION_LIVENESS_ROW_SKIPPED job=%s pid=%s reason=%s",
+                            job_name,
+                            pid_value,
+                            reason,
+                        )
                 except Exception as e:
                     _log_swallowed(
                         "STALE_INGESTION_HEARTBEAT_ROW_PARSE_FAILED",
+                        row=repr(row),
+                        error=str(e),
+                    )
+                    continue
+            lock_rows = con.execute(
+                f"""
+                SELECT job_name, pid, heartbeat_ts_ms AS ts_ms, owner, NULL AS extra_json
+                FROM job_locks
+                WHERE job_name IN ({placeholders})
+                """,
+                tuple(sorted(stale_liveness_jobs)),
+            ).fetchall()
+            for row in lock_rows or []:
+                try:
+                    eligible, pid_value, job_name, reason = _liveness_row_current_or_orphaned(
+                        row,
+                        now_ms=now_ms,
+                        max_age_ms=max_age_ms,
+                    )
+                    if eligible:
+                        if pid_value > 0:
+                            stale_pids.add(int(pid_value))
+                        if job_name:
+                            cleanup_liveness_jobs.add(str(job_name))
+                    else:
+                        LOG.info(
+                            "STALE_INGESTION_LOCK_ROW_SKIPPED job=%s pid=%s reason=%s",
+                            job_name,
+                            pid_value,
+                            reason,
+                        )
+                except Exception as e:
+                    _log_swallowed(
+                        "STALE_INGESTION_LOCK_ROW_PARSE_FAILED",
                         row=repr(row),
                         error=str(e),
                     )
@@ -1516,7 +1763,7 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
     except Exception as e:
         _log_swallowed("FINAL_INGESTION_PID_CLEANUP_FAILED", error=str(e))
 
-    if db_path and os.path.exists(db_path) and stale_liveness_jobs:
+    if db_path and os.path.exists(db_path) and cleanup_liveness_jobs:
         if _budget_exhausted() and unhandled_running_stale_pids:
             _log_swallowed(
                 "STALE_INGESTION_CLEANUP_BUDGET_EXHAUSTED",
@@ -1532,8 +1779,8 @@ def _terminate_stale_ingestion_processes(*, time_budget_s: Optional[float] = Non
                 stale_pid_count=len(stale_pids),
             )
         try:
-            placeholders = ",".join("?" for _ in stale_liveness_jobs)
-            cleanup_jobs = tuple(sorted(stale_liveness_jobs))
+            cleanup_jobs = tuple(sorted(cleanup_liveness_jobs))
+            placeholders = ",".join("?" for _ in cleanup_jobs)
 
             from engine.runtime.storage import run_write_txn
 
@@ -1793,6 +2040,8 @@ def _spawn_ingestion_if_enabled() -> None:
     env["ENGINE_SUPERVISED"] = "1"
     env["ENGINE_LAUNCHED_BY_SUPERVISOR"] = "1"
     env["ENGINE_JOB_NAME"] = "ingestion_runtime"
+    env["ENGINE_RUNTIME_OWNER_PID"] = str(int(os.getpid()))
+    env["TRADING_RUNTIME_OWNER_PID"] = str(int(os.getpid()))
     env.setdefault("ENGINE_PROCESS_ROLE", "ingestion")
     env.setdefault("TS_PG_POOL_PROFILE", "ingestion")
     env["PYTHONPATH"] = _BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
@@ -2102,6 +2351,7 @@ def _handle_signal(signum, _frame) -> None:
         terminate_ingestion=_terminate_ingestion,
         runtime_shutdown=runtime_shutdown,
         log_swallowed=_log_swallowed,
+        flush_logging_handlers=flush_logging_handlers,
     )
 
 

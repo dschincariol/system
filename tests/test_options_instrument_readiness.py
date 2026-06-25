@@ -57,6 +57,7 @@ def _set_live_broker_env(monkeypatch) -> None:
 
 def _set_complete_live_options_controls(monkeypatch) -> None:
     monkeypatch.setenv("OPTIONS_INSTRUMENTS_MODE", "live")
+    monkeypatch.setenv("OPTIONS_LIFECYCLE_ENABLED", "1")
     for name in (
         "OPTIONS_LIVE_GREEKS_READY",
         "OPTIONS_LIVE_LIQUIDITY_FILTERS_READY",
@@ -77,6 +78,19 @@ def _set_complete_live_options_controls(monkeypatch) -> None:
     monkeypatch.setenv("OPTIONS_MAX_POSITION_CONTRACTS", "10")
     monkeypatch.setenv("OPTIONS_MARGIN_IMPACT_MAX_FRACTION", "0.25")
     monkeypatch.setenv("OPTIONS_MAX_PORTFOLIO_DELTA_ABS", "2.0")
+    monkeypatch.setenv("OPTIONS_MAX_PORTFOLIO_GAMMA_ABS", "5.0")
+    monkeypatch.setenv("OPTIONS_MAX_PORTFOLIO_VEGA_ABS", "10.0")
+
+
+def _patch_healthy_gate_predicates(monkeypatch, readiness) -> None:
+    def predicate(kind, _context):
+        return True, {"test_gate": kind, "healthy": True}
+
+    monkeypatch.setattr(
+        readiness,
+        "_GATE_PREDICATES",
+        {control: predicate for control, _blocker, _names in readiness.CONTROL_FLAG_GROUPS},
+    )
 
 
 def test_options_default_to_shadow_only_not_live_required(monkeypatch):
@@ -121,6 +135,7 @@ def test_live_options_request_requires_all_controls_and_real_adapter(monkeypatch
 def test_complete_control_flags_still_block_until_live_adapter_exists(monkeypatch):
     _set_complete_live_options_controls(monkeypatch)
     readiness = _reload("engine.execution.options_readiness")
+    _patch_healthy_gate_predicates(monkeypatch, readiness)
 
     state = readiness.live_options_readiness_snapshot(
         engine_mode="live",
@@ -168,8 +183,19 @@ def test_router_rejects_live_option_order_before_adapter(monkeypatch):
 
 
 def test_sim_route_allows_shadow_option_intents(monkeypatch):
+    monkeypatch.delenv("OPTIONS_INSTRUMENTS_MODE", raising=False)
+    monkeypatch.delenv("OPTIONS_AS_INSTRUMENTS_MODE", raising=False)
+    monkeypatch.delenv("OPTIONS_LIVE_ORDERS_ENABLED", raising=False)
+    monkeypatch.delenv("OPTIONS_ENABLE_LIVE_ORDERS", raising=False)
+    monkeypatch.delenv("OPTIONS_AS_INSTRUMENTS_LIVE", raising=False)
     monkeypatch.setenv("ENGINE_MODE", "paper")
     monkeypatch.setenv("EXECUTION_MODE", "paper")
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "1")
+    monkeypatch.setenv("KILL_SWITCH_GLOBAL", "0")
+    monkeypatch.setenv("BROKER", "sim")
+    monkeypatch.setenv("BROKER_NAME", "sim")
+    monkeypatch.setenv("LIVE_BROKER", "sim")
+    monkeypatch.setenv("INTENDED_LIVE_BROKER", "sim")
     monkeypatch.setenv("BROKER_FAILOVER", "sim")
     broker_router = _reload("engine.execution.broker_router")
     sim_adapter = Mock(return_value={"ok": True, "status": "shadow_preview", "broker": "sim"})

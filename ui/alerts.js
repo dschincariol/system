@@ -36,13 +36,20 @@ function _pickAlertTs(row) {
   return null;
 }
 
-function _normalizeSeverity(value) {
+export const ALERT_SEVERITY_ORDER = Object.freeze(["INFO", "WARN", "HIGH", "CRIT"]);
+
+const ALERT_SEVERITY_ALIASES = Object.freeze({
+  INFO: "INFO",
+  WARN: "WARN",
+  WARNING: "WARN",
+  HIGH: "HIGH",
+  CRIT: "CRIT",
+  CRITICAL: "CRIT",
+});
+
+export function normalizeSeverity(value) {
   const raw = String(value || "").trim().toUpperCase();
-  if (raw === "CRIT") return "CRIT";
-  if (raw === "HIGH") return "HIGH";
-  if (raw === "WARN") return "WARN";
-  if (raw === "INFO") return "INFO";
-  return "INFO";
+  return ALERT_SEVERITY_ALIASES[raw] || "INFO";
 }
 
 function _normalizeStatus(row) {
@@ -52,6 +59,26 @@ function _normalizeStatus(row) {
     return "resolved";
   }
   return "active";
+}
+
+function _normalizeTsValue(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function _normalizeLifecycleList(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      ...item,
+      ts_ms: _normalizeTsValue(item.ts_ms ?? item.ts ?? item.time),
+      state: String(item.state || item.lifecycle_state || "triggered").trim().toLowerCase(),
+      actor: _pickAlertValue(item, ["actor", "owner", "who"]) || "",
+      reason: _pickAlertValue(item, ["reason", "message", "detail"]) || "",
+      source: _pickAlertValue(item, ["source", "surface"]) || "",
+    }))
+    .sort((a, b) => Number(a.ts_ms || 0) - Number(b.ts_ms || 0));
 }
 
 function _normalizeId(row, severity, symbol, ts, message) {
@@ -65,7 +92,7 @@ export function normalizeAlert(row) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
 
   const symbol = String(_pickAlertValue(row, ["symbol", "ticker"]) || "").trim().toUpperCase();
-  const severity = _normalizeSeverity(_pickAlertValue(row, ["severity", "level"]));
+  const severity = normalizeSeverity(_pickAlertValue(row, ["severity", "level"]));
   const ts = _pickAlertTs(row);
   const message = String(
     _pickAlertValue(row, ["message", "event_title", "title", "description", "reason"]) || "Alert"
@@ -73,6 +100,13 @@ export function normalizeAlert(row) {
   const status = _normalizeStatus(row);
   const id = _normalizeId(row, severity, symbol, ts, message);
   const resolved = status === "resolved";
+  const ackExpiresTsMs = _normalizeTsValue(_pickAlertValue(row, ["ack_expires_ts_ms", "ack_expiry_ts_ms"]));
+  const shelveExpiresTsMs = _normalizeTsValue(_pickAlertValue(row, ["shelve_expires_ts_ms", "shelf_expires_ts_ms", "snooze_until_ts_ms"]));
+  const lifecycle = _normalizeLifecycleList(row.lifecycle);
+  const lifecycleState = String(
+    _pickAlertValue(row, ["lifecycle_state", "escalation_state"])
+    || (resolved ? "resolved" : (lifecycle.length ? lifecycle[lifecycle.length - 1].state : "triggered"))
+  ).trim().toLowerCase() || "triggered";
 
   return {
     ...row,
@@ -92,7 +126,27 @@ export function normalizeAlert(row) {
     prediction_strength: _pickAlertValue(row, ["prediction_strength"]),
     expected_z: _pickAlertValue(row, ["expected_z", "z_score", "z"]),
     acked: !!(row && row.acked),
+    ack_expired: !!(row && row.ack_expired),
+    retriggered: !!(row && row.retriggered),
+    acked_ts_ms: _normalizeTsValue(_pickAlertValue(row, ["acked_ts_ms", "ack_ts_ms", "acked_at"])),
+    ack_expires_ts_ms: ackExpiresTsMs,
+    ack_reason: _pickAlertValue(row, ["ack_reason"]),
     acked_by: _pickAlertValue(row, ["acked_by"]),
+    shelved: !!(row && row.shelved),
+    shelve_expired: !!(row && row.shelve_expired),
+    shelved_ts_ms: _normalizeTsValue(_pickAlertValue(row, ["shelved_ts_ms", "shelve_ts_ms", "shelved_at"])),
+    shelve_expires_ts_ms: shelveExpiresTsMs,
+    shelved_by: _pickAlertValue(row, ["shelved_by"]),
+    shelve_reason: _pickAlertValue(row, ["shelve_reason", "snooze_reason"]),
+    lifecycle,
+    lifecycle_state: lifecycleState,
+    escalation_state: _pickAlertValue(row, ["escalation_state"]) || lifecycleState,
+    next_escalation_ts_ms: _normalizeTsValue(_pickAlertValue(row, ["next_escalation_ts_ms"])),
+    notification_policy: row.notification_policy && typeof row.notification_policy === "object"
+      ? { ...row.notification_policy }
+      : null,
+    resolved_ts_ms: _normalizeTsValue(_pickAlertValue(row, ["resolved_ts_ms", "resolved_at"])),
+    resolved_by: _pickAlertValue(row, ["resolved_by"]),
     resolved_reason: _pickAlertValue(row, ["resolved_reason"]),
   };
 }
@@ -144,12 +198,14 @@ export function applyAlertLocalState(rows, localState = {}) {
 // Severity helpers
 // -----------------------------
 export function severityRank(s) {
-  const sev = _normalizeSeverity(s);
-  if (sev === "CRIT") return 4;
-  if (sev === "HIGH") return 3;
-  if (sev === "WARN") return 2;
-  if (sev === "INFO") return 1;
-  return 0;
+  const sev = normalizeSeverity(s);
+  const index = ALERT_SEVERITY_ORDER.indexOf(sev);
+  return index >= 0 ? index + 1 : 0;
+}
+
+export function severityAtLeast(value, minimum) {
+  const minRank = severityRank(minimum);
+  return minRank > 0 && severityRank(value) >= minRank;
 }
 
 export function cellColor(r) {
@@ -208,6 +264,7 @@ export function filterAlerts(rows, filters, localState) {
     if (filters.changedOnly) {
       if (r.status === "resolved") continue;
       if (r.acked || localState.isAcked(r.id)) continue;
+      if (r.shelved) continue;
       if (localState.isSnoozed(r.id)) continue;
     } else {
       if (localState.isSnoozed(r.id)) continue;

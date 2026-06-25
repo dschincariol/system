@@ -38,19 +38,38 @@ class FxSessionTests(unittest.TestCase):
         self.assertEqual(rollover_state["session"], "rollover")
         self.assertTrue(bool(rollover_state["in_rollover_window"]))
 
-    def test_dst_boundaries_use_new_york_clock_not_fixed_utc(self) -> None:
-        # 2026-03-13 is in US daylight time: Friday 17:00 ET == 21:00 UTC.
-        self.assertTrue(bool(self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 3, 13, 20, 59))["is_open"]))
-        self.assertEqual(
-            self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 3, 13, 21))["session"],
-            "weekend_closed",
-        )
-        # 2026-01-02 is standard time: Friday 17:00 ET == 22:00 UTC.
+    def test_boundaries_use_new_york_clock_in_standard_and_daylight_time(self) -> None:
+        # January standard time: 17:00 ET == 22:00 UTC.
         self.assertEqual(self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 1, 2, 21, 59))["session"], "open")
         self.assertEqual(
             self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 1, 2, 22))["session"],
             "weekend_closed",
         )
+        self.assertEqual(
+            self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 1, 4, 21, 59))["session"],
+            "weekend_closed",
+        )
+        self.assertTrue(bool(self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 1, 4, 22))["is_open"]))
+
+        # June daylight time: 17:00 ET == 21:00 UTC.
+        self.assertEqual(self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 6, 26, 20, 59))["session"], "open")
+        self.assertEqual(
+            self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 6, 26, 21))["session"],
+            "weekend_closed",
+        )
+        self.assertEqual(
+            self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 6, 28, 20, 59))["session"],
+            "weekend_closed",
+        )
+        self.assertTrue(bool(self.fx_session.fx_session_state("EURUSD", _utc_ms(2026, 6, 28, 21))["is_open"]))
+
+    def test_no_fixed_utc_fallback_clock_remains(self) -> None:
+        source = Path(self.fx_session.__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn("FX_WEEK_OPEN_HOUR_UTC", source)
+        self.assertNotIn("FX_WEEK_CLOSE_HOUR_UTC", source)
+        self.assertNotIn("_fallback_closed_utc", source)
+        self.assertNotIn("_fallback_next_open_utc", source)
 
     def test_env_rollover_override_and_purity(self) -> None:
         with patch.dict(

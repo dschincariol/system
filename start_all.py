@@ -19,10 +19,58 @@ from pathlib import Path
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.log_retention import rotate_log_if_needed
 from engine.runtime.logging import get_logger
-from engine.runtime.platform import default_local_db_dir, default_local_log_dir, default_local_tmp_dir
+from engine.runtime.platform import (
+    default_local_db_dir,
+    default_local_db_path,
+    default_local_log_dir,
+    default_local_tmp_dir,
+    resolve_runtime_paths,
+)
+from engine.startup.env import strict_runtime_requires_explicit_db_path
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _launcher_env_file_path() -> Path:
+    raw = str(os.environ.get("TRADING_ENV_FILE") or ".env").strip() or ".env"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def _bootstrap_launcher_env() -> None:
+    env_path = _launcher_env_file_path()
+    if env_path.exists():
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(env_path, override=False)
+        except Exception as e:
+            print(f"[startup] dotenv_load_failed: {type(e).__name__}: {e}", flush=True)
+
+    if str(os.environ.get("TRADING_ENV_FILE") or "").strip() and not str(os.environ.get("OPERATOR_ENV_PATH") or "").strip():
+        try:
+            operator_env_path = default_local_tmp_dir() / "start_all.env"
+            operator_env_path.parent.mkdir(parents=True, exist_ok=True)
+            operator_env_path.write_text(env_path.read_text(encoding="utf-8"), encoding="utf-8")
+            os.environ["OPERATOR_ENV_PATH"] = str(operator_env_path)
+        except Exception as e:
+            print(f"[startup] operator_env_copy_failed: {type(e).__name__}: {e}", flush=True)
+
+    os.environ.setdefault("TRADING_LOGS", str(default_local_log_dir().resolve()))
+    os.environ.setdefault("TRADING_DATA", str(default_local_db_dir().resolve()))
+    if not strict_runtime_requires_explicit_db_path(os.environ):
+        os.environ.setdefault("DB_PATH", str(default_local_db_path().resolve()))
+    try:
+        resolve_runtime_paths(os.environ, project_root=ROOT)
+    except Exception as e:
+        print(f"[startup] runtime_path_resolve_failed: {type(e).__name__}: {e}", flush=True)
+
+
+_bootstrap_launcher_env()
+
 OPERATOR_URL = os.environ.get("OPERATOR_URL", "http://127.0.0.1:4001/")
 NODE_ENTRY = ROOT / "boot" / "operator_server.js"
 EXPRESS_PKG = ROOT / "node_modules" / "express" / "package.json"

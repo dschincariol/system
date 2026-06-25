@@ -324,6 +324,9 @@ function _renderChart(root, vm, renderLineChart) {
       return point && point.time ? _fmtTime(point.time) : String(point && point.label || index + 1);
     },
     topLabel: `${vm.chart.label} expected to live`,
+    seriesLabel: vm.chart.label,
+    xAxisLabel: "source/time",
+    yAxisLabel: vm.chart.unit === "pct" ? "percent" : vm.chart.unit === "bps" ? "basis points" : "value",
     a11yTitle: "Model performance divergence",
     a11ySeries: vm.chart.points,
     a11yLabelKey: "label",

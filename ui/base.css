@@ -536,6 +536,31 @@ canvas[id$="Canvas"] {
   outline: 1px solid transparent;
 }
 
+.chartDataWindow {
+  margin-top: var(--space-xs, 6px);
+  padding: 6px 8px;
+  border: 1px solid rgba(157,167,177,0.34);
+  border-left: 4px solid #56B4E9;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.035);
+  color: var(--text, #e8f0fa);
+  min-height: 1.55rem;
+}
+
+.chartDataWindow::before {
+  content: "Point";
+  display: inline-block;
+  margin-right: 0.45rem;
+  padding: 1px 5px;
+  border: 1px solid rgba(157,167,177,0.42);
+  border-radius: 999px;
+  color: #9da7b1;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
 .riskCharts {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -875,7 +900,8 @@ body.theme-tech tr.symbolContextMatch td {
   .hmCell,
   .dataRow,
   .safetyStatus,
-  .termBanner {
+  .termBanner,
+  .chartDataWindow {
     border-width: 2px !important;
   }
 
@@ -899,6 +925,7 @@ body.theme-tech tr.symbolContextMatch td {
   .dataRow,
   .safetyStatus,
   .termBanner,
+  .chartDataWindow,
   .chartCanvas,
   .proChart {
     forced-color-adjust: auto;

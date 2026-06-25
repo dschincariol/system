@@ -24,7 +24,7 @@ class FxPredictorRegimeRoutingTests(unittest.TestCase):
         self.assertEqual(self.predictor._regime_anchor_symbol("EURUSD"), "EURUSD")
         self.assertEqual(self.predictor._regime_anchor_symbol("eur/usd"), "EURUSD")
         self.assertEqual(self.predictor._regime_anchor_symbol("SPY"), "SPY")
-        self.assertEqual(self.predictor._regime_anchor_symbol("BTC"), "SPY")
+        self.assertEqual(self.predictor._regime_anchor_symbol("AAPL"), "SPY")
 
     def test_prediction_regime_context_uses_fx_symbol_not_spy(self) -> None:
         seen: list[str] = []

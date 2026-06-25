@@ -117,7 +117,7 @@ def test_check_coverage_fails_below_configured_threshold(
     coverage_json.write_text(json.dumps(_coverage_payload()), encoding="utf-8")
 
     config = coverage_gate.load_config(pyproject)
-    exit_code = coverage_gate.check_coverage(coverage_json, config)
+    exit_code = coverage_gate.check_coverage(coverage_json, config, require_run_metadata=False)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -139,7 +139,7 @@ def test_check_coverage_passes_at_or_above_threshold(
     coverage_json.write_text(json.dumps(_coverage_payload()), encoding="utf-8")
 
     config = coverage_gate.load_config(pyproject)
-    exit_code = coverage_gate.check_coverage(coverage_json, config)
+    exit_code = coverage_gate.check_coverage(coverage_json, config, require_run_metadata=False)
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -160,7 +160,7 @@ def test_check_coverage_enforces_nested_package_floor(
     coverage_json.write_text(json.dumps(_coverage_payload()), encoding="utf-8")
 
     config = coverage_gate.load_config(pyproject)
-    exit_code = coverage_gate.check_coverage(coverage_json, config)
+    exit_code = coverage_gate.check_coverage(coverage_json, config, require_run_metadata=False)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -193,7 +193,7 @@ def test_zero_covered_module_ratchet_fails_for_new_critical_module(
     coverage_json.write_text(json.dumps(payload), encoding="utf-8")
 
     config = coverage_gate.load_config(pyproject)
-    exit_code = coverage_gate.check_coverage(coverage_json, config)
+    exit_code = coverage_gate.check_coverage(coverage_json, config, require_run_metadata=False)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -225,11 +225,129 @@ def test_zero_covered_module_allowlist_preserves_existing_burndown(
     coverage_json.write_text(json.dumps(payload), encoding="utf-8")
 
     config = coverage_gate.load_config(pyproject)
-    exit_code = coverage_gate.check_coverage(coverage_json, config)
+    exit_code = coverage_gate.check_coverage(coverage_json, config, require_run_metadata=False)
 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "Zero-covered module burndown: remaining=1 allowlisted=1 new=0" in captured.out
+
+
+def test_check_coverage_rejects_unstamped_report_by_default(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config = coverage_gate.CoverageGateConfig(
+        minimum_percent=0.0,
+        package_roots=("engine", "services", "routes", "ops"),
+        package_minimums={},
+        zero_covered_module_roots=(),
+        zero_covered_module_allowlist=frozenset(),
+        report_dir=tmp_path,
+    )
+    coverage_json = tmp_path / "coverage.json"
+    coverage_json.write_text(json.dumps(_coverage_payload()), encoding="utf-8")
+
+    exit_code = coverage_gate.check_coverage(coverage_json, config)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "stale or partial coverage report" in captured.err
+    assert "not stamped by tools/coverage_gate.py run" in captured.err
+
+
+def test_check_coverage_accepts_stamped_full_gate_report(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config = coverage_gate.CoverageGateConfig(
+        minimum_percent=0.0,
+        package_roots=("engine", "services", "routes", "ops"),
+        package_minimums={},
+        zero_covered_module_roots=(),
+        zero_covered_module_allowlist=frozenset(),
+        report_dir=tmp_path,
+    )
+    coverage_json = tmp_path / "coverage.json"
+    coverage_xml = tmp_path / "coverage.xml"
+    coverage_json.write_text(json.dumps(_coverage_payload()), encoding="utf-8")
+    coverage_xml.write_text("<coverage />\n", encoding="utf-8")
+    coverage_gate.write_run_metadata(
+        coverage_json=coverage_json,
+        coverage_xml=coverage_xml,
+        config=config,
+        pytest_args=["tests/"],
+        pytest_exit_code=0,
+    )
+
+    exit_code = coverage_gate.check_coverage(coverage_json, config)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Coverage gate PASSED" in captured.out
+
+
+def test_check_coverage_rejects_focused_run_metadata(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config = coverage_gate.CoverageGateConfig(
+        minimum_percent=0.0,
+        package_roots=("engine", "services", "routes", "ops"),
+        package_minimums={},
+        zero_covered_module_roots=(),
+        zero_covered_module_allowlist=frozenset(),
+        report_dir=tmp_path,
+    )
+    coverage_json = tmp_path / "coverage.json"
+    coverage_xml = tmp_path / "coverage.xml"
+    coverage_json.write_text(json.dumps(_coverage_payload()), encoding="utf-8")
+    coverage_xml.write_text("<coverage />\n", encoding="utf-8")
+    coverage_gate.write_run_metadata(
+        coverage_json=coverage_json,
+        coverage_xml=coverage_xml,
+        config=config,
+        pytest_args=["tests/test_coverage_gate.py", "-q"],
+        pytest_exit_code=0,
+    )
+
+    exit_code = coverage_gate.check_coverage(coverage_json, config)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "focused/partial pytest run" in captured.err
+
+
+def test_run_coverage_rejects_existing_report_when_pytest_does_not_refresh(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    config = coverage_gate.CoverageGateConfig(
+        minimum_percent=0.0,
+        package_roots=("engine",),
+        package_minimums={},
+        zero_covered_module_roots=(),
+        zero_covered_module_allowlist=frozenset(),
+        report_dir=tmp_path,
+    )
+    stale_json = tmp_path / "coverage.json"
+    stale_json.write_text(json.dumps(_coverage_payload()), encoding="utf-8")
+
+    class Result:
+        returncode = 0
+
+    def fake_run(*args, **kwargs):
+        assert "COVERAGE_PROCESS_START" in dict(kwargs.get("env") or {})
+        return Result()
+
+    monkeypatch.setattr(coverage_gate.subprocess, "run", fake_run)
+
+    exit_code = coverage_gate.run_coverage(config, [])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert not stale_json.exists()
+    assert "was not generated by this run" in captured.err
 
 
 def test_build_pytest_command_enables_branch_coverage_and_reports(

@@ -79,10 +79,11 @@ function _renderSummary(el, rows, rawPayload, state, reason) {
   `;
 }
 
-export async function loadWeatherWidgets({ symbol = "SPY" } = {}) {
+export async function loadWeatherWidgets({ symbol = "SPY", fetchJSON = null } = {}) {
   const root = document.getElementById("weather-widgets");
   if (!root) return;
   const activeSymbol = String(symbol || "").trim().toUpperCase() || "SPY";
+  const sharedFetchJSON = typeof fetchJSON === "function" ? fetchJSON : null;
 
   const reqId = ++_weatherReqSeq;
   const weatherState = {
@@ -135,6 +136,9 @@ export async function loadWeatherWidgets({ symbol = "SPY" } = {}) {
   }
 
   async function jget(url) {
+    if (sharedFetchJSON) {
+      return sharedFetchJSON(url);
+    }
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(new Error(`fetch_timeout:${url}`)), WEATHER_FETCH_TIMEOUT_MS);
     try {

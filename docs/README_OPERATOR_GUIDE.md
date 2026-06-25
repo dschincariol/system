@@ -35,6 +35,24 @@ In short, the operator is supervising an automated workflow, not manually tradin
 | `ui/data_sources.html` | Single-page Data Sources Control Center for provider setup, credential resets, tests, and enable/disable actions |
 | `services/operator_ai/agent.js` | Bounded AI analysis layer for operator diagnostics and guarded repair flows |
 
+The documented one-command launcher path is `./start_all.sh` to
+`start_all.py` to `boot/operator_server.js`. When the operator starts the
+engine, it passes runtime DSN/config values such as `TS_PG_DSN`, `TS_PG_PORT`,
+`DB_PATH`, `TRADING_DATA`, and `TRADING_LOGS`, plus secret-file pointers such as
+`TS_PG_PASSWORD_FILE`, `TIMESCALE_PASSWORD_FILE`,
+`DATA_SOURCE_MASTER_KEY_FILE`, `REDIS_PASSWORD_FILE`, and
+`OBJECT_STORE_*_FILE` to every engine bootstrap subprocess and the final
+`start_system.py` child. Inline password/master-key variables such as
+`TS_PG_PASSWORD` and `TIMESCALE_PASSWORD` are stripped from those child
+environments; use `*_FILE` or provider-backed secret references instead.
+The operator-side `.env` loader follows `python-dotenv` quote and inline-comment
+semantics before spawning the engine: one matching pair of surrounding single or
+double quotes is stripped, quoted `#` and `=` characters remain data, and
+unquoted comments begin only at whitespace followed by `#`. Keep DSN-style
+values unquoted in checked-in examples and local `.env` files unless quoting is
+required to preserve leading/trailing whitespace, newlines, or literal
+whitespace-`#` content.
+
 ### Local Safe/Sim Boot Smoke
 
 Use the safe/sim smoke before any execution testing on a clean local checkout:
@@ -69,6 +87,81 @@ To generate the sanitized env without starting processes:
 python tools/safe_sim_boot_smoke.py --prepare-only
 TRADING_ENV_FILE=var/tmp/safe_sim_boot/.env.safe-sim ./start_local.sh
 ```
+
+### Local Paper/Sim Fill Profile
+
+Use `.env.codex-sim-paper-fills.bak` only when you need to exercise the
+end-to-end simulated-fill path:
+
+```bash
+set -a
+. ./.env.codex-sim-paper-fills.bak
+set +a
+python - <<'PY'
+from engine.runtime.storage import init_db
+from engine.cache.wrappers.execution_mode import set_execution_mode
+
+init_db()
+set_execution_mode("paper", actor="operator", reason="paper_sim_fill_profile")
+PY
+python -c "from engine.execution.broker_router import effective_broker_chain; assert effective_broker_chain() == ['sim']"
+TRADING_ENV_FILE=.env.codex-sim-paper-fills.bak ./start_local.sh
+```
+
+This profile is simulation-only. It sets `ENGINE_MODE=paper`,
+`EXECUTION_MODE=paper`, `BROKER=sim`, `BROKER_NAME=sim`, and
+`BROKER_FAILOVER=sim`. It also keeps `DISABLE_LIVE_EXECUTION=1`, so live
+capital cannot be armed or routed. `KILL_SWITCH_GLOBAL=0` lets the simulator run;
+setting it to `1` freezes every order path, including paper simulation.
+
+To drive one simulated fill through the dashboard/API:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/terminal/order \
+  -H "Content-Type: application/json" \
+  -H "X-API-Token: $(cat data/secrets/dashboard_api_token)" \
+  -d '{"symbol":"AAPL","side":"BUY","qty":1}'
+python engine/execution/jobs/broker_apply_orders.py
+python engine/execution/jobs/execution_poll_and_attrib.py
+```
+
+Terminal order intents are recorded as explicit quantity orders with portfolio
+sides (`FLAT` to `LONG`/`SHORT`) and a `source_alert_id` lineage value; when the
+caller does not provide one, the terminal route uses the intent timestamp so
+execution fills can be attributed.
+
+Then confirm `/api/execution/barrier` reports `mode=paper`,
+`allow_simulation=true`, and `real_trading_allowed=false`, and inspect the
+dashboard execution/attribution panels for the simulated fill. The broker router
+enforces the same contract in production code: when mode is paper, any live
+broker in `BROKER`, `BROKER_NAME`, `LIVE_BROKER`, `INTENDED_LIVE_BROKER`, or
+`BROKER_FAILOVER` fails before a live adapter can be resolved.
+
+`tests/test_paper_mode_sim_fill_boot.py` is the boot-level regression for this
+profile. It launches `start_system.py paper`, posts a terminal order through the
+dashboard API, runs `broker_apply_orders` and `execution_poll_and_attrib`, and
+asserts the simulated fill plus attribution rows persist while the barrier stays
+paper-only (`allow_simulation=true`, `real_trading_allowed=false`) and shutdown
+finishes within the bounded startup/shutdown path.
+
+### Live Options With Tradier
+
+Live option order routing is opt-in and remains shadow-only by default. The only
+registered live options order broker is `tradier_options`; equity Alpaca and
+IBKR routes still reject option contracts. A live options run must set
+`BROKER=tradier_options`, `BROKER_NAME=tradier_options`,
+`LIVE_BROKER=tradier_options`, and `BROKER_FAILOVER=tradier_options`, with
+`ENGINE_MODE=live`, `EXECUTION_MODE=live`, and `OPTIONS_INSTRUMENTS_MODE=live`.
+
+Every options readiness env gate must be enabled, every numeric options control
+must be configured in range, and the runtime checks behind those gates must pass:
+options data quality, bid/ask quality, portfolio greeks and margin/position
+limits, lifecycle readiness, broker adapter importability, and kill-switch
+`execution_allowed`. Tradier submission also requires `TRADIER_API_TOKEN` and
+`TRADIER_ACCOUNT_ID`. Missing env gates produce the existing `*_missing`
+readiness blockers; enabled gates whose runtime check fails produce
+`*_check_failed` blockers. Do not treat a configured Tradier token as live
+permission by itself.
 
 ## 3. What The Dashboard Is Meant To Show
 
@@ -356,6 +449,21 @@ It is additive to the global kill switch and blocks only the affected model's or
 - `model_intent.should_trade` or timing suppressed entry
 
 Even when the model does want to trade, the runtime can still block or compress the action through risk, execution, or kill-switch controls.
+
+### Kill-switch effective state precedence
+
+The operator API reports both persisted rows and the effective kill-switch state.
+The effective state is fail-safe: it is armed when any environment kill-switch
+flag is armed, or when any persisted kill-switch row is armed. In formula form:
+`effective.armed = env_armed OR persisted_armed`.
+
+This means a persisted row can show `enabled=0` while the system is still armed
+because `KILL_SWITCH_GLOBAL=1`, `TRADING_KILL_SWITCH=1`, `KILL_SWITCH=1`, or a
+scoped env list such as `KILL_SWITCH_SYMBOLS` is set. In that case
+`/api/system/kill_switches` and the dashboard show `ARMED VIA ENV` and
+`PERSISTED DISARMED` instead of collapsing both sources into one ambiguous flag.
+Clearing an environment hold does not auto-clear a persisted armed row, and
+clearing a persisted row does not override an armed environment hold.
 
 ### Automatic vs manual halt ownership
 

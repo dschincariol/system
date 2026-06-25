@@ -77,36 +77,12 @@
     ]
   },
   "summary": {
-    "error_count": 44,
+    "error_count": 29,
     "warning_count": 0,
     "information_count": 0,
-    "diagnostic_count": 44
+    "diagnostic_count": 29
   },
   "diagnostics": [
-    {
-      "file": "engine/execution/broker_apply_orders.py",
-      "severity": "error",
-      "rule": "reportGeneralTypeIssues",
-      "line": 1190,
-      "character": 5,
-      "message": "Code is too complex to analyze; reduce complexity by refactoring into subroutines or reducing conditional code paths"
-    },
-    {
-      "file": "engine/execution/broker_router.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 475,
-      "character": 28,
-      "message": "Argument of type \"Dict[str, Any]\" cannot be assigned to parameter \"execution_degraded\" of type \"bool\" in function \"execution_gate_snapshot\"\n  \"Dict[str, Any]\" is not assignable to \"bool\""
-    },
-    {
-      "file": "engine/execution/broker_router.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 509,
-      "character": 28,
-      "message": "Argument of type \"Dict[str, Any]\" cannot be assigned to parameter \"execution_degraded\" of type \"bool\" in function \"execution_gate_snapshot\"\n  \"Dict[str, Any]\" is not assignable to \"bool\""
-    },
     {
       "file": "engine/execution/execution_ledger.py",
       "severity": "error",
@@ -284,70 +260,6 @@
       "message": "Type \"list[dict[str, str | float | int]]\" is not assignable to return type \"List[Dict[str, float]]\"\n  \"str\" is not assignable to \"float\""
     },
     {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 466,
-      "character": 30,
-      "message": "Argument of type \"object | dict[list[bytes], _VT@dict]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[list[bytes]]\" in function \"__init__\"\n  Type \"object | dict[list[bytes], _VT@dict]\" is not assignable to type \"Iterable[list[bytes]]\"\n    \"object\" is incompatible with protocol \"Iterable[list[bytes]]\"\n      \"__iter__\" is not present"
-    },
-    {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 469,
-      "character": 37,
-      "message": "Argument of type \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_ID']\" cannot be assigned to parameter \"key\" of type \"bytes\" in function \"get\"\n  \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_ID']\" is not assignable to \"bytes\""
-    },
-    {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 470,
-      "character": 40,
-      "message": "Argument of type \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER']\" cannot be assigned to parameter \"key\" of type \"bytes\" in function \"get\"\n  \"Literal['LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER']\" is not assignable to \"bytes\""
-    },
-    {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 471,
-      "character": 40,
-      "message": "Argument of type \"object | list[_T@list]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[_T@list]\" in function \"__init__\"\n  Type \"object | list[_T@list]\" is not assignable to type \"Iterable[_T@list]\"\n    \"object\" is incompatible with protocol \"Iterable[_T@list]\"\n      \"__iter__\" is not present"
-    },
-    {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 476,
-      "character": 44,
-      "message": "Argument of type \"object | list[_T@list]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[_T@list]\" in function \"__init__\"\n  Type \"object | list[_T@list]\" is not assignable to type \"Iterable[_T@list]\"\n    \"object\" is incompatible with protocol \"Iterable[_T@list]\"\n      \"__iter__\" is not present"
-    },
-    {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 477,
-      "character": 47,
-      "message": "Argument of type \"object | list[_T@list]\" cannot be assigned to parameter \"iterable\" of type \"Iterable[_T@list]\" in function \"__init__\"\n  Type \"object | list[_T@list]\" is not assignable to type \"Iterable[_T@list]\"\n    \"object\" is incompatible with protocol \"Iterable[_T@list]\"\n      \"__iter__\" is not present"
-    },
-    {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 488,
-      "character": 25,
-      "message": "Argument of type \"object | None\" cannot be assigned to parameter \"engine_mode\" of type \"str | None\" in function \"live_trading_preflight\"\n  Type \"object | None\" is not assignable to type \"str | None\"\n    Type \"object\" is not assignable to type \"str | None\"\n      \"object\" is not assignable to \"str\"\n      \"object\" is not assignable to \"None\""
-    },
-    {
-      "file": "engine/runtime/prod_preflight.py",
-      "severity": "error",
-      "rule": "reportCallIssue",
-      "line": 466,
-      "character": 25,
-      "message": "No overloads for \"__init__\" match the provided arguments"
-    },
-    {
       "file": "engine/strategy/champion_manager.py",
       "severity": "error",
       "rule": "reportGeneralTypeIssues",
@@ -402,38 +314,6 @@
       "line": 6053,
       "character": 42,
       "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
-    },
-    {
-      "file": "engine/strategy/predictor.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 3514,
-      "character": 54,
-      "message": "Argument of type \"ndarray[Unknown, Unknown]\" cannot be assigned to parameter \"scores\" of type \"Sequence[Any]\" in function \"ranker_scores_to_signals\"\n  \"ndarray[Unknown, Unknown]\" is not assignable to \"Sequence[Any]\""
-    },
-    {
-      "file": "engine/strategy/predictor.py",
-      "severity": "error",
-      "rule": "reportOperatorIssue",
-      "line": 2227,
-      "character": 12,
-      "message": "Operator \"not in\" not supported for types \"tuple[int, str, int]\" and \"Unknown | dict[Unknown, Unknown] | None\"\n  Operator \"not in\" not supported for types \"tuple[int, str, int]\" and \"None\""
-    },
-    {
-      "file": "engine/strategy/predictor.py",
-      "severity": "error",
-      "rule": "reportOptionalSubscript",
-      "line": 2238,
-      "character": 13,
-      "message": "Object of type \"None\" is not subscriptable"
-    },
-    {
-      "file": "engine/strategy/predictor.py",
-      "severity": "error",
-      "rule": "reportReturnType",
-      "line": 892,
-      "character": 16,
-      "message": "Type \"object\" is not assignable to return type \"Dict[str, Any] | None\"\n  Type \"object\" is not assignable to type \"Dict[str, Any] | None\"\n    \"object\" is not assignable to \"Dict[str, Any]\"\n    \"object\" is not assignable to \"None\""
     }
   ]
 }

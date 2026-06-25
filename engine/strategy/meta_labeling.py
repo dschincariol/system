@@ -22,6 +22,7 @@ import numpy as np
 from engine.artifacts.serialization import dumps_pickle_artifact, loads_pickle_artifact
 from engine.artifacts.store import LocalArtifactStore
 from engine.model_registry import get_stage_latest, register_model, register_model_family
+from engine.data.futures_roll import load_futures_roll_boundaries
 from engine.runtime.storage import connect, init_db
 from engine.runtime.workload_profiles import model_family_n_jobs
 from engine.strategy.model_lifecycle import register_model_version
@@ -799,12 +800,31 @@ def _cpcv_calibration(
 
         starts = np.asarray([int(row.get("ts_ms") or 0) for row in rows], dtype=np.float64)
         ends = np.asarray([int(row.get("vertical_ts_ms") or row.get("ts_ms") or 0) for row in rows], dtype=np.float64)
+        roll_times: list[int] = []
+        con = None
+        try:
+            con = connect()
+            roll_times = load_futures_roll_boundaries(
+                con,
+                symbols=[str(row.get("symbol") or "").upper().strip() for row in rows],
+                start_ts_ms=float(np.min(starts)) if starts.size else None,
+                end_ts_ms=float(np.max(ends)) if ends.size else None,
+            )
+        except Exception:
+            roll_times = []
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    LOG.debug("ignored recoverable close failure while loading futures roll boundaries", exc_info=True)
         splitter = CombinatorialPurgedKFold(
             n_splits=int(n_splits),
             n_test_splits=int(n_test_splits),
             embargo=float(max(0.0, embargo_pct)),
             label_start_times=starts,
             label_end_times=ends,
+            roll_times=roll_times,
         )
         prob_sum = np.zeros(total, dtype=np.float64)
         prob_count = np.zeros(total, dtype=np.float64)

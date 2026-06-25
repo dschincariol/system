@@ -108,6 +108,16 @@ function healthyResults() {
         visible_jobs_running: 2,
       },
     }),
+    feedStatus: fulfilled({
+      ok: true,
+      price_freshness: {
+        ok: true,
+        status: "fresh",
+        source: "prices",
+        age_s: 12,
+        last_ts_ms: FRESH_TS,
+      },
+    }),
     telemetry: fulfilled({
       system_state: "LIVE",
       ts_ms: FRESH_TS,
@@ -161,13 +171,15 @@ test("data health fetch boundary owns the screen endpoints", async () => {
 
   assert.deepEqual(calls.map((call) => call[0]), [
     "/api/ingestion/status",
+    "/api/feeds",
     "/api/telemetry",
     "/api/execution/barrier",
     "/api/operator/provider_telemetry",
     "/api/data/feature_visibility?limit=12",
   ]);
-  assert.deepEqual(calls[2][1], { allowBusinessFalse: true });
-  assert.deepEqual(calls[4][1], { allowBusinessFalse: true });
+  assert.deepEqual(calls[3][1], { allowBusinessFalse: true });
+  assert.deepEqual(calls[5][1], { allowBusinessFalse: true });
+  assert.equal(result.feedStatus.status, "fulfilled");
   assert.equal(result.provider.status, "fulfilled");
 });
 

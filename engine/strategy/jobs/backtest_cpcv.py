@@ -29,6 +29,7 @@ from engine.runtime.storage import (
     release_job_lock,
     touch_job_lock,
 )
+from engine.data.futures_roll import load_futures_roll_boundaries
 from engine.strategy.cpcv import _apply_transaction_costs_to_returns, cpcv_cost_config_from_env
 
 JOB_NAME = "backtest_cpcv"
@@ -355,12 +356,30 @@ def run_cpcv_backtest(cfg: Dict[str, Any], *, con=None, persist: bool = True) ->
                 "dataset_source": str(dataset.get("source") or ""),
             }
 
-        label_end = np.arange(y.size, dtype=float) + float(max(0, int(cfg.get("holding_horizon_bars") or 1)))
+        label_start = np.asarray([int(row.get("ts_ms") or 0) for row in rows], dtype=float)
+        label_end = np.asarray(
+            [
+                int(row.get("ts_ms") or 0) + (int(row.get("horizon_s") or 0) * 1000)
+                for row in rows
+            ],
+            dtype=float,
+        )
+        fallback_end = label_start + float(max(0, int(cfg.get("holding_horizon_bars") or 1)))
+        label_end = np.maximum(label_end, fallback_end)
+        symbols = [str(row.get("symbol") or "").upper().strip() for row in rows]
+        roll_times = load_futures_roll_boundaries(
+            con,
+            symbols=symbols,
+            start_ts_ms=float(np.min(label_start)) if label_start.size else None,
+            end_ts_ms=float(np.max(label_end)) if label_end.size else None,
+        )
         splitter = CombinatorialPurgedKFold(
             n_splits=int(cfg.get("n_splits") or 6),
             n_test_splits=int(cfg.get("n_test_splits") or 2),
             embargo=float(cfg.get("embargo_pct") or 0.0),
+            label_start_times=label_start,
             label_end_times=label_end,
+            roll_times=roll_times,
         )
         cost_config = cpcv_cost_config_from_env(cfg)
 
@@ -452,6 +471,8 @@ def run_cpcv_backtest(cfg: Dict[str, Any], *, con=None, persist: bool = True) ->
             ),
             "dataset_source": str(dataset.get("source") or ""),
             "uses_precomputed_predictions": bool(uses_precomputed),
+            "futures_roll_boundary_count": int(len(roll_times)),
+            "futures_roll_boundaries": [int(value) for value in roll_times],
         }
     finally:
         if owns_connection and con is not None:

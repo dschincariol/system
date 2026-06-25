@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from engine.audit.chain import append_chain_row
@@ -25,6 +26,12 @@ KILL_SWITCH_CODEC_VERSION = 1
 KILL_SWITCH_CACHE_TTL_ENV = "KILL_SWITCH_CACHE_TTL_S"
 KILL_SWITCH_TTL_S = 30
 KILL_SWITCH_MAX_TTL_S = 300
+ENV_GLOBAL_KEYS = ("KILL_SWITCH_GLOBAL", "TRADING_KILL_SWITCH", "KILL_SWITCH")
+ENV_SCOPED_KEYS = (
+    ("symbol", "KILL_SWITCH_SYMBOLS"),
+    ("regime", "KILL_SWITCH_REGIMES"),
+    ("model", "KILL_SWITCH_MODELS"),
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -48,6 +55,195 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return int(default)
+
+
+def _env_truthy(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _csv_values(value: Any) -> list[str]:
+    return [
+        str(part or "").strip()
+        for part in str(value or "").split(",")
+        if str(part or "").strip()
+    ]
+
+
+def _env_kill_switch_entries(environ: Mapping[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for key in ENV_GLOBAL_KEYS:
+        raw = str(environ.get(key, "") or "").strip()
+        if _env_truthy(raw):
+            entries.append(
+                {
+                    "source": "env",
+                    "scope": "global",
+                    "key": key,
+                    "env_key": key,
+                    "reason": "env_flag_truthy",
+                }
+            )
+    for scope, env_key in ENV_SCOPED_KEYS:
+        for value in _csv_values(environ.get(env_key, "")):
+            entries.append(
+                {
+                    "source": "env",
+                    "scope": scope,
+                    "key": value,
+                    "env_key": env_key,
+                    "reason": "env_scope_listed",
+                }
+            )
+    return entries
+
+
+def _row_enabled(row: Mapping[str, Any]) -> bool:
+    try:
+        return int(row.get("enabled") or 0) == 1
+    except Exception:
+        return False
+
+
+def _persisted_active_entries(rows: list[Any]) -> list[dict[str, Any]]:
+    active: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or not _row_enabled(row):
+            continue
+        active.append(
+            {
+                "source": "persisted",
+                "scope": str(row.get("scope") or "global"),
+                "key": str(row.get("key") or "global"),
+                "reason": str(row.get("reason") or ""),
+                "actor": str(row.get("actor") or ""),
+            }
+        )
+    return active
+
+
+def _persisted_source_kind(snapshot: Mapping[str, Any], persisted_read_source: str | None) -> str:
+    read_source = str(persisted_read_source or snapshot.get("persisted_read_source") or snapshot.get("read_source") or "").strip().lower()
+    source = str(snapshot.get("source") or "").strip().lower()
+    cache_status = str(snapshot.get("cache_status") or "").strip().lower()
+
+    if read_source in {"redis", "l1"} or "redis" in read_source or "l1" in read_source:
+        return "redis"
+    if read_source in {"db", "direct_db", "db_load", "db_reload", "db_refresh", "db_readonly"} or "db" in read_source:
+        return "db"
+    if "redis" in source:
+        return "redis"
+    if source.endswith(":db") or ":db" in source or "provider_unavailable" in source:
+        return "db"
+    if "loaded" in cache_status and "db" in source:
+        return "db"
+    return "unknown"
+
+
+def _source_summary(sources: list[str]) -> str:
+    if not sources:
+        return "disarmed"
+    return "armed via " + "+".join(sources)
+
+
+def annotate_effective_state(
+    snapshot: dict[str, Any] | None,
+    *,
+    environ: Mapping[str, Any] | None = None,
+    persisted_read_source: str | None = None,
+) -> dict[str, Any]:
+    """Add an operator-facing effective kill-switch state to a snapshot.
+
+    The effective state is reporting-only. It is the fail-safe OR of environment
+    kill-switch flags and any enabled persisted row, and it does not clear or
+    otherwise mutate persisted rows.
+    """
+
+    out = dict(snapshot or {"state": []})
+    state = out.get("state")
+    rows = list(state) if isinstance(state, list) else []
+    out["state"] = rows
+
+    env_entries = _env_kill_switch_entries(environ or os.environ)
+    persisted_entries = _persisted_active_entries(rows)
+    persisted_source = _persisted_source_kind(out, persisted_read_source)
+
+    env_armed = bool(env_entries)
+    persisted_armed = bool(persisted_entries)
+    armed = bool(env_armed or persisted_armed)
+
+    sources: list[str] = []
+    if env_armed:
+        sources.append("env")
+    if persisted_armed:
+        sources.append(persisted_source if persisted_source in {"db", "redis"} else "persisted")
+
+    persisted_summary = (
+        f"persisted armed via {persisted_source}"
+        if persisted_armed and persisted_source != "unknown"
+        else ("persisted armed" if persisted_armed else "persisted disarmed")
+    )
+    summary = f"{_source_summary(sources)}; {persisted_summary}"
+    active = [
+        *env_entries,
+        *[
+            {
+                **entry,
+                "source": persisted_source if persisted_source in {"db", "redis"} else "persisted",
+                "read_source": str(out.get("read_source") or persisted_source or "unknown"),
+            }
+            for entry in persisted_entries
+        ],
+    ]
+
+    source_entries: dict[str, list[dict[str, Any]]] = {"env": env_entries, "db": [], "redis": []}
+    if persisted_source == "db":
+        source_entries["db"] = [
+            {**entry, "source": "db", "read_source": str(out.get("read_source") or "db")}
+            for entry in persisted_entries
+        ]
+    elif persisted_source == "redis":
+        source_entries["redis"] = [
+            {**entry, "source": "redis", "read_source": str(out.get("read_source") or "redis")}
+            for entry in persisted_entries
+        ]
+
+    out["effective"] = {
+        "armed": armed,
+        "state": "armed" if armed else "disarmed",
+        "sources": sources,
+        "summary": summary,
+        "env_armed": env_armed,
+        "persisted_armed": persisted_armed,
+        "persisted_state": "armed" if persisted_armed else "disarmed",
+        "persisted_read_source": persisted_source,
+        "active": active,
+        "provenance": {
+            "env": {
+                "armed": env_armed,
+                "keys": sorted({str(entry.get("env_key") or "") for entry in env_entries if entry.get("env_key")}),
+                "active": env_entries,
+            },
+            "db": {
+                "read": persisted_source == "db",
+                "armed": bool(persisted_armed and persisted_source == "db"),
+                "active": source_entries["db"],
+            },
+            "redis": {
+                "read": persisted_source == "redis",
+                "armed": bool(persisted_armed and persisted_source == "redis"),
+                "active": source_entries["redis"],
+            },
+            "persisted": {
+                "armed": persisted_armed,
+                "source": persisted_source,
+                "active": persisted_entries,
+                "rows": len(rows),
+            },
+        },
+    }
+    return out
 
 
 def _normalize_scope(scope: str) -> str:
@@ -204,6 +400,7 @@ def _finalize_return_snapshot(
     out["cache_fresh"] = bool(age_ms is not None and int(age_ms) <= int(out["max_age_ms"]))
     out["read_source"] = str(read_source)
     out["cache_status"] = str(cache_status)
+    out = annotate_effective_state(out, persisted_read_source=str(read_source))
 
     source = str(out.get("source") or "unknown")
     try:

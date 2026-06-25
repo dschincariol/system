@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from engine.execution.broker_sim import _offline_ac_cost_components
@@ -57,3 +59,16 @@ def test_non_fx_offline_cost_output_shape_is_unchanged() -> None:
     assert result["commission_bps"] == pytest.approx(1.0)
     assert result["half_spread_bps"] == pytest.approx(2.0)
 
+
+def test_fx_weight_to_qty_seam_is_explicitly_unowned() -> None:
+    source = Path("engine/execution/broker_sim.py").read_text(encoding="utf-8")
+    marker = "NO-GO-pending-owner: FX weight-to-lots conversion is deliberately"
+    start = source.index(marker)
+    end = source.index("if abs(delta) < 1e-9:", start)
+    seam = source[start:end]
+
+    assert "target_qty = (to_w * equity) / float(px_mid)" in seam
+    assert "fx_weight_to_notional" not in seam
+    assert "clamp_fx_weight_to_leverage" not in seam
+    assert "base_ccy" not in seam
+    assert "quote_ccy" not in seam

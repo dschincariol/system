@@ -2133,6 +2133,138 @@ class StartupHealthValidationTests(unittest.TestCase):
             )
         )
 
+    def test_start_system_repo_process_scan_requires_current_runtime_owner(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+        current_pid = int(os.getpid())
+        repo_root = str(Path(start_system._BASE_DIR))
+
+        class _Proc:
+            def __init__(self, pid: int, env: dict[str, str]) -> None:
+                self.pid = int(pid)
+                self.info = {
+                    "pid": int(pid),
+                    "cmdline": [
+                        sys.executable,
+                        "-u",
+                        str(Path(repo_root) / "engine" / "data" / "jobs" / "poll_macro.py"),
+                    ],
+                }
+                self._env = dict(env)
+
+            def environ(self):
+                return dict(self._env)
+
+            def ppid(self):
+                return 1
+
+            def parents(self):
+                return []
+
+        procs = [
+            _Proc(111001, {}),
+            _Proc(111002, {"ENGINE_RUNTIME_OWNER_PID": str(current_pid + 9999)}),
+            _Proc(111003, {"ENGINE_RUNTIME_OWNER_PID": str(current_pid)}),
+        ]
+        fake_psutil = types.SimpleNamespace(
+            Process=lambda _pid: types.SimpleNamespace(ppid=lambda: 0),
+            process_iter=lambda attrs=None: list(procs),
+        )
+
+        with patch.object(start_system, "psutil", fake_psutil):
+            discovered = start_system._discover_repo_ingestion_process_pids(known_jobs={"poll_macro"})
+
+        self.assertEqual(discovered, {111003})
+
+    def test_stale_ingestion_cleanup_reaps_recorded_orphan_pid(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+        log_dir = Path(self.tmp.name) / "orphan_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        start_system._LOG_DIR = str(log_dir)
+        start_system._INGESTION_PID_PATH = str(log_dir / "ingestion.pid")
+        orphan_pid = 444321
+        dead_owner_pid = 444111
+        start_system._write_pid_file_record(
+            start_system._INGESTION_PID_PATH,
+            pid=orphan_pid,
+            label="ingestion",
+            entry="start_ingestion.py",
+            owner_pid=dead_owner_pid,
+        )
+        terminated: list[int] = []
+
+        with patch.object(start_system, "_discover_repo_ingestion_process_pids", return_value=set()):
+            with patch.object(start_system, "_pid_exists_quiet", side_effect=lambda pid: int(pid) == orphan_pid):
+                with patch.object(start_system, "_pid_is_running_cross_platform", side_effect=lambda pid: int(pid) == orphan_pid):
+                    with patch.object(
+                        start_system,
+                        "_terminate_pid_tree_cross_platform",
+                        side_effect=lambda pid, timeout_s=15.0: terminated.append(int(pid)) or True,
+                    ):
+                        old_db_path = os.environ.get("DB_PATH")
+                        os.environ["DB_PATH"] = str(Path(self.tmp.name) / "missing-cleanup.db")
+                        try:
+                            start_system._terminate_stale_ingestion_processes(time_budget_s=1.0)
+                        finally:
+                            if old_db_path is None:
+                                os.environ.pop("DB_PATH", None)
+                            else:
+                                os.environ["DB_PATH"] = old_db_path
+
+        self.assertEqual(terminated, [orphan_pid])
+
+    def test_stale_ingestion_cleanup_preserves_fresh_other_owner_liveness(self) -> None:
+        storage, start_system = _reload_modules("engine.runtime.storage", "start_system")
+        storage.init_db()
+        other_owner_pid = 555001
+        other_child_pid = 555002
+        storage.acquire_job_lock("ingestion_runtime", "other-runtime", other_child_pid, ttl_s=60)
+        con = storage.connect()
+        try:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO job_heartbeats(job_name, owner, pid, ts_ms, extra_json)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    "ingestion_runtime",
+                    "other-runtime",
+                    other_child_pid,
+                    int(time.time() * 1000),
+                    json.dumps({"supervisor_owner_pid": other_owner_pid}),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+        terminated: list[int] = []
+
+        with patch.object(start_system, "_discover_repo_ingestion_process_pids", return_value=set()):
+            with patch.object(start_system, "_pid_exists_quiet", side_effect=lambda pid: int(pid) in {other_owner_pid, other_child_pid}):
+                with patch.object(start_system, "_pid_is_running_cross_platform", side_effect=lambda pid: int(pid) == other_child_pid):
+                    with patch.object(
+                        start_system,
+                        "_terminate_pid_tree_cross_platform",
+                        side_effect=lambda pid, timeout_s=15.0: terminated.append(int(pid)) or True,
+                    ):
+                        start_system._terminate_stale_ingestion_processes(time_budget_s=1.0)
+
+        self.assertEqual(terminated, [])
+        con = storage.connect(readonly=True)
+        try:
+            hb = con.execute(
+                "SELECT pid FROM job_heartbeats WHERE job_name = ?",
+                ("ingestion_runtime",),
+            ).fetchone()
+            lock = con.execute(
+                "SELECT pid FROM job_locks WHERE job_name = ?",
+                ("ingestion_runtime",),
+            ).fetchone()
+        finally:
+            con.close()
+            storage.close_pooled_connections()
+        self.assertEqual(int(hb[0]), other_child_pid)
+        self.assertEqual(int(lock[0]), other_child_pid)
+
     def test_first_run_seed_handles_legacy_portfolio_equity_state_schema(self) -> None:
         db_path = Path(os.environ["DB_PATH"])
         con = sqlite3.connect(db_path)

@@ -10,7 +10,8 @@ Current split:
 - `env.py` owns local `.env` bootstrap helpers, local master-key file creation,
   strict-runtime DB-path detection, and scalar environment parsing used during
   startup.
-- `mode.py` owns launch-mode selection from argv and `ENGINE_MODE`.
+- `mode.py` owns launch-mode selection from argv and `ENGINE_MODE` for
+  `safe`, `paper`, `shadow`, and `live`.
 - `phase.py` owns startup phase and first-failure trace mutation helpers.
 - `subprocesses.py` owns import-smoke child-process command construction,
   import-smoke result shaping, and runtime-graph validator subprocess

@@ -56,12 +56,87 @@ def test_sqlite_quote_rows_limit_bounds_newest_rows_and_returns_ascending(
     assert [row[1] for row in rows] == [115.0, 116.0, 117.0, 118.0, 119.0]
 
 
+def test_sqlite_quote_rows_supports_canonical_time_column(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "quotes-time.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE price_quotes (
+              time INTEGER NOT NULL,
+              symbol TEXT NOT NULL,
+              last REAL,
+              volume REAL,
+              PRIMARY KEY(symbol, time)
+            );
+            """
+        )
+        con.executemany(
+            'INSERT INTO price_quotes("time", symbol, last, volume) VALUES (?, ?, ?, ?)',
+            [(BASE_TS_MS + i, "GLD", 200.0 + i, float(i)) for i in range(8)],
+        )
+        con.commit()
+
+    monkeypatch.setattr(price_read_router, "connect_ro", _connect_factory(db_path))
+
+    rows = price_read_router._fetch_sqlite_quote_rows(symbol="GLD", since_ts_ms=BASE_TS_MS + 2, limit=3)
+
+    assert rows == [
+        (BASE_TS_MS + 5, 205.0, 5.0),
+        (BASE_TS_MS + 6, 206.0, 6.0),
+        (BASE_TS_MS + 7, 207.0, 7.0),
+    ]
+
+
+def test_sqlite_quote_rows_falls_back_to_prices_price_px_without_volume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "prices.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE prices (
+              ts_ms INTEGER NOT NULL,
+              symbol TEXT NOT NULL,
+              price REAL,
+              px REAL,
+              source TEXT,
+              PRIMARY KEY(symbol, ts_ms)
+            );
+            """
+        )
+        con.executemany(
+            "INSERT INTO prices(ts_ms, symbol, price, px, source) VALUES (?, ?, ?, ?, ?)",
+            [
+                (BASE_TS_MS + 1, "GLD", None, 190.0, "unit"),
+                (BASE_TS_MS + 2, "GLD", 191.0, 190.5, "unit"),
+                (BASE_TS_MS + 3, "GLD", 192.0, 191.5, "unit"),
+            ],
+        )
+        con.commit()
+
+    monkeypatch.setattr(price_read_router, "connect_ro", _connect_factory(db_path))
+
+    rows = price_read_router._fetch_sqlite_quote_rows(symbol="GLD", since_ts_ms=0, limit=10)
+
+    assert rows == [
+        (BASE_TS_MS + 1, 190.0, None),
+        (BASE_TS_MS + 2, 191.0, None),
+        (BASE_TS_MS + 3, 192.0, None),
+    ]
+
+
 def test_timescale_quote_rows_query_bounds_newest_rows_and_returns_ascending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeCursor:
         def __init__(self) -> None:
             self.executed: list[tuple[str, tuple[Any, ...]]] = []
+            self.last_sql = ""
+            self.last_params: tuple[Any, ...] = ()
 
         def __enter__(self):
             return self
@@ -70,9 +145,14 @@ def test_timescale_quote_rows_query_bounds_newest_rows_and_returns_ascending(
             return None
 
         def execute(self, sql: str, params: tuple[Any, ...]) -> None:
+            self.last_sql = str(sql)
+            self.last_params = tuple(params or ())
             self.executed.append((sql, params))
 
         def fetchall(self):
+            if "information_schema.columns" in self.last_sql:
+                assert self.last_params == ("public", "price_quotes")
+                return [("time",), ("symbol",), ("last",), ("volume",), ("source",)]
             return [
                 (BASE_TS_MS + 2, 102.0, 2.0),
                 (BASE_TS_MS + 1, 101.0, 1.0),
@@ -96,12 +176,13 @@ def test_timescale_quote_rows_query_bounds_newest_rows_and_returns_ascending(
             return None
 
     fake_con = FakeConnection()
+    price_read_router._TIMESCALE_TABLE_COLUMNS_CACHE.clear()
     monkeypatch.setattr(price_read_router, "_timescale_connection", lambda: FakeTimescaleContext(fake_con))
 
     rows = price_read_router._fetch_timescale_quote_rows(symbol="SPY", since_ts_ms=123, limit=2)
 
     assert [row[0] for row in rows] == [BASE_TS_MS + 1, BASE_TS_MS + 2]
-    sql, params = fake_con.cursor_obj.executed[0]
+    sql, params = fake_con.cursor_obj.executed[-1]
     assert 'ORDER BY "time" DESC' in sql
     assert "LIMIT %s" in sql
     assert "ORDER BY ts_ms ASC" in sql
@@ -114,6 +195,8 @@ def test_market_candles_timescale_time_schema_returns_populated_candles(
     class FakeCursor:
         def __init__(self) -> None:
             self.executed: list[tuple[str, tuple[Any, ...]]] = []
+            self.last_sql = ""
+            self.last_params: tuple[Any, ...] = ()
 
         def __enter__(self):
             return self
@@ -122,8 +205,10 @@ def test_market_candles_timescale_time_schema_returns_populated_candles(
             return None
 
         def execute(self, sql: str, params: tuple[Any, ...]) -> None:
+            self.last_sql = str(sql)
+            self.last_params = tuple(params or ())
             normalized = " ".join(str(sql).split())
-            if "FROM \"public\".price_quotes" in normalized:
+            if "FROM \"public\".\"price_quotes\"" in normalized:
                 assert '"time" > TO_TIMESTAMP' in normalized
                 assert 'ORDER BY "time" DESC' in normalized
                 assert "AND ts_ms" not in normalized
@@ -131,6 +216,9 @@ def test_market_candles_timescale_time_schema_returns_populated_candles(
             self.executed.append((sql, params))
 
         def fetchall(self):
+            if "information_schema.columns" in self.last_sql:
+                assert self.last_params == ("public", "price_quotes")
+                return [("time",), ("symbol",), ("last",), ("volume",), ("source",)]
             return [
                 (BASE_TS_MS + 121_000, 103.0, 3.0),
                 (BASE_TS_MS + 61_000, 102.0, 2.0),
@@ -155,6 +243,7 @@ def test_market_candles_timescale_time_schema_returns_populated_candles(
             return None
 
     fake_con = FakeConnection()
+    price_read_router._TIMESCALE_TABLE_COLUMNS_CACHE.clear()
     monkeypatch.setattr(price_read_router, "get_price_read_backend", lambda: "timescale")
     monkeypatch.setattr(price_read_router, "_timescale_connection", lambda: FakeTimescaleContext(fake_con))
     monkeypatch.setattr(api_market, "cache_get_or_load", lambda _scope, _key, loader, ttl_s=0.0: loader())
@@ -170,7 +259,97 @@ def test_market_candles_timescale_time_schema_returns_populated_candles(
     assert candles[-1]["close"] == 103.0
     assert candles[-1]["volume"] == 3.0
     assert fake_con.cursor_obj.executed
-    assert fake_con.cursor_obj.executed[0][1][0] == "TSMS"
+    data_query = [item for item in fake_con.cursor_obj.executed if 'FROM "public"."price_quotes"' in item[0]][0]
+    assert data_query[1][0] == "TSMS"
+
+
+def test_market_stream_reads_canonical_time_quote_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "stream-quotes.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE price_quotes (
+              time INTEGER NOT NULL,
+              symbol TEXT NOT NULL,
+              last REAL,
+              volume REAL,
+              PRIMARY KEY(symbol, time)
+            );
+            """
+        )
+        con.executemany(
+            'INSERT INTO price_quotes("time", symbol, last, volume) VALUES (?, ?, ?, ?)',
+            [(BASE_TS_MS + (i * 1000), "GLD", 180.0 + i, 1.0) for i in range(3)],
+        )
+        con.commit()
+
+    monkeypatch.setattr(price_read_router, "_READ_BACKEND", "sqlite")
+    monkeypatch.setattr(price_read_router, "connect_ro", _connect_factory(db_path))
+    response = api_market.api_get_market_stream({"symbol": "GLD", "tf": "1m"}, None)
+    writes: list[bytes] = []
+
+    class FakeWfile:
+        def write(self, data: bytes) -> None:
+            writes.append(bytes(data))
+            if data.startswith(b": ping"):
+                raise BrokenPipeError("stop stream after first candle")
+
+        def flush(self) -> None:
+            return None
+
+    class FakeHandler:
+        wfile = FakeWfile()
+
+    response.stream_fn(FakeHandler())
+
+    body = b"".join(writes)
+    assert b"event: hello" in body
+    assert b"event: candle" in body
+    assert b'"close":182.0' in body
+
+
+def test_operator_market_data_uses_candles_handler_with_canonical_time_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine.api import api_operator_handlers
+
+    db_path = tmp_path / "operator-quotes.db"
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript(
+            """
+            CREATE TABLE price_quotes (
+              time INTEGER NOT NULL,
+              symbol TEXT NOT NULL,
+              last REAL,
+              volume REAL,
+              PRIMARY KEY(symbol, time)
+            );
+            """
+        )
+        con.executemany(
+            'INSERT INTO price_quotes("time", symbol, last, volume) VALUES (?, ?, ?, ?)',
+            [(BASE_TS_MS + (i * 60_000), "GLD", 170.0 + i, 2.0) for i in range(4)],
+        )
+        con.commit()
+
+    monkeypatch.setattr(price_read_router, "_READ_BACKEND", "sqlite")
+    monkeypatch.setattr(price_read_router, "connect_ro", _connect_factory(db_path))
+    monkeypatch.setattr(api_market, "cache_get_or_load", lambda _scope, _key, loader, ttl_s=0.0: loader())
+    monkeypatch.setattr(api_market.time, "time", lambda: (BASE_TS_MS + (5 * 60_000)) / 1000.0)
+
+    payload = api_operator_handlers.api_get_operator_market_data(
+        {"symbol": "GLD", "tf": "1m", "limit": "10"},
+        {"API_HANDLERS": {"api_get_market_candles": api_market.api_get_market_candles}},
+    )
+
+    assert payload["ok"] is True
+    assert payload["symbol"] == "GLD"
+    assert payload["candles"]
+    assert payload["candles"][-1]["close"] == 173.0
 
 
 def test_price_reader_reuses_pool_until_dsn_or_schema_changes(monkeypatch: pytest.MonkeyPatch) -> None:

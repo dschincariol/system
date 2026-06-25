@@ -84,6 +84,32 @@ except Exception as e:
         return None
 
 
+try:
+    from engine.data.futures_instrument import parse_futures_symbol  # type: ignore
+except Exception as e:
+    _warn_nonfatal(
+        "DATA_UNIVERSE_FUTURES_INSTRUMENT_IMPORT_FAILED",
+        e,
+        once_key="futures_instrument_import",
+    )
+
+    def parse_futures_symbol(symbol: object):  # type: ignore
+        return None
+
+
+try:
+    from engine.data.options_instrument import parse_option_symbol  # type: ignore
+except Exception as e:
+    _warn_nonfatal(
+        "DATA_UNIVERSE_OPTIONS_INSTRUMENT_IMPORT_FAILED",
+        e,
+        once_key="options_instrument_import",
+    )
+
+    def parse_option_symbol(symbol: object):  # type: ignore
+        return None
+
+
 # Very conservative ticker extraction:
 # - captures $TSLA or TSLA
 # - rejects too-short/too-long
@@ -107,10 +133,44 @@ _INSTRUMENT_METADATA_COLUMNS = (
     "session_calendar",
     "instrument_meta_source",
 )
+_FUTURES_INSTRUMENT_COLUMNS = (
+    "fut_root",
+    "fut_exchange",
+    "fut_multiplier",
+    "fut_tick_size",
+    "fut_tick_value",
+    "fut_price_ccy",
+    "fut_margin_ref",
+    "fut_expiry_rule",
+    "fut_roll_method",
+    "fut_continuous_alias",
+)
+_OPTION_INSTRUMENT_COLUMNS = (
+    "opt_underlying",
+    "opt_expiry",
+    "opt_right",
+    "opt_strike",
+    "opt_multiplier",
+    "opt_exercise_style",
+    "opt_settlement",
+    "opt_price_ccy",
+)
 
 
-def _instrument_column_values(metadata) -> Tuple[object, ...]:
+def _instrument_column_values(metadata, futures_metadata=None) -> Tuple[object, ...]:
     if metadata is None:
+        if futures_metadata is not None:
+            return (
+                futures_metadata.instrument_kind,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                futures_metadata.session_calendar,
+                futures_metadata.source,
+            )
         return (None,) * len(_INSTRUMENT_METADATA_COLUMNS)
     return (
         metadata.instrument_kind,
@@ -122,6 +182,54 @@ def _instrument_column_values(metadata) -> Tuple[object, ...]:
         float(metadata.leverage_cap),
         metadata.session_calendar,
         metadata.source,
+    )
+
+
+def _futures_column_values(metadata) -> Tuple[object, ...]:
+    if metadata is None:
+        return (None,) * len(_FUTURES_INSTRUMENT_COLUMNS)
+    return (
+        metadata.root,
+        metadata.exchange,
+        float(metadata.multiplier),
+        float(metadata.tick_size),
+        float(metadata.tick_value),
+        metadata.price_ccy,
+        float(metadata.margin_ref),
+        metadata.expiry_rule,
+        metadata.roll_method,
+        metadata.continuous_alias,
+    )
+
+
+def _option_instrument_column_values(metadata) -> Tuple[object, ...]:
+    if metadata is None:
+        return (None,) * len(_INSTRUMENT_METADATA_COLUMNS)
+    return (
+        metadata.instrument_kind,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        metadata.session_calendar,
+        metadata.source,
+    )
+
+
+def _option_column_values(metadata) -> Tuple[object, ...]:
+    if metadata is None:
+        return (None,) * len(_OPTION_INSTRUMENT_COLUMNS)
+    return (
+        metadata.underlying,
+        metadata.expiry.isoformat(),
+        metadata.right,
+        float(metadata.strike),
+        float(metadata.multiplier),
+        metadata.exercise_style,
+        metadata.settlement,
+        metadata.price_ccy,
     )
 
 
@@ -137,6 +245,17 @@ def _missing_instrument_column_error(error: BaseException) -> bool:
         or "leverage_cap" in message
         or "session_calendar" in message
         or "instrument_meta_source" in message
+        or "fut_root" in message
+        or "fut_exchange" in message
+        or "fut_multiplier" in message
+        or "fut_tick_size" in message
+        or "fut_tick_value" in message
+        or "fut_price_ccy" in message
+        or "fut_margin_ref" in message
+        or "fut_expiry_rule" in message
+        or "fut_roll_method" in message
+        or "fut_continuous_alias" in message
+        or any(column in message for column in _OPTION_INSTRUMENT_COLUMNS)
         or "no such column" in message
         or "has no column named" in message
     )
@@ -184,6 +303,102 @@ def _metadata_dict_from_row(symbol: str, row, fallback) -> Optional[Dict]:
         return fallback.to_dict() if fallback is not None else None
 
 
+def _futures_metadata_dict_from_row(symbol: str, row, fallback) -> Optional[Dict]:
+    if row is None:
+        return fallback.to_dict() if fallback is not None else None
+    try:
+        instrument_kind = row[0]
+        if not instrument_kind:
+            return fallback.to_dict() if fallback is not None else None
+        root = row[1]
+        exchange = row[2]
+        multiplier = row[3]
+        tick_size = row[4]
+        tick_value = row[5]
+        price_ccy = row[6]
+        margin_ref = row[7]
+        expiry_rule = row[8]
+        roll_method = row[9]
+        continuous_alias = row[10]
+        session_calendar = row[11]
+        source = row[12] if len(row) > 12 else None
+        data = {
+            "asset_class": "FUTURES",
+            "continuous_alias": str(continuous_alias) if continuous_alias is not None else None,
+            "exchange": str(exchange or ""),
+            "expiry_rule": str(expiry_rule or ""),
+            "instrument_kind": str(instrument_kind),
+            "margin_ref": float(margin_ref),
+            "multiplier": float(multiplier),
+            "price_ccy": str(price_ccy or ""),
+            "roll_method": str(roll_method or ""),
+            "root": str(root or ""),
+            "session_calendar": str(session_calendar or ""),
+            "source": str(source or "parser"),
+            "symbol": str(symbol),
+            "tick_size": float(tick_size),
+            "tick_value": float(tick_value),
+        }
+        return {key: data[key] for key in sorted(data)}
+    except Exception as e:
+        _warn_nonfatal(
+            "UNIVERSE_FUTURES_METADATA_ROW_PARSE_FAILED",
+            e,
+            once_key=f"futures_metadata_row:{symbol}",
+            symbol=str(symbol),
+        )
+        return fallback.to_dict() if fallback is not None else None
+
+
+def _option_metadata_dict_from_row(symbol: str, row, fallback) -> Optional[Dict]:
+    if row is None:
+        return fallback.to_dict() if fallback is not None else None
+    fallback_data = fallback.to_dict() if fallback is not None else {}
+    try:
+        instrument_kind = row[0]
+        if not instrument_kind:
+            return dict(fallback_data) if fallback_data else None
+        underlying = row[1]
+        expiry = row[2]
+        right = row[3]
+        strike = row[4]
+        multiplier = row[5]
+        exercise_style = row[6]
+        settlement = row[7]
+        price_ccy = row[8]
+        session_calendar = row[9]
+        source = row[10] if len(row) > 10 else None
+        if not all((underlying, expiry, right, exercise_style, settlement, price_ccy)):
+            return dict(fallback_data) if fallback_data else None
+        data = {
+            "asset_class": "OPTION",
+            "contract_spec_source": str(fallback_data.get("contract_spec_source") or source or "unknown"),
+            "contract_specs_verified": bool(fallback_data.get("contract_specs_verified", False)),
+            "exercise_style": str(exercise_style or ""),
+            "expiry": str(expiry or ""),
+            "instrument_kind": str(instrument_kind),
+            "multiplier": float(multiplier),
+            "multiplier_source": str(fallback_data.get("multiplier_source") or source or "unknown"),
+            "occ_symbol": str(symbol),
+            "price_ccy": str(price_ccy or ""),
+            "right": str(right or ""),
+            "session_calendar": str(session_calendar or ""),
+            "settlement": str(settlement or ""),
+            "source": str(source or fallback_data.get("source") or "unknown"),
+            "strike": float(strike),
+            "underlying": str(underlying or ""),
+        }
+        return {key: data[key] for key in sorted(data)}
+    except Exception as e:
+        _warn_nonfatal(
+            "UNIVERSE_OPTIONS_METADATA_ROW_PARSE_FAILED",
+            e,
+            once_key=f"options_metadata_row:{symbol}",
+            symbol=str(symbol),
+        )
+        return dict(fallback_data) if fallback_data else None
+
+
 def _insert_symbol_row(
     con,
     *,
@@ -195,7 +410,14 @@ def _insert_symbol_row(
     meta_json: str,
     now_ms: int,
     instrument_metadata,
+    futures_metadata,
+    option_metadata,
 ) -> None:
+    instrument_values = (
+        _option_instrument_column_values(option_metadata)
+        if option_metadata is not None
+        else _instrument_column_values(instrument_metadata, futures_metadata)
+    )
     try:
         con.execute(
             """
@@ -205,9 +427,14 @@ def _insert_symbol_row(
               instrument_kind, base_ccy, quote_ccy, pip_size,
               contract_size, pnl_ccy, leverage_cap, session_calendar,
               instrument_meta_source,
+              fut_root, fut_exchange, fut_multiplier, fut_tick_size,
+              fut_tick_value, fut_price_ccy, fut_margin_ref, fut_expiry_rule,
+              fut_roll_method, fut_continuous_alias,
+              opt_underlying, opt_expiry, opt_right, opt_strike, opt_multiplier,
+              opt_exercise_style, opt_settlement, opt_price_ccy,
               created_ts_ms, updated_ts_ms
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 sym,
@@ -216,7 +443,9 @@ def _insert_symbol_row(
                 float(new_score),
                 int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
                 meta_json,
-                *_instrument_column_values(instrument_metadata),
+                *instrument_values,
+                *_futures_column_values(futures_metadata),
+                *_option_column_values(option_metadata),
                 now_ms,
                 now_ms,
             ),
@@ -263,7 +492,14 @@ def _update_symbol_row(
     meta_json: str,
     now_ms: int,
     instrument_metadata,
+    futures_metadata,
+    option_metadata,
 ) -> None:
+    instrument_values = (
+        _option_instrument_column_values(option_metadata)
+        if option_metadata is not None
+        else _instrument_column_values(instrument_metadata, futures_metadata)
+    )
     try:
         con.execute(
             """
@@ -282,6 +518,24 @@ def _update_symbol_row(
               leverage_cap=?,
               session_calendar=?,
               instrument_meta_source=?,
+              fut_root=?,
+              fut_exchange=?,
+              fut_multiplier=?,
+              fut_tick_size=?,
+              fut_tick_value=?,
+              fut_price_ccy=?,
+              fut_margin_ref=?,
+              fut_expiry_rule=?,
+              fut_roll_method=?,
+              fut_continuous_alias=?,
+              opt_underlying=?,
+              opt_expiry=?,
+              opt_right=?,
+              opt_strike=?,
+              opt_multiplier=?,
+              opt_exercise_style=?,
+              opt_settlement=?,
+              opt_price_ccy=?,
               updated_ts_ms=?
             WHERE symbol=?
             """,
@@ -291,7 +545,9 @@ def _update_symbol_row(
                 float(new_score),
                 int(last_seen_event_ts_ms) if last_seen_event_ts_ms is not None else None,
                 meta_json,
-                *_instrument_column_values(instrument_metadata),
+                *instrument_values,
+                *_futures_column_values(futures_metadata),
+                *_option_column_values(option_metadata),
                 now_ms,
                 sym,
             ),
@@ -329,7 +585,7 @@ def _update_symbol_row(
 
 
 def get_instrument_metadata(con, symbol) -> Optional[Dict]:
-    """Return FX instrument metadata, or ``None`` for non-FX symbols.
+    """Return FX/options/futures instrument metadata, or ``None`` otherwise.
 
     This accessor is the FX-02 single source of truth that FX-03/04/05/06/07
     MUST consume as ``from engine.data.universe import get_instrument_metadata``.
@@ -338,17 +594,88 @@ def get_instrument_metadata(con, symbol) -> Optional[Dict]:
     Downstream code that receives broker-style keys such as ``EUR_USD`` must
     normalize through ``parse_fx_symbol(sym).symbol`` or this accessor before
     keying feature, cost, risk, execution, or UI tables.
+
+    For futures, only explicit continuous aliases (``<ROOT>.c.<N>``) and dated
+    contracts (``<ROOT><MONTHCODE><YY>``) return metadata. Bare roots such as
+    ``ES`` and ``GC`` return ``None`` to preserve existing commodity/rates/COT
+    behavior.
     """
     parsed = parse_fx_symbol(symbol)
-    if parsed is None:
+    if parsed is not None:
+        canonical = str(parsed.symbol)
+        try:
+            row = con.execute(
+                """
+                SELECT instrument_kind, base_ccy, quote_ccy, pip_size,
+                       contract_size, pnl_ccy, leverage_cap, session_calendar,
+                       instrument_meta_source
+                FROM symbols
+                WHERE symbol=?
+                """,
+                (canonical,),
+            ).fetchone()
+        except Exception as e:
+            if not _missing_instrument_column_error(e):
+                _warn_nonfatal(
+                    "UNIVERSE_INSTRUMENT_METADATA_LOOKUP_FAILED",
+                    e,
+                    once_key=f"instrument_metadata_lookup:{canonical}",
+                    symbol=canonical,
+                )
+            else:
+                _warn_nonfatal(
+                    "UNIVERSE_INSTRUMENT_METADATA_COLUMNS_UNAVAILABLE",
+                    e,
+                    once_key="instrument_metadata_columns_unavailable",
+                    symbol=canonical,
+                )
+            return parsed.to_dict()
+        return _metadata_dict_from_row(canonical, row, parsed)
+
+    option_parsed = parse_option_symbol(symbol)
+    if option_parsed is not None:
+        canonical = str(option_parsed.occ_symbol)
+        try:
+            row = con.execute(
+                """
+                SELECT instrument_kind, opt_underlying, opt_expiry, opt_right,
+                       opt_strike, opt_multiplier, opt_exercise_style,
+                       opt_settlement, opt_price_ccy, session_calendar,
+                       instrument_meta_source
+                FROM symbols
+                WHERE symbol=?
+                """,
+                (canonical,),
+            ).fetchone()
+        except Exception as e:
+            if not _missing_instrument_column_error(e):
+                _warn_nonfatal(
+                    "UNIVERSE_OPTIONS_METADATA_LOOKUP_FAILED",
+                    e,
+                    once_key=f"options_metadata_lookup:{canonical}",
+                    symbol=canonical,
+                )
+            else:
+                _warn_nonfatal(
+                    "UNIVERSE_OPTIONS_METADATA_COLUMNS_UNAVAILABLE",
+                    e,
+                    once_key="options_metadata_columns_unavailable",
+                    symbol=canonical,
+                )
+            return option_parsed.to_dict()
+        return _option_metadata_dict_from_row(canonical, row, option_parsed)
+
+    futures_parsed = parse_futures_symbol(symbol)
+    if futures_parsed is None:
         return None
-    canonical = str(parsed.symbol)
+    canonical = str(futures_parsed.symbol)
     try:
         row = con.execute(
             """
-            SELECT instrument_kind, base_ccy, quote_ccy, pip_size,
-                   contract_size, pnl_ccy, leverage_cap, session_calendar,
-                   instrument_meta_source
+            SELECT instrument_kind, fut_root, fut_exchange, fut_multiplier,
+                   fut_tick_size, fut_tick_value, fut_price_ccy, fut_margin_ref,
+                   fut_expiry_rule, fut_roll_method, fut_continuous_alias,
+                   session_calendar, instrument_meta_source
             FROM symbols
             WHERE symbol=?
             """,
@@ -357,20 +684,20 @@ def get_instrument_metadata(con, symbol) -> Optional[Dict]:
     except Exception as e:
         if not _missing_instrument_column_error(e):
             _warn_nonfatal(
-                "UNIVERSE_INSTRUMENT_METADATA_LOOKUP_FAILED",
+                "UNIVERSE_FUTURES_METADATA_LOOKUP_FAILED",
                 e,
-                once_key=f"instrument_metadata_lookup:{canonical}",
+                once_key=f"futures_metadata_lookup:{canonical}",
                 symbol=canonical,
             )
         else:
             _warn_nonfatal(
-                "UNIVERSE_INSTRUMENT_METADATA_COLUMNS_UNAVAILABLE",
+                "UNIVERSE_FUTURES_METADATA_COLUMNS_UNAVAILABLE",
                 e,
-                once_key="instrument_metadata_columns_unavailable",
+                once_key="futures_metadata_columns_unavailable",
                 symbol=canonical,
             )
-        return parsed.to_dict()
-    return _metadata_dict_from_row(canonical, row, parsed)
+        return futures_parsed.to_dict()
+    return _futures_metadata_dict_from_row(canonical, row, futures_parsed)
 
 
 def extract_symbol_candidates(text: str) -> List[str]:
@@ -414,7 +741,18 @@ def upsert_symbol(
 ) -> None:
     raw_sym = str(symbol or "").upper().strip()
     instrument_metadata = parse_fx_symbol(raw_sym)
-    sym = str(instrument_metadata.symbol if instrument_metadata is not None else raw_sym).upper().strip()
+    futures_metadata = parse_futures_symbol(raw_sym) if instrument_metadata is None else None
+    option_metadata = (
+        parse_option_symbol(raw_sym) if instrument_metadata is None and futures_metadata is None else None
+    )
+    if instrument_metadata is not None:
+        sym = str(instrument_metadata.symbol).upper().strip()
+    elif futures_metadata is not None:
+        sym = str(futures_metadata.symbol).strip()
+    elif option_metadata is not None:
+        sym = str(option_metadata.occ_symbol).upper().strip()
+    else:
+        sym = raw_sym
     if not sym:
         return
 
@@ -453,6 +791,8 @@ def upsert_symbol(
             meta_json=mj,
             now_ms=now_ms,
             instrument_metadata=instrument_metadata,
+            futures_metadata=futures_metadata,
+            option_metadata=option_metadata,
         )
         return
 
@@ -495,6 +835,8 @@ def upsert_symbol(
         meta_json=merged_meta_json,
         now_ms=now_ms,
         instrument_metadata=instrument_metadata,
+        futures_metadata=futures_metadata,
+        option_metadata=option_metadata,
     )
 
 

@@ -38,7 +38,7 @@ from engine.data.default_symbols import fx_pair_to_oanda_instrument, is_fx_major
 from engine.data.provider_registry import get_polling_provider_names
 from engine.data.provider_router import compute_provider_health, detect_cross_provider_anomalies, select_best_quotes_from_snapshots
 from engine.data.provider_sessions import BaseProviderSession, ProviderSessionManager
-from engine.data.price_hygiene import is_split_like_price_jump, log_split_like_price_row
+from engine.data.price_hygiene import is_explained_split, is_split_like_price_jump, log_split_like_price_row
 from engine.runtime.alerts import emit_alert
 from engine.runtime.ingestion_shards import (
     current_ingestion_shard,
@@ -198,9 +198,90 @@ def _put_ingest_slippage_batch(con, rows) -> None:
     )
 
 
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return float(out)
+
+
+def _build_futures_contract_bar_row(
+    *,
+    provider_name: str,
+    symbol: str,
+    row: Dict[str, Any],
+    provider_symbol_map: Dict[str, str],
+    now_ts_ms: int,
+) -> Optional[Tuple[str, int, float, float, float, float, Optional[float], Optional[float], str]]:
+    if str(provider_name or "").strip().lower() != "futures":
+        return None
+    sym = str(symbol or "").strip()
+    contract = str(
+        provider_symbol_map.get(sym)
+        or provider_symbol_map.get(sym.upper())
+        or row.get("contract")
+        or row.get("symbol")
+        or sym
+    ).strip()
+    if not contract:
+        return None
+    close = _float_or_none(row.get("close", row.get("price", row.get("last"))))
+    if close is None:
+        return None
+    open_px = _float_or_none(row.get("open"))
+    high_px = _float_or_none(row.get("high"))
+    low_px = _float_or_none(row.get("low"))
+    volume = _float_or_none(row.get("volume"))
+    open_interest = _float_or_none(row.get("open_interest"))
+    try:
+        ts_ms = int(row.get("ts_ms") or now_ts_ms)
+    except Exception:
+        ts_ms = int(now_ts_ms)
+    return (
+        str(contract),
+        int(ts_ms),
+        float(open_px if open_px is not None else close),
+        float(high_px if high_px is not None else close),
+        float(low_px if low_px is not None else close),
+        float(close),
+        volume,
+        open_interest,
+        str(row.get("source") or provider_name or "futures"),
+    )
+
+
+def _put_futures_contract_bars_batch(con, rows) -> None:
+    if not rows:
+        return
+    from engine.data.live_prices.futures_live import ensure_futures_bars_table
+
+    ensure_futures_bars_table(con)
+    con.executemany(
+        """
+        INSERT INTO futures_contract_bars(
+          contract, ts_ms, open, high, low, close, volume, open_interest, source
+        )
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(contract, ts_ms) DO UPDATE SET
+          open=excluded.open,
+          high=excluded.high,
+          low=excluded.low,
+          close=excluded.close,
+          volume=excluded.volume,
+          open_interest=excluded.open_interest,
+          source=excluded.source
+        """,
+        rows,
+    )
+
+
 def _enqueue_provider_auxiliary_rows(
     raw_quote_rows,
     slip_rows,
+    futures_bar_rows=None,
 ) -> bool:
     ok = True
 
@@ -249,6 +330,11 @@ def _enqueue_provider_auxiliary_rows(
                 raw_rows=int(len(raw_quote_rows)),
             )
 
+    if futures_bar_rows:
+        provider_rows_ok, _ = _persist_futures_contract_bars_sync(futures_bar_rows)
+        if not provider_rows_ok:
+            ok = False
+
     if slip_rows:
         try:
             accepted = enqueue_ingest_slippage_rows(tuple(slip_rows))
@@ -275,6 +361,7 @@ def _enqueue_provider_auxiliary_rows(
 def _persist_provider_auxiliary_rows_sync(
     raw_quote_rows,
     slip_rows,
+    futures_bar_rows=None,
 ):
     if raw_quote_rows:
         raw_events = [
@@ -307,18 +394,49 @@ def _persist_provider_auxiliary_rows_sync(
             )
         if slip_rows:
             _put_ingest_slippage_batch(conw, slip_rows)
+        if futures_bar_rows:
+            _put_futures_contract_bars_batch(conw, futures_bar_rows)
 
     return _run_write_txn_allow_busy(
         _write_provider_rows,
         default=None,
         table="prices",
         operation="ingest_provider_price_rows",
-        context={"job": JOB_NAME, "raw_rows": int(len(raw_quote_rows)), "slip_rows": int(len(slip_rows))},
+        context={
+            "job": JOB_NAME,
+            "raw_rows": int(len(raw_quote_rows)),
+            "slip_rows": int(len(slip_rows)),
+            "futures_bar_rows": int(len(futures_bar_rows or ())),
+        },
         attempts=1,
         maintenance=False,
         busy_event="poll_prices_provider_rows_write_busy",
         warn_key="poll_prices_provider_rows_write_busy",
-        extra={"raw_rows": int(len(raw_quote_rows)), "slip_rows": int(len(slip_rows))},
+        extra={
+            "raw_rows": int(len(raw_quote_rows)),
+            "slip_rows": int(len(slip_rows)),
+            "futures_bar_rows": int(len(futures_bar_rows or ())),
+        },
+        timeout_s=0.5,
+        busy_timeout_ms=500,
+    )
+
+
+def _persist_futures_contract_bars_sync(futures_bar_rows):
+    def _write_futures_bars(conw):
+        _put_futures_contract_bars_batch(conw, futures_bar_rows)
+
+    return _run_write_txn_allow_busy(
+        _write_futures_bars,
+        default=None,
+        table="futures_contract_bars",
+        operation="ingest_futures_contract_bars",
+        context={"job": JOB_NAME, "futures_bar_rows": int(len(futures_bar_rows or ()))},
+        attempts=1,
+        maintenance=False,
+        busy_event="poll_prices_futures_bars_write_busy",
+        warn_key="poll_prices_futures_bars_write_busy",
+        extra={"futures_bar_rows": int(len(futures_bar_rows or ()))},
         timeout_s=0.5,
         busy_timeout_ms=500,
     )
@@ -722,10 +840,13 @@ class ActiveSymbolUniverse:
     ccxt_map: Dict[str, str]
     polygon_map: Dict[str, str]
     oanda_map: Dict[str, str] = field(default_factory=dict)
+    futures_map: Dict[str, str] = field(default_factory=dict)
 
     @property
     def assigned_symbol_count(self) -> int:
-        return int(len(set(self.yf_map) | set(self.ccxt_map) | set(self.polygon_map) | set(self.oanda_map)))
+        return int(
+            len(set(self.yf_map) | set(self.ccxt_map) | set(self.polygon_map) | set(self.oanda_map) | set(self.futures_map))
+        )
 
 
 @dataclass(frozen=True)
@@ -803,6 +924,7 @@ def _load_active_symbol_universe() -> ActiveSymbolUniverse:
     ccxt_map: Dict[str, str] = {}
     polygon_map: Dict[str, str] = {}
     oanda_map: Dict[str, str] = {}
+    futures_map: Dict[str, str] = {}
 
     for sym, meta_json in provider_rows:
         try:
@@ -821,6 +943,12 @@ def _load_active_symbol_universe() -> ActiveSymbolUniverse:
                 oanda_map[sym_s] = str(meta.get("oanda_instrument") or fx_pair_to_oanda_instrument(sym_s))
             except ValueError as e:
                 _log_nonfatal("poll_prices_oanda_symbol_map_failed", e, symbol=sym_s)
+            continue
+
+        if provider == "futures" or str(meta.get("futures_contract") or "").strip():
+            contract = str(meta.get("futures_contract") or sym_s).strip()
+            if contract:
+                futures_map[sym_s] = contract
             continue
 
         if provider == "ccxt":
@@ -865,6 +993,7 @@ def _load_active_symbol_universe() -> ActiveSymbolUniverse:
     ccxt_map = filter_symbol_mapping_for_shard(ccxt_map, INGESTION_SHARD)
     polygon_map = filter_symbol_mapping_for_shard(polygon_map, INGESTION_SHARD)
     oanda_map = filter_symbol_mapping_for_shard(oanda_map, INGESTION_SHARD)
+    futures_map = filter_symbol_mapping_for_shard(futures_map, INGESTION_SHARD)
     return ActiveSymbolUniverse(
         active_symbol_rows=active_rows,
         provider_symbol_rows=provider_rows,
@@ -872,6 +1001,7 @@ def _load_active_symbol_universe() -> ActiveSymbolUniverse:
         ccxt_map=ccxt_map,
         polygon_map=polygon_map,
         oanda_map=oanda_map,
+        futures_map=futures_map,
     )
 
 
@@ -901,6 +1031,8 @@ def _provider_symbol_map_for_cycle(provider_name: str, universe: ActiveSymbolUni
         return symbol_map
     if provider == "oanda":
         return dict(universe.oanda_map)
+    if provider == "futures":
+        return dict(universe.futures_map)
     if provider == "ccxt":
         return dict(universe.ccxt_map)
     return dict(universe.yf_map)
@@ -1088,6 +1220,17 @@ def _reject_split_like_price_row(
     previous_price = float(hist[-1])
     if not is_split_like_price_jump(previous_price, current_price):
         return False
+    try:
+        with connect(readonly=True) as con:
+            if is_explained_split(con, symbol=str(symbol), ts_ms=int(ts_ms)):
+                return False
+    except Exception as e:
+        _log_nonfatal(
+            "poll_prices_split_explanation_lookup_failed",
+            e,
+            warn_key="split_explanation_lookup",
+            symbol=str(symbol),
+        )
     log_split_like_price_row(
         symbol=str(symbol),
         ts_ms=int(ts_ms),
@@ -2059,6 +2202,7 @@ def main() -> None:
             got_by_provider: Dict[str, Dict[str, Any]] = {}
             raw_quote_rows = []
             slip_rows = []
+            futures_bar_rows = []
 
             # -----------------------------
             # REST / snapshot providers
@@ -2200,6 +2344,15 @@ def main() -> None:
                                 p["source"] = pname
 
                             ts_ms = int(p.get("ts_ms") or now_ts_ms)
+                            futures_bar = _build_futures_contract_bar_row(
+                                provider_name=str(pname),
+                                symbol=str(sym),
+                                row=p,
+                                provider_symbol_map=provider_symbol_map,
+                                now_ts_ms=int(ts_ms),
+                            )
+                            if futures_bar is not None:
+                                futures_bar_rows.append(futures_bar)
                             last = p.get("price")
                             bid = p.get("bid")
                             ask = p.get("ask")
@@ -2572,30 +2725,35 @@ def main() -> None:
                         pending_outlier_alerts,
                         post_commit_first_tick,
                     )
-                    if (raw_quote_rows or slip_rows) and _should_persist_provider_rows():
+                    if (raw_quote_rows or slip_rows or futures_bar_rows) and _should_persist_provider_rows():
                         if get_timeseries_write_policy().sync_provider_aux_sqlite_write_enabled:
                             provider_rows_ok, _ = _persist_provider_auxiliary_rows_sync(
                                 raw_quote_rows,
                                 slip_rows,
+                                futures_bar_rows,
                             )
                         else:
                             provider_rows_ok = _enqueue_provider_auxiliary_rows(
                                 raw_quote_rows,
                                 slip_rows,
+                                futures_bar_rows,
                             )
                         if not provider_rows_ok and not pipeline_error:
                             pipeline_error = "provider_rows_write_busy"
                         if not provider_rows_ok:
                             producer_backpressure = True
                 else:
-                    pipeline_raw_rows = int(len(raw_quote_rows))
-                    pipeline_last_ingested_ts_ms = max((int(row[0]) for row in raw_quote_rows), default=None)
+                    pipeline_raw_rows = int(len(raw_quote_rows) + len(futures_bar_rows))
+                    pipeline_last_ingested_ts_ms = max(
+                        [int(row[0]) for row in raw_quote_rows] + [int(row[1]) for row in futures_bar_rows],
+                        default=None,
+                    )
                     pipeline_error = "price_write_busy"
                     fail_s = _next_fail_backoff_s(fail_s)
 
                 pipeline_price_rows = int(len(price_rows))
                 pipeline_quote_rows = int(len(quote_rows))
-                pipeline_raw_rows = int(len(raw_quote_rows))
+                pipeline_raw_rows = int(len(raw_quote_rows) + len(futures_bar_rows))
                 pipeline_dedup_drops = int(publish_counts.get("dedup_drops") or 0)
                 pipeline_gap_events = int(publish_counts.get("gap_events") or 0)
                 pipeline_normalization_failures = int(publish_counts.get("normalization_failures") or 0)
@@ -2652,8 +2810,11 @@ def main() -> None:
                             payload={"symbols": int(len(price_rows)), "latency_ms": int(latency_ms)},
                             job=JOB_NAME,
                         )
-                    elif raw_quote_rows:
-                        pipeline_last_ingested_ts_ms = max(int(row[0]) for row in raw_quote_rows)
+                    elif raw_quote_rows or futures_bar_rows:
+                        pipeline_last_ingested_ts_ms = max(
+                            [int(row[0]) for row in raw_quote_rows] + [int(row[1]) for row in futures_bar_rows],
+                            default=None,
+                        )
 
                     fail_s = _successful_price_cycle_backoff_s(
                         current_fail_s=fail_s,
@@ -2670,11 +2831,14 @@ def main() -> None:
                     _log_nonfatal("poll_prices_waiting_state_update_failed", e)
 
                 pipeline_ok = any(bool(session_manager.ok()) for session_manager in rest_managers.values())
-                pipeline_raw_rows = int(len(raw_quote_rows))
+                pipeline_raw_rows = int(len(raw_quote_rows) + len(futures_bar_rows))
                 pipeline_dedup_drops = 0
                 pipeline_gap_events = 0
                 pipeline_normalization_failures = 0
-                pipeline_last_ingested_ts_ms = max((int(row[0]) for row in raw_quote_rows), default=None)
+                pipeline_last_ingested_ts_ms = max(
+                    [int(row[0]) for row in raw_quote_rows] + [int(row[1]) for row in futures_bar_rows],
+                    default=None,
+                )
                 if not pipeline_ok:
                     pipeline_error = "no_live_quotes_merged"
                 fail_s = _next_fail_backoff_s(fail_s)

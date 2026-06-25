@@ -26,16 +26,20 @@ Adds:
 
 import logging
 import os
+import re
 import time
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, cast
 
 from engine.execution.execution_slicing_engine import build_order_slices
 from engine.execution.contextual_bandit_slicer import validate_routed_learned_orders
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
 from engine.execution.options_readiness import live_options_order_block
-from engine.execution.mode_safety import live_broker_mode_boundary_block
+from engine.execution.mode_safety import env_execution_mode_snapshot, live_broker_mode_boundary_block
 from engine.execution.broker_failover_policy import (
+    LIVE_BROKERS,
     broker_exception_terminal_failure,
+    canonical_broker_name,
     configured_failover_chain,
     is_non_retryable_broker_result,
     live_broker_environment_contract,
@@ -117,6 +121,7 @@ except Exception as e:
 _sim_apply = None
 _alpaca_apply = None
 _ibkr_apply = None
+_tradier_options_apply = None
 
 # Pre-live reconciliation gate (hard block on mismatch)
 try:
@@ -133,6 +138,21 @@ BROKER_ROUTER_RETRY_ATTEMPTS = max(1, int(os.environ.get("BROKER_ROUTER_RETRY_AT
 BROKER_ROUTER_RETRY_BASE_S = max(0.0, float(os.environ.get("BROKER_ROUTER_RETRY_BASE_S", "0.1")))
 BROKER_ROUTER_RETRY_MAX_S = max(0.0, float(os.environ.get("BROKER_ROUTER_RETRY_MAX_S", "1.0")))
 _PRELIVE_RECONCILE_FALSEY = {"0", "false", "f", "no", "n", "off", "none", "null"}
+_TRUTHY = {"1", "true", "t", "yes", "y", "on"}
+_FUTURES_MONTH_TO_NUM = {
+    "F": 1,
+    "G": 2,
+    "H": 3,
+    "J": 4,
+    "K": 5,
+    "M": 6,
+    "N": 7,
+    "Q": 8,
+    "U": 9,
+    "V": 10,
+    "X": 11,
+    "Z": 12,
+}
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: Any) -> None:
@@ -195,6 +215,20 @@ def _resolve_ibkr_apply():
     return _ibkr_apply
 
 
+def _resolve_tradier_options_apply():
+    global _tradier_options_apply
+    if _tradier_options_apply is not None:
+        return _tradier_options_apply
+    try:
+        from engine.execution.broker_tradier_options import apply_latest_portfolio_orders_live
+
+        _tradier_options_apply = apply_latest_portfolio_orders_live
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_TRADIER_OPTIONS_IMPORT_FAILED", e, once_key="adapter_import:tradier_options")
+        _tradier_options_apply = None
+    return _tradier_options_apply
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     if value in (None, ""):
         return int(default)
@@ -223,6 +257,13 @@ def _optional_int(value: Any) -> Optional[int]:
             value_type=type(value).__name__,
         )
         return None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(str(name))
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in _TRUTHY
 
 
 def _stamp_parent_slice_identity(
@@ -449,7 +490,68 @@ def _execution_degraded_from_cache() -> Dict[str, Any]:
     }
 
 
-def _execution_gate_or_block(dry_run: bool) -> Optional[Dict[str, Any]]:
+def _paper_sim_broker_contract(
+    chain: Optional[List[str]] = None,
+    *,
+    env: Optional[dict] = None,
+) -> Dict[str, Any]:
+    source: Dict[str, Any] = dict(env) if env is not None else dict(os.environ)
+    mode_snapshot = env_execution_mode_snapshot(source)
+    invalid = mode_snapshot.get("invalid")
+    mode = str(mode_snapshot.get("mode") or "safe").strip().lower() or "safe"
+    normalized_chain = [canonical_broker_name(item) for item in list(chain if chain is not None else effective_broker_chain(source))]
+
+    broker_env = {
+        "BROKER": str(source.get("BROKER", "") or "").strip(),
+        "BROKER_NAME": str(source.get("BROKER_NAME", "") or "").strip(),
+        "LIVE_BROKER": str(source.get("LIVE_BROKER", "") or "").strip(),
+        "INTENDED_LIVE_BROKER": str(source.get("INTENDED_LIVE_BROKER", "") or "").strip(),
+        "BROKER_FAILOVER": str(source.get("BROKER_FAILOVER", "") or "").strip(),
+    }
+    canonical_env = {
+        key: canonical_broker_name(value)
+        for key, value in broker_env.items()
+        if key != "BROKER_FAILOVER" and value
+    }
+    blockers: List[str] = []
+    if invalid:
+        blockers.append("invalid_execution_mode")
+    if mode == "paper":
+        if normalized_chain != ["sim"]:
+            blockers.append("paper_requires_sim_failover_chain")
+        live_env_keys = [key for key, value in canonical_env.items() if value in LIVE_BROKERS]
+        if live_env_keys:
+            blockers.append("paper_live_broker_env_forbidden")
+        non_sim_env_keys = [key for key, value in canonical_env.items() if value != "sim"]
+        if non_sim_env_keys:
+            blockers.append("paper_requires_sim_broker_env")
+
+    blockers = list(dict.fromkeys(blockers))
+    return {
+        "ok": not blockers,
+        "status": "ok" if not blockers else "paper_sim_broker_contract_invalid",
+        "reason": "ok" if not blockers else blockers[0],
+        "mode": mode,
+        "mode_snapshot": dict(mode_snapshot or {}),
+        "chain": normalized_chain,
+        "broker_env": broker_env,
+        "canonical_broker_env": canonical_env,
+        "live_adapter_import_reachable": bool(
+            any(item in LIVE_BROKERS for item in normalized_chain)
+            or any(value in LIVE_BROKERS for value in canonical_env.values())
+        ),
+        "blockers": blockers,
+    }
+
+
+def _paper_simulation_route_enabled_with_live_disabled(chain: Optional[List[str]]) -> bool:
+    if not live_execution_disabled():
+        return False
+    contract = _paper_sim_broker_contract(chain)
+    return bool(contract.get("ok")) and str(contract.get("mode") or "") == "paper"
+
+
+def _execution_gate_or_block(dry_run: bool, *, chain: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """
     Returns None if allowed, else a structured block response.
     Fail-closed if providers missing.
@@ -457,7 +559,8 @@ def _execution_gate_or_block(dry_run: bool) -> Optional[Dict[str, Any]]:
     if bool(dry_run):
         return None
 
-    if live_execution_disabled():
+    allow_paper_sim_with_live_disabled = _paper_simulation_route_enabled_with_live_disabled(chain)
+    if live_execution_disabled() and not allow_paper_sim_with_live_disabled:
         return {
             "ok": False,
             "status": "execution_blocked",
@@ -472,9 +575,26 @@ def _execution_gate_or_block(dry_run: bool) -> Optional[Dict[str, Any]]:
 
     gate = _execution_gate_snapshot(
         get_execution_mode_fn=_get_execution_mode,
-        execution_degraded=_execution_degraded_from_cache(),
+        execution_degraded=cast(Any, _execution_degraded_from_cache()),
         kill_switches=(_kill_switch_snapshot() or {}),
     )
+
+    if allow_paper_sim_with_live_disabled:
+        mode = str(gate.get("mode") or "").strip().lower()
+        if (
+            bool(gate.get("ok"))
+            and bool(gate.get("allowed"))
+            and bool(gate.get("allow_simulation"))
+            and not bool(gate.get("real_trading_allowed"))
+            and mode == "paper"
+        ):
+            return None
+        return {
+            "ok": False,
+            "status": "execution_blocked",
+            "gate": gate,
+            "paper_sim_broker_contract": _paper_sim_broker_contract(chain),
+        }
 
     if (not bool(gate.get("ok"))) or (not bool(gate.get("allowed"))):
         return {"ok": False, "status": "execution_blocked", "gate": gate}
@@ -506,7 +626,7 @@ def _real_trading_gate_or_block(broker_name: str, dry_run: bool) -> Optional[Dic
 
     gate = _execution_gate_snapshot(
         get_execution_mode_fn=_get_execution_mode,
-        execution_degraded=_execution_degraded_from_cache(),
+        execution_degraded=cast(Any, _execution_degraded_from_cache()),
         kill_switches=(_kill_switch_snapshot() or {}),
     )
     if (not bool(gate.get("ok"))) or (not bool(gate.get("real_trading_allowed"))):
@@ -719,6 +839,12 @@ def _parse_failover_chain() -> List[str]:
     return configured_failover_chain()
 
 
+def effective_broker_chain(env: Optional[dict] = None) -> List[str]:
+    """Return the canonical broker chain the router will use for this process."""
+
+    return configured_failover_chain(env)
+
+
 def _is_fx_order_symbol(symbol: str) -> bool:
     try:
         from engine.data.fx_instrument import parse_fx_symbol
@@ -766,6 +892,263 @@ def _prefer_fx_capable_broker(chain: List[str], orders: Optional[List[dict]]) ->
     if not fx_broker or (ordered and ordered[0] == fx_broker):
         return ordered
     return [fx_broker] + [name for name in ordered if canonical_broker_name(name) != fx_broker]
+
+
+def _fx_order_safety_block(chain: List[str], orders: Optional[List[dict]]) -> Optional[Dict[str, Any]]:
+    if not _batch_has_fx(orders):
+        return None
+    fx_broker = _fx_capable_broker(chain)
+    if fx_broker:
+        return None
+    return {
+        "ok": False,
+        "status": "fx_broker_unavailable",
+        "reason": "fx_execution_requires_ibkr_cash_idealpro",
+        "broker": "failover_chain",
+        "stop_failover": True,
+        "retryable": False,
+        "failover_attempts": [],
+        "required_broker": "ibkr",
+        "supported_fx_route": "IBKR CASH/IDEALPRO",
+    }
+
+
+def normalize_crypto_symbol(symbol: str) -> str:
+    """Return the local bare-root crypto symbol used by asset_map/storage.
+
+    Local fallback only: the canonical ``crypto_instrument.py`` owner is still
+    absent, so keep this behavior aligned with the other crypto fallbacks.
+    """
+
+    text = str(symbol or "").upper().strip()
+    if not text:
+        return ""
+    for separator in ("/", "-", "_", ":"):
+        if separator in text:
+            text = text.split(separator, 1)[0]
+            break
+    for quote in ("USDT", "USDC", "USD"):
+        if text.endswith(quote) and len(text) > len(quote):
+            text = text[: -len(quote)]
+            break
+    return {"XBT": "BTC"}.get(text, text)
+
+
+def _is_crypto_order_symbol(symbol: str) -> bool:
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        return bool(asset_class_for_symbol(normalize_crypto_symbol(symbol)) == "CRYPTO")
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_CRYPTO_CLASSIFY_FAILED", e, once_key=f"crypto_classify:{symbol}", symbol=str(symbol))
+    return False
+
+
+def _batch_has_crypto(orders: Optional[List[dict]]) -> bool:
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        if _is_crypto_order_symbol(str(order.get("symbol") or "")):
+            return True
+    return False
+
+
+def _crypto_capable_broker(chain: List[str]) -> Optional[str]:
+    from engine.execution.broker_failover_policy import IBKR_BROKERS, canonical_broker_name
+
+    for name in list(chain or []):
+        if canonical_broker_name(name) in IBKR_BROKERS:
+            return "ibkr"
+    return None
+
+
+def _prefer_crypto_capable_broker(chain: List[str], orders: Optional[List[dict]]) -> List[str]:
+    from engine.execution.broker_failover_policy import canonical_broker_name
+
+    ordered = [canonical_broker_name(name) for name in list(chain or [])]
+    if not _batch_has_crypto(orders):
+        return ordered
+    crypto_broker = _crypto_capable_broker(ordered)
+    if not crypto_broker or (ordered and ordered[0] == crypto_broker):
+        return ordered
+    return [crypto_broker] + [name for name in ordered if canonical_broker_name(name) != crypto_broker]
+
+
+def _parse_futures_order_metadata(symbol: str):
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+
+        return parse_futures_symbol(symbol)
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_FUTURES_PARSE_FAILED",
+            e,
+            once_key=f"futures_parse:{symbol}",
+            symbol=str(symbol),
+        )
+        return None
+
+
+def _is_futures_order_symbol(symbol: str) -> bool:
+    return _parse_futures_order_metadata(symbol) is not None
+
+
+def _batch_has_futures(orders: Optional[List[dict]]) -> bool:
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        if _is_futures_order_symbol(str(order.get("symbol") or "")):
+            return True
+    return False
+
+
+def _futures_capable_broker(chain: List[str]) -> Optional[str]:
+    from engine.execution.broker_failover_policy import IBKR_BROKERS, canonical_broker_name
+
+    for name in list(chain or []):
+        if canonical_broker_name(name) in IBKR_BROKERS:
+            return "ibkr"
+    return None
+
+
+def _prefer_futures_capable_broker(chain: List[str], orders: Optional[List[dict]]) -> List[str]:
+    from engine.execution.broker_failover_policy import canonical_broker_name
+
+    ordered = [canonical_broker_name(name) for name in list(chain or [])]
+    if not _batch_has_futures(orders):
+        return ordered
+    futures_broker = _futures_capable_broker(ordered)
+    if not futures_broker or (ordered and ordered[0] == futures_broker):
+        return ordered
+    return [futures_broker] + [name for name in ordered if canonical_broker_name(name) != futures_broker]
+
+
+def _futures_delivery_block_window_ms() -> int:
+    default = 7 * 24 * 60 * 60 * 1000
+    try:
+        return max(0, int(str(os.environ.get("FUTURES_DELIVERY_BLOCK_WINDOW_MS", str(default)) or str(default)).strip()))
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_ROUTER_FUTURES_DELIVERY_BLOCK_WINDOW_PARSE_FAILED",
+            e,
+            once_key="futures_delivery_block_window",
+        )
+        return int(default)
+
+
+def _futures_contract_month(symbol: str) -> tuple[int, int] | None:
+    text = str(symbol or "").upper().strip()
+    match = re.match(r"^([A-Z0-9]+)([FGHJKMNQUVXZ])(\d{2})$", text)
+    if match is None:
+        return None
+    _root, month_code, year_text = match.groups()
+    month = _FUTURES_MONTH_TO_NUM.get(month_code)
+    if month is None:
+        return None
+    return 2000 + int(year_text), int(month)
+
+
+def _futures_order_safety_block(
+    orders: Optional[List[dict]],
+    *,
+    dry_run: bool,
+    chain: Optional[List[str]],
+    ts_ms: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if bool(dry_run) or not _batch_has_futures(orders):
+        return None
+
+    normalized_chain = [canonical_broker_name(name) for name in list(chain or [])]
+    if any(name in LIVE_BROKERS for name in normalized_chain) and not _env_bool("FUTURES_LIVE_TRADING_ENABLED", False):
+        return {
+            "ok": False,
+            "status": "futures_live_disabled",
+            "reason": "futures_live_trading_disabled_by_default",
+            "broker": "failover_chain",
+            "stop_failover": True,
+            "retryable": False,
+            "env": {"FUTURES_LIVE_TRADING_ENABLED": str(os.environ.get("FUTURES_LIVE_TRADING_ENABLED", "0") or "0")},
+        }
+
+    ts = int(ts_ms if ts_ms is not None else time.time() * 1000)
+    delivery_window = _futures_delivery_block_window_ms()
+    try:
+        from engine.data.calendar.futures_sessions import futures_market_closed, is_maintenance_break
+    except Exception as e:
+        _warn_nonfatal("BROKER_ROUTER_FUTURES_SESSION_IMPORT_FAILED", e, once_key="futures_session_import")
+        return {
+            "ok": False,
+            "status": "futures_session_check_unavailable",
+            "reason": "futures_session_check_failed_closed",
+            "broker": "failover_chain",
+            "stop_failover": True,
+            "retryable": False,
+            "error": str(e),
+        }
+
+    for order in list(orders or []):
+        if not isinstance(order, dict):
+            continue
+        symbol = str(order.get("symbol") or "").upper().strip()
+        metadata = _parse_futures_order_metadata(symbol)
+        if metadata is None:
+            continue
+        root = str(getattr(metadata, "root", "") or "").upper().strip()
+        if is_maintenance_break(ts):
+            return {
+                "ok": False,
+                "status": "futures_maintenance_break_blocked",
+                "reason": "futures_order_during_maintenance_break",
+                "broker": "failover_chain",
+                "symbol": str(getattr(metadata, "symbol", symbol) or symbol),
+                "root": root,
+                "stop_failover": True,
+                "retryable": False,
+            }
+        if futures_market_closed(ts, session_calendar=str(getattr(metadata, "session_calendar", "") or "CME_GLOBEX_24x5")):
+            return {
+                "ok": False,
+                "status": "futures_closed_session_blocked",
+                "reason": "futures_order_during_closed_session",
+                "broker": "failover_chain",
+                "symbol": str(getattr(metadata, "symbol", symbol) or symbol),
+                "root": root,
+                "stop_failover": True,
+                "retryable": False,
+            }
+        for key in ("first_notice_ts_ms", "expiry_ts_ms", "last_trade_ts_ms"):
+            boundary = _optional_int(order.get(key))
+            if boundary is not None and ts >= int(boundary) - int(delivery_window):
+                return {
+                    "ok": False,
+                    "status": "futures_delivery_window_blocked",
+                    "reason": f"futures_order_inside_{key}_window",
+                    "broker": "failover_chain",
+                    "symbol": str(getattr(metadata, "symbol", symbol) or symbol),
+                    "root": root,
+                    "boundary_ts_ms": int(boundary),
+                    "window_ms": int(delivery_window),
+                    "stop_failover": True,
+                    "retryable": False,
+                }
+        contract_month = _futures_contract_month(str(getattr(metadata, "symbol", symbol) or symbol))
+        if contract_month is not None:
+            year, month = contract_month
+            month_start = int(datetime(int(year), int(month), 1, tzinfo=timezone.utc).timestamp() * 1000)
+            if ts >= int(month_start) - int(delivery_window):
+                return {
+                    "ok": False,
+                    "status": "futures_delivery_window_blocked",
+                    "reason": "futures_order_inside_contract_month_window",
+                    "broker": "failover_chain",
+                    "symbol": str(getattr(metadata, "symbol", symbol) or symbol),
+                    "root": root,
+                    "boundary_ts_ms": int(month_start),
+                    "window_ms": int(delivery_window),
+                    "stop_failover": True,
+                    "retryable": False,
+                }
+    return None
 
 
 def list_open_orders_router(*, broker: Optional[str] = None, timeout_s: float = 10.0) -> Dict[str, Any]:
@@ -1058,6 +1441,7 @@ def _is_retryable_result(res: Optional[Dict[str, Any]]) -> bool:
         "sim_adapter_missing",
         "alpaca_adapter_missing",
         "ibkr_adapter_missing",
+        "tradier_options_adapter_missing",
         "execution_blocked",
         "execution_blocked_gate_unavailable",
         "execution_blocked_gate_providers_missing",
@@ -1207,6 +1591,7 @@ def _apply_one(
         "alpaca", "alpaca_rest",
         "ibkr", "interactivebrokers", "interactive_brokers",
         "ib_gateway", "ibgateway", "tws",
+        "tradier_options",
     )
 
     if is_live:
@@ -1231,6 +1616,16 @@ def _apply_one(
         if options_block is not None:
             return options_block
 
+        futures_block = _futures_order_safety_block(
+            override_orders,
+            dry_run=bool(dry_run),
+            chain=[name],
+            ts_ms=override_ts_ms,
+        )
+        if futures_block is not None:
+            futures_block["broker"] = name
+            return futures_block
+
     # Pre-live reconcile gate (never blocks dry_run)
     if is_live and (not bool(dry_run)):
         reconcile_block = _prelive_reconcile_or_block(
@@ -1239,6 +1634,25 @@ def _apply_one(
         )
         if reconcile_block is not None:
             return reconcile_block
+
+    # ---------------- TRADIER OPTIONS ----------------
+    if name == "tradier_options":
+        tradier_apply = _resolve_tradier_options_apply()
+        if tradier_apply is None:
+            return {"ok": False, "status": "tradier_options_adapter_missing", "broker": name}
+        delay_res = _apply_batch_entry_delay(orders=override_orders, dry_run=bool(dry_run), broker_name="tradier_options")
+        if int(delay_res) < 0:
+            return {"ok": False, "status": "blocked_kill_switch_during_entry_delay", "broker": "tradier_options"}
+        res = _call_adapter(
+            tradier_apply,
+            dry_run=dry_run,
+            override_orders=override_orders,
+            override_order_id=override_order_id,
+            override_ts_ms=override_ts_ms,
+        ) or {}
+        if isinstance(res, dict) and "broker" not in res:
+            res["broker"] = "tradier_options"
+        return res
 
     # ---------------- ALPACA ----------------
     if name in ("alpaca", "alpaca_rest"):
@@ -1382,11 +1796,28 @@ def apply_new_portfolio_orders_router(
 
     lineage = _lineage_summary(override_orders)
 
-    chain = _parse_failover_chain()
+    chain = effective_broker_chain()
     if not chain:
         chain = ["sim"]
 
     engine_mode = os.environ.get("ENGINE_MODE", "safe")
+    paper_contract = _paper_sim_broker_contract(chain)
+    if (
+        str(paper_contract.get("mode") or "") == "paper"
+        and not bool(paper_contract.get("ok"))
+        and live_execution_disabled()
+    ):
+        return {
+            "ok": False,
+            "status": "paper_sim_broker_contract_invalid",
+            "reason": str(paper_contract.get("reason") or "paper_requires_sim_broker"),
+            "broker": "failover_chain",
+            "stop_failover": True,
+            "retryable": False,
+            "failover_attempts": [],
+            "paper_sim_broker_contract": paper_contract,
+        }
+
     chain_policy = validate_live_failover_chain(
         chain,
         engine_mode=engine_mode,
@@ -1419,9 +1850,21 @@ def apply_new_portfolio_orders_router(
                 "failover_policy": dict(broker_contract.get("chain_policy") or chain_policy),
             }
 
-    blocked = _execution_gate_or_block(dry_run=bool(dry_run))
+    blocked = _execution_gate_or_block(dry_run=bool(dry_run), chain=chain)
     if blocked is not None:
         return blocked
+
+    if str(paper_contract.get("mode") or "") == "paper" and not bool(paper_contract.get("ok")):
+        return {
+            "ok": False,
+            "status": "paper_sim_broker_contract_invalid",
+            "reason": str(paper_contract.get("reason") or "paper_requires_sim_broker"),
+            "broker": "failover_chain",
+            "stop_failover": True,
+            "retryable": False,
+            "failover_attempts": [],
+            "paper_sim_broker_contract": paper_contract,
+        }
 
     options_block = live_options_order_block(
         override_orders,
@@ -1433,7 +1876,24 @@ def apply_new_portfolio_orders_router(
     if options_block is not None:
         return options_block
 
-    chain = _prefer_fx_capable_broker(chain, override_orders)
+    futures_block = _futures_order_safety_block(
+        override_orders,
+        dry_run=bool(dry_run),
+        chain=chain,
+        ts_ms=override_ts_ms,
+    )
+    if futures_block is not None:
+        futures_block["failover_attempts"] = []
+        return futures_block
+
+    fx_block = _fx_order_safety_block(chain, override_orders)
+    if fx_block is not None:
+        return fx_block
+
+    chain = _prefer_crypto_capable_broker(
+        _prefer_futures_capable_broker(_prefer_fx_capable_broker(chain, override_orders), override_orders),
+        override_orders,
+    )
     attempts: List[Dict[str, Any]] = []
 
     for name in chain:

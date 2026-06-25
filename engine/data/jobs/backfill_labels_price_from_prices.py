@@ -63,6 +63,12 @@ HORIZONS = [300, 3600]
 LOOKBACK_DAYS = int(os.environ.get("LABELS_PRICE_LOOKBACK_DAYS", "30"))
 # rolling window size for zscore
 ZSCORE_LOOKBACK = int(os.environ.get("LABELS_PRICE_ZLOOKBACK", "500"))
+LABELS_USE_CORP_ACTION_ADJUSTMENT = os.environ.get("LABELS_USE_CORP_ACTION_ADJUSTMENT", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _warn_nonfatal(event: str, code: str, error: BaseException, *, warn_key: str | None = None, **extra: object) -> None:
@@ -133,6 +139,59 @@ def _label_price_eval_target(symbol: str, ts_pred_ms: int, horizon_s: int) -> Tu
         {"fx_clock_corrected": True, "naive_eval_ms": int(naive_eval_ms)},
         bool(spans_gap),
     )
+
+
+def _corporate_action_adjusted_return(
+    con,
+    *,
+    symbol: str,
+    start_ts_ms: int,
+    end_ts_ms: int,
+    entry_px: float,
+    exit_px: float,
+    raw_ret: float,
+) -> tuple[float, dict]:
+    if not LABELS_USE_CORP_ACTION_ADJUSTMENT:
+        return float(raw_ret), {}
+    try:
+        from engine.data.corporate_actions import corporate_action_total_return_factor
+
+        split_factor, meta = corporate_action_total_return_factor(
+            con,
+            symbol=str(symbol),
+            start_ts_ms=int(start_ts_ms),
+            end_ts_ms=int(end_ts_ms),
+            entry_px=float(entry_px),
+        )
+    except Exception as exc:
+        _warn_nonfatal(
+            "backfill_labels_price_corp_action_adjustment_failed",
+            "BACKFILL_LABELS_PRICE_CORP_ACTION_ADJUSTMENT_FAILED",
+            exc,
+            warn_key=f"backfill_labels_price_corp_action_adjustment_failed:{symbol}",
+            symbol=str(symbol),
+        )
+        return float(raw_ret), {}
+
+    reason = str((meta or {}).get("reason") or "")
+    if reason in {"", "no_corporate_action", "invalid_entry_price"}:
+        return float(raw_ret), {}
+    if reason == "corp_action_unparseable":
+        return float(raw_ret), {"corporate_actions": dict(meta or {})}
+
+    dividend_return = float((meta or {}).get("dividend_return") or 0.0)
+    adjusted = ((float(exit_px) * float(split_factor)) - float(entry_px)) / float(entry_px)
+    adjusted += float(dividend_return)
+    out_meta = dict(meta or {})
+    out_meta.update(
+        {
+            "raw_return": float(raw_ret),
+            "adjusted_return": float(adjusted),
+            "entry_px": float(entry_px),
+            "exit_px": float(exit_px),
+        }
+    )
+    return float(adjusted), {"corporate_actions": out_meta}
 
 
 def _rolling_z(con, symbol: str, horizon_s: int, new_ret: float) -> float:
@@ -283,7 +342,16 @@ def main():
                 if exit_px <= 0:
                     continue
 
-                ret = (exit_px - entry_px) / entry_px
+                raw_ret = (exit_px - entry_px) / entry_px
+                ret, corp_action_meta = _corporate_action_adjusted_return(
+                    con,
+                    symbol=str(sym),
+                    start_ts_ms=int(entry_ts),
+                    end_ts_ms=int(exit_ts),
+                    entry_px=float(entry_px),
+                    exit_px=float(exit_px),
+                    raw_ret=float(raw_ret),
+                )
                 dir_ = 1 if ret > 0 else (-1 if ret < 0 else 0)
                 ret_z = _rolling_z(con, sym, horizon_s, float(ret))
 
@@ -291,6 +359,8 @@ def main():
                     meta_payload = {"entry_ts_ms": int(entry_ts), "exit_ts_ms": int(exit_ts)}
                     if fx_clock_meta:
                         meta_payload.update(dict(fx_clock_meta))
+                    if corp_action_meta:
+                        meta_payload.update(dict(corp_action_meta))
                     con.execute(
                         """
                         INSERT OR REPLACE INTO labels_price(

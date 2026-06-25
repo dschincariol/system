@@ -222,7 +222,7 @@ from engine.runtime.shutdown import runtime_shutdown
 # ------------------------------------------------------------------
 # DB HEALTH
 # ------------------------------------------------------------------
-from engine.runtime.storage import DB_PATH
+from engine.runtime.storage import DB_PATH, get_active_backend_name
 
 def _db_health_snapshot():
     from engine.runtime.storage import connect_ro
@@ -231,6 +231,7 @@ def _db_health_snapshot():
         db_path=DB_PATH,
         base_dir=_BASE_DIR,
         connect_ro=connect_ro,
+        backend_name=get_active_backend_name(),
     )
 
 def api_get_db_health(_parsed, _ctx=None):
@@ -2695,6 +2696,10 @@ ROUTE_SPECS_OPERATOR_BRIDGE = [
     ("GET", "/api/operator/ping", "api_get_operator_ping"),
 ]
 
+ROUTE_SPECS_FUTURES_UI = [
+    ("GET", "/api/data/futures/rolls", "api_get_futures_rolls"),
+]
+
 # (optional) terminal route modules are consolidated via ROUTE_SPECS_TERMINAL_ALL below
 
 # -------------------------------------------------------------------
@@ -2723,6 +2728,7 @@ _RAW_ROUTE_SPECS = _build_raw_route_specs(
     ROUTE_SPECS_UI_METRICS,
     ROUTE_SPECS_BROKER_CONFIG,
     ROUTE_SPECS_OPERATOR_BRIDGE,
+    ROUTE_SPECS_FUTURES_UI,
     _terminal_routes,
     fallback_route_specs=_FALLBACK_ROUTE_SPECS,
 )
@@ -3292,6 +3298,364 @@ def api_get_prices(parsed, _ctx=None):
                 con.close()
         except Exception as e:
             _warn_nonfatal("DASHBOARD_SERVER_API_CON_CLOSE_FAILED", e, endpoint="api_get_trades")
+
+
+def _dashboard_futures_root(contract: Any) -> str:
+    text = str(contract or "").upper().strip()
+    if ".C." in text:
+        return text.split(".C.", 1)[0]
+    import re
+
+    match = re.match(r"^([A-Z0-9]+)[FGHJKMNQUVXZ]\d{2}$", text)
+    if match:
+        return str(match.group(1))
+    return text
+
+
+def _dashboard_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return float(default)
+    try:
+        out = float(value)
+        if out == out:
+            return float(out)
+    except Exception as e:
+        _warn_nonfatal(
+            "DASHBOARD_SERVER_FUTURES_FLOAT_PARSE_FAILED",
+            e,
+            value_type=type(value).__name__,
+        )
+        return float(default)
+    return float(default)
+
+
+def _dashboard_int(value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return int(default)
+    try:
+        return int(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "DASHBOARD_SERVER_FUTURES_INT_PARSE_FAILED",
+            e,
+            value_type=type(value).__name__,
+        )
+        return int(default)
+
+
+def _dashboard_latest_futures_prices(con) -> dict[str, dict[str, Any]]:
+    prices: dict[str, dict[str, Any]] = {}
+    if _dashboard_table_exists(con, "futures_contract_bars"):
+        rows = con.execute(
+            """
+            SELECT contract, ts_ms, close, volume, open_interest, source
+            FROM futures_contract_bars
+            ORDER BY contract, ts_ms DESC
+            LIMIT 1000
+            """
+        ).fetchall() or []
+        for row in rows:
+            contract = str(row[0] or "").upper().strip()
+            if contract and contract not in prices:
+                prices[contract] = {
+                    "symbol": contract,
+                    "root": _dashboard_futures_root(contract),
+                    "ts_ms": _dashboard_int(row[1]),
+                    "close": _dashboard_float(row[2]),
+                    "volume": _dashboard_float(row[3]),
+                    "open_interest": _dashboard_float(row[4]),
+                    "source": str(row[5] or "futures_contract_bars"),
+                }
+    if _dashboard_table_exists(con, "futures_continuous_bars"):
+        rows = con.execute(
+            """
+            SELECT continuous_symbol, ts_ms, close, volume, adj_method
+            FROM futures_continuous_bars
+            ORDER BY continuous_symbol, ts_ms DESC
+            LIMIT 1000
+            """
+        ).fetchall() or []
+        for row in rows:
+            symbol = str(row[0] or "").strip()
+            if symbol and symbol not in prices:
+                prices[symbol] = {
+                    "symbol": symbol,
+                    "root": _dashboard_futures_root(symbol),
+                    "ts_ms": _dashboard_int(row[1]),
+                    "close": _dashboard_float(row[2]),
+                    "volume": _dashboard_float(row[3]),
+                    "open_interest": None,
+                    "source": str(row[4] or "futures_continuous_bars"),
+                }
+    return prices
+
+
+def _dashboard_futures_position_qty(con) -> dict[str, float]:
+    if not _dashboard_table_exists(con, "broker_positions"):
+        return {}
+    cols = set(_dashboard_table_columns(con, "broker_positions"))
+    if "symbol" not in cols or "qty" not in cols:
+        return {}
+    order_col = "updated_ts_ms" if "updated_ts_ms" in cols else ("ts_ms" if "ts_ms" in cols else "symbol")
+    rows = con.execute(f"SELECT symbol, qty FROM broker_positions ORDER BY symbol, {order_col} DESC").fetchall() or []
+    out: dict[str, float] = {}
+    for row in rows:
+        symbol = str(row[0] or "").strip()
+        if symbol and symbol not in out:
+            out[symbol] = _dashboard_float(row[1])
+    return out
+
+
+def _dashboard_query_futures_rolls(con, *, limit: int, warnings: list[str]) -> list[dict[str, Any]]:
+    if not _dashboard_table_exists(con, "futures_roll_calendar"):
+        warnings.append("futures_roll_calendar table not present")
+        return []
+    rows = con.execute(
+        """
+        SELECT root, roll_ts_ms, from_contract, to_contract, gap_ratio, method, ingested_ts_ms
+        FROM futures_roll_calendar
+        ORDER BY roll_ts_ms DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall() or []
+    return [
+        {
+            "root": str(row[0] or ""),
+            "roll_ts_ms": _dashboard_int(row[1]),
+            "from_contract": str(row[2] or ""),
+            "to_contract": str(row[3] or ""),
+            "gap_ratio": _dashboard_float(row[4], 1.0),
+            "method": str(row[5] or "oi_volume"),
+            "ingested_ts_ms": _dashboard_int(row[6]),
+            "lineage": "futures_roll_calendar",
+        }
+        for row in rows
+    ]
+
+
+def _dashboard_query_futures_curve(con, *, limit: int, warnings: list[str]) -> list[dict[str, Any]]:
+    latest = _dashboard_latest_futures_prices(con)
+    if not latest:
+        warnings.append("futures_contract_bars/futures_continuous_bars tables empty or not present")
+        return []
+    return sorted(latest.values(), key=lambda item: (str(item.get("root") or ""), str(item.get("symbol") or "")))[:limit]
+
+
+def _dashboard_query_futures_roll_yield(con, *, limit: int, warnings: list[str]) -> list[dict[str, Any]]:
+    if not _dashboard_table_exists(con, "futures_roll_yield"):
+        warnings.append("futures_roll_yield table not present")
+        return []
+    rows = con.execute(
+        """
+        SELECT root, ts_ms, roll_yield
+        FROM futures_roll_yield
+        ORDER BY ts_ms DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall() or []
+    return [
+        {
+            "root": str(row[0] or ""),
+            "ts_ms": _dashboard_int(row[1]),
+            "roll_yield": _dashboard_float(row[2]),
+            "lineage": "futures_roll_yield",
+        }
+        for row in rows
+    ]
+
+
+def _dashboard_query_futures_cot(con, *, limit: int, warnings: list[str]) -> list[dict[str, Any]]:
+    if not _dashboard_table_exists(con, "cot_symbol_features"):
+        warnings.append("cot_symbol_features table not present")
+        return []
+    rows = con.execute(
+        """
+        SELECT symbol, asof_ts_ms, cot_commercial_net_pctile_3y, cot_noncomm_net_z,
+               cot_noncomm_extreme_flag, cot_open_interest_z, source_max_availability_ts_ms
+        FROM cot_symbol_features
+        ORDER BY asof_ts_ms DESC
+        LIMIT ?
+        """,
+        (max(int(limit), 50),),
+    ).fetchall() or []
+    out: list[dict[str, Any]] = []
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+    except Exception:
+        parse_futures_symbol = None
+    for row in rows:
+        symbol = str(row[0] or "").strip()
+        is_futures = parse_futures_symbol(symbol) is not None if callable(parse_futures_symbol) else ".c." in symbol.lower()
+        if not is_futures:
+            continue
+        out.append(
+            {
+                "symbol": symbol,
+                "asof_ts_ms": _dashboard_int(row[1]),
+                "commercial_net_pctile_3y": _dashboard_float(row[2]),
+                "noncomm_net_z": _dashboard_float(row[3]),
+                "noncomm_extreme_flag": _dashboard_float(row[4]),
+                "open_interest_z": _dashboard_float(row[5]),
+                "source_max_availability_ts_ms": _dashboard_int(row[6]),
+                "lineage": "cot_symbol_features",
+            }
+        )
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def _dashboard_query_futures_margin(con, *, limit: int, warnings: list[str]) -> list[dict[str, Any]]:
+    if not _dashboard_table_exists(con, "symbols"):
+        warnings.append("symbols table not present")
+        return []
+    cols = set(_dashboard_table_columns(con, "symbols"))
+    required = {"symbol", "asset_class", "fut_root", "fut_multiplier", "fut_price_ccy", "fut_margin_ref"}
+    if not required.issubset(cols):
+        warnings.append("symbols futures metadata columns not present")
+        return []
+    latest_prices = _dashboard_latest_futures_prices(con)
+    qty_map = _dashboard_futures_position_qty(con)
+    rows = con.execute(
+        """
+        SELECT symbol, asset_class, instrument_kind, fut_root, fut_exchange, fut_multiplier,
+               fut_tick_size, fut_tick_value, fut_price_ccy, fut_margin_ref,
+               fut_expiry_rule, fut_roll_method, fut_continuous_alias, session_calendar
+        FROM symbols
+        WHERE asset_class='FUTURES' OR fut_root IS NOT NULL
+        ORDER BY symbol
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall() or []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        symbol = str(row[0] or "").strip()
+        px_row = latest_prices.get(symbol) or latest_prices.get(str(row[12] or "").strip()) or {}
+        price = _dashboard_float(px_row.get("close"), 0.0)
+        multiplier = _dashboard_float(row[5], 0.0)
+        qty = _dashboard_float(qty_map.get(symbol), 0.0)
+        one_contract_notional = price * multiplier if price > 0.0 and multiplier > 0.0 else 0.0
+        position_notional = abs(qty) * one_contract_notional
+        out.append(
+            {
+                "symbol": symbol,
+                "root": str(row[3] or "").strip(),
+                "asset_class": str(row[1] or "FUTURES"),
+                "instrument_kind": str(row[2] or ""),
+                "exchange": str(row[4] or ""),
+                "multiplier": multiplier,
+                "tick_size": _dashboard_float(row[6]),
+                "tick_value": _dashboard_float(row[7]),
+                "price_ccy": str(row[8] or "USD"),
+                "margin_ref": _dashboard_float(row[9]),
+                "expiry_rule": str(row[10] or ""),
+                "roll_method": str(row[11] or ""),
+                "continuous_alias": str(row[12] or ""),
+                "session_calendar": str(row[13] or ""),
+                "latest_price": price if price > 0.0 else None,
+                "latest_price_ts_ms": _dashboard_int(px_row.get("ts_ms")),
+                "position_qty": qty,
+                "one_contract_notional": one_contract_notional,
+                "position_notional": position_notional,
+                "lineage": "symbols,futures_contract_bars,broker_positions",
+            }
+        )
+    return out
+
+
+def api_get_futures_rolls(parsed, _ctx=None):
+    con = None
+    warnings: list[str] = []
+    try:
+        qs = _qs_dict(parsed)
+        limit = max(1, min(200, int(qs.get("limit", "50") or "50")))
+        con = _dashboard_db_connect()
+        generated_ts_ms = int(time.time() * 1000)
+        rolls = _dashboard_query_futures_rolls(con, limit=limit, warnings=warnings)
+        curve = _dashboard_query_futures_curve(con, limit=limit, warnings=warnings)
+        roll_yield = _dashboard_query_futures_roll_yield(con, limit=limit, warnings=warnings)
+        cot = _dashboard_query_futures_cot(con, limit=limit, warnings=warnings)
+        margin = _dashboard_query_futures_margin(con, limit=limit, warnings=warnings)
+        latest_ts = max(
+            [0]
+            + [_dashboard_int(row.get("roll_ts_ms")) for row in rolls]
+            + [_dashboard_int(row.get("ts_ms")) for row in curve]
+            + [_dashboard_int(row.get("ts_ms")) for row in roll_yield]
+            + [_dashboard_int(row.get("asof_ts_ms")) for row in cot]
+            + [_dashboard_int(row.get("latest_price_ts_ms")) for row in margin]
+        )
+        state = "ready" if any((rolls, curve, roll_yield, cot, margin)) else "empty"
+        return {
+            "ok": True,
+            "state": state,
+            "read_only": True,
+            "shadow_only": True,
+            "generated_ts_ms": int(generated_ts_ms),
+            "latest_ts_ms": int(latest_ts),
+            "summary": {
+                "roll_count": len(rolls),
+                "curve_count": len(curve),
+                "roll_yield_count": len(roll_yield),
+                "cot_count": len(cot),
+                "margin_count": len(margin),
+                "status": state,
+            },
+            "roll_calendar": rolls,
+            "term_structure": curve,
+            "roll_yield": roll_yield,
+            "cot": cot,
+            "margin": margin,
+            "lineage": {
+                "tables": [
+                    "futures_roll_calendar",
+                    "futures_contract_bars",
+                    "futures_continuous_bars",
+                    "futures_roll_yield",
+                    "cot_symbol_features",
+                    "symbols",
+                    "broker_positions",
+                ],
+                "source": "dashboard_server.api_get_futures_rolls",
+            },
+            "warnings": sorted(set(warnings)),
+        }
+    except Exception as e:
+        if _is_dashboard_storage_unavailable_error(e):
+            payload = _dashboard_storage_unavailable_payload("/api/data/futures/rolls", e)
+            _warn_nonfatal("DASHBOARD_SERVER_FUTURES_ROLLS_STORAGE_UNAVAILABLE", e, endpoint="api_get_futures_rolls")
+            payload.update(
+                {
+                    "roll_calendar": [],
+                    "term_structure": [],
+                    "roll_yield": [],
+                    "cot": [],
+                    "margin": [],
+                    "read_only": True,
+                    "shadow_only": True,
+                }
+            )
+            return payload
+        _warn_nonfatal("DASHBOARD_SERVER_FUTURES_ROLLS_FAILED", e, endpoint="api_get_futures_rolls")
+        return {
+            "ok": False,
+            "error": str(e),
+            "roll_calendar": [],
+            "term_structure": [],
+            "roll_yield": [],
+            "cot": [],
+            "margin": [],
+            "read_only": True,
+            "shadow_only": True,
+        }
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal("DASHBOARD_SERVER_API_CON_CLOSE_FAILED", e, endpoint="api_get_futures_rolls")
 
 
 def api_get_trades(parsed, _ctx=None):
@@ -4069,6 +4433,41 @@ def api_get_promotion_audit(parsed, _ctx=None):
         out = []
         for r in rows:
             reason = _dashboard_parse_json(r[5], {})
+            model_card = {}
+            gate_state = {}
+            badges = []
+            citations = []
+            confirmation = {}
+            if isinstance(reason, dict):
+                model_card = reason.get("model_card_snapshot") if isinstance(reason.get("model_card_snapshot"), dict) else {}
+                gate_state = reason.get("gate_state_at_decision") if isinstance(reason.get("gate_state_at_decision"), dict) else {}
+                badges = (
+                    gate_state.get("staleness_badges")
+                    if isinstance(gate_state.get("staleness_badges"), list)
+                    else reason.get("staleness_badges") if isinstance(reason.get("staleness_badges"), list)
+                    else []
+                )
+                raw_citations = []
+                if isinstance(model_card.get("source_citations"), list):
+                    raw_citations.extend(model_card.get("source_citations") or [])
+                if isinstance(gate_state.get("source_citations"), list):
+                    raw_citations.extend(gate_state.get("source_citations") or [])
+                if isinstance(reason.get("source_citations"), list):
+                    raw_citations.extend(reason.get("source_citations") or [])
+                seen_citations = set()
+                for citation in raw_citations:
+                    if not isinstance(citation, dict):
+                        continue
+                    key = (
+                        str(citation.get("source") or ""),
+                        str(citation.get("label") or ""),
+                        int(citation.get("ts_ms") or 0),
+                    )
+                    if key in seen_citations:
+                        continue
+                    seen_citations.add(key)
+                    citations.append(dict(citation))
+                confirmation = reason.get("confirmation") if isinstance(reason.get("confirmation"), dict) else {}
             out.append({
                 "ts_ms": int(r[0] or 0),
                 "actor": str(r[1] or ""),
@@ -4077,6 +4476,11 @@ def api_get_promotion_audit(parsed, _ctx=None):
                 "regime": ("" if r[4] is None else str(r[4])),
                 "reason": reason,
                 "causal_scores": reason.get("causal_scores", {}) if isinstance(reason, dict) else {},
+                "model_card_snapshot": model_card,
+                "gate_state_at_decision": gate_state,
+                "staleness_badges": badges,
+                "source_citations": citations,
+                "confirmation": confirmation,
             })
         return out
     except Exception as e:
@@ -4165,7 +4569,7 @@ def api_get_causal_scores(parsed, _ctx=None):
             _warn_nonfatal("DASHBOARD_SERVER_API_CON_CLOSE_FAILED", e, endpoint="api_get_causal_scores")
 
 from engine.api.api_system import (
-    api_get_health,
+    api_get_health as _api_get_health,
     api_get_liveness,
     api_get_status,
     api_get_system_state,
@@ -4195,6 +4599,32 @@ from engine.api.api_system import (
     api_get_ingestion_status,
     api_get_portfolio_risk,
 )
+
+
+def _options_ingestion_dashboard_label(snapshot: dict) -> tuple[str, str]:
+    options = snapshot.get("options_ingestion") if isinstance(snapshot, dict) else {}
+    options = options if isinstance(options, dict) else {}
+    credentials_configured = bool(options.get("credentials_configured"))
+    degraded = bool(options.get("degraded")) or bool(options.get("failed")) or options.get("ok") is False
+    if credentials_configured and degraded:
+        return "options: DEGRADED - creds set, chain stale", "bad"
+    if credentials_configured:
+        return "options: ok - creds set", "ok"
+    return "options: shadow (no creds)", "dim"
+
+
+def api_get_health(parsed, ctx=None):
+    payload = _api_get_health(parsed, ctx)
+    if isinstance(payload, dict):
+        label, tone = _options_ingestion_dashboard_label(payload)
+        out = dict(payload)
+        labels = dict(out.get("operator_labels") or {})
+        labels["options_ingestion"] = label
+        out["operator_labels"] = labels
+        out["options_ingestion_label"] = label
+        out["options_ingestion_tone"] = tone
+        return out
+    return payload
 
 from engine.api.api_self_repair import (
     api_post_repair_schema,
@@ -4485,6 +4915,20 @@ def _dashboard_load_alert_state(con, alert_id: int) -> dict[str, Any]:
     if alert_key <= 0:
         return state
 
+    try:
+        from engine.api.api_read import _load_alert_state_maps
+
+        ack_map, resolution_map, shelf_map, lifecycle_map = _load_alert_state_maps(con, [alert_key])
+        state.update(ack_map.get(alert_key, {}))
+        state.update(shelf_map.get(alert_key, {}))
+        state.update(resolution_map.get(alert_key, {}))
+        lifecycle = lifecycle_map.get(alert_key, [])
+        if lifecycle:
+            state["lifecycle"] = lifecycle
+        return state
+    except Exception as e:
+        _warn_nonfatal("DASHBOARD_SERVER_ALERT_STATE_MAP_FAILED", e, alert_id=alert_key)
+
     if _dashboard_table_exists(con, "alert_acks"):
         try:
             row = con.execute(
@@ -4673,6 +5117,16 @@ def api_get_alert_by_id(parsed, _ctx=None):
                 if isinstance(item, dict)
             ]
         out.update(_dashboard_load_alert_state(conn, int(alert_id)))
+        try:
+            from engine.api.api_read import _alert_notification_policy
+
+            out["notification_policy"] = _alert_notification_policy(
+                out.get("severity"),
+                out,
+                int(time.time() * 1000),
+            )
+        except Exception as e:
+            _warn_nonfatal("DASHBOARD_SERVER_ALERT_NOTIFICATION_POLICY_FAILED", e, alert_id=alert_id)
         return {"ok": True, "id": alert_id, "alert": out}
     except Exception as e:
         _warn_nonfatal("DASHBOARD_SERVER_ALERT_DETAIL_FAILED", e, endpoint="api_get_alert_detail")
@@ -5390,6 +5844,7 @@ API_HANDLERS = {
     "api_get_recent_decisions": api_get_recent_decisions,
     "api_get_decision_detail": api_get_decision_detail,
     "api_get_feature_visibility": api_get_feature_visibility,
+    "api_get_futures_rolls": api_get_futures_rolls,
     "api_get_audit_records": api_get_audit_records,
     "api_post_ui_interaction": api_post_ui_interaction,
     "api_post_copilot_ask": api_post_copilot_ask,
@@ -5757,7 +6212,17 @@ def _run_dashboard_control_plane():
     try:
         import signal
 
-        def _shutdown(_sig=None, _frame=None):
+        def _log_signal_swallowed(event: str, **extra) -> None:
+            try:
+                log.warning(
+                    "dashboard_server_signal_shutdown_event event=%s extra=%s",
+                    str(event),
+                    dict(extra or {}),
+                )
+            except Exception as log_error:
+                sys.stderr.write(f"dashboard_server_signal_shutdown_log_failed: {log_error}\n")
+
+        def _append_shutdown_signal_event(_sig=None) -> None:
             try:
                 if append_event:
                     try:
@@ -5781,8 +6246,25 @@ def _run_dashboard_control_plane():
                         )
             except Exception as e:
                 log.exception("dashboard_server_shutdown_append_event_failed: %s", e)
-            _shutdown_runtime_once(f"signal={_sig}" if _sig is not None else "signal")
-            _request_httpd_shutdown(f"signal={_sig}" if _sig is not None else "signal")
+
+        def _shutdown(_sig=None, _frame=None):
+            from engine.startup.shutdown import handle_signal as _handle_bounded_signal
+
+            reason = f"signal={_sig}" if _sig is not None else "signal"
+
+            def _runtime_shutdown_for_signal(**_kwargs) -> None:
+                _append_shutdown_signal_event(_sig)
+                _shutdown_runtime_once(reason)
+                _request_httpd_shutdown(reason)
+
+            _handle_bounded_signal(
+                int(_sig or 0),
+                watchdog_stop=_SERVER_STOP_EVENT,
+                mark_clean_shutdown_loader=lambda: (lambda: None),
+                terminate_ingestion=lambda: None,
+                runtime_shutdown=_runtime_shutdown_for_signal,
+                log_swallowed=_log_signal_swallowed,
+            )
 
         try:
             signal.signal(signal.SIGINT, _shutdown)

@@ -145,6 +145,7 @@ def _feature_schema(feature_ids: Sequence[Any], preprocessing: Mapping[str, Any]
         "feature_ids": list(columns),
         "feature_set_tag": str(feature_set_tag_from_ids(list(columns))),
         "feature_count": int(len(columns)),
+        "feature_flags": feature_registry.feature_schema_flags(list(columns)),
     }
     if isinstance(preprocessing, Mapping) and preprocessing:
         schema["preprocessing"] = dict(preprocessing)
@@ -441,6 +442,17 @@ def _assert_loaded_feature_schema_current(loaded: Any) -> None:
             f"artifact_feature_set_tag={artifact_tag} current_feature_set_tag={current_tag} "
             f"artifact_columns={loaded_feature_ids} current_columns={current}"
         )
+    else:
+        try:
+            feature_registry.assert_feature_schema_runtime_parity(
+                artifact_schema,
+                current_schema=current_schema,
+                context="feature_schema_drift",
+                model_name=str(getattr(loaded, "model_name", DEFAULT_MODEL_NAME)),
+            )
+        except ValueError as exc:
+            reason = "runtime_feature_flag_mismatch"
+            error = exc
     if error is not None:
         _emit_feature_schema_load_failure(
             loaded=loaded,

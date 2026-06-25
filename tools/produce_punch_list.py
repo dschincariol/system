@@ -118,9 +118,11 @@ def main() -> int:
     lines.append("## Counts by severity\n\n")
     lines.append("| Severity | Layer 1 actionable | Layer 3 | Total |\n|---|---:|---:|---:|\n")
     l1c = Counts()
-    for f in actionable_l1: l1c.add(f["severity"])
+    for f in actionable_l1:
+        l1c.add(f["severity"])
     l3c = Counts()
-    for f in layer3: l3c.add(f["severity"])
+    for f in layer3:
+        l3c.add(f["severity"])
     for sev, l1n, l3n in [("P0", l1c.p0, l3c.p0), ("P1", l1c.p1, l3c.p1), ("P2", l1c.p2, l3c.p2)]:
         lines.append(f"| {sev} | {l1n} | {l3n} | {l1n + l3n} |\n")
     lines.append("\n")

@@ -79,6 +79,9 @@ SMOKE_CMDS = [
 _WARNED_NONFATAL_KEYS: set[str] = set()
 _PG_PASSWORD_RE = re.compile(r"(?:^|\s)password=", re.IGNORECASE)
 _DSN_USER_RE = re.compile(r"(?:^|\s)user=(?P<value>'(?:\\'|[^'])*'|\S+)")
+# Paid equity providers only. yfinance/simulated are deliberately excluded
+# because they are free/fallback feeds, not expected paid equity rails.
+_EQUITY_PRICE_PROVIDERS = ("polygon_ws", "polygon", "ibkr")
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -94,6 +97,25 @@ def _looks_like_file_path(path: Path) -> bool:
 
 def _split_names(raw: str) -> List[str]:
     return [part.strip() for part in re.split(r"[\s,]+", str(raw or "")) if part.strip()]
+
+
+def _runtime_mode_name() -> str:
+    for name in ("ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE", "MODE"):
+        value = str(os.environ.get(name) or "").strip().lower()
+        if value:
+            return value
+    return "safe"
+
+
+def _paid_equity_provider_names() -> List[str]:
+    raw = str(os.environ.get("PREFLIGHT_PAID_EQUITY_PROVIDERS", "") or "").strip()
+    names = _split_names(raw) if raw else list(_EQUITY_PRICE_PROVIDERS)
+    out: List[str] = []
+    for name in names:
+        provider = str(name or "").strip().lower()
+        if provider and provider not in out:
+            out.append(provider)
+    return out
 
 
 def _dsn_user(conninfo: str) -> str:
@@ -385,6 +407,20 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
         _WARNED_NONFATAL_KEYS.add(once_key)
 
 
+def _dict_payload(value: object) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _list_payload(value: object) -> List[Any]:
+    return list(value) if isinstance(value, (list, tuple, set)) else []
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
 def _compile_files(files: List[str]) -> List[str]:
     errs: List[str] = []
     with tempfile.TemporaryDirectory(prefix="prod_preflight_pycompile_") as tmp_dir:
@@ -411,17 +447,22 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             validate_workload_profile_guardrails,
         )
         from engine.runtime.hardware import runtime_hardware_snapshot
+        from engine.runtime.health import (
+            _options_credentials_configured,
+            _options_ingestion_snapshot,
+            _provider_readiness_enforced,
+        )
         from engine.runtime.live_trading_preflight import live_trading_preflight
 
         ConfigError = RuntimeConfigError
 
-        safety = get_runtime_safety_context()
+        safety = _dict_payload(get_runtime_safety_context())
         cfg = load_runtime_config()
         workload_ack = validate_workload_profile_guardrails(safety)
-        hardware = runtime_hardware_snapshot()
-        hardware_devices = dict(hardware.get("devices") or {})
-        hardware_threads = dict(hardware.get("threads") or {})
-        live_risk = live_risk_threshold_validation_snapshot(safety)
+        hardware = _dict_payload(runtime_hardware_snapshot())
+        hardware_devices = _dict_payload(hardware.get("devices"))
+        hardware_threads = _dict_payload(hardware.get("threads"))
+        live_risk = _dict_payload(live_risk_threshold_validation_snapshot(safety))
         notes.append(
             "runtime config ok "
             f"env={safety.get('env')} "
@@ -436,11 +477,11 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             "runtime hardware ok "
             f"profile={hardware.get('profile')} "
             f"dependency_profile={hardware.get('dependency_profile')} "
-            f"torch_device={dict(hardware_devices.get('TORCH_DEVICE') or {}).get('resolved')} "
-            f"embed_device={dict(hardware_devices.get('EMBED_DEVICE') or {}).get('resolved')} "
-            f"nlp_device={dict(hardware_devices.get('NLP_DEVICE') or {}).get('resolved')} "
-            f"finbert_device={dict(hardware_devices.get('FINBERT_DEVICE') or {}).get('resolved')} "
-            f"ts_foundation_device={dict(hardware_devices.get('TS_FOUNDATION_DEVICE') or {}).get('resolved')} "
+            f"torch_device={_dict_payload(hardware_devices.get('TORCH_DEVICE')).get('resolved')} "
+            f"embed_device={_dict_payload(hardware_devices.get('EMBED_DEVICE')).get('resolved')} "
+            f"nlp_device={_dict_payload(hardware_devices.get('NLP_DEVICE')).get('resolved')} "
+            f"finbert_device={_dict_payload(hardware_devices.get('FINBERT_DEVICE')).get('resolved')} "
+            f"ts_foundation_device={_dict_payload(hardware_devices.get('TS_FOUNDATION_DEVICE')).get('resolved')} "
             f"cpu_threads={hardware_threads.get('cpu_threads')} "
             f"interop_threads={hardware_threads.get('interop_threads')} "
             f"nvidia_telemetry={int(bool(hardware.get('nvidia_telemetry_enabled')))} "
@@ -463,18 +504,18 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             )
         if bool(live_risk.get("required")):
             if bool(live_risk.get("override")):
-                audit = dict(live_risk.get("audit") or {})
+                audit = _dict_payload(live_risk.get("audit"))
                 notes.append(
                     "live risk thresholds override accepted "
                     f"id={audit.get('LIVE_RISK_THRESHOLD_ACCEPTANCE_ID')} "
                     f"owner={audit.get('LIVE_RISK_THRESHOLD_ACCEPTANCE_OWNER')} "
-                    f"issues={len(list(live_risk.get('issues') or []))}"
+                    f"issues={len(_list_payload(live_risk.get('issues')))}"
                 )
             else:
                 notes.append(
                     "live risk thresholds ok "
-                    f"thresholds={len(list(live_risk.get('required_thresholds') or []))} "
-                    f"enabled_flags={len(list(live_risk.get('required_enabled_flags') or []))}"
+                    f"thresholds={len(_list_payload(live_risk.get('required_thresholds')))} "
+                    f"enabled_flags={len(_list_payload(live_risk.get('required_enabled_flags')))}"
                 )
         promotion_min_observations = int(os.environ.get("CHAMPION_PROMOTION_MIN_OBSERVATIONS") or 50)
         notes.append(
@@ -484,35 +525,35 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             f"legacy_stat_gate={int(_env_truthy('CHAMPION_PROMOTION_USE_STAT_GATE', default=False))} "
             f"cpcv={int(_env_truthy('CPCV_ENABLED', default=False))}"
         )
-        live_preflight = live_trading_preflight(
-            engine_mode=safety.get("engine_mode"),
+        live_preflight = _dict_payload(live_trading_preflight(
+            engine_mode=_optional_str(safety.get("engine_mode")),
             execution_mode=os.environ.get("EXECUTION_MODE", ""),
-        )
+        ))
         if bool(live_preflight.get("required")):
-            live_env = dict(live_preflight.get("deployment_contract") or {})
-            prelive_reconcile = dict(live_preflight.get("prelive_reconcile") or {})
-            backup_restore_evidence = dict(live_preflight.get("backup_restore_evidence") or {})
-            clock_health = dict(live_preflight.get("clock_health") or {})
-            execution_arming_audit = dict(live_preflight.get("execution_arming_audit") or {})
-            live_ai_safety = dict(live_preflight.get("live_ai_safety") or {})
-            lob_deeplob_shadow = dict(live_preflight.get("lob_deeplob_shadow") or {})
-            options_instruments = dict(live_preflight.get("options_instruments") or {})
+            live_env = _dict_payload(live_preflight.get("deployment_contract"))
+            prelive_reconcile = _dict_payload(live_preflight.get("prelive_reconcile"))
+            backup_restore_evidence = _dict_payload(live_preflight.get("backup_restore_evidence"))
+            clock_health = _dict_payload(live_preflight.get("clock_health"))
+            execution_arming_audit = _dict_payload(live_preflight.get("execution_arming_audit"))
+            live_ai_safety = _dict_payload(live_preflight.get("live_ai_safety"))
+            lob_deeplob_shadow = _dict_payload(live_preflight.get("lob_deeplob_shadow"))
+            options_instruments = _dict_payload(live_preflight.get("options_instruments"))
             classified_blockers: set[str] = set()
 
             if not bool(live_env.get("ok")):
-                env_blockers = [str(item) for item in list(live_env.get("blockers") or [])]
+                env_blockers = [str(item) for item in _list_payload(live_env.get("blockers"))]
                 classified_blockers.update(env_blockers)
                 issues = "; ".join(env_blockers)
                 errors.append(f"live environment contract invalid: {issues or live_env.get('reason')}")
 
             if bool(prelive_reconcile.get("required")):
-                reconcile_blockers = [str(item) for item in list(prelive_reconcile.get("blockers") or [])]
+                reconcile_blockers = [str(item) for item in _list_payload(prelive_reconcile.get("blockers"))]
                 classified_blockers.update(reconcile_blockers)
                 if not bool(prelive_reconcile.get("ok")):
                     issues = "; ".join(reconcile_blockers)
                     errors.append(f"pre-live reconcile invalid: {issues or prelive_reconcile.get('reason')}")
                 elif bool(prelive_reconcile.get("override")):
-                    audit = dict(prelive_reconcile.get("audit") or {})
+                    audit = _dict_payload(prelive_reconcile.get("audit"))
                     notes.append(
                         "pre-live reconcile break-glass accepted "
                         f"actor={audit.get('actor')} "
@@ -520,58 +561,82 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
                     )
 
             if bool(backup_restore_evidence.get("required")) and not bool(backup_restore_evidence.get("ok")):
-                backup_blockers = [str(item) for item in list(backup_restore_evidence.get("blockers") or [])]
+                backup_blockers = [str(item) for item in _list_payload(backup_restore_evidence.get("blockers"))]
                 classified_blockers.update(backup_blockers)
                 issues = "; ".join(backup_blockers)
                 errors.append(f"backup restore evidence invalid: {issues or backup_restore_evidence.get('reason')}")
 
             if bool(clock_health.get("required")) and not bool(clock_health.get("ok")):
-                clock_blockers = [str(item) for item in list(clock_health.get("blockers") or [])]
+                clock_blockers = [str(item) for item in _list_payload(clock_health.get("blockers"))]
                 classified_blockers.update(clock_blockers)
                 issues = "; ".join(clock_blockers)
                 errors.append(f"clock health invalid: {issues or clock_health.get('reason')}")
 
             if bool(execution_arming_audit.get("required")) and not bool(execution_arming_audit.get("ok")):
-                arming_blockers = [str(item) for item in list(execution_arming_audit.get("blockers") or [])]
+                arming_blockers = [str(item) for item in _list_payload(execution_arming_audit.get("blockers"))]
                 classified_blockers.update(arming_blockers)
                 issues = "; ".join(arming_blockers)
                 errors.append(f"execution arming audit invalid: {issues or execution_arming_audit.get('reason')}")
 
             if bool(live_ai_safety.get("required")) and not bool(live_ai_safety.get("ok")):
-                ai_blockers = [str(item) for item in list(live_ai_safety.get("blockers") or [])]
+                ai_blockers = [str(item) for item in _list_payload(live_ai_safety.get("blockers"))]
                 classified_blockers.update(ai_blockers)
                 issues = "; ".join(ai_blockers)
                 errors.append(f"live AI safety invalid: {issues or live_ai_safety.get('reason')}")
 
             if bool(lob_deeplob_shadow.get("enabled")) and not bool(lob_deeplob_shadow.get("ok")):
-                lob_blockers = [str(item) for item in list(lob_deeplob_shadow.get("blockers") or [])]
+                lob_blockers = [str(item) for item in _list_payload(lob_deeplob_shadow.get("blockers"))]
                 classified_blockers.update(lob_blockers)
                 issues = "; ".join(lob_blockers)
                 errors.append(f"LOB DeepLOB shadow readiness invalid: {issues or lob_deeplob_shadow.get('reason')}")
 
             if bool(options_instruments.get("required")) and not bool(options_instruments.get("ok")):
-                options_blockers = [str(item) for item in list(options_instruments.get("blockers") or [])]
+                options_blockers = [str(item) for item in _list_payload(options_instruments.get("blockers"))]
                 classified_blockers.update(options_blockers)
                 issues = "; ".join(options_blockers)
                 errors.append(f"options instrument readiness invalid: {issues or options_instruments.get('reason')}")
 
+            engine_mode = str(safety.get("engine_mode") or os.environ.get("ENGINE_MODE", "safe") or "safe")
+            execution_mode = str(os.environ.get("EXECUTION_MODE") or "")
+            options_provider_readiness_required = (
+                _provider_readiness_enforced(engine_mode)
+                or _provider_readiness_enforced(execution_mode)
+            )
+            if options_provider_readiness_required:
+                options_credentials_configured, _options_credential_names = _options_credentials_configured()
+                if options_credentials_configured:
+                    options_ingestion = _dict_payload(_options_ingestion_snapshot(_t_ms()))
+                    if (
+                        not bool(options_ingestion.get("credentials_configured"))
+                        or bool(options_ingestion.get("degraded"))
+                        or not bool(options_ingestion.get("ok"))
+                    ):
+                        blocker = "options_chain_stale_despite_credentials"
+                        classified_blockers.add(blocker)
+                        errors.append(
+                            "options chain stale despite configured credentials: "
+                            f"{blocker}"
+                        )
+                else:
+                    notes.append("options chain credentials not configured; options ingestion shadow-only")
+
             other_blockers = [
                 str(item)
-                for item in list(live_preflight.get("blockers") or [])
+                for item in _list_payload(live_preflight.get("blockers"))
                 if str(item) not in classified_blockers
             ]
             if other_blockers:
                 errors.append(f"live trading preflight invalid: {'; '.join(other_blockers)}")
 
             if bool(live_preflight.get("ok")):
-                broker_contract = dict(live_env.get("broker_contract") or {})
-                initial_hold = dict(live_env.get("initial_kill_switch_hold") or {})
-                arming_audit = dict(live_preflight.get("execution_arming_audit") or {})
+                broker_contract = _dict_payload(live_env.get("broker_contract"))
+                initial_hold = _dict_payload(live_env.get("initial_kill_switch_hold"))
+                arming_audit = _dict_payload(live_preflight.get("execution_arming_audit"))
                 notes.append(
                     "live environment contract ok "
                     f"execution_mode={live_env.get('execution_mode')} "
                     f"broker={broker_contract.get('broker')} "
-                    f"chain={','.join(str(item) for item in list(broker_contract.get('chain') or []))} "
+                    f"chain={','.join(str(item) for item in _list_payload(broker_contract.get('chain')))} "
                     f"initial_kill_switch_armed={int(bool(initial_hold.get('armed')))} "
                     f"execution_arming_audited={int(bool(arming_audit.get('ok')))} "
                     f"clock_health={int(bool(clock_health.get('ok', True)))} "
@@ -2135,6 +2200,131 @@ def _capital_equity_freshness_gate() -> Tuple[List[str], List[str], List[str], D
     return notes, warnings, errors, state
 
 
+def _paid_equity_provider_degradation_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    mode_name = _runtime_mode_name()
+    enforced_mode = mode_name in {"paper", "live"}
+    equity_providers = _paid_equity_provider_names()
+    state: Dict[str, Any] = {
+        "ok": True,
+        "required": False,
+        "mode": mode_name,
+        "enforced_mode": bool(enforced_mode),
+        "equity_providers": list(equity_providers),
+        "required_equity_providers": [],
+        "degraded": [],
+    }
+
+    if not enforced_mode:
+        notes.append(f"paid equity provider gate not required mode={mode_name}")
+        state["reason"] = "mode_not_enforced"
+        return notes, warnings, errors, state
+
+    if not _env_truthy("PREFLIGHT_ENFORCE_PAID_EQUITY_PROVIDERS", default=True):
+        notes.append("paid equity provider gate disabled")
+        state["reason"] = "disabled"
+        return notes, warnings, errors, state
+
+    try:
+        snapshot_fn = globals().get("provider_readiness_snapshot")
+        if snapshot_fn is None:
+            from engine.runtime.health import provider_readiness_snapshot as snapshot_fn
+
+        snapshot = dict(snapshot_fn(mode=mode_name) or {})
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_PAID_EQUITY_PROVIDER_GATE_FAILED",
+            e,
+            once_key="paid_equity_provider_degradation_gate",
+        )
+        state.update(
+            {
+                "ok": False,
+                "required": True,
+                "reason": "provider_readiness_snapshot_failed",
+                "error": f"{type(e).__name__}: {e}",
+            }
+        )
+        errors.append(f"paid equity provider degradation validation failed: {type(e).__name__}: {e}")
+        return notes, warnings, errors, state
+
+    required = [
+        str(provider or "").strip().lower()
+        for provider in list(snapshot.get("required_providers") or [])
+        if str(provider or "").strip()
+    ]
+    required_equity = [provider for provider in equity_providers if provider in required]
+    by_provider = dict(snapshot.get("by_provider") or {})
+    state.update(
+        {
+            "required": bool(required_equity),
+            "provider_readiness": snapshot,
+            "required_equity_providers": list(required_equity),
+        }
+    )
+
+    if not required_equity:
+        notes.append("paid equity provider gate not required no_required_equity_provider")
+        state["reason"] = "no_required_equity_provider"
+        return notes, warnings, errors, state
+
+    degraded: List[Dict[str, Any]] = []
+    for provider in required_equity:
+        row = dict(by_provider.get(provider) or {})
+        if bool(row.get("ok")):
+            continue
+        blockers = [str(item) for item in list(row.get("blockers") or []) if str(item).strip()]
+        secret_names = [
+            str(item)
+            for item in list(row.get("credential_secret_names") or row.get("missing_credential_env_vars") or [])
+            if str(item).strip()
+        ]
+        degraded.append(
+            {
+                "provider": str(provider),
+                "credential_source": str(row.get("credential_source") or ""),
+                "credential_secret_names": list(dict.fromkeys(secret_names)),
+                "blockers": list(dict.fromkeys(blockers)),
+                "telemetry_present": bool(row.get("telemetry_present")),
+                "telemetry_ok": bool(row.get("telemetry_ok")),
+                "error_count": int(row.get("error_count") or 0),
+                "circuit_open": bool(row.get("circuit_open")),
+            }
+        )
+
+    if degraded:
+        state["ok"] = False
+        state["reason"] = "paid_equity_provider_degraded"
+        state["degraded"] = list(degraded)
+        provider_names = ",".join(item["provider"] for item in degraded)
+        credential_sources = ",".join(
+            str(item.get("credential_source") or "unknown") for item in degraded
+        )
+        blockers = ",".join(
+            blocker
+            for item in degraded
+            for blocker in list(item.get("blockers") or [])
+        )
+        secret_names = ",".join(
+            name
+            for item in degraded
+            for name in list(item.get("credential_secret_names") or [])
+        )
+        errors.append(
+            "paid equity provider degraded: "
+            f"providers={provider_names} credential_source={credential_sources}"
+            + (f" blockers={blockers}" if blockers else "")
+            + (f" missing_secret_names={secret_names}" if secret_names else "")
+            + "; system would silently fall back to free data"
+        )
+    else:
+        notes.append(f"paid equity provider gate ok providers={','.join(required_equity)}")
+
+    return notes, warnings, errors, state
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
@@ -2171,6 +2361,7 @@ def main() -> int:
         "operator_sidecar_security": {},
         "network_exposure": {},
         "capital_equity_freshness": {},
+        "paid_equity_provider_degradation": {},
     }
 
     # Fail fast in dependency order: source integrity first, then schema,
@@ -2442,6 +2633,19 @@ def main() -> int:
         else:
             for error in equity_errors:
                 print("[capital-equity]", error)
+        return 3
+
+    paid_equity_notes, paid_equity_warnings, paid_equity_errors, paid_equity_state = _paid_equity_provider_degradation_gate()
+    result["steps"].extend(paid_equity_notes)
+    result["warnings"].extend(paid_equity_warnings)
+    result["paid_equity_provider_degradation"] = dict(paid_equity_state or {})
+    if paid_equity_errors:
+        result["errors"].extend(paid_equity_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in paid_equity_errors:
+                print("[paid-equity-feed]", error)
         return 3
 
     external_notes, external_warnings, external_errors, external_services = _check_external_services()

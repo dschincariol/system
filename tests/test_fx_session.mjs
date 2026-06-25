@@ -17,10 +17,27 @@ test("FX session is closed during Saturday and before Sunday open", () => {
   assert.equal(saturday.open, false);
   assert.match(saturday.label, /closed/);
 
-  const beforeOpen = fxSessionStatus(ms("2026-06-28T21:59:00Z"));
-  const afterOpen = fxSessionStatus(ms("2026-06-28T22:01:00Z"));
+  const beforeOpen = fxSessionStatus(ms("2026-06-28T20:59:00Z"));
+  const afterOpen = fxSessionStatus(ms("2026-06-28T21:01:00Z"));
   assert.equal(beforeOpen.open, false);
   assert.equal(afterOpen.open, true);
+});
+
+test("default presentation mirror follows New York DST boundaries", () => {
+  const beforeEdtClose = fxSessionStatus(ms("2026-06-26T20:59:00Z"));
+  const afterEdtClose = fxSessionStatus(ms("2026-06-26T21:01:00Z"));
+  const beforeEstClose = fxSessionStatus(ms("2026-01-02T21:59:00Z"));
+  const afterEstClose = fxSessionStatus(ms("2026-01-02T22:01:00Z"));
+  const beforeEstOpen = fxSessionStatus(ms("2026-01-04T21:59:00Z"));
+  const afterEstOpen = fxSessionStatus(ms("2026-01-04T22:01:00Z"));
+
+  assert.equal(beforeEdtClose.open, true);
+  assert.equal(afterEdtClose.open, false);
+  assert.equal(beforeEstClose.open, true);
+  assert.equal(afterEstClose.open, false);
+  assert.equal(beforeEstOpen.open, false);
+  assert.equal(afterEstOpen.open, true);
+  assert.match(afterEdtClose.label, /Sun 17:00 America\/New_York/);
 });
 
 test("FX session is deterministic and boundary overridable", () => {

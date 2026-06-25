@@ -77,9 +77,11 @@ test("alert normalizer keeps active alerts sorted by severity", () => {
       { id: 1, severity: "INFO", status: "active", message: "one" },
       { id: 2, severity: "CRIT", status: "active", message: "two" },
       { id: 3, severity: "WARN", status: "resolved", message: "three" },
+      { id: 4, severity: "HIGH", status: "active", message: "four" },
+      { id: 5, severity: "WARN", status: "active", message: "five" },
     ],
   });
-  assert.deepEqual(rows.map((row) => row.id), [2, 1]);
+  assert.deepEqual(rows.map((row) => row.id), [2, 4, 5, 1]);
 });
 
 test("emergency consequence preview states the action boundary", () => {

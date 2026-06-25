@@ -35,10 +35,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.data.asset_map import asset_class_for_symbol
+from engine.data.quiver_gov import sector_for_symbol
+from engine.risk.futures_margin import (
+    cap_contracts_by_margin,
+    contract_notional,
+    currency_conversion_rate,
+    weight_to_contracts,
+)
+from engine.risk.equity_leverage_caps import equity_leverage_mode, max_equity_leverage
 from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.strategy.risk import realized_vol_from_prices, corr_from_prices
 from engine.strategy.har_rv import resolve_vol_forecast
+from engine.strategy.equity_sizing import clamp_equity_gross_to_leverage, equity_deployable_base
 from engine.strategy.fx_sizing import _fx_instrument, clamp_fx_weight_to_leverage, fx_weight_to_notional
+from engine.strategy.crypto_sizing import (
+    _crypto_instrument,
+    attach_crypto_sizing_context,
+    clamp_crypto_weight_to_leverage,
+    crypto_weight_to_notional,
+    normalize_crypto_symbol,
+)
 from engine.runtime.risk_state import set_state, get_state_row
 from engine.runtime.event_log import record_risk_block
 from engine.runtime.storage import _table_exists
@@ -52,6 +68,22 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None or str(raw).strip() == "":
         return bool(default)
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_positive_float(name: str, default: str = "0.0") -> float:
+    try:
+        value = float(os.environ.get(name, default) or default)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_POSITIVE_FLOAT_ENV_PARSE_FAILED",
+            e,
+            once_key=f"env_positive_float:{name}",
+            env_name=str(name),
+        )
+        return 0.0
+    if value != value or value <= 0.0:
+        return 0.0
+    return float(value)
 
 
 def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
@@ -123,10 +155,24 @@ CLUSTER_MAX_GROSS = float(os.environ.get("PORTFOLIO_RISK_CLUSTER_MAX_GROSS", "0.
 CLUSTER_MAX_COMPONENTS = int(os.environ.get("PORTFOLIO_RISK_CLUSTER_MAX_COMPONENTS", "12"))
 USE_FX_CURRENCY_CLUSTERS = os.environ.get("PORTFOLIO_RISK_FX_CURRENCY_CLUSTERS", "1") == "1"
 USE_FX_LEVERAGE_CAPS = os.environ.get("PORTFOLIO_RISK_USE_FX_LEVERAGE_CAPS", "1") == "1"
+USE_EQUITY_LEVERAGE_CAPS = os.environ.get("PORTFOLIO_RISK_USE_EQUITY_LEVERAGE_CAPS", "1") == "1"
+USE_CRYPTO_LEVERAGE_CAPS = os.environ.get("PORTFOLIO_RISK_USE_CRYPTO_LEVERAGE_CAPS", "1") == "1"
+USE_FUTURES_MARGIN_CAPS = os.environ.get("PORTFOLIO_RISK_USE_FUTURES_MARGIN_CAPS", "1") == "1"
+USE_OPTIONS_GREEK_LIMITS = os.environ.get("PORTFOLIO_RISK_USE_OPTIONS_GREEK_LIMITS", "1") == "1"
+OPTIONS_MAX_POSITION_CONTRACTS = _env_positive_float("OPTIONS_MAX_POSITION_CONTRACTS")
+OPTIONS_MARGIN_IMPACT_MAX_FRACTION = _env_positive_float("OPTIONS_MARGIN_IMPACT_MAX_FRACTION")
+OPTIONS_MAX_PORTFOLIO_DELTA_ABS = _env_positive_float("OPTIONS_MAX_PORTFOLIO_DELTA_ABS")
+OPTIONS_MAX_PORTFOLIO_GAMMA_ABS = _env_positive_float("OPTIONS_MAX_PORTFOLIO_GAMMA_ABS")
+OPTIONS_MAX_PORTFOLIO_VEGA_ABS = _env_positive_float("OPTIONS_MAX_PORTFOLIO_VEGA_ABS")
 
 # Asset-class budgets
 USE_ASSET_CLASS_BUDGETS = os.environ.get("PORTFOLIO_RISK_USE_ASSET_CLASS_BUDGETS", "1") == "1"
+PORTFOLIO_RISK_BIND_EQUITY_BUDGET = _env_bool("PORTFOLIO_RISK_BIND_EQUITY_BUDGET", True)
+_EQUITY_ASSET_CLASS_BUDGET = 0.80 if PORTFOLIO_RISK_BIND_EQUITY_BUDGET else 1.00
 _ASSET_CLASS_BUDGETS_JSON = os.environ.get("PORTFOLIO_RISK_ASSET_CLASS_BUDGETS_JSON", "").strip()
+USE_SECTOR_BUDGETS = os.environ.get("PORTFOLIO_RISK_USE_SECTOR_BUDGETS", "1") == "1"
+SECTOR_MAX_GROSS = float(os.environ.get("PORTFOLIO_RISK_SECTOR_MAX_GROSS", "0.30"))
+_SECTOR_BUDGETS_JSON = os.environ.get("PORTFOLIO_RISK_SECTOR_BUDGETS_JSON", "").strip()
 
 # Strategy-level budgets
 USE_STRATEGY_BUDGETS = os.environ.get("PORTFOLIO_RISK_USE_STRATEGY_BUDGETS", "1") == "1"
@@ -136,10 +182,13 @@ USE_ALPHA_DECAY_THROTTLE = os.environ.get("PORTFOLIO_RISK_USE_ALPHA_DECAY_THROTT
 ALPHA_DECAY_THROTTLE_FRESH_S = int(os.environ.get("PORTFOLIO_RISK_ALPHA_DECAY_FRESH_S", "21600"))
 
 _DEFAULT_ASSET_CLASS_BUDGETS = {
-    "EQUITY": 1.00,
+    "EQUITY": _EQUITY_ASSET_CLASS_BUDGET,
     "CRYPTO": 0.35,
     "COMMODITY": 0.50,
+    # Conservative default enforced by the existing asset-class budget path.
+    "OPTION": 0.20,
     "FX": 0.50,
+    "FUTURES": 0.40,
     "RATES": 0.60,
     "UNKNOWN": 0.40,
 }
@@ -153,6 +202,18 @@ if _ASSET_CLASS_BUDGETS_JSON:
                 ASSET_CLASS_BUDGETS[str(k).upper()] = float(v)
     except Exception:
         ASSET_CLASS_BUDGETS = dict(_DEFAULT_ASSET_CLASS_BUDGETS)
+
+SECTOR_BUDGETS: Dict[str, float] = {}
+if _SECTOR_BUDGETS_JSON:
+    try:
+        d = json.loads(_SECTOR_BUDGETS_JSON)
+        if isinstance(d, dict):
+            for k, v in d.items():
+                key = str(k or "").upper().strip()
+                if key:
+                    SECTOR_BUDGETS[key] = float(v)
+    except Exception:
+        SECTOR_BUDGETS = {}
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -192,6 +253,19 @@ def _optional_float(x: Any) -> Optional[float]:
 
 def _asset_class_for(con, symbol: str) -> str:
     try:
+        futures = _futures_instrument(con, symbol)
+        if isinstance(futures, dict):
+            asset_class = str(futures.get("asset_class") or "").upper().strip()
+            if asset_class:
+                return asset_class
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_FUTURES_ASSET_CLASS_LOOKUP_FAILED",
+            e,
+            once_key=f"futures_asset_class:{symbol}",
+            symbol=str(symbol),
+        )
+    try:
         instrument = _fx_instrument(con, symbol)
         if isinstance(instrument, dict):
             asset_class = str(instrument.get("asset_class") or "").upper().strip()
@@ -205,6 +279,19 @@ def _asset_class_for(con, symbol: str) -> str:
             symbol=str(symbol),
         )
     try:
+        crypto = _crypto_instrument(con, symbol)
+        if isinstance(crypto, dict):
+            asset_class = str(crypto.get("asset_class") or "").upper().strip()
+            if asset_class:
+                return asset_class
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_CRYPTO_ASSET_CLASS_LOOKUP_FAILED",
+            e,
+            once_key=f"crypto_asset_class:{symbol}",
+            symbol=str(symbol),
+        )
+    try:
         fallback_asset_class = str(asset_class_for_symbol(str(symbol)) or "UNKNOWN").upper()
     except Exception as e:
         _warn_nonfatal(
@@ -215,6 +302,63 @@ def _asset_class_for(con, symbol: str) -> str:
         )
         fallback_asset_class = "UNKNOWN"
     return fallback_asset_class
+
+
+def _sector_for(con, symbol: str) -> str:
+    if con is None or not str(symbol or "").strip():
+        return ""
+    try:
+        return str(sector_for_symbol(con, str(symbol)) or "").upper().strip()
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_SECTOR_LOOKUP_FAILED",
+            e,
+            once_key=f"sector_lookup:{symbol}",
+            symbol=str(symbol),
+        )
+        return ""
+
+
+def _futures_instrument(con, symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        from engine.data.universe import get_instrument_metadata
+
+        if con is not None:
+            raw = get_instrument_metadata(con, str(symbol))
+            if isinstance(raw, dict) and str(raw.get("asset_class") or "").upper().strip() == "FUTURES":
+                return dict(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_FUTURES_METADATA_LOOKUP_FAILED",
+            e,
+            once_key=f"futures_metadata:{symbol}",
+            symbol=str(symbol),
+        )
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+
+        parsed = parse_futures_symbol(symbol)
+        if parsed is None:
+            return None
+        return dict(parsed.to_dict())
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_FUTURES_PARSE_FAILED",
+            e,
+            once_key=f"futures_parse:{symbol}",
+            symbol=str(symbol),
+        )
+        return None
+
+
+def _futures_multiplier_factor(con, symbol: str) -> float:
+    meta = _futures_instrument(con, str(symbol))
+    if not isinstance(meta, dict):
+        return 1.0
+    multiplier = _safe_float(meta.get("multiplier", meta.get("fut_multiplier")), 1.0)
+    if multiplier <= 0.0:
+        return 1.0
+    return float(multiplier)
 
 
 def _is_live_risk_runtime() -> bool:
@@ -554,12 +698,20 @@ def _abs_weight(row: Optional[Dict[str, Any]]) -> float:
     return abs(_signed_weight(row))
 
 
-def _gross(rows: Dict[str, Dict[str, Any]]) -> float:
-    return float(sum(_abs_weight(v) for v in (rows or {}).values()))
+def _signed_exposure_weight(con, symbol: str, row: Optional[Dict[str, Any]]) -> float:
+    return float(_signed_weight(row) * _futures_multiplier_factor(con, str(symbol)))
 
 
-def _net(rows: Dict[str, Dict[str, Any]]) -> float:
-    return float(sum(_signed_weight(v) for v in (rows or {}).values()))
+def _abs_exposure_weight(con, symbol: str, row: Optional[Dict[str, Any]]) -> float:
+    return abs(_signed_exposure_weight(con, str(symbol), row))
+
+
+def _gross(rows: Dict[str, Dict[str, Any]], con=None) -> float:
+    return float(sum(_abs_exposure_weight(con, str(sym), row) for sym, row in (rows or {}).items()))
+
+
+def _net(rows: Dict[str, Dict[str, Any]], con=None) -> float:
+    return float(sum(_signed_exposure_weight(con, str(sym), row) for sym, row in (rows or {}).items()))
 
 
 def _annotate(desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> None:
@@ -679,13 +831,16 @@ def _exposure_snapshot(rows: Dict[str, Dict[str, Any]], con=None) -> Dict[str, A
     by_asset_class: Dict[str, Dict[str, float]] = {}
     by_strategy: Dict[str, Dict[str, float]] = {}
     by_model: Dict[str, Dict[str, float]] = {}
+    by_sector: Dict[str, Dict[str, float]] = {}
 
     long_gross = 0.0
     short_gross = 0.0
 
     for sym, row in (rows or {}).items():
         s = str(sym)
-        sw = _signed_weight(row)
+        raw_sw = _signed_weight(row)
+        factor = _futures_multiplier_factor(con, s)
+        sw = float(raw_sw) * float(factor)
         aw = abs(sw)
         if aw <= 0.0:
             continue
@@ -696,6 +851,9 @@ def _exposure_snapshot(rows: Dict[str, Dict[str, Any]], con=None) -> Dict[str, A
             "gross": float(aw),
             "side": side,
         }
+        if abs(float(factor) - 1.0) > 1e-12:
+            by_symbol[s]["raw_signed_weight"] = float(raw_sw)
+            by_symbol[s]["exposure_multiplier"] = float(factor)
 
         if sw > 0.0:
             long_gross += float(aw)
@@ -708,6 +866,12 @@ def _exposure_snapshot(rows: Dict[str, Dict[str, Any]], con=None) -> Dict[str, A
         ac["gross"] = float(ac.get("gross", 0.0) + aw)
         ac["net"] = float(ac.get("net", 0.0) + sw)
 
+        sector = _sector_for(con, s)
+        if sector:
+            sec = by_sector.setdefault(sector, {"gross": 0.0, "net": 0.0})
+            sec["gross"] = float(sec.get("gross", 0.0) + aw)
+            sec["net"] = float(sec.get("net", 0.0) + sw)
+
         strategy = _strategy_bucket_for_row(row)
         st = by_strategy.setdefault(strategy, {"gross": 0.0, "net": 0.0})
         st["gross"] = float(st.get("gross", 0.0) + aw)
@@ -719,14 +883,274 @@ def _exposure_snapshot(rows: Dict[str, Dict[str, Any]], con=None) -> Dict[str, A
         md["net"] = float(md.get("net", 0.0) + sw)
 
     return {
-        "gross": float(_gross(rows or {})),
-        "net": float(_net(rows or {})),
+        "gross": float(_gross(rows or {}, con)),
+        "net": float(_net(rows or {}, con)),
         "long_gross": float(long_gross),
         "short_gross": float(short_gross),
         "by_symbol": by_symbol,
         "by_asset_class": dict(sorted(by_asset_class.items(), key=lambda kv: kv[0])),
         "by_strategy": dict(sorted(by_strategy.items(), key=lambda kv: kv[0])),
         "by_model": dict(sorted(by_model.items(), key=lambda kv: kv[0])),
+        "by_sector": dict(sorted(by_sector.items(), key=lambda kv: kv[0])),
+    }
+
+
+def _option_contract_meta(con, symbol: str) -> Optional[Dict[str, Any]]:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return None
+    try:
+        from engine.data.universe import get_instrument_metadata
+
+        if con is not None:
+            raw = get_instrument_metadata(con, sym)
+            if isinstance(raw, dict) and str(raw.get("asset_class") or "").upper().strip() == "OPTION":
+                return dict(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_OPTION_METADATA_LOOKUP_FAILED",
+            e,
+            once_key=f"option_metadata:{sym}",
+            symbol=str(sym),
+        )
+    try:
+        from engine.data.options_instrument import parse_option_symbol
+
+        parsed = parse_option_symbol(sym)
+        if parsed is not None:
+            to_dict = getattr(parsed, "to_dict", None)
+            payload: Any = to_dict() if callable(to_dict) else None
+            if isinstance(payload, dict):
+                return {str(key): value for key, value in payload.items()}
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_OPTION_METADATA_PARSE_FAILED",
+            e,
+            once_key=f"option_metadata_parse:{sym}",
+            symbol=str(sym),
+        )
+    return None
+
+
+def _option_contract_key(con, symbol: str, row: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    payload = row or {}
+    for key in ("option_contract", "contract", "occ_symbol", "local_symbol"):
+        raw = payload.get(key)
+        if raw not in (None, ""):
+            text = str(raw).upper().strip()
+            if text.startswith("O:"):
+                text = text[2:]
+            if text:
+                return text
+    meta = _option_contract_meta(con, symbol)
+    if not meta:
+        return None
+    contract = str(meta.get("occ_symbol") or meta.get("symbol") or symbol).upper().strip()
+    if contract.startswith("O:"):
+        contract = contract[2:]
+    return contract or None
+
+
+def _option_contract_multiplier(con, symbol: str) -> Optional[float]:
+    meta = _option_contract_meta(con, symbol)
+    if not meta:
+        return None
+    multiplier = _optional_float(meta.get("multiplier") if isinstance(meta, dict) else None)
+    if multiplier is None or multiplier <= 0.0:
+        return None
+    return float(multiplier)
+
+
+def _option_greeks(con, symbol: str) -> Optional[Dict[str, Any]]:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return None
+    try:
+        if str(_asset_class_for(con, sym) or "").upper().strip() != "OPTION":
+            return None
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_OPTION_ASSET_CLASS_CHECK_FAILED",
+            e,
+            once_key=f"option_asset_class:{sym}",
+            symbol=str(sym),
+        )
+        return None
+
+    contract = _option_contract_key(con, sym)
+    multiplier = _option_contract_multiplier(con, sym)
+    if not contract or multiplier is None:
+        return None
+
+    try:
+        row = con.execute(
+            """
+            SELECT delta, gamma, theta, vega, ts_ms
+            FROM options_chain_v2
+            WHERE contract=?
+            ORDER BY ts_ms DESC
+            LIMIT 1
+            """,
+            (str(contract),),
+        ).fetchone()
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_OPTION_GREEKS_LOOKUP_FAILED",
+            e,
+            once_key=f"option_greeks:{contract}",
+            symbol=str(sym),
+            contract=str(contract),
+        )
+        return None
+    if not row:
+        return None
+
+    delta = _optional_float(row[0])
+    gamma = _optional_float(row[1])
+    theta = _optional_float(row[2])
+    vega = _optional_float(row[3])
+    if delta is None or gamma is None or theta is None or vega is None:
+        return None
+    return {
+        "delta": float(delta),
+        "gamma": float(gamma),
+        "theta": float(theta),
+        "vega": float(vega),
+        "multiplier": float(multiplier),
+        "contract": str(contract),
+        "quote_ts_ms": float(_safe_float(row[4], 0.0)),
+    }
+
+
+def _nested_numeric_value(row: Optional[Dict[str, Any]], keys: Tuple[str, ...]) -> Optional[float]:
+    containers: List[Any] = [row or {}]
+    reason = (row or {}).get("reason") if isinstance(row, dict) else None
+    if isinstance(reason, dict):
+        containers.append(reason)
+    for json_key in ("meta_json", "explain_json"):
+        parsed = _maybe_parse_json((row or {}).get(json_key) if isinstance(row, dict) else None)
+        if parsed:
+            containers.append(parsed)
+            nested_reason = parsed.get("reason")
+            if isinstance(nested_reason, dict):
+                containers.append(nested_reason)
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            value = _optional_float(container.get(key))
+            if value is not None:
+                return float(value)
+    return None
+
+
+def _option_signed_contracts(row: Optional[Dict[str, Any]]) -> float:
+    explicit = _nested_numeric_value(row, ("contracts", "qty", "quantity", "order_qty", "target_contracts"))
+    if explicit is not None:
+        if explicit < 0.0:
+            return float(explicit)
+        return float(abs(explicit)) * float(_side_sign((row or {}).get("side", "LONG")))
+    return float(_signed_weight(row))
+
+
+def _option_margin_impact_fraction(row: Optional[Dict[str, Any]]) -> float:
+    value = _nested_numeric_value(row, ("margin_impact_fraction", "estimated_margin_fraction", "margin_fraction"))
+    return max(0.0, float(value or 0.0))
+
+
+def _options_greek_snapshot(con, rows: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate option greeks from chain rows.
+
+    Each option row contributes ``signed_contracts * contract_multiplier *
+    per-contract-greek``. ``margin_impact_fraction`` is summed from row metadata
+    as an already-normalized fraction of equity; missing values add zero rather
+    than fabricating a margin estimate.
+    """
+
+    by_symbol: Dict[str, Dict[str, Any]] = {}
+    net_delta = 0.0
+    net_gamma = 0.0
+    net_theta = 0.0
+    net_vega = 0.0
+    gross_contracts = 0.0
+    max_position_contracts = 0.0
+    margin_impact_fraction = 0.0
+    missing_greeks: List[str] = []
+
+    equity_ref, equity_source = _equity_reference(con)
+
+    for sym, row in (rows or {}).items():
+        symbol = str(sym or "").upper().strip()
+        if not symbol:
+            continue
+        try:
+            if str(_asset_class_for(con, symbol) or "").upper().strip() != "OPTION":
+                continue
+        except Exception as e:
+            _warn_nonfatal(
+                "PORTFOLIO_RISK_OPTION_SNAPSHOT_ASSET_CLASS_FAILED",
+                e,
+                once_key=f"option_snapshot_asset_class:{symbol}",
+                symbol=str(symbol),
+            )
+            continue
+
+        signed_contracts = _option_signed_contracts(row)
+        if abs(float(signed_contracts)) <= 1e-12:
+            continue
+        greeks = _option_greeks(con, symbol)
+        if not greeks:
+            missing_greeks.append(symbol)
+            continue
+        multiplier = float(greeks.get("multiplier") or 0.0)
+        if multiplier <= 0.0:
+            missing_greeks.append(symbol)
+            continue
+
+        delta_contribution = float(signed_contracts) * float(greeks["delta"]) * multiplier
+        gamma_contribution = float(signed_contracts) * float(greeks["gamma"]) * multiplier
+        theta_contribution = float(signed_contracts) * float(greeks["theta"]) * multiplier
+        vega_contribution = float(signed_contracts) * float(greeks["vega"]) * multiplier
+        margin_fraction = _option_margin_impact_fraction(row)
+
+        net_delta += float(delta_contribution)
+        net_gamma += float(gamma_contribution)
+        net_theta += float(theta_contribution)
+        net_vega += float(vega_contribution)
+        gross_contracts += abs(float(signed_contracts))
+        max_position_contracts = max(float(max_position_contracts), abs(float(signed_contracts)))
+        margin_impact_fraction += float(margin_fraction)
+
+        by_symbol[symbol] = {
+            "contract": str(greeks.get("contract") or symbol),
+            "signed_contracts": float(signed_contracts),
+            "gross_contracts": float(abs(float(signed_contracts))),
+            "contract_multiplier": float(multiplier),
+            "delta": float(greeks["delta"]),
+            "gamma": float(greeks["gamma"]),
+            "theta": float(greeks["theta"]),
+            "vega": float(greeks["vega"]),
+            "net_delta": float(delta_contribution),
+            "net_gamma": float(gamma_contribution),
+            "net_theta": float(theta_contribution),
+            "net_vega": float(vega_contribution),
+            "margin_impact_fraction": float(margin_fraction),
+            "quote_ts_ms": int(greeks.get("quote_ts_ms") or 0),
+        }
+
+    return {
+        "net_delta": float(net_delta),
+        "net_gamma": float(net_gamma),
+        "net_theta": float(net_theta),
+        "net_vega": float(net_vega),
+        "gross_contracts": float(gross_contracts),
+        "max_position_contracts": float(max_position_contracts),
+        "margin_impact_fraction": float(margin_impact_fraction),
+        "by_symbol": dict(sorted(by_symbol.items(), key=lambda kv: kv[0])),
+        "missing_greeks": sorted(missing_greeks),
+        "equity_ref": (float(equity_ref) if float(equity_ref) > 0.0 else None),
+        "equity_ref_source": str(equity_source),
+        "enabled": bool(USE_OPTIONS_GREEK_LIMITS),
     }
 
 
@@ -840,6 +1264,8 @@ def _last_price(con, symbol: str) -> Optional[float]:
 
 
 def _equity_reference(con) -> Tuple[float, str]:
+    if con is None:
+        return 0.0, "unknown"
     if _table_exists(con, "broker_account"):
         try:
             row = con.execute("SELECT equity FROM broker_account WHERE id=1").fetchone()
@@ -870,6 +1296,72 @@ def _equity_reference(con) -> Tuple[float, str]:
             _warn_nonfatal("PORTFOLIO_RISK_EQUITY_REFERENCE_LOOKUP_FAILED", e, once_key="equity_reference:equity_history_latest", source="equity_history", query="latest")
 
     return 0.0, "unknown"
+
+
+def _broker_account_columns(con) -> set[str]:
+    if con is None or not _table_exists(con, "broker_account"):
+        return set()
+    try:
+        return {str(row[1]) for row in con.execute("PRAGMA table_info(broker_account)").fetchall() or []}
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_BROKER_ACCOUNT_COLUMNS_LOOKUP_FAILED",
+            e,
+            once_key="broker_account_columns",
+            source="broker_account",
+        )
+        return set()
+
+
+def _buying_power_reference(con) -> Tuple[Optional[float], str]:
+    """Return latest broker buying power when the current schema exposes it.
+
+    The repository has two broker_account shapes: a broker-sim table with
+    cash/equity but no buying_power, and runtime repair/first-run tables with
+    equity/buying_power. Probe columns before every query so the guard fails
+    closed instead of assuming either schema.
+    """
+
+    if con is None or not _table_exists(con, "broker_account"):
+        return None, "unavailable"
+    cols = _broker_account_columns(con)
+    if "buying_power" not in cols:
+        return None, "unavailable"
+
+    queries: List[Tuple[str, str]] = []
+    if "id" in cols:
+        queries.append(("broker_account:id=1", "SELECT buying_power FROM broker_account WHERE id=1 LIMIT 1"))
+    if "ts_ms" in cols:
+        queries.append(("broker_account:ts_ms", "SELECT buying_power FROM broker_account ORDER BY ts_ms DESC LIMIT 1"))
+    if "updated_ts_ms" in cols:
+        queries.append(
+            (
+                "broker_account:updated_ts_ms",
+                "SELECT buying_power FROM broker_account ORDER BY updated_ts_ms DESC LIMIT 1",
+            )
+        )
+    queries.append(("broker_account:first", "SELECT buying_power FROM broker_account LIMIT 1"))
+
+    seen: set[str] = set()
+    for source, sql in queries:
+        if sql in seen:
+            continue
+        seen.add(sql)
+        try:
+            row = con.execute(sql).fetchone()
+            if row and row[0] is not None:
+                bp = _optional_float(row[0])
+                if bp is not None and bp >= 0.0:
+                    return float(bp), str(source)
+        except Exception as e:
+            _warn_nonfatal(
+                "PORTFOLIO_RISK_BUYING_POWER_REFERENCE_LOOKUP_FAILED",
+                e,
+                once_key=f"buying_power_reference:{source}",
+                source="broker_account",
+                query=str(source),
+            )
+    return None, "unavailable"
 
 
 def _row_with_signed_weight(base_row: Optional[Dict[str, Any]], signed_weight: float, source: str) -> Dict[str, Any]:
@@ -923,7 +1415,15 @@ def _load_live_positions(con) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]
             if px <= 0.0:
                 continue
 
-            signed_notional = float(q) * float(px)
+            meta = _futures_instrument(con, str(symbol))
+            if isinstance(meta, dict):
+                multiplier = _safe_float(meta.get("multiplier", meta.get("fut_multiplier")), 1.0)
+                price_ccy = str(meta.get("price_ccy") or meta.get("fut_price_ccy") or "USD").upper().strip() or "USD"
+                fx_rates = _futures_fx_rates_for(con, price_ccy, "USD")
+                fx_rate = currency_conversion_rate(price_ccy, "USD", fx_rates)
+                signed_notional = float(q) * float(px) * float(multiplier) * float(fx_rate)
+            else:
+                signed_notional = float(q) * float(px)
             notionals[str(symbol)] = float(signed_notional)
             gross_notional += abs(float(signed_notional))
 
@@ -1108,6 +1608,22 @@ def _post_constraint_checks(snapshot: Dict[str, Any]) -> Dict[str, Any]:
                 checks["asset_class_within_cap"] = False
                 checks.setdefault("asset_class_violations", {})[str(cls)] = {"gross": float(gross), "cap": float(cap)}
 
+    checks["sector_within_cap"] = True
+    if USE_SECTOR_BUDGETS:
+        for sector, row in dict(snapshot.get("by_sector") or {}).items():
+            sector_key = str(sector or "").upper().strip()
+            cap = float(SECTOR_BUDGETS.get(sector_key, SECTOR_MAX_GROSS))
+            try:
+                gross = float((row or {}).get("gross", 0.0) or 0.0)
+            except Exception:
+                gross = 0.0
+            if cap > 0.0 and gross > cap + 1e-9:
+                checks["sector_within_cap"] = False
+                checks.setdefault("sector_violations", {})[str(sector)] = {
+                    "gross": float(gross),
+                    "cap": float(cap),
+                }
+
     checks["strategy_within_cap"] = True
     if USE_STRATEGY_BUDGETS:
         for strategy, row in dict(snapshot.get("by_strategy") or {}).items():
@@ -1126,11 +1642,108 @@ def _post_constraint_checks(snapshot: Dict[str, Any]) -> Dict[str, Any]:
                     "max_net": float(STRATEGY_MAX_NET),
                 }
 
+    checks["options_greeks_within_cap"] = True
+    if USE_OPTIONS_GREEK_LIMITS:
+        option_snapshot = dict(snapshot.get("options_greeks") or {})
+        violations: Dict[str, Any] = {}
+
+        def _check_abs(name: str, value_key: str, cap: float) -> None:
+            if float(cap) <= 0.0:
+                return
+            value = float(option_snapshot.get(value_key, 0.0) or 0.0)
+            if abs(value) > float(cap) + 1e-9:
+                violations[name] = {"value": float(value), "abs": float(abs(value)), "cap": float(cap)}
+
+        _check_abs("delta", "net_delta", float(OPTIONS_MAX_PORTFOLIO_DELTA_ABS))
+        _check_abs("gamma", "net_gamma", float(OPTIONS_MAX_PORTFOLIO_GAMMA_ABS))
+        _check_abs("vega", "net_vega", float(OPTIONS_MAX_PORTFOLIO_VEGA_ABS))
+
+        if float(OPTIONS_MARGIN_IMPACT_MAX_FRACTION) > 0.0:
+            margin_fraction = float(option_snapshot.get("margin_impact_fraction", 0.0) or 0.0)
+            if margin_fraction > float(OPTIONS_MARGIN_IMPACT_MAX_FRACTION) + 1e-9:
+                violations["margin_impact_fraction"] = {
+                    "value": float(margin_fraction),
+                    "cap": float(OPTIONS_MARGIN_IMPACT_MAX_FRACTION),
+                }
+
+        if float(OPTIONS_MAX_POSITION_CONTRACTS) > 0.0:
+            for sym, row in dict(option_snapshot.get("by_symbol") or {}).items():
+                contracts = abs(float((row or {}).get("signed_contracts", 0.0) or 0.0))
+                if contracts > float(OPTIONS_MAX_POSITION_CONTRACTS) + 1e-9:
+                    violations.setdefault("position_contracts", {})[str(sym)] = {
+                        "contracts": float(contracts),
+                        "cap": float(OPTIONS_MAX_POSITION_CONTRACTS),
+                    }
+
+        if violations:
+            checks["options_greeks_within_cap"] = False
+            checks["options_greek_violations"] = violations
+
     return checks
+
+
+def _apply_options_delta_cap(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if (not USE_OPTIONS_GREEK_LIMITS) or float(OPTIONS_MAX_PORTFOLIO_DELTA_ABS) <= 0.0:
+        return dict(desired or {})
+
+    out = dict(desired or {})
+    snapshot = _options_greek_snapshot(con, out)
+    net_delta = float(snapshot.get("net_delta", 0.0) or 0.0)
+    cap = float(OPTIONS_MAX_PORTFOLIO_DELTA_ABS)
+    if abs(net_delta) <= cap + 1e-9:
+        return out
+
+    scale = float(cap / abs(net_delta)) if abs(net_delta) > 1e-12 else 0.0
+    adjusted: Dict[str, Any] = {}
+    option_symbols = set((snapshot.get("by_symbol") or {}).keys())
+    for sym in sorted(option_symbols):
+        if sym not in out:
+            continue
+        try:
+            signed_contracts = _option_signed_contracts(out.get(sym))
+            post_contracts = float(signed_contracts) * float(scale)
+            out[sym] = _row_with_signed_weight(out.get(sym), float(post_contracts), "options_delta_cap")
+            out[sym]["contracts"] = float(abs(post_contracts))
+            for qty_key in ("qty", "quantity", "order_qty", "target_contracts"):
+                if qty_key in out[sym]:
+                    out[sym][qty_key] = float(abs(post_contracts))
+            out[sym].setdefault("reason", {})
+            if isinstance(out[sym]["reason"], dict):
+                out[sym]["reason"]["options_delta_cap"] = {
+                    "pre_net_delta": float(net_delta),
+                    "cap": float(cap),
+                    "scale": float(scale),
+                    "pre_contracts": float(signed_contracts),
+                    "post_contracts": float(post_contracts),
+                }
+            adjusted[str(sym)] = {
+                "pre_contracts": float(signed_contracts),
+                "post_contracts": float(post_contracts),
+                "scale": float(scale),
+            }
+        except Exception as e:
+            _warn_nonfatal(
+                "PORTFOLIO_RISK_OPTIONS_DELTA_CAP_APPLY_FAILED",
+                e,
+                once_key=f"options_delta_cap:{sym}",
+                symbol=str(sym),
+            )
+
+    if adjusted:
+        info["options_delta_cap_scaled"] = True
+        info["options_delta_cap_scale"] = float(scale)
+        info["options_delta_cap_pre"] = dict(snapshot)
+        info["options_delta_cap_adjustments"] = adjusted
+    return out
 
 
 def _apply_portfolio_caps(desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     out = dict(desired or {})
+
+    try:
+        out = _apply_options_delta_cap(info.get("_risk_con"), out, info)
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_RISK_OPTIONS_DELTA_CAP_FAILED", e, once_key="options_delta_cap")
 
     g = _gross(out)
     n = _net(out)
@@ -1225,10 +1838,11 @@ def _apply_asset_class_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[st
 
     out = dict(desired or {})
     lookup = dict(info.get("asset_class_by_symbol") or {}) if isinstance(info.get("asset_class_by_symbol"), dict) else {}
+    exposure_con = info.get("_risk_con")
     by_cls: Dict[str, float] = {}
     for sym, row in (out or {}).items():
-        cls = str(lookup.get(str(sym)) or _asset_class_for(None, str(sym)) or "UNKNOWN").upper()
-        by_cls[cls] = float(by_cls.get(cls, 0.0) + _abs_weight(row))
+        cls = str(lookup.get(str(sym)) or _asset_class_for(exposure_con, str(sym)) or "UNKNOWN").upper()
+        by_cls[cls] = float(by_cls.get(cls, 0.0) + _abs_exposure_weight(exposure_con, str(sym), row))
 
     info["asset_class_gross_pre"] = dict(sorted(by_cls.items(), key=lambda kv: kv[0]))
 
@@ -1239,7 +1853,7 @@ def _apply_asset_class_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[st
             scale = float(cap) / float(gross) if gross > 1e-12 else 0.0
             for sym in list(out.keys()):
                 try:
-                    cls2 = str(lookup.get(str(sym)) or _asset_class_for(None, str(sym)) or "UNKNOWN").upper()
+                    cls2 = str(lookup.get(str(sym)) or _asset_class_for(exposure_con, str(sym)) or "UNKNOWN").upper()
                     if cls2 == str(cls).upper():
                         sw = _signed_weight(out[sym])
                         sgn = 1.0 if sw >= 0.0 else -1.0
@@ -1262,9 +1876,73 @@ def _apply_asset_class_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[st
     # post
     by_cls2: Dict[str, float] = {}
     for sym, row in (out or {}).items():
-        cls = str(lookup.get(str(sym)) or _asset_class_for(None, str(sym)) or "UNKNOWN").upper()
-        by_cls2[cls] = float(by_cls2.get(cls, 0.0) + _abs_weight(row))
+        cls = str(lookup.get(str(sym)) or _asset_class_for(exposure_con, str(sym)) or "UNKNOWN").upper()
+        by_cls2[cls] = float(by_cls2.get(cls, 0.0) + _abs_exposure_weight(exposure_con, str(sym), row))
     info["asset_class_gross_post"] = dict(sorted(by_cls2.items(), key=lambda kv: kv[0]))
+
+    return out
+
+
+def _apply_sector_budgets(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not USE_SECTOR_BUDGETS:
+        return dict(desired or {})
+
+    out = dict(desired or {})
+    sector_by_symbol: Dict[str, str] = {}
+    by_sector: Dict[str, float] = {}
+    for sym, row in (out or {}).items():
+        sector = _sector_for(con, str(sym))
+        if not sector:
+            continue
+        sector_by_symbol[str(sym)] = str(sector)
+        by_sector[sector] = float(by_sector.get(sector, 0.0) + _abs_exposure_weight(con, str(sym), row))
+
+    if by_sector:
+        info["sector_gross_pre"] = dict(sorted(by_sector.items(), key=lambda kv: kv[0]))
+    else:
+        info["sector_gross_pre"] = {}
+
+    hit: Dict[str, Any] = {}
+    for sector, gross in list(by_sector.items()):
+        sector_key = str(sector).upper().strip()
+        cap = float(SECTOR_BUDGETS.get(sector_key, SECTOR_MAX_GROSS))
+        if cap > 0.0 and float(gross) > float(cap) + 1e-12:
+            scale = float(cap) / float(gross) if gross > 1e-12 else 0.0
+            for sym in list(out.keys()):
+                if sector_by_symbol.get(str(sym)) != sector_key:
+                    continue
+                try:
+                    sw = _signed_weight(out[sym])
+                    sgn = 1.0 if sw >= 0.0 else -1.0
+                    out[sym]["weight"] = float(abs(sw) * scale) * float(sgn)
+                    out[sym].setdefault("reason", {})
+                    if isinstance(out[sym]["reason"], dict):
+                        out[sym]["reason"]["sector_budget"] = {
+                            "sector": sector_key,
+                            "gross_pre": float(gross),
+                            "cap": float(cap),
+                            "scale": float(scale),
+                        }
+                except Exception as e:
+                    _warn_nonfatal(
+                        "PORTFOLIO_RISK_SECTOR_BUDGET_APPLY_FAILED",
+                        e,
+                        once_key=f"sector_budget:{sector_key}:{sym}",
+                        sector=str(sector_key),
+                        symbol=str(sym),
+                    )
+            hit[sector_key] = {"gross_pre": float(gross), "cap": float(cap), "scale": float(scale)}
+
+    if hit:
+        info["sector_budgets_hit"] = hit
+
+    by_sector_post: Dict[str, float] = {}
+    for sym, row in (out or {}).items():
+        sector = sector_by_symbol.get(str(sym))
+        if not sector:
+            continue
+        by_sector_post[sector] = float(by_sector_post.get(sector, 0.0) + _abs_exposure_weight(con, str(sym), row))
+    info["sector_gross_post"] = dict(sorted(by_sector_post.items(), key=lambda kv: kv[0]))
 
     return out
 
@@ -1357,6 +2035,397 @@ def _apply_fx_leverage_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[
         info["fx_leverage_adjustments"] = adjustments
     if hard_blocks:
         info["fx_leverage_hard_blocks"] = hard_blocks
+    return out
+
+
+def _apply_equity_leverage_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not USE_EQUITY_LEVERAGE_CAPS:
+        return dict(desired or {})
+
+    out = dict(desired or {})
+    lookup = dict(info.get("asset_class_by_symbol") or {}) if isinstance(info.get("asset_class_by_symbol"), dict) else {}
+    equity_rows = [
+        str(sym)
+        for sym, row in (out or {}).items()
+        if _abs_weight(row) > 0.0 and str(lookup.get(str(sym)) or _asset_class_for(con, str(sym))).upper() == "EQUITY"
+    ]
+    if not equity_rows:
+        return out
+
+    rows_subset = {sym: dict(out.get(sym) or {}) for sym in equity_rows}
+    gross_pre = float(_gross(rows_subset, con))
+    account_equity, account_equity_source = _equity_reference(con)
+    buying_power, buying_power_source = _buying_power_reference(con)
+    mode = equity_leverage_mode()
+    max_leverage = max_equity_leverage(mode=mode)
+    hard_blocks: List[Dict[str, Any]] = []
+
+    if account_equity <= 0.0:
+        for sym in equity_rows:
+            hard_blocks.append({"symbol": str(sym), "reason": "equity_account_reference_unavailable"})
+        info["equity_leverage_account_equity"] = float(account_equity or 0.0)
+        info["equity_leverage_account_equity_source"] = str(account_equity_source or "unknown")
+        info["equity_leverage_gross_pre"] = float(gross_pre)
+        info["equity_leverage_mode"] = str(mode)
+        info["equity_leverage_hard_blocks"] = hard_blocks
+        return out
+
+    if str(mode) == "reg_t" and buying_power is None:
+        for sym in equity_rows:
+            hard_blocks.append({"symbol": str(sym), "reason": "equity_buying_power_unavailable"})
+        info["equity_leverage_account_equity"] = float(account_equity)
+        info["equity_leverage_account_equity_source"] = str(account_equity_source or "unknown")
+        info["equity_leverage_buying_power"] = None
+        info["equity_leverage_buying_power_source"] = str(buying_power_source or "unavailable")
+        info["equity_leverage_gross_pre"] = float(gross_pre)
+        info["equity_leverage_mode"] = str(mode)
+        info["equity_leverage_max_leverage"] = float(max_leverage)
+        info["equity_leverage_hard_blocks"] = hard_blocks
+        return out
+
+    account = {"equity": float(account_equity)}
+    if buying_power is not None:
+        account["buying_power"] = float(buying_power)
+    buying_power_base, base_reason = equity_deployable_base(
+        account,
+        account_equity=float(account_equity),
+        mode=str(mode),
+        max_leverage=float(max_leverage),
+    )
+    allowed_gross_weight = min(
+        float(max_leverage),
+        (float(buying_power_base) / float(account_equity) if float(account_equity) > 0.0 else 0.0),
+    )
+    allowed_gross_weight = max(0.0, float(allowed_gross_weight))
+
+    clamped_rows, clamp_reason = clamp_equity_gross_to_leverage(
+        rows_subset,
+        account_equity=float(account_equity),
+        allowed_gross_weight=float(allowed_gross_weight),
+        mode=str(mode),
+    )
+    if not bool(clamp_reason.get("clamped")):
+        return out
+
+    gross_post = float(_gross(clamped_rows, con))
+    adjustments: Dict[str, Any] = {}
+    for sym in equity_rows:
+        row = dict(out.get(sym) or {})
+        pre_signed = _signed_weight(row)
+        post_signed = _signed_weight(clamped_rows.get(sym))
+        if abs(float(post_signed)) + 1e-12 < abs(float(pre_signed)) or (pre_signed == 0.0 and post_signed != 0.0):
+            row = _row_with_signed_weight(row, float(post_signed), "equity_leverage_cap")
+        row.setdefault("reason", {})
+        if not isinstance(row.get("reason"), dict):
+            row["reason"] = {"raw": row.get("reason")}
+        row["reason"]["equity_leverage_cap"] = dict(clamp_reason)
+        equity_meta = {
+            "mode": str(mode),
+            "account_equity": float(account_equity),
+            "account_equity_source": str(account_equity_source or "unknown"),
+            "buying_power": (float(buying_power) if buying_power is not None else None),
+            "buying_power_source": str(buying_power_source or "unavailable"),
+            "buying_power_base": float(buying_power_base),
+            "allowed_gross_weight": float(allowed_gross_weight),
+            "gross_pre": float(gross_pre),
+            "gross_post": float(gross_post),
+            "effective_leverage_pre": float(gross_pre),
+            "effective_leverage_post": float(gross_post),
+        }
+        row["equity"] = dict(equity_meta)
+        out[sym] = row
+        adjustments[sym] = {
+            "pre_weight": float(pre_signed),
+            "post_weight": float(post_signed),
+            "clamp": dict(clamp_reason),
+            "equity": dict(equity_meta),
+        }
+
+    if gross_post > allowed_gross_weight + 1e-9:
+        for sym in equity_rows:
+            hard_blocks.append(
+                {
+                    "symbol": str(sym),
+                    "reason": "equity_leverage_residual_breach",
+                    "gross_post": float(gross_post),
+                    "allowed_gross_weight": float(allowed_gross_weight),
+                }
+            )
+
+    info["equity_leverage_account_equity"] = float(account_equity)
+    info["equity_leverage_account_equity_source"] = str(account_equity_source or "unknown")
+    info["equity_leverage_buying_power"] = (float(buying_power) if buying_power is not None else None)
+    info["equity_leverage_buying_power_source"] = str(buying_power_source or "unavailable")
+    info["equity_leverage_buying_power_base"] = float(buying_power_base)
+    info["equity_leverage_base_reason"] = dict(base_reason)
+    info["equity_leverage_gross_pre"] = float(gross_pre)
+    info["equity_leverage_gross_post"] = float(gross_post)
+    info["equity_leverage_allowed_gross_weight"] = float(allowed_gross_weight)
+    info["equity_leverage_mode"] = str(mode)
+    info["equity_leverage_max_leverage"] = float(max_leverage)
+    info["equity_leverage_adjustments"] = adjustments
+    if hard_blocks:
+        info["equity_leverage_hard_blocks"] = hard_blocks
+    return out
+
+
+def _apply_crypto_leverage_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not USE_CRYPTO_LEVERAGE_CAPS:
+        return dict(desired or {})
+
+    out = dict(desired or {})
+    lookup = dict(info.get("asset_class_by_symbol") or {}) if isinstance(info.get("asset_class_by_symbol"), dict) else {}
+    crypto_rows = [
+        str(sym)
+        for sym, row in (out or {}).items()
+        if _abs_weight(row) > 0.0
+        and str(lookup.get(str(sym)) or _asset_class_for(con, str(sym))).upper() in {"CRYPTO", "CRYPTOCURRENCY"}
+    ]
+    if not crypto_rows:
+        return out
+
+    equity, equity_source = _equity_reference(con)
+    info["crypto_leverage_equity_ref"] = float(equity or 0.0)
+    info["crypto_leverage_equity_ref_source"] = str(equity_source or "unknown")
+    adjustments: Dict[str, Any] = {}
+    hard_blocks: List[Dict[str, Any]] = []
+
+    if equity <= 0.0:
+        for sym in crypto_rows:
+            hard_blocks.append({"symbol": str(sym), "reason": "crypto_equity_reference_unavailable"})
+        info["crypto_leverage_hard_blocks"] = hard_blocks
+        return out
+
+    for sym in crypto_rows:
+        row = dict(out.get(sym) or {})
+        signed_weight = _signed_weight(row)
+        instrument = _crypto_instrument(con, sym) or {"asset_class": "CRYPTO", "symbol": normalize_crypto_symbol(sym)}
+
+        try:
+            resolved = _symbol_vol_input(con, str(sym), ts_ms=int(info.get("ts_ms") or 0))
+            if resolved.get("vol") is None:
+                root = normalize_crypto_symbol(sym)
+                if root and root != str(sym).upper().strip():
+                    resolved = _symbol_vol_input(con, str(root), ts_ms=int(info.get("ts_ms") or 0))
+            if resolved.get("vol") is not None:
+                instrument = dict(instrument)
+                instrument["volatility"] = float(resolved.get("vol") or 0.0)
+                instrument["volatility_source"] = str(resolved.get("source") or "")
+        except Exception as e:
+            _warn_nonfatal(
+                "PORTFOLIO_RISK_CRYPTO_VOL_INPUT_FAILED",
+                e,
+                once_key=f"crypto_vol:{sym}",
+                symbol=str(sym),
+            )
+
+        price = _last_price(con, sym)
+        if price is None or float(price) <= 0.0:
+            root = normalize_crypto_symbol(sym)
+            if root and root != str(sym).upper().strip():
+                price = _last_price(con, root)
+
+        clamped, clamp_reason = clamp_crypto_weight_to_leverage(sym, signed_weight, equity, instrument)
+        crypto_meta = crypto_weight_to_notional(sym, clamped, equity, instrument, price=(float(price) if price is not None else None))
+        crypto_meta["pre_weight"] = float(signed_weight)
+        crypto_meta["post_weight"] = float(clamped)
+        if instrument.get("volatility_source"):
+            crypto_meta["volatility_source"] = str(instrument.get("volatility_source") or "")
+
+        if abs(float(clamped)) + 1e-9 < abs(float(signed_weight)):
+            row = _row_with_signed_weight(row, float(clamped), "crypto_leverage_cap")
+
+        row = attach_crypto_sizing_context(row, crypto_meta, clamp_reason)
+        out[sym] = row
+        adjustments[sym] = {"clamp": dict(clamp_reason), "crypto": dict(crypto_meta)}
+
+        cap = float(crypto_meta.get("effective_leverage_cap") or 0.0)
+        eff = abs(float(crypto_meta.get("effective_leverage") or 0.0))
+        if cap <= 0.0 or eff > cap + 1e-9:
+            hard_blocks.append(
+                {
+                    "symbol": str(sym),
+                    "reason": "crypto_leverage_residual_breach",
+                    "effective_leverage": float(eff),
+                    "effective_leverage_cap": float(cap),
+                }
+            )
+
+    if adjustments:
+        info["crypto_leverage_adjustments"] = adjustments
+    if hard_blocks:
+        info["crypto_leverage_hard_blocks"] = hard_blocks
+    return out
+
+
+def _margin_override_for(symbol: str, meta: Dict[str, Any]) -> Optional[float]:
+    raw = str(os.environ.get("FUTURES_MARGIN_REQUIREMENTS_JSON") or os.environ.get("FUTURES_BROKER_MARGIN_JSON") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        keys = [
+            str(symbol),
+            str(symbol).upper(),
+            str(meta.get("symbol") or ""),
+            str(meta.get("root") or meta.get("fut_root") or ""),
+        ]
+        for key in keys:
+            if key and key in data:
+                value = _safe_float(data.get(key), 0.0)
+                if value > 0.0:
+                    return float(value)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_FUTURES_MARGIN_JSON_FAILED",
+            e,
+            once_key="futures_margin_json",
+        )
+    return None
+
+
+def _futures_fx_rates_for(con, price_ccy: str, account_ccy: str = "USD") -> Dict[str, float]:
+    price = str(price_ccy or account_ccy or "USD").upper().strip() or "USD"
+    account = str(account_ccy or "USD").upper().strip() or "USD"
+    if price == account:
+        return {}
+    rates: Dict[str, float] = {}
+    direct = f"{price}{account}"
+    inverse = f"{account}{price}"
+    try:
+        px = _last_price(con, direct)
+        if px is not None and float(px) > 0.0:
+            rates[direct] = float(px)
+            return rates
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_FUTURES_DIRECT_FX_RATE_LOOKUP_FAILED",
+            e,
+            once_key=f"futures_direct_fx_rate:{direct}",
+            pair=direct,
+        )
+    try:
+        px = _last_price(con, inverse)
+        if px is not None and float(px) > 0.0:
+            rates[inverse] = float(px)
+            return rates
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_FUTURES_INVERSE_FX_RATE_LOOKUP_FAILED",
+            e,
+            once_key=f"futures_inverse_fx_rate:{inverse}",
+            pair=inverse,
+        )
+    return rates
+
+
+def _apply_futures_margin_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not USE_FUTURES_MARGIN_CAPS:
+        return dict(desired or {})
+
+    out = dict(desired or {})
+    futures_rows = [
+        str(sym)
+        for sym, row in (out or {}).items()
+        if _abs_weight(row) > 0.0 and _futures_instrument(con, str(sym)) is not None
+    ]
+    if not futures_rows:
+        return out
+
+    equity, equity_source = _equity_reference(con)
+    info["futures_margin_equity_ref"] = float(equity or 0.0)
+    info["futures_margin_equity_ref_source"] = str(equity_source or "unknown")
+    budget_weight = float(ASSET_CLASS_BUDGETS.get("FUTURES", ASSET_CLASS_BUDGETS.get("UNKNOWN", 0.40)))
+    info["futures_margin_budget_weight"] = float(budget_weight)
+
+    adjustments: Dict[str, Any] = {}
+    hard_blocks: List[Dict[str, Any]] = []
+
+    if equity <= 0.0:
+        for sym in futures_rows:
+            hard_blocks.append({"symbol": str(sym), "reason": "futures_equity_reference_unavailable"})
+        info["futures_margin_hard_blocks"] = hard_blocks
+        return out
+
+    for sym in futures_rows:
+        row = dict(out.get(sym) or {})
+        signed_weight = _signed_weight(row)
+        meta = _futures_instrument(con, sym) or {}
+        multiplier = _safe_float(meta.get("multiplier", meta.get("fut_multiplier")), 0.0)
+        reference_margin = _safe_float(meta.get("margin_ref", meta.get("fut_margin_ref")), 0.0)
+        price_ccy = str(meta.get("price_ccy") or meta.get("fut_price_ccy") or "USD").upper().strip() or "USD"
+        px = _last_price(con, sym)
+        if px is None or float(px) <= 0.0:
+            reason = {
+                "symbol": str(sym),
+                "reason": "futures_price_unavailable",
+                "asset_class": "FUTURES",
+            }
+            hard_blocks.append(reason)
+            row.setdefault("reason", {})
+            if not isinstance(row.get("reason"), dict):
+                row["reason"] = {"raw": row.get("reason")}
+            row["reason"]["futures_margin_cap"] = dict(reason)
+            out[sym] = row
+            adjustments[sym] = dict(reason)
+            continue
+
+        fx_rates = _futures_fx_rates_for(con, price_ccy, "USD")
+        fx_rate = currency_conversion_rate(price_ccy, "USD", fx_rates)
+        account_price = float(px) * float(fx_rate)
+        desired_contracts = weight_to_contracts(signed_weight, equity, multiplier, account_price)
+        broker_margin = _margin_override_for(sym, meta)
+        capped_contracts, margin_meta = cap_contracts_by_margin(
+            desired_contracts,
+            equity,
+            budget_weight,
+            reference_margin,
+            broker_margin,
+            price_ccy=price_ccy,
+            account_ccy="USD",
+            fx_rates=fx_rates,
+        )
+        post_notional = contract_notional(
+            capped_contracts,
+            float(px),
+            multiplier,
+            price_ccy=price_ccy,
+            account_ccy="USD",
+            fx_rates=fx_rates,
+        )
+        post_signed_weight = (post_notional / float(equity)) * (1.0 if signed_weight >= 0.0 else -1.0)
+        if abs(float(post_signed_weight) - float(signed_weight)) > 1e-12:
+            row = _row_with_signed_weight(row, float(post_signed_weight), "futures_margin_cap")
+
+        futures_meta = {
+            "asset_class": "FUTURES",
+            "pre_weight": float(signed_weight),
+            "post_weight": float(post_signed_weight),
+            "price": float(px),
+            "price_ccy": price_ccy,
+            "fx_rate": float(fx_rate),
+            "multiplier": float(multiplier),
+            "desired_contracts": int(desired_contracts),
+            "contracts": int(capped_contracts),
+            "reference_margin": float(reference_margin),
+            "regulatory_or_broker_margin": (float(broker_margin) if broker_margin is not None else None),
+            "notional": float(post_notional),
+            "margin": dict(margin_meta),
+        }
+        row.setdefault("reason", {})
+        if not isinstance(row.get("reason"), dict):
+            row["reason"] = {"raw": row.get("reason")}
+        row["reason"]["futures_margin_cap"] = dict(futures_meta)
+        row["futures"] = dict(futures_meta)
+        out[sym] = row
+        adjustments[sym] = dict(futures_meta)
+
+    if adjustments:
+        info["futures_margin_adjustments"] = adjustments
+    if hard_blocks:
+        info["futures_margin_hard_blocks"] = hard_blocks
     return out
 
 
@@ -1593,8 +2662,8 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
         gross = 0.0
         net = 0.0
         for s in comp:
-            gross += _abs_weight(out.get(s))
-            net += _signed_weight(out.get(s))
+            gross += _abs_exposure_weight(con, str(s), out.get(s))
+            net += _signed_exposure_weight(con, str(s), out.get(s))
         comp_set = set(comp)
         comp_fx_edges = [
             edge
@@ -1622,8 +2691,8 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
         gross = 0.0
         net = 0.0
         for s in comp:
-            gross += _abs_weight(out.get(s))
-            net += _signed_weight(out.get(s))
+            gross += _abs_exposure_weight(con, str(s), out.get(s))
+            net += _signed_exposure_weight(con, str(s), out.get(s))
         if gross <= float(CLUSTER_MAX_GROSS) + 1e-12:
             continue
 
@@ -1675,14 +2744,14 @@ def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]], info: Optional
     if not syms:
         return None
 
-    # signed weights (use raw weights as exposure fractions)
+    # signed exposure weights; futures are scaled by contract multiplier.
     active_syms: List[str] = []
     w: List[float] = []
     vols: List[float] = []
     vol_inputs: Dict[str, Dict[str, Any]] = {}
     for s in syms:
         row = (desired or {}).get(s) or {}
-        sw = _signed_weight(row)
+        sw = _signed_exposure_weight(con, str(s), row)
         aw = abs(sw)
         if aw <= 0.0:
             continue
@@ -2018,10 +3087,24 @@ def apply_portfolio_risk_engine(
         _warn_nonfatal("PORTFOLIO_RISK_DRAWDOWN_THROTTLE_FAILED", e, once_key="apply_drawdown_throttle", ts_ms=int(now_ms))
 
     try:
+        info["_risk_con"] = con
         out = _apply_asset_class_budgets(out, info)
         info["asset_class_by_symbol"] = _asset_class_lookup(con, out)
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_ASSET_CLASS_BUDGETS_FAILED", e, once_key="apply_asset_class_budgets", ts_ms=int(now_ms))
+    finally:
+        info.pop("_risk_con", None)
+
+    try:
+        out = _apply_futures_margin_caps(con, out, info)
+        if bool(info.get("futures_margin_hard_blocks")):
+            blocked = True
+            block_reason = {
+                "type": "futures_margin_hard_block",
+                "legs": list(info.get("futures_margin_hard_blocks") or []),
+            }
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_RISK_FUTURES_MARGIN_CAPS_FAILED", e, once_key="apply_futures_margin_caps", ts_ms=int(now_ms))
 
     try:
         out = _apply_fx_leverage_caps(con, out, info)
@@ -2035,9 +3118,44 @@ def apply_portfolio_risk_engine(
         _warn_nonfatal("PORTFOLIO_RISK_FX_LEVERAGE_CAPS_FAILED", e, once_key="apply_fx_leverage_caps", ts_ms=int(now_ms))
 
     try:
+        out = _apply_equity_leverage_caps(con, out, info)
+        if bool(info.get("equity_leverage_hard_blocks")):
+            blocked = True
+            block_reason = {
+                "type": "equity_leverage_hard_block",
+                "legs": list(info.get("equity_leverage_hard_blocks") or []),
+            }
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_EQUITY_LEVERAGE_CAPS_FAILED",
+            e,
+            once_key="apply_equity_leverage_caps",
+            ts_ms=int(now_ms),
+        )
+
+    try:
+        out = _apply_crypto_leverage_caps(con, out, info)
+        if bool(info.get("crypto_leverage_hard_blocks")):
+            blocked = True
+            block_reason = {
+                "type": "crypto_leverage_hard_block",
+                "legs": list(info.get("crypto_leverage_hard_blocks") or []),
+            }
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_RISK_CRYPTO_LEVERAGE_CAPS_FAILED", e, once_key="apply_crypto_leverage_caps", ts_ms=int(now_ms))
+
+    try:
+        out = _apply_sector_budgets(con, out, info)
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_RISK_SECTOR_BUDGETS_FAILED", e, once_key="apply_sector_budgets", ts_ms=int(now_ms))
+
+    try:
+        info["_risk_con"] = con
         out = _apply_strategy_budgets(out, info)
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_STRATEGY_BUDGETS_FAILED", e, once_key="apply_strategy_budgets", ts_ms=int(now_ms))
+    finally:
+        info.pop("_risk_con", None)
 
     try:
         out = _apply_alpha_decay_throttle(con, out, info, int(now_ms))
@@ -2080,14 +3198,20 @@ def apply_portfolio_risk_engine(
         _warn_nonfatal("PORTFOLIO_RISK_MONTE_CARLO_SUMMARY_FAILED", e, once_key="monte_carlo_summary", ts_ms=int(now_ms))
 
     try:
+        info["_risk_con"] = con
         out = _apply_portfolio_caps(out, info)
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_PORTFOLIO_CAPS_FAILED", e, once_key="apply_portfolio_caps", ts_ms=int(now_ms))
+    finally:
+        info.pop("_risk_con", None)
 
     info["asset_class_by_symbol"] = _asset_class_lookup(con, out)
     final_snapshot = _exposure_snapshot(out, con)
+    options_greek_snapshot = _options_greek_snapshot(con, out)
+    final_snapshot["options_greeks"] = dict(options_greek_snapshot)
     info["projected_live_plus_orders_post"] = final_snapshot
     info["target_exposure_post"] = final_snapshot
+    info["options_greeks_post"] = dict(options_greek_snapshot)
     info["target_delta_post"] = _delta_snapshot(live_rows or {}, out)
     info["state_to_target_delta_post"] = _delta_snapshot(state or {}, _projected_to_desired_targets(out, live_rows or {}, state or {}))
     info["final_gross"] = float(final_snapshot.get("gross", 0.0) or 0.0)
@@ -2098,14 +3222,22 @@ def apply_portfolio_risk_engine(
 
     if (not blocked) and (not all(bool(v) for k, v in post_checks.items() if not str(k).endswith("_violations"))):
         blocked = True
-        block_reason = {
-            "type": "post_cap_validation_failed",
-            "final_gross": float(info["final_gross"]),
-            "final_net": float(info["final_net"]),
-            "max_gross": float(MAX_GROSS),
-            "max_net": float(MAX_NET),
-            "checks": dict(post_checks),
-        }
+        if not bool(post_checks.get("options_greeks_within_cap", True)):
+            block_reason = {
+                "type": "options_greek_limit_breached",
+                "options_greeks": dict(options_greek_snapshot),
+                "options_greek_violations": dict(post_checks.get("options_greek_violations") or {}),
+                "checks": dict(post_checks),
+            }
+        else:
+            block_reason = {
+                "type": "post_cap_validation_failed",
+                "final_gross": float(info["final_gross"]),
+                "final_net": float(info["final_net"]),
+                "max_gross": float(MAX_GROSS),
+                "max_net": float(MAX_NET),
+                "checks": dict(post_checks),
+            }
 
     out = _projected_to_desired_targets(out, live_rows or {}, state or {})
     info["asset_class_by_symbol"] = _asset_class_lookup(con, out)
@@ -2170,13 +3302,14 @@ def _apply_strategy_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[str, 
         return dict(desired or {})
 
     out = dict(desired or {})
+    exposure_con = info.get("_risk_con")
 
     strat_gross: Dict[str, float] = {}
     strat_net: Dict[str, float] = {}
 
     for sym, row in (out or {}).items():
         sid = _strategy_bucket_for_row(row)
-        sw = _signed_weight(row)
+        sw = _signed_exposure_weight(exposure_con, str(sym), row)
         strat_gross[sid] = float(strat_gross.get(sid, 0.0) + abs(sw))
         strat_net[sid] = float(strat_net.get(sid, 0.0) + sw)
 
@@ -2227,7 +3360,7 @@ def _apply_strategy_budgets(desired: Dict[str, Dict[str, Any]], info: Dict[str, 
 
     for sym, row in (out or {}).items():
         sid = _strategy_bucket_for_row(row)
-        sw = _signed_weight(row)
+        sw = _signed_exposure_weight(exposure_con, str(sym), row)
         strat_gross_post[sid] = float(strat_gross_post.get(sid, 0.0) + abs(sw))
         strat_net_post[sid] = float(strat_net_post.get(sid, 0.0) + sw)
 

@@ -1195,6 +1195,7 @@ def test_mutation_controls_are_post_only_and_confirmed(route_runtime):
         "ok": False,
         "error": "confirmation_required",
         "required_confirm": "ROLLBACK_CHAMPION",
+        "required_action_id": "promotion.rollback",
         "http_status": 422,
     }
     assert api_post_rollback(None, {"confirm": "ROLLBACK_CHAMPION"}, route_runtime["ctx"]) == {

@@ -84,6 +84,10 @@ def test_promotion_gate_response_shape_includes_comparison_checklist_and_safe_ac
     assert gate["actions"]["rollback"]["requires_justification"] is True
     assert gate["actions"]["rollback"]["required_confirm"] == "ROLLBACK_CHAMPION"
     assert gate["actions"]["force_promote"]["available"] is False
+    assert gate["model_card_preview"]["intended_use"]
+    assert gate["gate_state_snapshot"]["checklist"]
+    assert gate["source_citations"]
+    assert any(row["key"].startswith("temporal_eval") for row in gate["staleness_badges"])
 
     metrics = {row["key"]: row for row in gate["comparison_metrics"]}
     assert metrics["rmse"]["champion"] == 1.2
@@ -100,6 +104,67 @@ def test_promotion_gate_response_shape_includes_comparison_checklist_and_safe_ac
     assert checklist["statistical_gate"]["state"] == "unavailable"
     assert checklist["deconfounded_signal_validation"]["state"] == "fail"
     assert checklist["deconfounded_signal_validation"]["observed"]["status"] == "weak_incremental_effect"
+
+
+def test_decision_snapshot_serializes_model_card_gate_state_and_citations():
+    from engine.strategy.model_decision_snapshot import enrich_decision_reason
+
+    now_ms = int(time.time() * 1000)
+    reason = enrich_decision_reason(
+        {"justification": "metrics were stale before rollback"},
+        action="rollback",
+        actor="risk-owner",
+        model_name="embed_regressor",
+        from_kind="ridge_v2",
+        from_ts_ms=102,
+        to_kind="ridge_v1",
+        to_ts_ms=101,
+        regime="global",
+        gate_snapshot={
+            "source": "unit-test",
+            "status": {
+                "allowed": False,
+                "blockers": ["execution_degradation"],
+                "updated_ts_ms": now_ms,
+            },
+            "champion": {
+                "model_name": "embed_regressor",
+                "model_kind": "ridge_v2",
+                "model_ts_ms": 102,
+                "updated_ts_ms": 1,
+                "metrics": {"rmse": 1.3},
+            },
+            "rollback_target": {
+                "model_name": "embed_regressor",
+                "model_kind": "ridge_v1",
+                "model_ts_ms": 101,
+                "updated_ts_ms": now_ms,
+                "metrics": {"rmse": 1.1},
+            },
+            "comparison_metrics": [{"key": "rmse", "champion": 1.3, "challenger": 1.1}],
+            "checklist": [{"key": "cpcv_gate", "state": "fail"}],
+            "validation": {"replay_status": {"fresh": False, "status": "stale", "ts_ms": 1}},
+        },
+        confirmation={
+            "action_id": "promotion.rollback",
+            "confirmation_token": "ROLLBACK_CHAMPION",
+        },
+        decision_ts_ms=now_ms,
+    )
+
+    card = reason["model_card_snapshot"]
+    gate_state = reason["gate_state_at_decision"]
+    assert card["schema_version"] == 1
+    assert card["action"] == "rollback"
+    assert card["owner"] == "risk-owner"
+    assert card["metrics"]["from_model"]["model_kind"] == "ridge_v2"
+    assert card["metrics"]["to_model"]["model_kind"] == "ridge_v1"
+    assert card["comparison_to_champion"][0]["key"] == "rmse"
+    assert card["source_citations"]
+    assert gate_state["checklist"][0]["key"] == "cpcv_gate"
+    assert any(row["key"] == "replay_stale" for row in gate_state["staleness_badges"])
+    assert any(row["key"] == "execution_degradation" for row in gate_state["staleness_badges"])
+    assert reason["confirmation"]["action_id"] == "promotion.rollback"
 
 
 def test_rollback_requires_justification_after_confirmation():
@@ -127,13 +192,30 @@ def test_rollback_audit_reason_includes_operator_justification(monkeypatch):
     monkeypatch.setattr(model_registry, "get_stage_latest", lambda *args, **kwargs: before)
     monkeypatch.setattr(model_registry, "rollback_champion", lambda *args, **kwargs: after)
     monkeypatch.setattr(promotion_audit, "audit", lambda **kwargs: seen.update(kwargs))
+    monkeypatch.setattr(
+        api_governance,
+        "_current_gate_snapshot_for_audit",
+        lambda *args, **kwargs: {
+            "source": "unit-test",
+            "status": {"allowed": False, "blockers": ["execution_degradation"], "updated_ts_ms": 123},
+            "champion": {"model_kind": "ridge_v2", "model_ts_ms": 102, "updated_ts_ms": 123},
+            "rollback_target": {"model_kind": "ridge_v1", "model_ts_ms": 101, "updated_ts_ms": 123},
+            "comparison_metrics": [{"key": "rmse", "champion": 1.4, "challenger": 1.1}],
+            "checklist": [{"key": "cpcv_gate", "state": "fail"}],
+            "validation": {"replay_status": {"fresh": False, "status": "stale", "ts_ms": 1}},
+        },
+    )
 
     response = api_governance.api_post_rollback(
         None,
         {
             "confirm": "ROLLBACK_CHAMPION",
+            "confirmation_token": "ROLLBACK_CHAMPION",
+            "action_id": "promotion.rollback",
+            "confirmation_method": "typed_phrase",
             "justification": "risk metrics deteriorated materially",
             "preview": {"action": "rollback"},
+            "request_id": "req-123",
         },
     )
 
@@ -142,6 +224,12 @@ def test_rollback_audit_reason_includes_operator_justification(monkeypatch):
     assert seen["action"] == "rollback"
     assert seen["reason"]["justification"] == "risk metrics deteriorated materially"
     assert seen["reason"]["preview"] == {"action": "rollback"}
+    assert seen["reason"]["confirmation"]["action_id"] == "promotion.rollback"
+    assert seen["reason"]["confirmation"]["confirmation_token"] == "ROLLBACK_CHAMPION"
+    assert seen["reason"]["confirmation"]["request_id"] == "req-123"
+    assert seen["reason"]["model_card_snapshot"]["metrics"]["to_model"]["model_kind"] == "ridge_v1"
+    assert seen["reason"]["gate_state_at_decision"]["checklist"][0]["key"] == "cpcv_gate"
+    assert any(row["key"] == "replay_stale" for row in seen["reason"]["staleness_badges"])
 
 
 def test_promotion_gate_ui_helpers_render_states_and_justification_payload():
@@ -152,6 +240,8 @@ import {
   buildPromotionActionPayload,
   buildRollbackConsequencePreview,
   formatGateState,
+  normalizePromotionAuditRow,
+  renderPromotionAuditRows,
   renderGateStateBadge,
   validatePromotionActionInput
 } from "./ui/promotion_gate.mjs";
@@ -170,10 +260,12 @@ const payload = buildPromotionActionPayload({
   confirm: "ROLLBACK_CHAMPION",
   justification: "risk deterioration exceeded rollback threshold",
   preview: { action: "rollback" },
+  gateSnapshot: { source: "unit-test" },
 });
 assert.equal(payload.justification, "risk deterioration exceeded rollback threshold");
 assert.equal(payload.confirm, "ROLLBACK_CHAMPION");
 assert.deepEqual(payload.preview, { action: "rollback" });
+assert.equal(payload.gate_snapshot.source, "unit-test");
 
 const preview = buildRollbackConsequencePreview({
   model_name: "embed_regressor",
@@ -222,6 +314,43 @@ assert.equal(Math.round(comparison.bars[0].challengerPct), 83);
 assert.equal(Math.round(comparison.bars[0].thresholdPct), 92);
 assert.equal(comparison.bars[1].decision.state, "fail");
 assert.equal(comparison.bars[1].stale, true);
+
+const auditRow = normalizePromotionAuditRow({
+  ts_ms: 123,
+  actor: "manual",
+  action: "rollback",
+  model_name: "embed_regressor",
+  regime: "global",
+  reason: {
+    justification: "risk metrics stale",
+    confirmation: { action_id: "promotion.rollback", confirmation_token: "ROLLBACK_CHAMPION" },
+  },
+  model_card_snapshot: {
+    owner: "risk-owner",
+    intended_use: "governed trading predictions",
+    data_window: { start_ts_ms: 100, end_ts_ms: 120 },
+    metrics: {
+      from_model: { model_kind: "ridge_v2" },
+      to_model: { model_kind: "ridge_v1" },
+    },
+    caveats: ["Replay evidence stale"],
+  },
+  gate_state_at_decision: {
+    checklist: [{ key: "cpcv_gate", state: "fail" }],
+    staleness_badges: [{ key: "replay_stale", label: "Replay evidence stale", state: "stale", source: "runtime_meta", ts_ms: 1 }],
+    source_citations: [{ source: "model_registry", label: "champion", ts_ms: 100 }],
+  },
+  source_citations: [{ source: "promotion_guard.status", label: "guard", ts_ms: 123 }],
+});
+assert.equal(auditRow.confirmation.action_id, "promotion.rollback");
+assert.equal(auditRow.badges[0].key, "replay_stale");
+
+const auditHtml = renderPromotionAuditRows([auditRow]);
+assert.match(auditHtml, /ridge_v2 -&gt; ridge_v1/);
+assert.match(auditHtml, /governed trading predictions/);
+assert.match(auditHtml, /Replay evidence stale: stale/);
+assert.match(auditHtml, /promotion_guard.status/);
+assert.match(auditHtml, /promotion.rollback \/ ROLLBACK_CHAMPION/);
 """
     result = subprocess.run(
         ["node", "--input-type=module", "-e", script],

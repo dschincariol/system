@@ -135,7 +135,11 @@ def _patch_dispatcher_runtime_guards(monkeypatch):
 def _assert_terminal_sell_contract(writes):
     assert len(writes.statements) == 1
     _sql, params = writes.statements[0]
+    assert params[3] == "SELL"
+    assert params[4] == "FLAT"
+    assert params[5] == "SHORT"
     assert params[8] == 0.0
+    assert int(params[9]) > 0
 
     explain = json.loads(params[10])
     assert explain["terminal_order"]["sizing"] == "quantity"
@@ -143,6 +147,7 @@ def _assert_terminal_sell_contract(writes):
     assert explain["terminal_order"]["side"] == "SELL"
     assert explain["terminal_order"]["qty"] == 3.0
     assert explain["terminal_order"]["signed_qty"] == -3.0
+    assert explain["terminal_order"]["source_alert_id"] == int(params[9])
 
 
 def test_terminal_order_accepts_dispatcher_body_and_records_quantity_contract(monkeypatch):
@@ -192,6 +197,42 @@ def test_terminal_order_accepts_paper_pipeline_gate(monkeypatch):
     _assert_terminal_sell_contract(writes)
 
 
+def test_terminal_order_accepts_paper_pipeline_gate_with_live_disabled(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "1")
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    monkeypatch.setenv("EXECUTION_MODE", "paper")
+    writes = _patch_terminal_order_storage(monkeypatch)
+    monkeypatch.setattr(
+        terminal_orders,
+        "execution_gate_snapshot",
+        lambda **_kwargs: {
+            "real_trading_allowed": False,
+            "allow_execution_pipeline": True,
+            "allow_simulation": True,
+            "allowed": True,
+            "mode": "paper",
+            "reason": "mode_paper",
+        },
+    )
+    monkeypatch.setattr(
+        terminal_orders,
+        "_get_execution_mode",
+        lambda: {"mode": "paper", "armed": 0, "source": "test"},
+    )
+
+    result = terminal_orders.api_post_terminal_order(
+        urlparse("/api/terminal/order"),
+        {"symbol": "spy", "side": "sell", "qty": 3},
+        {},
+    )
+
+    assert result["ok"] is True
+    assert result["symbol"] == "SPY"
+    assert result["side"] == "SELL"
+    assert result["qty"] == 3.0
+    _assert_terminal_sell_contract(writes)
+
+
 def test_terminal_flatten_accepts_paper_pipeline_gate(monkeypatch):
     monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
     monkeypatch.setenv("ENGINE_MODE", "paper")
@@ -226,10 +267,16 @@ def test_terminal_flatten_accepts_paper_pipeline_gate(monkeypatch):
     assert result["symbol"] == "SPY"
     assert result["flatten_qty"] == 2.0
     assert len(writes.statements) == 1
-    explain = json.loads(writes.statements[0][1][10])
+    params = writes.statements[0][1]
+    assert params[3] == "FLATTEN"
+    assert params[4] == "LONG"
+    assert params[5] == "FLAT"
+    assert int(params[9]) > 0
+    explain = json.loads(params[10])
     assert explain["terminal_order"]["flatten"] is True
     assert explain["terminal_order"]["side"] == "SELL"
     assert explain["terminal_order"]["qty"] == 2.0
+    assert explain["terminal_order"]["source_alert_id"] == int(params[9])
 
 
 def test_terminal_order_blocks_when_disable_live_execution_truthy(monkeypatch):
@@ -289,6 +336,19 @@ def _assert_rejection_recorded(writes, reason_code: str) -> None:
     assert any(reason_code in tuple(map(str, params)) for _sql, params in writes.statements)
 
 
+def _portfolio_order_insert_count(writes) -> int:
+    return sum(1 for sql, _params in writes.statements if "insert into portfolio_orders" in str(sql).lower())
+
+
+def test_terminal_keyboard_shortcuts_use_visible_quantity_field():
+    source = Path("ui/terminal/terminal.js").read_text(encoding="utf-8")
+
+    assert 'submitTerminalOrder("BUY", currentOrderQty(), "Buy")' in source
+    assert 'submitTerminalOrder("SELL", currentOrderQty(), "Sell")' in source
+    assert 'submitTerminalOrder("BUY", 100' not in source
+    assert 'submitTerminalOrder("SELL", 100' not in source
+
+
 def test_terminal_order_rejects_stale_price_and_records_reason(monkeypatch):
     monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
     monkeypatch.setenv("ENGINE_MODE", "safe")
@@ -341,6 +401,149 @@ def test_terminal_order_rejects_duplicate_recent_intent(monkeypatch):
     assert result["ok"] is False
     assert result["reason_code"] == "duplicate_recent_order"
     _assert_rejection_recorded(writes, "duplicate_recent_order")
+
+
+def test_terminal_order_rejects_per_symbol_qty_cap(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TERMINAL_SYMBOL_CAPS_JSON", json.dumps({"SPY": {"max_qty": 2}}))
+    writes = _patch_terminal_order_storage(monkeypatch)
+
+    result = terminal_orders.api_post_terminal_order(
+        urlparse("/api/terminal/order"),
+        {"symbol": "spy", "side": "buy", "qty": 3},
+        {},
+    )
+
+    assert result["ok"] is False
+    assert result["reason_code"] == "max_qty_exceeded"
+    assert _portfolio_order_insert_count(writes) == 0
+    _assert_rejection_recorded(writes, "max_qty_exceeded")
+
+
+def test_terminal_order_requires_high_notional_threshold_confirmation(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TERMINAL_MAX_NOTIONAL", "1000")
+    monkeypatch.setenv("TERMINAL_CONFIRM_NOTIONAL", "200")
+    writes = _patch_terminal_order_storage(monkeypatch)
+
+    result = terminal_orders.api_post_terminal_order(
+        urlparse("/api/terminal/order"),
+        {"symbol": "spy", "side": "buy", "qty": 3},
+        {},
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "confirmation_required"
+    assert result["http_status"] == 422
+    assert result["reason_code"] == "threshold_notional_confirmation_required"
+    assert result["required_confirm"] == "HIGH_NOTIONAL"
+    assert _portfolio_order_insert_count(writes) == 0
+    _assert_rejection_recorded(writes, "threshold_notional_confirmation_required")
+
+
+def test_terminal_order_allows_high_notional_after_threshold_confirmation(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("TERMINAL_MAX_NOTIONAL", "1000")
+    monkeypatch.setenv("TERMINAL_CONFIRM_NOTIONAL", "200")
+    writes = _patch_terminal_order_storage(monkeypatch)
+
+    result = terminal_orders.api_post_terminal_order(
+        urlparse("/api/terminal/order"),
+        {
+            "symbol": "spy",
+            "side": "buy",
+            "qty": 3,
+            "threshold_confirmation": "HIGH_NOTIONAL",
+            "threshold_consequence_ack": True,
+        },
+        {},
+    )
+
+    assert result["ok"] is True
+    assert result["estimated_notional"] == 300.0
+    assert _portfolio_order_insert_count(writes) == 1
+
+
+def test_terminal_flatten_requires_position_threshold_confirmation(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    monkeypatch.setenv("TERMINAL_FLATTEN_CONFIRM_POSITION_QTY", "1")
+    writes = _FakeWriteConnection()
+    monkeypatch.setattr(
+        terminal_orders,
+        "execution_gate_snapshot",
+        lambda **_kwargs: {
+            "real_trading_allowed": False,
+            "allow_execution_pipeline": True,
+            "allow_simulation": True,
+            "mode": "paper",
+            "reason": "mode_paper",
+        },
+    )
+    monkeypatch.setattr(terminal_orders, "connect", lambda **_kwargs: _FakePositionReadConnection(2.0))
+    monkeypatch.setattr(
+        terminal_orders,
+        "_table_exists",
+        lambda _con, table: table in {"portfolio_orders", "broker_positions", "prices"},
+    )
+    monkeypatch.setattr(terminal_orders, "cache_invalidate_namespace", lambda _namespace: None)
+    monkeypatch.setattr(terminal_orders, "run_write_txn", lambda fn, **_kwargs: fn(writes))
+
+    result = terminal_orders.api_post_terminal_flatten(
+        urlparse("/api/terminal/flatten"),
+        {"symbol": "spy"},
+        {},
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "confirmation_required"
+    assert result["reason_code"] == "threshold_position_confirmation_required"
+    assert result["required_confirm"] == "POSITION_LIMIT"
+    assert _portfolio_order_insert_count(writes) == 0
+    _assert_rejection_recorded(writes, "threshold_position_confirmation_required")
+
+
+def test_terminal_flatten_allows_position_threshold_after_confirmation(monkeypatch):
+    monkeypatch.setenv("DISABLE_LIVE_EXECUTION", "0")
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    monkeypatch.setenv("TERMINAL_FLATTEN_CONFIRM_POSITION_QTY", "1")
+    writes = _FakeWriteConnection()
+    monkeypatch.setattr(
+        terminal_orders,
+        "execution_gate_snapshot",
+        lambda **_kwargs: {
+            "real_trading_allowed": False,
+            "allow_execution_pipeline": True,
+            "allow_simulation": True,
+            "mode": "paper",
+            "reason": "mode_paper",
+        },
+    )
+    monkeypatch.setattr(terminal_orders, "connect", lambda **_kwargs: _FakePositionReadConnection(2.0))
+    monkeypatch.setattr(
+        terminal_orders,
+        "_table_exists",
+        lambda _con, table: table in {"portfolio_orders", "broker_positions", "prices"},
+    )
+    monkeypatch.setattr(terminal_orders, "cache_invalidate_namespace", lambda _namespace: None)
+    monkeypatch.setattr(terminal_orders, "run_write_txn", lambda fn, **_kwargs: fn(writes))
+
+    result = terminal_orders.api_post_terminal_flatten(
+        urlparse("/api/terminal/flatten"),
+        {
+            "symbol": "spy",
+            "threshold_confirmation": "POSITION_LIMIT",
+            "threshold_consequence_ack": True,
+        },
+        {},
+    )
+
+    assert result["ok"] is True
+    assert result["flatten_qty"] == 2.0
+    assert _portfolio_order_insert_count(writes) == 1
 
 
 def test_terminal_order_post_through_http_dispatcher_uses_json_body(monkeypatch, tmp_path):
@@ -497,6 +700,40 @@ def test_terminal_snapshot_includes_execution_barrier(monkeypatch):
     assert "mode_paper" in barrier["blocking_reasons"]
 
 
+def test_terminal_snapshot_price_reference_uses_prices_table_not_position_marks(monkeypatch):
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    wrapped = _NoCloseSQLiteConnection(con)
+    now_ms = int(time.time() * 1000)
+    con.execute("CREATE TABLE prices (symbol TEXT, price REAL, ts_ms INTEGER)")
+    con.execute("INSERT INTO prices(symbol, price, ts_ms) VALUES ('SPY', 123.45, ?)", (now_ms - 250,))
+    con.execute("CREATE TABLE broker_positions (symbol TEXT, market_px REAL, avg_px REAL, updated_ts_ms INTEGER)")
+    con.execute(
+        "INSERT INTO broker_positions(symbol, market_px, avg_px, updated_ts_ms) VALUES ('SPY', 999.0, 998.0, ?)",
+        (now_ms,),
+    )
+    monkeypatch.setattr(terminal_api, "connect_ro", lambda: wrapped)
+    monkeypatch.setattr(terminal_api, "api_get_terminal_watchlist", lambda *_args, **_kwargs: {"ok": True, "symbols": ["SPY"]})
+    monkeypatch.setattr(terminal_api, "api_get_terminal_positions", lambda *_args, **_kwargs: {"ok": True, "rows": []})
+    monkeypatch.setattr(terminal_api, "api_get_terminal_orders", lambda *_args, **_kwargs: {"ok": True, "data": {"broker": [], "portfolio": []}})
+    monkeypatch.setattr(terminal_api, "api_get_terminal_fills", lambda *_args, **_kwargs: {"ok": True, "rows": []})
+    monkeypatch.setattr(terminal_api, "api_get_terminal_equity", lambda *_args, **_kwargs: {"ok": True, "account": None, "series": []})
+    monkeypatch.setattr(
+        terminal_api,
+        "execution_gate_snapshot",
+        lambda **_kwargs: {"ok": True, "real_trading_allowed": True, "mode": "paper", "ts_ms": now_ms},
+    )
+
+    result = terminal_api.api_get_terminal_snapshot(urlparse("/api/terminal/snapshot?symbol=SPY"), {})
+
+    price_ref = result["price_reference"]
+    assert price_ref["ok"] is True
+    assert price_ref["source"] == "prices"
+    assert price_ref["symbol"] == "SPY"
+    assert price_ref["price"] == 123.45
+    assert price_ref["price"] != 999.0
+
+
 def test_terminal_read_handlers_close_read_connections(monkeypatch):
     connections = []
 
@@ -556,22 +793,131 @@ def test_terminal_orders_include_rejected_intents_with_reason_codes(monkeypatch)
     payload = terminal_api.api_get_terminal_orders(urlparse("/api/terminal/orders"), {})
 
     rejected = payload["data"]["rejected"]
-    assert rejected == [
-        {
-            "id": 7,
-            "ts_ms": 123456,
-            "updated_ts_ms": 123456,
-            "symbol": "SPY",
-            "side": "BUY",
-            "qty": 10.0,
-            "state": "REJECTED",
-            "action": "REJECTED",
-            "reason_code": "max_notional_exceeded",
-            "reason": "Order exceeds max notional.",
-            "source": "terminal",
-            "detail_json": "{}",
-        }
-    ]
+    assert len(rejected) == 1
+    assert rejected[0]["id"] == 7
+    assert rejected[0]["symbol"] == "SPY"
+    assert rejected[0]["state"] == "REJECTED"
+    assert rejected[0]["reason_code"] == "max_notional_exceeded"
+    assert rejected[0]["reason"] == "Order exceeds max notional."
+    assert rejected[0]["status_bucket"] == "rejected"
+    assert rejected[0]["status_label"] == "Rejected"
+    assert rejected[0]["rejection_reason_code"] == "max_notional_exceeded"
+    assert payload["data"]["summary"]["rejected"] == 1
+    assert payload["data"]["all"][0]["status_bucket"] == "rejected"
+
+
+def test_terminal_orders_include_suppressed_intents_with_machine_reason(monkeypatch):
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    wrapped = _NoCloseSQLiteConnection(con)
+    con.execute(
+        """
+        CREATE TABLE trade_attribution_ledger (
+          id INTEGER PRIMARY KEY,
+          ts_ms INTEGER NOT NULL,
+          symbol TEXT NOT NULL,
+          source_alert_id INTEGER,
+          model_id TEXT,
+          signal_json TEXT,
+          execution_policy_json TEXT,
+          decision_json TEXT,
+          suppression_reason TEXT,
+          expected_price REAL,
+          fill_price REAL
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO trade_attribution_ledger
+        (id, ts_ms, symbol, source_alert_id, model_id, signal_json, execution_policy_json, decision_json, suppression_reason, expected_price, fill_price)
+        VALUES (11, 223344, 'AAPL', 99, 'model-a', ?, '{}', ?, 'max_position', 101.25, NULL)
+        """,
+        (
+            json.dumps({"side": "BUY", "qty": 15}),
+            json.dumps({"blocked_by": "max_position"}),
+        ),
+    )
+    monkeypatch.setattr(terminal_api, "connect_ro", lambda: wrapped)
+
+    payload = terminal_api.api_get_terminal_orders(urlparse("/api/terminal/orders"), {})
+
+    suppressed = payload["data"]["suppressed"]
+    assert len(suppressed) == 1
+    row = suppressed[0]
+    assert row["symbol"] == "AAPL"
+    assert row["status_bucket"] == "suppressed"
+    assert row["reason_code"] == "max_position"
+    assert row["suppression_reason"] == "max_position"
+    assert row["expected_price"] == 101.25
+    assert row["lineage_ids"]["source_alert_id"] == 99
+    assert payload["data"]["summary"]["suppressed"] == 1
+
+
+def test_terminal_fills_aggregate_partial_fills_with_tca_and_child_detail(monkeypatch):
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    wrapped = _NoCloseSQLiteConnection(con)
+    con.execute(
+        """
+        CREATE TABLE execution_fills (
+          id INTEGER PRIMARY KEY,
+          client_order_id TEXT NOT NULL,
+          fill_id TEXT,
+          broker TEXT,
+          symbol TEXT,
+          portfolio_orders_id INTEGER,
+          source_alert_id INTEGER,
+          prediction_id INTEGER,
+          ts_ms INTEGER,
+          submit_ts_ms INTEGER,
+          fill_ts_ms INTEGER,
+          fill_qty REAL,
+          fill_px REAL,
+          expected_px REAL,
+          mid_px REAL,
+          spread_bps REAL,
+          slippage_bps REAL,
+          fees REAL,
+          extra_json TEXT
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO execution_fills
+        (id, client_order_id, fill_id, broker, symbol, portfolio_orders_id, source_alert_id, prediction_id, ts_ms, submit_ts_ms, fill_ts_ms, fill_qty, fill_px, expected_px, mid_px, spread_bps, slippage_bps, fees, extra_json)
+        VALUES (1, 'cid-1', 'fill-a', 'sim', 'AAPL', 21, 31, 41, 1000, 900, 1000, 4, 100.0, 99.8, 99.9, 2.0, 10.0, 0.10, ?)
+        """,
+        (json.dumps({"implementation_shortfall_bps": 12.0}),),
+    )
+    con.execute(
+        """
+        INSERT INTO execution_fills
+        (id, client_order_id, fill_id, broker, symbol, portfolio_orders_id, source_alert_id, prediction_id, ts_ms, submit_ts_ms, fill_ts_ms, fill_qty, fill_px, expected_px, mid_px, spread_bps, slippage_bps, fees, extra_json)
+        VALUES (2, 'cid-1', 'fill-b', 'sim', 'AAPL', 21, 31, 41, 1100, 900, 1100, 6, 101.0, 99.8, 99.9, 2.0, 20.0, 0.20, ?)
+        """,
+        (json.dumps({"implementation_shortfall_bps": 18.0}),),
+    )
+    monkeypatch.setattr(terminal_api, "connect_ro", lambda: wrapped)
+
+    payload = terminal_api.api_get_terminal_fills(urlparse("/api/terminal/fills"), {})
+
+    assert payload["ok"] is True
+    assert payload["meta"]["source_table"] == "execution_fills"
+    assert len(payload["raw_rows"]) == 2
+    assert len(payload["rows"]) == 1
+    row = payload["rows"][0]
+    assert row["client_order_id"] == "cid-1"
+    assert row["status_bucket"] == "partial"
+    assert row["child_fill_count"] == 2
+    assert len(row["child_fills"]) == 2
+    assert row["qty"] == 10.0
+    assert row["fill_vwap"] == pytest.approx(100.6)
+    assert row["slippage_bps"] == pytest.approx(16.0)
+    assert row["implementation_shortfall_bps"] == pytest.approx(15.6)
+    assert payload["summary"]["partial_orders"] == 1
+    assert payload["summary"]["avg_slippage_bps"] == pytest.approx(16.0)
 
 
 def test_terminal_decision_overlays_explain_traded_and_not_traded_decisions(monkeypatch):
@@ -678,7 +1024,7 @@ def test_terminal_decision_overlays_explain_traded_and_not_traded_decisions(monk
             0.25,
             0.50,
             101,
-            json.dumps({"entry_price": 100.5, "stop_loss_px": 98.0, "take_profit_px": 105.0}),
+            json.dumps({"entry_price": 100.5, "stop_loss_px": 98.0, "take_profit_px": 105.0, "max_risk_px": 97.5}),
         ),
     )
     con.execute(
@@ -762,7 +1108,7 @@ def test_terminal_decision_overlays_explain_traded_and_not_traded_decisions(monk
     assert {"fill_executed", "portfolio_intent", "ttl_expired", "kill_switch_db_global", "portfolio_risk_cap_scaled"}.issubset(reason_codes)
 
     price_line_kinds = {line["kind"] for line in payload["price_lines"]}
-    assert {"average_cost", "entry", "stop", "take_profit", "cap"}.issubset(price_line_kinds)
+    assert {"average_cost", "entry", "stop", "take_profit", "max_risk", "cap"}.issubset(price_line_kinds)
 
     window_kinds = {w["kind"] for w in payload["windows"]}
     assert {"kill_switch_window", "suppression_window", "drawdown_throttle_window", "circuit_breaker_window"}.issubset(window_kinds)
@@ -788,6 +1134,11 @@ def test_terminal_ui_gates_order_controls_from_execution_barrier():
     assert "setFlattenEnabled(false, title)" in js
     assert "Flatten cannot be sent by keypress" in js
     assert "pointerdown" in js and "startFlattenHold" in js
+    assert "confirmation_token" in js
+    assert "confirmation_method" in js
+    assert "source_surface: \"terminal\"" in js
+    assert "actionId = normalizedToken === \"FLATTEN\" ? \"terminal.flatten\" : \"terminal.order\"" in js
+    assert "request_id: requestId(actionId.replace" in js
 
 
 def test_terminal_quantity_contract_survives_intent_weight_normalization():
@@ -821,8 +1172,8 @@ def test_terminal_quantity_contract_loads_as_explicit_qty_with_neutral_weights(m
               model_id TEXT NOT NULL,
               symbol TEXT NOT NULL,
               action TEXT NOT NULL,
-              from_side TEXT,
-              to_side TEXT,
+              from_side TEXT NOT NULL,
+              to_side TEXT NOT NULL,
               from_weight REAL NOT NULL,
               to_weight REAL NOT NULL,
               delta_weight REAL NOT NULL,
@@ -844,8 +1195,8 @@ def test_terminal_quantity_contract_loads_as_explicit_qty_with_neutral_weights(m
                 "baseline",
                 "SPY",
                 "SELL",
-                None,
-                "SELL",
+                "FLAT",
+                "SHORT",
                 0.0,
                 0.0,
                 0.0,

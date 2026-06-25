@@ -25,7 +25,8 @@ import time
 from typing import Dict, Iterable, List, Tuple
 
 from engine.data.default_symbols import default_symbol_metadata, load_default_symbols, parse_symbol_limit
-from engine.data.universe import extract_symbol_candidates, upsert_symbol
+from engine.data.quiver_gov import sector_coverage_report, seed_equity_sector_reference
+from engine.data.universe import extract_symbol_candidates, get_active_symbols, upsert_symbol
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import (
     acquire_job_lock,
@@ -994,12 +995,15 @@ def main() -> None:
 
         disabled = _disable_stale_symbols(con, now_ms)
         active_count, watch_count = _assign_statuses(con)
+        live_universe_symbols = get_active_symbols(con, limit=None)
+        sector_seed_counts = seed_equity_sector_reference(con, symbols=live_universe_symbols)
+        sector_coverage = sector_coverage_report(con, symbols=live_universe_symbols, equity_only=True)
         universe_active, universe_watch, universe_blocked = _persist_symbol_universe(con, now_ms)
 
         con.commit()
         dur_ms = _now_ms() - started_ms
         logging.info(
-            "universe updated: active=%s watch=%s disabled=%s persisted_active=%s persisted_watch=%s persisted_blocked=%s sources=%s dur_ms=%s",
+            "universe updated: active=%s watch=%s disabled=%s persisted_active=%s persisted_watch=%s persisted_blocked=%s sources=%s sector_seeded=%s sector_resolved=%s sector_unresolved=%s dur_ms=%s",
             active_count,
             watch_count,
             disabled,
@@ -1007,6 +1011,9 @@ def main() -> None:
             universe_watch,
             universe_blocked,
             json.dumps(source_counts, separators=(",", ":"), sort_keys=True),
+            int(sector_seed_counts.get("symbol_sectors") or 0),
+            int(sector_coverage.get("resolved") or 0),
+            int(sector_coverage.get("unresolved") or 0),
             dur_ms,
         )
     finally:

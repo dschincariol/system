@@ -35,7 +35,9 @@ import { fetchJSON, fetchWithTimeout as _fetchWithTimeout } from "./api_client.j
 import {
   applyStalenessState,
   setPanelState,
-  setSurfaceState
+  setSurfaceState,
+  subscribeConnectionState,
+  updateConnectionStateSurfaces
 } from "./panel_state.js";
 
 import {
@@ -48,6 +50,7 @@ import {
   filterAlerts,
   renderHeatmap,
   renderIncidentQueue,
+  normalizeSeverity,
   severityRank
 } from "./alerts.js";
 
@@ -118,6 +121,7 @@ import { renderDecisionStepper } from "./decision_stepper.js";
 import { renderDecisionAttribution } from "./decision_attribution.js";
 import { renderFeatureVisibility } from "./feature_visibility.js";
 import { loadDataHealthScreen as loadDataHealthScreenModule } from "./data_health.js";
+import { loadFuturesPanel as loadFuturesPanelModule } from "./futures_panel.js";
 import { requestConfirmation } from "./confirmation_modal.mjs";
 import {
   formatFxPrice,
@@ -139,6 +143,7 @@ import {
   normalizePromotionGatePayload,
   promotionGateStateTone,
   renderGovernanceEvidenceCenter,
+  renderPromotionAuditRows,
   summarizeGovernanceEvidence,
   summarizeCooldown,
   validatePromotionActionInput
@@ -330,6 +335,7 @@ let _latestHealthStateTs = 0;
 let _latestPnLStateTs = 0;
 let _latestSystemStatusTs = 0;
 let _lastNotificationStatus = null;
+let _connectionStateUnsubscribe = null;
 let _wsRenderTimer = null;
 let _pendingWsHealth = null;
 let _pendingWsHealthTs = 0;
@@ -380,6 +386,13 @@ const _dashboardLiveState = {
     uiMetrics: "",
   },
 };
+
+function updateDashboardConnectionStateSurfaces() {
+  return updateConnectionStateSurfaces({
+    document,
+    readOnly: isReadOnlyMode(),
+  });
+}
 
 function coerceRealtimeTs(...values) {
   for (const value of values) {
@@ -712,6 +725,14 @@ function buildHealthDetailLines({
       `Price freshness: ${prices.ok === true ? "fresh" : "stale"}${prices.age_s != null ? ` (${formatAgeMs(Number(prices.age_s) * 1000)})` : ""}`
     );
   }
+  const optionsLabel = String(
+    safeHealth.options_ingestion_label ||
+    asObject(safeHealth.operator_labels).options_ingestion ||
+    ""
+  ).trim();
+  if (optionsLabel) {
+    lines.push(`Options: ${optionsLabel.replace(/^options:\s*/i, "")}`);
+  }
 
   if (startup.blockers.length) {
     lines.push("Operational blockers:");
@@ -734,75 +755,12 @@ function renderDashboardDegradedBanner({
   executionBarrier = null,
   failures = [],
 } = {}) {
-  const banner = document.getElementById("dashboardDegradedBanner");
-  const titleEl = document.getElementById("dashboardDegradedBannerTitle");
-  const detailEl = document.getElementById("dashboardDegradedBannerDetail");
-  if (!banner || !titleEl || !detailEl) return;
-
-  const normalizedFailures = normalizeFailureItems(failures);
-  const safeHealth = normalizeOperatorHealthPayload(health) || asObject(health);
-  const safeReadiness = asObject(readiness);
-  const safeBarrier = asObject(executionBarrier || safeHealth.execution_barrier);
-  const safeSystemState = asObject(systemState);
-  const startup = buildStartupDiagnostics({
-    readiness: safeReadiness,
-    health: safeHealth,
-    systemState: safeSystemState,
-    broker: null,
-  });
-
-  const blockers = [
-    ...normalizedFailures.map((item) => `${item.label}: ${item.message}`),
-    ...startup.blockers,
-  ].filter(Boolean);
-
-  const degraded =
-    normalizedFailures.length > 0 ||
-    safeHealth.ok === false ||
-    safeReadiness.ready === false ||
-    safeBarrier.allowed === false ||
-    String(safeSystemState.state || "").trim().toUpperCase() !== "LIVE" ||
-    blockers.length > 0;
-
-  banner.className = "opsBanner";
-  if (!degraded) {
-    return;
-  }
-
-  const latestTs = pickTimestamp(
-    safeHealth.ts_ms,
-    safeReadiness.ts_ms,
-    asObject(safeReadiness.readiness).ts_ms,
-    safeSystemState.ts_ms,
-    safeBarrier.ts_ms
-  );
-  const latestAgeMs = ageMsFromTimestamp(latestTs);
-  const tone =
-    normalizedFailures.length > 0 || safeBarrier.allowed === false
-      ? "crit"
-      : "warn";
-
-  banner.classList.add("is-visible", tone);
-  if (normalizedFailures.length > 0) {
-    titleEl.textContent = "Critical backend routes are unavailable";
-  } else if (safeBarrier.allowed === false) {
-    titleEl.textContent = "Execution is blocked";
-  } else if (safeReadiness.ready === false) {
-    titleEl.textContent = "Readiness gates are blocking normal operation";
-  } else {
-    titleEl.textContent = "Runtime is degraded";
-  }
-
-  const detailParts = [];
-  if (blockers.length) {
-    detailParts.push(blockers.slice(0, 3).join(" | "));
-  }
-  if (latestTs) {
-    detailParts.push(`Last backend snapshot ${formatAgeMs(latestAgeMs)} old (${fmtTime(latestTs)})`);
-  } else {
-    detailParts.push("No current backend snapshot timestamp is available.");
-  }
-  detailEl.textContent = detailParts.join(". ");
+  void health;
+  void systemState;
+  void readiness;
+  void executionBarrier;
+  void failures;
+  updateDashboardConnectionStateSurfaces();
 }
 
 function renderDashboardSystemStatus(health, systemState = window.__LAST_SYSTEM_STATE__ || null) {
@@ -1273,6 +1231,7 @@ function layoutDashboardPanels(screen = ACTIVE_DASHBOARD_SCREEN) {
     data: {
       left: [
         "dataHealthSummaryCard",
+        "futuresPanelCard",
       ],
       center: [
         "dataProviderTelemetryCard",
@@ -1502,7 +1461,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
       loadSocialPressure({ symbol: _getSelectedSymbolOptional() }),
       loadSocialRegimes({ symbol: _getSelectedSymbolOptional() }),
       loadSocialBlocks({ symbol: _getSelectedSymbolOptional() }),
-      loadWeatherWidgets({ symbol: _getActiveSymbol("SPY") }),
+      loadWeatherWidgets({ symbol: _getActiveSymbol("SPY"), fetchJSON }),
       loadGovernanceEvidence(),
       loadPromotionAudit(),
       loadCausalScores(),
@@ -1527,6 +1486,7 @@ function buildScreenRefreshTasks(screen, preloaded = {}) {
     ],
     data: [
       loadDataHealthScreen(),
+      loadFuturesPanel(),
     ],
     positions: [
       loadPositionsExposureScreen(),
@@ -2156,7 +2116,7 @@ function scheduleSymbolAwarePanelRefresh() {
       tasks.push(loadSocialPressure({ symbol: selected }));
       tasks.push(loadSocialRegimes({ symbol: selected }));
       tasks.push(loadSocialBlocks({ symbol: selected }));
-      tasks.push(loadWeatherWidgets({ symbol: selected || "SPY" }));
+      tasks.push(loadWeatherWidgets({ symbol: selected || "SPY", fetchJSON }));
       tasks.push(loadNewsPanels(fetchJSON, { symbol: selected }));
       tasks.push(loadNewsSentiment(fetchJSON, { symbol: selected }));
     }
@@ -3190,6 +3150,45 @@ function _setExpertUnlock(on) {
   });
 }
 
+function _setOperatorMode(on) {
+  OPERATOR_MODE = !!on;
+  saveOperatorMode(OPERATOR_MODE);
+  applyPolicyToDOM({
+    operatorMode: OPERATOR_MODE,
+    expertUnlocked: EXPERT_UNLOCK
+  });
+}
+
+async function confirmAdvancedUiModeChange({ nextExpertUnlocked = EXPERT_UNLOCK, nextOperatorMode = OPERATOR_MODE } = {}) {
+  const unlockingAdvanced = nextExpertUnlocked === true && EXPERT_UNLOCK !== true;
+  const leavingOperatorMode = nextOperatorMode === false && OPERATOR_MODE !== false;
+  if (!unlockingAdvanced && !leavingOperatorMode) return { ok: true, payload: null };
+  const title = unlockingAdvanced ? "Unlock advanced controls" : "Switch to expert mode";
+  const confirmText = unlockingAdvanced ? "UNLOCK_ADVANCED" : "EXPERT_MODE";
+  const confirmation = await requestConfirmation({
+    title,
+    action: title,
+    actionId: unlockingAdvanced ? "dashboard.expert_unlock" : "dashboard.expert_mode",
+    target: unlockingAdvanced ? "advanced dashboard controls" : "dashboard mode",
+    consequence: unlockingAdvanced
+      ? "Advanced dashboard controls become visible and easier to trigger from this browser. Server execution gates remain authoritative."
+      : "Operator-only simplifications are removed and advanced dashboard controls become visible. Server execution gates remain authoritative.",
+    reversibility: "Reversible from this browser by turning Operator Mode back on or locking advanced controls.",
+    confirmText,
+    requireReason: true,
+    minReasonLength: 6,
+    submitLabel: unlockingAdvanced ? "Unlock advanced controls" : "Switch to expert mode",
+    actor: "operator",
+    source: "dashboard_policy",
+  });
+  if (confirmation && confirmation.ok) {
+    try {
+      window.__LAST_DASHBOARD_POLICY_CONFIRMATION__ = confirmation.payload || null;
+    } catch {}
+  }
+  return confirmation;
+}
+
 function _parseRangeToMs(r) {
   const map = { "15m": 15*60e3, "1h": 60*60e3, "6h": 6*60*60e3, "24h": 24*60*60e3, "7d": 7*24*60*60e3 };
   return map[r] || map["6h"];
@@ -3241,7 +3240,9 @@ function _normalizeLocalAlertEntry(kind, value) {
       ? (value.until ?? value.expires_at ?? value.ts)
       : value
   );
-  return Number.isFinite(until) && until > 0 ? { until } : null;
+  return Number.isFinite(until) && until > 0
+    ? { until, reason: String((value && typeof value === "object" ? value.reason : "") || "") }
+    : null;
 }
 function _loadMap(key, kind = "ack") {
   const now = Date.now();
@@ -3265,7 +3266,7 @@ function _loadMap(key, kind = "ack") {
       if ((now - Number(entry.resolved_at || 0)) > _LOCAL_ALERT_RESOLVE_TTL_MS) continue;
       entries.push([id, { resolved_at: Number(entry.resolved_at) }]);
     } else if (Number(entry.until || 0) > now) {
-      entries.push([id, { until: Number(entry.until) }]);
+      entries.push([id, { until: Number(entry.until), reason: String(entry.reason || "") }]);
     }
   }
 
@@ -3349,11 +3350,11 @@ function _resolveAlertLocal(id) {
   m[key] = { resolved_at: Date.now() };
   _saveMap(_RESOLVED_KEY, m);
 }
-function _snoozeAlertLocal(id, minutes) {
+function _snoozeAlertLocal(id, minutes, reason = "") {
   const key = _normalizeAlertStorageKey(id);
   if (!key) return;
   const m = _loadMap(_SNOOZE_KEY, "snooze");
-  m[key] = { until: Date.now() + (minutes * 60 * 1000) };
+  m[key] = { until: Date.now() + (minutes * 60 * 1000), reason: String(reason || "") };
   _saveMap(_SNOOZE_KEY, m);
 }
 function _isSnoozedLocal(id) {
@@ -3393,14 +3394,19 @@ async function ackAlertPersisted(row) {
   }
 
   try {
-    await postJSON(`/api/alerts/${encodeURIComponent(alertId)}/ack`, {
+    const result = await postJSON(`/api/alerts/${encodeURIComponent(alertId)}/ack`, {
       actor: "operator",
       source: "dashboard",
+      reason: "acknowledged in dashboard",
     });
     _clearLocalAlertState(_ACK_KEY, "ack", alertId);
     _applyAlertStatePatch(alertId, {
       acked: true,
       acked_by: "operator",
+      acked_ts_ms: result.acked_ts_ms,
+      ack_expires_ts_ms: result.expires_ts_ms,
+      lifecycle_state: "acknowledged",
+      next_escalation_ts_ms: result.expires_ts_ms,
     });
     try {
       await postUiInteraction({
@@ -3412,12 +3418,19 @@ async function ackAlertPersisted(row) {
         }
       });
     } catch {}
-    return { ok: true, persistence: "server" };
+    return {
+      ok: true,
+      persistence: "server",
+      acked_ts_ms: result.acked_ts_ms,
+      expires_ts_ms: result.expires_ts_ms,
+    };
   } catch (e) {
     _ackAlertLocal(alertId);
     _applyAlertStatePatch(alertId, {
       acked: true,
       acked_by: "local",
+      acked_ts_ms: Date.now(),
+      lifecycle_state: "acknowledged",
     });
     try {
       await postUiInteraction({
@@ -3437,6 +3450,128 @@ async function ackAlertPersisted(row) {
     };
   }
 }
+
+function _alertShelveDurationMs(row) {
+  const severity = normalizeSeverity(row && row.severity);
+  if (severity === "HIGH") return 15 * 60 * 1000;
+  if (severity === "WARN") return 30 * 60 * 1000;
+  if (severity === "INFO") return 60 * 60 * 1000;
+  return 5 * 60 * 1000;
+}
+
+async function shelveAlertPersisted(row) {
+  const alertId = _normalizeAlertStorageKey(row && row.id);
+  if (!alertId) {
+    return { ok: false, persistence: "none", error: "missing alert id" };
+  }
+  if (hardBlockIfReadOnly({ actionName: "shelve alert", toastFn: toast })) {
+    return { ok: false, persistence: "none", blocked: true };
+  }
+
+  const durationMs = _alertShelveDurationMs(row);
+  const expiresTsMs = Date.now() + durationMs;
+  const severity = normalizeSeverity(row && row.severity);
+  const confirmation = await requestConfirmation({
+    title: "Shelve alert",
+    action: "Shelve alert",
+    actionId: "alert.shelve",
+    target: `${severity} ${(row && (row.symbol || row.rule_id)) || "SYSTEM"} alert ${alertId}`,
+    consequence: `Suppresses this unresolved alert until ${fmtTime(expiresTsMs)}. If the alert is still active after expiry, it returns to the escalation path.`,
+    reversibility: "Reversible by waiting for expiry or resolving the incident after the root cause is fixed.",
+    confirmText: "SHELVE_ALERT",
+    requireReason: true,
+    minReasonLength: 8,
+    submitLabel: `Shelve ${Math.max(1, Math.round(durationMs / 60000))}m`,
+    actor: "operator",
+    source: "dashboard_alerts",
+  });
+  if (!(confirmation && confirmation.ok)) {
+    return { ok: false, persistence: "none", blocked: true };
+  }
+  const reason = String(confirmation.reason || "").trim();
+
+  try {
+    const result = await postJSONAllowBusinessFalse(`/api/alerts/${encodeURIComponent(alertId)}/shelve`, {
+      ...(confirmation.payload || {}),
+      actor: "operator",
+      source: "dashboard",
+      reason,
+      severity,
+      duration_ms: durationMs,
+      expires_ts_ms: expiresTsMs,
+    });
+    if (!(result && result.ok)) {
+      const error = String((result && result.error) || "shelve rejected by server policy");
+      toast(`Alert shelving blocked: ${error}`, "warn");
+      return {
+        ok: false,
+        persistence: "server",
+        error,
+      };
+    }
+    _clearLocalAlertState(_SNOOZE_KEY, "snooze", alertId);
+    _applyAlertStatePatch(alertId, {
+      shelved: true,
+      shelved_by: "operator",
+      shelved_ts_ms: result.shelved_ts_ms,
+      shelve_expires_ts_ms: result.expires_ts_ms,
+      shelve_reason: reason,
+      lifecycle_state: "shelved",
+      next_escalation_ts_ms: result.expires_ts_ms,
+    });
+    try {
+      await postUiInteraction({
+        alert_id: alertId,
+        interaction_type: "alert_shelve",
+        detail: {
+          persistence: "server",
+          panel: "incident_drawer",
+          duration_ms: durationMs,
+          severity,
+        }
+      });
+    } catch {}
+    return {
+      ok: true,
+      persistence: "server",
+      shelved_ts_ms: result.shelved_ts_ms,
+      expires_ts_ms: result.expires_ts_ms,
+      reason,
+    };
+  } catch (e) {
+    _snoozeAlertLocal(alertId, Math.max(1, Math.round(durationMs / 60000)), reason);
+    _applyAlertStatePatch(alertId, {
+      shelved: true,
+      shelved_by: "local",
+      shelved_ts_ms: Date.now(),
+      shelve_expires_ts_ms: expiresTsMs,
+      shelve_reason: reason,
+      lifecycle_state: "shelved",
+      next_escalation_ts_ms: expiresTsMs,
+    });
+    try {
+      await postUiInteraction({
+        alert_id: alertId,
+        interaction_type: "alert_shelve",
+        detail: {
+          persistence: "local",
+          panel: "incident_drawer",
+          duration_ms: durationMs,
+          severity,
+          error: String(e && e.message ? e.message : e || ""),
+        }
+      });
+    } catch {}
+    return {
+      ok: true,
+      persistence: "local",
+      shelved_ts_ms: Date.now(),
+      expires_ts_ms: expiresTsMs,
+      reason,
+      error: String(e && e.message ? e.message : e || "shelve failed"),
+    };
+  }
+}
 async function resolveAlertPersisted(row) {
   const alertId = _normalizeAlertStorageKey(row && row.id);
   if (!alertId) {
@@ -3447,7 +3582,7 @@ async function resolveAlertPersisted(row) {
   }
 
   try {
-    await postJSON(`/api/alerts/${encodeURIComponent(alertId)}/resolve`, {
+    const result = await postJSON(`/api/alerts/${encodeURIComponent(alertId)}/resolve`, {
       actor: "operator",
       reason: "resolved in dashboard",
       source: "dashboard",
@@ -3460,6 +3595,8 @@ async function resolveAlertPersisted(row) {
       status: "resolved",
       resolved: true,
       resolved_reason: "resolved in dashboard",
+      resolved_ts_ms: result.resolved_ts_ms,
+      lifecycle_state: "resolved",
     });
     try {
       await postUiInteraction({
@@ -3471,13 +3608,15 @@ async function resolveAlertPersisted(row) {
         }
       });
     } catch {}
-    return { ok: true, persistence: "server" };
+    return { ok: true, persistence: "server", resolved_ts_ms: result.resolved_ts_ms };
   } catch (e) {
     _resolveAlertLocal(alertId);
     _applyAlertStatePatch(alertId, {
       status: "resolved",
       resolved: true,
       resolved_reason: "local fallback",
+      resolved_ts_ms: Date.now(),
+      lifecycle_state: "resolved",
     });
     try {
       await postUiInteraction({
@@ -3585,15 +3724,19 @@ function _scoreCell(rows) {
 
 function _meaningForAlert(r) {
   const sym = (r.symbol === "EXECUTION") ? "Execution" : r.symbol;
+  const severity = normalizeSeverity(r.severity);
   if (sym === "EXECUTION") return "Execution quality looks degraded. Treat signals cautiously; avoid amplifying with aggressive actions.";
-  if (r.severity === "CRIT") return "This is high severity and likely needs attention now.";
-  if (r.severity === "WARN") return "This is a warning. Check context and monitor for escalation.";
+  if (severity === "CRIT") return "This is critical severity and likely needs attention now.";
+  if (severity === "HIGH") return "This is high severity. Validate context before adding risk or trusting the signal.";
+  if (severity === "WARN") return "This is a warning. Check context and monitor for escalation.";
   return "Informational alert. Usually safe to monitor.";
 }
 
 function _recommendedPosture(r) {
-  if (r.severity === "CRIT") return "Act now";
-  if (r.severity === "WARN") return "Monitor closely";
+  const severity = normalizeSeverity(r.severity);
+  if (severity === "CRIT") return "Act now";
+  if (severity === "HIGH") return "Validate before acting";
+  if (severity === "WARN") return "Monitor closely";
   return "Observe only";
 }
 
@@ -3606,15 +3749,19 @@ function _decisionConfidence(r) {
 }
 
 function _safeToIgnore(r) {
-  if (r.severity === "INFO") return "Yes — informational";
-  if (r.severity === "WARN" && Number(r.confidence) < 0.6) return "Likely safe short-term";
+  const severity = normalizeSeverity(r.severity);
+  if (severity === "INFO") return "Yes — informational";
+  if (severity === "WARN" && Number(r.confidence) < 0.6) return "Likely safe short-term";
   return "No";
 }
 
 function _ifNothingChanges(r) {
-  if (r.severity === "CRIT")
+  const severity = normalizeSeverity(r.severity);
+  if (severity === "CRIT")
     return "Likely escalation or downstream impact within this horizon.";
-  if (r.severity === "WARN")
+  if (severity === "HIGH")
+    return "Elevated risk can compound quickly if similar alerts continue.";
+  if (severity === "WARN")
     return "May self-resolve, but repeated alerts increase risk.";
   return "No material impact expected.";
 }
@@ -4048,7 +4195,18 @@ function renderAlertsUnavailable(message) {
   const detail = escapeHTML(String(message || "alerts unavailable"));
   const heatmap = document.getElementById("alertsHeatmap");
   if (heatmap) {
-    heatmap.innerHTML = `<div class="hmCell hmHead" style="grid-column:1 / -1;">Alerts unavailable</div><div class="hmCell" style="grid-column:1 / -1;">${detail}</div>`;
+    const token = statusToken("unavailable");
+    heatmap.setAttribute("role", "grid");
+    heatmap.setAttribute("aria-label", "Alert heatmap by symbol and horizon");
+    heatmap.innerHTML =
+      `<div class="hmCell hmHead" role="columnheader" style="grid-column:1 / -1;">Alerts unavailable</div>` +
+      `<div class="hmCell hmStatus-unavailable" style="grid-column:1 / -1;" ` +
+      `role="gridcell" data-status="unavailable" data-severity="UNAVAILABLE" ` +
+      `aria-label="${escapeHTML(statusAriaLabel(token.key, `Alerts unavailable. ${String(message || "alerts unavailable")}`))}">` +
+      `<span class="hmSwatch" style="--hm-color:${escapeHTML(token.color)};" aria-hidden="true">${escapeHTML(token.glyph)}</span>` +
+      `<span class="hmStatusLabel">${escapeHTML(token.label)}</span>` +
+      `<span class="hmMeta">${detail}</span>` +
+      `</div>`;
   }
 
   const incidentList = document.getElementById("incidentList");
@@ -4219,7 +4377,8 @@ function detectLogViewerLevel(line) {
   const text = String(line || "").toUpperCase();
   if (/\b(CRIT|CRITICAL|FATAL)\b/.test(text)) return "CRIT";
   if (/\b(ERROR|ERR)\b/.test(text)) return "ERROR";
-  if (/\b(WARN|WARNING|HIGH)\b/.test(text)) return "WARN";
+  if (/\bHIGH\b/.test(text)) return "HIGH";
+  if (/\b(WARN|WARNING)\b/.test(text)) return "WARN";
   if (/\bINFO\b/.test(text)) return "INFO";
   if (/\bDEBUG\b/.test(text)) return "DEBUG";
   if (/\bTRACE\b/.test(text)) return "TRACE";
@@ -4844,6 +5003,7 @@ async function loadAlerts() {
       _isResolvedLocal,
       _isSnoozedLocal,
       ackAlert: ackAlertPersisted,
+      shelveAlert: shelveAlertPersisted,
       resolveAlert: resolveAlertPersisted,
       reloadAlerts: loadAlerts,
       OPERATOR_MODE,
@@ -5057,6 +5217,13 @@ async function loadDataHealthScreen() {
     fetchJSON,
     document,
     renderFeatureVisibility,
+  });
+}
+
+async function loadFuturesPanel() {
+  return loadFuturesPanelModule({
+    fetchJSON,
+    document,
   });
 }
 
@@ -6913,6 +7080,7 @@ async function loadHealth(preloaded) {
     setPillTone("healthPrices", "bad", "prices unavailable");
     setPillTone("healthLabels", "bad", "labels unavailable");
     setPillTone("healthModel", "bad", "model health unavailable");
+    setPillTone("healthOptions", "bad", "options health unavailable");
     updateDashboardLiveState({}, { errorKey: "health", error: failures[0] || "health route unavailable" });
     setPanelState("systemHealthCard", {
       state: "error",
@@ -6984,6 +7152,34 @@ async function loadHealth(preloaded) {
     healthRouteFailed
       ? `model snapshot stale · last good ${healthSnapshotTs ? `${formatAgeMs(healthSnapshotAgeMs)} ago` : "timestamp unavailable"}`
       : `model n=${safeHealth.model ? safeHealth.model.support_n : "?"}`,
+    healthSnapshotAgeMs,
+    60_000,
+    300_000
+  );
+
+  const optionsIngestion = asObject(safeHealth.options_ingestion);
+  const optionsLabel = String(
+    safeHealth.options_ingestion_label ||
+    asObject(safeHealth.operator_labels).options_ingestion ||
+    (
+      optionsIngestion.credentials_configured
+        ? (optionsIngestion.degraded || optionsIngestion.ok === false
+            ? "options: DEGRADED - creds set, chain stale"
+            : "options: ok - creds set")
+        : "options: shadow (no creds)"
+    )
+  );
+  const optionsTone = healthRouteFailed
+    ? "warn"
+    : optionsIngestion.credentials_configured
+      ? ((optionsIngestion.degraded || optionsIngestion.ok === false) ? "bad" : "ok")
+      : "dim";
+  setPillTone(
+    "healthOptions",
+    optionsTone,
+    healthRouteFailed
+      ? `options snapshot stale · last good ${healthSnapshotTs ? `${formatAgeMs(healthSnapshotAgeMs)} ago` : "timestamp unavailable"}`
+      : optionsLabel,
     healthSnapshotAgeMs,
     60_000,
     300_000
@@ -7163,30 +7359,7 @@ async function loadPromotionAudit() {
     rows = [];
   }
 
-  tbody.innerHTML = "";
-  for (const r of rows) {
-    const ts = fmtTime(r.ts_ms);
-    const model = String(r.model_name || "");
-    const action = String(r.action || "");
-    const reg = (r.regime === null || r.regime === undefined) ? "" : String(r.regime);
-    const causalScores = r.causal_scores || (r.reason && r.reason.causal_scores) || {};
-    const causal = Object.entries(causalScores)
-      .slice(0, 5)
-      .map(([feature, score]) => `${feature}:${score === null || score === undefined ? "" : Number(score).toFixed(2)}`)
-      .join(", ");
-    const why = JSON.stringify(r.reason || {}).slice(0, 240);
-
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${escapeHTML(ts)}</td>
-      <td>${escapeHTML(model)}</td>
-      <td>${escapeHTML(action)}</td>
-      <td>${escapeHTML(reg)}</td>
-      <td><code>${escapeHTML(causal || "")}</code></td>
-      <td><code>${escapeHTML(why)}</code></td>
-    `;
-    tbody.appendChild(tr);
-  }
+  tbody.innerHTML = renderPromotionAuditRows(rows);
 }
 
 
@@ -7411,6 +7584,8 @@ function renderPromotionGate(payload) {
 
   const rollback = gate.actions.rollback && typeof gate.actions.rollback === "object" ? gate.actions.rollback : {};
   const forcePromote = gate.actions.force_promote && typeof gate.actions.force_promote === "object" ? gate.actions.force_promote : {};
+  const stalenessBadges = Array.isArray(gate.raw.staleness_badges) ? gate.raw.staleness_badges : [];
+  const sourceCitations = Array.isArray(gate.raw.source_citations) ? gate.raw.source_citations : [];
   renderStructuredSummary(summaryEl, [
     {
       label: "Promotion",
@@ -7445,6 +7620,20 @@ function renderPromotionGate(payload) {
       label: "Force promote",
       value: forcePromote.available ? "Available" : "Unavailable",
       meta: forcePromote.reason || "No audit-safe force promotion endpoint is registered.",
+    },
+    {
+      label: "Evidence freshness",
+      value: stalenessBadges.length ? `${stalenessBadges.length} issue(s)` : "Fresh",
+      meta: stalenessBadges.length
+        ? stalenessBadges.slice(0, 4).map((badge) => `${badge.label || badge.key || "evidence"}: ${badge.state || badge.severity || "unknown"}`).join("; ")
+        : "Metrics, replay, temporal evaluation, and execution-degradation evidence have no stale/conflict badges.",
+    },
+    {
+      label: "Evidence sources",
+      value: sourceCitations.length ? `${sourceCitations.length} cited` : "Not cited",
+      meta: sourceCitations.length
+        ? sourceCitations.slice(0, 3).map((citation) => `${citation.source || "source"} ${citation.ts_ms ? fmtTime(citation.ts_ms) : "no timestamp"}`).join("; ")
+        : "No source/timestamp citations returned.",
     },
   ]);
 
@@ -7856,7 +8045,7 @@ function _runtimeHealthAlertSummary(runtimeAlert) {
   }
 
   const state = String(alert.state || "").trim().toLowerCase();
-  const severity = String(alert.severity || "").trim().toUpperCase();
+  const severity = normalizeSeverity(alert.severity);
   const reasonCodes = Array.isArray(alert.reason_codes) ? alert.reason_codes.filter(Boolean) : [];
   const headline = String(alert.headline || "").trim() || (state === "healthy" ? "Runtime health recovered" : "Runtime health degraded");
   const updated = Number(alert.updated_ts_ms || 0);
@@ -7873,7 +8062,7 @@ function _runtimeHealthAlertSummary(runtimeAlert) {
 
   return {
     banner: `${headline} • ${severity || "WARN"} • ${when}`,
-    bannerClass: severity === "CRITICAL" ? "status bad" : "status warn",
+    bannerClass: severity === "CRIT" ? "status bad" : severity === "HIGH" ? "status high" : "status warn",
     meta: reasonCodes.length ? reasonCodes.slice(0, 5).join(", ") : (summary || "No blocker codes recorded."),
   };
 }
@@ -8538,6 +8727,7 @@ async function loadExecutionBarrier() {
     window.__LAST_EXECUTION_BARRIER__ = j;
     syncJobActionSafetyState();
     applyReadOnlyBanner();
+    updateDashboardConnectionStateSurfaces();
     updateDashboardLiveState({ executionBarrier: j }, { sourceTs: extractRealtimeTs(j, Date.now()) });
 
     pill.className = buildPillClassName(pill, j.allowed ? "ok" : "crit");
@@ -8551,6 +8741,7 @@ async function loadExecutionBarrier() {
     window.__LAST_EXECUTION_BARRIER__ = { ok: false, allowed: false, real_trading_allowed: false };
     syncJobActionSafetyState();
     applyReadOnlyBanner();
+    updateDashboardConnectionStateSurfaces();
     updateDashboardLiveState({ executionBarrier: window.__LAST_EXECUTION_BARRIER__ }, { sourceTs: Date.now() });
     pill.className = buildPillClassName(pill, "crit");
     pill.textContent = "execution: error";
@@ -8708,7 +8899,7 @@ renderTrainingStatusPanel(trainingStatus, trainingError);
 
 // Auto-snapshot if CRIT alert detected
 if (Array.isArray(_lastAlerts)) {
-  const crit = _lastAlerts.find(a => a.severity === "CRIT" && !a.resolved);
+  const crit = _lastAlerts.find(a => normalizeSeverity(a && a.severity) === "CRIT" && !a.resolved);
 
   if (crit && !sessionStorage.getItem("auto_snapshot_crit")) {
     sessionStorage.setItem("auto_snapshot_crit", "pending");
@@ -8726,7 +8917,7 @@ if (Array.isArray(_lastAlerts)) {
 
 // ✅ PATCH 2 — Reset auto-snapshot flag if CRIT cleared
 if (Array.isArray(_lastAlerts)) {
-  const stillCrit = _lastAlerts.some(a => a.severity === "CRIT" && !a.resolved);
+  const stillCrit = _lastAlerts.some(a => normalizeSeverity(a && a.severity) === "CRIT" && !a.resolved);
   if (!stillCrit) {
     sessionStorage.removeItem("auto_snapshot_crit");
   }
@@ -8922,8 +9113,10 @@ function wirePromotionButtons() {
         const confirmation = await requestConfirmation({
           title: "Rollback champion",
           action: "Rollback champion model",
+          actionId: "promotion.rollback",
           target: (rollback.preview && rollback.preview.target) || "retired champion",
           consequence: previewText,
+          reversibility: "Reversible only by a later governed model promotion or rollback decision with a new audit record.",
           confirmText: "ROLLBACK_CHAMPION",
           requireReason: true,
           minReasonLength: 12,
@@ -8949,6 +9142,7 @@ function wirePromotionButtons() {
           justification: validation.justification,
           preview: rollback.preview || {},
           source: "dashboard",
+          gateSnapshot: gate.raw || {},
         });
         Object.assign(payload, confirmation.payload, {
           justification: validation.justification,
@@ -9030,6 +9224,30 @@ function wireUI() {
   wireJobCatalogControls();
   wireDashboardTableControls();
   wireBrokerConfigControls();
+
+  const btnOperatorMode = document.getElementById("btnOperatorMode");
+  if (btnOperatorMode && !btnOperatorMode._boundOperatorMode) {
+    btnOperatorMode._boundOperatorMode = true;
+    btnOperatorMode.addEventListener("click", async () => {
+      const next = !OPERATOR_MODE;
+      const confirmation = await confirmAdvancedUiModeChange({ nextOperatorMode: next });
+      if (!confirmation || confirmation.ok !== true) return;
+      _setOperatorMode(next);
+      toast(next ? "Operator mode enabled" : "Expert mode enabled", next ? "ok" : "warn", 2600);
+    });
+  }
+
+  const btnExpertUnlock = document.getElementById("btnExpertUnlock");
+  if (btnExpertUnlock && !btnExpertUnlock._boundExpertUnlock) {
+    btnExpertUnlock._boundExpertUnlock = true;
+    btnExpertUnlock.addEventListener("click", async () => {
+      const next = !EXPERT_UNLOCK;
+      const confirmation = await confirmAdvancedUiModeChange({ nextExpertUnlocked: next });
+      if (!confirmation || confirmation.ok !== true) return;
+      _setExpertUnlock(next);
+      toast(next ? "Advanced controls unlocked" : "Advanced controls locked", next ? "warn" : "ok", 2600);
+    });
+  }
 
   const whyCloseBtn = document.getElementById("btnCloseWhy");
   if (whyCloseBtn && !whyCloseBtn._boundWhyClose) {
@@ -9128,6 +9346,23 @@ function wireUI() {
     btnSP.addEventListener("click", async () => {
       if (hardBlockIfReadOnly({ actionName: "train size policy", toastFn: toast })) return;
 
+      const confirmation = await requestConfirmation({
+        title: "Train size policy",
+        action: "Train size-policy calibration",
+        target: "size policy",
+        consequence: "This starts backend calibration work and may write a new size-policy table used by future sizing decisions.",
+        confirmText: "TRAIN_SIZE_POLICY",
+        requireReason: true,
+        minReasonLength: 6,
+        submitLabel: "Train size policy",
+        actor: "operator",
+        source: "dashboard_size_policy",
+      });
+      if (!confirmation.ok) {
+        toast("Size-policy training cancelled", "warn", 2600);
+        return;
+      }
+
       btnSP.disabled = true;
       try {
         const el = document.getElementById("console");
@@ -9135,7 +9370,11 @@ function wireUI() {
 
         const res = await fetchJSON("/api/strategy/size_policy/train", {
           method: "POST",
-          body: JSON.stringify({ confirm: "TRAIN_SIZE_POLICY" }),
+          body: JSON.stringify({
+            confirm: "TRAIN_SIZE_POLICY",
+            ...confirmation.payload,
+            reason: confirmation.reason,
+          }),
         });
         if (!res || !res.ok) {
           throw new Error((res && res.error) || "train_size_policy failed");
@@ -9367,6 +9606,12 @@ setStage("UI WIRED");
   }
 
   applyReadOnlyBanner();
+  if (!_connectionStateUnsubscribe) {
+    _connectionStateUnsubscribe = subscribeConnectionState(() => {
+      updateDashboardConnectionStateSurfaces();
+    });
+  }
+  updateDashboardConnectionStateSurfaces();
   setStage("POLICY APPLIED");
 
   refresh().then(async () => {

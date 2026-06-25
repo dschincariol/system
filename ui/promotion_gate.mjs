@@ -304,14 +304,216 @@ export function buildPromotionActionPayload({
   confirm,
   preview = {},
   source = "dashboard",
+  gateSnapshot = null,
 } = {}) {
-  return {
+  const payload = {
     action: String(action || "rollback"),
     confirm: String(confirm || ""),
     justification: String(justification || "").trim(),
     source: String(source || "dashboard"),
     preview: preview && typeof preview === "object" ? preview : {},
   };
+  if (gateSnapshot && typeof gateSnapshot === "object") {
+    payload.gate_snapshot = gateSnapshot;
+  }
+  return payload;
+}
+
+function formatAuditTimestamp(value) {
+  const ts = finiteNumber(value, 0) || 0;
+  if (ts <= 0) return "not recorded";
+  try {
+    return new Date(ts).toLocaleString();
+  } catch (_e) {
+    return String(Math.trunc(ts));
+  }
+}
+
+function auditTone(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (["crit", "critical", "conflict", "fail", "failed", "stale"].includes(text)) return "crit";
+  if (["warn", "warning", "unavailable", "unknown"].includes(text)) return "warn";
+  if (["pass", "ok", "fresh", "available"].includes(text)) return "ok";
+  return "dim";
+}
+
+function normalizeBadge(badge = {}) {
+  const source = badge && typeof badge === "object" ? badge : {};
+  const state = String(source.state || source.severity || "unknown");
+  return {
+    key: String(source.key || source.label || state || "evidence"),
+    label: String(source.label || source.key || state || "Evidence"),
+    state,
+    tone: auditTone(source.severity || state),
+    source: String(source.source || ""),
+    tsMs: finiteNumber(source.ts_ms, 0) || 0,
+    detail: String(source.detail || ""),
+  };
+}
+
+function renderAuditBadges(badges = []) {
+  const rows = Array.isArray(badges) ? badges.map(normalizeBadge).slice(0, 5) : [];
+  if (!rows.length) {
+    return `<span class="pill ok">Fresh evidence</span>`;
+  }
+  return rows.map((badge) => {
+    const title = [badge.source, badge.tsMs ? formatAuditTimestamp(badge.tsMs) : "", badge.detail]
+      .filter(Boolean)
+      .join(" | ");
+    return `<span class="pill ${escapeHtml(badge.tone)}" title="${escapeHtml(title)}">${escapeHtml(badge.label)}: ${escapeHtml(badge.state)}</span>`;
+  }).join(" ");
+}
+
+function normalizeCitation(citation = {}) {
+  const source = citation && typeof citation === "object" ? citation : {};
+  return {
+    source: String(source.source || "unknown"),
+    label: String(source.label || source.source || "source"),
+    tsMs: finiteNumber(source.ts_ms, 0) || 0,
+    detail: String(source.detail || ""),
+  };
+}
+
+function renderCitations(citations = []) {
+  const rows = Array.isArray(citations) ? citations.map(normalizeCitation).slice(0, 5) : [];
+  if (!rows.length) return `<span class="metric-meta">No source citation stored.</span>`;
+  return rows.map((citation) => `
+    <div class="metric-meta">
+      <span class="mono">${escapeHtml(citation.source)}</span>
+      <span>${escapeHtml(citation.label)}</span>
+      <span>${escapeHtml(formatAuditTimestamp(citation.tsMs))}</span>
+      ${citation.detail ? `<span>${escapeHtml(citation.detail)}</span>` : ""}
+    </div>
+  `).join("");
+}
+
+function summarizeGateState(gateState = {}) {
+  const state = gateState && typeof gateState === "object" ? gateState : {};
+  const checklist = Array.isArray(state.checklist) ? state.checklist : [];
+  const passCount = checklist.filter((row) => String(row && row.state || "").toLowerCase() === "pass").length;
+  const failCount = checklist.filter((row) => String(row && row.state || "").toLowerCase() === "fail").length;
+  const unavailableCount = checklist.filter((row) => String(row && row.state || "").toLowerCase() === "unavailable").length;
+  return `${passCount} pass / ${failCount} fail / ${unavailableCount} unavailable`;
+}
+
+function summarizeModelCard(card = {}) {
+  const snapshot = card && typeof card === "object" ? card : {};
+  const metrics = snapshot.metrics && typeof snapshot.metrics === "object" ? snapshot.metrics : {};
+  const toModel = metrics.to_model && typeof metrics.to_model === "object" ? metrics.to_model : {};
+  const fromModel = metrics.from_model && typeof metrics.from_model === "object" ? metrics.from_model : {};
+  const target = toModel.model_kind || toModel.model_name || "target unavailable";
+  const previous = fromModel.model_kind || fromModel.model_name || "previous unavailable";
+  const owner = snapshot.owner || "owner unavailable";
+  const dataWindow = snapshot.data_window && typeof snapshot.data_window === "object" ? snapshot.data_window : {};
+  return {
+    title: `${String(previous)} -> ${String(target)}`,
+    owner: String(owner),
+    intendedUse: String(snapshot.intended_use || "intended use not recorded"),
+    dataWindow: `${formatAuditTimestamp(dataWindow.start_ts_ms)} to ${formatAuditTimestamp(dataWindow.end_ts_ms)}`,
+    caveats: Array.isArray(snapshot.caveats) ? snapshot.caveats.slice(0, 3).map(String) : [],
+  };
+}
+
+export function normalizePromotionAuditRow(row = {}) {
+  const source = row && typeof row === "object" ? row : {};
+  const reason = source.reason && typeof source.reason === "object" ? source.reason : {};
+  const modelCard = source.modelCard && typeof source.modelCard === "object"
+    ? source.modelCard
+    : source.model_card_snapshot && typeof source.model_card_snapshot === "object"
+    ? source.model_card_snapshot
+    : reason.model_card_snapshot && typeof reason.model_card_snapshot === "object"
+      ? reason.model_card_snapshot
+      : {};
+  const gateState = source.gateState && typeof source.gateState === "object"
+    ? source.gateState
+    : source.gate_state_at_decision && typeof source.gate_state_at_decision === "object"
+    ? source.gate_state_at_decision
+    : reason.gate_state_at_decision && typeof reason.gate_state_at_decision === "object"
+      ? reason.gate_state_at_decision
+      : {};
+  const badges = Array.isArray(source.badges)
+    ? source.badges
+    : Array.isArray(source.staleness_badges)
+    ? source.staleness_badges
+    : Array.isArray(gateState.staleness_badges)
+      ? gateState.staleness_badges
+      : Array.isArray(reason.staleness_badges)
+        ? reason.staleness_badges
+        : [];
+  const citations = Array.isArray(source.citations)
+    ? source.citations
+    : Array.isArray(source.source_citations)
+    ? source.source_citations
+    : Array.isArray(modelCard.source_citations)
+      ? modelCard.source_citations
+      : Array.isArray(gateState.source_citations)
+        ? gateState.source_citations
+        : [];
+  return {
+    tsMs: finiteNumber(source.tsMs ?? source.ts_ms, 0) || 0,
+    actor: String(source.actor || ""),
+    action: String(source.action || ""),
+    modelName: String(source.modelName ?? source.model_name ?? ""),
+    regime: String(source.regime || ""),
+    reason,
+    causalScores: source.causalScores && typeof source.causalScores === "object"
+      ? source.causalScores
+      : source.causal_scores && typeof source.causal_scores === "object" ? source.causal_scores : {},
+    modelCard,
+    gateState,
+    badges,
+    citations,
+    confirmation: source.confirmation && typeof source.confirmation === "object" ? source.confirmation : reason.confirmation || {},
+  };
+}
+
+export function renderPromotionAuditRows(rows = []) {
+  const normalized = Array.isArray(rows) ? rows.map(normalizePromotionAuditRow) : [];
+  if (!normalized.length) {
+    return `<tr class="table-row"><td colspan="8" class="metric-meta">No promotion audit rows returned.</td></tr>`;
+  }
+  return normalized.map((row) => {
+    const card = summarizeModelCard(row.modelCard);
+    const causal = Object.entries(row.causalScores || {})
+      .slice(0, 4)
+      .map(([feature, score]) => {
+        const n = finiteNumber(score);
+        return `${feature}:${n == null ? "" : n.toFixed(2)}`;
+      })
+      .join(", ");
+    const confirmation = row.confirmation && typeof row.confirmation === "object" ? row.confirmation : {};
+    const confirmationText = confirmation.action_id || confirmation.confirmation_token
+      ? `${confirmation.action_id || "action"} / ${confirmation.confirmation_token || "token"}`
+      : "confirmation not recorded";
+    const why = [
+      row.reason.justification || row.reason.note || row.reason.error || "",
+      causal ? `Causal ${causal}` : "",
+      `Confirmation ${confirmationText}`,
+    ].filter(Boolean).join(" | ");
+    return `
+      <tr class="table-row" data-governance-action="${escapeHtml(row.action)}">
+        <td>${escapeHtml(formatAuditTimestamp(row.tsMs))}</td>
+        <td>
+          <div class="metric-title">${escapeHtml(row.modelName || "model")}</div>
+          <div class="metric-meta">${escapeHtml(card.owner)}</div>
+        </td>
+        <td>${escapeHtml(row.action)}</td>
+        <td>${escapeHtml(row.regime)}</td>
+        <td>
+          <div class="metric-title">${escapeHtml(card.title)}</div>
+          <div class="metric-meta">${escapeHtml(card.intendedUse)}</div>
+          <div class="metric-meta">Data ${escapeHtml(card.dataWindow)}</div>
+          ${card.caveats.length ? `<div class="metric-meta">Caveats: ${escapeHtml(card.caveats.join("; "))}</div>` : ""}
+        </td>
+        <td>
+          <div>${renderAuditBadges(row.badges)}</div>
+          <div class="metric-meta">${escapeHtml(summarizeGateState(row.gateState))}</div>
+        </td>
+        <td>${renderCitations(row.citations)}</td>
+        <td>${escapeHtml(why)}</td>
+      </tr>
+    `;
+  }).join("");
 }
 
 const GOVERNANCE_EVIDENCE_STATE_LABELS = Object.freeze({

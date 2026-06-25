@@ -47,6 +47,7 @@ addopts = "-q --strict-markers --strict-config --durations=20"
 markers = [
   "linux_only: test runs only on Linux",
   "live_network: test intentionally contacts non-local live services; deselected unless TRADING_TEST_ALLOW_LIVE_NETWORK=1",
+  "integration: boot-level or multi-process integration test that still runs in the standard validation suite",
   "requires_postgres: test needs a reachable Postgres instance at TS_PG_DSN; auto-skipped when unreachable",
   "requires_redis: test needs a reachable Redis instance at TS_REDIS_URL; auto-skipped when unreachable",
   "requires_rocm: test requires a local ROCm torch build with a visible GPU",
@@ -63,6 +64,7 @@ timeout_func_only = false
 
 [tool.coverage.run]
 branch = true
+parallel = true
 source = ["engine", "services", "routes", "ops"]
 relative_files = true
 

@@ -12,6 +12,12 @@
 > defaults to `shadow`, `broker_sim` treats options 1:1 like shares, there is no OPTION asset class, no
 > greeks-based portfolio risk, and no option-lifecycle handling.
 
+> **OPT-10 implementation status:** live options now have exactly one registered order adapter:
+> `tradier_options`. The default remains shadow-only. A live options order still requires
+> `OPTIONS_INSTRUMENTS_MODE=live`, every `OPTIONS_LIVE_*_READY` gate env flag, all numeric controls,
+> the runtime subsystem predicate behind each gate to pass, `TRADIER_API_TOKEN`, and
+> `TRADIER_ACCOUNT_ID`. Registering the adapter alone does not permit live routing.
+
 ## Sequencing & dependency map
 
 OPT-01 is the keystone (the OCC instrument/asset-class model); everything structural consumes it.
@@ -587,6 +593,8 @@ After implementation, audit your own work. Show exact files changed, why each ch
 ## OPT-10 (full) — One concrete LIVE options broker adapter + satisfaction of the nine readiness gates
 
 **Mission.** This is the capstone of OPTIONS enablement: turn the hard-blocked live-options path into a genuinely-gated, opt-in path behind one real broker adapter. Today `engine/execution/options_readiness.py:26` defines `LIVE_OPTIONS_BROKER_ADAPTERS: frozenset[str] = frozenset()` (empty), so every live option order is rejected at `engine/execution/broker_router.py:1224` and `:1426` via `live_options_order_block`, and the nine `CONTROL_FLAG_GROUPS` gates (lines 28-70) plus eight `NUMERIC_CONTROLS` (lines 72-81) are currently rubber-stamp `_env_bool` reads in `_control_flag_snapshot` (lines 283-296) — flipping an env var asserts a control is "ready" without checking that anything is actually wired. This slice: (1) implements ONE concrete live options order adapter (Tradier options orders — note `engine/data/options/tradier_live.py` is chain-data only today, so the *order* path is greenfield), registers it in `LIVE_OPTIONS_BROKER_ADAPTERS`, and resolves it in `broker_router` exactly like `_resolve_alpaca_apply` (lines 170-181); and (2) replaces each of the nine gates' env-rubber-stamp with a REAL runtime predicate that delegates to the subsystems built by OPT-03/05/06/07, so a gate passes only when its underlying capability genuinely exists. The fail-closed default is preserved absolutely: `OPTIONS_INSTRUMENTS_MODE` stays `"shadow"` (line 134 default) and `force_options_shadow_intent` (line 487) remains the safety net. No alpha / no profitability claim.
+
+**Implemented operator contract.** The only live options broker name is `tradier_options`; Alpaca and IBKR remain blocked for option contracts by `options_live_broker_adapter_missing:{broker}`. Live routing requires `BROKER`, `BROKER_NAME`, `LIVE_BROKER`, and `BROKER_FAILOVER` to agree on `tradier_options`, `ENGINE_MODE=live`, `EXECUTION_MODE=live`, `OPTIONS_INSTRUMENTS_MODE=live`, every gate env flag in `CONTROL_FLAG_GROUPS`, all numeric controls in `NUMERIC_CONTROLS`, passing runtime checks from options data quality, portfolio risk, lifecycle, broker adapter importability, and kill-switch execution allowance, plus `TRADIER_API_TOKEN` and `TRADIER_ACCOUNT_ID`. Missing prerequisites fail closed with the original `*_missing` blocker when an env flag is absent and a `*_check_failed` blocker when the env flag is present but the real check fails.
 
 **Prerequisites.** See map. OPT-05 (broker_sim x100/margin/MTM — provides the fill/margin primitives the live adapter mirrors), OPT-06 (greeks-based portfolio risk + numeric-limit enforcement), OPT-07 (lifecycle: assignment/exercise + expiration handling), OPT-08 (OPTION sleeve binding), and transitively OPT-01 (the OCC instrument model) and OPT-03 (data-quality monitors for liquidity/bid-ask gates). Do not start until those land; this prompt consumes their public entry points and must not reimplement them.
 

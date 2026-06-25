@@ -111,6 +111,7 @@ _BASE_CREDENTIAL_RUNTIME_ENV_KEYS = (
     "COINBASE_API_KEY",
     "COINBASE_API_SECRET",
     "COINBASE_SECRET",
+    "DATABENTO_API_KEY",
     "FINNHUB_API_KEY",
     "FMP_API_KEY",
     "FRED_API_KEY",
@@ -142,6 +143,7 @@ _SAFE_NO_CREDENTIAL_ENV = {
     "IBKR_ENABLED": "0",
     "CCXT_ENABLED": "0",
     "OANDA_ENABLED": "0",
+    "FUTURES_ENABLED": "0",
     "TRADIER_ENABLED": "0",
     "YFINANCE_ENABLED": "1",
     "SIMULATED_MARKET_DATA_ENABLED": "1",
@@ -576,6 +578,7 @@ class DataSourceContract:
 _PROVIDER_TEST_REGISTRY: Dict[str, Dict[str, str]] = {
     "polygon": {"handler": "_test_polygon_rest_connection", "label": "Polygon REST"},
     "oanda_fx": {"handler": "_test_oanda_connection", "label": "OANDA FX pricing"},
+    "futures_data": {"handler": "_test_futures_connection", "label": "Futures pricing"},
     "polygon_ws": {"handler": "_test_polygon_ws_connection", "label": "Polygon WebSocket"},
     "ibkr": {"handler": "_test_ibkr_connection", "label": "IBKR market data"},
     "alpaca_broker_data": {"handler": "_test_alpaca_broker_data_connection", "label": "Alpaca broker data"},
@@ -741,6 +744,104 @@ def _default_catalog() -> Dict[str, SourceDefinition]:
             safe_to_auto_enable=False,
             storage_tables=("prices", "price_quotes", "price_quotes_raw", "price_provider_health"),
             consumers=("price_router", "model_feature_snapshots", "dashboard_data_health"),
+        ),
+        "futures_data": SourceDefinition(
+            source_type="price_provider",
+            display_name="Futures Data",
+            provider_name="futures",
+            job_name="poll_prices",
+            default_enabled=False,
+            credential_env={"api_key": "DATABENTO_API_KEY"},
+            setting_env={
+                "provider": "FUTURES_PROVIDER",
+                "roots": "FUTURES_ROOTS",
+            },
+            credential_metadata={
+                "api_key": SourceFieldMetadata(
+                    field="api_key",
+                    label="API Key",
+                    help_text="Databento API key used only for read-only futures pricing and reference metadata.",
+                    placeholder="Enter new key; leave blank to preserve",
+                    safety_warning="This source has no order, cancel, replace, trade, account-mutation, or flatten authority.",
+                    secret=True,
+                    required=True,
+                    validation_regex=_SECRET_VALUE_VALIDATION_REGEX,
+                    validation_hint="Use a single-line Databento API key.",
+                    input_type="password",
+                ),
+            },
+            setting_metadata={
+                "provider": SourceFieldMetadata(
+                    field="provider",
+                    label="Provider",
+                    help_text="Futures market-data vendor selector. Databento is the default.",
+                    placeholder="databento",
+                    validation_regex=r"^(?:databento|databento_rest|db)$",
+                    validation_hint="Use databento until another read-only provider is explicitly implemented.",
+                    safety_warning="Changing this setting cannot grant order authority.",
+                    input_type="text",
+                ),
+                "roots": SourceFieldMetadata(
+                    field="roots",
+                    label="Futures Roots",
+                    help_text="Optional comma-separated roots to include in futures polling and future roll jobs.",
+                    placeholder="ES,NQ,CL,GC,ZN",
+                    validation_regex=r"^[A-Za-z0-9_,.\s-]*$",
+                    validation_hint="Use canonical roots or contracts such as ES, CL, ES.c.0.",
+                    input_type="text",
+                ),
+            },
+            guide=_source_guide(
+                category="Market Data",
+                summary="Polls read-only futures OHLCV and open-interest data through the existing price ingestion loop.",
+                needs=("A Databento API key with the required futures market-data entitlements.",),
+                setup=(
+                    "Enter the Databento API key.",
+                    "Confirm CME non-display and derived-works licensing before enabling production use.",
+                    "Save the source, then run Test Connection.",
+                    "Enable only when futures pricing should be included in poll_prices.",
+                ),
+                when_enabled="The runtime can poll futures prices and open interest without adding any order authority.",
+                docs_url="https://databento.com/docs",
+                signup_url="https://databento.com/pricing",
+                plan_note="Vendor pricing, CME exchange fees, non-display use, and derived-works licensing must be confirmed before production enablement.",
+                safety_warnings=(
+                    "This source is read-only market data and reference metadata.",
+                    "It does not add order, cancel, replace, trade, account-mutation, or flatten authority.",
+                ),
+            ),
+            safe_to_auto_enable=False,
+            storage_tables=("prices", "price_quotes", "price_quotes_raw", "price_provider_health", "futures_contract_bars"),
+            consumers=("price_router", "futures_roll_engine", "model_feature_snapshots", "dashboard_data_health"),
+        ),
+        "futures_rolls": SourceDefinition(
+            source_type="derived_data",
+            display_name="Futures Rolls",
+            provider_name="",
+            job_name="ingest_futures_rolls",
+            default_enabled=False,
+            credential_env={},
+            setting_env={},
+            guide=_source_guide(
+                category="Derived Data",
+                summary="Builds futures roll calendars, ratio-adjusted continuous bars, and roll-yield from raw futures bars.",
+                needs=("The Futures Data source enabled and populated with raw per-contract bars plus open interest.",),
+                setup=(
+                    "Enable Futures Data first.",
+                    "Confirm raw futures_contract_bars rows are present.",
+                    "Enable this derived job only when roll artifacts should be materialized.",
+                ),
+                when_enabled="The supervised daemon can derive roll calendars and ratio-adjusted continuous bars without adding any order authority.",
+                docs_url="",
+                plan_note="Synthetic tests cover the roll method in this sandbox; live feed-derived rolls require FUT-02 data.",
+                safety_warnings=(
+                    "This source is derived read-only analytics.",
+                    "It does not add order, cancel, replace, trade, account-mutation, or flatten authority.",
+                ),
+            ),
+            safe_to_auto_enable=False,
+            storage_tables=("futures_roll_calendar", "futures_continuous_bars", "futures_roll_yield"),
+            consumers=("futures_features", "futures_labels", "futures_backtest", "dashboard_data_health"),
         ),
         "ibkr": SourceDefinition(
             source_type="price_provider",
@@ -1719,6 +1820,38 @@ def _provider_account_catalog() -> Dict[str, ProviderAccountDefinition]:
                 ),
             },
         ),
+        "futures": ProviderAccountDefinition(
+            account_key="futures",
+            display_name="Futures Data",
+            provider_name="futures",
+            credential_env={"api_key": "DATABENTO_API_KEY"},
+            used_by_sources=("futures_data",),
+            guide=_source_guide(
+                category="Provider Account",
+                summary="Shared Databento credentials inherited by the read-only futures pricing source.",
+                needs=("A Databento API key with futures data entitlements.",),
+                setup=("Enter the Databento API key once, then enable the futures data source when pricing should run.",),
+                when_enabled="Dependent feeds inherit DATABENTO_API_KEY unless a source-level override is explicitly saved.",
+                docs_url="https://databento.com/docs",
+                signup_url="https://databento.com/pricing",
+                plan_note="CME licensing and Databento plan entitlements must be confirmed before production enablement.",
+                safety_warnings=("This provider account is read-only and grants no broker order authority.",),
+            ),
+            credential_metadata={
+                "api_key": SourceFieldMetadata(
+                    field="api_key",
+                    label="API Key",
+                    help_text="Databento API key used only for read-only futures market data.",
+                    placeholder="Enter new key; leave blank to preserve",
+                    safety_warning="This key is never used for orders, account mutation, cancel, replace, or flatten operations.",
+                    secret=True,
+                    required=True,
+                    validation_regex=_SECRET_VALUE_VALIDATION_REGEX,
+                    validation_hint="Use a single-line Databento API key.",
+                    input_type="password",
+                ),
+            },
+        ),
         "alpaca_data": ProviderAccountDefinition(
             account_key="alpaca_data",
             display_name="Alpaca Broker Data",
@@ -1953,6 +2086,7 @@ MANAGED_DAEMON_JOBS = {
     "ingest_congressional_trades",
     "ingest_etf_flows",
     "ingest_cftc_cot",
+    "ingest_futures_rolls",
     "ingest_finra_short_volume",
     "ingest_finra_short_interest",
     "ingest_crypto_funding",
@@ -1996,6 +2130,16 @@ _SOURCE_CATALOG_OPERATIONAL_METADATA: Dict[str, Dict[str, Any]] = {
     "oanda_fx": {
         "storage_tables": ("prices", "price_quotes", "price_quotes_raw", "price_provider_health"),
         "consumers": ("price_router", "model_feature_snapshots", "dashboard_data_health"),
+        "safe_to_auto_enable": False,
+    },
+    "futures_data": {
+        "storage_tables": ("prices", "price_quotes", "price_quotes_raw", "price_provider_health", "futures_contract_bars"),
+        "consumers": ("price_router", "futures_roll_engine", "model_feature_snapshots", "dashboard_data_health"),
+        "safe_to_auto_enable": False,
+    },
+    "futures_rolls": {
+        "storage_tables": ("futures_roll_calendar", "futures_continuous_bars", "futures_roll_yield"),
+        "consumers": ("futures_features", "futures_labels", "futures_backtest", "dashboard_data_health"),
         "safe_to_auto_enable": False,
     },
     "ibkr": {
@@ -2262,6 +2406,7 @@ _SOURCE_DATA_CONTRACTS: Dict[str, DataSourceContract] = {
     "polygon_ws": _PRICE_CONTRACT,
     "polygon": _PRICE_CONTRACT,
     "oanda_fx": _PRICE_CONTRACT,
+    "futures_data": _PRICE_CONTRACT,
     "ibkr": _PRICE_CONTRACT,
     "yfinance": _PRICE_CONTRACT,
     "ccxt": _PRICE_CONTRACT,
@@ -2457,6 +2602,7 @@ _POPULATE_NOW_HANDLER_REGISTRY: Dict[str, str] = {
     "polygon": "_populate_price_polygon_rest",
     "polygon_ws": "_populate_price_polygon_rest",
     "oanda_fx": "_populate_generic_price_marker",
+    "futures_data": "_populate_generic_price_marker",
     "yfinance": "_populate_price_yfinance",
     "simulated": "_populate_price_simulated",
     "ccxt": "_populate_generic_price_marker",
@@ -4746,6 +4892,36 @@ class DataSourceManager:
             account_credentials=account_credentials,
             project_credentials=False,
         )
+        missing_credential_env_vars = list(runtime_assessment.get("missing_credential_env_vars") or [])
+        credential_required = bool(runtime_assessment.get("credential_required"))
+        runtime_credentialed = bool(runtime_assessment.get("runtime_credentialed"))
+        if not credential_required:
+            credential_status = "not_required"
+            credential_status_reason = "credential_not_required"
+        elif runtime_credentialed:
+            credential_status = "configured"
+            credential_status_reason = "required_credentials_available"
+        else:
+            credential_status = "needs_credentials"
+            credential_status_reason = "missing_required_credentials"
+        missing_credentials_detail: List[Dict[str, Any]] = []
+        if credential_status == "needs_credentials":
+            missing_credentials_detail = self._missing_credential_metadata(
+                {
+                    **dict(row),
+                    "source_key": source_key,
+                    "job_name": str(row.get("job_name") or (definition.job_name if definition else "")),
+                    "template_key": str(template_key or ""),
+                },
+                definition,
+                missing_credential_env_vars,
+            )
+        stored_status = str(row.get("status") or "unknown")
+        effective_status = stored_status
+        if credential_error:
+            effective_status = "error"
+        elif credential_status == "needs_credentials":
+            effective_status = "needs_credentials"
         out = {
             "id": int(row.get("id") or 0),
             "source_key": source_key,
@@ -4763,14 +4939,21 @@ class DataSourceManager:
             "populate_evidence": populate_evidence,
             "runnable_state": str(runtime_assessment.get("runnable_state") or RUNNABLE_STATE_OFF),
             "runnable_state_reason": str(runtime_assessment.get("runnable_state_reason") or ""),
-            "credential_required": bool(runtime_assessment.get("credential_required")),
-            "runtime_credentialed": bool(runtime_assessment.get("runtime_credentialed")),
+            "credential_required": credential_required,
+            "credential_status": credential_status,
+            "credential_status_reason": credential_status_reason,
+            "needs_credentials": bool(credential_status == "needs_credentials"),
+            "missing_credentials": missing_credentials_detail,
+            "effective_status": effective_status,
+            "status_reason": credential_status_reason if effective_status == "needs_credentials" else "",
+            "runtime_credentialed": runtime_credentialed,
             "runtime_projected": bool(runtime_assessment.get("runtime_projected")),
             "runtime_desired_eligible": bool(runtime_assessment.get("runtime_desired_eligible")),
-            "missing_credential_env_vars": list(runtime_assessment.get("missing_credential_env_vars") or []),
+            "missing_credential_env_vars": missing_credential_env_vars,
             "projected_env_vars": list(runtime_assessment.get("projected_env_vars") or []),
             "settings": settings if isinstance(settings, dict) else {},
-            "status": str(row.get("status") or "unknown"),
+            "status": stored_status,
+            "stored_status": stored_status,
             "last_error": str(row.get("last_error") or ""),
             "last_success_ts_ms": int(row.get("last_success_ts_ms") or 0),
             "last_test_ts_ms": int(row.get("last_test_ts_ms") or 0),
@@ -5414,6 +5597,7 @@ class DataSourceManager:
             env["SIMULATED_MARKET_DATA_ENABLED"] = "1" if "simulated" in chain else "0"
             env["CCXT_ENABLED"] = "1" if "ccxt" in chain else "0"
             env["OANDA_ENABLED"] = "1" if "oanda" in chain else "0"
+            env["FUTURES_ENABLED"] = "1" if "futures" in chain else "0"
             env["FX_PAIRS_ENABLED"] = "1" if "oanda" in chain else "0"
         elif job_name_s == "stream_prices_polygon_ws":
             env["POLYGON_WS_ENABLED"] = "1" if active_row_count > 0 else "0"
@@ -5429,6 +5613,8 @@ class DataSourceManager:
             env["INGEST_ETF_FLOW_ENABLED"] = "1" if active_row_count > 0 else "0"
         elif job_name_s == "ingest_cftc_cot":
             env["INGEST_CFTC_COT_ENABLED"] = "1" if active_row_count > 0 else "0"
+        elif job_name_s == "ingest_futures_rolls":
+            env["INGEST_FUTURES_ROLLS_ENABLED"] = "1" if active_row_count > 0 else "0"
         elif job_name_s == "ingest_finra_short_volume":
             env["INGEST_FINRA_SHORT_VOLUME_ENABLED"] = "1" if active_row_count > 0 else "0"
         elif job_name_s == "ingest_finra_short_interest":
@@ -5471,6 +5657,7 @@ class DataSourceManager:
                 "ingest_now",
                 "ingest_etf_flows",
                 "ingest_cftc_cot",
+                "ingest_futures_rolls",
                 "ingest_finra_short_volume",
                 "ingest_finra_short_interest",
                 "ingest_crypto_funding",
@@ -7988,6 +8175,20 @@ class DataSourceManager:
             empty_message="oanda_fx_empty_payload",
         )
 
+    def _test_futures_connection(self, source: Dict[str, Any]) -> ConnectionTestResult:
+        token = self._connection_effective_env_value(source, "DATABENTO_API_KEY")
+        if not token:
+            return self._missing_credentials_result("futures_data", "DATABENTO_API_KEY", source=source)
+        return self._http_json_probe(
+            source,
+            provider="futures_data",
+            url="https://hist.databento.com/v0/metadata.list_publishers",
+            headers={"Authorization": f"Bearer {token}"},
+            expected_paths=("publishers", "result", ""),
+            success_message="futures_data_connection_ok",
+            empty_message="futures_data_empty_payload",
+        )
+
     def _test_polygon_ws_connection(self, source: Dict[str, Any]) -> ConnectionTestResult:
         api_key = self._connection_effective_env_value(source, "POLYGON_API_KEY")
         if not api_key:
@@ -8747,10 +8948,60 @@ class DataSourceManager:
             invalid_message="finra_short_interest_malformed_payload",
         )
 
+    def _crypto_funding_readiness_evidence(self, source: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(source.get("source_key") or "crypto_funding").strip() or "crypto_funding"
+        template_key, definition = self._resolve_definition(
+            key,
+            source_type=str(source.get("source_type") or ""),
+            provider_name=str(source.get("provider_name") or ""),
+        )
+        contract = _data_contract_for_source(template_key or key, definition)
+        now_ms = int(time.time() * 1000)
+        desired_jobs: set[str] = set()
+        try:
+            desired_jobs = {
+                str(name or "").strip()
+                for name in self.get_desired_ingestion_jobs(read_only=True, project_credentials=False)
+                if str(name or "").strip()
+            }
+        except Exception as exc:
+            _warn_nonfatal(
+                "DATA_SOURCE_MANAGER_CRYPTO_FUNDING_DESIRED_JOBS_FAILED",
+                RuntimeError(type(exc).__name__),
+                source_key=key,
+                error_type=type(exc).__name__,
+            )
+        storage = self._verify_source_contract_storage(
+            source,
+            contract,
+            now_ms=now_ms,
+            provider_evidence={"source": "crypto_funding_readiness"},
+        )
+        latest_ts_ms = int(storage.get("latest_ts_ms") or 0)
+        last_row_age_s = None if latest_ts_ms <= 0 else round(max(0, now_ms - latest_ts_ms) / 1000.0, 1)
+        stale_after_s = round(float(contract.stale_after_ms or 0) / 1000.0, 1) if int(contract.stale_after_ms or 0) > 0 else None
+        return {
+            "wired": bool(contract.storage_table == "crypto_funding_rates"),
+            "source_enabled": bool(source.get("enabled")),
+            "job_enabled": "ingest_crypto_funding" in desired_jobs,
+            "env_ingest_enabled": str(os.environ.get("INGEST_CRYPTO_FUNDING_ENABLED", "0")).strip().lower()
+            in {"1", "true", "yes", "on"},
+            "env_ccxt_enabled": str(os.environ.get("CCXT_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"},
+            "use_funding_features": str(os.environ.get("USE_FUNDING_FEATURES", "0")).strip().lower() in {"1", "true", "yes", "on"},
+            "storage_table": str(storage.get("storage_table") or contract.storage_table),
+            "row_count": int(storage.get("row_count") or 0),
+            "last_row_ts_ms": int(latest_ts_ms) if latest_ts_ms > 0 else None,
+            "last_row_age_s": last_row_age_s,
+            "stale_after_s": stale_after_s,
+            "storage_status": str(storage.get("contract_status") or storage.get("status") or ""),
+            "stale_gap_status": str(storage.get("stale_gap_status") or ""),
+        }
+
     def _test_crypto_funding_connection(self, source: Dict[str, Any]) -> ConnectionTestResult:
         limited = self._connection_probe_rate_limit(str(source.get("source_key") or ""))
         if limited is not None:
             return limited
+        readiness = self._crypto_funding_readiness_evidence(source)
         try:
             import ccxt  # type: ignore
         except Exception as exc:
@@ -8762,16 +9013,25 @@ class DataSourceManager:
                 dependency="ccxt",
                 error_type=type(exc).__name__,
             )
-            return self._dependency_missing_result("crypto_funding", "ccxt", exc)
+            return self._connection_fail(
+                "provider_unreachable",
+                "crypto_funding_dependency_unavailable",
+                evidence={"provider": "crypto_funding", "dependency": "ccxt", "error_type": type(exc).__name__, **readiness},
+                next_steps=("Install or enable the provider dependency in the runtime environment, then test again.",),
+            )
         exchange_id = self._connection_setting(source, "funding_exchange_id", "CCXT_FUNDING_EXCHANGE_ID", "binanceusdm")
         market_map_raw = self._connection_setting(source, "perp_markets", "CRYPTO_PERP_MARKETS", "")
         symbol = ""
         if market_map_raw:
             try:
-                parsed = json.loads(market_map_raw)
-                if isinstance(parsed, dict):
-                    symbol = str(next(iter(parsed.values())) or "").strip()
+                from engine.data.crypto_positioning import parse_env_market_map
+
+                parsed_markets = parse_env_market_map(str(market_map_raw))
+                if parsed_markets:
+                    symbol = str(parsed_markets[0].perp_market or "").strip()
             except Exception:
+                symbol = ""
+            if not symbol:
                 symbol = str(market_map_raw).split(",", 1)[0].split("=", 1)[-1].strip()
         try:
             exchange_cls = getattr(ccxt, exchange_id)
@@ -8783,14 +9043,14 @@ class DataSourceManager:
                 return self._connection_fail(
                     "empty_payload",
                     "crypto_funding_market_missing",
-                    evidence={"provider": "crypto_funding", "exchange_id": exchange_id, "payload_count": 0},
+                    evidence={"provider": "crypto_funding", "exchange_id": exchange_id, "payload_count": 0, **readiness},
                     next_steps=("Configure CRYPTO_PERP_MARKETS or choose an exchange with visible perpetual markets.",),
                 )
             if not getattr(exchange, "has", {}).get("fetchFundingRate"):
                 return self._connection_fail(
                     "entitlement_missing",
                     "crypto_funding_endpoint_unavailable",
-                    evidence={"provider": "crypto_funding", "exchange_id": exchange_id, "symbol": symbol},
+                    evidence={"provider": "crypto_funding", "exchange_id": exchange_id, "symbol": symbol, **readiness},
                     next_steps=("Choose a CCXT exchange that exposes public fetchFundingRate support for the configured symbol.",),
                 )
             payload = exchange.fetch_funding_rate(symbol)
@@ -8805,7 +9065,7 @@ class DataSourceManager:
             return self._connection_fail(
                 "provider_unreachable",
                 "crypto_funding_exchange_unknown",
-                evidence={"provider": "crypto_funding", "exchange_id": exchange_id},
+                evidence={"provider": "crypto_funding", "exchange_id": exchange_id, **readiness},
                 next_steps=("Set CCXT_FUNDING_EXCHANGE_ID to a supported ccxt exchange id.",),
             )
         except Exception as exc:
@@ -8816,15 +9076,28 @@ class DataSourceManager:
                 exchange_id=exchange_id,
                 error_type=type(exc).__name__,
             )
-            return self._request_exception_result("crypto_funding", exchange_id, exc)
+            return self._connection_result(
+                "degraded" if "rate" in type(exc).__name__.lower() else "fail",
+                "rate_limited" if "rate" in type(exc).__name__.lower() else "provider_unreachable",
+                "crypto_funding_rate_limited" if "rate" in type(exc).__name__.lower() else "crypto_funding_provider_unreachable",
+                evidence={"provider": "crypto_funding", "endpoint": self._safe_endpoint(exchange_id), "error_type": type(exc).__name__, **readiness},
+                next_steps=("Retry later if this is transient; otherwise verify network, DNS, and provider status.",),
+            )
         if not payload:
             return self._connection_fail(
                 "empty_payload",
                 "crypto_funding_empty_payload",
-                evidence={"provider": "crypto_funding", "exchange_id": exchange_id, "symbol": symbol, "payload_count": 0},
+                evidence={"provider": "crypto_funding", "exchange_id": exchange_id, "symbol": symbol, "payload_count": 0, **readiness},
                 next_steps=("The exchange responded but returned no funding-rate payload. Verify market support and retry later.",),
             )
-        return self._connection_pass("crypto_funding_connection_ok", provider="crypto_funding", exchange_id=exchange_id, symbol=symbol, payload_count=1)
+        return self._connection_pass(
+            "crypto_funding_connection_ok",
+            provider="crypto_funding",
+            exchange_id=exchange_id,
+            symbol=symbol,
+            payload_count=1,
+            **readiness,
+        )
 
     def _test_congressional_trades_connection(self, source: Dict[str, Any]) -> ConnectionTestResult:
         url = self._connection_setting(

@@ -66,11 +66,11 @@ class CotContractSpec:
 
 
 DEFAULT_COT_CONTRACT_SPECS: Tuple[CotContractSpec, ...] = (
-    CotContractSpec("ES", "legacy", "E-MINI S&P 500", ("SPY", "VOO", "IVV", "VTI", "ES"), "equity_index"),
-    CotContractSpec("NQ", "legacy", "NASDAQ-100", ("QQQ", "TQQQ", "SQQQ", "SMH", "NQ"), "equity_index"),
-    CotContractSpec("ZN", "legacy", "10-YEAR U.S. TREASURY", ("TLT", "IEF", "ZN"), "rates"),
-    CotContractSpec("CL", "disaggregated", "CRUDE OIL, LIGHT SWEET", ("USO", "XLE", "OIL", "XOM", "CVX", "CL"), "oil"),
-    CotContractSpec("GC", "disaggregated", "GOLD", ("GLD", "GDX", "GC"), "gold"),
+    CotContractSpec("ES", "legacy", "E-MINI S&P 500", ("SPY", "VOO", "IVV", "VTI", "ES", "ES.c.0"), "equity_index"),
+    CotContractSpec("NQ", "legacy", "NASDAQ-100", ("QQQ", "TQQQ", "SQQQ", "SMH", "NQ", "NQ.c.0"), "equity_index"),
+    CotContractSpec("ZN", "legacy", "10-YEAR U.S. TREASURY", ("TLT", "IEF", "ZN", "ZN.c.0"), "rates"),
+    CotContractSpec("CL", "disaggregated", "CRUDE OIL, LIGHT SWEET", ("USO", "XLE", "OIL", "XOM", "CVX", "CL", "CL.c.0"), "oil"),
+    CotContractSpec("GC", "disaggregated", "GOLD", ("GLD", "GDX", "GC", "GC.c.0"), "gold"),
     CotContractSpec("6E", "legacy", "EURO FX", ("EURUSD", "FXE", "6E"), "fx"),
     CotContractSpec("6B", "legacy", "BRITISH POUND", ("GBPUSD", "6B"), "fx"),
     CotContractSpec("6J", "legacy", "JAPANESE YEN", ("USDJPY", "6J"), "fx"),
@@ -298,6 +298,9 @@ def seed_default_cot_mappings(con) -> int:
     written = 0
     for spec in load_cot_contract_specs():
         for symbol in spec.symbols:
+            symbol_key = _clean_symbol(symbol)
+            if not symbol_key:
+                continue
             cur = con.execute(
                 """
                 INSERT INTO cot_contract_symbol_map(contract_key, symbol, topic, weight, active, updated_ts_ms, meta_json)
@@ -306,7 +309,7 @@ def seed_default_cot_mappings(con) -> int:
                 """,
                 (
                     str(spec.contract_key),
-                    str(symbol),
+                    str(symbol_key),
                     str(spec.topic or ""),
                     float(spec.weight or 1.0),
                     int(now_ms),
@@ -327,7 +330,7 @@ def cot_target_contracts_for_symbol(con, symbol: str) -> List[Tuple[str, float]]
             """
             SELECT contract_key, weight
             FROM cot_contract_symbol_map
-            WHERE symbol = ?
+            WHERE UPPER(symbol) = ?
               AND active = 1
             ORDER BY contract_key ASC
             """,
@@ -345,7 +348,7 @@ def cot_target_contracts_for_symbol(con, symbol: str) -> List[Tuple[str, float]]
         return out
     fallback = []
     for spec in load_cot_contract_specs():
-        if symbol_key in set(spec.symbols):
+        if symbol_key in {_clean_symbol(symbol) for symbol in spec.symbols}:
             fallback.append((str(spec.contract_key), float(spec.weight or 1.0)))
     return fallback
 

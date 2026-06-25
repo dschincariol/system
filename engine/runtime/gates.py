@@ -23,8 +23,8 @@ from engine.runtime.live_trading_preflight import live_trading_preflight
 from engine.runtime.logging import get_logger
 from engine.execution.mode_safety import (
     env_execution_mode_snapshot,
-    mode_rank,
     parse_execution_mode,
+    resolve_effective_execution_mode,
 )
 
 import json
@@ -114,8 +114,26 @@ def _env_global_kill_switch_snapshot() -> Dict[str, Any]:
             active.append(key)
     return {
         "active": bool(active),
+        "armed": bool(active),
+        "source": "env",
         "keys": active,
         "env": env,
+        "provenance": {
+            "env": {
+                "armed": bool(active),
+                "keys": list(active),
+                "active": [
+                    {
+                        "source": "env",
+                        "scope": "global",
+                        "key": key,
+                        "env_key": key,
+                        "reason": "env_flag_truthy",
+                    }
+                    for key in active
+                ],
+            }
+        },
     }
 
 
@@ -965,6 +983,20 @@ def execution_gate_snapshot(
             return reason_text
         return "runtime_critical_health"
 
+    def _paper_mode_can_simulate_with_critical_runtime() -> bool:
+        if mode != "paper" or runtime_state != "DEGRADED":
+            return False
+        reasons = [str(item or "").strip().lower() for item in severity_reasons]
+        reasons = [item for item in reasons if item]
+        if not reasons:
+            return False
+        allowed_prefixes = ("critical_source_stale:", "source_stale:")
+        allowed_exact = {"critical_source_failed:prices"}
+        return all(
+            item in allowed_exact or any(item.startswith(prefix) for prefix in allowed_prefixes)
+            for item in reasons
+        )
+
     def _apply_mode_state(r: Any, source_name: str) -> None:
         nonlocal mode, db_mode, armed, armed_source, source, invalid_mode
 
@@ -1075,15 +1107,17 @@ def execution_gate_snapshot(
             runtime_detail = ""
             runtime_source = "lifecycle_state:error"
 
-    # Most restrictive mode wins when env and DB differ. This prevents stale DB
-    # state from silently enabling execution after an operator explicitly chose
-    # a safer mode for the current run.
-    if db_mode:
-        if env_mode_explicit and mode_rank(env_mode) >= mode_rank(db_mode):
-            mode = _normalize_mode(env_mode, "safe")
-            source = f"{source}+env_restrictive"
-        else:
-            mode = _normalize_mode(db_mode, "safe")
+    resolved_mode = resolve_effective_execution_mode(
+        {"mode": db_mode, "armed": armed, "source": source} if db_mode else (
+            {"armed": armed, "source": source} if armed is not None else None
+        ),
+        environ=os.environ,
+    )
+    if not bool(resolved_mode.get("ok")):
+        return _invalid_mode_gate(dict(resolved_mode.get("invalid_mode") or {}))
+    mode = _normalize_mode(resolved_mode.get("mode"), "safe")
+    armed = resolved_mode.get("armed")
+    source = str(resolved_mode.get("source") or source or "unknown")
 
     gate_severity, severity_reasons = _classify_runtime_severity()
 
@@ -1091,7 +1125,7 @@ def execution_gate_snapshot(
     # blocked when the degradation is classified as critical. LIVE can also be
     # re-blocked by critical health markers after the runtime has previously
     # reached live.
-    if gate_severity == "CRITICAL":
+    if gate_severity == "CRITICAL" and not _paper_mode_can_simulate_with_critical_runtime():
         blocked_reason = _runtime_state_block_reason()
 
         return {
@@ -1272,6 +1306,9 @@ def execution_gate_snapshot(
                 "cache_fresh",
                 "read_source",
                 "cache_status",
+                "effective",
+                "effective_state",
+                "provenance",
             }:
                 continue
             if isinstance(v, dict) and (v.get("enabled") is True or v.get("active") is True):

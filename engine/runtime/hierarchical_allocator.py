@@ -29,6 +29,9 @@ Config (optional env):
   SLEEVE_RISK_BUDGETS_JSON='{"equities":0.50,"options":0.30,"futures":0.20}'
   STRATEGY_RISK_BUDGETS_JSON='{"my_strategy":0.25,...}'
   STRATEGY_SLEEVE_MAP_JSON='{"my_strategy":"equities",...}'
+  # Unmapped strategies can auto-bind by symbol asset class:
+  # OPTION->options, EQUITY->equities, FUTURES/COMMODITY/RATES->futures.
+  # Disable with HIER_ALLOC_BIND_ASSET_CLASS_SLEEVE=0.
 
   HIER_ALLOC_CORR_GAMMA_SLEEVE=1.5
   HIER_ALLOC_CORR_GAMMA_STRAT=1.5
@@ -67,6 +70,7 @@ MIN_SHARE = float(os.environ.get("HIER_ALLOC_MIN_SHARE", "0.0"))
 MAX_SHARE = float(os.environ.get("HIER_ALLOC_MAX_SHARE", "1.0"))
 
 SCORE_FLOOR = float(os.environ.get("HIER_ALLOC_SCORE_FLOOR", "0.0"))
+HIER_ALLOC_BIND_ASSET_CLASS_SLEEVE = os.environ.get("HIER_ALLOC_BIND_ASSET_CLASS_SLEEVE", "1") == "1"
 
 _SLEEVE_BUDGETS_RAW = os.environ.get("SLEEVE_RISK_BUDGETS_JSON", "").strip()
 _STRATEGY_BUDGETS_RAW = os.environ.get("STRATEGY_RISK_BUDGETS_JSON", "").strip()
@@ -91,6 +95,19 @@ def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = No
     )
     if once_key:
         _WARNED_NONFATAL_KEYS.add(once_key)
+
+
+try:
+    from engine.data.asset_map import asset_class_for_symbol  # type: ignore
+except Exception as e:
+    _warn_nonfatal(
+        "HIER_ALLOC_ASSET_MAP_IMPORT_FAILED",
+        e,
+        once_key="asset_map_import",
+    )
+
+    def asset_class_for_symbol(symbol: object) -> str:
+        return "UNKNOWN"
 
 
 def _now_ms() -> int:
@@ -228,6 +245,76 @@ def _load_strategy_registry_meta(con) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _asset_class_to_sleeve(asset_class: str) -> Optional[str]:
+    cls = str(asset_class or "").upper().strip()
+    if cls == "OPTION":
+        return "options"
+    if cls == "EQUITY":
+        return "equities"
+    if cls in {"FUTURES", "COMMODITY", "RATES"}:
+        return "futures"
+    return None
+
+
+def _strategy_symbol_candidates(sname: str, meta: Dict[str, Any]) -> List[str]:
+    keys = (
+        "symbol",
+        "symbols",
+        "primary_symbol",
+        "primarySymbol",
+        "underlying",
+        "underlying_symbol",
+        "root_symbol",
+        "ticker",
+        "contract",
+        "occ_symbol",
+        "instrument_symbol",
+    )
+    candidates: List[str] = []
+    for key in keys:
+        try:
+            value = (meta or {}).get(key)
+        except Exception:
+            value = None
+        values = value if isinstance(value, (list, tuple, set)) else (value,)
+        for item in values:
+            text = str(item or "").upper().strip()
+            if text:
+                candidates.append(text)
+    strategy_text = str(sname or "").upper().strip()
+    if strategy_text:
+        candidates.append(strategy_text)
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _asset_class_sleeve_for_strategy(sname: str, meta: Dict[str, Any]) -> Optional[str]:
+    if not HIER_ALLOC_BIND_ASSET_CLASS_SLEEVE:
+        return None
+    for symbol in _strategy_symbol_candidates(sname, meta):
+        try:
+            sleeve = _asset_class_to_sleeve(asset_class_for_symbol(symbol))
+        except Exception as e:
+            _warn_nonfatal(
+                "HIER_ALLOC_ASSET_CLASS_SLEEVE_LOOKUP_FAILED",
+                e,
+                once_key=f"asset_class_sleeve:{symbol}",
+                strategy_name=str(sname or ""),
+                symbol=str(symbol),
+            )
+            continue
+        if sleeve:
+            return sleeve
+    return None
+
+
 def _strategy_to_sleeve(con, sname: str, explicit_map: Dict[str, Any], meta_map: Dict[str, Dict[str, Any]]) -> str:
     s = str(sname or "").strip()
     if not s:
@@ -263,6 +350,10 @@ def _strategy_to_sleeve(con, sname: str, explicit_map: Dict[str, Any], meta_map:
                 meta_key=str(key),
             )
             continue
+
+    asset_class_sleeve = _asset_class_sleeve_for_strategy(s, meta)
+    if asset_class_sleeve:
+        return asset_class_sleeve
 
     return "default"
 

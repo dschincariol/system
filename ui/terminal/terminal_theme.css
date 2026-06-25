@@ -324,9 +324,22 @@ body.term{
 .subHd{ font-weight:900; margin: 4px 0 8px; }
 .tableSubHd{
   display:grid;
-  grid-template-columns: auto minmax(120px, 1fr);
+  grid-template-columns: auto minmax(80px, 1fr);
   gap:8px;
   align-items:center;
+}
+.tableSubHd .tableFilter{
+  grid-column:1 / -1;
+}
+.tableStatusFilter{
+  grid-column:1 / -1;
+  height:30px;
+  font-size:12px;
+}
+.tableMeta{
+  justify-self:end;
+  font-size:11px;
+  font-weight:600;
 }
 .tableFilter{
   height:30px;
@@ -334,6 +347,28 @@ body.term{
   font-size:12px;
 }
 .panelBody > .tableFilter.full{ margin-bottom:8px; }
+.panelBody > .tableStatusFilter{ width:100%; margin-bottom:8px; }
+.tcaSummary{
+  display:grid;
+  grid-template-columns: repeat(5, minmax(84px, 1fr));
+  gap:8px;
+  margin-bottom:8px;
+}
+.tcaCell{
+  min-height:42px;
+  padding:7px 8px;
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:8px;
+  background:rgba(10,13,18,.55);
+}
+.tcaCell .k,
+.tcaCell .v{
+  display:block;
+}
+.tcaCell .v{
+  margin-top:2px;
+  font-weight:900;
+}
 
 .safetyStatus{
   min-height:34px;
@@ -411,6 +446,53 @@ body.term{
   z-index: 2;
 }
 .row .c{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.statusMini{
+  display:inline-flex;
+  align-items:center;
+  max-width:100%;
+  min-height:22px;
+  padding:2px 7px;
+  border:1px solid currentColor;
+  border-radius:7px;
+  font-weight:900;
+  line-height:1.15;
+}
+.statusMini::before{
+  content:"";
+  width:.65em;
+  height:.65em;
+  margin-right:5px;
+  border:1px solid currentColor;
+  flex:0 0 auto;
+}
+.statusMini-info{
+  color:var(--status-info);
+  border-style:solid;
+}
+.statusMini-info::before{
+  border-radius:50%;
+}
+.statusMini-ok{
+  color:var(--status-ok);
+  border-style:solid;
+}
+.statusMini-ok::before{
+  border-radius:2px;
+}
+.statusMini-warn{
+  color:var(--status-warn);
+  border-style:dashed;
+}
+.statusMini-warn::before{
+  transform:rotate(45deg);
+}
+.statusMini-crit{
+  color:var(--status-crit);
+  border-style:double;
+}
+.statusMini-crit::before{
+  border-radius:0;
+}
 .sortBtn{
   width:100%;
   display:inline-flex;
@@ -455,6 +537,7 @@ body.term{
     grid-column:1; grid-row:auto;
   }
   .chartCanvas{ min-height: 420px; }
+  .tcaSummary{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }
 }
 
 @media (prefers-reduced-motion: reduce){
@@ -490,7 +573,9 @@ body.term{
   .item,
   .panel,
   .chartCanvas,
-  .xhair{
+  .xhair,
+  .statusMini,
+  .tcaCell{
     forced-color-adjust:auto;
     background:Canvas !important;
     color:CanvasText !important;

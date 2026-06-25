@@ -49,6 +49,7 @@ const PERSONA_PANEL_ALLOWLISTS = {
     ],
     data: [
       "dataHealthSummaryCard",
+      "futuresPanelCard",
       "dataProviderTelemetryCard",
       "dataRuntimeSignalsCard",
     ],

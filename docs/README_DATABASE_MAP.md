@@ -23,6 +23,13 @@ The public storage facade is `engine/runtime/storage.py`. Current production-lik
 
 Runtime connection targets come from `TS_PG_DSN` or platform defaults. `DB_PATH` now means "local data root / legacy identity path" for diagnostics, artifacts, and test backends. In supervised or production-like modes it must be an absolute directory such as `/var/lib/trading`; relative values fail runtime config and production preflight. File-shaped legacy values are tolerated by `db_guard.resolve_db_path()` and normalized to their parent directory only after the raw path has passed the absolute-path gate.
 
+`/api/db/health` follows the active runtime storage backend. For the isolated
+SQLite backend it sizes the local database file plus `-wal` and `-shm`
+sidecars. For the Postgres backend it does not derive or stat a local
+`DB_PATH-wal` file; Postgres WAL is server-owned, so the endpoint reports local
+WAL fields as not applicable and relies on the normal Postgres liveness check
+and `/api/health.storage_wal_guards.pg_wal_disk_risk` for PG WAL risk.
+
 For the Docker Timescale/Postgres deployment, database tuning comes from the
 `TIMESCALE_*` variables in `deploy/compose/.env`. The compose service passes
 those values directly to Postgres, and production preflight records a
@@ -52,6 +59,11 @@ honored.
 Do not infer that new schema work is local-file-only. Treat the runtime storage facade and Postgres migrations as the primary persistence layer, and add migrations/tests for any schema or write-path change.
 
 Postgres durability defaults to the server/session setting for every write.
+Postgres write transactions that request bounded lock or statement waits apply
+those limits transaction-locally through `SELECT set_config(..., true)` with
+bound values. Do not use parameterized `SET LOCAL ... = %s` for these limits:
+Postgres rejects bind parameters in `SET` syntax, which breaks lock release and
+runtime metadata writes before the transaction body runs.
 `TRADING_REFETCHABLE_PG_DURABILITY_TIER` accepts only `default` and `relaxed`;
 empty/unset behaves as `default`, and invalid values fail production preflight
 and the write-surface configuration path. `relaxed` is the only supported opt-in
@@ -270,6 +282,53 @@ columns, required indexes, and owned-table column types from the live catalog;
 production preflight fails closed when any expected migration ID or required
 owned schema element is missing.
 
+The universe `symbols` table carries additive instrument-registry metadata on
+top of the baseline symbol/status/score fields. FX rows use the generic
+`instrument_kind`, currency, pip, contract-size, leverage, calendar, and
+`instrument_meta_source` columns. Futures rows reuse the generic kind/calendar
+fields and store contract details in `fut_*` columns. OCC option contracts use
+the canonical compact OCC symbol as `symbols.symbol`, classify as
+`asset_class='OPTION'`, reuse the generic kind/calendar/source columns, and
+store contract details in `opt_underlying`, `opt_expiry`, `opt_right`,
+`opt_strike`, `opt_multiplier`, `opt_exercise_style`, `opt_settlement`, and
+`opt_price_ccy`. Polygon `O:`-prefixed contract tickers are normalized before
+universe storage; these metadata columns do not enable live options execution.
+
+Equity symbol lifecycle retirement is additive and default-off. When
+`UNIVERSE_LIFECYCLE_ENABLED=1`, `engine/data/jobs/retire_delisted_symbols.py`
+can mark confirmed stale/delisted/renamed EQUITY rows as
+`symbols.status='DISABLED'`, merge lineage evidence into `symbols.meta_json`, and
+write an audit row to the existing `universe_audit` table. The job records the
+best known delist/last-trade timestamp in the existing `symbols.last_traded_ts_ms`
+field so `universe_pit` can exclude retired rows from slices after that point.
+The optional reference-data layer is separately gated by
+`UNIVERSE_LIFECYCLE_REFERENCE_ENABLED=1` and only runs when a provider credential
+resolves through the standard secret loader. This is separate from
+`symbol_blacklist`, which is a portfolio/trading suppression mechanism and does
+not represent symbol lifecycle or survivorship state.
+
+Options chain population is credential-visible in runtime health. If neither
+`POLYGON_API_KEY` nor `TRADIER_API_TOKEN` resolves through the standard secret
+loader, `/api/health.options_ingestion` reports
+`detail=options_provider_unconfigured` with `credentials_configured=false`.
+If either credential is configured but `options_poll` has no fresh
+`options_chain_v2` status, health degrades with
+`detail=options_credentials_configured_but_chain_stale`; paper/live preflight
+uses the same signal to block stale configured chains.
+
+Options chain data quality is exposed additively at
+`/api/health.options_ingestion.data_quality`. The report reads
+`options_symbol_ingestion_state`, `options_chain_v2`, and legacy
+`options_chain` without mutating them. It reports fresh-underlying coverage,
+per-provider IV/open-interest/volume, bid/ask, and greeks completeness, and IV
+sanity counts. Legacy `options_chain` rows explicitly show bid/ask and greeks
+completeness as `0.0` because those columns do not exist in that table. The
+same report emits best-effort `options.dq.*` runtime metrics and a throttled
+`event_type=options` / `event_kind=options_data_quality_degraded` event when
+coverage or field-quality thresholds fail. The consumer helper
+`engine.data.options_data_quality.options_data_quality_ok(report)` is the
+intended OPT-04 gate input; `USE_OPTIONS_FEATURES` remains off by default.
+
 | Table | Role |
 | --- | --- |
 | `prices` | simple price points |
@@ -286,6 +345,7 @@ owned schema element is missing.
 | `options_symbol_features`, `options_event_features` | symbol-linked options summaries and event-linked options signals derived from chain snapshots |
 | `events` | canonical normalized non-price event layer across news, social, filings, earnings, weather, and macro-style signals |
 | `earnings_calendar` | earnings source table feeding normalized `events` |
+| `corporate_actions` | point-in-time split and cash-dividend calendar keyed by `source_record_id`; used by price labels, split hygiene, and ETF flow anomaly suppression |
 | `sec_filings` | filings source table feeding normalized `events` |
 | `social_posts`, `social_features`, `social_regimes` | social-source raw and derived features; raw social events are also normalized into `events` |
 | `weather_forecast_region_daily`, `weather_alerts`, `weather_provider_health` | weather source tables and provider state; alert/forecast events are also normalized into `events` |
@@ -310,6 +370,9 @@ These tables sit between raw data and trade decisions.
 | `event_embeddings_seq` | sequence bookkeeping for embeddings |
 
 `labels_price` rows created by the sqlite-oriented price-label backfill may include `meta_json.fx_clock_corrected=true` and `meta_json.naive_eval_ms` when an FX label used the canonical `engine/data/prices/fx_clock.py` evaluation timestamp instead of the naive wall-clock horizon. This is a sqlite-side audit enrichment only; the Postgres compatibility table records the corrected `ts_eval_ms` but does not have a JSON metadata column.
+
+`corporate_actions` is an append-only PIT calendar for split and cash-dividend rows from Polygon (`/v3/reference/splits`, `/v3/reference/dividends`) with FMP historical dividend/split endpoints as fallback. Inserts are idempotent on `source_record_id`, and consumers gate on `availability_ts_ms` so labels do not look ahead. `LABELS_USE_CORP_ACTION_ADJUSTMENT=1` lets the price-label backfill add cash dividends back to realized returns and normalize split-adjusted exits without adding columns to `labels_price`. `PRICE_HYGIENE_USE_CORP_ACTION_CALENDAR=1` allows known split ex-dates through the split-jump filter while retaining the heuristic fallback when no calendar row exists. `ETF_FLOW_SUPPRESS_EX_DIVIDEND=1` suppresses ETF unexpected-flow anomalies on known cash-dividend ex-dates when ETF flow feature materialization supplies a DB connection; callers without a connection keep legacy output.
+
 | `factor_features` | factor-style features |
 | `factor_observations` | raw factor observations |
 | `factor_group_scores` | grouped factor scoring |

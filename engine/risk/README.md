@@ -49,11 +49,116 @@ Knob families (module-level constants read from `PORTFOLIO_RISK_*` env):
 - Portfolio gross/net caps — `MAX_GROSS` (1.00) and `MAX_NET` (0.60); gross scales
   all abs weights, net scales signed weights toward zero.
 - Budgets — asset-class budgets (`USE_ASSET_CLASS_BUDGETS`,
-  `ASSET_CLASS_BUDGETS_JSON`, default EQUITY 1.00 / CRYPTO 0.35 / COMMODITY 0.50 /
-  FX 0.50 / RATES 0.60 / UNKNOWN 0.40), strategy budgets (`MAX_STRATEGY_GROSS`
-  0.60, `MAX_STRATEGY_NET` 0.40), and an alpha-decay throttle
+  `ASSET_CLASS_BUDGETS_JSON`, default EQUITY 0.80 when
+  `PORTFOLIO_RISK_BIND_EQUITY_BUDGET=1` / CRYPTO 0.35 / COMMODITY 0.50 /
+  FX 0.50 / FUTURES 0.40 / RATES 0.60 / UNKNOWN 0.40), strategy budgets
+  (`MAX_STRATEGY_GROSS` 0.60, `MAX_STRATEGY_NET` 0.40), and an alpha-decay throttle
   (`USE_ALPHA_DECAY_THROTTLE`, `ALPHA_DECAY_FRESH_S`) that rescales per strategy
   from fresh `strategy_metrics`.
+
+### EQUITY Asset-Class Classification And Sleeve
+
+In this section, `EQUITY` means the stocks/ETFs asset class. It does not mean
+account equity, NAV, cash balance, or deployable capital.
+
+`engine.data.asset_map.asset_class_for_symbol` classifies listed US stocks and
+ETFs through a deterministic registry loaded once at module import when
+`ASSET_MAP_USE_EQUITY_REGISTRY=1` (default). The registry is seeded from the same
+SEC ticker-to-exchange file used by `engine.data.default_symbols`
+(`SEC_TICKER_MAP_CACHE`, default `data/sec_company_tickers_exchange.json`).
+Only main exchange venues are admitted: `NASDAQ`, `NYSE`, `NYSE ARCA`,
+`NYSE AMERICAN`, `AMEX`, and `CBOE`. `OTC` and rows with no exchange stay
+`UNKNOWN`, because they have different liquidity and cost assumptions.
+
+The registry branch runs after explicit `ASSET_CLASS_MAP_JSON` overrides and
+after the existing crypto, commodity, futures, options, FX, and rates branches.
+That ordering makes it a strict upgrade only for symbols that would otherwise be
+`UNKNOWN`; FX, crypto, commodity, futures, options, and rates instruments keep
+their established rails. With `ASSET_MAP_USE_EQUITY_REGISTRY=0`, the registry is
+empty and legacy classification is restored.
+
+This classification is point-in-time stable for a checked-in file snapshot: it
+is a pure function of the symbol, environment overrides, and SEC registry file
+contents. It does not read the clock, database, network, or broker state, and it
+reflects membership in the current file snapshot rather than historical
+per-date exchange membership.
+
+Newly discovered or re-upserted symbols flow into storage automatically through
+`engine.data.universe.upsert_symbol`, which writes the classifier output to the
+existing `symbols.asset_class` column. There is no schema change and no backfill;
+historical `UNKNOWN` rows are reclassified only when they are next upserted.
+
+The dedicated EQUITY sleeve is binding by default:
+`PORTFOLIO_RISK_BIND_EQUITY_BUDGET=1` sets the default EQUITY asset-class budget
+to `0.80`, below `MAX_GROSS` (`1.00`) and above the legacy `UNKNOWN` sleeve
+(`0.40`). This gives listed stocks/ETFs their own gross-exposure rail while the
+existing gross, per-symbol (`MAX_SYMBOL_GROSS`, default `0.35`), and correlation
+cluster (`CLUSTER_MAX_GROSS`, default `0.45`) caps continue to apply. Setting
+`PORTFOLIO_RISK_BIND_EQUITY_BUDGET=0` restores the legacy `EQUITY: 1.00`
+default, and `PORTFOLIO_RISK_ASSET_CLASS_BUDGETS_JSON` can still override the
+effective sleeve table.
+
+### Sector Budgets
+
+`PORTFOLIO_RISK_USE_SECTOR_BUDGETS=1` enables an additive runtime sector budget
+stage. It reads sector through `engine.data.quiver_gov.sector_for_symbol`, which
+uses the existing `gov_symbol_sector_map`, sector-bearing reference tables
+(`security_master`, `securities`, `symbols`/`symbols.meta_json`), and the
+checked-in PIT seed at `data/equity_sector_reference.json`. The seed is explicit:
+missing symbols stay unresolved (`""`) and are not assigned to a fallback bucket.
+`engine.data.jobs.update_universe` seeds matching active-universe symbols into
+`gov_symbol_sector_map` and logs resolved/unresolved coverage; Quiver government
+ingestion also runs the same idempotent seed path. It does not read
+`engine.data.equity_snapshot`; that module tracks account equity/NAV, not GICS
+or sector classification.
+
+The default sector gross budget is `PORTFOLIO_RISK_SECTOR_MAX_GROSS=0.30`.
+Operators can override individual sectors with
+`PORTFOLIO_RISK_SECTOR_BUDGETS_JSON`, for example
+`{"ENERGY":0.50,"FINANCIALS":0.25}`. The stage runs after leverage clamps and
+before strategy, volatility, and correlation-cluster caps, so sector compression
+and cluster compression compose. When a sector is over budget, member target
+weights are scaled proportionally and each adjusted row gets a
+`reason.sector_budget` blob.
+
+Sector budgeting is intentionally decoupled from the `EQUITY` asset-class
+classifier. A discovered single name with a persisted sector is governed even if
+the asset map still reports `UNKNOWN`; symbols with no resolvable sector are
+left untouched. `engine.data.quiver_gov.sector_coverage_report` reports the
+active/listed-equity resolved-vs-unresolved count so operators can see what is
+governed before relying on the rail. The post-constraint `sector_within_cap`
+check enforces the budget on the final exposure snapshot and blocks with the
+existing `post_cap_validation_failed` path if a projected book remains over cap.
+The diagnostics `sector_gross_pre`, `sector_gross_post`, and
+`sector_budgets_hit` are serialized through the existing `portfolio_risk_info`
+state for read-model consumers; no API, route, or UI edit is required.
+
+### EQUITY Leverage And Buying-Power Guard
+
+`PORTFOLIO_RISK_USE_EQUITY_LEVERAGE_CAPS=1` enables the runtime stock/ETF
+pre-sizing guard by default. The stage runs after FX leverage caps and before the
+strategy-budget stage. It is separate from the FX leverage helper: EQUITY
+exposure is capped as aggregate gross stock/ETF weight against account equity
+and deployable buying power, not as a per-symbol leverage multiple.
+
+`EQUITY_LEVERAGE_MODE=cash` caps aggregate EQUITY gross at 1.0x account equity.
+`EQUITY_LEVERAGE_MODE=reg_t` permits up to the Reg-T initial 2.0x ceiling only
+when the `broker_account` schema exposes a valid `buying_power` value.
+`EQUITY_LEVERAGE_CAPS_JSON` can lower or override the mode ceilings, for example
+`{"cash":0.75,"reg_t":1.5}`. Unknown modes, malformed cap JSON, unavailable
+account equity, and Reg-T mode without buying power fail closed.
+
+The guard probes `PRAGMA table_info(broker_account)` before reading buying power
+so broker-sim schemas that have `cash` and `equity` but no `buying_power` remain
+valid in cash mode and fail closed in Reg-T mode. It consumes
+`engine.execution.deployable_capital.compute_deployable_equity` read-only to
+derive the deployable base, then writes clamp diagnostics under
+`equity_leverage_*` only when it clamps or hard-blocks.
+The standalone `equity_deployable_base` helper also fails closed for Reg-T
+callers that omit buying power: it returns a zero deployable ceiling with
+`unavailable_reason="equity_buying_power_unavailable"` instead of deriving a
+2.0x ceiling from account equity alone. The engine still hard-blocks that case
+before calling the helper.
 
 ### FX Sizing And Risk
 
@@ -139,6 +244,48 @@ These variables are consumed directly by the risk engines and should be document
 ## Monte Carlo Live Gating
 
 `PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE=1` is the conservative default. In live/prod runtime, the portfolio-risk engine blocks approval when Monte Carlo risk state is missing, unreadable, unparseable, stale beyond `PORTFOLIO_RISK_MC_MAX_AGE_S`, explicitly disabled, or marked `ready=false`/`status=error`. Intentional advisory-only or disabled Monte Carlo behavior must be configured explicitly and is rejected by strict live config validation unless the audited live-risk acceptance override is present.
+
+### EQ-10 Cost-Aware Edge Filter And Tail-Risk Rollout
+
+The alert edge filter in `engine.strategy.edge_filter` remains default-off:
+`ALERT_USE_EXEC_COST_FILTER=0` and `ALERT_MIN_NET_ABS_Z=0.0` do not reject or
+adjust live alerts. `ALERT_EXEC_COST_FILTER_ASSET_CLASSES` defaults empty, which
+preserves current behavior for any operator who explicitly enables the filter.
+The enable flag, minimum net z threshold, and asset-class scope are read at each
+`adjust_expected_z_for_costs` call, so supervised env reloads after module import
+take effect in the live alert gate. Set the scope to `EQUITY` only after the
+equity asset map is populated enough for the target stock/ETF universe.
+
+Rollout order:
+
+1. Run `python tools/calibrate_edge_filter_min_net_abs_z.py --asset-class EQUITY`
+   against paper or shadow `trade_attribution_ledger` data. The tool is
+   read-only, emits JSON to stdout, and returns `status:"insufficient_data"`
+   with `recommended_min_net_abs_z:null` when usable fills are below
+   `--min-fills` instead of fabricating a threshold.
+2. Set the operator-chosen `ALERT_MIN_NET_ABS_Z` from calibration, enable
+   `ALERT_USE_EXEC_COST_FILTER=1`, and scope with
+   `ALERT_EXEC_COST_FILTER_ASSET_CLASSES=EQUITY`.
+3. Prove the behavior in paper or shadow. The existing production preflight
+   sanity probe exercises `adjust_expected_z_for_costs` when the filter is
+   enabled and reports missing-volatility warnings without arming live capital.
+4. Set `EQUITY_EXEC_COST_FILTER_REQUIRED_IN_LIVE=1` only when the calibrated
+   threshold and paper/shadow evidence are accepted. Strict live validation then
+   requires `ALERT_USE_EXEC_COST_FILTER=1` and `ALERT_MIN_NET_ABS_Z > 0`, using
+   the existing `LIVE_RISK_THRESHOLD_ACCEPTANCE_OVERRIDE` audit path for any
+   deliberate exception.
+
+`UNKNOWN` classification is intentionally not promoted to `EQUITY` by this
+rollout. Operators should populate `ASSET_CLASS_MAP_JSON` or the equity
+registry inputs for real stocks and ETFs. Including `UNKNOWN` in
+`ALERT_EXEC_COST_FILTER_ASSET_CLASSES` is a deliberate broadened scope, not a
+default.
+
+This rollout does not lower or default-enable Monte Carlo thresholds. The
+existing `PORTFOLIO_RISK_MC_VAR_*`, `PORTFOLIO_RISK_MC_CVAR_*`, drawdown, and
+staleness blocks stay the live fail-closed tail-risk authority; EQ-10 only adds
+a calibrated execution-cost edge rail that can be required after paper/shadow
+evidence exists.
 
 ## Monte Carlo Visualization Contract
 

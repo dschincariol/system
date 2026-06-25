@@ -67,6 +67,7 @@ function flash(message, isError = false) {
 function statusPill(source) {
   const status = String(source.status || "unknown").toLowerCase();
   if (status === "ok" || status === "tested") return `<span class="pill ok">${esc(status)}</span>`;
+  if (status === "needs_credentials") return `<span class="pill err">needs credentials</span>`;
   if (status === "test_degraded") return `<span class="pill warn">${esc(status)}</span>`;
   if (status === "error" || status === "test_failed") return `<span class="pill err">${esc(status)}</span>`;
   if (status === "test_unsupported") return `<span class="pill dim">${esc(status)}</span>`;
@@ -253,6 +254,9 @@ function deriveSourceState(source, template) {
   const missingEnvVars = (source?.missing_credential_env_vars || [])
     .map((name) => String(name || "").trim())
     .filter(Boolean);
+  const missingCredentialDetails = (source?.missing_credentials || [])
+    .map((item) => String(item?.label || item?.env_var || item?.source_field || "").trim())
+    .filter(Boolean);
   const enabled = !!source?.enabled;
   const credentialsRequired = credentialFields.length > 0;
   const credentialsConfigured = !!source?.credentials_configured;
@@ -267,13 +271,13 @@ function deriveSourceState(source, template) {
     };
   }
 
-  if (runtimeState === "enabled-missing-credential") {
+  if (source?.needs_credentials || status === "needs_credentials" || runtimeState === "enabled-missing-credential") {
     return {
-      label: "Missing credential",
+      label: "Needs credentials",
       tone: "err",
       priority: 0,
       detail: missingEnvVars.length
-        ? `Missing runtime credential: ${missingEnvVars.join(", ")}.`
+        ? `Missing required credential: ${missingEnvVars.join(", ")}${missingCredentialDetails.length ? ` (${missingCredentialDetails.join(", ")})` : ""}.`
         : "A required runtime credential is missing or could not be projected.",
       nextStep: "Enter the required credential or disable the source."
     };
@@ -594,6 +598,7 @@ function renderSourceCards() {
         <div class="source-card-meta">
           ${fxSourceBadge(source, template)}
           <span class="pill dim">${source.enabled ? "Enabled" : "Disabled"}</span>
+          ${statusPill(source)}
           ${runnableStatePill(source)}
           ${isFxDataSource(source, template) ? fxFeedStatusPill(source) : ""}
           <span class="pill dim">${esc(source.provider_name || source.source_type)}</span>
@@ -821,6 +826,7 @@ function renderDetail() {
       <div class="detail-summary">
         <div class="detail-banner">
           ${statePill(stateInfo)}
+          ${statusPill(source)}
           ${runnableStatePill(source)}
           ${fxSourceBadge(source, template)}
           <span class="pill dim">${source.enabled ? "Enabled" : "Disabled"}</span>
@@ -1462,6 +1468,22 @@ async function saveProviderAccount(event) {
   };
   if (body.replace_credentials || Object.keys(credentials).length) body.credentials = credentials;
   if (clear.length) body.clear_credential_fields = clear;
+  if (clear.length) {
+    const confirmed = await requestConfirmation({
+      title: "Clear provider account credentials",
+      action: "Clear provider account credentials",
+      target: `${accountKey}: ${clear.join(", ")}`,
+      consequence: "Stored shared provider credentials will be cleared and dependent sources may stop authenticating until credentials are replaced.",
+      confirmText: "RESET_CREDENTIALS",
+      requireReason: true,
+      minReasonLength: 8,
+      submitLabel: "Clear credentials",
+      actor,
+      source: "data_sources_ui",
+    });
+    if (!confirmed.ok) return;
+    Object.assign(body, confirmed.payload);
+  }
   await request("/api/data_sources/accounts/update", { method: "POST", body: JSON.stringify(body) });
   closeAccountModal();
   flash("Provider account updated.");

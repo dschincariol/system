@@ -289,6 +289,24 @@ MACRO_SERIES_SPECS: List[MacroSeriesSpec] = [
         download_mode="fred_graph",
         symbol_topic="fx",
     ),
+    MacroSeriesSpec(
+        factor_id="macro.japan_call_money_rate",
+        source_series_id="IRSTCI01JPM156N",
+        family="macro",
+        name="Japan Call Money Interbank Rate",
+        cadence="monthly",
+        applies_to="fx",
+        units="pct",
+        transform="initial_release_level",
+        release_hour_et=23,
+        release_minute_et=59,
+        is_revisioned=False,
+        history_start="2020-01-01",
+        z_window=24,
+        delta_lag=1,
+        download_mode="fred_graph",
+        symbol_topic="fx",
+    ),
 ]
 
 

@@ -14,6 +14,9 @@ _PARTICIPATION_CLAMP_WARNED = False
 _DEFAULT_OVERRIDES: Dict[str, tuple[float, float]] = {
     "US_EQUITY": (0.142, 0.314),
     "EQUITY": (0.142, 0.314),
+    # CALIBRATION-TODO: conservative crypto placeholder so offline crypto
+    # impact does not silently reuse equity coefficients.
+    "CRYPTO": (0.220, 0.420),
 }
 
 

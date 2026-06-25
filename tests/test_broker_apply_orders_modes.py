@@ -76,6 +76,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         "EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS",
         "EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_ACTOR",
         "EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_REASON",
+        "EPE_EQUITY_SESSION_ENFORCE",
         "TS_STORAGE_BACKEND",
         "TS_PG_DSN",
         "PG_DSN",
@@ -148,6 +149,7 @@ class BrokerApplyOrdersModeTests(unittest.TestCase):
         os.environ["DRAWDOWN_MIN_HISTORY_POINTS"] = "5"
         os.environ["DISABLE_LIVE_EXECUTION"] = "1"
         os.environ["EXECUTION_PRELIVE_RECONCILE"] = "1"
+        os.environ["EPE_EQUITY_SESSION_ENFORCE"] = "0"
         os.environ.pop("EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS", None)
         os.environ.pop("EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_ACTOR", None)
         os.environ.pop("EXECUTION_PRELIVE_RECONCILE_BREAK_GLASS_REASON", None)

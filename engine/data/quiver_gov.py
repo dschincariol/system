@@ -25,7 +25,9 @@ import os
 import re
 import time
 from datetime import date, datetime, time as dt_time, timezone
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -58,6 +60,7 @@ _KEY_RE = re.compile(r"[^a-z0-9]+", re.IGNORECASE)
 _AMOUNT_RANGE_RX = re.compile(r"(?P<lo>\d[\d,]*(?:\.\d+)?)\s*(?:-|to)\s*(?P<hi>\d[\d,]*(?:\.\d+)?)", re.IGNORECASE)
 _AMOUNT_SINGLE_RX = re.compile(r"(?P<value>\d[\d,]*(?:\.\d+)?)")
 LOG = get_logger("engine.data.quiver_gov")
+_REFERENCE_SECTOR_SOURCE = "checked_in_equity_sector_reference"
 
 
 def _warn_nonfatal(code: str, error: BaseException | None = None, **extra: Any) -> None:
@@ -90,6 +93,10 @@ DEFAULT_COMMITTEE_SECTOR_MAP: Tuple[Tuple[str, str, float], ...] = (
     ("Ways and Means", "healthcare", 0.5),
     ("Ways and Means", "consumer_discretionary", 0.5),
 )
+
+
+def _equity_sector_reference_path() -> Path:
+    return (Path(__file__).resolve().parents[2] / "data" / "equity_sector_reference.json").resolve()
 
 
 def utc_now_ms() -> int:
@@ -492,10 +499,200 @@ def _parse_json_env(name: str) -> Any:
         return None
 
 
+@lru_cache(maxsize=1)
+def _load_equity_sector_reference() -> Dict[str, Dict[str, str]]:
+    path = _equity_sector_reference_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _warn_nonfatal("QUIVER_GOV_EQUITY_SECTOR_REFERENCE_LOAD_FAILED", e, path=str(path))
+        return {}
+
+    fields = list(payload.get("fields") or []) if isinstance(payload, dict) else []
+    rows = list(payload.get("data") or []) if isinstance(payload, dict) else []
+    if not fields or not rows:
+        _warn_nonfatal(
+            "QUIVER_GOV_EQUITY_SECTOR_REFERENCE_EMPTY",
+            RuntimeError("empty equity sector reference"),
+            path=str(path),
+        )
+        return {}
+
+    try:
+        symbol_idx = fields.index("symbol")
+        sector_idx = fields.index("sector")
+    except ValueError as e:
+        _warn_nonfatal(
+            "QUIVER_GOV_EQUITY_SECTOR_REFERENCE_MISSING_FIELD",
+            e,
+            path=str(path),
+            fields=fields[:20],
+        )
+        return {}
+    source_idx = fields.index("source") if "source" in fields else -1
+    asof_idx = fields.index("asof_date") if "asof_date" in fields else -1
+
+    out: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        if not isinstance(row, list) or symbol_idx >= len(row) or sector_idx >= len(row):
+            continue
+        symbol = _clean_symbol(row[symbol_idx])
+        sector = _clean_text(row[sector_idx])
+        if not symbol or not sector:
+            continue
+        source = _clean_text(row[source_idx]) if source_idx >= 0 and source_idx < len(row) else ""
+        asof_date = _clean_text(row[asof_idx]) if asof_idx >= 0 and asof_idx < len(row) else ""
+        out[symbol] = {
+            "sector": sector,
+            "source_detail": source,
+            "asof_date": asof_date,
+        }
+    return out
+
+
+def _sector_from_equity_reference(symbol: str) -> str:
+    row = _load_equity_sector_reference().get(_clean_symbol(symbol)) or {}
+    return _clean_text(row.get("sector"))
+
+
+def seed_equity_sector_reference(con, *, symbols: Iterable[Any] | None = None) -> Dict[str, int]:
+    """Seed gov_symbol_sector_map from the checked-in PIT sector reference."""
+    ensure_gov_tables(con)
+    reference = _load_equity_sector_reference()
+    if symbols is None:
+        allowed_symbols = None
+    else:
+        allowed_symbols = {_clean_symbol(symbol) for symbol in symbols if _clean_symbol(symbol)}
+    now_ms = utc_now_ms()
+    counts = {
+        "reference_symbols": int(len(reference)),
+        "eligible_symbols": int(len(allowed_symbols) if allowed_symbols is not None else len(reference)),
+        "symbol_sectors": 0,
+    }
+    for symbol, row in sorted(reference.items()):
+        if allowed_symbols is not None and symbol not in allowed_symbols:
+            continue
+        sector = _clean_text(row.get("sector"))
+        if not symbol or not sector:
+            continue
+        meta = {
+            "source": _REFERENCE_SECTOR_SOURCE,
+            "source_detail": _clean_text(row.get("source_detail")),
+            "asof_date": _clean_text(row.get("asof_date")),
+        }
+        cur = con.execute(
+            """
+            INSERT INTO gov_symbol_sector_map(symbol, sector, source, updated_ts_ms, meta_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+              sector = excluded.sector,
+              source = excluded.source,
+              updated_ts_ms = excluded.updated_ts_ms,
+              meta_json = excluded.meta_json
+            WHERE COALESCE(gov_symbol_sector_map.source, '') IN ('', ?)
+            """,
+            (
+                symbol,
+                sector,
+                _REFERENCE_SECTOR_SOURCE,
+                int(now_ms),
+                _json_param(con, meta),
+                _REFERENCE_SECTOR_SOURCE,
+            ),
+        )
+        counts["symbol_sectors"] += int(getattr(cur, "rowcount", 0) or 0)
+    return counts
+
+
+def _is_equity_symbol_for_sector_report(con, symbol: str, asset_class: Any = None) -> bool:
+    stored_asset_class = str(asset_class or "").upper().strip()
+    if not stored_asset_class:
+        try:
+            row = con.execute("SELECT COALESCE(asset_class, '') FROM symbols WHERE symbol = ? LIMIT 1", (_clean_symbol(symbol),)).fetchone()
+            stored_asset_class = str(row[0] if row else "").upper().strip()
+        except Exception:
+            stored_asset_class = ""
+    if stored_asset_class == "EQUITY":
+        return True
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        return str(asset_class_for_symbol(_clean_symbol(symbol)) or "").upper().strip() == "EQUITY"
+    except Exception:
+        return False
+
+
+def _active_universe_symbols_for_sector_report(con, *, equity_only: bool = True) -> List[str]:
+    try:
+        rows = con.execute(
+            """
+            SELECT symbol, COALESCE(asset_class, '')
+            FROM symbols
+            WHERE status IN ('ACTIVE', 'WATCH')
+            ORDER BY symbol ASC
+            """
+        ).fetchall()
+    except Exception:
+        return []
+
+    out: List[str] = []
+    for symbol, asset_class in rows or []:
+        sym = _clean_symbol(symbol)
+        if not sym:
+            continue
+        if not equity_only:
+            out.append(sym)
+            continue
+        if _is_equity_symbol_for_sector_report(con, sym, asset_class):
+            out.append(sym)
+    return out
+
+
+def sector_coverage_report(
+    con,
+    *,
+    symbols: Iterable[Any] | None = None,
+    equity_only: bool = True,
+    unresolved_limit: int = 25,
+) -> Dict[str, Any]:
+    ensure_gov_tables(con)
+    if symbols is None:
+        symbol_list = _active_universe_symbols_for_sector_report(con, equity_only=bool(equity_only))
+        universe_source = "symbols_active_watch"
+    else:
+        symbol_list = [_clean_symbol(symbol) for symbol in symbols if _clean_symbol(symbol)]
+        universe_source = "explicit"
+
+    deduped = list(dict.fromkeys(symbol_list))
+    if equity_only:
+        deduped = [symbol for symbol in deduped if _is_equity_symbol_for_sector_report(con, symbol)]
+    resolved: Dict[str, str] = {}
+    unresolved: List[str] = []
+    for symbol in deduped:
+        sector = _clean_text(sector_for_symbol(con, symbol))
+        if sector:
+            resolved[symbol] = sector
+        else:
+            unresolved.append(symbol)
+    return {
+        "universe_source": universe_source,
+        "equity_only": bool(equity_only),
+        "total": int(len(deduped)),
+        "resolved": int(len(resolved)),
+        "unresolved": int(len(unresolved)),
+        "coverage": float(len(resolved) / len(deduped)) if deduped else 0.0,
+        "resolved_by_symbol": dict(sorted(resolved.items())),
+        "unresolved_symbols": unresolved[: max(0, int(unresolved_limit))],
+    }
+
+
 def seed_gov_conditioning_tables(con) -> Dict[str, int]:
     ensure_gov_tables(con)
     now_ms = utc_now_ms()
     counts = {"committee_sectors": 0, "member_committees": 0, "leadership": 0, "symbol_sectors": 0}
+    reference_counts = seed_equity_sector_reference(con)
+    counts["reference_symbol_sectors"] = int(reference_counts.get("symbol_sectors") or 0)
+    counts["symbol_sectors"] += int(reference_counts.get("symbol_sectors") or 0)
     for committee, sector, weight in DEFAULT_COMMITTEE_SECTOR_MAP:
         cur = con.execute(
             """
@@ -887,6 +1084,26 @@ def _symbol_sector_from_reference(con, symbol: str) -> str:
             row = None
         if row and _clean_text(row[0]):
             return _clean_text(row[0])
+    for table in ("security_master", "securities", "symbols"):
+        try:
+            row = con.execute(f"SELECT meta_json FROM {table} WHERE symbol = ? LIMIT 1", (symbol_key,)).fetchone()
+        except Exception:
+            row = None
+        if not row:
+            continue
+        try:
+            meta = json.loads(str(row[0] or "{}"))
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            continue
+        for key in ("sector", "gics_sector", "industry_sector", "sector_name"):
+            sector = _clean_text(meta.get(key))
+            if sector:
+                return sector
+    sector = _sector_from_equity_reference(symbol_key)
+    if sector:
+        return sector
     return ""
 
 
@@ -1294,5 +1511,8 @@ __all__ = [
     "put_quiver_gov_contract",
     "put_quiver_lobbying_filing",
     "resolve_gov_features",
+    "sector_coverage_report",
+    "sector_for_symbol",
+    "seed_equity_sector_reference",
     "seed_gov_conditioning_tables",
 ]

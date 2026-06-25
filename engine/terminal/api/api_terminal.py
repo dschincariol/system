@@ -18,6 +18,7 @@ from engine.api.http_parsing import qs as _qs
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.gates import execution_gate_snapshot
 from engine.runtime.storage import connect_ro
+from engine.terminal.api.price_reference import latest_terminal_price
 
 try:
     from engine.cache.wrappers.execution_mode import read_execution_mode as _get_execution_mode
@@ -188,6 +189,177 @@ def _find_number(payload: Any, keys: set[str], *, depth: int = 0) -> Optional[fl
             if found is not None:
                 return found
     return None
+
+
+def _find_numeric(payload: Any, keys: set[str], *, depth: int = 0, positive_only: bool = False) -> Optional[float]:
+    if depth > 5:
+        return None
+    normalized = {str(key or "").strip().lower() for key in keys}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_norm = str(key or "").strip().lower()
+            if key_norm in normalized:
+                found = _safe_float(value, None)
+                if found is not None and (not positive_only or found > 0):
+                    return found
+        for value in payload.values():
+            found = _find_numeric(value, normalized, depth=depth + 1, positive_only=positive_only)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_numeric(item, normalized, depth=depth + 1, positive_only=positive_only)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_text(payload: Any, keys: set[str], *, depth: int = 0) -> str:
+    if depth > 5:
+        return ""
+    normalized = {str(key or "").strip().lower() for key in keys}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_norm = str(key or "").strip().lower()
+            if key_norm in normalized and value not in (None, ""):
+                return str(value).strip()
+        for value in payload.values():
+            found = _find_text(value, normalized, depth=depth + 1)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_text(item, normalized, depth=depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def _humanize_reason(value: Any, fallback: str = "") -> str:
+    text = str(value or fallback or "").strip()
+    if not text:
+        return ""
+    text = text.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip().capitalize()
+
+
+def _compact_lineage(row: Dict[str, Any]) -> Dict[str, Any]:
+    lineage = {}
+    for key in (
+        "client_order_id",
+        "source_order_id",
+        "portfolio_orders_id",
+        "portfolio_order_id",
+        "source_alert_id",
+        "prediction_id",
+        "fill_id",
+    ):
+        value = row.get(key)
+        if value not in (None, ""):
+            lineage[key] = value
+    return lineage
+
+
+def _status_from_order_state(state: Any, updated_ts_ms: Any = None, ttl_ms: Any = None, *, now_ms: Optional[int] = None) -> Dict[str, str]:
+    text = str(state or "").strip()
+    lower = text.lower()
+    ttl = _safe_int(ttl_ms, 0)
+    updated = _safe_int(updated_ts_ms, 0)
+    now = int(now_ms or int(time.time() * 1000))
+    if ttl > 0 and updated > 0 and updated + ttl < now and not any(token in lower for token in ("filled", "cancel", "reject", "suppress")):
+        return {"status_bucket": "stale", "status_label": "Stale"}
+    if "reject" in lower:
+        return {"status_bucket": "rejected", "status_label": "Rejected"}
+    if "suppress" in lower or "blocked" in lower:
+        return {"status_bucket": "suppressed", "status_label": "Suppressed"}
+    if "partial" in lower:
+        return {"status_bucket": "partial", "status_label": "Partial"}
+    if "fill" in lower or "complete" in lower or lower == "done":
+        return {"status_bucket": "filled", "status_label": "Filled"}
+    if "cancel" in lower:
+        return {"status_bucket": "canceled", "status_label": "Canceled"}
+    return {"status_bucket": "active", "status_label": text.title() if text else "Active"}
+
+
+def _signed_bps(fill_px: Any, benchmark_px: Any, qty: Any = None, side: Any = None) -> Optional[float]:
+    fill = _safe_float(fill_px, None)
+    benchmark = _safe_float(benchmark_px, None)
+    if fill is None or benchmark is None or benchmark <= 0:
+        return None
+    side_text = str(side or "").upper().strip()
+    if side_text in ("SELL", "SHORT"):
+        direction = -1.0
+    elif side_text in ("BUY", "LONG"):
+        direction = 1.0
+    else:
+        q = _safe_float(qty, 0.0) or 0.0
+        direction = 1.0 if q >= 0 else -1.0
+    return float(((fill - benchmark) / benchmark) * 10000.0 * direction)
+
+
+def _weighted_avg(values: List[tuple[Optional[float], float]]) -> Optional[float]:
+    total_weight = 0.0
+    total = 0.0
+    for value, weight in values:
+        if value is None:
+            continue
+        w = abs(float(weight or 0.0))
+        if w <= 0:
+            continue
+        total += float(value) * w
+        total_weight += w
+    if total_weight <= 0:
+        return None
+    return float(total / total_weight)
+
+
+def _extract_tca_fields(row: Dict[str, Any], *payloads: Any) -> Dict[str, Any]:
+    payload_list = [payload for payload in payloads if isinstance(payload, (dict, list))]
+    expected = (
+        _safe_float(row.get("expected_price"), None)
+        or _safe_float(row.get("expected_px"), None)
+        or _find_numeric(payload_list, {"expected_price", "expected_px", "expected_fill_price"}, positive_only=True)
+    )
+    arrival = (
+        _safe_float(row.get("arrival_price"), None)
+        or _safe_float(row.get("arrival_px"), None)
+        or _safe_float(row.get("mid_px"), None)
+        or _find_numeric(payload_list, {"arrival_price", "arrival_px", "decision_price", "decision_px", "mid_px", "reference_px", "ref_px"}, positive_only=True)
+    )
+    decision = (
+        _safe_float(row.get("decision_price"), None)
+        or _safe_float(row.get("decision_px"), None)
+        or _find_numeric(payload_list, {"decision_price", "decision_px", "arrival_price", "arrival_px", "reference_px", "ref_px"}, positive_only=True)
+    )
+    px = _safe_float(row.get("fill_px"), _safe_float(row.get("px"), None))
+    fill_vwap = (
+        _safe_float(row.get("fill_vwap"), None)
+        or _safe_float(row.get("vwap_px"), None)
+        or _find_numeric(payload_list, {"fill_vwap", "fill_vwap_px", "vwap_px", "avg_fill_px"}, positive_only=True)
+        or px
+    )
+    slippage = _safe_float(row.get("slippage_bps"), None)
+    if slippage is None:
+        slippage = _find_numeric(payload_list, {"slippage_bps", "expected_slippage_bps"})
+    if slippage is None:
+        slippage = _signed_bps(fill_vwap, expected, row.get("qty") or row.get("fill_qty"), row.get("side"))
+    shortfall = _safe_float(row.get("implementation_shortfall_bps"), None)
+    if shortfall is None:
+        shortfall = _find_numeric(payload_list, {"implementation_shortfall_bps", "implementation_shortfall", "shortfall_bps"})
+    if shortfall is None:
+        shortfall = _signed_bps(fill_vwap, arrival, row.get("qty") or row.get("fill_qty"), row.get("side"))
+    return {
+        "arrival_price": arrival,
+        "arrival_px": arrival,
+        "decision_price": decision,
+        "decision_px": decision,
+        "expected_price": expected,
+        "expected_px": expected,
+        "fill_vwap": fill_vwap,
+        "fill_vwap_px": fill_vwap,
+        "slippage_bps": slippage,
+        "implementation_shortfall_bps": shortfall,
+    }
 
 
 def _add_marker(markers: List[Dict[str, Any]], **kwargs: Any) -> None:
@@ -418,6 +590,25 @@ def _terminal_execution_barrier_snapshot() -> Dict[str, Any]:
     }
 
 
+def _terminal_price_reference(parsed: Any) -> Dict[str, Any]:
+    try:
+        symbol = str(_qs(parsed, "symbol", "") or "").strip().upper()
+    except Exception:
+        symbol = ""
+    if not symbol:
+        return {"ok": False, "error": "missing_symbol", "source": "prices"}
+    con = connect_ro()
+    try:
+        return latest_terminal_price(
+            con,
+            symbol,
+            table_exists_fn=_table_exists,
+            warn_fn=_warn_nonfatal,
+        )
+    finally:
+        con.close()
+
+
 def api_get_terminal_watchlist(_parsed: Any, _ctx=None) -> Dict[str, Any]:
     con = connect_ro()
     try:
@@ -552,38 +743,110 @@ def api_get_terminal_orders(parsed: Any, _ctx=None) -> Dict[str, Any]:
         # Merge broker-facing state with portfolio intent rows. They represent
         # different stages of the order lifecycle, so the API returns both instead
         # of pretending there is a single authoritative table.
-        # Merge: broker_order_state + portfolio_orders (best effort)
-        out = {"broker": [], "portfolio": [], "rejected": []}
+        # Merge: broker_order_state + portfolio_orders + rejected/suppressed intents.
+        now_ms = int(time.time() * 1000)
+        out = {"broker": [], "portfolio": [], "rejected": [], "suppressed": []}
 
         if _table_exists(con, "broker_order_state"):
             try:
+                cols = _table_columns(con, "broker_order_state")
+                select = ", ".join([
+                    _column_expr(cols, ["id"], "id", "NULL"),
+                    _column_expr(cols, ["source_order_id"], "source_order_id", "NULL"),
+                    _column_expr(cols, ["client_order_id"], "client_order_id", "NULL"),
+                    _column_expr(cols, ["symbol"], "symbol", "''"),
+                    _column_expr(cols, ["state", "status"], "state", "'UNKNOWN'"),
+                    _column_expr(cols, ["created_ts_ms", "ts_ms"], "created_ts_ms", "0"),
+                    _column_expr(cols, ["updated_ts_ms", "ts_ms"], "updated_ts_ms", "0"),
+                    _column_expr(cols, ["ttl_ms"], "ttl_ms", "0"),
+                    _column_expr(cols, ["meta_json", "extra_json", "raw_json"], "meta_json", "NULL"),
+                ])
+                ts_order = "updated_ts_ms" if "updated_ts_ms" in cols else ("ts_ms" if "ts_ms" in cols else "id")
                 rows = con.execute(
-                    """
-                    SELECT id, source_order_id, symbol, state, created_ts_ms, updated_ts_ms, ttl_ms, meta_json
+                    f"""
+                    SELECT {select}
                       FROM broker_order_state
-                     ORDER BY updated_ts_ms DESC
+                     ORDER BY {ts_order} DESC
                      LIMIT ?
                     """,
                     (int(limit),),
                 ).fetchall()
-                out["broker"] = _rows_to_dicts(rows)
-            except Exception:
+                broker_rows = []
+                for row in _rows_to_dicts(rows):
+                    meta = _json_loads(row.get("meta_json")) or {}
+                    status = _status_from_order_state(row.get("state"), row.get("updated_ts_ms"), row.get("ttl_ms"), now_ms=now_ms)
+                    reason_code = _find_text(meta, {"reason_code", "rejection_reason_code", "suppression_reason_code", "blocked_by"})
+                    reason = _find_text(meta, {"reason", "rejection_reason", "suppression_reason", "message", "explanation"})
+                    normalized = {
+                        **row,
+                        "kind": "broker",
+                        "symbol": str(row.get("symbol") or "").upper().strip(),
+                        "state": str(row.get("state") or status["status_label"]).upper(),
+                        "action": str(row.get("state") or status["status_label"]).upper(),
+                        "client_order_id": str(row.get("client_order_id") or row.get("source_order_id") or "").strip(),
+                        "reason_code": _stable_reason_code(reason_code, status["status_bucket"]) if reason_code else "",
+                        "reason": reason or "",
+                        **status,
+                    }
+                    normalized.update(_extract_tca_fields(normalized, meta))
+                    normalized["lineage_ids"] = _compact_lineage(normalized)
+                    broker_rows.append(normalized)
+                out["broker"] = broker_rows
+            except Exception as e:
+                _warn_nonfatal("API_TERMINAL_BROKER_ORDERS_READ_FAILED", e, once_key="terminal_broker_orders_read")
                 out["broker"] = []
 
         if _table_exists(con, "portfolio_orders"):
             try:
+                cols = _table_columns(con, "portfolio_orders")
+                select = ", ".join([
+                    _column_expr(cols, ["id"], "id", "NULL"),
+                    _column_expr(cols, ["ts_ms"], "ts_ms", "0"),
+                    _column_expr(cols, ["model_id"], "model_id", "NULL"),
+                    _column_expr(cols, ["symbol"], "symbol", "''"),
+                    _column_expr(cols, ["action"], "action", "'INTENT'"),
+                    _column_expr(cols, ["from_side"], "from_side", "NULL"),
+                    _column_expr(cols, ["to_side"], "to_side", "NULL"),
+                    _column_expr(cols, ["from_weight"], "from_weight", "0"),
+                    _column_expr(cols, ["to_weight"], "to_weight", "0"),
+                    _column_expr(cols, ["delta_weight"], "delta_weight", "0"),
+                    _column_expr(cols, ["source_alert_id"], "source_alert_id", "NULL"),
+                    _column_expr(cols, ["explain_json", "extra_json"], "explain_json", "NULL"),
+                ])
                 rows = con.execute(
-                    """
-                    SELECT id, ts_ms, model_id, symbol, action, from_side, to_side,
-                           from_weight, to_weight, delta_weight, source_alert_id
+                    f"""
+                    SELECT {select}
                       FROM portfolio_orders
                      ORDER BY ts_ms DESC
                      LIMIT ?
                     """,
                     (int(limit),),
                 ).fetchall()
-                out["portfolio"] = _rows_to_dicts(rows)
-            except Exception:
+                portfolio_rows = []
+                for row in _rows_to_dicts(rows):
+                    explain = _json_loads(row.get("explain_json")) or {}
+                    side = _side_from_payload(row, explain)
+                    qty = _safe_float((explain.get("terminal_order") or {}).get("qty") if isinstance(explain, dict) else None, None)
+                    normalized = {
+                        **row,
+                        "kind": "portfolio",
+                        "symbol": str(row.get("symbol") or "").upper().strip(),
+                        "side": side,
+                        "qty": qty,
+                        "state": str(row.get("action") or "INTENT").upper(),
+                        "status_bucket": "active",
+                        "status_label": "Intent",
+                        "client_order_id": f"portfolio:{row.get('id')}" if row.get("id") not in (None, "") else "",
+                        "updated_ts_ms": _safe_int(row.get("ts_ms"), 0),
+                        "reason_code": "",
+                        "reason": "",
+                    }
+                    normalized.update(_extract_tca_fields(normalized, explain))
+                    normalized["lineage_ids"] = _compact_lineage(normalized)
+                    portfolio_rows.append(normalized)
+                out["portfolio"] = portfolio_rows
+            except Exception as e:
+                _warn_nonfatal("API_TERMINAL_PORTFOLIO_ORDERS_READ_FAILED", e, once_key="terminal_portfolio_orders_read")
                 out["portfolio"] = []
 
         if _table_exists(con, "terminal_intent_rejections"):
@@ -611,8 +874,13 @@ def api_get_terminal_orders(parsed: Any, _ctx=None) -> Dict[str, Any]:
                             "action": "REJECTED",
                             "reason_code": str(row[5] or "rejected"),
                             "reason": str(row[6] or "Terminal request rejected."),
+                            "rejection_reason_code": str(row[5] or "rejected"),
+                            "rejection_reason": str(row[6] or "Terminal request rejected."),
+                            "status_bucket": "rejected",
+                            "status_label": "Rejected",
                             "source": str(row[7] or "terminal"),
                             "detail_json": str(row[8] or "{}"),
+                            "lineage_ids": {"rejection_id": row[0]},
                         })
                     except Exception as e:
                         _warn_nonfatal("API_TERMINAL_REJECTION_ROW_PARSE_FAILED", e, once_key="terminal_rejection_row")
@@ -621,9 +889,221 @@ def api_get_terminal_orders(parsed: Any, _ctx=None) -> Dict[str, Any]:
                 _warn_nonfatal("API_TERMINAL_REJECTIONS_READ_FAILED", e, once_key="terminal_rejections_read")
                 out["rejected"] = []
 
+        if _table_exists(con, "trade_attribution_ledger"):
+            try:
+                cols = _table_columns(con, "trade_attribution_ledger")
+                if {"symbol", "ts_ms", "suppression_reason"}.issubset(cols):
+                    select = ", ".join([
+                        _column_expr(cols, ["id"], "id", "NULL"),
+                        _column_expr(cols, ["ts_ms"], "ts_ms", "0"),
+                        _column_expr(cols, ["symbol"], "symbol", "''"),
+                        _column_expr(cols, ["source_alert_id"], "source_alert_id", "NULL"),
+                        _column_expr(cols, ["model_id"], "model_id", "NULL"),
+                        _column_expr(cols, ["signal_json"], "signal_json", "NULL"),
+                        _column_expr(cols, ["execution_policy_json"], "execution_policy_json", "NULL"),
+                        _column_expr(cols, ["decision_json"], "decision_json", "NULL"),
+                        _column_expr(cols, ["suppression_reason"], "suppression_reason", "NULL"),
+                        _column_expr(cols, ["expected_price"], "expected_price", "NULL"),
+                        _column_expr(cols, ["fill_price"], "fill_price", "NULL"),
+                    ])
+                    rows = con.execute(
+                        f"""
+                        SELECT {select}
+                          FROM trade_attribution_ledger
+                         WHERE suppression_reason IS NOT NULL
+                           AND TRIM(suppression_reason) != ''
+                         ORDER BY ts_ms DESC
+                         LIMIT ?
+                        """,
+                        (int(limit),),
+                    ).fetchall() or []
+                    suppressed = []
+                    for row in _rows_to_dicts(rows):
+                        signal = _json_loads(row.get("signal_json")) or {}
+                        policy = _json_loads(row.get("execution_policy_json")) or {}
+                        decision = _json_loads(row.get("decision_json")) or {}
+                        reason = str(row.get("suppression_reason") or "Suppressed by execution policy.").strip()
+                        reason_code = _stable_reason_code(reason, "suppressed")
+                        side = _side_from_payload(signal, decision, policy)
+                        qty = _safe_float((signal.get("qty") if isinstance(signal, dict) else None), None)
+                        normalized = {
+                            "id": row.get("id"),
+                            "ts_ms": _safe_int(row.get("ts_ms"), 0),
+                            "updated_ts_ms": _safe_int(row.get("ts_ms"), 0),
+                            "symbol": str(row.get("symbol") or "").upper().strip(),
+                            "side": side,
+                            "qty": qty,
+                            "state": "SUPPRESSED",
+                            "action": "SUPPRESSED",
+                            "kind": "suppressed",
+                            "status_bucket": "suppressed",
+                            "status_label": "Suppressed",
+                            "reason_code": reason_code,
+                            "reason": reason,
+                            "suppression_reason_code": reason_code,
+                            "suppression_reason": reason,
+                            "source": "trade_attribution_ledger",
+                            "source_alert_id": row.get("source_alert_id"),
+                            "model_id": row.get("model_id"),
+                            "client_order_id": f"suppressed:{row.get('id')}" if row.get("id") not in (None, "") else "",
+                        }
+                        normalized.update(_extract_tca_fields(normalized, row, signal, policy, decision))
+                        normalized["expected_price"] = normalized.get("expected_price") or _safe_float(row.get("expected_price"), None)
+                        normalized["fill_price"] = _safe_float(row.get("fill_price"), None)
+                        normalized["lineage_ids"] = _compact_lineage(normalized)
+                        suppressed.append(normalized)
+                    out["suppressed"] = suppressed
+            except Exception as e:
+                _warn_nonfatal("API_TERMINAL_SUPPRESSED_INTENTS_READ_FAILED", e, once_key="terminal_suppressed_intents_read")
+                out["suppressed"] = []
+
+        all_rows = []
+        for bucket in ("broker", "portfolio", "rejected", "suppressed"):
+            for row in out.get(bucket) or []:
+                merged = dict(row)
+                merged.setdefault("kind", bucket[:-1] if bucket.endswith("s") else bucket)
+                all_rows.append(merged)
+        all_rows.sort(key=lambda row: _safe_int(row.get("updated_ts_ms") or row.get("ts_ms"), 0), reverse=True)
+        out["all"] = all_rows[: int(limit)]
+        out["summary"] = {
+            "total": int(len(all_rows)),
+            "active": int(sum(1 for row in all_rows if row.get("status_bucket") == "active")),
+            "rejected": int(sum(1 for row in all_rows if row.get("status_bucket") == "rejected")),
+            "suppressed": int(sum(1 for row in all_rows if row.get("status_bucket") == "suppressed")),
+            "filled": int(sum(1 for row in all_rows if row.get("status_bucket") == "filled")),
+            "partial": int(sum(1 for row in all_rows if row.get("status_bucket") == "partial")),
+            "canceled": int(sum(1 for row in all_rows if row.get("status_bucket") == "canceled")),
+            "stale": int(sum(1 for row in all_rows if row.get("status_bucket") == "stale")),
+        }
+
         return {"ok": True, "data": out}
     finally:
         _close_ro_connection(con)
+
+
+def _normalize_terminal_fill(row: Dict[str, Any], *, source_table: str) -> Dict[str, Any]:
+    meta = _json_loads(row.get("meta_json")) or {}
+    qty = _safe_float(row.get("qty") or row.get("fill_qty"), 0.0) or 0.0
+    px = _safe_float(row.get("px") or row.get("fill_px"), None)
+    side = str(row.get("side") or "").upper().strip()
+    if side not in ("BUY", "SELL"):
+        side = "BUY" if qty >= 0 else "SELL"
+    normalized = {
+        **row,
+        "source_table": source_table,
+        "ts_ms": _safe_int(row.get("ts_ms") or row.get("fill_ts_ms"), 0),
+        "fill_ts_ms": _safe_int(row.get("fill_ts_ms") or row.get("ts_ms"), 0),
+        "symbol": str(row.get("symbol") or "").upper().strip(),
+        "qty": qty,
+        "fill_qty": qty,
+        "px": px,
+        "fill_px": px,
+        "side": side,
+        "client_order_id": str(row.get("client_order_id") or row.get("source_order_id") or "").strip(),
+        "source_order_id": row.get("source_order_id") or row.get("client_order_id"),
+        "fill_id": row.get("fill_id") or row.get("id"),
+        "status_bucket": "filled",
+        "status_label": "Filled",
+        "state": "FILLED",
+    }
+    normalized.update(_extract_tca_fields(normalized, meta))
+    normalized["fees"] = _safe_float(row.get("fees"), _safe_float(row.get("commission"), None))
+    normalized["lineage_ids"] = _compact_lineage(normalized)
+    return normalized
+
+
+def _aggregate_terminal_fills(rows: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = str(row.get("client_order_id") or row.get("source_order_id") or f"fill:{row.get('id')}").strip()
+        groups.setdefault(key or f"fill:{len(groups)}", []).append(row)
+
+    aggregates: List[Dict[str, Any]] = []
+    all_weights: List[float] = []
+    all_slippage: List[tuple[Optional[float], float]] = []
+    all_shortfall: List[tuple[Optional[float], float]] = []
+    total_fees = 0.0
+    partial_orders = 0
+
+    for client_order_id, children in groups.items():
+        children_sorted = sorted(children, key=lambda row: _safe_int(row.get("ts_ms"), 0), reverse=True)
+        abs_qty = sum(abs(_safe_float(row.get("qty"), 0.0) or 0.0) for row in children_sorted)
+        signed_qty = sum(_safe_float(row.get("qty"), 0.0) or 0.0 for row in children_sorted)
+        fill_vwap = None
+        if abs_qty > 0:
+            weighted_px = sum((abs(_safe_float(row.get("qty"), 0.0) or 0.0) * (_safe_float(row.get("px"), 0.0) or 0.0)) for row in children_sorted)
+            fill_vwap = float(weighted_px / abs_qty)
+        latest = children_sorted[0] if children_sorted else {}
+        fill_count = len(children_sorted)
+        status_bucket = "partial" if fill_count > 1 else "filled"
+        if status_bucket == "partial":
+            partial_orders += 1
+        child_summary = [
+            {
+                "id": child.get("id"),
+                "fill_id": child.get("fill_id"),
+                "ts_ms": child.get("ts_ms"),
+                "qty": child.get("qty"),
+                "px": child.get("px"),
+                "slippage_bps": child.get("slippage_bps"),
+                "implementation_shortfall_bps": child.get("implementation_shortfall_bps"),
+            }
+            for child in children_sorted
+        ]
+        weights = [abs(_safe_float(row.get("qty"), 0.0) or 0.0) for row in children_sorted]
+        slippage = _weighted_avg([(_safe_float(row.get("slippage_bps"), None), weight) for row, weight in zip(children_sorted, weights)])
+        shortfall = _weighted_avg([(_safe_float(row.get("implementation_shortfall_bps"), None), weight) for row, weight in zip(children_sorted, weights)])
+        expected = _weighted_avg([(_safe_float(row.get("expected_price"), None), weight) for row, weight in zip(children_sorted, weights)])
+        arrival = _weighted_avg([(_safe_float(row.get("arrival_price"), None), weight) for row, weight in zip(children_sorted, weights)])
+        decision = _weighted_avg([(_safe_float(row.get("decision_price"), None), weight) for row, weight in zip(children_sorted, weights)])
+        fees = sum(_safe_float(row.get("fees"), 0.0) or 0.0 for row in children_sorted)
+        total_fees += fees
+        all_weights.extend(weights)
+        all_slippage.extend([(_safe_float(row.get("slippage_bps"), None), weight) for row, weight in zip(children_sorted, weights)])
+        all_shortfall.extend([(_safe_float(row.get("implementation_shortfall_bps"), None), weight) for row, weight in zip(children_sorted, weights)])
+        aggregate = {
+            **latest,
+            "id": latest.get("id"),
+            "client_order_id": client_order_id,
+            "source_order_id": latest.get("source_order_id") or client_order_id,
+            "ts_ms": max((_safe_int(row.get("ts_ms"), 0) for row in children_sorted), default=0),
+            "symbol": str(latest.get("symbol") or "").upper().strip(),
+            "qty": signed_qty,
+            "fill_qty": signed_qty,
+            "px": fill_vwap,
+            "fill_px": fill_vwap,
+            "fill_vwap": fill_vwap,
+            "fill_vwap_px": fill_vwap,
+            "expected_price": expected,
+            "expected_px": expected,
+            "arrival_price": arrival,
+            "arrival_px": arrival,
+            "decision_price": decision,
+            "decision_px": decision,
+            "slippage_bps": slippage,
+            "implementation_shortfall_bps": shortfall,
+            "fees": fees,
+            "fill_count": fill_count,
+            "child_fill_count": fill_count,
+            "child_fills": child_summary,
+            "status_bucket": status_bucket,
+            "status_label": "Partial fills" if status_bucket == "partial" else "Filled",
+            "state": "PARTIAL" if status_bucket == "partial" else "FILLED",
+        }
+        aggregate["lineage_ids"] = _compact_lineage(aggregate)
+        aggregates.append(aggregate)
+
+    aggregates.sort(key=lambda row: _safe_int(row.get("ts_ms"), 0), reverse=True)
+    summary = {
+        "raw_fills": int(len(rows)),
+        "orders": int(len(aggregates)),
+        "partial_orders": int(partial_orders),
+        "filled_orders": int(max(0, len(aggregates) - partial_orders)),
+        "total_fees": float(total_fees),
+        "avg_slippage_bps": _weighted_avg(all_slippage),
+        "avg_implementation_shortfall_bps": _weighted_avg(all_shortfall),
+    }
+    return aggregates, summary
 
 
 def api_get_terminal_fills(parsed: Any, _ctx=None) -> Dict[str, Any]:
@@ -639,17 +1119,48 @@ def api_get_terminal_fills(parsed: Any, _ctx=None) -> Dict[str, Any]:
             limit = 1000
 
         rows = []
-        fills_table = "broker_fills_v2" if _table_exists(con, "broker_fills_v2") else ("broker_fills" if _table_exists(con, "broker_fills") else None)
+        fills_table = (
+            "execution_fills"
+            if _table_exists(con, "execution_fills")
+            else ("broker_fills_v2" if _table_exists(con, "broker_fills_v2") else ("broker_fills" if _table_exists(con, "broker_fills") else None))
+        )
 
         if fills_table:
             try:
+                cols = _table_columns(con, fills_table)
+                ts_candidates = ["fill_ts_ms", "ts_ms"]
+                ts_col = "fill_ts_ms" if "fill_ts_ms" in cols else ("ts_ms" if "ts_ms" in cols else "id")
+                select = ", ".join([
+                    _column_expr(cols, ["id"], "id", "NULL"),
+                    _column_expr(cols, ts_candidates, "ts_ms", "0"),
+                    _column_expr(cols, ["fill_ts_ms", "ts_ms"], "fill_ts_ms", "0"),
+                    _column_expr(cols, ["symbol"], "symbol", "''"),
+                    _column_expr(cols, ["fill_qty", "qty"], "qty", "0"),
+                    _column_expr(cols, ["fill_px", "px", "price"], "px", "NULL"),
+                    _column_expr(cols, ["client_order_id"], "client_order_id", "NULL"),
+                    _column_expr(cols, ["source_order_id", "portfolio_orders_id"], "source_order_id", "NULL"),
+                    _column_expr(cols, ["fill_id"], "fill_id", "NULL"),
+                    _column_expr(cols, ["side"], "side", "NULL"),
+                    _column_expr(cols, ["broker"], "broker", "NULL"),
+                    _column_expr(cols, ["portfolio_orders_id"], "portfolio_orders_id", "NULL"),
+                    _column_expr(cols, ["source_alert_id"], "source_alert_id", "NULL"),
+                    _column_expr(cols, ["prediction_id"], "prediction_id", "NULL"),
+                    _column_expr(cols, ["expected_px", "expected_price"], "expected_px", "NULL"),
+                    _column_expr(cols, ["mid_px", "arrival_px", "arrival_price"], "mid_px", "NULL"),
+                    _column_expr(cols, ["slippage_bps"], "slippage_bps", "NULL"),
+                    _column_expr(cols, ["spread_bps"], "spread_bps", "NULL"),
+                    _column_expr(cols, ["fees", "commission"], "fees", "NULL"),
+                    _column_expr(cols, ["commission"], "commission", "NULL"),
+                    _column_expr(cols, ["note"], "note", "NULL"),
+                    _column_expr(cols, ["extra_json", "explain_json", "raw_json"], "meta_json", "NULL"),
+                ])
                 if symbol:
                     rows = con.execute(
                         f"""
-                        SELECT id, ts_ms, symbol, qty, px, source_order_id, note, explain_json
+                        SELECT {select}
                           FROM {fills_table}
-                         WHERE symbol=?
-                         ORDER BY ts_ms DESC
+                         WHERE UPPER(symbol)=?
+                         ORDER BY {ts_col} DESC
                          LIMIT ?
                         """,
                         (str(symbol), int(limit)),
@@ -657,17 +1168,32 @@ def api_get_terminal_fills(parsed: Any, _ctx=None) -> Dict[str, Any]:
                 else:
                     rows = con.execute(
                         f"""
-                        SELECT id, ts_ms, symbol, qty, px, source_order_id, note, explain_json
+                        SELECT {select}
                           FROM {fills_table}
-                         ORDER BY ts_ms DESC
+                         ORDER BY {ts_col} DESC
                          LIMIT ?
                         """,
                         (int(limit),),
                     ).fetchall()
-            except Exception:
+            except Exception as e:
+                _warn_nonfatal("API_TERMINAL_FILLS_READ_FAILED", e, once_key=f"terminal_fills_read_{fills_table}", table=fills_table)
                 rows = []
 
-        return {"ok": True, "rows": _rows_to_dicts(rows)}
+        raw_rows = [_normalize_terminal_fill(row, source_table=str(fills_table or "")) for row in _rows_to_dicts(rows)]
+        aggregate_rows, summary = _aggregate_terminal_fills(raw_rows)
+        return {
+            "ok": True,
+            "rows": aggregate_rows,
+            "aggregates": aggregate_rows,
+            "raw_rows": raw_rows,
+            "summary": summary,
+            "meta": {
+                "source_table": fills_table,
+                "aggregation": "client_order_id",
+                "raw_count": int(len(raw_rows)),
+                "aggregate_count": int(len(aggregate_rows)),
+            },
+        }
     finally:
         _close_ro_connection(con)
 
@@ -1459,6 +1985,7 @@ def api_get_terminal_snapshot(parsed: Any, _ctx=None) -> Dict[str, Any]:
     ords = api_get_terminal_orders(parsed, _ctx)
     fills = api_get_terminal_fills(parsed, _ctx)
     eq = api_get_terminal_equity(parsed, _ctx)
+    price_reference = _terminal_price_reference(parsed)
 
     return {
         "ok": True,
@@ -1468,6 +1995,10 @@ def api_get_terminal_snapshot(parsed: Any, _ctx=None) -> Dict[str, Any]:
         "positions": (pos.get("rows") if isinstance(pos, dict) else []),
         "orders": (ords.get("data") if isinstance(ords, dict) else {"broker": [], "portfolio": []}),
         "fills": (fills.get("rows") if isinstance(fills, dict) else []),
+        "fills_raw": (fills.get("raw_rows") if isinstance(fills, dict) else []),
+        "fills_summary": (fills.get("summary") if isinstance(fills, dict) else {}),
+        "orders_summary": ((ords.get("data") or {}).get("summary") if isinstance(ords, dict) else {}),
         "equity": {"account": eq.get("account"), "series": eq.get("series")} if isinstance(eq, dict) else {"account": None, "series": []},
+        "price_reference": price_reference,
         "execution_barrier": barrier,
     }

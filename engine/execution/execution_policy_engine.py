@@ -47,6 +47,9 @@ from engine.execution.execution_decision_engine import (
     decide_execution_strategy,
     load_execution_feedback_snapshot,
 )
+from engine.data.asset_map import asset_class_for_symbol
+from engine.execution.crypto_session import crypto_timing_adjustment
+from engine.execution.equity_session import equity_session_state, equity_timing_adjustment
 from engine.execution.fx_session import fx_timing_adjustment
 from engine.execution.lob_simulation import (
     deeplob_shadow_enabled,
@@ -106,6 +109,7 @@ DEFAULT_TTL_MS = int(os.environ.get("EPE_DEFAULT_TTL_MS", str(5 * 60 * 1000)))
 DEFAULT_HALF_LIFE_MS = int(os.environ.get("EPE_DEFAULT_HALF_LIFE_MS", str(90 * 1000)))
 
 STRICT_SIGNAL_TS = os.environ.get("EPE_STRICT_SIGNAL_TS", "1") == "1"
+EPE_EQUITY_SESSION_ENFORCE = os.environ.get("EPE_EQUITY_SESSION_ENFORCE", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 PASSIVE_MIN_ALPHA = float(os.environ.get("EPE_PASSIVE_MIN_ALPHA", "0.70"))
 NEUTRAL_MIN_ALPHA = float(os.environ.get("EPE_NEUTRAL_MIN_ALPHA", "0.40"))
@@ -604,6 +608,29 @@ def _attach_fx_session_metadata(row: Dict[str, Any], execution_decision: Dict[st
         row["fx_session_reason"] = str(execution_decision.get("fx_session_reason"))
 
 
+def _attach_crypto_session_metadata(row: Dict[str, Any], execution_decision: Dict[str, Any]) -> None:
+    crypto_session = execution_decision.get("crypto_session")
+    if not isinstance(crypto_session, dict):
+        return
+    row["crypto_session"] = dict(crypto_session)
+    row["crypto_session_blocked"] = bool(execution_decision.get("crypto_session_blocked", False))
+    if execution_decision.get("crypto_session_reason"):
+        row["crypto_session_reason"] = str(execution_decision.get("crypto_session_reason"))
+
+
+def _attach_equity_session_metadata(row: Dict[str, Any], execution_decision: Dict[str, Any]) -> None:
+    equity_session = execution_decision.get("equity_session")
+    if not isinstance(equity_session, dict):
+        return
+    row["equity_session"] = dict(equity_session)
+    row["equity_session_blocked"] = bool(execution_decision.get("equity_session_blocked", False))
+    row["equity_out_of_session_mark"] = bool(execution_decision.get("equity_out_of_session_mark", False))
+    if "equity_session_timing_bias" in execution_decision:
+        row["equity_session_timing_bias"] = bool(execution_decision.get("equity_session_timing_bias"))
+    if execution_decision.get("equity_session_reason"):
+        row["equity_session_reason"] = str(execution_decision.get("equity_session_reason"))
+
+
 def apply_execution_policy(
     orders: Optional[List[Dict[str, Any]]] = None,
     *,
@@ -835,6 +862,47 @@ def apply_execution_policy(
                 )
                 continue
 
+            equity_session_info: Dict[str, Any] = {}
+            equity_session_applies = False
+            equity_session_pre_block: Dict[str, Any] | None = None
+            if bool(EPE_EQUITY_SESSION_ENFORCE):
+                try:
+                    equity_session_applies = bool(asset_class_for_symbol(symbol) == "EQUITY")
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_EQUITY_CLASSIFICATION_FAILED",
+                        e,
+                        once_key=f"equity_classification:{symbol}",
+                        symbol=str(symbol),
+                    )
+                    equity_session_applies = False
+                if equity_session_applies:
+                    try:
+                        equity_session_info = equity_session_state(str(symbol), int(now_ms))
+                    except Exception as e:
+                        _warn_nonfatal(
+                            "EXECUTION_POLICY_ENGINE_EQUITY_SESSION_STATE_FAILED",
+                            e,
+                            once_key=f"equity_session_state:{symbol}",
+                            symbol=str(symbol),
+                        )
+                        equity_session_info = {}
+                    unknown_policy = str(equity_session_info.get("unknown_year_policy") or "").strip().lower()
+                    fail_closed_unknown = (
+                        not bool(equity_session_info.get("holiday_table_covered", True))
+                        and unknown_policy in {"fail_closed", "closed", "block"}
+                    )
+                    uncovered_open_policy = (
+                        not bool(equity_session_info.get("holiday_table_covered", True))
+                        and not fail_closed_unknown
+                    )
+                    if bool(fail_closed_unknown) or (equity_session_info and not bool(equity_session_info.get("is_open")) and not bool(uncovered_open_policy)):
+                        reason_state = "holiday_table_uncovered" if bool(fail_closed_unknown) else str(equity_session_info.get("session") or "closed")
+                        equity_session_pre_block = {
+                            "reason": f"equity_session_closed:{reason_state}",
+                            "equity_session": dict(equity_session_info or {}),
+                        }
+
             signal_ts = _normalize_signal_ts(o, default_signal_ts_ms)
             ttl_ms = max(1, _safe_int(o.get("alpha_ttl_ms"), DEFAULT_TTL_MS))
             half_life_ms = max(1, _safe_int(o.get("alpha_half_life_ms"), DEFAULT_HALF_LIFE_MS))
@@ -905,6 +973,22 @@ def apply_execution_policy(
                     "risk_reduction_bypass": True,
                     "size_multiplier": 1.0,
                 }
+
+            if equity_session_pre_block is not None:
+                equity_session_payload = dict(equity_session_pre_block.get("equity_session") or {})
+                _log_suppression_event(
+                    o=o,
+                    reason=str(equity_session_pre_block.get("reason") or "equity_session_closed:closed"),
+                    decision_json={
+                        "blocked_by": "equity_session",
+                        "equity_session": equity_session_payload,
+                        "equity_out_of_session_mark": True,
+                    },
+                    execution_policy_json={
+                        "equity_session": equity_session_payload,
+                    },
+                )
+                continue
 
             ttl_ms = max(1, _safe_int(learned_alpha_gate.get("ttl_ms"), ttl_ms))
             half_life_ms = max(1, _safe_int(learned_alpha_gate.get("half_life_ms"), half_life_ms))
@@ -1023,6 +1107,35 @@ def apply_execution_policy(
                 feedback=feedback_snapshot,
             )
 
+            if bool(EPE_EQUITY_SESSION_ENFORCE) and bool(equity_session_applies):
+                try:
+                    execution_decision = equity_timing_adjustment(str(symbol), int(now_ms), dict(execution_decision or {}))
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_EQUITY_SESSION_ADJUSTMENT_FAILED",
+                        e,
+                        once_key=f"equity_session:{symbol}",
+                        symbol=str(symbol),
+                    )
+                if bool((execution_decision or {}).get("equity_session_blocked")):
+                    equity_session = dict((execution_decision or {}).get("equity_session") or equity_session_info or {})
+                    reason_code = str((execution_decision or {}).get("equity_session_reason") or equity_session.get("session") or "closed")
+                    _log_suppression_event(
+                        o=o,
+                        reason=f"equity_session_closed:{reason_code}",
+                        decision_json={
+                            "blocked_by": "equity_session",
+                            "equity_session": equity_session,
+                            "execution_decision": dict(execution_decision or {}),
+                            "equity_out_of_session_mark": True,
+                        },
+                        execution_policy_json={
+                            "equity_session": equity_session,
+                            "execution_decision": dict(execution_decision or {}),
+                        },
+                    )
+                    continue
+
             if _env_bool("EPE_FX_SESSION_ENFORCE", True):
                 try:
                     execution_decision = fx_timing_adjustment(str(symbol), int(now_ms), dict(execution_decision or {}))
@@ -1045,6 +1158,33 @@ def apply_execution_policy(
                         },
                         execution_policy_json={
                             "fx_session": fx_session,
+                            "execution_decision": dict(execution_decision or {}),
+                        },
+                    )
+                    continue
+
+            if _env_bool("EPE_CRYPTO_SESSION_ENFORCE", True):
+                try:
+                    execution_decision = crypto_timing_adjustment(str(symbol), int(now_ms), dict(execution_decision or {}))
+                except Exception as e:
+                    _warn_nonfatal(
+                        "EXECUTION_POLICY_ENGINE_CRYPTO_SESSION_ADJUSTMENT_FAILED",
+                        e,
+                        once_key=f"crypto_session:{symbol}",
+                        symbol=str(symbol),
+                    )
+                if bool((execution_decision or {}).get("crypto_session_blocked")):
+                    crypto_session = dict((execution_decision or {}).get("crypto_session") or {})
+                    _log_suppression_event(
+                        o=o,
+                        reason=str((execution_decision or {}).get("crypto_session_reason") or "crypto_session_closed"),
+                        decision_json={
+                            "blocked_by": "crypto_session",
+                            "crypto_session": crypto_session,
+                            "execution_decision": dict(execution_decision or {}),
+                        },
+                        execution_policy_json={
+                            "crypto_session": crypto_session,
                             "execution_decision": dict(execution_decision or {}),
                         },
                     )
@@ -1435,6 +1575,9 @@ def apply_execution_policy(
                 "ood_gate": dict(ood_gate),
                 "uncertainty_gate": dict(uncertainty_gate),
             }
+            if isinstance(execution_decision.get("equity_session"), dict):
+                decision_blob["equity_session"] = dict(execution_decision.get("equity_session") or {})
+                decision_blob["equity_out_of_session_mark"] = bool(execution_decision.get("equity_out_of_session_mark", False))
             ope_payload = _ope_payload_from_order(
                 o,
                 shaped_order,
@@ -1637,6 +1780,8 @@ def apply_execution_policy(
                     }
                     row["learned_execution"] = dict(learned_execution)
                     _attach_fx_session_metadata(row, dict(execution_decision or {}))
+                    _attach_crypto_session_metadata(row, dict(execution_decision or {}))
+                    _attach_equity_session_metadata(row, dict(execution_decision or {}))
                     if learned_decision is not None and learned_constraints is not None:
                         row.update(
                             learned_execution_metadata_for_order(
@@ -1731,6 +1876,8 @@ def apply_execution_policy(
                 "extra_slippage_bps": float(sim_extra_slip),
             }
             _attach_fx_session_metadata(row, dict(execution_decision or {}))
+            _attach_crypto_session_metadata(row, dict(execution_decision or {}))
+            _attach_equity_session_metadata(row, dict(execution_decision or {}))
             shaped.append(row)
 
             policy_json = dict(decision_blob)

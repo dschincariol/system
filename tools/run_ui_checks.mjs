@@ -9,6 +9,7 @@ const NODE_RANGE = ">=20.17.0 <21";
 const NPM_RANGE = ">=10.0.0 <11";
 const PYTHON_RANGE = ">=3.11";
 const NODE_TESTS = [
+  "tests/test_api_client_auth.mjs",
   "tests/test_canvas_line_chart_helpers.mjs",
   "tests/test_confirmation_modal.mjs",
   "tests/test_command_palette_helpers.mjs",

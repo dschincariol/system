@@ -1396,8 +1396,20 @@ def _append_model_promotion_audit_row(
     regime: Optional[str] = None,
 ) -> None:
     from engine.audit.chain import append_chain_row
+    from engine.strategy.model_decision_snapshot import enrich_decision_reason
 
     _ensure_model_promotion_audit_schema(con)
+    reason_payload = enrich_decision_reason(
+        dict(reason or {}),
+        action=str(action),
+        actor=str(actor),
+        model_name=str(model_name),
+        from_kind=from_kind,
+        from_ts_ms=from_ts_ms,
+        to_kind=to_kind,
+        to_ts_ms=to_ts_ms,
+        regime=regime,
+    )
     append_chain_row(
         "model_promotion_audit",
         {
@@ -1409,7 +1421,7 @@ def _append_model_promotion_audit_row(
             "from_model_ts_ms": (int(from_ts_ms) if from_ts_ms is not None else None),
             "to_model_kind": (str(to_kind) if to_kind else None),
             "to_model_ts_ms": (int(to_ts_ms) if to_ts_ms is not None else None),
-            "reason_json": dict(reason or {}),
+            "reason_json": reason_payload,
             "regime": (str(regime) if regime is not None else None),
         },
         con,

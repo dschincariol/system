@@ -37,14 +37,17 @@ import time
 import json
 import logging
 import re
+import socket
 import threading
 import hashlib
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine.execution.broker_failover_policy import terminal_broker_failure
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
 from engine.execution.options_readiness import live_options_order_block
+from engine.execution.share_rounding import round_equity_qty
 from engine.execution.broker_submission_recovery import (
     record_submission_unrecorded,
     unrecorded_submission_gate,
@@ -106,6 +109,14 @@ _WARNED_NONFATAL_KEYS: set[str] = set()
 
 class IBKRCredentialError(RuntimeError):
     """Raised when required IBKR connection credentials/config are absent."""
+
+
+class IBKRConnectionError(RuntimeError):
+    """Raised when the IBKR TCP endpoint is not reachable within the configured bound."""
+
+    def __init__(self, state: str, message: str) -> None:
+        super().__init__(message)
+        self.state = str(state or "connect_failed")
 
 
 def _warn_nonfatal(code: str, error: Exception, *, once_key: str | None = None, **extra: Any) -> None:
@@ -236,6 +247,45 @@ def _ibkr_terminal_failure(
         error=error,
         extra=extra,
     )
+
+
+def _ibkr_connect_timeout_s(timeout_s: Optional[float]) -> float:
+    connect_timeout = 10.0
+    try:
+        connect_timeout = max(0.1, min(10.0, float(timeout_s if timeout_s is not None else 10.0)))
+    except (TypeError, ValueError):
+        connect_timeout = 10.0
+    return float(connect_timeout)
+
+
+def _ibkr_tcp_preflight(host: str, port: int, *, timeout_s: Optional[float]) -> None:
+    resolved_host = str(host or "").strip()
+    resolved_port = _safe_i(port, 0)
+    connect_timeout = _ibkr_connect_timeout_s(timeout_s)
+    sock = None
+    try:
+        sock = socket.create_connection((resolved_host, int(resolved_port)), timeout=float(connect_timeout))
+    except (TimeoutError, socket.timeout) as exc:
+        raise IBKRConnectionError(
+            "connect_timeout",
+            f"ibkr_connect_timeout:host={resolved_host}:port={int(resolved_port)}:timeout_s={connect_timeout:g}",
+        ) from exc
+    except ConnectionRefusedError as exc:
+        raise IBKRConnectionError(
+            "connect_refused",
+            f"ibkr_connect_refused:host={resolved_host}:port={int(resolved_port)}",
+        ) from exc
+    except OSError as exc:
+        raise IBKRConnectionError(
+            "connect_failed",
+            f"ibkr_connect_failed:host={resolved_host}:port={int(resolved_port)}:{type(exc).__name__}: {exc}",
+        ) from exc
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception as exc:
+                _warn_nonfatal("BROKER_IBKR_GATEWAY_PREFLIGHT_CLOSE_FAILED", exc, once_key="ibkr_tcp_preflight_close")
 
 
 def _ibkr_credentials_block(*, require_explicit: Optional[bool] = None) -> Optional[Dict[str, Any]]:
@@ -666,15 +716,51 @@ def _apply_execution_risk_caps(
 # IB API Client Wrapper
 # ============================================================
 
-def _connect_ib(timeout_s: Optional[float] = None):
+def _connect_ib(
+    timeout_s: Optional[float] = None,
+    *,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    client_id: Optional[int] = None,
+):
     # Connection setup is intentionally strict in supervised/prod mode so a
     # partially configured IBKR deployment fails early and visibly.
     config_state = ibkr_credentials_status(require_explicit=_explicit_ibkr_config_required())
+    supplied_host = str(host or "").strip()
+    supplied_port = _safe_i(port, 0) if port not in (None, "") else 0
+    supplied_client_id = _safe_i(client_id, -1) if client_id not in (None, "") else -1
+    if supplied_host or supplied_port > 0 or supplied_client_id >= 0:
+        config_state = dict(config_state or {})
+        missing = set(str(item) for item in list(config_state.get("missing") or []))
+        invalid = set(str(item) for item in list(config_state.get("invalid") or []))
+        if supplied_host:
+            config_state["host"] = supplied_host
+            missing.discard("IBKR_HOST")
+        if supplied_port > 0:
+            config_state["port"] = int(supplied_port)
+            missing.discard("IBKR_PORT")
+            invalid.discard("IBKR_PORT")
+        elif port not in (None, ""):
+            invalid.add("IBKR_PORT")
+        if supplied_client_id >= 0:
+            config_state["client_id"] = int(supplied_client_id)
+            missing.discard("IBKR_CLIENT_ID")
+            invalid.discard("IBKR_CLIENT_ID")
+        elif client_id not in (None, ""):
+            invalid.add("IBKR_CLIENT_ID")
+        config_state["missing"] = sorted(missing)
+        config_state["invalid"] = sorted(invalid)
+        config_state["ok"] = not missing and not invalid
     if not bool(config_state.get("ok")):
         missing = ",".join(str(item) for item in list(config_state.get("missing") or []))
         invalid = ",".join(str(item) for item in list(config_state.get("invalid") or []))
         detail = missing or invalid or "unknown"
         raise IBKRCredentialError("missing_required_ibkr_env:" + detail)
+
+    resolved_host = str(config_state.get("host") or IBKR_HOST)
+    resolved_port = int(config_state.get("port") or IBKR_PORT)
+    resolved_client_id = int(config_state.get("client_id") or IBKR_CLIENT_ID)
+    _ibkr_tcp_preflight(resolved_host, resolved_port, timeout_s=timeout_s)
 
     from ibapi.client import EClient
     from ibapi.wrapper import EWrapper
@@ -799,18 +885,15 @@ def _connect_ib(timeout_s: Optional[float] = None):
 
     app = App()
     app.connect(
-        str(config_state.get("host") or IBKR_HOST),
-        int(config_state.get("port") or IBKR_PORT),
-        clientId=int(config_state.get("client_id") or IBKR_CLIENT_ID),
+        resolved_host,
+        resolved_port,
+        clientId=resolved_client_id,
     )
 
     t = threading.Thread(target=app.run, daemon=True)
     t.start()
 
-    try:
-        connect_timeout = max(0.1, min(10.0, float(timeout_s if timeout_s is not None else 10.0)))
-    except Exception:
-        connect_timeout = 10.0
+    connect_timeout = _ibkr_connect_timeout_s(timeout_s)
     if not app._next_order_evt.wait(timeout=float(connect_timeout)):
         raise RuntimeError("IBKR: nextValidId not received")
 
@@ -853,6 +936,23 @@ def _is_fx_symbol(symbol: str) -> bool:
     return _fx_pair_parts(symbol) is not None
 
 
+def _share_rounding_asset_class(symbol: str) -> str:
+    if _is_fx_symbol(symbol):
+        return "FX"
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        return str(asset_class_for_symbol(symbol) or "UNKNOWN").upper().strip() or "UNKNOWN"
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_SHARE_ROUNDING_ASSET_CLASS_FAILED",
+            e,
+            once_key=f"share_rounding_asset_class:{symbol}",
+            symbol=str(symbol),
+        )
+        return "UNKNOWN"
+
+
 def _mk_fx_contract(symbol: str):
     from ibapi.contract import Contract
 
@@ -868,7 +968,352 @@ def _mk_fx_contract(symbol: str):
     return c
 
 
+_DEFAULT_CRYPTO_QUOTE = "USD"
+_KNOWN_CRYPTO_BASES = {"BTC", "ETH", "SOL", "BNB", "XRP"}
+_KNOWN_CRYPTO_QUOTES = {"USD", "USDT", "USDC"}
+_CRYPTO_BASE_ALIASES = {"XBT": "BTC"}
+
+
+def normalize_crypto_symbol(symbol: str) -> str:
+    """Return the local bare-root crypto symbol used by asset_map/storage.
+
+    Local fallback only: the canonical ``crypto_instrument.py`` owner is still
+    absent, so keep this behavior aligned with the other crypto fallbacks.
+    """
+
+    text = str(symbol or "").upper().strip()
+    if not text:
+        return ""
+    for separator in ("/", "-", "_", ":"):
+        if separator in text:
+            text = text.split(separator, 1)[0]
+            break
+    for quote in sorted(_KNOWN_CRYPTO_QUOTES, key=len, reverse=True):
+        if text.endswith(quote) and len(text) > len(quote):
+            text = text[: -len(quote)]
+            break
+    return _CRYPTO_BASE_ALIASES.get(text, text)
+
+
+def _crypto_pair_parts(symbol: str) -> tuple[str, str] | None:
+    text = str(symbol or "").upper().strip()
+    if not text:
+        return None
+
+    if "/" in text:
+        base, quote = text.split("/", 1)
+        quote = quote.split(":", 1)[0]
+        base = normalize_crypto_symbol(base)
+        quote = str(quote or _DEFAULT_CRYPTO_QUOTE).upper().strip()
+    else:
+        base = normalize_crypto_symbol(text)
+        quote = _DEFAULT_CRYPTO_QUOTE
+        for candidate in sorted(_KNOWN_CRYPTO_QUOTES, key=len, reverse=True):
+            if text.endswith(candidate) and len(text) > len(candidate):
+                quote = candidate
+                break
+
+    if not base or not quote or base == quote:
+        return None
+
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        if asset_class_for_symbol(base) != "CRYPTO":
+            return None
+    except Exception as e:
+        _warn_nonfatal("BROKER_IBKR_GATEWAY_CRYPTO_FALLBACK_FAILED", e, once_key=f"crypto_fallback:{symbol}", symbol=str(symbol))
+        return None
+
+    return str(base), str(quote)
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    return _crypto_pair_parts(symbol) is not None
+
+
+def _mk_crypto_contract(symbol: str):
+    from ibapi.contract import Contract
+
+    parts = _crypto_pair_parts(symbol)
+    if parts is None:
+        raise ValueError(f"IBKR crypto contract requires a parseable crypto spot pair: {symbol!r}")
+    base, quote = parts
+    c = Contract()
+    c.symbol = str(base).upper().strip()
+    c.secType = "CRYPTO"
+    c.exchange = "PAXOS"
+    c.currency = str(quote).upper().strip()
+    return c
+
+
+_FUTURES_MONTH_TO_NUM = {
+    "F": 1,
+    "G": 2,
+    "H": 3,
+    "J": 4,
+    "K": 5,
+    "M": 6,
+    "N": 7,
+    "Q": 8,
+    "U": 9,
+    "V": 10,
+    "X": 11,
+    "Z": 12,
+}
+
+
+def _parse_futures_metadata(symbol: str):
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+
+        return parse_futures_symbol(symbol)
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_FUTURES_PARSE_FAILED",
+            e,
+            once_key=f"futures_parse:{symbol}",
+            symbol=str(symbol),
+        )
+        return None
+
+
+def _is_futures_symbol(symbol: str) -> bool:
+    return _parse_futures_metadata(symbol) is not None
+
+
+def _futures_contract_month(symbol: str) -> tuple[int, int] | None:
+    text = str(symbol or "").upper().strip()
+    match = re.match(r"^([A-Z0-9]+)([FGHJKMNQUVXZ])(\d{2})$", text)
+    if match is None:
+        return None
+    _root, month_code, year_text = match.groups()
+    month = _FUTURES_MONTH_TO_NUM.get(month_code)
+    if month is None:
+        return None
+    year = 2000 + int(year_text)
+    return int(year), int(month)
+
+
+def _mk_futures_contract(symbol: str):
+    from ibapi.contract import Contract
+
+    metadata = _parse_futures_metadata(symbol)
+    if metadata is None:
+        raise ValueError(f"IBKR futures contract requires a parseable futures symbol: {symbol!r}")
+    c = Contract()
+    c.symbol = str(metadata.root).upper().strip()
+    c.exchange = str(metadata.exchange or "CME").upper().strip()
+    c.currency = str(metadata.price_ccy or "USD").upper().strip()
+    if str(metadata.instrument_kind or "") == "fut_continuous":
+        c.secType = "CONTFUT"
+        return c
+    c.secType = "FUT"
+    contract_month = _futures_contract_month(str(metadata.symbol))
+    if contract_month is not None:
+        year, month = contract_month
+        c.lastTradeDateOrContractMonth = f"{int(year):04d}{int(month):02d}"
+    return c
+
+
+def _futures_live_orders_enabled() -> bool:
+    return str(os.environ.get("FUTURES_LIVE_TRADING_ENABLED", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def _futures_block_window_ms(kind: str = "delivery") -> int:
+    env_name = "FUTURES_ROLL_BLOCK_WINDOW_MS" if kind == "roll" else "FUTURES_DELIVERY_BLOCK_WINDOW_MS"
+    default = 24 * 60 * 60 * 1000 if kind == "roll" else 7 * 24 * 60 * 60 * 1000
+    try:
+        return max(0, int(str(os.environ.get(env_name, str(default)) or str(default)).strip()))
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_FUTURES_BLOCK_WINDOW_PARSE_FAILED",
+            e,
+            once_key=f"futures_block_window:{env_name}",
+            env_name=env_name,
+        )
+        return int(default)
+
+
+def _futures_metadata_from_order(symbol: str, order: Optional[Dict[str, Any]] = None):
+    metadata = _parse_futures_metadata(symbol)
+    if metadata is not None:
+        return metadata
+    root = str((order or {}).get("fut_root") or (order or {}).get("root") or "").upper().strip()
+    if not root:
+        return None
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+
+        return parse_futures_symbol(f"{root}.c.0")
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_FUTURES_ORDER_METADATA_PARSE_FAILED",
+            e,
+            once_key=f"futures_order_metadata:{root}",
+            symbol=str(symbol),
+        )
+        return None
+
+
+def _query_futures_roll_window_block(con: Any, root: str, ts_ms: int) -> Optional[Dict[str, Any]]:
+    if con is None or not root:
+        return None
+    window = _futures_block_window_ms("roll")
+    try:
+        row = con.execute(
+            """
+            SELECT roll_ts_ms, from_contract, to_contract
+            FROM futures_roll_calendar
+            WHERE root=? AND roll_ts_ms BETWEEN ? AND ?
+            ORDER BY ABS(roll_ts_ms - ?) ASC
+            LIMIT 1
+            """,
+            (str(root).upper().strip(), int(ts_ms) - int(window), int(ts_ms) + int(window), int(ts_ms)),
+        ).fetchone()
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_FUTURES_ROLL_WINDOW_QUERY_FAILED",
+            e,
+            once_key=f"futures_roll_window:{root}",
+            root=str(root),
+        )
+        return None
+    if row is None:
+        return None
+    return {
+        "ok": False,
+        "status": "futures_roll_window_blocked",
+        "reason": "futures_order_inside_roll_window",
+        "symbol": "",
+        "root": str(root).upper().strip(),
+        "roll_ts_ms": int(row[0]),
+        "from_contract": str(row[1] or ""),
+        "to_contract": str(row[2] or ""),
+        "window_ms": int(window),
+    }
+
+
+def futures_order_block(
+    symbol: str,
+    *,
+    ts_ms: Optional[int] = None,
+    con: Any = None,
+    order: Optional[Dict[str, Any]] = None,
+    require_live_enabled: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Return a futures execution block, or ``None`` when the order is allowed.
+
+    This is a pre-submit safety check only. It does not place, cancel, replace,
+    or flatten orders; live authority remains governed by execution-mode and
+    broker-router preflights.
+    """
+
+    metadata = _futures_metadata_from_order(symbol, order)
+    if metadata is None:
+        return None
+    ts = int(ts_ms if ts_ms is not None else time.time() * 1000)
+    sym = str(getattr(metadata, "symbol", symbol) or symbol).upper().strip()
+    root = str(getattr(metadata, "root", "") or "").upper().strip()
+    session_calendar = str(getattr(metadata, "session_calendar", "") or "CME_GLOBEX_24x5")
+
+    if bool(require_live_enabled) and not _futures_live_orders_enabled():
+        return {
+            "ok": False,
+            "status": "futures_live_disabled",
+            "reason": "futures_live_trading_disabled_by_default",
+            "symbol": sym,
+            "root": root,
+            "env": {"FUTURES_LIVE_TRADING_ENABLED": str(os.environ.get("FUTURES_LIVE_TRADING_ENABLED", "0") or "0")},
+        }
+
+    try:
+        from engine.data.calendar.futures_sessions import futures_market_closed, is_maintenance_break
+
+        if is_maintenance_break(ts):
+            return {
+                "ok": False,
+                "status": "futures_maintenance_break_blocked",
+                "reason": "futures_order_during_maintenance_break",
+                "symbol": sym,
+                "root": root,
+                "ts_ms": int(ts),
+            }
+        if futures_market_closed(ts, session_calendar=session_calendar):
+            return {
+                "ok": False,
+                "status": "futures_closed_session_blocked",
+                "reason": "futures_order_during_closed_session",
+                "symbol": sym,
+                "root": root,
+                "session_calendar": session_calendar,
+                "ts_ms": int(ts),
+            }
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_IBKR_GATEWAY_FUTURES_SESSION_CHECK_FAILED",
+            e,
+            once_key=f"futures_session:{sym}",
+            symbol=sym,
+        )
+        return {
+            "ok": False,
+            "status": "futures_session_check_unavailable",
+            "reason": "futures_session_check_failed_closed",
+            "symbol": sym,
+            "root": root,
+            "error": str(e),
+        }
+
+    delivery_window = _futures_block_window_ms("delivery")
+    for key in ("first_notice_ts_ms", "expiry_ts_ms", "last_trade_ts_ms"):
+        boundary = _safe_i((order or {}).get(key), 0)
+        if boundary > 0 and ts >= int(boundary) - int(delivery_window):
+            return {
+                "ok": False,
+                "status": "futures_delivery_window_blocked",
+                "reason": f"futures_order_inside_{key}_window",
+                "symbol": sym,
+                "root": root,
+                "boundary_ts_ms": int(boundary),
+                "window_ms": int(delivery_window),
+            }
+
+    contract_month = _futures_contract_month(sym)
+    if contract_month is not None:
+        year, month = contract_month
+        month_start = int(datetime(int(year), int(month), 1, tzinfo=timezone.utc).timestamp() * 1000)
+        if ts >= int(month_start) - int(delivery_window):
+            return {
+                "ok": False,
+                "status": "futures_delivery_window_blocked",
+                "reason": "futures_order_inside_contract_month_window",
+                "symbol": sym,
+                "root": root,
+                "boundary_ts_ms": int(month_start),
+                "window_ms": int(delivery_window),
+            }
+
+    roll_block = _query_futures_roll_window_block(con, root, ts)
+    if roll_block is not None:
+        roll_block["symbol"] = sym
+        return roll_block
+
+    return None
+
+
 def _mk_contract_for_symbol(symbol: str):
+    if _is_crypto_symbol(symbol):
+        return _mk_crypto_contract(symbol)
+    if _is_futures_symbol(symbol):
+        return _mk_futures_contract(symbol)
     if _is_fx_symbol(symbol):
         return _mk_fx_contract(symbol)
     return _mk_stock_contract(symbol)
@@ -1119,6 +1564,7 @@ def apply_latest_portfolio_orders_live(
         # ----------------------------------------
         live_positions = {p["symbol"]: p["qty"] for p in get_positions_live()}
         latest_prices = _load_latest_prices(con)
+        share_rounding_skipped: List[Dict[str, Any]] = []
 
         app = _connect_ib()
         try:
@@ -1171,8 +1617,88 @@ def apply_latest_portfolio_orders_live(
                     live_positions[symbol] = float(current_qty)
                     continue
 
+                futures_block = futures_order_block(
+                    symbol,
+                    ts_ms=int(ts_ms),
+                    con=con,
+                    order=o,
+                    require_live_enabled=True,
+                )
+                if futures_block is not None:
+                    futures_block.update(
+                        {
+                            "broker": "ibkr",
+                            "stop_failover": True,
+                            "submitted_n": int(n),
+                        }
+                    )
+                    return futures_block
+                if _is_futures_symbol(symbol):
+                    rounded_delta = int(round(float(delta)))
+                    if abs(float(delta) - float(rounded_delta)) > 1e-9:
+                        return {
+                            "ok": False,
+                            "status": "futures_fractional_contract_qty_blocked",
+                            "reason": "futures_orders_require_integer_contracts",
+                            "broker": "ibkr",
+                            "symbol": str(symbol),
+                            "qty": float(delta),
+                            "submitted_n": int(n),
+                            "stop_failover": True,
+                        }
+                    delta = float(rounded_delta)
+                    if abs(delta) < 1e-6:
+                        live_positions[symbol] = float(current_qty)
+                        continue
+
                 order_meta = dict(o or {})
                 order_meta["portfolio_risk_caps"] = dict(risk_cap_audit or {})
+
+                # EQ-07 owns equity share rounding only. FX weight-to-lots conversion
+                # remains the unowned FX-06 seam and passes through untouched here.
+                delta, share_rounding_audit = round_equity_qty(
+                    float(delta),
+                    float(px),
+                    broker="ibkr",
+                    asset_class=_share_rounding_asset_class(symbol),
+                )
+                record_share_rounding = bool(
+                    share_rounding_audit.get("enabled") and share_rounding_audit.get("eligible")
+                )
+                if record_share_rounding:
+                    order_meta["share_rounding"] = dict(share_rounding_audit)
+                if abs(delta) < 1e-6:
+                    if record_share_rounding and bool(share_rounding_audit.get("changed")):
+                        skipped = {
+                            "symbol": str(symbol),
+                            "reason": str(share_rounding_audit.get("reason") or "share_rounding_zero_delta"),
+                            "share_rounding": dict(share_rounding_audit),
+                        }
+                        share_rounding_skipped.append(skipped)
+                        audit = record_broker_action_audit(
+                            broker="ibkr",
+                            action="order_submit_skipped",
+                            status="skipped",
+                            symbol=str(symbol),
+                            qty=0.0,
+                            portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                            mode=str(order_meta.get("execution_mode") or ""),
+                            payload=skipped,
+                        )
+                        if not bool(audit.get("ok")):
+                            return {
+                                "ok": False,
+                                "status": "broker_action_audit_failed",
+                                "broker": "ibkr",
+                                "stop_failover": True,
+                                "detail": "share_rounding_skip_audit_failed",
+                                "symbol": str(symbol),
+                                "submitted_n": int(n),
+                                "audit": dict(audit or {}),
+                            }
+                    live_positions[symbol] = float(current_qty)
+                    continue
+
                 order_type, aggressiveness, spread_bps, est_notional = _adaptive_aggressiveness(
                     symbol=symbol,
                     qty=float(delta),
@@ -1239,6 +1765,7 @@ def apply_latest_portfolio_orders_live(
                         "order_uid": str(expected_order_uid),
                         "ibkr_order_ref": str(ibkr_order_ref),
                         "broker_native_client_order_ref": str(ibkr_order_ref),
+                        **({"share_rounding": dict(share_rounding_audit)} if record_share_rounding else {}),
                     },
                 )
                 if not bool(audit.get("ok")):
@@ -1517,13 +2044,16 @@ def apply_latest_portfolio_orders_live(
             if order_id is not None and not bool(multi_slice_override):
                 set_state("ibkr_last_portfolio_orders_id", str(int(order_id)))
 
-            return {
+            result = {
                 "ok": True,
                 "status": "applied",
                 "submitted_n": n,
                 "broker": "ibkr",
                 "parent_cursor_deferred": bool(multi_slice_override),
             }
+            if share_rounding_skipped:
+                result["share_rounding_skipped"] = list(share_rounding_skipped)
+            return result
         finally:
             try:
                 app.disconnect()
@@ -1823,9 +2353,18 @@ def flatten_positions(
     }
 
 
-def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str, Any]:
+def ping_broker_connection(
+    timeout_s: float = 8.0,
+    retries: int = 2,
+    *,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    client_id: Optional[int] = None,
+) -> Dict[str, Any]:
     started_ms = int(time.time() * 1000)
     last_error = None
+    last_state = "reconnect_failed"
+    last_attempt = 0
     max_retries = max(1, int(retries or 1))
     credentials_block = _ibkr_credentials_block(require_explicit=_explicit_ibkr_config_required())
     if credentials_block is not None:
@@ -1839,9 +2378,10 @@ def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str
         return credentials_block
 
     for attempt in range(1, max_retries + 1):
+        last_attempt = int(attempt)
         app = None
         try:
-            app = _connect_ib(timeout_s=timeout_s)
+            app = _connect_ib(timeout_s=timeout_s, host=host, port=port, client_id=client_id)
             latency_ms = int(time.time() * 1000) - int(started_ms)
             err_rows = []
             try:
@@ -1858,7 +2398,12 @@ def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str
                 "attempt": int(attempt),
                 "errors": err_rows[:5],
             }
+        except IBKRConnectionError as e:
+            last_state = str(getattr(e, "state", "") or "connect_failed")
+            last_error = str(e)
+            break
         except Exception as e:
+            last_state = "reconnect_failed"
             last_error = str(e)
             try:
                 time.sleep(min(1.0, max(0.1, float(timeout_s) / 8.0)))
@@ -1874,10 +2419,11 @@ def ping_broker_connection(timeout_s: float = 8.0, retries: int = 2) -> Dict[str
     return {
         "ok": False,
         "broker": "ibkr",
-        "state": "reconnect_failed",
+        "state": str(last_state or "reconnect_failed"),
         "latency_ms": int(time.time() * 1000) - int(started_ms),
-        "attempt": int(max_retries),
+        "attempt": int(last_attempt or max_retries),
         "error": str(last_error or "ibkr_connect_failed"),
+        "reasons": [str(last_state or "reconnect_failed")],
     }
 
 

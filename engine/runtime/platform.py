@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -36,6 +37,13 @@ _LAN_MODE_ALIASES = frozenset({"lan", "host", "server", "remote", "0.0.0.0", "wi
 # window.location). Override with TRADING_LAN_IP.
 DEFAULT_LAN_ADVERTISE_IP = "192.168.0.165"
 DEFAULT_OPERATOR_PORT = 4001
+RUNTIME_PATH_ENV_KEYS = (
+    "DB_PATH",
+    "TRADING_DATA",
+    "TRADING_LOGS",
+    "SQLITE_LIVENESS_DB_PATH",
+)
+_ENV_REF_RE = re.compile(r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))")
 
 
 def is_linux() -> bool:
@@ -233,6 +241,62 @@ def default_container_runtime_roots() -> tuple[str, ...]:
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _expand_path_env_refs(value: str, environ: Mapping[str, str] | None = None) -> str:
+    source = os.environ if environ is None else environ
+
+    def _replace(match: re.Match[str]) -> str:
+        name = str(match.group("braced") or match.group("bare") or "")
+        if not name:
+            return str(match.group(0))
+        if name in source:
+            return str(source.get(name) or "")
+        return str(os.environ.get(name, match.group(0)))
+
+    return _ENV_REF_RE.sub(_replace, str(value))
+
+
+def resolve_runtime_path(
+    value: str,
+    *,
+    project_root: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Return an absolute runtime filesystem path for launcher/profile values."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    root = Path(project_root).expanduser() if project_root is not None else repo_root()
+    root = root.resolve(strict=False)
+    expanded = _expand_path_env_refs(raw, environ).strip()
+    path = Path(expanded).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return str(path.resolve(strict=False))
+
+
+def resolve_runtime_paths(
+    environ: MutableMapping[str, str] | None = None,
+    *,
+    project_root: Path | str | None = None,
+    keys: tuple[str, ...] = RUNTIME_PATH_ENV_KEYS,
+) -> dict[str, str]:
+    """Absolutize runtime path env vars in-place against the project root.
+
+    Empty values stay empty so optional paths such as ``SQLITE_LIVENESS_DB_PATH``
+    can continue to use their downstream defaults.
+    """
+    env = os.environ if environ is None else environ
+    resolved: dict[str, str] = {}
+    for key in keys:
+        raw = str(env.get(key) or "").strip()
+        if not raw:
+            continue
+        value = resolve_runtime_path(raw, project_root=project_root, environ=env)
+        env[key] = value
+        resolved[key] = value
+    return resolved
 
 
 def default_local_runtime_root() -> Path:

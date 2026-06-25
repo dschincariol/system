@@ -5,9 +5,11 @@ import unittest
 from pathlib import Path
 
 from tools.check_local_asset_refs import (
+    find_disallowed_vendor_assets,
     find_local_asset_reference_issues,
     iter_scannable_paths,
     iter_local_asset_refs,
+    is_disallowed_vendor_asset,
     load_tracked_paths,
     resolve_local_asset_ref,
 )
@@ -110,6 +112,24 @@ class UiAssetReferenceTests(unittest.TestCase):
         tracked_paths = load_tracked_paths(ROOT)
 
         self.assertFalse((ROOT / blocked_path).exists())
+        self.assertEqual(find_disallowed_vendor_assets(tracked_paths, root=ROOT), [])
+
+        self.assertTrue(is_disallowed_vendor_asset("ui/vendor/chart.umd.min.js"))
+        self.assertTrue(is_disallowed_vendor_asset("ui/vendor/chart.min.js"))
+        self.assertTrue(is_disallowed_vendor_asset("ui/vendor/chartjs.bundle.js"))
+        self.assertFalse(
+            is_disallowed_vendor_asset("ui/vendor/lightweight-charts.standalone.production.js")
+        )
+        self.assertEqual(
+            find_disallowed_vendor_assets(
+                {
+                    "ui/vendor/chart.umd.min.js",
+                    "ui/vendor/lightweight-charts.standalone.production.js",
+                },
+                root=ROOT,
+            ),
+            ["ui/vendor/chart.umd.min.js"],
+        )
 
         runtime_mentions: list[str] = []
         for rel_path in iter_scannable_paths(tracked_paths):

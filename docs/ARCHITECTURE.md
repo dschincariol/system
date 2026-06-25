@@ -97,7 +97,7 @@ The observed startup order is:
 12. `start_system.py` starts the ingestion watchdog and waits for startup health.
    - Healthy startup ends in `LIVE`.
    - Configured fail-open startup can end in `DEGRADED`.
-13. Shutdown and fatal paths call `runtime_shutdown()`, flush logs, terminate the ingestion child, and mark lifecycle as `SHUTTING_DOWN` or `DEGRADED` depending on whether shutdown was clean.
+13. Shutdown and fatal paths mark lifecycle as `SHUTTING_DOWN` or `DEGRADED`, terminate the ingestion child when owned by the process, call `runtime_shutdown()`, and flush logs. Both `start_system.py` and the serving dashboard SIGTERM/SIGINT handler are bounded by `RUNTIME_SHUTDOWN_HARD_DEADLINE_S`; if cleanup or leftover non-daemon threads exceed that deadline, the handler logs the outstanding step and force-exits after flushing.
 
 ## Ingestion And Data Flow
 

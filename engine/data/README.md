@@ -184,8 +184,8 @@ schema. `default_symbols.py` can seed the seven major FX pairs behind
 `FX_PAIRS_ENABLED` or `OANDA_FX_PAIRS`, storing canonical six-letter symbols
 such as `EURUSD` while deriving OANDA instruments such as `EUR_USD` through the
 shared helper. `factor_ingestion.py` adds raw FRED rows for real yields, broad
-USD, ECB policy rates, and UK SONIA only; per-pair rate differentials, carry,
-DXY transforms, cross-pair correlations, and trend features belong to the later
-feature-loader workstream. `cftc_cot.py` owns the major FX futures COT contract
-specs (`6E`, `6B`, `6J`, `6S`, `6C`, `6A`, `6N`) and keeps the COT daemon
-default-off/control-plane gated.
+USD, ECB policy rates, UK SONIA, and Japan call-money/interbank rates; per-pair
+rate differentials, carry, DXY transforms, cross-pair correlations, and trend
+features belong to the later feature-loader workstream. `cftc_cot.py` owns the
+major FX futures COT contract specs (`6E`, `6B`, `6J`, `6S`, `6C`, `6A`, `6N`)
+and keeps the COT daemon default-off/control-plane gated.

@@ -92,20 +92,28 @@ class FxBrokerRoutingTests(unittest.TestCase):
         alpaca_apply.assert_called_once()
         ibkr_apply.assert_not_called()
 
-    def test_fx_batch_without_fx_capable_broker_falls_back_safely(self) -> None:
+    def test_fx_batch_without_fx_capable_broker_fails_closed(self) -> None:
         orders = [{"symbol": "EURUSD", "qty": 1.0, "side": "BUY"}]
         with patch.dict(os.environ, {"BROKER_FAILOVER": "alpaca", "BROKER_ROUTER_RETRY_ATTEMPTS": "1"}, clear=False):
             broker_router = _reload_router()
+            execution_gate = Mock(return_value=None)
+            real_gate = Mock(side_effect=AssertionError("no broker-specific real gate exists when FX broker is absent"))
             alpaca_apply = Mock(return_value={"ok": True, "status": "alpaca_ok"})
 
             with ExitStack() as stack:
                 _mute_router_side_effects(stack, broker_router)
-                stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", Mock(return_value=None)))
-                stack.enter_context(patch.object(broker_router, "_real_trading_gate_or_block", Mock(return_value=None)))
+                stack.enter_context(patch.object(broker_router, "_execution_gate_or_block", execution_gate))
+                stack.enter_context(patch.object(broker_router, "_real_trading_gate_or_block", real_gate))
                 stack.enter_context(patch.object(broker_router, "_alpaca_apply", alpaca_apply))
 
                 result = broker_router.apply_new_portfolio_orders_router(dry_run=True, override_orders=orders)
 
-        self.assertTrue(bool(result["ok"]))
-        self.assertEqual(result["broker"], "alpaca")
-        self.assertEqual(result["failover_attempts"][0]["broker"], "alpaca")
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "fx_broker_unavailable")
+        self.assertEqual(result["broker"], "failover_chain")
+        self.assertTrue(bool(result["stop_failover"]))
+        self.assertEqual(result["failover_attempts"], [])
+        self.assertEqual(result["required_broker"], "ibkr")
+        execution_gate.assert_called_once()
+        real_gate.assert_not_called()
+        alpaca_apply.assert_not_called()

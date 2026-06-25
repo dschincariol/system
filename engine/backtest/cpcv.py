@@ -111,6 +111,16 @@ def _embargo_count(embargo: int | float, n_samples: int) -> int:
     return int(value)
 
 
+def _roll_times(values: Any) -> np.ndarray:
+    if values is None:
+        return np.asarray([], dtype=float)
+    try:
+        arr = np.asarray(list(values) if not isinstance(values, np.ndarray) else values, dtype=float).reshape(-1)
+    except Exception:
+        return np.asarray([], dtype=float)
+    return arr[np.isfinite(arr)]
+
+
 def embargo_indices(
     test_indices: Sequence[int] | np.ndarray,
     n_samples: int,
@@ -140,6 +150,7 @@ def purged_train_indices(
     label_end_times: Sequence[float] | np.ndarray | None = None,
     label_horizon: int | float = 0,
     embargo: int | float = 0.0,
+    roll_times: Sequence[float] | np.ndarray | None = None,
     n_samples: int | None = None,
 ) -> np.ndarray:
     """Remove train samples whose label windows overlap test windows."""
@@ -172,6 +183,13 @@ def purged_train_indices(
     emb = embargo_indices(test, inferred_n, embargo)
     if emb.size:
         keep &= ~np.isin(train, emb)
+    rolls = _roll_times(roll_times)
+    if rolls.size:
+        train_starts = starts[train]
+        train_ends = ends[train]
+        for roll_ts in rolls:
+            straddles_roll = (train_starts <= float(roll_ts)) & (train_ends >= float(roll_ts))
+            keep &= ~straddles_roll
     return np.sort(train[keep].astype(int, copy=False))
 
 
@@ -191,6 +209,9 @@ class CombinatorialPurgedKFold:
     label_horizon:
         Fallback label horizon in sample units when explicit label end times
         are not supplied.
+    roll_times:
+        Optional futures roll timestamps. Train samples whose label windows
+        straddle a supplied roll timestamp are purged.
     """
 
     n_splits: int = 6
@@ -199,6 +220,7 @@ class CombinatorialPurgedKFold:
     label_horizon: int | float = 0
     label_start_times: Sequence[float] | np.ndarray | None = None
     label_end_times: Sequence[float] | np.ndarray | None = None
+    roll_times: Sequence[float] | np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if int(self.n_splits) < 2:
@@ -228,6 +250,11 @@ class CombinatorialPurgedKFold:
             label_end_times=self.label_end_times,
             label_horizon=self.label_horizon,
         )
+        roll_times = self.roll_times
+        if roll_times is None and isinstance(groups, dict):
+            roll_times = groups.get("roll_times")
+            if roll_times is None:
+                roll_times = groups.get("roll_boundaries")
         folds = [np.asarray(fold, dtype=int) for fold in np.array_split(np.arange(n, dtype=int), int(self.n_splits))]
         all_indices = np.arange(n, dtype=int)
 
@@ -240,6 +267,7 @@ class CombinatorialPurgedKFold:
                 label_start_times=starts,
                 label_end_times=ends,
                 embargo=self.embargo,
+                roll_times=roll_times,
                 n_samples=n,
             )
             yield train_idx.astype(int, copy=False), test_idx.astype(int, copy=False)

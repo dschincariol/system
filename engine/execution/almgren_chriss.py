@@ -91,10 +91,12 @@ def estimate_almgren_chriss_costs(
     side: int | str,
     ts_ms: Optional[int] = None,
     liquidity_snapshot: Optional[Dict[str, Any]] = None,
+    contract_multiplier: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Estimate bounded temporary, permanent, and risk costs for one order."""
     qty_abs = abs(_safe_float(qty, 0.0))
     px_f = _safe_float(px, 0.0)
+    multiplier = max(1.0, _safe_float(contract_multiplier, 1.0))
     sym = str(symbol or "").upper().strip()
     side_text = str(side or "").upper().strip()
     side_sign = -1.0 if side_text in {"-1", "SELL", "SHORT"} or _safe_float(side, 1.0) < 0.0 else 1.0
@@ -107,6 +109,8 @@ def estimate_almgren_chriss_costs(
         "side": ("SELL" if side_sign < 0.0 else "BUY"),
         "qty_abs": float(qty_abs),
         "px": float(px_f),
+        "contract_multiplier": float(multiplier),
+        "notional": float(qty_abs * px_f * multiplier),
         "temporary_impact_bps": 0.0,
         "permanent_impact_bps": 0.0,
         "risk_term_bps": 0.0,

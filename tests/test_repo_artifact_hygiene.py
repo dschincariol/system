@@ -18,6 +18,7 @@ def test_allows_legitimate_tracked_sources_and_env_templates() -> None:
         "deploy/env/staging-prod-preflight.env.example",
         "engine/artifacts/store.py",
         "engine/strategy/models/base_model.py",
+        "data/equity_sector_reference.json",
         "data/model_configs.json",
         "data/sec_company_tickers_exchange.json",
     ]

@@ -4,6 +4,8 @@ Canonical repository validation entrypoint.
 Runs the deterministic checks that should pass on a clean workstation and in CI.
 Use ``--live`` to include runtime-coupled smoke checks against a running operator
 and engine instance.
+Use ``--pre-deploy`` to include the self-contained safe/sim production readiness
+gate.
 """
 
 from __future__ import annotations
@@ -432,6 +434,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Include runtime-coupled smoke checks that require a running operator and engine.",
     )
+    parser.add_argument(
+        "--pre-deploy",
+        action="store_true",
+        help="Include the self-contained safe/sim production readiness gate.",
+    )
     args = parser.parse_args(argv)
 
     env = dict(os.environ)
@@ -486,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
         ]
     )
 
+    if args.pre_deploy:
+        checks.append(("production-readiness-gate", [python, "tools/production_readiness_gate.py", "--compact"]))
     if args.live:
         checks.append(("pipeline-smoke", [python, "tools/pipeline_smoke_test.py"]))
 

@@ -21,18 +21,23 @@ export function renderKillSwitchPills(ks, lastRun, elId = "systemStateText") {
   const lines = [];
   const controlRows = buildKillSwitchRows(ks, lastRun);
   const stateRows = Array.isArray(ks.state) ? ks.state : null;
+  const effective = killSwitchEffectiveState(ks);
+
+  if (effective) {
+    lines.push(`effective:any: ${effectiveStatus(effective)} (${effectiveReason(effective)})`);
+  }
 
   if (stateRows) {
     stateRows.forEach((row) => {
       const key = `${row.scope || "global"}:${row.key || "global"}`;
       const on = Number(row.enabled || 0) === 1;
       const reason = row.reason ? ` (${row.reason})` : "";
-      lines.push(`${key}: ${on ? "ENABLED" : "DISABLED"}${reason}`);
+      lines.push(`${key}: ${on ? "PERSISTED ARMED" : "PERSISTED DISARMED"}${reason}`);
     });
   }
 
   Object.keys(ks).forEach(k => {
-    if (k === "state") return;
+    if (KILL_SWITCH_METADATA_KEYS.has(k)) return;
     const v = ks[k] || {};
     const on = !!v.enabled;
     const reason = v.reason ? ` (${v.reason})` : "";
@@ -65,10 +70,71 @@ function esc(value) {
     .replace(/'/g, "&#39;");
 }
 
+const KILL_SWITCH_METADATA_KEYS = new Set([
+  "state",
+  "loaded_ts_ms",
+  "source",
+  "max_age_ms",
+  "cache_age_ms",
+  "cache_fresh",
+  "read_source",
+  "cache_status",
+  "effective",
+  "effective_state",
+  "provenance",
+  "activation_failure",
+]);
+
+function killSwitchEffectiveState(ks) {
+  const effective = ks && typeof ks === "object" && ks.effective && typeof ks.effective === "object"
+    ? ks.effective
+    : null;
+  return effective;
+}
+
+function effectiveSources(effective) {
+  const sources = Array.isArray(effective && effective.sources)
+    ? effective.sources.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  return sources.length ? sources.join("+") : "unknown";
+}
+
+function effectiveStatus(effective) {
+  if (!effective || typeof effective !== "object") return "UNKNOWN";
+  return effective.armed ? `ARMED VIA ${effectiveSources(effective).toUpperCase()}` : "DISARMED";
+}
+
+function effectiveReason(effective) {
+  if (!effective || typeof effective !== "object") return "effective state unavailable";
+  const summary = String(effective.summary || "").trim();
+  if (summary) return summary;
+  const persisted = effective.persisted_armed ? "persisted armed" : "persisted disarmed";
+  return effective.armed ? `armed via ${effectiveSources(effective)}; ${persisted}` : `disarmed; ${persisted}`;
+}
+
 export function buildKillSwitchRows(ks, lastRun = null) {
   const rows = [];
   const root = ks && typeof ks === "object" ? ks : {};
   const stateRows = Array.isArray(root.state) ? root.state : [];
+  const effective = killSwitchEffectiveState(root);
+
+  if (effective) {
+    const armed = !!effective.armed;
+    const reason = effectiveReason(effective);
+    rows.push({
+      id: "effective:any",
+      key: "effective",
+      scope: "effective",
+      displayKey: "effective:any",
+      enabled: armed,
+      reason,
+      status: effectiveStatus(effective),
+      tone: armed ? "crit" : "ok",
+      action: "explain",
+      actionLabel: "Explain",
+      ariaLabel: `Explain effective kill-switch state ${armed ? "armed" : "disarmed"}`,
+    });
+  }
 
   stateRows.forEach((row) => {
     const scope = String((row && row.scope) || "global").trim() || "global";
@@ -83,7 +149,7 @@ export function buildKillSwitchRows(ks, lastRun = null) {
       displayKey,
       enabled,
       reason,
-      status: enabled ? "ENABLED" : "DISABLED",
+      status: enabled ? "PERSISTED ARMED" : "PERSISTED DISARMED",
       tone: enabled ? "crit" : "ok",
       action: enabled ? "explain" : "hint",
       actionLabel: enabled ? "Explain" : "Recovery hint",
@@ -92,7 +158,7 @@ export function buildKillSwitchRows(ks, lastRun = null) {
   });
 
   Object.keys(root).forEach((key) => {
-    if (key === "state") return;
+    if (KILL_SWITCH_METADATA_KEYS.has(key)) return;
     const value = root[key] || {};
     if (!value || typeof value !== "object") return;
     const enabled = !!value.enabled;

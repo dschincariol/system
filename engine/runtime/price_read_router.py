@@ -104,6 +104,7 @@ _CONFIG_KEY: tuple[Any, ...] | None = None
 _CONFIG: PostgresPriceStorageConfig | None = None
 _ACTIVE_POOL_KEY: tuple[Any, ...] | None = None
 _POOLS: dict[tuple[Any, ...], Any] = {}
+_TIMESCALE_TABLE_COLUMNS_CACHE: dict[tuple[Any, ...], dict[str, str]] = {}
 
 
 def _file_fingerprint(path: str) -> tuple[Any, ...]:
@@ -171,6 +172,120 @@ def _sqlite_table_exists(con: Any, name: str) -> bool:
     return bool(row)
 
 
+def _sqlite_table_columns(con: Any, name: str) -> Dict[str, str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({_quote_ident(str(name))})").fetchall() or []
+    except Exception:
+        return {}
+    return {
+        str(row[1] or "").strip().lower(): str(row[1] or "").strip()
+        for row in rows
+        if len(row) > 1 and str(row[1] or "").strip()
+    }
+
+
+def _pick_column(columns: Dict[str, str], *names: str) -> str:
+    for name in names:
+        key = str(name or "").strip().lower()
+        if key in columns:
+            return columns[key]
+    return ""
+
+
+def _sqlite_ts_ms_expr(timestamp_column: str) -> str:
+    column_ref = _quote_ident(timestamp_column)
+    if str(timestamp_column).strip().lower() == "ts_ms":
+        return f"CAST({column_ref} AS INTEGER)"
+    return (
+        "CASE "
+        f"WHEN typeof({column_ref}) IN ('integer','real') THEN CAST({column_ref} AS INTEGER) "
+        f"ELSE CAST(strftime('%s', {column_ref}) AS INTEGER) * 1000 "
+        "END"
+    )
+
+
+def _sqlite_last_expr(columns: Dict[str, str]) -> str:
+    last_col = _pick_column(columns, "last")
+    if last_col:
+        return f"CAST({_quote_ident(last_col)} AS REAL)"
+    price_col = _pick_column(columns, "price")
+    px_col = _pick_column(columns, "px")
+    if price_col and px_col:
+        return f"CAST(COALESCE({_quote_ident(price_col)}, {_quote_ident(px_col)}) AS REAL)"
+    if price_col:
+        return f"CAST({_quote_ident(price_col)} AS REAL)"
+    if px_col:
+        return f"CAST({_quote_ident(px_col)} AS REAL)"
+    return ""
+
+
+def _sqlite_volume_expr(columns: Dict[str, str]) -> str:
+    volume_col = _pick_column(columns, "volume")
+    return f"CAST({_quote_ident(volume_col)} AS REAL)" if volume_col else "NULL"
+
+
+def _timescale_table_columns(cur: Any, schema_name: str, table_name: str) -> Dict[str, str]:
+    cache_key = (_CONFIG_KEY, str(schema_name), str(table_name))
+    cached = _TIMESCALE_TABLE_COLUMNS_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+        """,
+        (str(schema_name), str(table_name)),
+    )
+    rows = cur.fetchall() or []
+    columns = {
+        str(row[0] or "").strip().lower(): str(row[0] or "").strip()
+        for row in rows
+        if row and str(row[0] or "").strip()
+    }
+    _TIMESCALE_TABLE_COLUMNS_CACHE[cache_key] = dict(columns)
+    return columns
+
+
+def _timescale_ts_ms_expr_for_column(timestamp_column: str) -> str:
+    if str(timestamp_column).strip().lower() == "time":
+        return price_timescale_ts_ms_expr()
+    return f"{_quote_ident(timestamp_column)}::BIGINT"
+
+
+def _timescale_since_predicate(timestamp_column: str, *, placeholder: str = "%s") -> str:
+    if str(timestamp_column).strip().lower() == "time":
+        return price_timescale_time_after_ms_predicate(placeholder=placeholder)
+    return f"{_quote_ident(timestamp_column)} > {str(placeholder)}"
+
+
+def _timescale_order_expr(timestamp_column: str) -> str:
+    if str(timestamp_column).strip().lower() == "time":
+        return price_timescale_time_ref()
+    return _quote_ident(timestamp_column)
+
+
+def _timescale_last_expr(columns: Dict[str, str]) -> str:
+    last_col = _pick_column(columns, "last")
+    if last_col:
+        return _quote_ident(last_col)
+    price_col = _pick_column(columns, "price")
+    px_col = _pick_column(columns, "px")
+    if price_col and px_col:
+        return f"COALESCE({_quote_ident(price_col)}, {_quote_ident(px_col)})"
+    if price_col:
+        return _quote_ident(price_col)
+    if px_col:
+        return _quote_ident(px_col)
+    return ""
+
+
+def _timescale_volume_expr(columns: Dict[str, str]) -> str:
+    volume_col = _pick_column(columns, "volume")
+    return _quote_ident(volume_col) if volume_col else "NULL::DOUBLE PRECISION"
+
+
 def _timescale_enabled() -> bool:
     config = _get_price_config()
     return bool(config.enabled and config.dsn and psycopg is not None and ConnectionPool is not None)
@@ -236,6 +351,7 @@ def close_timescale_price_read_pool() -> None:
     with _POOL_LOCK:
         pools = list(_POOLS.items())
         _POOLS.clear()
+        _TIMESCALE_TABLE_COLUMNS_CACHE.clear()
         _ACTIVE_POOL_KEY = None
     for key, pool in pools:
         timeout_s = float(key[5]) if len(key) > 5 else 1.0
@@ -491,41 +607,32 @@ def _quote_rows_as_tuples(rows: List[Any]) -> List[Tuple[int, Optional[float], O
 def _fetch_timescale_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> List[Tuple[int, Optional[float], Optional[float]]]:
     with _timescale_connection() as (con, schema_name):
         schema_ref = _quote_ident(schema_name)
-        time_ref = price_timescale_time_ref()
-        ts_ms_expr = price_timescale_ts_ms_expr()
-        since_predicate = price_timescale_time_after_ms_predicate(placeholder="%s")
         params = [str(symbol), int(since_ts_ms), int(limit)]
-        sql = f"""
-            SELECT ts_ms, last, volume
-            FROM (
-              SELECT
-                {ts_ms_expr} AS ts_ms,
-                last,
-                volume
-              FROM {schema_ref}.price_quotes
-              WHERE symbol = %s
-                AND {since_predicate}
-              ORDER BY {time_ref} DESC
-              LIMIT %s
-            ) newest_rows
-            ORDER BY ts_ms ASC
-        """
         with con.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            rows = cur.fetchall() or []
-            if not rows:
+            rows = []
+            for table_name in ("price_quotes", "price_quotes_raw", "price_ticks", "prices"):
+                columns = _timescale_table_columns(cur, schema_name, table_name)
+                timestamp_col = _pick_column(columns, "time", "ts_ms")
+                last_expr = _timescale_last_expr(columns)
+                symbol_col = _pick_column(columns, "symbol")
+                if not (timestamp_col and last_expr and symbol_col):
+                    continue
+                volume_expr = _timescale_volume_expr(columns)
+                ts_ms_expr = _timescale_ts_ms_expr_for_column(timestamp_col)
+                since_predicate = _timescale_since_predicate(timestamp_col, placeholder="%s")
+                order_expr = _timescale_order_expr(timestamp_col)
                 cur.execute(
                     f"""
                     SELECT ts_ms, last, volume
                     FROM (
                       SELECT
                         {ts_ms_expr} AS ts_ms,
-                        last,
-                        volume
-                      FROM {schema_ref}.price_quotes_raw
-                      WHERE symbol = %s
+                        {last_expr} AS last,
+                        {volume_expr} AS volume
+                      FROM {schema_ref}.{_quote_ident(table_name)}
+                      WHERE {_quote_ident(symbol_col)} = %s
                         AND {since_predicate}
-                      ORDER BY {time_ref} DESC
+                      ORDER BY {order_expr} DESC
                       LIMIT %s
                     ) newest_rows
                     ORDER BY ts_ms ASC
@@ -533,6 +640,8 @@ def _fetch_timescale_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) ->
                     tuple(params),
                 )
                 rows = cur.fetchall() or []
+                if rows:
+                    break
         return _quote_rows_as_tuples(rows)
 
 
@@ -540,38 +649,34 @@ def _fetch_sqlite_quote_rows(*, symbol: str, since_ts_ms: int, limit: int) -> Li
     con = connect_ro()
     try:
         rows = []
-        if _sqlite_table_exists(con, "price_quotes"):
+        for table_name in ("price_quotes", "price_quotes_raw", "price_ticks", "prices"):
+            if not _sqlite_table_exists(con, table_name):
+                continue
+            columns = _sqlite_table_columns(con, table_name)
+            timestamp_col = _pick_column(columns, "ts_ms", "time")
+            last_expr = _sqlite_last_expr(columns)
+            symbol_col = _pick_column(columns, "symbol")
+            if not (timestamp_col and last_expr and symbol_col):
+                continue
+            ts_ms_expr = _sqlite_ts_ms_expr(timestamp_col)
+            volume_expr = _sqlite_volume_expr(columns)
             rows = con.execute(
-                """
+                f"""
                 SELECT ts_ms, last, volume
                 FROM (
-                  SELECT ts_ms, last, volume
-                  FROM price_quotes
-                  WHERE symbol=?
-                    AND ts_ms > ?
-                  ORDER BY ts_ms DESC
+                  SELECT {ts_ms_expr} AS ts_ms, {last_expr} AS last, {volume_expr} AS volume
+                  FROM {_quote_ident(table_name)}
+                  WHERE {_quote_ident(symbol_col)}=?
+                    AND {ts_ms_expr} > ?
+                  ORDER BY {ts_ms_expr} DESC
                   LIMIT ?
                 ) newest_rows
                 ORDER BY ts_ms ASC
                 """,
                 (str(symbol), int(since_ts_ms), int(limit)),
             ).fetchall() or []
-        if not rows and _sqlite_table_exists(con, "price_quotes_raw"):
-            rows = con.execute(
-                """
-                SELECT ts_ms, last, volume
-                FROM (
-                  SELECT ts_ms, last, volume
-                  FROM price_quotes_raw
-                  WHERE symbol=?
-                    AND ts_ms > ?
-                  ORDER BY ts_ms DESC
-                  LIMIT ?
-                ) newest_rows
-                ORDER BY ts_ms ASC
-                """,
-                (str(symbol), int(since_ts_ms), int(limit)),
-            ).fetchall() or []
+            if rows:
+                break
         return _quote_rows_as_tuples(rows)
     finally:
         con.close()

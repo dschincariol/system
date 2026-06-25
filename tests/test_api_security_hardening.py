@@ -276,6 +276,41 @@ def test_high_impact_mutation_rejects_missing_confirmation_with_valid_token(tmp_
             assert body["required_token"] == "KILL"
 
 
+def test_high_impact_mutation_rejects_wrong_confirmation_token(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/terminal/flatten", "flatten")],
+        handlers={"flatten": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    body = _structured_confirmation(
+        token="TRADE",
+        action_id="terminal.flatten",
+        target="SPY",
+    )
+    body["confirmation_hold_ms"] = 1500
+
+    with _http_server(handler_cls) as base_url:
+        try:
+            _post_json(f"{base_url}/api/terminal/flatten", token=token, body=body)
+            raise AssertionError("request unexpectedly succeeded")
+        except HTTPError as exc:
+            code = exc.code
+            payload = json.loads(exc.read().decode("utf-8"))
+
+    assert code == 422
+    assert payload["error"] == "confirmation_required"
+    assert payload["required_confirm"] == "FLATTEN"
+    assert payload["required_fields"] == ["confirmation"]
+
+
 def test_production_mutation_rejects_invalid_dashboard_token(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ENV", "prod")
     monkeypatch.setenv("ENGINE_MODE", "safe")
@@ -301,6 +336,166 @@ def test_production_mutation_rejects_invalid_dashboard_token(tmp_path: Path, mon
             body = json.loads(exc.read().decode("utf-8"))
             assert exc.code == 401
             assert body["error"] == "unauthorized"
+
+
+def test_mutation_audit_records_confirmation_contract_fields(tmp_path: Path, monkeypatch) -> None:
+    import engine.api.http_transport as http_transport
+
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+
+    audit_events: list[dict] = []
+    monkeypatch.setattr(http_transport, "_append_mutation_audit_event", lambda payload: audit_events.append(dict(payload)))
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/terminal/flatten", "flatten")],
+        handlers={"flatten": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token=token,
+        static_dir=tmp_path,
+    )
+    body = _structured_confirmation(
+        token="FLATTEN",
+        action_id="terminal.flatten",
+        target="SPY",
+    )
+    body["confirmation_method"] = "typed_phrase_hold"
+    body["confirmation_hold_ms"] = 1500
+
+    with _http_server(handler_cls) as base_url:
+        status, _headers, payload = _post_json(
+            f"{base_url}/api/terminal/flatten",
+            token=token,
+            body=body,
+            extra_headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert audit_events
+    event = audit_events[-1]
+    assert event["action_id"] == "terminal.flatten"
+    assert event["actor"] == "security_test"
+    assert event["confirmed"] is True
+    assert event["confirmation_method"] == "typed_phrase_hold"
+    assert event["source_surface"] == "pytest"
+    assert event["request_id"] == "pytest-request-id"
+    assert event["client_ip"] == "127.0.0.1"
+    assert len(event["consequence_hash"]) == 64
+
+
+def test_confirmed_high_impact_mutations_reach_handlers(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+
+    seen: list[str] = []
+
+    def _handler(_parsed=None, _body=None, _ctx=None):
+        seen.append(str(_body.get("action_id") if isinstance(_body, dict) else ""))
+        return {"ok": True, "seen": list(seen)}
+
+    handler_cls = _build_handler(
+        routes=[
+            ("POST", "/api/operator/emergency_stop", "mutate"),
+            ("POST", "/api/terminal/flatten", "mutate"),
+            ("POST", "/api/champion/rollback", "mutate"),
+            ("POST", "/api/strategy/size_policy/train", "mutate"),
+            ("POST", "/api/data_sources/delete", "mutate"),
+            ("POST", "/api/jobs/start", "mutate"),
+        ],
+        handlers={"mutate": _handler},
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    cases = [
+        ("/api/operator/emergency_stop", _emergency_confirmation() | {"action_id": "operator.emergency_stop"}),
+        (
+            "/api/terminal/flatten",
+            _structured_confirmation(token="FLATTEN", action_id="terminal.flatten", target="SPY")
+            | {"confirmation_hold_ms": 1500},
+        ),
+        (
+            "/api/champion/rollback",
+            _structured_confirmation(token="ROLLBACK_CHAMPION", action_id="promotion.rollback"),
+        ),
+        (
+            "/api/strategy/size_policy/train",
+            _structured_confirmation(token="TRAIN_SIZE_POLICY", action_id="size_policy.train"),
+        ),
+        (
+            "/api/data_sources/delete",
+            _structured_confirmation(token="DELETE_SOURCE", action_id="data_sources.delete", target="polygon")
+            | {"source_key": "polygon"},
+        ),
+        (
+            "/api/jobs/start?name=broker_apply_orders",
+            _structured_confirmation(token="JOB_ACTION", action_id="jobs.start", target="broker_apply_orders")
+            | {"name": "broker_apply_orders"},
+        ),
+    ]
+
+    with _http_server(handler_cls) as base_url:
+        for path, body in cases:
+            status, _headers, payload = _post_json(f"{base_url}{path}", token=token, body=body)
+            assert status == 200
+            assert payload["ok"] is True
+
+    assert seen == [
+        "operator.emergency_stop",
+        "terminal.flatten",
+        "promotion.rollback",
+        "size_policy.train",
+        "data_sources.delete",
+        "jobs.start",
+    ]
+
+
+def test_denied_confirmation_audit_records_action_and_confirmed_false(tmp_path: Path, monkeypatch) -> None:
+    import engine.api.http_transport as http_transport
+
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+
+    audit_events: list[dict] = []
+    monkeypatch.setattr(http_transport, "_append_mutation_audit_event", lambda payload: audit_events.append(dict(payload)))
+
+    handler_cls = _build_handler(
+        routes=[("POST", "/api/data_sources/delete", "delete_source")],
+        handlers={"delete_source": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}},
+        token=token,
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        try:
+            _post_json(
+                f"{base_url}/api/data_sources/delete",
+                token=token,
+                body={"source_key": "polygon", "actor": "security_test", "source": "pytest"},
+            )
+            raise AssertionError("request unexpectedly succeeded")
+        except HTTPError as exc:
+            code = exc.code
+            payload = json.loads(exc.read().decode("utf-8"))
+
+    assert code == 422
+    assert payload["error"] == "confirmation_required"
+    assert audit_events
+    event = audit_events[-1]
+    assert event["outcome"] == "confirmation_denied"
+    assert event["action_id"] == "data_sources.delete"
+    assert event["confirmed"] is False
+    assert event["confirmation_severity"] == "high"
+    assert len(event["consequence_hash"]) == 64
 
 
 def test_localhost_fallback_requires_explicit_safe_dev_mode(tmp_path: Path, monkeypatch) -> None:
@@ -588,11 +783,50 @@ def test_sensitive_get_requires_dashboard_token_on_remote_bind(tmp_path: Path, m
         assert body["ok"] is True
 
 
+def test_auth_denied_sensitive_gets_do_not_consume_anonymous_rate_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    token = "production-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+    limiter = ApiRateLimiter(token_limit_per_min=1, ip_limit_per_min=1, clock=_Clock())
+
+    routes, handlers = _sensitive_get_routes_and_handlers()
+    handler_cls = _build_handler(
+        routes=routes,
+        handlers=handlers,
+        token=token,
+        ctx={"API_RATE_LIMITER": limiter},
+        static_dir=tmp_path,
+    )
+
+    with _http_server(handler_cls) as base_url:
+        for _attempt in range(2):
+            try:
+                _get_json(f"{base_url}/api/terminal/positions")
+                raise AssertionError("sensitive GET unexpectedly allowed no-token access")
+            except HTTPError as exc:
+                body = json.loads(exc.read().decode("utf-8"))
+                assert exc.code == 401
+                assert body["error"] == "unauthorized"
+
+        status, _headers, body = _get_json(
+            f"{base_url}/api/terminal/positions",
+            token=token,
+        )
+        assert status == 200
+        assert body["ok"] is True
+
+
 def test_sensitive_gets_are_rate_limited_when_protected(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ENV", "prod")
     monkeypatch.setenv("ENGINE_MODE", "safe")
     monkeypatch.setenv("EXECUTION_MODE", "safe")
     token = "production-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
     clock = _Clock()
     limiter = ApiRateLimiter(token_limit_per_min=1, ip_limit_per_min=1, clock=clock)
 

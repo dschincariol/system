@@ -31,6 +31,8 @@ def test_dashboard_sigterm_requests_httpd_shutdown_from_background_thread():
     assert "_HTTPD.shutdown()" in helper_block
     assert "_request_httpd_shutdown" in signal_block
     assert "_HTTPD.shutdown()" not in signal_block
+    assert "handle_signal as _handle_bounded_signal" in signal_block
+    assert "_handle_bounded_signal(" in signal_block
 
 
 def test_runtime_shutdown_skips_sqlite_pragmas_for_postgres_storage():

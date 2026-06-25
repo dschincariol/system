@@ -32,6 +32,11 @@ const https = require("https");
 const net = require("net");
 const { spawn, spawnSync } = require("child_process");
 const { URL: NodeURL } = require("url");
+const { buildEngineChildEnv } = require("./operator_engine_env");
+const {
+  parseEnvText: parseOperatorEnvText,
+  serializeEnv: serializeOperatorEnv
+} = require("./operator_env_file");
 
 const app = express();
 const WebSocket = require("ws");
@@ -589,6 +594,12 @@ app.get("/api/operator/proxy/health",
 const ROOT = path.join(__dirname, "..");
 const VAR_DIR = path.join(ROOT, "var");
 const DEFAULT_LOCAL_DB_PATH = "./var/db/trading.db";
+const RUNTIME_PATH_ENV_KEYS = [
+  "DB_PATH",
+  "TRADING_DATA",
+  "TRADING_LOGS",
+  "SQLITE_LIVENESS_DB_PATH",
+];
 
 // Python dashboard entrypoint (this repo ships start_system.py)
 const ENTRY = path.join(ROOT, "start_system.py");
@@ -1908,23 +1919,11 @@ function sleep(ms) {
 }
 
 function parseEnvText(text) {
-  const out = {};
-  for (const line of String(text || "").split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const idx = trimmed.indexOf("=");
-    if (idx === -1) continue;
-    const k = trimmed.slice(0, idx).trim();
-    const v = trimmed.slice(idx + 1).trim();
-    if (k) out[k] = v;
-  }
-  return out;
+  return parseOperatorEnvText(text);
 }
 
 function serializeEnv(obj) {
-  return Object.entries(obj)
-    .map(([k, v]) => `${k}=${v}`)
-    .join("\n");
+  return serializeOperatorEnv(obj);
 }
 
 function readEnvFileRaw() {
@@ -1952,6 +1951,33 @@ function liveExecutionEnvBlocker(v) {
   if (liveExecutionEnvCleared(v)) return null;
   const raw = String(v ?? "").trim();
   return raw ? `DISABLE_LIVE_EXECUTION=${raw}` : "DISABLE_LIVE_EXECUTION unset";
+}
+
+function expandRuntimePathEnvRefs(value, envObj) {
+  return String(value || "").replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (match, braced, bare) => {
+    const key = String(braced || bare || "");
+    if (key && Object.prototype.hasOwnProperty.call(envObj || {}, key)) return String(envObj[key] ?? "");
+    if (key && Object.prototype.hasOwnProperty.call(process.env, key)) return String(process.env[key] ?? "");
+    return match;
+  });
+}
+
+function resolveRuntimePathValue(value, envObj) {
+  let raw = expandRuntimePathEnvRefs(value, envObj).trim();
+  if (!raw) return "";
+  if (raw === "~") raw = os.homedir();
+  else if (raw.startsWith("~/") || raw.startsWith("~\\")) raw = path.join(os.homedir(), raw.slice(2));
+  return path.resolve(ROOT, raw);
+}
+
+function normalizeRuntimePathEnv(envObj) {
+  const out = { ...(envObj || {}) };
+  for (const key of RUNTIME_PATH_ENV_KEYS) {
+    const raw = String(out[key] || "").trim();
+    if (!raw) continue;
+    out[key] = resolveRuntimePathValue(raw, out);
+  }
+  return out;
 }
 
 function nowIso() {
@@ -2054,7 +2080,7 @@ function validateAndSanitizeEnv(envObj) {
     }
   }
 
-  return { sanitized, issues };
+  return { sanitized: normalizeRuntimePathEnv(sanitized), issues };
 }
 
 function ensureEnvFile() {
@@ -2321,16 +2347,22 @@ function pickPythonCmd() {
   return "python3";
 }
 
+function buildOperatorEngineEnv(sanitized = {}, extraEnv = {}) {
+  return buildEngineChildEnv(sanitized || {}, {
+    baseEnv: process.env,
+    extraEnv: {
+      PYTHONPATH: ROOT,
+      ...(extraEnv || {})
+    }
+  });
+}
+
 function spawnEngineProcess(python, sanitized, finalMode) {
   const args = [ENTRY, finalMode];
 
   const spawnOptions = {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      ...sanitized,
-      PYTHONPATH: ROOT
-    },
+    env: buildOperatorEngineEnv(sanitized),
     stdio: ["ignore", "pipe", "pipe"]
   };
 
@@ -2835,7 +2867,7 @@ function startEngine(mode = "safe") {
     stream: "stderr"
   });
 
-  const boot = runPythonBootstrap(python);
+  const boot = runPythonBootstrap(python, sanitized);
   if (!boot.ok) {
     const bootTail = JSON.stringify(boot.steps || [], null, 2);
     const bootDetails = {
@@ -2906,11 +2938,7 @@ function startEngine(mode = "safe") {
       ],
       {
         cwd: ROOT,
-        env: {
-          ...process.env,
-          ...sanitized,
-          PYTHONPATH: ROOT
-        },
+        env: buildOperatorEngineEnv(sanitized),
         stdio: "pipe"
       }
     );
@@ -3321,7 +3349,7 @@ function emergencyStop() {
       ],
       {
         cwd: ROOT,
-        env: { ...process.env, ...sanitized, PYTHONPATH: ROOT },
+        env: buildOperatorEngineEnv(sanitized),
         stdio: "pipe"
       }
     );
@@ -3391,7 +3419,7 @@ function runBrokerRiskCommand(body = {}, confirmation = {}) {
 
   const r = spawnSyncSafe(python, cliArgs, {
     cwd: ROOT,
-    env: { ...process.env, ...sanitized, PYTHONPATH: ROOT },
+    env: buildOperatorEngineEnv(sanitized),
     stdio: "pipe",
     timeout: Math.max(5000, Math.ceil(timeoutS * 1000) + 5000),
   });
@@ -3899,12 +3927,7 @@ function runProductionValidationGate(sanitized) {
 
     const result = spawnSyncSafe(python, args, {
       cwd: ROOT,
-      env: {
-        ...process.env,
-        ...(sanitized || {}),
-        PYTHONPATH: ROOT,
-        TRADING_VALIDATION_MODE: "startup"
-      },
+      env: buildOperatorEngineEnv(sanitized, { TRADING_VALIDATION_MODE: "startup" }),
       stdio: "pipe",
       timeout: OPERATOR_VALIDATION_TIMEOUT_MS
     });
@@ -4861,7 +4884,7 @@ function touchDbFile(resolvedDb) {
 // --------------------------------------------------
 // Python bootstrap (schema/module DB init) — consolidated from ui_console.pyw
 // --------------------------------------------------
-function runPythonBootstrap(pythonCmd) {
+function runPythonBootstrap(pythonCmd, sanitized = {}) {
   try {
     const steps = [];
     const pyPrefix = pythonCmd === "py" ? ["-3"] : [];
@@ -4882,10 +4905,10 @@ function runPythonBootstrap(pythonCmd) {
           + "print('[startup] module db init ok')"
         ],
         {
-  cwd: ROOT,
-  env: { ...process.env, PYTHONPATH: ROOT },
-  stdio: "pipe"
-}
+          cwd: ROOT,
+          env: buildOperatorEngineEnv(sanitized),
+          stdio: "pipe"
+        }
       );
 
       const out = (r.stdout ? String(r.stdout) : "") + (r.stderr ? String(r.stderr) : "");
@@ -4908,10 +4931,10 @@ steps.push({ id: "module_db_init", ok, details: out.trim() });
           + "print('[startup] portfolio_backtest schema ok')"
         ],
         {
-  cwd: ROOT,
-  env: { ...process.env, PYTHONPATH: ROOT },
-  stdio: "pipe"
-}
+          cwd: ROOT,
+          env: buildOperatorEngineEnv(sanitized),
+          stdio: "pipe"
+        }
       );
 
       const out = (r.stdout ? String(r.stdout) : "") + (r.stderr ? String(r.stderr) : "");

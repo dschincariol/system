@@ -37,6 +37,15 @@ def _running_python_tests() -> bool:
     )
 
 
+if os.environ.get("COVERAGE_PROCESS_START") and not _running_python_tests():
+    try:
+        import coverage
+
+        coverage.process_startup()
+    except Exception:
+        # Coverage startup must never change application startup semantics.
+        pass
+
 if _running_python_tests():
     try:
         from engine.runtime.test_isolation import apply_runtime_test_defaults, reset_runtime_test_env

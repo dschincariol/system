@@ -61,6 +61,9 @@ _LIVE_RISK_REQUIRED_FLOAT_THRESHOLDS = (
 _LIVE_RISK_REQUIRED_INT_THRESHOLDS = (
     "KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES",
 )
+_LIVE_RISK_REQUIRED_COST_FILTER_FLAG = "ALERT_USE_EXEC_COST_FILTER"
+_LIVE_RISK_REQUIRED_COST_FILTER_THRESHOLD = "ALERT_MIN_NET_ABS_Z"
+_LIVE_RISK_COST_FILTER_REQUIRED_IN_LIVE = "EQUITY_EXEC_COST_FILTER_REQUIRED_IN_LIVE"
 _LIVE_RISK_ACCEPTANCE_OVERRIDE = "LIVE_RISK_THRESHOLD_ACCEPTANCE_OVERRIDE"
 _LIVE_RISK_ACCEPTANCE_AUDIT_FIELDS = (
     "LIVE_RISK_THRESHOLD_ACCEPTANCE_ID",
@@ -202,6 +205,8 @@ def live_risk_threshold_validation_snapshot(
     required = _live_risk_required(ctx)
     issues: list[str] = []
     audit: dict[str, str] = {}
+    required_enabled_flags = list(_LIVE_RISK_REQUIRED_ENABLED_FLAGS)
+    required_thresholds = list(_LIVE_RISK_REQUIRED_FLOAT_THRESHOLDS + _LIVE_RISK_REQUIRED_INT_THRESHOLDS)
 
     if not required:
         return {
@@ -211,6 +216,16 @@ def live_risk_threshold_validation_snapshot(
             "issues": [],
             "audit": {},
         }
+
+    try:
+        cost_filter_required = _parse_bool_value(
+            _LIVE_RISK_COST_FILTER_REQUIRED_IN_LIVE,
+            os.environ.get(_LIVE_RISK_COST_FILTER_REQUIRED_IN_LIVE),
+            default=False,
+        )
+    except ConfigError as exc:
+        issues.append(str(exc))
+        cost_filter_required = False
 
     for name in _LIVE_RISK_REQUIRED_ENABLED_FLAGS:
         raw = os.environ.get(name)
@@ -232,6 +247,26 @@ def live_risk_threshold_validation_snapshot(
 
     for name in _LIVE_RISK_REQUIRED_INT_THRESHOLDS:
         issue = _positive_int_issue(name)
+        if issue:
+            issues.append(issue)
+
+    if cost_filter_required:
+        required_enabled_flags.append(_LIVE_RISK_REQUIRED_COST_FILTER_FLAG)
+        required_thresholds.append(_LIVE_RISK_REQUIRED_COST_FILTER_THRESHOLD)
+
+        raw = os.environ.get(_LIVE_RISK_REQUIRED_COST_FILTER_FLAG)
+        if raw is not None and _is_placeholder_value(raw):
+            issues.append(f"{_LIVE_RISK_REQUIRED_COST_FILTER_FLAG} placeholder")
+        else:
+            try:
+                enabled = _parse_bool_value(_LIVE_RISK_REQUIRED_COST_FILTER_FLAG, raw, default=False)
+            except ConfigError as exc:
+                issues.append(str(exc))
+            else:
+                if not enabled:
+                    issues.append(f"{_LIVE_RISK_REQUIRED_COST_FILTER_FLAG} disabled")
+
+        issue = _positive_float_issue(_LIVE_RISK_REQUIRED_COST_FILTER_THRESHOLD)
         if issue:
             issues.append(issue)
 
@@ -260,8 +295,9 @@ def live_risk_threshold_validation_snapshot(
         "override": bool(override and ok),
         "issues": list(issues),
         "audit": audit,
-        "required_thresholds": list(_LIVE_RISK_REQUIRED_FLOAT_THRESHOLDS + _LIVE_RISK_REQUIRED_INT_THRESHOLDS),
-        "required_enabled_flags": list(_LIVE_RISK_REQUIRED_ENABLED_FLAGS),
+        "required_thresholds": required_thresholds,
+        "required_enabled_flags": required_enabled_flags,
+        "cost_filter_required": bool(cost_filter_required),
     }
 
 

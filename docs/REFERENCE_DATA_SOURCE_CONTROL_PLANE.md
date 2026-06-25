@@ -103,6 +103,7 @@ These templates are seeded automatically by [services/data_source_manager.py](..
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `polygon_ws` | `polygon_ws` | `stream_prices_polygon_ws` | On | No | `POLYGON_API_KEY`; WS subscription settings | `prices`, `price_quotes`, `price_quotes_raw`, `price_provider_health` | price router, model snapshots, Data Health |
 | `polygon` | `polygon` | `poll_prices` | On | No | `POLYGON_API_KEY` | `prices`, `price_quotes`, `price_quotes_raw`, `price_provider_health` | price router, model snapshots, Data Health |
+| `oanda_fx` | `oanda` | `poll_prices` | Off | No | `OANDA_ACCESS_TOKEN` or fallback `OANDA_API_KEY`; `OANDA_ACCOUNT_ID`, `OANDA_ENVIRONMENT`, optional `OANDA_FX_PAIRS` | `prices`, `price_quotes`, `price_quotes_raw`, `price_provider_health` | price router, model snapshots, Data Health |
 | `ibkr` | `ibkr` | `stream_prices_ibkr` | Off | No | host, port, client ID, market-data type, currency | `prices`, `price_quotes_raw`, `price_provider_health` | price router, live readiness, Data Health |
 | `alpaca_broker_data` | `alpaca` | `alpaca_broker_data_readonly` | Off | No | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY`, base URL defaulting to paper, optional trade-updates observation settings | `broker_connection_health`, `broker_positions` | live readiness, position reconcile |
 | `yfinance` | `yfinance` | `poll_prices` | On | Yes | None | `prices`, `price_provider_health` | price router, model snapshots, Data Health |
@@ -153,6 +154,11 @@ Shared provider accounts are seeded in `data_source_provider_accounts` and encry
 
 Effective credential precedence is enforced in manager runtime code: source override, then shared provider account, then allowed external runtime source, then missing. `build_job_environment()` projects one effective value per env var for each job. In strict runtime mode, secret values are written to runtime secret files and projected through `*_FILE`; non-secret SEC identity values are projected as normal env vars because the existing SEC clients read those names directly.
 
+Two provisioning paths are supported:
+
+- File-backed runtime credentials: write one credential per file outside the repo checkout or in the deployment secret mount, mode `0600` when the host filesystem supports it, then point the matching env var at it. Common mappings are `POLYGON_API_KEY_FILE=.../polygon_api_key`, `TRADIER_API_TOKEN_FILE=.../tradier_api_token`, `ALPACA_KEY_ID_FILE=.../alpaca_key_id`, `ALPACA_SECRET_KEY_FILE=.../alpaca_secret_key`, and `OPENAI_API_KEY_FILE=.../openai_api_key`. Missing, unreadable, non-regular, or zero-byte files resolve to a structured missing credential state. They do not crash the control plane and do not trigger a live provider call with an empty credential.
+- UI/API managed credentials: after `DATA_SOURCE_MASTER_KEY` or `DATA_SOURCE_MASTER_KEY_FILE` is configured, `POST /api/data_sources/update`, `POST /api/data_sources/test_save`, and `POST /api/data_sources/accounts/update` store submitted credentials in `credentials_enc` as AES-GCM ciphertext with `key_version`. Normal API responses return only masked values and credential presence/status metadata.
+
 ## Runnable-State Contract
 
 Every source and every source-managed job has a first-class `runnable_state`:
@@ -176,7 +182,7 @@ Production code enforces these states in [services/data_source_manager.py](../se
 - `manage_lifecycle()` marks the runtime dirty on every source/provider-account mutation, starts `ingestion_runtime` when newly required, and stops it when no runnable desired jobs remain and a jobs manager is available.
 - `get_provider_registry_overrides()` reports provider entries as enabled only when their source is credentialed and desired-eligible.
 
-`GET /api/data_sources` surfaces `runnable_state`, `runnable_state_reason`, `runtime_credentialed`, `runtime_projected`, `runtime_desired_eligible`, `missing_credential_env_vars`, and `job_runnable_state` on source rows. The `runtime.jobs` snapshot exposes per-job state keyed by job name. `GET /api/data_sources/logs` includes the current source state in addition to recent log rows, and enable/disable log events include non-secret runnable-state detail.
+`GET /api/data_sources` surfaces `status`, `stored_status`, `credential_status`, `needs_credentials`, `runnable_state`, `runnable_state_reason`, `runtime_credentialed`, `runtime_projected`, `runtime_desired_eligible`, `missing_credential_env_vars`, `missing_credentials`, and `job_runnable_state` on source rows. When required credentials are absent, the operator-facing `status` is `needs_credentials` even if the stored row status is an older `configured` or `test_failed` value. The `runtime.jobs` snapshot exposes per-job state keyed by job name. `GET /api/data_sources/logs` includes the current source state in addition to recent log rows, and enable/disable log events include non-secret runnable-state detail.
 
 Provider health and readiness include data-source runnable state for provider-backed feeds. Missing credentials show as explicit provider blockers instead of silently appearing as absent telemetry.
 
@@ -258,6 +264,12 @@ Source setup, credential storage, and runtime lifecycle reconciliation remain ow
 - `runnable_state`
 - `runnable_state_reason`
 - `credential_required`
+- `credential_status`
+- `credential_status_reason`
+- `needs_credentials`
+- `missing_credentials`
+- `effective_status`
+- `stored_status`
 - `runtime_credentialed`
 - `runtime_projected`
 - `runtime_desired_eligible`
@@ -387,7 +399,7 @@ Connection tests resolve credentials through the same effective path used by ing
 1. Source-level encrypted credentials are projected for the source.
 2. Shared provider-account credentials are projected when the source inherits an account.
 3. Strict/prod runtime projects secret values to files and reads them through `<ENV>_FILE`.
-4. Existing external `<ENV>_FILE`, `<ENV>_SECRET`, secret-provider, and compatible plain env values are read by `engine.data._credentials.get_data_credential()`.
+4. Existing external `<ENV>_FILE`, `<ENV>_SECRET`, secret-provider, and compatible plain env values are read by `engine.data._credentials.get_data_credential()`. A configured file path that is missing, empty, unreadable, or not a regular file returns no credential and is surfaced as missing credential metadata.
 5. The credential cache is cleared before and after the test so rotations are visible immediately.
 
 Missing-credential test responses include `evidence.missing_env_vars` with exact env var names and `evidence.missing_credentials[]` with the catalog docs, signup URL, plan note, source field, and provider-account options operators can use to obtain or store the credential.

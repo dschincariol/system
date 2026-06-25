@@ -21,7 +21,11 @@ from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.hardware import resolve_torch_device, torch_device_is_cuda
 from engine.runtime.storage import init_db, run_write_txn
 from engine.strategy.ensemble.oos_store import upsert_oos_predictions
-from engine.strategy.feature_registry import feature_set_tag_from_ids
+from engine.strategy.feature_registry import (
+    assert_feature_schema_runtime_parity,
+    feature_schema_flags,
+    feature_set_tag_from_ids,
+)
 from engine.strategy.model_competition import CompetitionRepository
 from engine.strategy.model_lifecycle import (
     load_lifecycle_plan,
@@ -102,6 +106,7 @@ def _feature_schema(
         "feature_ids": list(ids),
         "feature_set_tag": str(feature_set_tag_from_ids(list(ids))),
         "feature_count": int(len(ids)),
+        "feature_flags": feature_schema_flags(list(ids)),
         "sequence_schema": {
             "seq_len": int(seq_len),
             "n_horizons": int(n_horizons),
@@ -235,6 +240,17 @@ def _assert_config_feature_schema_current(config: Mapping[str, Any]) -> list[str
             f"artifact_seq_len={_safe_int(artifact_seq.get('seq_len'), 0)} "
             f"config_seq_len={int(config.get('seq_len') or DEFAULT_SEQ_LEN)}"
         )
+    else:
+        try:
+            assert_feature_schema_runtime_parity(
+                artifact_schema,
+                current_schema=current_schema,
+                context="itransformer_feature_schema_drift",
+                model_name=str(config.get("model_name") or FAMILY),
+            )
+        except ValueError as exc:
+            reason = "runtime_feature_flag_mismatch"
+            error = exc
 
     if error is not None:
         _emit_config_feature_schema_load_failure(

@@ -97,16 +97,89 @@ class RankDataset:
     meta_rows: list[dict[str, int | str]]
 
 
+_EQUITY_ASSET_CLASSES = {"EQUITY", "EQUITIES", "US_EQUITY", "STOCK", "STOCKS"}
+_CRYPTO_ASSET_CLASSES = {"CRYPTO", "CRYPTOCURRENCY", "DIGITAL_ASSET", "DIGITAL_ASSETS"}
+_DEFAULT_RANKER_EXCLUDED_ASSET_CLASSES = {
+    "CRYPTO",
+    "CRYPTOCURRENCY",
+    "DIGITAL_ASSET",
+    "DIGITAL_ASSETS",
+    "COMMODITY",
+    "FX",
+    "RATES",
+    "OPTION",
+    "OPTIONS",
+    "FUTURES",
+}
+_CRYPTO_QUOTE_SUFFIXES = ("USDT", "USD", "USDC", "EUR", "GBP")
+
+
+def _normalize_ranker_asset_scope(asset_scope: Any = None) -> str:
+    raw = str(asset_scope or "EQUITY").upper().strip()
+    if not raw:
+        return "EQUITY"
+    if "CRYPTO" in raw or "DIGITAL_ASSET" in raw:
+        return "CRYPTO"
+    if raw in {"EQUITY", "EQUITIES", "US_EQUITY", "STOCK", "STOCKS", "CROSS_SECTIONAL_EQUITIES"}:
+        return "EQUITY"
+    return raw
+
+
+def _crypto_base_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip().replace("/", "").replace("-", "")
+    if not sym:
+        return ""
+    for suffix in _CRYPTO_QUOTE_SUFFIXES:
+        if sym.endswith(suffix) and len(sym) > len(suffix):
+            return sym[: -len(suffix)]
+    return sym
+
+
+def _asset_class_for_ranker_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip()
+    try:
+        asset_class = str(asset_class_for_symbol(sym) or "UNKNOWN").upper().strip()
+    except Exception:
+        asset_class = "UNKNOWN"
+    if asset_class == "UNKNOWN":
+        base = _crypto_base_symbol(sym)
+        if base and base != sym:
+            try:
+                base_asset_class = str(asset_class_for_symbol(base) or "UNKNOWN").upper().strip()
+            except Exception:
+                base_asset_class = "UNKNOWN"
+            if base_asset_class in _CRYPTO_ASSET_CLASSES:
+                asset_class = base_asset_class
+    return asset_class
+
+
 def _is_equity_symbol(symbol: str) -> bool:
     sym = str(symbol or "").upper().strip()
     if not sym:
         return False
-    asset_class = str(asset_class_for_symbol(sym) or "UNKNOWN").upper().strip()
-    if asset_class in {"EQUITY", "EQUITIES", "US_EQUITY", "STOCK", "STOCKS"}:
+    asset_class = _asset_class_for_ranker_symbol(sym)
+    if asset_class in _EQUITY_ASSET_CLASSES:
         return True
-    if asset_class in {"CRYPTO", "COMMODITY", "FX", "RATES", "OPTION", "OPTIONS"}:
+    if asset_class in _DEFAULT_RANKER_EXCLUDED_ASSET_CLASSES:
         return False
     return bool(re.fullmatch(r"[A-Z][A-Z0-9.]{0,9}", sym))
+
+
+def _ranker_symbol_in_scope(symbol: str, *, asset_scope: Any = None) -> bool:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return False
+    scope = _normalize_ranker_asset_scope(asset_scope)
+    asset_class = _asset_class_for_ranker_symbol(sym)
+    if scope == "CRYPTO":
+        return asset_class in _CRYPTO_ASSET_CLASSES
+    if scope == "EQUITY":
+        return _is_equity_symbol(sym)
+    if scope in _EQUITY_ASSET_CLASSES:
+        return _is_equity_symbol(sym)
+    if scope in _CRYPTO_ASSET_CLASSES:
+        return asset_class in _CRYPTO_ASSET_CLASSES
+    return False
 
 
 def _rank_relevance(values: Sequence[Any], *, bins: int = DEFAULT_LABEL_BINS) -> np.ndarray:
@@ -132,13 +205,15 @@ def make_cross_sectional_rank_dataset(
     *,
     min_group_size: int = DEFAULT_MIN_GROUP_SIZE,
     label_bins: int = DEFAULT_LABEL_BINS,
+    asset_scope: Any = None,
 ) -> RankDataset:
     """Build timestamp ranking groups from per-symbol forward-return rows."""
 
+    scope = _normalize_ranker_asset_scope(asset_scope)
     grouped: dict[int, list[tuple[str, dict[str, float], float, dict[str, int | str]]]] = {}
     for X, y, meta in zip(list(X_rows or []), list(y_returns or []), list(meta_rows or [])):
         sym = str((meta or {}).get("symbol") or "").upper().strip()
-        if not _is_equity_symbol(sym):
+        if not _ranker_symbol_in_scope(sym, asset_scope=scope):
             continue
         ts_ms = _safe_int((meta or {}).get("ts") or (meta or {}).get("ts_ms"), 0)
         if ts_ms <= 0:
@@ -805,6 +880,13 @@ def run_ranker_training_job(
     lookback_days = int(cfg.get("training_window_days") or DEFAULT_LOOKBACK_DAYS)
     cutoff_ms = now_ms - lookback_days * 86_400_000
     feature_ids = list(cfg.get("feature_ids") or [])
+    asset_scope = _normalize_ranker_asset_scope(
+        cfg.get("asset_scope")
+        or cfg.get("ranker_asset_scope")
+        or cfg.get("training_asset_scope")
+        or cfg.get("learning_scope")
+        or os.environ.get("LGBM_RANKER_ASSET_SCOPE")
+    )
     try:
         from engine.data.universe_pit import resolve_training_window_universe
 
@@ -836,6 +918,7 @@ def run_ranker_training_job(
         meta_rows,
         min_group_size=int(os.environ.get("LGBM_RANKER_MIN_GROUP_SIZE", str(DEFAULT_MIN_GROUP_SIZE))),
         label_bins=int(os.environ.get("LGBM_RANKER_LABEL_BINS", str(DEFAULT_LABEL_BINS))),
+        asset_scope=str(asset_scope),
     )
     min_samples = int(os.environ.get(f"{str(family).upper()}_MIN_SAMPLES", str(DEFAULT_MIN_SAMPLES)))
     if len(dataset.y_relevance) < max(2, min_samples) or len(dataset.group_counts) < 2:
@@ -921,6 +1004,11 @@ def run_ranker_training_job(
     except Exception:
         LOG.debug("Ignored recoverable exception.", exc_info=True)
 
+    performance_metrics["asset_scope"] = str(asset_scope)
+    performance_metrics["ranker_asset_scope"] = str(asset_scope)
+    performance_metrics["learning_scope"] = (
+        "cross_sectional_crypto" if str(asset_scope) == "CRYPTO" else "cross_sectional_equities"
+    )
     version = str(
         plan.get("model_version")
         or cfg.get("training_version_id")
@@ -978,6 +1066,7 @@ __all__ = [
     "load_model_from_artifact",
     "main",
     "make_cross_sectional_rank_dataset",
+    "_ranker_symbol_in_scope",
     "ranker_metrics",
     "ranker_scores_to_signals",
     "run_ranker_training_job",

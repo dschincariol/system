@@ -70,14 +70,26 @@ class FxClockTests(unittest.TestCase):
         self.assertTrue(self.fx_clock.fx_market_closed(_ms_et(2026, 1, 11, 17, 30)))
         self.assertFalse(self.fx_clock.fx_market_closed(_ms_et(2026, 1, 11, 18, 0)))
 
-    def test_uses_real_new_york_dst_offsets(self) -> None:
-        standard_close = _ms_et(2026, 1, 9, 17, 0)
-        dst_close = _ms_et(2026, 3, 13, 17, 0)
-        dst_reopen = _ms_et(2026, 3, 8, 17, 0)
+    def test_default_boundaries_pin_standard_and_daylight_time(self) -> None:
+        standard_close = _ms_et(2026, 1, 2, 17, 0)
+        standard_reopen = _ms_et(2026, 1, 4, 17, 0)
+        daylight_close = _ms_et(2026, 6, 26, 17, 0)
+        daylight_reopen = _ms_et(2026, 6, 28, 17, 0)
+
         self.assertEqual(_dt_utc(standard_close).hour, 22)
-        self.assertEqual(_dt_utc(dst_close).hour, 21)
-        self.assertEqual(_dt_utc(dst_reopen).hour, 21)
-        self.assertFalse(self.fx_clock.fx_market_closed(dst_reopen))
+        self.assertEqual(_dt_utc(standard_reopen).hour, 22)
+        self.assertEqual(_dt_utc(daylight_close).hour, 21)
+        self.assertEqual(_dt_utc(daylight_reopen).hour, 21)
+
+        self.assertFalse(self.fx_clock.fx_market_closed(_ms_et(2026, 1, 2, 16, 59)))
+        self.assertTrue(self.fx_clock.fx_market_closed(standard_close))
+        self.assertTrue(self.fx_clock.fx_market_closed(_ms_et(2026, 1, 4, 16, 59)))
+        self.assertFalse(self.fx_clock.fx_market_closed(standard_reopen))
+
+        self.assertFalse(self.fx_clock.fx_market_closed(_ms_et(2026, 6, 26, 16, 59)))
+        self.assertTrue(self.fx_clock.fx_market_closed(daylight_close))
+        self.assertTrue(self.fx_clock.fx_market_closed(_ms_et(2026, 6, 28, 16, 59)))
+        self.assertFalse(self.fx_clock.fx_market_closed(daylight_reopen))
 
 
 if __name__ == "__main__":

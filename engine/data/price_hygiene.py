@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any, Iterable, Mapping, Sequence
 
+from engine.data.asset_map import asset_class_for_symbol
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 
@@ -13,6 +15,13 @@ LOG = get_logger("engine.data.price_hygiene")
 
 SPLIT_DOWN_RETURN = -0.45
 SPLIT_UP_RETURN = 0.90
+PRICE_HYGIENE_USE_CORP_ACTION_CALENDAR = os.environ.get("PRICE_HYGIENE_USE_CORP_ACTION_CALENDAR", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_DAY_MS = 24 * 60 * 60 * 1000
 
 
 def _safe_float(value: Any) -> float | None:
@@ -30,6 +39,31 @@ def is_split_like_price_jump(previous_price: Any, current_price: Any) -> bool:
         return False
     ret = (float(cur) - float(prev)) / float(prev)
     return bool(ret < SPLIT_DOWN_RETURN or ret > SPLIT_UP_RETURN)
+
+
+def _utc_day_window(ts_ms: int) -> tuple[int, int]:
+    start = (int(ts_ms) // _DAY_MS) * _DAY_MS
+    return int(start - 1), int(start + _DAY_MS - 1)
+
+
+def is_explained_split(con: Any, *, symbol: str, ts_ms: int) -> bool:
+    if not PRICE_HYGIENE_USE_CORP_ACTION_CALENDAR:
+        return False
+    try:
+        from engine.data.corporate_actions import corporate_action_ex_dates
+
+        start, end = _utc_day_window(int(ts_ms))
+        return bool(
+            corporate_action_ex_dates(
+                con,
+                symbol=str(symbol),
+                action_type="split",
+                start_ts_ms=int(start),
+                end_ts_ms=int(end),
+            )
+        )
+    except Exception:
+        return False
 
 
 def _has_news_or_corporate_action_flag(row: Mapping[str, Any]) -> bool:
@@ -118,7 +152,13 @@ def filter_split_like_price_rows(
         symbol = str(rec.get(symbol_key) or "").upper().strip()
         current = _safe_float(rec.get(price_key))
         ts_ms = int(rec.get(ts_key) or 0)
-        if not symbol or current is None or ts_ms <= 0 or _has_news_or_corporate_action_flag(rec):
+        if (
+            not symbol
+            or current is None
+            or ts_ms <= 0
+            or _has_news_or_corporate_action_flag(rec)
+            or asset_class_for_symbol(symbol) == "FUTURES"
+        ):
             accepted.append(rec)
             continue
         try:
@@ -127,6 +167,9 @@ def filter_split_like_price_rows(
             accepted.append(rec)
             continue
         if previous is None or not is_split_like_price_jump(previous[1], current):
+            accepted.append(rec)
+            continue
+        if is_explained_split(con, symbol=symbol, ts_ms=int(ts_ms)):
             accepted.append(rec)
             continue
         log_split_like_price_row(

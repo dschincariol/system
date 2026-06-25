@@ -10,11 +10,24 @@ from typing import Any, Callable, Dict, Mapping, Sequence
 
 import numpy as np
 
+from engine.backtest.cpcv import purged_train_indices as _time_purged_train_indices
 from engine.backtest.deflated_sharpe import deflated_sharpe_ratio
 from engine.execution.cost_models.almgren_chriss import AlmgrenChrissCost
+from engine.execution.crypto_costs import (
+    fee_bps as crypto_fee_bps,
+    funding_carry_bps as crypto_funding_carry_bps,
+    is_crypto_asset_class,
+    normalize_crypto_symbol,
+    spread_bps as crypto_spread_bps,
+)
 from engine.execution.fx_costs import is_fx_asset_class, normalize_fx_symbol, pip_spread_bps, swap_bps, weekend_gap_bps
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.storage import connect_ro, init_db, record_backtest_cpcv_run
+from engine.strategy.borrow_cost_model import (
+    borrow_bps_for_period,
+    cpcv_borrow_cost_enabled,
+    is_borrowable_short_equity,
+)
 from engine.strategy.gated_backtest import run_gated_backtest
 
 
@@ -43,6 +56,14 @@ def _safe_bool_env(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def _safe_bool_value(value: Any, default: bool) -> bool:
+    if value in (None, ""):
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _safe_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name, "")
     if raw in (None, ""):
@@ -62,6 +83,16 @@ def _safe_float_env(name: str, default: float) -> float:
     except Exception:
         return float(default)
     return float(value) if math.isfinite(value) else float(default)
+
+
+def _safe_float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return float(default)
+        out = float(value)
+    except Exception:
+        return float(default)
+    return float(out) if math.isfinite(out) else float(default)
 
 
 def _table_exists(con, table: str) -> bool:
@@ -186,11 +217,16 @@ def cpcv_cost_config_from_env(config: Mapping[str, Any] | None = None) -> Dict[s
     if not asset_class:
         asset_class = "US_EQUITY"
     is_fx = is_fx_asset_class(asset_class)
+    is_crypto = is_crypto_asset_class(asset_class)
     fx_symbol = normalize_fx_symbol(str(cfg.get("symbol") or cfg.get("pair") or os.environ.get("CPCV_FX_SYMBOL") or "EUR_USD"))
+    crypto_symbol = normalize_crypto_symbol(
+        str(cfg.get("symbol") or cfg.get("pair") or os.environ.get("CPCV_CRYPTO_SYMBOL") or "BTC")
+    )
+    crypto_liquidity = str(cfg.get("liquidity") or os.environ.get("CPCV_CRYPTO_LIQUIDITY") or "taker").lower().strip()
     default_half_spread = (
         float(pip_spread_bps(fx_symbol, half=True))
         if is_fx
-        else _safe_float_env("CPCV_HALF_SPREAD_BPS", 1.0)
+        else (float(crypto_spread_bps(crypto_symbol, half=True)) if is_crypto else _safe_float_env("CPCV_HALF_SPREAD_BPS", 1.0))
     )
     sigma_default = _safe_float_env("CPCV_SIGMA_DAILY_BPS", _safe_float_env("CPCV_SIGMA_DAILY", 200.0))
     fx_nights_raw = cfg.get("nights", _safe_int_env("CPCV_FX_NIGHTS", 1))
@@ -198,26 +234,63 @@ def cpcv_cost_config_from_env(config: Mapping[str, Any] | None = None) -> Dict[s
         fx_nights = int(fx_nights_raw)
     except Exception:
         fx_nights = _safe_int_env("CPCV_FX_NIGHTS", 1)
+    crypto_nights_raw = cfg.get("nights", _safe_int_env("CPCV_CRYPTO_NIGHTS", 1))
+    try:
+        crypto_nights = int(crypto_nights_raw)
+    except Exception:
+        crypto_nights = _safe_int_env("CPCV_CRYPTO_NIGHTS", 1)
+    commission_default = _default_commission_bps(asset_class)
+    if is_crypto and "commission_bps" not in cfg:
+        has_explicit_crypto_commission = any(
+            os.environ.get(name) not in (None, "")
+            for name in ("CPCV_COMMISSION_BPS", "CPCV_CRYPTO_COMMISSION_BPS", "CPCV_CRYPTO_TAKER_BPS", "CPCV_CRYPTO_MAKER_BPS")
+        )
+        if not has_explicit_crypto_commission:
+            commission_default = float(
+                crypto_fee_bps(
+                    crypto_symbol,
+                    taker=crypto_liquidity != "maker",
+                )
+            )
     out = {
         "enabled": bool(cfg.get("enabled", _safe_bool_env("CPCV_COSTS_ENABLED", True))),
         "asset_class": asset_class,
-        "commission_bps": float(cfg.get("commission_bps", _default_commission_bps(asset_class))),
+        "commission_bps": float(cfg.get("commission_bps", commission_default)),
         "half_spread_bps": float(cfg.get("half_spread_bps", default_half_spread)),
         "notional": float(cfg.get("notional", _safe_float_env("CPCV_TRADE_NOTIONAL", 100_000.0))),
         "adv": float(cfg.get("adv", _safe_float_env("CPCV_ADV", 10_000_000.0))),
         "sigma_daily": float(cfg.get("sigma_daily", sigma_default)),
         "participation": float(cfg.get("participation", _safe_float_env("CPCV_PARTICIPATION", 0.10))),
+        "borrow_enabled": _safe_bool_value(cfg.get("borrow_enabled"), cpcv_borrow_cost_enabled()),
+        "period_days": _safe_float_value(cfg.get("period_days"), _safe_float_env("CPCV_PERIOD_DAYS", 1.0)),
     }
+    borrow_bucket = str(cfg.get("borrow_bucket") or os.environ.get("CPCV_BORROW_BUCKET", "") or "").upper().strip()
+    if borrow_bucket:
+        out["borrow_bucket"] = borrow_bucket
+    for key, env_name in (
+        ("days_to_cover", "CPCV_BORROW_DAYS_TO_COVER"),
+        ("short_interest_shares", "CPCV_BORROW_SHORT_INTEREST_SHARES"),
+        ("float_shares", "CPCV_BORROW_FLOAT_SHARES"),
+    ):
+        raw_value = cfg.get(key, os.environ.get(env_name))
+        if raw_value not in (None, ""):
+            out[key] = _safe_float_value(raw_value, 0.0)
     if is_fx:
         out["symbol"] = str(fx_symbol or "EUR_USD")
         out["nights"] = int(max(0, fx_nights))
         out["crosses_weekend"] = bool(cfg.get("crosses_weekend", _safe_bool_env("CPCV_FX_CROSSES_WEEKEND", False)))
+    if is_crypto:
+        out["symbol"] = str(crypto_symbol or "BTC")
+        out["nights"] = int(max(0, crypto_nights))
+        out["liquidity"] = str(crypto_liquidity or "taker")
+        out["side_sign"] = _safe_float_value(cfg.get("side_sign", cfg.get("direction", 1.0)), 1.0)
     out["commission_bps"] = max(0.0, float(out["commission_bps"]))
     out["half_spread_bps"] = max(0.0, float(out["half_spread_bps"]))
     out["notional"] = max(0.0, float(out["notional"]))
     out["adv"] = max(_EPS, float(out["adv"]))
     out["sigma_daily"] = max(0.0, float(out["sigma_daily"]))
     out["participation"] = max(0.0, min(1.0, float(out["participation"])))
+    out["period_days"] = max(0.0, float(out["period_days"]))
     return out
 
 
@@ -255,6 +328,7 @@ def _cost_components_for_turnover(
     swap_carry_bps = 0.0
     weekend_gap_cost_bps = 0.0
     is_fx = is_fx_asset_class(str(cost_config.get("asset_class") or ""))
+    is_crypto = is_crypto_asset_class(str(cost_config.get("asset_class") or ""))
     if is_fx:
         symbol = str(cost_config.get("symbol") or cost_config.get("pair") or "EUR_USD")
         nights_raw = cost_config.get("nights", 1)
@@ -272,7 +346,27 @@ def _cost_components_for_turnover(
         weekend_gap_cost_bps = float(
             weekend_gap_bps(symbol, crosses_weekend=bool(cost_config.get("crosses_weekend", False)))
         )
-    total_bps = max(0.0, float(commission_bps + half_spread_bps + temporary_bps + swap_carry_bps + weekend_gap_cost_bps))
+    crypto_funding_bps = 0.0
+    crypto_full_spread_bps = 0.0
+    if is_crypto:
+        symbol = str(cost_config.get("symbol") or cost_config.get("pair") or "BTC")
+        crypto_full_spread_bps = float(crypto_spread_bps(symbol, half=False))
+        nights_raw = cost_config.get("nights", 1)
+        try:
+            nights = int(nights_raw)
+        except Exception:
+            nights = 1
+        crypto_funding_bps = float(
+            crypto_funding_carry_bps(
+                symbol,
+                float(cost_config.get("side_sign") or 1.0),
+                int(max(0, nights)),
+            )
+        )
+    total_bps = max(
+        0.0,
+        float(commission_bps + half_spread_bps + temporary_bps + swap_carry_bps + weekend_gap_cost_bps + crypto_funding_bps),
+    )
     result = {
         "turnover": float(turnover_f),
         "commission_bps": float(commission_bps),
@@ -288,6 +382,14 @@ def _cost_components_for_turnover(
                 "fx_pip_spread_bps": float(pip_spread_bps(str(cost_config.get("symbol") or "EUR_USD"), half=False)),
                 "swap_carry_bps": float(swap_carry_bps),
                 "weekend_gap_bps": float(weekend_gap_cost_bps),
+            }
+        )
+    if is_crypto:
+        result.update(
+            {
+                "crypto_spread_bps": float(crypto_full_spread_bps),
+                "crypto_fee_bps": float(commission_bps),
+                "funding_carry_bps": float(crypto_funding_bps),
             }
         )
     return result
@@ -309,30 +411,62 @@ def _apply_transaction_costs_to_returns(
     frictionless = positions * y
     adjusted = np.asarray(frictionless, dtype=float).copy()
     cost_returns: list[float] = []
+    borrow_returns: list[float] = []
+    borrow_bps_values: list[float] = []
     turnovers: list[float] = []
     component_rows: list[Dict[str, float]] = []
     previous = float(np.sign(initial_position))
     for idx, position in enumerate(positions):
         turnover = abs(float(position) - float(previous))
         row_cfg = dict(cfg)
-        if is_fx_asset_class(str(row_cfg.get("asset_class") or "")):
+        if is_fx_asset_class(str(row_cfg.get("asset_class") or "")) or is_crypto_asset_class(str(row_cfg.get("asset_class") or "")):
             row_cfg["side_sign"] = float(position)
         components = _cost_components_for_turnover(turnover, cost_config=row_cfg)
         cost_return = float(components.get("cost_return") or 0.0)
         adjusted[idx] = float(adjusted[idx]) - float(cost_return)
+        borrow_bps = 0.0
+        borrow_return = 0.0
+        # CPCV returns at idx use the current position, so borrow accrues for
+        # the interval represented by that short-held current position.
+        if bool(cfg.get("borrow_enabled")) and is_borrowable_short_equity(
+            side=float(position),
+            asset_class=str(cfg.get("asset_class") or ""),
+        ):
+            borrow_bps = float(
+                borrow_bps_for_period(
+                    str(cfg.get("symbol") or ""),
+                    holding_days=float(cfg.get("period_days") or 0.0),
+                    bucket=cfg.get("borrow_bucket"),
+                    days_to_cover=cfg.get("days_to_cover"),
+                    short_interest_shares=cfg.get("short_interest_shares"),
+                    float_shares=cfg.get("float_shares"),
+                )
+            )
+            borrow_return = float(abs(float(position)) * borrow_bps / 10000.0)
+            adjusted[idx] = float(adjusted[idx]) - float(borrow_return)
+        components["borrow_bps"] = float(borrow_bps)
+        components["borrow_return"] = float(borrow_return)
         turnovers.append(float(turnover))
         cost_returns.append(float(cost_return))
+        borrow_returns.append(float(borrow_return))
+        borrow_bps_values.append(float(borrow_bps))
         component_rows.append(components)
         previous = float(position)
+    total_borrow_return = float(np.sum(np.asarray(borrow_returns, dtype=float))) if borrow_returns else 0.0
+    total_transaction_cost_return = float(np.sum(np.asarray(cost_returns, dtype=float))) if cost_returns else 0.0
     return adjusted, {
         "enabled": bool(cfg.get("enabled")),
         "config": dict(cfg),
         "positions": [float(value) for value in positions.tolist()],
         "turnover": [float(value) for value in turnovers],
         "cost_returns": [float(value) for value in cost_returns],
+        "borrow_bps": [float(value) for value in borrow_bps_values],
+        "borrow_returns": [float(value) for value in borrow_returns],
         "components": component_rows,
         "total_turnover": float(np.sum(np.asarray(turnovers, dtype=float))) if turnovers else 0.0,
-        "total_cost_return": float(np.sum(np.asarray(cost_returns, dtype=float))) if cost_returns else 0.0,
+        "total_transaction_cost_return": float(total_transaction_cost_return),
+        "total_borrow_return": float(total_borrow_return),
+        "total_cost_return": float(total_transaction_cost_return + total_borrow_return),
         "frictionless_returns": [float(value) for value in frictionless.tolist()],
         "cost_adjusted_returns": [float(value) for value in adjusted.tolist()],
     }
@@ -494,6 +628,16 @@ def embargo_train_indices(
     return train[keep]
 
 
+def _normalize_roll_times(values: Any) -> np.ndarray:
+    if values is None:
+        return np.asarray([], dtype=float)
+    try:
+        arr = np.asarray(list(values) if not isinstance(values, np.ndarray) else values, dtype=float).reshape(-1)
+    except Exception:
+        return np.asarray([], dtype=float)
+    return arr[np.isfinite(arr)]
+
+
 def compute_pbo(
     in_sample_scores: Sequence[float] | Sequence[Sequence[float]],
     out_of_sample_scores: Sequence[float] | Sequence[Sequence[float]],
@@ -622,6 +766,8 @@ def cpcv_backtest(
     min_train_samples: int = 2,
     gated_backtest: bool = False,
     symbols: Sequence[Any] | np.ndarray | None = None,
+    roll_times: Sequence[int | float] | np.ndarray | None = None,
+    con: Any = None,
 ) -> Dict[str, Any]:
     """Run CPCV backtesting over feature and label arrays."""
     try:
@@ -724,6 +870,12 @@ def cpcv_backtest(
     out_of_sample_scores: list[float] = []
     frictionless_out_scores: list[float] = []
     cost_cfg = cpcv_cost_config_from_env(cost_config)
+    configured_roll_times = roll_times
+    if configured_roll_times is None and isinstance(cost_config, Mapping):
+        configured_roll_times = cost_config.get("roll_times")
+        if configured_roll_times is None:
+            configured_roll_times = cost_config.get("roll_boundaries")
+    roll_boundaries = _normalize_roll_times(configured_roll_times)
     replay_enabled = bool(replay_retrain_cadence)
     gated_enabled = bool(gated_backtest)
     metric_basis = "gated_cost_adjusted" if gated_enabled else "cost_adjusted"
@@ -733,7 +885,17 @@ def cpcv_backtest(
 
     for path_idx, (train_idx_raw, test_idx) in enumerate(splits):
         train_idx_purged = purge_train_indices(train_idx_raw, test_idx, label_horizon)
-        train_idx = embargo_train_indices(train_idx_purged, test_idx, embargo_pct)
+        train_idx_roll_purged = train_idx_purged
+        if roll_boundaries.size:
+            train_idx_roll_purged = _time_purged_train_indices(
+                train_idx_purged,
+                test_idx,
+                label_start_times=sample_times,
+                label_end_times=sample_times + float(max(0, int(label_horizon or 0))),
+                roll_times=roll_boundaries,
+                n_samples=int(n_samples),
+            )
+        train_idx = embargo_train_indices(train_idx_roll_purged, test_idx, embargo_pct)
         if train_idx.size < 2 or test_idx.size < 1:
             paths.append(
                 {
@@ -743,7 +905,8 @@ def cpcv_backtest(
                     "train_size": int(train_idx.size),
                     "test_size": int(test_idx.size),
                     "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
-                    "embargoed_rows": int(max(0, train_idx_purged.size - train_idx.size)),
+                    "roll_purged_rows": int(max(0, train_idx_purged.size - train_idx_roll_purged.size)),
+                    "embargoed_rows": int(max(0, train_idx_roll_purged.size - train_idx.size)),
                     "returns": [],
                     "sharpe": 0.0,
                     "train_sharpe": 0.0,
@@ -786,10 +949,11 @@ def cpcv_backtest(
                         "status": "skipped_no_replay_predictions" if replay_enabled else "skipped_no_predictions",
                         "train_size_raw": int(train_idx_raw.size),
                         "train_size": int(train_idx.size),
-                        "test_size": int(test_idx.size),
-                        "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
-                        "embargoed_rows": int(max(0, train_idx_purged.size - train_idx.size)),
-                        "returns": [],
+                    "test_size": int(test_idx.size),
+                    "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
+                    "roll_purged_rows": int(max(0, train_idx_purged.size - train_idx_roll_purged.size)),
+                    "embargoed_rows": int(max(0, train_idx_roll_purged.size - train_idx.size)),
+                    "returns": [],
                         "frictionless_returns": [],
                         "cost_adjusted_returns": [],
                         "sharpe": 0.0,
@@ -810,6 +974,7 @@ def cpcv_backtest(
                     symbols=(symbol_values[effective_test_idx] if symbol_values is not None else None),
                     cost_config=cost_cfg,
                     model_id="cpcv_candidate",
+                    con=con,
                 )
                 test_returns = np.asarray(gated_result.get("returns") or [], dtype=float).reshape(-1)
                 test_frictionless = np.asarray(gated_result.get("frictionless_returns") or [], dtype=float).reshape(-1)
@@ -843,7 +1008,8 @@ def cpcv_backtest(
                     "train_size": int(train_idx.size),
                     "test_size": int(test_idx.size),
                     "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
-                    "embargoed_rows": int(max(0, train_idx_purged.size - train_idx.size)),
+                    "roll_purged_rows": int(max(0, train_idx_purged.size - train_idx_roll_purged.size)),
+                    "embargoed_rows": int(max(0, train_idx_roll_purged.size - train_idx.size)),
                     "returns": [],
                     "frictionless_returns": [],
                     "cost_adjusted_returns": [],
@@ -869,7 +1035,8 @@ def cpcv_backtest(
                 "test_size": int(effective_test_idx.size),
                 "test_size_raw": int(test_idx.size),
                 "purged_rows": int(max(0, train_idx_raw.size - train_idx_purged.size)),
-                "embargoed_rows": int(max(0, train_idx_purged.size - train_idx.size)),
+                "roll_purged_rows": int(max(0, train_idx_purged.size - train_idx_roll_purged.size)),
+                "embargoed_rows": int(max(0, train_idx_roll_purged.size - train_idx.size)),
                 "returns": [float(value) for value in np.asarray(test_returns, dtype=float).reshape(-1)],
                 "cost_adjusted_returns": [float(value) for value in np.asarray(test_returns, dtype=float).reshape(-1)],
                 "frictionless_returns": [float(value) for value in np.asarray(test_frictionless, dtype=float).reshape(-1)],
@@ -927,6 +1094,8 @@ def cpcv_backtest(
             "n_test_splits": int(n_test_splits),
             "embargo_pct": float(embargo_pct),
             "label_horizon": int(max(0, int(label_horizon or 0))),
+            "futures_roll_boundaries": [float(value) for value in roll_boundaries.tolist()],
+            "futures_roll_boundary_count": int(roll_boundaries.size),
             "total_paths": int(len(paths)),
             "valid_paths": int(len(valid_path_rows)),
             "skipped_paths": int(max(0, len(paths) - len(valid_path_rows))),
@@ -1347,21 +1516,36 @@ def run_backtest_cpcv_job(
     features, labels, feature_meta = _build_feature_matrix(rows)
     sample_times = [int(row.get("event_ts_ms") or row.get("prediction_ts_ms") or idx) for idx, row in enumerate(rows)]
     symbols = [str(row.get("symbol") or f"ASSET_{idx:05d}") for idx, row in enumerate(rows)]
-    cpcv_result = cpcv_backtest(
-        features,
-        labels,
-        model_factory=lambda: _LinearPredictionCalibrator(),
-        n_splits=resolved_n_splits,
-        n_test_splits=resolved_n_test_splits,
-        embargo_pct=resolved_embargo_pct,
-        label_horizon=resolved_label_horizon,
-        sample_times_ms=sample_times,
-        cost_config=cost_config,
-        replay_retrain_cadence=resolved_replay_retrain,
-        retrain_cadence_ms=resolved_retrain_cadence_ms,
-        gated_backtest=resolved_gated_backtest,
-        symbols=symbols,
-    )
+    cpcv_con = None
+    try:
+        cpcv_con = connect_ro()
+        cpcv_result = cpcv_backtest(
+            features,
+            labels,
+            model_factory=lambda: _LinearPredictionCalibrator(),
+            n_splits=resolved_n_splits,
+            n_test_splits=resolved_n_test_splits,
+            embargo_pct=resolved_embargo_pct,
+            label_horizon=resolved_label_horizon,
+            sample_times_ms=sample_times,
+            cost_config=cost_config,
+            replay_retrain_cadence=resolved_replay_retrain,
+            retrain_cadence_ms=resolved_retrain_cadence_ms,
+            gated_backtest=resolved_gated_backtest,
+            symbols=symbols,
+            con=cpcv_con,
+        )
+    finally:
+        if cpcv_con is not None:
+            try:
+                cpcv_con.close()
+            except Exception as e:
+                _warn_nonfatal(
+                    "CPCV_BACKTEST_CONNECTION_CLOSE_FAILED",
+                    e,
+                    model_name=resolved_model_name,
+                    candidate_version=resolved_candidate_version,
+                )
     metric_basis = "gated_cost_adjusted" if resolved_gated_backtest else "cost_adjusted"
 
     diagnostics = {

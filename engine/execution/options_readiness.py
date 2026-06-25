@@ -12,18 +12,35 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from importlib import import_module
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+
+try:
+    from engine.data.options_instrument import parse_option_symbol  # type: ignore
+except Exception:
+
+    def parse_option_symbol(symbol: object):  # type: ignore
+        return None
 
 
 TRUTHY = {"1", "true", "t", "yes", "y", "on"}
 FALSEY = {"0", "false", "f", "no", "n", "off"}
-LIVE_BROKERS = {"alpaca", "alpaca_rest", "ibkr", "interactivebrokers", "interactive_brokers", "ib_gateway", "ibgateway", "tws"}
+LIVE_BROKERS = {
+    "alpaca",
+    "alpaca_rest",
+    "ibkr",
+    "interactivebrokers",
+    "interactive_brokers",
+    "ib_gateway",
+    "ibgateway",
+    "tws",
+    "tradier_options",
+}
 OPTIONS_MODES = {"disabled", "shadow", "paper", "live"}
 
-# Empty until a live options order adapter is implemented and reviewed. Keeping
-# this list in code prevents an env-only toggle from enabling stock adapters to
-# receive option contracts.
-LIVE_OPTIONS_BROKER_ADAPTERS: frozenset[str] = frozenset()
+# Keeping this list in code prevents an env-only toggle from enabling stock
+# adapters to receive option contracts.
+LIVE_OPTIONS_BROKER_ADAPTERS: frozenset[str] = frozenset({"tradier_options"})
 
 CONTROL_FLAG_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("greeks", "options_live_greeks_gate_missing", ("OPTIONS_LIVE_GREEKS_READY", "OPTIONS_GREEKS_REQUIRED")),
@@ -78,6 +95,8 @@ NUMERIC_CONTROLS: tuple[tuple[str, str, float | None, float | None], ...] = (
     ("OPTIONS_MAX_POSITION_CONTRACTS", "options_live_position_contract_limit_missing", 0.0, None),
     ("OPTIONS_MARGIN_IMPACT_MAX_FRACTION", "options_live_margin_limit_missing", 0.0, 1.0),
     ("OPTIONS_MAX_PORTFOLIO_DELTA_ABS", "options_live_portfolio_delta_limit_missing", 0.0, None),
+    ("OPTIONS_MAX_PORTFOLIO_GAMMA_ABS", "options_live_portfolio_gamma_limit_missing", 0.0, None),
+    ("OPTIONS_MAX_PORTFOLIO_VEGA_ABS", "options_live_portfolio_vega_limit_missing", 0.0, None),
 )
 
 _OCC_COMPACT_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
@@ -197,7 +216,10 @@ def is_options_order(order: Any) -> bool:
     ):
         return True
     contract_symbol = _first_text(order, ("option_symbol", "option_contract", "contract", "occ_symbol", "local_symbol"))
-    if contract_symbol and _OCC_COMPACT_RE.match(contract_symbol.upper().replace(" ", "")):
+    if contract_symbol and (
+        _OCC_COMPACT_RE.match(contract_symbol.upper().replace(" ", ""))
+        or parse_option_symbol(contract_symbol) is not None
+    ):
         return True
     return False
 
@@ -217,6 +239,16 @@ def option_order_metadata(order: Mapping[str, Any]) -> dict[str, Any]:
     expiration = _first_text(order, ("expiration", "expiry", "expiration_date", "maturity"))
     contract_type = _normalize_contract_type(_first_text(order, ("contract_type", "option_type", "right", "put_call", "call_put")))
     strike = _first_number(order, ("strike", "strike_price"))
+    parsed_contract = parse_option_symbol(contract)
+    if parsed_contract is not None:
+        if not underlying:
+            underlying = parsed_contract.underlying
+        if not expiration:
+            expiration = parsed_contract.expiry.isoformat()
+        if not contract_type:
+            contract_type = _normalize_contract_type(parsed_contract.right)
+        if not math.isfinite(strike):
+            strike = float(parsed_contract.strike)
     greeks = {
         "delta": _first_number(order, ("delta", "option_delta")),
         "gamma": _first_number(order, ("gamma", "option_gamma")),
@@ -280,19 +312,402 @@ def _numeric_control_snapshot() -> tuple[list[str], dict[str, Any]]:
     return blockers, controls
 
 
-def _control_flag_snapshot() -> tuple[list[str], dict[str, Any]]:
+def _check_failed_blocker(blocker: str) -> str:
+    text = str(blocker or "").strip()
+    if text.endswith("_missing"):
+        return f"{text[:-8]}_check_failed"
+    return f"{text}_check_failed"
+
+
+def _option_qty(order: Mapping[str, Any]) -> float:
+    return abs(_first_number(order, ("contracts", "qty", "quantity", "order_qty", "target_contracts")))
+
+
+def _option_side_sign(order: Mapping[str, Any]) -> float:
+    raw_qty = _first_number(order, ("contracts", "qty", "quantity", "order_qty", "target_contracts"))
+    if math.isfinite(raw_qty) and raw_qty < 0.0:
+        return -1.0
+    side = _first_text(order, ("tradier_side", "side", "action", "order_side")).strip().lower()
+    if side in {"sell", "short", "sell_short", "sell_to_open", "sell_to_close"}:
+        return -1.0
+    return 1.0
+
+
+def _option_multiplier(contract: Any) -> float | None:
+    try:
+        parsed = parse_option_symbol(contract)
+        multiplier = float(getattr(parsed, "multiplier", 0.0) or 0.0) if parsed is not None else 0.0
+        multiplier_source = str(getattr(parsed, "multiplier_source", "") or "").strip() if parsed is not None else ""
+        specs_verified = bool(getattr(parsed, "contract_specs_verified", False)) if parsed is not None else False
+        if multiplier > 0.0 and (specs_verified or multiplier_source):
+            return float(multiplier)
+        return None
+    except Exception:
+        return None
+
+
+def _option_underlyings(orders: Sequence[Mapping[str, Any]]) -> list[str]:
+    out: list[str] = []
+    for order in list(orders or []):
+        if not is_options_order(order):
+            continue
+        meta = option_order_metadata(order)
+        underlying = str(meta.get("underlying") or "").upper().strip()
+        if underlying:
+            out.append(underlying)
+    return _dedupe(out)
+
+
+def _first_order_scope(orders: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    for order in list(orders or []):
+        if not is_options_order(order):
+            continue
+        meta = option_order_metadata(order)
+        symbol = str(meta.get("contract") or _first_text(order, ("symbol", "option_symbol")) or "").upper().strip()
+        return {
+            "symbol": symbol,
+            "regime": _first_text(order, ("regime", "market_regime")),
+            "model_id": _first_text(order, ("model_id", "model", "strategy_id")),
+        }
+    return {"symbol": "", "regime": "", "model_id": ""}
+
+
+def _option_order_greek_snapshot(orders: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    net_delta = 0.0
+    net_gamma = 0.0
+    net_theta = 0.0
+    net_vega = 0.0
+    gross_contracts = 0.0
+    max_position_contracts = 0.0
+    margin_impact_fraction = 0.0
+    by_symbol: dict[str, Any] = {}
+    missing_greeks: list[str] = []
+    missing_multiplier: list[str] = []
+
+    for order in list(orders or []):
+        if not is_options_order(order):
+            continue
+        meta = option_order_metadata(order)
+        contract = str(meta.get("contract") or _first_text(order, ("symbol", "option_symbol")) or "").upper().strip()
+        if not contract:
+            continue
+        qty = _option_qty(order)
+        if not math.isfinite(qty) or qty <= 0.0:
+            continue
+        signed_contracts = float(qty) * _option_side_sign(order)
+        greeks = dict(meta.get("greeks") or {})
+        if any(greeks.get(name) is None for name in ("delta", "gamma", "theta", "vega")):
+            missing_greeks.append(contract)
+            continue
+        multiplier = _option_multiplier(meta.get("contract"))
+        if multiplier is None:
+            missing_multiplier.append(contract)
+            continue
+        delta = float(greeks["delta"])
+        gamma = float(greeks["gamma"])
+        theta = float(greeks["theta"])
+        vega = float(greeks["vega"])
+        margin_fraction = float(meta.get("margin_impact_fraction") or 0.0)
+
+        delta_contribution = signed_contracts * delta * multiplier
+        gamma_contribution = signed_contracts * gamma * multiplier
+        theta_contribution = signed_contracts * theta * multiplier
+        vega_contribution = signed_contracts * vega * multiplier
+        net_delta += delta_contribution
+        net_gamma += gamma_contribution
+        net_theta += theta_contribution
+        net_vega += vega_contribution
+        gross_contracts += abs(signed_contracts)
+        max_position_contracts = max(max_position_contracts, abs(signed_contracts))
+        margin_impact_fraction += max(0.0, margin_fraction)
+        by_symbol[contract] = {
+            "signed_contracts": float(signed_contracts),
+            "gross_contracts": float(abs(signed_contracts)),
+            "contract_multiplier": float(multiplier),
+            "delta": delta,
+            "gamma": gamma,
+            "theta": theta,
+            "vega": vega,
+            "net_delta": float(delta_contribution),
+            "net_gamma": float(gamma_contribution),
+            "net_theta": float(theta_contribution),
+            "net_vega": float(vega_contribution),
+            "margin_impact_fraction": float(max(0.0, margin_fraction)),
+        }
+
+    return {
+        "net_delta": float(net_delta),
+        "net_gamma": float(net_gamma),
+        "net_theta": float(net_theta),
+        "net_vega": float(net_vega),
+        "gross_contracts": float(gross_contracts),
+        "max_position_contracts": float(max_position_contracts),
+        "margin_impact_fraction": float(margin_impact_fraction),
+        "by_symbol": dict(sorted(by_symbol.items())),
+        "missing_greeks": sorted(missing_greeks),
+        "missing_multiplier": sorted(missing_multiplier),
+        "enabled": True,
+    }
+
+
+def _portfolio_risk_predicate(kind: str, context: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    try:
+        risk = import_module("engine.risk.portfolio_risk_engine")
+        apply_entry = getattr(risk, "apply_portfolio_risk_engine", None)
+        post_checks_fn = getattr(risk, "_post_constraint_checks", None)
+    except Exception as exc:
+        return False, {"provider": "portfolio_risk_engine", "available": False, "error": str(exc)}
+
+    if not callable(apply_entry) or not callable(post_checks_fn):
+        return False, {
+            "provider": "portfolio_risk_engine",
+            "available": False,
+            "apply_entrypoint": callable(apply_entry),
+            "post_constraint_checker": callable(post_checks_fn),
+        }
+
+    orders = [dict(order) for order in list(context.get("orders") or []) if isinstance(order, Mapping)]
+    snapshot = _option_order_greek_snapshot(orders)
+    checks = dict(post_checks_fn({"gross": 0.0, "net": 0.0, "options_greeks": snapshot}) or {})
+    missing_greeks = list(snapshot.get("missing_greeks") or [])
+    missing_multiplier = list(snapshot.get("missing_multiplier") or [])
+    violations = dict(checks.get("options_greek_violations") or {})
+    if kind == "greeks":
+        ok = not missing_greeks and not missing_multiplier and bool(checks.get("options_greeks_within_cap", True))
+    elif kind == "margin_impact":
+        ok = "margin_impact_fraction" not in violations
+    elif kind == "position_limits":
+        ok = "max_position_contracts" not in violations
+    else:
+        ok = bool(checks.get("options_greeks_within_cap", True))
+    return bool(ok), {
+        "provider": "portfolio_risk_engine",
+        "available": True,
+        "entrypoint": "apply_portfolio_risk_engine",
+        "checker": "_post_constraint_checks",
+        "kind": str(kind),
+        "checks": checks,
+        "options_greeks": snapshot,
+    }
+
+
+def _storage_connect_readonly():
+    storage = import_module("engine.runtime.storage")
+    connect = getattr(storage, "connect", None)
+    if not callable(connect):
+        raise RuntimeError("storage_connect_unavailable")
+    return connect(readonly=True)
+
+
+def _data_quality_predicate(kind: str, context: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    try:
+        dq = import_module("engine.data.options_data_quality")
+        compute = getattr(dq, "compute_options_data_quality", None)
+        is_ok = getattr(dq, "options_data_quality_ok", None)
+    except Exception as exc:
+        return False, {"provider": "options_data_quality", "available": False, "error": str(exc)}
+
+    if not callable(compute) or not callable(is_ok):
+        return False, {
+            "provider": "options_data_quality",
+            "available": False,
+            "compute_entrypoint": callable(compute),
+            "ok_helper": callable(is_ok),
+        }
+
+    orders = [dict(order) for order in list(context.get("orders") or []) if isinstance(order, Mapping)]
+    symbols = _option_underlyings(orders) or None
+    con = None
+    try:
+        con = _storage_connect_readonly()
+        report = dict(compute(con, now_ms=int(context.get("now_ms") or time.time() * 1000), symbols=symbols) or {})
+    except Exception as exc:
+        return False, {
+            "provider": "options_data_quality",
+            "available": True,
+            "kind": str(kind),
+            "symbols": symbols or [],
+            "error": str(exc),
+        }
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:  # no-op-guard: allow - read-only DQ connection cleanup is best-effort.
+                pass
+
+    ok = bool(is_ok(report))
+    if kind == "bid_ask_quality":
+        providers = dict(report.get("providers") or {})
+        completeness = [
+            float((stats or {}).get("bid_ask_complete_fraction") or 0.0)
+            for stats in providers.values()
+            if isinstance(stats, Mapping)
+        ]
+        ok = bool(ok and completeness and min(completeness) > 0.0)
+    return bool(ok), {
+        "provider": "options_data_quality",
+        "available": True,
+        "kind": str(kind),
+        "symbols": symbols or [],
+        "report": report,
+    }
+
+
+def _lifecycle_predicate(kind: str, _context: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    try:
+        lifecycle = import_module("engine.execution.options_lifecycle")
+        evidence_fn = getattr(lifecycle, "lifecycle_readiness_evidence", None)
+    except Exception as exc:
+        return False, {"provider": "options_lifecycle", "available": False, "error": str(exc)}
+
+    if not callable(evidence_fn):
+        return False, {"provider": "options_lifecycle", "available": False, "entrypoint": False}
+
+    try:
+        evidence = dict(evidence_fn(os.environ) or {})
+    except Exception as exc:
+        return False, {"provider": "options_lifecycle", "available": True, "error": str(exc)}
+
+    required_key = "assignment_exercise_model" if kind == "assignment_exercise" else "expiration_risk_model"
+    ok = bool(evidence.get("implemented")) and bool(evidence.get("enabled")) and bool(evidence.get(required_key))
+    return bool(ok), {
+        "provider": "options_lifecycle",
+        "available": True,
+        "kind": str(kind),
+        "required_evidence": required_key,
+        "evidence": evidence,
+    }
+
+
+def _broker_support_predicate(_kind: str, context: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    broker_names = _broker_tokens(context.get("broker") or os.environ.get("BROKER") or os.environ.get("BROKER_NAME") or "")
+    adapter_names = [name for name in broker_names if name in LIVE_OPTIONS_BROKER_ADAPTERS]
+    missing_adapter = [name for name in broker_names if name in LIVE_BROKERS and name not in LIVE_OPTIONS_BROKER_ADAPTERS]
+    if missing_adapter and not adapter_names:
+        return True, {
+            "provider": "options_broker_adapter_registry",
+            "available": True,
+            "broker_names": broker_names,
+            "registered_adapters": sorted(LIVE_OPTIONS_BROKER_ADAPTERS),
+            "specific_adapter_blocker": [f"options_live_broker_adapter_missing:{name}" for name in missing_adapter],
+        }
+    if not adapter_names:
+        return False, {
+            "provider": "options_broker_adapter_registry",
+            "available": False,
+            "broker_names": broker_names,
+            "registered_adapters": sorted(LIVE_OPTIONS_BROKER_ADAPTERS),
+        }
+    importable: dict[str, bool] = {}
+    errors: dict[str, str] = {}
+    for adapter_name in adapter_names:
+        try:
+            module_name = "engine.execution.broker_tradier_options" if adapter_name == "tradier_options" else ""
+            if not module_name:
+                raise RuntimeError(f"options_adapter_module_unknown:{adapter_name}")
+            module = import_module(module_name)
+            importable[adapter_name] = callable(getattr(module, "apply_latest_portfolio_orders_live", None))
+        except Exception as exc:
+            importable[adapter_name] = False
+            errors[adapter_name] = str(exc)
+    return all(importable.values()), {
+        "provider": "options_broker_adapter_registry",
+        "available": True,
+        "broker_names": broker_names,
+        "registered_adapters": sorted(LIVE_OPTIONS_BROKER_ADAPTERS),
+        "adapter_importable": importable,
+        "errors": errors,
+    }
+
+
+def _kill_switch_predicate(_kind: str, context: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    try:
+        kill_switch = import_module("engine.execution.kill_switch")
+        execution_allowed = getattr(kill_switch, "execution_allowed", None)
+    except Exception as exc:
+        return False, {"provider": "kill_switch.execution_allowed", "available": False, "error": str(exc)}
+    if not callable(execution_allowed):
+        return False, {"provider": "kill_switch.execution_allowed", "available": False, "entrypoint": False}
+    scope = _first_order_scope([dict(order) for order in list(context.get("orders") or []) if isinstance(order, Mapping)])
+    try:
+        allowed, reason, meta = execution_allowed(
+            con=None,
+            symbol=scope.get("symbol") or None,
+            regime=scope.get("regime") or None,
+            model_id=scope.get("model_id") or None,
+        )
+    except Exception as exc:
+        return False, {
+            "provider": "kill_switch.execution_allowed",
+            "available": True,
+            "scope": scope,
+            "error": str(exc),
+        }
+    return bool(allowed), {
+        "provider": "kill_switch.execution_allowed",
+        "available": True,
+        "scope": scope,
+        "reason": str(reason or "ok"),
+        "meta": dict(meta or {}),
+    }
+
+
+GatePredicate = Callable[[str, Mapping[str, Any]], tuple[bool, dict[str, Any]]]
+
+_GATE_PREDICATES: dict[str, GatePredicate] = {
+    "greeks": _portfolio_risk_predicate,
+    "liquidity_filters": _data_quality_predicate,
+    "bid_ask_quality": _data_quality_predicate,
+    "assignment_exercise": _lifecycle_predicate,
+    "expiration_risk": _lifecycle_predicate,
+    "margin_impact": _portfolio_risk_predicate,
+    "broker_support": _broker_support_predicate,
+    "position_limits": _portfolio_risk_predicate,
+    "kill_switch_integration": _kill_switch_predicate,
+}
+
+
+def _control_flag_snapshot(
+    *,
+    broker: Any = None,
+    orders: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> tuple[list[str], dict[str, Any]]:
     blockers: list[str] = []
     controls: dict[str, Any] = {}
+    context = {
+        "broker": broker,
+        "orders": [dict(order) for order in list(orders or []) if isinstance(order, Mapping)],
+        "now_ms": int(time.time() * 1000),
+    }
     for control, blocker, names in CONTROL_FLAG_GROUPS:
         enabled = _env_bool(*names, default=False)
         configured = any(bool(_env_text(name)) for name in names)
+        real_ok = False
+        detail: dict[str, Any] = {"evaluated": False, "reason": "env_flag_not_enabled"}
+        if enabled:
+            predicate = _GATE_PREDICATES.get(control)
+            if callable(predicate):
+                try:
+                    real_ok, detail = predicate(control, context)
+                    detail = dict(detail or {})
+                    detail["evaluated"] = True
+                except Exception as exc:
+                    real_ok = False
+                    detail = {"evaluated": True, "error": str(exc), "provider": control}
+            else:
+                real_ok = False
+                detail = {"evaluated": True, "error": "gate_predicate_missing", "provider": control}
         controls[control] = {
-            "ok": bool(enabled),
+            "ok": bool(enabled and real_ok),
             "configured": bool(configured),
             "env": list(names),
+            "detail": detail,
         }
         if not enabled:
             blockers.append(blocker)
+        elif not real_ok:
+            blockers.append(_check_failed_blocker(blocker))
     return blockers, controls
 
 
@@ -419,7 +834,7 @@ def live_options_readiness_snapshot(
     if mode != "live" or not requested:
         blockers.append("options_live_orders_disabled_shadow_only")
 
-    flag_blockers, flag_controls = _control_flag_snapshot()
+    flag_blockers, flag_controls = _control_flag_snapshot(broker=broker, orders=option_orders)
     numeric_blockers, numeric_controls = _numeric_control_snapshot()
     blockers.extend(flag_blockers)
     blockers.extend(numeric_blockers)

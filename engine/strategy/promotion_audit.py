@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any
 from engine.audit.chain import append_chain_row
 from engine.artifacts.store import LocalArtifactStore
 from engine.runtime.storage import connect, init_db, run_write_txn
+from engine.strategy.model_decision_snapshot import enrich_decision_reason
 
 
 _MODEL_ID_RE = re.compile(
@@ -214,7 +215,17 @@ def audit(
     regime: Optional[str] = None,
 ) -> None:
     init_db()
-    reason_payload = dict(reason or {})
+    reason_payload = enrich_decision_reason(
+        dict(reason or {}),
+        action=str(action),
+        actor=str(actor),
+        model_name=str(model_name),
+        from_kind=from_kind,
+        from_ts_ms=from_ts_ms,
+        to_kind=to_kind,
+        to_ts_ms=to_ts_ms,
+        regime=regime,
+    )
     con = connect()
     try:
         resolved_from_sha = str(from_artifact_sha256 or "").strip() or _lookup_artifact_sha(

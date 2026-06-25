@@ -2593,7 +2593,18 @@ def snapshot(con=None) -> Dict[str, Any]:
                     "updated_ts_ms": int(r[7] or 0),
                 }
             )
-        return _with_activation_failure({"state": out})
+        try:
+            from engine.cache.wrappers.kill_switch import annotate_effective_state
+
+            payload = annotate_effective_state({"state": out}, persisted_read_source="db")
+        except Exception as e:
+            _warn_nonfatal(
+                "KILL_SWITCH_EFFECTIVE_STATE_ANNOTATION_FAILED",
+                e,
+                once_key="snapshot_effective_state_annotation",
+            )
+            payload = {"state": out}
+        return _with_activation_failure(payload)
     finally:
         if owns:
             con.close()

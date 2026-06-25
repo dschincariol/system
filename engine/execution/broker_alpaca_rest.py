@@ -39,6 +39,7 @@ from engine.execution.broker_failover_policy import terminal_broker_failure
 from engine.execution.broker_fill_utils import parse_broker_timestamp_ms
 from engine.execution.kill_switch_reactivity import wait_with_kill_interrupt
 from engine.execution.options_readiness import live_options_order_block
+from engine.execution.share_rounding import round_equity_qty
 from engine.execution.execution_ledger import init_execution_ledger, log_submit, log_fill
 from engine.execution.broker_submission_recovery import (
     record_submission_unrecorded,
@@ -293,6 +294,21 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
             value_type=type(value).__name__,
         )
         return float(default)
+
+
+def _share_rounding_asset_class(symbol: str) -> str:
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        return str(asset_class_for_symbol(symbol) or "UNKNOWN").upper().strip() or "UNKNOWN"
+    except Exception as e:
+        _warn_nonfatal(
+            "BROKER_ALPACA_SHARE_ROUNDING_ASSET_CLASS_FAILED",
+            e,
+            once_key=f"share_rounding_asset_class:{symbol}",
+            symbol=str(symbol),
+        )
+        return "UNKNOWN"
 
 
 def _is_multi_slice_override(orders: Optional[List[Dict[str, Any]]]) -> bool:
@@ -1532,6 +1548,7 @@ def apply_latest_portfolio_orders_live(
             }
 
         submitted = []
+        share_rounding_skipped: List[Dict[str, Any]] = []
         n = 0
 
         for o in orders_ale[: int(MAX_ORDERS_PER_PASS)]:
@@ -1585,6 +1602,51 @@ def apply_latest_portfolio_orders_live(
             order_meta = dict(o or {})
             order_meta["portfolio_risk_caps"] = dict(risk_cap_audit or {})
 
+            # EQ-07 owns equity share rounding only. FX weight-to-lots conversion
+            # remains the unowned FX-06 seam and passes through untouched here.
+            delta, share_rounding_audit = round_equity_qty(
+                float(delta),
+                float(px),
+                broker="alpaca",
+                asset_class=_share_rounding_asset_class(symbol),
+            )
+            record_share_rounding = bool(
+                share_rounding_audit.get("enabled") and share_rounding_audit.get("eligible")
+            )
+            if record_share_rounding:
+                order_meta["share_rounding"] = dict(share_rounding_audit)
+            if abs(delta) < 1e-6:
+                if record_share_rounding and bool(share_rounding_audit.get("changed")):
+                    skipped = {
+                        "symbol": str(symbol),
+                        "reason": str(share_rounding_audit.get("reason") or "share_rounding_zero_delta"),
+                        "share_rounding": dict(share_rounding_audit),
+                    }
+                    share_rounding_skipped.append(skipped)
+                    audit = record_broker_action_audit(
+                        broker="alpaca",
+                        action="order_submit_skipped",
+                        status="skipped",
+                        symbol=str(symbol),
+                        qty=0.0,
+                        portfolio_orders_id=(int(order_id) if order_id is not None else None),
+                        mode=str(order_meta.get("execution_mode") or ""),
+                        payload=skipped,
+                    )
+                    if not bool(audit.get("ok")):
+                        return {
+                            "ok": False,
+                            "status": "broker_action_audit_failed",
+                            "broker": "alpaca",
+                            "stop_failover": True,
+                            "detail": "share_rounding_skip_audit_failed",
+                            "symbol": str(symbol),
+                            "submitted_n": int(n),
+                            "audit": dict(audit or {}),
+                        }
+                pos[symbol] = float(cur_qty)
+                continue
+
             audit = record_broker_action_audit(
                 broker="alpaca",
                 action="order_submit_attempt",
@@ -1598,6 +1660,7 @@ def apply_latest_portfolio_orders_live(
                     "aggressiveness": str(aggressiveness or ""),
                     "source_order_id": o.get("source_order_id"),
                     "source_alert_id": o.get("source_alert_id"),
+                    **({"share_rounding": dict(share_rounding_audit)} if record_share_rounding else {}),
                 },
             )
             if not bool(audit.get("ok")):
@@ -1866,12 +1929,15 @@ def apply_latest_portfolio_orders_live(
         if order_id is not None and not bool(multi_slice_override):
             set_state("alpaca_last_portfolio_orders_id", str(int(order_id)))
 
-        return {
+        result = {
             "ok": True,
             "broker": "alpaca",
             "submitted_n": n,
             "parent_cursor_deferred": bool(multi_slice_override),
         }
+        if share_rounding_skipped:
+            result["share_rounding_skipped"] = list(share_rounding_skipped)
+        return result
 
     finally:
         con.close()

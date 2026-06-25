@@ -185,12 +185,23 @@ def _dashboard_route_contract_introspection_enabled() -> bool:
 if not _dashboard_route_contract_introspection_enabled():
     try:
         from dotenv import load_dotenv
-        load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
+        env_file_raw = str(os.environ.get("TRADING_ENV_FILE") or ".env").strip() or ".env"
+        env_file_path = os.path.expanduser(env_file_raw)
+        if not os.path.isabs(env_file_path):
+            env_file_path = os.path.join(_PROJECT_ROOT, env_file_path)
+        load_dotenv(env_file_path, override=False)
     except ModuleNotFoundError as e:
         if not _is_missing_optional_module(e, "dotenv"):
             _bootstrap_stderr_event("runtime_bootstrap_dotenv_load_failed", e)
     except Exception as e:
         _bootstrap_stderr_event("runtime_bootstrap_dotenv_load_failed", e)
+
+    try:
+        from engine.runtime.platform import resolve_runtime_paths
+
+        resolve_runtime_paths(os.environ, project_root=_PROJECT_ROOT)
+    except Exception as e:
+        _bootstrap_stderr_event("runtime_bootstrap_path_resolve_failed", e)
 
 from engine.runtime.config_schema import ConfigError, get_runtime_safety_context, load_runtime_config
 from engine.runtime.platform import default_data_root

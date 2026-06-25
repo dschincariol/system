@@ -56,6 +56,11 @@ def _normalize_state(state: Any) -> str:
     return s
 
 
+_WARMUP_TIMEOUT_DETAILS = {
+    "warmup_timeout_awaiting_first_price_tick",
+}
+
+
 def _warn_nonfatal(code: str, error: BaseException, **extra: object) -> None:
     log_failure(
         _logger,
@@ -119,6 +124,8 @@ def set_state(state: Any, detail: str = "") -> Dict[str, Any]:
     # After that point, late bootstrap / child-start callbacks must not drag the
     # global lifecycle back out of LIVE or DEGRADED.
     if norm == WARMING_UP and first_price_seen:
+        return get_state()
+    if norm == WARMING_UP and prev == DEGRADED and prev_detail in _WARMUP_TIMEOUT_DETAILS:
         return get_state()
 
     # Lifecycle monitoring polls continuously. When the state/detail pair has

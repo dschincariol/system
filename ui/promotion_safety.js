@@ -6,7 +6,7 @@
   Extracted verbatim from dashboard.js
 */
 
-import { requestConfirmation } from "./confirmation_modal.mjs";
+import { buildConfirmationPayload, requestConfirmation } from "./confirmation_modal.mjs";
 
 const _PROMO_PAUSED_KEY = "promo_paused_due_to_exec_v1";
 
@@ -18,6 +18,19 @@ let _loadPromotionStatus = null;
 let _loadSizePolicy = null;
 let _refresh = null;
 let _getManipBlockedSyms = () => new Set();
+
+function fallbackConfirmationPayload({ token, actionId, source, target, reason = "operator mode confirmation" }) {
+  return buildConfirmationPayload(
+    { reason, holdMs: 0 },
+    {
+      actionId,
+      confirmText: token,
+      actor: "operator",
+      source,
+      target,
+    },
+  );
+}
 
 export function initPromotionSafetyEngine(deps) {
   _isExecutionDegraded = deps.isExecutionDegraded;
@@ -56,6 +69,13 @@ export async function maybeAutoResumePromotionsAfterRecovery({
       return;
     }
 
+    let confirmationPayload = fallbackConfirmationPayload({
+      token: "PROMOTION",
+      actionId: "promotion.enable",
+      source: "dashboard_promotion",
+      target: "promotion automation",
+      reason: "resume promotions after execution recovery",
+    });
     if (!operatorMode) {
       const confirmation = await requestConfirmation({
         title: "Resume promotions",
@@ -68,6 +88,7 @@ export async function maybeAutoResumePromotionsAfterRecovery({
         source: "dashboard_promotion",
       });
       if (!confirmation.ok) return;
+      confirmationPayload = confirmation.payload;
     }
 
     const res = await _fetchJSON("/api/promotion/enable", {
@@ -75,10 +96,7 @@ export async function maybeAutoResumePromotionsAfterRecovery({
       body: JSON.stringify({
         on: "1",
         confirm: "PROMOTION",
-        confirmation: "PROMOTION",
-        consequence_ack: true,
-        actor: "operator",
-        source: "dashboard_promotion",
+        ...confirmationPayload,
       }),
     });
     if (res && res.ok) {
@@ -111,6 +129,13 @@ export async function handlePromotionToggle({
     return;
   }
 
+  let confirmationPayload = fallbackConfirmationPayload({
+    token: "PROMOTION",
+    actionId: "promotion.enable",
+    source: "dashboard_promotion",
+    target: "promotion automation",
+    reason: "toggle promotions from operator mode",
+  });
   if (!operatorMode) {
     const confirmation = await requestConfirmation({
       title: "Toggle promotions",
@@ -123,6 +148,7 @@ export async function handlePromotionToggle({
       source: "dashboard_promotion",
     });
     if (!confirmation.ok) return;
+    confirmationPayload = confirmation.payload;
   }
 
   const st = await _fetchJSON("/api/promotion/status");
@@ -142,10 +168,7 @@ export async function handlePromotionToggle({
     body: JSON.stringify({
       on: next,
       confirm: "PROMOTION",
-      confirmation: "PROMOTION",
-      consequence_ack: true,
-      actor: "operator",
-      source: "dashboard_promotion",
+      ...confirmationPayload,
     }),
   });
   if (!res || !res.ok) {
@@ -161,6 +184,13 @@ export async function handlePromotionToggle({
 export async function handleAutoFix({
   operatorMode
 }) {
+  let confirmationPayload = fallbackConfirmationPayload({
+    token: "SYSTEM_FIX",
+    actionId: "system.fix",
+    source: "dashboard_system_fix",
+    target: "startup and runtime checks",
+    reason: "operator mode system fix",
+  });
   if (!operatorMode) {
     const confirmation = await requestConfirmation({
       title: "Run automatic fix",
@@ -175,6 +205,7 @@ export async function handleAutoFix({
       source: "dashboard_system_fix",
     });
     if (!confirmation.ok) return;
+    confirmationPayload = confirmation.payload;
   }
 
   const el = document.getElementById("console");
@@ -184,10 +215,7 @@ export async function handleAutoFix({
     method: "POST",
     body: JSON.stringify({
       confirm: "SYSTEM_FIX",
-      confirmation: "SYSTEM_FIX",
-      consequence_ack: true,
-      actor: "operator",
-      source: "dashboard_system_fix",
+      ...confirmationPayload,
     }),
   });
   if (!res || !res.ok) {

@@ -16,10 +16,12 @@ import time
 from engine.api.internal_access import db_connect
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
+from engine.strategy.model_decision_snapshot import enrich_decision_reason
 
 LOG = get_logger("engine.api.api_governance")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 ROLLBACK_CONFIRM_TOKEN = "ROLLBACK_CHAMPION"
+ROLLBACK_ACTION_ID = "promotion.rollback"
 ROLLBACK_JUSTIFICATION_MIN_LEN = 12
 
 
@@ -59,13 +61,28 @@ def _rollback_justification_error(body) -> dict | None:
 
 
 def _rollback_confirmation_error(body) -> dict | None:
-    confirm = str(_body_dict(body).get("confirm") or "").strip()
+    payload = _body_dict(body)
+    confirm = str(
+        payload.get("confirm")
+        or payload.get("confirmation_token")
+        or payload.get("confirmation")
+        or ""
+    ).strip()
     if confirm == ROLLBACK_CONFIRM_TOKEN:
-        return None
+        action_id = str(payload.get("action_id") or ROLLBACK_ACTION_ID).strip()
+        if not action_id or action_id == ROLLBACK_ACTION_ID:
+            return None
+        return {
+            "ok": False,
+            "error": "confirmation_action_mismatch",
+            "required_action_id": ROLLBACK_ACTION_ID,
+            "http_status": 422,
+        }
     return {
         "ok": False,
         "error": "confirmation_required",
         "required_confirm": ROLLBACK_CONFIRM_TOKEN,
+        "required_action_id": ROLLBACK_ACTION_ID,
         "http_status": 422,
     }
 
@@ -419,14 +436,16 @@ def build_promotion_gate_data(
     rollback_target = _stage_latest(rows, "retired")
     safe_replay_status = dict(replay_status or {})
     safe_shadow_scores = list(shadow_scores or [])
+    checklist = _gate_checklist(safe_status, reason, safe_replay_status, safe_shadow_scores)
+    comparison_metrics = _comparison_metrics(champion, challenger)
 
     cooldown_check = next(
-        (item for item in _gate_checklist(safe_status, reason, safe_replay_status, safe_shadow_scores) if item["key"] == "cooldown"),
+        (item for item in checklist if item["key"] == "cooldown"),
         {},
     )
     cooldown_observed = cooldown_check.get("observed") if isinstance(cooldown_check, dict) else {}
 
-    return {
+    gate_payload = {
         "ok": True,
         "model_name": str(model_name),
         "regime": str(regime or "global"),
@@ -439,8 +458,8 @@ def build_promotion_gate_data(
         "champion": champion,
         "challenger": challenger,
         "rollback_target": rollback_target,
-        "comparison_metrics": _comparison_metrics(champion, challenger),
-        "checklist": _gate_checklist(safe_status, reason, safe_replay_status, safe_shadow_scores),
+        "comparison_metrics": comparison_metrics,
+        "checklist": checklist,
         "cooldown": {
             "available": bool(cooldown_observed),
             "state": str(cooldown_check.get("state") or "unavailable") if isinstance(cooldown_check, dict) else "unavailable",
@@ -477,6 +496,83 @@ def build_promotion_gate_data(
         },
         "source": "api_governance.get_promotion_explain",
     }
+    snapshot_reason = enrich_decision_reason(
+        {"note": "promotion gate preview"},
+        action="preview",
+        actor="system",
+        model_name=str(model_name),
+        from_kind=(champion or {}).get("model_kind") if champion else None,
+        from_ts_ms=(champion or {}).get("model_ts_ms") if champion else None,
+        to_kind=(challenger or rollback_target or {}).get("model_kind") if (challenger or rollback_target) else None,
+        to_ts_ms=(challenger or rollback_target or {}).get("model_ts_ms") if (challenger or rollback_target) else None,
+        regime=str(regime or "global"),
+        gate_snapshot=gate_payload,
+    )
+    gate_payload["model_card_preview"] = snapshot_reason.get("model_card_snapshot")
+    gate_payload["gate_state_snapshot"] = snapshot_reason.get("gate_state_at_decision")
+    gate_payload["staleness_badges"] = snapshot_reason.get("staleness_badges", [])
+    gate_payload["source_citations"] = snapshot_reason.get("source_citations", [])
+    return gate_payload
+
+
+def _current_gate_snapshot_for_audit(model_name: str = "embed_regressor", regime: str = "global") -> dict:
+    """Best-effort server-side gate snapshot for audit writes."""
+
+    try:
+        rows = []
+        try:
+            from engine.model_registry import list_recent
+
+            rows = list_recent(str(model_name), limit=50) or []
+        except Exception as e:
+            _warn_nonfatal(
+                "API_GOVERNANCE_AUDIT_REGISTRY_SNAPSHOT_FAILED",
+                e,
+                once_key="api_governance_audit_registry_snapshot_failed",
+            )
+
+        replay_status = {}
+        replay_validation = {}
+        try:
+            from engine.runtime.runtime_meta import meta_get
+
+            replay_status = _safe_json_dict(meta_get("competition_replay_validation_status", "") or "{}")
+            replay_validation = _safe_json_dict(meta_get("competition_replay_validation", "") or "{}")
+        except Exception as e:
+            _warn_nonfatal(
+                "API_GOVERNANCE_AUDIT_REPLAY_SNAPSHOT_FAILED",
+                e,
+                once_key="api_governance_audit_replay_snapshot_failed",
+            )
+
+        shadow_scores = []
+        try:
+            from engine.runtime.shadow_capital_allocator import get_shadow_capital_scores
+
+            shadow_scores = list((get_shadow_capital_scores(limit=10, regime=str(regime or "global")) or {}).get("rows") or [])
+        except Exception as e:
+            _warn_nonfatal(
+                "API_GOVERNANCE_AUDIT_SHADOW_SNAPSHOT_FAILED",
+                e,
+                once_key="api_governance_audit_shadow_snapshot_failed",
+            )
+
+        return build_promotion_gate_data(
+            status=get_promotion_status(),
+            registry_rows=rows,
+            model_name=str(model_name),
+            regime=str(regime or "global"),
+            replay_status=replay_status,
+            replay_validation=replay_validation,
+            shadow_scores=shadow_scores,
+        )
+    except Exception as e:
+        _warn_nonfatal(
+            "API_GOVERNANCE_AUDIT_GATE_SNAPSHOT_FAILED",
+            e,
+            once_key="api_governance_audit_gate_snapshot_failed",
+        )
+        return {}
 
 
 # --------------------------------------------------
@@ -507,9 +603,41 @@ def api_post_rollback(_parsed=None, _body=None, _ctx=None):
                 once_key="api_governance_pre_rollback_champion_read",
             )
 
+        gate_snapshot = _current_gate_snapshot_for_audit("embed_regressor", "global")
         ch_after = _rb("embed_regressor")
         if not ch_after:
             return {"ok": False, "error": "no retired model available"}
+
+        confirmation = {
+            "confirmed": True,
+            "action_id": str(payload.get("action_id") or ROLLBACK_ACTION_ID),
+            "confirmation_token": str(payload.get("confirmation_token") or payload.get("confirm") or ROLLBACK_CONFIRM_TOKEN),
+            "confirmation_method": str(payload.get("confirmation_method") or "typed_phrase"),
+            "confirmation_hold_ms": _safe_int(payload.get("confirmation_hold_ms"), 0),
+            "consequence_ack": bool(payload.get("consequence_ack", True)),
+            "request_id": str(payload.get("request_id") or ""),
+            "source_surface": str(payload.get("source_surface") or payload.get("source") or "dashboard"),
+        }
+        reason = enrich_decision_reason(
+            {
+                "note": "dashboard rollback",
+                "justification": justification,
+                "confirmed": True,
+                "source": str(payload.get("source") or "dashboard"),
+                "preview": payload.get("preview") if isinstance(payload.get("preview"), dict) else {},
+                "client_gate_snapshot": payload.get("gate_snapshot") if isinstance(payload.get("gate_snapshot"), dict) else {},
+            },
+            action="rollback",
+            actor=str(payload.get("actor") or "manual"),
+            model_name="embed_regressor",
+            from_kind=(ch_before.get("model_kind") if ch_before else None),
+            from_ts_ms=(ch_before.get("model_ts_ms") if ch_before else None),
+            to_kind=ch_after.get("model_kind"),
+            to_ts_ms=ch_after.get("model_ts_ms"),
+            regime="global",
+            gate_snapshot=gate_snapshot,
+            confirmation=confirmation,
+        )
 
         _audit(
             actor="manual",
@@ -519,13 +647,8 @@ def api_post_rollback(_parsed=None, _body=None, _ctx=None):
             from_ts_ms=(ch_before.get("model_ts_ms") if ch_before else None),
             to_kind=ch_after.get("model_kind"),
             to_ts_ms=ch_after.get("model_ts_ms"),
-            reason={
-                "note": "dashboard rollback",
-                "justification": justification,
-                "confirmed": True,
-                "source": str(payload.get("source") or "dashboard"),
-                "preview": payload.get("preview") if isinstance(payload.get("preview"), dict) else {},
-            },
+            reason=reason,
+            regime="global",
         )
 
         return {"ok": True, "champion": ch_after, "audit_justification_recorded": True}
@@ -636,7 +759,7 @@ def get_promotion_explain():
         con = db_connect()
         rows = con.execute(
                 """
-                SELECT ts_ms, model_name, key, decision, reason, detail_json
+                SELECT ts_ms, actor, action, model_name, reason_json, regime
                 FROM model_promotion_audit
                 ORDER BY ts_ms DESC
                 LIMIT 50
@@ -645,13 +768,16 @@ def get_promotion_explain():
         con.close()
 
         for r in rows or []:
+            reason = _safe_json_dict(r[4])
             out["audit"].append({
                 "ts_ms": int(r[0] or 0),
-                "model_name": str(r[1] or ""),
-                "key": str(r[2] or ""),
-                "decision": str(r[3] or ""),
-                "reason": str(r[4] or ""),
-                "detail_json": r[5],
+                "actor": str(r[1] or ""),
+                "action": str(r[2] or ""),
+                "model_name": str(r[3] or ""),
+                "reason": reason,
+                "regime": str(r[5] or "global"),
+                "model_card_snapshot": reason.get("model_card_snapshot") if isinstance(reason.get("model_card_snapshot"), dict) else {},
+                "gate_state_at_decision": reason.get("gate_state_at_decision") if isinstance(reason.get("gate_state_at_decision"), dict) else {},
             })
     except Exception as e:
         _warn_nonfatal(

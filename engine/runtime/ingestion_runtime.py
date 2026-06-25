@@ -554,6 +554,7 @@ def _emit_ingestion_heartbeat(children: Optional[Dict[str, Dict[str, object]]]) 
             "market_state": dict(_INGESTION_STATE),
             "shard": INGESTION_SHARD.as_dict(),
             "liveness_job_name": str(INGESTION_RUNTIME_JOB_LOCK_NAME),
+            "supervisor_owner_pid": _safe_int(os.environ.get("ENGINE_RUNTIME_OWNER_PID"), 0),
             "writer_diagnostics": writer_diagnostics,
             "heartbeat_every_s": float(HEARTBEAT_EVERY_S),
         },

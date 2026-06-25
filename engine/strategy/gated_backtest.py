@@ -111,6 +111,148 @@ def _safe_trade_suppression(**kwargs: Any) -> Dict[str, Any]:
         return _neutral_trade_suppression("no_backtest_trade_suppression_history")
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return float(default)
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    return float(out) if math.isfinite(out) else float(default)
+
+
+def _config_enabled(cost_config: Mapping[str, Any] | None) -> bool:
+    if not isinstance(cost_config, Mapping):
+        return True
+    raw = cost_config.get("enabled", True)
+    if isinstance(raw, bool):
+        return bool(raw)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _futures_backtest_equity(cost_config: Mapping[str, Any] | None) -> float:
+    cfg = dict(cost_config or {})
+    for key in ("equity", "account_equity", "portfolio_equity", "notional"):
+        value = _safe_float(cfg.get(key), 0.0)
+        if value > 0.0:
+            return float(value)
+    return 100_000.0
+
+
+def _cost_config_asset_class(cost_config: Mapping[str, Any] | None) -> str:
+    if not isinstance(cost_config, Mapping):
+        return ""
+    return str(cost_config.get("asset_class") or "").upper().strip()
+
+
+def _is_futures_symbol(symbol: str) -> bool:
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+
+        return parse_futures_symbol(str(symbol or "")) is not None
+    except Exception as exc:
+        _warn_nonfatal(
+            "GATED_BACKTEST_FUTURES_SYMBOL_PARSE_FAILED",
+            exc,
+            symbol=str(symbol),
+        )
+        return False
+
+
+def _should_apply_futures_costs(
+    cost_config: Mapping[str, Any] | None,
+    previous_weights: Mapping[str, float],
+    selected_weights: Mapping[str, float],
+) -> bool:
+    if not _config_enabled(cost_config):
+        return False
+    if _cost_config_asset_class(cost_config) == "FUTURES":
+        return True
+    return any(_is_futures_symbol(str(symbol)) for symbol in set(previous_weights.keys()) | set(selected_weights.keys()))
+
+
+def _estimate_futures_transition_costs(
+    *,
+    con: Any,
+    previous_weights: Mapping[str, float],
+    selected_weights: Mapping[str, float],
+    equity: float,
+    ts_ms: int,
+    force_metadata_lookup: bool = False,
+) -> Dict[str, Any]:
+    """Apply the existing FUT-08 point-value cost estimator to futures deltas only."""
+    try:
+        from engine.strategy import portfolio_backtest
+    except Exception as exc:
+        _warn_nonfatal("GATED_BACKTEST_FUTURES_COST_IMPORT_FAILED", exc)
+        return {
+            "enabled": False,
+            "status": "import_failed",
+            "cost_return": 0.0,
+            "trade_costs": [],
+        }
+
+    total_cost = 0.0
+    trade_costs: list[Dict[str, Any]] = []
+    symbols = sorted(set(previous_weights.keys()) | set(selected_weights.keys()))
+    for symbol in symbols:
+        symbol_text = str(symbol or "").upper().strip()
+        if not symbol_text:
+            continue
+        if not bool(force_metadata_lookup) and not _is_futures_symbol(symbol_text):
+            continue
+        try:
+            futures_meta = portfolio_backtest._futures_metadata(con, symbol_text)
+        except Exception as exc:
+            _warn_nonfatal(
+                "GATED_BACKTEST_FUTURES_METADATA_FAILED",
+                exc,
+                symbol=symbol_text,
+            )
+            futures_meta = None
+        if not isinstance(futures_meta, dict):
+            continue
+
+        delta_weight = float(selected_weights.get(symbol_text, 0.0)) - float(previous_weights.get(symbol_text, 0.0))
+        if abs(float(delta_weight)) <= 1e-9:
+            continue
+        try:
+            trade_cost = dict(
+                portfolio_backtest._estimate_weight_delta_trade_cost(
+                    con,
+                    symbol_text,
+                    delta_weight=float(delta_weight),
+                    equity=float(equity),
+                    ts_ms=int(ts_ms),
+                )
+                or {}
+            )
+        except Exception as exc:
+            _warn_nonfatal(
+                "GATED_BACKTEST_FUTURES_COST_ESTIMATE_FAILED",
+                exc,
+                symbol=symbol_text,
+                ts_ms=int(ts_ms),
+            )
+            continue
+        if str(trade_cost.get("status") or "") != "estimated_futures":
+            trade_cost.setdefault("asset_class", "FUTURES")
+            trade_costs.append(trade_cost)
+            continue
+        total_cost += float(trade_cost.get("exec_cost") or 0.0)
+        trade_costs.append(trade_cost)
+
+    equity_base = max(1e-12, float(equity))
+    return {
+        "enabled": True,
+        "status": "evaluated",
+        "equity": float(equity_base),
+        "exec_cost": float(total_cost),
+        "cost_return": float(total_cost / equity_base),
+        "trade_costs": trade_costs,
+    }
+
+
 def run_gated_backtest(
     predictions: Sequence[float] | np.ndarray,
     realized_returns: Sequence[float] | np.ndarray,
@@ -150,11 +292,14 @@ def run_gated_backtest(
     returns: list[float] = []
     frictionless_returns: list[float] = []
     cost_returns: list[float] = []
+    futures_cost_returns: list[float] = []
     turnover_rows: list[float] = []
     cost_rows: list[Dict[str, float]] = []
+    futures_cost_rows: list[Dict[str, Any]] = []
     selected_symbols_by_ts: list[Dict[str, Any]] = []
     shaped_order_count = 0
     blocked_order_count = 0
+    futures_cost_equity = _futures_backtest_equity(cost_config)
 
     try:
         cursor = 0
@@ -255,11 +400,29 @@ def run_gated_backtest(
             turnover = float(broker_result.get("turnover") or 0.0)
             components = dict(broker_result.get("costs") or {})
             cost_return = float(components.get("cost_return") or 0.0)
-            returns.append(float(broker_result.get("net_return") or 0.0))
+            futures_cost = {
+                "enabled": False,
+                "status": "disabled",
+                "cost_return": 0.0,
+                "trade_costs": [],
+            }
+            if _should_apply_futures_costs(cost_config, previous_weights, selected_weights):
+                futures_cost = _estimate_futures_transition_costs(
+                    con=con,
+                    previous_weights=previous_weights,
+                    selected_weights=selected_weights,
+                    equity=float(futures_cost_equity),
+                    ts_ms=int(ts_ms),
+                    force_metadata_lookup=(_cost_config_asset_class(cost_config) == "FUTURES"),
+                )
+            futures_cost_return = float(futures_cost.get("cost_return") or 0.0)
+            returns.append(float(broker_result.get("net_return") or 0.0) - float(futures_cost_return))
             frictionless_returns.append(float(frictionless_group_return))
             cost_returns.append(float(cost_return))
+            futures_cost_returns.append(float(futures_cost_return))
             turnover_rows.append(float(turnover))
             cost_rows.append(dict(components))
+            futures_cost_rows.append(dict(futures_cost))
             previous_weights = dict(selected_weights)
             selected_symbols_by_ts.append(
                 {
@@ -288,11 +451,15 @@ def run_gated_backtest(
         "cost_adjusted_returns": [float(value) for value in returns_arr.tolist()],
         "frictionless_returns": [float(value) for value in frictionless_arr.tolist()],
         "cost_returns": [float(value) for value in cost_returns],
+        "futures_cost_returns": [float(value) for value in futures_cost_returns],
         "turnover": [float(value) for value in turnover_rows],
         "costs": {
             "components": cost_rows,
+            "futures_components": futures_cost_rows,
             "total_turnover": float(sum(turnover_rows)),
-            "total_cost_return": float(sum(cost_returns)),
+            "total_broker_cost_return": float(sum(cost_returns)),
+            "total_futures_cost_return": float(sum(futures_cost_returns)),
+            "total_cost_return": float(sum(cost_returns) + sum(futures_cost_returns)),
         },
         "selected_symbols_by_ts": selected_symbols_by_ts,
         "diagnostics": {

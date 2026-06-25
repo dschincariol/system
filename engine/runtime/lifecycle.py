@@ -198,11 +198,14 @@ def start_lifecycle_monitor(
                 if first_tick and prices_ok and not critical_freshness_stale:
                     live_detail = "market_data_healthy" if current_state == LIVE else "first_market_data_tick"
                     _lc_set_state(LIVE, live_detail)
-                elif not first_tick and (elapsed_ms < warmup_timeout_ms or not critical_freshness_stale):
+                elif not first_tick and elapsed_ms < warmup_timeout_ms:
                     _lc_set_state(
                         WARMING_UP,
                         "awaiting_first_price_tick",
                     )
+                elif not first_tick:
+                    detail = freshness_detail or "warmup_timeout_awaiting_first_price_tick"
+                    _lc_set_state(DEGRADED, detail)
                 else:
                     if critical_freshness_stale:
                         detail = freshness_detail or "critical_ingestion_stale"

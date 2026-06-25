@@ -163,7 +163,7 @@ def _secret_text_from_env(*env_names: str) -> str:
             if path:
                 from engine.runtime.secret_sources import read_secret_text_file
 
-                return read_secret_text_file(path)
+                return read_secret_text_file(path).value
         if name.endswith("_FILE"):
             continue
         secret_name = str(os.environ.get(name) or "").strip()

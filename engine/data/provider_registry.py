@@ -83,6 +83,10 @@ def _builtin_provider_definitions() -> Dict[str, PriceProviderDefinition]:
         from engine.data.live_prices.oanda_live import OANDAPriceProvider
         return OANDAPriceProvider()
 
+    def _build_futures():
+        from engine.data.live_prices.futures_live import FuturesPriceProvider
+        return FuturesPriceProvider()
+
     # Built-ins define the canonical provider catalog. Dynamic plugins can
     # override or extend this catalog, but these entries are the baseline
     # control-plane expectation for market-data jobs.
@@ -106,7 +110,7 @@ def _builtin_provider_definitions() -> Dict[str, PriceProviderDefinition]:
             daemon_job_name="stream_prices_ibkr",
             daemon_script="engine/data/providers/ibkr/daemon_stream.py",
             priority=20,
-            supports={"asset_classes": ["equities", "fx"], "transport": "gateway"},
+            supports={"asset_classes": ["equities", "fx", "futures"], "transport": "gateway"},
             build_price_provider=_build_ibkr,
         ),
         PriceProviderDefinition(
@@ -162,6 +166,17 @@ def _builtin_provider_definitions() -> Dict[str, PriceProviderDefinition]:
             priority=45,
             supports={"asset_classes": ["fx"], "transport": "rest"},
             build_price_provider=_build_oanda,
+        ),
+        PriceProviderDefinition(
+            provider_name="futures",
+            mode="polling",
+            implementation_kind="live_price_provider",
+            enabled=_env_enabled("FUTURES_ENABLED", False),
+            daemon_job_name="poll_prices",
+            daemon_script="engine/data/poll_prices.py",
+            priority=47,
+            supports={"asset_classes": ["futures"], "transport": "rest"},
+            build_price_provider=_build_futures,
         ),
         PriceProviderDefinition(
             provider_name="ccxt",
@@ -379,6 +394,8 @@ def _operational_market_data_job_names(candidates: list[str]) -> list[str]:
     simulated_enabled = _simulated_market_data_enabled()
     oanda_enabled = _env_enabled("OANDA_ENABLED", False)
     oanda_key = bool(get_data_credential("OANDA_ACCESS_TOKEN") or get_data_credential("OANDA_API_KEY"))
+    futures_enabled = _env_enabled("FUTURES_ENABLED", False)
+    futures_key = bool(get_data_credential("DATABENTO_API_KEY"))
     ccxt_enabled = _env_enabled("CCXT_ENABLED", False)
     tradier_enabled = _env_enabled("TRADIER_ENABLED", False)
 
@@ -407,10 +424,41 @@ def _operational_market_data_job_names(candidates: list[str]) -> list[str]:
                 or simulated_enabled
                 or ccxt_enabled
                 or (oanda_key and oanda_enabled and ((not chain) or ("oanda" in chain)))
+                or (futures_key and futures_enabled and ((not chain) or ("futures" in chain)))
                 or (polygon_key and polygon_rest_enabled and ((not chain) or ("polygon" in chain)))
             ):
                 out.append(name)
     return out
+
+
+def _warn_paid_equity_downgrade_if_needed(
+    out: List[str],
+    *,
+    polygon_key: bool,
+    polygon_ws_enabled: bool,
+    polygon_rest_enabled: bool,
+    ibkr_enabled: bool,
+) -> None:
+    configured_polygon = bool(polygon_key) and bool(polygon_ws_enabled or polygon_rest_enabled)
+    configured_paid_equity = bool(configured_polygon or ibkr_enabled)
+    paid_job_present = any(
+        str(job) in {"stream_prices_polygon_ws", "stream_prices_ibkr"}
+        for job in list(out or [])
+    )
+    free_fallback_only = list(out or []) == ["poll_prices"]
+    if not configured_paid_equity or paid_job_present or not free_fallback_only:
+        return
+    _warn_nonfatal(
+        "PROVIDER_REGISTRY_PAID_EQUITY_DOWNGRADE",
+        RuntimeError("configured paid equity provider dropped to free fallback"),
+        once_key="paid_equity_downgrade",
+        configured_polygon=bool(configured_polygon),
+        polygon_enabled=bool(polygon_ws_enabled or polygon_rest_enabled),
+        polygon_ws_enabled=bool(polygon_ws_enabled),
+        polygon_rest_enabled=bool(polygon_rest_enabled),
+        ibkr_enabled=bool(ibkr_enabled),
+        returned_jobs=list(out or []),
+    )
 
 
 def get_enabled_market_data_job_names() -> List[str]:
@@ -419,7 +467,15 @@ def get_enabled_market_data_job_names() -> List[str]:
         # Explicit env override is the highest-priority operational control,
         # but provider disable flags and missing credentials still fail closed.
         filtered = _operational_market_data_job_names(raw)
-        return filtered or ["poll_prices"]
+        out = filtered or ["poll_prices"]
+        _warn_paid_equity_downgrade_if_needed(
+            out,
+            polygon_key=bool(get_data_credential("POLYGON_API_KEY")),
+            polygon_ws_enabled=_env_enabled("POLYGON_WS_ENABLED", True),
+            polygon_rest_enabled=_env_enabled("POLYGON_REST_ENABLED", True),
+            ibkr_enabled=_env_enabled("IBKR_ENABLED", False),
+        )
+        return out
 
     try:
         from services.data_source_manager import desired_ingestion_jobs
@@ -430,7 +486,15 @@ def get_enabled_market_data_job_names() -> List[str]:
             if str(name).strip() in _MARKET_DATA_JOB_NAMES
         ])
         if desired:
-            return list(dict.fromkeys(desired))
+            out = list(dict.fromkeys(desired))
+            _warn_paid_equity_downgrade_if_needed(
+                out,
+                polygon_key=bool(get_data_credential("POLYGON_API_KEY")),
+                polygon_ws_enabled=_env_enabled("POLYGON_WS_ENABLED", True),
+                polygon_rest_enabled=_env_enabled("POLYGON_REST_ENABLED", True),
+                ibkr_enabled=_env_enabled("IBKR_ENABLED", False),
+            )
+            return out
     except Exception as e:
         _warn_nonfatal(
             "PROVIDER_REGISTRY_DESIRED_JOBS_PARSE_FAILED",
@@ -445,6 +509,8 @@ def get_enabled_market_data_job_names() -> List[str]:
     ibkr_enabled = _env_enabled("IBKR_ENABLED", False)
     oanda_enabled = _env_enabled("OANDA_ENABLED", False)
     oanda_key = get_data_credential("OANDA_ACCESS_TOKEN") or get_data_credential("OANDA_API_KEY")
+    futures_enabled = _env_enabled("FUTURES_ENABLED", False)
+    futures_key = get_data_credential("DATABENTO_API_KEY")
     simulated_enabled = _simulated_market_data_enabled()
 
     out: List[str] = []
@@ -462,6 +528,10 @@ def get_enabled_market_data_job_names() -> List[str]:
         if "poll_prices" not in out:
             out.append("poll_prices")
 
+    if futures_key and futures_enabled and ((not chain) or ("futures" in chain)):
+        if "poll_prices" not in out:
+            out.append("poll_prices")
+
     if ibkr_enabled:
         out.append("stream_prices_ibkr")
         if "poll_prices" not in out:
@@ -473,6 +543,13 @@ def get_enabled_market_data_job_names() -> List[str]:
     elif simulated_enabled and "poll_prices" not in out:
         out.append("poll_prices")
 
+    _warn_paid_equity_downgrade_if_needed(
+        out,
+        polygon_key=bool(polygon_key),
+        polygon_ws_enabled=bool(polygon_ws_enabled),
+        polygon_rest_enabled=bool(polygon_rest_enabled),
+        ibkr_enabled=bool(ibkr_enabled),
+    )
     return out
 
 

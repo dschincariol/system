@@ -17,15 +17,13 @@ from engine.runtime.storage import connect
 from engine.strategy.risk import realized_vol_from_prices
 from engine.execution.execution_costs import estimate_cost_bps
 
-USE = os.environ.get("ALERT_USE_EXEC_COST_FILTER", "0") == "1"
-
 PRICE_STEP_S = int(os.environ.get("ALERT_PRICE_STEP_S", "60"))
 
 FEES_BPS = float(os.environ.get("ALERT_EXEC_FEES_BPS", os.environ.get("EXEC_FEES_BPS", "0.5")))
 SLIPPAGE_BPS = float(os.environ.get("ALERT_EXEC_SLIPPAGE_BPS", os.environ.get("EXEC_SLIPPAGE_BPS", "2.0")))
 
-MIN_NET_ABS_Z = float(os.environ.get("ALERT_MIN_NET_ABS_Z", "0.0"))
 LOG = get_logger("strategy.edge_filter")
+
 
 def _warn_nonfatal(code: str, error: BaseException, **extra: object) -> None:
     log_failure(
@@ -53,6 +51,39 @@ def _safe_float(x, d=0.0):
         return float(d)
 
 
+def _exec_cost_filter_asset_classes() -> tuple[str, ...]:
+    return tuple(
+        item.strip().upper()
+        for item in os.environ.get("ALERT_EXEC_COST_FILTER_ASSET_CLASSES", "").split(",")
+        if item.strip()
+    )
+
+
+def _edge_filter_config() -> tuple[bool, float, tuple[str, ...]]:
+    return (
+        os.environ.get("ALERT_USE_EXEC_COST_FILTER", "0") == "1",
+        _safe_float(os.environ.get("ALERT_MIN_NET_ABS_Z", "0.0"), 0.0),
+        _exec_cost_filter_asset_classes(),
+    )
+
+
+def _asset_class_in_scope(symbol: str, asset_classes: tuple[str, ...]) -> bool:
+    if not asset_classes:
+        return True
+    try:
+        from engine.data.asset_map import asset_class_for_symbol
+
+        asset_class = str(asset_class_for_symbol(symbol) or "UNKNOWN").upper().strip()
+    except Exception as e:
+        _warn_nonfatal(
+            "EDGE_FILTER_ASSET_CLASS_SCOPE_FAILED",
+            e,
+            symbol=str(symbol or "").upper()[:32],
+        )
+        asset_class = "UNKNOWN"
+    return asset_class in asset_classes
+
+
 def adjust_expected_z_for_costs(
     *,
     symbol: str,
@@ -77,10 +108,14 @@ def adjust_expected_z_for_costs(
     - We convert bps cost into return space by (bps / 1e4) and
       then into z by dividing by vol_horizon.
     """
-    if not USE:
+    use, min_net_abs_z, asset_classes = _edge_filter_config()
+    if not use:
         return None
 
     sym = str(symbol)
+    if not _asset_class_in_scope(sym, asset_classes):
+        return None
+
     h = int(horizon_s)
     ez = _safe_float(expected_z, 0.0)
 
@@ -119,7 +154,7 @@ def adjust_expected_z_for_costs(
 
     ez_adj = float(ez) - float(cost_z)
 
-    if MIN_NET_ABS_Z > 0.0 and abs(ez_adj) < float(MIN_NET_ABS_Z):
+    if min_net_abs_z > 0.0 and abs(ez_adj) < float(min_net_abs_z):
         # hard reject by signaling "no edge"
         return {
             "expected_z_adj": float("nan"),

@@ -5,7 +5,11 @@
   Extracted from ui/dashboard.js (Phase 3)
 */
 
-import { formatChartTime, renderChartAccessibility } from "./chart_a11y.js";
+import {
+  formatChartTime,
+  installChartPointInspector,
+  renderChartAccessibility,
+} from "./chart_a11y.js";
 
 // -----------------------------
 // Small utilities
@@ -159,6 +163,65 @@ function _pickTicks(points) {
     });
   }
   return out;
+}
+
+function _formatLineValue(value, opts = {}) {
+  const formatter = opts.fmtY || opts.a11yValueFormatter;
+  if (typeof formatter === "function") {
+    try {
+      const out = formatter(value);
+      if (out !== undefined && out !== null && out !== "") return String(out);
+    } catch {}
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(3) : "unavailable";
+}
+
+function _measureText(ctx, text) {
+  if (ctx && typeof ctx.measureText === "function") {
+    try { return ctx.measureText(String(text)).width; } catch {}
+  }
+  return String(text || "").length * 6;
+}
+
+function _clamp(value, lo, hi) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function _lineSeriesLabel(opts = {}) {
+  return String(opts.seriesLabel || opts.legendLabel || opts.valueLabel || opts.topLabel || "Value").trim() || "Value";
+}
+
+function _drawLineLegend(ctx, opts, x, y) {
+  const label = _lineSeriesLabel(opts);
+  const color = opts.stroke || "#2ea043";
+  if (typeof ctx.fillRect === "function") {
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y - 8, 14, 3);
+  }
+  ctx.fillStyle = "#9da7b1";
+  ctx.font = "11px Consolas, monospace";
+  ctx.fillText(label, x + 18, y - 4);
+}
+
+export function buildLineChartInspectorPoints(vm, opts = {}, geometry = {}) {
+  if (!vm || !Array.isArray(vm.finitePoints)) return [];
+  const xFor = typeof geometry.xFor === "function" ? geometry.xFor : null;
+  const yFor = typeof geometry.yFor === "function" ? geometry.yFor : null;
+  return vm.finitePoints.map((point) => ({
+    label: point.xText,
+    x: xFor ? xFor(point.xCoord) : point.xCoord,
+    y: yFor ? yFor(point.value) : null,
+    value: point.value,
+    values: [{
+      label: _lineSeriesLabel(opts),
+      value: point.value,
+      formatter: opts.fmtY || opts.a11yValueFormatter,
+      valueText: _formatLineValue(point.value, opts),
+    }],
+  }));
 }
 
 export function buildLineChartViewModel(ys, opts = {}) {
@@ -318,6 +381,11 @@ export function renderLineChart(canvas, ys, opts = {}) {
       maxRows: opts.a11yMaxRows,
       chartType: "canvas-line",
     });
+    installChartPointInspector(canvas, [], {
+      title: opts.a11yTitle || opts.title || opts.topLabel || "Line chart",
+      kind: "canvas-line",
+      emptyMessage: message,
+    });
     return;
   }
 
@@ -328,6 +396,7 @@ export function renderLineChart(canvas, ys, opts = {}) {
   ctx.font = "12px Consolas, monospace";
   if (opts.topLabel) ctx.fillText(opts.topLabel, 8, padT + 10);
   if (opts.bottomLabel) ctx.fillText(opts.bottomLabel, 8, vm.xTicks.length ? h - 18 : h - 8);
+  if (opts.yAxisLabel) ctx.fillText(String(opts.yAxisLabel), 8, padT + 34);
 
   const fmtY = opts.fmtY || ((v) => v.toFixed(3));
   ctx.fillText(fmtY(yMax), 8, padT + 22);
@@ -351,6 +420,13 @@ export function renderLineChart(canvas, ys, opts = {}) {
   ctx.lineTo(w - padR, padT + plotH / 2);
   ctx.stroke();
   _drawXAxis(ctx, vm, xFor, padT + plotH, w, padL, padR);
+  if (opts.xAxisLabel) {
+    const label = String(opts.xAxisLabel);
+    ctx.fillStyle = "#9da7b1";
+    ctx.font = "11px Consolas, monospace";
+    ctx.fillText(label, Math.max(padL, w - padR - _measureText(ctx, label)), h - 4);
+  }
+  _drawLineLegend(ctx, opts, padL, padT + 12);
 
   // line
   ctx.strokeStyle = opts.stroke || "#2ea043";
@@ -363,6 +439,21 @@ export function renderLineChart(canvas, ys, opts = {}) {
     drew = true;
   }
   if (drew) ctx.stroke();
+  const latest = vm.finitePoints[vm.finitePoints.length - 1];
+  if (latest && opts.showLatestValue !== false) {
+    const x = xFor(latest.xCoord);
+    const y = yFor(latest.value);
+    const label = _formatLineValue(latest.value, opts);
+    if (typeof ctx.beginPath === "function" && typeof ctx.arc === "function" && typeof ctx.fill === "function") {
+      ctx.fillStyle = opts.stroke || "#2ea043";
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = "#e8f0fa";
+    ctx.font = "11px Consolas, monospace";
+    ctx.fillText(label, _clamp(x + 6, padL, w - padR - _measureText(ctx, label)), _clamp(y - 6, padT + 10, h - padB - 2));
+  }
 
   renderChartAccessibility(canvas, {
     title: opts.a11yTitle || opts.title || opts.topLabel || "Line chart",
@@ -381,6 +472,16 @@ export function renderLineChart(canvas, ys, opts = {}) {
     maxRows: opts.a11yMaxRows,
     chartType: "canvas-line",
   });
+  installChartPointInspector(
+    canvas,
+    buildLineChartInspectorPoints(vm, opts, { xFor, yFor }),
+    {
+      title: opts.a11yTitle || opts.title || opts.topLabel || "Line chart",
+      kind: "canvas-line",
+      valueLabel: _lineSeriesLabel(opts),
+      valueFormatter: opts.fmtY || opts.a11yValueFormatter,
+    },
+  );
 }
 
 // -----------------------------
@@ -592,6 +693,11 @@ export function drawCalibration(canvas, pts, opts = {}) {
         { label: "Count", value: (row) => row.raw && Number.isFinite(Number(row.raw.count)) ? String(Math.round(Number(row.raw.count))) : "unavailable" },
       ],
     });
+    installChartPointInspector(canvas, [], {
+      title: opts.a11yTitle || "Confidence calibration",
+      kind: "canvas-calibration",
+      emptyMessage: message,
+    });
     return;
   }
 
@@ -608,11 +714,23 @@ export function drawCalibration(canvas, pts, opts = {}) {
   ctx.stroke();
 
   ctx.beginPath();
+  const inspectorPoints = [];
   rows.forEach((p, i) => {
     const x = Math.max(0, Math.min(1, Number(p.confidence)));
     const y = Math.max(0, Math.min(1, Number(p.accuracy)));
     const px = x0 + x * (x1 - x0);
     const py = y0 - y * (y0 - y1);
+    inspectorPoints.push({
+      label: p.label,
+      x: px,
+      y: py,
+      values: [
+        { label: "Confidence", value: p.confidence, valueText: _formatPct(p.confidence, 1) },
+        { label: "Accuracy", value: p.accuracy, valueText: _formatPct(p.accuracy, 1) },
+        { label: "Gap", value: p.gap, valueText: _formatPct(p.gap, 1) },
+        { label: "Count", value: p.count, valueText: p.count == null ? "unavailable" : String(Math.round(Number(p.count))) },
+      ],
+    });
     if (i === 0) ctx.moveTo(px, py);
     else ctx.lineTo(px, py);
   });
@@ -648,6 +766,15 @@ export function drawCalibration(canvas, pts, opts = {}) {
     ? "sample count unavailable"
     : `samples ${vm.totalSampleCount}`;
   ctx.fillText(sampleLabel, Math.max(x0, W - pad - 150), 12);
+  if (typeof ctx.fillRect === "function") {
+    ctx.fillStyle = "rgba(220,220,220,0.85)";
+    ctx.fillRect(x0, 20, 14, 3);
+    ctx.fillStyle = "rgba(230,159,0,0.36)";
+    ctx.fillRect(x0 + 92, 18, 10, 7);
+  }
+  ctx.fillStyle = "#9da7b1";
+  ctx.fillText("accuracy line", x0 + 18, 23);
+  ctx.fillText("bin count bars", x0 + 106, 23);
 
   renderChartAccessibility(canvas, {
     title: opts.a11yTitle || "Confidence calibration",
@@ -665,5 +792,10 @@ export function drawCalibration(canvas, pts, opts = {}) {
       { label: "Gap", value: (row) => row.raw && Number.isFinite(row.raw.gap) ? _formatPct(row.raw.gap, 1) : "unavailable" },
       { label: "Count", value: (row) => row.raw && Number.isFinite(Number(row.raw.count)) ? String(Math.round(Number(row.raw.count))) : "unavailable" },
     ],
+  });
+  installChartPointInspector(canvas, inspectorPoints, {
+    title: opts.a11yTitle || "Confidence calibration",
+    kind: "canvas-calibration",
+    emptyMessage: "No calibration point data is available.",
   });
 }

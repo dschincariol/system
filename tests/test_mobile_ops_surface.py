@@ -45,3 +45,8 @@ def test_mobile_emergency_confirmation_requires_typed_phrase_and_hold():
     assert 'KILL_SWITCH_CONFIRM_PHRASE = "KILL"' in helpers
     assert "holdComplete === true" in helpers
     assert "canStartKillSwitchHold({ typedPhrase, pending })" in helpers
+    js = (MOBILE_DIR / "mobile.js").read_text(encoding="utf-8")
+    assert 'action_id: "operator.emergency_stop"' in js
+    assert 'source_surface: "mobile_pwa"' in js
+    assert 'confirmation_method: "typed_phrase_hold"' in js
+    assert 'request_id: requestId("mobile-emergency-stop")' in js

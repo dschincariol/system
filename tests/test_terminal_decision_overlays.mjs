@@ -16,6 +16,7 @@ import {
   VWAP_OVERLAY_LABEL,
   VWAP_OVERLAY_SEMANTICS,
 } from "../ui/decision_overlays.js";
+import { STATUS_TOKENS } from "../ui/utils.js";
 
 class FakeSeries {
   constructor() {
@@ -46,7 +47,13 @@ test("decision overlay markers expose distinct visual semantics", () => {
   const normalized = normalizeDecisionOverlayPayload({ markers });
   assert.deepEqual(normalized.markers.map((m) => m.text), ["FILL B", "INTENT", "SUPP", "BLOCK", "CAP"]);
   assert.deepEqual(normalized.markers.map((m) => m.shape), ["arrowUp", "circle", "square", "arrowDown", "arrowUp"]);
-  assert.equal(new Set(normalized.markers.map((m) => m.color)).size, 5);
+  assert.deepEqual(normalized.markers.map((m) => m.color), [
+    STATUS_TOKENS.info.color,
+    STATUS_TOKENS.ok.color,
+    STATUS_TOKENS.warn.color,
+    STATUS_TOKENS.blocked.color,
+    STATUS_TOKENS.high.color,
+  ]);
 
   const lwMarkers = toLightweightMarkers(markers);
   assert.equal(lwMarkers.length, 5);
@@ -56,6 +63,7 @@ test("decision overlay markers expose distinct visual semantics", () => {
   const sellFill = decisionMarkerStyle("filled", "SELL", -2);
   assert.equal(sellFill.shape, "arrowDown");
   assert.equal(sellFill.text, "FILL S");
+  assert.equal(sellFill.color, STATUS_TOKENS.crit.color);
 });
 
 test("decision overlay payload normalizes price levels, windows, and accessibility summary", () => {
@@ -65,6 +73,7 @@ test("decision overlay payload normalizes price levels, windows, and accessibili
       { kind: "average_cost", price: "99.5" },
       { kind: "stop", px: 98 },
       { kind: "take_profit", value: 105 },
+      { kind: "max_risk", price: 97.5 },
       { kind: "cap", price: 200 },
     ],
     windows: [
@@ -74,13 +83,13 @@ test("decision overlay payload normalizes price levels, windows, and accessibili
   });
 
   assert.equal(payload.markers[0].kind, "risk_capped");
-  assert.deepEqual(payload.price_lines.map((line) => line.kind), ["average_cost", "stop", "take_profit", "cap"]);
+  assert.deepEqual(payload.price_lines.map((line) => line.kind), ["average_cost", "stop", "take_profit", "max_risk", "cap"]);
   assert.deepEqual(payload.windows.map((window) => window.kind), ["kill_switch_window", "circuit_breaker_window"]);
   assert.deepEqual(payload.windows.map((window) => window.start_s), [1_789_500_000, 1_789_500_060]);
   assert.deepEqual(payload.windows.map((window) => window.end_s), [null, 1_789_500_120]);
   assert.match(buildOverlayAccessibilitySummary(payload), /1 risk-capped/);
   assert.match(buildOverlayAccessibilitySummary(payload), /2 active or recent windows/);
-  assert.match(buildOverlayAccessibilitySummary(payload), /4 price levels/);
+  assert.match(buildOverlayAccessibilitySummary(payload), /5 price levels/);
 });
 
 test("decision windows convert milliseconds to chart seconds and extend open ends", () => {
@@ -117,6 +126,8 @@ test("decision window legend exposes readable band entries", () => {
   assert.deepEqual(items.map((item) => item.shape), ["band", "band"]);
   assert.deepEqual(items.map((item) => item.text), ["KILL", "TSE"]);
   assert.ok(items.every((item) => item.fillColor && item.borderColor));
+  assert.equal(items[0].fillColor, STATUS_TOKENS.crit.fill);
+  assert.equal(items[1].fillColor, STATUS_TOKENS.warn.fill);
 });
 
 test("price-line rendering replaces existing lightweight chart handles", () => {

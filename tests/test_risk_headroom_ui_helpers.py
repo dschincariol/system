@@ -261,3 +261,139 @@ console.log(JSON.stringify(rows));
     assert "data-ks-action" in source
     assert "clientY" not in source
     assert "lineHeight" not in source
+
+
+def test_kill_switch_row_activation_opens_existing_modal_paths() -> None:
+    code = r"""
+import { pathToFileURL } from "node:url";
+
+class FakeElement {
+  constructor(id = "", ownerDocument = null) {
+    this.id = id;
+    this.ownerDocument = ownerDocument;
+    this.parentNode = ownerDocument ? ownerDocument.body : null;
+    this.textContent = "";
+    this.innerHTML = "";
+    this.className = "";
+    this.style = {};
+    this.listeners = {};
+  }
+  insertAdjacentElement(_position, element) {
+    element.parentNode = this.parentNode;
+    element.ownerDocument = this.ownerDocument;
+    if (element.id) this.ownerDocument.elements.set(element.id, element);
+  }
+  addEventListener(type, handler) {
+    this.listeners[type] = handler;
+  }
+}
+
+class FakeDocument {
+  constructor() {
+    this.elements = new Map();
+    this.body = { nodeName: "BODY" };
+  }
+  createElement() {
+    return new FakeElement("", this);
+  }
+  getElementById(id) {
+    return this.elements.get(id) || null;
+  }
+  add(id) {
+    const element = new FakeElement(id, this);
+    this.elements.set(id, element);
+    return element;
+  }
+}
+
+function fakeButton(attrs) {
+  return {
+    closest(selector) {
+      return selector === "[data-ks-action]" ? {
+        getAttribute(name) {
+          return attrs[name] || "";
+        },
+      } : null;
+    },
+  };
+}
+
+const doc = new FakeDocument();
+doc.add("systemStateText");
+doc.add("whyModal");
+doc.add("whyBody");
+doc.add("whyTitle");
+globalThis.document = doc;
+
+const mod = await import(pathToFileURL(process.argv[1]).href);
+mod.renderKillSwitchPills({
+  state: [{ scope: "global", key: "global", enabled: 1, reason: "unit_test" }],
+  auto_pipeline: { enabled: false, reason: "AUTO_PIPELINE=0" },
+}, null, "systemStateText");
+
+const mount = doc.getElementById("systemStateTextKillSwitchRows");
+mount.listeners.click({
+  target: fakeButton({
+    "data-ks-action": "explain",
+    "data-ks-key": "global",
+    "data-ks-display-key": "global:global",
+    "data-ks-reason": "unit_test",
+  }),
+});
+const explainTitle = doc.getElementById("whyTitle").textContent;
+const explainBody = doc.getElementById("whyBody").textContent;
+
+mount.listeners.click({
+  target: fakeButton({
+    "data-ks-action": "hint",
+    "data-ks-key": "auto_pipeline",
+    "data-ks-display-key": "auto_pipeline",
+    "data-ks-reason": "AUTO_PIPELINE=0",
+  }),
+});
+const hintTitle = doc.getElementById("whyTitle").textContent;
+const hintBody = doc.getElementById("whyBody").textContent;
+
+console.log(JSON.stringify({
+  hasMount: !!mount,
+  explainTitle,
+  explainBody,
+  hintTitle,
+  hintBody,
+  display: doc.getElementById("whyModal").style.display,
+}));
+"""
+    parsed = _run_node(code, REPO_ROOT / "ui" / "kill_switch_ui.js")
+
+    assert parsed["hasMount"] is True
+    assert parsed["explainTitle"] == "Kill-switch state: global:global"
+    assert "read-only kill-switch status row" in parsed["explainBody"]
+    assert "unit_test" in parsed["explainBody"]
+    assert parsed["hintTitle"] == "How to re-enable auto_pipeline"
+    assert "AUTO_PIPELINE=1" in parsed["hintBody"]
+    assert parsed["display"] == "block"
+
+
+def test_kill_switch_rows_surface_effective_env_vs_persisted_disarmed() -> None:
+    code = r"""
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.argv[1]).href);
+const rows = mod.buildKillSwitchRows({
+  state: [{ scope: "global", key: "global", enabled: 0, reason: "persisted_clear" }],
+  effective: {
+    armed: true,
+    sources: ["env"],
+    summary: "armed via env; persisted disarmed",
+    env_armed: true,
+    persisted_armed: false,
+  },
+});
+console.log(JSON.stringify(rows));
+"""
+    parsed = _run_node(code, REPO_ROOT / "ui" / "kill_switch_ui.js")
+
+    by_id = {row["id"]: row for row in parsed}
+    assert by_id["effective:any"]["status"] == "ARMED VIA ENV"
+    assert by_id["effective:any"]["reason"] == "armed via env; persisted disarmed"
+    assert by_id["global:global"]["status"] == "PERSISTED DISARMED"

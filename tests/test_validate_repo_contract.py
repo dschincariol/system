@@ -19,6 +19,7 @@ class ValidateRepoContractTests(unittest.TestCase):
         failing_label: str | None = None,
         returncode: int = 23,
         env_overrides: dict[str, str] | None = None,
+        argv: list[str] | None = None,
     ) -> tuple[int, list[tuple[str, list[str], dict[str, str]]], str, Path]:
         root = Path("C:/validate-repo-root")
         calls: list[tuple[str, list[str], dict[str, str]]] = []
@@ -37,7 +38,7 @@ class ValidateRepoContractTests(unittest.TestCase):
             patch.dict(os.environ, dict(env_overrides or {}), clear=True),
             redirect_stdout(output),
         ):
-            exit_code = validate_repo.main([])
+            exit_code = validate_repo.main(list(argv or []))
 
         return exit_code, calls, output.getvalue(), root
 
@@ -212,6 +213,8 @@ class ValidateRepoContractTests(unittest.TestCase):
                 exit_code = validate_repo.main(["--live"])
 
         self.assertEqual(exit_code, 0)
+        labels = [label for label, _, _ in calls]
+        self.assertNotIn("production-readiness-gate", labels)
         smoke_call = next(call for call in calls if call[0] == "pipeline-smoke")
         self.assertEqual(smoke_call[2]["DASHBOARD_API_TOKEN"], "dashboard-secret")
         self.assertEqual(smoke_call[2]["OPERATOR_API_TOKEN"], "operator-secret")
@@ -224,6 +227,16 @@ class ValidateRepoContractTests(unittest.TestCase):
         self.assertEqual(runtime_graph_call[2]["TIMESCALE_ENABLED"], "1")
         self.assertEqual(runtime_graph_call[2]["LIVE_CACHE_BACKEND"], "redis")
         self.assertEqual(runtime_graph_call[2]["PREFLIGHT_REQUIRE_REDIS"], "1")
+
+    def test_validate_repo_pre_deploy_runs_production_readiness_gate(self) -> None:
+        exit_code, calls, _, _ = self._run_main(argv=["--pre-deploy"])
+
+        self.assertEqual(exit_code, 0)
+        labels = [label for label, _, _ in calls]
+        self.assertIn("production-readiness-gate", labels)
+        self.assertNotIn("pipeline-smoke", labels)
+        gate_call = next(call for call in calls if call[0] == "production-readiness-gate")
+        self.assertEqual(gate_call[1], ["python-bin", "tools/production_readiness_gate.py", "--compact"])
 
     def test_validate_repo_skips_telemetry_burnin_check_by_default(self) -> None:
         exit_code, calls, _, _ = self._run_main()

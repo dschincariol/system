@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildLineChartInspectorPoints,
   buildCalibrationViewModel,
   buildLineChartViewModel,
   calibrationVerdict,
+  drawCalibration,
   renderLineChart,
 } from "../ui/charts.js";
 
@@ -17,6 +19,7 @@ class FakeElement {
     this.innerHTML = "";
     this.textContent = "";
     this.style = {};
+    this.listeners = new Map();
     this.classList = {
       add: (...classes) => {
         const next = new Set(String(this.className || "").split(/\s+/).filter(Boolean));
@@ -33,6 +36,21 @@ class FakeElement {
   }
   hasAttribute(name) {
     return this.attributes.has(String(name));
+  }
+  addEventListener(name, handler) {
+    const key = String(name);
+    const handlers = this.listeners.get(key) || [];
+    handlers.push(handler);
+    this.listeners.set(key, handlers);
+  }
+  removeEventListener(name, handler) {
+    const key = String(name);
+    const handlers = this.listeners.get(key) || [];
+    this.listeners.set(key, handlers.filter((item) => item !== handler));
+  }
+  dispatchEvent(event = {}) {
+    const key = String(event.type || "");
+    for (const handler of this.listeners.get(key) || []) handler(event);
   }
 }
 
@@ -51,6 +69,9 @@ class FakeContext {
   lineTo(...args) { this.calls.push(["lineTo", ...args]); }
   stroke(...args) { this.calls.push(["stroke", ...args]); }
   fillText(...args) { this.calls.push(["fillText", ...args]); }
+  fillRect(...args) { this.calls.push(["fillRect", ...args]); }
+  arc(...args) { this.calls.push(["arc", ...args]); }
+  fill(...args) { this.calls.push(["fill", ...args]); }
   measureText(value) { return { width: String(value).length * 6 }; }
 }
 
@@ -63,6 +84,9 @@ class FakeCanvas extends FakeElement {
   }
   getContext(type) {
     return type === "2d" ? this.context : null;
+  }
+  getBoundingClientRect() {
+    return { left: 0, top: 0, width: this.width, height: this.height };
   }
 }
 
@@ -118,6 +142,56 @@ test("line chart builds two to three timestamp x-axis ticks", () => {
   assert.deepEqual(vm.xTicks.map((tick) => tick.label), ["14:30", "14:31", "14:32"]);
   assert.equal(vm.xMin, times[0]);
   assert.equal(vm.xMax, times[2]);
+});
+
+test("line chart builds point inspector rows with formatted values", () => {
+  const vm = buildLineChartViewModel([1, 2, 4]);
+  const points = buildLineChartInspectorPoints(vm, {
+    seriesLabel: "Equity",
+    fmtY: (value) => Number(value).toFixed(1),
+  });
+
+  assert.equal(points.length, 3);
+  assert.deepEqual(
+    points.map((point) => point.values[0].valueText),
+    ["1.0", "2.0", "4.0"],
+  );
+  assert.equal(points[2].values[0].label, "Equity");
+});
+
+test("line chart renders legend, axis labels, latest value, and keyboard inspector", () => {
+  const doc = new FakeDocument();
+  const canvas = doc.add(new FakeCanvas("interactiveLineChart"));
+  const fallback = doc.add(new FakeElement("interactiveLineChartA11y"));
+  const dataWindow = doc.add(new FakeElement("interactiveLineChartDataWindow"));
+  let prevented = false;
+
+  renderLineChart(canvas, [1, 2, 4], {
+    a11yTitle: "Portfolio equity curve",
+    seriesLabel: "Equity",
+    xAxisLabel: "run time",
+    yAxisLabel: "equity",
+    fmtY: (value) => Number(value).toFixed(1),
+  });
+
+  const labels = canvas.context.calls
+    .filter((call) => call[0] === "fillText")
+    .map((call) => String(call[1]));
+  assert.ok(labels.includes("Equity"));
+  assert.ok(labels.includes("run time"));
+  assert.ok(labels.includes("equity"));
+  assert.ok(labels.includes("4.0"));
+  assert.match(dataWindow.textContent, /Portfolio equity curve: 3; Equity 4\.0/);
+  assert.match(fallback.innerHTML, /View chart data table/);
+
+  canvas.dispatchEvent({
+    type: "keydown",
+    key: "Home",
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.match(dataWindow.textContent, /Portfolio equity curve: 1; Equity 1\.0/);
+  assert.equal(canvas.getAttribute("data-chart-selected-index"), "0");
 });
 
 test("line chart renders explicit no-data state without throwing", () => {
@@ -195,4 +269,25 @@ test("calibration view model does not invent bin counts when counts are absent",
   assert.equal(vm.weighting, "equal_bins");
   assert.equal(vm.points.every((point) => point.count === null), true);
   assert.equal(Number(vm.ece.toFixed(6)), 0.05);
+});
+
+test("calibration chart renders legend and point inspector data", () => {
+  const doc = new FakeDocument();
+  const canvas = doc.add(new FakeCanvas("calibCanvas"));
+  doc.add(new FakeElement("calibCanvasA11y"));
+  const dataWindow = doc.add(new FakeElement("calibCanvasDataWindow"));
+
+  drawCalibration(canvas, [
+    { conf: 0.2, acc: 0.1, n: 30 },
+    { conf: 0.8, acc: 0.7, n: 70 },
+  ]);
+
+  const labels = canvas.context.calls
+    .filter((call) => call[0] === "fillText")
+    .map((call) => String(call[1]));
+  assert.ok(labels.includes("accuracy line"));
+  assert.ok(labels.includes("bin count bars"));
+  assert.match(dataWindow.textContent, /Confidence calibration: Bin 2/);
+  assert.match(dataWindow.textContent, /Accuracy 70\.0%/);
+  assert.match(dataWindow.textContent, /Count 70/);
 });

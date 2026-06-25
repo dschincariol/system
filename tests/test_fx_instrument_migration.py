@@ -19,6 +19,17 @@ FX_METADATA_COLUMNS = (
 )
 
 
+def test_fx_migration_slot_70_is_deliberately_occupied() -> None:
+    migration = importlib.import_module("engine.runtime.schema.migrations.0070_data_source_populate_evidence")
+
+    assert migration.id == 70
+    assert "populate" in migration.description
+    text = Path("engine/runtime/schema/migrations/0070_data_source_populate_evidence.py").read_text(
+        encoding="utf-8",
+    )
+    assert "data_source_populate_evidence" in text
+
+
 def test_fx_instrument_metadata_migration_contract() -> None:
     migration = importlib.import_module("engine.runtime.schema.migrations.0071_fx_instrument_metadata")
 
@@ -30,6 +41,7 @@ def test_fx_instrument_metadata_migration_contract() -> None:
 def test_expected_migration_ids_include_fx_metadata_migration_contiguously() -> None:
     ids = expected_migration_ids()
 
+    assert 70 in ids
     assert 71 in ids
     assert ids == tuple(sorted(ids))
     assert ids == tuple(range(1, max(ids) + 1))

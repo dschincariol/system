@@ -9,6 +9,8 @@ The `ui/` directory contains browser assets served by the dashboard server.
 - [dashboard.js](dashboard.js)
   Main dashboard controller that coordinates API reads, refresh loops, panel rendering, and operator-side state.
   It delegates focused screen controllers such as Data Health to dedicated modules while preserving screen routing and refresh scheduling. It also owns the broker configuration panel for masked config summaries, connection testing, guarded activate/disable actions, and audit-log rendering.
+- [api_client.js](api_client.js)
+  Shared dashboard API client. It imports a `token` launch parameter into same-origin browser storage, falls back to the stored token on later loads, supports explicit clearing with `clear_token=1`, and attaches `X-API-Token` only to same-origin `/api/*` requests. It also paces same-origin API GET fan-out under the default dashboard token budget while leaving mutations outside the read throttle. It must not place tokens in request URLs or forward them to cross-origin fetches.
 - [dashboard_theme.css](dashboard_theme.css)
   Main dashboard styling.
 - [alerts_ui.js](alerts_ui.js)
@@ -19,6 +21,8 @@ The `ui/` directory contains browser assets served by the dashboard server.
   Browser-side operator/expert interaction policy helpers.
 - [read_only_mode.js](read_only_mode.js)
   Read-only safety layer that mirrors backend execution barriers in the browser.
+- [panel_state.js](panel_state.js)
+  Shared panel-state and connection/freshness model for dashboard reads. Route loaders should report through the shared fetch client so the global banner, card metadata, and advisory action guards stay consistent.
 - [confirmation_modal.mjs](confirmation_modal.mjs)
   Shared accessible confirmation modal for high-impact operator/dashboard
   mutations. It gathers typed tokens, consequence acknowledgement, optional

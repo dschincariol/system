@@ -24,6 +24,25 @@ continue to use those paths.
 Production and supervised runtimes still require explicit absolute storage
 roots. The repo-local `var/` defaults are for non-strict local development and
 validation only.
+Launcher-loaded profiles may use project-relative or `${PWD}`-anchored values
+for `DB_PATH`, `TRADING_DATA`, `TRADING_LOGS`, and `SQLITE_LIVENESS_DB_PATH`;
+the launchers resolve them to absolute paths before strict runtime validation.
+
+## Safe Runtime Liveness
+
+`start_system.py` keeps stale ingestion cleanup ownership-scoped. A process
+found only by command line is eligible for termination only when its parent
+chain or `ENGINE_RUNTIME_OWNER_PID` / `TRADING_RUNTIME_OWNER_PID` ties it to
+the current runtime. Recorded pid files and stale liveness rows still allow
+genuine orphaned ingestion processes to be reaped, while fresh rows owned by a
+different live runtime are preserved.
+
+Safe runtimes with no configured market-data feed do not exit when
+`WARMUP_TIMEOUT_S` expires. The lifecycle monitor transitions from
+`WARMING_UP` to `DEGRADED` with
+`warmup_timeout_awaiting_first_price_tick`; the dashboard remains bound and
+serving, while execution gates continue to block because the runtime is not
+`LIVE`.
 
 The legacy ignored paths remain ignored so older local runs do not become git
 noise:

@@ -21,6 +21,7 @@ from engine.runtime.storage import connect, run_write_txn
 from engine.execution.almgren_chriss import estimate_almgren_chriss_costs
 from engine.execution.execution_costs import estimate_cost_bps
 from engine.execution.execution_liquidity_model import get_execution_liquidity_snapshot
+from engine.risk.futures_margin import contract_notional, weight_to_contracts
 from engine.strategy.regime_stack import compute_regime_vector, regime_model_version
 from engine.execution.execution_policy_engine import apply_execution_policy
 from engine.strategy.portfolio import (
@@ -43,6 +44,9 @@ PORTFOLIO_BACKTEST_USE_EXEC_COSTS = os.environ.get("PORTFOLIO_BACKTEST_USE_EXEC_
 PORTFOLIO_BACKTEST_FEE_BPS = float(os.environ.get("BROKER_FEE_BPS", "0.5"))
 PORTFOLIO_BACKTEST_SLIPPAGE_BPS = float(os.environ.get("BROKER_SLIPPAGE_BPS", "1.0"))
 PORTFOLIO_BACKTEST_SPREAD_BPS = float(os.environ.get("BROKER_SPREAD_BPS", "2.0"))
+PORTFOLIO_BACKTEST_FUTURES_SLIPPAGE_TICKS = float(os.environ.get("PORTFOLIO_BACKTEST_FUTURES_SLIPPAGE_TICKS", "1.0"))
+PORTFOLIO_BACKTEST_FUTURES_ROLL_TICKS = float(os.environ.get("PORTFOLIO_BACKTEST_FUTURES_ROLL_TICKS", "2.0"))
+PORTFOLIO_BACKTEST_FUTURES_ROLL_WINDOW_MS = int(os.environ.get("PORTFOLIO_BACKTEST_FUTURES_ROLL_WINDOW_MS", str(24 * 60 * 60 * 1000)))
 
 
 def _warn_nonfatal(code: str, error: BaseException, **extra: object) -> None:
@@ -289,6 +293,73 @@ def _price_at_or_before(con, symbol: str, ts_ms: int) -> float | None:
     return None
 
 
+def _futures_metadata(con, symbol: str) -> dict[str, Any] | None:
+    try:
+        from engine.data.universe import get_instrument_metadata
+
+        raw = get_instrument_metadata(con, symbol)
+        if isinstance(raw, dict) and str(raw.get("asset_class") or "").upper().strip() == "FUTURES":
+            return dict(raw)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_BACKTEST_FUTURES_METADATA_LOOKUP_FAILED",
+            e,
+            symbol=str(symbol),
+        )
+    try:
+        from engine.data.futures_instrument import parse_futures_symbol
+
+        parsed = parse_futures_symbol(symbol)
+        if parsed is None:
+            return None
+        return dict(parsed.to_dict())
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_BACKTEST_FUTURES_SYMBOL_PARSE_FAILED",
+            e,
+            symbol=str(symbol),
+        )
+        return None
+
+
+def _futures_roll_day(con, root: str, ts_ms: int) -> bool:
+    if not root:
+        return False
+    window = max(0, int(PORTFOLIO_BACKTEST_FUTURES_ROLL_WINDOW_MS))
+    start = int(ts_ms) - int(window // 2)
+    end = int(ts_ms) + int(window // 2)
+    try:
+        row = con.execute(
+            """
+            SELECT 1
+            FROM futures_roll_calendar
+            WHERE root=? AND roll_ts_ms BETWEEN ? AND ?
+            LIMIT 1
+            """,
+            (str(root).upper().strip(), int(start), int(end)),
+        ).fetchone()
+        return bool(row)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_BACKTEST_FUTURES_ROLL_DAY_LOOKUP_FAILED",
+            e,
+            root=str(root),
+        )
+        return False
+
+
+def futures_point_value_pnl(
+    *,
+    contracts: int | float,
+    multiplier: float,
+    entry_px: float,
+    exit_px: float,
+    side: int | float = 1,
+) -> float:
+    side_sign = 1.0 if float(side or 0.0) >= 0.0 else -1.0
+    return float(float(contracts or 0.0) * float(multiplier or 0.0) * (float(exit_px or 0.0) - float(entry_px or 0.0)) * side_sign)
+
+
 def _estimate_weight_delta_trade_cost(con, symbol: str, delta_weight: float, equity: float, ts_ms: int) -> dict[str, Any]:
     out: dict[str, Any] = {
         "symbol": str(symbol).upper().strip(),
@@ -310,13 +381,45 @@ def _estimate_weight_delta_trade_cost(con, symbol: str, delta_weight: float, equ
         out["status"] = "missing_price"
         return out
 
-    notional = abs(float(delta_weight)) * max(0.0, float(equity))
-    if notional <= 0.0:
-        out["status"] = "no_notional"
-        return out
+    futures_meta = _futures_metadata(con, str(symbol))
+    is_futures = isinstance(futures_meta, dict)
+    contract_multiplier = 1.0
+    tick_size = 0.0
+    tick_value = 0.0
+    contracts = 0
+    roll_cost = 0.0
+    tick_slippage_cost = 0.0
+    roll_cost_bps = 0.0
 
-    qty = float(notional) / float(px)
-    side = 1 if float(delta_weight) >= 0.0 else -1
+    if is_futures:
+        contract_multiplier = _safe_f(futures_meta.get("multiplier", futures_meta.get("fut_multiplier")), 1.0)
+        tick_size = _safe_f(futures_meta.get("tick_size", futures_meta.get("fut_tick_size")), 0.0)
+        tick_value = _safe_f(futures_meta.get("tick_value", futures_meta.get("fut_tick_value")), 0.0)
+        contracts = weight_to_contracts(float(delta_weight), float(equity), float(contract_multiplier), float(px))
+        if contracts == 0:
+            out["status"] = "no_contracts"
+            out["contract_multiplier"] = float(contract_multiplier)
+            out["px"] = float(px)
+            return out
+        qty = float(abs(contracts))
+        side = 1 if int(contracts) >= 0 else -1
+        notional = contract_notional(qty, float(px), float(contract_multiplier))
+        if notional <= 0.0:
+            out["status"] = "no_notional"
+            return out
+        tick_slippage_cost = float(qty) * max(0.0, float(tick_value)) * max(0.0, float(PORTFOLIO_BACKTEST_FUTURES_SLIPPAGE_TICKS))
+        root = str(futures_meta.get("root") or futures_meta.get("fut_root") or "").upper().strip()
+        if _futures_roll_day(con, root, int(ts_ms)):
+            roll_cost = float(qty) * max(0.0, float(tick_value)) * max(0.0, float(PORTFOLIO_BACKTEST_FUTURES_ROLL_TICKS)) * 2.0
+        roll_cost_bps = (float(roll_cost) / float(notional) * 10000.0) if notional > 0.0 else 0.0
+    else:
+        notional = abs(float(delta_weight)) * max(0.0, float(equity))
+        if notional <= 0.0:
+            out["status"] = "no_notional"
+            return out
+
+        qty = float(notional) / float(px)
+        side = 1 if float(delta_weight) >= 0.0 else -1
     try:
         liquidity_snapshot = dict(
             get_execution_liquidity_snapshot(
@@ -349,16 +452,21 @@ def _estimate_weight_delta_trade_cost(con, symbol: str, delta_weight: float, equ
         side=int(side),
         ts_ms=int(ts_ms),
         liquidity_snapshot=liquidity_snapshot,
+        contract_multiplier=float(contract_multiplier),
     )
+    futures_slippage_bps = (float(tick_slippage_cost) / float(notional) * 10000.0) if is_futures and notional > 0.0 else None
     cost_bps = estimate_cost_bps(
         px=float(px),
         bid=None,
         ask=None,
         side=int(side),
         fees_bps=float(PORTFOLIO_BACKTEST_FEE_BPS),
-        slippage_bps=float(PORTFOLIO_BACKTEST_SLIPPAGE_BPS),
+        slippage_bps=float(futures_slippage_bps if futures_slippage_bps is not None else PORTFOLIO_BACKTEST_SLIPPAGE_BPS),
         spread_bps_override=float(spread_cost_bps),
-        extra_cost_bps=float(ac_costs.get("execution_cost_bps") or 0.0),
+        extra_cost_bps=float(ac_costs.get("execution_cost_bps") or 0.0) + float(roll_cost_bps),
+        contract_multiplier=(float(contract_multiplier) if is_futures else None),
+        tick_size=(float(tick_size) if is_futures else None),
+        tick_value=(float(tick_value) if is_futures else None),
     )
     fees_cost = float(notional) * (float(cost_bps.get("fees_bps") or 0.0) / 10000.0)
     slippage_cost = float(notional) * (
@@ -381,9 +489,23 @@ def _estimate_weight_delta_trade_cost(con, symbol: str, delta_weight: float, equ
             "liquidity_snapshot": dict(liquidity_snapshot or {}),
             "cost_bps": dict(cost_bps or {}),
             "almgren_chriss": dict(ac_costs or {}),
-            "status": "estimated",
+            "status": ("estimated_futures" if is_futures else "estimated"),
         }
     )
+    if is_futures:
+        out.update(
+            {
+                "asset_class": "FUTURES",
+                "contracts": int(contracts),
+                "contract_multiplier": float(contract_multiplier),
+                "tick_size": float(tick_size),
+                "tick_value": float(tick_value),
+                "tick_slippage_cost": float(tick_slippage_cost),
+                "roll_cost": float(roll_cost),
+                "roll_cost_bps": float(roll_cost_bps),
+                "point_value_notional": float(notional),
+            }
+        )
     return out
 
 

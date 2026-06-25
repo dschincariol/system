@@ -8,6 +8,7 @@
 
 import { setMetricValueAttribute } from "./tooltip.js";
 import { statusAriaLabel, statusPillClasses, statusToken } from "./utils.js";
+import { normalizeSeverity, severityAtLeast } from "./alerts.js";
 
 let _getLastAlerts = () => [];
 let _getLastHealth = () => null;
@@ -65,7 +66,7 @@ export function updateDecisionBarFromState(state) {
   const warnKnown = Number.isFinite(Number(state.warn));
   _setPill("pillSystem", `SYSTEM: ${state.system}`, state.system === "CRIT" ? "crit" : state.system === "WARN" ? "warn" : state.system === "OK" ? "ok" : "unavailable", state.system);
   _setPill("pillCrit", `CRIT: ${critKnown ? state.crit : "N/A"}`, !critKnown ? "unavailable" : state.crit > 0 ? "crit" : "neutral", critKnown ? state.crit : null);
-  _setPill("pillWarn", `WARN: ${warnKnown ? state.warn : "N/A"}`, !warnKnown ? "unavailable" : state.warn > 0 ? "warn" : "neutral", warnKnown ? state.warn : null);
+  _setPill("pillWarn", `WARN+: ${warnKnown ? state.warn : "N/A"}`, !warnKnown ? "unavailable" : state.warn > 0 ? "warn" : "neutral", warnKnown ? state.warn : null);
   _setPill("pillData", `Data: ${state.data}`, state.data === "BAD" ? "crit" : state.data === "WARN" ? "warn" : state.data === "OK" ? "ok" : "unavailable", state.data);
   _setPill("pillModel", `Model: ${state.model}`, state.model === "BLOCKED" ? "blocked" : state.model === "OK" ? "ok" : "unavailable", state.model);
   _setPill("pillExec", `Exec: ${state.exec}`, state.exec === "BLOCKED" ? "blocked" : state.exec === "DEGRADED" ? "warn" : state.exec === "OK" ? "ok" : "unavailable", state.exec);
@@ -115,8 +116,7 @@ function _deriveExecStatus(barrier, alerts) {
   const hasExecutionAlert = (alerts || []).some((alert) => {
     if (!alert || alert.resolved) return false;
     const symbol = String(alert.symbol || "").trim().toUpperCase();
-    const severity = String(alert.severity || "").trim().toUpperCase();
-    return symbol === "EXECUTION" && (severity === "WARN" || severity === "HIGH" || severity === "CRIT");
+    return symbol === "EXECUTION" && severityAtLeast(alert.severity, "WARN");
   });
   if (hasExecutionAlert) return "DEGRADED";
   if (barrier && barrier.allowed === true) return "OK";
@@ -165,12 +165,11 @@ export function updateDecisionHeader(updatedLabel) {
     const _lastPromotionStatus = _getLastPromotionStatus() || null;
     const alertsUnavailable = !!(typeof window !== "undefined" && window.__LAST_ALERTS_FAILED__);
 
-    const critN = alertsUnavailable ? null : (_lastAlerts || []).filter((a)=>!a.resolved && String(a.severity || "").toUpperCase() === "CRIT").length;
+    const critN = alertsUnavailable ? null : (_lastAlerts || []).filter((a) => !a.resolved && normalizeSeverity(a && a.severity) === "CRIT").length;
     const warnN = alertsUnavailable
       ? null
       : (_lastAlerts || []).filter((a) => {
-          const severity = String(a && a.severity || "").toUpperCase();
-          return !a.resolved && (severity === "WARN" || severity === "HIGH" || severity === "CRIT");
+          return !a.resolved && severityAtLeast(a && a.severity, "WARN");
         }).length;
 
     updateDecisionBarFromState({

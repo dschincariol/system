@@ -162,6 +162,18 @@
 
         <div class="subHd tableSubHd">
           <span>Orders</span>
+          <div class="muted mono tableMeta" id="ordersMeta">—</div>
+          <label class="srOnly" for="ordStatusFilter">Filter orders by status</label>
+          <select id="ordStatusFilter" class="sel tableStatusFilter" aria-label="Filter orders by status">
+            <option value="all">All statuses</option>
+            <option value="active">Active</option>
+            <option value="rejected">Rejected</option>
+            <option value="suppressed">Suppressed</option>
+            <option value="filled">Filled</option>
+            <option value="partial">Partial</option>
+            <option value="canceled">Canceled</option>
+            <option value="stale">Stale</option>
+          </select>
           <label class="srOnly" for="ordFilter">Filter orders</label>
           <input id="ordFilter" class="inp tableFilter" placeholder="Search orders" autocomplete="off" spellcheck="false">
         </div>
@@ -175,6 +187,18 @@
         <div class="muted mono" id="fillsMeta">—</div>
       </div>
       <div class="panelBody">
+        <div id="terminalTcaSummary" class="tcaSummary" aria-live="polite"></div>
+        <label class="srOnly" for="fillsStatusFilter">Filter fills by status</label>
+        <select id="fillsStatusFilter" class="sel tableStatusFilter" aria-label="Filter fills by status">
+          <option value="all">All statuses</option>
+          <option value="active">Active</option>
+          <option value="rejected">Rejected</option>
+          <option value="suppressed">Suppressed</option>
+          <option value="filled">Filled</option>
+          <option value="partial">Partial</option>
+          <option value="canceled">Canceled</option>
+          <option value="stale">Stale</option>
+        </select>
         <label class="srOnly" for="fillsFilter">Filter fills</label>
         <input id="fillsFilter" class="inp full tableFilter" placeholder="Search fills" autocomplete="off" spellcheck="false">
         <div id="fillsTbl" class="tbl"></div>

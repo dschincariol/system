@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 
@@ -691,7 +690,6 @@ class SoakRunner:
     def preflight(self) -> bool:
         mode = str(os.environ.get("ENGINE_MODE") or os.environ.get("EXECUTION_MODE") or "").strip().lower()
         exec_mode = str(os.environ.get("EXECUTION_MODE") or "").strip().lower()
-        broker = str(os.environ.get("BROKER") or os.environ.get("BROKER_NAME") or "").strip().lower()
         if mode != "paper" and exec_mode != "paper":
             self.step("paper_mode_required", False, engine_mode=mode, execution_mode=exec_mode)
         else:

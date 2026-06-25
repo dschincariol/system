@@ -1009,9 +1009,12 @@ def _apply_write_txn_timeouts(con: StorageConnection, *, timeout_s: float | None
         return
     with raw.cursor() as cur:
         if lock_timeout_ms > 0:
-            cur.execute("SET LOCAL lock_timeout = %s", (f"{int(lock_timeout_ms)}ms",))
+            cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{int(lock_timeout_ms)}ms",))
         if statement_timeout_ms > 0:
-            cur.execute("SET LOCAL statement_timeout = %s", (f"{int(statement_timeout_ms)}ms",))
+            cur.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{int(statement_timeout_ms)}ms",),
+            )
 
 
 def _safe_log_identifier(value: Any) -> str:

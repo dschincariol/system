@@ -10,7 +10,7 @@ def pick_mode_from_argv_or_env(argv: Sequence[str], environ: Mapping[str, str]) 
     else:
         mode = str(environ.get("ENGINE_MODE", "") or "").strip().lower() or "safe"
 
-    allowed = {"safe", "shadow", "live"}
+    allowed = {"safe", "paper", "shadow", "live"}
     if mode not in allowed:
         raise RuntimeError(f"invalid ENGINE_MODE: {mode}")
 

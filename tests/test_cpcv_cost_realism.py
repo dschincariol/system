@@ -20,6 +20,8 @@ def test_transaction_costs_apply_on_position_changes_with_ac_temporary_impact() 
         "adv": 10_000.0,
         "sigma_daily": 100.0,
         "participation": 0.10,
+        # Deliberate borrow-free AC/turnover baseline; EQ-02 borrow math is tested separately.
+        "borrow_enabled": False,
     }
 
     adjusted, meta = cpcv._apply_transaction_costs_to_returns(
@@ -61,6 +63,8 @@ def test_nonzero_costs_and_turnover_reduce_sharpe() -> None:
             "adv": 10_000_000.0,
             "sigma_daily": 100.0,
             "participation": 0.10,
+            # Keep this Sharpe regression focused on transaction costs, not short borrow carry.
+            "borrow_enabled": False,
         },
     )
 
@@ -100,6 +104,8 @@ def test_cpcv_reports_frictionless_and_cost_adjusted_metrics() -> None:
             "adv": 10_000_000.0,
             "sigma_daily": 100.0,
             "participation": 0.10,
+            # Preserve the existing CPCV metric golden as a borrow-free realism baseline.
+            "borrow_enabled": False,
         },
     )
 

@@ -13,6 +13,7 @@ import {
   normalizeAlert,
   normalizeAlertDetailPayload,
   normalizeAlertsPayload,
+  normalizeSeverity,
 } from "./alerts.js";
 
 export function _scoreCell(rows, severityRank) {
@@ -446,11 +447,7 @@ function _alertRuleKey(r) {
 }
 
 function _alertSeverityKey(r) {
-  const raw = String(r?.severity_raw || r?.level || r?.severity || "").trim().toUpperCase();
-  if (raw === "CRIT") return "CRIT";
-  if (raw === "HIGH") return "HIGH";
-  if (raw === "WARN") return "WARN";
-  return "INFO";
+  return normalizeSeverity(r?.severity_raw || r?.level || r?.severity);
 }
 
 function _formatHorizonLabel(value) {
@@ -652,6 +649,12 @@ function _drawerStateMeta(alertRow) {
   if (alert.status === "resolved") {
     return { text: "RESOLVED", cls: "ok" };
   }
+  if (alert.shelved) {
+    return { text: "SHELVED", cls: "warn" };
+  }
+  if (alert.ack_expired || alert.retriggered || alert.lifecycle_state === "retriggered") {
+    return { text: "RE-TRIGGERED", cls: cellColor(alert).cls };
+  }
   if (alert.acked) {
     return { text: "ACKED", cls: cellColor(alert).cls };
   }
@@ -682,12 +685,151 @@ function _scheduleAlertsReload(reloadAlerts, delayMs = 1000) {
   }, Math.max(0, Number(delayMs) || 0));
 }
 
+function _lifecycleLabel(state) {
+  const key = String(state || "").trim().toLowerCase();
+  return {
+    triggered: "Triggered",
+    acknowledged: "Acknowledged",
+    shelved: "Shelved",
+    retriggered: "Re-triggered",
+    shelve_expired: "Shelving expired",
+    resolved: "Resolved",
+  }[key] || (key ? key.replace(/_/g, " ") : "Updated");
+}
+
+function _lifecycleTone(state, severity = "") {
+  const key = String(state || "").trim().toLowerCase();
+  if (key === "resolved") return "ok";
+  if (key === "shelved" || key === "acknowledged") return "warn";
+  if (key === "retriggered" || key === "shelve_expired") {
+    return normalizeSeverity(severity) === "CRIT" ? "crit" : "high";
+  }
+  return cellColor({ severity }).cls;
+}
+
+function _hasLifecycleState(events, state) {
+  const target = String(state || "").trim().toLowerCase();
+  return events.some((item) => String(item && item.state || "").trim().toLowerCase() === target);
+}
+
+function _eventFromAlert(_alert, state, ts, reason = "", actor = "", source = "dashboard") {
+  return {
+    ts_ms: Number.isFinite(Number(ts)) && Number(ts) > 0 ? Number(ts) : null,
+    state,
+    actor,
+    reason,
+    source,
+  };
+}
+
+export function normalizeAlertLifecycle(row, nowMs = Date.now()) {
+  const alert = normalizeAlert(row) || {};
+  const events = Array.isArray(alert.lifecycle) ? alert.lifecycle.map((item) => ({ ...item })) : [];
+  if (!_hasLifecycleState(events, "triggered")) {
+    events.push(_eventFromAlert(alert, "triggered", alert.ts_ms || alert.ts, alert.message || alert.event_title || "alert triggered", "system", "alerts"));
+  }
+  if (alert.acked && !_hasLifecycleState(events, "acknowledged")) {
+    events.push(_eventFromAlert(alert, "acknowledged", alert.acked_ts_ms, alert.ack_reason || "acknowledged", alert.acked_by || "operator", alert.ack_source || "dashboard"));
+  }
+  if ((alert.ack_expired || alert.retriggered) && !_hasLifecycleState(events, "retriggered")) {
+    events.push(_eventFromAlert(alert, "retriggered", alert.ack_expires_ts_ms || nowMs, "ack timeout expired before resolution", alert.acked_by || "", "alert_lifecycle"));
+  }
+  if (alert.shelved && !_hasLifecycleState(events, "shelved")) {
+    events.push(_eventFromAlert(alert, "shelved", alert.shelved_ts_ms, alert.shelve_reason || "shelved", alert.shelved_by || "operator", alert.shelve_source || "dashboard"));
+  }
+  if (alert.shelve_expired && !_hasLifecycleState(events, "shelve_expired")) {
+    events.push(_eventFromAlert(alert, "shelve_expired", alert.shelve_expires_ts_ms || nowMs, "shelving expired before resolution", alert.shelved_by || "", "alert_lifecycle"));
+  }
+  if (alert.status === "resolved" && !_hasLifecycleState(events, "resolved")) {
+    events.push(_eventFromAlert(alert, "resolved", alert.resolved_ts_ms || nowMs, alert.resolved_reason || "resolved", alert.resolved_by || "operator", alert.resolve_source || "dashboard"));
+  }
+  return events
+    .map((item) => ({
+      ...item,
+      state: String(item.state || item.lifecycle_state || "updated").trim().toLowerCase(),
+      ts_ms: Number.isFinite(Number(item.ts_ms)) && Number(item.ts_ms) > 0 ? Number(item.ts_ms) : null,
+      actor: String(item.actor || item.owner || ""),
+      reason: String(item.reason || ""),
+      source: String(item.source || ""),
+    }))
+    .sort((a, b) => Number(a.ts_ms || 0) - Number(b.ts_ms || 0));
+}
+
+export function alertLifecycleSummary(row, nowMs = Date.now()) {
+  const alert = normalizeAlert(row) || {};
+  if (alert.status === "resolved") {
+    return `Resolved${alert.resolved_reason ? `: ${alert.resolved_reason}` : ""}.`;
+  }
+  if (alert.shelved) {
+    const until = alert.shelve_expires_ts_ms ? fmtTime(alert.shelve_expires_ts_ms) : "expiry unavailable";
+    return `Shelved until ${until}${alert.shelve_reason ? `: ${alert.shelve_reason}` : ""}.`;
+  }
+  if (alert.ack_expired || alert.retriggered) {
+    return "Acknowledgement timed out while unresolved; escalation resumes now.";
+  }
+  if (alert.acked) {
+    const until = alert.ack_expires_ts_ms ? fmtTime(alert.ack_expires_ts_ms) : "timeout unavailable";
+    return `Acknowledged until ${until}; unresolved alerts re-escalate after the timeout.`;
+  }
+  const next = Number(alert.next_escalation_ts_ms || 0);
+  if (Number.isFinite(next) && next > nowMs) {
+    return `Triggered; next escalation window starts ${fmtTime(next)}.`;
+  }
+  return "Triggered; severity-aware notifications are active.";
+}
+
+export function notificationPolicySummary(row, nowMs = Date.now()) {
+  const alert = normalizeAlert(row) || {};
+  const policy = alert.notification_policy && typeof alert.notification_policy === "object"
+    ? alert.notification_policy
+    : {};
+  const rateLimitMs = Number(policy.rate_limit_ms);
+  const rate = Number.isFinite(rateLimitMs) && rateLimitMs > 0
+    ? `${Math.round(rateLimitMs / 60000)}m rate limit`
+    : "rate limit unavailable";
+  const next = Number(policy.next_escalation_ts_ms || alert.next_escalation_ts_ms || 0);
+  const nextText = Number.isFinite(next) && next > 0
+    ? (next <= nowMs ? "next escalation is due now" : `next escalation ${fmtTime(next)}`)
+    : "next escalation not scheduled";
+  const suppressed = policy.suppressed || alert.shelved || alert.status === "resolved"
+    ? "suppressed"
+    : "active";
+  const explanation = String(policy.explanation || alertLifecycleSummary(alert, nowMs));
+  return `${normalizeSeverity(policy.severity || alert.severity)} notifications ${suppressed}; ${rate}; ${nextText}. ${explanation}`;
+}
+
+function _renderAlertLifecycle(row) {
+  const alert = normalizeAlert(row) || {};
+  const events = normalizeAlertLifecycle(alert);
+  if (!events.length) return "<div class='metric-meta'>No lifecycle events recorded.</div>";
+  return `
+    <ol class="alertLifecycleList">
+      ${events.map((item) => {
+        const tone = _lifecycleTone(item.state, alert.severity);
+        const time = item.ts_ms ? fmtTime(item.ts_ms) : "time unavailable";
+        const actor = item.actor ? ` by ${item.actor}` : "";
+        const reason = item.reason ? `<div class="metric-meta">${esc(item.reason)}</div>` : "";
+        return `
+          <li class="alertLifecycleItem" data-state="${esc(item.state)}">
+            <span class="alertLifecycleMarker ${tone}" aria-hidden="true">${esc(_lifecycleLabel(item.state).slice(0, 1).toUpperCase())}</span>
+            <div>
+              <div><strong>${esc(_lifecycleLabel(item.state))}</strong><span class="metric-meta"> ${esc(time)}${esc(actor)}</span></div>
+              ${reason}
+            </div>
+          </li>
+        `;
+      }).join("")}
+    </ol>
+  `;
+}
+
 export async function openIncidentDrawer(row, deps) {
   const {
     fetchJSON,
     getLastAlerts,
     postUiInteraction,
     ackAlert,
+    shelveAlert,
     resolveAlert,
     reloadAlerts,
     isAckedLocal,
@@ -731,8 +873,11 @@ export async function openIncidentDrawer(row, deps) {
   const whyPosture = document.getElementById("drawerWhyPosture");
   const statePill = document.getElementById("drawerAlertState");
   const ackBtn = document.getElementById("btnIncidentAck");
+  const shelveBtn = document.getElementById("btnIncidentShelve");
   const resolveBtn = document.getElementById("btnIncidentResolve");
   const actionStatus = document.getElementById("drawerActionStatus");
+  const lifecycleEl = document.getElementById("drawerLifecycle");
+  const notificationEl = document.getElementById("drawerNotificationPolicy");
   const simEl = document.getElementById("drawerSimilar");
   let actionPending = false;
 
@@ -763,6 +908,12 @@ export async function openIncidentDrawer(row, deps) {
     if (whyPosture) {
       whyPosture.textContent = _alertWhyPosture(alertRow);
     }
+    if (lifecycleEl) {
+      lifecycleEl.innerHTML = _renderAlertLifecycle(alertRow);
+    }
+    if (notificationEl) {
+      notificationEl.textContent = notificationPolicySummary(alertRow);
+    }
 
     if (facts) {
       const z = Number(alertRow.expected_z);
@@ -772,12 +923,17 @@ export async function openIncidentDrawer(row, deps) {
       const ageMin = Number.isFinite(Number(alertRow.ts))
         ? Math.max(0, Math.floor((Date.now() - Number(alertRow.ts)) / 60000))
         : null;
+      const nextEscalation = Number(alertRow.next_escalation_ts_ms || 0);
+      const shelfExpiry = Number(alertRow.shelve_expires_ts_ms || 0);
 
       facts.innerHTML = `
         <div class="kvK">symbol</div><div class="kvV">${esc(titleSymbol)}</div>
         <div class="kvK">severity</div><div class="kvV">${esc(alertRow.severity)}</div>
         <div class="kvK">rule_id</div><div class="kvV">${esc(alertRow.rule_id || "—")}</div>
         <div class="kvK">status</div><div class="kvV">${esc(alertRow.status)}</div>
+        <div class="kvK">lifecycle</div><div class="kvV">${esc(alertLifecycleSummary(alertRow))}</div>
+        <div class="kvK">next escalation</div><div class="kvV">${Number.isFinite(nextEscalation) && nextEscalation > 0 ? esc(fmtTime(nextEscalation)) : "—"}</div>
+        <div class="kvK">shelving expiry</div><div class="kvV">${Number.isFinite(shelfExpiry) && shelfExpiry > 0 ? esc(fmtTime(shelfExpiry)) : "—"}</div>
         <div class="kvK">horizon_s</div><div class="kvV">${esc(alertRow.horizon_s)}</div>
         <div class="kvK">expected_z</div><div class="kvV">${Number.isFinite(z) ? z.toFixed(3) : "—"}</div>
         <div class="kvK">confidence</div><div class="kvV">${Number.isFinite(conf) ? conf.toFixed(2) : "—"}</div>
@@ -800,12 +956,22 @@ export async function openIncidentDrawer(row, deps) {
     }
 
     if (ackBtn) {
-      ackBtn.disabled = actionPending || alertRow.status === "resolved" || !!alertRow.acked;
+      ackBtn.disabled = actionPending || alertRow.status === "resolved" || !!alertRow.acked || !!alertRow.shelved;
       ackBtn.textContent = alertRow.status === "resolved"
         ? "Resolved"
+        : alertRow.shelved
+          ? "Shelved"
         : alertRow.acked
           ? "Acknowledged"
           : "Acknowledge";
+    }
+    if (shelveBtn) {
+      shelveBtn.disabled = actionPending || alertRow.status === "resolved" || !!alertRow.shelved;
+      shelveBtn.textContent = alertRow.status === "resolved"
+        ? "Resolved"
+        : alertRow.shelved
+          ? "Shelved"
+          : "Shelve";
     }
     if (resolveBtn) {
       resolveBtn.disabled = actionPending || alertRow.status === "resolved";
@@ -823,7 +989,7 @@ export async function openIncidentDrawer(row, deps) {
 
   if (ackBtn) {
     ackBtn.onclick = async () => {
-      if (actionPending || typeof ackAlert !== "function" || alertRow.status === "resolved" || alertRow.acked) return;
+      if (actionPending || typeof ackAlert !== "function" || alertRow.status === "resolved" || alertRow.acked || alertRow.shelved) return;
       actionPending = true;
       _setDrawerActionStatus(actionStatus, "Saving acknowledgement…");
       renderDrawer();
@@ -833,6 +999,12 @@ export async function openIncidentDrawer(row, deps) {
           ...alertRow,
           acked: true,
           acked_by: result.persistence === "local" ? "local" : (alertRow.acked_by || "operator"),
+          acked_ts_ms: result.acked_ts_ms || alertRow.acked_ts_ms || Date.now(),
+          ack_expires_ts_ms: result.expires_ts_ms || alertRow.ack_expires_ts_ms || null,
+          ack_expired: false,
+          retriggered: false,
+          lifecycle_state: "acknowledged",
+          next_escalation_ts_ms: result.expires_ts_ms || alertRow.next_escalation_ts_ms || null,
         };
         renderDrawer();
         _setDrawerActionStatus(
@@ -845,6 +1017,41 @@ export async function openIncidentDrawer(row, deps) {
         _scheduleAlertsReload(reloadAlerts, result.persistence === "local" ? 80 : 1000);
       } else if (!(result && result.blocked)) {
         _setDrawerActionStatus(actionStatus, result && result.error ? result.error : "Acknowledge failed.", "bad");
+      }
+      actionPending = false;
+      renderDrawer();
+    };
+  }
+
+  if (shelveBtn) {
+    shelveBtn.onclick = async () => {
+      if (actionPending || typeof shelveAlert !== "function" || alertRow.status === "resolved" || alertRow.shelved) return;
+      actionPending = true;
+      _setDrawerActionStatus(actionStatus, "Saving shelving state…");
+      renderDrawer();
+      const result = await shelveAlert(alertRow);
+      if (result && result.ok) {
+        alertRow = {
+          ...alertRow,
+          shelved: true,
+          shelved_by: result.persistence === "local" ? "local" : (alertRow.shelved_by || "operator"),
+          shelved_ts_ms: result.shelved_ts_ms || alertRow.shelved_ts_ms || Date.now(),
+          shelve_expires_ts_ms: result.expires_ts_ms || alertRow.shelve_expires_ts_ms || null,
+          shelve_reason: result.reason || alertRow.shelve_reason || "shelved in dashboard",
+          lifecycle_state: "shelved",
+          next_escalation_ts_ms: result.expires_ts_ms || alertRow.next_escalation_ts_ms || null,
+        };
+        renderDrawer();
+        _setDrawerActionStatus(
+          actionStatus,
+          result.persistence === "local"
+            ? "Server unavailable. Shelved locally for this browser."
+            : "Shelved. Syncing dashboard…",
+          result.persistence === "local" ? "warn" : "ok"
+        );
+        _scheduleAlertsReload(reloadAlerts, result.persistence === "local" ? 80 : 1000);
+      } else if (!(result && result.blocked)) {
+        _setDrawerActionStatus(actionStatus, result && result.error ? result.error : "Shelve failed.", "bad");
       }
       actionPending = false;
       renderDrawer();
@@ -866,6 +1073,8 @@ export async function openIncidentDrawer(row, deps) {
           resolved_reason: result.persistence === "local"
             ? "local fallback"
             : (alertRow.resolved_reason || "resolved in dashboard"),
+          resolved_ts_ms: result.resolved_ts_ms || alertRow.resolved_ts_ms || Date.now(),
+          lifecycle_state: "resolved",
         };
         renderDrawer();
         _setDrawerActionStatus(
@@ -930,6 +1139,7 @@ export async function loadAlertsUI(deps) {
     _isResolvedLocal,
     _isSnoozedLocal,
     ackAlert,
+    shelveAlert,
     resolveAlert,
     reloadAlerts,
     OPERATOR_MODE,
@@ -985,6 +1195,7 @@ export async function loadAlertsUI(deps) {
         getLastAlerts,
         postUiInteraction,
         ackAlert,
+        shelveAlert,
         resolveAlert,
         reloadAlerts,
         isAckedLocal: _isAckedLocal,
@@ -1070,6 +1281,7 @@ ${ageMin == null ? "—" : `${ageMin}m ago`}${
         getLastAlerts,
         postUiInteraction,
         ackAlert,
+        shelveAlert,
         resolveAlert,
         reloadAlerts,
         isAckedLocal: _isAckedLocal,
@@ -1085,6 +1297,7 @@ ${ageMin == null ? "—" : `${ageMin}m ago`}${
           getLastAlerts,
           postUiInteraction,
           ackAlert,
+          shelveAlert,
           resolveAlert,
           reloadAlerts,
           isAckedLocal: _isAckedLocal,

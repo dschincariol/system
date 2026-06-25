@@ -6,42 +6,63 @@
   dashboard chart tests can exercise the production mapping directly.
 */
 
+import { statusToken } from "./utils.js";
+
+function tokenColor(key) {
+  return statusToken(key).color;
+}
+
+function tokenFill(key) {
+  return statusToken(key).fill;
+}
+
+function tokenBorder(key, alpha) {
+  const color = tokenColor(key);
+  const match = color.match(/^#([0-9a-f]{6})$/i);
+  if (!match) return color;
+  const hex = match[1];
+  const r = Number.parseInt(hex.slice(0, 2), 16);
+  const g = Number.parseInt(hex.slice(2, 4), 16);
+  const b = Number.parseInt(hex.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 const COLORS = Object.freeze({
-  fillBuy: "#56B4E9",
-  fillSell: "#D55E00",
-  intent: "#009E73",
-  suppressed: "#E69F00",
-  blocked: "#73B7E6",
-  riskCapped: "#CC79A7",
-  window: "#8B949E",
+  fillBuy: tokenColor("info"),
+  fillSell: tokenColor("crit"),
+  intent: tokenColor("ok"),
+  suppressed: tokenColor("warn"),
+  blocked: tokenColor("blocked"),
+  riskCapped: tokenColor("high"),
+  window: tokenColor("unavailable"),
   averageCost: "#F0E442",
-  stop: "#D55E00",
-  takeProfit: "#009E73",
-  maxRisk: "#CC79A7",
-  cap: "#73B7E6",
-  entry: "#56B4E9",
+  stop: tokenColor("crit"),
+  takeProfit: tokenColor("ok"),
+  maxRisk: tokenColor("high"),
+  cap: tokenColor("blocked"),
+  entry: tokenColor("info"),
 });
 
 const WINDOW_COLORS = Object.freeze({
   kill: Object.freeze({
-    fill: "rgba(213, 94, 0, 0.16)",
-    border: "rgba(213, 94, 0, 0.42)",
+    fill: tokenFill("crit"),
+    border: tokenBorder("crit", "0.42"),
   }),
   suppression: Object.freeze({
-    fill: "rgba(230, 159, 0, 0.15)",
-    border: "rgba(230, 159, 0, 0.40)",
+    fill: tokenFill("warn"),
+    border: tokenBorder("warn", "0.40"),
   }),
   circuit: Object.freeze({
-    fill: "rgba(115, 183, 230, 0.16)",
-    border: "rgba(115, 183, 230, 0.42)",
+    fill: tokenFill("blocked"),
+    border: tokenBorder("blocked", "0.42"),
   }),
   drawdown: Object.freeze({
-    fill: "rgba(204, 121, 167, 0.15)",
-    border: "rgba(204, 121, 167, 0.40)",
+    fill: tokenFill("high"),
+    border: tokenBorder("high", "0.40"),
   }),
   risk: Object.freeze({
-    fill: "rgba(139, 148, 158, 0.13)",
-    border: "rgba(139, 148, 158, 0.35)",
+    fill: tokenFill("unavailable"),
+    border: tokenBorder("unavailable", "0.35"),
   }),
 });
 
@@ -61,8 +82,8 @@ export const VWAP_OVERLAY_SEMANTICS = Object.freeze({
 });
 
 const INDICATOR_COLORS = Object.freeze({
-  vwap: "#56B4E9",
-  ema: "#E69F00",
+  vwap: tokenColor("info"),
+  ema: tokenColor("warn"),
   equity: "#F0E442",
 });
 

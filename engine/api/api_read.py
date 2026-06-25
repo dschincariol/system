@@ -117,6 +117,50 @@ def _extract_confidence_metrics_from_explain(explain: dict) -> dict:
     }
 
 
+def _normalize_alert_severity(value: Any) -> str:
+    raw = str(value or "").strip().upper()
+    if raw == "WARNING":
+        raw = "WARN"
+    if raw == "CRITICAL":
+        raw = "CRIT"
+    return raw if raw in {"INFO", "WARN", "HIGH", "CRIT"} else "INFO"
+
+
+def _alert_notification_policy(severity: Any, state: dict[str, Any], now_ms: int) -> dict[str, Any]:
+    sev = _normalize_alert_severity(severity)
+    rate_limit_ms = {
+        "INFO": 60 * 60 * 1000,
+        "WARN": 30 * 60 * 1000,
+        "HIGH": 10 * 60 * 1000,
+        "CRIT": 5 * 60 * 1000,
+    }[sev]
+    lifecycle_state = str(state.get("lifecycle_state") or "triggered")
+    suppressed = bool(state.get("shelved")) or bool(state.get("resolved"))
+    next_escalation_ts_ms = state.get("next_escalation_ts_ms")
+    if state.get("shelved"):
+        next_escalation_ts_ms = state.get("shelve_expires_ts_ms")
+    elif state.get("acked") and not state.get("ack_expired"):
+        next_escalation_ts_ms = state.get("ack_expires_ts_ms")
+    elif state.get("ack_expired"):
+        next_escalation_ts_ms = now_ms
+    return {
+        "severity": sev,
+        "state": lifecycle_state,
+        "rate_limit_ms": rate_limit_ms,
+        "suppressed": suppressed,
+        "next_escalation_ts_ms": next_escalation_ts_ms,
+        "explanation": (
+            "notifications suppressed while shelved"
+            if state.get("shelved")
+            else "ack timeout elapsed; alert should re-trigger"
+              if state.get("ack_expired")
+              else "notifications paused until ack timeout"
+                if state.get("acked")
+                else "severity-aware notifications active"
+        ),
+    }
+
+
 def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
     ids = []
     for alert_id in alert_ids or []:
@@ -176,6 +220,8 @@ def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[st
                     "ack_expires_ts_ms": expires_ts_ms,
                     "ack_reason": str(row[5] or "") if len(row) > 5 else "",
                     "ack_expired": expired,
+                    "retriggered": expired,
+                    "escalation_state": "retriggered" if expired else "acknowledged",
                     "lifecycle_state": "retriggered" if expired else "acknowledged",
                     "next_escalation_ts_ms": expires_ts_ms,
                 }
@@ -218,6 +264,8 @@ def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[st
                     "shelve_source": str(row[5] or ""),
                     "shelve_severity": str(row[6] or ""),
                     "shelve_expired": expired,
+                    "escalation_state": "retriggered" if expired else "shelved",
+                    "next_escalation_ts_ms": expires_ts_ms,
                     "lifecycle_state": "shelve_expired" if expired else "shelved",
                 }
         except Exception as e:
@@ -255,6 +303,8 @@ def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[st
                     "resolved_by": str(row[2] or ""),
                     "resolved_reason": str(row[3] or ""),
                     "resolve_source": str(row[4] or ""),
+                    "lifecycle_state": "resolved",
+                    "escalation_state": "resolved",
                 }
         except Exception as e:
             _warn_nonfatal(
@@ -302,6 +352,53 @@ def _load_alert_state_maps(con, alert_ids: list[int]) -> tuple[dict[int, dict[st
                 e,
                 warn_key="api_read_alert_lifecycle_failed",
             )
+
+    for alert_id, state in ack_map.items():
+        if not state.get("ack_expired"):
+            continue
+        expires_ts_ms = int(state.get("ack_expires_ts_ms") or now_ms)
+        existing_states = {
+            str(item.get("state") or "")
+            for item in lifecycle_map.get(alert_id, [])
+            if int(item.get("ts_ms") or 0) == expires_ts_ms
+        }
+        if "retriggered" not in existing_states:
+            lifecycle_map.setdefault(alert_id, []).append({
+                "ts_ms": expires_ts_ms,
+                "state": "retriggered",
+                "actor": str(state.get("acked_by") or ""),
+                "reason": "ack timeout expired before resolution",
+                "source": "alert_lifecycle",
+                "detail": {
+                    "ack_expires_ts_ms": expires_ts_ms,
+                    "ack_reason": str(state.get("ack_reason") or ""),
+                },
+            })
+
+    for alert_id, state in shelf_map.items():
+        if not state.get("shelve_expired"):
+            continue
+        expires_ts_ms = int(state.get("shelve_expires_ts_ms") or now_ms)
+        existing_states = {
+            str(item.get("state") or "")
+            for item in lifecycle_map.get(alert_id, [])
+            if int(item.get("ts_ms") or 0) == expires_ts_ms
+        }
+        if "shelve_expired" not in existing_states:
+            lifecycle_map.setdefault(alert_id, []).append({
+                "ts_ms": expires_ts_ms,
+                "state": "shelve_expired",
+                "actor": str(state.get("shelved_by") or ""),
+                "reason": "shelving expired before resolution",
+                "source": "alert_lifecycle",
+                "detail": {
+                    "shelve_expires_ts_ms": expires_ts_ms,
+                    "shelve_reason": str(state.get("shelve_reason") or ""),
+                },
+            })
+
+    for items in lifecycle_map.values():
+        items.sort(key=lambda item: int(item.get("ts_ms") or 0))
 
     return ack_map, resolution_map, shelf_map, lifecycle_map
 
@@ -390,6 +487,7 @@ def get_alerts():
                 lifecycle = lifecycle_map.get(alert_id, [])
                 if lifecycle:
                     alert_row["lifecycle"] = lifecycle
+                alert_row["notification_policy"] = _alert_notification_policy(sev, alert_row, int(time.time() * 1000))
                 out_rows.append(alert_row)
 
             return {

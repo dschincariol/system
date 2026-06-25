@@ -14,6 +14,7 @@ import numpy as np
 from engine.execution.fx_costs import normalize_fx_symbol
 from engine.strategy.cpcv import cpcv_backtest
 from engine.strategy.gated_backtest import run_gated_backtest
+from engine.strategy.promotion_guard import assess_challenger
 from engine.strategy.statistical_gates import passes_promotion_gate
 
 
@@ -67,22 +68,34 @@ def _cost_drag_bps(frictionless: np.ndarray, net: np.ndarray) -> float:
     return float(np.mean(frictionless[:n] - net[:n]) * 10000.0)
 
 
+def _list_or_default(value: Any, default: Sequence[Any]) -> list[Any]:
+    if value is None:
+        return list(default)
+    try:
+        return list(value)
+    except Exception:
+        return list(default)
+
+
 def evaluate_fx_challengers(
     challengers: Iterable[Mapping[str, Any]],
     *,
     n_competing_trials: int,
     cost_config_base: Mapping[str, Any] | None = None,
     gate_config: Mapping[str, Any] | None = None,
+    governance_config: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Return per-pair/per-factor pass/fail evidence net of FX costs.
 
     This function calls the shared ``run_gated_backtest``/``cpcv_backtest`` and
-    ``passes_promotion_gate`` paths. It does not promote, persist, route, or call
-    live broker modules.
+    ``passes_promotion_gate`` paths, then consumes the real
+    ``assess_challenger`` verdict with ``persist=False``. It does not promote,
+    persist, route, or call live broker modules.
     """
 
     report: Dict[str, Any] = {"pairs": {}, "summary": {"n_pass": 0, "n_fail": 0}}
     base_cost = dict(cost_config_base or {})
+    base_governance = dict(governance_config or {})
     for row in list(challengers or []):
         pair = normalize_fx_symbol(str(row.get("pair") or row.get("symbol") or "EUR_USD"))
         factor = str(row.get("factor") or row.get("factor_id") or "unknown_factor")
@@ -151,17 +164,85 @@ def evaluate_fx_challengers(
             models_returns=row.get("models_returns"),
         )
         pbo = float(cpcv_result.get("pbo") or 1.0)
-        passed = bool(gate_passed and pbo <= float(row.get("max_pbo", 1.0)))
+        governance_overrides = {
+            **base_governance,
+            **dict(row.get("governance_config") or {}),
+        }
+        governance_passed = False
+        governance_diag: Dict[str, Any] = {
+            "passed": False,
+            "status": "not_evaluated",
+        }
+        try:
+            model_id = str(
+                row.get("model_id")
+                or f"fx_profitability_report_{pair}_{factor}"
+            )
+            governance_passed, governance_diag = assess_challenger(
+                model_id=model_id,
+                model_name=str(row.get("model_name") or model_id),
+                candidate_version=str(row.get("candidate_version") or "fx_profitability_report"),
+                challenger_returns=[float(value) for value in net_returns.tolist()],
+                champion_returns=_list_or_default(
+                    row.get("champion_returns"),
+                    [0.0] * int(net_returns.size),
+                ),
+                models_returns=row.get("models_returns"),
+                pool_returns=row.get("pool_returns"),
+                evaluation_timestamps=_list_or_default(row.get("evaluation_timestamps"), sample_times),
+                era_labels=row.get("era_labels"),
+                regime_labels=row.get("regime_labels"),
+                challenger_predictions=[float(value) for value in predictions.tolist()],
+                realized_returns=[float(value) for value in realized.tolist()],
+                neutralization_features=row.get("neutralization_features"),
+                candidate_symbols=[pair] * n,
+                candidate_features=row.get("candidate_features"),
+                deconfounded_validation=row.get("deconfounded_validation"),
+                deconfounded_config=dict(governance_overrides.get("deconfounded_config") or {}),
+                new_features=row.get("new_features"),
+                current_feature_ids=row.get("current_feature_ids"),
+                challenger_feature_ids=row.get("challenger_feature_ids"),
+                feature_returns=row.get("feature_returns"),
+                feature_p_values=row.get("feature_p_values"),
+                feature_t_stats=row.get("feature_t_stats"),
+                max_pool_corr=governance_overrides.get("max_pool_corr"),
+                corr_sharpe_uplift=governance_overrides.get("corr_sharpe_uplift"),
+                min_mpc=governance_overrides.get("min_mpc"),
+                mpc_weight=governance_overrides.get("mpc_weight"),
+                alpha=float(governance_overrides.get("alpha", row.get("alpha", 0.05))),
+                fdr_q=float(governance_overrides.get("fdr_q", row.get("fdr_q", 0.10))),
+                random_state=int(governance_overrides.get("random_state", row.get("random_state", 42))),
+                bootstrap_samples=int(
+                    governance_overrides.get("bootstrap_samples", row.get("bootstrap_samples", 10_000))
+                ),
+                persist=False,
+            )
+            governance_diag = dict(governance_diag or {})
+        except Exception as exc:
+            governance_passed = False
+            governance_diag = {
+                "passed": False,
+                "status": "governance_exception",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        passed = bool(gate_passed and pbo <= float(row.get("max_pbo", 1.0)) and governance_passed)
         entry = {
             "passed": bool(passed),
+            "governance_passed": bool(governance_passed),
             "net_sharpe": float(_sharpe(net_returns)),
             "deflated_sharpe": float(gate_diag.get("deflated_sharpe") or 0.0),
             "pbo": float(pbo),
             "reality_check_passed": bool(gate_diag.get("spa_pass", True)),
             "frictionless_sharpe": float(_sharpe(frictionless)),
             "cost_drag_bps": float(_cost_drag_bps(frictionless, net_returns)),
-            "reason": str(gate_diag.get("status") or cpcv_result.get("status") or "evaluated"),
+            "reason": str(
+                gate_diag.get("status")
+                or cpcv_result.get("status")
+                or governance_diag.get("status")
+                or "evaluated"
+            ),
             "gate_diagnostics": dict(gate_diag),
+            "governance_diagnostics": dict(governance_diag),
             "cpcv": {
                 "ok": bool(cpcv_result.get("ok", False)),
                 "mean_sharpe": float(cpcv_result.get("mean_sharpe") or 0.0),

@@ -206,8 +206,11 @@ def test_postgres_write_txn_applies_bounded_timeouts_before_retry(monkeypatch) -
     ) == "ok"
     assert len(connections) == 2
     for con in connections:
-        assert ("SET LOCAL lock_timeout = %s", ("250ms",)) in con.raw.statements
-        assert ("SET LOCAL statement_timeout = %s", ("250ms",)) in con.raw.statements
+        assert ("SELECT set_config('lock_timeout', %s, true)", ("250ms",)) in con.raw.statements
+        assert (
+            "SELECT set_config('statement_timeout', %s, true)",
+            ("250ms",),
+        ) in con.raw.statements
         assert con.closed is True
     assert connections[0].rollbacks == 1
     assert connections[1].commits == 1

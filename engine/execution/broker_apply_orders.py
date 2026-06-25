@@ -91,7 +91,7 @@ def _execution_gate_snapshot() -> Dict[str, Any]:
 class LivePayloadLoadError(RuntimeError):
     """Raised when live mode cannot load audited execution intents."""
 
-    def __init__(self, reason: str, error: BaseException) -> None:
+    def __init__(self, reason: str, error: Exception) -> None:
         super().__init__(str(reason))
         self.reason = str(reason)
         self.error = error
@@ -159,12 +159,23 @@ except Exception as e:
     _import_nonfatal("BROKER_APPLY_ORDERS_EXECUTION_AI_ADVISOR_IMPORT_FAILED", e)
     persist_execution_advisories = None  # type: ignore
 
-# Optional dual execution (IBKR)
-try:
-    from engine.execution.dual_execution import apply_portfolio_orders_dual_ibkr  # type: ignore
-except Exception as e:
-    _import_nonfatal("BROKER_APPLY_ORDERS_DUAL_EXECUTION_IMPORT_FAILED", e)
-    apply_portfolio_orders_dual_ibkr = None  # type: ignore
+# Optional dual execution imports IBKR live adapters, so resolve it lazily only
+# after the live/IBKR dual branch has been selected.
+apply_portfolio_orders_dual_ibkr = None  # type: ignore
+
+
+def _resolve_dual_ibkr_apply():
+    global apply_portfolio_orders_dual_ibkr
+    if apply_portfolio_orders_dual_ibkr is not None:
+        return apply_portfolio_orders_dual_ibkr
+    try:
+        from engine.execution.dual_execution import apply_portfolio_orders_dual_ibkr as _apply_dual  # type: ignore
+    except Exception as e:
+        _import_nonfatal("BROKER_APPLY_ORDERS_DUAL_EXECUTION_IMPORT_FAILED", e)
+        apply_portfolio_orders_dual_ibkr = None  # type: ignore
+    else:
+        apply_portfolio_orders_dual_ibkr = _apply_dual  # type: ignore
+    return apply_portfolio_orders_dual_ibkr
 
 
 JOB_NAME = "broker_apply_orders"
@@ -1037,6 +1048,13 @@ def _pre_submit_revalidate_competition(
         if _execution_target(order) != "real":
             updated_orders.append(order)
             continue
+        explain = order.get("explain")
+        terminal_order = bool(order.get("terminal_order")) or bool(
+            isinstance(explain, dict) and isinstance(explain.get("terminal_order"), dict)
+        )
+        if terminal_order:
+            updated_orders.append(order)
+            continue
 
         symbol = str(order.get("symbol") or "").strip().upper()
         horizon_s = int(order.get("horizon_s") or 0)
@@ -1185,6 +1203,624 @@ def _execute_shadow_groups(
         if not bool((res or {}).get("ok", True)):
             out["ok"] = False
     return out
+
+
+def _batch_correlation_id(batch_or_oid: Optional[int]) -> Optional[str]:
+    return str(batch_or_oid) if batch_or_oid is not None else None
+
+
+def _execute_shadow_mode(
+    *,
+    started_ms: int,
+    batch_or_oid: Optional[int],
+    payload_ts_ms: Optional[int],
+    payload_source: str,
+    raw_payload: List[dict],
+    shaped_payload: List[dict],
+    real_payload: List[dict],
+    shadow_payload_by_model: Dict[str, List[dict]],
+    model_blocked_orders: List[Dict[str, Any]],
+    production_model_blocked_orders: List[Dict[str, Any]],
+    mode_state: Dict[str, Any],
+) -> int:
+    shadow_all = dict(shadow_payload_by_model)
+    if real_payload:
+        shadow_all.setdefault("champion", []).extend(list(real_payload))
+    command_id = _record_execution_command_boundary(
+        ts_ms=int(_now_ms()),
+        batch_id=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+        payload_source=str(payload_source),
+        mode="shadow",
+        broker=str(BROKER_NAME),
+        raw_payload=list(raw_payload or []),
+        shaped_payload=list(shaped_payload or []),
+        real_payload=[],
+        shadow_payload_by_model=shadow_all,
+        blocked_orders=list(model_blocked_orders) + list(production_model_blocked_orders),
+    ) if shadow_all else None
+    _emit_decision_execution_snapshot(
+        list(shaped_payload or []),
+        mode="shadow",
+        payload_source=str(payload_source),
+        broker=str(BROKER_NAME),
+    )
+    shadow_res = _execute_shadow_groups(
+        shadow_groups=shadow_all,
+        batch_or_oid=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+    )
+    _log_shadow_intents(shaped_payload, OWNER, mode_state)
+    _record_execution_event_boundary(
+        event_type="command_result",
+        status=("executed" if bool((shadow_res or {}).get("ok", True)) else "failed"),
+        mode="shadow",
+        broker=str(BROKER_NAME),
+        payload={
+            "payload_source": str(payload_source),
+            "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
+            "payload_ts_ms": (int(payload_ts_ms) if payload_ts_ms is not None else None),
+            "shadow_result": dict(shadow_res or {}),
+            "shaped_count": int(len(shaped_payload or [])),
+            "blocked_count": int(len(model_blocked_orders or [])) + int(len(production_model_blocked_orders or [])),
+            "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
+        },
+        command_id=command_id,
+        batch_id=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+    )
+    _print(
+        {
+            "status": "ok",
+            "mode": "shadow",
+            "broker": BROKER_NAME,
+            "payload_source": payload_source,
+            "batch_id": batch_or_oid,
+            "raw_count": len(raw_payload),
+            "shaped_count": len(shaped_payload),
+            "blocked_count": len(model_blocked_orders),
+            "production_model_blocked_count": len(production_model_blocked_orders),
+            "real_count": len(real_payload),
+            "shadow_count": sum(len(v) for v in shadow_payload_by_model.values()),
+            "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
+            "shadow_result": shadow_res,
+            "executed": True,
+            "ts_ms": _now_ms(),
+            "dur_ms": _now_ms() - started_ms,
+        }
+    )
+    return 0
+
+
+def _execute_paper_mode(
+    *,
+    started_ms: int,
+    batch_or_oid: Optional[int],
+    payload_ts_ms: Optional[int],
+    payload_source: str,
+    raw_payload: List[dict],
+    shaped_payload: List[dict],
+    real_payload: List[dict],
+    shadow_payload_by_model: Dict[str, List[dict]],
+    model_blocked_orders: List[Dict[str, Any]],
+    production_model_blocked_orders: List[Dict[str, Any]],
+) -> int:
+    paper_broker = "sim"
+    command_id = _record_execution_command_boundary(
+        ts_ms=int(_now_ms()),
+        batch_id=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+        payload_source=str(payload_source),
+        mode="paper",
+        broker=paper_broker,
+        raw_payload=list(raw_payload or []),
+        shaped_payload=list(shaped_payload or []),
+        real_payload=list(real_payload or []),
+        shadow_payload_by_model=shadow_payload_by_model,
+        blocked_orders=list(model_blocked_orders) + list(production_model_blocked_orders),
+    ) if (real_payload or shadow_payload_by_model) else None
+    _emit_decision_execution_snapshot(
+        list(real_payload or []),
+        mode="paper",
+        payload_source=str(payload_source),
+        broker=paper_broker,
+    )
+    res = apply_shadow_portfolio_orders(
+        dry_run=False,
+        override_orders=real_payload,
+        override_order_id=(int(batch_or_oid) if batch_or_oid is not None else None),
+        override_ts_ms=(int(payload_ts_ms) if payload_ts_ms is not None else None),
+    ) if real_payload else {"ok": True, "status": "no_real_orders", "broker": "sim"}
+    paper_result_issue = _paper_sim_result_issue(res)
+    if paper_result_issue is not None:
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="paper_broker_result",
+            mode="paper",
+            broker=paper_broker,
+            reason=str(paper_result_issue.get("reason") or "paper_broker_result_invalid"),
+            payload={
+                "result_ok": bool((res or {}).get("ok")) if isinstance(res, dict) else False,
+                "result_status": str(paper_result_issue.get("result_status") or ""),
+                "result_broker": str(paper_result_issue.get("result_broker") or ""),
+            },
+            command_id=command_id,
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+    shadow_res = _execute_shadow_groups(
+        shadow_groups=shadow_payload_by_model,
+        batch_or_oid=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+    ) if shadow_payload_by_model else {"ok": True, "groups": [], "submitted_models": 0, "fills_written": 0}
+    _write_execution_meta_last(paper_broker, "paper_broker_sim")
+    _record_execution_event_boundary(
+        event_type="command_result",
+        status=("executed" if bool((res or {}).get("ok", True)) else "failed"),
+        mode="paper",
+        broker=paper_broker,
+        payload={
+            "payload_source": str(payload_source),
+            "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
+            "payload_ts_ms": (int(payload_ts_ms) if payload_ts_ms is not None else None),
+            "result": dict(res or {}),
+            "shadow_result": dict(shadow_res or {}),
+            "blocked_count": int(len(model_blocked_orders or [])) + int(len(production_model_blocked_orders or [])),
+            "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
+            "real_count": int(len(real_payload or [])),
+            "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
+        },
+        command_id=command_id,
+        batch_id=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+    )
+    _print(
+        {
+            "status": "ok",
+            "mode": "paper",
+            "broker": paper_broker,
+            "payload_source": payload_source,
+            "batch_id": batch_or_oid,
+            "result": res,
+            "shadow_result": shadow_res,
+            "blocked_count": len(model_blocked_orders),
+            "production_model_blocked_count": len(production_model_blocked_orders),
+            "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
+            "real_count": len(real_payload),
+            "shadow_count": sum(len(v) for v in shadow_payload_by_model.values()),
+            "ts_ms": _now_ms(),
+            "dur_ms": _now_ms() - started_ms,
+        }
+    )
+    return 0
+
+
+def _execute_live_mode(
+    *,
+    started_ms: int,
+    batch_or_oid: Optional[int],
+    payload_ts_ms: Optional[int],
+    payload_source: str,
+    raw_payload: List[dict],
+    shaped_payload: List[dict],
+    model_blocked_orders: List[Dict[str, Any]],
+    production_model_blocked_orders: List[Dict[str, Any]],
+    gate: Dict[str, Any],
+    mode_state: Dict[str, Any],
+    deferred_initial_kill_switch: Optional[Dict[str, Any]],
+) -> int:
+    if not bool(int(mode_state.get("armed", 0)) == 1):
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="execution_mode",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="live_not_armed",
+            payload={},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    if not bool(gate.get("real_trading_allowed")):
+        blocked_ts_ms = _now_ms()
+        _record_execution_event_boundary(
+            event_type="execution_block",
+            status="blocked",
+            mode="live",
+            broker=str(BROKER_NAME),
+            payload={
+                "layer": "execution_gate",
+                "reason": str(gate.get("reason") or "real_trading_not_allowed"),
+                "gate": gate,
+                "dur_ms": int(blocked_ts_ms - started_ms),
+            },
+            ts_ms=int(blocked_ts_ms),
+            batch_id=batch_or_oid,
+            payload_ts_ms=payload_ts_ms,
+        )
+        _print(
+            {
+                "status": "blocked",
+                "layer": "execution_gate",
+                "mode": "live",
+                "broker": BROKER_NAME,
+                "reason": str(gate.get("reason") or "real_trading_not_allowed"),
+                "gate": gate,
+                "ts_ms": _now_ms(),
+                "dur_ms": _now_ms() - started_ms,
+            }
+        )
+        return 0
+
+    max_signal_age_s = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_S", "300"))
+    if payload_ts_ms is None or int(payload_ts_ms) <= 0:
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="payload_freshness",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="payload_ts_missing",
+            payload={},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    payload_age_ms = _now_ms() - int(payload_ts_ms)
+    if payload_age_ms > (max_signal_age_s * 1000):
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="payload_freshness",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="payload_stale",
+            payload={
+                "payload_ts_ms": int(payload_ts_ms),
+                "payload_age_ms": int(payload_age_ms),
+                "max_signal_age_s": int(max_signal_age_s),
+            },
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    try:
+        from engine.runtime.health import run_preflight
+        pre = run_preflight()
+    except Exception as e:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_PREFLIGHT_EXCEPTION", e, once_key="preflight_exception")
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="preflight_exception",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="preflight_exception",
+            payload={"error": str(e)},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    if not bool((pre or {}).get("ok")):
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="preflight",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="preflight_failed",
+            payload={"preflight": pre},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    prelive_policy_block = prelive_reconcile_policy_gate(
+        source="engine.execution.broker_apply_orders",
+        engine_mode="live",
+        broker=str(BROKER_NAME),
+        audit_override=True,
+        correlation_id=_batch_correlation_id(batch_or_oid),
+    )
+    if prelive_policy_block is not None:
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="position_reconcile_policy",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason=str(prelive_policy_block.get("reason") or prelive_policy_block.get("status") or "prelive_reconcile_policy_block"),
+            payload={"prelive_reconcile_policy": dict(prelive_policy_block)},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    con_ks = connect()
+    try:
+        allow, ks_reason, ks_meta = execution_allowed(con=con_ks, symbol=None, regime=None)
+    finally:
+        con_ks.close()
+
+    if not allow:
+        payload = {"meta": dict(ks_meta or {})}
+        if deferred_initial_kill_switch is not None:
+            payload["deferred_initial_kill_switch"] = dict(deferred_initial_kill_switch)
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="kill_switch",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason=str(ks_reason or "kill_switch_block"),
+            payload=payload,
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    try:
+        con2 = connect()
+        try:
+            rec = pre_live_position_reconcile(
+                broker=str(BROKER_NAME or ""),
+                con=con2,
+            )
+            if isinstance(rec, dict) and rec.get("fatal_reconcile"):
+                return _blocked(
+                    started_ms=int(started_ms),
+                    layer="position_reconcile",
+                    mode="live",
+                    broker=str(BROKER_NAME),
+                    reason="fatal_reconcile",
+                    payload={"reconcile": rec},
+                    correlation_id=_batch_correlation_id(batch_or_oid),
+                )
+        finally:
+            con2.close()
+    except Exception as e:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_POSITION_RECONCILE_EXCEPTION", e, once_key="position_reconcile_exception")
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="position_reconcile_exception",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="position_reconcile_exception",
+            payload={"error": str(e)},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    try:
+        con3 = connect()
+        try:
+            governed, gov_info = apply_execution_risk_governor(
+                con3,
+                list(shaped_payload or []),
+                broker=str(BROKER_NAME or ""),
+                mode="live",
+                equity_usd=None,
+            )
+        finally:
+            con3.close()
+    except Exception as e:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_RISK_GOVERNOR_EXCEPTION", e, once_key="risk_governor_exception")
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="risk_governor_exception",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="risk_governor_exception",
+            payload={"error": str(e)},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    if isinstance(gov_info, dict) and (not gov_info.get("ok")):
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="risk_governor",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="risk_governor_block",
+            payload={"governor": gov_info},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+        )
+
+    shaped_payload = list(governed or [])
+    shaped_payload, pre_submit_competition_blocks = _pre_submit_revalidate_competition(
+        shaped_payload,
+    )
+    real_payload, shadow_payload_by_model = _split_execution_payload(shaped_payload)
+    live_blocked_orders = (
+        list(production_model_blocked_orders or [])
+        + list(model_blocked_orders or [])
+        + list(pre_submit_competition_blocks or [])
+    )
+
+    dual_enable = os.environ.get("EXECUTION_DUAL_ENABLE", "0") == "1"
+    command_id = _record_execution_command_boundary(
+        ts_ms=int(_now_ms()),
+        batch_id=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+        payload_source=str(payload_source),
+        mode="live",
+        broker=str(BROKER_NAME),
+        raw_payload=list(raw_payload or []),
+        shaped_payload=list(shaped_payload or []),
+        real_payload=list(real_payload or []),
+        shadow_payload_by_model=shadow_payload_by_model,
+        blocked_orders=list(live_blocked_orders or []),
+    ) if (real_payload or shadow_payload_by_model) else None
+    shadow_res = _execute_shadow_groups(
+        shadow_groups=shadow_payload_by_model,
+        batch_or_oid=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+    ) if shadow_payload_by_model else {"ok": True, "groups": [], "submitted_models": 0, "fills_written": 0}
+    _emit_decision_execution_snapshot(
+        list(real_payload or []),
+        mode="live",
+        payload_source=str(payload_source),
+        broker=str(BROKER_NAME),
+    )
+
+    try:
+        broker_connection = refresh_broker_connection_health(broker=str(BROKER_NAME))
+    except Exception as e:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_BROKER_HEALTH_REFRESH_FAILED", e, once_key="broker_health_refresh")
+        broker_connection = {"ok": False, "state": "unknown"}
+
+    if not bool((broker_connection or {}).get("ok")) or str((broker_connection or {}).get("state") or "").lower().strip() in ("disconnected", "connect_failed", "reconnect_failed"):
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="broker_connection_watchdog",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="broker_connection_unavailable",
+            payload={"broker_connection": broker_connection, "shadow_result": shadow_res},
+            correlation_id=_batch_correlation_id(batch_or_oid),
+            command_id=command_id,
+        )
+
+    try:
+        pre_exec_supervisor = refresh_execution_quality_supervisor(lookback_n=500)
+    except Exception as e:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_EXECUTION_SUPERVISOR_REFRESH_FAILED", e, once_key="pre_exec_supervisor_refresh")
+        pre_exec_supervisor = {"ok": False, "state": "unknown"}
+
+    if str((pre_exec_supervisor or {}).get("state") or "").lower().strip() == "critical":
+        return _blocked(
+            started_ms=int(started_ms),
+            layer="execution_quality_supervisor",
+            mode="live",
+            broker=str(BROKER_NAME),
+            reason="execution_quality_critical",
+            payload={
+                "execution_supervisor": pre_exec_supervisor,
+                "broker_connection": broker_connection,
+                "shadow_result": shadow_res,
+            },
+            correlation_id=_batch_correlation_id(batch_or_oid),
+            command_id=command_id,
+        )
+
+    dual_ibkr_apply = _resolve_dual_ibkr_apply() if dual_enable and str(BROKER_NAME).lower() == "ibkr" else None
+    if dual_enable and str(BROKER_NAME).lower() == "ibkr" and callable(dual_ibkr_apply):
+        res = dual_ibkr_apply(
+            dry_run_live=False,
+            override_orders=real_payload,
+            override_order_id=(int(batch_or_oid) if batch_or_oid is not None else None),
+            override_ts_ms=(int(payload_ts_ms) if payload_ts_ms is not None else None),
+        )
+    else:
+        res = apply_new_portfolio_orders(
+            dry_run=False,
+            override_orders=real_payload,
+            override_order_id=(int(batch_or_oid) if batch_or_oid is not None else None),
+            override_ts_ms=(int(payload_ts_ms) if payload_ts_ms is not None else None),
+        ) if real_payload else {"ok": True, "status": "no_real_orders", "broker": BROKER_NAME}
+
+    broker_used = str((res or {}).get("broker") or BROKER_NAME)
+    _write_execution_meta_last(broker_used, "live_broker")
+    _record_execution_event_boundary(
+        event_type="command_result",
+        status=("submitted" if bool((res or {}).get("ok", True)) else "failed"),
+        mode="live",
+        broker=str(BROKER_NAME),
+        payload={
+            "payload_source": str(payload_source),
+            "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
+            "payload_ts_ms": (int(payload_ts_ms) if payload_ts_ms is not None else None),
+            "broker_used": str(broker_used),
+            "result": dict(res or {}),
+            "shadow_result": dict(shadow_res or {}),
+            "blocked_count": int(len(live_blocked_orders or [])),
+            "blocked_orders": list(live_blocked_orders or []),
+            "real_count": int(len(real_payload or [])),
+            "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
+        },
+        command_id=command_id,
+        batch_id=batch_or_oid,
+        payload_ts_ms=payload_ts_ms,
+    )
+
+    try:
+        append_event(
+            event_type=("order_submit_result" if bool((res or {}).get("ok", True)) else "order_error"),
+            event_source="engine.execution.broker_apply_orders",
+            event_version=1,
+            entity_type="order_batch",
+            entity_id=(str(batch_or_oid) if batch_or_oid is not None else str(int(_now_ms()))),
+            correlation_id=_batch_correlation_id(batch_or_oid),
+            payload={
+                "ts_ms": int(_now_ms()),
+                "mode": "live",
+                "broker": str(BROKER_NAME),
+                "broker_used": str(broker_used),
+                "payload_source": str(payload_source),
+                "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
+                "result": dict(res or {}),
+                "raw_count": int(len(raw_payload or [])),
+                "shaped_count": int(len(shaped_payload or [])),
+                "blocked_count": int(len(live_blocked_orders or [])),
+                "blocked_orders": list(live_blocked_orders or []),
+                "real_count": int(len(real_payload or [])),
+                "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
+                "shadow_result": dict(shadow_res or {}),
+            },
+        )
+    except Exception:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_ERROR_EVENT_APPEND_FAILED", Exception("append_event failed"), once_key="append_order_error")
+
+    try:
+        from engine.execution.execution_analytics_engine import build_execution_analytics
+        build_execution_analytics(limit=2000)
+    except Exception as e:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_ANALYTICS_BUILD_FAILED", e, once_key="build_execution_analytics")
+
+    try:
+        refresh_execution_quality_supervisor(lookback_n=500)
+    except Exception as e:
+        _warn_nonfatal("BROKER_APPLY_ORDERS_EXECUTION_SUPERVISOR_REFRESH_FAILED", e, once_key="post_exec_supervisor_refresh")
+
+    emit_counter(
+        "order_throughput",
+        int(len(shaped_payload or [])),
+        component="engine.execution.broker_apply_orders",
+        job=JOB_NAME,
+        broker=str(BROKER_NAME),
+        extra_tags={"throughput_type": "orders_shaped"},
+    )
+
+    emit_timing(
+        "execution_latency_ms",
+        int(_now_ms() - started_ms),
+        component="engine.execution.broker_apply_orders",
+        job=JOB_NAME,
+        broker=str(BROKER_NAME),
+    )
+
+    trace_event(
+        "order_submission",
+        component="engine.execution.broker_apply_orders",
+        entity_type="order_batch",
+        entity_id=(str(batch_or_oid) if batch_or_oid is not None else JOB_NAME),
+        payload={
+            "mode": "live",
+            "broker": str(BROKER_NAME),
+            "broker_used": str(broker_used),
+            "payload_source": str(payload_source),
+            "raw_count": int(len(raw_payload or [])),
+            "shaped_count": int(len(shaped_payload or [])),
+            "blocked_count": int(len(live_blocked_orders or [])),
+            "real_count": int(len(real_payload or [])),
+            "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
+            "latency_ms": int(_now_ms() - started_ms),
+        },
+        job=JOB_NAME,
+        broker=str(BROKER_NAME),
+    )
+
+    _print(
+        {
+            "status": "ok",
+            "mode": "live",
+            "broker": BROKER_NAME,
+            "broker_used": broker_used,
+            "payload_source": payload_source,
+            "batch_id": batch_or_oid,
+            "result": res,
+            "shadow_result": shadow_res,
+            "blocked_count": len(live_blocked_orders),
+            "blocked_orders": live_blocked_orders,
+            "real_count": len(real_payload),
+            "shadow_count": sum(len(v) for v in shadow_payload_by_model.values()),
+            "ts_ms": _now_ms(),
+            "dur_ms": _now_ms() - started_ms,
+        }
+    )
+    return 0
 
 
 def main() -> int:
@@ -1415,7 +2051,10 @@ def main() -> int:
             except Exception as e:
                 _warn_nonfatal("BROKER_APPLY_ORDERS_COMMIT_FAILED", e, once_key="epe_commit")
         finally:
-            con.close()
+            try:
+                con.close()
+            except Exception as e:
+                _warn_nonfatal("BROKER_APPLY_ORDERS_EPE_CONNECTION_CLOSE_FAILED", e, once_key="epe_connection_close")
 
         production_ready_payload, production_model_blocked_orders = _enforce_production_model_sources(
             shaped_payload,
@@ -1469,162 +2108,33 @@ def main() -> int:
             )
 
         if mode == "shadow":
-            shadow_all = dict(shadow_payload_by_model)
-            if real_payload:
-                shadow_all.setdefault("champion", []).extend(list(real_payload))
-            command_id = _record_execution_command_boundary(
-                ts_ms=int(_now_ms()),
-                batch_id=batch_or_oid,
-                payload_ts_ms=payload_ts_ms,
-                payload_source=str(payload_source),
-                mode="shadow",
-                broker=str(BROKER_NAME),
-                raw_payload=list(raw_payload or []),
-                shaped_payload=list(shaped_payload or []),
-                real_payload=[],
-                shadow_payload_by_model=shadow_all,
-                blocked_orders=list(model_blocked_orders) + list(production_model_blocked_orders),
-            ) if shadow_all else None
-            _emit_decision_execution_snapshot(
-                list(shaped_payload or []),
-                mode="shadow",
-                payload_source=str(payload_source),
-                broker=str(BROKER_NAME),
-            )
-            shadow_res = _execute_shadow_groups(
-                shadow_groups=shadow_all,
+            return _execute_shadow_mode(
+                started_ms=int(started_ms),
                 batch_or_oid=batch_or_oid,
                 payload_ts_ms=payload_ts_ms,
-            )
-            _log_shadow_intents(shaped_payload, OWNER, mode_state)
-            _record_execution_event_boundary(
-                event_type="command_result",
-                status=("executed" if bool((shadow_res or {}).get("ok", True)) else "failed"),
-                mode="shadow",
-                broker=str(BROKER_NAME),
-                payload={
-                    "payload_source": str(payload_source),
-                    "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
-                    "payload_ts_ms": (int(payload_ts_ms) if payload_ts_ms is not None else None),
-                    "shadow_result": dict(shadow_res or {}),
-                    "shaped_count": int(len(shaped_payload or [])),
-                    "blocked_count": int(len(model_blocked_orders or [])) + int(len(production_model_blocked_orders or [])),
-                    "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
-                },
-                command_id=command_id,
-                batch_id=batch_or_oid,
-                payload_ts_ms=payload_ts_ms,
-            )
-            _print(
-                {
-                    "status": "ok",
-                    "mode": "shadow",
-                    "broker": BROKER_NAME,
-                    "payload_source": payload_source,
-                    "batch_id": batch_or_oid,
-                    "raw_count": len(raw_payload),
-                    "shaped_count": len(shaped_payload),
-                    "blocked_count": len(model_blocked_orders),
-                    "production_model_blocked_count": len(production_model_blocked_orders),
-                    "real_count": len(real_payload),
-                    "shadow_count": sum(len(v) for v in shadow_payload_by_model.values()),
-                    "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
-                    "shadow_result": shadow_res,
-                    "executed": True,
-                    "ts_ms": _now_ms(),
-                    "dur_ms": _now_ms() - started_ms,
-                }
-            )
-            return 0
-
-        if mode == "paper":
-            paper_broker = "sim"
-            command_id = _record_execution_command_boundary(
-                ts_ms=int(_now_ms()),
-                batch_id=batch_or_oid,
-                payload_ts_ms=payload_ts_ms,
                 payload_source=str(payload_source),
-                mode="paper",
-                broker=paper_broker,
                 raw_payload=list(raw_payload or []),
                 shaped_payload=list(shaped_payload or []),
                 real_payload=list(real_payload or []),
-                shadow_payload_by_model=shadow_payload_by_model,
-                blocked_orders=list(model_blocked_orders) + list(production_model_blocked_orders),
-            ) if (real_payload or shadow_payload_by_model) else None
-            _emit_decision_execution_snapshot(
-                list(real_payload or []),
-                mode="paper",
-                payload_source=str(payload_source),
-                broker=paper_broker,
+                shadow_payload_by_model=dict(shadow_payload_by_model or {}),
+                model_blocked_orders=list(model_blocked_orders or []),
+                production_model_blocked_orders=list(production_model_blocked_orders or []),
+                mode_state=dict(mode_state or {}),
             )
-            res = apply_shadow_portfolio_orders(
-                dry_run=False,
-                override_orders=real_payload,
-                override_order_id=(int(batch_or_oid) if batch_or_oid is not None else None),
-                override_ts_ms=(int(payload_ts_ms) if payload_ts_ms is not None else None),
-            ) if real_payload else {"ok": True, "status": "no_real_orders", "broker": "sim"}
-            paper_result_issue = _paper_sim_result_issue(res)
-            if paper_result_issue is not None:
-                return _blocked(
-                    started_ms=int(started_ms),
-                    layer="paper_broker_result",
-                    mode="paper",
-                    broker=paper_broker,
-                    reason=str(paper_result_issue.get("reason") or "paper_broker_result_invalid"),
-                    payload={
-                        "result_ok": bool((res or {}).get("ok")) if isinstance(res, dict) else False,
-                        "result_status": str(paper_result_issue.get("result_status") or ""),
-                        "result_broker": str(paper_result_issue.get("result_broker") or ""),
-                    },
-                    command_id=command_id,
-                    correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-                )
-            shadow_res = _execute_shadow_groups(
-                shadow_groups=shadow_payload_by_model,
+
+        if mode == "paper":
+            return _execute_paper_mode(
+                started_ms=int(started_ms),
                 batch_or_oid=batch_or_oid,
                 payload_ts_ms=payload_ts_ms,
-            ) if shadow_payload_by_model else {"ok": True, "groups": [], "submitted_models": 0, "fills_written": 0}
-            _write_execution_meta_last(paper_broker, "paper_broker_sim")
-            _record_execution_event_boundary(
-                event_type="command_result",
-                status=("executed" if bool((res or {}).get("ok", True)) else "failed"),
-                mode="paper",
-                broker=paper_broker,
-                payload={
-                    "payload_source": str(payload_source),
-                    "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
-                    "payload_ts_ms": (int(payload_ts_ms) if payload_ts_ms is not None else None),
-                    "result": dict(res or {}),
-                    "shadow_result": dict(shadow_res or {}),
-                    "blocked_count": int(len(model_blocked_orders or [])) + int(len(production_model_blocked_orders or [])),
-                    "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
-                    "real_count": int(len(real_payload or [])),
-                    "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
-                },
-                command_id=command_id,
-                batch_id=batch_or_oid,
-                payload_ts_ms=payload_ts_ms,
+                payload_source=str(payload_source),
+                raw_payload=list(raw_payload or []),
+                shaped_payload=list(shaped_payload or []),
+                real_payload=list(real_payload or []),
+                shadow_payload_by_model=dict(shadow_payload_by_model or {}),
+                model_blocked_orders=list(model_blocked_orders or []),
+                production_model_blocked_orders=list(production_model_blocked_orders or []),
             )
-            _print(
-                {
-                    "status": "ok",
-                    "mode": "paper",
-                    "broker": paper_broker,
-                    "payload_source": payload_source,
-                    "batch_id": batch_or_oid,
-                    "result": res,
-                    "shadow_result": shadow_res,
-                    "blocked_count": len(model_blocked_orders),
-                    "production_model_blocked_count": len(production_model_blocked_orders),
-                    "blocked_orders": list(model_blocked_orders) + list(production_model_blocked_orders),
-                    "real_count": len(real_payload),
-                    "shadow_count": sum(len(v) for v in shadow_payload_by_model.values()),
-                    "ts_ms": _now_ms(),
-                    "dur_ms": _now_ms() - started_ms,
-                }
-            )
-            return 0
 
         if mode != "live":
             return _blocked(
@@ -1637,427 +2147,23 @@ def main() -> int:
                 correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
             )
 
-        armed = int(mode_state.get("armed", 0)) == 1
-        if not armed:
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="execution_mode",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="live_not_armed",
-                payload={},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        if not bool(gate.get("real_trading_allowed")):
-            blocked_ts_ms = _now_ms()
-            _record_execution_event_boundary(
-                event_type="execution_block",
-                status="blocked",
-                mode=str(mode or "live"),
-                broker=str(BROKER_NAME),
-                payload={
-                    "layer": "execution_gate",
-                    "reason": str(gate.get("reason") or "real_trading_not_allowed"),
-                    "gate": gate,
-                    "dur_ms": int(blocked_ts_ms - started_ms),
-                },
-                ts_ms=int(blocked_ts_ms),
-                batch_id=batch_or_oid,
-                payload_ts_ms=payload_ts_ms,
-            )
-            _print(
-                {
-                    "status": "blocked",
-                    "layer": "execution_gate",
-                    "mode": str(mode or "live"),
-                    "broker": BROKER_NAME,
-                    "reason": str(gate.get("reason") or "real_trading_not_allowed"),
-                    "gate": gate,
-                    "ts_ms": _now_ms(),
-                    "dur_ms": _now_ms() - started_ms,
-                }
-            )
-            return 0
-
-        max_signal_age_s = int(os.environ.get("EXECUTION_MAX_SIGNAL_AGE_S", "300"))
-        if payload_ts_ms is None or int(payload_ts_ms) <= 0:
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="payload_freshness",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="payload_ts_missing",
-                payload={},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        payload_age_ms = _now_ms() - int(payload_ts_ms)
-        if payload_age_ms > (max_signal_age_s * 1000):
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="payload_freshness",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="payload_stale",
-                payload={
-                    "payload_ts_ms": int(payload_ts_ms),
-                    "payload_age_ms": int(payload_age_ms),
-                    "max_signal_age_s": int(max_signal_age_s),
-                },
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        try:
-            from engine.runtime.health import run_preflight
-            pre = run_preflight()
-        except Exception as e:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_PREFLIGHT_EXCEPTION", e, once_key="preflight_exception")
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="preflight_exception",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="preflight_exception",
-                payload={"error": str(e)},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        if not bool((pre or {}).get("ok")):
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="preflight",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="preflight_failed",
-                payload={"preflight": pre},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        # ------------------------------------------------------------
-        # Institutional completion layer (pre-trade):
-        # 1) Position reconciliation (live brokers)
-        # 2) Execution risk governor (defense in depth)
-        # ------------------------------------------------------------
-        prelive_policy_block = prelive_reconcile_policy_gate(
-            source="engine.execution.broker_apply_orders",
-            engine_mode="live",
-            broker=str(BROKER_NAME),
-            audit_override=True,
-            correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-        )
-        if prelive_policy_block is not None:
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="position_reconcile_policy",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason=str(prelive_policy_block.get("reason") or prelive_policy_block.get("status") or "prelive_reconcile_policy_block"),
-                payload={"prelive_reconcile_policy": dict(prelive_policy_block)},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        con_ks = connect()
-        try:
-            allow, ks_reason, ks_meta = execution_allowed(con=con_ks, symbol=None, regime=None)
-        finally:
-            con_ks.close()
-
-        if not allow:
-            payload = {"meta": dict(ks_meta or {})}
-            if deferred_initial_kill_switch is not None:
-                payload["deferred_initial_kill_switch"] = dict(deferred_initial_kill_switch)
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="kill_switch",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason=str(ks_reason or "kill_switch_block"),
-                payload=payload,
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        try:
-            con2 = connect()
-            try:
-                rec = pre_live_position_reconcile(
-                    broker=str(BROKER_NAME or ""),
-                    con=con2,
-                )
-                if isinstance(rec, dict) and rec.get("fatal_reconcile"):
-                    return _blocked(
-                        started_ms=int(started_ms),
-                        layer="position_reconcile",
-                        mode="live",
-                        broker=str(BROKER_NAME),
-                        reason="fatal_reconcile",
-                        payload={"reconcile": rec},
-                        correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-                    )
-            finally:
-                con2.close()
-        except Exception as e:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_POSITION_RECONCILE_EXCEPTION", e, once_key="position_reconcile_exception")
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="position_reconcile_exception",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="position_reconcile_exception",
-                payload={"error": str(e)},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        try:
-            con3 = connect()
-            try:
-                governed, gov_info = apply_execution_risk_governor(
-                    con3,
-                    list(shaped_payload or []),
-                    broker=str(BROKER_NAME or ""),
-                    mode="live",
-                    equity_usd=None,
-                )
-            finally:
-                con3.close()
-        except Exception as e:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_RISK_GOVERNOR_EXCEPTION", e, once_key="risk_governor_exception")
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="risk_governor_exception",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="risk_governor_exception",
-                payload={"error": str(e)},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        if isinstance(gov_info, dict) and (not gov_info.get("ok")):
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="risk_governor",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="risk_governor_block",
-                payload={"governor": gov_info},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-            )
-
-        shaped_payload = list(governed or [])
-        shaped_payload, pre_submit_competition_blocks = _pre_submit_revalidate_competition(
-            shaped_payload,
-        )
-        real_payload, shadow_payload_by_model = _split_execution_payload(shaped_payload)
-        live_blocked_orders = (
-            list(production_model_blocked_orders or [])
-            + list(model_blocked_orders or [])
-            + list(pre_submit_competition_blocks or [])
-        )
-
-        dual_enable = os.environ.get("EXECUTION_DUAL_ENABLE", "0") == "1"
-        command_id = _record_execution_command_boundary(
-            ts_ms=int(_now_ms()),
-            batch_id=batch_or_oid,
-            payload_ts_ms=payload_ts_ms,
-            payload_source=str(payload_source),
-            mode="live",
-            broker=str(BROKER_NAME),
-            raw_payload=list(raw_payload or []),
-            shaped_payload=list(shaped_payload or []),
-            real_payload=list(real_payload or []),
-            shadow_payload_by_model=shadow_payload_by_model,
-            blocked_orders=list(live_blocked_orders or []),
-        ) if (real_payload or shadow_payload_by_model) else None
-        shadow_res = _execute_shadow_groups(
-            shadow_groups=shadow_payload_by_model,
+        return _execute_live_mode(
+            started_ms=int(started_ms),
             batch_or_oid=batch_or_oid,
             payload_ts_ms=payload_ts_ms,
-        ) if shadow_payload_by_model else {"ok": True, "groups": [], "submitted_models": 0, "fills_written": 0}
-        _emit_decision_execution_snapshot(
-            list(real_payload or []),
-            mode="live",
             payload_source=str(payload_source),
-            broker=str(BROKER_NAME),
+            raw_payload=list(raw_payload or []),
+            shaped_payload=list(shaped_payload or []),
+            model_blocked_orders=list(model_blocked_orders or []),
+            production_model_blocked_orders=list(production_model_blocked_orders or []),
+            gate=dict(gate or {}),
+            mode_state=dict(mode_state or {}),
+            deferred_initial_kill_switch=(
+                dict(deferred_initial_kill_switch)
+                if deferred_initial_kill_switch is not None
+                else None
+            ),
         )
-
-        try:
-            broker_connection = refresh_broker_connection_health(broker=str(BROKER_NAME))
-        except Exception as e:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_BROKER_HEALTH_REFRESH_FAILED", e, once_key="broker_health_refresh")
-            broker_connection = {"ok": False, "state": "unknown"}
-
-        if not bool((broker_connection or {}).get("ok")) or str((broker_connection or {}).get("state") or "").lower().strip() in ("disconnected", "connect_failed", "reconnect_failed"):
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="broker_connection_watchdog",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="broker_connection_unavailable",
-                payload={"broker_connection": broker_connection, "shadow_result": shadow_res},
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-                command_id=command_id,
-            )
-
-        try:
-            pre_exec_supervisor = refresh_execution_quality_supervisor(lookback_n=500)
-        except Exception as e:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_EXECUTION_SUPERVISOR_REFRESH_FAILED", e, once_key="pre_exec_supervisor_refresh")
-            pre_exec_supervisor = {"ok": False, "state": "unknown"}
-
-        if str((pre_exec_supervisor or {}).get("state") or "").lower().strip() == "critical":
-            return _blocked(
-                started_ms=int(started_ms),
-                layer="execution_quality_supervisor",
-                mode="live",
-                broker=str(BROKER_NAME),
-                reason="execution_quality_critical",
-                payload={
-                    "execution_supervisor": pre_exec_supervisor,
-                    "broker_connection": broker_connection,
-                    "shadow_result": shadow_res,
-                },
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-                command_id=command_id,
-            )
-
-        if dual_enable and str(BROKER_NAME).lower() == "ibkr" and callable(apply_portfolio_orders_dual_ibkr):
-            res = apply_portfolio_orders_dual_ibkr(
-                dry_run_live=False,
-                override_orders=real_payload,
-                override_order_id=(int(batch_or_oid) if batch_or_oid is not None else None),
-                override_ts_ms=(int(payload_ts_ms) if payload_ts_ms is not None else None),
-            )
-        else:
-            res = apply_new_portfolio_orders(
-                dry_run=False,
-                override_orders=real_payload,
-                override_order_id=(int(batch_or_oid) if batch_or_oid is not None else None),
-                override_ts_ms=(int(payload_ts_ms) if payload_ts_ms is not None else None),
-            ) if real_payload else {"ok": True, "status": "no_real_orders", "broker": BROKER_NAME}
-
-        broker_used = str((res or {}).get("broker") or BROKER_NAME)
-        _write_execution_meta_last(broker_used, "live_broker")
-        _record_execution_event_boundary(
-            event_type="command_result",
-            status=("submitted" if bool((res or {}).get("ok", True)) else "failed"),
-            mode="live",
-            broker=str(BROKER_NAME),
-            payload={
-                "payload_source": str(payload_source),
-                "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
-                "payload_ts_ms": (int(payload_ts_ms) if payload_ts_ms is not None else None),
-                "broker_used": str(broker_used),
-                "result": dict(res or {}),
-                "shadow_result": dict(shadow_res or {}),
-                "blocked_count": int(len(live_blocked_orders or [])),
-                "blocked_orders": list(live_blocked_orders or []),
-                "real_count": int(len(real_payload or [])),
-                "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
-            },
-            command_id=command_id,
-            batch_id=batch_or_oid,
-            payload_ts_ms=payload_ts_ms,
-        )
-
-        try:
-            append_event(
-                event_type=("order_submit_result" if bool((res or {}).get("ok", True)) else "order_error"),
-                event_source="engine.execution.broker_apply_orders",
-                event_version=1,
-                entity_type="order_batch",
-                entity_id=(str(batch_or_oid) if batch_or_oid is not None else str(int(_now_ms()))),
-                correlation_id=(str(batch_or_oid) if batch_or_oid is not None else None),
-                payload={
-                    "ts_ms": int(_now_ms()),
-                    "mode": "live",
-                    "broker": str(BROKER_NAME),
-                    "broker_used": str(broker_used),
-                    "payload_source": str(payload_source),
-                    "batch_id": (int(batch_or_oid) if batch_or_oid is not None else None),
-                    "result": dict(res or {}),
-                    "raw_count": int(len(raw_payload or [])),
-                    "shaped_count": int(len(shaped_payload or [])),
-                    "blocked_count": int(len(live_blocked_orders or [])),
-                    "blocked_orders": list(live_blocked_orders or []),
-                    "real_count": int(len(real_payload or [])),
-                    "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
-                    "shadow_result": dict(shadow_res or {}),
-                },
-            )
-        except Exception:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_ERROR_EVENT_APPEND_FAILED", Exception("append_event failed"), once_key="append_order_error")
-
-        # ------------------------------------------------------------
-        # Institutional completion layer (post-trade):
-        # ------------------------------------------------------------
-        try:
-            from engine.execution.execution_analytics_engine import build_execution_analytics
-            build_execution_analytics(limit=2000)
-        except Exception as e:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_ANALYTICS_BUILD_FAILED", e, once_key="build_execution_analytics")
-
-        try:
-            refresh_execution_quality_supervisor(lookback_n=500)
-        except Exception as e:
-            _warn_nonfatal("BROKER_APPLY_ORDERS_EXECUTION_SUPERVISOR_REFRESH_FAILED", e, once_key="post_exec_supervisor_refresh")
-
-        emit_counter(
-            "order_throughput",
-            int(len(shaped_payload or [])),
-            component="engine.execution.broker_apply_orders",
-            job=JOB_NAME,
-            broker=str(BROKER_NAME),
-            extra_tags={"throughput_type": "orders_shaped"},
-        )
-
-        emit_timing(
-            "execution_latency_ms",
-            int(_now_ms() - started_ms),
-            component="engine.execution.broker_apply_orders",
-            job=JOB_NAME,
-            broker=str(BROKER_NAME),
-        )
-
-        trace_event(
-            "order_submission",
-            component="engine.execution.broker_apply_orders",
-            entity_type="order_batch",
-            entity_id=(str(batch_or_oid) if batch_or_oid is not None else JOB_NAME),
-            payload={
-                "mode": "live",
-                "broker": str(BROKER_NAME),
-                "broker_used": str(broker_used),
-                "payload_source": str(payload_source),
-                "raw_count": int(len(raw_payload or [])),
-                "shaped_count": int(len(shaped_payload or [])),
-                "blocked_count": int(len(live_blocked_orders or [])),
-                "real_count": int(len(real_payload or [])),
-                "shadow_count": int(sum(len(v) for v in shadow_payload_by_model.values())),
-                "latency_ms": int(_now_ms() - started_ms),
-            },
-            job=JOB_NAME,
-            broker=str(BROKER_NAME),
-        )
-
-        _print(
-            {
-                "status": "ok",
-                "mode": "live",
-                "broker": BROKER_NAME,
-                "broker_used": broker_used,
-                "payload_source": payload_source,
-                "batch_id": batch_or_oid,
-                "result": res,
-                "shadow_result": shadow_res,
-                "blocked_count": len(live_blocked_orders),
-                "blocked_orders": live_blocked_orders,
-                "real_count": len(real_payload),
-                "shadow_count": sum(len(v) for v in shadow_payload_by_model.values()),
-                "ts_ms": _now_ms(),
-                "dur_ms": _now_ms() - started_ms,
-            }
-        )
-        return 0
     except Exception as e:
         lineage = _summarize_order_lineage(shaped_payload or raw_payload)
         _record_execution_event_boundary(

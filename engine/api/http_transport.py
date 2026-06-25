@@ -356,12 +356,15 @@ _DESTRUCTIVE_ENDPOINT_PATHS = frozenset(
         "/api/operator/stop",
         "/api/operator/restart",
         "/api/operator/restart_engine",
+        "/api/operator/execution_arm",
         "/api/operator/autofix",
         "/api/operator/restart_feeds",
+        "/api/system/self_repair",
         "/api/operator/self_repair",
         "/api/operator/bootstrap_pipeline",
         "/api/system/repair_schema",
         "/api/repair_schema",
+        "/api/server/shutdown",
         "/api/jobs/start",
         "/api/jobs/stop",
         "/api/pipeline/run",
@@ -373,6 +376,122 @@ _DESTRUCTIVE_ENDPOINT_PATHS = frozenset(
         "/api/data_sources/accounts/update",
     }
 )
+
+_MUTATION_ROUTE_INVENTORY = {
+    # Low: acknowledgement, telemetry, tests, and read-like writes.
+    "/api/alerts/{id}/ack": {
+        "action_id": "alerts.ack",
+        "severity": "low",
+        "consequence": "Acknowledges an alert without changing execution state.",
+    },
+    "/api/alerts/{id}/shelve": {
+        "action_id": "alerts.shelve",
+        "severity": "medium",
+        "consequence": "Temporarily shelves an alert and can reduce operator visibility.",
+    },
+    "/api/alerts/{id}/resolve": {
+        "action_id": "alerts.resolve",
+        "severity": "medium",
+        "consequence": "Resolves an alert and removes it from active incident views.",
+    },
+    "/api/copilot/ask": {
+        "action_id": "copilot.ask",
+        "severity": "low",
+        "consequence": "Sends read-only dashboard context to the configured copilot endpoint.",
+    },
+    "/api/ui/interaction": {
+        "action_id": "ui.interaction",
+        "severity": "low",
+        "consequence": "Records a UI interaction audit event.",
+    },
+    "/api/notifications/test": {
+        "action_id": "notifications.test",
+        "severity": "low",
+        "consequence": "Sends a test notification through the selected channel.",
+    },
+    "/api/broker/test_connection": {
+        "action_id": "broker.test_connection",
+        "severity": "low",
+        "consequence": "Tests broker connectivity without activating the broker configuration.",
+    },
+    "/api/data_sources/test": {
+        "action_id": "data_sources.test",
+        "severity": "low",
+        "consequence": "Runs a data-source connection test without saving credentials.",
+    },
+    # Medium: operational state changes that do not directly trade or delete.
+    "/api/operator/start": {
+        "action_id": "operator.start",
+        "severity": "medium",
+        "consequence": "Starts operator-managed runtime processes.",
+    },
+    "/api/operator/bootstrap": {
+        "action_id": "operator.bootstrap",
+        "severity": "medium",
+        "consequence": "Starts operator bootstrap work.",
+    },
+    "/api/operator/execution_arm": {
+        "action_id": "operator.execution_arm",
+        "severity": "medium",
+        "consequence": "Updates the execution armed flag; arming live execution is confirmed separately.",
+    },
+    "/api/operator/clearLastError": {
+        "action_id": "operator.clear_last_error",
+        "severity": "low",
+        "consequence": "Clears displayed operator error state.",
+    },
+    "/api/execution/advisories/action": {
+        "action_id": "execution.advisory_action",
+        "severity": "medium",
+        "consequence": "Records an operator action against an execution advisory.",
+    },
+    "/api/data_sources/create": {
+        "action_id": "data_sources.create",
+        "severity": "medium",
+        "consequence": "Creates a data-source configuration and may reconcile ingestion jobs.",
+    },
+    "/api/data_sources/update": {
+        "action_id": "data_sources.update",
+        "severity": "medium",
+        "consequence": "Updates a data-source configuration.",
+    },
+    "/api/data_sources/enable": {
+        "action_id": "data_sources.enable",
+        "severity": "medium",
+        "consequence": "Enables a data source for ingestion.",
+    },
+    "/api/data_sources/disable": {
+        "action_id": "data_sources.disable",
+        "severity": "medium",
+        "consequence": "Disables a data source and may reduce data freshness.",
+    },
+    "/api/data_sources/populate_now": {
+        "action_id": "data_sources.populate_now",
+        "severity": "medium",
+        "consequence": "Runs immediate data-source population work.",
+    },
+    "/api/data_sources/test_save": {
+        "action_id": "data_sources.test_save",
+        "severity": "medium",
+        "consequence": "Saves a data-source configuration and tests provider access.",
+    },
+    "/api/data_sources/accounts/update": {
+        "action_id": "data_sources.provider_account_update",
+        "severity": "medium",
+        "consequence": "Updates shared provider account metadata or credentials.",
+    },
+    "/api/broker/config": {
+        "action_id": "broker.config_update",
+        "severity": "medium",
+        "consequence": "Updates broker configuration without activating a non-sim broker.",
+    },
+    # High and emergency routes are mirrored by the confirmation registry below.
+    "/api/server/shutdown": {
+        "action_id": "server.shutdown",
+        "severity": "high",
+        "consequence": "Shuts down the dashboard HTTP server.",
+    },
+}
 
 _CONFIRMATION_REGISTRY = {
     "/api/operator/emergency_stop": {
@@ -425,6 +544,16 @@ _CONFIRMATION_REGISTRY = {
         "consequence": "Restarts operator-controlled runtime processes.",
         "require_ack": True,
     },
+    "/api/operator/execution_arm": {
+        "action_id": "operator.execution_arm",
+        "required_token": "ARM_EXECUTION",
+        "severity": "high",
+        "consequence": "Arms live execution after backend preflight checks pass.",
+        "require_ack": True,
+        "require_actor": True,
+        "require_source": True,
+        "body_policy": {"truthy_any": ("armed", "arm")},
+    },
     "/api/operator/autofix": {
         "action_id": "operator.autofix",
         "required_token": "SYSTEM_FIX",
@@ -440,6 +569,13 @@ _CONFIRMATION_REGISTRY = {
         "require_ack": True,
     },
     "/api/operator/self_repair": {
+        "action_id": "operator.self_repair",
+        "required_token": "SYSTEM_FIX",
+        "severity": "high",
+        "consequence": "Runs automatic runtime repair actions.",
+        "require_ack": True,
+    },
+    "/api/system/self_repair": {
         "action_id": "operator.self_repair",
         "required_token": "SYSTEM_FIX",
         "severity": "high",
@@ -549,42 +685,56 @@ _CONFIRMATION_REGISTRY = {
         "required_token": "PROMOTION",
         "severity": "high",
         "consequence": "Changes model promotion automation state.",
+        "require_ack": True,
     },
     "/api/models/promote": {
         "action_id": "models.promote",
         "required_token": "PROMOTION",
         "severity": "high",
         "consequence": "Promotes a model candidate.",
+        "require_ack": True,
     },
     "/api/system/fix": {
         "action_id": "system.fix",
         "required_token": "SYSTEM_FIX",
         "severity": "high",
         "consequence": "Runs automatic system repair actions.",
+        "require_ack": True,
     },
     "/api/size_policy/train": {
         "action_id": "size_policy.train",
         "required_token": "TRAIN_SIZE_POLICY",
         "severity": "high",
         "consequence": "Trains and writes size-policy calibration.",
+        "require_ack": True,
     },
     "/api/strategy/size_policy/train": {
         "action_id": "size_policy.train",
         "required_token": "TRAIN_SIZE_POLICY",
         "severity": "high",
         "consequence": "Trains and writes size-policy calibration.",
+        "require_ack": True,
     },
     "/api/promotion/rollback": {
         "action_id": "promotion.rollback",
         "required_token": "ROLLBACK_CHAMPION",
         "severity": "high",
         "consequence": "Rolls the champion model back to a retired candidate.",
+        "require_ack": True,
     },
     "/api/champion/rollback": {
         "action_id": "promotion.rollback",
         "required_token": "ROLLBACK_CHAMPION",
         "severity": "high",
         "consequence": "Rolls the champion model back to a retired candidate.",
+        "require_ack": True,
+    },
+    "/api/server/shutdown": {
+        "action_id": "server.shutdown",
+        "required_token": "SHUTDOWN_SERVER",
+        "severity": "high",
+        "consequence": "Shuts down the dashboard HTTP server.",
+        "require_ack": True,
     },
 }
 _CONFIRMATION_ENDPOINTS = {
@@ -614,6 +764,35 @@ def _route_confirmation_spec(path: str, body) -> dict | None:
     if truthy_any and not any(_truthy_confirmation_value(payload.get(key)) for key in truthy_any):
         return None
     return dict(spec)
+
+
+def _route_mutation_spec(path: str, body=None) -> dict | None:
+    confirmation_spec = _route_confirmation_spec(path, body)
+    if confirmation_spec:
+        return confirmation_spec
+    spec = _MUTATION_ROUTE_INVENTORY.get(str(path or ""))
+    if spec:
+        return dict(spec)
+    confirmation_spec = _CONFIRMATION_REGISTRY.get(str(path or ""))
+    if confirmation_spec:
+        return dict(confirmation_spec)
+    path_text = str(path or "")
+    for route_path, route_spec in _MUTATION_ROUTE_INVENTORY.items():
+        if "{" not in route_path or "}" not in route_path:
+            continue
+        pattern = "^" + re.sub(r"\\\{[^/{}]+\\\}", r"[^/]+", re.escape(route_path)) + "$"
+        try:
+            if re.match(pattern, path_text):
+                return dict(route_spec)
+        except Exception as e:
+            _log_nonfatal(
+                "http_transport_mutation_route_pattern_match_failed",
+                e,
+                route_path=str(route_path),
+                path=path_text,
+            )
+            continue
+    return None
 
 
 def _confirmation_hash(spec: dict | None) -> str:
@@ -890,6 +1069,8 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             self._response_streaming = False
             self._request_body_valid = True
             self._mutation_auth_kind = ""
+            self._mutation_confirmation = None
+            self._mutation_confirmation_spec = None
             self._route_sensitivity = ROUTE_SENSITIVITY_PUBLIC
             self._response_redaction_enabled = False
             try:
@@ -1354,16 +1535,20 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
         def _require_mutation_confirmation(self, parsed_path, body):
             spec = _route_confirmation_spec(str(parsed_path or ""), body)
             self._mutation_confirmation = None
+            self._mutation_confirmation_spec = dict(spec or {}) if spec else None
             if not spec:
                 return None
             expected = str(spec.get("required_token") or "").strip()
             payload = dict(body or {}) if isinstance(body, dict) else {}
             actual = str(payload.get("confirmation") or payload.get("confirm") or "").strip()
-            method = "typed_phrase" if payload.get("confirmation") is not None else "legacy_confirm"
+            method = str(payload.get("confirmation_method") or "").strip()
+            if not method:
+                method = "typed_phrase" if payload.get("confirmation") is not None else "legacy_confirm"
             actor = str(payload.get("actor") or payload.get("who") or "").strip()
             source = str(payload.get("source") or payload.get("source_surface") or "").strip()
             reason = str(payload.get("reason") or payload.get("justification") or payload.get("note") or "").strip()
             target = str(payload.get("target") or payload.get("target_id") or payload.get("name") or payload.get("source_key") or "").strip()
+            request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
             hold_ms = 0
             try:
                 hold_ms = int(float(payload.get("confirmation_hold_ms") or payload.get("hold_ms") or 0))
@@ -1391,6 +1576,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     "source_surface": source,
                     "reason": reason,
                     "target": target,
+                    "request_id": request_id,
                     "confirmation_hold_ms": int(hold_ms),
                     "consequence_hash": _confirmation_hash(spec),
                     "threshold_policy": dict(spec.get("threshold_policy") or {}),
@@ -1432,6 +1618,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 request_id = (
                     self.headers.get("X-Request-ID")
                     or self.headers.get("X-Correlation-ID")
+                    or confirmation.get("request_id")
                     or f"{int(time.time() * 1000)}-{id(self)}"
                 )
                 payload = {
@@ -1457,9 +1644,15 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     "body_valid": bool(body_valid),
                     "rate_limited": bool(rate_limited),
                 }
-                if confirmed is not None:
-                    payload["confirmed"] = bool(confirmed)
-                spec = _route_confirmation_spec(str(path or ""), {})
+                payload["confirmed"] = (
+                    bool(confirmed)
+                    if confirmed is not None
+                    else bool(confirmation)
+                )
+                spec = (
+                    dict(getattr(self, "_mutation_confirmation_spec", None) or {})
+                    or _route_mutation_spec(str(path or ""), {})
+                )
                 if confirmation:
                     payload.update({
                         "action_id": confirmation.get("action_id", ""),
@@ -1475,8 +1668,12 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 elif spec:
                     payload.update({
                         "action_id": str(spec.get("action_id") or ""),
+                        "actor": "",
+                        "confirmation_method": "",
+                        "source_surface": "",
                         "confirmation_severity": str(spec.get("severity") or ""),
                         "consequence_hash": _confirmation_hash(spec),
+                        "threshold_policy": dict(spec.get("threshold_policy") or {}),
                     })
                 _append_mutation_audit_event(payload)
             except Exception as e:
@@ -1503,6 +1700,7 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
             self._response_streaming = False
             self._request_body_valid = True
             self._mutation_confirmation = None
+            self._mutation_confirmation_spec = None
             self._route_sensitivity = ROUTE_SENSITIVITY_PUBLIC
             self._response_redaction_enabled = False
             self._serving_static = False
@@ -1632,19 +1830,6 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                 )
                 if auth:
                     auth_status = _derive_response_status(auth, default_status=403)
-                    limited = self._rate_limit_protected_request(parsed.path, token_for_bucket="")
-                    if limited:
-                        payload, headers = limited
-                        self._audit_mutation(
-                            method=method,
-                            path=parsed.path,
-                            handler_name=handler_name,
-                            outcome="rate_limited_auth_denied",
-                            status=429,
-                            error=str(payload.get("error") or "rate_limit_exceeded"),
-                            rate_limited=True,
-                        )
-                        return self.respond_json(payload, 429, headers=headers)
                     self._audit_mutation(
                         method=method,
                         path=parsed.path,

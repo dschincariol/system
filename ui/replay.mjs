@@ -1,6 +1,6 @@
 "use strict";
 
-import { renderChartAccessibility } from "./chart_a11y.js";
+import { installChartPointInspector, renderChartAccessibility } from "./chart_a11y.js";
 import { chartMarkerStyle, statusToken } from "./utils.js";
 
 const CHART_COLORS = Object.freeze({
@@ -701,6 +701,11 @@ export function renderReplayChart(canvas, vm) {
     ctx.font = "12px Consolas, monospace";
     ctx.fillText(model.noDataText, 12, 24);
     _renderReplayChartA11y(canvas, vm);
+    installChartPointInspector(canvas, [], {
+      title: "Historical replay",
+      kind: "canvas-replay",
+      emptyMessage: model.noDataText,
+    });
     return;
   }
 
@@ -768,6 +773,25 @@ export function renderReplayChart(canvas, vm) {
   }
 
   _renderReplayChartA11y(canvas, vm);
+  installChartPointInspector(
+    canvas,
+    (model.candles || []).map((candle) => ({
+      label: _fmtTime(candle.ts_ms),
+      x: candle.x,
+      values: [
+        { label: "Open", value: _num(candle.open, null), valueText: _fmtNum(candle.open, 2) },
+        { label: "High", value: _num(candle.high, null), valueText: _fmtNum(candle.high, 2) },
+        { label: "Low", value: _num(candle.low, null), valueText: _fmtNum(candle.low, 2) },
+        { label: "Close", value: _num(candle.close, null), valueText: _fmtNum(candle.close, 2) },
+      ],
+      note: candle.up ? "up candle" : "down candle",
+    })),
+    {
+      title: "Historical replay",
+      kind: "canvas-replay",
+      emptyMessage: "No replay price series is available.",
+    },
+  );
 }
 
 export function renderReplayPanel(payload = {}, root = null, options = {}) {

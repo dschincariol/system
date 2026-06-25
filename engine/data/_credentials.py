@@ -53,7 +53,7 @@ def _load_from_file(name: str) -> str:
         path = str(os.environ.get(f"{candidate}_FILE") or "").strip()
         if not path:
             continue
-        value = read_secret_text_file(path)
+        value = read_secret_text_file(path).value
         if value:
             return value
     return ""

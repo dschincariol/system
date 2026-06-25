@@ -24,7 +24,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -44,6 +44,12 @@ FMP_PROFILE_URL = "https://financialmodelingprep.com/api/v3/profile/{symbol}"
 REQUEST_TIMEOUT_S = float(os.environ.get("ETF_FLOW_REQUEST_TIMEOUT_S", "20"))
 FEATURE_LOOKBACK_READINGS = max(24, int(os.environ.get("ETF_FLOW_FEATURE_LOOKBACK_READINGS", "64") or "64"))
 EWMA_ALPHA_20 = 2.0 / 21.0
+ETF_FLOW_SUPPRESS_EX_DIVIDEND = os.environ.get("ETF_FLOW_SUPPRESS_EX_DIVIDEND", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 _EASTERN = ZoneInfo("America/New_York")
 _UTC = timezone.utc
@@ -465,7 +471,38 @@ def split_adjusted_share_delta(
     return float(curr_shares) - float(prev_shares), False
 
 
-def compute_flow_features(readings: Sequence[Dict[str, Any]], *, asof_ts_ms: int) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
+def _crosses_ex_dividend(con: Any | None, *, previous: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+    if con is None or not ETF_FLOW_SUPPRESS_EX_DIVIDEND:
+        return False
+    symbol = _clean_symbol(current.get("symbol") or previous.get("symbol"))
+    if not symbol:
+        return False
+    start = int(previous.get("asof_ts_ms") or previous.get("availability_ts_ms") or 0)
+    end = int(current.get("asof_ts_ms") or current.get("availability_ts_ms") or 0)
+    if start <= 0 or end <= start:
+        return False
+    try:
+        from engine.data.corporate_actions import corporate_action_ex_dates
+
+        return bool(
+            corporate_action_ex_dates(
+                con,
+                symbol=symbol,
+                action_type="dividend",
+                start_ts_ms=int(start),
+                end_ts_ms=int(end),
+            )
+        )
+    except Exception:
+        return False
+
+
+def compute_flow_features(
+    readings: Sequence[Dict[str, Any]],
+    *,
+    asof_ts_ms: int,
+    con: Any | None = None,
+) -> Tuple[Dict[str, float], Dict[str, Any], bool]:
     features = {fid: 0.0 for fid in ETF_FLOW_FEATURE_IDS}
     rows = [
         dict(row)
@@ -497,6 +534,7 @@ def compute_flow_features(readings: Sequence[Dict[str, Any]], *, asof_ts_ms: int
     latest_unexpected = 0.0
     latest_aum = 0.0
     split_count = 0
+    ex_dividend_suppressions = 0
     previous: Dict[str, Any] | None = None
     for row in rows:
         shares = float(_safe_float(row.get("shares_outstanding")) or 0.0)
@@ -515,6 +553,9 @@ def compute_flow_features(readings: Sequence[Dict[str, Any]], *, asof_ts_ms: int
             split_count += 1 if is_split else 0
             flow = float(delta * (price or 0.0)) if price is not None and price > 0.0 else 0.0
             expected = float(ewma or 0.0)
+            if _crosses_ex_dividend(con, previous=previous, current=row):
+                flow = float(expected)
+                ex_dividend_suppressions += 1
             unexpected = float(flow - expected)
             scaled_flow = float(flow / max(abs(aum), 1.0))
             scaled_unexpected = float(unexpected / max(abs(aum), 1.0))
@@ -557,6 +598,8 @@ def compute_flow_features(readings: Sequence[Dict[str, Any]], *, asof_ts_ms: int
             "split_adjustments": int(split_count),
         }
     )
+    if ex_dividend_suppressions > 0:
+        meta["ex_dividend_suppressions"] = int(ex_dividend_suppressions)
     return {str(k): float(v or 0.0) for k, v in features.items()}, meta, len(rows) >= 2
 
 
@@ -615,7 +658,7 @@ def resolve_etf_flow_features(con, *, symbol: str, ts_ms: int) -> Tuple[Dict[str
         rows = _load_share_rows(con, symbol=symbol, ts_ms=int(ts_ms))
     except Exception:
         return features, meta, False
-    resolved, resolved_meta, available = compute_flow_features(rows, asof_ts_ms=int(ts_ms))
+    resolved, resolved_meta, available = compute_flow_features(rows, asof_ts_ms=int(ts_ms), con=con)
     for fid in ETF_FLOW_FEATURE_IDS:
         features[fid] = float(resolved.get(fid, 0.0) or 0.0)
     return features, dict(resolved_meta or {}), bool(available)

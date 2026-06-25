@@ -57,6 +57,7 @@ FALLBACK_ONLY_UI_ENDPOINT_ALLOWLIST = {
     "/api/alerts/timeline": "Alert timeline cards use the dashboard-server alerts fallback until timeline ownership moves into ops route specs.",
     "/api/alerts/{param}/ack": "Alert acknowledgement is UI-critical and intentionally protected by a dashboard-server fallback mutation.",
     "/api/alerts/{param}/resolve": "Alert resolution is UI-critical and intentionally protected by a dashboard-server fallback mutation.",
+    "/api/alerts/{param}/shelve": "Alert shelving is UI-critical and intentionally protected by a dashboard-server fallback mutation.",
     "/api/audit/records": "Audit record drilldowns use dashboard-server fallback reads until audit routes are split into canonical route specs.",
     "/api/broker": "Broker summary cards depend on the dashboard-server fallback while broker read routes are not split into route specs.",
     "/api/causal/scores": "Model analysis panel uses a dashboard-server fallback until causal score reads have a canonical route module.",
@@ -200,6 +201,16 @@ def test_business_refusal_ui_helpers_surface_reason_codes() -> None:
     assert "j.reason_code || j.error" in terminal_js
     assert "allowBusinessFalse" in api_client_js
     assert "data.message || data.reason || data.reason_code || data.error" in api_client_js
+
+
+def test_weather_widgets_use_shared_dashboard_fetch_client() -> None:
+    dashboard_js = (REPO_ROOT / "ui" / "dashboard.js").read_text(encoding="utf-8")
+    weather_js = (REPO_ROOT / "ui" / "weather_widgets.js").read_text(encoding="utf-8")
+
+    assert "loadWeatherWidgets({ symbol: _getActiveSymbol(\"SPY\"), fetchJSON })" in dashboard_js
+    assert "loadWeatherWidgets({ symbol: selected || \"SPY\", fetchJSON })" in dashboard_js
+    assert "sharedFetchJSON = typeof fetchJSON === \"function\" ? fetchJSON : null" in weather_js
+    assert "return sharedFetchJSON(url);" in weather_js
 
 
 def test_dashboard_route_contract_introspection_still_enforces_security_preflight():

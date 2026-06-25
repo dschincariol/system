@@ -128,6 +128,16 @@ def _with_refusal_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _with_operator_status(source: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(source or {})
+    stored_status = str(out.get("status") or "")
+    out.setdefault("stored_status", stored_status)
+    effective_status = str(out.get("effective_status") or stored_status or "unknown")
+    if effective_status:
+        out["status"] = effective_status
+    return out
+
+
 def api_get_data_sources(parsed, _body=None, ctx=None):
     """Return source catalog, templates, runtime status, and auth requirements.
 
@@ -158,6 +168,7 @@ def api_get_data_sources(parsed, _body=None, ctx=None):
         desired_jobs=desired_jobs,
         job_states=job_states,
     )
+    sources = [_with_operator_status(source) for source in sources]
     return {
         "ok": True,
         "ts_ms": int(time.time() * 1000),

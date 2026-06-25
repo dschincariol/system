@@ -9,6 +9,8 @@
     - Enforce HARD blocks for actions unless Expert-unlocked
 */
 
+import { normalizeSeverity, severityAtLeast } from "./alerts.js";
+
 const _MANIP_STATE_KEY = "ui_manip_killswitch_v1";
 
 let _manipBlockedSyms = new Set();
@@ -30,8 +32,8 @@ function _kwHit(s) {
 
 function _isManipulationAlert(r) {
   if (!r) return false;
-  const sev = String(r.severity || "").toUpperCase();
-  if (sev !== "WARN" && sev !== "CRIT") return false;
+  const sev = normalizeSeverity(r.severity);
+  if (!severityAtLeast(sev, "WARN")) return false;
 
   // Quantitative evidence (preferred when available)
   if (typeof r.manip_risk === "number" && r.manip_risk >= 0.7) return true;
@@ -56,7 +58,7 @@ export function updateManipulationStateFromAlerts(rows) {
 
     reasons.push({
       symbol: sym,
-      severity: String(r.severity || ""),
+      severity: normalizeSeverity(r.severity),
       why: String(r.reason || r.event_title || "manipulation risk"),
       id: r.id,
       ts_ms: r.ts_ms

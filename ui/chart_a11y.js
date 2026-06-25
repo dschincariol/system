@@ -10,6 +10,7 @@
 */
 
 const DEFAULT_MAX_TABLE_ROWS = 80;
+const INSPECTOR_CLEANUPS = typeof WeakMap !== "undefined" ? new WeakMap() : null;
 
 function _docFor(el) {
   if (el && el.ownerDocument) return el.ownerDocument;
@@ -57,7 +58,7 @@ function _num(value) {
 }
 
 export function formatChartValue(value, digits = 4) {
-  const n = _num(value);
+  const n = value === null || value === undefined || value === "" ? null : _num(value);
   if (n == null) return "unavailable";
   const d = Number.isFinite(Number(digits)) ? Number(digits) : 4;
   if (Math.abs(n) >= 1000) {
@@ -330,6 +331,17 @@ function _defaultMultiSeriesColumns(seriesFields, valueFormatter) {
   ];
 }
 
+function _addClass(el, className) {
+  if (!el || !className) return;
+  if (el.classList && typeof el.classList.add === "function") {
+    el.classList.add(className);
+    return;
+  }
+  const classes = new Set(String(el.className || "").split(/\s+/).filter(Boolean));
+  classes.add(className);
+  el.className = Array.from(classes).join(" ");
+}
+
 function _renderTableRows(rows, columns, emptyText, maxRows) {
   if (!rows.length) {
     return `<tr><td colspan="${Math.max(1, columns.length)}" class="metric-meta">${_esc(emptyText)}</td></tr>`;
@@ -340,6 +352,237 @@ function _renderTableRows(rows, columns, emptyText, maxRows) {
       ${columns.map((column) => `<td>${_esc(_columnValue(column, row))}</td>`).join("")}
     </tr>
   `).join("");
+}
+
+function _resolveDataWindow(chartEl, containerId) {
+  const doc = _docFor(chartEl);
+  if (!doc || !chartEl) return null;
+  const id = containerId || `${_safeId(chartEl.id || chartEl.getAttribute?.("data-chart-a11y-title") || "chart")}DataWindow`;
+  let node = id ? doc.getElementById(id) : null;
+  if (!node && typeof doc.createElement === "function") {
+    node = doc.createElement("div");
+    node.id = id;
+    if (chartEl.parentNode && typeof chartEl.parentNode.insertBefore === "function") {
+      chartEl.parentNode.insertBefore(node, chartEl.nextSibling || null);
+    }
+  }
+  if (!node) return null;
+  _addClass(node, "chartDataWindow");
+  _addClass(node, "small");
+  _addClass(node, "mono");
+  if (typeof node.setAttribute === "function") {
+    node.setAttribute("role", "status");
+    node.setAttribute("aria-live", "polite");
+  }
+  return node;
+}
+
+function _setNodeText(node, text) {
+  if (!node) return;
+  if ("textContent" in node) {
+    node.textContent = String(text || "");
+  } else {
+    node.innerHTML = _esc(text || "");
+  }
+}
+
+function _normalizeInspectorValue(field, raw, index, options = {}) {
+  const formatter = field && (field.formatter || field.valueFormatter) || options.valueFormatter;
+  let value;
+  if (field && typeof field.value === "function") {
+    try { value = field.value(raw, index); } catch { value = null; }
+  } else if (field && field.key && raw && typeof raw === "object") {
+    value = raw[field.key];
+  } else if (field && Object.prototype.hasOwnProperty.call(field, "value")) {
+    value = field.value;
+  }
+  const n = _num(value);
+  return {
+    key: field && field.key ? String(field.key) : "",
+    label: String(field && (field.label || field.valueLabel || field.key) || options.valueLabel || "Value"),
+    value: n,
+    valueText: field && field.valueText
+      ? String(field.valueText)
+      : (n == null ? "unavailable" : _formatWith(formatter, n)),
+  };
+}
+
+function _normalizeInspectorPoint(row, index, options = {}) {
+  const raw = row && typeof row === "object" ? (row.raw && typeof row.raw === "object" ? row.raw : row) : row;
+  const base = row && typeof row === "object" ? row : {};
+  const explicitLabel = _pick(base, ["label", "timeText", "bucket", "step"])
+    ?? _pick(raw, ["label", "timeText", "bucket", "step"]);
+  const timeLabel = explicitLabel == null
+    ? (_pick(base, ["time", "ts_ms"]) ?? _pick(raw, ["time", "ts_ms"]))
+    : null;
+  let values = [];
+  if (Array.isArray(base.values)) {
+    values = base.values.map((field) => _normalizeInspectorValue(field, raw, index, options));
+  } else if (Array.isArray(base.seriesValues)) {
+    values = base.seriesValues.map((field) => _normalizeInspectorValue(field, raw, index, options));
+  } else if (Array.isArray(options.fields)) {
+    values = options.fields.map((field) => _normalizeInspectorValue(field, raw, index, options));
+  } else {
+    const sourceValue = base.value ?? raw;
+    const value = sourceValue === null || sourceValue === undefined || sourceValue === "" ? null : _num(sourceValue);
+    values = [{
+      key: "value",
+      label: String(options.valueLabel || "Value"),
+      value,
+      valueText: value == null ? "unavailable" : _formatWith(options.valueFormatter, value),
+    }];
+  }
+  return {
+    ...base,
+    raw,
+    index,
+    label: explicitLabel == null
+      ? (formatChartTime(timeLabel) || String(timeLabel ?? index + 1))
+      : String(explicitLabel),
+    x: _num(base.x ?? base.xCoord ?? base.plotX),
+    y: _num(base.y ?? base.yCoord ?? base.plotY),
+    values,
+    note: base.note || "",
+  };
+}
+
+export function buildChartPointSummary(point, options = {}) {
+  if (!point) {
+    return `${String(options.title || "Chart").trim() || "Chart"}: no point selected.`;
+  }
+  const title = String(options.title || "Chart").trim() || "Chart";
+  const label = String(point.label || point.timeText || point.index + 1 || "point").trim();
+  const values = Array.isArray(point.values) ? point.values : [];
+  const valueText = values.length
+    ? values.map((field) => `${field.label} ${field.valueText || "unavailable"}`).join(", ")
+    : "value unavailable";
+  const note = String(point.note || "").trim();
+  return `${title}: ${label}; ${valueText}${note ? `; ${note}` : ""}.`;
+}
+
+function _normalizedInspectorPoints(points, options = {}) {
+  return (Array.isArray(points) ? points : [])
+    .map((point, index) => _normalizeInspectorPoint(point, index, options))
+    .filter((point) => point.values.some((field) => field.value != null) || point.label);
+}
+
+function _nearestInspectorIndex(rows, x, fallbackIndex) {
+  if (!rows.length) return 0;
+  const withX = rows.filter((row) => Number.isFinite(row.x));
+  if (!withX.length || !Number.isFinite(Number(x))) return Math.max(0, Math.min(rows.length - 1, fallbackIndex));
+  let bestIndex = 0;
+  let bestDistance = Infinity;
+  rows.forEach((row, index) => {
+    if (!Number.isFinite(row.x)) return;
+    const distance = Math.abs(row.x - Number(x));
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  return bestIndex;
+}
+
+function _eventCanvasX(chartEl, event) {
+  if (!event) return null;
+  const clientX = _num(event.clientX);
+  if (clientX == null) return null;
+  const rect = typeof chartEl.getBoundingClientRect === "function"
+    ? chartEl.getBoundingClientRect()
+    : null;
+  const width = _num(chartEl.width) || (rect && _num(rect.width)) || null;
+  if (!rect || !Number.isFinite(Number(rect.left)) || !Number.isFinite(Number(rect.width)) || Number(rect.width) <= 0 || width == null) {
+    return clientX;
+  }
+  return (clientX - Number(rect.left)) * (width / Number(rect.width));
+}
+
+export function installChartPointInspector(target, points = [], options = {}) {
+  const chartEl = _asElement(target);
+  if (!chartEl) return null;
+  const rows = _normalizedInspectorPoints(points, options);
+  const title = String(options.title || chartEl.getAttribute?.("data-chart-a11y-title") || "Chart").trim() || "Chart";
+  const dataWindow = _resolveDataWindow(chartEl, options.containerId || options.dataWindowId);
+  const existingAriaLabel = String(chartEl.getAttribute?.("aria-label") || "").trim();
+  const existingState = String(chartEl.getAttribute?.("data-chart-a11y-state") || "").trim();
+  if (INSPECTOR_CLEANUPS && INSPECTOR_CLEANUPS.has(chartEl)) {
+    try { INSPECTOR_CLEANUPS.get(chartEl)(); } catch {}
+    INSPECTOR_CLEANUPS.delete(chartEl);
+  }
+  const initialCandidate = Number(options.initialIndex ?? rows.length - 1);
+  const initialIndex = Number.isFinite(initialCandidate)
+    ? Math.max(0, Math.min(rows.length - 1, initialCandidate))
+    : Math.max(0, rows.length - 1);
+  const existingDescribedBy = String(chartEl.getAttribute?.("aria-describedby") || "").trim();
+  const describedBy = [
+    existingDescribedBy,
+    dataWindow && dataWindow.id ? dataWindow.id : "",
+  ].filter(Boolean).join(" ");
+  applyChartFocusMetadata(chartEl, {
+    title,
+    summary: existingAriaLabel || (rows.length
+      ? buildChartPointSummary(rows[initialIndex], { title })
+      : `${title}: ${String(options.emptyMessage || "No point data is available.")}`),
+    pointCount: rows.length,
+    state: rows.length ? (existingState || "ready") : (existingState || "empty"),
+    kind: options.kind || options.chartType || chartEl.getAttribute?.("data-chart-a11y-kind"),
+    describedBy: describedBy || chartEl.getAttribute?.("aria-describedby"),
+    focusable: options.focusable,
+  });
+
+  if (!rows.length) {
+    const message = `${title}: ${String(options.emptyMessage || "No point data is available.")}`;
+    _setNodeText(dataWindow, message);
+    if (typeof chartEl.setAttribute === "function") chartEl.setAttribute("data-chart-inspector-state", "empty");
+    return { rows, dataWindow, selectedIndex: -1, selectPoint: () => null };
+  }
+
+  let selectedIndex = initialIndex;
+  const show = (index) => {
+    selectedIndex = Math.max(0, Math.min(rows.length - 1, Number(index)));
+    const summary = buildChartPointSummary(rows[selectedIndex], { ...options, title });
+    _setNodeText(dataWindow, summary);
+    if (typeof chartEl.setAttribute === "function") {
+      chartEl.setAttribute("data-chart-inspector-state", "ready");
+      chartEl.setAttribute("data-chart-selected-index", String(selectedIndex));
+      chartEl.setAttribute("title", summary);
+      if (!existingAriaLabel || options.updateAriaLabel === true) {
+        chartEl.setAttribute("aria-label", summary);
+      }
+    }
+    return rows[selectedIndex];
+  };
+  const onMove = (event) => {
+    const x = _eventCanvasX(chartEl, event);
+    show(_nearestInspectorIndex(rows, x, selectedIndex));
+  };
+  const onFocus = () => show(selectedIndex);
+  const onKeyDown = (event) => {
+    const key = String(event && event.key || "");
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(key)) return;
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    if (key === "Home") show(0);
+    else if (key === "End") show(rows.length - 1);
+    else if (key === "ArrowLeft") show(selectedIndex - 1);
+    else if (key === "ArrowRight") show(selectedIndex + 1);
+  };
+  const listeners = [
+    ["mousemove", onMove],
+    ["focus", onFocus],
+    ["keydown", onKeyDown],
+  ];
+  if (typeof chartEl.addEventListener === "function") {
+    listeners.forEach(([eventName, handler]) => chartEl.addEventListener(eventName, handler));
+    if (INSPECTOR_CLEANUPS) {
+      INSPECTOR_CLEANUPS.set(chartEl, () => {
+        if (typeof chartEl.removeEventListener === "function") {
+          listeners.forEach(([eventName, handler]) => chartEl.removeEventListener(eventName, handler));
+        }
+      });
+    }
+  }
+  show(selectedIndex);
+  return { rows, dataWindow, selectedIndex, selectPoint: show };
 }
 
 export function applyChartFocusMetadata(target, options = {}) {

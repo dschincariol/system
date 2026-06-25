@@ -53,6 +53,8 @@ logging.basicConfig(
 POLL_LOOKBACK_S = int(os.environ.get("EXEC_POLL_LOOKBACK_S", "3600"))
 LOG = logging.getLogger(__name__)
 _WARNED_NONFATAL_KEYS: set[str] = set()
+_ALPACA_BROKER_NAMES = {"alpaca"}
+_IBKR_BROKER_NAMES = {"ibkr", "interactive_brokers", "interactivebrokers"}
 
 
 def _warn_nonfatal(event: str, code: str, error: BaseException, *, warn_key: str | None = None, **extra: object) -> None:
@@ -71,6 +73,31 @@ def _warn_nonfatal(event: str, code: str, error: BaseException, *, warn_key: str
     )
     if warn_key:
         _WARNED_NONFATAL_KEYS.add(warn_key)
+
+
+def _configured_live_poll_brokers() -> set[str]:
+    """Return live broker adapters that are actually reachable for this process."""
+
+    try:
+        from engine.execution.broker_router import effective_broker_chain
+
+        chain = [str(item or "").strip().lower() for item in list(effective_broker_chain() or [])]
+    except Exception as exc:
+        _warn_nonfatal(
+            "execution_poll_and_attrib_broker_chain_load_failed",
+            "EXECUTION_POLL_AND_ATTRIB_BROKER_CHAIN_LOAD_FAILED",
+            exc,
+            warn_key="execution_poll_and_attrib_broker_chain_load_failed",
+        )
+        chain = []
+
+    brokers: set[str] = set()
+    for name in chain:
+        if name in _ALPACA_BROKER_NAMES:
+            brokers.add("alpaca")
+        if name in _IBKR_BROKER_NAMES:
+            brokers.add("ibkr")
+    return brokers
 
 # ------------------------------------------------------------
 # Phase 2: Residual Hard Invariant (fail-closed)
@@ -196,35 +223,38 @@ def main() -> int:
     init_execution_ledger()
 
     after_ts_ms = int(time.time() * 1000) - int(POLL_LOOKBACK_S) * 1000
+    live_poll_brokers = _configured_live_poll_brokers()
 
     # Poll fills from each broker adapter that exists.
     # These are best-effort adapters; absence of one broker should not block
     # analytics for another.
-    try:
-        from engine.execution.broker_alpaca_rest import poll_and_log_fills
+    if "alpaca" in live_poll_brokers:
+        try:
+            from engine.execution.broker_alpaca_rest import poll_and_log_fills
 
-        poll_and_log_fills(after_ts_ms=after_ts_ms)
-    except Exception as exc:
-        _warn_nonfatal(
-            "execution_poll_and_attrib_alpaca_poll_failed",
-            "EXECUTION_POLL_AND_ATTRIB_ALPACA_POLL_FAILED",
-            exc,
-            warn_key="execution_poll_and_attrib_alpaca_poll_failed",
-            after_ts_ms=int(after_ts_ms),
-        )
+            poll_and_log_fills(after_ts_ms=after_ts_ms)
+        except Exception as exc:
+            _warn_nonfatal(
+                "execution_poll_and_attrib_alpaca_poll_failed",
+                "EXECUTION_POLL_AND_ATTRIB_ALPACA_POLL_FAILED",
+                exc,
+                warn_key="execution_poll_and_attrib_alpaca_poll_failed",
+                after_ts_ms=int(after_ts_ms),
+            )
 
-    try:
-        from engine.execution.broker_ibkr_gateway import poll_and_log_fills as ibkr_poll
+    if "ibkr" in live_poll_brokers:
+        try:
+            from engine.execution.broker_ibkr_gateway import poll_and_log_fills as ibkr_poll
 
-        ibkr_poll(after_ts_ms=after_ts_ms)
-    except Exception as exc:
-        _warn_nonfatal(
-            "execution_poll_and_attrib_ibkr_poll_failed",
-            "EXECUTION_POLL_AND_ATTRIB_IBKR_POLL_FAILED",
-            exc,
-            warn_key="execution_poll_and_attrib_ibkr_poll_failed",
-            after_ts_ms=int(after_ts_ms),
-        )
+            ibkr_poll(after_ts_ms=after_ts_ms)
+        except Exception as exc:
+            _warn_nonfatal(
+                "execution_poll_and_attrib_ibkr_poll_failed",
+                "EXECUTION_POLL_AND_ATTRIB_IBKR_POLL_FAILED",
+                exc,
+                warn_key="execution_poll_and_attrib_ibkr_poll_failed",
+                after_ts_ms=int(after_ts_ms),
+            )
 
     # Phase 2: manage open orders (cancel/replace) best-effort
     try:

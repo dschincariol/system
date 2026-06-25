@@ -525,6 +525,18 @@ ALLOWED_JOBS = {
     {"execution": False, "pipeline_stage": "universe"},
 ),
 
+"retire_delisted_symbols": (
+    "engine/data/jobs/retire_delisted_symbols.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "schedule": "manual one-shot",
+        "pipeline_stage": "universe_lifecycle",
+        "requires_secret_any": ["POLYGON_API_KEY", "FMP_API_KEY"],
+    },
+),
+
 "backfill_universe_pit": (
     "engine/data/jobs/backfill_universe_pit.py",
     "oneshot",
@@ -1087,8 +1099,27 @@ ALLOWED_JOBS = {
     {"execution": False, "schedule": "every 86400s", "cadence_seconds": 86400},
 ),
 
+"ingest_corporate_actions": (
+    "engine/data/jobs/ingest_corporate_actions.py",
+    "daemon",
+    None,
+    {
+        "execution": False,
+        "schedule": "every 86400s",
+        "cadence_seconds": 86400,
+        "requires_secret_any": ["POLYGON_API_KEY", "FMP_API_KEY"],
+    },
+),
+
 "ingest_cftc_cot": (
     "engine/data/jobs/ingest_cftc_cot.py",
+    "daemon",
+    None,
+    {"execution": False, "schedule": "every 86400s", "cadence_seconds": 86400},
+),
+
+"ingest_futures_rolls": (
+    "engine/data/jobs/ingest_futures_rolls.py",
     "daemon",
     None,
     {"execution": False, "schedule": "every 86400s", "cadence_seconds": 86400},
@@ -1588,6 +1619,7 @@ QUARANTINED_JOB_FILES = frozenset()
 def _build_pipeline_order() -> List[str]:
     order: List[str] = [
         "update_universe",
+        "retire_delisted_symbols",
     ]
     if _pit_universe_backfill_enabled():
         order.append("backfill_universe_pit")

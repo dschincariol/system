@@ -16,12 +16,14 @@ IBKR_BROKERS = {
     "ibgateway",
     "tws",
 }
-LIVE_BROKERS = ALPACA_BROKERS | IBKR_BROKERS
+TRADIER_OPTIONS_BROKERS = {"tradier_options"}
+LIVE_BROKERS = ALPACA_BROKERS | IBKR_BROKERS | TRADIER_OPTIONS_BROKERS
 
 _CANONICAL_BROKER = {
     **{name: "sim" for name in SIM_BROKERS},
     **{name: "alpaca" for name in ALPACA_BROKERS},
     **{name: "ibkr" for name in IBKR_BROKERS},
+    **{name: "tradier_options" for name in TRADIER_OPTIONS_BROKERS},
 }
 
 NON_RETRYABLE_BROKER_STATUSES = {
@@ -371,6 +373,7 @@ __all__ = [
     "LIVE_BROKERS",
     "NON_RETRYABLE_BROKER_STATUSES",
     "SIM_BROKERS",
+    "TRADIER_OPTIONS_BROKERS",
     "broker_exception_terminal_failure",
     "broker_startup_preflight",
     "canonical_broker_name",

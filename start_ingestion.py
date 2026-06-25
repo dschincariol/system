@@ -16,7 +16,12 @@ from pathlib import Path
 
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
-from engine.runtime.platform import default_local_db_dir, default_local_db_path, default_local_log_dir
+from engine.runtime.platform import (
+    default_local_db_dir,
+    default_local_db_path,
+    default_local_log_dir,
+    resolve_runtime_paths,
+)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG_DIR = os.path.abspath(
@@ -105,7 +110,11 @@ def _bootstrap_ingestion_env() -> None:
 
     try:
         from dotenv import load_dotenv
-        load_dotenv(os.path.join(_BASE_DIR, ".env"))
+        env_file_raw = str(os.environ.get("TRADING_ENV_FILE") or ".env").strip() or ".env"
+        env_file = Path(env_file_raw).expanduser()
+        if not env_file.is_absolute():
+            env_file = Path(_BASE_DIR) / env_file
+        load_dotenv(env_file, override=False)
     except Exception as e:
         log_failure(
             LOG,
@@ -118,6 +127,11 @@ def _bootstrap_ingestion_env() -> None:
             include_health=False,
             persist=True,
         )
+
+    try:
+        resolve_runtime_paths(os.environ, project_root=Path(_BASE_DIR))
+    except Exception as e:
+        _warn_nonfatal("START_INGESTION_RUNTIME_PATH_RESOLVE_FAILED", e)
 
     # Ignore the known-dead local proxy sentinel if present so polling providers can reach upstream APIs.
     dead_local_proxy = "http://127.0.0.1:9"
