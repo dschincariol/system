@@ -122,7 +122,17 @@ ensure_venv() {
   REQ_FILE="$(PYTHON_BIN="$VENV_DIR/bin/python" bash "$ROOT/deploy/bin/resolve_python_requirements.sh" "$ROOT")"
   log "installing Python dependencies from $REQ_FILE"
   "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel setuptools
-  "$VENV_DIR/bin/python" -m pip install -r "$REQ_FILE"
+  case "$(basename "$REQ_FILE")" in
+    requirements.txt|requirements-dev.txt|requirements-nvidia-cuda.txt|requirements-amd-rocm-full.txt)
+      "$VENV_DIR/bin/python" -m pip install --require-hashes -r "$REQ_FILE"
+      ;;
+    requirements-amd-rocm.txt)
+      "$VENV_DIR/bin/python" -m pip install --require-hashes -r "$ROOT/requirements-amd-rocm-full.txt"
+      ;;
+    *)
+      "$VENV_DIR/bin/python" -m pip install -r "$REQ_FILE"
+      ;;
+  esac
 }
 
 ensure_node() {

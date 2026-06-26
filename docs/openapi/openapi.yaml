@@ -35,7 +35,7 @@ components:
         header. Sensitive GET routes require this header in production/live or
         remote-bind deployments. Query-string `token` authentication is legacy
         local-development compatibility only and is rejected for protected
-        routes in production/live.
+        routes in production/live or on non-loopback binds.
   schemas:
     FreeformObject:
       type: object
@@ -767,7 +767,7 @@ paths:
       description: |
         Sensitive GET. In production/live or remote-bind deployments the
         transport requires `X-API-Token`, applies rate limiting and audit
-        logging, rejects query-string tokens in production/live, and redacts
+        logging, rejects query-string tokens in production/live or on non-loopback binds, and redacts
         DSNs, tokens, passwords, API keys, Authorization headers, and broker or
         account identifiers in the response.
       security:
@@ -988,7 +988,7 @@ paths:
           required: false
           schema:
             type: integer
-            default: 50
+            default: 20
             minimum: 1
             maximum: 500
         - name: regime
@@ -1099,7 +1099,7 @@ paths:
       description: |
         Sensitive GET. In production/live or remote-bind deployments the
         transport requires `X-API-Token`, applies rate limiting and audit
-        logging, rejects query-string tokens in production/live, and redacts
+        logging, rejects query-string tokens in production/live or on non-loopback binds, and redacts
         secrets and broker/account identifiers in the response.
       security:
         - DashboardApiToken: []
@@ -1132,7 +1132,7 @@ paths:
       description: |
         Sensitive GET. In production/live or remote-bind deployments the
         transport requires `X-API-Token`, applies rate limiting and audit
-        logging, rejects query-string tokens in production/live, and redacts
+        logging, rejects query-string tokens in production/live or on non-loopback binds, and redacts
         DSNs, tokens, passwords, API keys, Authorization headers, and broker or
         account identifiers in log text.
       security:
@@ -1444,7 +1444,7 @@ paths:
       tags: [data-sources]
       summary: Create a new configurable data source.
       operationId: postDataSourceCreate
-      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` on this mutating route. Query-string `token` is legacy local-development compatibility and is rejected in production/live.
+      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` on this mutating route. Query-string `token` is legacy local-development compatibility and is rejected in production/live or on non-loopback binds.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -1471,7 +1471,7 @@ paths:
       tags: [data-sources]
       summary: Update an existing configurable data source.
       operationId: postDataSourceUpdate
-      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` on this mutating route. Query-string `token` is legacy local-development compatibility and is rejected in production/live.
+      description: When `DASHBOARD_API_TOKEN` is configured, the transport layer requires `X-API-Token` on this mutating route. Query-string `token` is legacy local-development compatibility and is rejected in production/live or on non-loopback binds.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -1502,7 +1502,7 @@ paths:
         `source_key` may be supplied in the request body or query string. When
         `DASHBOARD_API_TOKEN` is configured, the transport layer requires
         `X-API-Token` on this mutating route. Query-string `token` is legacy
-        local-development compatibility and is rejected in production/live.
+        local-development compatibility and is rejected in production/live or on non-loopback binds.
       security:
         - DashboardApiToken: []
       parameters:
@@ -1539,7 +1539,7 @@ paths:
         `source_key` may be supplied in the request body or query string. When
         `DASHBOARD_API_TOKEN` is configured, the transport layer requires
         `X-API-Token` on this mutating route. Query-string `token` is legacy
-        local-development compatibility and is rejected in production/live.
+        local-development compatibility and is rejected in production/live or on non-loopback binds.
       security:
         - DashboardApiToken: []
       parameters:
@@ -1576,7 +1576,7 @@ paths:
         `source_key` may be supplied in the request body or query string. When
         `DASHBOARD_API_TOKEN` is configured, the transport layer requires
         `X-API-Token` on this mutating route. Query-string `token` is legacy
-        local-development compatibility and is rejected in production/live.
+        local-development compatibility and is rejected in production/live or on non-loopback binds.
       security:
         - DashboardApiToken: []
       parameters:
@@ -1619,7 +1619,7 @@ paths:
         with retry guidance and stop composite fallback probes. When
         `DASHBOARD_API_TOKEN` is configured, the transport layer requires
         `X-API-Token` on this mutating route. Query-string `token` is legacy
-        local-development compatibility and is rejected in production/live.
+        local-development compatibility and is rejected in production/live or on non-loopback binds.
       security:
         - DashboardApiToken: []
       parameters:
@@ -1781,7 +1781,7 @@ paths:
         activation is blocked until a passing connection test exists for the
         selected broker. When `DASHBOARD_API_TOKEN` is configured, the
         transport layer requires `X-API-Token`. Query-string `token` is legacy
-        local-development compatibility and is rejected in production/live.
+        local-development compatibility and is rejected in production/live or on non-loopback binds.
       security:
         - DashboardApiToken: []
       requestBody:
@@ -1890,7 +1890,7 @@ paths:
       description: |
         Sensitive GET. In production/live or remote-bind deployments the
         transport requires `X-API-Token`, applies rate limiting and audit
-        logging, rejects query-string tokens in production/live, and redacts
+        logging, rejects query-string tokens in production/live or on non-loopback binds, and redacts
         broker/account identifiers in the response.
       security:
         - DashboardApiToken: []
@@ -2003,7 +2003,7 @@ paths:
         intent only when `execution_gate_snapshot()` reports that real trading
         is currently allowed. When `DASHBOARD_API_TOKEN` is configured, the
         transport layer requires `X-API-Token`. Query-string `token` is legacy
-        local-development compatibility and is rejected in production/live.
+        local-development compatibility and is rejected in production/live or on non-loopback binds.
 
         Manual quantity is not stored in `delta_weight`. Successful requests
         persist neutral weight fields and carry quantity under
@@ -2040,7 +2040,7 @@ paths:
         and quantity, and writes a portfolio-order intent instead of mutating
         positions directly. When `DASHBOARD_API_TOKEN` is configured, the
         transport layer requires `X-API-Token`. Query-string `token` is legacy
-        local-development compatibility and is rejected in production/live.
+        local-development compatibility and is rejected in production/live or on non-loopback binds.
 
         Flatten uses the same terminal quantity contract as manual orders:
         neutral weight fields in `portfolio_orders`, positive absolute quantity

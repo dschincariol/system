@@ -171,6 +171,37 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _none_suppression_soft_mult() -> float:
+    value = _safe_float(os.environ.get("EXECUTION_NONE_SUPPRESSION_SOFT_MULT", "0.5"), 0.5)
+    if value <= 0.0:
+        return 0.5
+    return min(float(value), 1.0)
+
+
+def _default_suppression_for_mode(mode: str, execution_mode: str) -> Dict[str, Any]:
+    requested_mode = str(mode or "").strip().lower()
+    canonical_mode = str(execution_mode or "").strip().lower()
+    if requested_mode == "live" or canonical_mode == "live":
+        soft_mult = _none_suppression_soft_mult()
+        _warn_nonfatal(
+            "EXECUTION_POLICY_ENGINE_SUPPRESSION_NONE_LIVE",
+            RuntimeError("trade suppression evaluation returned no state in live mode"),
+            once_key="suppression_none_live",
+            mode=str(mode or "unknown"),
+            execution_mode=str(execution_mode or "unknown"),
+            size_mult=float(soft_mult),
+        )
+        return {
+            "state": "SOFT_THROTTLE",
+            "action": "SOFT_THROTTLE",
+            "size_mult": float(soft_mult),
+            "throttle_mult": float(soft_mult),
+            "hard_block": False,
+            "reason": "suppression_eval_none_conservative_default",
+        }
+    return {"state": "NONE", "action": "NONE", "size_mult": 1.0, "throttle_mult": 1.0, "hard_block": False}
+
+
 def _ensure_tables(con) -> None:
     # The audit table is additive and compatibility-tolerant because policy
     # decisions are long-lived operational evidence across schema revisions.
@@ -734,7 +765,7 @@ def apply_execution_policy(
 
         now_ms = int(now_ms if now_ms is not None else _now_ms())
         resolved_trade_suppression = trade_suppression_fn or evaluate_trade_suppression
-        tse = resolved_trade_suppression(
+        suppression_result = resolved_trade_suppression(
             con=con,
             actor=str(actor or "system"),
             mode=str(mode or "unknown"),
@@ -742,7 +773,12 @@ def apply_execution_policy(
             initialize_storage=bool(initialize_storage),
             now_ms=int(now_ms),
             persist_runtime_state=bool(initialize_storage),
-        ) or {"state": "NONE", "action": "NONE", "size_mult": 1.0, "throttle_mult": 1.0, "hard_block": False}
+        )
+        if suppression_result:
+            tse = suppression_result
+        else:
+            execution_mode = (execution_mode_fn or get_execution_mode)()
+            tse = _default_suppression_for_mode(str(mode or "unknown"), str(execution_mode or "unknown"))
 
         if bool(tse.get("hard_block")):
             for o in payload:

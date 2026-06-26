@@ -256,7 +256,7 @@ FX surfacing is read-only in the browser. The UI displays data that upstream FX 
 
 - Data Sources: FX or OANDA-style feeds are marked with an `FX feed` badge. Use the existing Test Connection action to check connectivity. The test-result panel displays only status, ok, latency, detail, and message fields, never credential values.
 - Positions & Exposure: the dashboard shows FX position count, sleeve gross/net exposure, effective leverage, and lot/unit sizing when those fields are present in `/api/ui/metrics`, `/api/portfolio`, `/api/risk/portfolio`, `/api/broker`, or `/api/terminal/positions`. If FX-05 or FX-06 has not surfaced those fields yet, the tile says `FX data not yet available`.
-- Browser Terminal: FX pairs use pip-aware price formatting, lot-aware quantities, and a 24/5 session label. The session label mirrors FX-04's FX clock defaults: Sunday 22:00 UTC open and Friday 22:00 UTC close unless configured otherwise.
+- Browser Terminal: FX pairs use pip-aware price formatting, lot-aware quantities, and a 24/5 session label. The session label mirrors FX-04's FX clock defaults: a 17:00 America/New_York boundary (Sunday open, Friday close) unless configured otherwise, which renders as roughly 21:00 UTC during US daylight time and 22:00 UTC during US standard time.
 
 The UI must not be used as proof of profitability. Profitability remains a backend governance and backtest-gate question, net of realistic costs.
 
@@ -364,6 +364,12 @@ stop/restart, emergency stop, factory reset, repair/admin actions, secret
 changes, feed restarts, and operator-AI patch apply/rollback ask for a typed phrase, consequence
 acknowledgement, and a reason or hold period where the server contract requires
 one.
+
+In the operator console, Emergency Stop is isolated at the end of the primary
+control rows and rendered as a larger octagonal incident control. Its visual
+shape, icon, size, position, and accessible name distinguish it from routine
+start/restart/stop controls without changing the guarded emergency-stop
+confirmation or server execution path.
 
 The modal is not the authority. Direct calls to the operator sidecar or
 dashboard API must still include the structured confirmation fields
@@ -509,6 +515,19 @@ It is additive to the global kill switch and blocks only the affected model's or
 - `model_intent.should_trade` or timing suppressed entry
 
 Even when the model does want to trade, the runtime can still block or compress the action through risk, execution, or kill-switch controls.
+
+### Portfolio vol: soft-only by default
+
+`PORTFOLIO_RISK_VOL_HARD_BLOCK` is soft-only by default: it defaults to `0.0`,
+which disables the portfolio-vol hard block. With that default, realized
+portfolio vol only scales exposure through vol targeting
+(`PORTFOLIO_RISK_VOL_TARGET`, default `0.020`); it never blocks a batch by
+itself.
+
+To make portfolio vol a hard stop, set `PORTFOLIO_RISK_VOL_HARD_BLOCK` to a
+positive annualized/realized-vol threshold. The block fires when the realized
+portfolio-vol proxy `pv >= threshold`. At the default `0.0`, gross/net caps and
+`PORTFOLIO_RISK_DD_HARD_BLOCK` remain the binding hard stops.
 
 ### Kill-switch effective state precedence
 

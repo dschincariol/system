@@ -8,7 +8,7 @@ staged because the current codebase is not full-repo clean under pyright yet.
 Install the locked dev tools first:
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-dev.txt
 ```
 
 Run the gate from the repo root:

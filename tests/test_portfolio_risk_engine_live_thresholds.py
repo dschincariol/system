@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import json
 
+import pytest
+
 
 class _DrawdownOK:
     ok = True
@@ -26,6 +28,25 @@ def _reload_required_mc_engine(monkeypatch, **env):
     return importlib.reload(portfolio_risk_engine)
 
 
+def _reload_live_overlay_engine(monkeypatch, **env):
+    monkeypatch.setenv("ENGINE_MODE", "live")
+    monkeypatch.setenv("EXECUTION_MODE", "live")
+    monkeypatch.setenv("PORTFOLIO_RISK_USE_MONTE_CARLO", "0")
+    monkeypatch.setenv("PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE", "0")
+    monkeypatch.setenv("PORTFOLIO_RISK_USE_ALPHA_DECAY_THROTTLE", "1")
+    monkeypatch.setenv("PORTFOLIO_RISK_USE_VOL_CAPS", "1")
+    monkeypatch.setenv("PORTFOLIO_RISK_USE_CORR_CLUSTERS", "1")
+    monkeypatch.setenv("PORTFOLIO_RISK_DD_THROTTLE_START", "0.01")
+    monkeypatch.setenv("PORTFOLIO_RISK_DD_THROTTLE_MIN_SCALE", "0.35")
+    monkeypatch.setenv("PORTFOLIO_RISK_VOL_TARGET", "0.02")
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+
+    import engine.risk.portfolio_risk_engine as portfolio_risk_engine
+
+    return importlib.reload(portfolio_risk_engine)
+
+
 def _patch_fast_apply_path(monkeypatch, portfolio_risk_engine):
     captured_state = {}
     monkeypatch.setattr(portfolio_risk_engine, "evaluate_current_drawdown", lambda _con: _DrawdownOK())
@@ -36,6 +57,11 @@ def _patch_fast_apply_path(monkeypatch, portfolio_risk_engine):
     )
     monkeypatch.setattr(portfolio_risk_engine, "_apply_drawdown_throttle", lambda desired, _dd, _info: dict(desired or {}))
     monkeypatch.setattr(portfolio_risk_engine, "_apply_asset_class_budgets", lambda desired, _info: dict(desired or {}))
+    monkeypatch.setattr(portfolio_risk_engine, "_apply_futures_margin_caps", lambda _con, desired, _info: dict(desired or {}))
+    monkeypatch.setattr(portfolio_risk_engine, "_apply_fx_leverage_caps", lambda _con, desired, _info: dict(desired or {}))
+    monkeypatch.setattr(portfolio_risk_engine, "_apply_equity_leverage_caps", lambda _con, desired, _info: dict(desired or {}))
+    monkeypatch.setattr(portfolio_risk_engine, "_apply_crypto_leverage_caps", lambda _con, desired, _info: dict(desired or {}))
+    monkeypatch.setattr(portfolio_risk_engine, "_apply_sector_budgets", lambda _con, desired, _info: dict(desired or {}))
     monkeypatch.setattr(portfolio_risk_engine, "_apply_strategy_budgets", lambda desired, _info: dict(desired or {}))
     monkeypatch.setattr(portfolio_risk_engine, "_apply_alpha_decay_throttle", lambda _con, desired, _info, _now_ms: dict(desired or {}))
     monkeypatch.setattr(portfolio_risk_engine, "_apply_symbol_vol_caps", lambda _con, desired, _info: dict(desired or {}))
@@ -182,3 +208,50 @@ def test_monte_carlo_cvar_thresholds_block_when_tail_losses_breach(monkeypatch):
     assert "monte_carlo_cvar_95_block" in reason_types
     assert "monte_carlo_cvar_99_block" in reason_types
     _assert_apply_blocks_for_mc_reason(monkeypatch, portfolio_risk_engine, "monte_carlo_cvar_95_block", now_ms)
+
+
+@pytest.mark.parametrize(
+    ("overlay_name", "function_name"),
+    [
+        ("drawdown_throttle", "_apply_drawdown_throttle"),
+        ("alpha_decay_throttle", "_apply_alpha_decay_throttle"),
+        ("symbol_vol_caps", "_apply_symbol_vol_caps"),
+        ("corr_cluster_caps", "_apply_corr_cluster_caps"),
+        ("portfolio_vol_target", "_apply_portfolio_vol_target"),
+    ],
+)
+def test_live_enabled_overlay_failure_blocks_portfolio_risk_state(monkeypatch, overlay_name, function_name):
+    portfolio_risk_engine = _reload_live_overlay_engine(monkeypatch)
+    captured_state = _patch_fast_apply_path(monkeypatch, portfolio_risk_engine)
+    now_ms = 1_700_000_000_000
+    desired = {"AAPL": {"symbol": "AAPL", "weight": 0.10, "side": "LONG", "reason": {}}}
+
+    def _raise_overlay_failure(*_args, **_kwargs):
+        raise RuntimeError(f"{overlay_name} injected failure")
+
+    monkeypatch.setattr(portfolio_risk_engine, function_name, _raise_overlay_failure)
+
+    _out, info = portfolio_risk_engine.apply_portfolio_risk_engine(None, desired, {}, now_ms=now_ms)
+
+    assert info["blocked"] is True
+    assert info["overlay_failed"] == overlay_name
+    assert info["block_reason"]["type"] == "required_overlay_failed"
+    assert info["block_reason"]["overlay"] == overlay_name
+    assert info["post_checks"]["required_overlays_ok"] is False
+    assert captured_state["portfolio_risk_block"] == "1"
+    failures = list(info.get("required_overlay_failures") or [])
+    assert any(str(row.get("name") or "") == overlay_name for row in failures)
+
+
+def test_live_enabled_overlay_success_path_remains_clear(monkeypatch):
+    portfolio_risk_engine = _reload_live_overlay_engine(monkeypatch)
+    captured_state = _patch_fast_apply_path(monkeypatch, portfolio_risk_engine)
+    now_ms = 1_700_000_000_000
+    desired = {"AAPL": {"symbol": "AAPL", "weight": 0.10, "side": "LONG", "reason": {}}}
+
+    out, info = portfolio_risk_engine.apply_portfolio_risk_engine(None, desired, {}, now_ms=now_ms)
+
+    assert info["blocked"] is False
+    assert "overlay_failed" not in info
+    assert captured_state["portfolio_risk_block"] == "0"
+    assert out["AAPL"]["weight"] == pytest.approx(0.10)

@@ -89,6 +89,36 @@ def test_registry_failure_forces_final_snapshot_fail_closed(monkeypatch):
     assert snapshot["data_flow_ok"] is False
 
 
+def test_critical_disk_pressure_blocks_final_health_in_paper_mode(monkeypatch):
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    monkeypatch.setattr(health, "_lc_get_state", lambda: {"state": "PAPER", "detail": ""})
+    out = _healthy_minimal_payload()
+    out["disk_pressure"] = {
+        "ok": False,
+        "status": "critical",
+        "critical": ["root:disk_critical:free_bytes=1024:free_pct=0.01"],
+        "warnings": [],
+        "paths": [
+            {
+                "label": "root",
+                "critical": True,
+                "detail": "disk_critical:free_bytes=1024:free_pct=0.01",
+            }
+        ],
+    }
+    ctx = health.HealthSnapshotContext(con=object(), now_ms=123, out=out)
+
+    snapshot = health._finalize_health_snapshot(ctx)
+
+    assert snapshot["ok"] is False
+    assert snapshot["startup"]["disk_pressure_ok"] is False
+    assert "disk_pressure_critical" in snapshot["reasons"]
+    assert "disk_pressure:root:disk_critical:free_bytes=1024:free_pct=0.01" in snapshot["reasons"]
+    assert "disk_pressure_critical" in snapshot["critical_blockers"]
+    assert "disk_pressure:root:disk_critical:free_bytes=1024:free_pct=0.01" in snapshot["critical_blockers"]
+    assert snapshot["data_flow_ok"] is False
+
+
 def test_get_health_snapshot_uses_registered_checks_and_closes_connection(monkeypatch):
     fake_con = _FakeConnection()
 

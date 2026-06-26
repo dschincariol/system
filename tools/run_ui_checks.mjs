@@ -24,6 +24,7 @@ const NODE_TESTS = [
   "tests/test_decision_attribution.mjs",
   "tests/test_health_score.mjs",
   "tests/test_operator_overview.mjs",
+  "tests/test_operator_ui_crash_resilience.mjs",
   "tests/test_market_stress_ui.mjs",
   "tests/test_news_sentiment_ui.mjs",
   "tests/test_data_health_ui.mjs",

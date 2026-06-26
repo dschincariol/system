@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.runtime_graph_check import (
     _VALIDATION_DATA_SOURCE_MASTER_KEY,
+    _check_python_file,
     _collect_entrypoint_imports,
     _embedded_startup_validation_error,
     _run_cold_boot_db_bootstrap_check,
@@ -175,6 +176,31 @@ class RuntimeGraphCheckTests(unittest.TestCase):
         self.assertNotIn("start_ingestion", modules)
         self.assertNotIn("start_system", modules)
         self.assertNotIn("engine.app", modules)
+
+    def test_check_python_file_uses_temp_bytecode_for_read_only_source_tree(self) -> None:
+        import stat
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entrypoint = root / "entrypoint.py"
+            entrypoint.write_text("VALUE = 1\n", encoding="utf-8")
+            previous_modes = {
+                root: stat.S_IMODE(root.stat().st_mode),
+                entrypoint: stat.S_IMODE(entrypoint.stat().st_mode),
+            }
+            try:
+                entrypoint.chmod(0o444)
+                root.chmod(0o555)
+                errors: list[tuple[str, str, str]] = []
+
+                _check_python_file("entrypoint.py", str(entrypoint), errors)
+
+                self.assertEqual(errors, [])
+                self.assertFalse((root / "__pycache__").exists())
+            finally:
+                root.chmod(previous_modes[root])
+                entrypoint.chmod(previous_modes[entrypoint])
 
     def test_startup_bootstrap_uses_sqlite_backend_by_default(self) -> None:
         with patch.dict(

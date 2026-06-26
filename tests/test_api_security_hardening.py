@@ -1077,6 +1077,62 @@ def test_sensitive_get_rejects_query_string_token_in_production(tmp_path: Path, 
             assert body["error"] == "query_token_forbidden"
 
 
+def test_http_transport_query_string_token_rejected_on_remote_bind_but_header_and_loopback_work(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ENGINE_MODE", "safe")
+    monkeypatch.setenv("EXECUTION_MODE", "safe")
+    monkeypatch.delenv("TS_ENV", raising=False)
+    monkeypatch.delenv("NODE_ENV", raising=False)
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.delenv("PROD_LOCK", raising=False)
+    token = "remote-bind-token-1234567890"
+    monkeypatch.setenv("DASHBOARD_API_TOKEN", token)
+
+    routes = [("POST", "/api/test/protected", "protected")]
+    handlers = {"protected": lambda _parsed=None, _body=None, _ctx=None: {"ok": True}}
+
+    monkeypatch.setenv("DASHBOARD_HOST", "0.0.0.0")
+    remote_handler_cls = _build_handler(
+        routes=routes,
+        handlers=handlers,
+        token=token,
+        static_dir=tmp_path,
+    )
+    with _http_server(remote_handler_cls) as base_url:
+        try:
+            _post_json(f"{base_url}/api/test/protected?token={quote(token, safe='')}")
+            raise AssertionError("remote-bind query-string token unexpectedly authenticated")
+        except HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 401
+            assert body["error"] == "query_token_forbidden"
+            assert body["reason"] == "query_string_token_authentication_rejected_on_non_loopback_bind"
+
+        status, _headers, body = _post_json(
+            f"{base_url}/api/test/protected",
+            token=token,
+        )
+        assert status == 200
+        assert body["ok"] is True
+
+    monkeypatch.setenv("DASHBOARD_HOST", "127.0.0.1")
+    loopback_handler_cls = _build_handler(
+        routes=routes,
+        handlers=handlers,
+        token=token,
+        static_dir=tmp_path,
+    )
+    with _http_server(loopback_handler_cls) as base_url:
+        status, _headers, body = _post_json(
+            f"{base_url}/api/test/protected?token={quote(token, safe='')}"
+        )
+        assert status == 200
+        assert body["ok"] is True
+
+
 def test_sensitive_get_requires_dashboard_token_on_remote_bind(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ENV", "dev")
     monkeypatch.setenv("ENGINE_MODE", "safe")

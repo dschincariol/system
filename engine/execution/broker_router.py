@@ -97,7 +97,11 @@ except Exception as e:
     _import_nonfatal("BROKER_ROUTER_EXECUTION_MODE_WRAPPER_IMPORT_FAILED", e)
     _get_execution_mode = None  # type: ignore
 
-_read_execution_health = None  # type: ignore
+try:
+    from engine.cache.wrappers.execution_health import read_execution_health as _read_execution_health  # type: ignore
+except Exception as e:
+    _import_nonfatal("BROKER_ROUTER_EXECUTION_HEALTH_WRAPPER_IMPORT_FAILED", e)
+    _read_execution_health = None  # type: ignore
 
 # Best-effort DB access for realized slippage distribution
 try:
@@ -467,16 +471,31 @@ def _jobs_from_db_snapshot() -> List[Dict[str, Any]]:
 
 def _execution_degraded_from_cache() -> Dict[str, Any]:
     if _read_execution_health is None:
-        return {"active": False, "detail": {}}
+        return {
+            "active": True,
+            "severity": "WARNING",
+            "reason": "execution_health_reader_unavailable",
+            "reason_codes": ["execution_health_reader_unavailable"],
+            "detail": {},
+        }
     try:
-        health = _read_execution_health() or {}
+        health = _read_execution_health()
     except Exception as e:
         _warn_nonfatal(
             "BROKER_ROUTER_EXECUTION_HEALTH_CACHE_READ_FAILED",
             e,
             once_key="execution_health_cache_read",
         )
-        return {"active": False, "detail": {}}
+        return {
+            "active": True,
+            "severity": "WARNING",
+            "reason": "execution_health_read_failed",
+            "reason_codes": ["execution_health_read_failed"],
+            "detail": {},
+        }
+    # None means the execution-health cache/DB has no row primed yet; treat it
+    # as quiet rather than degrading a freshly started system.
+    health = health or {}
     state = str(health.get("state") or health.get("status") or "").strip().lower()
     if state not in {"critical", "degraded", "down", "unhealthy"}:
         return {"active": False, "detail": dict(health or {})}
@@ -894,9 +913,29 @@ def _prefer_fx_capable_broker(chain: List[str], orders: Optional[List[dict]]) ->
     return [fx_broker] + [name for name in ordered if canonical_broker_name(name) != fx_broker]
 
 
-def _fx_order_safety_block(chain: List[str], orders: Optional[List[dict]]) -> Optional[Dict[str, Any]]:
+def _fx_order_safety_block(
+    chain: List[str],
+    orders: Optional[List[dict]],
+    *,
+    dry_run: bool = False,
+) -> Optional[Dict[str, Any]]:
     if not _batch_has_fx(orders):
         return None
+    normalized_chain = [canonical_broker_name(name) for name in list(chain or [])]
+    if (
+        not bool(dry_run)
+        and any(name in LIVE_BROKERS for name in normalized_chain)
+        and not _env_bool("FX_LIVE_TRADING_ENABLED", False)
+    ):
+        return {
+            "ok": False,
+            "status": "fx_live_trading_disabled_by_default",
+            "reason": "fx_live_trading_disabled_by_default",
+            "broker": "failover_chain",
+            "stop_failover": True,
+            "retryable": False,
+            "env": {"FX_LIVE_TRADING_ENABLED": str(os.environ.get("FX_LIVE_TRADING_ENABLED", "0") or "0")},
+        }
     fx_broker = _fx_capable_broker(chain)
     if fx_broker:
         return None
@@ -951,6 +990,29 @@ def _batch_has_crypto(orders: Optional[List[dict]]) -> bool:
         if _is_crypto_order_symbol(str(order.get("symbol") or "")):
             return True
     return False
+
+
+def _crypto_order_safety_block(
+    orders: Optional[List[dict]],
+    *,
+    dry_run: bool,
+    chain: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    if bool(dry_run) or not _batch_has_crypto(orders):
+        return None
+
+    normalized_chain = [canonical_broker_name(name) for name in list(chain or [])]
+    if any(name in LIVE_BROKERS for name in normalized_chain) and not _env_bool("CRYPTO_LIVE_TRADING_ENABLED", False):
+        return {
+            "ok": False,
+            "status": "crypto_live_disabled",
+            "reason": "crypto_live_trading_disabled_by_default",
+            "broker": "failover_chain",
+            "stop_failover": True,
+            "retryable": False,
+            "env": {"CRYPTO_LIVE_TRADING_ENABLED": str(os.environ.get("CRYPTO_LIVE_TRADING_ENABLED", "0") or "0")},
+        }
+    return None
 
 
 def _crypto_capable_broker(chain: List[str]) -> Optional[str]:
@@ -1626,6 +1688,24 @@ def _apply_one(
             futures_block["broker"] = name
             return futures_block
 
+        crypto_block = _crypto_order_safety_block(
+            override_orders,
+            dry_run=bool(dry_run),
+            chain=[name],
+        )
+        if crypto_block is not None:
+            crypto_block["broker"] = name
+            return crypto_block
+
+        fx_block = _fx_order_safety_block(
+            [name],
+            override_orders,
+            dry_run=bool(dry_run),
+        )
+        if fx_block is not None:
+            fx_block["broker"] = name
+            return fx_block
+
     # Pre-live reconcile gate (never blocks dry_run)
     if is_live and (not bool(dry_run)):
         reconcile_block = _prelive_reconcile_or_block(
@@ -1886,7 +1966,16 @@ def apply_new_portfolio_orders_router(
         futures_block["failover_attempts"] = []
         return futures_block
 
-    fx_block = _fx_order_safety_block(chain, override_orders)
+    crypto_block = _crypto_order_safety_block(
+        override_orders,
+        dry_run=bool(dry_run),
+        chain=chain,
+    )
+    if crypto_block is not None:
+        crypto_block["failover_attempts"] = []
+        return crypto_block
+
+    fx_block = _fx_order_safety_block(chain, override_orders, dry_run=bool(dry_run))
     if fx_block is not None:
         return fx_block
 

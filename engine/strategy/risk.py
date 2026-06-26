@@ -154,6 +154,21 @@ def _logrets_from_prices(con, symbol: str, lookback: int = 240):
   return rets
 
 def corr_from_prices(con, a: str, b: str, lookback: int = 240):
+  try:
+    from engine.risk.covariance import correlation_for_pair
+
+    corr = correlation_for_pair(con, a, b, lookback=int(lookback))
+    if corr is not None:
+      return float(corr)
+  except Exception as e:
+    _warn_nonfatal(
+        "STRATEGY_RISK_COVARIANCE_CORR_FAILED",
+        e,
+        once_key=f"covariance_corr:{a}:{b}",
+        left_symbol=str(a),
+        right_symbol=str(b),
+    )
+
   ra = _logrets_from_prices(con, a, lookback=lookback)
   rb = _logrets_from_prices(con, b, lookback=lookback)
   if not ra or not rb:
@@ -180,16 +195,40 @@ def portfolio_realized_vol(
   desired: Dict[str, Dict[str, Any]],
   lookback: int = VOL_LOOKBACK,
 ) -> Optional[float]:
-  items = []
+  active_weights: Dict[str, float] = {}
   for sym, tgt in (desired or {}).items():
     sw = _signed_weight_from_target(tgt)
     if abs(float(sw)) <= 1e-12:
       continue
+    active_weights[str(sym)] = float(sw)
 
+  if not active_weights:
+    return None
+
+  # Preserve the established single-asset path exactly: it uses the existing
+  # realized-vol floors/ceilings and skips missing histories.
+  if len(active_weights) == 1:
+    sym, sw = next(iter(active_weights.items()))
+    vol = realized_vol_from_prices(con, str(sym), lookback=int(lookback))
+    if vol is None:
+      return None
+    return float(abs(float(sw)) * float(vol))
+
+  try:
+    from engine.risk.covariance import estimate_covariance, portfolio_volatility_from_estimate
+
+    estimate = estimate_covariance(con, list(active_weights.keys()), lookback=int(lookback))
+    pv = portfolio_volatility_from_estimate(estimate, active_weights)
+    if pv is not None:
+      return float(pv)
+  except Exception as e:
+    _warn_nonfatal("STRATEGY_RISK_COVARIANCE_PORTFOLIO_VOL_FAILED", e, once_key="covariance_portfolio_vol")
+
+  items = []
+  for sym, sw in active_weights.items():
     vol = realized_vol_from_prices(con, str(sym), lookback=int(lookback))
     if vol is None:
       continue
-
     items.append((str(sym), float(sw), float(vol)))
 
   n = len(items)

@@ -2743,7 +2743,7 @@ def _check_memory_pressure(ctx: HealthSnapshotContext) -> None:
     _trace_section(
         "memory_pressure",
         section_started,
-        ok=bool((out.get("memory_pressure") or {}).get("ok", True)),
+        ok=bool((out.get("memory_pressure") or {}).get("ok", False)),
     )
 
 
@@ -2766,7 +2766,7 @@ def _check_effective_runtime_state(ctx: HealthSnapshotContext) -> None:
     _trace_section(
         "effective_runtime_state",
         section_started,
-        ok=bool((out.get("effective_runtime_state") or {}).get("ok", True)),
+        ok=bool((out.get("effective_runtime_state") or {}).get("ok", False)),
     )
 
 
@@ -2834,7 +2834,7 @@ def _check_storage_wal_guards(ctx: HealthSnapshotContext) -> None:
     _trace_section(
         "storage_wal_guards",
         section_started,
-        ok=bool((out.get("storage_wal_guards") or {}).get("ok", True)),
+        ok=bool((out.get("storage_wal_guards") or {}).get("ok", False)),
     )
 
 
@@ -3537,6 +3537,7 @@ def _check_provider_health(ctx: HealthSnapshotContext) -> None:
         raw_healthy_n = 0
         live_healthy_n = 0
         simulated_healthy_n = 0
+        fallback_healthy_n = 0
         missing_env_vars: List[str] = []
         for provider_name, provider_info in list(providers.items()):
             if not isinstance(provider_info, dict):
@@ -3563,6 +3564,8 @@ def _check_provider_health(ctx: HealthSnapshotContext) -> None:
                 live_healthy_n += 1
             elif raw_ok and bool(truth.get("simulated")):
                 simulated_healthy_n += 1
+            elif raw_ok and bool(truth.get("fallback_not_live")):
+                fallback_healthy_n += 1
         missing_env_vars = list(dict.fromkeys(missing_env_vars))
 
         out["providers"] = {
@@ -3570,12 +3573,15 @@ def _check_provider_health(ctx: HealthSnapshotContext) -> None:
             "healthy": live_healthy_n,
             "raw_healthy": raw_healthy_n,
             "simulated_healthy": simulated_healthy_n,
+            "fallback_healthy": fallback_healthy_n,
             "total": len(providers),
             "active_provider": str(meta_get("price_provider_active", "") or ""),
             "by_provider": providers,
             "live_market_data_ok": live_healthy_n > 0 and not missing_env_vars,
             "live_feed_status": "live" if live_healthy_n > 0 and not missing_env_vars else (
-                "missing_credentials" if missing_env_vars else ("simulated" if simulated_healthy_n > 0 else "degraded")
+                "missing_credentials" if missing_env_vars else (
+                    "simulated" if simulated_healthy_n > 0 else ("fallback" if fallback_healthy_n > 0 else "degraded")
+                )
             ),
             "missing_credential_env_vars": missing_env_vars,
         }
@@ -3816,7 +3822,7 @@ def _check_model_serving(ctx: HealthSnapshotContext) -> None:
             "fallback_rate": 0.0,
             "detail": f"model_serving_error:{type(e).__name__}:{e}",
         }
-    _trace_section("model_serving", section_started, ok=bool((out.get("model_serving") or {}).get("ok", True)))
+    _trace_section("model_serving", section_started, ok=bool((out.get("model_serving") or {}).get("ok", False)))
 
 
 def _check_alert_lifecycle(ctx: HealthSnapshotContext) -> None:
@@ -3836,7 +3842,7 @@ def _check_alert_lifecycle(ctx: HealthSnapshotContext) -> None:
             "expired_unconsumed_count": 0,
             "detail": f"alert_lifecycle_error:{type(e).__name__}:{e}",
         }
-    _trace_section("alert_lifecycle", section_started, ok=bool((out.get("alert_lifecycle") or {}).get("ok", True)))
+    _trace_section("alert_lifecycle", section_started, ok=bool((out.get("alert_lifecycle") or {}).get("ok", False)))
 
 
 def _check_execution_supervisor(ctx: HealthSnapshotContext) -> None:
@@ -4516,6 +4522,17 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
     memory_pressure = dict(out.get("memory_pressure") or {})
     memory_pressure_required = bool(memory_pressure.get("required"))
     memory_pressure_ok = bool((not memory_pressure_required) or memory_pressure.get("ok", True))
+    disk_pressure = dict(out.get("disk_pressure") or {})
+    disk_pressure_critical = bool(disk_pressure.get("critical")) or str(
+        disk_pressure.get("status") or ""
+    ).strip().lower() == "critical"
+    if not disk_pressure_critical:
+        disk_pressure_critical = any(
+            bool(item.get("critical"))
+            for item in list(disk_pressure.get("paths") or [])
+            if isinstance(item, dict)
+        )
+    disk_pressure_ok = not disk_pressure_critical
     effective_runtime_state = dict(out.get("effective_runtime_state") or {})
     effective_runtime_required = bool(effective_runtime_state.get("required"))
     effective_runtime_ok = bool((not effective_runtime_required) or effective_runtime_state.get("ok", True))
@@ -4610,6 +4627,7 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         "execution_degraded": execution_degraded_active,
         "startup_validation_ok": startup_validation_ok,
         "memory_pressure_ok": memory_pressure_ok,
+        "disk_pressure_ok": disk_pressure_ok,
         "effective_runtime_state_ok": effective_runtime_ok,
         "storage_wal_guards_ok": storage_wal_guards_ok,
         "ingestion_soak_ok": ingestion_soak_ok,
@@ -4680,6 +4698,9 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
     if not memory_pressure_ok:
         out["reasons"].append("memory_pressure_not_ok")
         out["reasons"].extend([f"memory_pressure:{item}" for item in list(memory_pressure.get("errors") or [])])
+    if not disk_pressure_ok:
+        out["reasons"].append("disk_pressure_critical")
+        out["reasons"].extend([f"disk_pressure:{item}" for item in list(disk_pressure.get("critical") or [])])
     if not effective_runtime_ok:
         out["reasons"].append("effective_runtime_state_not_ok")
         out["reasons"].extend([f"effective_runtime_state:{item}" for item in list(effective_runtime_state.get("errors") or [])])
@@ -4738,6 +4759,7 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
             startup_ok
             and startup_validation_ok
             and memory_pressure_ok
+            and disk_pressure_ok
             and effective_runtime_ok
             and storage_wal_guards_ok
             and ingestion_soak_ok
@@ -4759,6 +4781,7 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
             startup_ok
             and startup_validation_ok
             and memory_pressure_ok
+            and disk_pressure_ok
             and effective_runtime_ok
             and storage_wal_guards_ok
             and ingestion_soak_ok
@@ -4778,6 +4801,7 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
             startup_ok
             and startup_validation_ok
             and memory_pressure_ok
+            and disk_pressure_ok
             and effective_runtime_ok
             and storage_wal_guards_ok
             and ingestion_soak_ok
@@ -4863,6 +4887,9 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
     if not memory_pressure_ok:
         critical_blockers.append("memory_pressure_not_ok")
         critical_blockers.extend([f"memory_pressure:{item}" for item in list(memory_pressure.get("errors") or [])])
+    if not disk_pressure_ok:
+        critical_blockers.append("disk_pressure_critical")
+        critical_blockers.extend([f"disk_pressure:{item}" for item in list(disk_pressure.get("critical") or [])])
     if not effective_runtime_ok:
         critical_blockers.append("effective_runtime_state_not_ok")
         critical_blockers.extend([f"effective_runtime_state:{item}" for item in list(effective_runtime_state.get("errors") or [])])
@@ -4909,6 +4936,7 @@ def _finalize_health_snapshot(ctx: HealthSnapshotContext) -> Dict[str, Any]:
         and bool((out.get("attribution") or {}).get("ok"))
         and (mode_name not in ("shadow", "live") or bool((out.get("competition") or {}).get("ok")))
         and memory_pressure_ok
+        and disk_pressure_ok
         and effective_runtime_ok
         and storage_wal_guards_ok
         and ingestion_soak_ok

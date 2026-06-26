@@ -14,7 +14,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from engine.data.asset_map import asset_class_for_symbol
 from engine.data.futures_instrument import parse_futures_symbol
 from engine.data.weather_features import get_weather_feature_snapshot
+from engine.risk.notional_backstop import BACKSTOP_ENABLED
 from engine.runtime.failure_diagnostics import log_failure
+from engine.runtime.live_execution_control import live_execution_disabled
 from engine.runtime.storage import table_exists
 from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.strategy.crypto_sizing import normalize_crypto_symbol
@@ -1357,7 +1359,23 @@ def apply_portfolio_risk_gate(
     Returns (desired_clamped, gate_info)
     """
     if not USE:
-        return desired, {"enabled": False}
+        try:
+            is_live = not live_execution_disabled()
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_RISK_GATE_LIVE_STATUS_READ_FAILED", e, once_key="disable_live_status")
+            is_live = True
+        blocked = bool(is_live and not BACKSTOP_ENABLED)
+        return desired, {
+            "enabled": False,
+            "blocked": bool(blocked),
+            "is_live": bool(is_live),
+            "notional_backstop_enabled": bool(BACKSTOP_ENABLED),
+            "status": (
+                "risk_gate_disabled_live"
+                if blocked
+                else ("disabled_backstop_expected" if bool(is_live and BACKSTOP_ENABLED) else "disabled")
+            ),
+        }
 
     out = dict(desired or {})
     info: Dict[str, Any] = {"enabled": True}

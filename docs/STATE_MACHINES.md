@@ -274,7 +274,6 @@ Promotion is also globally gated by `engine.strategy.promotion_guard.promotion_a
 - `equity_drift_crit`
 - `drift_ratio`
 - `negative_real_pnl_models`
-- generated-candidate `experiment_ledger` failures when `PROMOTION_EXPERIMENT_LEDGER_REQUIRED=1`
 
 ## 5. Operator Autofix And Patch Gating
 
@@ -308,7 +307,7 @@ flowchart TD
     B --> C[preview response]
 
     D[POST /api/operator/ai/apply_patch] --> E{confirm is APPLY_PATCH?}
-    E -->|no| E1[block apply_patch_confirmation_required]
+    E -->|no| E1[block confirmation_required token APPLY_PATCH]
     E -->|yes| F{state.lastMode is not live?}
     F -->|no| F1[block apply_patch_blocked_in_live_mode]
     F -->|yes| G{analysis has file and patch object?}
@@ -320,7 +319,7 @@ flowchart TD
     J --> K[return applied patch info]
 
     L[POST /api/operator/ai/rollback_patch] --> M{confirm == ROLLBACK_PATCH?}
-    M -->|no| M1[block rollback_patch_confirmation_required]
+    M -->|no| M1[block confirmation_required token ROLLBACK_PATCH]
     M -->|yes| N[rollbackAiPatch(patchId)]
     N --> O[restore backup file]
 ```

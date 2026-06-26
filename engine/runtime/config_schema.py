@@ -44,6 +44,7 @@ _PLACEHOLDER_VALUES = {
 
 _LIVE_RISK_REQUIRED_ENABLED_FLAGS = (
     "PORTFOLIO_USE_RISK_ENGINE",
+    "PORTFOLIO_NOTIONAL_BACKSTOP",
     "PORTFOLIO_RISK_USE_MONTE_CARLO",
     "PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE",
     "MODEL_AWARE_KILL_SWITCH",
@@ -76,9 +77,30 @@ _CPU_FIRST_DEVICE_ENV_KEYS = (
     "NLP_DEVICE",
     "FINBERT_DEVICE",
     "TS_FOUNDATION_DEVICE",
+    "TSFM_BENCHMARK_DEVICE",
 )
 _DEVICE_VALUE_PREFIXES = ("cuda:",)
-_DEVICE_VALUE_EXACT = {"cpu", "cuda", "auto"}
+_DEVICE_VALUE_EXACT = {"cpu", "cuda", "auto", "rocm", "hip", "amd", "amd-rocm", "amd_rocm"}
+_TSFM_ALLOWED_BACKENDS = {"chronos", "timesfm", "moirai", "toto", "fake"}
+_NLP_EMBED_ALLOWED_BACKENDS = {
+    "current",
+    "default",
+    "finbert",
+    "nlp_finbert",
+    "sentence_transformer",
+    "sentence-transformer",
+    "sbert",
+    "st",
+    "financial_sentence_transformer",
+    "financial-sentence-transformer",
+    "finance",
+    "fin_e5",
+    "openai",
+    "api",
+    "openai_api",
+    "hashing",
+    "hash",
+}
 
 
 def _req(name: str) -> str:
@@ -571,13 +593,19 @@ def _validate_new_subsystem_flags() -> None:
             raise ConfigError(f"{n_jobs_key} must be >= 1")
 
     ts_foundation_backend = _opt("TS_FOUNDATION_BACKEND", "chronos").lower() or "chronos"
-    if ts_foundation_backend not in {"chronos"}:
+    if ts_foundation_backend not in _TSFM_ALLOWED_BACKENDS:
         raise ConfigError(f"Invalid TS_FOUNDATION_BACKEND: {ts_foundation_backend}")
-    if not _opt("TS_FOUNDATION_CHRONOS_MODEL_ID", _opt("TS_FOUNDATION_MODEL_ID", "amazon/chronos-2")).strip():
+    if ts_foundation_backend == "chronos" and not _opt(
+        "TS_FOUNDATION_CHRONOS_MODEL_ID",
+        _opt("TS_FOUNDATION_MODEL_ID", "amazon/chronos-2"),
+    ).strip():
         raise ConfigError("TS_FOUNDATION_CHRONOS_MODEL_ID must be non-empty")
     ts_foundation_dim = _opt_int("TS_FOUNDATION_EMBEDDING_DIM", 16)
     if ts_foundation_dim < 1 or ts_foundation_dim > 512:
         raise ConfigError("TS_FOUNDATION_EMBEDDING_DIM must be between 1 and 512")
+    tsfm_benchmark_dim = _opt_int("TSFM_BENCHMARK_EMBEDDING_DIM", ts_foundation_dim)
+    if tsfm_benchmark_dim < 1 or tsfm_benchmark_dim > 512:
+        raise ConfigError("TSFM_BENCHMARK_EMBEDDING_DIM must be between 1 and 512")
     ts_foundation_context_rows = _opt_int("TS_FOUNDATION_CONTEXT_ROWS", 256)
     ts_foundation_min_context_rows = _opt_int("TS_FOUNDATION_MIN_CONTEXT_ROWS", 32)
     if ts_foundation_context_rows < 16:
@@ -586,6 +614,25 @@ def _validate_new_subsystem_flags() -> None:
         raise ConfigError("TS_FOUNDATION_MIN_CONTEXT_ROWS must be >= 4")
     if ts_foundation_min_context_rows > ts_foundation_context_rows:
         raise ConfigError("TS_FOUNDATION_MIN_CONTEXT_ROWS must be <= TS_FOUNDATION_CONTEXT_ROWS")
+    tsfm_benchmark_context_rows = _opt_int("TSFM_BENCHMARK_CONTEXT_ROWS", ts_foundation_context_rows)
+    tsfm_benchmark_min_context_rows = _opt_int("TSFM_BENCHMARK_MIN_CONTEXT_ROWS", min(16, tsfm_benchmark_context_rows))
+    tsfm_benchmark_horizon_rows = _opt_int("TSFM_BENCHMARK_HORIZON_ROWS", 1)
+    if tsfm_benchmark_context_rows < 4:
+        raise ConfigError("TSFM_BENCHMARK_CONTEXT_ROWS must be >= 4")
+    if tsfm_benchmark_min_context_rows < 2:
+        raise ConfigError("TSFM_BENCHMARK_MIN_CONTEXT_ROWS must be >= 2")
+    if tsfm_benchmark_min_context_rows > tsfm_benchmark_context_rows:
+        raise ConfigError("TSFM_BENCHMARK_MIN_CONTEXT_ROWS must be <= TSFM_BENCHMARK_CONTEXT_ROWS")
+    if tsfm_benchmark_horizon_rows < 1:
+        raise ConfigError("TSFM_BENCHMARK_HORIZON_ROWS must be >= 1")
+    if _opt_int("TSFM_BENCHMARK_MAX_EVAL_POINTS", 100) < 1:
+        raise ConfigError("TSFM_BENCHMARK_MAX_EVAL_POINTS must be >= 1")
+    tsfm_benchmark_fallback = _opt("TSFM_BENCHMARK_FALLBACK", "skip").lower() or "skip"
+    if tsfm_benchmark_fallback not in {"skip", "fake"}:
+        raise ConfigError(f"Invalid TSFM_BENCHMARK_FALLBACK: {tsfm_benchmark_fallback}")
+    for backend in [part.strip().lower() for part in _opt("TSFM_BENCHMARK_BACKENDS", ts_foundation_backend).split(",") if part.strip()]:
+        if backend not in _TSFM_ALLOWED_BACKENDS:
+            raise ConfigError(f"Invalid TSFM_BENCHMARK_BACKENDS backend: {backend}")
     graph_max_neighbors = _opt_int("GRAPH_RELATIONAL_MAX_NEIGHBORS", 24)
     if graph_max_neighbors < 1 or graph_max_neighbors > 512:
         raise ConfigError("GRAPH_RELATIONAL_MAX_NEIGHBORS must be between 1 and 512")
@@ -604,6 +651,15 @@ def _validate_new_subsystem_flags() -> None:
         raise ConfigError("FINBERT_BATCH_SIZE must be >= 1")
     if _opt_int("FINBERT_MAX_TEXT_LEN", 4000) < 64:
         raise ConfigError("FINBERT_MAX_TEXT_LEN must be >= 64")
+    for key in ("NEWS_EMBED_BACKEND", "NLP_EMBED_BACKEND"):
+        backend = _opt(key, "current" if key == "NEWS_EMBED_BACKEND" else "sentence_transformer").strip().lower()
+        if backend and backend not in _NLP_EMBED_ALLOWED_BACKENDS:
+            raise ConfigError(f"Invalid {key}: {backend}")
+    fallback_policy = _opt("NEWS_EMBED_FALLBACK_POLICY", _opt("NLP_EMBED_FALLBACK_POLICY", "skip")).strip().lower()
+    if fallback_policy not in {"skip", "hashing", "hash", "zero", "zeros", "raise"}:
+        raise ConfigError(f"Invalid NEWS_EMBED_FALLBACK_POLICY: {fallback_policy}")
+    if _opt_int("NEWS_EMBED_HASHING_DIM", _opt_int("NLP_HASHING_EMBED_DIM", 128)) < 1:
+        raise ConfigError("NEWS_EMBED_HASHING_DIM must be >= 1")
 
     if _opt_int("DRIFT_RETRAIN_COOLDOWN_S", 6 * 60 * 60) < 0:
         raise ConfigError("DRIFT_RETRAIN_COOLDOWN_S must be >= 0")

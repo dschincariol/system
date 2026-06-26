@@ -87,7 +87,7 @@ The `ui/` directory contains browser assets served by the dashboard server.
 - [fx_format.js](fx_format.js)
   Pure display helpers for FX pairs. They mirror FX-02's accepted pair spellings for browser formatting only, providing pip-aware prices, pip-distance text, and lot/unit quantity rendering without DOM, network, or credential access.
 - [fx_session.js](fx_session.js)
-  Pure browser-side mirror of FX-04's 24/5 session boundary model. The default presentation calendar opens Sunday 22:00 UTC and closes Friday 22:00 UTC, with override knobs so the UI can be pinned to backend FX-clock settings.
+  Pure browser-side mirror of FX-04's 24/5 session boundary model. The default presentation calendar opens Sunday 17:00 and closes Friday 17:00 in America/New_York local time, with UTC override knobs so the UI can be pinned to backend FX-clock settings.
 - [portfolio.js](portfolio.js)
   Portfolio panel rendering and portfolio-specific dashboard helpers.
 - [bullet_bars.js](bullet_bars.js)
@@ -99,6 +99,7 @@ The `ui/` directory contains browser assets served by the dashboard server.
 - [risk_charts.js](risk_charts.js)
   Lazy-loaded risk, Monte-Carlo, alpha-decay, and regime-history chart renderers for the Positions & Exposure surface.
   Monte-Carlo rendering consumes `/api/risk/monte_carlo` summary metrics, `fan` percentile rows, and final-return `distribution` buckets. When the backend exposes only a legacy summary payload, the fan and distribution canvases are hidden and replaced with explicit unavailable notes.
+  VaR/CVaR model-validation evidence is exposed through `/api/risk/var_backtest`. The payload is read-only and reports `schema_missing` or `empty` when forecast/backtest tables are absent or no forecasts have matured, so Monte-Carlo chart rendering remains independent of backtest evidence availability.
   Alpha-decay defaults to the highest-severity/relevance chartable strategy, not the strategy with the most rows, and the header selector lets operators switch among returned strategies. Multi-series visuals pass every visible line or band into [chart_a11y.js](chart_a11y.js): portfolio risk exposes gross, net, drawdown, and blocked bands; the Monte-Carlo fan exposes p05, p50, and p95; alpha-decay exposes rolling Sharpe and half-life.
 - [market_stress.js](market_stress.js)
   Market-stress panel renderer and history sparkline. The sparkline preserves post-GDELT stress scores above `1.0`, auto-scales the y-axis, and draws warning/critical reference bands from shared threshold helpers.

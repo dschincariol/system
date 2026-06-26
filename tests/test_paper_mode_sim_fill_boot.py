@@ -419,25 +419,33 @@ def _wait_for_paper_barrier(
     stdout_path: Path,
     stderr_path: Path,
     *,
-    timeout_s: float = 12.0,
+    timeout_s: float = 35.0,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + float(timeout_s)
     last_body: dict[str, Any] = {}
+    last_error = ""
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise AssertionError("paper boot exited while waiting for barrier\n" + _process_failure(proc, stdout_path, stderr_path))
-        status, body = _http_json(base_url, "/api/execution/barrier", token=_DASHBOARD_TOKEN, timeout_s=2.0)
-        last_body = body
-        barrier = dict(body.get("execution_barrier") or {})
-        if (
-            status == 200
-            and str(barrier.get("mode") or body.get("mode") or "") == "paper"
-            and bool(barrier.get("allow_simulation")) is True
-            and bool(barrier.get("real_trading_allowed")) is False
-        ):
-            return body
+        try:
+            status, body = _http_json(base_url, "/api/execution/barrier", token=_DASHBOARD_TOKEN, timeout_s=2.0)
+            last_body = body
+            barrier = dict(body.get("execution_barrier") or {})
+            if (
+                status == 200
+                and str(barrier.get("mode") or body.get("mode") or "") == "paper"
+                and bool(barrier.get("allow_simulation")) is True
+                and bool(barrier.get("real_trading_allowed")) is False
+            ):
+                return body
+            last_error = f"status={status} body={body}"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
         time.sleep(0.25)
-    raise AssertionError(f"paper barrier did not become simulation-ready: {last_body}")
+    raise AssertionError(
+        f"paper barrier did not become simulation-ready: last_error={last_error} last_body={last_body}\n"
+        + _process_failure(proc, stdout_path, stderr_path)
+    )
 
 
 def _install_live_import_canary(tmp_path: Path, env: dict[str, str]) -> tuple[dict[str, str], Path]:

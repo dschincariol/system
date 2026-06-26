@@ -820,9 +820,20 @@ class PatchTSTRegressor:
         stacked = np.stack(preds, axis=0).astype(np.float32)
         mean_pred = stacked.mean(axis=0)
         std_pred = stacked.std(axis=0)
+        q10 = np.quantile(stacked, 0.10, axis=0).astype(np.float32)
+        q50 = np.quantile(stacked, 0.50, axis=0).astype(np.float32)
+        q90 = np.quantile(stacked, 0.90, axis=0).astype(np.float32)
         return {
             "prediction": float(mean_pred.reshape(-1)[0]) if mean_pred.size else 0.0,
             "prediction_vector": mean_pred.astype(float).tolist(),
+            "prediction_lower": float(q10.reshape(-1)[0]) if q10.size else 0.0,
+            "prediction_median": float(q50.reshape(-1)[0]) if q50.size else 0.0,
+            "prediction_upper": float(q90.reshape(-1)[0]) if q90.size else 0.0,
+            "quantile_forecasts": {
+                "0.10": float(q10.reshape(-1)[0]) if q10.size else 0.0,
+                "0.50": float(q50.reshape(-1)[0]) if q50.size else 0.0,
+                "0.90": float(q90.reshape(-1)[0]) if q90.size else 0.0,
+            },
             "epistemic_uncertainty": float(std_pred.reshape(-1)[0]) if std_pred.size else 0.0,
             "epistemic_uncertainty_vector": std_pred.astype(float).tolist(),
             "mc_dropout_samples": int(sample_count),
@@ -831,6 +842,7 @@ class PatchTSTRegressor:
                 "method": "mc_dropout",
                 "samples": int(sample_count),
                 "dropout": float(self.dropout),
+                "quantile_levels": [0.10, 0.50, 0.90],
             },
         }
 

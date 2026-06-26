@@ -249,6 +249,62 @@ class ProdPreflightSmokeContractTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn("DASHBOARD_API_TOKEN must be set", errors[0])
 
+    def test_notification_channel_gate_blocks_live_without_enabled_channel(self) -> None:
+        prod_preflight = _reload_module()
+        channel_status = [
+            {"channel": "email", "configured": False, "enabled": False, "status": "not_configured"},
+            {"channel": "webhook", "configured": False, "enabled": False, "status": "not_configured"},
+        ]
+
+        with patch.dict(os.environ, {"ENGINE_MODE": "live"}, clear=True):
+            with patch("engine.runtime.alerts_notify.get_notification_channel_status", return_value=channel_status):
+                notes, warnings, errors, state = prod_preflight._notification_channel_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(warnings, [])
+        self.assertTrue(errors)
+        self.assertIn("no enabled channel configured", errors[0])
+        self.assertTrue(state["required"])
+        self.assertFalse(state["ok"])
+        self.assertEqual(state["enabled_channels"], [])
+
+    def test_notification_channel_gate_warns_non_live_without_enabled_channel(self) -> None:
+        prod_preflight = _reload_module()
+        channel_status = [
+            {"channel": "email", "configured": True, "enabled": False, "status": "invalid_config"},
+            {"channel": "webhook", "configured": False, "enabled": False, "status": "not_configured"},
+        ]
+
+        with patch.dict(os.environ, {"ENGINE_MODE": "paper"}, clear=True):
+            with patch("engine.runtime.alerts_notify.get_notification_channel_status", return_value=channel_status):
+                notes, warnings, errors, state = prod_preflight._notification_channel_gate()
+
+        self.assertEqual(notes, [])
+        self.assertEqual(errors, [])
+        self.assertTrue(warnings)
+        self.assertIn("live go-live would be blocked", warnings[0])
+        self.assertFalse(state["required"])
+        self.assertFalse(state["ok"])
+        self.assertEqual(state["configured_channels"], ["email"])
+
+    def test_notification_channel_gate_passes_live_with_webhook(self) -> None:
+        prod_preflight = _reload_module()
+        channel_status = [
+            {"channel": "email", "configured": False, "enabled": False, "status": "not_configured"},
+            {"channel": "webhook", "configured": True, "enabled": True, "status": "ready"},
+        ]
+
+        with patch.dict(os.environ, {"ENGINE_MODE": "live"}, clear=True):
+            with patch("engine.runtime.alerts_notify.get_notification_channel_status", return_value=channel_status):
+                notes, warnings, errors, state = prod_preflight._notification_channel_gate()
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(errors, [])
+        self.assertEqual(notes, ["alert notification channel gate ok enabled=webhook"])
+        self.assertTrue(state["required"])
+        self.assertTrue(state["ok"])
+        self.assertEqual(state["enabled_channels"], ["webhook"])
+
     def test_operator_sidecar_security_gate_blocks_weak_token_in_prod(self) -> None:
         prod_preflight = _reload_module()
 

@@ -258,6 +258,103 @@ class NotificationChannelsTests(unittest.TestCase):
         self.assertIn("[ALERT CRIT] pg_wal disk risk", sent["subject"])
         self.assertIn("PG_WAL_DISK_RISK", sent["body"])
 
+    def test_runtime_alert_notification_uses_configured_webhook_channel(self):
+        os.environ["EQ_CRIT_WEBHOOK_URL"] = "https://hooks.example.test/runtime-alert"
+
+        calls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(
+                {
+                    "url": request.full_url,
+                    "data": request.data,
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = self.alerts_notify.send_runtime_alert_notification(
+                {
+                    "alert_id": 43,
+                    "event_title": "equity reconciliation CRIT",
+                    "symbol": "PORTFOLIO",
+                    "severity": "CRIT",
+                    "rule_id": "EQUITY_RECON",
+                    "detail": {"diff_equity_pct": 0.12},
+                    "ts_ms": 1_700_000_000_000,
+                },
+                actor="system",
+                source="unit",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual(calls[0]["url"], "https://hooks.example.test/runtime-alert")
+        self.assertIn(b"EQUITY_RECON", calls[0]["data"])
+
+    def test_critical_zero_channel_delivery_warns_once_per_process(self):
+        with patch.object(self.alerts_notify, "log_failure") as log_mock:
+            first = self.alerts_notify.send_runtime_alert_notification(
+                {
+                    "event_title": "unroutable critical alert",
+                    "symbol": "SYSTEM",
+                    "severity": "CRIT",
+                    "rule_id": "NO_CHANNEL",
+                },
+                actor="system",
+                source="unit",
+            )
+            second = self.alerts_notify.send_runtime_alert_notification(
+                {
+                    "event_title": "unroutable critical alert again",
+                    "symbol": "SYSTEM",
+                    "severity": "CRIT",
+                    "rule_id": "NO_CHANNEL_AGAIN",
+                },
+                actor="system",
+                source="unit",
+            )
+
+        self.assertEqual(first["delivered"], 0)
+        self.assertEqual(second["delivered"], 0)
+        self.assertEqual(log_mock.call_count, 1)
+        self.assertEqual(log_mock.call_args.kwargs["code"], "RUNTIME_ALERTS_NOTIFY_ZERO_CRITICAL_DELIVERY")
+
+    def test_critical_health_zero_channel_delivery_warns_once_per_process(self):
+        degraded_health = {
+            "ok": False,
+            "execution_degraded": {
+                "active": True,
+                "severity": "CRITICAL",
+                "reason_codes": ["event_bus_critical_backpressure"],
+            },
+        }
+
+        with patch.object(self.alerts_notify, "log_failure") as log_mock:
+            first = self.alerts_notify.send_runtime_health_notification(
+                degraded_health,
+                actor="system",
+                source="unit",
+            )
+            second = self.alerts_notify.send_runtime_health_notification(
+                degraded_health,
+                actor="system",
+                source="unit",
+            )
+
+        self.assertEqual(first["delivered"], 0)
+        self.assertFalse(second["changed"])
+        self.assertEqual(log_mock.call_count, 1)
+        self.assertEqual(log_mock.call_args.kwargs["code"], "RUNTIME_ALERTS_NOTIFY_ZERO_CRITICAL_DELIVERY")
+
     def test_notification_status_handler_includes_runtime_health_alert(self):
         degraded_health = {
             "ok": False,

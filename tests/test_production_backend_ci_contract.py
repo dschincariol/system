@@ -60,9 +60,20 @@ def test_validate_workflow_has_hard_gated_production_backend_job() -> None:
     assert 'TS_PRODUCTION_BACKEND_TESTS: "1"' in workflow
     assert "TS_STORAGE_BACKEND: postgres" in workflow
     assert "TS_PG_DSN:" in workflow
+    assert "TS_PGBOUNCER_TEST_DSN:" in workflow
+    assert "TS_PG_DIRECT_TEST_DSN:" in workflow
+    assert "Start PgBouncer for backend integration tests" in workflow
+    assert "edoburu/pgbouncer:v1.25.2-p0" in workflow
+    assert "docker run" in workflow
+    assert "--network host" in workflow
+    assert "pool_mode = transaction" in workflow
+    assert "ignore_startup_parameters = extra_float_digits,options" in workflow
+    assert "pgbouncer_select_1=" in workflow
+    assert "Stop PgBouncer test container" in workflow
     assert "TS_REDIS_URL:" in workflow
     assert "tools/run_required_backend_tests.py" in workflow
     assert 'requires_postgres or requires_redis' in workflow
+    assert '--allow-skip-message-regex "TS_PGBOUNCER_TEST_DSN"' not in workflow
     assert "tests/test_storage_migrator.py" in workflow
     assert "tests/test_layer5_audit_chain_bypass_detected.py" in workflow
     assert "tests/test_live_cache.py::LiveCacheTests::test_explicit_redis_live_cache_round_trip" in workflow
@@ -84,8 +95,13 @@ def test_local_reproduction_docs_cover_backend_gate_and_evidence() -> None:
     assert "TS_PRODUCTION_BACKEND_TESTS=1" in docs
     assert "TS_STORAGE_BACKEND=postgres" in docs
     assert "TS_PG_DSN=" in docs
+    assert "TS_PGBOUNCER_TEST_DSN=" in docs
+    assert "TS_PG_DIRECT_TEST_DSN=" in docs
+    assert "edoburu/pgbouncer:v1.25.2-p0" in docs
+    assert "--network host" in docs
     assert "TS_REDIS_URL=" in docs
     assert "tools/run_required_backend_tests.py" in docs
     assert "requires_postgres or requires_redis" in docs
+    assert '--allow-skip-message-regex "TS_PGBOUNCER_TEST_DSN"' not in docs
     assert "engine.runtime.staging_prod_preflight" in docs
     assert "var/artifacts/preflight/staging" in docs

@@ -1,0 +1,215 @@
+name: Nightly Soak Chaos
+
+# Runs nightly at 07:00 UTC and on manual dispatch only. This lane is separate
+# from validate.yml's push/PR merge gates and is non-blocking for merges.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_s:
+        description: Bounded soak duration in seconds, max 600
+        required: false
+        default: "600"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak-chaos:
+    name: Safe-mode soak and chaos
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_DB: trading_ci
+          POSTGRES_USER: ts_app
+          POSTGRES_PASSWORD: test-app-password # pragma: allowlist secret
+        ports:
+          - 5432:5432
+        options: >-
+          --shm-size 1g
+          --health-cmd "pg_isready -U ts_app -d trading_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PYTHONPATH: .
+      TS_PRODUCTION_BACKEND_TESTS: "1"
+      TS_STORAGE_BACKEND: postgres
+      TS_PG_DSN: "host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password" # pragma: allowlist secret
+      TS_PG_PASSWORD: test-app-password # pragma: allowlist secret
+      TS_PG_SCHEMA_PER_DB_PATH: "1"
+      TS_PG_POOL_SIZE: "16"
+      TS_PG_POOL_MIN_SIZE: "1"
+      TS_PG_POOL_TIMEOUT: "15"
+      TS_PG_CONNECT_TIMEOUT: "5"
+      TRADING_UNIT_TEST_SCHEMA_FAST: "1"
+      TRADING_FAILURE_DIAGNOSTICS_PERSIST: "0"
+      TRADING_PG_AUTOINIT_ON_CONNECT: "1"
+      TS_REDIS_URL: redis://127.0.0.1:6379/0
+      TS_REDIS_CONNECT_TIMEOUT_S: "0.25"
+      TS_REDIS_SOCKET_TIMEOUT_S: "0.25"
+      TS_REDIS_CIRCUIT_COOLDOWN_S: "600"
+      TS_CACHE_REAL_INTEGRATION: "1"
+      LIVE_CACHE_BACKEND: redis
+      LIVE_CACHE_REDIS_URL: redis://127.0.0.1:6379/0
+      APP_ENV: test
+      ENGINE_MODE: safe
+      EXECUTION_MODE: safe
+      OPERATOR_MODE: safe
+      PROD_LOCK: "0"
+      KILL_SWITCH_GLOBAL: "0"
+      AUTO_BOOT_DAEMONS: "0"
+      AUTO_PIPELINE: "0"
+      DASHBOARD_HOST: 127.0.0.1
+      DASHBOARD_PORT: "8000"
+      OPEN_DASHBOARD_BROWSER_ON_START: "0"
+      SOAK_DURATION_S: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.duration_s || '600' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install locked Python dev/test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements-dev.txt
+
+      - name: Verify provisioned Postgres and Redis
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+          import redis
+
+          with psycopg.connect(os.environ["TS_PG_DSN"], connect_timeout=5) as con:
+              print("postgres_select_1=", con.execute("SELECT 1").fetchone()[0])
+
+          client = redis.Redis.from_url(os.environ["TS_REDIS_URL"], socket_connect_timeout=2, socket_timeout=2)
+          print("redis_ping=", client.ping())
+          PY
+
+      - name: Resolve bounded soak duration
+        shell: bash
+        run: |
+          set -euo pipefail
+          duration="${SOAK_DURATION_S:-600}"
+          if [[ ! "$duration" =~ ^[0-9]+$ ]]; then
+            echo "duration_s must be an integer number of seconds" >&2
+            exit 2
+          fi
+          if (( duration < 60 || duration > 600 )); then
+            echo "duration_s must be between 60 and 600 seconds for the 30-minute CI lane" >&2
+            exit 2
+          fi
+          echo "SOAK_DURATION_S=$duration" >> "$GITHUB_ENV"
+
+      - name: Generate ephemeral soak report signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(openssl rand -hex 32)"
+          printf '::add-mask::%s\n' "$key"
+          printf 'SOAK_REPORT_SIGNING_KEY=%s\n' "$key" >> "$GITHUB_ENV"
+
+      - name: Boot dashboard server in SAFE mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p var/log "$RUNNER_TEMP/soaks"
+          : > var/log/runtime.log
+          python dashboard_server.py >> var/log/runtime.log 2>&1 &
+          dashboard_pid=$!
+          echo "DASHBOARD_PID=$dashboard_pid" >> "$GITHUB_ENV"
+          echo "SAFE_MODE_SOAK_PID=$dashboard_pid" >> "$GITHUB_ENV"
+
+          ready=0
+          for _attempt in $(seq 1 120); do
+            if ! kill -0 "$dashboard_pid" 2>/dev/null; then
+              echo "dashboard_server.py exited before /api/health became ready" >&2
+              tail -n 200 var/log/runtime.log >&2 || true
+              exit 1
+            fi
+            if python -c 'import json, urllib.request; response = urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=1.0); payload = json.loads(response.read().decode("utf-8")); raise SystemExit(0 if isinstance(payload, dict) else 1)'
+            then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if (( ready != 1 )); then
+            echo "dashboard_server.py did not become ready within 120 seconds" >&2
+            tail -n 200 var/log/runtime.log >&2 || true
+            exit 1
+          fi
+
+      - name: Run safe-mode soak gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/safe_mode_soak.py \
+            --duration-s "$SOAK_DURATION_S" \
+            --interval-s 30 \
+            --server-pid "$DASHBOARD_PID" \
+            --out "$RUNNER_TEMP/safe_mode_soak.ndjson"
+
+      - name: Run market-session chaos soak
+        shell: bash
+        run: |
+          set -euo pipefail
+          # market_session_soak.py injects the provider-disconnect chaos fault via
+          # exercise_provider_disconnect(); keep its native non-zero NO-GO exit.
+          python tools/market_session_soak.py \
+            --duration-s "$SOAK_DURATION_S" \
+            --interval-s 30 \
+            --allow-after-hours \
+            --no-wait-for-open \
+            --allow-partial-session \
+            --out-dir "$RUNNER_TEMP/soaks"
+
+      - name: Stop dashboard server
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${DASHBOARD_PID:-}" ]] && kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+            kill "$DASHBOARD_PID" || true
+            for _attempt in $(seq 1 15); do
+              if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+                exit 0
+              fi
+              sleep 1
+            done
+            kill -9 "$DASHBOARD_PID" || true
+          fi
+
+      - name: Upload soak chaos evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-chaos-evidence
+          path: |
+            var/log/runtime.log
+            ${{ runner.temp }}/safe_mode_soak.ndjson
+            ${{ runner.temp }}/soaks
+          if-no-files-found: warn

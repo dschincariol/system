@@ -21,6 +21,7 @@ from engine.runtime.storage import connect, init_db, run_write_txn
 LOG = get_logger("runtime.alerts_notify")
 _RUNTIME_HEALTH_ALERT_NAMESPACE = "runtime_health_alert"
 _RUNTIME_HEALTH_ALERT_KEY = "global"
+_ZERO_DELIVERY_WARNED: set[str] = set()
 
 
 def _env_int(key: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -100,6 +101,56 @@ def _webhook_provider_name(url: str) -> str:
     if "discord.com/api/webhooks" in lowered or "discordapp.com/api/webhooks" in lowered:
         return "discord"
     return "generic"
+
+
+def _is_critical_severity(value: Any) -> bool:
+    return str(value or "").strip().upper() in {"CRIT", "CRITICAL"}
+
+
+def _warn_zero_critical_delivery_once(
+    *,
+    kind: str,
+    payload: dict[str, Any],
+    source: str,
+    deliveries: list[dict[str, Any]],
+) -> None:
+    key = str(kind or "runtime_alert")
+    if key in _ZERO_DELIVERY_WARNED:
+        return
+    _ZERO_DELIVERY_WARNED.add(key)
+    try:
+        channels = get_notification_channel_status()
+    except Exception:
+        channels = []
+    enabled_channels = [
+        str(channel.get("channel") or "").strip().lower()
+        for channel in list(channels or [])
+        if bool(channel.get("enabled"))
+    ]
+    configured_channels = [
+        str(channel.get("channel") or "").strip().lower()
+        for channel in list(channels or [])
+        if bool(channel.get("configured"))
+    ]
+    log_failure(
+        LOG,
+        event=f"runtime_alerts_notify_{key}_zero_critical_delivery",
+        code="RUNTIME_ALERTS_NOTIFY_ZERO_CRITICAL_DELIVERY",
+        message="critical runtime notification delivered to zero channels",
+        level=logging.WARNING,
+        component="engine.runtime.alerts_notify",
+        persist=False,
+        extra={
+            "kind": key,
+            "source": str(source or "runtime"),
+            "severity": str(payload.get("severity") or ""),
+            "rule_id": str(payload.get("rule_id") or ""),
+            "state": str(payload.get("state") or ""),
+            "enabled_channels": enabled_channels,
+            "configured_channels": configured_channels,
+            "delivery_attempts": list(deliveries or []),
+        },
+    )
 
 
 def _notification_test_table_exists(con: Any) -> bool:
@@ -891,9 +942,17 @@ def send_runtime_alert_notification(
                     "source": str(source or "runtime"),
                 },
             )
+    delivered = int(sum(1 for item in deliveries if item.get("ok")))
+    if _is_critical_severity(payload.get("severity")) and delivered <= 0:
+        _warn_zero_critical_delivery_once(
+            kind="runtime_alert",
+            payload=payload,
+            source=source,
+            deliveries=deliveries,
+        )
     return {
         "ok": bool(ok),
-        "delivered": int(sum(1 for item in deliveries if item.get("ok"))),
+        "delivered": delivered,
         "deliveries": deliveries,
         "payload": payload,
     }
@@ -1189,6 +1248,14 @@ def send_runtime_health_notification(
                         "source": str(source or "runtime"),
                     },
                 )
+        delivered = int(sum(1 for item in deliveries if item.get("ok")))
+        if _is_critical_severity(payload.get("severity")) and delivered <= 0:
+            _warn_zero_critical_delivery_once(
+                kind="runtime_health",
+                payload=payload,
+                source=source,
+                deliveries=deliveries,
+            )
 
     return {
         "ok": bool(ok),
@@ -1197,6 +1264,7 @@ def send_runtime_health_notification(
         "state_value": state_value,
         "state": str(payload.get("state") or ""),
         "reason_codes": list(payload.get("reason_codes") or []),
+        "delivered": int(sum(1 for item in deliveries if item.get("ok"))),
         "deliveries": deliveries,
         "runtime_health_alert": get_runtime_health_notification_status(),
     }

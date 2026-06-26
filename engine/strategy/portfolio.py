@@ -45,7 +45,9 @@ from engine.strategy.symbol_blacklist import is_blacklisted
 from engine.strategy.portfolio_risk_gate import apply_portfolio_risk_gate
 from engine.risk.portfolio_risk_engine import apply_portfolio_risk_engine
 from engine.risk.monte_carlo_risk_engine import request_monte_carlo_refresh
-from engine.runtime.risk_state import get_state
+from engine.risk.notional_backstop import BACKSTOP_ENABLED, apply_notional_backstop
+from engine.runtime.live_execution_control import live_execution_disabled
+from engine.runtime.risk_state import get_state, set_state
 from engine.runtime.factor_universe import _get_feature_asof as _get_factor_feature_asof
 from engine.strategy.model_intent import is_canonical_model_intent
 from engine.strategy import portfolio_constraints as _portfolio_constraints
@@ -1115,15 +1117,22 @@ def _persist_portfolio_runtime_health(
 
 _PORTFOLIO_EXECUTION_BLOCKED_DEGRADED_CODES = frozenset(
     {
-        "PORTFOLIO_STRATEGY_ALLOCATOR_FAILED",
-        "PORTFOLIO_RISK_ENGINE_FAILED",
-        "PORTFOLIO_RISK_GATE_FAILED",
-        "PORTFOLIO_TOTAL_RISK_FAILED",
+        "PORTFOLIO_STRATEGY_ALLOCATOR_FAILED", "PORTFOLIO_RISK_ENGINE_FAILED",
+        "PORTFOLIO_RISK_GATE_FAILED", "PORTFOLIO_VOL_TARGET_FAILED",
+        "PORTFOLIO_TEMPORAL_DAMPENER_FAILED", "PORTFOLIO_CAPITAL_AT_RISK_FAILED",
+        "PORTFOLIO_EXPOSURE_NETTING_FAILED", "PORTFOLIO_TOTAL_RISK_FAILED",
     }
+)
+_LIVE_ONLY_PORTFOLIO_EXECUTION_BLOCKED_DEGRADED_CODES = frozenset(
+    {"PORTFOLIO_NOTIONAL_BACKSTOP_FAILED"}
 )
 
 
-def _portfolio_execution_blocked_codes(degraded_reasons: List[Dict[str, Any]]) -> List[str]:
+def _portfolio_execution_blocked_codes(
+    degraded_reasons: List[Dict[str, Any]],
+    *,
+    is_live: bool = False,
+) -> List[str]:
     blocked_codes: list[str] = []
     for row in list(degraded_reasons or []):
         if not isinstance(row, dict):
@@ -1132,6 +1141,13 @@ def _portfolio_execution_blocked_codes(degraded_reasons: List[Dict[str, Any]]) -
         if (
             code
             and code in _PORTFOLIO_EXECUTION_BLOCKED_DEGRADED_CODES
+            and code not in blocked_codes
+        ):
+            blocked_codes.append(code)
+        if (
+            is_live
+            and code
+            and code in _LIVE_ONLY_PORTFOLIO_EXECUTION_BLOCKED_DEGRADED_CODES
             and code not in blocked_codes
         ):
             blocked_codes.append(code)
@@ -1336,9 +1352,10 @@ def hierarchical_clustering(corr_matrix) -> List[List[float]]:
                 cur = min(float(dist[a][b]) for a in left["members"] for b in right["members"])
                 pair_ids = (int(left["id"]), int(right["id"]))
                 ordered_ids = pair_ids if pair_ids[0] <= pair_ids[1] else (pair_ids[1], pair_ids[0])
+                best_dist_value = float("inf") if best_dist is None else float(best_dist)
                 if (
                     best_pair is None
-                    or float(cur) < float(best_dist) - 1e-12
+                    or float(cur) < best_dist_value - 1e-12
                     or (abs(float(cur) - float(best_dist or 0.0)) <= 1e-12 and ordered_ids < (best_ids or ordered_ids))
                 ):
                     best_pair = (i, j)
@@ -5916,7 +5933,7 @@ def _apply_rebalance_risk_gates_stage(ctx: _RebalanceContext) -> None:
         _warn_nonfatal("PORTFOLIO_EXPOSURE_NETTING_FAILED", e, once_key="exposure_netting")
         _netting = None
 
-    # Final hard portfolio-risk clamp after all other portfolio transforms.
+    # Realized-vol scale before the final notional backstop.
     try:
         desired, _total_risk = _apply_total_portfolio_risk_limit(con, desired)
         try:
@@ -5939,6 +5956,72 @@ def _apply_rebalance_risk_gates_stage(ctx: _RebalanceContext) -> None:
         _record_degraded_phase("flip_flop_penalty", "PORTFOLIO_FLIP_FLOP_PENALTY_FAILED", e)
         _warn_nonfatal("PORTFOLIO_FLIP_FLOP_PENALTY_FAILED", e, once_key="flip_flop_penalty")
         _flip_penalty = {}
+
+    # Non-bypassable final gross/net notional clamp. This is intentionally after
+    # every optional portfolio transform in this stage, including flip-flop.
+    _backstop: Dict[str, Any] | None = None
+    _backstop_live = False
+    try:
+        try:
+            _backstop_live = not live_execution_disabled()
+        except Exception as live_status_error:
+            _backstop_live = True
+            raise RuntimeError("portfolio_notional_backstop_live_status_unavailable") from live_status_error
+        desired, _backstop = apply_notional_backstop(desired, is_live=bool(_backstop_live))
+        if bool(_backstop_live) and not bool((_backstop or {}).get("enabled")):
+            raise RuntimeError("portfolio_notional_backstop_disabled_live")
+        try:
+            _put_meta(
+                con,
+                "last_notional_backstop",
+                json.dumps(_backstop or {}, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_NOTIONAL_BACKSTOP_META_FAILED", e, once_key="notional_backstop_meta")
+    except Exception as e:
+        _record_degraded_phase("notional_backstop", "PORTFOLIO_NOTIONAL_BACKSTOP_FAILED", e)
+        _warn_nonfatal("PORTFOLIO_NOTIONAL_BACKSTOP_FAILED", e, once_key="notional_backstop")
+        failure_meta = {
+            "enabled": bool(BACKSTOP_ENABLED),
+            "is_live": bool(_backstop_live),
+            "blocked": bool(_backstop_live),
+            "status": "backstop_unavailable",
+            "error_type": type(e).__name__,
+            "error": str(e),
+        }
+        if isinstance(_backstop, dict):
+            failure_meta.update({k: v for k, v in _backstop.items() if k not in {"blocked", "status", "error"}})
+            failure_meta["blocked"] = bool(_backstop_live)
+            failure_meta["status"] = "backstop_unavailable"
+            failure_meta["error_type"] = type(e).__name__
+            failure_meta["error"] = str(e)
+        try:
+            _put_meta(
+                con,
+                "last_notional_backstop",
+                json.dumps(failure_meta, separators=(",", ":"), sort_keys=True),
+            )
+        except Exception as meta_error:
+            _warn_nonfatal(
+                "PORTFOLIO_NOTIONAL_BACKSTOP_META_FAILED",
+                meta_error,
+                once_key="notional_backstop_meta_failed",
+            )
+        if bool(_backstop_live):
+            state_blob = json.dumps(failure_meta, separators=(",", ":"), sort_keys=True)
+            try:
+                set_state("portfolio_risk_block", "1")
+                set_state("portfolio_risk_info", state_blob)
+                set_state("portfolio_risk_summary", state_blob)
+                set_state("portfolio_risk_status", "backstop_unavailable")
+                set_state("portfolio_risk_ts_ms", str(int(now_ms)))
+            except Exception as state_error:
+                _warn_nonfatal(
+                    "PORTFOLIO_NOTIONAL_BACKSTOP_STATE_SET_FAILED",
+                    state_error,
+                    once_key="notional_backstop_state_set",
+                    ts_ms=int(now_ms),
+                )
 
     portfolio_diag = {}
     try:
@@ -5972,7 +6055,12 @@ def _build_rebalance_result(
 def _apply_rebalance_execution_block_stage(ctx: _RebalanceContext) -> Optional[Dict[str, Any]]:
     con = ctx.con
     now_ms = ctx.now_ms
-    execution_blocked_codes = _portfolio_execution_blocked_codes(ctx.degraded_reasons)
+    try:
+        is_live = not live_execution_disabled()
+    except Exception as e:
+        _warn_nonfatal("PORTFOLIO_LIVE_STATUS_READ_FAILED", e, once_key="rebalance_execution_live_status")
+        is_live = True
+    execution_blocked_codes = _portfolio_execution_blocked_codes(ctx.degraded_reasons, is_live=bool(is_live))
     ctx.execution_blocked_codes = list(execution_blocked_codes)
     if not execution_blocked_codes:
         return None
@@ -6049,8 +6137,9 @@ def _emit_rebalance_orders_stage(ctx: _RebalanceContext) -> None:
             explain["horizon_s"] = int(tgt.get("horizon_s") or 0)
         if model_identity.get("model_kind"):
             explain["model_kind"] = str(model_identity.get("model_kind"))
-        if model_identity.get("model_ts_ms") is not None:
-            explain["model_ts_ms"] = int(model_identity.get("model_ts_ms"))
+        model_ts_ms = model_identity.get("model_ts_ms")
+        if model_ts_ms is not None:
+            explain["model_ts_ms"] = int(model_ts_ms)
         if model_identity.get("model_version"):
             explain["model_version"] = str(model_identity.get("model_version"))
 

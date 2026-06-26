@@ -68,14 +68,14 @@ Manual quantity orders keep portfolio-weight fields neutral: `from_weight = 0.0`
 
 Before writing an intent, terminal mutations also enforce fresh price, max quantity, max notional, optional per-symbol caps, and duplicate-recent-order controls. Rejections are persisted to `terminal_intent_rejections` with stable reason codes.
 
-Expected terminal refusals are not server crashes. Safety-gate blocks return structured 403 payloads, and pre-trade business refusals such as stale price, duplicate recent intent, max quantity, or max notional return structured 409 payloads. All refusal payloads include `ok=false`, `error`, `reason_code`, a safe human `message`, and `meta.status`. The handlers still do not submit, cancel, replace, or flatten broker orders directly.
+Expected terminal refusals are not server crashes. Safety-gate blocks return structured 403 payloads, and pre-trade business refusals such as stale price, duplicate recent intent, max quantity, or max notional return structured 409 payloads. Non-live execution-mode arm refusals are also conflicts and map to 409 without changing the refusal body. All refusal payloads include `ok=false`, `error`, `reason_code`, a safe human `message`, and `meta.status` when emitted by terminal handlers. The handlers still do not submit, cancel, replace, or flatten broker orders directly.
 
 ## Business Refusal Status Contract
 
 The shared HTTP transport maps expected business refusals to 4xx responses instead of allowing them to fall through to 500:
 
 - safety or execution blocks: 403
-- pre-trade/order conflicts: 409
+- pre-trade/order conflicts and `*_not_live` mode conflicts: 409
 - missing data-source credentials or incomplete provider configuration: 422
 - rejected provider credentials: 401
 - missing provider entitlements: 403
@@ -244,9 +244,10 @@ metrics such as `rolling_sharpe` are `null` when the source value is missing and
 UI consumers that need the latest snapshot must select the row with the maximum
 numeric `ts_ms` rather than assuming a positional row. This keeps risk headroom
 stable if tests, replay tooling, or compatibility callers pass ascending
-history. The browser bullet-bar thresholds live in
-`ui/bullet_bars.js`: OK is `<0.85` of cap, Watch is `>=0.85` through exactly
-`1.00`, and Over is strictly `>1.00`.
+history. The browser bullet-bar thresholds are defined in
+`ui/risk_headroom_thresholds.js` (re-exported by `ui/bullet_bars.js`): OK is
+`<0.85` of cap, Watch is `>=0.85` through exactly `1.00`, and Over is strictly
+`>1.00`.
 
 The risk-history chart draws a zero baseline with `yFor(0)` only when zero is
 inside the visible y-domain. A plot midpoint is not a semantic zero reference
@@ -311,7 +312,7 @@ execution policy engine, kill switches, and broker adapters.
 
 Each evidence item includes `id`, `title`, `status`, `severity`, `blocking`, `source_subsystem`, `source_route`, `source_config_key`, `freshness`, `detail`, and `remediation`. Status values are `passing`, `warning`, `blocked`, and `unavailable`; missing or stale critical evidence in live/paper context is never serialized as passing.
 
-The route aggregates the existing authoritative producers instead of replacing them: `/api/readiness`, `/api/health`, `/api/liveness`, `/api/execution/barrier`, `/api/system/kill_switches`, `/api/broker/config`, `/api/operator/provider_telemetry`, `live_trading_preflight()`, `backup_restore_evidence_snapshot()`, `live_ai_safety_snapshot()`, `live_options_readiness_snapshot()`, and `/api/governance/evidence`.
+The route aggregates the existing authoritative producers instead of replacing them: `/api/readiness`, `/api/health`, `/api/liveness`, `/api/execution/barrier`, `/api/system/kill_switches`, `/api/broker/config`, `/api/operator/provider_telemetry`, `live_trading_preflight()` (which itself incorporates `backup_restore_evidence_snapshot()`, `live_ai_safety_snapshot()`, and `live_options_readiness_snapshot()`), and `/api/governance/evidence`.
 
 The payload also includes `action_guards.broker_activation`, which the dashboard uses before posting broker activation. This is an advisory browser guard; backend broker activation still enforces the fresh connection-test requirement, and live/paper execution remains gated by the runtime/execution barriers.
 
@@ -348,7 +349,7 @@ The route is explanatory only. Live model serving still rejects shadow feature c
 
 `http_transport.py` classifies registered routes before dispatch. Explicit health, liveness, and readiness GET routes remain public; other registered `/api/*` GET routes are sensitive by default, including `/api/system/config`, `/api/operator/logs`, `/api/operator/support_snapshot`, and `/api/terminal/positions`.
 
-Sensitive GET routes require `X-API-Token` in production/live or remote-bind deployments, use the same rate limiter and append-only audit event path as protected mutations, and reject query-string `token` authentication in production/live. Authentication failures return the underlying 401/403 and are audited without consuming the anonymous IP rate-limit bucket; once a request is authenticated, the normal token bucket applies. Responses from sensitive GET routes pass through the shared API redactor, which masks DSNs, tokens, passwords, API keys, Authorization header values, and broker/account identifiers.
+Sensitive GET routes require `X-API-Token` in production/live or remote-bind deployments, use the same rate limiter and append-only audit event path as protected mutations, and reject query-string `token` authentication in production/live or on non-loopback binds. Authentication failures return the underlying 401/403 and are audited without consuming the anonymous IP rate-limit bucket; once a request is authenticated, the normal token bucket applies. Responses from sensitive GET routes pass through the shared API redactor, which masks DSNs, tokens, passwords, API keys, Authorization header values, and broker/account identifiers.
 
 The dashboard-owned `GET /api/operator/ping` bridge is intentionally public like health/liveness and proxies the operator sidecar ping with a bounded timeout. If the sidecar is unavailable, it returns a structured 503 with `reason_code=operator_sidecar_unreachable`.
 

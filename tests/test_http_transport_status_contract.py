@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 from engine.api import http_transport
-from engine.api.http_transport import _derive_response_status
+from engine.api.http_transport import _derive_response_status, _map_error_to_status
 
 
 class _TestHTTPServer(ThreadingHTTPServer):
@@ -119,6 +119,41 @@ class HttpTransportStatusContractTests(unittest.TestCase):
         for payload, expected in cases:
             with self.subTest(payload=payload):
                 self.assertEqual(_derive_response_status(payload, default_status=200), expected)
+
+    def test_not_live_refusals_map_to_http_409_conflict(self) -> None:
+        for error_code in [
+            "execution_mode_not_live",
+            "operator_execution_mode_not_live",
+            "mode_not_live",
+            "simulated_market_data_not_live",
+            "mode_paper_not_live",
+        ]:
+            with self.subTest(error_code=error_code):
+                self.assertEqual(_map_error_to_status(error_code), 409)
+
+        self.assertEqual(
+            _derive_response_status(
+                {"ok": False, "error": "execution_mode_not_live", "execution_mode": {}},
+                default_status=200,
+            ),
+            409,
+        )
+
+    def test_status_mapper_preserves_existing_contracts(self) -> None:
+        cases = [
+            ("unauthorized", 401),
+            ("forbidden", 403),
+            ("execution_blocked", 403),
+            ("pre_trade_rejected", 409),
+            ("unknown_endpoint", 404),
+            ("deprecated_endpoint", 410),
+            ("rate_limit_exceeded", 429),
+            ("missing_credentials", 422),
+            ("some_other_error", 500),
+        ]
+        for error_code, expected in cases:
+            with self.subTest(error_code=error_code):
+                self.assertEqual(_map_error_to_status(error_code), expected)
 
     def test_unexpected_handler_exception_still_returns_500(self) -> None:
         def _boom(_parsed=None, _body=None, _ctx=None):

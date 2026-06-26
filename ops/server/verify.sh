@@ -125,7 +125,7 @@ check_credstore() {
   require_command systemd-creds
   log "checking encrypted credential inventory"
   local name path owner group mode
-  for name in master_key pg_password_app pg_password_ingest pg_password_reader redis_password object_store_secret_key dashboard_api_token operator_api_token; do
+  for name in master_key pg_password_app pg_password_ingest pg_password_reader redis_password object_store_access_key object_store_secret_key dashboard_api_token operator_api_token; do
     path="${CREDSTORE_DIR}/${name}.cred"
     [ -r "$path" ] || fail "missing encrypted credential ${path}"
     owner="$(stat -c '%U' "$path")"

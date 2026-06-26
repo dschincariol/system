@@ -220,6 +220,61 @@ def test_production_monitoring_computes_metrics_and_threshold_states() -> None:
     assert {row["metric_name"] for row in stored["metrics"]} >= set(metrics)
 
 
+def test_conformal_risk_control_metric_uses_labeled_decision_payloads() -> None:
+    con = sqlite3.connect(":memory:")
+    _init_source_schema(con)
+    total = pm.MIN_N
+    for idx in range(total):
+        event_id = idx + 10_000
+        ts_ms = NOW_MS - idx * 1000
+        target = -1.0 if idx < 3 else 1.0
+        con.execute(
+            """
+            INSERT INTO labels(event_id, symbol, horizon_s, impact_z, created_at_ms)
+            VALUES(?, 'AAPL', 300, ?, ?)
+            """,
+            (event_id, target, ts_ms + 300_000),
+        )
+        con.execute(
+            """
+            INSERT INTO decision_log(ts_ms, event_id, symbol, horizon_s, predicted_z, confidence, model_name, explain_json)
+            VALUES(?, ?, 'AAPL', 300, 1.0, 0.8, 'live_model', ?)
+            """,
+            (
+                ts_ms,
+                event_id,
+                json.dumps(
+                    {
+                        "conformal": {
+                            "available": True,
+                            "interval_lower": -2.0,
+                            "interval_upper": 2.0,
+                            "alpha_target": 0.20,
+                            "risk_control": {
+                                "enabled": True,
+                                "available": True,
+                                "loss_definition": "accepted_trade_loss",
+                                "target_risk": 0.20,
+                                "calibrated_loss_threshold": 0.50,
+                                "recommended_action": "log_only",
+                            },
+                        }
+                    }
+                ),
+            ),
+        )
+
+    metric = {row["metric_name"]: row for row in pm.compute_production_monitoring_metrics(con, now_ms=NOW_MS)}[
+        "conformal_risk_control"
+    ]
+
+    assert metric["labels_available"] is True
+    assert metric["sample_n"] == total
+    assert metric["value"] == 3 / total
+    assert abs(metric["baseline_value"] - 0.20) < 1.0e-12
+    assert metric["details"]["loss_definitions"] == ["accepted_trade_loss"]
+
+
 def test_monitoring_alerts_create_signals_without_auto_promotion() -> None:
     con = sqlite3.connect(":memory:")
     _init_source_schema(con)

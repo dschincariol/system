@@ -99,6 +99,48 @@ class ModelActivationTests(unittest.TestCase):
         self.assertEqual(str(resolved.get("fallback_reason") or ""), "resolved_to_env_default")
         self.assertIn("temporal_predictor.experimental", list(resolved.get("candidate_names") or []))
 
+    def test_live_model_resolution_flags_env_default_without_governed_champion(self) -> None:
+        (_, predictor) = _reload_modules(
+            "engine.strategy.model_config",
+            "engine.strategy.predictor",
+        )
+
+        env_default = "embed_regressor.env_default"
+        with patch.object(predictor, "MODEL_NAME", env_default):
+            with patch.object(predictor, "get_live_competition_champion_name", return_value=""):
+                with patch.object(predictor, "get_champion_assignment", return_value={}):
+                    with patch.object(predictor, "get_active_model_name", return_value=""):
+                        with patch.object(predictor, "resolve_active_model_name", return_value=env_default):
+                            resolved = predictor._live_model_resolution("AAPL", 300)
+
+        self.assertEqual(str(resolved.get("requested_model_name") or ""), env_default)
+        self.assertEqual(str(resolved.get("resolved_model_name") or ""), env_default)
+        self.assertEqual(str(resolved.get("resolution_source") or ""), "env_default")
+        self.assertTrue(bool(resolved.get("env_default_fallback")))
+        self.assertFalse(bool(resolved.get("serve_fallback_active")))
+        self.assertEqual(str(resolved.get("fallback_reason") or ""), "no_governed_champion_env_default")
+
+    def test_live_model_resolution_does_not_flag_governed_champion(self) -> None:
+        (_, predictor) = _reload_modules(
+            "engine.strategy.model_config",
+            "engine.strategy.predictor",
+        )
+
+        champion = "embed_regressor.governed_champion"
+        with patch.object(predictor, "MODEL_NAME", "embed_regressor.env_default"):
+            with patch.object(predictor, "get_live_competition_champion_name", return_value=""):
+                with patch.object(predictor, "get_champion_assignment", return_value={"model_name": champion}):
+                    with patch.object(predictor, "get_active_model_name", return_value=""):
+                        with patch.object(predictor, "resolve_active_model_name", return_value=champion):
+                            resolved = predictor._live_model_resolution("AAPL", 300)
+
+        self.assertEqual(str(resolved.get("requested_model_name") or ""), champion)
+        self.assertEqual(str(resolved.get("resolved_model_name") or ""), champion)
+        self.assertEqual(str(resolved.get("resolution_source") or ""), "assignment")
+        self.assertFalse(bool(resolved.get("env_default_fallback")))
+        self.assertFalse(bool(resolved.get("serve_fallback_active")))
+        self.assertEqual(str(resolved.get("fallback_reason") or ""), "")
+
     def test_predict_forced_model_rejects_inactive_model_name(self) -> None:
         (_, predictor) = _reload_modules(
             "engine.strategy.model_config",

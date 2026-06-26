@@ -39,6 +39,7 @@ ROUTE_SPECS_SYSTEM = [
     ("GET", "/api/execution/barrier", "api_get_execution_barrier"),
     ("GET", "/api/risk/portfolio", "api_get_portfolio_risk"),
     ("GET", "/api/risk/monte_carlo", "api_get_monte_carlo_risk"),
+    ("GET", "/api/risk/var_backtest", "api_get_risk_var_backtest"),
     ("GET", "/api/alpha_decay", "api_get_alpha_decay"),
     ("GET", "/api/regime/context", "api_get_regime_context"),
     ("GET", "/api/regime/history", "api_get_regime_history"),

@@ -76,6 +76,29 @@ def _no_equity_snapshot(**_kwargs: Any) -> Dict[str, Any]:
     }
 
 
+def _yfinance_only_snapshot(**_kwargs: Any) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "required": True,
+        "mode": "paper",
+        "reason": "ok",
+        "blockers": [],
+        "required_providers": ["yfinance"],
+        "healthy_required": 1,
+        "total_required": 1,
+        "by_provider": {
+            "yfinance": {
+                "ok": True,
+                "credential_source": "not_required",
+                "credential_secret_names": [],
+                "blockers": [],
+                "telemetry_present": True,
+                "telemetry_ok": True,
+            }
+        },
+    }
+
+
 def _patch_preflight_until_paid_gate(monkeypatch: pytest.MonkeyPatch, prod_preflight: Any) -> None:
     monkeypatch.setattr(prod_preflight, "_production_provisioning_gate", lambda: (["provisioning ok"], [], {"ok": True}))
     monkeypatch.setattr(prod_preflight, "_cpu_power_policy_gate", lambda: (["cpu ok"], [], [], {"ok": True}))
@@ -136,6 +159,32 @@ def test_paid_equity_provider_gate_fails_loud_and_main_returns_3(monkeypatch, ca
     assert "POLYGON_API_KEY" in rendered
     assert canary not in rendered
     assert canary not in caplog.text
+
+
+def test_paid_equity_provider_gate_blocks_yfinance_only_paper_preflight(monkeypatch, capsys) -> None:
+    prod_preflight = _load_preflight()
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    monkeypatch.setattr(prod_preflight, "provider_readiness_snapshot", _yfinance_only_snapshot, raising=False)
+
+    notes, warnings, errors, state = prod_preflight._paid_equity_provider_degradation_gate()
+    assert notes == []
+    assert warnings == []
+    assert errors
+    assert state["ok"] is False
+    assert state["reason"] == "paid_equity_provider_required"
+    assert state["fallback_equity_providers"] == ["yfinance"]
+    assert "yfinance" in errors[0]
+    assert "fallback_not_live" in errors[0]
+
+    _patch_preflight_until_paid_gate(monkeypatch, prod_preflight)
+    monkeypatch.setattr(sys, "argv", ["prod_preflight.py", "--json"])
+    rc = prod_preflight.main()
+
+    captured = capsys.readouterr()
+    payload = _last_json(captured.out)
+    assert rc == 3
+    assert payload["paid_equity_provider_degradation"]["reason"] == "paid_equity_provider_required"
+    assert payload["paid_equity_provider_degradation"]["fallback_equity_providers"] == ["yfinance"]
 
 
 def test_paid_equity_provider_gate_fails_closed_on_snapshot_error(monkeypatch) -> None:

@@ -257,16 +257,20 @@ def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
     run_env.setdefault("TS_REDIS_CONNECT_TIMEOUT_S", "0.05")
     run_env.setdefault("TS_REDIS_SOCKET_TIMEOUT_S", "0.05")
     run_env.setdefault("TS_REDIS_CIRCUIT_COOLDOWN_S", "600")
-    run_env.setdefault("ENGINE_MODE", "safe")
-    run_env.setdefault("EXECUTION_MODE", "safe")
-    run_env.setdefault("OPERATOR_MODE", "safe")
+    run_env["TRADING_VALIDATE_REPO_LIVE"] = "0"
+    run_env["TRADING_VALIDATION_REQUIRE_PROD_DEPS"] = "0"
+    run_env["TRADING_VALIDATION_MODE"] = "unit-test"
+    run_env["ENGINE_MODE"] = "safe"
+    run_env["EXECUTION_MODE"] = "safe"
+    run_env["OPERATOR_MODE"] = "safe"
     run_env["APP_ENV"] = "test"
     run_env["PROD_LOCK"] = "0"
     run_env.pop("ENV", None)
     run_env.pop("NODE_ENV", None)
     run_env.pop("TS_ENV", None)
-    run_env.setdefault("AUTO_BOOT_DAEMONS", "0")
-    run_env.setdefault("AUTO_PIPELINE", "0")
+    run_env["AUTO_BOOT_DAEMONS"] = "0"
+    run_env["AUTO_PIPELINE"] = "0"
+    run_env["START_INGESTION_WITH_SERVER"] = "0"
     run_env["KILL_SWITCH_GLOBAL"] = "0"
 
     for key in (
@@ -306,6 +310,38 @@ def _unit_test_env(env: dict[str, str]) -> dict[str, str]:
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "TRAINING_DATASET_URI_PREFIX",
+        "DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST",
+        "DASHBOARD_PUBLIC_PORT",
+        "DASHBOARD_PUBLIC_BASE_URL",
+        "DASHBOARD_ALLOWED_HOSTS",
+        "DASHBOARD_ALLOWED_ORIGINS",
+        "OPERATOR_BIND_HOST",
+        "OPERATOR_PUBLIC_HOST",
+        "OPERATOR_PUBLIC_PORT",
+        "OPERATOR_ALLOWED_ORIGIN",
+        "OPERATOR_INTERNAL_ONLY",
+        "OPERATOR_SIDECAR_INTERNAL_ONLY",
+        "OPERATOR_ALLOW_DANGEROUS_PUBLIC_BIND",
+        "OPERATOR_DANGEROUS_PUBLIC_BIND_HOST",
+        "OPERATOR_HOST_BIND",
+        "LIVE_BROKER",
+        "BROKER",
+        "BROKER_NAME",
+        "BROKER_FAILOVER",
+        "ALPACA_BASE_URL",
+        "LIVE_TRADING_CONFIRM",
+        "LIVE_TRADING_REQUIRE_CONFIRMATION",
+        "LIVE_TRADING_REQUIRE_DASHBOARD_API_TOKEN",
+        "DISABLE_LIVE_EXECUTION",
+        "PREFLIGHT_REQUIRE_BACKUP_EVIDENCE",
+        "BACKUP_EVIDENCE_REQUIRE_SIGNATURE",
+        "BACKUP_EVIDENCE_PATH",
+        "PREFLIGHT_REQUIRE_ZFS_STORAGE",
+        "PREFLIGHT_STORAGE_REQUIRE_VISIBLE_HOST_PATHS",
+        "TRADING_ZFS_ROOT",
+        "TRADING_ALLOWED_STORAGE_PREFIXES",
+        "TRADING_ALLOWED_STORAGE_FS_TYPES",
+        "TRADING_FORBIDDEN_STORAGE_PREFIXES",
     ):
         run_env.pop(key, None)
     return run_env
@@ -497,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.pre_deploy:
         checks.append(("production-readiness-gate", [python, "tools/production_readiness_gate.py", "--compact"]))
     if args.live:
+        checks.append(("live-host-readiness", [python, "tools/live_host_readiness_check.py"]))
         checks.append(("pipeline-smoke", [python, "tools/pipeline_smoke_test.py"]))
 
     try:

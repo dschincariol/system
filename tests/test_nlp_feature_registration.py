@@ -19,6 +19,10 @@ def test_nlp_groups_are_registered_and_legacy_sentiment_is_deprecated(monkeypatc
     assert "nlp_transcripts_v1" in groups
     assert "lexical_sentiment_v0" in groups
     assert groups["lexical_sentiment_v0"].get("deprecated_after")
+    assert groups["nlp_filings_v1"]["direct_trading_authority"] is False
+    assert groups["nlp_filings_v1"]["promotion_gate_required"] is True
+    assert ":" in groups["nlp_filings_v1"]["cache_namespace"]
+    assert groups["nlp_filings_v1"]["model_card"]["model_card_url"]
     assert "nlp.finbert_news_v1.score_mean" in feature_registry.registered_feature_ids()
 
 

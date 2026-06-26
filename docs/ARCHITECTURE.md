@@ -72,7 +72,7 @@ The observed startup order is:
    - `startup_trace`
    - `import_smoke`
 3. `start_system.py` validates the runtime graph with `engine.runtime.job_registry.validate_runtime_architecture()`.
-4. `engine.runtime.lifecycle_state.set_lifecycle_state()` moves the runtime into `BOOTING`.
+4. `engine.runtime.lifecycle_state.set_state()` moves the runtime into `BOOTING`.
 5. `engine.runtime.first_run.bootstrap_first_run(mode=mode)` runs first-run/bootstrap setup.
 6. `services.data_source_manager.get_manager().initialize()` and `.apply_runtime_environment()` project enabled source settings into the process environment.
 7. `start_system.py` starts best-effort side services.
@@ -131,6 +131,8 @@ operator feed restarts clear the accounting window.
 ### Structured Document/Event Extraction
 
 Normalized SEC filing, transcript, and news writes flow through `engine.runtime.storage_pg.put_normalized_event(...)`. That write path calls `engine.data.structured_document_events.extract_structured_document_events(...)`, which stores source-document keyed rows in `structured_document_events` with event timestamp, availability timestamp, extraction confidence, and PIT metadata. The resolver `resolve_structured_document_event_features(...)` only reads rows whose `availability_ts_ms` is at or before the model snapshot timestamp.
+
+The optional offline `llm_event_extraction` job adds a stricter LLM-backed path on top of the same feature surface. `engine.data.llm_event_extraction.select_source_documents(...)` retrieves only normalized source documents available by the decision timestamp, provider adapters return schema-constrained JSON where supported, and deterministic validation rejects invalid JSON, unexpected fields, future timestamps, source-hash mismatches, and evidence spans that do not match the source text. Accepted rows are persisted in `llm_extracted_events`, accept/reject/cost lineage is persisted in `llm_event_extraction_audit`, and accepted events are projected into `structured_document_events` with prompt/model/source hashes and `direct_trading_authority=false`.
 
 The feature group is registered as `structured_doc_events_v1.*` in `engine/strategy/feature_registry.py` and is wired into `engine/strategy/model_feature_snapshots.py` under the PIT group `structured_doc_events`. These features are shadow-stage with `direct_trading_authority=false`; live model serving rejects contracts containing them via `feature_registry.assert_no_shadow_features(...)`.
 
@@ -339,6 +341,7 @@ It builds a context object with:
 - `status`
 - `health`
 - `logs`
+- `support_snapshot`
 - `snapshot`
 - `telemetry`
 - `watchdogs`
@@ -347,13 +350,14 @@ It builds a context object with:
 
 In the inspected code, `ALLOWED_ACTIONS = []`, so this module returns diagnostics but does not execute actions. It writes JSONL records to `var/log/ai_operator_log.jsonl` locally, or to `AI_OPERATOR_LOG_PATH` / `OPERATOR_AI_LOG_PATH` when configured.
 
-One implementation detail matters for support work: `buildContext()` currently issues eight HTTP requests but destructures them into seven variables. As implemented:
+`buildContext()` issues eight HTTP requests and destructures them into eight variables, each assigned to its own endpoint:
 
-- `snapshot` receives `/api/operator/support_snapshot?mode=quick`
-- `telemetry` receives `/api/operator/snapshot?mode=quick`
-- `watchdogs` receives `/api/operator/provider_telemetry`
-- `barrier` receives `/api/operator/runtime_watchdogs`
-- the final `/api/execution/barrier` response is fetched but not assigned into the returned context object
+- `snapshot` receives `/api/operator/snapshot?mode=quick`
+- `telemetry` receives `/api/operator/provider_telemetry`
+- `watchdogs` receives `/api/operator/runtime_watchdogs`
+- `barrier` receives `/api/execution/barrier`
+
+All eight responses (including `/api/execution/barrier`) are placed into the returned context object.
 
 ### Patch-preview and rollback path
 

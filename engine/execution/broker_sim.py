@@ -245,6 +245,146 @@ def _warn_nonfatal(event: str, code: str, error: BaseException, *, warn_key: Opt
     )
     if warn_key:
         _WARNED_NONFATAL_KEYS.add(warn_key)
+
+
+def _is_closed_connection_error(error: BaseException) -> bool:
+    text = str(error or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "cannot operate on a closed database",
+            "closed database",
+            "connection already closed",
+            "connection is closed",
+            "connection closed",
+            "closed connection",
+        )
+    )
+
+
+def _connection_marked_closed(con: Any) -> bool:
+    if con is None:
+        return True
+    missing = object()
+    for attr in ("_closed", "closed"):
+        try:
+            value = getattr(con, attr, missing)
+        except Exception as e:
+            _warn_nonfatal(
+                "broker_sim_connection_state_attr_failed",
+                "BROKER_SIM_CONNECTION_STATE_ATTR_FAILED",
+                e,
+                warn_key=f"connection_state_attr:{attr}",
+                attr=str(attr),
+            )
+            continue
+        if value is missing:
+            continue
+        if isinstance(value, bool):
+            return bool(value)
+        if value is not None and not callable(value):
+            try:
+                return bool(value)
+            except Exception as e:
+                _warn_nonfatal(
+                    "broker_sim_connection_state_coerce_failed",
+                    "BROKER_SIM_CONNECTION_STATE_COERCE_FAILED",
+                    e,
+                    warn_key=f"connection_state_coerce:{attr}",
+                    attr=str(attr),
+                )
+                continue
+    try:
+        raw = getattr(con, "raw", None)
+    except Exception:
+        raw = None
+    if raw is not None:
+        for attr in ("closed", "_closed"):
+            try:
+                value = getattr(raw, attr, missing)
+                if value is not missing and bool(value):
+                    return True
+            except Exception as e:
+                _warn_nonfatal(
+                    "broker_sim_raw_connection_state_failed",
+                    "BROKER_SIM_RAW_CONNECTION_STATE_FAILED",
+                    e,
+                    warn_key=f"raw_connection_state:{attr}",
+                    attr=str(attr),
+                )
+                continue
+    return False
+
+
+def _safe_commit_connection(con: Any, *, context: str, once_key: str) -> bool:
+    connection = con
+    if _connection_marked_closed(connection):
+        _warn_nonfatal(
+            "broker_sim_commit_skipped_closed_connection",
+            "BROKER_SIM_COMMIT_SKIPPED_CLOSED_CONNECTION",
+            RuntimeError("connection already closed before commit"),
+            warn_key=f"{once_key}:closed",
+            context=str(context),
+        )
+        return False
+    try:
+        connection.commit()
+        return True
+    except Exception as e:
+        if _is_closed_connection_error(e):
+            _warn_nonfatal(
+                "broker_sim_commit_skipped_closed_connection",
+                "BROKER_SIM_COMMIT_SKIPPED_CLOSED_CONNECTION",
+                RuntimeError("connection already closed before commit"),
+                warn_key=f"{once_key}:closed",
+                context=str(context),
+            )
+            return False
+        _warn_nonfatal(
+            "broker_sim_commit_failed",
+            "BROKER_SIM_COMMIT_FAILED",
+            e,
+            warn_key=once_key,
+            context=str(context),
+        )
+        return False
+
+
+def _safe_close_connection(con: Any, *, context: str, once_key: str) -> bool:
+    connection = con
+    if connection is None:
+        return False
+    if _connection_marked_closed(connection):
+        _warn_nonfatal(
+            "broker_sim_connection_close_skipped_closed",
+            "BROKER_SIM_CONNECTION_CLOSE_SKIPPED_CLOSED",
+            RuntimeError("connection already closed before close"),
+            warn_key=f"{once_key}:closed",
+            context=str(context),
+        )
+        return False
+    try:
+        connection.close()
+        return True
+    except Exception as e:
+        if _is_closed_connection_error(e):
+            _warn_nonfatal(
+                "broker_sim_connection_close_skipped_closed",
+                "BROKER_SIM_CONNECTION_CLOSE_SKIPPED_CLOSED",
+                RuntimeError("connection already closed before close"),
+                warn_key=f"{once_key}:closed",
+                context=str(context),
+            )
+            return False
+        _warn_nonfatal(
+            "broker_sim_connection_close_failed",
+            "BROKER_SIM_CONNECTION_CLOSE_FAILED",
+            e,
+            warn_key=once_key,
+            context=str(context),
+        )
+        return False
+
 EXEC_SYMBOL_CONCENTRATION_CAP = float(
     os.environ.get(
         "EXEC_PORTFOLIO_SYMBOL_CONCENTRATION_CAP",
@@ -539,6 +679,12 @@ _BROKER_SCHEMA_INDEXES = (
     "idx_broker_shadow_positions_book",
     "idx_broker_shadow_order_state_book",
 )
+_BROKER_FILLS_DEDUP_INDEX = "uq_broker_fills_src"
+_BROKER_FILLS_DEDUP_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_broker_fills_src
+  ON broker_fills(source, COALESCE(book_key, ''), symbol, ts_ms, source_order_id)
+  WHERE source_order_id IS NOT NULL
+"""
 _BROKER_DB_INIT_LOCK = threading.Lock()
 
 
@@ -683,6 +829,78 @@ def _ensure_broker_fill_provenance_columns(con) -> None:
     )
 
 
+def _broker_fill_dedup_conflict_row(con):
+    try:
+        return con.execute(
+            """
+            SELECT source, COALESCE(book_key, ''), symbol, ts_ms, source_order_id, COUNT(*) AS duplicate_count
+            FROM broker_fills
+            WHERE source_order_id IS NOT NULL
+            GROUP BY source, COALESCE(book_key, ''), symbol, ts_ms, source_order_id
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_fill_dedup_conflict_probe_failed",
+            "BROKER_SIM_FILL_DEDUP_CONFLICT_PROBE_FAILED",
+            e,
+            warn_key="broker_fill_dedup_conflict_probe_failed",
+        )
+        return None
+
+
+def _warn_broker_fill_dedup_index_skipped(row) -> None:
+    duplicate_count = None
+    try:
+        duplicate_count = int(row[5]) if row and row[5] is not None else None
+    except Exception:
+        duplicate_count = None
+    _warn_nonfatal(
+        "broker_sim_fill_dedup_index_skipped_existing_duplicates",
+        "BROKER_SIM_FILL_DEDUP_INDEX_SKIPPED_EXISTING_DUPLICATES",
+        RuntimeError("broker_fills contains duplicate sourced fill identities"),
+        warn_key="broker_fill_dedup_index_skipped_existing_duplicates",
+        source=(str(row[0]) if row and row[0] is not None else None),
+        book_key=(str(row[1]) if row and row[1] is not None else None),
+        symbol=(str(row[2]) if row and row[2] is not None else None),
+        ts_ms=(int(row[3]) if row and row[3] is not None else None),
+        source_order_id=(int(row[4]) if row and row[4] is not None else None),
+        duplicate_count=duplicate_count,
+    )
+
+
+def _broker_fill_dedup_index_ready(con) -> bool:
+    if _index_exists(con, _BROKER_FILLS_DEDUP_INDEX):
+        return True
+    if not _table_exists(con, "broker_fills"):
+        return False
+    row = _broker_fill_dedup_conflict_row(con)
+    if row:
+        _warn_broker_fill_dedup_index_skipped(row)
+        return True
+    return False
+
+
+def _ensure_broker_fill_dedup_index(con) -> None:
+    if _index_exists(con, _BROKER_FILLS_DEDUP_INDEX):
+        return
+    row = _broker_fill_dedup_conflict_row(con)
+    if row:
+        _warn_broker_fill_dedup_index_skipped(row)
+        return
+    try:
+        con.execute(_BROKER_FILLS_DEDUP_INDEX_SQL)
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_fill_dedup_index_create_failed",
+            "BROKER_SIM_FILL_DEDUP_INDEX_CREATE_FAILED",
+            e,
+            warn_key="broker_fill_dedup_index_create_failed",
+        )
+
+
 def _account_snapshot_value_missing(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
@@ -747,21 +965,6 @@ def _account_snapshot_needs_repair(
         )
         return True
     return False
-
-
-def _is_closed_connection_error(error: BaseException) -> bool:
-    text = str(error or "").strip().lower()
-    return any(
-        marker in text
-        for marker in (
-            "cannot operate on a closed database",
-            "closed database",
-            "connection already closed",
-            "connection is closed",
-            "connection closed",
-            "closed connection",
-        )
-    )
 
 
 def _repair_account_snapshot_if_needed(
@@ -877,8 +1080,9 @@ def _broker_account_seeded(con) -> bool:
 
 def _broker_schema_ready(con) -> bool:
     fill_columns = _broker_fills_columns(con)
+    tables_ready = all(_table_exists(con, table_name) for table_name in _BROKER_SCHEMA_TABLES)
     return (
-        all(_table_exists(con, table_name) for table_name in _BROKER_SCHEMA_TABLES)
+        tables_ready
         and all(_index_exists(con, index_name) for index_name in _BROKER_SCHEMA_INDEXES)
         and {
             "source",
@@ -887,6 +1091,7 @@ def _broker_schema_ready(con) -> bool:
             "option_quote_source",
             "option_margin_debit",
         }.issubset(fill_columns)
+        and _broker_fill_dedup_index_ready(con)
         and _broker_account_seeded(con)
     )
 
@@ -894,6 +1099,7 @@ def _broker_schema_ready(con) -> bool:
 def _ensure_tables(con):
     con.executescript(SCHEMA)
     _ensure_broker_fill_provenance_columns(con)
+    _ensure_broker_fill_dedup_index(con)
     if not _broker_account_seeded(con):
         ts = _now_ms()
         # Preserve legacy defaults unless user explicitly sets env
@@ -974,7 +1180,7 @@ def init_broker_db(*, use_write_txn: bool = True):
             return
     finally:
         if con is not None:
-            con.close()
+            _safe_close_connection(con, context="init_broker_db_schema_probe", once_key="init_broker_db_schema_probe_close")
     with _BROKER_DB_INIT_LOCK:
         con = None
         try:
@@ -986,7 +1192,7 @@ def init_broker_db(*, use_write_txn: bool = True):
                 return
         finally:
             if con is not None:
-                con.close()
+                _safe_close_connection(con, context="init_broker_db_locked_schema_probe", once_key="init_broker_db_locked_schema_probe_close")
 
         if use_write_txn:
             run_write_txn(
@@ -1013,7 +1219,7 @@ def init_broker_db(*, use_write_txn: bool = True):
                 )
             raise
         finally:
-            con.close()
+            _safe_close_connection(con, context="init_broker_db_direct_write", once_key="init_broker_db_direct_write_close")
 
 
 def _read_account(con, book_key: Optional[str] = None) -> dict:
@@ -1138,7 +1344,13 @@ def _is_transient_write_error(error: BaseException) -> bool:
     return dbapi.is_transient_write_error(error)
 
 
-def _persist_account_snapshot(cash: float, equity: float, ts_ms: int, book_key: Optional[str] = None) -> None:
+def _persist_account_snapshot(
+    cash: float,
+    equity: float,
+    ts_ms: int,
+    book_key: Optional[str] = None,
+    con: Optional[Any] = None,
+) -> None:
     def _txn(tx_con) -> None:
         _write_account(
             tx_con,
@@ -1147,6 +1359,10 @@ def _persist_account_snapshot(cash: float, equity: float, ts_ms: int, book_key: 
             ts_ms=int(ts_ms),
             book_key=book_key,
         )
+
+    if con is not None:
+        _txn(con)
+        return
 
     run_write_txn(
         _txn,
@@ -1804,6 +2020,83 @@ def simulate_weight_order_batch(
     }
 
 
+def _broker_fill_duplicate_exists(
+    con,
+    *,
+    ts_ms: int,
+    source_order_id,
+    symbol: str,
+    source: str,
+    book_key: Optional[str],
+    columns: set[str],
+) -> bool:
+    if source_order_id is None:
+        return False
+    try:
+        if {"source", "book_key"}.issubset(columns):
+            row = con.execute(
+                """
+                SELECT 1
+                FROM broker_fills
+                WHERE source_order_id=?
+                  AND source=?
+                  AND COALESCE(book_key, '')=?
+                  AND symbol=?
+                  AND ts_ms=?
+                LIMIT 1
+                """,
+                (
+                    source_order_id,
+                    str(source),
+                    str(_book_key(book_key) or ""),
+                    str(symbol),
+                    int(ts_ms),
+                ),
+            ).fetchone()
+        else:
+            row = con.execute(
+                """
+                SELECT 1
+                FROM broker_fills
+                WHERE source_order_id=? AND symbol=? AND ts_ms=?
+                LIMIT 1
+                """,
+                (source_order_id, str(symbol), int(ts_ms)),
+            ).fetchone()
+        return bool(row)
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_fill_duplicate_probe_failed",
+            "BROKER_SIM_FILL_DUPLICATE_PROBE_FAILED",
+            e,
+            warn_key=f"broker_fill_duplicate_probe_failed:{symbol}",
+            symbol=str(symbol),
+            source_order_id=(int(source_order_id) if source_order_id is not None else None),
+        )
+        return False
+
+
+def _warn_broker_fill_deduped(
+    *,
+    ts_ms: int,
+    source_order_id,
+    symbol: str,
+    source: str,
+    book_key: Optional[str],
+) -> None:
+    _warn_nonfatal(
+        "broker_sim_fill_duplicate_ignored",
+        "BROKER_SIM_FILL_DUPLICATE_IGNORED",
+        RuntimeError("duplicate sourced broker fill ignored"),
+        warn_key=f"broker_fill_duplicate_ignored:{source}:{_book_key(book_key) or ''}:{symbol}:{ts_ms}:{source_order_id}",
+        source=str(source),
+        book_key=str(_book_key(book_key) or ""),
+        symbol=str(symbol),
+        ts_ms=int(ts_ms),
+        source_order_id=(int(source_order_id) if source_order_id is not None else None),
+    )
+
+
 def _write_fill(
     con,
     ts_ms: int,
@@ -1820,16 +2113,36 @@ def _write_fill(
     contract_multiplier: Optional[float] = None,
     option_quote_source: Optional[str] = None,
     option_margin_debit: Optional[float] = None,
-):
+) -> bool:
     from engine.runtime.state_cache import cache_invalidate_namespace
 
     fill_book_key = _book_key(book_key)
     fill_source = str(source or ("shadow" if fill_book_key else "sim")).strip() or "sim"
     columns = _broker_fills_columns(con)
+    dedup_source_fill = source_order_id is not None
+    if dedup_source_fill and _broker_fill_duplicate_exists(
+        con,
+        ts_ms=int(ts_ms),
+        source_order_id=source_order_id,
+        symbol=str(symbol),
+        source=str(fill_source),
+        book_key=fill_book_key,
+        columns=columns,
+    ):
+        _warn_broker_fill_deduped(
+            ts_ms=int(ts_ms),
+            source_order_id=source_order_id,
+            symbol=str(symbol),
+            source=str(fill_source),
+            book_key=fill_book_key,
+        )
+        return False
+    insert_prefix = "INSERT OR IGNORE" if dedup_source_fill else "INSERT"
+    insert_cur = None
     if {"source", "book_key", "contract_multiplier", "option_quote_source", "option_margin_debit"}.issubset(columns):
-        con.execute(
-            """
-            INSERT INTO broker_fills(
+        insert_cur = con.execute(
+            f"""
+            {insert_prefix} INTO broker_fills(
               ts_ms, symbol, qty, px, source_order_id, source, book_key,
               contract_multiplier, option_quote_source, option_margin_debit,
               note, explain_json
@@ -1852,9 +2165,9 @@ def _write_fill(
             ),
         )
     elif {"source", "book_key"}.issubset(columns):
-        con.execute(
-            """
-            INSERT INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, source, book_key, note, explain_json)
+        insert_cur = con.execute(
+            f"""
+            {insert_prefix} INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, source, book_key, note, explain_json)
             VALUES(?,?,?,?,?,?,?,?,?)
             """,
             (
@@ -1870,18 +2183,28 @@ def _write_fill(
             ),
         )
     else:
-        con.execute(
-            """
-            INSERT INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, note, explain_json)
+        insert_cur = con.execute(
+            f"""
+            {insert_prefix} INTO broker_fills(ts_ms, symbol, qty, px, source_order_id, note, explain_json)
             VALUES(?,?,?,?,?,?,?)
             """,
             (int(ts_ms), str(symbol), float(qty), float(px), source_order_id, str(note or ""), explain_json),
         )
+    inserted = int(getattr(insert_cur, "rowcount", 0) or 0) > 0
+    if dedup_source_fill and not inserted:
+        _warn_broker_fill_deduped(
+            ts_ms=int(ts_ms),
+            source_order_id=source_order_id,
+            symbol=str(symbol),
+            source=str(fill_source),
+            book_key=fill_book_key,
+        )
+        return False
     cache_invalidate_namespace("api_read", prefix="execution_stats")
     cache_invalidate_namespace("api_read", prefix="execution_metrics")
 
     if fill_book_key:
-        return
+        return True
 
     # --- execution ledger mirror (for slippage + pnl attribution parity) ---
     try:
@@ -1935,6 +2258,7 @@ def _write_fill(
             symbol=str(symbol),
             source_order_id=(int(source_order_id) if source_order_id is not None else None),
         )
+    return True
 
 
 def _mark_to_market(
@@ -1944,6 +2268,7 @@ def _mark_to_market(
     *,
     persist: bool = True,
     best_effort: bool = False,
+    persist_con: Optional[Any] = None,
 ):
     acct = _read_account(con, book_key=book_key)
     cash = float(acct.get("cash") or 0.0)
@@ -1988,7 +2313,13 @@ def _mark_to_market(
         return snapshot
 
     try:
-        _persist_account_snapshot(cash=float(cash), equity=float(eq), ts_ms=int(ts_ms), book_key=book_key)
+        _persist_account_snapshot(
+            cash=float(cash),
+            equity=float(eq),
+            ts_ms=int(ts_ms),
+            book_key=book_key,
+            con=persist_con,
+        )
         snapshot["storage_status"] = "persisted"
     except Exception as e:
         if bool(best_effort) and _is_transient_write_error(e):
@@ -2344,9 +2675,9 @@ def apply_option_lifecycle(con, *, book_key: Optional[str] = None, now_ms: Optio
             ts_ms=int(ts_ms),
             book_key=book_key,
         )
-        con.commit()
+        _safe_commit_connection(con, context="options_lifecycle", once_key="options_lifecycle_commit_account")
         summary["account"] = _mark_to_market(con, int(ts_ms), book_key=book_key)
-        con.commit()
+        _safe_commit_connection(con, context="options_lifecycle", once_key="options_lifecycle_commit_mtm")
         return summary
     except Exception as e:
         try:
@@ -2631,7 +2962,7 @@ def _broker_sim_phase_size_cap(
             ts_ms=int(now_ms),
             book_key=book_key,
         )
-        con.commit()
+        _safe_commit_connection(con, context="fallback_write_account", once_key="fallback_write_account_commit")
 
     base_max_notional_budget = max(0.0, float(equity) * float(BROKER_MAX_TRADE_PCT_EQUITY))
 
@@ -2761,6 +3092,55 @@ def _broker_sim_phase_log_ledger_effects(
         )
 
 
+def _broker_sim_phase_cleanup_duplicate_pending_order_state(
+    con,
+    *,
+    order: Dict[str, Any],
+    symbol: str,
+    book_key: Optional[str],
+) -> None:
+    source_order_id = int(order.get("source_order_id") or 0)
+    try:
+        if _is_shadow_book(book_key):
+            con.execute(
+                """
+                DELETE FROM broker_shadow_order_state
+                WHERE id IN (
+                  SELECT id
+                  FROM broker_shadow_order_state
+                  WHERE book_key=? AND source_order_id=? AND symbol=? AND state='PENDING'
+                  ORDER BY id DESC
+                  LIMIT 1
+                )
+                """,
+                (str(_book_key(book_key)), int(source_order_id), str(symbol)),
+            )
+            return
+        con.execute(
+            """
+            DELETE FROM broker_order_state
+            WHERE id IN (
+              SELECT id
+              FROM broker_order_state
+              WHERE source_order_id=? AND symbol=? AND state='PENDING'
+              ORDER BY id DESC
+              LIMIT 1
+            )
+            """,
+            (int(source_order_id), str(symbol)),
+        )
+    except Exception as e:
+        _warn_nonfatal(
+            "broker_sim_duplicate_pending_order_state_cleanup_failed",
+            "BROKER_SIM_DUPLICATE_PENDING_ORDER_STATE_CLEANUP_FAILED",
+            e,
+            warn_key=f"duplicate_pending_order_state_cleanup:{symbol}:{source_order_id}",
+            symbol=str(symbol),
+            source_order_id=int(source_order_id),
+            book_key=str(_book_key(book_key) or ""),
+        )
+
+
 def _broker_sim_phase_persist_fill_effects(
     con,
     *,
@@ -2789,10 +3169,8 @@ def _broker_sim_phase_persist_fill_effects(
     contract_multiplier: Optional[float] = None,
     option_quote_source: Optional[str] = None,
     option_margin_debit: Optional[float] = None,
-) -> None:
-    _write_position(con, symbol, qty=float(new_qty), avg_px=float(new_avg), ts_ms=int(fill_ts), book_key=book_key)
-
-    _write_fill(
+) -> bool:
+    fill_inserted = _write_fill(
         con,
         ts_ms=int(fill_ts),
         source_order_id=(int(order.get("source_order_id")) if order.get("source_order_id") is not None else order_id),
@@ -2817,6 +3195,16 @@ def _broker_sim_phase_persist_fill_effects(
         option_quote_source=option_quote_source,
         option_margin_debit=option_margin_debit,
     )
+    if not fill_inserted:
+        _broker_sim_phase_cleanup_duplicate_pending_order_state(
+            con,
+            order=order,
+            symbol=symbol,
+            book_key=book_key,
+        )
+        return False
+
+    _write_position(con, symbol, qty=float(new_qty), avg_px=float(new_avg), ts_ms=int(fill_ts), book_key=book_key)
 
     if not _is_shadow_book(book_key):
         try:
@@ -2890,7 +3278,7 @@ def _broker_sim_phase_persist_fill_effects(
             """,
             ("FILLED", _now_ms(), str(_book_key(book_key)), int(order.get("source_order_id") or 0), symbol),
         )
-        return
+        return True
 
     filled_ts_ms = _now_ms()
     con.execute(
@@ -2911,6 +3299,7 @@ def _broker_sim_phase_persist_fill_effects(
         ttl_ms=(int(order_ttl_ms) if order_ttl_ms is not None else None),
         meta=state_meta,
     )
+    return True
 
 
 def _broker_sim_phase_persist_account_positions(
@@ -2945,9 +3334,8 @@ def _broker_sim_phase_persist_account_positions(
             int(now_ms),
             book_key=book_key,
         )
-    con.commit()
 
-    return _mark_to_market(con, int(now_ms), book_key=book_key)
+    return _mark_to_market(con, int(now_ms), book_key=book_key, persist_con=con)
 
 
 def _broker_sim_phase_return_summary(
@@ -2956,6 +3344,7 @@ def _broker_sim_phase_return_summary(
     order_id: Optional[int],
     wrote_fills: bool,
     fills_written: int,
+    fills_deduped: int,
     account: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
@@ -2965,6 +3354,7 @@ def _broker_sim_phase_return_summary(
         "status": "applied" if wrote_fills else "no_changes",
         "order_id": (int(order_id) if order_id is not None else None),
         "fills_written": int(fills_written),
+        "fills_deduped": int(fills_deduped),
         "account": account,
     }
 
@@ -3038,8 +3428,11 @@ def apply_new_portfolio_orders(
 
         wrote_fills = False
         fills_written = 0
+        fills_deduped = 0
         submitted_count = min(len(orders or []), int(max_rows))
         share_rounding_skipped: List[Dict[str, Any]] = []
+
+        _begin_managed_write(con)
 
         # Phase 4: simulate fills. Per-fill persistence and ledger effects are
         # delegated to named phase helpers so the write path stays auditable.
@@ -3728,9 +4121,9 @@ def apply_new_portfolio_orders(
                             )
 
                 # cash: BUY spends (negative), SELL receives (positive). fees always reduce cash.
-                cash += (-notional - fee)
+                cash_after_fill = float(cash) + float(-notional - fee)
                 if option_margin_debit is not None:
-                    cash -= float(option_margin_debit)
+                    cash_after_fill -= float(option_margin_debit)
 
                 new_qty = float(cur_qty) + float(qty_cap)
 
@@ -3831,7 +4224,7 @@ def apply_new_portfolio_orders(
                     explain["shadow_book_key"] = str(_book_key(book_key))
                     explain["shadow_model_id"] = str(o.get("model_id") or "")
 
-                _broker_sim_phase_persist_fill_effects(
+                fill_inserted = _broker_sim_phase_persist_fill_effects(
                     con,
                     order=order_for_audit,
                     symbol=symbol,
@@ -3862,8 +4255,12 @@ def apply_new_portfolio_orders(
                     ),
                 )
 
-                wrote_fills = True
-                fills_written += 1
+                if fill_inserted:
+                    cash = float(cash_after_fill)
+                    wrote_fills = True
+                    fills_written += 1
+                else:
+                    fills_deduped += 1
                 chunk_idx += 1
 
                 # Optional wall-clock latency simulation (default off)
@@ -3880,8 +4277,9 @@ def apply_new_portfolio_orders(
                         )
 
                 # update loop state
-                cur_qty = float(new_qty)
-                cur_avg = float(new_avg)
+                if fill_inserted:
+                    cur_qty = float(new_qty)
+                    cur_avg = float(new_avg)
                 remaining -= float(qty_cap)
 
                 max_notional_budget = max(0.0, float(max_notional_budget) - abs(float(notional)))
@@ -3897,7 +4295,7 @@ def apply_new_portfolio_orders(
         # mark orders applied (idempotency)
         if order_id is not None:
             _set_meta(con, "last_portfolio_orders_id", str(order_id), book_key=book_key)
-            con.commit()
+        _safe_commit_connection(con, context="apply_new_portfolio_orders", once_key="apply_orders_commit")
 
         lifecycle_summary = None
         if _options_lifecycle_enabled():
@@ -3911,6 +4309,7 @@ def apply_new_portfolio_orders(
             order_id=(int(order_id) if order_id is not None else None),
             wrote_fills=bool(wrote_fills),
             fills_written=int(fills_written),
+            fills_deduped=int(fills_deduped),
             account=acct2,
         )
         if lifecycle_summary is not None:
@@ -3918,8 +4317,19 @@ def apply_new_portfolio_orders(
         if share_rounding_skipped:
             summary["share_rounding_skipped"] = list(share_rounding_skipped)
         return summary
+    except Exception:
+        try:
+            con.rollback()
+        except Exception as rollback_error:
+            _warn_nonfatal(
+                "broker_sim_apply_orders_rollback_failed",
+                "BROKER_SIM_APPLY_ORDERS_ROLLBACK_FAILED",
+                rollback_error,
+                warn_key="apply_orders_rollback_failed",
+            )
+        raise
     finally:
-        con.close()
+        _safe_close_connection(con, context="apply_new_portfolio_orders", once_key="apply_orders_close")
 
 
 def broker_equity_at(ts_ms: int, include_prices: bool = False) -> dict:
@@ -4004,7 +4414,7 @@ def broker_equity_at(ts_ms: int, include_prices: bool = False) -> dict:
             "missing_prices": missing,
         }
     finally:
-        con.close()
+        _safe_close_connection(con, context="broker_equity_at", once_key="broker_equity_at_close")
 
 
 def broker_snapshot(limit_fills: int = 50):
@@ -4051,7 +4461,7 @@ def broker_snapshot(limit_fills: int = 50):
             ],
         }
     finally:
-        con.close()
+        _safe_close_connection(con, context="broker_snapshot", once_key="broker_snapshot_close")
 
 
 def main():

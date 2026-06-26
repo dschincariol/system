@@ -76,6 +76,8 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertIn("Environment=TS_SECRETS_PROVIDER=systemd-creds", unit)
         self.assertIn("Environment=DASHBOARD_API_TOKEN_SECRET=dashboard_api_token", unit)
         self.assertIn("Environment=OPERATOR_API_TOKEN_SECRET=operator_api_token", unit)
+        self.assertIn("Environment=OBJECT_STORE_ACCESS_KEY_SECRET=object_store_access_key", unit)
+        self.assertIn("Environment=OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key", unit)
         self.assertIn("Environment=BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key", unit)
         self.assertIn("Environment=PREFLIGHT_REQUIRE_CPU_POWER_POLICY=1", unit)
         self.assertIn("Environment=PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY=1", unit)
@@ -85,6 +87,10 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         )
         self.assertIn(
             "LoadCredentialEncrypted=redis_password:/etc/credstore.encrypted/redis_password.cred",
+            unit,
+        )
+        self.assertIn(
+            "LoadCredentialEncrypted=object_store_access_key:/etc/credstore.encrypted/object_store_access_key.cred",
             unit,
         )
         self.assertIn(
@@ -103,6 +109,7 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
             "LoadCredentialEncrypted=backup_evidence_hmac_key:/etc/credstore.encrypted/backup_evidence_hmac_key.cred",
             unit,
         )
+        self.assertIn("UnsetEnvironment=OBJECT_STORE_ACCESS_KEY OBJECT_STORE_ACCESS_KEY_FILE", unit)
         self.assertIn("ExecStart=/opt/trading/venv/bin/python engine/runtime/prod_preflight.py --json", unit)
         self.assertIn("ReadWritePaths=/var/lib/trading /var/backups/trading", unit)
         self.assertIn("ProtectSystem=strict", unit)
@@ -119,12 +126,17 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         self.assertIn("memory_pressure_hardening.sh", verify)
         self.assertIn("check_memory_pressure_assets", verify)
         self.assertIn("check_prod_preflight_runner", verify)
+        self.assertIn("object_store_access_key", verify)
         self.assertIn(
-            "redis_password object_store_secret_key dashboard_api_token operator_api_token backup_evidence_hmac_key",
+            "redis_password object_store_access_key object_store_secret_key dashboard_api_token operator_api_token backup_evidence_hmac_key",
             (REPO_ROOT / "ops/server/credstore/install.sh").read_text(encoding="utf-8"),
         )
         self.assertIn("--property=\"LoadCredentialEncrypted=pg_password_app:${CREDSTORE_DIR}/pg_password_app.cred\"", runner)
         self.assertIn("--property=\"LoadCredentialEncrypted=redis_password:${CREDSTORE_DIR}/redis_password.cred\"", runner)
+        self.assertIn(
+            "--property=\"LoadCredentialEncrypted=object_store_access_key:${CREDSTORE_DIR}/object_store_access_key.cred\"",
+            runner,
+        )
         self.assertIn(
             "--property=\"LoadCredentialEncrypted=object_store_secret_key:${CREDSTORE_DIR}/object_store_secret_key.cred\"",
             runner,
@@ -143,6 +155,9 @@ class ProdPreflightProvisioningTests(unittest.TestCase):
         )
         self.assertIn("DASHBOARD_API_TOKEN_SECRET=dashboard_api_token", runner)
         self.assertIn("OPERATOR_API_TOKEN_SECRET=operator_api_token", runner)
+        self.assertIn("OBJECT_STORE_ACCESS_KEY_SECRET=object_store_access_key", runner)
+        self.assertIn("OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key", runner)
+        self.assertIn("unset OBJECT_STORE_ACCESS_KEY OBJECT_STORE_ACCESS_KEY_FILE", runner)
         self.assertIn("BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key", runner)
         self.assertIn("TS_SECRETS_PROVIDER=systemd-creds", runner)
         self.assertNotIn('if [ -r "$PROVIDER_ENV" ]', runner)

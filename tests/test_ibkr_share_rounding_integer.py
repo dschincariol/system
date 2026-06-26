@@ -34,6 +34,8 @@ def _patch_ibkr_common(monkeypatch, mod: Any, *, asset_class: str) -> Dict[str, 
     monkeypatch.setenv("EXEC_USE_SHARE_ROUNDING", "1")
     monkeypatch.setenv("EXEC_IBKR_SHARE_INCREMENT", "1")
     monkeypatch.setenv("EXEC_EQUITY_MIN_NOTIONAL_USD", "1")
+    if asset_class.upper() == "FX":
+        monkeypatch.setenv("FX_LIVE_TRADING_ENABLED", "1")
     monkeypatch.setattr(mod, "connect", lambda: _FakeCon())
     monkeypatch.setattr(mod, "_real_trading_gate", lambda: {"ok": True, "real_trading_allowed": True})
     monkeypatch.setattr(mod, "_ibkr_credentials_block", lambda require_explicit=True: None)

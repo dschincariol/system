@@ -6,6 +6,7 @@ for the local/service runtime.
 """
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -57,6 +59,8 @@ from engine.startup.dashboard import wait_for_dashboard_bind as _startup_wait_fo
 from engine.startup.shutdown import bootstrap_runtime_side_effects as _startup_bootstrap_runtime_side_effects
 from engine.startup.shutdown import handle_signal as _startup_handle_signal
 from engine.startup.shutdown import request_dashboard_runtime_stop as _startup_request_dashboard_runtime_stop
+from engine.runtime.sd_notify import notify_ready as _systemd_notify_ready
+from engine.runtime.sd_notify import notify_watchdog as _systemd_notify_watchdog
 
 warnings.filterwarnings(
     "ignore",
@@ -252,12 +256,13 @@ def _bootstrap_start_system_env() -> None:
         sys.path.insert(0, _BASE_DIR)
 
     try:
-        _ensure_local_env_file()
         from dotenv import load_dotenv
         env_file_raw = str(os.environ.get("TRADING_ENV_FILE") or ".env").strip() or ".env"
         env_file = Path(env_file_raw).expanduser()
         if not env_file.is_absolute():
             env_file = Path(_BASE_DIR) / env_file
+        if env_file == Path(_BASE_DIR) / ".env":
+            _ensure_local_env_file()
         load_dotenv(env_file, override=False)
     except Exception as e:
         sys.stderr.write(f"[start_system] dotenv_load_failed: {type(e).__name__}: {e}\n")
@@ -865,79 +870,81 @@ def _run_import_smoke() -> None:
             continue
         targets.append((_module_name_from_path(script_rel), script_rel))
 
-    for module_name, rel_path in targets:
-        key = (str(module_name), str(rel_path))
-        if key in seen:
-            continue
-        seen.add(key)
+    with tempfile.TemporaryDirectory(prefix="startup_import_smoke_pycompile_") as compile_dir:
+        for module_name, rel_path in targets:
+            key = (str(module_name), str(rel_path))
+            if key in seen:
+                continue
+            seen.add(key)
 
-        abs_path = os.path.join(_BASE_DIR, rel_path)
-        if not os.path.exists(abs_path):
-            failures.append({
-                "module": str(module_name),
-                "path": str(rel_path),
-                "error_type": "FileNotFoundError",
-                "error": f"module_path_missing:{abs_path}",
-                "line": 0,
-            })
-            continue
+            abs_path = os.path.join(_BASE_DIR, rel_path)
+            if not os.path.exists(abs_path):
+                failures.append({
+                    "module": str(module_name),
+                    "path": str(rel_path),
+                    "error_type": "FileNotFoundError",
+                    "error": f"module_path_missing:{abs_path}",
+                    "line": 0,
+                })
+                continue
 
-        try:
-            py_compile.compile(abs_path, doraise=True)
-        except (SyntaxError, IndentationError, py_compile.PyCompileError) as e:
-            err = getattr(e, "exc_value", e)
-            line_no = int(getattr(err, "lineno", 0) or 0)
-            _log_swallowed(
-                "IMPORT_SMOKE_COMPILE_FAILED",
-                module=str(module_name),
-                path=str(rel_path),
-                error=str(err),
-                line=int(line_no),
+            try:
+                digest = hashlib.sha256(os.path.abspath(abs_path).encode("utf-8", "surrogatepass")).hexdigest()
+                py_compile.compile(abs_path, cfile=os.path.join(compile_dir, f"{digest}.pyc"), doraise=True)
+            except (SyntaxError, IndentationError, py_compile.PyCompileError) as e:
+                err = getattr(e, "exc_value", e)
+                line_no = int(getattr(err, "lineno", 0) or 0)
+                _log_swallowed(
+                    "IMPORT_SMOKE_COMPILE_FAILED",
+                    module=str(module_name),
+                    path=str(rel_path),
+                    error=str(err),
+                    line=int(line_no),
+                )
+                failures.append({
+                    "module": str(module_name),
+                    "path": str(rel_path),
+                    "error_type": type(err).__name__,
+                    "error": str(err),
+                    "line": line_no,
+                })
+                continue
+            except Exception as e:
+                _log_swallowed(
+                    "IMPORT_SMOKE_COMPILE_FAILED",
+                    module=str(module_name),
+                    path=str(rel_path),
+                    error=str(e),
+                    line=int(getattr(e, "lineno", 0) or 0),
+                )
+                failures.append({
+                    "module": str(module_name),
+                    "path": str(rel_path),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "line": int(getattr(e, "lineno", 0) or 0),
+                })
+                continue
+
+            should_import = key in bootstrap_keys or bool(_IMPORT_SMOKE_IMPORT_JOBS)
+            if not should_import:
+                continue
+
+            import_result = _import_smoke_subprocess(
+                str(module_name),
+                str(abs_path),
+                timeout_s=float(_IMPORT_SMOKE_TIMEOUT_S),
             )
-            failures.append({
-                "module": str(module_name),
-                "path": str(rel_path),
-                "error_type": type(err).__name__,
-                "error": str(err),
-                "line": line_no,
-            })
-            continue
-        except Exception as e:
-            _log_swallowed(
-                "IMPORT_SMOKE_COMPILE_FAILED",
-                module=str(module_name),
-                path=str(rel_path),
-                error=str(e),
-                line=int(getattr(e, "lineno", 0) or 0),
-            )
-            failures.append({
-                "module": str(module_name),
-                "path": str(rel_path),
-                "error_type": type(e).__name__,
-                "error": str(e),
-                "line": int(getattr(e, "lineno", 0) or 0),
-            })
-            continue
-
-        should_import = key in bootstrap_keys or bool(_IMPORT_SMOKE_IMPORT_JOBS)
-        if not should_import:
-            continue
-
-        import_result = _import_smoke_subprocess(
-            str(module_name),
-            str(abs_path),
-            timeout_s=float(_IMPORT_SMOKE_TIMEOUT_S),
-        )
-        if not bool(import_result.get("ok")):
-            failures.append({
-                "module": str(module_name),
-                "path": str(rel_path),
-                "error_type": str(import_result.get("error_type") or "ImportError"),
-                "error": str(import_result.get("error") or "import_failed"),
-                "line": 0,
-                "stdout": str(import_result.get("stdout") or ""),
-                "stderr": str(import_result.get("stderr") or ""),
-            })
+            if not bool(import_result.get("ok")):
+                failures.append({
+                    "module": str(module_name),
+                    "path": str(rel_path),
+                    "error_type": str(import_result.get("error_type") or "ImportError"),
+                    "error": str(import_result.get("error") or "import_failed"),
+                    "line": 0,
+                    "stdout": str(import_result.get("stdout") or ""),
+                    "stderr": str(import_result.get("stderr") or ""),
+                })
 
     _IMPORT_SMOKE["ok"] = len(failures) == 0
     _IMPORT_SMOKE["failures"] = failures
@@ -1074,12 +1081,80 @@ _INGESTION_WATCHDOG_SLEEP_S = _env_float("INGESTION_WATCHDOG_SLEEP_S", 2.0, mini
 _INGESTION_WATCHDOG_STOP = threading.Event()
 _INGESTION_RESTART_BLOCKED = False
 _INGESTION_WATCHDOG_THREAD: Optional[threading.Thread] = None
+_SYSTEMD_WATCHDOG_THREAD: Optional[threading.Thread] = None
+_SYSTEMD_READY_SENT = False
 _STARTUP_HEALTH_THREAD: Optional[threading.Thread] = None
+
+
+def _default_systemd_watchdog_ping_seconds() -> float:
+    raw_watchdog_usec = str(os.environ.get("WATCHDOG_USEC") or "0").strip() or "0"
+    try:
+        watchdog_usec = int(raw_watchdog_usec)
+    except (TypeError, ValueError) as e:
+        _log_swallowed("SYSTEMD_WATCHDOG_BUDGET_PARSE_FAILED", error=e, raw_watchdog_usec=raw_watchdog_usec)
+        return 15.0
+    if watchdog_usec > 0:
+        return max(1.0, min(15.0, (watchdog_usec / 1_000_000.0) / 2.0))
+    return 15.0
+
+
+_SYSTEMD_WATCHDOG_PING_SECONDS = _env_float(
+    "WATCHDOG_PING_SECONDS",
+    _default_systemd_watchdog_ping_seconds(),
+    minimum=1.0,
+    maximum=30.0,
+)
 
 
 def _start_ingestion_with_server_enabled() -> bool:
     enabled = str(os.environ.get("START_INGESTION_WITH_SERVER", "1")).strip().lower()
     return enabled in ("1", "true", "yes", "on")
+
+
+def _systemd_watchdog_liveness_ok() -> bool:
+    try:
+        from engine.runtime.lifecycle_state import LIVE, WARMING_UP, get_state
+
+        state = str((get_state() or {}).get("state") or "").strip().upper()
+        return state in {LIVE, WARMING_UP}
+    except Exception as e:
+        _log_swallowed("SYSTEMD_WATCHDOG_LIVENESS_CHECK_FAILED", error=e)
+        return False
+
+
+def _notify_systemd_ready() -> bool:
+    global _SYSTEMD_READY_SENT
+    if _SYSTEMD_READY_SENT:
+        return False
+    sent = _systemd_notify_ready()
+    _SYSTEMD_READY_SENT = True
+    return bool(sent)
+
+
+def _notify_systemd_watchdog_if_live() -> bool:
+    if not _systemd_watchdog_liveness_ok():
+        return False
+    return bool(_systemd_notify_watchdog())
+
+
+def _systemd_watchdog_loop() -> None:
+    while not _INGESTION_WATCHDOG_STOP.is_set():
+        _notify_systemd_watchdog_if_live()
+        _INGESTION_WATCHDOG_STOP.wait(max(1.0, float(_SYSTEMD_WATCHDOG_PING_SECONDS)))
+
+
+def _ensure_systemd_watchdog_started() -> None:
+    global _SYSTEMD_WATCHDOG_THREAD
+    if not str(os.environ.get("NOTIFY_SOCKET") or "").strip():
+        return
+    if _start_ingestion_with_server_enabled():
+        return
+    thread = _SYSTEMD_WATCHDOG_THREAD
+    if thread is not None and thread.is_alive():
+        return
+    thread = threading.Thread(target=_systemd_watchdog_loop, name="systemd_watchdog", daemon=True)
+    _SYSTEMD_WATCHDOG_THREAD = thread
+    thread.start()
 
 
 def _watch_ingestion() -> None:
@@ -1137,6 +1212,7 @@ def _watch_ingestion() -> None:
 
             if _INGESTION_PROC is None:
                 if _existing_ingestion_runtime_active():
+                    _notify_systemd_watchdog_if_live()
                     _INGESTION_WATCHDOG_STOP.wait(max(0.25, float(_INGESTION_WATCHDOG_SLEEP_S)))
                     continue
                 try:
@@ -1175,6 +1251,7 @@ def _watch_ingestion() -> None:
                 stdout_log=str(_INGESTION_STDOUT_PATH),
             )
 
+        _notify_systemd_watchdog_if_live()
         _INGESTION_WATCHDOG_STOP.wait(max(0.25, float(_INGESTION_WATCHDOG_SLEEP_S)))
 
 def _read_pid_file_record(pid_path: str, *, label: str = "runtime") -> dict:
@@ -2388,6 +2465,8 @@ def _start_startup_health_validation_async(*, mode: str) -> threading.Thread:
     def _runner() -> None:
         try:
             _perform_startup_health_validation(mode=str(mode))
+            _notify_systemd_ready()
+            _ensure_systemd_watchdog_started()
         except Exception as e:
             _log_swallowed("STARTUP_HEALTH_ASYNC_FATAL", mode=str(mode), error=str(e))
             _handle_late_startup_health_validation_failure(
@@ -2404,6 +2483,36 @@ def _start_startup_health_validation_async(*, mode: str) -> threading.Thread:
     thread.start()
     _STARTUP_HEALTH_THREAD = thread
     return thread
+
+
+def _start_systemd_ready_after_dashboard_bind(*, host: str, port: int) -> None:
+    if not str(os.environ.get("NOTIFY_SOCKET") or "").strip():
+        return
+
+    def _runner() -> None:
+        try:
+            bind_wait_timeout_s = max(5.0, min(120.0, float(_STARTUP_HEALTH_TIMEOUT_S)))
+            if not _wait_for_dashboard_bind(
+                host=str(host),
+                port=int(port),
+                timeout_s=float(bind_wait_timeout_s),
+            ):
+                raise TimeoutError(f"dashboard_bind_timeout:{host}:{port}")
+            _notify_systemd_ready()
+            _ensure_systemd_watchdog_started()
+        except Exception as e:
+            _log_swallowed(
+                "SYSTEMD_READY_AFTER_BIND_FAILED",
+                host=str(host),
+                port=int(port),
+                error=str(e),
+            )
+
+    threading.Thread(
+        target=_runner,
+        name="systemd_ready_after_bind",
+        daemon=True,
+    ).start()
 
 
 def _wait_for_dashboard_bind(*, host: str, port: int, timeout_s: float) -> bool:
@@ -2449,6 +2558,18 @@ def _run_dashboard_server(run_server, *, mode: str) -> None:
         mode=mode,
         perform_startup_health_validation=_perform_startup_health_validation,
     )
+
+
+def _run_dashboard_server_with_systemd_ready_after_bind(
+    run_server,
+    *,
+    mode: str,
+    host: str,
+    port: int,
+) -> None:
+    _perform_startup_health_validation(mode=str(mode))
+    _start_systemd_ready_after_dashboard_bind(host=str(host), port=int(port))
+    run_server()
 
 
 def _coerce_ts_ms(value: Any) -> int:
@@ -2916,7 +3037,12 @@ def main():
                     port=int(dashboard_port),
                 )
             else:
-                _run_dashboard_server(run_server, mode=str(mode))
+                _run_dashboard_server_with_systemd_ready_after_bind(
+                    run_server,
+                    mode=str(mode),
+                    host=str(dashboard_host),
+                    port=int(dashboard_port),
+                )
             _safe_print("[start_system] dashboard_server_run_server_returned")
 
             try:

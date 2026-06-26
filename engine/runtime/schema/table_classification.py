@@ -248,6 +248,39 @@ TABLE_CLASS["har_rv_forecasts"] = _h(
     write_rate="medium",
     read_pattern="latest forecast by (symbol, ts_ms) and walk-forward validation windows",
 )
+TABLE_CLASS["garch_vol_forecasts"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol",),
+    rationale="point-in-time GARCH-family volatility forecasts used by sizing and Monte Carlo risk inputs",
+    write_rate="medium",
+    read_pattern="latest forecast by (symbol, model_type, ts_ms) and walk-forward validation windows",
+)
+TABLE_CLASS["tsfm_benchmark_runs"] = _r(
+    "governed time-series foundation-model benchmark run manifests and governance summaries",
+    write_rate="low",
+    read_pattern="latest benchmark run by run_id/status and governance evidence review",
+    cleanup="retain with model evidence artifacts",
+)
+TABLE_CLASS["tsfm_benchmark_rows"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol", "family"),
+    rationale="point-in-time TSFM challenger and baseline OOS benchmark rows with feature/provenance snapshots",
+    write_rate="medium",
+    read_pattern="symbol/task/family walk-forward benchmark comparisons and promotion evidence review",
+)
+TABLE_CLASS["tsfm_risk_inputs"] = _h(
+    chunk="1 week",
+    compress_after="30 days",
+    retain="3 years",
+    segmentby=("symbol", "adapter"),
+    rationale="shadow TSFM volatility forecasts registered as risk-input candidates with explicit provenance",
+    write_rate="medium",
+    read_pattern="latest shadow risk-input candidate by symbol/adapter/time",
+)
 _add(("news_event_features", "options_event_features"), FEATURE_SERIES)
 TABLE_CLASS["news_symbol_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
 TABLE_CLASS["news_story_embeddings"] = _r(
@@ -269,6 +302,16 @@ TABLE_CLASS["structured_document_events"] = _r(
     "structured extracted events from filings, transcripts, and news keyed by source document and extractor version",
     write_rate="medium",
     read_pattern="symbol availability-window PIT feature snapshots and source-document audits",
+)
+TABLE_CLASS["llm_extracted_events"] = _r(
+    "validated structured LLM event rows keyed by source document, evidence span, schema, prompt, and model lineage",
+    write_rate="low to medium",
+    read_pattern="source-document audits and symbol availability-window PIT feature projection",
+)
+TABLE_CLASS["llm_event_extraction_audit"] = _r(
+    "append-only LLM extraction acceptance/rejection ledger with prompt, model, source hash, cost, and PIT guard lineage",
+    write_rate="low to medium",
+    read_pattern="latest audit rows by status/source document and forensic lineage review",
 )
 TABLE_CLASS["options_symbol_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
 TABLE_CLASS["social_features"] = _h(**{**FEATURE_SERIES.__dict__, "time_column": "bucket_ts_ms"})
@@ -297,6 +340,12 @@ TABLE_CLASS["graph_relational_snapshots"] = _h(
     rationale="versioned point-in-time graph/relational feature snapshots for shadow-only train/serve parity and promotion evidence",
     write_rate="medium",
     read_pattern="latest graph snapshot by symbol/graph_id/time and historical replay windows",
+)
+TABLE_CLASS["graph_challenger_runs"] = _r(
+    "shadow graph-relational challenger run manifests and promotion-readiness diagnostics",
+    write_rate="low",
+    read_pattern="latest graph challenger runs by model name and creation time",
+    cleanup="retain with model evidence artifacts",
 )
 TABLE_CLASS["feature_data"] = _h(
     chunk="1 week",
@@ -328,14 +377,14 @@ TABLE_CLASS["nlp_text_blobs"] = _r(
     read_pattern="primary-key lookup and symbol/time backfill scans",
 )
 TABLE_CLASS["nlp_embeddings"] = _r(
-    "content-addressed embedding cache keyed by text hash and local model name",
+    "content-addressed embedding cache keyed by text hash and backend/model namespace",
     write_rate="medium",
-    read_pattern="primary-key lookup by hash/model",
+    read_pattern="primary-key lookup by hash/backend/model namespace",
 )
 TABLE_CLASS["nlp_sentiments"] = _r(
-    "content-addressed sentiment cache keyed by text hash and local model name",
+    "content-addressed sentiment cache keyed by text hash and backend/model namespace",
     write_rate="medium",
-    read_pattern="primary-key lookup by hash/model",
+    read_pattern="primary-key lookup by hash/backend/model namespace",
 )
 TABLE_CLASS["sec_filings"] = FEATURE_SERIES
 TABLE_CLASS["insider_transactions"] = _r(
@@ -597,8 +646,23 @@ _add(
         "broker_connection_health",
         "execution_divergence",
         "data_source_logs",
+        "risk_var_backtest_results",
     ),
     HEALTH_SERIES,
+)
+TABLE_CLASS["risk_var_forecasts"] = _r(
+    "Monte Carlo VaR/CVaR forecast snapshots retained for point-in-time risk-model validation",
+    write_rate="low",
+    read_pattern="latest forecasts and matured forecast scans by forecast_ts_ms",
+)
+TABLE_CLASS["risk_var_backtest_results"] = _h(
+    chunk="30 days",
+    compress_after="90 days",
+    retain="5 years",
+    segmentby=("confidence_level",),
+    rationale="VaR/CVaR exception evidence with Kupiec, Christoffersen, rolling exception rate, and traffic-light status",
+    write_rate="low",
+    read_pattern="recent risk-model validation dashboard scans by time and confidence",
 )
 TABLE_CLASS["broker_connection_health"] = _h(
     chunk="1 day",

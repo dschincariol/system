@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -142,7 +143,12 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("ENV TRADING_REQUIREMENTS_FILE=${TRADING_REQUIREMENTS_FILE}", dockerfile_text)
         self.assertIn("requirements-amd-rocm.txt)", dockerfile_text)
         self.assertIn("requirements-amd-rocm-full.txt", dockerfile_text)
-        self.assertIn("python -m pip install -r /app/requirements-amd-rocm-full.txt", dockerfile_text)
+        self.assertIn('python -m pip install --require-hashes -r "$REQ_FILE"', dockerfile_text)
+        self.assertIn(
+            "python -m pip install --require-hashes -r /app/requirements-amd-rocm-full.txt",
+            dockerfile_text,
+        )
+        self.assertIn("requirements-nvidia-cuda.txt|requirements-amd-rocm-full.txt", dockerfile_text)
 
     def test_minio_initializer_retries_until_object_store_is_ready(self) -> None:
         external_compose = REPO_ROOT / "deploy" / "compose" / "docker-compose.external-services.yml"
@@ -349,7 +355,7 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
         self.assertIn("BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S: ${BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S:-93600}", stack_text)
         self.assertIn("BACKUP_EVIDENCE_RPO_S: ${BACKUP_EVIDENCE_RPO_S:-120}", stack_text)
         self.assertIn("BACKUP_EVIDENCE_WAL_RPO_S: ${BACKUP_EVIDENCE_WAL_RPO_S:-120}", stack_text)
-        self.assertIn("BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S: ${BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S:-7776000}", stack_text)
+        self.assertIn("BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S: ${BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S:-604800}", stack_text)
         self.assertIn("BACKUP_EVIDENCE_RTO_S: ${BACKUP_EVIDENCE_RTO_S:-1800}", stack_text)
         self.assertIn("BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S: ${BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S:-120}", stack_text)
         self.assertIn("BACKUP_EVIDENCE_REQUIRE_SIGNATURE: ${BACKUP_EVIDENCE_REQUIRE_SIGNATURE:-1}", stack_text)
@@ -363,7 +369,7 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             "BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S=93600",
             "BACKUP_EVIDENCE_RPO_S=120",
             "BACKUP_EVIDENCE_WAL_RPO_S=120",
-            "BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=7776000",
+            "BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=604800",
             "BACKUP_EVIDENCE_RTO_S=1800",
             "BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S=120",
             "BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1",
@@ -400,12 +406,57 @@ class ComposeDeploymentAssetTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, env_example_text)
 
+    def test_restore_drill_cadence_and_spool_durability_contract(self) -> None:
+        evidence_script = (REPO_ROOT / "ops" / "backup" / "backup_restore_evidence.sh").read_text(encoding="utf-8")
+        deploy_env = (REPO_ROOT / "deploy" / "env" / "trading.env.example").read_text(encoding="utf-8")
+        install_script = (REPO_ROOT / "deploy" / "install_trading_system.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'restore_reuse_max_s="${TS_BACKUP_EVIDENCE_REUSE_RESTORE_MAX_AGE_S:-${BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S:-1209600}}"',
+            evidence_script,
+        )
+
+        for timer_path in (
+            REPO_ROOT / "ops" / "server" / "systemd" / "trading-restore-drill.timer",
+            REPO_ROOT / "deploy" / "systemd" / "trading-restore-drill.timer",
+        ):
+            with self.subTest(timer=str(timer_path.relative_to(REPO_ROOT))):
+                timer_text = timer_path.read_text(encoding="utf-8")
+                self.assertIn("OnCalendar=weekly", timer_text)
+                self.assertIn("RandomizedDelaySec=3600", timer_text)
+                self.assertIn("Persistent=true", timer_text)
+                self.assertIn("Unit=trading-restore-drill.service", timer_text)
+                self.assertNotIn("OnCalendar=monthly", timer_text)
+
+        deploy_service = (REPO_ROOT / "deploy" / "systemd" / "trading-restore-drill.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("SyslogIdentifier=trading-restore-drill", deploy_service)
+        self.assertIn("/opt/trading/app/ops/backup/restore_drill.sh", deploy_service)
+        self.assertIn("install -m 0644 \"$REPO_DIR/deploy/systemd/trading-restore-drill.service\"", install_script)
+        self.assertIn("install -m 0644 \"$REPO_DIR/deploy/systemd/trading-restore-drill.timer\"", install_script)
+        self.assertIn("systemctl enable trading-restore-drill.timer", install_script)
+        self.assertIn("systemctl start trading-restore-drill.timer", install_script)
+
+        restore_match = re.search(r"^BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=(\d+)$", deploy_env, re.MULTILINE)
+        self.assertIsNotNone(restore_match)
+        restore_max_age_s = int(restore_match.group(1))
+        self.assertGreaterEqual(restore_max_age_s, 604800)
+        self.assertLessEqual(restore_max_age_s, 1209600)
+        self.assertIn("604800-1209600 seconds", deploy_env)
+        self.assertIn("Staleness past this window fails backup evidence", deploy_env)
+
+        self.assertIn("Accepted values: FULL | NORMAL (default) | EXTRA", deploy_env)
+        self.assertIn("hard OS/power loss can lose the most recent spooled transaction", deploy_env)
+        self.assertIn("FULL fsyncs every spool commit", deploy_env)
+        self.assertIn("order, ledger, risk, capital, and audit writes do not use this spool", deploy_env)
+        self.assertRegex(deploy_env, r"(?m)^ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS=$")
+
     def test_logrotate_bounds_runtime_and_container_mounted_logs(self) -> None:
         logrotate = (REPO_ROOT / "deploy" / "logrotate" / "trading-system").read_text(encoding="utf-8")
 
-        self.assertIn("/opt/trading-system/logs/*.log", logrotate)
-        self.assertIn("/opt/trading-system/logs/*.jsonl", logrotate)
-        self.assertIn("/opt/trading-system/repo/var/log/*.log", logrotate)
+        self.assertIn("/var/lib/trading/logs/*.log", logrotate)
+        self.assertIn("/var/lib/trading/logs/*.jsonl", logrotate)
         self.assertIn("/opt/trading/app/logs/*.log", logrotate)
         self.assertIn("/opt/trading/app/var/log/*.log", logrotate)
         self.assertIn("/opt/trading/app/boot/*.log", logrotate)

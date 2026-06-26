@@ -223,6 +223,7 @@ Consumers:
 
 Production enforcement:
 - durable rows live in `structured_document_events`, created by migration `0060_structured_document_events.py`
+- LLM-backed rows additionally live in `llm_extracted_events`, with accept/reject/cost lineage in `llm_event_extraction_audit`, created by migration `0082_llm_event_extraction.py`
 - feature joins only use `availability_ts_ms <= decision ts_ms`
 - PIT metadata is attached to both raw rows (`pit_metadata_json`) and model snapshots (`source_timestamps.structured_doc_events`)
 - all `structured_doc_events_v1.*` features are registry stage `shadow` with `direct_trading_authority=false`; live model serving rejects them through `feature_registry.assert_no_shadow_features(...)`
@@ -233,12 +234,19 @@ Production enforcement:
 | `source_event_id` | `INTEGER` | No | Normalized `events.id` when available. | event id |
 | `symbol` | `TEXT` | Yes | Upper-cased asset symbol; empty string when document is market-wide. | symbol |
 | `document_type` | `TEXT` | Yes | `filing`, `transcript`, or `news`. | enum |
-| `event_type` | `TEXT` | Yes | Extracted event kind such as `guidance_raise`, `guidance_cut`, `margin_pressure`, `liquidity_stress`, `capex_increase`, `capex_cut`, `debt_refinancing_risk`, `regulatory_litigation_risk`, `customer_concentration`, or `management_uncertainty`. | enum |
+| `event_type` | `TEXT` | Yes | Extracted event kind such as `guidance_raise`, `guidance_cut`, `margin_pressure`, `liquidity_stress`, `capex_increase`, `capex_cut`, `debt_refinancing_risk`, `regulatory_litigation_risk`, `supply_chain_exposure`, `capital_allocation_positive`, `capital_allocation_negative`, `buyback_increase`, `buyback_cut`, `dividend_increase`, `dividend_cut`, `customer_concentration`, `management_tone_positive`, `management_tone_negative`, `management_uncertainty`, `macro_positive_surprise`, or `macro_negative_surprise`. | enum |
 | `event_ts_ms` | `INTEGER` | Yes | Source document event timestamp. | ms |
 | `availability_ts_ms` | `INTEGER` | Yes | Earliest timestamp the extraction may be used by PIT features. | ms |
 | `extraction_confidence` | `REAL` | Yes | Deterministic extractor confidence for the matched evidence. | 0-1 score |
 | `feature_id` | `TEXT` | Yes | Registered `structured_doc_events_v1.*` feature receiving the event. | feature id |
 | `pit_metadata_json` | `JSON object` | Yes | Source timestamp, availability timestamp, extractor version, lag policy, and `direct_trading_authority=false`. | JSON |
+
+LLM extraction contract:
+- `engine.data.llm_event_extraction.select_source_documents(...)` reads normalized `events` rows only when source and availability timestamps are at or before the configured decision timestamp.
+- Provider calls are behind reusable adapters (`openai`, `anthropic`, and deterministic `fake` for tests), are offline/manual by default, and are bounded by `LLM_EVENT_EXTRACT_MAX_DOCS`, `LLM_EVENT_EXTRACT_MAX_COST_USD`, `LLM_EVENT_EXTRACT_MAX_INPUT_CHARS`, `LLM_EVENT_EXTRACT_MAX_OUTPUT_TOKENS`, and `LLM_EVENT_EXTRACT_MIN_INTERVAL_MS`.
+- Accepted provider output must match strict schema `llm_financial_event_v1`: `entity`, `ticker`, `event_type`, `direction`, `polarity`, numeric `magnitude` when present, `confidence`, source document/url/timestamps, evidence offsets/text, extraction model, prompt/schema version, and PIT guard metadata.
+- Rejected JSON, extra fields, future documents, source-hash mismatches, evidence-span mismatches, and any `direct_trading_authority=true` payload are written to `llm_event_extraction_audit` and are not projected into features.
+- Accepted rows store `prompt_hash`, `model_hash`, and `source_hash` in both `llm_extracted_events` and the audit table, then project to `structured_document_events` for shadow-only feature materialization.
 
 ### 3C. Structured Document And Graph Feature Visibility API
 
@@ -692,7 +700,7 @@ Source evidence:
 
 Consumers:
 - `engine.execution.execution_policy_engine.apply_execution_policy(...)` shortens TTL/half-life, blocks stale learned cohorts, blocks low-capacity/crowded risk-increasing orders, and records the learned gate in execution audit payloads
-- `engine.strategy.portfolio_execution_intents.load_latest_portfolio_execution_intents(...)` applies learned capacity/crowding multipliers before model/group/portfolio caps are enforced
+- `engine.strategy.portfolio_execution_intents.load_latest_execution_intents(...)` applies learned capacity/crowding multipliers before model/group/portfolio caps are enforced
 - `engine.strategy.position_sizing.position_from_signal(...)` accepts the learned estimate object and scales or blocks direct sizing calls
 - `engine.strategy.champion_manager.evaluate_competition_cycle(...)` treats learned low-capacity/crowded cohorts as candidate/current blockers during champion evaluation
 
@@ -1031,7 +1039,7 @@ Failure if malformed:
 Snapshot schema:
 
 - `name = "operator_repair_snapshot"`
-- `version = 2`
+- `version = 3`
 - `producer = "engine.api.api_system"`
 
 ### Top-level sections
@@ -1430,7 +1438,7 @@ Every row in `evidence`, `blockers`, and `unknowns` uses:
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
-| `key` | `TEXT` | Yes | Stable evidence id such as `ope_gate`, `experiment_ledger`, `net_after_cost_labels`, `learned_alpha_decay`, `alpha_shrinkage`, `production_monitoring`, `shadow_live_monitoring`, or `shadow_capital_scores`. | id |
+| `key` | `TEXT` | Yes | Stable evidence id such as `ope_gate`, `experiment_ledger`, `net_after_cost_labels`, `learned_alpha_decay`, `alpha_shrinkage`, `risk_var_backtesting`, `production_monitoring`, `shadow_live_monitoring`, or `shadow_capital_scores`. | id |
 | `label` | `TEXT` | Yes | Operator-facing evidence label. | text |
 | `state` | `TEXT` | Yes | `pass`, `block`, or `unknown`. Missing, stale, failed, or insufficient required evidence is `block`. | enum |
 | `freshness` | `TEXT` | Yes | `fresh`, `stale`, `missing`, or `unknown`. | enum |

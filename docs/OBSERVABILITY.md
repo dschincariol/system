@@ -22,10 +22,10 @@ This document records the observability surfaces that are present in the reposit
 | Ingestion soak readiness | `engine/runtime/ingestion_soak.py`, `engine/runtime/health.py`, `engine/runtime/health_readiness.py`, and `engine/runtime/prod_preflight.py` | `/api/health.ingestion_soak` consolidates async price writer, telemetry append buffer, options durable buffer, Timescale client, Postgres price sidecar, Redis pool/circuit, and applied Timescale policy evidence. Required production checks fail closed when live writer evidence is missing, queues or spools exceed thresholds, backpressure is active, COPY falls back unexpectedly, loss/corruption/dead-letter counters are nonzero, Redis cache circuit is open, required scoring indexes are absent, or hypertable chunk/compression policy is not applied. |
 | Execution barrier | `engine/runtime/gates.py` and `engine/api/api_system.py` | Fail-closed execution state from `/api/execution/barrier`. |
 | Operator logs | `var/log/` and `boot/operator_server.js` | Runtime log tails, stderr tails, and operator-side snapshots exposed through the Node operator server. |
-| Disk pressure | `engine/runtime/health.py` and `engine/runtime/prod_preflight.py` | Per-path filesystem headroom for `/`, runtime data, runtime logs, backups, and Docker roots when present. |
+| Disk pressure | `engine/runtime/health.py` and `engine/runtime/prod_preflight.py` | Per-path filesystem headroom for `/`, runtime data, runtime logs, backups, and Docker roots when present. Critical disk-pressure evidence makes `/api/health.ok=false` in every engine mode. |
 | Host memory pressure | `engine/runtime/memory_pressure.py`, `engine/runtime/health.py`, `engine/runtime/prod_preflight.py`, and `engine/strategy/jobs/observability_snapshot.py` | Read-only RAM/swap/zram/swappiness/ZFS ARC policy evidence. Required production/live checks fail closed when total swap, zram, managed swapfile, swappiness, ARC max, or container memory headroom do not meet policy. |
 | Effective Docker/Postgres/Redis state | `engine/runtime/effective_runtime_state.py`, `engine/runtime/postgres_tuning.py`, `engine/runtime/health.py`, and `engine/runtime/prod_preflight.py` | `/api/health.effective_runtime_state` and `prod_preflight.py` compare intended compose/env limits with actual Docker inspect evidence, Redis `CONFIG GET`, and Postgres `pg_settings`. Required compose production checks fail closed when evidence is missing or drifted. |
-| Storage/WAL guards | `engine/runtime/health.py` and `engine/strategy/jobs/observability_snapshot.py` | `/api/health.storage_wal_guards` exposes storage placement, `pg_stat_archiver`, `pg_wal` growth/backlog, and free-space evidence. The observability snapshot emits runtime alerts and `component_health.storage_wal_guards` when the same checks fail in production-like mode. |
+| Storage/WAL guards | `engine/runtime/health.py` and `engine/strategy/jobs/observability_snapshot.py` | `/api/health.storage_wal_guards` exposes storage placement, `pg_stat_archiver`, `pg_wal` growth/backlog, and free-space evidence. The observability snapshot emits durability alerts for critical free space and confirmed WAL-archiver outage in every mode, while production-only placement/backlog warnings remain production-gated. |
 | CPU power policy drift | `engine/strategy/jobs/observability_snapshot.py` and `engine/runtime/cpu_power_policy.py` | Read-only `cpu_power_policy.sh verify` snapshots recorded as component health under `cpu_power_policy`. Drift reports `status=drift` and `reason=cpu_power_policy_drift`; non-required environments with no visible host CPU controls report `status=skipped`. |
 | Backup accounting | `engine/runtime/backup_evidence.py` and `ops/backup/accounting.sh` | Backup root apparent/allocated bytes, container mount source, subdirectory sizes, inventory counts, and retention status/settings. |
 
@@ -65,6 +65,7 @@ This document records the observability surfaces that are present in the reposit
 | `OBS_COMPONENT_HEALTH_TTL_S` | How long a component-health record stays fresh before it is marked stale. | `900` |
 | `OBS_RATE_WINDOW` | Rolling observation window used by `record_rolling_rate(...)`. | `50` |
 | `API_HEALTH_CACHE_TTL_S` | Cache TTL for `/api/health` snapshots. | `3.0` |
+| `HEALTH_SNAPSHOT_TRACE` | Enables per-section `health_snapshot_section` debug logs for `/api/health`; trace-only `ok` fields default to false when a section omits its own `ok` sub-key so logs cannot show uncomputed sections as healthy. | off |
 | `DISK_PRESSURE_WARN_FREE_PCT` / `DISK_PRESSURE_WARN_FREE_BYTES` | Warning threshold for filesystem headroom in health and preflight. | `15` / `21474836480` |
 | `DISK_PRESSURE_CRITICAL_FREE_PCT` / `DISK_PRESSURE_CRITICAL_FREE_BYTES` | Critical threshold that fails startup validation and production preflight. | `5` / `5368709120` |
 | `BACKUP_ACCOUNTING_DU_TIMEOUT_S` | Timeout for backup accounting size checks. | `8` |
@@ -82,7 +83,7 @@ This document records the observability surfaces that are present in the reposit
 | `ASYNC_PRICE_WRITER_WORKERS` | Number of async price writer shard workers. Rows are split into durable shard envelopes by stable symbol/event key before being spooled, so each symbol's writes stay on one worker and replay in spool order. Must be less than or equal to `TIMESCALE_PRICES_POOL_MAX_SIZE`; writer startup, storage config, and production preflight reject undersized price pools. | `4` (`8` under `host_32t_123g`) |
 | `ASYNC_PRICE_WRITER_SPOOL_MAX_BYTES` | Logical payload byte cap for the SQLite WAL async price-writer spool. Enqueue rejects and dead-letters new envelopes when the cap or `ASYNC_PRICE_WRITER_QUEUE_MAXSIZE` envelope cap would be exceeded. | `268435456` |
 | `ASYNC_PRICE_WRITER_SPOOL_PATH` | Optional durable spool file override. Empty defaults beside `DB_PATH` when file-shaped, under `DB_PATH` when directory-shaped, then under `TS_DATA_ROOT` or the platform data root. | empty |
-| `ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS` / `ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS` | SQLite writer lock wait and WAL durability mode for the async price-writer spool. `NORMAL` is the fast safe default for re-fetchable market data because commits are durable through SQLite WAL without forcing a local fsync on every enqueue; set `FULL` or `EXTRA` explicitly when local spool fsync strength matters more than enqueue latency. | `50` / `NORMAL` |
+| `ASYNC_PRICE_WRITER_SPOOL_BUSY_TIMEOUT_MS` / `ASYNC_PRICE_WRITER_SPOOL_SYNCHRONOUS` | SQLite writer lock wait and WAL durability mode for the async price-writer spool. Accepted values are `FULL`, `NORMAL`, and `EXTRA`; `NORMAL` remains the default and is safe against process crashes for re-fetchable market data, but a hard OS/power loss can lose the most recent spooled transaction. Set `FULL` on power-unreliable hosts to fsync every spool commit and eliminate that last-transaction loss at a measurable write-throughput cost. This affects market-data spool durability only, never order, ledger, risk, capital, or audit writes. | `50` / `NORMAL` |
 | `TELEMETRY_APPEND_BUFFER_SPOOL_PATH` | Optional durable spool file override for high-volume refetchable non-price telemetry writes (`price_provider_health`, `weather_provider_health`, `ingestion_pipeline_health`, `ingest_slippage`, and `price_quotes_raw`). Empty defaults beside `DB_PATH` when file-shaped, under `DB_PATH` when directory-shaped, then under `TS_DATA_ROOT` or the platform data root. | empty |
 | `TELEMETRY_APPEND_BUFFER_SPOOL_MAX_BYTES` | Logical payload byte cap for the non-price telemetry SQLite WAL spool. Enqueue returns backpressure and increments rejection/drop counters when either this cap or `TELEMETRY_APPEND_BUFFER_MAX_ROWS` would be exceeded. | `67108864` |
 | `TELEMETRY_APPEND_BUFFER_SPOOL_BUSY_TIMEOUT_MS` / `TELEMETRY_APPEND_BUFFER_SPOOL_SYNCHRONOUS` | SQLite writer lock wait and WAL durability mode for the non-price telemetry spool. `NORMAL` matches the price spool default for refetchable telemetry; set `FULL` or `EXTRA` explicitly when local spool fsync strength matters more than enqueue latency. | `50` / `NORMAL` |
@@ -101,18 +102,21 @@ snapshot can connect: `postgres.wal_archiver.failed_count`,
 `postgres.wal.directory_bytes`, `postgres.wal.file_count`, and
 `postgres.wal.archive_ready_count`. It also records
 `postgres.wal.alert_state` as `0=ok`, `1=warning`, `2=critical`, and
-`-1=disabled` so the alert evaluator itself is visible. In production-like mode
-it turns the same guard failures into runtime alerts with rule ids
-`STORAGE_PLACEMENT_INVALID`, `WAL_ARCHIVER_OUTAGE`, `PG_WAL_DISK_RISK`,
-`STORAGE_FREE_SPACE_CRITICAL`, or `STORAGE_WAL_WARNING`. Newly inserted
+`-1=disabled` for any future disabled evaluator state. Critical free-space
+evidence emits `STORAGE_FREE_SPACE_CRITICAL`, and confirmed `pg_stat_archiver`
+outage blockers emit `WAL_ARCHIVER_OUTAGE`, regardless of `ENGINE_MODE`.
+Production-like mode also turns placement, `pg_wal` backlog/free-space risk,
+and warning-only transitions into runtime alerts with rule ids
+`STORAGE_PLACEMENT_INVALID`, `PG_WAL_DISK_RISK`, or `STORAGE_WAL_WARNING`.
+Newly inserted
 storage/WAL runtime alerts are delivered through the configured email/webhook
 notification channels by `engine.runtime.alerts_notify`. Stable failures are
 fingerprinted in-process so the job does not call the alert emitter every 60s;
 a recovery clears the fingerprint and a changed WAL segment, backlog, or free
 space payload emits a new alert. A rising `pg_stat_archiver.failed_count` or
-recent recovered `last_failed_wal` becomes a `STORAGE_WAL_WARNING`; unrecovered
-archive failure, excessive `pg_wal` bytes/`.ready` backlog, or critical WAL
-free space remains `CRIT`.
+recent recovered `last_failed_wal` becomes a production-gated
+`STORAGE_WAL_WARNING`; unrecovered archive failure, excessive production
+`pg_wal` bytes/`.ready` backlog, or critical storage free space remains `CRIT`.
 
 The dashboard alert queue preserves these backend alert rows but presents them
 as lifecycle-aware incidents: WARN/HIGH/CRIT are actionable alarms, INFO is a
@@ -175,8 +179,8 @@ Use this order when the system looks unhealthy:
    Confirms whether the runtime is blocked from execution and surfaces the primary reason.
 2. `GET /api/health`
    Shows the broad health snapshot used by the dashboard, including
-   `disk_pressure` warnings before root, runtime data, runtime logs, or backup
-   storage blocks writes. Inspect `memory_pressure.ok`,
+   `disk_pressure` warnings and critical blockers before root, runtime data,
+   runtime logs, or backup storage blocks writes. Inspect `memory_pressure.ok`,
    `memory_pressure.status`, `memory_pressure.errors`,
    `effective_runtime_state.ok`, `effective_runtime_state.errors`,
    `storage_wal_guards.ok`,

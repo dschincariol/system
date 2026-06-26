@@ -23,7 +23,64 @@ The runtime is intentionally conservative in safety-critical paths:
 | Portfolio risk block | `/api/risk/portfolio`, `/api/risk/monte_carlo`, `/api/execution/barrier` | `engine/risk/portfolio_risk_engine.py`, `engine/risk/monte_carlo_risk_engine.py`, `engine/runtime/risk_state.py` |
 | Broker connection or execution-quality degradation | `/api/operator/runtime_watchdogs`, execution metrics APIs, execution barrier reasons | `engine/execution/execution_broker_watchdog.py`, `engine/execution/execution_quality_supervisor.py`, `engine/execution/broker_router.py` |
 | Post-trade attribution or reconciliation failure | Attribution quality APIs, `pnl_attribution`, `trade_attribution_ledger`, recent errors | `engine/execution/execution_poll_and_attrib.py`, `engine/execution/execution_ledger.py`, `engine/runtime/trade_lifecycle.py` |
+| Critical alert delivery not configured | Production preflight, notification channel status, runtime warning logs | `engine/runtime/prod_preflight.py`, `engine/runtime/alerts_notify.py`, `deploy/env/trading.env.example` |
 | WAL archive or storage placement failure | `alerts`, `component_health.storage_wal_guards`, `postgres.wal.alert_state`, production preflight, Timescale compose startup | `deploy/compose/docker-compose.external-services.yml`, `engine/runtime/storage_placement.py`, `engine/strategy/jobs/observability_snapshot.py`, `ops/backup/wal_archive.sh`, `ops/backup/wal_archive_catchup.sh` |
+
+## systemd Watchdog Heartbeat Contract
+
+Production engine and operator units are `Type=notify` services with
+`WatchdogSec=60s`. The engine sends `READY=1` only after startup validation and
+startup-health validation pass, then sends `WATCHDOG=1` at `<=30s` cadence from
+the ingestion watchdog loop or from a fallback systemd-watchdog thread when
+`START_INGESTION_WITH_SERVER=0`. The heartbeat is lifecycle-gated and only
+pings in `LIVE` or `WARMING_UP`; a degraded, kill-switch, or stuck runtime stops
+pinging, so a missed watchdog deadline lets systemd send `SIGABRT` and apply
+`Restart=on-failure` within the existing `StartLimitBurst` guard.
+
+The operator sends `READY=1` after the HTTP listener is bound and sends
+`WATCHDOG=1` at `<=30s` cadence after its periodic watchdog body completes
+without an unrecoverable exception. The engine uses `NotifyAccess=main`; the
+operator uses `NotifyAccess=all` so its `/usr/bin/systemd-notify` fallback is
+accepted if the native `unix-dgram` module is unavailable on a host. The primary
+path for both services is still direct AF_UNIX datagrams from the main process,
+including systemd's NUL-prefixed abstract socket form.
+
+Memory cgroups make the supervised app processes preferred victims over
+co-located Postgres, Redis, and storage services. The engine has
+`MemoryHigh=24G`, `MemoryMax=32G`, and `OOMScoreAdjust=600`; the operator has
+`MemoryHigh=4G`, `MemoryMax=6G`, and `OOMScoreAdjust=700`. These limits are
+sized against the 128 GiB host budget in
+[MEMORY_PRESSURE_RUNBOOK.md](MEMORY_PRESSURE_RUNBOOK.md), including the 48 GiB
+ZFS ARC cap plus managed zram and disk swap. To retune them, edit the installed
+unit or deploy a systemd drop-in, then run `systemctl daemon-reload` and restart
+the affected service. Validate the applied state with `systemctl show`; inactive
+units can still show `WatchdogUSec=infinity`, so the go-live gate requires the
+engine and operator services to be restarted and active before accepting the
+watchdog property. Both long-lived units set `TimeoutStartSec=300s` so normal
+startup validation and safe-mode warmup are not killed before readiness can be
+reported.
+
+## Critical Alert Delivery
+
+Live go-live requires at least one off-box critical alert channel before
+production preflight can pass. Configure either SMTP with both
+`EQ_CRIT_SMTP_HOST` and `EQ_CRIT_EMAIL_TO`, or set `EQ_CRIT_WEBHOOK_URL` to a
+Slack, Discord, or generic HTTPS webhook. The notification status API and
+preflight gate report which channels are configured and enabled.
+
+Operator runbook before go-live:
+
+```bash
+# Pick at least one delivery path in deploy/env/trading.env or the host secret/env source.
+EQ_CRIT_SMTP_HOST=smtp.example.com
+EQ_CRIT_EMAIL_TO=oncall@example.com
+# or:
+EQ_CRIT_WEBHOOK_URL=https://hooks.example.com/services/...
+```
+
+If a CRITICAL runtime alert has zero successful deliveries, the notifier logs a
+structured warning once per process. Equity reconciliation CRITICAL alerts are
+sent through the same runtime notification path after the alert row is inserted.
 
 ## WAL Archive And Storage Placement
 

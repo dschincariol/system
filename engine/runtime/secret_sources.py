@@ -115,6 +115,7 @@ SECRET_ENV_SPECS: tuple[SecretEnvSpec, ...] = (
     _spec("POLYGON_KEY", "Polygon market-data API key alias", provider_names=("polygon_api_key",)),
     _spec("TRADIER_API_TOKEN", "Tradier API token", provider_names=("tradier_api_token",)),
     _spec("OPENAI_API_KEY", "OpenAI API key", provider_names=("openai_api_key",)),
+    _spec("ANTHROPIC_API_KEY", "Anthropic API key", provider_names=("anthropic_api_key",)),
     _spec("TIMESCALE_PASSWORD", "Timescale/Postgres password", provider_names=("pg_password_app", "timescale_password")),
     _spec("TS_PG_PASSWORD", "runtime Postgres password", provider_names=("pg_password_app",)),
     _spec("PGPASSWORD", "libpq password", provider_names=("pg_password_app",)),
@@ -209,6 +210,7 @@ OPTIONAL_PROVIDER_SECRET_KEYS = frozenset(
         "POLYGON_KEY",
         "TRADIER_API_TOKEN",
         "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
     }
 )
 REPO_LOCAL_ENV_RELATIVE_PATHS = (
@@ -518,6 +520,7 @@ def secret_source_policy_snapshot(
     root = Path(repo_root).resolve() if repo_root is not None else _repo_root(env)
     required = strict_secret_source_policy_required(env)
     suppressed = bool(required and _policy_suppressed_for_tests(env))
+    provider = str(env.get("TS_SECRETS_PROVIDER") or "systemd-creds").strip().lower()
     inventory = repo_local_secret_key_inventory(root)
     inline_env: list[dict[str, Any]] = []
     approved: list[dict[str, Any]] = []
@@ -525,6 +528,16 @@ def secret_source_policy_snapshot(
     sources_by_key: dict[str, list[dict[str, Any]]] = {}
     required_groups = _required_secret_groups(env)
     required_keys = _required_secret_keys(required_groups)
+
+    if required and not suppressed and provider == "plaintext":
+        violations.append(
+            {
+                "key": "TS_SECRETS_PROVIDER",
+                "kind": "config",
+                "reason": "plaintext_provider_forbidden",
+                "provider": provider,
+            }
+        )
 
     for spec in SECRET_ENV_SPECS:
         value = env.get(spec.key)
@@ -616,6 +629,7 @@ def secret_source_policy_snapshot(
             "repo_local_inline_secret",
             "secret_file_invalid",
             "required_secret_source_missing",
+            "plaintext_provider_forbidden",
         }
     ]
     blockers = list(dict.fromkeys(blockers))

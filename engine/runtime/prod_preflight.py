@@ -23,6 +23,7 @@ Runtime subsystem module for `prod_preflight`.
 
 import argparse
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
 import py_compile
@@ -55,6 +56,11 @@ import logging as _stdlib_logging
 
 sys.modules["logging"] = _stdlib_logging
 
+from engine.runtime.feed_truth import (
+    is_fallback_not_live_provider as _is_fallback_not_live_provider,
+    is_simulated_provider as _is_simulated_provider,
+)
+
 KEY_FILES = [
     os.path.join(REPO_ROOT, "dashboard_server.py"),
     os.path.join(REPO_ROOT, "engine", "runtime", "alerts.py"),
@@ -79,6 +85,9 @@ SMOKE_CMDS = [
 _WARNED_NONFATAL_KEYS: set[str] = set()
 _PG_PASSWORD_RE = re.compile(r"(?:^|\s)password=", re.IGNORECASE)
 _DSN_USER_RE = re.compile(r"(?:^|\s)user=(?P<value>'(?:\\'|[^'])*'|\S+)")
+_DEPENDENCY_DRIFT_SKIP_ENV = "PROD_PREFLIGHT_SKIP_DEPENDENCY_DRIFT"
+_DEPENDENCY_DRIFT_REQUIRE_ENV = "PROD_PREFLIGHT_REQUIRE_DEPENDENCY_LOCK_MATCH"
+_PRODUCTION_LIKE_VALUES = {"prod", "production", "live"}
 # Paid equity providers only. yfinance/simulated are deliberately excluded
 # because they are free/fallback feeds, not expected paid equity rails.
 _EQUITY_PRICE_PROVIDERS = ("polygon_ws", "polygon", "ibkr")
@@ -105,6 +114,17 @@ def _runtime_mode_name() -> str:
         if value:
             return value
     return "safe"
+
+
+def _production_like_runtime() -> bool:
+    for name in ("PROD_LOCK", "ENGINE_SUPERVISED"):
+        if _env_truthy(name):
+            return True
+    for name in ("ENV", "APP_ENV", "TS_ENV", "NODE_ENV", "ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE"):
+        value = str(os.environ.get(name) or "").strip().lower()
+        if value in _PRODUCTION_LIKE_VALUES:
+            return True
+    return False
 
 
 def _paid_equity_provider_names() -> List[str]:
@@ -548,6 +568,7 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
             backup_restore_evidence = _dict_payload(live_preflight.get("backup_restore_evidence"))
             clock_health = _dict_payload(live_preflight.get("clock_health"))
             execution_arming_audit = _dict_payload(live_preflight.get("execution_arming_audit"))
+            cpcv_leakage_gate = _dict_payload(live_preflight.get("cpcv_leakage_gate"))
             live_ai_safety = _dict_payload(live_preflight.get("live_ai_safety"))
             lob_deeplob_shadow = _dict_payload(live_preflight.get("lob_deeplob_shadow"))
             options_instruments = _dict_payload(live_preflight.get("options_instruments"))
@@ -590,6 +611,12 @@ def _runtime_config_gate() -> Tuple[List[str], List[str]]:
                 classified_blockers.update(arming_blockers)
                 issues = "; ".join(arming_blockers)
                 errors.append(f"execution arming audit invalid: {issues or execution_arming_audit.get('reason')}")
+
+            if bool(cpcv_leakage_gate.get("required")) and not bool(cpcv_leakage_gate.get("ok")):
+                cpcv_blockers = [str(item) for item in _list_payload(cpcv_leakage_gate.get("blockers"))]
+                classified_blockers.update(cpcv_blockers)
+                issues = "; ".join(cpcv_blockers)
+                errors.append(f"CPCV/PBO leakage gate invalid: {issues or cpcv_leakage_gate.get('reason')}")
 
             if bool(live_ai_safety.get("required")) and not bool(live_ai_safety.get("ok")):
                 ai_blockers = [str(item) for item in _list_payload(live_ai_safety.get("blockers"))]
@@ -1538,6 +1565,68 @@ def _ensure_schemas() -> List[str]:
     return notes
 
 
+def _notification_channel_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    mode_name = _runtime_mode_name()
+    live_mode = mode_name == "live"
+    state: Dict[str, Any] = {
+        "ok": False,
+        "required": bool(live_mode),
+        "mode": mode_name,
+        "enabled_channels": [],
+        "configured_channels": [],
+        "channels": [],
+    }
+    try:
+        from engine.runtime.alerts_notify import get_notification_channel_status
+
+        channels = [dict(item) for item in list(get_notification_channel_status() or []) if isinstance(item, dict)]
+        enabled_channels = [
+            str(item.get("channel") or "").strip().lower()
+            for item in channels
+            if bool(item.get("enabled"))
+        ]
+        configured_channels = [
+            str(item.get("channel") or "").strip().lower()
+            for item in channels
+            if bool(item.get("configured"))
+        ]
+        state.update(
+            {
+                "ok": bool(enabled_channels),
+                "enabled_channels": enabled_channels,
+                "configured_channels": configured_channels,
+                "channels": channels,
+            }
+        )
+        if enabled_channels:
+            notes.append(f"alert notification channel gate ok enabled={','.join(enabled_channels)}")
+            return notes, warnings, errors, state
+
+        message = (
+            "alert notification channel gate invalid: no enabled channel configured; "
+            "set EQ_CRIT_SMTP_HOST+EQ_CRIT_EMAIL_TO or EQ_CRIT_WEBHOOK_URL before live go-live"
+        )
+        if live_mode:
+            errors.append(message)
+        else:
+            warnings.append(
+                "alert notification channel gate warning: no enabled channel configured; "
+                "live go-live would be blocked until SMTP or webhook delivery is configured"
+            )
+        return notes, warnings, errors, state
+    except Exception as e:
+        state["error"] = f"{type(e).__name__}: {e}"
+        _stdlib_logging.warning("alert notification channel gate unavailable: %s: %s", type(e).__name__, e)
+        if live_mode:
+            errors.append(f"alert notification channel gate failed: {type(e).__name__}: {e}")
+        else:
+            warnings.append(f"alert notification channel gate unavailable: {type(e).__name__}: {e}")
+        return notes, warnings, errors, state
+
+
 def _verify_postgres_contract() -> Tuple[List[str], List[str], Dict[str, Any]]:
     notes: List[str] = []
     errors: List[str] = []
@@ -1770,6 +1859,133 @@ def _storage_placement_gate() -> Tuple[List[str], List[str], List[str], Dict[str
         list(summary.get("errors") or []),
         summary,
     )
+
+
+def _dependency_drift_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+    state: Dict[str, Any] = {
+        "checked": False,
+        "direct_count": 0,
+        "ok_count": 0,
+        "drift": [],
+        "missing": [],
+        "unlocked_direct": [],
+        "required": bool(_runtime_mode_name() == "live" or _env_truthy(_DEPENDENCY_DRIFT_REQUIRE_ENV)),
+        "skipped": bool(_env_truthy(_DEPENDENCY_DRIFT_SKIP_ENV)),
+        "lock": "requirements.lock.txt",
+    }
+
+    if bool(state["skipped"]):
+        message = f"dependency_drift: skipped by {_DEPENDENCY_DRIFT_SKIP_ENV}=1; requirements.lock.txt match not enforced"
+        warnings.append(message)
+        return notes, warnings, errors, state
+
+    try:
+        from tools.validate_dependency_lock import (
+            PIN_RE,
+            _exact_pin_version,
+            _normalize_req_name,
+            _requirements_entries,
+        )
+
+        repo_root = Path(__file__).resolve().parents[2]
+        input_path = repo_root / "requirements.in"
+        lock_path = repo_root / "requirements.lock.txt"
+        direct_entries = _requirements_entries(input_path)
+        lock_entries = _requirements_entries(lock_path)
+    except Exception as exc:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_DEPENDENCY_DRIFT_PARSE_FAILED",
+            exc,
+            once_key="dependency_drift:parser_failed",
+        )
+        return notes, warnings, errors, {}
+
+    direct_names = sorted(str(name) for name in direct_entries if str(name).strip())
+    locked_versions: Dict[str, str] = {}
+    for raw_name, entry in sorted(lock_entries.items()):
+        normalized_name = _normalize_req_name(str(raw_name))
+        if not normalized_name:
+            normalized_name = str(raw_name).replace("_", "-").lower()
+        parts = str(entry).split(":", 2)
+        line = parts[2].strip() if len(parts) >= 3 else str(entry).strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        if "==" not in line or "===" in line or not PIN_RE.search(line):
+            continue
+        version = _exact_pin_version(str(entry))
+        if version is not None:
+            locked_versions[normalized_name] = version
+
+    drift: List[str] = []
+    missing: List[str] = []
+    unlocked_direct: List[str] = []
+    ok_count = 0
+    for name in direct_names:
+        normalized_name = _normalize_req_name(name) or str(name).replace("_", "-").lower()
+        locked_version = locked_versions.get(normalized_name)
+        if locked_version is None:
+            unlocked_direct.append(f"unlocked_direct:{normalized_name}")
+            continue
+        try:
+            installed_version = importlib_metadata.version(normalized_name)
+        except importlib_metadata.PackageNotFoundError as exc:
+            _warn_nonfatal(
+                "PROD_PREFLIGHT_DEPENDENCY_MISSING",
+                exc,
+                once_key=f"dependency_drift:missing:{normalized_name}",
+                package=normalized_name,
+                locked=locked_version,
+            )
+            missing.append(f"{normalized_name} locked={locked_version} not-installed")
+            continue
+        except Exception as exc:
+            _warn_nonfatal(
+                "PROD_PREFLIGHT_DEPENDENCY_METADATA_FAILED",
+                exc,
+                once_key=f"dependency_drift:metadata:{normalized_name}",
+                package=normalized_name,
+                locked=locked_version,
+            )
+            missing.append(f"{normalized_name} locked={locked_version} metadata-error={type(exc).__name__}")
+            continue
+        if str(installed_version) == str(locked_version):
+            ok_count += 1
+        else:
+            drift.append(f"{normalized_name} installed={installed_version} locked={locked_version}")
+
+    state.update(
+        {
+            "checked": True,
+            "direct_count": len(direct_names),
+            "ok_count": ok_count,
+            "drift": drift,
+            "missing": missing,
+            "unlocked_direct": unlocked_direct,
+        }
+    )
+    notes.append(f"dependency drift check: direct={len(direct_names)} ok={ok_count} lock=requirements.lock.txt")
+    notes.extend(unlocked_direct)
+
+    if not drift and not missing:
+        return notes, warnings, errors, state
+
+    detail = "; ".join((drift + missing)[:12])
+    remainder = len(drift) + len(missing) - min(len(drift) + len(missing), 12)
+    if remainder > 0:
+        detail = f"{detail}; ... {remainder} more"
+    message = (
+        "dependency_drift: "
+        f"{len(drift)} drifted, {len(missing)} missing vs requirements.lock.txt"
+        + (f": {detail}" if detail else "")
+    )
+    if _runtime_mode_name() == "live" or _env_truthy(_DEPENDENCY_DRIFT_REQUIRE_ENV):
+        errors.append(message)
+    else:
+        warnings.append(message)
+    return notes, warnings, errors, state
 
 
 def _backup_restore_evidence_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
@@ -2279,6 +2495,34 @@ def _paid_equity_provider_degradation_gate() -> Tuple[List[str], List[str], List
     )
 
     if not required_equity:
+        fallback_equity = [
+            provider
+            for provider in required
+            if _is_fallback_not_live_provider(provider) or _is_simulated_provider(provider)
+        ]
+        state.update(
+            {
+                "fallback_equity_providers": list(fallback_equity),
+                "non_equity_required_providers": [
+                    provider for provider in required if provider not in set(fallback_equity)
+                ],
+            }
+        )
+        if not required or fallback_equity:
+            state["ok"] = False
+            state["required"] = True
+            state["reason"] = "paid_equity_provider_required"
+            state["missing_paid_equity_provider"] = True
+            configured = ",".join(required) if required else "<none>"
+            fallback_names = ",".join(fallback_equity) if fallback_equity else "<none>"
+            paid_names = ",".join(equity_providers)
+            errors.append(
+                "paid equity provider required: "
+                f"configured_providers={configured} fallback_equity_providers={fallback_names} "
+                f"required_paid_equity_any={paid_names}; "
+                "yfinance/simulated rows are fallback_not_live and cannot arm paper/live"
+            )
+            return notes, warnings, errors, state
         notes.append("paid equity provider gate not required no_required_equity_provider")
         state["reason"] = "no_required_equity_provider"
         return notes, warnings, errors, state
@@ -2371,8 +2615,10 @@ def main() -> int:
         "ingestion_soak": {},
         "refetchable_pg_durability": {},
         "cpu_power_policy": {},
+        "dependency_drift": {},
         "operator_sidecar_security": {},
         "network_exposure": {},
+        "notification_channels": {},
         "capital_equity_freshness": {},
         "paid_equity_provider_degradation": {},
     }
@@ -2469,6 +2715,19 @@ def main() -> int:
         else:
             for error in effective_runtime_errors:
                 print("[effective-runtime]", error)
+        return 3
+
+    dependency_notes, dependency_warnings, dependency_errors, dependency_drift = _dependency_drift_gate()
+    result["steps"].extend(dependency_notes)
+    result["warnings"].extend(dependency_warnings)
+    result["dependency_drift"] = dict(dependency_drift or {})
+    if dependency_errors:
+        result["errors"].extend(dependency_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in dependency_errors:
+                print("[dependency-drift]", error)
         return 3
 
     wal_archiver_notes, wal_archiver_warnings, wal_archiver_errors, wal_archiver_runtime = _wal_archiver_runtime_gate()
@@ -2621,6 +2880,19 @@ def main() -> int:
             print(json.dumps(result, separators=(",", ":"), sort_keys=True))
         else:
             print("[schema]", e)
+        return 3
+
+    notification_notes, notification_warnings, notification_errors, notification_state = _notification_channel_gate()
+    result["steps"].extend(notification_notes)
+    result["warnings"].extend(notification_warnings)
+    result["notification_channels"] = dict(notification_state or {})
+    if notification_errors:
+        result["errors"].extend(notification_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in notification_errors:
+                print("[notifications]", error)
         return 3
 
     notes, validation_errors, validation = _verify_sqlite_contract()

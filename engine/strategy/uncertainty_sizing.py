@@ -241,14 +241,13 @@ def _wide_interval_multiplier(
     if not bool(conformal.get("interval_excludes_zero", conformal_gate.get("interval_excludes_zero") if conformal_gate else False)):
         return 1.0, {"applied": False, "reason": "interval_crosses_zero"}
 
-    direct = _safe_float(
-        conformal.get(
-            "size_mult",
-            conformal.get("conformal_size_mult", (conformal_gate or {}).get("size_mult", 1.0)),
-        ),
-        1.0,
-    )
-    direct = max(0.0, min(1.0, float(direct)))
+    direct_values = [
+        conformal.get("size_mult"),
+        conformal.get("conformal_size_mult"),
+        (conformal_gate or {}).get("size_mult"),
+    ]
+    finite_direct = [max(0.0, min(1.0, _safe_float(value, 1.0))) for value in direct_values if value is not None]
+    direct = min(finite_direct or [1.0])
 
     width = _safe_float(
         conformal.get("interval_width", (conformal_gate or {}).get("interval_width")),

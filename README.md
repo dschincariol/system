@@ -138,7 +138,7 @@ Supplementary but useful:
 
 - Copy [.env.example](.env.example) to `.env` for a new workstation.
 - On Linux/macOS development machines, run `bash tools/bootstrap_local_toolchain.sh` from the repo root. It creates or updates `.venv` with Python 3.11, installs the selected Python dependency profile (`TRADING_DEPENDENCY_PROFILE=cpu` by default), installs Node.js 20.19.4 with npm 10.8.2 inside `.venv` when needed, runs `npm ci`, and links the `python`, `python3`, `node`, `npm`, and `npx` command names into `$HOME/.local/bin` by default.
-- Install locked CPU/default Python dependencies with `TRADING_DEPENDENCY_PROFILE=cpu python -m pip install -r requirements.txt`. Use [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md) before selecting NVIDIA CUDA or AMD/ROCm profiles or updating Python locks.
+- Install locked CPU/default Python dependencies with `TRADING_DEPENDENCY_PROFILE=cpu python -m pip install --require-hashes -r requirements.txt`. Use [docs/DEPENDENCY_PROFILES.md](docs/DEPENDENCY_PROFILES.md) before selecting NVIDIA CUDA or AMD/ROCm profiles or updating Python locks.
 - Use Node.js 20 LTS (`>=20.17.0 <21`) with npm 10.x for the operator UI. The checked-in `.npmrc` enforces this during `npm ci`.
 - Install Node dependencies reproducibly with `npm ci`; do not edit or vendor `node_modules/`.
 - Prefer `ENGINE_MODE=safe` and `EXECUTION_MODE=safe` until the environment, providers, and operator controls are verified.

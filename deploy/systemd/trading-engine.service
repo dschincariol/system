@@ -6,21 +6,58 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
 User=trading
 Group=trading
-WorkingDirectory=/opt/trading-system/repo
-EnvironmentFile=/etc/trading-system/trading.env
-ExecStart=/opt/trading-system/venv/bin/python /opt/trading-system/repo/start_system.py
+WorkingDirectory=/opt/trading/app
+EnvironmentFile=/etc/trading/trading.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/trading/app
+Environment=APP_ROOT=/opt/trading/app
+Environment=TRADING_ENV_FILE=/etc/trading/trading.env
+Environment=DATA_DIR=/var/lib/trading
+Environment=LOG_DIR=/var/lib/trading/logs
+Environment=TRADING_LOGS=/var/lib/trading/logs
+Environment=TS_SERVICE_NAME=trading-engine
+Environment=TS_SECRETS_PROVIDER=systemd-creds
+Environment=TS_PG_ROLE=app
+Environment=DATA_SOURCE_MASTER_KEY_FILE=
+Environment=DATA_SOURCE_MASTER_KEY_SECRET=master_key
+Environment=TS_PG_PASSWORD_SECRET=pg_password_app
+Environment=TIMESCALE_PASSWORD_SECRET=pg_password_app
+Environment=LIVE_CACHE_REDIS_PASSWORD_SECRET=redis_password
+Environment=TS_REDIS_PASSWORD_SECRET=redis_password
+Environment=OBJECT_STORE_ACCESS_KEY=
+Environment=OBJECT_STORE_ACCESS_KEY_SECRET=object_store_access_key
+Environment=OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key
+Environment=BACKUP_EVIDENCE_HMAC_KEY_FILE=
+Environment=BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key
+LoadCredentialEncrypted=master_key:/etc/credstore.encrypted/master_key.cred
+LoadCredentialEncrypted=pg_password_app:/etc/credstore.encrypted/pg_password_app.cred
+LoadCredentialEncrypted=dashboard_api_token:/etc/credstore.encrypted/dashboard_api_token.cred
+LoadCredentialEncrypted=redis_password:/etc/credstore.encrypted/redis_password.cred
+LoadCredentialEncrypted=object_store_access_key:/etc/credstore.encrypted/object_store_access_key.cred
+LoadCredentialEncrypted=object_store_secret_key:/etc/credstore.encrypted/object_store_secret_key.cred
+LoadCredentialEncrypted=backup_evidence_hmac_key:/etc/credstore.encrypted/backup_evidence_hmac_key.cred
+UnsetEnvironment=OBJECT_STORE_ACCESS_KEY OBJECT_STORE_ACCESS_KEY_FILE MINIO_ACCESS_KEY MINIO_ACCESS_KEY_FILE AWS_ACCESS_KEY_ID AWS_ACCESS_KEY_ID_FILE OBJECT_STORE_SECRET_KEY OBJECT_STORE_SECRET_KEY_FILE MINIO_SECRET_KEY MINIO_SECRET_KEY_FILE AWS_SECRET_ACCESS_KEY AWS_SECRET_ACCESS_KEY_FILE
+ExecStart=/opt/trading/venv/bin/python /opt/trading/app/start_system.py
+TimeoutStartSec=300s
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/opt/trading-system/logs/engine.log
-StandardError=append:/opt/trading-system/logs/engine.log
+WatchdogSec=60s
+NotifyAccess=main
+StandardOutput=append:/var/lib/trading/logs/engine.log
+StandardError=append:/var/lib/trading/logs/engine.log
+MemoryAccounting=true
+MemoryHigh=24G
+MemoryMax=32G
+OOMScoreAdjust=600
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/opt/trading-system /etc/trading-system
+ReadWritePaths=/var/lib/trading /var/backups/trading /opt/trading/app/data /opt/trading/app/logs /opt/trading/app/var /etc/trading
 
 [Install]
 WantedBy=multi-user.target

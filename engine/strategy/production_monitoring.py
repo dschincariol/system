@@ -20,7 +20,7 @@ import numpy as np
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import connect, init_db
-from engine.strategy.conformal import extract_conformal_payload
+from engine.strategy.conformal import extract_conformal_payload, monotone_trading_loss
 
 
 LOG = get_logger("engine.strategy.production_monitoring")
@@ -44,6 +44,8 @@ CALIBRATION_ECE_WARN = float(os.environ.get("PRODUCTION_CALIBRATION_ECE_WARN", "
 CALIBRATION_ECE_CRIT = float(os.environ.get("PRODUCTION_CALIBRATION_ECE_CRIT", "0.20"))
 CONFORMAL_COVERAGE_WARN_GAP = float(os.environ.get("PRODUCTION_CONFORMAL_COVERAGE_WARN_GAP", "0.05"))
 CONFORMAL_COVERAGE_CRIT_GAP = float(os.environ.get("PRODUCTION_CONFORMAL_COVERAGE_CRIT_GAP", "0.10"))
+CONFORMAL_RISK_WARN_GAP = float(os.environ.get("PRODUCTION_CONFORMAL_RISK_WARN_GAP", "0.02"))
+CONFORMAL_RISK_CRIT_GAP = float(os.environ.get("PRODUCTION_CONFORMAL_RISK_CRIT_GAP", "0.05"))
 SHADOW_DISAGREE_WARN = float(os.environ.get("PRODUCTION_SHADOW_DISAGREE_RATE_WARN", "0.25"))
 SHADOW_DISAGREE_CRIT = float(os.environ.get("PRODUCTION_SHADOW_DISAGREE_RATE_CRIT", "0.40"))
 SHADOW_ABS_DELTA_WARN = float(os.environ.get("PRODUCTION_SHADOW_ABS_DELTA_WARN", "0.75"))
@@ -757,7 +759,7 @@ def _conformal_rows(con: Any, *, limit: int | None = None) -> tuple[list[dict[st
     d_cols = _table_columns(con, "decision_log")
     l_cols = _table_columns(con, "labels")
     target_col = _first_existing(l_cols, "impact_z", "realized_z", "realized_ret", "label")
-    if not {"event_id", "symbol", "horizon_s"}.issubset(d_cols) or not target_col:
+    if not {"event_id", "symbol", "horizon_s", "predicted_z"}.issubset(d_cols) or not target_col:
         return [], labels_available
     explain_col = _first_existing(d_cols, "explain_json", "reason_json", "payload_json")
     if not explain_col:
@@ -767,7 +769,7 @@ def _conformal_rows(con: Any, *, limit: int | None = None) -> tuple[list[dict[st
         rows = con.execute(
             f"""
             SELECT d.ts_ms, d.event_id, d.symbol, d.horizon_s, d.{_safe_ident(explain_col)},
-                   l.{_safe_ident(target_col)}, l.{_safe_ident(label_ts)}
+                   l.{_safe_ident(target_col)}, l.{_safe_ident(label_ts)}, d.predicted_z
             FROM decision_log d
             JOIN labels l
               ON l.event_id=d.event_id
@@ -789,6 +791,7 @@ def _conformal_rows(con: Any, *, limit: int | None = None) -> tuple[list[dict[st
         payload = extract_conformal_payload(_json_obj(row[4]))
         lower = _safe_float(payload.get("interval_lower", payload.get("lower")))
         upper = _safe_float(payload.get("interval_upper", payload.get("upper")))
+        prediction = _safe_float(row[7])
         if target is None or lower is None or upper is None:
             continue
         alpha = _safe_float(payload.get("alpha_target"), None)
@@ -800,10 +803,12 @@ def _conformal_rows(con: Any, *, limit: int | None = None) -> tuple[list[dict[st
                 "symbol": str(row[2] or "").upper(),
                 "horizon_s": _safe_int(row[3], 0),
                 "target": float(target),
+                "prediction": float(prediction) if prediction is not None else None,
                 "lower": float(lower),
                 "upper": float(upper),
                 "covered": bool(float(lower) <= float(target) <= float(upper)),
                 "target_coverage": max(0.0, min(1.0, float(target_coverage))),
+                "payload": dict(payload),
             }
         )
     return out, labels_available
@@ -850,6 +855,85 @@ def _conformal_metric(con: Any, now_ms: int) -> dict[str, Any]:
         labels_available=True,
         sample_n=len(rows),
         details={"target_coverage": target, "coverage_gap": gap},
+        ts_ms=now_ms,
+    )
+
+
+def _conformal_risk_metric(con: Any, now_ms: int) -> dict[str, Any]:
+    rows, labels_available = _conformal_rows(con)
+    if not labels_available:
+        return _metric(
+            "conformal_risk_control",
+            value=None,
+            state="no_labels_yet",
+            labels_available=False,
+            details={"reason": "no matured labels available"},
+            ts_ms=now_ms,
+        )
+
+    evaluated: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row.get("payload") or {})
+        risk = dict(payload.get("risk_control") or {})
+        if not bool(risk.get("enabled")) or not bool(risk.get("available")):
+            continue
+        threshold = _safe_float(risk.get("calibrated_loss_threshold"))
+        target_risk = _safe_float(risk.get("target_risk"))
+        definition = str(risk.get("loss_definition") or "accepted_trade_loss")
+        prediction = _safe_float(row.get("prediction"))
+        target = _safe_float(row.get("target"))
+        if threshold is None or target_risk is None or prediction is None or target is None:
+            continue
+        loss = monotone_trading_loss(definition, prediction=prediction, realized=target, payload=payload)
+        if loss is None:
+            continue
+        evaluated.append(
+            {
+                "loss": float(loss),
+                "breach": bool(float(loss) > float(threshold)),
+                "threshold": float(threshold),
+                "target_risk": max(0.0, min(1.0, float(target_risk))),
+                "loss_definition": str(definition),
+            }
+        )
+
+    if len(evaluated) < MIN_N:
+        return _metric(
+            "conformal_risk_control",
+            value=None,
+            state="insufficient_labels",
+            labels_available=True,
+            sample_n=len(evaluated),
+            details={"reason": "not enough labeled conformal risk-control rows"},
+            ts_ms=now_ms,
+        )
+
+    empirical = float(np.mean([1.0 if row["breach"] else 0.0 for row in evaluated]))
+    target = float(np.mean([float(row["target_risk"]) for row in evaluated]))
+    gap = float(empirical - target)
+    if gap >= CONFORMAL_RISK_CRIT_GAP:
+        severity, state = "CRIT", "crit"
+    elif gap >= CONFORMAL_RISK_WARN_GAP:
+        severity, state = "WARN", "warn"
+    else:
+        severity, state = "OK", "ok"
+    definitions = sorted({str(row["loss_definition"]) for row in evaluated})
+    return _metric(
+        "conformal_risk_control",
+        value=empirical,
+        baseline_value=target,
+        threshold_value=min(1.0, target + CONFORMAL_RISK_WARN_GAP),
+        severity=severity,
+        state=state,
+        action_signal=("shadow_review" if severity in {"WARN", "CRIT"} else ""),
+        labels_available=True,
+        sample_n=len(evaluated),
+        details={
+            "target_risk": target,
+            "risk_gap": gap,
+            "loss_definitions": definitions,
+            "breaches": int(sum(1 for row in evaluated if row["breach"])),
+        },
         ts_ms=now_ms,
     )
 
@@ -1015,6 +1099,7 @@ def compute_production_monitoring_metrics(con: Any, *, now_ms: int | None = None
         _label_drift_metric(con, ts_value),
         _calibration_metric(con, ts_value),
         _conformal_metric(con, ts_value),
+        _conformal_risk_metric(con, ts_value),
         _shadow_live_metric(con, ts_value),
         _net_pnl_metric(con, ts_value),
     ]

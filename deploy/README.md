@@ -9,7 +9,7 @@ The `deploy/` directory contains Linux-only installation and service automation 
 - `compose/`
   External dependency stack plus runtime/operator compose assets for Timescale/Postgres, Redis, MinIO-style object storage, and the current app deployment path.
 - `systemd/`
-  Service and timer units.
+  Service and timer units, including the weekly restore-drill timer required by backup evidence.
 - [install_trading_system.sh](install_trading_system.sh)
   Main install entrypoint for Linux-style environments.
 
@@ -25,5 +25,5 @@ The `deploy/` directory contains Linux-only installation and service automation 
 - Production/live deployments must set `DB_PATH` to an absolute local data root such as `/var/lib/trading` or `/app/data` inside a container. `DB_PATH` is not a SQLite control-plane database target; relative values fail runtime config and production preflight.
 - Use [compose/docker-compose.external-services.yml](compose/docker-compose.external-services.yml) when you need a local or staging dependency stack for Timescale/Postgres, Redis, and object storage. Copy [compose/.env.example](compose/.env.example) to `.env` in the compose directory and set approved image tags plus credentials before bringing it up.
 - Use [compose/docker-compose.stack.yml](compose/docker-compose.stack.yml) together with the external-services file when you want the current runtime and operator deployed as containers. The operator sidecar is internal-only by default; see [compose/README.md](compose/README.md) for the exact command and the operator sidecar constraint in container mode.
-- Use [../ops/backup](../ops/backup) and [../ops/server/systemd](../ops/server/systemd) for current Postgres base backups, WAL archive, pruning, and restore drills. [bin/backup_trading_db.sh](bin/backup_trading_db.sh) is retained for legacy/local SQLite-file backups only; it fails in production/live profiles and is not a production recovery plan for the Postgres-backed runtime.
+- Use [../ops/backup](../ops/backup) for current Postgres base backups, WAL archive, pruning, and restore drills. `deploy/systemd/` ships the matching weekly `trading-restore-drill` unit/timer for the deploy installer, and [../ops/server/systemd](../ops/server/systemd) remains the canonical host-bootstrap unit source. [bin/backup_trading_db.sh](bin/backup_trading_db.sh) is retained for legacy/local SQLite-file backups only; it fails in production/live profiles and is not a production recovery plan for the Postgres-backed runtime.
 - Use [../docs/DISK_RETENTION_RUNBOOK.md](../docs/DISK_RETENTION_RUNBOOK.md) before responding to root filesystem or Docker storage pressure. It separates safe Docker cache/image pruning from destructive live volume or backup deletion and documents the backup accounting command.

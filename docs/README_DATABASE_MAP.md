@@ -218,7 +218,10 @@ If you only learn ten tables, learn these first.
 | --- | --- |
 | `prices` | simple market price history by symbol and timestamp |
 | `events` | external or derived event records |
-| `structured_document_events` | timestamped filing/transcript/news event extractions with source document id, availability timestamp, confidence, and PIT metadata |
+| `structured_document_events` | timestamped filing/transcript/news/macro event extractions with source document id, availability timestamp, confidence, and PIT metadata |
+| `llm_extracted_events` | accepted schema-validated LLM financial-event rows with evidence offsets, prompt/model/source hashes, and no direct trading authority |
+| `llm_event_extraction_audit` | accepted/rejected LLM extraction audit rows with cost/rate metadata, bounded raw response excerpts, and PIT guard lineage |
+| `llm_extracted_events`, `llm_event_extraction_audit` | validated structured LLM event rows plus prompt/model/source-hash acceptance and rejection lineage; projected only to shadow structured-document features |
 | `predictions` | model output by symbol and horizon |
 | `decision_log` | the system's recorded trading decisions and explanations |
 | `alerts` | alert records emitted by rules or policy surfaces |
@@ -520,6 +523,7 @@ These tables support offline analysis more than live control.
 | `backtest_scores` | backtest outputs |
 | `walk_forward_runs`, `walk_forward_scores` | walk-forward evaluation |
 | `backtest_cpcv_runs`, `backtest_cpcv_paths` | CPCV/PBO, cost-adjusted, and gated-backtest evidence |
+| `risk_var_forecasts`, `risk_var_backtest_results` | VaR/CVaR forecast snapshots and exception backtesting evidence |
 | `validation_scores` | validation results |
 | `model_metrics` | model performance summaries |
 | `embed_model_eval`, `embed_conf_calib` | embedding/evaluation calibration tables |

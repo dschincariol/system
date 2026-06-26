@@ -264,6 +264,16 @@ FEATURE_PIT_POLICIES: dict[str, FeaturePITPolicy] = {
         lag_policy="price_history_asof_and_frozen_encoder_artifact_available",
         stale_behavior="zero_and_mark_unavailable",
     ),
+    "ts_foundation_adapters": FeaturePITPolicy(
+        group="ts_foundation_adapters",
+        source_timestamp_field="price_history_last_ts_ms",
+        availability_timestamp_field="benchmark_artifact_created_ts_ms",
+        availability_timestamp_candidates=("price_history_last_ts_ms",),
+        freshness_ttl_ms=2 * MS_DAY,
+        lag_policy="price_history_asof_and_tsfm_benchmark_artifact_available",
+        stale_behavior="zero_and_mark_unavailable",
+        availability_required=False,
+    ),
     "graph_relational_v1": FeaturePITPolicy(
         group="graph_relational_v1",
         source_timestamp_field="max_source_ts_ms",
@@ -308,6 +318,10 @@ _PREFIX_GROUPS: tuple[tuple[str, str], ...] = (
     ("nlp.", "nlp"),
     ("discovered.llm.", "discovered_llm"),
     ("tsfm.chronos_v2.", "ts_foundation_chronos"),
+    ("tsfm.timesfm.", "ts_foundation_adapters"),
+    ("tsfm.moirai.", "ts_foundation_adapters"),
+    ("tsfm.toto.", "ts_foundation_adapters"),
+    ("tsfm.fake.", "ts_foundation_adapters"),
     ("graph.relational_v1.", "graph_relational_v1"),
 )
 

@@ -121,6 +121,7 @@ def test_catalog_seeds_all_discovered_feed_sources_and_operational_metadata(monk
         "crypto_funding": False,
         "polygon_options": True,
         "news_flow": True,
+        "llm_event_extraction": False,
         "alpaca_broker_data": False,
     }
     for source_key, default_enabled in expected_defaults.items():

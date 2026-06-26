@@ -228,6 +228,23 @@ def _wait_for_operator_sidecar(proc, port: int):
     raise AssertionError(f"operator sidecar did not start: {last_error}\nstdout={out}\nstderr={err}")
 
 
+def _read_error_json(url: str, *, method: str = "GET", body=None, headers=None, timeout=10):
+    data = None
+    request_headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    request_headers.update(dict(headers or {}))
+    req = Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return int(response.status), dict(response.headers), payload
+    except HTTPError as exc:
+        payload = json.loads(exc.read().decode("utf-8"))
+        return int(exc.code), dict(exc.headers), payload
+
+
 def _build_operator_bridge_handler(*, token="", events=None, limiter=None, monkeypatch=None):
     import dashboard_server
     import engine.api.http_transport as http_transport
@@ -1183,6 +1200,122 @@ def test_operator_sidecar_rejects_missing_structured_confirmation_with_operator_
             assert body["action_id"] == action_id
             assert body["required_token"] == required_token
     finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=5)
+
+
+def test_operator_start_and_restart_fs_faults_return_json_500_and_keep_sidecar_alive(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    port = _unused_local_port()
+    dashboard_port = _unused_local_port()
+    operator_token = "operator-token-1234567890"
+
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "Python 3.11.0"; fi\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    env_path = tmp_path / "operator.env"
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    env_path.write_text(
+        "\n".join(
+            [
+                "DASHBOARD_HOST=127.0.0.1",
+                f"DASHBOARD_PORT={dashboard_port}",
+                f"DASHBOARD_BASE=http://127.0.0.1:{dashboard_port}",
+                f"DB_PATH={db_dir / 'trading.db'}",
+                "AUTO_BOOT_DAEMONS=false",
+                "OPERATOR_AUTORESTART=false",
+                "DISABLE_LIVE_EXECUTION=1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.mkdir()
+    blocked_parent.chmod(0o500)
+    log_dir = blocked_parent / "runtime-logs"
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "OPERATOR_BIND_HOST": "127.0.0.1",
+            "OPERATOR_PORT": str(port),
+            "OPERATOR_API_TOKEN": operator_token,
+            "OPERATOR_ENV_PATH": str(env_path),
+            "OPERATOR_DATA_DIR": str(tmp_path / "operator-data"),
+            "OPERATOR_AUTO_START": "0",
+            "OPERATOR_PYTHON": str(fake_python),
+            "OPERATOR_PREFLIGHT_CACHE_TTL_MS": "0",
+            "OPERATOR_VALIDATION_TIMEOUT_MS": "1000",
+            "OPERATOR_START_REQUEST_TIMEOUT_MS": "5000",
+            "TRADING_LOGS": str(log_dir),
+            "LOG_DIR": str(log_dir),
+            "DASHBOARD_HOST": "127.0.0.1",
+            "DASHBOARD_PORT": str(dashboard_port),
+            "DASHBOARD_BASE": f"http://127.0.0.1:{dashboard_port}",
+            "NODE_ENV": "test",
+        }
+    )
+
+    proc = subprocess.Popen(
+        ["node", "boot/operator_server.js"],
+        cwd=str(root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def confirmed_body(action_id, token):
+        return {
+            "mode": "safe",
+            "confirmation": token,
+            "confirmation_token": token,
+            "confirm": token,
+            "confirmation_method": "typed_phrase",
+            "consequence_ack": True,
+            "action_id": action_id,
+            "actor": "pytest",
+            "source_surface": "operator_sidecar_regression",
+            "reason": "filesystem fault route guard test",
+        }
+
+    try:
+        _wait_for_operator_sidecar(proc, port)
+
+        for path, action_id, token in [
+            ("/api/operator/start", "operator.start", "START_OPERATOR"),
+            ("/api/operator/restart", "operator.restart", "RESTART_OPERATOR"),
+        ]:
+            status, _headers, payload = _read_error_json(
+                f"http://127.0.0.1:{port}{path}",
+                method="POST",
+                body=confirmed_body(action_id, token),
+                headers={"X-Operator-Token": operator_token},
+            )
+
+            assert status == 500
+            assert payload["ok"] is False
+            assert payload["error"] == "internal_server_error"
+            assert "EACCES" in payload.get("detail", "") or "permission denied" in payload.get("detail", "").lower()
+            assert proc.poll() is None
+
+            ping_status, _headers, ping_payload = _read_json(f"http://127.0.0.1:{port}/api/operator/ping")
+            assert ping_status == 200
+            assert ping_payload["ok"] is True
+    finally:
+        blocked_parent.chmod(0o700)
         if proc.poll() is None:
             proc.terminate()
             try:

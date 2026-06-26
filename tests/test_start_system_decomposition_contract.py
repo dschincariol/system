@@ -108,6 +108,27 @@ def test_start_system_local_env_bootstrap_remains_idempotent(
     assert secret_path.read_text(encoding="utf-8").strip()
 
 
+def test_start_system_bootstrap_skips_local_env_when_explicit_env_file_is_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    explicit_env = tmp_path / "trading.env"
+    explicit_env.write_text("START_SYSTEM_EXPLICIT_ENV_TEST=present\n", encoding="utf-8")
+    local_env_calls: list[bool] = []
+
+    monkeypatch.setattr(start_system, "_BASE_DIR", str(tmp_path / "app"))
+    monkeypatch.setenv("TRADING_ENV_FILE", str(explicit_env))
+    monkeypatch.delenv("START_SYSTEM_EXPLICIT_ENV_TEST", raising=False)
+    monkeypatch.setattr(start_system, "_ensure_local_env_file", lambda: local_env_calls.append(True))
+    monkeypatch.setattr(start_system, "resolve_runtime_paths", lambda *args, **kwargs: None)
+
+    start_system._bootstrap_start_system_env()
+
+    assert local_env_calls == []
+    assert not (tmp_path / "app" / ".env").exists()
+    assert start_system.os.environ["START_SYSTEM_EXPLICIT_ENV_TEST"] == "present"
+
+
 def test_start_system_launch_mode_selection_preserves_argv_precedence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

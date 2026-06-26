@@ -844,7 +844,7 @@ TRADING_IMPORT_SMOKE_TIMEOUT_S=12.0
 BACKUP_EVIDENCE_PATH=${BACKUP_ROOT}/evidence/latest_backup_restore_evidence.json
 BACKUP_EVIDENCE_BASE_BACKUP_MAX_AGE_S=93600
 BACKUP_EVIDENCE_RPO_S=120
-BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=7776000
+BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S=604800
 BACKUP_EVIDENCE_RTO_S=1800
 BACKUP_EVIDENCE_SIGNATURE_MAX_AGE_S=120
 BACKUP_EVIDENCE_REQUIRE_SIGNATURE=1
@@ -1105,7 +1105,17 @@ install_python_runtime() {
   fi
 
   PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
-  PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install -r "$resolved_requirements"
+  case "$(basename "$resolved_requirements")" in
+    requirements.txt|requirements-dev.txt|requirements-nvidia-cuda.txt|requirements-amd-rocm-full.txt)
+      PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install --require-hashes -r "$resolved_requirements"
+      ;;
+    requirements-amd-rocm.txt)
+      PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install --require-hashes -r "$REPO_ROOT/requirements-amd-rocm-full.txt"
+      ;;
+    *)
+      PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV_DIR/bin/python" -m pip install -r "$resolved_requirements"
+      ;;
+  esac
   printf '%s' "$req_hash" > "$marker"
   chown -R "$TRADING_USER:$TRADING_GROUP" "$VENV_DIR"
 }

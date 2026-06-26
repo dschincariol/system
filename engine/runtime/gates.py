@@ -1177,6 +1177,7 @@ def execution_gate_snapshot(
         }
 
     portfolio_risk_state = None
+    portfolio_risk_state_load_failed = False
     get_risk_state = risk_state_getter if callable(risk_state_getter) else _get_risk_state
     if callable(get_risk_state):
         try:
@@ -1228,6 +1229,7 @@ def execution_gate_snapshot(
                 once_key="runtime_gates_portfolio_risk_state_load_failed",
             )
             portfolio_risk_state = None
+            portfolio_risk_state_load_failed = True
 
     if isinstance(portfolio_risk_gate, dict) and portfolio_risk_gate.get("blocked"):
         return {
@@ -1269,6 +1271,27 @@ def execution_gate_snapshot(
             "portfolio_risk": portfolio_risk_state,
             "severity": "CRITICAL",
             "severity_reasons": _dedupe_strs(severity_reasons + ["portfolio_risk_block"]),
+        }
+
+    if portfolio_risk_state_load_failed and mode == "live":
+        return {
+            "ok": True,
+            "ts_ms": ts,
+            "mode": mode,
+            "armed": armed,
+            "allow_execution": False,
+            "allow_execution_pipeline": False,
+            "allow_simulation": False,
+            "real_trading_allowed": False,
+            "allowed": False,
+            "reason": "portfolio_risk_state_read_error",
+            "source": source,
+            "runtime_state": runtime_state,
+            "runtime_detail": runtime_detail,
+            "runtime_source": runtime_source,
+            "portfolio_risk": None,
+            "severity": "CRITICAL",
+            "severity_reasons": _dedupe_strs(severity_reasons + ["portfolio_risk_state_read_error"]),
         }
 
     ks = _default_kill_switch_state() if kill_switches is None else kill_switches

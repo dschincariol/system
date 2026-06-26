@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from engine.runtime.effective_runtime_state import effective_runtime_state_snapshot, main, redact_evidence
 from engine.runtime.postgres_tuning import parse_size_bytes
 
@@ -189,18 +191,27 @@ def test_effective_runtime_state_missing_required_evidence_returns_operator_comm
     assert "/run/secrets/redis_password" in commands
 
 
-def test_effective_runtime_state_redacts_secret_strings() -> None:
+def test_effective_runtime_state_redaction_uses_canonical_api_redactor() -> None:
     payload = {
         "DASHBOARD_API_TOKEN": "live-token",
+        "master_key": "abc123",
+        "session_token": "xyz789",
         "dsn": "postgresql://trading:secret@timescaledb:5432/trading",
+        "pg_dsn": "postgresql://u:p@h:5432/db",
+        "broker_account_number": "U1234567",
         "message": "password=secret token=live-token",
     }
 
-    rendered = str(redact_evidence(payload))
+    rendered = json.dumps(redact_evidence(payload), sort_keys=True)
 
     assert "live-token" not in rendered
+    assert "abc123" not in rendered
+    assert "xyz789" not in rendered
     assert "password=secret" not in rendered
     assert ":secret@" not in rendered
+    assert "p@h" not in rendered
+    assert "U1234567" not in rendered
+    assert "<redacted" in rendered
 
 
 def test_effective_runtime_state_cli_honors_json_flag(capsys) -> None:

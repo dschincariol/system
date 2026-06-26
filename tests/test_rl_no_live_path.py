@@ -25,6 +25,32 @@ def test_engine_rl_does_not_import_broker_router():
     assert offenders == []
 
 
+def test_offline_rl_modules_do_not_import_live_broker_paths():
+    rl_root = REPO_ROOT / "engine" / "rl"
+    banned = {
+        "engine.execution.broker_router",
+        "engine.execution.broker_apply_orders",
+        "engine.execution.broker_alpaca_rest",
+        "engine.execution.broker_ibkr_gateway",
+    }
+    offenders: list[str] = []
+    for path in sorted(rl_root.glob("offline*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = str(alias.name)
+                    if name in banned:
+                        offenders.append(f"{path.name}:{name}")
+            elif isinstance(node, ast.ImportFrom):
+                module = str(node.module or "")
+                if module in banned:
+                    offenders.append(f"{path.name}:{module}")
+        source = path.read_text(encoding="utf-8")
+        assert "apply_new_portfolio_orders" not in source
+    assert offenders == []
+
+
 def test_broker_router_rejects_rl_sourced_orders_before_routing():
     from engine.execution import broker_router
 

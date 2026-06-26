@@ -275,6 +275,32 @@ def _wal_archiver_transition_warnings(wal_archiver: dict[str, Any], *, ts_ms: in
     return warnings
 
 
+def _confirmed_wal_archiver_outage_blockers(wal_archiver: dict[str, Any]) -> list[str]:
+    if bool(wal_archiver.get("skipped")):
+        return []
+    unconfirmed = {
+        "wal_archiver_stats_unavailable",
+        "wal_archiver_stats_missing",
+    }
+    confirmed_prefixes = (
+        "wal_archiver_failed",
+        "wal_archiver_failure_unrecovered",
+        "wal_archiver_last_archive_missing",
+        "wal_archiver_stale",
+        "wal_archiver_timeout",
+        "wal_archiver_archive_mode_disabled",
+        "wal_archiver_archive_command_unaudited",
+    )
+    out: list[str] = []
+    for raw in list(wal_archiver.get("blockers") or []):
+        item = str(raw or "").strip()
+        if not item or item in unconfirmed or item.startswith("wal_archiver_probe_failed:"):
+            continue
+        if any(item.startswith(prefix) for prefix in confirmed_prefixes):
+            out.append(item)
+    return out
+
+
 def _emit_storage_runtime_alert(
     *,
     ts_ms: int,
@@ -324,55 +350,82 @@ def _emit_storage_runtime_alert(
 
 
 def _emit_storage_wal_alerts(ts_ms: int) -> dict[str, Any]:
-    if not _production_storage_alerts_enabled():
-        _clear_inactive_storage_alert_fingerprints(set())
-        _emit_wal_alert_state_metric(ts_ms=ts_ms, enabled=False)
-        return {"enabled": False, "emitted": 0, "ok": True}
-
+    production_alerts_enabled = _production_storage_alerts_enabled()
     emitted = 0
-    snapshots: dict[str, Any] = {"enabled": True}
+    snapshots: dict[str, Any] = {
+        "enabled": True,
+        "production_storage_alerts_enabled": bool(production_alerts_enabled),
+    }
     blockers: list[str] = []
     warnings: list[str] = []
     active_rule_ids: set[str] = set()
 
-    try:
-        from engine.runtime.storage_placement import check_storage_placement
+    if production_alerts_enabled:
+        try:
+            from engine.runtime.storage_placement import check_storage_placement
 
-        storage = dict(check_storage_placement() or {})
-    except Exception as exc:
-        storage = {"ok": False, "errors": [f"storage_placement_probe_failed:{type(exc).__name__}: {exc}"]}
-    snapshots["storage_placement"] = storage
-    storage_errors = [str(item) for item in list(storage.get("errors") or []) if str(item).strip()]
-    storage_warnings = [str(item) for item in list(storage.get("warnings") or []) if str(item).strip()]
-    if storage_errors:
-        blockers.extend(f"storage_placement:{item}" for item in storage_errors)
-        active_rule_ids.add("STORAGE_PLACEMENT_INVALID")
-        emitted += _emit_storage_runtime_alert(
-            ts_ms=ts_ms,
-            severity="CRIT",
-            rule_id="STORAGE_PLACEMENT_INVALID",
-            title="Storage placement invalid",
-            detail={"errors": storage_errors, "storage_placement": storage},
-        )
-    elif storage_warnings:
-        warnings.extend(f"storage_placement:{item}" for item in storage_warnings)
+            storage = dict(check_storage_placement() or {})
+        except Exception as exc:
+            storage = {"ok": False, "errors": [f"storage_placement_probe_failed:{type(exc).__name__}: {exc}"]}
+        snapshots["storage_placement"] = storage
+        storage_errors = [str(item) for item in list(storage.get("errors") or []) if str(item).strip()]
+        storage_warnings = [str(item) for item in list(storage.get("warnings") or []) if str(item).strip()]
+        if storage_errors:
+            blockers.extend(f"storage_placement:{item}" for item in storage_errors)
+            active_rule_ids.add("STORAGE_PLACEMENT_INVALID")
+            emitted += _emit_storage_runtime_alert(
+                ts_ms=ts_ms,
+                severity="CRIT",
+                rule_id="STORAGE_PLACEMENT_INVALID",
+                title="Storage placement invalid",
+                detail={"errors": storage_errors, "storage_placement": storage},
+            )
+        elif storage_warnings:
+            warnings.extend(f"storage_placement:{item}" for item in storage_warnings)
+    else:
+        snapshots["storage_placement"] = {"skipped": True, "reason": "production_storage_alerts_disabled"}
 
     try:
         from engine.runtime.backup_evidence import pg_wal_disk_risk_snapshot, wal_archiver_runtime_snapshot
 
-        wal_archiver = dict(wal_archiver_runtime_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe"), required=True) or {})
-        pg_wal = dict(pg_wal_disk_risk_snapshot(engine_mode=os.environ.get("ENGINE_MODE", "safe"), required=True) or {})
+        wal_archiver = dict(
+            wal_archiver_runtime_snapshot(
+                engine_mode=os.environ.get("ENGINE_MODE", "safe"),
+                required=True,
+            )
+            or {}
+        )
+        if production_alerts_enabled:
+            pg_wal = dict(
+                pg_wal_disk_risk_snapshot(
+                    engine_mode=os.environ.get("ENGINE_MODE", "safe"),
+                    required=True,
+                )
+                or {}
+            )
+        else:
+            pg_wal = {"skipped": True, "reason": "production_storage_alerts_disabled"}
     except Exception as exc:
         wal_archiver = {"ok": False, "blockers": [f"wal_archiver_probe_failed:{type(exc).__name__}: {exc}"]}
-        pg_wal = {"ok": False, "blockers": [f"pg_wal_probe_failed:{type(exc).__name__}: {exc}"]}
+        pg_wal = (
+            {"ok": False, "blockers": [f"pg_wal_probe_failed:{type(exc).__name__}: {exc}"]}
+            if production_alerts_enabled
+            else {"skipped": True, "reason": "production_storage_alerts_disabled"}
+        )
     snapshots["wal_archiver_runtime"] = wal_archiver
     snapshots["pg_wal_disk_risk"] = pg_wal
 
     wal_blockers = [str(item) for item in list(wal_archiver.get("blockers") or []) if str(item).strip()]
     wal_warnings = [str(item) for item in list(wal_archiver.get("warnings") or []) if str(item).strip()]
-    wal_warnings.extend(_wal_archiver_transition_warnings(wal_archiver, ts_ms=ts_ms))
-    if wal_blockers:
-        blockers.extend(f"wal_archiver:{item}" for item in wal_blockers)
+    if production_alerts_enabled:
+        wal_warnings.extend(_wal_archiver_transition_warnings(wal_archiver, ts_ms=ts_ms))
+    wal_alert_blockers = (
+        wal_blockers
+        if production_alerts_enabled
+        else _confirmed_wal_archiver_outage_blockers(wal_archiver)
+    )
+    if wal_alert_blockers:
+        blockers.extend(f"wal_archiver:{item}" for item in wal_alert_blockers)
         active_rule_ids.add("WAL_ARCHIVER_OUTAGE")
         emitted += _emit_storage_runtime_alert(
             ts_ms=ts_ms,
@@ -380,19 +433,19 @@ def _emit_storage_wal_alerts(ts_ms: int) -> dict[str, Any]:
             rule_id="WAL_ARCHIVER_OUTAGE",
             title="WAL archiver outage risk",
             detail={
-                "blockers": wal_blockers,
+                "blockers": wal_alert_blockers,
                 "last_failed_wal": str(wal_archiver.get("last_failed_wal") or ""),
                 "last_archived_wal": str(wal_archiver.get("last_archived_wal") or ""),
                 "failed_count": _safe_int(wal_archiver.get("failed_count"), 0),
                 "wal_archiver_runtime": wal_archiver,
             },
         )
-    elif wal_warnings:
+    elif production_alerts_enabled and wal_warnings:
         warnings.extend(f"wal_archiver:{item}" for item in wal_warnings)
 
     pg_wal_blockers = [str(item) for item in list(pg_wal.get("blockers") or []) if str(item).strip()]
     pg_wal_warnings = [str(item) for item in list(pg_wal.get("warnings") or []) if str(item).strip()]
-    if pg_wal_blockers:
+    if production_alerts_enabled and pg_wal_blockers:
         blockers.extend(f"pg_wal:{item}" for item in pg_wal_blockers)
         active_rule_ids.add("PG_WAL_DISK_RISK")
         emitted += _emit_storage_runtime_alert(
@@ -408,7 +461,7 @@ def _emit_storage_wal_alerts(ts_ms: int) -> dict[str, Any]:
                 "pg_wal_disk_risk": pg_wal,
             },
         )
-    elif pg_wal_warnings:
+    elif production_alerts_enabled and pg_wal_warnings:
         warnings.extend(f"pg_wal:{item}" for item in pg_wal_warnings)
 
     try:
@@ -434,7 +487,7 @@ def _emit_storage_wal_alerts(ts_ms: int) -> dict[str, Any]:
     elif disk_warnings:
         warnings.extend(f"free_space:{item}" for item in disk_warnings)
 
-    if not blockers and warnings:
+    if production_alerts_enabled and not blockers and warnings:
         active_rule_ids.add("STORAGE_WAL_WARNING")
         emitted += _emit_storage_runtime_alert(
             ts_ms=ts_ms,

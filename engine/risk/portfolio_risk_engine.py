@@ -42,7 +42,9 @@ from engine.risk.futures_margin import (
     currency_conversion_rate,
     weight_to_contracts,
 )
+from engine.risk.covariance import correlation_matrix_dict, estimate_covariance
 from engine.risk.equity_leverage_caps import equity_leverage_mode, max_equity_leverage
+from engine.risk.notional_backstop import BACKSTOP_ENABLED
 from engine.strategy.drawdown_state import evaluate_current_drawdown
 from engine.strategy.risk import realized_vol_from_prices, corr_from_prices
 from engine.strategy.har_rv import resolve_vol_forecast
@@ -55,6 +57,7 @@ from engine.strategy.crypto_sizing import (
     crypto_weight_to_notional,
     normalize_crypto_symbol,
 )
+from engine.runtime.live_execution_control import live_execution_disabled
 from engine.runtime.risk_state import set_state, get_state_row
 from engine.runtime.event_log import record_risk_block
 from engine.runtime.storage import _table_exists
@@ -127,7 +130,7 @@ DD_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_DD_HARD_BLOCK", "0.15"))
 VOL_LOOKBACK = int(os.environ.get("PORTFOLIO_RISK_VOL_LOOKBACK", os.environ.get("PORTFOLIO_VOL_LOOKBACK", "240")))
 VOL_TARGET = float(os.environ.get("PORTFOLIO_RISK_VOL_TARGET", os.environ.get("PORTFOLIO_TARGET_VOL", "0.020")))
 VOL_FORECAST_SOURCE = str(os.environ.get("VOL_FORECAST_SOURCE", "trailing") or "trailing").strip().lower()
-PORTFOLIO_VOL_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_VOL_HARD_BLOCK", "0.0"))  # 0 disables
+PORTFOLIO_VOL_HARD_BLOCK = float(os.environ.get("PORTFOLIO_RISK_VOL_HARD_BLOCK", "0.0"))  # 0.0 = intentional soft-only default; vol targeting still scales; set >0 to make portfolio vol a hard stop
 PORTFOLIO_VOL_FLOOR = float(os.environ.get("PORTFOLIO_RISK_VOL_FLOOR", "0.005"))
 PORTFOLIO_VOL_CEIL = float(os.environ.get("PORTFOLIO_RISK_VOL_CEIL", "0.080"))
 USE_GEX_VOL_MODIFIER = os.environ.get("PORTFOLIO_RISK_USE_GEX_VOL_MODIFIER", os.environ.get("USE_OPTIONS_FEATURES", "0")) == "1"
@@ -371,6 +374,58 @@ def _is_live_risk_runtime() -> bool:
 
 def _monte_carlo_required_in_current_runtime() -> bool:
     return bool(PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE and _is_live_risk_runtime())
+
+
+def _risk_overlay_enabled(name: str) -> bool:
+    overlay = str(name or "").strip()
+    if overlay == "drawdown_throttle":
+        return bool(float(DD_THROTTLE_START) > 0.0 and float(DD_THROTTLE_MIN_SCALE) < 1.0)
+    if overlay == "alpha_decay_throttle":
+        return bool(USE_ALPHA_DECAY_THROTTLE)
+    if overlay == "symbol_vol_caps":
+        return bool(USE_VOL_CAPS)
+    if overlay == "corr_cluster_caps":
+        return bool(USE_CORR_CLUSTERS)
+    if overlay == "portfolio_vol_target":
+        return bool(float(VOL_TARGET) > 0.0 or float(PORTFOLIO_VOL_HARD_BLOCK) > 0.0)
+    return False
+
+
+def _required_overlay_failures_block_current_runtime() -> bool:
+    return bool(_is_live_risk_runtime())
+
+
+def _record_overlay_failure(
+    info: Dict[str, Any],
+    overlay: str,
+    error: Exception,
+    *,
+    now_ms: int,
+) -> Optional[Dict[str, Any]]:
+    name = str(overlay or "").strip()
+    enabled = _risk_overlay_enabled(name)
+    required = _required_overlay_failures_block_current_runtime()
+    failure = {
+        "name": name,
+        "enabled": bool(enabled),
+        "required": bool(required),
+        "ts_ms": int(now_ms),
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    info.setdefault("overlay_failures", []).append(dict(failure))
+    if not (enabled and required):
+        return None
+
+    required_failures = info.setdefault("required_overlay_failures", [])
+    required_failures.append(dict(failure))
+    info["overlay_failed"] = name
+    info["overlay_failure_required"] = True
+    return {
+        "type": "required_overlay_failed",
+        "overlay": name,
+        "failures": list(required_failures),
+    }
 
 
 def _monte_carlo_failure_summary(
@@ -2554,19 +2609,34 @@ def _apply_symbol_vol_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[s
 def _corr_graph_components(
     con,
     syms: List[str],
-) -> Tuple[List[List[str]], Dict[str, Dict[str, float]], List[Dict[str, Any]]]:
+) -> Tuple[List[List[str]], Dict[str, Dict[str, float]], List[Dict[str, Any]], Dict[str, Any]]:
     if not syms or len(syms) < 2:
-        return [], {}, []
+        return [], {}, [], {}
 
     # Build adjacency (undirected) for abs(corr) >= threshold
     adj: Dict[str, List[str]] = {s: [] for s in syms}
     matrix: Dict[str, Dict[str, float]] = {s: {} for s in syms}
+    covariance_diagnostics: Dict[str, Any] = {}
+    corr_by_symbol: Dict[str, Dict[str, float]] = {}
+    try:
+        covariance_estimate = estimate_covariance(con, syms, lookback=int(CORR_LOOKBACK))
+        covariance_diagnostics = dict(covariance_estimate.diagnostics or {})
+        corr_by_symbol = correlation_matrix_dict(covariance_estimate)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_ENGINE_CLUSTER_COVARIANCE_FAILED",
+            e,
+            once_key="cluster_covariance",
+            symbols=list(syms),
+        )
     for i in range(len(syms)):
         matrix[syms[i]][syms[i]] = 1.0
         for j in range(i + 1, len(syms)):
             a, b = syms[i], syms[j]
             try:
-                c = corr_from_prices(con, a, b, lookback=int(CORR_LOOKBACK))
+                c = corr_by_symbol.get(a, {}).get(b)
+                if c is None:
+                    c = corr_from_prices(con, a, b, lookback=int(CORR_LOOKBACK))
                 if c is None:
                     continue
                 cc = max(-1.0, min(1.0, _safe_float(c, 0.0)))
@@ -2640,7 +2710,7 @@ def _corr_graph_components(
             comps.append(sorted(comp))
 
     comps.sort(key=lambda comp: (-len(comp), ",".join(comp)))
-    return comps, matrix, fx_shared_edges
+    return comps, matrix, fx_shared_edges, covariance_diagnostics
 
 
 def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -2649,11 +2719,13 @@ def _apply_corr_cluster_caps(con, desired: Dict[str, Dict[str, Any]], info: Dict
 
     out = dict(desired or {})
     syms = _top_symbols_by_abs(out, int(MAX_SYMBOLS))
-    comps, corr_matrix, fx_shared_edges = _corr_graph_components(con, syms)
+    comps, corr_matrix, fx_shared_edges, covariance_diagnostics = _corr_graph_components(con, syms)
 
     info["corr_matrix"] = corr_matrix
     info["corr_cluster_symbols"] = list(syms)
     info["corr_cluster_corr_th"] = float(CLUSTER_CORR_TH)
+    if covariance_diagnostics:
+        info["corr_covariance_diagnostics"] = dict(covariance_diagnostics)
     if fx_shared_edges:
         info["corr_cluster_fx_shared_currency_edges"] = list(fx_shared_edges)
 
@@ -2787,7 +2859,23 @@ def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]], info: Optional
         return None
     wn = [float(x / gross) for x in w]
 
-    # covariance proxy via corr
+    covariance_diagnostics: Dict[str, Any] = {}
+    corr_by_symbol: Dict[str, Dict[str, float]] = {}
+    try:
+        covariance_estimate = estimate_covariance(con, active_syms, lookback=int(CORR_LOOKBACK))
+        covariance_diagnostics = dict(covariance_estimate.diagnostics or {})
+        corr_by_symbol = correlation_matrix_dict(covariance_estimate)
+    except Exception as e:
+        _warn_nonfatal(
+            "PORTFOLIO_RISK_ENGINE_PORTFOLIO_VOL_COVARIANCE_FAILED",
+            e,
+            once_key="portfolio_vol_covariance",
+            symbols=list(active_syms),
+        )
+    if info is not None and covariance_diagnostics:
+        info["portfolio_covariance_diagnostics"] = dict(covariance_diagnostics)
+
+    # covariance proxy via canonical covariance correlations and forecast vols
     var = 0.0
     for i in range(len(wn)):
         var += float(wn[i] * wn[i]) * float(vols[i] * vols[i])
@@ -2796,7 +2884,9 @@ def _portfolio_vol_proxy(con, desired: Dict[str, Dict[str, Any]], info: Optional
     for i in range(len(wn)):
         for j in range(i + 1, len(wn)):
             try:
-                c = corr_from_prices(con, active_syms[i], active_syms[j], lookback=int(CORR_LOOKBACK))
+                c = corr_by_symbol.get(active_syms[i], {}).get(active_syms[j])
+                if c is None:
+                    c = corr_from_prices(con, active_syms[i], active_syms[j], lookback=int(CORR_LOOKBACK))
                 if c is None:
                     continue
                 cc = max(-1.0, min(1.0, _safe_float(c, 0.0)))
@@ -3028,15 +3118,34 @@ def apply_portfolio_risk_engine(
     """
     if not USE:
         try:
-            clear_info = {"enabled": False, "ts_ms": int(now_ms), "blocked": False}
-            set_state("portfolio_risk_block", "0")
-            set_state("portfolio_risk_info", json.dumps(clear_info, separators=(",", ":"), sort_keys=True))
-            set_state("portfolio_risk_summary", json.dumps(clear_info, separators=(",", ":"), sort_keys=True))
-            set_state("portfolio_risk_status", "disabled")
-            set_state("portfolio_risk_ts_ms", str(int(now_ms)))
+            ts_ms = int(now_ms)
+        except Exception:
+            ts_ms = 0
+        try:
+            is_live = not live_execution_disabled()
         except Exception as e:
-            _warn_nonfatal("PORTFOLIO_RISK_DISABLE_STATE_SET_FAILED", e, once_key="disable_state_set", ts_ms=int(now_ms))
-        return desired, {"enabled": False}
+            _warn_nonfatal("PORTFOLIO_RISK_LIVE_STATUS_READ_FAILED", e, once_key="disable_live_status")
+            is_live = True
+        blocked = bool(is_live and not BACKSTOP_ENABLED)
+        status = "risk_engine_disabled_live" if blocked else "disabled"
+        clear_info = {
+            "enabled": False,
+            "ts_ms": int(ts_ms),
+            "blocked": bool(blocked),
+            "status": status,
+            "is_live": bool(is_live),
+            "notional_backstop_enabled": bool(BACKSTOP_ENABLED),
+        }
+        try:
+            set_state("portfolio_risk_block", "1" if blocked else "0")
+            state_blob = json.dumps(clear_info, separators=(",", ":"), sort_keys=True)
+            set_state("portfolio_risk_info", state_blob)
+            set_state("portfolio_risk_summary", state_blob)
+            set_state("portfolio_risk_status", status)
+            set_state("portfolio_risk_ts_ms", str(int(ts_ms)))
+        except Exception as e:
+            _warn_nonfatal("PORTFOLIO_RISK_DISABLE_STATE_SET_FAILED", e, once_key="disable_state_set", ts_ms=int(ts_ms))
+        return desired, dict(clear_info)
 
     info: Dict[str, Any] = {"enabled": True, "ts_ms": int(now_ms)}
 
@@ -3085,6 +3194,11 @@ def apply_portfolio_risk_engine(
         out = _apply_drawdown_throttle(out, float(dd), info)
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_DRAWDOWN_THROTTLE_FAILED", e, once_key="apply_drawdown_throttle", ts_ms=int(now_ms))
+        overlay_block_reason = _record_overlay_failure(info, "drawdown_throttle", e, now_ms=int(now_ms))
+        if overlay_block_reason is not None:
+            blocked = True
+            if block_reason is None or str(block_reason.get("type") or "") == "required_overlay_failed":
+                block_reason = dict(overlay_block_reason)
 
     try:
         info["_risk_con"] = con
@@ -3161,16 +3275,31 @@ def apply_portfolio_risk_engine(
         out = _apply_alpha_decay_throttle(con, out, info, int(now_ms))
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_ALPHA_DECAY_THROTTLE_FAILED", e, once_key="apply_alpha_decay_throttle", ts_ms=int(now_ms))
+        overlay_block_reason = _record_overlay_failure(info, "alpha_decay_throttle", e, now_ms=int(now_ms))
+        if overlay_block_reason is not None:
+            blocked = True
+            if block_reason is None or str(block_reason.get("type") or "") == "required_overlay_failed":
+                block_reason = dict(overlay_block_reason)
 
     try:
         out = _apply_symbol_vol_caps(con, out, info)
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_SYMBOL_VOL_CAPS_FAILED", e, once_key="apply_symbol_vol_caps", ts_ms=int(now_ms))
+        overlay_block_reason = _record_overlay_failure(info, "symbol_vol_caps", e, now_ms=int(now_ms))
+        if overlay_block_reason is not None:
+            blocked = True
+            if block_reason is None or str(block_reason.get("type") or "") == "required_overlay_failed":
+                block_reason = dict(overlay_block_reason)
 
     try:
         out = _apply_corr_cluster_caps(con, out, info)
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_CORR_CLUSTER_CAPS_FAILED", e, once_key="apply_corr_cluster_caps", ts_ms=int(now_ms))
+        overlay_block_reason = _record_overlay_failure(info, "corr_cluster_caps", e, now_ms=int(now_ms))
+        if overlay_block_reason is not None:
+            blocked = True
+            if block_reason is None or str(block_reason.get("type") or "") == "required_overlay_failed":
+                block_reason = dict(overlay_block_reason)
 
     try:
         out = _apply_portfolio_vol_target(con, out, info)
@@ -3183,6 +3312,11 @@ def apply_portfolio_risk_engine(
             }
     except Exception as e:
         _warn_nonfatal("PORTFOLIO_RISK_VOL_TARGET_FAILED", e, once_key="apply_portfolio_vol_target", ts_ms=int(now_ms))
+        overlay_block_reason = _record_overlay_failure(info, "portfolio_vol_target", e, now_ms=int(now_ms))
+        if overlay_block_reason is not None:
+            blocked = True
+            if block_reason is None or str(block_reason.get("type") or "") == "required_overlay_failed":
+                block_reason = dict(overlay_block_reason)
 
     try:
         mc_info = _load_monte_carlo_risk_summary(int(now_ms))
@@ -3218,11 +3352,19 @@ def apply_portfolio_risk_engine(
     info["final_net"] = float(final_snapshot.get("net", 0.0) or 0.0)
 
     post_checks = _post_constraint_checks(final_snapshot)
+    if info.get("required_overlay_failures"):
+        post_checks["required_overlays_ok"] = False
+        post_checks["required_overlay_failures"] = list(info.get("required_overlay_failures") or [])
     info["post_checks"] = post_checks
 
     if (not blocked) and (not all(bool(v) for k, v in post_checks.items() if not str(k).endswith("_violations"))):
         blocked = True
-        if not bool(post_checks.get("options_greeks_within_cap", True)):
+        if not bool(post_checks.get("required_overlays_ok", True)):
+            block_reason = {
+                "type": "required_overlay_failed",
+                "failures": list(post_checks.get("required_overlay_failures") or []),
+            }
+        elif not bool(post_checks.get("options_greeks_within_cap", True)):
             block_reason = {
                 "type": "options_greek_limit_breached",
                 "options_greeks": dict(options_greek_snapshot),

@@ -364,6 +364,21 @@ def _schema_ready_for_reads(con) -> bool:
         )
     return False
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    return int(str(raw).strip())
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    return float(str(raw).strip())
+
+
 try:
     from engine.runtime.lifecycle_state import get_state as _get_lifecycle_state  # type: ignore
 except Exception:
@@ -387,40 +402,36 @@ ENV_MODELS_KEY = "KILL_SWITCH_MODELS"     # CSV: "baseline,model_a,model_b"
 REQUIRE_FRESH_DATA = os.environ.get("KILL_SWITCH_REQUIRE_FRESH_DATA", "1") == "1"
 REQUIRE_FRESH_JOBS = os.environ.get("KILL_SWITCH_REQUIRE_FRESH_JOBS", "1") == "1"
 
-MAX_PRICE_STALE_S = int(os.environ.get("KILL_SWITCH_MAX_PRICE_STALE_S", "300"))          # 5m
-MAX_EVENT_STALE_S = int(os.environ.get("KILL_SWITCH_MAX_EVENT_STALE_S", "3600"))         # 1h
-MAX_PRED_STALE_S  = int(os.environ.get("KILL_SWITCH_MAX_PRED_STALE_S", "900"))           # 15m
+MAX_PRICE_STALE_S = _env_int("KILL_SWITCH_MAX_PRICE_STALE_S", 300)          # 5m
+MAX_EVENT_STALE_S = _env_int("KILL_SWITCH_MAX_EVENT_STALE_S", 3600)         # 1h
+MAX_PRED_STALE_S  = _env_int("KILL_SWITCH_MAX_PRED_STALE_S", 900)           # 15m
 
 # Heartbeat freshness (job_heartbeats.ts_ms)
-MAX_JOB_STALE_S   = int(os.environ.get("KILL_SWITCH_MAX_JOB_STALE_S", "600"))            # 10m
+MAX_JOB_STALE_S   = _env_int("KILL_SWITCH_MAX_JOB_STALE_S", 600)            # 10m
 REQUIRED_JOBS_CSV = os.environ.get("KILL_SWITCH_REQUIRED_JOBS", "ingestion_runtime,process_events").strip()
 
 # Capital-aware kill switch (additive, non-breaking)
 CAPITAL_AWARE_KILL_SWITCH = os.environ.get("CAPITAL_AWARE_KILL_SWITCH", "1") == "1"
-KILL_SWITCH_DAILY_DRAWDOWN_PCT = float(os.environ.get("KILL_SWITCH_DAILY_DRAWDOWN_PCT", "0.05"))
-KILL_SWITCH_ROLLING_DRAWDOWN_PCT = float(os.environ.get("KILL_SWITCH_ROLLING_DRAWDOWN_PCT", "0.12"))
-KILL_SWITCH_ROLLING_DRAWDOWN_LOOKBACK_DAYS = int(os.environ.get("KILL_SWITCH_ROLLING_DRAWDOWN_LOOKBACK_DAYS", "7"))
-KILL_SWITCH_VAR_LOOKBACK_POINTS = int(os.environ.get("KILL_SWITCH_VAR_LOOKBACK_POINTS", "250"))
-KILL_SWITCH_VAR_CONFIDENCE = float(os.environ.get("KILL_SWITCH_VAR_CONFIDENCE", "0.99"))
-KILL_SWITCH_VAR_MIN_HISTORY = int(os.environ.get("KILL_SWITCH_VAR_MIN_HISTORY", "30"))
-KILL_SWITCH_MAX_EQUITY_AGE_S = int(os.environ.get("KILL_SWITCH_MAX_EQUITY_AGE_S", "300"))
-KILL_SWITCH_DAILY_EQUITY_MIN_POINTS = int(os.environ.get("KILL_SWITCH_DAILY_EQUITY_MIN_POINTS", "2"))
-KILL_SWITCH_ROLLING_EQUITY_MIN_POINTS = int(os.environ.get("KILL_SWITCH_ROLLING_EQUITY_MIN_POINTS", "5"))
-KILL_SWITCH_VAR_EQUITY_MIN_POINTS = int(
-    os.environ.get(
-        "KILL_SWITCH_VAR_EQUITY_MIN_POINTS",
-        str(max(2, int(KILL_SWITCH_VAR_MIN_HISTORY) + 1)),
-    )
+KILL_SWITCH_DAILY_DRAWDOWN_PCT = _env_float("KILL_SWITCH_DAILY_DRAWDOWN_PCT", 0.05)
+KILL_SWITCH_ROLLING_DRAWDOWN_PCT = _env_float("KILL_SWITCH_ROLLING_DRAWDOWN_PCT", 0.12)
+KILL_SWITCH_ROLLING_DRAWDOWN_LOOKBACK_DAYS = _env_int("KILL_SWITCH_ROLLING_DRAWDOWN_LOOKBACK_DAYS", 7)
+KILL_SWITCH_VAR_LOOKBACK_POINTS = _env_int("KILL_SWITCH_VAR_LOOKBACK_POINTS", 250)
+KILL_SWITCH_VAR_CONFIDENCE = _env_float("KILL_SWITCH_VAR_CONFIDENCE", 0.99)
+KILL_SWITCH_VAR_MIN_HISTORY = _env_int("KILL_SWITCH_VAR_MIN_HISTORY", 30)
+KILL_SWITCH_MAX_EQUITY_AGE_S = _env_int("KILL_SWITCH_MAX_EQUITY_AGE_S", 300)
+KILL_SWITCH_DAILY_EQUITY_MIN_POINTS = _env_int("KILL_SWITCH_DAILY_EQUITY_MIN_POINTS", 2)
+KILL_SWITCH_ROLLING_EQUITY_MIN_POINTS = _env_int("KILL_SWITCH_ROLLING_EQUITY_MIN_POINTS", 5)
+KILL_SWITCH_VAR_EQUITY_MIN_POINTS = _env_int(
+    "KILL_SWITCH_VAR_EQUITY_MIN_POINTS",
+    max(2, int(KILL_SWITCH_VAR_MIN_HISTORY) + 1),
 )
-KILL_SWITCH_CONCENTRATION_MAX_SINGLE = float(os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_SINGLE", "0.35"))
-KILL_SWITCH_CONCENTRATION_MAX_TOP3 = float(os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_TOP3", "0.70"))
-KILL_SWITCH_CONCENTRATION_MAX_SINGLE = float(os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_SINGLE", "0.35"))
-KILL_SWITCH_CONCENTRATION_MAX_TOP3 = float(os.environ.get("KILL_SWITCH_CONCENTRATION_MAX_TOP3", "0.70"))
-KILL_SWITCH_COOLDOWN_MINUTES = float(os.environ.get("KILL_SWITCH_COOLDOWN_MINUTES", "60"))
+KILL_SWITCH_CONCENTRATION_MAX_SINGLE = _env_float("KILL_SWITCH_CONCENTRATION_MAX_SINGLE", 0.35)
+KILL_SWITCH_CONCENTRATION_MAX_TOP3 = _env_float("KILL_SWITCH_CONCENTRATION_MAX_TOP3", 0.70)
+KILL_SWITCH_COOLDOWN_MINUTES = _env_float("KILL_SWITCH_COOLDOWN_MINUTES", 60.0)
 MODEL_AWARE_KILL_SWITCH = os.environ.get("MODEL_AWARE_KILL_SWITCH", "1") == "1"
-KILL_SWITCH_MODEL_MAX_DRAWDOWN = float(os.environ.get("KILL_SWITCH_MODEL_MAX_DRAWDOWN", "0"))
-KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES", "0"))
-KILL_SWITCH_MODEL_LOOKBACK_ROWS = int(os.environ.get("KILL_SWITCH_MODEL_LOOKBACK_ROWS", "250"))
+KILL_SWITCH_MODEL_MAX_DRAWDOWN = _env_float("KILL_SWITCH_MODEL_MAX_DRAWDOWN", 0.0)
+KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES = _env_int("KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES", 0)
+KILL_SWITCH_MODEL_LOOKBACK_ROWS = _env_int("KILL_SWITCH_MODEL_LOOKBACK_ROWS", 250)
 
 def _now_ms() -> int:
     return int(time.time() * 1000)

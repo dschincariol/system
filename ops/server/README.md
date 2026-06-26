@@ -117,7 +117,7 @@ Current runtime storage is Postgres-backed. Backup ownership for this host layer
   `/var/backups/trading/evidence/backup_restore_evidence_<timestamp>.txt`
   plus `latest_backup_restore_evidence.json`
 
-Bootstrap installs the matching `trading-base-backup`, `trading-backup-evidence`, `trading-backup-prune`, and `trading-restore-drill` systemd units and timers. A backup is not considered operationally valid until a restore drill has produced a passing report. `trading-backup-evidence.timer` refreshes WAL archive proof every 60 seconds and reuses fresh base-backup/restore-drill evidence until the configured policy windows expire.
+Bootstrap installs the matching `trading-base-backup`, `trading-backup-evidence`, `trading-backup-prune`, and `trading-restore-drill` systemd units and timers. A backup is not considered operationally valid until a restore drill has produced a passing report. `trading-restore-drill.timer` runs weekly with a bounded randomized delay, while `trading-backup-evidence.timer` refreshes WAL archive proof every 60 seconds and reuses fresh base-backup/restore-drill evidence until the configured policy windows expire. Production installs set restore-drill evidence freshness to 604800 seconds (7 days); the evidence script hard default is 1209600 seconds (14 days) when no override is configured.
 The timer path is check-only for heavyweight work: it does not run a base
 backup, restore drill, or WAL catch-up unless the operator explicitly sets
 `TS_BACKUP_EVIDENCE_RUN_BASE_BACKUP=1`,

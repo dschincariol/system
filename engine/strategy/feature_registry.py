@@ -26,6 +26,7 @@ from engine.runtime.config import (
     FEATURE_STORE_VERSION,
     USE_CONGRESSIONAL_TRADE_DATA,
 )
+from engine.nlp.encoder import current_sentiment_config, resolve_text_embedding_config
 from engine.data.asset_map import asset_class_for_symbol
 from engine.data.finbert_sentiment import (
     FINBERT_FEATURE_IDS as _FINBERT_FEATURE_IDS,
@@ -53,6 +54,11 @@ from engine.strategy.ts_foundation_encoder import (
     TS_FOUNDATION_CHRONOS_GROUP,
     TS_FOUNDATION_CHRONOS_PREFIX,
     chronos_model_id,
+)
+from engine.strategy.tsfm_adapters import (
+    TSFM_ADAPTER_FEATURE_IDS,
+    TSFM_SHADOW_GROUP,
+    is_tsfm_shadow_feature_id,
 )
 
 USE_TECH_FEATURES = os.environ.get("USE_TECH_FEATURES", "0") == "1"
@@ -545,8 +551,13 @@ AVAILABILITY_FEATURE_IDS = [
 TSFRESH_FEATURE_IDS = list(get_tsfresh_feature_ids())
 
 NLP_EMBEDDING_DIM = max(1, int(os.environ.get("NLP_EMBEDDING_DIM", "384")))
-NLP_FINBERT_MODEL_NAME = str(os.environ.get("NLP_FINBERT_MODEL_NAME", "ProsusAI/finbert") or "ProsusAI/finbert")
-NLP_SENTENCE_MODEL_NAME = str(os.environ.get("NLP_SENTENCE_MODEL_NAME", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2")
+_NLP_TEXT_EMBED_CONFIG = resolve_text_embedding_config(kind="nlp")
+_NLP_SENTIMENT_CONFIG = current_sentiment_config()
+NLP_EMBEDDING_BACKEND = str(_NLP_TEXT_EMBED_CONFIG.backend)
+NLP_FINBERT_MODEL_NAME = str(_NLP_SENTIMENT_CONFIG.model_name)
+NLP_FINBERT_MODEL_NAMESPACE = str(_NLP_SENTIMENT_CONFIG.namespace)
+NLP_SENTENCE_MODEL_NAME = str(_NLP_TEXT_EMBED_CONFIG.model_name)
+NLP_SENTENCE_MODEL_NAMESPACE = str(_NLP_TEXT_EMBED_CONFIG.namespace)
 NLP_FINBERT_NEWS_FEATURE_IDS = [
     "nlp.finbert_news_v1.score_mean",
     "nlp.finbert_news_v1.score_weighted_mean",
@@ -641,6 +652,7 @@ FEATURE_GROUPS = {
     "nlp_transcripts_v1": list(NLP_TRANSCRIPTS_FEATURE_IDS),
     "structured_doc_events_v1": list(STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS),
     TS_FOUNDATION_CHRONOS_GROUP: list(TS_FOUNDATION_CHRONOS_FEATURE_IDS),
+    TSFM_SHADOW_GROUP: list(TSFM_ADAPTER_FEATURE_IDS),
     GRAPH_RELATIONAL_GROUP: list(GRAPH_RELATIONAL_FEATURE_IDS),
 }
 if FINBERT_FEATURE_IDS:
@@ -679,6 +691,8 @@ FEATURE_STAGES: Dict[str, str] = {
 }
 for _fid in TS_FOUNDATION_CHRONOS_FEATURE_IDS:
     FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
+for _fid in TSFM_ADAPTER_FEATURE_IDS:
+    FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
 for _fid in GRAPH_RELATIONAL_FEATURE_IDS:
     FEATURE_STAGES[str(_fid)] = FEATURE_STAGE_SHADOW
 for _fid in STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS:
@@ -714,6 +728,19 @@ FEATURE_GROUP_METADATA[TS_FOUNDATION_CHRONOS_GROUP].update(
         "stage": FEATURE_STAGE_SHADOW,
     }
 )
+FEATURE_GROUP_METADATA[TSFM_SHADOW_GROUP].update(
+    {
+        "default_enabled": False,
+        "direct_trading_authority": False,
+        "model_family": "tsfm",
+        "model_family_provenance": {
+            "backends": ["chronos", "timesfm", "moirai", "toto", "fake"],
+            "direct_trading_authority": False,
+            "source": "governed_tsfm_benchmark_and_challenger_feature_layer",
+        },
+        "stage": FEATURE_STAGE_SHADOW,
+    }
+)
 FEATURE_GROUP_METADATA[GRAPH_RELATIONAL_GROUP].update(
     {
         "default_enabled": False,
@@ -733,11 +760,49 @@ FEATURE_GROUP_METADATA["structured_doc_events_v1"].update(
         "direct_trading_authority": False,
         "extractor_name": "structured_document_events",
         "extractor_version": "structured_document_events_v1",
-        "source_documents": ["filing", "transcript", "news"],
+        "accepted_extractors": ["structured_document_events", "llm_event_extraction"],
+        "llm_extractor_schema_version": "llm_financial_event_v1",
+        "source_documents": ["filing", "transcript", "news", "earnings", "macro"],
         "stage": FEATURE_STAGE_SHADOW,
         **FEATURE_PIT_POLICIES["structured_doc_events"].to_metadata(),
     }
 )
+for _nlp_group_name in ("nlp_finbert_news_v1", "nlp_filings_v1", "nlp_transcripts_v1"):
+    _is_sentiment_group = _nlp_group_name == "nlp_finbert_news_v1"
+    FEATURE_GROUP_METADATA[_nlp_group_name].update(
+        {
+            "default_enabled": False,
+            "direct_trading_authority": False,
+            "stage": FEATURE_STAGE_LIVE,
+            "feature_role": "text_derived_feature",
+            "promotion_gate_required": True,
+            "availability_timestamp_field": "b.ts",
+            "cache_namespace": NLP_FINBERT_MODEL_NAMESPACE if _is_sentiment_group else NLP_SENTENCE_MODEL_NAMESPACE,
+            "embedding_backend": "finbert" if _is_sentiment_group else NLP_EMBEDDING_BACKEND,
+            "model_name": NLP_FINBERT_MODEL_NAME if _is_sentiment_group else NLP_SENTENCE_MODEL_NAME,
+            "model_card": _NLP_SENTIMENT_CONFIG.metadata if _is_sentiment_group else _NLP_TEXT_EMBED_CONFIG.metadata,
+            "source_tables": ["nlp_text_blobs", "nlp_embeddings"]
+            + (["nlp_sentiments"] if _is_sentiment_group else []),
+        }
+    )
+if "news_flow" in FEATURE_GROUP_METADATA:
+    FEATURE_GROUP_METADATA["news_flow"].update(
+        {
+            "default_enabled": False,
+            "direct_trading_authority": False,
+            "feature_role": "text_derived_feature",
+            "promotion_gate_required": True,
+            "availability_timestamp_field": "latest_availability_ts_ms",
+            "embedding_backend_env": "NEWS_EMBED_BACKEND",
+            "embedding_model_envs": [
+                "NEWS_EMBED_FINBERT_MODEL",
+                "NEWS_EMBED_SENTENCE_MODEL",
+                "NEWS_EMBED_FINANCIAL_MODEL",
+                "NEWS_EMBED_OPENAI_MODEL",
+            ],
+            "model_card": _NLP_TEXT_EMBED_CONFIG.metadata,
+        }
+    )
 for _group_name, _pit_meta in policy_metadata_for_groups(FEATURE_GROUP_METADATA.keys()).items():
     FEATURE_GROUP_METADATA.setdefault(str(_group_name), {})
     FEATURE_GROUP_METADATA[str(_group_name)].update(_pit_meta)
@@ -1009,6 +1074,8 @@ def feature_stage(feature_id: str) -> str | None:
         return None
     if fid in FEATURE_STAGES:
         return str(FEATURE_STAGES[fid])
+    if is_tsfm_shadow_feature_id(fid):
+        return FEATURE_STAGE_SHADOW
     return _discovered_feature_stage_map().get(fid)
 
 
@@ -1504,7 +1571,7 @@ def resolve_feature_ids(
     for fid in requested:
         if fid in seen:
             continue
-        if fid in allowed or _is_registered_symbolic_feature(fid):
+        if fid in allowed or _is_registered_symbolic_feature(fid) or is_tsfm_shadow_feature_id(fid):
             seen.add(fid)
             out.append(fid)
             continue
@@ -1608,6 +1675,8 @@ def feature_set_tag_from_ids(feature_ids: List[str]) -> str:
         parts.append("nlp_v1")
     if any(fid.startswith(TS_FOUNDATION_CHRONOS_PREFIX) for fid in ids):
         parts.append("tsfm_chronos_v2_shadow")
+    if any(is_tsfm_shadow_feature_id(fid) and not fid.startswith(TS_FOUNDATION_CHRONOS_PREFIX) for fid in ids):
+        parts.append("tsfm_adapter_shadow")
     if any(fid.startswith(GRAPH_RELATIONAL_PREFIX) for fid in ids):
         parts.append("graph_relational_v1_shadow")
     if any(fid.startswith(TSFRESH_FEATURE_PREFIX) for fid in ids):
@@ -2571,6 +2640,16 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
     day_start = _day_start_ms(int(ts_ms))
     day_end = int(day_start + 86_400_000)
     out: Dict[str, float] = {}
+    sentence_model_keys = tuple(
+        key
+        for key in (NLP_SENTENCE_MODEL_NAMESPACE, NLP_SENTENCE_MODEL_NAME)
+        if str(key or "").strip()
+    ) or (NLP_SENTENCE_MODEL_NAME, NLP_SENTENCE_MODEL_NAME)
+    sentiment_model_keys = tuple(
+        key
+        for key in (NLP_FINBERT_MODEL_NAMESPACE, NLP_FINBERT_MODEL_NAME)
+        if str(key or "").strip()
+    ) or (NLP_FINBERT_MODEL_NAME, NLP_FINBERT_MODEL_NAME)
     con = None
     try:
         from engine.runtime.storage import connect
@@ -2589,9 +2668,16 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.ts >= ?
                   AND b.ts < ?
                   AND b.ts <= ?
-                  AND e.model_name = ?
+                  AND e.model_name IN (?, ?)
                 """,
-                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_FINBERT_MODEL_NAME),
+                (
+                    symbol_key,
+                    int(day_start),
+                    int(day_end),
+                    int(ts_ms),
+                    sentiment_model_keys[0],
+                    sentiment_model_keys[-1],
+                ),
             ).fetchall()
             if rows:
                 ts_values = [int(row[0] or 0) for row in rows]
@@ -2623,9 +2709,16 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.ts >= ?
                   AND b.ts < ?
                   AND b.ts <= ?
-                  AND e.model_name = ?
+                  AND e.model_name IN (?, ?)
                 """,
-                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_SENTENCE_MODEL_NAME),
+                (
+                    symbol_key,
+                    int(day_start),
+                    int(day_end),
+                    int(ts_ms),
+                    sentence_model_keys[0],
+                    sentence_model_keys[-1],
+                ),
             ).fetchall()
             if rows:
                 matrix = np.vstack([_vector_from_blob(row[2], row[1]) for row in rows]).astype(np.float32)
@@ -2648,9 +2741,16 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.ts >= ?
                   AND b.ts < ?
                   AND b.ts <= ?
-                  AND e.model_name = ?
+                  AND e.model_name IN (?, ?)
                 """,
-                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_SENTENCE_MODEL_NAME),
+                (
+                    symbol_key,
+                    int(day_start),
+                    int(day_end),
+                    int(ts_ms),
+                    sentence_model_keys[0],
+                    sentence_model_keys[-1],
+                ),
             ).fetchall()
             if rows:
                 matrix = np.vstack([_vector_from_blob(row[2], row[1]) for row in rows]).astype(np.float32)
@@ -2672,9 +2772,16 @@ def _load_nlp_cached_features(symbol: str, ts_ms: int, feature_ids: List[str]) -
                   AND b.ts >= ?
                   AND b.ts < ?
                   AND b.ts <= ?
-                  AND s.model_name = ?
+                  AND s.model_name IN (?, ?)
                 """,
-                (symbol_key, int(day_start), int(day_end), int(ts_ms), NLP_FINBERT_MODEL_NAME),
+                (
+                    symbol_key,
+                    int(day_start),
+                    int(day_end),
+                    int(ts_ms),
+                    sentiment_model_keys[0],
+                    sentiment_model_keys[-1],
+                ),
             ).fetchall()
             if qa_rows:
                 scores = np.asarray([float(row[1] or 0.0) for row in qa_rows], dtype=np.float64)

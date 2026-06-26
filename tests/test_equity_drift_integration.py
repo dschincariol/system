@@ -149,6 +149,45 @@ def test_snapshot_equity_writes_equity_drift(runtime_modules) -> None:
     assert current["diff_equity"] == pytest.approx(10000.0)
 
 
+def test_snapshot_equity_pages_equity_recon_critical(runtime_modules, monkeypatch: pytest.MonkeyPatch) -> None:
+    equity_snapshot, alerts_notify = _reload_modules(
+        "engine.data.equity_snapshot",
+        "engine.runtime.alerts_notify",
+    )
+    deliveries = []
+
+    def fake_notify(payload, *, actor="system", source="runtime"):
+        deliveries.append({"payload": dict(payload or {}), "actor": actor, "source": source})
+        return {"ok": True, "delivered": 1, "deliveries": [{"channel": "webhook", "ok": True}]}
+
+    monkeypatch.setattr(alerts_notify, "send_runtime_alert_notification", fake_notify)
+
+    now_ms = int(time.time() * 1000)
+    with sqlite3.connect(str(runtime_modules["db_path"])) as con:
+        con.execute(
+            """
+            INSERT INTO broker_account (ts_ms, updated_ts_ms, equity)
+            VALUES (?, ?, ?)
+            """,
+            (now_ms + 1_000, now_ms + 1_000, 112500.0),
+        )
+        _seed_latest_backtest(
+            con,
+            run_ts_ms=now_ms - 5_000,
+            point_ts_ms=now_ms - 5_000,
+            equity=100000.0,
+        )
+        con.commit()
+
+    assert equity_snapshot.snapshot_equity(ts_ms=now_ms) is True
+
+    assert len(deliveries) == 1
+    assert deliveries[0]["source"] == "equity_drift"
+    assert deliveries[0]["payload"]["rule_id"] == "EQUITY_RECON"
+    assert deliveries[0]["payload"]["severity"] == "CRIT"
+    assert deliveries[0]["payload"]["symbol"] == "PORTFOLIO"
+
+
 def test_sync_equity_drift_backfills_existing_history(runtime_modules) -> None:
     (equity_drift,) = _reload_modules("engine.runtime.equity_drift")
 

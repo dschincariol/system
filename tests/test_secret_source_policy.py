@@ -98,6 +98,48 @@ def test_strict_policy_rejects_inline_process_secret_without_value_leak(tmp_path
     assert inline_value not in rendered
 
 
+def test_strict_policy_rejects_plaintext_secret_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import engine.runtime.secret_sources as secret_sources
+
+    monkeypatch.setattr(secret_sources, "_policy_suppressed_for_tests", lambda _environ: False)
+
+    snapshot = secret_sources.secret_source_policy_snapshot(
+        environ={"ENGINE_MODE": "live", "TS_SECRETS_PROVIDER": "plaintext"},
+        repo_root=tmp_path,
+    )
+
+    assert snapshot["ok"] is False
+    assert "plaintext_provider_forbidden:TS_SECRETS_PROVIDER" in snapshot["blockers"]
+    assert snapshot["reason"] == "plaintext_provider_forbidden:TS_SECRETS_PROVIDER"
+    assert any(
+        violation.get("key") == "TS_SECRETS_PROVIDER"
+        and violation.get("kind") == "config"
+        and violation.get("reason") == "plaintext_provider_forbidden"
+        and violation.get("provider") == "plaintext"
+        for violation in snapshot["violations"]
+    )
+
+
+def test_strict_policy_defaults_to_systemd_creds_without_plaintext_provider_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import engine.runtime.secret_sources as secret_sources
+
+    monkeypatch.setattr(secret_sources, "_policy_suppressed_for_tests", lambda _environ: False)
+
+    snapshot = secret_sources.secret_source_policy_snapshot(
+        environ={"ENGINE_MODE": "live"},
+        repo_root=tmp_path,
+    )
+
+    assert "plaintext_provider_forbidden:TS_SECRETS_PROVIDER" not in snapshot["blockers"]
+    assert not any("plaintext_provider_forbidden" in str(blocker) for blocker in snapshot["blockers"])
+
+
 def test_strict_policy_rejects_repo_local_env_secret_without_value_leak(tmp_path: Path) -> None:
     from engine.runtime.secret_sources import secret_source_policy_snapshot
 
@@ -351,6 +393,7 @@ def test_config_schema_rejects_inline_secret_sources(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("ENGINE_MODE", "live")
     monkeypatch.setenv("TRADING_ENFORCE_SECRET_SOURCE_POLICY", "1")
     monkeypatch.setenv("TRADING_SECRET_POLICY_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("TS_SECRETS_PROVIDER", "systemd-creds")
     monkeypatch.setenv("DASHBOARD_API_TOKEN", inline_value)
 
     with pytest.raises(ConfigError) as excinfo:
@@ -370,6 +413,7 @@ def test_config_schema_accepts_file_secret_sources(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("ENGINE_MODE", "live")
     monkeypatch.setenv("TRADING_ENFORCE_SECRET_SOURCE_POLICY", "1")
     monkeypatch.setenv("TRADING_SECRET_POLICY_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("TS_SECRETS_PROVIDER", "systemd-creds")
     monkeypatch.setenv("DASHBOARD_API_TOKEN_FILE", str(secret_file))
     monkeypatch.delenv("DASHBOARD_API_TOKEN", raising=False)
 
@@ -433,6 +477,7 @@ def test_live_preflight_secret_policy_fails_inline_and_passes_file(
     monkeypatch.setenv("ENGINE_MODE", "live")
     monkeypatch.setenv("TRADING_ENFORCE_SECRET_SOURCE_POLICY", "1")
     monkeypatch.setenv("TRADING_SECRET_POLICY_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("TS_SECRETS_PROVIDER", "systemd-creds")
     monkeypatch.setenv("DASHBOARD_API_TOKEN", inline_value)
 
     blocked = production_secret_sources_snapshot()

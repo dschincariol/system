@@ -44,7 +44,9 @@ classified as `CRYPTO`.
 ## Live Crypto Gate
 
 `engine.strategy.portfolio_risk_gate.apply_execution_risk_governor(...)`
-enforces a dedicated live crypto gate before generic exposure caps:
+enforces a dedicated live crypto gate before generic exposure caps, and
+`engine.execution.broker_router._crypto_order_safety_block(...)` repeats the
+live-disable check at the broker routing boundary before broker attempts:
 
 - `CRYPTO_LIVE_TRADING_ENABLED`, default `0`, blocks crypto orders in live mode
   unless explicitly enabled.
@@ -52,8 +54,11 @@ enforces a dedicated live crypto gate before generic exposure caps:
   notional exceeds the cap.
 
 These checks are independent of the global live-execution controls, kill
-switches, and broker-specific preflights, which still apply on top. Paper/sim
-orders and non-crypto orders continue through the existing path.
+switches, and broker-specific preflights, which still apply on top. The router
+block is defense-in-depth for code paths that reach broker routing without the
+portfolio governor; it only applies to non-dry-run crypto batches whose failover
+chain contains a live broker. Paper/sim/dry-run orders and non-crypto orders
+continue through the existing path.
 
 ## Explicit Non-Goals
 

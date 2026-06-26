@@ -403,7 +403,7 @@ verify_persisted() {
 }
 
 verify_active() {
-  local actual arc_param="/sys/module/zfs/parameters/zfs_arc_max"
+  local actual page_size zram_min swapfile_min arc_param="/sys/module/zfs/parameters/zfs_arc_max"
   require_command sysctl
   require_command swapon
 
@@ -414,12 +414,19 @@ verify_active() {
   actual="$(cat "$arc_param")"
   [ "$actual" = "$ZFS_ARC_MAX_BYTES" ] || die "zfs_arc_max active=${actual}, expected ${ZFS_ARC_MAX_BYTES}"
 
-  swapon --noheadings --bytes --show=NAME,SIZE,PRIO | awk -v min="$ZRAM_SIZE_BYTES" -v prio="$TRADING_ZRAM_PRIORITY" '
+  page_size="$(getconf PAGESIZE 2>/dev/null || printf '4096')"
+  case "$page_size" in
+    ''|*[!0-9]*) page_size=4096 ;;
+  esac
+  zram_min="$((ZRAM_SIZE_BYTES - page_size))"
+  swapfile_min="$((SWAPFILE_SIZE_BYTES - page_size))"
+
+  swapon --noheadings --bytes --show=NAME,SIZE,PRIO | awk -v min="$zram_min" -v prio="$TRADING_ZRAM_PRIORITY" '
     $1 ~ /^\/dev\/zram[0-9]+$/ && $2 >= min && $3 >= prio { found=1 }
     END { exit(found ? 0 : 1) }
   ' || die "active zram swap >= ${TRADING_ZRAM_SIZE_GIB}GiB with priority >= ${TRADING_ZRAM_PRIORITY} not found"
 
-  swapon --noheadings --bytes --show=NAME,SIZE,PRIO | awk -v path="$TRADING_SWAPFILE_PATH" -v min="$SWAPFILE_SIZE_BYTES" -v prio="$TRADING_SWAPFILE_PRIORITY" '
+  swapon --noheadings --bytes --show=NAME,SIZE,PRIO | awk -v path="$TRADING_SWAPFILE_PATH" -v min="$swapfile_min" -v prio="$TRADING_SWAPFILE_PRIORITY" '
     $1 == path && $2 >= min && $3 >= prio { found=1 }
     END { exit(found ? 0 : 1) }
   ' || die "active ${TRADING_SWAPFILE_PATH} >= ${TRADING_SWAPFILE_SIZE_GIB}GiB with priority >= ${TRADING_SWAPFILE_PRIORITY} not found"

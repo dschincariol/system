@@ -86,6 +86,8 @@ def _infer_model_family_name(model_name: str) -> str:
         return ""
     if name == "lgbm_regressor" or name.startswith("lgbm_regressor"):
         return "lgbm_regressor"
+    if name == "tabular_foundation_challenger" or name.startswith("tabular_foundation_challenger"):
+        return "tabular_foundation_challenger"
     if name == "xgb_regressor" or name.startswith("xgb_regressor"):
         return "xgb_regressor"
     if name == "patchtst" or name.startswith("patchtst"):
@@ -646,6 +648,11 @@ for _family_name, _training_entrypoint, _inference_entrypoint in (
         "xgb_regressor",
         "engine.strategy.jobs.train_xgb_models",
         "engine.strategy.models.xgb_regressor.XGBRegressorModel",
+    ),
+    (
+        "tabular_foundation_challenger",
+        "engine.strategy.jobs.train_tabular_challenger_models",
+        "engine.strategy.models.tabular_challenger.TabularFoundationChallengerModel",
     ),
     (
         "patchtst",

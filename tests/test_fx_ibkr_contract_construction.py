@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -60,3 +61,36 @@ class FxIbkrContractConstructionTests(unittest.TestCase):
         self.assertFalse(self.gateway._is_fx_symbol("AAPL"))
         self.assertFalse(self.gateway._is_fx_symbol("GOOGLE"))
         self.assertEqual(self.gateway._mk_contract_for_symbol("AAPL").secType, "STK")
+
+    def test_direct_live_fx_submit_blocks_when_fx_live_flag_unset(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FX_LIVE_TRADING_ENABLED", None)
+            with patch.object(
+                self.gateway,
+                "_real_trading_gate",
+                return_value={"ok": True, "real_trading_allowed": True},
+            ), patch.object(
+                self.gateway,
+                "_prelive_reconcile_or_block",
+                return_value=None,
+            ), patch.object(
+                self.gateway,
+                "_ibkr_credentials_block",
+                return_value=None,
+            ), patch.object(
+                self.gateway,
+                "record_broker_action_audit",
+                Mock(side_effect=AssertionError("FX submit audit should not run when FX live is disabled")),
+            ), patch.object(
+                self.gateway,
+                "_connect_ib",
+                Mock(side_effect=AssertionError("IBKR connection should not open when FX live is disabled")),
+            ):
+                result = self.gateway.submit_market_order("EURUSD", 1000.0, "fx_live_disabled_test")
+
+        self.assertFalse(bool(result["ok"]))
+        self.assertEqual(result["status"], "fx_live_trading_disabled_by_default")
+        self.assertEqual(result["reason"], "fx_live_trading_disabled_by_default")
+        self.assertEqual(result["broker"], "ibkr")
+        self.assertTrue(bool(result["stop_failover"]))
+        self.assertEqual(result["env"]["FX_LIVE_TRADING_ENABLED"], "0")

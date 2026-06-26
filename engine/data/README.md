@@ -76,8 +76,8 @@ The `engine/data/` tree owns external data acquisition and transformation into D
 - [provider_registry.py](provider_registry.py)
   Registry of providers and provider capabilities. OANDA is registered as a
   default-off polling `live_price_provider` for `asset_classes=["fx"]`; IBKR's
-  streaming definition advertises both equities and FX because IBKR supports
-  FX cash/IDEALPRO market data.
+  streaming definition advertises equities, FX, and futures because IBKR
+  supports FX cash/IDEALPRO and futures market data.
 - [finbert_sentiment.py](finbert_sentiment.py)
   FinBERT-powered sentiment enrichment used to turn news and transcript text into train/serve-safe sentiment features.
 - [congressional_trades.py](congressional_trades.py)

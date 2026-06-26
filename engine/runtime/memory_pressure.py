@@ -40,6 +40,20 @@ _SERVICE_MEMORY_KEYS = (
 )
 
 
+def _page_size_bytes() -> int:
+    try:
+        return max(4096, int(os.sysconf("SC_PAGE_SIZE")))
+    except Exception:
+        return 4096
+
+
+def _meets_swap_minimum(actual_bytes: int | None, required_bytes: int, *, devices: int = 1) -> bool:
+    actual = int(actual_bytes or 0)
+    required = int(required_bytes)
+    tolerance = _page_size_bytes() * max(1, int(devices or 1))
+    return actual >= max(0, required - tolerance)
+
+
 def _clean(value: Any) -> str:
     return str(value or "").strip()
 
@@ -328,15 +342,23 @@ def host_memory_pressure_snapshot(
         violations.append("memory_pressure_host_ram_below_policy")
     if swap_total is None:
         violations.append("memory_pressure_swaptotal_unavailable")
-    elif int(swap_total) < int(policy["min_total_swap_bytes"]):
+    elif not _meets_swap_minimum(
+        swap_total,
+        int(policy["min_total_swap_bytes"]),
+        devices=len(zram_devices) + len(managed_swapfiles),
+    ):
         violations.append("memory_pressure_total_swap_below_policy")
     if swap_error:
         advisory.append(f"memory_pressure_swapon_unavailable:{swap_error}")
-    if zram_bytes < int(policy["min_zram_bytes"]):
+    if not _meets_swap_minimum(zram_bytes, int(policy["min_zram_bytes"]), devices=len(zram_devices)):
         violations.append("memory_pressure_zram_below_policy")
     if zram_priority is None or int(zram_priority) < int(policy["zram_priority"]):
         violations.append("memory_pressure_zram_priority_below_policy")
-    if managed_swapfile_bytes < int(policy["min_swapfile_bytes"]):
+    if not _meets_swap_minimum(
+        managed_swapfile_bytes,
+        int(policy["min_swapfile_bytes"]),
+        devices=len(managed_swapfiles),
+    ):
         violations.append("memory_pressure_swapfile_below_policy")
     if managed_swapfile_priority is None or int(managed_swapfile_priority) < int(policy["swapfile_priority"]):
         violations.append("memory_pressure_swapfile_priority_below_policy")

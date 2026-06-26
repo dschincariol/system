@@ -175,6 +175,97 @@
       border-color:var(--status-crit);
     }
 
+    .btn-estop{
+      min-height:56px;
+      min-width:200px;
+      padding:16px 24px;
+      font-size:18px;
+      letter-spacing:.5px;
+      font-weight:900;
+      border-radius:0;
+      clip-path: polygon(30% 0%, 70% 0%, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0% 70%, 0% 30%);
+      color:#fff;
+      background:var(--danger);
+      border:2px solid var(--status-crit);
+      box-shadow:0 0 0 3px var(--status-crit-bg);
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:10px;
+      text-transform:uppercase;
+    }
+
+    .btn-estop:hover{
+      filter:brightness(1.14);
+      background:var(--status-crit);
+      border-color:#fff;
+      box-shadow:0 0 0 3px var(--status-crit-bg), var(--shadow);
+    }
+
+    .btn-estop:focus-visible{
+      filter:brightness(1.14);
+      border-color:#fff;
+      box-shadow:var(--focus), 0 0 0 3px var(--status-crit-bg);
+    }
+
+    .btn-estop svg{
+      flex:0 0 auto;
+      vertical-align:middle;
+    }
+
+    .estop-wrap{
+      margin-left:auto;
+      padding-left:16px;
+      border-left:1px solid var(--danger);
+      display:flex;
+    }
+
+    @media (prefers-reduced-motion: reduce){
+      .btn-estop{
+        animation:none;
+        transition:none;
+      }
+    }
+
+    @media (max-width:640px){
+      .estop-wrap{
+        margin-left:0;
+        width:100%;
+        border-left:0;
+        border-top:1px solid var(--danger);
+        padding-left:0;
+        padding-top:12px;
+        margin-top:4px;
+      }
+
+      .btn-estop{
+        width:100%;
+      }
+    }
+
+    .operatorUiLoadFailureBanner{
+      display:none;
+      margin:0 0 18px;
+      padding:14px 16px;
+      border:2px solid var(--danger);
+      border-radius:8px;
+      background:var(--status-crit-bg);
+      color:var(--status-crit);
+      box-shadow:var(--shadow-soft);
+      font-weight:900;
+    }
+
+    .operatorUiLoadFailureBanner.visible{
+      display:block;
+    }
+
+    .operatorUiLoadFailureBanner .detail{
+      margin-top:4px;
+      color:var(--text);
+      font-size:13px;
+      font-weight:700;
+    }
+
     button.ghost,
     a.ghost{
       background:transparent;
@@ -761,6 +852,240 @@
     - This file intentionally keeps original API calls where possible.
   -->
 
+  <div
+    id="operatorUiLoadFailureBanner"
+    class="operatorUiLoadFailureBanner"
+    role="alert"
+    aria-live="assertive"
+    hidden
+  >
+    <div>Operator UI failed to load — Emergency Stop is in degraded fallback mode</div>
+    <div class="detail" id="operatorUiLoadFailureDetail">Module assets have not completed initialization.</div>
+  </div>
+
+<script id="operatorUiCrashFallback">
+(function(){
+  "use strict";
+
+  const BANNER_TEXT = "Operator UI failed to load — Emergency Stop is in degraded fallback mode";
+  const EMERGENCY_CONFIRM_TOKEN = "KILL";
+  const EMERGENCY_HOLD_MS = 3000;
+  const EMERGENCY_REASON_MIN_LENGTH = 10;
+  const OPERATOR_AUTH_STORAGE_KEYS = {
+    dashboard: "trading_dashboard_api_token",
+    operator: "trading_operator_api_token"
+  };
+
+  let moduleLoaded = false;
+
+  function operatorBridgePrefix(){
+    const path = String(location.pathname || "");
+    if(path === "/operator" || path === "/operator/" || path === "/operator_ui.html") return "/operator";
+    if(path.startsWith("/operator/")) return "/operator";
+    return "";
+  }
+
+  function storageGet(key){
+    try{
+      return String(window.sessionStorage && window.sessionStorage.getItem(key) || "").trim()
+        || String(window.localStorage && window.localStorage.getItem(key) || "").trim();
+    }catch{
+      return "";
+    }
+  }
+
+  function storageSet(key, value){
+    const text = String(value || "").trim();
+    if(!text) return;
+    try{
+      if(window.sessionStorage) window.sessionStorage.setItem(key, text);
+    }catch{}
+  }
+
+  function tokenParam(name){
+    try{
+      return String(new URLSearchParams(String(location.search || "")).get(name) || "").trim();
+    }catch{
+      return "";
+    }
+  }
+
+  function rememberAuthTokensFromUrl(){
+    const prefix = operatorBridgePrefix();
+    const dashboardToken = tokenParam("dashboard_token") || tokenParam("dashboard_api_token") || (prefix ? tokenParam("token") : "");
+    const operatorToken = tokenParam("operator_token") || tokenParam("operator_api_token") || (!prefix ? tokenParam("token") : "");
+    storageSet(OPERATOR_AUTH_STORAGE_KEYS.dashboard, dashboardToken);
+    storageSet(OPERATOR_AUTH_STORAGE_KEYS.operator, operatorToken);
+  }
+
+  function operatorAuthHeaders(method){
+    if(String(method || "GET").toUpperCase() === "OPTIONS") return {};
+    const headers = {};
+    if(operatorBridgePrefix()){
+      const dashboardToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.dashboard)
+        || tokenParam("dashboard_token")
+        || tokenParam("dashboard_api_token")
+        || tokenParam("token");
+      if(dashboardToken) headers["X-API-Token"] = dashboardToken;
+    }else{
+      const operatorToken = storageGet(OPERATOR_AUTH_STORAGE_KEYS.operator)
+        || tokenParam("operator_token")
+        || tokenParam("operator_api_token")
+        || tokenParam("token");
+      if(operatorToken) headers["X-Operator-Token"] = operatorToken;
+    }
+    return headers;
+  }
+
+  function operatorBridgeUrl(url){
+    const raw = String(url || "");
+    const prefix = operatorBridgePrefix();
+    if(!prefix) return raw;
+    if(raw.startsWith("/api/")) return `${prefix}${raw}`;
+    if(raw.startsWith("api/")) return `${prefix}/${raw}`;
+    return raw;
+  }
+
+  function loadFailureDetail(reason){
+    if(!reason) return "Module assets failed before full operator controls loaded.";
+    if(typeof reason === "string") return reason;
+    if(reason && reason.message) return String(reason.message);
+    return String(reason);
+  }
+
+  function renderLoadFailureBanner(reason){
+    let banner = document.getElementById("operatorUiLoadFailureBanner");
+    if(!banner){
+      banner = document.createElement("div");
+      banner.id = "operatorUiLoadFailureBanner";
+      banner.className = "operatorUiLoadFailureBanner";
+      banner.setAttribute("role", "alert");
+      banner.setAttribute("aria-live", "assertive");
+      banner.innerHTML = `<div>${BANNER_TEXT}</div><div class="detail" id="operatorUiLoadFailureDetail"></div>`;
+      const parent = document.body || document.documentElement;
+      if(parent && parent.prepend) parent.prepend(banner);
+    }
+    if(!banner) return;
+    banner.hidden = false;
+    banner.classList.add("visible");
+    const detail = document.getElementById("operatorUiLoadFailureDetail");
+    if(detail) detail.textContent = loadFailureDetail(reason);
+  }
+
+  function delay(ms){
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function degradedEmergencyStopHard(){
+    renderLoadFailureBanner("Emergency Stop fallback is active because the full operator UI did not load.");
+    const typed = String(window.prompt("Operator UI is degraded. Type KILL to Emergency Stop.") || "").trim();
+    if(typed !== EMERGENCY_CONFIRM_TOKEN){
+      window.alert("Emergency Stop cancelled: confirmation token did not match KILL.");
+      return;
+    }
+
+    renderLoadFailureBanner("Typed confirmation accepted. Waiting 3 seconds before submitting Emergency Stop.");
+    const holdStartedAt = Date.now();
+    await delay(EMERGENCY_HOLD_MS);
+
+    const reason = String(window.prompt("Enter an Emergency Stop reason (10+ characters).") || "").trim();
+    if(reason.length < EMERGENCY_REASON_MIN_LENGTH){
+      window.alert("Emergency Stop cancelled: reason must be at least 10 characters.");
+      return;
+    }
+
+    const holdMs = Math.max(EMERGENCY_HOLD_MS, Date.now() - holdStartedAt);
+    const payload = {
+      confirm: EMERGENCY_CONFIRM_TOKEN,
+      confirmation: EMERGENCY_CONFIRM_TOKEN,
+      confirmation_token: EMERGENCY_CONFIRM_TOKEN,
+      confirmation_method: "typed_phrase_hold",
+      confirmation_hold_ms: holdMs,
+      consequence_ack: true,
+      action_id: "operator.emergency_stop",
+      actor: "operator_ui",
+      source: "operator_console",
+      source_surface: "operator_console",
+      reason,
+      request_id: `operator-ui-degraded-${Date.now()}`,
+      target: "global"
+    };
+
+    try{
+      const response = await fetch(operatorBridgeUrl("/api/operator/emergency_stop"), {
+        method: "POST",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: {
+          ...operatorAuthHeaders("POST"),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+      const text = await response.text();
+      let body = {};
+      if(text){
+        try{
+          body = JSON.parse(text);
+        }catch{
+          body = { response_text: text.slice(0, 1000) };
+        }
+      }
+      if(!response.ok || body.ok === false){
+        renderLoadFailureBanner(`Emergency Stop fallback failed: ${body.error || `http_${response.status}`}`);
+        window.alert("Emergency Stop fallback request failed. Use the operator API directly.");
+        return;
+      }
+      renderLoadFailureBanner("Emergency Stop fallback submitted to /api/operator/emergency_stop.");
+      window.alert("Emergency Stop submitted.");
+    }catch(e){
+      renderLoadFailureBanner(`Emergency Stop fallback request failed: ${loadFailureDetail(e)}`);
+      window.alert("Emergency Stop fallback request failed. Use the operator API directly.");
+    }
+  }
+
+  rememberAuthTokensFromUrl();
+  window.emergencyStopHard = degradedEmergencyStopHard;
+  window.__operatorUiRenderLoadFailureBanner = renderLoadFailureBanner;
+  window.__operatorUiFallbackEmergencyStopHard = degradedEmergencyStopHard;
+  window.__operatorUiModuleLoaded = function(){
+    moduleLoaded = true;
+  };
+
+  const previousOnError = window.onerror;
+  window.onerror = function(message, source, line, column, error){
+    if(!moduleLoaded){
+      renderLoadFailureBanner(loadFailureDetail(error || message || source));
+    }
+    if(typeof previousOnError === "function"){
+      return previousOnError.call(this, message, source, line, column, error);
+    }
+    return false;
+  };
+
+  window.addEventListener("error", (event) => {
+    if(moduleLoaded) return;
+    const target = event && event.target;
+    const failedAsset = target && (target.src || target.href);
+    renderLoadFailureBanner(failedAsset ? `Asset failed to load: ${failedAsset}` : loadFailureDetail(event && event.message));
+  }, true);
+
+  window.addEventListener("unhandledrejection", (event) => {
+    if(!moduleLoaded){
+      renderLoadFailureBanner(loadFailureDetail(event && event.reason));
+    }
+  });
+
+  window.addEventListener("load", () => {
+    setTimeout(() => {
+      if(!moduleLoaded){
+        renderLoadFailureBanner("Module script did not complete initialization.");
+      }
+    }, 0);
+  });
+})();
+</script>
+
   <div class="topbar">
     <div>
       <h1>Trading Engine Operator Panel</h1>
@@ -834,9 +1159,16 @@
           <button class="ghost" onclick="start()">Start Engine</button>
           <button class="secondary" onclick="restart()">Restart</button>
           <button class="secondary" onclick="stop()">Stop</button>
-          <button class="danger" onclick="emergencyStopHard()">Emergency Stop</button>
           <a class="link" href="/ui/data_sources.html" target="_blank" rel="noopener">Open Source Control</a>
           <a class="link" id="dashLink" href="#" target="_blank" rel="noopener">Open Dashboard</a>
+          <div class="estop-wrap">
+            <button class="btn-estop" onclick="emergencyStopHard()" aria-label="Emergency Stop — halt all trading immediately">
+              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" focusable="false" style="vertical-align:middle">
+                <polygon points="8 2 16 2 22 8 22 16 16 22 8 22 2 16 2 8" fill="#fff" stroke="#fff" stroke-width="2"></polygon>
+              </svg>
+              Emergency Stop
+            </button>
+          </div>
         </div>
 
         <div class="miniGrid">
@@ -1127,7 +1459,14 @@
             <button class="ghost" onclick="viewStrategy()">View Strategy Decisions</button>
             <button class="secondary" onclick="restartFeeds()">Restart Feeds</button>
             <button class="secondary" onclick="restartEngine()">Restart Engine</button>
-            <button class="danger" onclick="emergencyStopHard()">Emergency Stop</button>
+            <div class="estop-wrap">
+              <button class="btn-estop" onclick="emergencyStopHard()" aria-label="Emergency Stop — halt all trading immediately">
+                <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" focusable="false" style="vertical-align:middle">
+                  <polygon points="8 2 16 2 22 8 22 16 16 22 8 22 2 16 2 8" fill="#fff" stroke="#fff" stroke-width="2"></polygon>
+                </svg>
+                Emergency Stop
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1345,7 +1684,7 @@ function operatorTelemetryWsUrl(){
     : new URL(`${proto}://${location.host}`);
   // The Python dashboard bridge is HTTP-only; telemetry connects directly to
   // the sidecar WebSocket and authenticates via Sec-WebSocket-Protocol.
-  // Query-token auth remains server-side only for backward-compatible tools.
+  // Query-token auth remains server-side only for loopback-compatible tools.
   direct.pathname = "/ws/operator";
   direct.search = "";
   direct.hash = "";
@@ -3530,6 +3869,7 @@ window.viewStrategy = viewStrategy;
 window.restartFeeds = restartFeeds;
 window.restartEngine = restartEngine;
 window.emergencyStopHard = emergencyStopHard;
+if(typeof window.__operatorUiModuleLoaded === "function") window.__operatorUiModuleLoaded();
 window.loadServiceStatus = loadServiceStatus;
 window.runBackup = runBackup;
 window.runSystemUpdate = runSystemUpdate;

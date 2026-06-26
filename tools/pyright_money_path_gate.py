@@ -245,7 +245,8 @@ def _run_pyright() -> tuple[dict[str, Any], str, str, int]:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(
             "pyright did not produce JSON output. Install dev dependencies with "
-            "`python -m pip install -r requirements-dev.txt` or set PYRIGHT_BIN. "
+            "`python -m pip install --require-hashes -r requirements-dev.txt` "
+            "or set PYRIGHT_BIN. "
             f"Command: {' '.join(command)}\n{detail}"
         ) from exc
     return payload, result.stdout, result.stderr, result.returncode

@@ -1695,6 +1695,80 @@ class RuntimeReliabilityRegressionTests(unittest.TestCase):
         finally:
             self._restore_shadow_env(prev_env)
 
+    def test_execution_gate_blocks_live_when_portfolio_risk_state_read_errors(self) -> None:
+        prev_env = self._set_live_env()
+        try:
+            (gates,) = _reload_modules("engine.runtime.gates")
+
+            def _raising_portfolio_risk_getter(key, default=None):
+                if key == "portfolio_risk_block":
+                    raise RuntimeError("portfolio risk state unavailable")
+                return default
+
+            with patch.object(gates, "live_trading_preflight", return_value={"ok": True, "reason": "ok"}) as preflight:
+                blocked = gates.execution_gate_snapshot(
+                    system_state={"state": "LIVE"},
+                    get_execution_mode_fn=lambda: {"mode": "live", "armed": 1},
+                    kill_switches={},
+                    risk_state_getter=_raising_portfolio_risk_getter,
+                )
+
+            self.assertFalse(bool(blocked["allow_execution_pipeline"]))
+            self.assertFalse(bool(blocked["allowed"]))
+            self.assertFalse(bool(blocked["real_trading_allowed"]))
+            self.assertEqual(str(blocked["reason"]), "portfolio_risk_state_read_error")
+            self.assertEqual(str(blocked["severity"]), "CRITICAL")
+            self.assertIn("portfolio_risk_state_read_error", list(blocked["severity_reasons"] or []))
+            preflight.assert_not_called()
+        finally:
+            self._restore_shadow_env(prev_env)
+
+    def test_execution_gate_keeps_non_live_behavior_when_portfolio_risk_state_read_errors(self) -> None:
+        prev_env = {
+            "EXECUTION_MODE": os.environ.get("EXECUTION_MODE"),
+            "ENGINE_MODE": os.environ.get("ENGINE_MODE"),
+            "OPERATOR_MODE": os.environ.get("OPERATOR_MODE"),
+            "MODE": os.environ.get("MODE"),
+        }
+        try:
+            (gates,) = _reload_modules("engine.runtime.gates")
+
+            def _default_risk_getter(_key, default=None):
+                return default
+
+            def _raising_portfolio_risk_getter(key, default=None):
+                if key == "portfolio_risk_block":
+                    raise RuntimeError("portfolio risk state unavailable")
+                return default
+
+            for mode in ("safe", "paper", "shadow"):
+                with self.subTest(mode=mode):
+                    os.environ["EXECUTION_MODE"] = mode
+                    os.environ["ENGINE_MODE"] = mode
+                    os.environ.pop("OPERATOR_MODE", None)
+                    os.environ.pop("MODE", None)
+
+                    kwargs = {
+                        "system_state": {"state": "LIVE"},
+                        "get_execution_mode_fn": lambda mode=mode: {"mode": mode, "armed": 0},
+                        "kill_switches": {},
+                    }
+                    with patch.object(gates, "_now_ms", return_value=1234567890):
+                        expected = gates.execution_gate_snapshot(
+                            **kwargs,
+                            risk_state_getter=_default_risk_getter,
+                        )
+                    with patch.object(gates, "_now_ms", return_value=1234567890):
+                        actual = gates.execution_gate_snapshot(
+                            **kwargs,
+                            risk_state_getter=_raising_portfolio_risk_getter,
+                        )
+
+                    self.assertEqual(actual, expected)
+                    self.assertNotEqual(str(actual["reason"]), "portfolio_risk_state_read_error")
+        finally:
+            self._restore_shadow_env(prev_env)
+
     def test_execution_gate_blocks_live_armed_runtime_when_disable_live_execution_set(self) -> None:
         prev_env = self._set_live_env()
         try:

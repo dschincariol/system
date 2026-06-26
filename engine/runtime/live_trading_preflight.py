@@ -490,6 +490,60 @@ def lob_deeplob_shadow_readiness_snapshot(
     return snapshot
 
 
+def _boolean_live_enablement_entry(
+    *,
+    asset_class: str,
+    flag: str,
+    default_posture: str,
+) -> Dict[str, Any]:
+    live_permitted, invalid_value, raw_value = _env_bool_snapshot(flag, False)
+    return {
+        "asset_class": str(asset_class),
+        "flag": str(flag),
+        "flag_value": str(raw_value),
+        "live_permitted": bool(live_permitted),
+        "default_posture": str(default_posture),
+        "invalid_flag_value": bool(invalid_value),
+    }
+
+
+def asset_class_live_enablement_snapshot() -> Dict[str, Any]:
+    """Report per-asset live-enable posture without adding preflight blockers."""
+
+    options_mode = str(os.environ.get("OPTIONS_INSTRUMENTS_MODE", "shadow") or "shadow").strip().lower() or "shadow"
+    asset_classes: Dict[str, Dict[str, Any]] = {
+        "fx": _boolean_live_enablement_entry(
+            asset_class="fx",
+            flag="FX_LIVE_TRADING_ENABLED",
+            default_posture="disabled",
+        ),
+        "crypto": _boolean_live_enablement_entry(
+            asset_class="crypto",
+            flag="CRYPTO_LIVE_TRADING_ENABLED",
+            default_posture="disabled",
+        ),
+        "futures": _boolean_live_enablement_entry(
+            asset_class="futures",
+            flag="FUTURES_LIVE_TRADING_ENABLED",
+            default_posture="disabled",
+        ),
+        "options": {
+            "asset_class": "options",
+            "flag": "OPTIONS_INSTRUMENTS_MODE",
+            "flag_value": options_mode,
+            "live_permitted": options_mode == "live",
+            "default_posture": "shadow",
+            "invalid_flag_value": options_mode not in {"shadow", "paper", "live"},
+        },
+    }
+    return {
+        "ok": True,
+        "status": "ok",
+        "asset_classes": asset_classes,
+        "any_live_permitted": any(bool(item.get("live_permitted")) for item in asset_classes.values()),
+    }
+
+
 def production_secret_sources_snapshot() -> Dict[str, Any]:
     """Return production secret-source policy state without exposing values."""
 
@@ -1053,6 +1107,59 @@ def live_environment_contract_snapshot(
     }
 
 
+def cpcv_leakage_gate_snapshot(*, engine_mode: str) -> Dict[str, Any]:
+    """Require the CPCV/PBO embargo+purge leakage gate in live mode."""
+
+    mode = _normalize_mode(engine_mode, "safe")
+    required = bool(mode == "live")
+    config_error = ""
+    try:
+        from engine.strategy.promotion_guard import cpcv_gate_config
+
+        gate_config = dict(cpcv_gate_config())
+    except Exception as exc:
+        gate_config = {}
+        config_error = f"{type(exc).__name__}:{exc}"
+
+    cpcv_enabled = bool(gate_config.get("enabled")) if gate_config else _env_bool("CPCV_ENABLED", False)
+    stat_gate_enabled = _env_bool("CHAMPION_PROMOTION_USE_STAT_GATE", False)
+    try:
+        embargo_pct = float(gate_config.get("embargo_pct") or 0.0)
+    except Exception:
+        embargo_pct = 0.0
+    try:
+        max_pbo = float(gate_config.get("max_pbo") or 0.0)
+    except Exception:
+        max_pbo = 0.0
+
+    blockers: list[str] = []
+    if required:
+        if config_error:
+            blockers.append("cpcv_leakage_gate_config_unavailable")
+        if not cpcv_enabled:
+            blockers.append("cpcv_leakage_gate_disabled_in_live")
+        if not stat_gate_enabled:
+            blockers.append("champion_promotion_stat_gate_disabled_in_live")
+        if cpcv_enabled and embargo_pct <= 0.0:
+            blockers.append("cpcv_embargo_pct_not_configured")
+        if cpcv_enabled and max_pbo <= 0.0:
+            blockers.append("cpcv_max_pbo_not_configured")
+
+    blockers = list(dict.fromkeys(blockers))
+    return {
+        "ok": not blockers,
+        "required": required,
+        "mode": mode,
+        "cpcv_enabled": cpcv_enabled,
+        "stat_gate_enabled": stat_gate_enabled,
+        "embargo_pct": embargo_pct,
+        "max_pbo": max_pbo,
+        "reason": "ok" if not blockers else blockers[0],
+        "blockers": blockers,
+        "config_error": config_error,
+    }
+
+
 def live_trading_preflight(
     *,
     engine_mode: Optional[str] = None,
@@ -1134,6 +1241,10 @@ def live_trading_preflight(
     if mode == "live" and not bool(execution_arming_audit.get("ok")):
         blockers.extend(str(item) for item in list(execution_arming_audit.get("blockers") or []))
 
+    cpcv_leakage_gate = cpcv_leakage_gate_snapshot(engine_mode=mode)
+    if mode == "live" and not bool(cpcv_leakage_gate.get("ok")):
+        blockers.extend(str(item) for item in list(cpcv_leakage_gate.get("blockers") or []))
+
     live_ai_safety = live_ai_safety_snapshot(
         engine_mode=mode,
         execution_mode=exec_mode,
@@ -1153,6 +1264,8 @@ def live_trading_preflight(
     )
     if mode == "live" and bool(options_instruments.get("required")) and not bool(options_instruments.get("ok")):
         blockers.extend(str(item) for item in list(options_instruments.get("blockers") or []))
+
+    asset_class_live_enablement = asset_class_live_enablement_snapshot()
 
     phrase = _confirmation_phrase()
     blockers = list(dict.fromkeys(blockers))
@@ -1184,9 +1297,11 @@ def live_trading_preflight(
         "wal_archiver_runtime": dict(wal_archiver_runtime or {}),
         "clock_health": dict(clock_health or {}),
         "execution_arming_audit": dict(execution_arming_audit or {}),
+        "cpcv_leakage_gate": dict(cpcv_leakage_gate or {}),
         "live_ai_safety": dict(live_ai_safety or {}),
         "lob_deeplob_shadow": dict(lob_deeplob_shadow or {}),
         "options_instruments": dict(options_instruments or {}),
+        "asset_class_live_enablement": dict(asset_class_live_enablement or {}),
     }
 
 
@@ -1217,6 +1332,8 @@ __all__ = [
     "assert_live_execution_arming_preflight",
     "assert_live_trading_confirmation",
     "assert_dashboard_security_config",
+    "asset_class_live_enablement_snapshot",
+    "cpcv_leakage_gate_snapshot",
     "live_confirmation_snapshot",
     "live_environment_contract_snapshot",
     "live_trading_preflight",

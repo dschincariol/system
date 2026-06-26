@@ -32,6 +32,13 @@ ts-foundation = [
   "chronos-forecasting>=2.1.0",
   "pandas>=2.2",
 ]
+volatility = [
+  "arch>=7.0",
+]
+tabular-foundation = [
+  "tabm>=0.0.3",
+  "tabpfn>=2.0.0",
+]
 
 [tool.setuptools]
 py-modules = []
@@ -86,7 +93,7 @@ output = "artifacts/coverage/coverage.json"
 minimum_percent = 52.0
 package_roots = ["engine", "services", "routes", "ops"]
 report_dir = "artifacts/coverage"
-zero_covered_module_roots = ["engine/risk", "engine/execution", "engine/runtime"]
+zero_covered_module_roots = ["engine/risk", "engine/execution", "engine/runtime", "engine/strategy"]
 zero_covered_module_allowlist = [
   "engine/execution/circuit_breaker.py",
   "engine/execution/exec_conf_calibration.py",
@@ -101,9 +108,22 @@ zero_covered_module_allowlist = [
   "engine/runtime/regime_stack.py",
   "engine/runtime/rules_audit.py",
   "engine/runtime/run_root_script.py",
+  "engine/strategy/compute_model_weather_effect.py",
+  "engine/strategy/compute_options_skew.py",
+  "engine/strategy/compute_social_regime.py",
+  "engine/strategy/decision_snapshot.py",
+  "engine/strategy/domain_blacklist_train.py",
+  "engine/strategy/evaluate_strategies.py",
+  "engine/strategy/pipeline_runner.py",
+  "engine/strategy/predict.py",
+  "engine/strategy/retraining_pipeline.py",
+  "engine/strategy/temporal_encoder.py",
+  "engine/strategy/train_temporal_embeddings.py",
+  "engine/strategy/training_window.py",
 ]
 
 [tool.trading_system.coverage_gate.package_minimums]
 "engine/risk" = 50.81
 "engine/execution" = 58.92
 "engine/runtime" = 58.49
+"engine/strategy" = 55.67

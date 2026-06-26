@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_FILE="${TRADING_ENV_FILE:-/etc/trading-system/trading.env}"
+ENV_FILE="${TRADING_ENV_FILE:-/etc/trading/trading.env}"
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$ENV_FILE"
 fi
 
-TRADING_ROOT="${TRADING_ROOT:-/opt/trading-system}"
-TRADING_REPO="${TRADING_REPO:-$TRADING_ROOT/repo}"
+TRADING_ROOT="${TRADING_ROOT:-/opt/trading}"
+TRADING_REPO="${TRADING_REPO:-$TRADING_ROOT/app}"
 PYTHON_VENV="${PYTHON_VENV:-$TRADING_ROOT/venv}"
 LOCK_FILE="${TRADING_ROOT}/upgrade.lock"
 TRADING_UPGRADE_SERVICE_CONTROL="${TRADING_UPGRADE_SERVICE_CONTROL:-1}"
@@ -56,10 +56,20 @@ fi
 
 "$PYTHON_VENV/bin/python" -m pip install --upgrade pip wheel setuptools
 REQ_FILE="$(PYTHON_BIN="$PYTHON_VENV/bin/python" bash "$TRADING_REPO/deploy/bin/resolve_python_requirements.sh" "$TRADING_REPO")"
-"$PYTHON_VENV/bin/pip" install -r "$REQ_FILE"
+case "$(basename "$REQ_FILE")" in
+  requirements.txt|requirements-dev.txt|requirements-nvidia-cuda.txt|requirements-amd-rocm-full.txt)
+    "$PYTHON_VENV/bin/pip" install --require-hashes -r "$REQ_FILE"
+    ;;
+  requirements-amd-rocm.txt)
+    "$PYTHON_VENV/bin/pip" install --require-hashes -r "$TRADING_REPO/requirements-amd-rocm-full.txt"
+    ;;
+  *)
+    "$PYTHON_VENV/bin/pip" install -r "$REQ_FILE"
+    ;;
+esac
 
 if [[ -f package.json ]]; then
-  npm ci
+  PATH="$PYTHON_VENV/bin:$PATH" npm ci
 fi
 
 "$PYTHON_VENV/bin/python" -c "from engine.runtime.db_repair import repair; import json; print(json.dumps(repair(), indent=2))"

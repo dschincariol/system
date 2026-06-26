@@ -523,6 +523,59 @@ def _latest_graph_rows(con: Any, *, symbol: str = "", limit: int = DEFAULT_LINEA
     return out
 
 
+def _latest_graph_challenger_run(con: Any) -> dict[str, Any]:
+    if not _table_exists(con, "graph_challenger_runs"):
+        return {"available": False, "status": "unavailable", "reason": "graph_challenger_runs table unavailable"}
+    row = _query_one(
+        con,
+        """
+        SELECT run_id, model_name, model_family, horizon_s, stage, artifact_sha256,
+               artifact_alias, oos_prediction_count, graph_metadata_json,
+               node_feature_schema_json, edge_feature_schema_json,
+               train_serve_parity_json, benchmark_json, created_ts_ms
+        FROM graph_challenger_runs
+        ORDER BY created_ts_ms DESC
+        LIMIT 1
+        """,
+    )
+    if not row:
+        return {"available": False, "status": "empty", "reason": "no graph challenger benchmark runs"}
+    graph_metadata = _json_obj(_row_get(row, "graph_metadata_json", 8))
+    parity = _json_obj(_row_get(row, "train_serve_parity_json", 11))
+    stage = str(_row_get(row, "stage", 4) or "shadow").strip().lower() or "shadow"
+    oos_count = _safe_int(_row_get(row, "oos_prediction_count", 7), 0)
+    artifact_sha = str(_row_get(row, "artifact_sha256", 5) or "")
+    artifact_alias = str(_row_get(row, "artifact_alias", 6) or "")
+    warnings: list[str] = []
+    if stage != "shadow":
+        warnings.append("graph challenger run is not marked shadow")
+    if _safe_bool(graph_metadata.get("direct_trading_authority"), False):
+        warnings.append("graph challenger metadata unexpectedly claims direct trading authority")
+    if parity and not _safe_bool(parity.get("ok"), False):
+        warnings.append("graph challenger train/serve parity failed")
+    return {
+        "available": bool(stage == "shadow" and oos_count > 0 and (artifact_sha or artifact_alias)),
+        "status": "shadow_only" if stage == "shadow" else "invalid_stage",
+        "shadow_only": True,
+        "direct_trading_authority": False,
+        "run_id": str(_row_get(row, "run_id", 0) or ""),
+        "model_name": str(_row_get(row, "model_name", 1) or ""),
+        "model_family": str(_row_get(row, "model_family", 2) or ""),
+        "horizon_s": _safe_int(_row_get(row, "horizon_s", 3), 0),
+        "stage": stage,
+        "artifact_sha256": artifact_sha,
+        "artifact_alias": artifact_alias,
+        "oos_prediction_count": int(oos_count),
+        "graph_metadata": graph_metadata,
+        "node_feature_schema": _json_obj(_row_get(row, "node_feature_schema_json", 9)),
+        "edge_feature_schema": _json_obj(_row_get(row, "edge_feature_schema_json", 10)),
+        "train_serve_parity": parity,
+        "benchmark": _json_obj(_row_get(row, "benchmark_json", 12)),
+        "created_ts_ms": _safe_int(_row_get(row, "created_ts_ms", 13), 0) or None,
+        "warnings": warnings,
+    }
+
+
 def graph_feature_visibility(
     con: Any,
     *,
@@ -550,6 +603,7 @@ def graph_feature_visibility(
         },
         "snapshot_freshness": {},
         "coverage": {"symbols": [], "relationship_types": []},
+        "challenger": _latest_graph_challenger_run(con),
         "snapshots": [],
         "pit_status": {},
         "warnings": warnings,
@@ -659,6 +713,7 @@ def graph_feature_visibility(
                     for rel, count in sorted(relationship_totals.items(), key=lambda item: (-int(item[1]), item[0]))
                 ],
             },
+            "challenger": _latest_graph_challenger_run(con),
             "snapshots": latest_rows,
             "pit_status": {
                 **dict(pit),

@@ -46,6 +46,8 @@ GRAPH_RELATIONSHIP_TYPES = {
     "options_comovement",
     "news_co_mentions",
 }
+GRAPH_RELATIONAL_EDGE_SCHEMA_VERSION = 1
+GRAPH_RELATIONAL_NODE_SCHEMA_VERSION = 1
 
 LOG = get_logger("engine.strategy.graph_relational")
 _WARNED_NONFATAL_KEYS: set[str] = set()
@@ -221,7 +223,7 @@ def _columns(con: Any, table: str) -> set[str]:
 
 
 def ensure_graph_relational_schema(con: Any) -> None:
-    """Create versioned graph snapshot and optional generic edge tables."""
+    """Create versioned graph snapshot, edge, and challenger run tables."""
 
     con.execute(
         """
@@ -279,6 +281,32 @@ def ensure_graph_relational_schema(con: Any) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_graph_relational_snapshots_graph_ts
           ON graph_relational_snapshots(graph_id, ts_ms DESC)
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS graph_challenger_runs (
+          run_id TEXT PRIMARY KEY,
+          model_name TEXT NOT NULL,
+          model_family TEXT NOT NULL,
+          horizon_s BIGINT NOT NULL,
+          stage TEXT NOT NULL DEFAULT 'shadow',
+          artifact_sha256 TEXT,
+          artifact_alias TEXT,
+          oos_prediction_count BIGINT NOT NULL DEFAULT 0,
+          graph_metadata_json JSONB NOT NULL,
+          node_feature_schema_json JSONB NOT NULL,
+          edge_feature_schema_json JSONB NOT NULL,
+          train_serve_parity_json JSONB NOT NULL,
+          benchmark_json JSONB NOT NULL,
+          created_ts_ms BIGINT NOT NULL
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_graph_challenger_runs_model_created
+          ON graph_challenger_runs(model_name, created_ts_ms DESC)
         """
     )
 
@@ -1082,10 +1110,27 @@ def graph_metadata_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     snap = dict(snapshot or {})
     metadata = {**snap, **dict(snap.get("metadata") or {})}
     source_timestamps = dict(snap.get("source_timestamps") or {})
+    relationship_types = metadata.get("relationship_types")
+    if not isinstance(relationship_types, list):
+        relationship_types = metadata.get("edge_types")
+    if not isinstance(relationship_types, list):
+        relationship_types = []
+    node_feature_schema = metadata.get("node_feature_schema")
+    if not isinstance(node_feature_schema, Mapping):
+        node_feature_schema = {}
+    edge_feature_schema = metadata.get("edge_feature_schema")
+    if not isinstance(edge_feature_schema, Mapping):
+        edge_feature_schema = {}
+    train_serve_parity = metadata.get("train_serve_parity")
+    if not isinstance(train_serve_parity, Mapping):
+        train_serve_parity = {}
     return {
         "graph_id": str(metadata.get("graph_id") or snap.get("graph_id") or GRAPH_RELATIONAL_GRAPH_ID),
         "snapshot_version": int(metadata.get("snapshot_version") or snap.get("snapshot_version") or 0),
         "feature_ids": [str(fid) for fid in list(metadata.get("feature_ids") or snap.get("feature_ids") or [])],
+        "edge_types": sorted(str(rel) for rel in relationship_types if str(rel or "").strip()),
+        "node_feature_schema": dict(node_feature_schema),
+        "edge_feature_schema": dict(edge_feature_schema),
         "relationship_hash": str(metadata.get("relationship_hash") or source_timestamps.get("relationship_hash") or ""),
         "snapshot_available": bool(metadata.get("snapshot_available", bool(snap))),
         "pit_safe": bool(metadata.get("pit_safe", False)),
@@ -1094,6 +1139,7 @@ def graph_metadata_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             metadata.get("max_availability_ts_ms") or source_timestamps.get("max_availability_ts_ms"),
             0,
         ),
+        "train_serve_parity": dict(train_serve_parity),
         "direct_trading_authority": bool(metadata.get("direct_trading_authority", False)),
         "stage": str(metadata.get("stage") or "shadow"),
     }
@@ -1114,6 +1160,18 @@ def graph_train_serve_parity(
     serve_ids = [str(fid) for fid in list(serve.get("feature_ids") or [])]
     if train_ids and serve_ids and train_ids != serve_ids:
         blockers.append("feature_ids_mismatch")
+    train_edge_types = [str(rel) for rel in list(train.get("edge_types") or [])]
+    serve_edge_types = [str(rel) for rel in list(serve.get("edge_types") or [])]
+    if train_edge_types and serve_edge_types and train_edge_types != serve_edge_types:
+        blockers.append("edge_types_mismatch")
+    train_node_schema = dict(train.get("node_feature_schema") or {})
+    serve_node_schema = dict(serve.get("node_feature_schema") or {})
+    if train_node_schema and serve_node_schema and train_node_schema != serve_node_schema:
+        blockers.append("node_feature_schema_mismatch")
+    train_edge_schema = dict(train.get("edge_feature_schema") or {})
+    serve_edge_schema = dict(serve.get("edge_feature_schema") or {})
+    if train_edge_schema and serve_edge_schema and train_edge_schema != serve_edge_schema:
+        blockers.append("edge_feature_schema_mismatch")
     if not bool(serve.get("snapshot_available")):
         blockers.append("serve_snapshot_unavailable")
     if not bool(serve.get("pit_safe")):
@@ -1254,7 +1312,7 @@ def evaluate_graph_promotion_gate(row: Mapping[str, Any] | None) -> tuple[bool, 
     if graph_meta and feature_ids and meta_feature_ids and feature_ids != meta_feature_ids:
         blockers.append("feature_ids_mismatch")
     parity = graph_meta.get("train_serve_parity") if isinstance(graph_meta, Mapping) else None
-    if isinstance(parity, Mapping) and not bool(parity.get("ok", False)):
+    if isinstance(parity, Mapping) and parity and not bool(parity.get("ok", False)):
         blockers.append("train_serve_parity_failed")
 
     if blockers:

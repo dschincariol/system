@@ -105,8 +105,10 @@ These templates are seeded automatically by [services/data_source_manager.py](..
 | `polygon` | `polygon` | `poll_prices` | On | No | `POLYGON_API_KEY` | `prices`, `price_quotes`, `price_quotes_raw`, `price_provider_health` | price router, model snapshots, Data Health |
 | `oanda_fx` | `oanda` | `poll_prices` | Off | No | `OANDA_ACCESS_TOKEN` or fallback `OANDA_API_KEY`; `OANDA_ACCOUNT_ID`, `OANDA_ENVIRONMENT`, optional `OANDA_FX_PAIRS` | `prices`, `price_quotes`, `price_quotes_raw`, `price_provider_health` | price router, model snapshots, Data Health |
 | `ibkr` | `ibkr` | `stream_prices_ibkr` | Off | No | host, port, client ID, market-data type, currency | `prices`, `price_quotes_raw`, `price_provider_health` | price router, live readiness, Data Health |
+| `futures_data` | `futures` | `poll_prices` | Off | No | `DATABENTO_API_KEY`; `FUTURES_PROVIDER`, `FUTURES_ROOTS` settings | `prices`, `price_quotes`, `price_quotes_raw`, `price_provider_health`, `futures_contract_bars` | price router, futures roll engine, model snapshots, Data Health |
+| `futures_rolls` | — (derived) | `ingest_futures_rolls` | Off | No | None; derives from raw futures bars | `futures_roll_calendar`, `futures_continuous_bars`, `futures_roll_yield` | futures features, futures labels, futures backtest, Data Health |
 | `alpaca_broker_data` | `alpaca` | `alpaca_broker_data_readonly` | Off | No | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY`, base URL defaulting to paper, optional trade-updates observation settings | `broker_connection_health`, `broker_positions` | live readiness, position reconcile |
-| `yfinance` | `yfinance` | `poll_prices` | On | Yes | None | `prices`, `price_provider_health` | price router, model snapshots, Data Health |
+| `yfinance` | `yfinance` | `poll_prices` | On | Yes | None | `prices`, `price_provider_health` | price router, model snapshots, Data Health fallback evidence; not production live-data proof |
 | `simulated` | `simulated` | `poll_prices` | Off | Yes | Optional `SIMULATED_MARKET_DATA_SYMBOLS`; no credentials | `prices`, `price_quotes`, `price_quotes_raw`, `price_provider_health` | price router, model snapshots, Data Health, safe/sim validation |
 | `ccxt` | `ccxt` | `poll_prices` | On | Yes | `CCXT_EXCHANGE_ID` setting | `prices`, `price_provider_health` | price router, crypto features, Data Health |
 | `tradier` | `tradier` | `options_poll` | On | No | `TRADIER_API_TOKEN` | `options_chain`, `options_chain_v2`, `options_symbol_ingestion_state`, `events` | options features, model snapshots, Data Health |
@@ -151,6 +153,8 @@ Shared provider accounts are seeded in `data_source_provider_accounts` and encry
 | `tradier` | `TRADIER_API_TOKEN` | Tradier options ingestion |
 | `fred` | `FRED_API_KEY` | Macro vintage ingestion and macro backfills |
 | `openai_embeddings` | `OPENAI_API_KEY` | Optional OpenAI-backed embedding jobs |
+| `oanda` | `OANDA_ACCESS_TOKEN`, `OANDA_API_KEY` | OANDA read-only FX pricing (`oanda_fx`) |
+| `futures` | `DATABENTO_API_KEY` | Databento read-only futures pricing (`futures_data`) |
 
 Effective credential precedence is enforced in manager runtime code: source override, then shared provider account, then allowed external runtime source, then missing. `build_job_environment()` projects one effective value per env var for each job. In strict runtime mode, secret values are written to runtime secret files and projected through `*_FILE`; non-secret SEC identity values are projected as normal env vars because the existing SEC clients read those names directly.
 
@@ -456,7 +460,7 @@ Safe and simulated runtime modes have a deterministic local market-data path thr
 
 `SIMULATED_MARKET_DATA_ENABLED=1` enables the provider explicitly. When the stack is in safe/sim/paper execution with a simulated broker, runtime bootstrap and ingestion child selection also allow the simulated feed so acceptance tests can produce fresh rows without real broker, exchange, or paid-provider credentials. `SIMULATED_MARKET_DATA_SYMBOLS` controls the symbols; otherwise the simulator uses a small deterministic equity universe.
 
-Missing credentials for real providers remain explicit `missing_credentials` failures. Transient provider errors and rate limits are classified separately in `poll_prices` job status, and the simulated provider may be appended as a fallback only when safe/sim mode permits it. No production provider success is inferred from simulated rows. `pipeline_health_summary()`, `/api/ingestion/status`, `/api/operator/provider_telemetry`, and `/api/feeds` expose raw/simulated evidence separately from live provider success.
+Missing credentials for real providers remain explicit `missing_credentials` failures. Transient provider errors and rate limits are classified separately in `poll_prices` job status, and the simulated provider may be appended as a fallback only when safe/sim mode permits it. No production provider success is inferred from simulated rows. yfinance is also classified as `fallback_not_live`: fresh yfinance rows can support development, research, and safe-mode diagnostics, but they do not set `live_market_data_ok=true` and cannot satisfy paper/live go-live preflight without a paid equity rail such as Polygon or IBKR. `pipeline_health_summary()`, `/api/ingestion/status`, `/api/operator/provider_telemetry`, and `/api/feeds` expose raw/simulated/fallback evidence separately from live provider success.
 
 Freshness is observable in the database and API. `GET /api/feeds` includes `price_freshness.status`, `stale`, `age_s`, `max_age_s`, `source`, `simulated`, `live_market_data_ok`, `live_feed_status`, and `missing_credential_env_vars` based on the latest `prices` row and manager-computed credential state. Runtime health exposes the same stale/fresh distinction through the `prices` check, so dashboards can render fresh simulated data differently from live, stale, or missing production data.
 
@@ -515,4 +519,4 @@ Important consequence:
 - Do not build a second long-lived provider-credential flow in the operator console or dashboard.
 - Keep provider guidance, field help, env mapping, validation hints, and safety warnings in the backend catalog so `GET /api/data_sources` remains the UI source of truth.
 - Keep the master key outside the database.
-- Treat the route and payload shapes above as the control-plane contract until the corresponding OpenAPI paths are added under [openapi/openapi.yaml](openapi/openapi.yaml).
+- The route and payload shapes above are mirrored by the corresponding OpenAPI paths under [openapi/openapi.yaml](openapi/openapi.yaml); keep both in sync when the control-plane contract changes.

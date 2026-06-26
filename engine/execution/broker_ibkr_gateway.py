@@ -1127,6 +1127,36 @@ def _futures_live_orders_enabled() -> bool:
     }
 
 
+def _fx_live_orders_enabled() -> bool:
+    return str(os.environ.get("FX_LIVE_TRADING_ENABLED", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def fx_order_block(
+    symbol: str,
+    *,
+    require_live_enabled: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not _is_fx_symbol(symbol):
+        return None
+    sym = str(symbol or "").upper().strip()
+    if bool(require_live_enabled) and not _fx_live_orders_enabled():
+        return {
+            "ok": False,
+            "status": "fx_live_trading_disabled_by_default",
+            "reason": "fx_live_trading_disabled_by_default",
+            "symbol": sym,
+            "env": {"FX_LIVE_TRADING_ENABLED": str(os.environ.get("FX_LIVE_TRADING_ENABLED", "0") or "0")},
+        }
+    return None
+
+
 def _futures_block_window_ms(kind: str = "delivery") -> int:
     env_name = "FUTURES_ROLL_BLOCK_WINDOW_MS" if kind == "roll" else "FUTURES_DELIVERY_BLOCK_WINDOW_MS"
     default = 24 * 60 * 60 * 1000 if kind == "roll" else 7 * 24 * 60 * 60 * 1000
@@ -1633,6 +1663,19 @@ def apply_latest_portfolio_orders_live(
                         }
                     )
                     return futures_block
+                fx_block = fx_order_block(
+                    symbol,
+                    require_live_enabled=True,
+                )
+                if fx_block is not None:
+                    fx_block.update(
+                        {
+                            "broker": "ibkr",
+                            "stop_failover": True,
+                            "submitted_n": int(n),
+                        }
+                    )
+                    return fx_block
                 if _is_futures_symbol(symbol):
                     rounded_delta = int(round(float(delta)))
                     if abs(float(delta) - float(rounded_delta)) > 1e-9:
@@ -2302,6 +2345,11 @@ def flatten_positions(
                 submitted.append({"ok": False, "status": "broker_action_audit_failed", **row, "audit": audit})
                 continue
             try:
+                fx_block = fx_order_block(symbol, require_live_enabled=True)
+                if fx_block is not None:
+                    failed_n += 1
+                    submitted.append({"broker": "ibkr", "stop_failover": True, **fx_block, **row})
+                    continue
                 oid = _consume_next_order_id(app)
                 contract = _mk_contract_for_symbol(symbol)
                 order = _mk_market_order(qty)
@@ -2609,6 +2657,10 @@ def submit_limit_order(symbol: str, qty: float, limit_price: float, client_oid: 
     credentials_block = _ibkr_credentials_block(require_explicit=True)
     if credentials_block is not None:
         return credentials_block
+    fx_block = fx_order_block(symbol, require_live_enabled=True)
+    if fx_block is not None:
+        fx_block.update({"broker": "ibkr", "stop_failover": True})
+        return fx_block
     failure = None
     try:
         ibkr_order_ref = validate_ibkr_order_ref(client_oid)
@@ -2673,6 +2725,10 @@ def submit_market_order(symbol: str, qty: float, client_oid: str) -> Dict[str, A
     credentials_block = _ibkr_credentials_block(require_explicit=True)
     if credentials_block is not None:
         return credentials_block
+    fx_block = fx_order_block(symbol, require_live_enabled=True)
+    if fx_block is not None:
+        fx_block.update({"broker": "ibkr", "stop_failover": True})
+        return fx_block
     failure = None
     try:
         ibkr_order_ref = validate_ibkr_order_ref(client_oid)

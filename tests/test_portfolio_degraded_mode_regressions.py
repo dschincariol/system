@@ -206,6 +206,55 @@ class PortfolioDegradedModeRegressionTests(unittest.TestCase):
         self.assertIn("PORTFOLIO_STRATEGY_ALLOCATOR_FAILED", list(snapshot.get("execution_blocked_codes") or []))
         self.assertIn("PORTFOLIO_RISK_ENGINE_FAILED", list(snapshot.get("execution_blocked_codes") or []))
 
+    def test_overlay_degraded_codes_short_circuit_rebalance_execution(self) -> None:
+        (portfolio,) = _reload_modules("engine.strategy.portfolio")
+        blocked_codes = [
+            "PORTFOLIO_VOL_TARGET_FAILED",
+            "PORTFOLIO_CAPITAL_AT_RISK_FAILED",
+            "PORTFOLIO_TEMPORAL_DAMPENER_FAILED",
+            "PORTFOLIO_EXPOSURE_NETTING_FAILED",
+        ]
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(portfolio, "_expire_stale_unconsumed_alerts", return_value=0))
+            stack.enter_context(patch.object(portfolio, "_set_meta", return_value=None))
+            stack.enter_context(patch.object(portfolio, "_persist_portfolio_runtime_health", return_value=None))
+
+            for code in blocked_codes:
+                with self.subTest(code=code):
+                    ctx = portfolio._RebalanceContext(con=object(), now_ms=1_700_000_000_000)
+                    ctx.desired = {"AAPL": {"symbol": "AAPL", "side": "LONG", "weight": 0.10}}
+                    ctx.changed = ["AAPL"]
+                    ctx.orders_n = 1
+                    ctx.record_degraded_phase("unit_test", code, RuntimeError("injected overlay failure"))
+
+                    result = portfolio._apply_rebalance_execution_block_stage(ctx)
+
+                    self.assertIsNotNone(result)
+                    self.assertTrue(bool(result.get("execution_blocked")), result)
+                    self.assertIn(code, list(result.get("execution_blocked_codes") or []))
+                    self.assertEqual(int(result.get("orders_n") or 0), 0)
+                    self.assertEqual(list(result.get("changed") or []), [])
+
+    def test_clean_rebalance_execution_block_stage_preserves_emitted_orders_control(self) -> None:
+        (portfolio,) = _reload_modules("engine.strategy.portfolio")
+        ctx = portfolio._RebalanceContext(con=object(), now_ms=1_700_000_000_000)
+        ctx.desired = {"AAPL": {"symbol": "AAPL", "side": "LONG", "weight": 0.10}}
+        ctx.changed = ["AAPL"]
+        ctx.orders_n = 1
+
+        result = portfolio._apply_rebalance_execution_block_stage(ctx)
+        final = portfolio._build_rebalance_result(
+            ctx,
+            execution_blocked=False,
+            execution_blocked_codes=[],
+        )
+
+        self.assertIsNone(result)
+        self.assertFalse(bool(final.get("execution_blocked")), final)
+        self.assertEqual(int(final.get("orders_n") or 0), 1)
+        self.assertEqual(list(final.get("changed") or []), ["AAPL"])
+
 
 if __name__ == "__main__":
     unittest.main()

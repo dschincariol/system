@@ -6,6 +6,7 @@ from typing import Any, Iterable, Mapping
 
 
 SIMULATED_PROVIDER_NAMES = frozenset({"simulated"})
+FALLBACK_NOT_LIVE_PROVIDER_NAMES = frozenset({"yfinance"})
 MARKET_DATA_SOURCE_TYPES = frozenset({"price_provider", "options_provider"})
 MARKET_DATA_PIPELINES = frozenset(
     {
@@ -31,12 +32,22 @@ def is_simulated_provider(provider_name: Any) -> bool:
     return str(provider_name or "").strip().lower() in SIMULATED_PROVIDER_NAMES
 
 
+def is_fallback_not_live_provider(provider_name: Any) -> bool:
+    return str(provider_name or "").strip().lower() in FALLBACK_NOT_LIVE_PROVIDER_NAMES
+
+
+def is_live_market_data_provider(provider_name: Any) -> bool:
+    provider = str(provider_name or "").strip().lower()
+    return bool(provider and provider not in SIMULATED_PROVIDER_NAMES and provider not in FALLBACK_NOT_LIVE_PROVIDER_NAMES)
+
+
 def classify_market_data_liveness(
     *,
     provider_name: Any = "",
     ok: bool = False,
     stale: bool = False,
     simulated: bool = False,
+    fallback_not_live: bool = False,
     missing_credential_env_vars: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """Classify whether a feed status proves live market-data connectivity.
@@ -48,8 +59,9 @@ def classify_market_data_liveness(
 
     missing = dedupe_strings(missing_credential_env_vars)
     simulated_feed = bool(simulated or is_simulated_provider(provider_name))
+    fallback_feed = bool(fallback_not_live or is_fallback_not_live_provider(provider_name))
     raw_ok = bool(ok) and not bool(stale)
-    live_ok = bool(raw_ok and not simulated_feed and not missing)
+    live_ok = bool(raw_ok and not simulated_feed and not fallback_feed and not missing)
     if live_ok:
         status = "live"
         classification = "live"
@@ -58,6 +70,10 @@ def classify_market_data_liveness(
         status = "simulated"
         classification = "simulated_not_live"
         reason = "simulated_market_data_not_live"
+    elif fallback_feed:
+        status = "fallback"
+        classification = "fallback_not_live"
+        reason = "fallback_market_data_not_live"
     elif missing:
         status = "missing_credentials"
         classification = "missing_credentials"
@@ -76,6 +92,7 @@ def classify_market_data_liveness(
         "live_feed_classification": classification,
         "live_feed_reason": reason,
         "simulated": bool(simulated_feed),
+        "fallback_not_live": bool(fallback_feed),
         "missing_credential_env_vars": missing,
     }
 
@@ -91,7 +108,7 @@ def missing_live_market_credentials_from_sources(sources: Iterable[Mapping[str, 
         if source_type not in MARKET_DATA_SOURCE_TYPES:
             continue
         provider_name = str(source.get("provider_name") or source.get("source_key") or "").strip()
-        if is_simulated_provider(provider_name):
+        if is_simulated_provider(provider_name) or is_fallback_not_live_provider(provider_name):
             continue
         if not bool(source.get("enabled")):
             continue
@@ -133,17 +150,21 @@ def classify_pipeline_liveness(status: Mapping[str, Any]) -> dict[str, Any]:
         for name, classification in error_classes.items()
         if str(classification or "").strip() == "missing_credentials"
     ]
-    real_success = any(not is_simulated_provider(name) for name in successful_providers)
+    live_successes = [name for name in successful_providers if is_live_market_data_provider(name)]
+    fallback_successes = [name for name in successful_providers if is_fallback_not_live_provider(name)]
+    simulated_successes = [name for name in successful_providers if is_simulated_provider(name)]
     truth = classify_market_data_liveness(
         provider_name=(active_providers[0] if len(active_providers) == 1 else ""),
-        ok=bool(status.get("ok")) and bool(real_success or simulated),
+        ok=bool(status.get("ok")) and bool(live_successes or fallback_successes or simulated_successes or simulated),
         stale=bool(status.get("stale")),
-        simulated=bool(simulated and not real_success),
-        missing_credential_env_vars=missing_providers if not real_success else [],
+        simulated=bool((simulated_successes or simulated) and not live_successes and not fallback_successes),
+        fallback_not_live=bool(fallback_successes and not live_successes),
+        missing_credential_env_vars=missing_providers if not live_successes else [],
     )
     truth["applies"] = True
-    truth["live_provider_successes"] = [name for name in successful_providers if not is_simulated_provider(name)]
-    truth["simulated_provider_successes"] = [name for name in successful_providers if is_simulated_provider(name)]
+    truth["live_provider_successes"] = list(live_successes)
+    truth["fallback_provider_successes"] = list(fallback_successes)
+    truth["simulated_provider_successes"] = list(simulated_successes)
     truth["missing_credential_providers"] = missing_providers
     return truth
 
@@ -160,6 +181,7 @@ def annotate_provider_map_liveness(
     raw_healthy = 0
     live_healthy = 0
     simulated_healthy = 0
+    fallback_healthy = 0
     for name, raw in (providers or {}).items():
         row = dict(raw or {}) if isinstance(raw, Mapping) else {}
         raw_ok = bool(row.get("ok"))
@@ -179,15 +201,20 @@ def annotate_provider_map_liveness(
             live_healthy += 1
         elif truth["simulated"] and raw_ok:
             simulated_healthy += 1
+        elif truth["fallback_not_live"] and raw_ok:
+            fallback_healthy += 1
         annotated[str(name)] = row
     return {
         "providers": annotated,
         "raw_healthy_providers": int(raw_healthy),
         "live_healthy_providers": int(live_healthy),
         "simulated_healthy_providers": int(simulated_healthy),
+        "fallback_healthy_providers": int(fallback_healthy),
         "missing_credential_env_vars": missing_env,
         "live_market_data_ok": bool(live_healthy > 0 and not missing_env),
         "live_feed_status": "live" if live_healthy > 0 and not missing_env else (
-            "missing_credentials" if missing_env else ("simulated" if simulated_healthy > 0 else "degraded")
+            "missing_credentials" if missing_env else (
+                "simulated" if simulated_healthy > 0 else ("fallback" if fallback_healthy > 0 else "degraded")
+            )
         ),
     }

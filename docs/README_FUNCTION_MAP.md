@@ -2,7 +2,7 @@
 
 This document maps the main Python files to the most important functions and classes inside them.
 
-Last verified against code: 2026-06-20
+Last verified against code: 2026-06-25
 
 It is designed for the moment when someone asks:
 
@@ -97,6 +97,17 @@ The iTransformer path includes `train_itransformer_models`, also a shadow-defaul
 oneshot training job. It writes feature-contract artifacts and OOS prediction
 rows for marketplace visibility, but those OOS rows are not live-promotion
 evidence without the normal realized-PnL, replay, and promotion-gate path.
+The TSFM benchmark path includes `tsfm_benchmark`, an opt-in shadow one-shot
+job that evaluates Chronos/TimesFM/Moirai/Toto/fake adapters under PIT
+walk-forward splits, writes OOS predictions and provenance, and exposes only
+shadow marketplace evidence until normal champion/challenger promotion gates
+are satisfied.
+The graph challenger path includes `graph_challenger_benchmark`, an opt-in
+shadow one-shot job enabled by `GRAPH_CHALLENGER_BENCHMARK_ENABLED=1`. It
+builds PIT-safe temporal heterogeneous graph samples from existing feature
+snapshots and graph relationship edges, trains the dependency-free relational
+baseline, persists artifacts/OOS rows, and publishes only shadow marketplace
+evidence with graph-vs-node-only ablation metrics.
 
 | Function | What it does |
 | --- | --- |
@@ -262,6 +273,20 @@ Champion/challenger marketplace: scoring, replay validation, self-critic, and ca
 | `compute_capital_plan()` | computes the capital allocation plan across the marketplace |
 | `publish_marketplace_snapshot(...)` | publishes the marketplace snapshot for the UI/operator |
 
+### `engine/strategy/graph_challenger.py`
+
+Shadow-only graph challenger framework for temporal heterogeneous graph
+experiments. It never participates in order selection; it writes artifacts,
+OOS predictions, graph metadata, feature/schema contracts, and marketplace
+rows that remain non-promotable under `evaluate_graph_promotion_gate`.
+
+| Function | What it does |
+| --- | --- |
+| `build_graph_challenger_dataset(...)` | materializes PIT-safe temporal graph samples from model-feature snapshots and graph relationship sources |
+| `train_graph_challenger_models(...)` | trains node-only and relational-message ridge baselines on the same split |
+| `run_graph_challenger_benchmark(...)` | persists the artifact, OOS rows, run metadata, and shadow marketplace rows |
+| `load_graph_challenger_artifact(...)` | reloads the content-addressed graph challenger artifact |
+
 ### `engine/strategy/champion_manager.py`
 
 Champion/challenger selection and the model-competition lifecycle.
@@ -388,7 +413,7 @@ This is the advisory-only sidecar added during integration.
 
 ### `engine/execution/execution_ledger.py`
 
-The execution attribution ledger (the largest execution module, ~231KB). It records order submissions and fills and computes execution analytics, P&L attribution, and capital efficiency.
+The execution attribution ledger (the largest execution module, ~218KB). It records order submissions and fills and computes execution analytics, P&L attribution, and capital efficiency.
 
 | Function | What it does |
 | --- | --- |
@@ -404,7 +429,7 @@ The execution attribution ledger (the largest execution module, ~231KB). It reco
 
 ### `engine/risk/portfolio_risk_engine.py`
 
-The portfolio-risk engine (~81KB, one public entrypoint). It applies additive exposure, drawdown, volatility-target, and correlation-cluster checks and writes the current portfolio-risk state consumed by API reads and the execution barrier.
+The portfolio-risk engine (~138KB, one public entrypoint). It applies additive exposure, drawdown, volatility-target, and correlation-cluster checks and writes the current portfolio-risk state consumed by API reads and the execution barrier.
 
 | Function | What it does |
 | --- | --- |
@@ -419,6 +444,15 @@ The Monte Carlo risk refresher. It simulates forward portfolio paths and persist
 | Function | What it does |
 | --- | --- |
 | `request_monte_carlo_refresh(desired)` | requests a background Monte Carlo refresh (`MC_SIMULATIONS` paths over `MC_HORIZON` steps) and persists the stressed risk summary served by `GET /api/risk/monte_carlo` |
+
+### `engine/risk/var_backtesting.py`
+
+VaR/CVaR model-validation helpers. This module persists forecast/backtest evidence, evaluates Kupiec POF and Christoffersen independence tests, computes rolling exception traffic-light status, and serves the read-only payload behind `GET /api/risk/var_backtest`.
+
+| Function | What it does |
+| --- | --- |
+| `run_var_backtest(...)` | consumes matured `risk_var_forecasts`, aligns realized returns from `equity_history`, and upserts `risk_var_backtest_results` evidence rows |
+| `build_var_backtest_payload(...)` | builds the dashboard/API payload for recent VaR/CVaR backtest rows and explicit empty/schema-missing states |
 
 ## 8. API Layer
 

@@ -10,9 +10,11 @@ This is the copy policy for a Linux deployment mirror.
   operational modules under `ops/`.
 - Browser/operator assets: `ui/`, `boot/`, `package.json`, and
   `package-lock.json`.
-- Deployment assets: `ops/server/`, `ops/backup/`, `deploy/`, `.dockerignore`,
-  `.env.example`, Python requirement manifests/locks (`requirements*.txt` and
-  `requirements*.in`), `pyproject.toml`, and `ruff.toml`.
+- Deployment assets: `ops/server/`, `ops/backup/`, `deploy/` (including the
+  restore-drill systemd unit/timer shipped by the deploy installer),
+  `.dockerignore`, `.env.example`, Python requirement manifests/locks
+  (`requirements*.txt` and `requirements*.in`), `pyproject.toml`, and
+  `ruff.toml`.
 - Static seed/reference data that is not runtime state, including
   `data/model_configs.json`, `data/sec_company_tickers_exchange.json`, and
   `sources_rss.json`.
@@ -42,3 +44,11 @@ This is the copy policy for a Linux deployment mirror.
 The Linux server should own production runtime state under `/var/lib/trading`,
 secrets under `/etc/credstore.encrypted` and `/etc/trading`, and app code under
 `/opt/trading/app`.
+
+`deploy/install_trading_system.sh` enforces this mirror policy by excluding
+non-example `*.env` and `.env*` files, `data/secrets/`, `data/runtime/`, and
+local DB files during rsync; deleting any leftover non-example env files,
+repo-local secret/runtime-data directories, and local DB files under
+`/opt/trading/app`; and seeding `/etc/trading/trading.env` only from
+`deploy/env/trading.env.example`. Do not use repo-local env files or
+repo-local `data/secrets` as runtime configuration sources on a systemd host.

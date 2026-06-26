@@ -273,11 +273,12 @@ Current groups visible in the registry include:
 - tsfresh and discovery-backed features
 - NLP/FinBERT/news, filings, and transcript feature groups
 - shadow-only `tsfm.chronos_v2.*` embeddings from the frozen Chronos encoder path when `USE_TS_FOUNDATION_FEATURES=1` and optional dependencies are installed
+- shadow-only TSFM benchmark/challenger feature ids from the governed Chronos/TimesFM/Moirai/Toto adapter layer; these are opt-in research features and never part of the default serving set
 - optional insider/Form 4, congressional, sentiment, and symbolic feature paths when their flags and dependencies are enabled
 
 Every new feature still needs an explicit feature id and must round-trip through the persisted feature schema.
 FX feature groups are registered in the catalog but only enter an FX model schema when `USE_FX_FEATURES=1` or an FX model explicitly requests an `fx.*` id. `resolve_feature_ids(..., asset_class="FX")` and `expected_columns(..., asset_class="FX")` drop equity-only options/social/insider/filing-style ids and append the canonical FX ids in registry order; non-FX asset classes drop `fx.*` ids; `asset_class=None` preserves the legacy ungated behavior. The `fx.event_*` ids are a deliberate structural-zero stub until an upstream economic-calendar feed owns central-bank, NFP, and CPI event timestamps.
-The Chronos foundation-model path is a feature generator only: it stores model-family provenance, artifact manifest hashes, and PIT source timestamps in the feature snapshot metadata, and live model serving rejects contracts that include shadow-stage feature ids.
+The Chronos foundation-model path is a feature generator only: it stores model-family provenance, artifact manifest hashes, and PIT source timestamps in the feature snapshot metadata, and live model serving rejects contracts that include shadow-stage feature ids. The TSFM benchmark path writes `model_oos_predictions`, feature snapshots, artifact/resource metadata, and shadow marketplace visibility for challenger review; those rows use `score_source=model_oos_predictions` and cannot satisfy live promotion without the normal realized net-cost, replay, and champion/challenger gates.
 
 ### FX clock, labels, and regime context
 

@@ -228,6 +228,9 @@ class ValidateRepoContractTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         labels = [label for label, _, _ in calls]
         self.assertNotIn("production-readiness-gate", labels)
+        self.assertIn("live-host-readiness", labels)
+        host_call = next(call for call in calls if call[0] == "live-host-readiness")
+        self.assertEqual(host_call[1], ["python-bin", "tools/live_host_readiness_check.py"])
         smoke_call = next(call for call in calls if call[0] == "pipeline-smoke")
         self.assertEqual(smoke_call[2]["DASHBOARD_API_TOKEN"], "dashboard-secret")
         self.assertEqual(smoke_call[2]["OPERATOR_API_TOKEN"], "operator-secret")
@@ -416,6 +419,12 @@ class ValidateRepoContractTests(unittest.TestCase):
                 "TIMESCALE_PASSWORD_FILE": "data/secrets/timescale_password",
                 "OBJECT_STORE_SECRET_KEY": "live-object-secret-should-not-control-tests",
                 "TS_SECRETS_PROVIDER": "systemd",
+                "TRADING_VALIDATE_REPO_LIVE": "1",
+                "TRADING_VALIDATION_REQUIRE_PROD_DEPS": "1",
+                "DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST": "192.168.0.165",
+                "OPERATOR_PUBLIC_PORT": "4001",
+                "LIVE_BROKER": "ibkr",
+                "AUTO_BOOT_DAEMONS": "1",
                 "DB_PATH": "var/runtime/live.sqlite",
                 "SQLITE_LIVENESS_DB_PATH": "var/runtime/live.liveness.sqlite",
                 "TS_STORAGE_BACKEND": "postgres",
@@ -426,6 +435,10 @@ class ValidateRepoContractTests(unittest.TestCase):
         self.assertEqual(run_env["PROD_LOCK"], "0")
         self.assertEqual(run_env["TS_TESTING"], "1")
         self.assertEqual(run_env["TS_STORAGE_BACKEND"], "sqlite")
+        self.assertEqual(run_env["TRADING_VALIDATE_REPO_LIVE"], "0")
+        self.assertEqual(run_env["TRADING_VALIDATION_REQUIRE_PROD_DEPS"], "0")
+        self.assertEqual(run_env["TRADING_VALIDATION_MODE"], "unit-test")
+        self.assertEqual(run_env["AUTO_BOOT_DAEMONS"], "0")
         self.assertNotIn("ENV", run_env)
         self.assertNotIn("NODE_ENV", run_env)
         self.assertNotIn("TS_ENV", run_env)
@@ -434,6 +447,9 @@ class ValidateRepoContractTests(unittest.TestCase):
         self.assertNotIn("TIMESCALE_PASSWORD_FILE", run_env)
         self.assertNotIn("OBJECT_STORE_SECRET_KEY", run_env)
         self.assertNotIn("TS_SECRETS_PROVIDER", run_env)
+        self.assertNotIn("DASHBOARD_DANGEROUS_PUBLIC_BIND_HOST", run_env)
+        self.assertNotIn("OPERATOR_PUBLIC_PORT", run_env)
+        self.assertNotIn("LIVE_BROKER", run_env)
         self.assertIn("/var/tmp/trading-system-tests-", run_env["TMPDIR"].replace("\\", "/"))
         self.assertTrue(Path(run_env["TRADING_TEST_TMPDIR"]).name.startswith("validate-repo-"))
         self.assertEqual(run_env["TMPDIR"], run_env["PYTEST_DEBUG_TEMPROOT"])

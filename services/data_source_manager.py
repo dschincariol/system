@@ -613,6 +613,7 @@ _PROVIDER_TEST_REGISTRY: Dict[str, Dict[str, str]] = {
     "weather_alerts": {"handler": "_test_weather_alerts_connection", "label": "Weather alerts"},
     "macro": {"handler": "_test_macro_fred_connection", "label": "FRED / ALFRED macro"},
     "news_flow": {"handler": "_test_news_flow_connection", "label": "News-flow embeddings"},
+    "llm_event_extraction": {"handler": "_test_llm_event_extraction_connection", "label": "LLM event extraction"},
     "rss_feed": {"handler": "_test_rss_connection", "label": "RSS feed"},
     "model_feature_snapshots": {
         "unsupported_reason": "internal_snapshot_source_has_no_external_connection_probe",
@@ -1735,6 +1736,41 @@ def _default_catalog() -> Dict[str, SourceDefinition]:
                 plan_note="OpenAI embeddings are optional and used only when the configured backend selects them.",
             ),
         ),
+        "llm_event_extraction": SourceDefinition(
+            source_type="feature_snapshot",
+            display_name="LLM Event Extraction",
+            provider_name="llm_event_extraction",
+            job_name="llm_event_extraction",
+            default_enabled=False,
+            setting_env={
+                "enabled": "LLM_EVENT_EXTRACT_ENABLED",
+                "provider": "LLM_EVENT_EXTRACT_PROVIDER",
+                "model": "LLM_EVENT_EXTRACT_MODEL",
+                "max_docs": "LLM_EVENT_EXTRACT_MAX_DOCS",
+                "max_cost_usd": "LLM_EVENT_EXTRACT_MAX_COST_USD",
+                "min_interval_ms": "LLM_EVENT_EXTRACT_MIN_INTERVAL_MS",
+            },
+            guide=_source_guide(
+                category="Model Support",
+                summary="Runs offline structured event extraction from already-ingested filings, transcripts, news, earnings, and macro documents.",
+                needs=(
+                    "An OpenAI or Anthropic credential only when the corresponding provider is selected.",
+                    "Already-ingested source documents with availability timestamps no later than the decision timestamp.",
+                ),
+                setup=(
+                    "Leave disabled unless an audited extraction batch is being run.",
+                    "Select provider/model and configure cost/rate limits.",
+                    "Enable the source, run the one-shot job, then review llm_event_extraction_audit.",
+                ),
+                when_enabled="The runtime may materialize shadow-only structured document event features from validated LLM extractions.",
+                docs_url="https://platform.openai.com/docs/guides/structured-outputs",
+                plan_note="Provider calls are cost-bounded and never grant order authority.",
+                safety_warnings=(
+                    "Accepted rows remain shadow-only and direct_trading_authority=false.",
+                    "The job reads only documents available by the configured decision timestamp.",
+                ),
+            ),
+        ),
         "rss_feed": SourceDefinition(
             source_type="rss_feed",
             display_name="RSS Feed",
@@ -2059,19 +2095,36 @@ def _provider_account_catalog() -> Dict[str, ProviderAccountDefinition]:
         ),
         "openai_embeddings": ProviderAccountDefinition(
             account_key="openai_embeddings",
-            display_name="OpenAI Embeddings",
+            display_name="OpenAI Embeddings / LLM Extraction",
             provider_name="openai",
             credential_env={"api_key": "OPENAI_API_KEY"},
-            used_by_sources=("news_flow",),
-            used_by_jobs=("embed_filings", "embed_transcripts"),
+            used_by_sources=("news_flow", "llm_event_extraction"),
+            used_by_jobs=("embed_filings", "embed_transcripts", "llm_event_extraction"),
             guide=_source_guide(
                 category="Provider Account",
-                summary="Optional OpenAI API key inherited by embedding-backed news and filing feature jobs.",
-                needs=("An OpenAI API key only when an OpenAI embedding backend is selected.",),
-                setup=("Enter the OpenAI API key once, then select OpenAI-backed embedding settings where needed.",),
-                when_enabled="Embedding jobs inherit OPENAI_API_KEY when configured.",
+                summary="Optional OpenAI API key inherited by embedding-backed news/filing jobs and structured LLM event extraction.",
+                needs=("An OpenAI API key only when an OpenAI-backed embedding or LLM extraction backend is selected.",),
+                setup=("Enter the OpenAI API key once, then select OpenAI-backed embedding or LLM extraction settings where needed.",),
+                when_enabled="Embedding and LLM event extraction jobs inherit OPENAI_API_KEY when configured.",
                 docs_url="https://platform.openai.com/docs/guides/embeddings",
-                plan_note="OpenAI embeddings are optional and not part of trading authority.",
+                plan_note="OpenAI-backed enrichment is optional and not part of trading authority.",
+            ),
+        ),
+        "anthropic_llm_extraction": ProviderAccountDefinition(
+            account_key="anthropic_llm_extraction",
+            display_name="Anthropic LLM Extraction",
+            provider_name="anthropic",
+            credential_env={"api_key": "ANTHROPIC_API_KEY"},
+            used_by_sources=("llm_event_extraction",),
+            used_by_jobs=("llm_event_extraction", "llm_factor_discovery"),
+            guide=_source_guide(
+                category="Provider Account",
+                summary="Optional Anthropic API key inherited by bounded LLM research and structured event extraction jobs.",
+                needs=("An Anthropic API key only when an Anthropic-backed LLM job is explicitly enabled.",),
+                setup=("Enter the Anthropic API key once, then run only the reviewed one-shot LLM jobs that need it.",),
+                when_enabled="LLM factor discovery and LLM event extraction can inherit ANTHROPIC_API_KEY when configured.",
+                docs_url="https://docs.anthropic.com/",
+                plan_note="Anthropic-backed jobs are advisory/extraction-only and not part of trading authority.",
             ),
         ),
     }
@@ -2104,6 +2157,7 @@ MANAGED_DAEMON_JOBS = {
     "poll_weather_alerts",
     "poll_macro",
     "process_news_flow",
+    "llm_event_extraction",
     "snapshot_model_features",
 }
 
@@ -2292,6 +2346,11 @@ _SOURCE_CATALOG_OPERATIONAL_METADATA: Dict[str, Dict[str, Any]] = {
         "storage_tables": ("news_story_embeddings", "news_flow_features"),
         "consumers": ("model_feature_snapshots", "dashboard_feature_visibility"),
         "safe_to_auto_enable": True,
+    },
+    "llm_event_extraction": {
+        "storage_tables": ("llm_extracted_events", "llm_event_extraction_audit", "structured_document_events"),
+        "consumers": ("structured_doc_events_v1", "model_feature_snapshots", "dashboard_feature_visibility"),
+        "safe_to_auto_enable": False,
     },
     "rss_feed": {
         "storage_tables": ("events", "news_event_features"),
@@ -2599,6 +2658,20 @@ _SOURCE_DATA_CONTRACTS: Dict[str, DataSourceContract] = {
         timestamp_field="asof_ts_ms",
         source_field="",
         stale_after_ms=24 * 60 * 60 * 1000,
+    ),
+    "llm_event_extraction": _contract(
+        storage_table="llm_extracted_events",
+        normalized_shape="one validated LLM-extracted financial event per source document/evidence span/model lineage",
+        required_fields=("event_uid", "source_doc_id", "event_type", "availability_ts_ms", "prompt_hash", "model_hash", "source_hash"),
+        units={"confidence": "0-1 score", "polarity": "-1 to 1 score"},
+        symbol_namespace="canonical upper-case equity ticker or empty market-wide symbol",
+        point_in_time_availability="source selector and validator require availability_ts_ms <= decision_ts_ms",
+        unique_key=("event_uid",),
+        idempotent_upsert="UPSERT by event_uid",
+        consumer="structured_doc_events_v1",
+        timestamp_field="availability_ts_ms",
+        source_field="source_doc_id",
+        stale_after_ms=7 * 24 * 60 * 60 * 1000,
     ),
 }
 
@@ -9396,6 +9469,36 @@ class DataSourceManager:
             expected_paths=("data",),
             success_message="news_flow_openai_embeddings_connection_ok",
             empty_message="news_flow_openai_embeddings_empty_payload",
+        )
+
+    def _test_llm_event_extraction_connection(self, source: Dict[str, Any]) -> ConnectionTestResult:
+        provider = self._connection_setting(source, "provider", "LLM_EVENT_EXTRACT_PROVIDER", "openai").lower()
+        if provider == "fake":
+            return ConnectionTestResult(
+                status="pass",
+                classification="ok",
+                message="llm_event_extraction_fake_adapter_configured",
+                evidence={"provider": "fake", "external_call": False, "direct_trading_authority": False},
+            )
+        if provider == "openai":
+            env_name = "OPENAI_API_KEY"
+        elif provider == "anthropic":
+            env_name = "ANTHROPIC_API_KEY"
+        else:
+            return ConnectionTestResult(
+                status="fail",
+                classification="configuration",
+                message="llm_event_extraction_provider_unsupported",
+                evidence={"provider": provider},
+                next_steps=("Set LLM_EVENT_EXTRACT_PROVIDER to openai, anthropic, or fake for isolated tests.",),
+            )
+        if not self._connection_effective_env_value(source, env_name):
+            return self._missing_credentials_result("llm_event_extraction", env_name, source=source)
+        return ConnectionTestResult(
+            status="pass",
+            classification="ok",
+            message="llm_event_extraction_credential_available",
+            evidence={"provider": provider, "credential_env": env_name, "external_call": False, "direct_trading_authority": False},
         )
 
     def _test_weather_forecasts_connection(self, source: Dict[str, Any]) -> ConnectionTestResult:

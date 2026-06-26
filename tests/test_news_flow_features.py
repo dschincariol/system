@@ -155,6 +155,21 @@ def test_news_novelty_identical_and_unrelated_texts() -> None:
     assert unrelated_stale is False
 
 
+def test_news_novelty_refuses_explicit_mixed_embedding_spaces() -> None:
+    (news_flow,) = _reload("engine.data.news_flow")
+    cfg = news_flow.NewsEmbeddingConfig(backend="hashing", model_name="hashing-v1")
+    other = news_flow.NewsEmbeddingConfig(backend="hashing", model_name="hashing-v2")
+    vectors = news_flow.encode_news_texts(["Apple revenue beat", "Apple revenue beat"], cfg)
+
+    with pytest.raises(ValueError, match="mixed_embedding_space_refused"):
+        news_flow.novelty_from_vector(
+            vectors[1],
+            [vectors[0]],
+            vector_space=cfg.namespace,
+            candidate_spaces=[other.namespace],
+        )
+
+
 def test_news_flow_mixed_embedding_space_guard_and_batch_cap(monkeypatch) -> None:
     (news_flow,) = _reload("engine.data.news_flow")
     cfg = news_flow.NewsEmbeddingConfig(backend="hashing", model_name="hashing-v1")
@@ -220,6 +235,36 @@ def test_news_flow_mixed_embedding_space_guard_and_batch_cap(monkeypatch) -> Non
     fake = _FakeCon()
     news_flow._recent_embedding_rows(fake, symbol="AAPL", availability_ts_ms=10_000, config=cfg)
     assert fake.params[-1] == 200
+
+
+def test_news_flow_unavailable_backend_degrades_without_crashing(monkeypatch) -> None:
+    (news_flow,) = _reload("engine.data.news_flow")
+    cfg = news_flow.NewsEmbeddingConfig(
+        backend="sentence_transformer",
+        model_name="unit-missing-model",
+        fallback_policy="skip",
+    )
+    con = _make_news_db(news_flow)
+    _insert_event(con, 1, 2_000, "Apple publishes a new product update")
+    monkeypatch.setattr(news_flow, "connect", lambda readonly=False: _NoClose(con))
+
+    from engine.nlp import encoder as encoder_module
+
+    original_import_module = encoder_module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "sentence_transformers":
+            raise ImportError("missing optional sentence-transformers")
+        return original_import_module(name)
+
+    monkeypatch.setattr(encoder_module.importlib, "import_module", fake_import_module)
+
+    result = news_flow.process_news_flow_batch(limit=1, config=cfg, now_ms=2_500)
+
+    assert result["degraded"] is True
+    assert result["written"] == 0
+    assert result["encoded"] == 0
+    assert "missing optional sentence-transformers" in result["errors"][0]
 
 
 def test_news_flow_no_lookahead_uses_embedding_availability(monkeypatch) -> None:

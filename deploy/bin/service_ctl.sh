@@ -5,6 +5,8 @@ ACTION="${1:-status}"
 TARGET="${2:-all}"
 SINCE="${3:-}"
 LINES="${4:-400}"
+ARG_COUNT="$#"
+LOG_DIR="${TRADING_LOGS:-${TRADING_LOG_DIR:-${LOG_DIR:-/var/lib/trading/logs}}}"
 
 map_unit() {
   case "$1" in
@@ -13,6 +15,19 @@ map_unit() {
     backup) echo "trading-backup.service" ;;
     upgrade) echo "trading-upgrade.service" ;;
     all) echo "all" ;;
+    *)
+      echo "invalid_target:$1" >&2
+      exit 2
+      ;;
+  esac
+}
+
+map_logfile() {
+  case "$1" in
+    engine) echo "$LOG_DIR/engine.log" ;;
+    operator) echo "$LOG_DIR/operator.log" ;;
+    upgrade) echo "$LOG_DIR/upgrade.log" ;;
+    backup|all) echo "" ;;
     *)
       echo "invalid_target:$1" >&2
       exit 2
@@ -40,19 +55,32 @@ require_sudo() {
 
 if [[ "$ACTION" == "logs" ]]; then
   UNIT="$(map_unit "$TARGET")"
+  LOGFILE="$(map_logfile "$TARGET")"
   require_sudo
-  if [[ -n "$SINCE" ]]; then
+  if [[ -n "$LOGFILE" && -r "$LOGFILE" ]]; then
+    if [[ "$ARG_COUNT" -ge 4 && -n "$SINCE" ]]; then
+      echo "# note: file sink has no --since filter; showing last ${LINES} lines" >&2
+      exec sudo -n tail -n "$LINES" -- "$LOGFILE"
+    fi
+    exec sudo -n tail -n "${SINCE:-$LINES}" -- "$LOGFILE"
+  fi
+  if [[ "$ARG_COUNT" -ge 4 && -n "$SINCE" ]]; then
     exec sudo -n journalctl -u "$UNIT" --since "$SINCE" -n "$LINES" --no-pager
   fi
-  exec sudo -n journalctl -u "$UNIT" -n "${SINCE:-400}" --no-pager
+  exec sudo -n journalctl -u "$UNIT" -n "${SINCE:-$LINES}" --no-pager
 fi
 
 if [[ "$ACTION" == "logs_since" ]]; then
   UNIT="$(map_unit "$TARGET")"
-  require_sudo
+  LOGFILE="$(map_logfile "$TARGET")"
   if [[ -z "$SINCE" ]]; then
     echo '{"ok":false,"error":"missing_since"}'
     exit 2
+  fi
+  require_sudo
+  if [[ -n "$LOGFILE" && -r "$LOGFILE" ]]; then
+    echo "# note: file sink has no --since filter; showing last ${LINES} lines" >&2
+    exec sudo -n tail -n "$LINES" -- "$LOGFILE"
   fi
   exec sudo -n journalctl -u "$UNIT" --since "$SINCE" -n "$LINES" --no-pager
 fi

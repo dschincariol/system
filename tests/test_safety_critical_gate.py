@@ -14,6 +14,7 @@ EXPECTED_SAFETY_CRITICAL_SUITES = {
     "tests/test_broker_order_idempotency_regressions.py",
     "tests/test_broker_apply_orders_modes.py",
     "tests/test_drawdown_fail_closed.py",
+    "tests/test_risk_invariants_property.py",
     "tests/test_real_capital_safety_e2e.py",
     "tests/test_position_reconcile_safety.py",
     "tests/test_live_prelive_reconcile_policy.py",

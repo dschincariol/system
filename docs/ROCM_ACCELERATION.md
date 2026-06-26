@@ -27,7 +27,7 @@ installing the ROCm profile on the Python 3.12 ROCm runtime baseline:
 ```bash
 python3.12 -m venv .venv-rocm
 .venv-rocm/bin/python -m pip install --upgrade pip setuptools wheel
-.venv-rocm/bin/python -m pip install -r requirements-amd-rocm-full.txt
+.venv-rocm/bin/python -m pip install --require-hashes -r requirements-amd-rocm-full.txt
 ```
 
 The profile pins:
@@ -51,6 +51,14 @@ ran a FP16 torch matmul on `Radeon 8060S Graphics`. The earlier CPython 3.11 /
 ROCm 6.4 PyTorch wheel detected the device but failed the first kernel launch
 with HIP `invalid device function`, so it is not considered host-validated for
 `gfx1151`.
+
+`requirements-amd-rocm-full.txt` applies `requirements-amd-rocm.lock.txt` as a
+hash-bearing constraint file. Runtime and host installs must use
+`--require-hashes`; regenerate the lock with `uv pip compile
+requirements-amd-rocm-full.txt --python-version 3.12 --python-platform
+x86_64-manylinux_2_36 --index-strategy unsafe-best-match --emit-index-url
+--generate-hashes --output-file requirements-amd-rocm.lock.txt` after any ROCm
+profile dependency change.
 
 ## Compose Runtime
 
@@ -84,7 +92,8 @@ container. The operator container receives no GPU devices. The dependency
 resolver validates that any ROCm requirements file is the real Strix
 Halo/gfx1151 ROCm 7.2.4 profile, and the runtime Dockerfile expands the
 lightweight `requirements-amd-rocm.txt` selection to
-`requirements-amd-rocm-full.txt` during installation.
+`requirements-amd-rocm-full.txt` during installation, using pip
+`--require-hashes` against the checked-in ROCm lock.
 
 ## Runtime Detection
 
@@ -106,9 +115,10 @@ on Python 3.11, torch cannot be imported, torch is CPU-only, HIP is missing,
 `/dev/kfd` is inaccessible, or no HIP device is visible, startup/preflight raises
 `AccelerationProfileError` instead of falling back to CPU.
 
-FinBERT, PatchTST, event embeddings, iTransformer, temporal predictors, and the
-time-series foundation encoder use this runtime resolver, so the hard error is
-enforced in production model code rather than only in tests or documentation.
+FinBERT, PatchTST, event embeddings, iTransformer, temporal predictors, the
+time-series foundation encoder, and the TSFM benchmark adapter layer use this
+runtime resolver, so the hard error is enforced in production model code rather
+than only in tests or documentation.
 
 ## Validation Harness
 

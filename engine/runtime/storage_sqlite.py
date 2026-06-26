@@ -603,6 +603,8 @@ _INIT_SENTINEL_TABLES = (
     "production_monitoring_metrics",
     "model_hyperparameter_registry",
     "model_best_params",
+    "risk_var_forecasts",
+    "risk_var_backtest_results",
     "data_sources",
     "strategy_metrics",
     "size_policy",
@@ -644,6 +646,8 @@ _INIT_SENTINEL_INDEXES = (
     "idx_model_performance_model_id_time",
     "idx_model_performance_regime_time",
     "idx_production_monitoring_metrics_ts",
+    "idx_risk_var_forecasts_ts",
+    "idx_risk_var_backtest_results_ts",
 )
 
 _INIT_SENTINEL_COLUMNS = {
@@ -715,6 +719,15 @@ _INIT_SENTINEL_COLUMNS = {
         "diagnostics",
     ),
     "model_best_params": ("model_family", "symbol", "params_json", "value", "trial_number", "seed"),
+    "risk_var_forecasts": ("forecast_id", "forecast_ts_ms", "horizon_steps", "simulation_method", "metadata_json"),
+    "risk_var_backtest_results": (
+        "forecast_id",
+        "forecast_ts_ms",
+        "realized_ts_ms",
+        "confidence_level",
+        "exception",
+        "traffic_light_status",
+    ),
     "data_sources": ("source_key", "display_name", "source_type", "job_name", "key_version"),
     "strategy_metrics": ("strategy_name", "window_days", "ts_ms", "metrics_json", "is_active"),
     "strategy_promotion_candidates": (
@@ -2193,6 +2206,51 @@ def _ensure_runtime_aux_schema(con: sqlite3.Connection) -> None:
           value TEXT,
           updated_ts_ms INTEGER
         );
+
+        CREATE TABLE IF NOT EXISTS risk_var_forecasts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          forecast_id TEXT NOT NULL UNIQUE,
+          forecast_ts_ms INTEGER NOT NULL,
+          horizon_steps INTEGER NOT NULL,
+          var_95 REAL,
+          var_99 REAL,
+          cvar_95 REAL,
+          cvar_99 REAL,
+          simulation_method TEXT,
+          metadata_json TEXT,
+          created_ts_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_risk_var_forecasts_ts
+          ON risk_var_forecasts(forecast_ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS risk_var_backtest_results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          forecast_id TEXT NOT NULL,
+          forecast_ts_ms INTEGER NOT NULL,
+          realized_ts_ms INTEGER NOT NULL,
+          horizon_steps INTEGER NOT NULL,
+          confidence_level REAL NOT NULL,
+          var_value REAL NOT NULL,
+          cvar_value REAL,
+          realized_portfolio_return REAL NOT NULL,
+          realized_portfolio_loss REAL NOT NULL,
+          exception INTEGER NOT NULL,
+          kupiec_pof_stat REAL,
+          kupiec_pof_p_value REAL,
+          kupiec_pof_status TEXT,
+          christoffersen_ind_stat REAL,
+          christoffersen_ind_p_value REAL,
+          christoffersen_ind_status TEXT,
+          rolling_exception_rate REAL,
+          rolling_window INTEGER,
+          traffic_light_status TEXT,
+          traffic_light_reason TEXT,
+          metadata_json TEXT,
+          created_ts_ms INTEGER NOT NULL,
+          UNIQUE(forecast_id, confidence_level)
+        );
+        CREATE INDEX IF NOT EXISTS idx_risk_var_backtest_results_ts
+          ON risk_var_backtest_results(forecast_ts_ms DESC, confidence_level);
 
         CREATE TABLE IF NOT EXISTS job_locks (
           job_name TEXT PRIMARY KEY,
@@ -5864,6 +5922,220 @@ def upsert_model_best_params(
     if con is not None:
         return int(_write(con) or 0)
     return int(run_write_txn(_write) or 0)
+
+
+def record_risk_var_forecast(con: StorageConnection | None = None, **kwargs: Any) -> int:
+    row = dict(kwargs or {})
+    row.setdefault("created_ts_ms", int(time.time() * 1000))
+    row["forecast_id"] = str(row.get("forecast_id") or "")
+    row["forecast_ts_ms"] = int(row.get("forecast_ts_ms") or row.get("ts_ms") or 0)
+    row["horizon_steps"] = int(row.get("horizon_steps") or row.get("horizon") or 0)
+    row["metadata_json"] = _json_payload(row.get("metadata_json") or row.get("metadata") or {})
+
+    def _write(db: StorageConnection) -> int:
+        db.execute(
+            """
+            INSERT INTO risk_var_forecasts(
+              forecast_id, forecast_ts_ms, horizon_steps, var_95, var_99, cvar_95, cvar_99,
+              simulation_method, metadata_json, created_ts_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(forecast_id) DO UPDATE SET
+              forecast_ts_ms=excluded.forecast_ts_ms,
+              horizon_steps=excluded.horizon_steps,
+              var_95=excluded.var_95,
+              var_99=excluded.var_99,
+              cvar_95=excluded.cvar_95,
+              cvar_99=excluded.cvar_99,
+              simulation_method=excluded.simulation_method,
+              metadata_json=excluded.metadata_json,
+              created_ts_ms=excluded.created_ts_ms
+            """,
+            (
+                row["forecast_id"],
+                int(row["forecast_ts_ms"]),
+                int(row["horizon_steps"]),
+                row.get("var_95"),
+                row.get("var_99"),
+                row.get("cvar_95"),
+                row.get("cvar_99"),
+                row.get("simulation_method"),
+                row.get("metadata_json"),
+                int(row["created_ts_ms"]),
+            ),
+        )
+        fetched = db.execute("SELECT id FROM risk_var_forecasts WHERE forecast_id=? LIMIT 1", (row["forecast_id"],)).fetchone()
+        return int((fetched or [0])[0] or 0)
+
+    if con is not None:
+        return _write(con)
+    return int(run_write_txn(_write) or 0)
+
+
+def record_risk_var_backtest_result(con: StorageConnection | None = None, **kwargs: Any) -> int:
+    row = dict(kwargs or {})
+    row.setdefault("created_ts_ms", int(time.time() * 1000))
+    row["metadata_json"] = _json_payload(row.get("metadata_json") or row.get("metadata") or {})
+
+    def _write(db: StorageConnection) -> int:
+        db.execute(
+            """
+            INSERT INTO risk_var_backtest_results(
+              forecast_id, forecast_ts_ms, realized_ts_ms, horizon_steps, confidence_level,
+              var_value, cvar_value, realized_portfolio_return, realized_portfolio_loss,
+              exception, kupiec_pof_stat, kupiec_pof_p_value, kupiec_pof_status,
+              christoffersen_ind_stat, christoffersen_ind_p_value, christoffersen_ind_status,
+              rolling_exception_rate, rolling_window, traffic_light_status, traffic_light_reason,
+              metadata_json, created_ts_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(forecast_id, confidence_level) DO UPDATE SET
+              realized_ts_ms=excluded.realized_ts_ms,
+              var_value=excluded.var_value,
+              cvar_value=excluded.cvar_value,
+              realized_portfolio_return=excluded.realized_portfolio_return,
+              realized_portfolio_loss=excluded.realized_portfolio_loss,
+              exception=excluded.exception,
+              kupiec_pof_stat=excluded.kupiec_pof_stat,
+              kupiec_pof_p_value=excluded.kupiec_pof_p_value,
+              kupiec_pof_status=excluded.kupiec_pof_status,
+              christoffersen_ind_stat=excluded.christoffersen_ind_stat,
+              christoffersen_ind_p_value=excluded.christoffersen_ind_p_value,
+              christoffersen_ind_status=excluded.christoffersen_ind_status,
+              rolling_exception_rate=excluded.rolling_exception_rate,
+              rolling_window=excluded.rolling_window,
+              traffic_light_status=excluded.traffic_light_status,
+              traffic_light_reason=excluded.traffic_light_reason,
+              metadata_json=excluded.metadata_json,
+              created_ts_ms=excluded.created_ts_ms
+            """,
+            (
+                str(row.get("forecast_id") or ""),
+                int(row.get("forecast_ts_ms") or 0),
+                int(row.get("realized_ts_ms") or 0),
+                int(row.get("horizon_steps") or 0),
+                float(row.get("confidence_level") or 0.0),
+                float(row.get("var_value") or 0.0),
+                row.get("cvar_value"),
+                float(row.get("realized_portfolio_return") or 0.0),
+                float(row.get("realized_portfolio_loss") or 0.0),
+                1 if bool(row.get("exception")) else 0,
+                row.get("kupiec_pof_stat"),
+                row.get("kupiec_pof_p_value"),
+                row.get("kupiec_pof_status"),
+                row.get("christoffersen_ind_stat"),
+                row.get("christoffersen_ind_p_value"),
+                row.get("christoffersen_ind_status"),
+                row.get("rolling_exception_rate"),
+                row.get("rolling_window"),
+                row.get("traffic_light_status"),
+                row.get("traffic_light_reason"),
+                row.get("metadata_json"),
+                int(row.get("created_ts_ms") or time.time() * 1000),
+            ),
+        )
+        fetched = db.execute(
+            """
+            SELECT id
+            FROM risk_var_backtest_results
+            WHERE forecast_id=? AND confidence_level=?
+            LIMIT 1
+            """,
+            (str(row.get("forecast_id") or ""), float(row.get("confidence_level") or 0.0)),
+        ).fetchone()
+        return int((fetched or [0])[0] or 0)
+
+    if con is not None:
+        return _write(con)
+    return int(run_write_txn(_write) or 0)
+
+
+def fetch_recent_risk_var_forecasts(
+    *,
+    limit: int = 100,
+    con: StorageConnection | None = None,
+) -> list[dict[str, Any]]:
+    owns = con is None
+    db = con or connect(readonly=True)
+    try:
+        if not _table_exists(db, "risk_var_forecasts"):
+            return []
+        columns = [
+            "id",
+            "forecast_id",
+            "forecast_ts_ms",
+            "horizon_steps",
+            "var_95",
+            "var_99",
+            "cvar_95",
+            "cvar_99",
+            "simulation_method",
+            "metadata_json",
+            "created_ts_ms",
+        ]
+        rows = db.execute(
+            f"""
+            SELECT {', '.join(_quote(column) for column in columns)}
+            FROM risk_var_forecasts
+            ORDER BY forecast_ts_ms DESC, id DESC
+            LIMIT ?
+            """,
+            (_bounded_limit(limit, default=100, maximum=1000),),
+        ).fetchall()
+        return [_format_plain_row(row, columns, json_columns=("metadata_json",)) for row in rows]
+    finally:
+        if owns:
+            db.close()
+
+
+def fetch_recent_risk_var_backtest_results(
+    *,
+    limit: int = 100,
+    con: StorageConnection | None = None,
+) -> list[dict[str, Any]]:
+    owns = con is None
+    db = con or connect(readonly=True)
+    try:
+        if not _table_exists(db, "risk_var_backtest_results"):
+            return []
+        columns = [
+            "id",
+            "forecast_id",
+            "forecast_ts_ms",
+            "realized_ts_ms",
+            "horizon_steps",
+            "confidence_level",
+            "var_value",
+            "cvar_value",
+            "realized_portfolio_return",
+            "realized_portfolio_loss",
+            "exception",
+            "kupiec_pof_stat",
+            "kupiec_pof_p_value",
+            "kupiec_pof_status",
+            "christoffersen_ind_stat",
+            "christoffersen_ind_p_value",
+            "christoffersen_ind_status",
+            "rolling_exception_rate",
+            "rolling_window",
+            "traffic_light_status",
+            "traffic_light_reason",
+            "metadata_json",
+            "created_ts_ms",
+        ]
+        rows = db.execute(
+            f"""
+            SELECT {', '.join(_quote(column) for column in columns)}
+            FROM risk_var_backtest_results
+            ORDER BY forecast_ts_ms DESC, confidence_level DESC, id DESC
+            LIMIT ?
+            """,
+            (_bounded_limit(limit, default=100, maximum=1000),),
+        ).fetchall()
+        return [_format_plain_row(row, columns, json_columns=("metadata_json",)) for row in rows]
+    finally:
+        if owns:
+            db.close()
 
 
 def fetch_model_best_params(

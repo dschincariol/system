@@ -2785,145 +2785,217 @@ def api_get_liveness(_parsed, ctx=None):
 
 def api_get_competition_view(_parsed, ctx=None):
     snapshot = _build_system_snapshot(_parsed, ctx)
-    health = _normalized_health_from_snapshot(snapshot)
-    competition_health = dict((health or {}).get("competition") or {})
-    system_state_detail = dict(snapshot.get("system_state_detail") or {})
-    active_symbols = list(((system_state_detail.get("competition") or {}).get("active_symbols")) or [])
-    runtime = current_competition_snapshot(active_symbols=active_symbols)
+    try:
+        health = _normalized_health_from_snapshot(snapshot)
+        competition_health = dict((health or {}).get("competition") or {})
+        system_state_detail = dict(snapshot.get("system_state_detail") or {})
+        active_symbols = list(((system_state_detail.get("competition") or {}).get("active_symbols")) or [])
+        runtime = current_competition_snapshot(active_symbols=active_symbols)
 
-    champions = list(runtime.get("champions") or [])
-    challengers = list(runtime.get("challengers") or [])
-    rankings = list(runtime.get("rankings") or runtime.get("model_rankings") or [])
-    champion = dict(runtime.get("champion") or {})
-    ranking_champion = dict(runtime.get("ranking_champion") or {})
-    capital_plan = dict(runtime.get("capital_plan") or {})
-    replay_status = dict(runtime.get("replay_validation_status") or {})
-    self_critic = dict(runtime.get("self_critic") or {})
-    cycle_status = dict(runtime.get("cycle_status") or {})
+        champions = list(runtime.get("champions") or [])
+        challengers = list(runtime.get("challengers") or [])
+        rankings = list(runtime.get("rankings") or runtime.get("model_rankings") or [])
+        champion = dict(runtime.get("champion") or {})
+        ranking_champion = dict(runtime.get("ranking_champion") or {})
+        capital_plan = dict(runtime.get("capital_plan") or {})
+        replay_status = dict(runtime.get("replay_validation_status") or {})
+        self_critic = dict(runtime.get("self_critic") or {})
+        cycle_status = dict(runtime.get("cycle_status") or {})
 
-    summary = {
-        "champion_model_name": str(champion.get("model_name") or ""),
-        "champion_symbol": str(champion.get("symbol") or ""),
-        "champion_horizon_s": int(champion.get("horizon_s") or 0),
-        "top_ranked_model_name": str(ranking_champion.get("model_name") or ""),
-        "rankings": int(len(rankings)),
-        "champions": int(len(champions)),
-        "challengers": int(len(challengers)),
-        "active_symbols": int(len(list(runtime.get("active_symbols") or []))),
-        "allocation_groups": int(len(dict(capital_plan.get("allocations") or {}))),
-        "critic_blocked_keys": int(len(list(self_critic.get("blocked_keys") or []))),
-        "replay_ready": str(replay_status.get("status") or "") == "ready",
-        "cycle_status": str(cycle_status.get("status") or "missing"),
-        "status": str(runtime.get("status") or ""),
-        "reason": str(runtime.get("reason") or ""),
-    }
-
-    return _snapshot_response(
-        snapshot,
-        ok=bool(runtime.get("ok", True)),
-        competition={
-            "summary": summary,
+        summary = {
+            "champion_model_name": str(champion.get("model_name") or ""),
+            "champion_symbol": str(champion.get("symbol") or ""),
+            "champion_horizon_s": int(champion.get("horizon_s") or 0),
+            "top_ranked_model_name": str(ranking_champion.get("model_name") or ""),
+            "rankings": int(len(rankings)),
+            "champions": int(len(champions)),
+            "challengers": int(len(challengers)),
+            "active_symbols": int(len(list(runtime.get("active_symbols") or []))),
+            "allocation_groups": int(len(dict(capital_plan.get("allocations") or {}))),
+            "critic_blocked_keys": int(len(list(self_critic.get("blocked_keys") or []))),
+            "replay_ready": str(replay_status.get("status") or "") == "ready",
+            "cycle_status": str(cycle_status.get("status") or "missing"),
             "status": str(runtime.get("status") or ""),
             "reason": str(runtime.get("reason") or ""),
-            "rankings": rankings,
-            "runtime": runtime,
-            "health": competition_health,
-        },
-    )
+        }
+
+        return _snapshot_response(
+            snapshot,
+            ok=bool(runtime.get("ok", True)),
+            competition={
+                "summary": summary,
+                "status": str(runtime.get("status") or ""),
+                "reason": str(runtime.get("reason") or ""),
+                "rankings": rankings,
+                "runtime": runtime,
+                "health": competition_health,
+            },
+        )
+    except Exception as e:
+        failure = failure_response(
+            log,
+            event="api_system_competition_view_failed",
+            code="API_SYSTEM_COMPETITION_VIEW_FAILED",
+            message=str(e),
+            error=e,
+            component="engine.api.api_system",
+            ctx=ctx,
+            extra={"status": str(snapshot.get("status") or "")},
+        )
+        return _snapshot_response(
+            snapshot,
+            ok=False,
+            status="DEGRADED" if snapshot.get("status") == "RUNNING" else snapshot.get("status"),
+            reasons=_dedupe_reasons(snapshot.get("reasons"), [f"competition_view_error:{e}"]),
+            competition={"ok": False, "error": str(e)},
+            error=str(e),
+            root_cause_code=failure.get("root_cause_code"),
+            failure_scope=failure.get("failure_scope"),
+            failure_type=failure.get("failure_type"),
+            system_state_snapshot=failure.get("system_state_snapshot"),
+        )
 
 
 def api_get_replay_freshness(_parsed, ctx=None):
     snapshot = _build_system_snapshot(_parsed, ctx)
-    health = _normalized_health_from_snapshot(snapshot)
-    competition_health = dict((health or {}).get("competition") or {})
-    replay = _meta_json("competition_replay_validation")
-    replay_status = _meta_json("competition_replay_validation_status")
-    models = dict(replay.get("models") or {})
+    try:
+        health = _normalized_health_from_snapshot(snapshot)
+        competition_health = dict((health or {}).get("competition") or {})
+        replay = _meta_json("competition_replay_validation")
+        replay_status = _meta_json("competition_replay_validation_status")
+        models = dict(replay.get("models") or {})
 
-    approved = 0
-    source_counts = {}
-    latest_window_end_ms = 0
-    for row in models.values():
-        if not isinstance(row, dict):
-            continue
-        if bool(row.get("approved")):
-            approved += 1
-        source = str(row.get("source") or "unknown")
-        source_counts[source] = int(source_counts.get(source) or 0) + 1
-        try:
-            latest_window_end_ms = max(latest_window_end_ms, int(row.get("window_end_ms") or 0))
-        except Exception as e:
-            _warn("api_system.replay_freshness.window_end_parse", e, row=row)
+        approved = 0
+        source_counts = {}
+        latest_window_end_ms = 0
+        for row in models.values():
+            if not isinstance(row, dict):
+                continue
+            if bool(row.get("approved")):
+                approved += 1
+            source = str(row.get("source") or "unknown")
+            source_counts[source] = int(source_counts.get(source) or 0) + 1
+            try:
+                latest_window_end_ms = max(latest_window_end_ms, int(row.get("window_end_ms") or 0))
+            except Exception as e:
+                _warn("api_system.replay_freshness.window_end_parse", e, row=row)
 
-    updated_ts_ms = int(replay_status.get("updated_ts_ms") or 0)
-    now_ms = _ts_ms()
-    age_ms = max(0, now_ms - updated_ts_ms) if updated_ts_ms > 0 else None
-    fresh = bool(replay_status.get("fresh"))
-    stale = bool(replay_status.get("stale")) or (fresh is False and updated_ts_ms > 0)
+        updated_ts_ms = int(replay_status.get("updated_ts_ms") or 0)
+        now_ms = _ts_ms()
+        age_ms = max(0, now_ms - updated_ts_ms) if updated_ts_ms > 0 else None
+        fresh = bool(replay_status.get("fresh"))
+        stale = bool(replay_status.get("stale")) or (fresh is False and updated_ts_ms > 0)
 
-    return _snapshot_response(
-        snapshot,
-        ok=bool(str(replay_status.get("status") or "") == "ready" and not stale),
-        replay_freshness={
-            "summary": {
-                "status": str(replay_status.get("status") or "missing"),
-                "fresh": fresh,
-                "stale": stale,
-                "updated_ts_ms": updated_ts_ms or None,
-                "age_ms": age_ms,
-                "model_count": int(replay_status.get("model_count") or len(models)),
-                "approved_model_count": int(approved),
-                "latest_window_end_ms": latest_window_end_ms or None,
+        return _snapshot_response(
+            snapshot,
+            ok=bool(str(replay_status.get("status") or "") == "ready" and not stale),
+            replay_freshness={
+                "summary": {
+                    "status": str(replay_status.get("status") or "missing"),
+                    "fresh": fresh,
+                    "stale": stale,
+                    "updated_ts_ms": updated_ts_ms or None,
+                    "age_ms": age_ms,
+                    "model_count": int(replay_status.get("model_count") or len(models)),
+                    "approved_model_count": int(approved),
+                    "latest_window_end_ms": latest_window_end_ms or None,
+                },
+                "status": replay_status,
+                "models": models,
+                "sources": source_counts,
+                "health": {
+                    "replay_status": str(competition_health.get("replay_status") or "missing"),
+                    "replay_age_s": competition_health.get("replay_age_s"),
+                    "reasons": list(competition_health.get("reasons") or []),
+                },
             },
-            "status": replay_status,
-            "models": models,
-            "sources": source_counts,
-            "health": {
-                "replay_status": str(competition_health.get("replay_status") or "missing"),
-                "replay_age_s": competition_health.get("replay_age_s"),
-                "reasons": list(competition_health.get("reasons") or []),
-            },
-        },
-    )
+        )
+    except Exception as e:
+        failure = failure_response(
+            log,
+            event="api_system_replay_freshness_failed",
+            code="API_SYSTEM_REPLAY_FRESHNESS_FAILED",
+            message=str(e),
+            error=e,
+            component="engine.api.api_system",
+            ctx=ctx,
+            extra={"status": str(snapshot.get("status") or "")},
+        )
+        return _snapshot_response(
+            snapshot,
+            ok=False,
+            status="DEGRADED" if snapshot.get("status") == "RUNNING" else snapshot.get("status"),
+            reasons=_dedupe_reasons(snapshot.get("reasons"), [f"replay_freshness_error:{e}"]),
+            replay_freshness={"ok": False, "error": str(e)},
+            error=str(e),
+            root_cause_code=failure.get("root_cause_code"),
+            failure_scope=failure.get("failure_scope"),
+            failure_type=failure.get("failure_type"),
+            system_state_snapshot=failure.get("system_state_snapshot"),
+        )
 
 
 def api_get_attribution_quality(_parsed, ctx=None):
     snapshot = _build_system_snapshot(_parsed, ctx)
-    health = _normalized_health_from_snapshot(snapshot)
-    attribution_health = dict((health or {}).get("attribution") or {})
-    completeness = _meta_json("attribution_completeness")
-    repair = _meta_json("execution_order_model_identity_repair")
-    historical_repair = _meta_json("trade_attribution_historical_repair")
-    poll_state = _meta_json("execution_poll_and_attrib_last")
+    try:
+        health = _normalized_health_from_snapshot(snapshot)
+        attribution_health = dict((health or {}).get("attribution") or {})
+        completeness = _meta_json("attribution_completeness")
+        repair = _meta_json("execution_order_model_identity_repair")
+        historical_repair = _meta_json("trade_attribution_historical_repair")
+        poll_state = _meta_json("execution_poll_and_attrib_last")
 
-    summary = {
-        "rows": int(completeness.get("rows") or 0),
-        "authoritative_model_present": int(completeness.get("authoritative_model_present") or 0),
-        "authoritative_model_present_ratio": float(completeness.get("authoritative_model_present_ratio") or 0.0),
-        "regime_present_ratio": float(completeness.get("regime_present_ratio") or 0.0),
-        "policy_present_ratio": float(completeness.get("policy_present_ratio") or 0.0),
-        "historical_repair_ok": bool(historical_repair.get("ok")) if historical_repair else None,
-        "recent_identity_repair_scanned": int(repair.get("rows_scanned") or 0),
-        "recent_identity_repair_updated": int(repair.get("rows_updated") or 0),
-        "updated_ts_ms": int(poll_state.get("ts_ms") or historical_repair.get("ts_ms") or 0) or None,
-        "warning_row_count": int(attribution_health.get("warning_row_count") or 0),
-        "max_residual_share": float(attribution_health.get("max_residual_share") or 0.0),
-        "latest_warning_ts_ms": attribution_health.get("latest_warning_ts_ms"),
-        "latest_reconstruction_error": dict(attribution_health.get("latest_reconstruction_error") or {}),
-        "quality_status": str(attribution_health.get("quality_status") or "ok"),
-    }
+        summary = {
+            "rows": int(completeness.get("rows") or 0),
+            "authoritative_model_present": int(completeness.get("authoritative_model_present") or 0),
+            "authoritative_model_present_ratio": float(completeness.get("authoritative_model_present_ratio") or 0.0),
+            "regime_present_ratio": float(completeness.get("regime_present_ratio") or 0.0),
+            "policy_present_ratio": float(completeness.get("policy_present_ratio") or 0.0),
+            "historical_repair_ok": bool(historical_repair.get("ok")) if historical_repair else None,
+            "recent_identity_repair_scanned": int(repair.get("rows_scanned") or 0),
+            "recent_identity_repair_updated": int(repair.get("rows_updated") or 0),
+            "updated_ts_ms": int(poll_state.get("ts_ms") or historical_repair.get("ts_ms") or 0) or None,
+            "warning_row_count": int(attribution_health.get("warning_row_count") or 0),
+            "max_residual_share": float(attribution_health.get("max_residual_share") or 0.0),
+            "latest_warning_ts_ms": attribution_health.get("latest_warning_ts_ms"),
+            "latest_reconstruction_error": dict(attribution_health.get("latest_reconstruction_error") or {}),
+            "quality_status": str(attribution_health.get("quality_status") or "ok"),
+        }
 
-    return _snapshot_response(
-        snapshot,
-        ok=bool(attribution_health.get("ok")),
-        attribution_quality={
-            "summary": summary,
-            "completeness": completeness,
-            "recent_repair": repair,
-            "historical_repair": historical_repair,
-            "health": attribution_health,
-        },
-    )
+        return _snapshot_response(
+            snapshot,
+            ok=bool(attribution_health.get("ok")),
+            attribution_quality={
+                "summary": summary,
+                "completeness": completeness,
+                "recent_repair": repair,
+                "historical_repair": historical_repair,
+                "health": attribution_health,
+            },
+        )
+    except Exception as e:
+        failure = failure_response(
+            log,
+            event="api_system_attribution_quality_failed",
+            code="API_SYSTEM_ATTRIBUTION_QUALITY_FAILED",
+            message=str(e),
+            error=e,
+            component="engine.api.api_system",
+            ctx=ctx,
+            extra={"status": str(snapshot.get("status") or "")},
+        )
+        return _snapshot_response(
+            snapshot,
+            ok=False,
+            status="DEGRADED" if snapshot.get("status") == "RUNNING" else snapshot.get("status"),
+            reasons=_dedupe_reasons(snapshot.get("reasons"), [f"attribution_quality_error:{e}"]),
+            attribution_quality={"ok": False, "error": str(e)},
+            error=str(e),
+            root_cause_code=failure.get("root_cause_code"),
+            failure_scope=failure.get("failure_scope"),
+            failure_type=failure.get("failure_type"),
+            system_state_snapshot=failure.get("system_state_snapshot"),
+        )
 
 
 def api_get_runtime_health(_parsed, ctx=None):
@@ -4251,6 +4323,30 @@ def api_get_monte_carlo_risk(_parsed, ctx=None):
     except Exception as e:
         payload = _failure_out("api_system_monte_carlo_risk_failed", "API_SYSTEM_MONTE_CARLO_RISK_FAILED", e)
         return payload
+
+
+def api_get_risk_var_backtest(parsed=None, ctx=None):
+    """Return read-only VaR/CVaR exception backtesting evidence."""
+
+    del ctx
+    q = _qs(parsed) or {}
+    try:
+        limit = max(1, min(1000, int(q.get("limit", "100") or "100")))
+    except Exception:
+        limit = 100
+    try:
+        from engine.risk.var_backtesting import build_var_backtest_payload
+
+        return build_var_backtest_payload(limit=limit)
+    except Exception as e:
+        return _failure_out(
+            "api_system_risk_var_backtest_failed",
+            "API_SYSTEM_RISK_VAR_BACKTEST_FAILED",
+            e,
+            rows=[],
+            ready=False,
+            status="unavailable",
+        )
 
 
 def api_get_alpha_decay(parsed=None, ctx=None):

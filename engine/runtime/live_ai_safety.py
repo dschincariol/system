@@ -18,6 +18,14 @@ from typing import Any, Mapping, Sequence
 LIVE_BROKERS = {"alpaca", "ibkr", "interactive_brokers"}
 SAFE_BROKERS = {"", "unknown", "sim", "paper", "sandbox", "test", "mock"}
 VALID_UNCERTAINTY_PRODUCTION_POLICIES = {"log_only", "shrink", "strict"}
+VALID_CONFORMAL_RISK_CONTROL_MODES = {"log_only", "size_compress", "suppress", "hard_block"}
+VALID_CONFORMAL_RISK_LOSSES = {
+    "accepted_trade_loss",
+    "var_breach",
+    "drawdown_contribution",
+    "slippage_breach",
+    "size_rule_shortfall",
+}
 
 _TRUTHY_VALUES = {"1", "true", "t", "yes", "y", "on"}
 _FALSEY_VALUES = {"0", "false", "f", "no", "n", "off"}
@@ -258,6 +266,11 @@ def live_uncertainty_threshold_snapshot(
     required = live_ai_required(engine_mode=engine_mode, execution_mode=execution_mode, broker=broker)
     blockers: list[str] = []
     policy = _env_text("UNCERTAINTY_SIZING_PRODUCTION_POLICY").lower()
+    conformal_risk_enabled = _env_truthy("CONFORMAL_RISK_CONTROL_ENABLED", False)
+    conformal_risk_mode = _env_text("CONFORMAL_RISK_CONTROL_MODE").lower() or "log_only"
+    if conformal_risk_mode in {"shrink", "compress"}:
+        conformal_risk_mode = "size_compress"
+    conformal_risk_loss = _env_text("CONFORMAL_RISK_LOSS").lower() or "accepted_trade_loss"
     thresholds: dict[str, dict[str, Any]] = {
         "uncertainty_high": _numeric_env_snapshot(
             ("UNCERTAINTY_HIGH_THRESHOLD",),
@@ -290,6 +303,26 @@ def live_uncertainty_threshold_snapshot(
             invalid_reason="live_ood_threshold_invalid:OOD_HARD_THRESHOLD",
         ),
     }
+    conformal_risk: dict[str, Any] = {
+        "enabled": bool(conformal_risk_enabled),
+        "mode": str(conformal_risk_mode),
+        "loss_definition": str(conformal_risk_loss),
+        "valid_modes": sorted(VALID_CONFORMAL_RISK_CONTROL_MODES),
+        "valid_losses": sorted(VALID_CONFORMAL_RISK_LOSSES),
+        "target_risk": _numeric_env_snapshot(
+            ("CONFORMAL_RISK_TARGET",),
+            minimum=0.0,
+            maximum=0.999,
+            missing_reason="live_conformal_risk_threshold_missing:CONFORMAL_RISK_TARGET",
+            invalid_reason="live_conformal_risk_threshold_invalid:CONFORMAL_RISK_TARGET",
+        ),
+        "min_samples": _numeric_env_snapshot(
+            ("CONFORMAL_RISK_MIN_SAMPLES",),
+            minimum=0.0,
+            missing_reason="live_conformal_risk_threshold_missing:CONFORMAL_RISK_MIN_SAMPLES",
+            invalid_reason="live_conformal_risk_threshold_invalid:CONFORMAL_RISK_MIN_SAMPLES",
+        ),
+    }
 
     if required and policy not in VALID_UNCERTAINTY_PRODUCTION_POLICIES:
         blockers.append("live_uncertainty_production_policy_missing")
@@ -297,6 +330,14 @@ def live_uncertainty_threshold_snapshot(
         for state in thresholds.values():
             if not bool(state.get("ok")):
                 blockers.append(str(state.get("reason") or "live_uncertainty_threshold_invalid"))
+    if required and conformal_risk_enabled:
+        if conformal_risk_mode not in VALID_CONFORMAL_RISK_CONTROL_MODES:
+            blockers.append("live_conformal_risk_mode_invalid")
+        if conformal_risk_loss not in VALID_CONFORMAL_RISK_LOSSES:
+            blockers.append("live_conformal_risk_loss_invalid")
+        for state in (conformal_risk["target_risk"], conformal_risk["min_samples"]):
+            if not bool(dict(state).get("ok")):
+                blockers.append(str(dict(state).get("reason") or "live_conformal_risk_threshold_invalid"))
 
     high = _safe_float(thresholds["uncertainty_high"].get("value"), math.nan)
     hard = _safe_float(thresholds["uncertainty_hard"].get("value"), math.nan)
@@ -321,6 +362,7 @@ def live_uncertainty_threshold_snapshot(
         "production_policy": str(policy),
         "valid_production_policies": sorted(VALID_UNCERTAINTY_PRODUCTION_POLICIES),
         "thresholds": thresholds,
+        "conformal_risk_control": conformal_risk,
     }
 
 
@@ -580,10 +622,18 @@ def live_model_serving_snapshot(
     """Validate live model resolution and artifact readability."""
 
     required = live_ai_required(engine_mode=engine_mode, execution_mode=execution_mode, broker=broker)
+    allow_env_default = _env_truthy("LIVE_ALLOW_ENV_DEFAULT_MODEL", False)
     blockers: list[str] = []
     probes: list[dict[str, Any]] = []
     if not required:
-        return {"ok": True, "required": False, "reason": "not_live", "blockers": [], "probes": []}
+        return {
+            "ok": True,
+            "required": False,
+            "reason": "not_live",
+            "blockers": [],
+            "allow_env_default_model": bool(allow_env_default),
+            "probes": [],
+        }
 
     probe_symbols = [str(sym).upper().strip() for sym in (symbols or _probe_symbols()) if str(sym or "").strip()]
     probe_horizons = [_safe_int(h, 0) for h in (horizons_s or _probe_horizons()) if _safe_int(h, 0) > 0]
@@ -627,6 +677,12 @@ def live_model_serving_snapshot(
             if bool(resolution.get("serve_fallback_active")):
                 blockers.append("live_model_resolution_fallback")
                 probe["ok"] = False
+            env_default_fallback = bool(resolution.get("env_default_fallback"))
+            if env_default_fallback:
+                probe["env_default_fallback"] = True
+                if not allow_env_default:
+                    blockers.append("live_model_no_governed_champion")
+                    probe["ok"] = False
             if not model_name:
                 blockers.append("live_model_resolution_missing")
                 probe["ok"] = False
@@ -651,6 +707,7 @@ def live_model_serving_snapshot(
         "required": True,
         "reason": "ok" if not blockers else blockers[0],
         "blockers": blockers,
+        "allow_env_default_model": bool(allow_env_default),
         "symbols": list(probe_symbols),
         "horizons_s": list(probe_horizons),
         "probes": probes,
@@ -675,6 +732,10 @@ def live_rl_policy_snapshot(
             "RL_POLICY_ENABLED",
             "RL_PORTFOLIO_LIVE_ENABLED",
             "RL_PORTFOLIO_EXECUTION_ENABLED",
+            "RL_OFFLINE_POLICY_LIVE_ENABLED",
+            "RL_OFFLINE_PORTFOLIO_EXECUTION_ENABLED",
+            "RL_OFFLINE_POLICY_CONSUME_LIVE",
+            "RL_OFFLINE_SHADOW_TO_LIVE_ENABLED",
         )
     }
     active = any(_env_truthy(name, False) for name in active_flags)
@@ -699,6 +760,7 @@ def live_rl_policy_snapshot(
         "env": {
             **active_flags,
             "RL_ALLOW_FALLBACK_AGENT": _env_text("RL_ALLOW_FALLBACK_AGENT"),
+            "RL_OFFLINE_MODEL_NAME": _env_text("RL_OFFLINE_MODEL_NAME"),
             "MODEL_NAME": _env_text("MODEL_NAME"),
         },
     }

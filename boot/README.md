@@ -26,9 +26,11 @@ the sidecar-specific layout.
 - Use the shared `--status-ok`, `--status-warn`, `--status-crit`, and
   `--status-info` tokens for pills, dots, issue badges, summaries, and
   degraded/error states.
-- Keep high-impact controls visually distinct: emergency/factory-reset actions
-  use the critical double-border treatment; restart/stop/update actions remain
-  neutral; read/refresh actions stay low-emphasis.
+- Keep high-impact controls visually distinct: Emergency Stop uses a fenced,
+  octagonal, full-size incident control with icon and ARIA consequence label;
+  factory-reset actions use the critical double-border treatment; restart,
+  stop, and update actions remain neutral; read/refresh actions stay
+  low-emphasis.
 - Keep operator-readable degraded/error copy primary. Raw backend payloads,
   stack details, and route diagnostics belong only under explicit
   `Technical details` disclosures.
@@ -97,6 +99,14 @@ bounded timeout. Start waits for bind/health/telemetry only inside
 `OPERATOR_START_REQUEST_TIMEOUT_MS` and returns named top-level failures such as
 `preflight_failed`, `bind_timeout`, `backend_unhealthy`, or `start_timeout`
 instead of a generic request failure.
+
+The sidecar's direct Start and Restart routes are wrapped by the shared
+operator route guard. Filesystem or launcher faults during env/log setup return
+JSON `500 internal_server_error` responses and are logged through
+`logOperatorCatch` without terminating the operator control plane. Process-level
+`unhandledRejection` and `uncaughtException` handlers use the same logging path
+and record the sidecar fault in operator state instead of relying on Node's
+default unhandled-rejection crash behavior.
 
 ## Operator Bridge And Snapshot Auth
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_FILE="${TRADING_ENV_FILE:-/etc/trading-system/trading.env}"
+ENV_FILE="${TRADING_ENV_FILE:-/etc/trading/trading.env}"
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$ENV_FILE"
 fi
 
-TRADING_ROOT="${TRADING_ROOT:-/opt/trading-system}"
-TRADING_REPO="${TRADING_REPO:-$TRADING_ROOT/repo}"
-TRADING_DATA="${TRADING_DATA:-$TRADING_ROOT/data}"
-TRADING_BACKUPS="${TRADING_BACKUPS:-$TRADING_ROOT/backups}"
+TRADING_ROOT="${TRADING_ROOT:-/opt/trading}"
+TRADING_REPO="${TRADING_REPO:-$TRADING_ROOT/app}"
+TRADING_DATA="${TRADING_DATA:-/var/lib/trading}"
+TRADING_BACKUPS="${TRADING_BACKUPS:-/var/backups/trading/legacy-sqlite}"
 DB_PATH="${DB_PATH:-$TRADING_DATA/trading.db}"
 PYTHON_VENV="${PYTHON_VENV:-$TRADING_ROOT/venv}"
 

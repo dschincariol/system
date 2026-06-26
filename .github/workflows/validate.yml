@@ -34,7 +34,7 @@ jobs:
       - name: Install locked Python dev/test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-dev.txt
 
       - name: Run pre-commit safety hooks on changed files
         run: |
@@ -143,7 +143,7 @@ jobs:
       - name: Install locked CPU test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-dev.txt
 
       - name: Run ROCm CPU-fallback and marker-gated tests
         env:
@@ -198,7 +198,7 @@ jobs:
       - name: Install locked Python dev/test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-dev.txt
 
       - name: Run branch coverage gate
         run: python tools/coverage_gate.py run
@@ -245,14 +245,14 @@ jobs:
       - name: Install locked Python dev/test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-dev.txt
 
       - name: Run safety-critical money-path suites without skips
         run: |
           python tools/run_required_backend_tests.py \
             --label safety-critical-money-path \
             --junitxml "$RUNNER_TEMP/pytest-safety-critical-money-path.xml" \
-            --min-selected 130 \
+            --min-selected 136 \
             --expected-source tests/test_kill_switch_regressions.py \
             --expected-source tests/test_broker_router_dry_run_gates.py \
             --expected-source tests/test_broker_order_idempotency_regressions.py \
@@ -261,6 +261,7 @@ jobs:
             --expected-source tests/test_real_capital_safety_e2e.py \
             --expected-source tests/test_position_reconcile_safety.py \
             --expected-source tests/test_live_prelive_reconcile_policy.py \
+            --expected-source tests/test_risk_invariants_property.py \
             -- -q -m "safety_critical" -rs \
               tests/test_kill_switch_regressions.py \
               tests/test_broker_router_dry_run_gates.py \
@@ -269,7 +270,8 @@ jobs:
               tests/test_drawdown_fail_closed.py \
               tests/test_real_capital_safety_e2e.py \
               tests/test_position_reconcile_safety.py \
-              tests/test_live_prelive_reconcile_policy.py
+              tests/test_live_prelive_reconcile_policy.py \
+              tests/test_risk_invariants_property.py
 
       - name: Upload safety-critical JUnit report
         if: always()
@@ -312,6 +314,9 @@ jobs:
       TS_PRODUCTION_BACKEND_TESTS: "1"
       TS_STORAGE_BACKEND: postgres
       TS_PG_DSN: "host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password" # pragma: allowlist secret
+      TS_PGBOUNCER_TEST_DSN: "host=127.0.0.1 port=6432 user=ts_app dbname=trading_ci password=test-app-password" # pragma: allowlist secret
+      TS_PG_DIRECT_TEST_DSN: "host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password" # pragma: allowlist secret
+      TS_PGBOUNCER_ASSERT_POOL_SIZE: "50"
       TS_PG_PASSWORD: test-app-password # pragma: allowlist secret
       TS_PG_SCHEMA_PER_DB_PATH: "1"
       TS_PG_POOL_SIZE: "16"
@@ -348,9 +353,75 @@ jobs:
       - name: Install locked Python dev/test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-dev.txt
 
-      - name: Verify provisioned Postgres and Redis
+      - name: Start PgBouncer for backend integration tests
+        run: |
+          set -euo pipefail
+          PGBOUNCER_IMAGE="edoburu/pgbouncer:v1.25.2-p0"
+
+          mkdir -p "$RUNNER_TEMP/pgbouncer"
+          printf '"ts_app" "%s"\n' "$TS_PG_PASSWORD" > "$RUNNER_TEMP/pgbouncer/userlist.txt"
+          {
+            echo "[databases]"
+            printf 'trading_ci = host=127.0.0.1 port=5432 dbname=trading_ci user=ts_app password=%s\n' "$TS_PG_PASSWORD"
+            echo
+            echo "[pgbouncer]"
+            echo "listen_addr = 127.0.0.1"
+            echo "listen_port = 6432"
+            echo "auth_type = plain"
+            echo "auth_file = /etc/pgbouncer/userlist.txt"
+            echo "pool_mode = transaction"
+            echo "default_pool_size = 50"
+            echo "min_pool_size = 0"
+            echo "reserve_pool_size = 0"
+            echo "max_client_conn = 200"
+            echo "server_idle_timeout = 60"
+            echo "query_wait_timeout = 30"
+            echo "server_reset_query = DISCARD ALL"
+            echo "server_check_query = SELECT 1"
+            echo "server_check_delay = 30"
+            echo "ignore_startup_parameters = extra_float_digits,options"
+            echo "admin_users = ts_app"
+            echo "stats_users = ts_app"
+            echo "pidfile = /tmp/pgbouncer.pid"
+            echo "logfile = /dev/stdout"
+          } > "$RUNNER_TEMP/pgbouncer/pgbouncer.ini"
+
+          docker rm -f trading-ci-pgbouncer >/dev/null 2>&1 || true
+          docker run \
+            --detach \
+            --name trading-ci-pgbouncer \
+            --network host \
+            --volume "$RUNNER_TEMP/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro" \
+            --volume "$RUNNER_TEMP/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro" \
+            "$PGBOUNCER_IMAGE"
+
+          if ! python - <<'PY'
+          import os
+          import time
+
+          import psycopg
+
+          deadline = time.monotonic() + 30
+          last_exc: Exception | None = None
+          while time.monotonic() < deadline:
+              try:
+                  with psycopg.connect(os.environ["TS_PGBOUNCER_TEST_DSN"], connect_timeout=2) as con:
+                      print("pgbouncer_ready=", con.execute("SELECT 1").fetchone()[0])
+                  break
+              except Exception as exc:  # pragma: no cover - CI diagnostic path
+                  last_exc = exc
+                  time.sleep(1)
+          else:
+              raise SystemExit(f"PgBouncer did not become ready: {last_exc!r}")
+          PY
+          then
+            docker logs trading-ci-pgbouncer || true
+            exit 1
+          fi
+
+      - name: Verify provisioned Postgres, PgBouncer, and Redis
         run: |
           python - <<'PY'
           import os
@@ -359,6 +430,9 @@ jobs:
 
           with psycopg.connect(os.environ["TS_PG_DSN"], connect_timeout=5) as con:
               print("postgres_select_1=", con.execute("SELECT 1").fetchone()[0])
+
+          with psycopg.connect(os.environ["TS_PGBOUNCER_TEST_DSN"], connect_timeout=5, prepare_threshold=1) as con:
+              print("pgbouncer_select_1=", con.execute("SELECT 1").fetchone()[0])
 
           client = redis.Redis.from_url(os.environ["TS_REDIS_URL"], socket_connect_timeout=2, socket_timeout=2)
           print("redis_ping=", client.ping())
@@ -401,13 +475,16 @@ jobs:
             --junitxml "$RUNNER_TEMP/pytest-full-postgres-redis.xml" \
             --min-selected 2400 \
             --allow-skip-message-regex "PySR and Julia are required" \
-            --allow-skip-message-regex "TS_PGBOUNCER_TEST_DSN" \
             --allow-skip-message-regex "requires Python 3\\.12 ROCm runtime image" \
             --allow-skip-message-regex "ROCm torch GPU is unavailable" \
             --allow-skip-message-regex "node executable is not available" \
             --allow-skip-message-regex "node is required" \
             --allow-skip-message-regex "dependency-free fallback" \
             -- -q tests/ -rs
+
+      - name: Stop PgBouncer test container
+        if: always()
+        run: docker rm -f trading-ci-pgbouncer >/dev/null 2>&1 || true
 
       - name: Run staging prod-preflight evidence harness
         run: |

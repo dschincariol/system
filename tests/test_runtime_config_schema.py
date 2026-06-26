@@ -20,6 +20,7 @@ LIVE_RISK_THRESHOLDS = {
     "PORTFOLIO_RISK_MC_DRAWDOWN_P95_BLOCK": "0.10",
     "PORTFOLIO_RISK_MC_WORST_DRAWDOWN_BLOCK": "0.16",
     "PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE": "1",
+    "PORTFOLIO_NOTIONAL_BACKSTOP": "1",
     "PORTFOLIO_RISK_VOL_HARD_BLOCK": "0.12",
     "KILL_SWITCH_MODEL_MAX_DRAWDOWN": "5000",
     "KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES": "4",
@@ -41,6 +42,10 @@ LIVE_ENV_CONTRACT = {
     "ALPACA_BASE_URL": "https://api.alpaca.markets",
     "ALPACA_KEY_ID": "alpaca-key",
     "ALPACA_SECRET_KEY": "alpaca-secret",
+    "CPCV_ENABLED": "1",
+    "CHAMPION_PROMOTION_USE_STAT_GATE": "1",
+    "CPCV_EMBARGO_PCT": "0.01",
+    "CPCV_MAX_PBO": "0.5",
 }
 GOOD_BACKUP_EVIDENCE = {
     "ok": True,
@@ -560,6 +565,50 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
         self.assertIn("allow_training=1", notes[0])
         self.assertIn("offline_ack=1", notes[0])
 
+    def test_prod_preflight_runtime_config_gate_surfaces_cpcv_leakage_blocker(self) -> None:
+        db_path = _var_db_path("prod_preflight_live_cpcv_disabled.db")
+        live_env = dict(LIVE_ENV_CONTRACT)
+        live_env.update(
+            {
+                "CPCV_ENABLED": "0",
+                "CHAMPION_PROMOTION_USE_STAT_GATE": "0",
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "ENGINE_MODE": "live",
+                "RUNTIME_WORKLOAD_PROFILE": "live",
+                "DB_PATH": db_path,
+                "ALLOW_TRAINING": "0",
+                **live_env,
+                **LIVE_RISK_THRESHOLDS,
+            },
+            clear=True,
+        ):
+            import engine.runtime.prod_preflight as prod_preflight
+
+            prod_preflight = importlib.reload(prod_preflight)
+            with patch(
+                "engine.runtime.live_trading_preflight.backup_restore_evidence_snapshot",
+                return_value=GOOD_BACKUP_EVIDENCE,
+            ), patch(
+                "engine.runtime.live_trading_preflight.wal_archiver_runtime_snapshot",
+                return_value=GOOD_WAL_ARCHIVER_RUNTIME,
+            ), patch(
+                "engine.runtime.live_trading_preflight.position_reconcile_evidence_snapshot",
+                return_value=GOOD_POSITION_RECONCILE_EVIDENCE,
+            ), patch(
+                "engine.runtime.live_trading_preflight.live_ai_safety_snapshot",
+                return_value=GOOD_LIVE_AI_SAFETY,
+            ):
+                notes, errors = prod_preflight._runtime_config_gate()
+
+        joined_errors = "\n".join(errors)
+        self.assertIn("CPCV/PBO leakage gate invalid", joined_errors)
+        self.assertIn("cpcv_leakage_gate_disabled_in_live", joined_errors)
+        self.assertIn("champion_promotion_stat_gate_disabled_in_live", joined_errors)
+
     def test_prod_preflight_rejects_nvidia_hardware_profile_without_dependency_profile(self) -> None:
         db_path = _var_db_path("prod_preflight_nvidia_profile_mismatch.db")
         with patch.dict(
@@ -879,6 +928,7 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
                 "ALLOW_TRAINING": "0",
                 "DATA_SOURCE_MASTER_KEY": VALID_DATA_SOURCE_MASTER_KEY,
                 **LIVE_RISK_THRESHOLDS,
+                "PORTFOLIO_NOTIONAL_BACKSTOP": "0",
                 "PORTFOLIO_RISK_USE_MONTE_CARLO": "0",
                 "PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE": "0",
                 "PORTFOLIO_RISK_MC_VAR_95_BLOCK": "0",
@@ -893,6 +943,7 @@ class RuntimeConfigSchemaTests(unittest.TestCase):
 
         message = str(ctx.exception)
         self.assertIn("PORTFOLIO_RISK_USE_MONTE_CARLO disabled", message)
+        self.assertIn("PORTFOLIO_NOTIONAL_BACKSTOP disabled", message)
         self.assertIn("PORTFOLIO_RISK_MC_REQUIRED_IN_LIVE disabled", message)
         self.assertIn("PORTFOLIO_RISK_MC_VAR_95_BLOCK must be > 0", message)
         self.assertIn("PORTFOLIO_RISK_MC_CVAR_95_BLOCK placeholder", message)

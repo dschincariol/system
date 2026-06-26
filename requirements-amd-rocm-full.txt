@@ -22,8 +22,10 @@
 # pinned here. The XGBoost pin stays CPU-safe.
 #
 # Build:  python3.12 -m venv .venv-rocm
-#         .venv-rocm/bin/pip install -r requirements-amd-rocm-full.txt
+#         .venv-rocm/bin/pip install --require-hashes -r requirements-amd-rocm-full.txt
 # Prove:  .venv-rocm/bin/python tools/validate_rocm_acceleration.py --require-gpu
+
+-c requirements-amd-rocm.lock.txt
 
 # --- ROCm acceleration stack (deviates from requirements.txt) ---
 torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torch-2.9.1%2Brocm7.2.4.lw.git39497456-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"

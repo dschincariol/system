@@ -22,7 +22,15 @@ LOG = get_logger("engine.data.finbert_sentiment")
 _WARNED_NONFATAL_KEYS: set[str] = set()
 
 USE_FINBERT_SENTIMENT = os.environ.get("USE_FINBERT_SENTIMENT", "0") == "1"
-FINBERT_MODEL_NAME = str(os.environ.get("FINBERT_MODEL_NAME", "ProsusAI/finbert") or "ProsusAI/finbert").strip() or "ProsusAI/finbert"
+FINBERT_MODEL_NAME = (
+    str(
+        os.environ.get("NLP_SENTIMENT_MODEL_NAME")
+        or os.environ.get("FINBERT_MODEL_NAME", "ProsusAI/finbert")
+        or "ProsusAI/finbert"
+    ).strip()
+    or "ProsusAI/finbert"
+)
+FINBERT_FALLBACK_MODEL_NAME = str(os.environ.get("NLP_SENTIMENT_FALLBACK_MODEL_NAME", "ProsusAI/finbert") or "ProsusAI/finbert").strip() or "ProsusAI/finbert"
 FINBERT_BATCH_SIZE = max(1, int(os.environ.get("FINBERT_BATCH_SIZE", "16")))
 FINBERT_MAX_TEXT_LEN = max(64, int(os.environ.get("FINBERT_MAX_TEXT_LEN", "4000")))
 FINBERT_USE_PERSISTED_ENRICHMENT = os.environ.get("FINBERT_USE_PERSISTED_ENRICHMENT", "1") == "1"

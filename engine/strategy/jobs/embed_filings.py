@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from engine.nlp.cache import NlpCache
-from engine.nlp.encoder import SentenceTransformerEncoder
+from engine.nlp.encoder import build_text_embedding_encoder, resolve_text_embedding_config
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import (
@@ -30,7 +30,8 @@ BATCH_SIZE = max(1, int(os.environ.get("NLP_FILINGS_BATCH_SIZE", "128")))
 MAX_PARAGRAPHS_PER_FILING = max(1, int(os.environ.get("NLP_FILINGS_MAX_PARAGRAPHS", "64")))
 FETCH_PRIMARY_DOC = str(os.environ.get("NLP_FILINGS_FETCH_PRIMARY_DOC", "0")).strip().lower() in {"1", "true", "yes", "on"}
 LOCK_STALE_AFTER_S = int(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180"))
-MODEL_NAME = str(os.environ.get("NLP_SENTENCE_MODEL_NAME", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2")
+EMBED_CONFIG = resolve_text_embedding_config(kind="nlp")
+MODEL_NAME = str(EMBED_CONFIG.model_name)
 LOG = get_logger("engine.strategy.jobs.embed_filings")
 logging.basicConfig(level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO))
 
@@ -143,7 +144,7 @@ def run(limit: int | None = None) -> dict[str, Any]:
     if not docs:
         return {"job": JOB_NAME, "paragraphs_seen": 0, "encoded": 0, "cache_hits": 0, "ts_ms": started_ms}
     cache = NlpCache()
-    with SentenceTransformerEncoder(model_name=MODEL_NAME, batch_size=64) as encoder:
+    with build_text_embedding_encoder(EMBED_CONFIG) as encoder:
         result = cache.get_or_encode_embeddings(
             [str(row["text"]) for row in docs],
             encoder,
@@ -154,6 +155,9 @@ def run(limit: int | None = None) -> dict[str, Any]:
     return {
         "job": JOB_NAME,
         "model_name": MODEL_NAME,
+        "model_namespace": EMBED_CONFIG.namespace,
+        "embedding_backend": EMBED_CONFIG.backend,
+        "model_metadata": EMBED_CONFIG.metadata,
         "paragraphs_seen": int(len(docs)),
         "encoded": int(result.encoded),
         "cache_hits": int(result.hits),

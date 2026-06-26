@@ -199,6 +199,25 @@ class BrokerSimOverrideOrderPipelineTests(unittest.TestCase):
         finally:
             con.close()
 
+    def _broker_cash(self, storage) -> float:
+        con = storage.connect(readonly=True)
+        try:
+            account_columns = {str(row[1]) for row in con.execute("PRAGMA table_info(broker_account)").fetchall()}
+            if "id" in account_columns:
+                row = con.execute("SELECT cash FROM broker_account WHERE id=1").fetchone()
+            else:
+                row = con.execute(
+                    """
+                    SELECT cash
+                    FROM broker_account
+                    ORDER BY COALESCE(updated_ts_ms, ts_ms, 0) DESC, ts_ms DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            return float(row[0])
+        finally:
+            con.close()
+
     def test_override_orders_dry_run_preserves_preview_without_writes(self) -> None:
         storage, broker_sim = self._init_runtime()
         now_ms = int(time.time() * 1000)
@@ -343,6 +362,129 @@ class BrokerSimOverrideOrderPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(execution_fills, 1)
         self.assertEqual(tuple(last_applied or ()), ("78",))
         self.assertLess(cash, 100000.0)
+
+    def test_broker_sim_apply_atomic_idempotency(self) -> None:
+        storage, broker_sim = self._init_runtime()
+        now_ms = int(time.time() * 1000)
+        self._seed_price(storage, ts_ms=now_ms)
+
+        con = storage.connect(readonly=True)
+        try:
+            index_names = {str(row[1]) for row in con.execute("PRAGMA index_list(broker_fills)").fetchall()}
+            self.assertIn("uq_broker_fills_src", index_names)
+        finally:
+            con.close()
+        cash_before = self._broker_cash(storage)
+
+        failing_order = {
+            "source_order_id": 8001,
+            "symbol": "AAPL",
+            "to_side": "LONG",
+            "qty": 1.0,
+        }
+        with patch("engine.execution.kill_switch.execution_allowed", return_value=(True, None, None)):
+            with patch.object(broker_sim, "get_execution_liquidity_snapshot", return_value={}):
+                with patch.object(broker_sim, "_earnings_proximity_decay", return_value=0.0):
+                    with patch.object(broker_sim, "_get_factor_feature_asof", return_value=0.0):
+                        with patch.object(broker_sim, "_prime_broker_order_state_after_commit", return_value=None):
+                            with patch.object(broker_sim, "_options_lifecycle_enabled", return_value=False):
+                                with patch.object(broker_sim, "_set_meta", side_effect=RuntimeError("marker write failed")):
+                                    with self.assertRaises(RuntimeError):
+                                        broker_sim.apply_new_portfolio_orders(
+                                            dry_run=False,
+                                            override_orders=[dict(failing_order)],
+                                            override_order_id=9001,
+                                            override_ts_ms=now_ms,
+                                        )
+
+        con = storage.connect(readonly=True)
+        try:
+            self.assertEqual(
+                int(
+                    con.execute(
+                        "SELECT COUNT(*) FROM broker_fills WHERE source_order_id=8001"
+                    ).fetchone()[0]
+                    or 0
+                ),
+                0,
+            )
+            self.assertIsNone(
+                con.execute("SELECT value FROM broker_meta WHERE key='last_portfolio_orders_id'").fetchone()
+            )
+        finally:
+            con.close()
+        self.assertEqual(self._broker_cash(storage), cash_before)
+
+        replay_order = {
+            "source_order_id": 8002,
+            "symbol": "AAPL",
+            "to_side": "LONG",
+            "qty": 1.0,
+        }
+        with patch("engine.execution.kill_switch.execution_allowed", return_value=(True, None, None)):
+            with patch.object(broker_sim, "get_execution_liquidity_snapshot", return_value={}):
+                with patch.object(broker_sim, "_earnings_proximity_decay", return_value=0.0):
+                    with patch.object(broker_sim, "_get_factor_feature_asof", return_value=0.0):
+                        with patch.object(broker_sim, "_prime_broker_order_state_after_commit", return_value=None):
+                            with patch.object(broker_sim, "_options_lifecycle_enabled", return_value=False):
+                                first = broker_sim.apply_new_portfolio_orders(
+                                    dry_run=False,
+                                    override_orders=[dict(replay_order)],
+                                    override_order_id=9002,
+                                    override_ts_ms=now_ms,
+                                )
+
+        self.assertTrue(first.get("ok"), first)
+        self.assertGreaterEqual(int(first.get("fills_written") or 0), 1)
+
+        con = storage.connect()
+        try:
+            fill_count_before = int(
+                con.execute("SELECT COUNT(*) FROM broker_fills WHERE source_order_id=8002").fetchone()[0] or 0
+            )
+            cash_after_first = self._broker_cash(storage)
+            con.execute(
+                """
+                INSERT INTO broker_meta(key, value)
+                VALUES('last_portfolio_orders_id', '0')
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """
+            )
+            con.execute("DELETE FROM execution_order_idempotency")
+            con.commit()
+        finally:
+            con.close()
+
+        with patch("engine.execution.kill_switch.execution_allowed", return_value=(True, None, None)):
+            with patch.object(broker_sim, "get_execution_liquidity_snapshot", return_value={}):
+                with patch.object(broker_sim, "_earnings_proximity_decay", return_value=0.0):
+                    with patch.object(broker_sim, "_get_factor_feature_asof", return_value=0.0):
+                        with patch.object(broker_sim, "_prime_broker_order_state_after_commit", return_value=None):
+                            with patch.object(broker_sim, "_options_lifecycle_enabled", return_value=False):
+                                second = broker_sim.apply_new_portfolio_orders(
+                                    dry_run=False,
+                                    override_orders=[dict(replay_order)],
+                                    override_order_id=9002,
+                                    override_ts_ms=now_ms,
+                                )
+
+        self.assertTrue(second.get("ok"), second)
+        self.assertEqual(str(second.get("status") or ""), "no_changes")
+        self.assertGreaterEqual(int(second.get("fills_deduped") or 0), 1)
+
+        con = storage.connect(readonly=True)
+        try:
+            self.assertEqual(
+                int(con.execute("SELECT COUNT(*) FROM broker_fills WHERE source_order_id=8002").fetchone()[0] or 0),
+                fill_count_before,
+            )
+            self.assertEqual(
+                tuple(con.execute("SELECT value FROM broker_meta WHERE key='last_portfolio_orders_id'").fetchone() or ()),
+                ("9002",),
+            )
+        finally:
+            con.close()
+        self.assertEqual(self._broker_cash(storage), cash_after_first)
 
 
 if __name__ == "__main__":

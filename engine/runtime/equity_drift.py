@@ -366,6 +366,29 @@ def _active_equity_alert_exists(con, *, rule_id: str, severity: str) -> bool:
         return False
 
 
+def _notify_inserted_critical_alert(result: Dict[str, Any], *, rule_id: str) -> Dict[str, Any]:
+    result_dict = dict(result or {})
+    payload = result_dict.get("payload") if isinstance(result_dict.get("payload"), dict) else {}
+    if not bool(result_dict.get("inserted")):
+        return {"ok": True, "skipped": True, "reason": "alert_not_inserted"}
+    if str(payload.get("severity") or "").strip().upper() not in {"CRIT", "CRITICAL"}:
+        return {"ok": True, "skipped": True, "reason": "severity_not_critical"}
+    try:
+        from engine.runtime.alerts_notify import send_runtime_alert_notification
+
+        return dict(
+            send_runtime_alert_notification(
+                dict(payload),
+                actor="system",
+                source="equity_drift",
+            )
+            or {}
+        )
+    except Exception as e:
+        _warn_nonfatal("EQUITY_DRIFT_ALERT_NOTIFY_FAILED", e, rule_id=str(rule_id))
+        return {"ok": False, "delivered": 0, "reason": f"{type(e).__name__}: {e}"}
+
+
 def emit_equity_drift_alerts(*, current_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
         from engine.runtime.alerts import emit_runtime_alert
@@ -433,7 +456,13 @@ def emit_equity_drift_alerts(*, current_row: Optional[Dict[str, Any]] = None) ->
                 ts_ms=int(row.get("ts_ms") or 0),
                 return_details=True,
             )
-            emitted.append({"rule_id": "EQUITY_RECON", **dict(recon or {})})
+            recon_result = dict(recon or {})
+            if severity == "CRIT":
+                recon_result["notification"] = _notify_inserted_critical_alert(
+                    recon_result,
+                    rule_id="EQUITY_RECON",
+                )
+            emitted.append({"rule_id": "EQUITY_RECON", **recon_result})
 
         sustained_severity = _alert_severity_for_level(str(sustained_level or ""))
         if sustained_severity is not None:
@@ -475,7 +504,13 @@ def emit_equity_drift_alerts(*, current_row: Optional[Dict[str, Any]] = None) ->
                     ts_ms=int(row.get("ts_ms") or 0),
                     return_details=True,
                 )
-                emitted.append({"rule_id": "EQUITY_DRIFT_SUSTAINED", **dict(sustained or {})})
+                sustained_result = dict(sustained or {})
+                if sustained_severity == "CRIT":
+                    sustained_result["notification"] = _notify_inserted_critical_alert(
+                        sustained_result,
+                        rule_id="EQUITY_DRIFT_SUSTAINED",
+                    )
+                emitted.append({"rule_id": "EQUITY_DRIFT_SUSTAINED", **sustained_result})
 
         return {"ok": True, "emitted": emitted, "reason": ""}
     except Exception as e:

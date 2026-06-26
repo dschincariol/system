@@ -13,7 +13,7 @@ import logging
 import math
 import os
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -624,6 +624,207 @@ def latest_har_forecast(
     }
 
 
+def _normalize_vol_source(source: Any) -> str:
+    source_key = str(source if source is not None else os.environ.get("VOL_FORECAST_SOURCE", "trailing")).strip().lower().replace("-", "_")
+    aliases = {
+        "": "trailing",
+        "realized": "trailing",
+        "realized_vol": "trailing",
+        "har": "har",
+        "har_rv": "har",
+        "harrv": "har",
+        "garch": "garch",
+        "garch_1_1": "garch",
+        "garch11": "garch",
+        "egarch": "egarch",
+        "gjr": "gjr_garch",
+        "gjr_garch": "gjr_garch",
+        "blend": "blend",
+    }
+    return aliases.get(source_key, source_key)
+
+
+def _parse_blend_weights(raw: Any | None) -> tuple[dict[str, float], str]:
+    if isinstance(raw, Mapping):
+        weights = {str(k).strip().lower().replace("-", "_"): float(v) for k, v in raw.items()}
+        return weights, "argument"
+    text = str(raw if raw is not None else os.environ.get("VOL_FORECAST_BLEND_WEIGHTS", "")).strip()
+    if not text:
+        return {"trailing": 0.34, "har": 0.33, "garch": 0.33}, "default"
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, Mapping):
+            return {str(k).strip().lower().replace("-", "_"): float(v) for k, v in parsed.items()}, "env_json"
+    except Exception:
+        pass  # no-op-guard: allow - fall back to comma-separated blend weights
+    weights: dict[str, float] = {}
+    for part in text.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" in item:
+            key, value = item.split("=", 1)
+        elif ":" in item:
+            key, value = item.split(":", 1)
+        else:
+            continue
+        try:
+            weights[str(key).strip().lower().replace("-", "_")] = float(value)
+        except Exception:
+            continue
+    return weights, "env"
+
+
+def _trailing_resolved(symbol: str, *, ts_ms: int | None, trailing_lookback: int, reason: str | None = None) -> dict[str, Any]:
+    return {
+        "symbol": str(symbol).upper().strip(),
+        "ts_ms": int(ts_ms or 0),
+        "vol": None,
+        "forecast_vol_1d": None,
+        "forecast_rv_1d": None,
+        "forecast_ratio": 1.0,
+        "source": "trailing",
+        "resolved_source": "trailing",
+        "fallback": True,
+        "diagnostics": ({"fallback_reason": str(reason)} if reason else {}),
+    }
+
+
+def _resolve_trailing_vol(con, symbol: str, *, ts_ms: int | None, trailing_lookback: int, reason: str | None = None) -> dict[str, Any]:
+    vol = _trailing_fallback_vol(con, str(symbol), lookback=int(trailing_lookback))
+    out = _trailing_resolved(symbol, ts_ms=ts_ms, trailing_lookback=int(trailing_lookback), reason=reason)
+    out["vol"] = None if vol is None else float(vol)
+    out["forecast_vol_1d"] = None if vol is None else float(vol)
+    out["forecast_rv_1d"] = None if vol is None else float(vol) * float(vol)
+    return out
+
+
+def _resolve_har_vol(con, symbol: str, *, ts_ms: int | None) -> dict[str, Any] | None:
+    row = latest_har_forecast(con, symbol, ts_ms=ts_ms)
+    if row and float(row.get("forecast_vol_1d") or 0.0) > 0.0:
+        out = dict(row)
+        out["vol"] = float(row["forecast_vol_1d"])
+        out["source"] = "har_rv"
+        out["resolved_source"] = "har" if not bool(row.get("fallback")) else "trailing_fallback"
+        return out
+    return None
+
+
+def _resolve_garch_vol(con, symbol: str, *, ts_ms: int | None, model_type: str = "garch") -> dict[str, Any] | None:
+    try:
+        from engine.strategy.garch_vol import latest_garch_forecast
+
+        row = latest_garch_forecast(con, symbol, ts_ms=ts_ms, model_type=str(model_type))
+    except Exception:
+        return None
+    if row and float(row.get("forecast_vol_1d") or 0.0) > 0.0:
+        out = dict(row)
+        out["vol"] = float(row["forecast_vol_1d"])
+        out["source"] = "garch"
+        out["resolved_source"] = str(row.get("model_type") or model_type)
+        return out
+    return None
+
+
+def _resolve_blend_vol(
+    con,
+    symbol: str,
+    *,
+    ts_ms: int | None,
+    trailing_lookback: int,
+    blend_weights: Any | None,
+) -> dict[str, Any]:
+    weights, weights_source = _parse_blend_weights(blend_weights)
+    components: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, str] = {}
+    weighted_rv = 0.0
+    total_weight = 0.0
+    trailing_vol: float | None = None
+    for raw_source, raw_weight in weights.items():
+        source_key = _normalize_vol_source(raw_source)
+        if source_key == "blend":
+            skipped[str(raw_source)] = "recursive_blend_component"
+            continue
+        try:
+            weight = float(raw_weight)
+        except Exception:
+            skipped[str(raw_source)] = "invalid_weight"
+            continue
+        if not math.isfinite(weight) or weight <= 0.0:
+            skipped[str(raw_source)] = "non_positive_weight"
+            continue
+        resolved = resolve_vol_forecast(
+            con,
+            symbol,
+            ts_ms=ts_ms,
+            source=source_key,
+            trailing_lookback=int(trailing_lookback),
+        )
+        vol = _safe_float(resolved.get("forecast_vol_1d") if resolved.get("forecast_vol_1d") is not None else resolved.get("vol"), None)
+        rv = _safe_float(resolved.get("forecast_rv_1d"), None)
+        if rv is None and vol is not None:
+            rv = float(vol) * float(vol)
+        if rv is None or rv <= 0.0:
+            skipped[str(raw_source)] = "missing_forecast"
+            continue
+        if source_key == "trailing" and vol is not None:
+            trailing_vol = float(vol)
+        weighted_rv += float(weight) * float(rv)
+        total_weight += float(weight)
+        components[source_key] = {
+            "input_weight": float(weight),
+            "forecast_rv_1d": float(rv),
+            "forecast_vol_1d": (None if vol is None else float(vol)),
+            "resolved_source": str(resolved.get("resolved_source") or resolved.get("source") or source_key),
+            "forecast_ts_ms": resolved.get("ts_ms"),
+            "fallback": bool(resolved.get("fallback", False)),
+        }
+    if total_weight <= 0.0:
+        out = _resolve_trailing_vol(
+            con,
+            symbol,
+            ts_ms=ts_ms,
+            trailing_lookback=int(trailing_lookback),
+            reason="blend_components_unavailable",
+        )
+        out["diagnostics"] = {
+            "fallback_reason": "blend_components_unavailable",
+            "blend_weights": dict(weights),
+            "weights_source": str(weights_source),
+            "skipped": dict(skipped),
+        }
+        return out
+    forecast_rv = max(1.0e-12, float(weighted_rv / total_weight))
+    forecast_vol = math.sqrt(float(forecast_rv))
+    if trailing_vol is None:
+        trailing_vol = _trailing_fallback_vol(con, str(symbol), lookback=int(trailing_lookback))
+    ratio_base = max(1.0e-12, float(trailing_vol or forecast_vol))
+    normalized_weights = {
+        str(source): float(component["input_weight"]) / float(total_weight)
+        for source, component in components.items()
+    }
+    return {
+        "symbol": str(symbol).upper().strip(),
+        "ts_ms": int(ts_ms or 0),
+        "vol": float(forecast_vol),
+        "forecast_vol_1d": float(forecast_vol),
+        "forecast_rv_1d": float(forecast_rv),
+        "forecast_ann_vol": float(forecast_vol * math.sqrt(TRADING_DAYS_PER_YEAR)),
+        "forecast_ratio": float(forecast_vol / ratio_base),
+        "source": "blend",
+        "resolved_source": "blend",
+        "fallback": False,
+        "diagnostics": {
+            "blend_space": "variance",
+            "blend_weights": dict(weights),
+            "normalized_weights": normalized_weights,
+            "weights_source": str(weights_source),
+            "components": components,
+            "skipped": skipped,
+        },
+    }
+
+
 def resolve_vol_forecast(
     con,
     symbol: str,
@@ -631,27 +832,28 @@ def resolve_vol_forecast(
     ts_ms: int | None = None,
     source: str | None = None,
     trailing_lookback: int = 240,
+    blend_weights: Any | None = None,
 ) -> dict[str, Any]:
-    source_key = str(source if source is not None else os.environ.get("VOL_FORECAST_SOURCE", "trailing")).strip().lower()
+    source_key = _normalize_vol_source(source)
     if source_key == "har":
-        row = latest_har_forecast(con, symbol, ts_ms=ts_ms)
-        if row and float(row.get("forecast_vol_1d") or 0.0) > 0.0:
-            out = dict(row)
-            out["vol"] = float(row["forecast_vol_1d"])
-            out["resolved_source"] = "har" if not bool(row.get("fallback")) else "trailing_fallback"
-            return out
-    vol = _trailing_fallback_vol(con, str(symbol), lookback=int(trailing_lookback))
-    return {
-        "symbol": str(symbol).upper().strip(),
-        "ts_ms": int(ts_ms or 0),
-        "vol": None if vol is None else float(vol),
-        "forecast_vol_1d": None if vol is None else float(vol),
-        "forecast_rv_1d": None if vol is None else float(vol) * float(vol),
-        "forecast_ratio": 1.0,
-        "source": "trailing",
-        "resolved_source": "trailing",
-        "fallback": True,
-    }
+        row = _resolve_har_vol(con, symbol, ts_ms=ts_ms)
+        if row:
+            return row
+        return _resolve_trailing_vol(con, symbol, ts_ms=ts_ms, trailing_lookback=int(trailing_lookback), reason="har_forecast_unavailable")
+    if source_key in {"garch", "egarch", "gjr_garch"}:
+        row = _resolve_garch_vol(con, symbol, ts_ms=ts_ms, model_type=source_key)
+        if row:
+            return row
+        return _resolve_trailing_vol(con, symbol, ts_ms=ts_ms, trailing_lookback=int(trailing_lookback), reason="garch_forecast_unavailable")
+    if source_key == "blend":
+        return _resolve_blend_vol(
+            con,
+            symbol,
+            ts_ms=ts_ms,
+            trailing_lookback=int(trailing_lookback),
+            blend_weights=blend_weights,
+        )
+    return _resolve_trailing_vol(con, symbol, ts_ms=ts_ms, trailing_lookback=int(trailing_lookback))
 
 
 def har_feature_values(con, symbol: str, ts_ms: int) -> dict[str, float]:

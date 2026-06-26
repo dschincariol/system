@@ -89,5 +89,21 @@
     "prediction_enabled": false,
     "experimental": true,
     "enabled": false
+  },
+  {
+    "family": "tabular_foundation_challenger",
+    "instance_name": "medium_meta_label_shadow",
+    "horizon": "medium",
+    "feature_groups": ["base", "macro", "options", "stress"],
+    "symbol_universe": ["*"],
+    "risk_profile": "balanced",
+    "training_window_days": 240,
+    "model_kind": "tabular_foundation",
+    "backend": "fake",
+    "task": "regression",
+    "fallback_policy": "fail_closed",
+    "prediction_enabled": false,
+    "experimental": true,
+    "enabled": false
   }
 ]

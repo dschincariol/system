@@ -27,6 +27,7 @@ DEFAULT_ALPHA_SHRINKAGE_STALE_MS = 24 * 60 * 60 * 1000
 DEFAULT_PRODUCTION_MONITORING_STALE_MS = 24 * 60 * 60 * 1000
 DEFAULT_SHADOW_CAPITAL_STALE_MS = 24 * 60 * 60 * 1000
 DEFAULT_EXPERIMENT_LEDGER_STALE_MS = 90 * 24 * 60 * 60 * 1000
+DEFAULT_RISK_VAR_BACKTEST_STALE_MS = 14 * 24 * 60 * 60 * 1000
 
 PASS_DECISIONS = frozenset({"pass", "passed", "accepted", "approved", "promote", "promoted"})
 SENSITIVE_COMPONENT_KEYS = frozenset(
@@ -935,6 +936,98 @@ def _overall_state(items: Sequence[Mapping[str, Any]]) -> str:
     return "unknown"
 
 
+def _risk_var_backtest_evidence(con: Any, *, now_ms: int, limit: int) -> EvidenceItem:
+    stale_after_ms = _env_int("RISK_VAR_BACKTEST_EVIDENCE_STALE_MS", DEFAULT_RISK_VAR_BACKTEST_STALE_MS)
+    if not _table_exists(con, "risk_var_backtest_results"):
+        return EvidenceItem(
+            key="risk_var_backtesting",
+            label="VaR/CVaR Backtesting",
+            state="unknown",
+            freshness="missing",
+            sample_count=0,
+            last_update_ts_ms=0,
+            source_artifact="risk_var_backtest_results",
+            remediation="Run migrations and schedule risk_var_backtest after Monte Carlo forecasts and realized equity history exist.",
+            details={"source_route": "/api/risk/var_backtest", "reason": "table_missing"},
+        )
+
+    try:
+        rows = con.execute(
+            """
+            SELECT forecast_ts_ms, confidence_level, exception, kupiec_pof_status,
+                   christoffersen_ind_status, rolling_exception_rate, traffic_light_status,
+                   traffic_light_reason, created_ts_ms
+            FROM risk_var_backtest_results
+            ORDER BY forecast_ts_ms DESC, confidence_level DESC, id DESC
+            LIMIT ?
+            """,
+            (max(1, min(500, int(limit or 20))),),
+        ).fetchall()
+    except Exception as exc:
+        _warn_nonfatal("GOVERNANCE_EVIDENCE_RISK_VAR_BACKTEST_FAILED", exc, once_key="risk_var_backtest")
+        return EvidenceItem(
+            key="risk_var_backtesting",
+            label="VaR/CVaR Backtesting",
+            state="unknown",
+            freshness="missing",
+            sample_count=0,
+            last_update_ts_ms=0,
+            source_artifact="risk_var_backtest_results",
+            remediation="Inspect risk_var_backtest_results readability and rerun the risk_var_backtest job.",
+            details={"source_route": "/api/risk/var_backtest", "reason": f"query_failed:{type(exc).__name__}"},
+        )
+
+    sample_count = len(rows or [])
+    if sample_count <= 0:
+        return EvidenceItem(
+            key="risk_var_backtesting",
+            label="VaR/CVaR Backtesting",
+            state="unknown",
+            freshness="missing",
+            sample_count=0,
+            last_update_ts_ms=0,
+            source_artifact="risk_var_backtest_results",
+            remediation="Allow forecasts to mature, ensure equity_history is populated, then run risk_var_backtest.",
+            details={"source_route": "/api/risk/var_backtest", "reason": "no_backtest_rows"},
+        )
+
+    latest_ts_ms = max(_safe_int(row[8], 0) or _safe_int(row[0], 0) for row in rows)
+    freshness = _freshness(latest_ts_ms, now_ms=now_ms, stale_after_ms=stale_after_ms)
+    failing = [
+        row
+        for row in rows
+        if str(row[6] or "").strip().lower() == "red"
+        or str(row[3] or "").strip().lower() == "fail"
+        or str(row[4] or "").strip().lower() == "fail"
+    ]
+    if freshness == "stale":
+        state = "block"
+    elif failing:
+        state = "block"
+    else:
+        state = "pass"
+    return EvidenceItem(
+        key="risk_var_backtesting",
+        label="VaR/CVaR Backtesting",
+        state=state,
+        freshness=freshness,
+        sample_count=sample_count,
+        last_update_ts_ms=latest_ts_ms,
+        source_artifact="risk_var_backtest_results",
+        remediation=(
+            "Review VaR model calibration, simulation method, and realized exception clustering before relying on live tail-risk forecasts."
+            if state == "block"
+            else "Continue scheduled risk_var_backtest evidence refreshes."
+        ),
+        details={
+            "source_route": "/api/risk/var_backtest",
+            "failing_count": int(len(failing)),
+            "latest_traffic_light": str(rows[0][6] or ""),
+            "latest_exception_rate": _safe_float(rows[0][5]),
+        },
+    )
+
+
 def build_governance_evidence_summary(
     *,
     limit: int = 20,
@@ -955,6 +1048,7 @@ def build_governance_evidence_summary(
         labels_item = _net_after_cost_evidence(con, now_ms=ts_ms)
         learned_item = _learned_alpha_evidence(con, now_ms=ts_ms)
         shrinkage_item = _alpha_shrinkage_evidence(con, now_ms=ts_ms)
+        risk_var_item = _risk_var_backtest_evidence(con, now_ms=ts_ms, limit=limit)
         monitoring_item, shadow_live_item, monitoring_payload = _production_monitoring_evidence(now_ms=ts_ms)
         shadow_capital_item, shadow_capital_payload = _shadow_capital_evidence(
             con,
@@ -969,6 +1063,7 @@ def build_governance_evidence_summary(
             labels_item.to_dict(),
             learned_item.to_dict(),
             shrinkage_item.to_dict(),
+            risk_var_item.to_dict(),
             monitoring_item.to_dict(),
             shadow_live_item.to_dict(),
             shadow_capital_item.to_dict(),

@@ -77,10 +77,10 @@
     ]
   },
   "summary": {
-    "error_count": 29,
+    "error_count": 23,
     "warning_count": 0,
     "information_count": 0,
-    "diagnostic_count": 29
+    "diagnostic_count": 23
   },
   "diagnostics": [
     {
@@ -199,7 +199,7 @@
       "file": "engine/execution/kill_switch.py",
       "severity": "error",
       "rule": "reportArgumentType",
-      "line": 2325,
+      "line": 2336,
       "character": 29,
       "message": "Argument of type \"dict[Unknown, Unknown]\" cannot be assigned to parameter \"value\" of type \"str\" in function \"__setitem__\"\n  \"dict[Unknown, Unknown]\" is not assignable to \"str\""
     },
@@ -207,7 +207,7 @@
       "file": "engine/execution/kill_switch.py",
       "severity": "error",
       "rule": "reportArgumentType",
-      "line": 2554,
+      "line": 2565,
       "character": 13,
       "message": "Argument of type \"dict[str, Any]\" cannot be assigned to parameter \"value\" of type \"list[Any]\" in function \"__setitem__\"\n  \"dict[str, Any]\" is not assignable to \"list[Any]\""
     },
@@ -244,22 +244,6 @@
       "message": "Argument of type \"dict[str, str | float]\" cannot be assigned to parameter \"object\" of type \"Dict[str, float]\" in function \"append\"\n  \"str\" is not assignable to \"float\"\n  Type \"Literal['broker_orphan', 'expected_orphan', 'quantity_mismatch']\" is not assignable to type \"float\"\n    \"Literal['broker_orphan']\" is not assignable to \"float\""
     },
     {
-      "file": "engine/risk/monte_carlo_risk_engine.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 119,
-      "character": 27,
-      "message": "Argument of type \"dict[str, str | float | int]\" cannot be assigned to parameter \"object\" of type \"Dict[str, float]\" in function \"append\"\n  \"str\" is not assignable to \"float\""
-    },
-    {
-      "file": "engine/risk/monte_carlo_risk_engine.py",
-      "severity": "error",
-      "rule": "reportReturnType",
-      "line": 95,
-      "character": 27,
-      "message": "Type \"list[dict[str, str | float | int]]\" is not assignable to return type \"List[Dict[str, float]]\"\n  \"str\" is not assignable to \"float\""
-    },
-    {
       "file": "engine/strategy/champion_manager.py",
       "severity": "error",
       "rule": "reportGeneralTypeIssues",
@@ -282,38 +266,6 @@
       "line": 1318,
       "character": 66,
       "message": "\"get\" is not a known attribute of \"None\""
-    },
-    {
-      "file": "engine/strategy/portfolio.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 1341,
-      "character": 43,
-      "message": "Argument of type \"float | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToFloat\" in function \"__new__\"\n  Type \"float | None\" is not assignable to type \"ConvertibleToFloat\"\n    Type \"None\" is not assignable to type \"ConvertibleToFloat\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsFloat\"\n        \"__float__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
-    },
-    {
-      "file": "engine/strategy/portfolio.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 1341,
-      "character": 43,
-      "message": "Argument of type \"float | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToFloat\" in function \"__new__\"\n  Type \"float | None\" is not assignable to type \"ConvertibleToFloat\"\n    Type \"None\" is not assignable to type \"ConvertibleToFloat\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsFloat\"\n        \"__float__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
-    },
-    {
-      "file": "engine/strategy/portfolio.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 6053,
-      "character": 42,
-      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\""
-    },
-    {
-      "file": "engine/strategy/portfolio.py",
-      "severity": "error",
-      "rule": "reportArgumentType",
-      "line": 6053,
-      "character": 42,
-      "message": "Argument of type \"Any | None\" cannot be assigned to parameter \"x\" of type \"ConvertibleToInt\" in function \"__new__\"\n  Type \"Any | None\" is not assignable to type \"ConvertibleToInt\"\n    Type \"None\" is not assignable to type \"ConvertibleToInt\"\n      \"None\" is not assignable to \"str\"\n      \"None\" is incompatible with protocol \"Buffer\"\n        \"__buffer__\" is not present\n      \"None\" is incompatible with protocol \"SupportsInt\"\n        \"__int__\" is not present\n      \"None\" is incompatible with protocol \"SupportsIndex\"\n  ..."
     }
   ]
 }

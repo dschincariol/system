@@ -65,6 +65,9 @@ from engine.strategy.models.lgbm_ranker import (
 from engine.strategy.models.itransformer import load_model_from_artifact as load_itransformer_model_from_artifact
 from engine.strategy.models.lgbm_regressor import load_model_from_artifact as load_lgbm_model_from_artifact
 from engine.strategy.models.patchtst import load_model_from_artifact as load_patchtst_model_from_artifact
+from engine.strategy.models.tabular_challenger import (
+    load_model_from_artifact as load_tabular_challenger_model_from_artifact,
+)
 from engine.strategy.models.xgb_regressor import load_model_from_artifact as load_xgb_model_from_artifact
 from engine.strategy.feature_expansion import build_feature_vector, feature_set_tag
 from engine.strategy.feature_registry import (
@@ -479,6 +482,7 @@ def _live_model_resolution(symbol: Optional[str] = None, horizon_s: Optional[int
     if not resolution_source:
         resolution_source = "env_default" if resolved_model_name == str(MODEL_NAME) else "registry"
 
+    env_default_fallback = bool(resolution_source == "env_default")
     fallback_reason = ""
     serve_fallback_active = bool(
         requested_model_name
@@ -491,6 +495,8 @@ def _live_model_resolution(symbol: Optional[str] = None, horizon_s: Optional[int
             if resolution_source
             else "live_model_resolution_fallback"
         )
+    if env_default_fallback and not serve_fallback_active:
+        fallback_reason = "no_governed_champion_env_default"
 
     return {
         "requested_model_name": str(requested_model_name),
@@ -498,6 +504,7 @@ def _live_model_resolution(symbol: Optional[str] = None, horizon_s: Optional[int
         "requested_model_family": str(_model_family(requested_model_name)),
         "resolution_source": str(resolution_source or "env_default"),
         "candidate_names": list(candidate_names),
+        "env_default_fallback": bool(env_default_fallback),
         "serve_fallback_active": bool(serve_fallback_active),
         "fallback_reason": str(fallback_reason),
     }
@@ -512,6 +519,8 @@ def _model_family(model_name: str) -> str:
     name = str(model_name or "").strip().lower()
     if name == "lgbm_regressor" or name.startswith("lgbm_regressor"):
         return "lgbm_regressor"
+    if name == "tabular_foundation_challenger" or name.startswith("tabular_foundation_challenger"):
+        return "tabular_foundation_challenger"
     if name == "lgbm_ranker" or name.startswith("lgbm_ranker"):
         return "lgbm_ranker"
     if name == "xgb_regressor" or name.startswith("xgb_regressor"):
@@ -1472,6 +1481,38 @@ def _predict_via_xgb_adapter(
     )
 
 
+def _predict_via_tabular_challenger_adapter(
+    query_vec: np.ndarray,
+    sym: str,
+    h: int,
+    *,
+    event: Optional[Dict] = None,
+    active_model_name: str,
+    active_model_version: str,
+    active_family: str,
+    feature_ids: List[str],
+    knn_z: float,
+    wsum: float,
+    knn_ex: Dict[str, Any],
+    regime_at_trade: str,
+) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+    del query_vec, active_model_version
+    return _predict_via_tabular_artifact_adapter(
+        "tabular_foundation_challenger",
+        load_tabular_challenger_model_from_artifact,
+        sym,
+        int(h),
+        event=event,
+        active_model_name=active_model_name,
+        active_family=active_family,
+        feature_ids=feature_ids,
+        knn_z=knn_z,
+        wsum=wsum,
+        knn_ex=knn_ex,
+        regime_at_trade=regime_at_trade,
+    )
+
+
 def _predict_via_patchtst_adapter(
     query_vec: np.ndarray,
     sym: str,
@@ -1494,6 +1535,7 @@ def _predict_via_patchtst_adapter(
     event_payload = dict(event or {})
     if not event_payload:
         event_payload = {"ts_ms": int(time.time() * 1000), "title": "", "body": "", "source": ""}
+    prediction_payload: Dict[str, Any] = {}
     try:
         model = load_patchtst_model_from_artifact(
             alias=str(location.get("alias") or ""),
@@ -1509,8 +1551,12 @@ def _predict_via_patchtst_adapter(
         vector = np.asarray([float(dict(feature_map or {}).get(fid, 0.0) or 0.0) for fid in model_feature_ids], dtype=np.float32)
         seq_len = int(getattr(model, "seq_len", 1) or 1)
         X = np.repeat(vector.reshape(1, 1, -1), seq_len, axis=1)
-        horizon_pred = np.asarray(model.predict(X), dtype=np.float32).reshape(-1)
-        pred_z = float(horizon_pred[0]) if horizon_pred.size else 0.0
+        if hasattr(model, "predict_with_uncertainty") and callable(getattr(model, "predict_with_uncertainty")):
+            prediction_payload = dict(model.predict_with_uncertainty(X) or {})
+            pred_z = float(prediction_payload.get("prediction") or 0.0)
+        else:
+            horizon_pred = np.asarray(model.predict(X), dtype=np.float32).reshape(-1)
+            pred_z = float(horizon_pred[0]) if horizon_pred.size else 0.0
     except Exception as e:
         _warn_nonfatal(
             "predictor_patchtst_predict_failed",
@@ -1541,12 +1587,26 @@ def _predict_via_patchtst_adapter(
         "model_n": int(n_support),
         "training_metrics": dict(metrics),
         "artifact_alias": str(location.get("alias") or ""),
+        "epistemic_uncertainty": float(prediction_payload.get("epistemic_uncertainty") or 0.0),
+        "uncertainty_ts_ms": int(prediction_payload.get("uncertainty_ts_ms") or int(time.time() * 1000)),
+        "uncertainty_detail": dict(prediction_payload.get("uncertainty_detail") or {"method": "deterministic"}),
         "fallback_knn": {
             "knn_z": float(knn_z),
             "weight_sum": float(wsum),
             "knn": knn_ex,
         },
     }
+    for key in (
+        "prediction_lower",
+        "prediction_median",
+        "prediction_upper",
+        "quantile_forecast",
+        "quantile_forecasts",
+        "prediction_quantiles",
+        "forecast_quantiles",
+    ):
+        if key in prediction_payload:
+            explain[key] = prediction_payload.get(key)
     explain = _attach_ood_diagnostics(
         explain,
         model,
@@ -1644,6 +1704,17 @@ def _predict_via_itransformer_adapter(
             "knn": knn_ex,
         },
     }
+    for key in (
+        "prediction_lower",
+        "prediction_median",
+        "prediction_upper",
+        "quantile_forecast",
+        "quantile_forecasts",
+        "prediction_quantiles",
+        "forecast_quantiles",
+    ):
+        if key in prediction_payload:
+            explain[key] = prediction_payload.get(key)
     explain = _attach_ood_diagnostics(
         explain,
         model,
@@ -1807,6 +1878,7 @@ _MODEL_ADAPTERS: Dict[str, Callable[..., Optional[Tuple[float, float, Dict[str, 
     "lgbm_regressor": _predict_via_lgbm_adapter,
     "lgbm_ranker": _predict_via_lgbm_ranker_adapter,
     "xgb_regressor": _predict_via_xgb_adapter,
+    "tabular_foundation_challenger": _predict_via_tabular_challenger_adapter,
     "patchtst": _predict_via_patchtst_adapter,
     "itransformer": _predict_via_itransformer_adapter,
     "embed_regressor": _predict_via_embed_adapter,

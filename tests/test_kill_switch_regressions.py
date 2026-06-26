@@ -79,6 +79,25 @@ class RulesManagedConnection(ManagedConnection):
         self._con.close()
 
 
+def test_blank_numeric_kill_switch_env_values_import_as_unset(monkeypatch):
+    for key in (
+        "KILL_SWITCH_MAX_PRICE_STALE_S",
+        "KILL_SWITCH_DAILY_DRAWDOWN_PCT",
+        "KILL_SWITCH_VAR_EQUITY_MIN_POINTS",
+        "KILL_SWITCH_MODEL_MAX_DRAWDOWN",
+        "KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES",
+    ):
+        monkeypatch.setenv(key, "")
+
+    kill_switch = importlib.reload(importlib.import_module("engine.execution.kill_switch"))
+
+    assert kill_switch.MAX_PRICE_STALE_S == 300
+    assert kill_switch.KILL_SWITCH_DAILY_DRAWDOWN_PCT == 0.05
+    assert kill_switch.KILL_SWITCH_VAR_EQUITY_MIN_POINTS == 31
+    assert kill_switch.KILL_SWITCH_MODEL_MAX_DRAWDOWN == 0.0
+    assert kill_switch.KILL_SWITCH_MODEL_MAX_CONSECUTIVE_LOSSES == 0
+
+
 class _DrawdownState:
     def __init__(self, *, ok: bool = True, drawdown: float = 0.0, reason_code: str = "ok") -> None:
         self.ok = bool(ok)

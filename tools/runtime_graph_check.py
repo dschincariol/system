@@ -326,7 +326,12 @@ def _check_import(name: str, errors: List[Tuple[str, str, str]]) -> None:
 
 def _check_python_file(label: str, file_path: str, errors: List[Tuple[str, str, str]]) -> None:
     try:
-        py_compile.compile(file_path, doraise=True)
+        with tempfile.TemporaryDirectory(prefix="runtime_graph_pycompile_") as compile_dir:
+            py_compile.compile(
+                file_path,
+                cfile=str(Path(compile_dir) / "entrypoint.pyc"),
+                doraise=True,
+            )
         print("OK  ", label)
     except Exception as e:
         _record_error(errors, label, e, traceback.format_exc())

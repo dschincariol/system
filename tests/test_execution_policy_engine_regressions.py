@@ -204,6 +204,113 @@ class ExecutionPolicyEngineRegressionTests(unittest.TestCase):
         policy = json.loads(str(audit_row[0] or "{}"))
         self.assertEqual(int(policy.get("slices") or 0), 7)
 
+    def test_none_trade_suppression_live_defaults_to_soft_throttle_and_warns(self) -> None:
+        now_ms = 1_710_000_000_000
+        order = {
+            "symbol": "TEST",
+            "qty": 10.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "source_order_id": 401,
+        }
+        warnings: list[tuple[str, Exception, dict]] = []
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EXECUTION_NONE_SUPPRESSION_SOFT_MULT", None)
+            with self._patch_policy_dependencies():
+                with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                    with patch.object(
+                        self.execution_policy_engine,
+                        "live_ai_order_guard",
+                        return_value={"ok": True, "required": False, "reason": "test"},
+                    ):
+                        with patch.object(
+                            self.execution_policy_engine,
+                            "uncertainty_gate_from_payload",
+                            return_value={
+                                "enabled": True,
+                                "applied": False,
+                                "hard_block": False,
+                                "action": "NONE",
+                                "multiplier": 1.0,
+                                "reason": "",
+                            },
+                        ):
+                            with patch.object(
+                                self.execution_policy_engine,
+                                "_warn_nonfatal",
+                                side_effect=lambda code, error, **kwargs: warnings.append((str(code), error, dict(kwargs))),
+                            ):
+                                shaped = self.execution_policy_engine.apply_execution_policy(
+                                    [order],
+                                    con=self.con,
+                                    actor="test",
+                                    mode="live",
+                                    broker="sim",
+                                    trade_suppression_fn=lambda **_kwargs: None,
+                                )
+
+        self.assertTrue(shaped)
+        self.assertTrue(all(str(row.get("tse_state") or "") == "SOFT_THROTTLE" for row in shaped))
+        self.assertTrue(all(str(row.get("tse_action") or "") == "SOFT_THROTTLE" for row in shaped))
+        self.assertTrue(all(abs(float(row.get("tse_size_mult") or 0.0) - 0.5) <= 1.0e-12 for row in shaped))
+        self.assertAlmostEqual(sum(float(row.get("qty") or 0.0) for row in shaped), 5.0, places=9)
+        self.assertIn("EXECUTION_POLICY_ENGINE_SUPPRESSION_NONE_LIVE", [code for code, _error, _kwargs in warnings])
+
+        audit_row = self.con.execute(
+            "SELECT decision_json FROM execution_policy_audit ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(audit_row)
+        decision = json.loads(str(audit_row[0] or "{}"))
+        tse = dict(decision.get("tse") or {})
+        self.assertEqual(str(tse.get("state") or ""), "SOFT_THROTTLE")
+        self.assertAlmostEqual(float(tse.get("size_mult") or 0.0), 0.5, places=9)
+        self.assertIs(tse.get("hard_block"), False)
+        self.assertEqual(str(tse.get("reason") or ""), "suppression_eval_none_conservative_default")
+
+    def test_none_trade_suppression_non_live_preserves_none_default(self) -> None:
+        now_ms = 1_710_000_000_000
+        order = {
+            "symbol": "TEST",
+            "qty": 10.0,
+            "side": "BUY",
+            "signal_ts_ms": now_ms,
+            "alpha_ttl_ms": 60_000,
+            "alpha_half_life_ms": 60_000,
+            "volatility": 0.01,
+            "confidence": 0.9,
+            "expected_z": 1.5,
+            "source_order_id": 402,
+        }
+        warnings: list[tuple[str, Exception, dict]] = []
+
+        with self._patch_policy_dependencies():
+            with patch.object(self.execution_policy_engine, "_now_ms", return_value=now_ms):
+                with patch.object(
+                    self.execution_policy_engine,
+                    "_warn_nonfatal",
+                    side_effect=lambda code, error, **kwargs: warnings.append((str(code), error, dict(kwargs))),
+                ):
+                    shaped = self.execution_policy_engine.apply_execution_policy(
+                        [order],
+                        con=self.con,
+                        actor="test",
+                        mode="paper",
+                        broker="sim",
+                        trade_suppression_fn=lambda **_kwargs: None,
+                    )
+
+        self.assertTrue(shaped)
+        self.assertTrue(all(str(row.get("tse_state") or "") == "NONE" for row in shaped))
+        self.assertTrue(all(abs(float(row.get("tse_size_mult") or 0.0) - 1.0) <= 1.0e-12 for row in shaped))
+        self.assertAlmostEqual(sum(float(row.get("qty") or 0.0) for row in shaped), 10.0, places=9)
+        self.assertNotIn("EXECUTION_POLICY_ENGINE_SUPPRESSION_NONE_LIVE", [code for code, _error, _kwargs in warnings])
+
     def test_learned_execution_slicing_preserves_trade_intent_and_stamps_guard(self) -> None:
         from engine.execution.contextual_bandit_slicer import validate_routed_learned_orders
 

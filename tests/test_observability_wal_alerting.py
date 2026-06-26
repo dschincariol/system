@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -47,6 +48,19 @@ def _install_ok_pg_wal(monkeypatch, backup_evidence) -> None:
             "local_space": {"path": "/var/lib/postgresql/data/pg_wal", "free_bytes": 50_000_000_000},
         },
     )
+
+
+def _clear_prod_storage_alert_env(monkeypatch) -> None:
+    for name in (
+        "PROD_LOCK",
+        "ENGINE_SUPERVISED",
+        "PREFLIGHT_REQUIRE_ZFS_STORAGE",
+        "ENV",
+        "APP_ENV",
+        "EXECUTION_MODE",
+        "OPERATOR_MODE",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_wal_archiver_failed_count_transition_emits_warn_once(monkeypatch):
@@ -110,6 +124,122 @@ def test_wal_archiver_failed_count_transition_emits_warn_once(monkeypatch):
         args[0] == "postgres.wal.alert_state" and kwargs.get("value_text") == "warning"
         for args, kwargs in metrics
     )
+
+
+def test_paper_mode_storage_free_space_and_confirmed_wal_outage_write_alert_rows(monkeypatch, tmp_path):
+    db_path = tmp_path / "paper-storage-alerts.sqlite"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TS_TESTING", "1")
+    monkeypatch.setenv("TS_STORAGE_BACKEND", "sqlite")
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    _clear_prod_storage_alert_env(monkeypatch)
+    importlib.reload(importlib.import_module("engine.runtime.storage"))
+    (
+        job,
+        storage_placement,
+        backup_evidence,
+        health_mod,
+        _alerts,
+        alerts_notify,
+        metrics_store,
+    ) = _reload_alert_modules()
+    job._STORAGE_ALERT_FINGERPRINTS.clear()
+    job._WAL_ARCHIVER_LAST_FAILED_COUNT = None
+
+    monkeypatch.setattr(storage_placement, "storage_pressure_paths", lambda _env: [("root", Path("/"))])
+    monkeypatch.setattr(
+        health_mod,
+        "get_disk_pressure_snapshot",
+        lambda _paths: {
+            "ok": False,
+            "status": "critical",
+            "critical": ["root:disk_critical:free_bytes=1024:free_pct=0.01"],
+            "warnings": [],
+            "paths": [],
+        },
+    )
+    monkeypatch.setattr(
+        backup_evidence,
+        "wal_archiver_runtime_snapshot",
+        lambda **_kwargs: {
+            "ok": False,
+            "required": True,
+            "source": "pg_stat_archiver",
+            "blockers": ["wal_archiver_failure_unrecovered"],
+            "warnings": [],
+            "failed_count": 4,
+            "last_failed_wal": "0000000100000000000000CC",
+            "last_failed_at_ts": 2_000.0,
+            "last_archived_wal": "0000000100000000000000CB",
+            "last_archived_at_ts": 1_000.0,
+        },
+    )
+    monkeypatch.setattr(
+        backup_evidence,
+        "pg_wal_disk_risk_snapshot",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("pg_wal risk is production-gated")),
+    )
+    monkeypatch.setattr(alerts_notify, "send_runtime_alert_notification", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(metrics_store, "write_runtime_metric", lambda *_args, **_kwargs: None)
+
+    first = job._emit_storage_wal_alerts(ts_ms=3_000_000)
+    second = job._emit_storage_wal_alerts(ts_ms=3_001_000)
+
+    assert first["ok"] is False
+    assert first["emitted"] == 2
+    assert first["production_storage_alerts_enabled"] is False
+    assert second["ok"] is False
+    assert second["emitted"] == 0
+    with sqlite3.connect(db_path) as con:
+        rows = con.execute("SELECT rule_id, severity FROM alerts ORDER BY rule_id").fetchall()
+    assert rows == [
+        ("STORAGE_FREE_SPACE_CRITICAL", "CRIT"),
+        ("WAL_ARCHIVER_OUTAGE", "CRIT"),
+    ]
+
+
+def test_paper_mode_healthy_disk_and_unconfirmed_wal_probe_do_not_alert(monkeypatch):
+    (
+        job,
+        storage_placement,
+        backup_evidence,
+        health_mod,
+        _alerts,
+        _alerts_notify,
+        metrics_store,
+    ) = _reload_alert_modules()
+    monkeypatch.setenv("ENGINE_MODE", "paper")
+    _clear_prod_storage_alert_env(monkeypatch)
+    job._STORAGE_ALERT_FINGERPRINTS.clear()
+    job._WAL_ARCHIVER_LAST_FAILED_COUNT = None
+    _install_ok_storage(monkeypatch, storage_placement, health_mod)
+    monkeypatch.setattr(
+        backup_evidence,
+        "wal_archiver_runtime_snapshot",
+        lambda **_kwargs: {
+            "ok": False,
+            "required": True,
+            "source": "pg_stat_archiver",
+            "blockers": ["wal_archiver_stats_unavailable"],
+            "warnings": [],
+            "error": "Connection refused",
+        },
+    )
+    monkeypatch.setattr(
+        backup_evidence,
+        "pg_wal_disk_risk_snapshot",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("pg_wal risk is production-gated")),
+    )
+    emitted = []
+    monkeypatch.setattr(job, "_emit_storage_runtime_alert", lambda **kwargs: emitted.append(kwargs) or 1)
+    monkeypatch.setattr(metrics_store, "write_runtime_metric", lambda *_args, **_kwargs: None)
+
+    result = job._emit_storage_wal_alerts(ts_ms=4_000_000)
+
+    assert result["ok"] is True
+    assert result["emitted"] == 0
+    assert result["blockers"] == []
+    assert emitted == []
 
 
 def test_pg_wal_disk_risk_alert_payload_names_wal_mount_and_dedupes(monkeypatch):

@@ -94,6 +94,14 @@ Live broker routing has additional fail-closed constraints:
 - Live failover chains must not include `sim`, `paper`, `sandbox`, or mixed live brokers.
 - `DISABLE_LIVE_EXECUTION` blocks real trading when it is unset or set to any value other than `0`, `false`, `no`, or `off`.
 - Pre-live reconciliation must run in live mode unless the break-glass environment contract is explicitly filled and audited.
+- If `engine.runtime.gates.execution_gate_snapshot()` raises while reading the
+  persisted `portfolio_risk_*` runtime state in live mode, it blocks with
+  `portfolio_risk_state_read_error` before live preflight or broker submission.
+- `broker_router.py` binds the `execution_health` cache reader at import time
+  and forwards that signal into the execution gate. A missing reader or cache
+  read exception is reported as a WARNING-active degraded snapshot; unprimed or
+  empty health remains quiet, and recognized `critical`/`degraded`/`down`/
+  `unhealthy` states keep their existing severity mapping.
 - `broker_apply_orders.py` revalidates aggregate gross and net exposure in
   `apply_execution_risk_governor(...)` after EPE shaping and model/kill-switch
   gates but before the broker router or any broker adapter sees the payload.
@@ -210,6 +218,12 @@ orders. No live order, cancel, replace, flatten, pre-live reconcile,
 kill-switch, execution-mode, options-block, or live broker contract mechanics
 are changed by this path.
 
+For non-dry live routes, `broker_router.py` also fails closed before broker
+attempts when a crypto batch would route to a live broker and
+`CRYPTO_LIVE_TRADING_ENABLED` is unset or false. This mirrors the upstream
+portfolio-risk live crypto gate and keeps crypto live authority default-off even
+if a future caller reaches the router without running the governor first.
+
 `crypto_session.py` models crypto as 24/7 open by default, including weekends.
 The execution policy engine applies this asset-class-aware clock behind
 `EPE_CRYPTO_SESSION_ENFORCE` (default on) and suppresses only during an
@@ -235,16 +249,38 @@ do not write broker fills, positions, order state, or execution-ledger rows. Liv
 paper-sim override orders still write the broker and execution-ledger evidence
 used by attribution, idempotency, and operator diagnostics.
 
+The non-dry sim apply opens a managed write transaction before claiming order
+idempotency. Sourced fills, broker positions, account cash/equity, mark-to-market
+state, order state, execution-ledger mirrors, and `last_portfolio_orders_id` are
+committed together by a single final apply commit. Any exception before that
+commit explicitly rolls back the active transaction, so a failed marker write
+cannot leave durable fills or cash debits without the batch marker.
+
+`broker_fills` also has a replay guard for sourced fills:
+`uq_broker_fills_src` enforces uniqueness on source, normalized book key, symbol,
+fill timestamp, and `source_order_id` when `source_order_id` is present.
+`_write_fill` uses duplicate-safe inserts for those fills and reports ignored
+duplicates through the apply summary as `fills_deduped`; duplicate replays do not
+apply position or cash effects. If an existing database already contains rows
+that would violate the unique index, startup logs a nonfatal warning and skips
+creating the index rather than failing the simulator boot.
+
 `broker_apply_orders.py` treats connection finalization as idempotent on the
 paper/sim path: commits are skipped when the storage wrapper is already marked
 closed, and close calls are skipped for already-closed handles. This prevents a
 primary broker-sim or policy error from being replaced by a secondary closed
-database exception. `broker_sim.py` also repairs null or blank account snapshot
-fields before sizing: null `cash` defaults to `BROKER_START_CASH`, zero/missing
-`equity` falls back to cash or `BROKER_START_EQUITY`, and the repaired snapshot is
-written back on the active transaction. Advisory-only execution analytics remain
-optional; if `execution_analytics` is not present yet, `execution_ai_advisor.py`
-falls back to `execution_fills` without warning spam.
+database exception. `broker_sim.py` uses local safe commit/close helpers on the
+simulated order apply, option lifecycle, equity snapshot, and broker snapshot
+teardown paths. Already-closed SQLite teardown errors and other secondary
+commit/close failures are logged once as nonfatal and return `False` to the
+caller, so teardown cannot mask the original apply-path error. `broker_sim.py`
+also repairs null or
+blank account snapshot fields before sizing: null `cash` defaults to
+`BROKER_START_CASH`, zero/missing `equity` falls back to cash or
+`BROKER_START_EQUITY`, and the repaired snapshot is written back on the active
+transaction. Advisory-only execution analytics remain optional; if
+`execution_analytics` is not present yet, `execution_ai_advisor.py` falls back
+to `execution_fills` without warning spam.
 
 ### Broker Simulation Options
 
@@ -342,7 +378,7 @@ preflight fails closed and live readiness includes the LOB blockers.
 The tree contains two distinct Almgren-Chriss modules that share the same
 basename. They are separate, both imported, and not duplicates:
 
-- [almgren_chriss.py](almgren_chriss.py) (196 lines) is an opt-in,
+- [almgren_chriss.py](almgren_chriss.py) (200 lines) is an opt-in,
   env-gated impact **estimator** for simulation and validation. It is disabled
   unless `ALMGREN_CHRISS_ENABLED=1`, reads its coefficients and bounds from the
   `ALMGREN_CHRISS_*` knobs, and exposes `estimate_almgren_chriss_costs(...)`,
@@ -350,7 +386,7 @@ basename. They are separate, both imported, and not duplicates:
   order from a liquidity snapshot. It is imported by
   [broker_sim.py](broker_sim.py) as a compatibility patch target and by
   `engine/strategy/portfolio_backtest.py`.
-- [cost_models/almgren_chriss.py](cost_models/almgren_chriss.py) (132 lines)
+- [cost_models/almgren_chriss.py](cost_models/almgren_chriss.py) (135 lines)
   is the `AlmgrenChrissCost` expected market-impact **cost-model** dataclass
   (`eta`/`gamma`/asset-class coefficient overrides) exposing `components_bps(...)`
   and `cost_bps(...)`. It is imported by [broker_sim.py](broker_sim.py),

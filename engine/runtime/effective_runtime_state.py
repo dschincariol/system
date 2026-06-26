@@ -11,22 +11,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlsplit, urlunsplit
 
+from engine.api.redaction import redact_api_payload, redact_string
 from engine.runtime.postgres_tuning import format_bytes, parse_size_bytes
 
 BYTES_IN_GIB = 1024**3
-_SENSITIVE_KEY_RE = re.compile(r"(password|passwd|secret|token|api[_-]?key|access[_-]?key)", re.IGNORECASE)
-_SECRET_KV_RE = re.compile(
-    r"(?P<key>(?:password|passwd|secret|token|api[_-]?key|access[_-]?key))=(?P<value>[^\s;&]+)",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -146,38 +140,11 @@ def _gib(value: int | None) -> float | None:
 
 
 def _redact_string(value: str) -> str:
-    text = str(value or "")
-    try:
-        parts = urlsplit(text)
-        if parts.scheme and parts.password:
-            host = parts.hostname or ""
-            if ":" in host and not host.startswith("["):
-                host = f"[{host}]"
-            if parts.port:
-                host = f"{host}:{parts.port}"
-            user = parts.username or ""
-            netloc = f"{user}:<redacted>@{host}" if user else f"<redacted>@{host}"
-            text = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    except Exception:
-        text = str(value or "")
-    return _SECRET_KV_RE.sub(lambda match: f"{match.group('key')}=<redacted>", text)
+    return redact_string(value)
 
 
 def redact_evidence(value: Any, *, key: str = "") -> Any:
-    if isinstance(value, Mapping):
-        out: dict[str, Any] = {}
-        for item_key, item_value in value.items():
-            out[str(item_key)] = redact_evidence(item_value, key=str(item_key))
-        return out
-    if isinstance(value, list):
-        return [redact_evidence(item, key=key) for item in value]
-    if isinstance(value, tuple):
-        return [redact_evidence(item, key=key) for item in value]
-    if isinstance(value, str):
-        if _SENSITIVE_KEY_RE.search(str(key or "")):
-            return "<redacted>" if value else ""
-        return _redact_string(value)
-    return value
+    return redact_api_payload(value, key=key)
 
 
 def _default_docker_evidence_path(env: Mapping[str, str]) -> str:

@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from engine.nlp.cache import NlpCache
-from engine.nlp.encoder import FinBertSentimentEncoder
+from engine.nlp.encoder import build_sentiment_encoder, current_sentiment_config
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import (
@@ -27,7 +27,8 @@ PID = os.getpid()
 
 BATCH_SIZE = max(1, int(os.environ.get("NLP_NEWS_BATCH_SIZE", "256")))
 LOCK_STALE_AFTER_S = int(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180"))
-FINBERT_MODEL_NAME = str(os.environ.get("NLP_FINBERT_MODEL_NAME", "ProsusAI/finbert") or "ProsusAI/finbert")
+SENTIMENT_CONFIG = current_sentiment_config()
+FINBERT_MODEL_NAME = str(SENTIMENT_CONFIG.model_name)
 LOG = get_logger("engine.strategy.jobs.embed_news")
 logging.basicConfig(level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO))
 
@@ -98,7 +99,7 @@ def run(limit: int | None = None) -> dict[str, Any]:
     if not candidates:
         return {"job": JOB_NAME, "rows_seen": 0, "encoded": 0, "cache_hits": 0, "ts_ms": started_ms}
     cache = NlpCache()
-    with FinBertSentimentEncoder(model_name=FINBERT_MODEL_NAME, batch_size=32) as encoder:
+    with build_sentiment_encoder(SENTIMENT_CONFIG) as encoder:
         result = cache.get_or_encode_sentiments(
             [str(row["text"]) for row in candidates],
             encoder,
@@ -109,6 +110,8 @@ def run(limit: int | None = None) -> dict[str, Any]:
     stats = {
         "job": JOB_NAME,
         "model_name": FINBERT_MODEL_NAME,
+        "model_namespace": SENTIMENT_CONFIG.namespace,
+        "model_metadata": SENTIMENT_CONFIG.metadata,
         "rows_seen": int(len(candidates)),
         "encoded": int(result.encoded),
         "cache_hits": int(result.hits),

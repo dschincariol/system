@@ -175,6 +175,49 @@ class StartupHealthValidationTests(unittest.TestCase):
         self.assertTrue(bool(start_system._IMPORT_SMOKE["ok"]))
         self.assertEqual(start_system._IMPORT_SMOKE["failures"], [])
 
+    def test_startup_import_smoke_compiles_with_read_only_source_tree(self) -> None:
+        (start_system,) = _reload_modules("start_system")
+        tmp_root = Path(self.tmp.name) / "import_smoke_read_only"
+        dirs = [
+            tmp_root,
+            tmp_root / "engine",
+            tmp_root / "engine" / "runtime",
+            tmp_root / "jobs",
+        ]
+        for path in dirs:
+            path.mkdir(parents=True, exist_ok=True)
+        for path in [
+            tmp_root / "engine" / "__init__.py",
+            tmp_root / "engine" / "runtime" / "__init__.py",
+            tmp_root / "jobs" / "__init__.py",
+        ]:
+            path.write_text("", encoding="utf-8")
+        (tmp_root / "dashboard_server.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (tmp_root / "start_ingestion.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (tmp_root / "engine" / "runtime" / "ingestion_runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (tmp_root / "jobs" / "safe_job.py").write_text("VALUE = 1\n", encoding="utf-8")
+        fake_registry = types.ModuleType("engine.runtime.job_registry")
+        fake_registry.ALLOWED_JOBS = {"safe_job": ("jobs/safe_job.py",)}
+
+        for path in reversed(dirs):
+            self.addCleanup(lambda p=path: p.exists() and p.chmod(0o700))
+        for path in dirs:
+            path.chmod(0o555)
+
+        start_system._BASE_DIR = str(tmp_root)
+        start_system._IMPORT_SMOKE_IMPORT_JOBS = False
+        start_system._IMPORT_SMOKE_TIMEOUT_S = 2.0
+        start_system._IMPORT_SMOKE["ok"] = False
+        start_system._IMPORT_SMOKE["failures"] = [{"stale": True}]
+
+        with patch.dict(sys.modules, {"engine.runtime.job_registry": fake_registry}):
+            with patch.object(start_system, "_persist_import_smoke"):
+                with patch.object(start_system, "_persist_startup_trace"):
+                    start_system._run_import_smoke()
+
+        self.assertTrue(bool(start_system._IMPORT_SMOKE["ok"]))
+        self.assertEqual(start_system._IMPORT_SMOKE["failures"], [])
+
     def test_startup_import_smoke_can_opt_into_full_job_imports(self) -> None:
         (start_system,) = _reload_modules("start_system")
         tmp_root = Path(self.tmp.name) / "import_smoke_full"

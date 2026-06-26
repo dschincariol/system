@@ -123,6 +123,135 @@ def _write_executable(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def _run_backup_restore_evidence_with_stale_drill(root: Path, *, restore_max_age_s: str | None = None):
+    bin_dir = root / "bin"
+    scripts_dir = root / "scripts"
+    backup_root = root / "backup"
+    evidence_dir = backup_root / "evidence"
+    base_dir = backup_root / "base"
+    wal_dir = backup_root / "wal"
+    drill_dir = backup_root / "drills"
+    latest_json = evidence_dir / "latest_backup_restore_evidence.json"
+    bin_dir.mkdir(parents=True)
+    scripts_dir.mkdir()
+    evidence_dir.mkdir(parents=True)
+    base_dir.mkdir()
+    wal_dir.mkdir()
+    (wal_dir / ".tmp").mkdir()
+    drill_dir.mkdir()
+    for path in (backup_root, wal_dir, wal_dir / ".tmp"):
+        path.chmod(0o2750)
+
+    backup_dir = base_dir / "base_20260617"
+    backup_dir.mkdir()
+    (backup_dir / "backup_manifest").write_text("{}\n", encoding="utf-8")
+    (backup_dir / "pg_verifybackup.out").write_text("backup successfully verified\n", encoding="utf-8")
+    (base_dir / "latest").symlink_to(backup_dir.name)
+
+    stale_report = drill_dir / "restore_drill_stale.txt"
+    stale_report.write_text(
+        "\n".join(
+            [
+                "restore_drill_report_version=1",
+                "generated_at=2026-01-01T00:00:00Z",
+                "exit_code=0",
+                "status=pass",
+                "time_to_recover_s=42",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    stale_ts = time.time() - 1_300_000
+    os.utime(stale_report, (stale_ts, stale_ts))
+    (drill_dir / "latest_restore_drill.txt").symlink_to(stale_report.name)
+
+    for name in ("base_backup.sh", "restore.sh", "restore_drill.sh", "wal_archive.sh", "wal_archive_catchup.sh"):
+        _write_executable(scripts_dir / name, "#!/usr/bin/env bash\nexit 0\n")
+
+    _write_executable(
+        bin_dir / "psql",
+        """#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *pg_switch_wal*)
+    mkdir -p "${TS_BACKUP_WAL_DIR}"
+    printf 'wal segment\n' > "${TS_BACKUP_WAL_DIR}/0000000100000000000000AA"
+    printf '0000000100000000000000AA\n'
+    ;;
+  *pg_stat_archiver*)
+    now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    now_epoch="$(date +%s)"
+    printf 'on|/opt/trading/ops/backup/wal_archive.sh "%%p" "%%f"|1|0000000100000000000000AA|%s|%s|0||||%s\n' "$now_iso" "$now_epoch" "$now_iso"
+    ;;
+  *)
+    printf 'unexpected psql query: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+""",
+    )
+
+    env = os.environ.copy()
+    env.pop("TS_BACKUP_EVIDENCE_REUSE_RESTORE_MAX_AGE_S", None)
+    env.pop("BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S", None)
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+            "TS_BACKUP_EVIDENCE_SKIP_SYSTEMD": "1",
+            "TS_BASE_BACKUP_SCRIPT": str(scripts_dir / "base_backup.sh"),
+            "TS_WAL_ARCHIVE_SCRIPT": str(scripts_dir / "wal_archive.sh"),
+            "TS_WAL_ARCHIVE_CATCHUP_SCRIPT": str(scripts_dir / "wal_archive_catchup.sh"),
+            "TS_RESTORE_SCRIPT": str(scripts_dir / "restore.sh"),
+            "TS_RESTORE_DRILL_SCRIPT": str(scripts_dir / "restore_drill.sh"),
+            "TS_BACKUP_BASE_DIR": str(base_dir),
+            "TS_BACKUP_WAL_DIR": str(wal_dir),
+            "TS_RESTORE_DRILL_DIR": str(drill_dir),
+            "TS_BACKUP_EVIDENCE_DIR": str(evidence_dir),
+            "TS_BACKUP_EVIDENCE_WORK_DIR": str(evidence_dir / "work" / "stale_restore"),
+            "TS_BACKUP_EVIDENCE_STAMP": "stale_restore",
+            "TS_BACKUP_WAL_TARGET_OWNER_UID": str(os.getuid()),
+            "TS_BACKUP_WAL_TARGET_GROUP": grp.getgrgid(os.getgid()).gr_name,
+            "TS_BACKUP_WAL_TARGET_DIR_MODE": "2750",
+            "BACKUP_EVIDENCE_PATH": str(latest_json),
+            "BACKUP_EVIDENCE_REQUIRE_SIGNATURE": "0",
+        }
+    )
+    if restore_max_age_s is not None:
+        env["BACKUP_EVIDENCE_RESTORE_DRILL_MAX_AGE_S"] = restore_max_age_s
+
+    proc = subprocess.run(
+        ["bash", str(REPO_ROOT / "ops" / "backup" / "backup_restore_evidence.sh")],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+        check=False,
+    )
+    return proc, Path(env["TS_BACKUP_EVIDENCE_WORK_DIR"])
+
+
+def test_backup_restore_evidence_restore_drill_default_and_override_windows(tmp_path):
+    default_proc, default_work_dir = _run_backup_restore_evidence_with_stale_drill(tmp_path / "default")
+
+    assert default_proc.returncode == 1, default_proc.stdout
+    default_restore_out = (default_work_dir / "restore_drill.out").read_text(encoding="utf-8")
+    assert "restore_drill_max_age_s=1209600" in default_restore_out
+    assert "restore_drill_required_timer=trading-restore-drill.timer" in default_restore_out
+
+    override_proc, override_work_dir = _run_backup_restore_evidence_with_stale_drill(
+        tmp_path / "override",
+        restore_max_age_s="604800",
+    )
+
+    assert override_proc.returncode == 1, override_proc.stdout
+    override_restore_out = (override_work_dir / "restore_drill.out").read_text(encoding="utf-8")
+    assert "restore_drill_max_age_s=604800" in override_restore_out
+    assert "restore_drill_required_timer=trading-restore-drill.timer" in override_restore_out
+
+
 def test_backup_restore_evidence_script_writes_signed_component_evidence(monkeypatch, tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

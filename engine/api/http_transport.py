@@ -202,6 +202,8 @@ def _map_error_to_status(error_code: str) -> int:
         "missing_price",
     }:
         return 409
+    if code in {"execution_mode_not_live", "mode_not_live"} or code.endswith("_not_live"):
+        return 409
     if code == "unknown_endpoint" or "not_found" in code or "not_registered" in code:
         return 404
     if code.startswith("deprecated") or code.startswith("gone"):
@@ -1502,11 +1504,17 @@ def build_handler(ROUTE_SPECS, API_HANDLERS, dashboard_api_token, ctx=None, stat
                     }
 
                 supplied, source = self._request_api_token_parts()
-                if source == "query" and strict_reasons:
+                bind_reasons = self._remote_bind_reasons()
+                if source == "query" and (strict_reasons or bind_reasons):
+                    query_rejection_reason = (
+                        "query_string_token_authentication_disabled_in_production_live"
+                        if strict_reasons
+                        else "query_string_token_authentication_rejected_on_non_loopback_bind"
+                    )
                     return {
                         "ok": False,
                         "error": "query_token_forbidden",
-                        "reason": "query_string_token_authentication_disabled_in_production_live",
+                        "reason": query_rejection_reason,
                         "meta": {"status": 401},
                     }
                 if hmac.compare_digest(supplied, dashboard_token):

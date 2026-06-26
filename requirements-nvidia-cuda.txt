@@ -1,3 +1,4 @@
+-c requirements-nvidia-cuda.lock.txt
 -r requirements-base.txt
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.4.1+cu121

@@ -32,8 +32,19 @@ STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS = [
     "structured_doc_events_v1.capex_cut_confidence",
     "structured_doc_events_v1.debt_refinancing_risk_confidence",
     "structured_doc_events_v1.regulatory_litigation_risk_confidence",
+    "structured_doc_events_v1.supply_chain_exposure_confidence",
+    "structured_doc_events_v1.capital_allocation_positive_confidence",
+    "structured_doc_events_v1.capital_allocation_negative_confidence",
+    "structured_doc_events_v1.buyback_increase_confidence",
+    "structured_doc_events_v1.buyback_cut_confidence",
+    "structured_doc_events_v1.dividend_increase_confidence",
+    "structured_doc_events_v1.dividend_cut_confidence",
     "structured_doc_events_v1.customer_concentration_confidence",
+    "structured_doc_events_v1.management_tone_positive_confidence",
+    "structured_doc_events_v1.management_tone_negative_confidence",
     "structured_doc_events_v1.management_uncertainty_confidence",
+    "structured_doc_events_v1.macro_positive_surprise_confidence",
+    "structured_doc_events_v1.macro_negative_surprise_confidence",
     "structured_doc_events_v1.event_count_30d",
     "structured_doc_events_v1.latest_event_age_days",
 ]
@@ -48,8 +59,19 @@ EVENT_FEATURE_ID = {
     "capex_cut": "structured_doc_events_v1.capex_cut_confidence",
     "debt_refinancing_risk": "structured_doc_events_v1.debt_refinancing_risk_confidence",
     "regulatory_litigation_risk": "structured_doc_events_v1.regulatory_litigation_risk_confidence",
+    "supply_chain_exposure": "structured_doc_events_v1.supply_chain_exposure_confidence",
+    "capital_allocation_positive": "structured_doc_events_v1.capital_allocation_positive_confidence",
+    "capital_allocation_negative": "structured_doc_events_v1.capital_allocation_negative_confidence",
+    "buyback_increase": "structured_doc_events_v1.buyback_increase_confidence",
+    "buyback_cut": "structured_doc_events_v1.buyback_cut_confidence",
+    "dividend_increase": "structured_doc_events_v1.dividend_increase_confidence",
+    "dividend_cut": "structured_doc_events_v1.dividend_cut_confidence",
     "customer_concentration": "structured_doc_events_v1.customer_concentration_confidence",
+    "management_tone_positive": "structured_doc_events_v1.management_tone_positive_confidence",
+    "management_tone_negative": "structured_doc_events_v1.management_tone_negative_confidence",
     "management_uncertainty": "structured_doc_events_v1.management_uncertainty_confidence",
+    "macro_positive_surprise": "structured_doc_events_v1.macro_positive_surprise_confidence",
+    "macro_negative_surprise": "structured_doc_events_v1.macro_negative_surprise_confidence",
 }
 
 
@@ -127,6 +149,62 @@ EVENT_SPECS: Tuple[EventSpec, ...] = (
         ),
     ),
     EventSpec(
+        "supply_chain_exposure",
+        -0.75,
+        (
+            r"\b(?:supply chain|supplier|suppliers|component|components|logistics|freight|shipping)\b.{0,90}\b(?:disruption|constraint|shortage|delay|delays|exposure|risk|headwind)\b",
+            r"\b(?:shortage|shortages|delays|disruptions)\b.{0,90}\b(?:supplier|supply chain|component|components|logistics|freight|shipping)\b",
+        ),
+    ),
+    EventSpec(
+        "capital_allocation_positive",
+        0.35,
+        (
+            r"\b(?:capital allocation|cash deployment|free cash flow)\b.{0,90}\b(?:disciplined|improved|shareholder return|returning capital|accretive)\b",
+            r"\b(?:asset sale|divestiture|cost discipline)\b.{0,90}\b(?:strengthen|improve|improves|improved|balance sheet|returns)\b",
+        ),
+    ),
+    EventSpec(
+        "capital_allocation_negative",
+        -0.35,
+        (
+            r"\b(?:capital allocation|cash deployment|free cash flow)\b.{0,90}\b(?:deteriorated|strained|undisciplined|dilutive|pressure)\b",
+            r"\b(?:dilutive acquisition|equity issuance|cash burn)\b.{0,90}\b(?:pressure|risk|concern|negative)\b",
+        ),
+    ),
+    EventSpec(
+        "buyback_increase",
+        0.5,
+        (
+            r"\b(?:authorized|increased|expanded|raised|resumed)\b.{0,90}\b(?:share repurchase|stock repurchase|buyback|buy-back)\b",
+            r"\b(?:share repurchase|stock repurchase|buyback|buy-back)\b.{0,90}\b(?:authorized|increase|increased|expanded|raised|resumed)\b",
+        ),
+    ),
+    EventSpec(
+        "buyback_cut",
+        -0.5,
+        (
+            r"\b(?:suspend|suspended|pause|paused|reduce|reduced|cut|cancel|cancelled)\b.{0,90}\b(?:share repurchase|stock repurchase|buyback|buy-back)\b",
+            r"\b(?:share repurchase|stock repurchase|buyback|buy-back)\b.{0,90}\b(?:suspend|suspended|pause|paused|reduce|reduced|cut|cancel|cancelled)\b",
+        ),
+    ),
+    EventSpec(
+        "dividend_increase",
+        0.4,
+        (
+            r"\b(?:increase|increased|raises|raised|hike|hiked)\b.{0,90}\b(?:dividend|quarterly dividend|cash dividend)\b",
+            r"\b(?:dividend|quarterly dividend|cash dividend)\b.{0,90}\b(?:increase|increased|raises|raised|hike|hiked)\b",
+        ),
+    ),
+    EventSpec(
+        "dividend_cut",
+        -0.75,
+        (
+            r"\b(?:cut|cuts|reduced|reduce|suspend|suspended|eliminate|eliminated)\b.{0,90}\b(?:dividend|quarterly dividend|cash dividend)\b",
+            r"\b(?:dividend|quarterly dividend|cash dividend)\b.{0,90}\b(?:cut|cuts|reduced|reduce|suspend|suspended|eliminate|eliminated)\b",
+        ),
+    ),
+    EventSpec(
         "customer_concentration",
         -0.75,
         (
@@ -136,11 +214,43 @@ EVENT_SPECS: Tuple[EventSpec, ...] = (
         ),
     ),
     EventSpec(
+        "management_tone_positive",
+        0.35,
+        (
+            r"\b(?:management|executives?|ceo|cfo)\b.{0,90}\b(?:confident|confidence|encouraged|optimistic|strong demand|improving visibility)\b",
+            r"\b(?:confident|optimistic|encouraged)\b.{0,90}\b(?:outlook|demand|visibility|management)\b",
+        ),
+    ),
+    EventSpec(
+        "management_tone_negative",
+        -0.5,
+        (
+            r"\b(?:management|executives?|ceo|cfo)\b.{0,90}\b(?:cautious|uncertain|concerned|pressure|weak demand|limited visibility)\b",
+            r"\b(?:cautious|concerned|uncertain)\b.{0,90}\b(?:outlook|demand|visibility|management)\b",
+        ),
+    ),
+    EventSpec(
         "management_uncertainty",
         -0.5,
         (
             r"\b(?:limited visibility|low visibility|uncertain outlook|uncertainty remains|cannot provide guidance|suspend guidance|suspended guidance)\b",
             r"\b(?:management|executives?|ceo|cfo)\b.{0,90}\b(?:uncertain|uncertainty|resign|resigned|departure|turnover|transition)\b",
+        ),
+    ),
+    EventSpec(
+        "macro_positive_surprise",
+        0.4,
+        (
+            r"\b(?:above expectations|better than expected|positive surprise|stronger than expected)\b.{0,90}\b(?:inflation|jobs|payrolls|gdp|sales|pmi|macro|economic)\b",
+            r"\b(?:inflation|jobs|payrolls|gdp|sales|pmi|macro|economic)\b.{0,90}\b(?:above expectations|better than expected|positive surprise|stronger than expected)\b",
+        ),
+    ),
+    EventSpec(
+        "macro_negative_surprise",
+        -0.4,
+        (
+            r"\b(?:below expectations|worse than expected|negative surprise|weaker than expected)\b.{0,90}\b(?:inflation|jobs|payrolls|gdp|sales|pmi|macro|economic)\b",
+            r"\b(?:inflation|jobs|payrolls|gdp|sales|pmi|macro|economic)\b.{0,90}\b(?:below expectations|worse than expected|negative surprise|weaker than expected)\b",
         ),
     ),
 )

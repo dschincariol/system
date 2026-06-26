@@ -38,6 +38,13 @@ const {
   serializeEnv: serializeOperatorEnv
 } = require("./operator_env_file");
 
+let systemdDgram = null;
+try {
+  systemdDgram = require("unix-dgram");
+} catch {}
+
+const SYSTEMD_NOTIFY_BIN = process.env.SYSTEMD_NOTIFY_BIN || "/usr/bin/systemd-notify";
+
 const app = express();
 const WebSocket = require("ws");
 let _wsServer = null;
@@ -77,6 +84,80 @@ const SYSTEM_STATE = {
   started_at: null,
   engine_pid: null
 };
+
+function systemdNotifyAddress() {
+  const notifySocket = String(process.env.NOTIFY_SOCKET || "").trim();
+  if (!notifySocket) return "";
+  return notifySocket.startsWith("@") ? `\0${notifySocket.slice(1)}` : notifySocket;
+}
+
+function systemdNotify(stateValue) {
+  const notifySocket = systemdNotifyAddress();
+  if (!notifySocket) return false;
+  const payloadText = String(stateValue || "").trim();
+  if (!payloadText) return false;
+
+  if (!systemdDgram || typeof systemdDgram.createSocket !== "function") {
+    return systemdNotifyViaCli(payloadText);
+  }
+
+  let sock = null;
+  try {
+    sock = systemdDgram.createSocket("unix_dgram");
+    sock.on("error", () => {
+      try { sock.close(); } catch {}
+    });
+    const payload = Buffer.from(payloadText, "utf8");
+    sock.send(payload, 0, payload.length, notifySocket, () => {
+      try { sock.close(); } catch {}
+    });
+    return true;
+  } catch {
+    try { if (sock) sock.close(); } catch {}
+    return systemdNotifyViaCli(payloadText);
+  }
+}
+
+function systemdNotifyViaCli(payloadText) {
+  const notifySocket = String(process.env.NOTIFY_SOCKET || "").trim();
+  if (!notifySocket) return false;
+
+  const parts = String(payloadText || "")
+    .split(/\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!parts.length) return false;
+
+  const args = ["--pid=parent"];
+  for (const part of parts) {
+    if (part === "READY=1") {
+      args.push("--ready");
+    } else if (part.startsWith("STATUS=")) {
+      args.push("--status", part.slice("STATUS=".length));
+    } else {
+      args.push(part);
+    }
+  }
+
+  try {
+    const result = spawnSync(SYSTEMD_NOTIFY_BIN, args, {
+      env: process.env,
+      stdio: "ignore",
+      timeout: 2000
+    });
+    return result.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function systemdNotifyReady() {
+  return systemdNotify("READY=1");
+}
+
+function systemdNotifyWatchdog() {
+  return systemdNotify("WATCHDOG=1");
+}
 
 function clampNumber(value, fallback, min, max) {
   const n = Number(value);
@@ -5062,7 +5143,7 @@ function runPipInstallRequirements() {
     return { ok: false, kind: "REQ_MISSING", message: "requirements.txt missing", details: reqPath };
   }
 
-  const r = spawnSyncSafe(python, ["-m", "pip", "install", "-r", reqPath], {
+  const r = spawnSyncSafe(python, ["-m", "pip", "install", "--require-hashes", "-r", reqPath], {
     cwd: ROOT,
     stdio: "pipe",
     env: process.env,
@@ -5073,7 +5154,7 @@ function runPipInstallRequirements() {
   const out = (r.stdout ? String(r.stdout) : "") + (r.stderr ? String(r.stderr) : "");
   const ok = r.status === 0;
 
-  return { ok, kind: ok ? "PIP_OK" : "PIP_FAIL", message: ok ? "pip install -r requirements.txt ok" : "pip install failed", details: out.trim() };
+  return { ok, kind: ok ? "PIP_OK" : "PIP_FAIL", message: ok ? "pip install --require-hashes -r requirements.txt ok" : "pip install failed", details: out.trim() };
 }
 
 function touchDbFile(resolvedDb) {
@@ -6151,7 +6232,7 @@ function isLiveModeBlocked() {
   }
 }
 
-app.post("/api/operator/start", async (req, res) => {
+app.post("/api/operator/start", wrapOperatorRoute(async (req, res) => {
   const mode = String((req.body && req.body.mode) || "safe").trim().toLowerCase() || "safe";
   const confirmation = requireOperatorConfirmation(
     req,
@@ -6445,7 +6526,7 @@ try {
 } catch {}
 
 return jsonOk(res, { status: "RUNNING", mode, steps });
-});
+}));
 
 app.post("/api/operator/stop", (req, res) => {
   const confirmation = requireOperatorConfirmation(req, res, "operator.stop", {
@@ -6456,7 +6537,7 @@ app.post("/api/operator/stop", (req, res) => {
   return sendOperatorPayload(res, r, 200);
 });
 
-app.post("/api/operator/restart", async (req, res) => {
+app.post("/api/operator/restart", wrapOperatorRoute(async (req, res) => {
   const mode = String((req.body && req.body.mode) || state.lastMode || "safe");
   const confirmation = requireOperatorConfirmation(req, res, "operator.restart", {
     target: `mode:${mode}`,
@@ -6470,7 +6551,7 @@ app.post("/api/operator/restart", async (req, res) => {
     status: "RESTARTING",
     start: r
   }, r && r.ok ? 202 : 503);
-});
+}));
 
 app.post("/api/operator/emergencyStop", (req, res) => {
   const confirmation = requireOperatorConfirmation(req, res, "operator.emergency_stop", {
@@ -7308,6 +7389,7 @@ let _healthFailCount = 0;
 let _crashLoopDetected = false;
 
 _watchdogTimer = setInterval(async () => {
+  let systemdWatchdogOk = true;
   try {
 
     try {
@@ -7497,9 +7579,14 @@ try {
 }
 
   } catch (e) {
+    systemdWatchdogOk = false;
     setLastError("WATCHDOG_EXCEPTION", "Watchdog error", {
       message: String(e?.message || e || "watchdog_error")
     });
+  } finally {
+    if (systemdWatchdogOk) {
+      systemdNotifyWatchdog();
+    }
   }
 }, 8000);
 // --------------------------------------------------
@@ -7570,6 +7657,46 @@ async function shutdownOperator() {
   })();
 
   return _operatorShutdownPromise;
+}
+
+function recordOperatorProcessFault(kind, error, extra = {}) {
+  const scope = String(kind || "process_fault");
+  logOperatorCatch(scope, error, extra);
+  try {
+    setLastError(scope.toUpperCase().replace(/[^A-Z0-9]+/g, "_"), `Operator sidecar ${scope}`, {
+      message: String(error && error.message ? error.message : error || "unknown_error"),
+      origin: String(extra && extra.origin ? extra.origin : scope),
+      fatal: true
+    });
+  } catch (stateError) {
+    logOperatorCatch(`${scope}.state_record`, stateError);
+  }
+}
+
+function handleUnhandledRejection(reason) {
+  recordOperatorProcessFault("process.unhandledRejection", reason, {
+    origin: "unhandledRejection"
+  });
+}
+
+function handleUncaughtException(error, origin) {
+  recordOperatorProcessFault("process.uncaughtException", error, {
+    origin: String(origin || "uncaughtException")
+  });
+}
+
+try {
+  process.on("unhandledRejection", handleUnhandledRejection);
+} catch (e) {
+  logOperatorCatch("process.on.unhandledRejection", e);
+  throw e;
+}
+
+try {
+  process.on("uncaughtException", handleUncaughtException);
+} catch (e) {
+  logOperatorCatch("process.on.uncaughtException", e);
+  throw e;
 }
 
 try {
@@ -8474,6 +8601,7 @@ _httpServer = app.listen(OPERATOR_PORT, OPERATOR_BIND_HOST, () => {
     console.log("[operator_server] WARNING: direct operator LAN exposure is not the production default; use the dashboard /operator/ bridge.");
   }
   console.log(`Operator Control Center: http://${_localHost}:${OPERATOR_PORT}`);
+  systemdNotifyReady();
 
   const autoStart = normalizeBool(process.env.OPERATOR_AUTO_START);
   if (autoStart === true && !child) {

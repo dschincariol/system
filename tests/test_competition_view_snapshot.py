@@ -53,6 +53,44 @@ def _stub_system_snapshot() -> dict:
     }
 
 
+def _running_system_snapshot() -> dict:
+    snapshot = _stub_system_snapshot()
+    snapshot.update(
+        {
+            "ok": True,
+            "status": "RUNNING",
+            "state": "RUNNING",
+            "reasons": ["baseline_reason"],
+            "health": {
+                "competition": {
+                    "ok": True,
+                    "replay_status": "ready",
+                    "replay_age_s": 5,
+                    "reasons": [],
+                },
+                "attribution": {
+                    "ok": True,
+                    "warning_row_count": 0,
+                    "max_residual_share": 0.0,
+                    "quality_status": "ok",
+                },
+            },
+        }
+    )
+    return snapshot
+
+
+def _stub_failure_response(_logger, **kwargs) -> dict:
+    return {
+        "ok": False,
+        "error": str(kwargs.get("message") or ""),
+        "root_cause_code": str(kwargs.get("code") or ""),
+        "failure_scope": str(kwargs.get("event") or ""),
+        "failure_type": type(kwargs.get("error")).__name__,
+        "system_state_snapshot": {"stubbed": True},
+    }
+
+
 def _start_competition_server(stack: dict, tmp_path: Path, monkeypatch):
     api_system = stack["api_system"]
     http_transport = stack["http_transport"]
@@ -162,3 +200,121 @@ def test_competition_view_aliases_return_200_for_cold_and_seeded_db(tmp_path, mo
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=2)
+
+
+def test_observability_snapshot_handlers_return_degraded_payloads(monkeypatch):
+    api_system = importlib.import_module("engine.api.api_system")
+    monkeypatch.setattr(api_system, "_build_system_snapshot", lambda *_args, **_kwargs: _running_system_snapshot())
+    monkeypatch.setattr(api_system, "failure_response", _stub_failure_response)
+
+    monkeypatch.setattr(
+        api_system,
+        "current_competition_snapshot",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("competition boom")),
+    )
+    payload = api_system.api_get_competition_view(None, ctx={})
+    assert payload["ok"] is False
+    assert payload["status"] == "DEGRADED"
+    assert any(str(reason).startswith("competition_view_error:") for reason in payload["reasons"])
+    assert payload["competition"] == {"ok": False, "error": "competition boom"}
+    assert payload["root_cause_code"] == "API_SYSTEM_COMPETITION_VIEW_FAILED"
+
+    monkeypatch.setattr(
+        api_system,
+        "meta_get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("meta boom")),
+    )
+    payload = api_system.api_get_replay_freshness(None, ctx={})
+    assert payload["ok"] is False
+    assert payload["status"] == "DEGRADED"
+    assert any(str(reason).startswith("replay_freshness_error:") for reason in payload["reasons"])
+    assert payload["replay_freshness"] == {"ok": False, "error": "meta boom"}
+    assert payload["root_cause_code"] == "API_SYSTEM_REPLAY_FRESHNESS_FAILED"
+
+    payload = api_system.api_get_attribution_quality(None, ctx={})
+    assert payload["ok"] is False
+    assert payload["status"] == "DEGRADED"
+    assert any(str(reason).startswith("attribution_quality_error:") for reason in payload["reasons"])
+    assert payload["attribution_quality"] == {"ok": False, "error": "meta boom"}
+    assert payload["root_cause_code"] == "API_SYSTEM_ATTRIBUTION_QUALITY_FAILED"
+
+
+def test_observability_snapshot_handlers_keep_success_paths_truthy(monkeypatch):
+    api_system = importlib.import_module("engine.api.api_system")
+    monkeypatch.setattr(api_system, "_build_system_snapshot", lambda *_args, **_kwargs: _running_system_snapshot())
+    monkeypatch.setattr(
+        api_system,
+        "current_competition_snapshot",
+        lambda **_kwargs: {
+            "ok": True,
+            "status": "ready",
+            "reason": "",
+            "champion": {"model_name": "champion_v1", "symbol": "SPY", "horizon_s": 60},
+            "champions": [{"model_name": "champion_v1"}],
+            "ranking_champion": {"model_name": "ranked_v1"},
+            "challengers": [{"model_name": "challenger_v1"}],
+            "rankings": [{"model_name": "ranked_v1"}],
+            "capital_plan": {"allocations": {"global": 1.0}},
+            "replay_validation_status": {"status": "ready"},
+            "self_critic": {"blocked_keys": []},
+            "cycle_status": {"status": "ready"},
+            "active_symbols": ["SPY"],
+        },
+    )
+
+    meta_payloads = {
+        "competition_replay_validation": {
+            "models": {
+                "ranked_v1": {
+                    "approved": True,
+                    "source": "pytest",
+                    "window_end_ms": 123456,
+                }
+            }
+        },
+        "competition_replay_validation_status": {
+            "status": "ready",
+            "fresh": True,
+            "stale": False,
+            "updated_ts_ms": 123450,
+            "model_count": 1,
+        },
+        "attribution_completeness": {
+            "rows": 10,
+            "authoritative_model_present": 10,
+            "authoritative_model_present_ratio": 1.0,
+            "regime_present_ratio": 1.0,
+            "policy_present_ratio": 1.0,
+        },
+        "execution_order_model_identity_repair": {
+            "rows_scanned": 5,
+            "rows_updated": 1,
+        },
+        "trade_attribution_historical_repair": {
+            "ok": True,
+            "ts_ms": 123460,
+        },
+        "execution_poll_and_attrib_last": {
+            "ts_ms": 123470,
+        },
+    }
+    monkeypatch.setattr(
+        api_system,
+        "meta_get",
+        lambda key, default="": json.dumps(meta_payloads.get(key, default if isinstance(default, dict) else {})),
+    )
+
+    competition = api_system.api_get_competition_view(None, ctx={})
+    assert competition["ok"] is True
+    assert competition["competition"]["summary"]["top_ranked_model_name"] == "ranked_v1"
+    assert competition["competition"]["runtime"]["status"] == "ready"
+
+    replay = api_system.api_get_replay_freshness(None, ctx={})
+    assert replay["ok"] is True
+    assert replay["replay_freshness"]["summary"]["approved_model_count"] == 1
+    assert replay["replay_freshness"]["sources"] == {"pytest": 1}
+
+    attribution = api_system.api_get_attribution_quality(None, ctx={})
+    assert attribution["ok"] is True
+    assert attribution["attribution_quality"]["summary"]["rows"] == 10
+    assert attribution["attribution_quality"]["historical_repair"]["ok"] is True

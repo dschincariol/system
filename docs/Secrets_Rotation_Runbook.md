@@ -19,7 +19,7 @@ similar file-backed entries.
    printf '%s' "$NEW_SECRET_VALUE" | sudo tee /etc/trading/secrets/name.next >/dev/null
    sudo chmod 0600 /etc/trading/secrets/name.next
    ```
-3. For database, Redis, MinIO, broker, and provider credentials, rotate the backing service/provider credential first, then atomically replace the file path target:
+3. For database, Redis, MinIO/object-store, broker, and provider credentials, rotate the backing service/provider credential first, then atomically replace the file path target or encrypted systemd credential:
    ```bash
    sudo mv /etc/trading/secrets/name.next /etc/trading/secrets/name
    ```
@@ -29,7 +29,7 @@ similar file-backed entries.
      -f deploy/compose/docker-compose.external-services.yml \
      -f deploy/compose/docker-compose.stack.yml up -d --force-recreate runtime operator
    ```
-5. Run the production preflight and relevant readiness probe. Do not delete the old credential from the provider until the new runtime path passes.
+5. Run the production preflight and relevant readiness probe. Do not delete the old credential from the provider until the new runtime path passes. On systemd hosts, object-store access and secret keys should be exposed as `OBJECT_STORE_ACCESS_KEY_SECRET=object_store_access_key` and `OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key`; do not leave either value inline in `/etc/trading/trading.env`.
 6. Remove inline leftovers from repo-local env files and rerun:
    ```bash
    python - <<'PY'

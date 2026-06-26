@@ -94,6 +94,37 @@ def test_memory_pressure_snapshot_accepts_bart_policy() -> None:
     assert state["swap"]["managed_swapfile_gib"] == 16.0
 
 
+def test_memory_pressure_snapshot_accepts_swap_metadata_page_overhead() -> None:
+    from engine.runtime.memory_pressure import BYTES_IN_GIB, host_memory_pressure_snapshot
+
+    page = 4096
+    meminfo = "\n".join(
+        [
+            "MemTotal:       128974848 kB",
+            "MemAvailable:   83886080 kB",
+            "SwapTotal:      50331640 kB",
+            "SwapFree:       50331640 kB",
+        ]
+    )
+    swapon = "\n".join(
+        [
+            f"/dev/zram0 partition {32 * BYTES_IN_GIB - page} 0 100",
+            f"/swapfile-trading file {16 * BYTES_IN_GIB - page} 0 10",
+        ]
+    )
+
+    state = host_memory_pressure_snapshot(
+        {"PREFLIGHT_REQUIRE_MEMORY_PRESSURE_POLICY": "1"},
+        meminfo_text=meminfo,
+        swapon_text=swapon,
+        swappiness_text="10",
+        zfs_arc_max_text=str(48 * BYTES_IN_GIB),
+    )
+
+    assert state["ok"] is True
+    assert state["meets_policy"] is True
+
+
 def test_memory_pressure_snapshot_rejects_512m_swapfile_host() -> None:
     from engine.runtime.memory_pressure import BYTES_IN_GIB, host_memory_pressure_snapshot
 

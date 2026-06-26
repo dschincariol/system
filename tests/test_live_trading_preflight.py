@@ -10,6 +10,7 @@ import pytest
 
 from engine.runtime.live_trading_preflight import (
     DEFAULT_LIVE_CONFIRM_PHRASE,
+    cpcv_leakage_gate_snapshot,
     live_trading_preflight,
 )
 
@@ -25,6 +26,13 @@ GOOD_CLOCK_HEALTH = {
     "max_observed_skew_ms": 1.0,
     "timezone": {"ok": True, "required_timezone": "UTC", "actual_timezone": "UTC"},
 }
+
+
+def _set_cpcv_leakage_gate(monkeypatch) -> None:
+    monkeypatch.setenv("CPCV_ENABLED", "1")
+    monkeypatch.setenv("CHAMPION_PROMOTION_USE_STAT_GATE", "1")
+    monkeypatch.setenv("CPCV_EMBARGO_PCT", "0.01")
+    monkeypatch.setenv("CPCV_MAX_PBO", "0.5")
 
 
 def _sign_backup_evidence(payload: dict, key: str, *, key_id: str = "live-test-key") -> dict:
@@ -218,6 +226,7 @@ def _set_live_broker_contract(
     evidence: bool = True,
 ) -> None:
     broker = str(broker or "alpaca").strip().lower()
+    _set_cpcv_leakage_gate(monkeypatch)
     monkeypatch.setenv("BROKER", broker)
     monkeypatch.setenv("BROKER_NAME", broker)
     monkeypatch.setenv("LIVE_BROKER", broker)
@@ -320,6 +329,90 @@ def _latest_live_armed_audit_ts(con) -> int:
     ).fetchone()
     assert row is not None
     return int(row[0] or 0)
+
+
+def test_live_trading_preflight_blocks_disabled_cpcv_leakage_gate_in_live(monkeypatch):
+    for key in (
+        "CPCV_ENABLED",
+        "CHAMPION_PROMOTION_USE_STAT_GATE",
+        "CPCV_EMBARGO_PCT",
+        "CPCV_MAX_PBO",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    state = live_trading_preflight(
+        engine_mode="live",
+        execution_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="live-token-1234567890",
+        live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
+    )
+
+    assert state["ok"] is False
+    assert "cpcv_leakage_gate_disabled_in_live" in state["blockers"]
+    assert "champion_promotion_stat_gate_disabled_in_live" in state["blockers"]
+    assert state["cpcv_leakage_gate"]["required"] is True
+    assert state["cpcv_leakage_gate"]["ok"] is False
+
+
+def test_live_trading_preflight_accepts_configured_cpcv_leakage_gate(monkeypatch):
+    _set_cpcv_leakage_gate(monkeypatch)
+
+    state = live_trading_preflight(
+        engine_mode="live",
+        execution_mode="live",
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="live-token-1234567890",
+        live_confirm=DEFAULT_LIVE_CONFIRM_PHRASE,
+    )
+
+    snapshot = state["cpcv_leakage_gate"]
+    assert snapshot["ok"] is True
+    assert snapshot["required"] is True
+    assert snapshot["cpcv_enabled"] is True
+    assert snapshot["stat_gate_enabled"] is True
+    assert snapshot["embargo_pct"] > 0.0
+    assert snapshot["max_pbo"] > 0.0
+    assert "cpcv_leakage_gate_disabled_in_live" not in state["blockers"]
+    assert "champion_promotion_stat_gate_disabled_in_live" not in state["blockers"]
+    assert "cpcv_embargo_pct_not_configured" not in state["blockers"]
+    assert "cpcv_max_pbo_not_configured" not in state["blockers"]
+
+
+def test_live_trading_preflight_blocks_unconfigured_cpcv_thresholds_in_live(monkeypatch):
+    _set_cpcv_leakage_gate(monkeypatch)
+    monkeypatch.setenv("CPCV_EMBARGO_PCT", "0")
+    monkeypatch.setenv("CPCV_MAX_PBO", "0")
+
+    snapshot = cpcv_leakage_gate_snapshot(engine_mode="live")
+
+    assert snapshot["ok"] is False
+    assert "cpcv_embargo_pct_not_configured" in snapshot["blockers"]
+    assert "cpcv_max_pbo_not_configured" in snapshot["blockers"]
+
+
+@pytest.mark.parametrize("mode", ["safe", "paper", "shadow"])
+def test_cpcv_leakage_gate_not_required_outside_live(monkeypatch, mode):
+    for key in (
+        "CPCV_ENABLED",
+        "CHAMPION_PROMOTION_USE_STAT_GATE",
+        "CPCV_EMBARGO_PCT",
+        "CPCV_MAX_PBO",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    state = live_trading_preflight(
+        engine_mode=mode,
+        execution_mode=mode,
+        dashboard_host="127.0.0.1",
+        dashboard_api_token="",
+        live_confirm="",
+    )
+
+    assert state["cpcv_leakage_gate"]["required"] is False
+    assert state["cpcv_leakage_gate"]["ok"] is True
+    assert "cpcv_leakage_gate_disabled_in_live" not in state["blockers"]
+    assert "champion_promotion_stat_gate_disabled_in_live" not in state["blockers"]
 
 
 def test_live_trading_preflight_requires_token_and_confirmation(monkeypatch):

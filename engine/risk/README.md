@@ -8,6 +8,12 @@ The `engine/risk/` package owns the portfolio-risk engines that feed API reads, 
   Additive exposure, drawdown, volatility, and budget checks that write current portfolio-risk state and snapshots.
 - [monte_carlo_risk_engine.py](monte_carlo_risk_engine.py)
   Background Monte Carlo refresher that stores stressed portfolio-risk summaries and compact visualization artifacts in `risk_state`.
+- [var_backtesting.py](var_backtesting.py)
+  VaR/CVaR forecast persistence, exception evidence, Kupiec/Christoffersen tests, and traffic-light summaries.
+- [covariance.py](covariance.py)
+  Shared covariance-risk facade for aligned price returns, Ledoit-Wolf/OAS
+  shrinkage, optional RMT denoising, fallback diagnostics, and serializable
+  covariance/correlation matrices.
 
 ## `portfolio_risk_engine.py` Surface
 
@@ -26,7 +32,9 @@ Public entrypoint:
   the post-risk target map alongside the detailed `info` summary. Drawdown
   thresholds are equity fractions, not percentage integers; when disabled
   (`PORTFOLIO_USE_RISK_ENGINE=0`) it returns the input unchanged with
-  `{"enabled": False}`.
+  `{"enabled": False}`. In live mode, disabling the engine only clears
+  `portfolio_risk_block` when the independent `PORTFOLIO_NOTIONAL_BACKSTOP`
+  is enabled; otherwise it leaves execution hard-blocked.
 
 Knob families (module-level constants read from `PORTFOLIO_RISK_*` env):
 
@@ -35,13 +43,28 @@ Knob families (module-level constants read from `PORTFOLIO_RISK_*` env):
   start the engine linearly ramps a scale from 1.0 down to the min scale, and at
   the hard-block drawdown it fail-closes the whole evaluation. Drawdown is read
   via `engine.strategy.drawdown_state`; an unavailable reading is itself a block.
+- Covariance risk — `RISK_COVARIANCE_METHOD` defaults to `ledoit_wolf`, with
+  `oas` and `sample` as explicit alternatives. `RISK_COVARIANCE_MIN_OBS` (60)
+  is the aligned-return threshold for shrinkage. If shrinkage cannot run because
+  history is thin, symbols are missing, or `sklearn` is unavailable,
+  `RISK_COVARIANCE_FALLBACK` (`sample` by default) selects the fallback and the
+  diagnostics record `fallback_reason`, `method`, `n_obs`, `n_assets`,
+  `shrinkage`, `condition_number`, and covered symbols. `RISK_COVARIANCE_RMT_*`
+  gates optional eigenvalue clipping/detoning and stays off unless explicitly
+  enabled for larger universes.
 - Volatility target — `PORTFOLIO_RISK_VOL_TARGET` (0.020) with `VOL_LOOKBACK`,
   `VOL_FLOOR`/`VOL_CEIL` clamps, an optional `VOL_HARD_BLOCK`, and an optional
   GEX-derived volatility-regime modifier. A correlation-aware portfolio vol proxy
-  is compared to the (modifier-adjusted) target and all signed weights are scaled
-  down when the proxy exceeds target. Per-symbol vol-adjusted sizing caps
+  uses the canonical covariance facade's correlations, is compared to the
+  (modifier-adjusted) target, and all signed weights are scaled down when the
+  proxy exceeds target. Per-symbol vol-adjusted sizing caps
   (`USE_VOL_CAPS`, `SYMBOL_CAP_MAX_W`, `SYMBOL_CAP_MIN_MULT`, `MAX_SYMBOL_GROSS`)
-  size each name by `VOL_TARGET / forecast_vol`.
+  size each name by `VOL_TARGET / forecast_vol`. `forecast_vol` is resolved
+  centrally through `VOL_FORECAST_SOURCE`: `trailing`, `har`/`har_rv`, `garch`,
+  `egarch`, `gjr_garch`, or `blend`. GARCH-family forecasts are persisted in
+  `garch_vol_forecasts`; fitted `arch` models are opt-in via
+  `GARCH_VOL_USE_ARCH=1`, and dependency-missing or convergence failures fall
+  back to deterministic EWMA/trailing forecasts with diagnostics.
 - Correlation clusters — `USE_CORR_CLUSTERS`, `CORR_LOOKBACK`, `CLUSTER_CORR_TH`
   (0.85), `CLUSTER_MAX_GROSS` (0.45), `CLUSTER_MAX_COMPONENTS` (12). Highly
   correlated names are grouped into graph components (|corr| over threshold), and
@@ -221,6 +244,7 @@ documented in the Monte Carlo sections below.
 
 - `GET /api/risk/portfolio`
 - `GET /api/risk/monte_carlo`
+- `GET /api/risk/var_backtest`
 - `GET /api/execution/barrier`
 
 The execution barrier can incorporate portfolio-risk blocks, so risk changes can affect whether the execution pipeline is currently allowed to run.
@@ -238,6 +262,7 @@ design and only above-cap ratios are labeled Over.
 
 - `PORTFOLIO_RISK_*`
 - `MC_*`
+- `RISK_COVARIANCE_*`
 
 These variables are consumed directly by the risk engines and should be documented in `.env.example` and `docs/REFERENCE_CONFIGURATION_GLOSSARY.md` when their operator-facing meaning changes.
 
@@ -292,7 +317,21 @@ evidence exists.
 `GET /api/risk/monte_carlo` returns the latest persisted `monte_carlo_risk_info` state. Current refresher runs persist:
 
 - summary tail metrics: VaR/CVaR, worst simulated drawdown, drawdown percentiles, and stress-case equivalents;
+- `simulation`: method metadata for `gaussian`, `student_t`, `historical`, or `filtered_historical`, including fitted/configured Student-t DoF, historical sample size/window, deterministic seed status, and fallback reasons;
+- `evt`: optional EVT/POT CVaR overlay metadata with threshold, tail sample size, fitted shape/scale, and whether the EVT estimate was used;
 - `fan`: per-horizon simulated cumulative-return percentiles with `step`, `p05`, `p50`, and `p95`;
 - `distribution`: a compact histogram of final simulated cumulative returns with bucket bounds, midpoint `value`, `count`, and `probability`.
 
 The dashboard renders summary bars, a fan chart from `fan`, and a final-return distribution histogram from `distribution`. If an older persisted state only contains summary VaR/CVaR/drawdown fields, the API sets `chart_detail.mode="summary"` and lists the missing `fan_chart` and `distribution` fields so the UI shows an explicit summary-only state instead of an empty chart.
+
+## VaR/CVaR Backtesting Contract
+
+Monte Carlo refreshes best-effort upsert each forecast into `risk_var_forecasts` with `forecast_id`, `forecast_ts_ms`, horizon, VaR/CVaR levels, simulation method, and metadata. The `risk_var_backtest` job reads matured forecasts, aligns realized portfolio return from `equity_history` at `forecast_ts_ms + horizon * VAR_BACKTEST_STEP_MS`, and writes `risk_var_backtest_results` rows with:
+
+- forecast id/timestamp, realized timestamp, horizon, confidence level, VaR/CVaR values, realized return/loss, and exception flag;
+- Kupiec POF statistic/p-value/status;
+- Christoffersen independence statistic/p-value/status;
+- rolling exception rate/window and traffic-light status/reason;
+- PIT-alignment metadata recording the start equity point, target timestamp, and realized equity point used.
+
+`GET /api/risk/var_backtest` returns these rows with `authority.mode="read_only_risk_model_backtesting"`. Missing tables or no matured forecasts return an explicit empty state and do not affect unrelated dashboard reads. Live risk approval continues to fail closed through the existing Monte Carlo readiness/staleness/threshold gates.

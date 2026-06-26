@@ -10,7 +10,12 @@ import time
 from typing import Any
 
 from engine.nlp.cache import NlpCache
-from engine.nlp.encoder import FinBertSentimentEncoder, SentenceTransformerEncoder
+from engine.nlp.encoder import (
+    build_sentiment_encoder,
+    build_text_embedding_encoder,
+    current_sentiment_config,
+    resolve_text_embedding_config,
+)
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.storage import (
@@ -29,8 +34,10 @@ PID = os.getpid()
 BATCH_SIZE = max(1, int(os.environ.get("NLP_TRANSCRIPTS_BATCH_SIZE", "64")))
 MAX_SECTIONS_PER_TRANSCRIPT = max(1, int(os.environ.get("NLP_TRANSCRIPTS_MAX_SECTIONS", "96")))
 LOCK_STALE_AFTER_S = int(os.environ.get("JOB_LOCK_STALE_AFTER_S", "180"))
-SENTENCE_MODEL_NAME = str(os.environ.get("NLP_SENTENCE_MODEL_NAME", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2")
-FINBERT_MODEL_NAME = str(os.environ.get("NLP_FINBERT_MODEL_NAME", "ProsusAI/finbert") or "ProsusAI/finbert")
+EMBED_CONFIG = resolve_text_embedding_config(kind="nlp")
+SENTIMENT_CONFIG = current_sentiment_config()
+SENTENCE_MODEL_NAME = str(EMBED_CONFIG.model_name)
+FINBERT_MODEL_NAME = str(SENTIMENT_CONFIG.model_name)
 LOG = get_logger("engine.strategy.jobs.embed_transcripts")
 logging.basicConfig(level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO))
 
@@ -138,8 +145,8 @@ def run(limit: int | None = None) -> dict[str, Any]:
             )
 
     with (
-        SentenceTransformerEncoder(model_name=SENTENCE_MODEL_NAME, batch_size=64) as sentence_encoder,
-        FinBertSentimentEncoder(model_name=FINBERT_MODEL_NAME, batch_size=32) as finbert_encoder,
+        build_text_embedding_encoder(EMBED_CONFIG) as sentence_encoder,
+        build_sentiment_encoder(SENTIMENT_CONFIG) as finbert_encoder,
     ):
         sentence_result = cache.get_or_encode_embeddings(
             [str(row["text"]) for row in section_rows],
@@ -158,7 +165,12 @@ def run(limit: int | None = None) -> dict[str, Any]:
     return {
         "job": JOB_NAME,
         "sentence_model_name": SENTENCE_MODEL_NAME,
+        "sentence_model_namespace": EMBED_CONFIG.namespace,
+        "embedding_backend": EMBED_CONFIG.backend,
         "finbert_model_name": FINBERT_MODEL_NAME,
+        "finbert_model_namespace": SENTIMENT_CONFIG.namespace,
+        "sentiment_metadata": SENTIMENT_CONFIG.metadata,
+        "embedding_metadata": EMBED_CONFIG.metadata,
         "transcripts_seen": int(len(transcripts)),
         "sections_seen": int(len(section_rows)),
         "encoded": int(sentence_result.encoded),

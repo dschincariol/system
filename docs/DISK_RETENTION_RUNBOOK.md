@@ -15,7 +15,7 @@ Docker storage is under pressure.
 - Compose service stdout/stderr uses the Docker `local` log driver by default
   with `DOCKER_LOG_MAX_SIZE=50m` and `DOCKER_LOG_MAX_FILE=5`.
 - Runtime file logs under `/app/logs`, `/auxpool/trading/runtime/logs`,
-  `/opt/trading-system/logs`,
+  `/var/lib/trading/logs`,
   `/opt/trading/app/logs`, boot stderr logs, the diagnostics-only
   operator-AI JSONL log, and the ZFS runtime log bind mount rotate
   daily, rotate early at `maxsize 50M`, keep 10 rotations, delete rotations
@@ -71,7 +71,7 @@ Docker storage is under pressure.
   `ai_operator_log.jsonl`.
 - `dashboard_server.py` writes `crash_analytics.jsonl`.
 - systemd deployments append service stdout/stderr to
-  `/opt/trading-system/logs/*.log`; Docker deployments use the Docker `local`
+  `/var/lib/trading/logs/*.log`; Docker deployments use the Docker `local`
   driver plus `/app/logs` file rotation.
 
 ## Inspect First

@@ -12,6 +12,7 @@ import importlib
 import logging
 import os
 import py_compile
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -145,6 +146,15 @@ def _repo_relative_job_path(path: str | Path, repo_root: str | Path | None = Non
     return Path(_resolve_job_path(rel)).as_posix()
 
 
+def _compile_job_source(script_abs: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="job_registry_pycompile_") as compile_dir:
+        py_compile.compile(
+            script_abs,
+            cfile=str(Path(compile_dir) / "job.pyc"),
+            doraise=True,
+        )
+
+
 def _allow_unregistered_jobs() -> bool:
     if str(os.environ.get("TS_ENV", "") or "").strip().lower() == "production":
         return False
@@ -186,6 +196,10 @@ def _drift_retrain_pipeline_enabled() -> bool:
 
 def _cpcv_pipeline_enabled() -> bool:
     return bool(_env_flag("CPCV_ENABLED", False))
+
+
+def _tsfm_benchmark_enabled() -> bool:
+    return bool(_env_flag("USE_TSFM_BENCHMARK", False) or _env_flag("TSFM_BENCHMARK_ENABLED", False))
 
 
 def _causal_scoring_enabled() -> bool:
@@ -631,6 +645,35 @@ ALLOWED_JOBS = {
     },
 ),
 
+"garch_vol_forecast": (
+    "engine/strategy/jobs/garch_vol_forecast.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "risk_forecast",
+        "resource_class": "training",
+        "resource_priority": 34,
+        "slot_cost": 1,
+        "schedule": "daily",
+    },
+),
+
+"tsfm_benchmark": (
+    "engine/strategy/jobs/tsfm_benchmark.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "model_benchmark",
+        "resource_class": "training",
+        "resource_priority": 31,
+        "slot_cost": 1,
+        "schedule": "manual one-shot",
+        "purpose": "Runs governed PIT TSFM challenger benchmarks and writes shadow-only OOS evidence.",
+    },
+),
+
 "bocpd_regime_update": (
     "engine/strategy/jobs/bocpd_regime_update.py",
     "oneshot",
@@ -770,6 +813,20 @@ ALLOWED_JOBS = {
     },
 ),
 
+"train_tabular_challenger_models": (
+    "engine/strategy/jobs/train_tabular_challenger_models.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "tabular_challenger_train",
+        "resource_class": "training",
+        "resource_priority": 38,
+        "slot_cost": 1,
+        "default_stage": "shadow",
+    },
+),
+
 "train_patchtst_models": (
     "engine/strategy/jobs/train_patchtst_models.py",
     "oneshot",
@@ -870,6 +927,20 @@ ALLOWED_JOBS = {
     {"execution": False, "pipeline_stage": "temporal_shadow_eval"},
 ),
 
+"graph_challenger_benchmark": (
+    "engine/strategy/jobs/graph_challenger_benchmark.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "graph_shadow_benchmark",
+        "resource_class": "training",
+        "resource_priority": 30,
+        "slot_cost": 1,
+        "shadow_only": True,
+    },
+),
+
 "promote_temporal_models": (
     "engine/strategy/jobs/promote_temporal_models.py",
     "oneshot",
@@ -955,6 +1026,19 @@ ALLOWED_JOBS = {
         "resource_class": "replay",
         "resource_priority": 30,
         "slot_cost": 1,
+    },
+),
+
+"risk_var_backtest": (
+    "engine/runtime/jobs/risk_var_backtest.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "resource_class": "replay",
+        "resource_priority": 25,
+        "slot_cost": 1,
+        "schedule": "daily/manual",
     },
 ),
 
@@ -1210,6 +1294,22 @@ ALLOWED_JOBS = {
     },
 ),
 
+"llm_event_extraction": (
+    "engine/data/jobs/llm_event_extraction.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "schedule": "manual/offline batch",
+        "cadence_seconds": 0,
+        "resource_class": "inference",
+        "resource_priority": 55,
+        "slot_cost": 1,
+        "pipeline_stage": "llm_event_extraction",
+        "default_stage": "shadow",
+    },
+),
+
 "embed_filings": (
     "engine/strategy/jobs/embed_filings.py",
     "oneshot",
@@ -1385,6 +1485,19 @@ ALLOWED_JOBS = {
     {
         "execution": False,
         "pipeline_stage": "rl_portfolio_train",
+        "resource_class": "training",
+        "resource_priority": 28,
+        "slot_cost": 1,
+    },
+),
+
+"train_offline_rl_portfolio": (
+    "engine/strategy/jobs/train_offline_rl_portfolio.py",
+    "oneshot",
+    None,
+    {
+        "execution": False,
+        "pipeline_stage": "rl_portfolio_offline_train",
         "resource_class": "training",
         "resource_priority": 28,
         "slot_cost": 1,
@@ -1646,6 +1759,7 @@ def _build_pipeline_order() -> List[str]:
     if _hmm_pipeline_enabled():
         order.append("train_hmm_regime")
     order.append("har_rv_forecast")
+    order.append("garch_vol_forecast")
     order.append("bocpd_regime_update")
     order.append("shadow_metrics")
     if _gbm_pipeline_enabled():
@@ -1657,11 +1771,15 @@ def _build_pipeline_order() -> List[str]:
     order.append("train_meta_label_model")
     if _model_family_pipeline_enabled("xgb_regressor", "USE_XGB_REGRESSOR"):
         order.append("train_xgb_models")
+    if _model_family_pipeline_enabled("tabular_foundation_challenger", "USE_TABULAR_CHALLENGERS"):
+        order.append("train_tabular_challenger_models")
     if _model_family_pipeline_enabled("patchtst", "USE_PATCHTST"):
         order.append("pretrain_patchtst_models")
         order.append("train_patchtst_models")
     if _model_family_pipeline_enabled("itransformer", "USE_ITRANSFORMER"):
         order.append("train_itransformer_models")
+    if _tsfm_benchmark_enabled():
+        order.append("tsfm_benchmark")
     if _env_flag("TUNE_MODELS_ENABLED", False):
         order.append("tune_models")
     order.extend(
@@ -1671,6 +1789,8 @@ def _build_pipeline_order() -> List[str]:
             "model_lifecycle_manager",
         ]
     )
+    if _env_flag("GRAPH_CHALLENGER_BENCHMARK_ENABLED", False):
+        order.append("graph_challenger_benchmark")
     if _drift_retrain_pipeline_enabled():
         order.append("drift_triggered_retrain")
     order.append("alpha_discovery_loop")
@@ -1806,7 +1926,7 @@ def validate_job_registry_paths(
                 errors.append(f"invalid_script_extension:{job_name}:{script_rel}")
             else:
                 try:
-                    py_compile.compile(script_abs, doraise=True)
+                    _compile_job_source(script_abs)
                 except Exception as e:
                     errors.append(f"invalid_python_entry:{job_name}:{script_rel}:{type(e).__name__}:{e}")
                 else:
@@ -1934,7 +2054,9 @@ def is_offline_workload_job(job_name: str) -> bool:
         "alpha_discovery_loop",
         "discover_features",
         "llm_factor_discovery",
+        "llm_event_extraction",
         "backtest_cpcv",
+        "risk_var_backtest",
         "backtest_walk_forward",
         "portfolio_backtest",
     }:

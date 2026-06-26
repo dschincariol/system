@@ -22,9 +22,12 @@ COPY deploy/bin/resolve_python_requirements.sh /app/deploy/bin/resolve_python_re
 
 RUN python -m pip install --upgrade pip setuptools wheel \
     && REQ_FILE="$(bash /app/deploy/bin/resolve_python_requirements.sh /app)" \
-    && case "$(basename "$REQ_FILE")" in \
+    && REQ_BASENAME="$(basename "$REQ_FILE")" \
+    && case "$REQ_BASENAME" in \
+        requirements.txt|requirements-dev.txt|requirements-nvidia-cuda.txt|requirements-amd-rocm-full.txt) \
+          python -m pip install --require-hashes -r "$REQ_FILE" ;; \
         requirements-amd-rocm.txt) \
-          python -m pip install -r /app/requirements-amd-rocm-full.txt ;; \
+          python -m pip install --require-hashes -r /app/requirements-amd-rocm-full.txt ;; \
         *) \
           python -m pip install -r "$REQ_FILE" ;; \
       esac

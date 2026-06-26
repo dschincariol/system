@@ -4,8 +4,8 @@ The GitHub `Production backend gate (Postgres + Redis)` job is the go-live backe
 
 ## What The Gate Runs
 
-- provisions a Postgres 16 service with TimescaleDB available and a Redis 7 service; the Postgres service sets `--shm-size 1g` so the full-suite schema/migration workload does not exhaust Docker's small default shared-memory mount
-- sets `TS_PRODUCTION_BACKEND_TESTS=1`, `TS_STORAGE_BACKEND=postgres`, `TS_PG_DSN`, and `TS_REDIS_URL`
+- provisions a Postgres 16 service with TimescaleDB available, a Redis 7 service, and a CI PgBouncer listener on `127.0.0.1:6432` in transaction-pooling mode; the Postgres service sets `--shm-size 1g` so the full-suite schema/migration workload does not exhaust Docker's small default shared-memory mount
+- sets `TS_PRODUCTION_BACKEND_TESTS=1`, `TS_STORAGE_BACKEND=postgres`, `TS_PG_DSN`, `TS_PGBOUNCER_TEST_DSN`, `TS_PG_DIRECT_TEST_DSN`, and `TS_REDIS_URL`
 - runs all tests marked `requires_postgres` or `requires_redis`
 - fails if the marker-selected tests collect zero tests or produce any pytest skip
 - runs the full `pytest tests/` tree once under `TS_STORAGE_BACKEND=postgres`
@@ -13,8 +13,9 @@ The GitHub `Production backend gate (Postgres + Redis)` job is the go-live backe
   targeted-only backend gate, but it exercises the production storage/cache
   implementation where locking, isolation, upsert, and idempotency behavior can
   differ from SQLite
-- installs Python test dependencies through `requirements-dev.txt`, which applies
-  `requirements-dev.lock.txt` before resolving packages
+- installs Python test dependencies through `requirements-dev.txt` with
+  `--require-hashes`, which applies `requirements-dev.lock.txt` before resolving
+  packages and verifies checked-in artifact hashes
 - runs targeted production-path tests for migrations, Postgres locks, idempotency uniqueness, audit-chain detection, execution arming persistence, promotion evidence, CPCV/model competition, and Redis-backed cache wrappers
 - inherits the repo pytest timeout policy from `pyproject.toml`: a 120 second per-test default through `pytest-timeout` with `timeout_method=thread`
 - inherits the repo pytest socket isolation policy: DNS and non-local sockets are blocked by default, while the provisioned Postgres and Redis services remain reachable through `127.0.0.1`
@@ -22,7 +23,7 @@ The GitHub `Production backend gate (Postgres + Redis)` job is the go-live backe
 - uploads JUnit XML for the backend marker, targeted backend, and full Postgres
   suite runs
 
-The skip and shrinkage failures are enforced by [tools/run_required_backend_tests.py](../tools/run_required_backend_tests.py), which inspects pytest JUnit XML instead of grepping terminal output. The marked and targeted backend runs fail on any skip. The full-suite Postgres run allows only explicitly configured optional-capability skips, such as ROCm hardware, Julia/PySR, pgbouncer DSNs, Stable-Baselines3-vs-fallback RL coverage, or Node helper availability; Postgres/Redis reachability skips remain failures because those services are provisioned in the job.
+The skip and shrinkage failures are enforced by [tools/run_required_backend_tests.py](../tools/run_required_backend_tests.py), which inspects pytest JUnit XML instead of grepping terminal output. The marked and targeted backend runs fail on any skip. The full-suite Postgres run allows only explicitly configured optional-capability skips, such as ROCm hardware, Julia/PySR, Stable-Baselines3-vs-fallback RL coverage, or Node helper availability; Postgres, PgBouncer, and Redis reachability skips remain failures because those services are provisioned in the job.
 
 `@pytest.mark.live_network` tests are not part of this PR gate. They require an explicit run with `TRADING_TEST_ALLOW_LIVE_NETWORK=1` and should be reserved for reviewed live-service smoke checks outside normal CI.
 
@@ -80,12 +81,15 @@ docker run --rm --name trading-ci-redis \
 In a second shell from the repo root:
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-dev.txt
 
 export PYTHONPATH=.
 export TS_PRODUCTION_BACKEND_TESTS=1
 export TS_STORAGE_BACKEND=postgres
 export TS_PG_DSN="host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password"
+export TS_PGBOUNCER_TEST_DSN="host=127.0.0.1 port=6432 user=ts_app dbname=trading_ci password=test-app-password"
+export TS_PG_DIRECT_TEST_DSN="host=127.0.0.1 port=5432 user=ts_app dbname=trading_ci password=test-app-password"
+export TS_PGBOUNCER_ASSERT_POOL_SIZE=50
 export TS_PG_PASSWORD=test-app-password
 export TS_PG_SCHEMA_PER_DB_PATH=1
 export TS_PG_POOL_SIZE=16
@@ -107,6 +111,51 @@ export PROD_LOCK=0
 export KILL_SWITCH_GLOBAL=0
 ```
 
+Start a local PgBouncer listener. The CI job runs a containerized
+`edoburu/pgbouncer:v1.25.2-p0` instance with a mounted throwaway config written
+from `TS_PG_PASSWORD`; local runs can use the same shape:
+
+```bash
+PGBOUNCER_IMAGE=edoburu/pgbouncer:v1.25.2-p0
+docker rm -f trading-ci-pgbouncer >/dev/null 2>&1 || true
+
+mkdir -p var/tmp/pgbouncer-ci
+printf '"ts_app" "%s"\n' "$TS_PG_PASSWORD" > var/tmp/pgbouncer-ci/userlist.txt
+{
+  echo "[databases]"
+  printf 'trading_ci = host=127.0.0.1 port=5432 dbname=trading_ci user=ts_app password=%s\n' "$TS_PG_PASSWORD"
+  echo
+  echo "[pgbouncer]"
+  echo "listen_addr = 127.0.0.1"
+  echo "listen_port = 6432"
+  echo "auth_type = plain"
+  echo "auth_file = /etc/pgbouncer/userlist.txt"
+  echo "pool_mode = transaction"
+  echo "default_pool_size = 50"
+  echo "min_pool_size = 0"
+  echo "reserve_pool_size = 0"
+  echo "max_client_conn = 200"
+  echo "server_idle_timeout = 60"
+  echo "query_wait_timeout = 30"
+  echo "server_reset_query = DISCARD ALL"
+  echo "server_check_query = SELECT 1"
+  echo "server_check_delay = 30"
+  echo "ignore_startup_parameters = extra_float_digits,options"
+  echo "admin_users = ts_app"
+  echo "stats_users = ts_app"
+  echo "pidfile = /tmp/pgbouncer.pid"
+  echo "logfile = /dev/stdout"
+} > var/tmp/pgbouncer-ci/pgbouncer.ini
+
+docker run \
+  --detach \
+  --name trading-ci-pgbouncer \
+  --network host \
+  --volume "$PWD/var/tmp/pgbouncer-ci/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro" \
+  --volume "$PWD/var/tmp/pgbouncer-ci/userlist.txt:/etc/pgbouncer/userlist.txt:ro" \
+  "$PGBOUNCER_IMAGE"
+```
+
 Run the marker gate:
 
 ```bash
@@ -122,7 +171,6 @@ TRADING_UNIT_TEST_SCHEMA_FAST=0 python tools/run_required_backend_tests.py \
   --label full-postgres-redis-suite \
   --min-selected 2400 \
   --allow-skip-message-regex "PySR and Julia are required" \
-  --allow-skip-message-regex "TS_PGBOUNCER_TEST_DSN" \
   --allow-skip-message-regex "requires Python 3\\.12 ROCm runtime image" \
   --allow-skip-message-regex "ROCm torch GPU is unavailable" \
   --allow-skip-message-regex "node executable is not available" \
@@ -136,6 +184,12 @@ keeps the merge gate as close as practical to the real pytest invocation while
 accepting the runtime cost of a slower Postgres lane. It also disables the
 fast schema shortcut so Timescale continuous aggregates, compression, and
 retention policies are validated on the same path production uses.
+
+The PgBouncer contract is intentionally fail-closed. The full-suite JUnit XML
+must include `tests/test_pgbouncer_routing.py::test_prepared_statements_work_through_pgbouncer_when_available`
+and `tests/test_pgbouncer_routing.py::test_hundred_clients_multiplex_under_pool_size_when_available`
+without `<skipped>` children. If either PgBouncer DSN is missing, the runner
+reports an unexpected skip and fails the production-backend job.
 
 Run the safety-critical SQLite/mocks gate:
 

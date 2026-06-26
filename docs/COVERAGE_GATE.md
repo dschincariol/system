@@ -18,10 +18,10 @@ The custom gate enforces three hard checks from the same coverage JSON:
 
 - total line+branch coverage must meet `minimum_percent`
 - configured nested package floors must pass for `engine/risk`,
-  `engine/execution`, and `engine/runtime`
+  `engine/execution`, `engine/runtime`, and `engine/strategy`
 - no new zero-covered Python module may appear under
-  `engine/risk`, `engine/execution`, or `engine/runtime` outside the committed
-  zero-covered burndown allowlist
+  `engine/risk`, `engine/execution`, `engine/runtime`, or `engine/strategy`
+  outside the committed zero-covered burndown allowlist
 
 ## Local Command
 
@@ -74,10 +74,12 @@ The global gate is `52.0%`, based on a full local baseline originally taken on
   `routes 27.69%`, `ops 17.53%`
 - Nested hard floors, rounded down to avoid display-rounding false failures:
   `engine/risk 50.81%`, `engine/execution 58.92%`,
-  `engine/runtime 58.49%`
-- Zero-covered critical-root burndown: `13` allowlisted modules, with no new
-  zero-covered modules allowed under `engine/risk`, `engine/execution`, or
-  `engine/runtime`
+  `engine/runtime 58.49%`, `engine/strategy 55.67%`
+- The `engine/strategy` floor was added from a 2026-06-26 local measurement of
+  `55.68%` line+branch coverage, rounded down to `55.67%`.
+- Zero-covered critical-root burndown: `25` allowlisted modules, with no new
+  zero-covered modules allowed under `engine/risk`, `engine/execution`,
+  `engine/runtime`, or `engine/strategy`
 
 The threshold is intentionally just below the measured baseline to avoid
 rounding noise while still blocking real regressions.
@@ -94,8 +96,8 @@ baselined.
 Coverage owners raise thresholds after coverage improvements land and remain
 stable on the default branch. The normal global ratchet is one percentage point
 at a time in `pyproject.toml`; nested money-path floors should be raised to the
-new measured value when tests improve `engine/risk`, `engine/execution`, or
-`engine/runtime`.
+new measured value when tests improve `engine/risk`, `engine/execution`,
+`engine/runtime`, or `engine/strategy`.
 
 Do not lower the global threshold, lower a nested floor, expand the
 zero-covered allowlist, or add omit rules to pass CI unless the pull request

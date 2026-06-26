@@ -46,8 +46,17 @@ def test_live_start_aliases_require_confirmation():
 
 def test_operator_ui_uses_structured_modal_not_native_prompts():
     text = UI_PATH.read_text(encoding="utf-8")
+    fallback_match = re.search(
+        r'<script id="operatorUiCrashFallback">[\s\S]*?</script>',
+        text,
+    )
+    assert fallback_match is not None
+    fallback_script = fallback_match.group(0)
+    normal_ui_text = text.replace(fallback_script, "")
 
-    assert not re.search(r"(?:window\.)?(?:confirm|prompt)\s*\(", text)
+    assert not re.search(r"(?:window\.)?(?:confirm|prompt)\s*\(", normal_ui_text)
+    assert 'window.prompt("Operator UI is degraded. Type KILL to Emergency Stop.")' in fallback_script
+    assert 'window.prompt("Enter an Emergency Stop reason (10+ characters).")' in fallback_script
     assert 'import("/ui/confirmation_modal.mjs")' in text
     assert "operatorMutationConfirmation(" in text
     assert "actionId" in text
@@ -101,7 +110,7 @@ def test_operator_start_and_bootstrap_are_confirmed_bounded_routes():
     text = SERVER_PATH.read_text(encoding="utf-8")
     start_block = _extract_block(
         text,
-        'app.post("/api/operator/start", async (req, res) => {',
+        'app.post("/api/operator/start", wrapOperatorRoute(async (req, res) => {',
         'app.post("/api/operator/stop", (req, res) => {',
     )
     proxy_block = _extract_block(
@@ -160,7 +169,7 @@ def test_proxy_only_operator_start_reconciles_before_preflight():
     text = SERVER_PATH.read_text(encoding="utf-8")
     block = _extract_block(
         text,
-        'app.post("/api/operator/start", async (req, res) => {',
+        'app.post("/api/operator/start", wrapOperatorRoute(async (req, res) => {',
         'app.post("/api/operator/stop", (req, res) => {',
     )
 
@@ -246,6 +255,30 @@ def test_operator_status_endpoint_stays_lightweight():
 
     assert "await getReadiness()" not in block
     assert "health: null" in block
+
+
+def test_operator_start_restart_and_process_faults_are_guarded():
+    text = SERVER_PATH.read_text(encoding="utf-8")
+
+    start_block = _extract_block(
+        text,
+        'app.post("/api/operator/start", wrapOperatorRoute(async (req, res) => {',
+        'app.post("/api/operator/stop", (req, res) => {',
+    )
+    restart_block = _extract_block(
+        text,
+        'app.post("/api/operator/restart", wrapOperatorRoute(async (req, res) => {',
+        'app.post("/api/operator/emergencyStop", (req, res) => {',
+    )
+
+    assert "requireOperatorConfirmation(" in start_block
+    assert "OPERATOR_START_REQUEST_TIMEOUT_MS" in start_block
+    assert "startEngine(mode)" in start_block
+    assert "requireOperatorConfirmation(" in restart_block
+    assert "startEngine(mode)" in restart_block
+    assert 'process.on("unhandledRejection", handleUnhandledRejection);' in text
+    assert 'process.on("uncaughtException", handleUncaughtException);' in text
+    assert 'logOperatorCatch(scope, error, extra);' in text
 
 
 def test_operator_lan_mode_does_not_default_to_public_bind():

@@ -57,6 +57,7 @@ main() {
   require_file "${CREDSTORE_DIR}/master_key.cred"
   require_file "${CREDSTORE_DIR}/pg_password_app.cred"
   require_file "${CREDSTORE_DIR}/redis_password.cred"
+  require_file "${CREDSTORE_DIR}/object_store_access_key.cred"
   require_file "${CREDSTORE_DIR}/object_store_secret_key.cred"
   require_file "${CREDSTORE_DIR}/dashboard_api_token.cred"
   require_file "${CREDSTORE_DIR}/operator_api_token.cred"
@@ -70,6 +71,7 @@ main() {
     --property="LoadCredentialEncrypted=master_key:${CREDSTORE_DIR}/master_key.cred" \
     --property="LoadCredentialEncrypted=pg_password_app:${CREDSTORE_DIR}/pg_password_app.cred" \
     --property="LoadCredentialEncrypted=redis_password:${CREDSTORE_DIR}/redis_password.cred" \
+    --property="LoadCredentialEncrypted=object_store_access_key:${CREDSTORE_DIR}/object_store_access_key.cred" \
     --property="LoadCredentialEncrypted=object_store_secret_key:${CREDSTORE_DIR}/object_store_secret_key.cred" \
     --property="LoadCredentialEncrypted=dashboard_api_token:${CREDSTORE_DIR}/dashboard_api_token.cred" \
     --property="LoadCredentialEncrypted=operator_api_token:${CREDSTORE_DIR}/operator_api_token.cred" \
@@ -88,9 +90,11 @@ main() {
       TS_PG_ROLE=app \
       DASHBOARD_API_TOKEN_SECRET=dashboard_api_token \
       OPERATOR_API_TOKEN_SECRET=operator_api_token \
+      OBJECT_STORE_ACCESS_KEY_SECRET=object_store_access_key \
+      OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key \
       BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key \
       PYTHONUNBUFFERED=1 \
-      /usr/bin/bash -lc 'set -euo pipefail; set -a; . "$TRADING_ENV_FILE"; set +a; export TS_SERVICE_NAME=trading-prod-preflight TS_SECRETS_PROVIDER=systemd-creds TS_PG_ROLE=app DASHBOARD_API_TOKEN_SECRET=dashboard_api_token OPERATOR_API_TOKEN_SECRET=operator_api_token BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key PYTHONPATH="${PYTHONPATH:-$APP_ROOT}"; cd "$APP_ROOT"; exec "$PYTHON_BIN" engine/runtime/prod_preflight.py --json'
+      /usr/bin/bash -lc 'set -euo pipefail; set -a; . "$TRADING_ENV_FILE"; set +a; unset OBJECT_STORE_ACCESS_KEY OBJECT_STORE_ACCESS_KEY_FILE MINIO_ACCESS_KEY MINIO_ACCESS_KEY_FILE AWS_ACCESS_KEY_ID AWS_ACCESS_KEY_ID_FILE OBJECT_STORE_SECRET_KEY OBJECT_STORE_SECRET_KEY_FILE MINIO_SECRET_KEY MINIO_SECRET_KEY_FILE AWS_SECRET_ACCESS_KEY AWS_SECRET_ACCESS_KEY_FILE; export TS_SERVICE_NAME=trading-prod-preflight TS_SECRETS_PROVIDER=systemd-creds TS_PG_ROLE=app DASHBOARD_API_TOKEN_SECRET=dashboard_api_token OPERATOR_API_TOKEN_SECRET=operator_api_token OBJECT_STORE_ACCESS_KEY_SECRET=object_store_access_key OBJECT_STORE_SECRET_KEY_SECRET=object_store_secret_key BACKUP_EVIDENCE_HMAC_KEY_SECRET=backup_evidence_hmac_key PYTHONPATH="${PYTHONPATH:-$APP_ROOT}"; cd "$APP_ROOT"; exec "$PYTHON_BIN" engine/runtime/prod_preflight.py --json'
 }
 
 main "$@"

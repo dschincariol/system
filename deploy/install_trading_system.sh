@@ -5,14 +5,15 @@ if [[ "${EUID}" -ne 0 ]]; then
   exec sudo bash "$0" "$@"
 fi
 
-INSTALL_ROOT="${INSTALL_ROOT:-/opt/trading-system}"
-REPO_DIR="${REPO_DIR:-$INSTALL_ROOT/repo}"
+INSTALL_ROOT="${INSTALL_ROOT:-/opt/trading}"
+REPO_DIR="${REPO_DIR:-$INSTALL_ROOT/app}"
 VENV_DIR="${VENV_DIR:-$INSTALL_ROOT/venv}"
-DATA_DIR="${DATA_DIR:-$INSTALL_ROOT/data}"
-LOGS_DIR="${LOGS_DIR:-$INSTALL_ROOT/logs}"
-BACKUPS_DIR="${BACKUPS_DIR:-$INSTALL_ROOT/backups}"
-ETC_DIR="${ETC_DIR:-/etc/trading-system}"
+DATA_DIR="${DATA_DIR:-/var/lib/trading}"
+LOGS_DIR="${LOGS_DIR:-$DATA_DIR/logs}"
+BACKUPS_DIR="${BACKUPS_DIR:-/var/backups/trading}"
+ETC_DIR="${ETC_DIR:-/etc/trading}"
 ENV_FILE="${ENV_FILE:-$ETC_DIR/trading.env}"
+CREDSTORE_DIR="${CREDSTORE_DIR:-/etc/credstore.encrypted}"
 TRADING_USER="${TRADING_USER:-trading}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -94,7 +95,20 @@ mkdir -p "$INSTALL_ROOT" "$DATA_DIR" "$LOGS_DIR" "$BACKUPS_DIR" "$ETC_DIR"
 if [[ -d "$REPO_SRC/boot" && -f "$REPO_SRC/start_system.py" ]]; then
   mkdir -p "$REPO_DIR"
   rsync -a --delete \
+    --include '.env.example' \
+    --include '*.env.example' \
     --exclude '.git' \
+    --exclude '.env' \
+    --exclude '.env.*' \
+    --exclude '*.env' \
+    --exclude '*.env.*' \
+    --exclude 'data/secrets' \
+    --exclude 'data/secrets/**' \
+    --exclude 'data/runtime' \
+    --exclude 'data/runtime/**' \
+    --exclude '*.db' \
+    --exclude '*.sqlite' \
+    --exclude '*.sqlite-*' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     "$REPO_SRC/" "$REPO_DIR/"
@@ -103,11 +117,20 @@ else
   exit 1
 fi
 
-if [[ -f "$REPO_DIR/deploy/env/trading.env" ]]; then
-  ENV_TEMPLATE="$REPO_DIR/deploy/env/trading.env"
-else
-  ENV_TEMPLATE="$REPO_DIR/deploy/env/trading.env.example"
-fi
+find "$REPO_DIR" \
+  \( -name '.env' -o -name '.env.*' -o -name '*.env' -o -name '*.env.*' \) \
+  ! -name '.env.example' \
+  ! -name '*.env.example' \
+  \( -type f -o -type l \) \
+  -exec rm -f -- {} +
+
+rm -rf "$REPO_DIR/data/secrets" "$REPO_DIR/data/runtime"
+find "$REPO_DIR" \
+  \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite-*' \) \
+  -type f \
+  -exec rm -f -- {} +
+
+ENV_TEMPLATE="$REPO_DIR/deploy/env/trading.env.example"
 
 if [[ ! -f "$ENV_TEMPLATE" ]]; then
   echo "env_template_not_found:$ENV_TEMPLATE" >&2
@@ -185,6 +208,24 @@ ensure_generated_secret_file() {
   chmod 0600 "$path"
 }
 
+install_systemd_credential() {
+  local name="$1"
+  local source_file="$2"
+  local target_file="$CREDSTORE_DIR/${name}.cred"
+  local tmp_file
+
+  command -v systemd-creds >/dev/null 2>&1 || {
+    echo "systemd_creds_required_for_credential:$name" >&2
+    exit 1
+  }
+
+  install -d -o root -g root -m 0700 "$CREDSTORE_DIR"
+  tmp_file="$(mktemp "$CREDSTORE_DIR/.${name}.XXXXXX")"
+  systemd-creds encrypt --name="$name" "$source_file" "$tmp_file"
+  install -o root -g root -m 0400 "$tmp_file" "$target_file"
+  rm -f "$tmp_file"
+}
+
 set_env_value "TRADING_ROOT" "$INSTALL_ROOT"
 set_env_value "TRADING_REPO" "$REPO_DIR"
 set_env_value "TRADING_DATA" "$DATA_DIR"
@@ -204,26 +245,30 @@ if is_placeholder_secret "DATA_SOURCE_MASTER_KEY"; then
 fi
 ensure_generated_secret_file "$MASTER_KEY_FILE"
 BACKUP_EVIDENCE_KEY_FILE="$DATA_DIR/.backup_evidence_hmac_key"
-set_env_value "BACKUP_EVIDENCE_HMAC_KEY_SECRET" ""
-set_env_value "BACKUP_EVIDENCE_HMAC_KEY_FILE" "$BACKUP_EVIDENCE_KEY_FILE"
 ensure_generated_secret_file "$BACKUP_EVIDENCE_KEY_FILE"
+install_systemd_credential "backup_evidence_hmac_key" "$BACKUP_EVIDENCE_KEY_FILE"
+set_env_value "BACKUP_EVIDENCE_HMAC_KEY_FILE" ""
+set_env_value "BACKUP_EVIDENCE_HMAC_KEY_SECRET" "backup_evidence_hmac_key"
 set_env_value "DASHBOARD_BASE" "http://127.0.0.1:8000"
 ensure_generated_secret "DASHBOARD_API_TOKEN"
 chmod 0600 "$ENV_FILE"
 
 rm -f "$REPO_DIR/.env"
-ln -s "$ENV_FILE" "$REPO_DIR/.env"
 
 TRADING_REPO="$REPO_DIR" PYTHON_VENV="$VENV_DIR" PYTHON_BIN="python3.11" TRADING_DEPENDENCY_PROFILE="$DEPENDENCY_PROFILE" \
   bash "$REPO_DIR/deploy/bin/install_python_env.sh"
 
+ln -sfn "$(command -v node)" "$VENV_DIR/bin/node"
+ln -sfn "$(command -v npm)" "$VENV_DIR/bin/npm"
+ln -sfn "$(command -v npx)" "$VENV_DIR/bin/npx"
+
 cd "$REPO_DIR"
-node_major="$(node -p "Number(process.versions.node.split('.')[0])")"
+node_major="$(PATH="$VENV_DIR/bin:$PATH" "$VENV_DIR/bin/node" -p "Number(process.versions.node.split('.')[0])")"
 if ! [[ "$node_major" =~ ^[0-9]+$ ]] || (( node_major != 20 )); then
-  echo "node_version_too_old_before_npm_install:$(node --version 2>/dev/null || echo missing)" >&2
+  echo "node_version_too_old_before_npm_install:$("$VENV_DIR/bin/node" --version 2>/dev/null || echo missing)" >&2
   exit 1
 fi
-npm ci
+PATH="$VENV_DIR/bin:$PATH" "$VENV_DIR/bin/npm" ci
 
 chmod +x "$REPO_DIR"/deploy/install_trading_system.sh
 chmod +x "$REPO_DIR"/deploy/bin/*.sh
@@ -232,6 +277,8 @@ install -m 0644 "$REPO_DIR/deploy/systemd/trading-operator.service" /etc/systemd
 install -m 0644 "$REPO_DIR/deploy/systemd/trading-engine.service" /etc/systemd/system/trading-engine.service
 install -m 0644 "$REPO_DIR/deploy/systemd/trading-backup.service" /etc/systemd/system/trading-backup.service
 install -m 0644 "$REPO_DIR/deploy/systemd/trading-backup.timer" /etc/systemd/system/trading-backup.timer
+install -m 0644 "$REPO_DIR/deploy/systemd/trading-restore-drill.service" /etc/systemd/system/trading-restore-drill.service
+install -m 0644 "$REPO_DIR/deploy/systemd/trading-restore-drill.timer" /etc/systemd/system/trading-restore-drill.timer
 install -m 0644 "$REPO_DIR/deploy/systemd/trading-upgrade.service" /etc/systemd/system/trading-upgrade.service
 install -m 0644 "$REPO_DIR/deploy/logrotate/trading-system" /etc/logrotate.d/trading-system
 logrotate -d /etc/logrotate.d/trading-system >/dev/null
@@ -247,16 +294,24 @@ trading ALL=(root) NOPASSWD: /bin/systemctl restart trading-operator.service
 trading ALL=(root) NOPASSWD: /bin/systemctl status trading-operator.service
 trading ALL=(root) NOPASSWD: /bin/systemctl start trading-backup.service
 trading ALL=(root) NOPASSWD: /bin/systemctl status trading-backup.service
+trading ALL=(root) NOPASSWD: /bin/systemctl start trading-restore-drill.service
+trading ALL=(root) NOPASSWD: /bin/systemctl status trading-restore-drill.service
 trading ALL=(root) NOPASSWD: /bin/systemctl start trading-upgrade.service
 trading ALL=(root) NOPASSWD: /bin/systemctl status trading-upgrade.service
 trading ALL=(root) NOPASSWD: /bin/journalctl -u trading-engine.service *
 trading ALL=(root) NOPASSWD: /bin/journalctl -u trading-operator.service *
 trading ALL=(root) NOPASSWD: /bin/journalctl -u trading-backup.service *
+trading ALL=(root) NOPASSWD: /bin/journalctl -u trading-restore-drill.service *
 trading ALL=(root) NOPASSWD: /bin/journalctl -u trading-upgrade.service *
+trading ALL=(root) NOPASSWD: /usr/bin/true
+trading ALL=(root) NOPASSWD: /usr/bin/tail -n * -- /var/lib/trading/logs/*.log
+trading ALL=(root) NOPASSWD: /bin/tail -n * -- /var/lib/trading/logs/*.log
+trading ALL=(root) NOPASSWD: /usr/bin/tail -n * -- /opt/trading/app/logs/*.log
+trading ALL=(root) NOPASSWD: /bin/tail -n * -- /opt/trading/app/logs/*.log
 EOF
 chmod 0440 /etc/sudoers.d/trading-system
 
-chown -R "$TRADING_USER:$TRADING_USER" "$INSTALL_ROOT" "$ETC_DIR" "$REPO_DIR"
+chown -R "$TRADING_USER:$TRADING_USER" "$INSTALL_ROOT" "$DATA_DIR" "$LOGS_DIR" "$BACKUPS_DIR" "$ETC_DIR" "$REPO_DIR"
 
 TRADING_HOME="$(getent passwd "$TRADING_USER" | cut -d: -f6)"
 sudo -u "$TRADING_USER" env \
@@ -272,8 +327,11 @@ systemctl daemon-reload
 systemctl enable trading-operator.service
 systemctl enable trading-engine.service
 systemctl enable trading-backup.timer
+systemctl enable trading-restore-drill.timer
+systemctl restart trading-engine.service
 systemctl start trading-operator.service
 systemctl start trading-backup.timer
+systemctl start trading-restore-drill.timer
 
 echo "install_complete"
 echo "operator_url=http://$(hostname -I | awk '{print $1}'):4001"

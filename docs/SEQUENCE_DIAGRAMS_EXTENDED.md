@@ -201,7 +201,7 @@ Important distinction:
 - `services/operator_ai/agent.js` is diagnostics-only
 - `boot/operator_server.js` separately exposes AI patch preview/apply/rollback routes
 - `engine.api.api_operator_handlers.py` owns the Python autofix and emergency-stop paths
-- `services/operator_ai/agent.js` currently fetches `/api/execution/barrier` but does not assign that final response into the returned context object because its promise destructuring is offset by one slot
+- `services/operator_ai/agent.js` fetches `/api/execution/barrier` and assigns it as the `barrier` field on the returned diagnostics context; field alignment is guarded by `tests/test_operator_ai_context_contract.py`
 
 ## 5. Data-Source Credential, Update, And Test Flow
 

@@ -35,8 +35,11 @@ def up(conn) -> None:
         CREATE TABLE IF NOT EXISTS nlp_embeddings (
             hash TEXT NOT NULL,
             model_name TEXT NOT NULL,
+            backend TEXT DEFAULT 'legacy',
+            model_namespace TEXT,
             dim BIGINT NOT NULL,
             vector BYTEA NOT NULL,
+            model_metadata_json JSONB,
             PRIMARY KEY(hash, model_name)
         )
         """
@@ -52,8 +55,11 @@ def up(conn) -> None:
         CREATE TABLE IF NOT EXISTS nlp_sentiments (
             hash TEXT NOT NULL,
             model_name TEXT NOT NULL,
+            backend TEXT DEFAULT 'legacy',
+            model_namespace TEXT,
             score DOUBLE PRECISION,
             label TEXT,
+            model_metadata_json JSONB,
             PRIMARY KEY(hash, model_name)
         )
         """
@@ -62,5 +68,17 @@ def up(conn) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_nlp_sentiments_model_name
           ON nlp_sentiments(model_name)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_nlp_embeddings_backend_namespace
+          ON nlp_embeddings(backend, model_namespace)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_nlp_sentiments_backend_namespace
+          ON nlp_sentiments(backend, model_namespace)
         """
     )

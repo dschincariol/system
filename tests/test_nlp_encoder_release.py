@@ -212,3 +212,67 @@ def test_encoder_context_manager_loads_then_releases(monkeypatch, tmp_path) -> N
         assert fake_sentence_transformers.model_loads == 1
         assert sentence.encode(["Filing paragraph text."]).shape == (1, 3)
     assert sentence._model is None
+
+
+def test_missing_optional_embedding_backend_degrades_without_crash(monkeypatch) -> None:
+    from engine.nlp import encoder as encoder_module
+
+    original_import_module = encoder_module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "sentence_transformers":
+            raise ImportError("missing optional sentence-transformers")
+        return original_import_module(name)
+
+    monkeypatch.setattr(encoder_module.importlib, "import_module", fake_import_module)
+    cfg = encoder_module.TextEmbeddingConfig(
+        backend="sentence_transformer",
+        model_name="unit-missing-model",
+        fallback_policy="skip",
+    )
+
+    encoded = encoder_module.encode_texts_with_config(["Revenue beat expectations"], cfg)
+
+    assert encoded.degraded is True
+    assert encoded.values.shape == (0, 0)
+    assert "missing optional sentence-transformers" in encoded.errors[0]
+
+
+def test_missing_optional_embedding_backend_can_fallback_to_hashing(monkeypatch) -> None:
+    from engine.nlp import encoder as encoder_module
+
+    original_import_module = encoder_module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "sentence_transformers":
+            raise ImportError("missing optional sentence-transformers")
+        return original_import_module(name)
+
+    monkeypatch.setattr(encoder_module.importlib, "import_module", fake_import_module)
+    cfg = encoder_module.TextEmbeddingConfig(
+        backend="sentence_transformer",
+        model_name="unit-missing-model",
+        fallback_policy="hashing",
+        dim=16,
+    )
+
+    encoded = encoder_module.encode_texts_with_config(["Revenue beat expectations"], cfg)
+
+    assert encoded.degraded is True
+    assert encoded.effective_config.backend == "hashing"
+    assert encoded.values.shape == (1, 16)
+
+
+def test_financial_embedding_candidate_requires_license_review_ack(monkeypatch) -> None:
+    from engine.nlp import encoder as encoder_module
+
+    monkeypatch.delenv("NLP_FINANCIAL_EMBED_LICENSE_REVIEW_ACK", raising=False)
+    cfg = encoder_module.TextEmbeddingConfig(
+        backend="financial_sentence_transformer",
+        model_name=encoder_module.DEFAULT_FINANCIAL_EMBED_MODEL,
+    )
+
+    encoded = encoder_module.encode_texts_with_config(["cash flow guidance"], cfg)
+
+    assert encoded.degraded is True
+    assert "license_review_required" in encoded.errors[0]

@@ -26,8 +26,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from engine.data._credentials import get_data_credential
 from engine.nlp.cache import bytes_to_vector, vector_to_bytes
+from engine.nlp.encoder import (
+    EncodedTextBatch,
+    TextEmbeddingConfig,
+    encode_texts_with_config,
+    embedding_namespace,
+    resolve_text_embedding_config,
+)
 from engine.runtime.failure_diagnostics import log_failure
 from engine.runtime.logging import get_logger
 from engine.runtime.metrics import emit_gauge
@@ -56,6 +62,12 @@ NEWS_NEGATIVE_SENTIMENT_THRESHOLD = float(os.environ.get("NEWS_NEGATIVE_SENTIMEN
 class NewsEmbeddingConfig:
     backend: str
     model_name: str
+    fallback_policy: str = "skip"
+    local_files_only: bool = False
+
+    @property
+    def namespace(self) -> str:
+        return embedding_namespace(self.backend, self.model_name)
 
 
 def _warn_nonfatal(code: str, error: BaseException, *, once_key: str | None = None, **extra: object) -> None:
@@ -128,24 +140,13 @@ def text_hash(text: Any) -> str:
 
 
 def current_embedding_config() -> NewsEmbeddingConfig:
-    raw_backend = str(os.environ.get("NEWS_EMBED_BACKEND", "current") or "current").strip().lower()
-    if raw_backend in {"current", "default", "finbert", "nlp_finbert"}:
-        model = str(
-            os.environ.get("NEWS_EMBED_FINBERT_MODEL")
-            or os.environ.get("NLP_FINBERT_MODEL_NAME")
-            or os.environ.get("FINBERT_MODEL_NAME")
-            or "ProsusAI/finbert"
-        ).strip()
-        return NewsEmbeddingConfig(backend="finbert", model_name=model or "ProsusAI/finbert")
-    if raw_backend in {"sentence_transformer", "sentence-transformer", "st", "sbert"}:
-        model = str(os.environ.get("NEWS_EMBED_SENTENCE_MODEL", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2").strip()
-        return NewsEmbeddingConfig(backend="sentence_transformer", model_name=model or "all-MiniLM-L6-v2")
-    if raw_backend in {"api", "openai", "openai_api"}:
-        model = str(os.environ.get("NEWS_EMBED_OPENAI_MODEL", "text-embedding-3-small") or "text-embedding-3-small").strip()
-        return NewsEmbeddingConfig(backend="openai", model_name=model or "text-embedding-3-small")
-    if raw_backend in {"hash", "hashing", "test_hash"}:
-        return NewsEmbeddingConfig(backend="hashing", model_name="hashing-v1")
-    return NewsEmbeddingConfig(backend=raw_backend or "finbert", model_name=str(os.environ.get("NEWS_EMBED_MODEL", "") or raw_backend))
+    cfg = resolve_text_embedding_config(kind="news")
+    return NewsEmbeddingConfig(
+        backend=str(cfg.backend),
+        model_name=str(cfg.model_name),
+        fallback_policy=str(cfg.fallback_policy),
+        local_files_only=bool(cfg.local_files_only),
+    )
 
 
 def _normalize_matrix(values: np.ndarray) -> np.ndarray:
@@ -171,34 +172,47 @@ def _hashing_embeddings(texts: Sequence[str], dim: int = 128) -> np.ndarray:
     return np.vstack(rows).astype(np.float32) if rows else np.zeros((0, int(dim)), dtype=np.float32)
 
 
-def encode_news_texts(texts: Sequence[str], config: Optional[NewsEmbeddingConfig] = None) -> np.ndarray:
+def _to_text_embedding_config(config: Optional[NewsEmbeddingConfig | TextEmbeddingConfig]) -> TextEmbeddingConfig:
     cfg = config or current_embedding_config()
+    if isinstance(cfg, TextEmbeddingConfig):
+        return cfg
+    return TextEmbeddingConfig(
+        backend=str(cfg.backend),
+        model_name=str(cfg.model_name),
+        batch_size=max(1, int(os.environ.get("NEWS_EMBED_BATCH_SIZE", "32" if str(cfg.backend) == "finbert" else "64"))),
+        cache_dir=str(os.environ.get("NLP_MODEL_CACHE_DIR", "") or "") or None,
+        device=str(os.environ.get("NLP_DEVICE", os.environ.get("EMBED_DEVICE", "")) or "").strip(),
+        local_files_only=bool(getattr(cfg, "local_files_only", False)),
+        fallback_policy=str(getattr(cfg, "fallback_policy", "skip") or "skip").strip().lower(),
+        dim=max(1, int(os.environ.get("NEWS_EMBED_HASHING_DIM", os.environ.get("NLP_HASHING_EMBED_DIM", "128")) or 128)),
+        api_key=str(os.environ.get("OPENAI_API_KEY", "") or "").strip(),
+    )
+
+
+def _news_config_from_text_config(config: TextEmbeddingConfig) -> NewsEmbeddingConfig:
+    return NewsEmbeddingConfig(
+        backend=str(config.backend),
+        model_name=str(config.model_name),
+        fallback_policy=str(config.fallback_policy),
+        local_files_only=bool(config.local_files_only),
+    )
+
+
+def encode_news_texts_with_metadata(
+    texts: Sequence[str],
+    config: Optional[NewsEmbeddingConfig | TextEmbeddingConfig] = None,
+) -> EncodedTextBatch:
+    return encode_texts_with_config(texts, _to_text_embedding_config(config))
+
+
+def encode_news_texts(texts: Sequence[str], config: Optional[NewsEmbeddingConfig | TextEmbeddingConfig] = None) -> np.ndarray:
     rows = [str(text or "") for text in list(texts or [])]
     if not rows:
         return np.zeros((0, 0), dtype=np.float32)
-    if cfg.backend == "finbert":
-        from engine.nlp.encoder import FinBertSentimentEncoder
-
-        with FinBertSentimentEncoder(model_name=str(cfg.model_name), batch_size=int(os.environ.get("NEWS_EMBED_BATCH_SIZE", "32"))) as enc:
-            return _normalize_matrix(enc.encode(rows))
-    if cfg.backend == "sentence_transformer":
-        from engine.nlp.encoder import SentenceTransformerEncoder
-
-        with SentenceTransformerEncoder(model_name=str(cfg.model_name), batch_size=int(os.environ.get("NEWS_EMBED_BATCH_SIZE", "64"))) as enc:
-            return _normalize_matrix(enc.encode(rows))
-    if cfg.backend == "openai":
-        api_key = str(get_data_credential("OPENAI_API_KEY") or "").strip()
-        if not api_key:
-            raise RuntimeError("openai_embedding_backend_requires_OPENAI_API_KEY")
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)
-        response = client.embeddings.create(model=str(cfg.model_name), input=rows)
-        vectors = [list(item.embedding) for item in response.data]
-        return _normalize_matrix(np.asarray(vectors, dtype=np.float32))
-    if cfg.backend == "hashing":
-        return _normalize_matrix(_hashing_embeddings(rows))
-    raise RuntimeError(f"unsupported_news_embed_backend:{cfg.backend}")
+    encoded = encode_news_texts_with_metadata(rows, config)
+    if encoded.values.shape[0] == 0 and encoded.degraded:
+        raise RuntimeError(";".join(encoded.errors) or "news_embedding_backend_unavailable")
+    return _normalize_matrix(encoded.values)
 
 
 def cosine_max_similarity(vector: np.ndarray, candidates: Sequence[np.ndarray]) -> float:
@@ -219,7 +233,28 @@ def cosine_max_similarity(vector: np.ndarray, candidates: Sequence[np.ndarray]) 
     return float(np.max(sims))
 
 
-def novelty_from_vector(vector: np.ndarray, candidates: Sequence[np.ndarray]) -> Tuple[float, float, bool]:
+def _assert_same_embedding_space(
+    vector_space: str | None,
+    candidate_spaces: Sequence[str | None] | None,
+) -> None:
+    if not vector_space or candidate_spaces is None:
+        return
+    expected = str(vector_space)
+    for candidate_space in list(candidate_spaces or []):
+        if not candidate_space:
+            continue
+        if str(candidate_space) != expected:
+            raise ValueError(f"mixed_embedding_space_refused:{expected}!={candidate_space}")
+
+
+def novelty_from_vector(
+    vector: np.ndarray,
+    candidates: Sequence[np.ndarray],
+    *,
+    vector_space: str | None = None,
+    candidate_spaces: Sequence[str | None] | None = None,
+) -> Tuple[float, float, bool]:
+    _assert_same_embedding_space(vector_space, candidate_spaces)
     max_sim = cosine_max_similarity(vector, candidates)
     novelty = float(max(0.0, min(1.0, 1.0 - max(0.0, max_sim))))
     stale = bool(max_sim > float(NEWS_STALE_SIM_THRESHOLD))
@@ -527,10 +562,16 @@ def _put_story_embeddings_batch(
             "lookback_ms": int(NEWS_NOVELTY_LOOKBACK_MS),
             "max_comparisons": int(NEWS_NOVELTY_MAX_COMPARISONS),
             "stale_similarity_threshold": float(NEWS_STALE_SIM_THRESHOLD),
+            "embedding_namespace": config.namespace,
         }
     )
     event_feature_meta = _json_dumps(
-        {"news_flow": True, "embedding_backend": config.backend, "embedding_model_name": config.model_name}
+        {
+            "news_flow": True,
+            "embedding_backend": config.backend,
+            "embedding_model_name": config.model_name,
+            "embedding_namespace": config.namespace,
+        }
     )
     ingested_ts_ms = int(now_ms or _now_ms())
 
@@ -545,6 +586,9 @@ def _put_story_embeddings_batch(
             "source_id": event.get("source_id"),
             "event_key": event.get("event_key"),
             "text_hash": text_hash(event.get("text")),
+            "embedding_backend": config.backend,
+            "embedding_model_name": config.model_name,
+            "embedding_namespace": config.namespace,
         }
         availability_ts_ms = int(event.get("availability_ts_ms") or event.get("publish_ts_ms") or 0)
         publish_ts_ms = int(event.get("publish_ts_ms") or availability_ts_ms or 0)
@@ -694,13 +738,36 @@ def process_news_flow_batch(
         _emit_news_flow_batch_metrics(empty_result, config=cfg)
         return empty_result
 
-    embeddings = encode_news_texts([str(row["text"]) for row in candidates], cfg)
+    encoded_batch = encode_news_texts_with_metadata([str(row["text"]) for row in candidates], cfg)
+    if encoded_batch.degraded and encoded_batch.values.shape[0] != len(candidates):
+        degraded_result = {
+            "rows_seen": int(len(candidates)),
+            "batch_size": int(len(candidates)),
+            "encoded": 0,
+            "written": 0,
+            "backend": cfg.backend,
+            "model_name": cfg.model_name,
+            "requested_backend": cfg.backend,
+            "requested_model_name": cfg.model_name,
+            "degraded": True,
+            "errors": list(encoded_batch.errors),
+            "pending_event_queries": 1,
+            "recent_embedding_queries": 0,
+            "recent_embedding_prefetch_rows": 0,
+            "write_batches": 0,
+            "embedding_db_round_trips": 0,
+            "core_db_round_trips": 1,
+        }
+        _emit_news_flow_batch_metrics(degraded_result, config=cfg)
+        return degraded_result
+    effective_cfg = _news_config_from_text_config(encoded_batch.effective_config)
+    embeddings = encoded_batch.values
     if embeddings.shape[0] != len(candidates):
         raise RuntimeError(f"news_embedding_count_mismatch:{embeddings.shape[0]}:{len(candidates)}")
 
     def _write(db) -> Dict[str, Any]:
         ensure_news_flow_tables(db)
-        prefetched_by_symbol, prefetch_rows = _prefetch_recent_embedding_rows(db, events=candidates, config=cfg)
+        prefetched_by_symbol, prefetch_rows = _prefetch_recent_embedding_rows(db, events=candidates, config=effective_cfg)
         recent_embedding_queries = 1
         in_cycle_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         write_items: List[Dict[str, Any]] = []
@@ -715,7 +782,12 @@ def process_news_flow_batch(
                 event=event,
                 max_rows=int(NEWS_NOVELTY_MAX_COMPARISONS),
             )
-            novelty, max_similarity, stale = novelty_from_vector(vector, [row["vector"] for row in recent])
+            novelty, max_similarity, stale = novelty_from_vector(
+                vector,
+                [row["vector"] for row in recent],
+                vector_space=effective_cfg.namespace,
+                candidate_spaces=[effective_cfg.namespace for _row in recent],
+            )
             matched_event_id = None
             if recent and max_similarity > 0.0:
                 sims = [
@@ -746,11 +818,11 @@ def process_news_flow_batch(
         write_stats = _put_story_embeddings_batch(
             db,
             items=write_items,
-            config=cfg,
+            config=effective_cfg,
             now_ms=int(started),
         )
         for symbol in sorted(touched_symbols):
-            materialize_news_flow_features(db, symbol=symbol, ts_ms=int(started), config=cfg)
+            materialize_news_flow_features(db, symbol=symbol, ts_ms=int(started), config=effective_cfg)
         write_batches = int(write_stats.get("write_batches") or 0)
         return {
             "written": int(written),
@@ -766,14 +838,18 @@ def process_news_flow_batch(
         _write,
         table="news_story_embeddings",
         operation="process_news_flow_batch",
-        context={"rows": int(len(candidates)), "backend": cfg.backend, "model_name": cfg.model_name},
+        context={"rows": int(len(candidates)), "backend": effective_cfg.backend, "model_name": effective_cfg.model_name},
     )
     final_result = {
         "rows_seen": int(len(candidates)),
         "batch_size": int(len(candidates)),
         "encoded": int(embeddings.shape[0]),
-        "backend": str(cfg.backend),
-        "model_name": str(cfg.model_name),
+        "backend": str(effective_cfg.backend),
+        "model_name": str(effective_cfg.model_name),
+        "requested_backend": str(cfg.backend),
+        "requested_model_name": str(cfg.model_name),
+        "degraded": bool(encoded_batch.degraded),
+        "errors": list(encoded_batch.errors),
         "pending_event_queries": 1,
         **dict(result or {}),
     }
@@ -782,7 +858,7 @@ def process_news_flow_batch(
         + final_result.get("recent_embedding_queries", 0)
         + final_result.get("write_batches", 0)
     )
-    _emit_news_flow_batch_metrics(final_result, config=cfg)
+    _emit_news_flow_batch_metrics(final_result, config=effective_cfg)
     return final_result
 
 

@@ -96,6 +96,8 @@ system promotion-guard/cooldown approval, and promotion audit persistence.
   Deterministic TSFresh feature extraction and snapshot materialization for training and replay.
 - [ts_foundation_encoder.py](ts_foundation_encoder.py)
   Shadow-only frozen time-series foundation encoder. The initial backend is Chronos and it emits `tsfm.chronos_v2.*` feature ids with PIT and artifact provenance metadata.
+- [tsfm_adapters.py](tsfm_adapters.py) and [tsfm_benchmark.py](tsfm_benchmark.py)
+  Optional governed TSFM adapter and benchmark layer for Chronos, TimesFM, Moirai, Toto, and deterministic fake challengers. It persists PIT OOS rows, feature snapshots, artifact/resource provenance, and shadow-only marketplace evidence; zero-shot benchmark output is not live-promotion authority.
 - [statistical_gates.py](statistical_gates.py)
   Promotion-gate statistics such as bootstrap tests, SPA, and deflated Sharpe checks.
 - [deconfounded_promotion.py](deconfounded_promotion.py)

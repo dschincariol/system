@@ -6,6 +6,7 @@ from engine.strategy.models.lgbm_ranker import LGBMRankerModel
 from engine.strategy.models.lgbm_regressor import LGBMRegressorModel
 from engine.strategy.models.online_model import OnlineModel
 from engine.strategy.models.patchtst import PatchTST, PatchTSTRegressor
+from engine.strategy.models.tabular_challenger import TabularFoundationChallengerModel
 from engine.strategy.models.xgb_regressor import XGBRegressorModel
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "OnlineModel",
     "PatchTST",
     "PatchTSTRegressor",
+    "TabularFoundationChallengerModel",
     "XGBRegressorModel",
 ]
