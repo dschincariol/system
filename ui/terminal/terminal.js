@@ -45,6 +45,7 @@ import { requestConfirmation } from "../confirmation_modal.mjs";
 
 const LS_KEY = "terminal.state.v1";
 const FETCH_TIMEOUT_MS = 15000;
+const DIRECTIONAL_HOLD_MS = 1000;
 const FLATTEN_HOLD_MS = 1500;
 
 function requestId(prefix = "terminal") {
@@ -673,6 +674,31 @@ let _executionBarrier = normalizeExecutionBarrier(null);
 let _accountSnapshotAvailable = false;
 let _latestPriceReference = null;
 
+export function configureTerminalOrderStateForTests({
+  symbol,
+  executionBarrier,
+  accountSnapshotAvailable,
+  priceReference,
+  statusBanner,
+} = {}) {
+  if (symbol !== undefined) {
+    const normalizedSymbol = String(symbol || "").trim().toUpperCase();
+    if (normalizedSymbol) STATE = { ...STATE, symbol: normalizedSymbol };
+  }
+  if (executionBarrier !== undefined) {
+    _executionBarrier = normalizeExecutionBarrier(executionBarrier);
+  }
+  if (accountSnapshotAvailable !== undefined) {
+    _accountSnapshotAvailable = !!accountSnapshotAvailable;
+  }
+  if (priceReference !== undefined) {
+    _latestPriceReference = priceReference;
+  }
+  if (statusBanner !== undefined) {
+    el.statusBanner = statusBanner;
+  }
+}
+
 function setTerminalBanner(level, message) {
   if (!el.statusBanner) return;
   const tone = String(level || "warn").trim().toLowerCase();
@@ -827,6 +853,62 @@ function orderConfirmationPayload(token, holdMs = 0) {
     request_id: requestId(actionId.replace(".", "-")),
     target: STATE.symbol,
   };
+}
+
+export function buildDirectionalOrderBody({ symbol, side, qty, confirmationPayload } = {}) {
+  const payload = confirmationPayload && typeof confirmationPayload === "object"
+    ? confirmationPayload
+    : null;
+  if (!payload) throw new Error("directional_order_confirmation_required");
+  if (payload.consequence_ack !== true) throw new Error("directional_order_consequence_ack_required");
+
+  const confirmationToken = String(payload.confirmation_token || "").trim();
+  if (!confirmationToken) throw new Error("directional_order_confirmation_token_required");
+
+  const confirmationMethod = String(payload.confirmation_method || "").trim();
+  if (!confirmationMethod) throw new Error("directional_order_confirmation_method_required");
+
+  if (!Object.prototype.hasOwnProperty.call(payload, "confirmation_hold_ms")) {
+    throw new Error("directional_order_confirmation_hold_required");
+  }
+  const confirmationHoldMs = Number(payload.confirmation_hold_ms);
+  if (!Number.isFinite(confirmationHoldMs) || confirmationHoldMs < 0) {
+    throw new Error("directional_order_confirmation_hold_invalid");
+  }
+
+  const normalizedSymbol = String(symbol || "").trim().toUpperCase();
+  const normalizedSide = String(side || "").trim().toUpperCase();
+  const cleanQty = Number(qty || 0);
+  if (!normalizedSymbol) throw new Error("directional_order_symbol_required");
+  if (normalizedSide !== "BUY" && normalizedSide !== "SELL") {
+    throw new Error("directional_order_side_invalid");
+  }
+  if (!Number.isFinite(cleanQty) || cleanQty <= 0) {
+    throw new Error("enter a positive quantity");
+  }
+
+  return {
+    ...payload,
+    symbol: normalizedSymbol,
+    side: normalizedSide,
+    qty: cleanQty,
+    consequence_ack: payload.consequence_ack,
+    confirmation_token: confirmationToken,
+    confirmation_method: confirmationMethod,
+    confirmation_hold_ms: confirmationHoldMs,
+  };
+}
+
+function directionalOrderConsequence(side, qty) {
+  const normalizedSide = String(side || "").trim().toUpperCase();
+  const priceRef = latestPriceReferenceForSymbol(STATE.symbol);
+  const px = Number(priceRef && priceRef.ok !== false && priceRef.price);
+  const qtyText = fmtSymbolQty(STATE.symbol, qty);
+  if (Number.isFinite(px) && px > 0) {
+    const notional = Number(qty || 0) * px;
+    return `Send ${normalizedSide} ${qtyText} ${STATE.symbol} using price reference ${fmtSymbolPrice(STATE.symbol, px, 2)} for estimated notional ${fmtNum(notional, 2)}. Backend execution gates and thresholds still apply.`;
+  }
+  return `Send ${normalizedSide} ${qtyText} ${STATE.symbol}. Price reference is unavailable; backend execution gates and thresholds still apply.`;
 }
 
 function renderOrderPreview(side = "") {
@@ -1249,20 +1331,41 @@ async function requestTerminalThresholdPayload(error, { side = "", qty = 0, inte
   };
 }
 
-async function submitTerminalOrder(side, qty, label) {
+export async function submitTerminalOrder(side, qty, label, deps = {}) {
   if (!canSubmitDirectionalOrder(label || side)) return;
   const cleanQty = Number(qty || 0);
   if (!Number.isFinite(cleanQty) || cleanQty <= 0) throw new Error("enter a positive quantity");
   renderOrderPreview(side);
-  const body = {
+  const requestConfirmationFn = deps.requestConfirmation || requestConfirmation;
+  const postJsonFn = deps.postJson || postJson;
+  const refreshSnapshotFn = deps.refreshSnapshot || refreshSnapshot;
+  const normalizedSide = String(side || "").trim().toUpperCase();
+  const target = `${normalizedSide} ${STATE.symbol} qty ${fmtSymbolQty(STATE.symbol, cleanQty)}`;
+  const confirmation = await requestConfirmationFn({
+    title: "Confirm terminal order",
+    action: "Terminal directional order",
+    actionId: "terminal.order",
+    target,
+    consequence: directionalOrderConsequence(normalizedSide, cleanQty),
+    confirmText: "TRADE",
+    submitLabel: "Send Order",
+    actor: "terminal_operator",
+    sourceSurface: "terminal",
+    holdMs: DIRECTIONAL_HOLD_MS,
+  });
+  if (!confirmation || confirmation.ok !== true) {
+    setTerminalBanner("warn", `${label || side} confirmation cancelled.`);
+    return;
+  }
+  const body = buildDirectionalOrderBody({
     symbol: STATE.symbol,
-    side,
+    side: normalizedSide,
     qty: cleanQty,
-    ...orderConfirmationPayload("TRADE"),
-  };
+    confirmationPayload: confirmation.payload,
+  });
   let j;
   try {
-    j = await postJson("/api/terminal/order", body);
+    j = await postJsonFn("/api/terminal/order", body);
   } catch (error) {
     if (!isThresholdConfirmationError(error)) throw error;
     const thresholdPayload = await requestTerminalThresholdPayload(error, { side, qty: cleanQty, intent: "order" });
@@ -1270,9 +1373,9 @@ async function submitTerminalOrder(side, qty, label) {
       setTerminalBanner("warn", `${label || side} threshold confirmation cancelled.`);
       return;
     }
-    j = await postJson("/api/terminal/order", { ...body, ...thresholdPayload });
+    j = await postJsonFn("/api/terminal/order", { ...body, ...thresholdPayload });
   }
-  if (j.ok) await refreshSnapshot();
+  if (j.ok) await refreshSnapshotFn();
 }
 
 async function submitTerminalFlatten() {
@@ -1472,10 +1575,12 @@ async function main() {
   startSnapshotTimer();
 }
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", () => {
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => {
+      void main();
+    }, { once: true });
+  } else {
     void main();
-  }, { once: true });
-} else {
-  void main();
+  }
 }

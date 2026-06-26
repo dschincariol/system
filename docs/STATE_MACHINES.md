@@ -315,7 +315,7 @@ flowchart TD
     G -->|yes| H{confidence >= 0.85?}
     H -->|no| H1[block patch_confidence_too_low]
     H -->|yes| I[applyAiPatchWithBackup()]
-    I --> J[write backup and metadata under data/operator/patches]
+    I --> J[write backup and metadata under var/tmp/operator/patches by default]
     J --> K[return applied patch info]
 
     L[POST /api/operator/ai/rollback_patch] --> M{confirm == ROLLBACK_PATCH?}

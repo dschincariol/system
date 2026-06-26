@@ -135,6 +135,7 @@ These templates are seeded automatically by [services/data_source_manager.py](..
 | `macro` | `macro` | `poll_macro` | On | Yes | public macro cadence setting; optional FRED account | `factor_registry`, `factor_observations`, `factor_features`, `macro_series_vintages`, `macro_vintage_backfill_state`, `events` | regime features, model snapshots |
 | `model_feature_snapshots` | `model_feature_snapshots` | `snapshot_model_features` | On | Yes | internal cadence/bucket settings | `model_feature_snapshots` | model diagnostics, feature visibility |
 | `news_flow` | `news_flow` | `process_news_flow` | On | Yes | hashing backend by default; optional OpenAI embeddings account | `news_story_embeddings`, `news_flow_features` | model snapshots, feature visibility |
+| `llm_event_extraction` | `llm_event_extraction` | `llm_event_extraction` | Off | No | None directly; selects provider/model/cost-limit settings (`LLM_EVENT_EXTRACT_*`) and inherits OpenAI or Anthropic provider accounts only when that provider is selected | `llm_extracted_events`, `llm_event_extraction_audit`, `structured_document_events` | structured-document features, model snapshots, feature visibility |
 | `rss_feed` | `rss` | `ingest_now` | Custom | No | feed `name` and `url` settings | `events`, `news_event_features` | news flow, model snapshots |
 
 ## Provider Accounts
@@ -152,9 +153,10 @@ Shared provider accounts are seeded in `data_source_provider_accounts` and encry
 | `fundamentals_vendors` | `SIMFIN_API_KEY`, `SHARADAR_API_KEY` | PIT fundamentals ingestion |
 | `tradier` | `TRADIER_API_TOKEN` | Tradier options ingestion |
 | `fred` | `FRED_API_KEY` | Macro vintage ingestion and macro backfills |
-| `openai_embeddings` | `OPENAI_API_KEY` | Optional OpenAI-backed embedding jobs |
+| `openai_embeddings` | `OPENAI_API_KEY` | Optional OpenAI-backed embedding jobs and OpenAI-backed LLM event extraction (`news_flow`, `llm_event_extraction`) |
 | `oanda` | `OANDA_ACCESS_TOKEN`, `OANDA_API_KEY` | OANDA read-only FX pricing (`oanda_fx`) |
 | `futures` | `DATABENTO_API_KEY` | Databento read-only futures pricing (`futures_data`) |
+| `anthropic_llm_extraction` | `ANTHROPIC_API_KEY` | Optional Anthropic-backed LLM event extraction and LLM factor discovery (`llm_event_extraction`) |
 
 Effective credential precedence is enforced in manager runtime code: source override, then shared provider account, then allowed external runtime source, then missing. `build_job_environment()` projects one effective value per env var for each job. In strict runtime mode, secret values are written to runtime secret files and projected through `*_FILE`; non-secret SEC identity values are projected as normal env vars because the existing SEC clients read those names directly.
 
@@ -419,6 +421,8 @@ Connection-test responses classify outcomes as `success`, `simulated_not_live`, 
 Implemented checks include:
 
 - Polygon REST and WebSocket credentials
+- OANDA FX read-only pricing request against the practice or live `/v3/accounts/{account_id}/pricing` endpoint, requiring `OANDA_ACCESS_TOKEN`/`OANDA_API_KEY` plus `OANDA_ACCOUNT_ID`
+- Databento futures metadata request against `hist.databento.com` requiring `DATABENTO_API_KEY`
 - Polygon options snapshot credentials
 - Tradier options access
 - Finnhub company news
@@ -433,6 +437,7 @@ Implemented checks include:
 - SEC company ticker payload, required non-placeholder SEC caller identity, Form 4 ownership XML information-document discovery, and 13F Atom feed
 - Congressional trades JSON feed with per-source runtime status and malformed/empty-payload detection
 - Quiver government-flow payload
+- ETF-flows credential check that passes when either a Polygon (`POLYGON_API_KEY`) or FMP (`FMP_API_KEY`) account reference resolves, with partial-success degradation when only one passes
 - SimFin and Sharadar point-in-time fundamentals, including partial-success degradation when only one selected vendor passes
 - FRED observations with ALFRED CSV fallback clearly marked `degraded`; when `FRED_API_KEY` is missing and ALFRED fallback is allowed, runtime reports `fred_api_key_missing_alfred_fallback_used`
 - news-flow OpenAI embeddings only when `NEWS_EMBED_BACKEND=openai`; non-external hashing backends return `unsupported`
@@ -440,6 +445,7 @@ Implemented checks include:
 - IBKR read-only authenticated historical-data request through TWS/Gateway, including market-data type selection
 - Alpaca read-only account and positions GET probes; the data-source test and Populate Now path never call order, cancel, replace, or flatten paths
 - Simulated local prices, which require no external credentials, perform no broker or provider network calls, and return deterministic payload evidence marked `simulated=true`, `live_market_data_ok=false`, and `live_feed_status=simulated`
+- LLM event extraction credential availability for the selected provider: the `fake` adapter passes with no external call, `openai`/`anthropic` require `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` respectively, and the probe asserts `direct_trading_authority=false` without issuing a provider call
 - custom RSS/Atom feed payload validation plus per-feed runtime status so one failed publisher does not hide successful RSS sources
 
 Optional public-service live smoke is available through `python tools/public_feed_live_smoke.py`. It exits without network access unless `PUBLIC_FEED_LIVE_SMOKE=1` is set explicitly; normal CI and `validate_repo.py` use mocked tests and do not contact public services by default. Use that opt-in smoke when a public/keyless provider needs external-service evidence; do not treat simulated fallback rows as that evidence.

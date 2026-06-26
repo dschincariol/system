@@ -29,7 +29,7 @@ APIs:
   /api/health
   /api/pipeline/run
   /api/model/diagnostics
-  /api/confidence_massv
+  /api/confidence_mass
 """
 import json
 import base64

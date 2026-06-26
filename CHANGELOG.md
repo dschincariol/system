@@ -35,6 +35,13 @@ This changelog starts on 2026-04-12. Earlier repository history has not been ret
 - `docs/config_env_allowlist.txt` freezing the legacy backlog of environment variables read in code but not yet documented.
 - `tools/validate_docs.py` documentation-governance gates — subsystem-README coverage, environment-variable coverage, and staleness sentinels — recorded in `docs/adr/0006-documentation-governance-gates.md`.
 - Behavioral money-path pytest coverage for hierarchical allocation, shadow capital scoring, runtime bootstrap safe defaults, execution liquidity, slicing, dual execution, AI advisory, microstructure sizing, and open-order acknowledgement timeouts.
+- Tail-risk VaR/CVaR backtesting evidence: a new read-only `GET /api/risk/var_backtest` endpoint and `engine/risk/var_backtesting.py` surface Kupiec POF, Christoffersen independence, and Basel traffic-light exception results from `risk_var_backtest_results` (migration `0079`), with a `risk_var_backtest` runtime job; the route does not change risk caps, sizing, or execution authority.
+- Shadow-only GARCH volatility forecasting (`engine/strategy/garch_vol.py`, `garch_vol_forecast` job, migration `0080_garch_vol_forecasts.py`) and a covariance facade (`engine/risk/covariance.py`) for portfolio-risk consumers.
+- Shadow-only structured LLM financial-event extraction (`engine/data/llm_event_extraction.py` plus the `llm_event_extraction` job and migration `0082`), projecting shadow-only event feature rows with lineage and confidence; no live trading authority.
+- Foundation-model and challenger benchmarking surfaces (`engine/strategy/tsfm_benchmark.py`, `engine/strategy/tsfm_adapters.py`, `engine/nlp/benchmark.py`, the `tsfm_benchmark`/`graph_challenger_benchmark` jobs, and migrations `0081_tsfm_benchmark.py`/`0083_nlp_backend_namespaces.py`), all shadow-only with no live serving authority.
+- Critical-alert delivery hardening (GO-R3): `engine/runtime/alerts_notify.py` warns once per process when a CRIT/CRITICAL alert has zero configured notification channels, and `engine/runtime/prod_preflight.py` adds a go-live notification-channel gate that requires at least one enabled channel (`EQ_CRIT_SMTP_HOST`+`EQ_CRIT_EMAIL_TO` or `EQ_CRIT_WEBHOOK_URL`) before live go-live.
+- FX live-trading enable gate: `engine/execution/broker_router.py` blocks FX orders with `fx_live_trading_disabled_by_default` unless `FX_LIVE_TRADING_ENABLED=1`, and the live-trading preflight reports the FX enablement entry.
+- Nightly soak/chaos CI (`.github/workflows/soak_chaos.yml`) running the safe-mode soak gate and market-session provider-disconnect chaos soak with uploaded evidence, plus the deploy-installer `trading-restore-drill` systemd service/timer (`deploy/systemd/trading-restore-drill.service`/`.timer`) running the weekly Postgres restore drill required by backup evidence.
 
 ### Changed
 
@@ -53,6 +60,9 @@ This changelog starts on 2026-04-12. Earlier repository history has not been ret
 - `docs/README_FUNCTION_MAP.md` corrected (`boot/operator_server.js` symbol names; `engine/api/api_system.py` ownership of the watchdog/support/provider-telemetry handlers) and expanded with a Risk section plus `execution_ledger`/`model_marketplace`/`champion_manager`/`predictor` entries and a storage-facade re-export note.
 - `engine/README.md` and the `strategy`/`execution`/`api`/`risk` subsystem READMEs expanded to cover previously undocumented modules; `engine/jobs/` relabeled from "legacy" to the live price-ingestion path.
 - Documentation de-duplicated via cross-links: `docs/Database_Schema.md` marked the authoritative table register, `docs/README_DEVELOPER_MAP.md` made the canonical read-order / highest-risk-file / task-path home, and the readiness and ZFS-migration docs cross-linked to single sources.
+- Locked CPU/default Python dependency install now uses `pip install --require-hashes -r requirements.txt` (hash-pinned locks), and `README.md` was updated to match.
+- `docs/openapi/openapi.yaml` documents the new read-only `GET /api/risk/var_backtest` route, and the system/data-source sensitive-route descriptions note that query-string token auth is also rejected on non-loopback binds.
+- `CLAUDE.md` re-verified against code (count corrected to `~1,500+` Python files and `~140+` registered jobs, shadow feature catalog to `~1,902`, and Phase 2 updated to record the now-present shadow-only graph challenger, TSFM adapters/benchmarking, and structured LLM event extraction); `Last verified against code` bumped to 2026-06-26.
 
 ### Fixed
 

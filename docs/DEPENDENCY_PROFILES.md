@@ -60,6 +60,28 @@ review acknowledgement before real backends can train, and are blocked by
 runtime manifests. Keep `USE_TABULAR_CHALLENGERS=0` unless an offline shadow
 experiment is intended.
 
+## Other Optional `pyproject.toml` Extras
+
+The following extras are declared in `[project.optional-dependencies]` and are
+also not part of any default/locked runtime profile. The packages are imported
+lazily and degrade fail-nonfatal when absent, so the CPU base install never
+requires them:
+
+- `trading-system[volatility]` installs `arch>=7.0` for the GARCH/EGARCH/GJR
+  volatility models in `engine/strategy/garch_vol.py`. When `arch` is not
+  installed the model loader returns a non-fatal reason and the runtime falls
+  back to its non-GARCH volatility estimate.
+- `trading-system[ts-foundation]` installs `chronos-forecasting>=2.1.0` (plus a
+  `pandas>=2.2` floor) for the Chronos time-series foundation encoder in
+  `engine/strategy/ts_foundation_encoder.py`. It is gated behind
+  `USE_TS_FOUNDATION_FEATURES=1` with `TS_FOUNDATION_BACKEND=chronos`; without the
+  package or the flag the foundation feature group stays inactive.
+
+Install an extra alongside the CPU runtime only when its feature is intentionally
+enabled, for example `python -m pip install -e '.[volatility]'` or
+`python -m pip install -e '.[ts-foundation]'`. These extras are not hash-locked
+through the `requirements*.lock.txt` manifests.
+
 ## Profiles
 
 | Profile | Requirements file | Purpose |
@@ -199,15 +221,27 @@ includes `numpy`, `pandas`, `scipy`, `scikit-learn`, `statsmodels`, `numba`,
 `safetensors`, and `joblib`. `xgboost` is excluded because the CPU profile pins
 the separate `xgboost-cpu` distribution.
 
-Any scientific-stack divergence must be listed in `SHARED_PIN_ALLOWLIST` with
-package, profile, expected version, and reason. The validator only downgrades a
-divergence to `cross_profile_pin_allowlisted` when the actual profile version
-matches that expected version; stale or widened divergences fail as
-`cross_profile_pin_mismatch`. Regenerate every affected profile lock after
-changing shared pins, then rerun `python tools/validate_dependency_lock.py
---strict`. Allowlisted ROCm divergences are warnings, not errors, and model
-artifacts must be re-validated on that profile before promotion or production
-use.
+The AMD ROCm profile keeps the shared model-serving scientific pins aligned with
+the base/CI stack (`numpy`, `scikit-learn`, and `lightgbm` included). Any future
+scientific-stack divergence must be listed in `SHARED_PIN_ALLOWLIST` with
+package, profile, expected version, and a reason that names the passing
+`tools/model_artifact_compat_gate.py` load+predict parity gate that justifies
+it. Reasons containing `pending`, `unverified`, or `TODO` fail strict validation;
+an IOU cannot downgrade a mismatch to a warning. Regenerate every affected
+profile lock after changing shared pins, then rerun
+`python tools/validate_dependency_lock.py --strict`.
+
+CI also runs `python tools/model_artifact_compat_gate.py` in the base validation
+lane and inside the built `trading-system/runtime:amd-rocm-ci` image. The gate
+loads committed sklearn GradientBoosting and wrapped LightGBM regressor
+artifacts from `tests/fixtures/model_artifact_compat/`, predicts on a fixed
+feature matrix, and compares against golden base-stack predictions using
+`rtol=1e-5` and `atol=1e-6`. Regenerate those fixtures only on the base/CI stack:
+
+```bash
+python tools/model_artifact_compat_gate.py --regenerate
+python tools/model_artifact_compat_gate.py
+```
 
 ## AMD GPU/NPU
 

@@ -1025,6 +1025,69 @@ paths:
                         type: boolean
                       reason:
                         type: string
+  /api/risk/var_backtest:
+    get:
+      tags: [system]
+      summary: Return read-only VaR/CVaR exception backtesting evidence.
+      operationId: getRiskVarBacktest
+      description: |
+        Read-only risk-model backtesting evidence sourced from the
+        `risk_var_backtest_results` table. Surfaces Kupiec POF, Christoffersen
+        independence, and Basel traffic-light exception results. This route does
+        not change risk caps, sizing, or execution authority.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        '200':
+          description: |
+            VaR backtesting rows plus a summary. When the backtesting schema is
+            absent the response is `ready=false` with `status=schema_missing`;
+            with no rows it is `status=empty`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  ready:
+                    type: boolean
+                  status:
+                    type: string
+                    enum: [ok, empty, schema_missing]
+                  ts_ms:
+                    type: integer
+                  rows:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FreeformObject'
+                  summary:
+                    type: object
+                    properties:
+                      count:
+                        type: integer
+                      latest_status:
+                        type: string
+                      failing_count:
+                        type: integer
+                      latest_forecast_ts_ms:
+                        type: integer
+                  authority:
+                    type: object
+                    properties:
+                      mode:
+                        type: string
+                      source_table:
+                        type: string
+                      source_route:
+                        type: string
   /api/execution/diagnostics:
     get:
       tags: [execution]

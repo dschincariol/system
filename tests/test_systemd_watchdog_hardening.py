@@ -109,6 +109,28 @@ def test_engine_and_operator_units_have_watchdog_and_memory_bounds() -> None:
         assert "RestartSec=5" in text
 
 
+def test_operator_notify_access_rationale_is_documented() -> None:
+    unit_text = (REPO_ROOT / "deploy" / "systemd" / "trading-operator.service").read_text(encoding="utf-8")
+    docs_text = (REPO_ROOT / "docs" / "FAILURE_MODES.md").read_text(encoding="utf-8")
+
+    notify_match = re.search(
+        r"(?P<comment>(?:#[^\n]*\n)+)NotifyAccess=all",
+        unit_text,
+    )
+    assert notify_match is not None
+    comment = notify_match.group("comment")
+    assert "systemd-notify" in comment
+    assert "child" in comment
+    assert "NotifyAccess=main would reject" in comment
+    assert "docs/FAILURE_MODES.md" in comment
+
+    assert "NotifyAccess=all" in docs_text
+    assert "SCM_CREDENTIALS PID" in docs_text
+    assert "--pid=parent" in docs_text
+    assert "child-originated fallback datagram" in docs_text
+    assert "NotifyAccess=main` would reject" in docs_text
+
+
 def test_linux_installer_excludes_machine_local_env_files_from_app_mirror() -> None:
     text = (REPO_ROOT / "deploy" / "install_trading_system.sh").read_text(encoding="utf-8")
 

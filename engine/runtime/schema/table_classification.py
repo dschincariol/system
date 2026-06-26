@@ -412,8 +412,8 @@ TABLE_CLASS["finbert_sentiment_enrichments"] = _h(
     compress_after="30 days",
     retain="3 years",
     segmentby=("symbol",),
-    time_column="asof_ts_ms",
-    rationale="point-in-time FinBERT sentiment enrichments keyed by symbol/source availability",
+    time_column="ts_ms",
+    rationale="point-in-time FinBERT sentiment enrichments keyed by symbol/event timestamp",
     write_rate="medium",
     read_pattern="latest sentiment enrichment by symbol/time/source",
 )
@@ -660,6 +660,7 @@ TABLE_CLASS["risk_var_backtest_results"] = _h(
     compress_after="90 days",
     retain="5 years",
     segmentby=("confidence_level",),
+    time_column="forecast_ts_ms",
     rationale="VaR/CVaR exception evidence with Kupiec, Christoffersen, rolling exception rate, and traffic-light status",
     write_rate="low",
     read_pattern="recent risk-model validation dashboard scans by time and confidence",
@@ -722,6 +723,10 @@ _add(
     DECISION_SERIES,
 )
 TABLE_CLASS["model_predictions"] = _h(**{**DECISION_SERIES.__dict__, "time_column": "timestamp"})
+TABLE_CLASS["ensemble_predictions"] = _h(**{**DECISION_SERIES.__dict__, "time_column": "ts"})
+TABLE_CLASS["model_oos_predictions"] = _h(**{**DECISION_SERIES.__dict__, "time_column": "ts"})
+TABLE_CLASS["prediction_explanations"] = _h(**{**DECISION_SERIES.__dict__, "time_column": "ts"})
+TABLE_CLASS["rl_shadow_decisions"] = _h(**{**DECISION_SERIES.__dict__, "time_column": "ts"})
 
 _add(
     (
@@ -832,6 +837,19 @@ _add(
     ),
     GLOBAL_FEATURE_SERIES,
 )
+TABLE_CLASS["alpha_lifecycle"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "created_ts"})
+TABLE_CLASS["causal_scores"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "ts"})
+TABLE_CLASS["nlp_text_blobs"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "ts"})
+TABLE_CLASS["nlp_embeddings"] = _r(
+    "content-hash embedding cache keyed by text hash and model namespace; no time dimension in the materialized schema",
+    write_rate="medium",
+    read_pattern="content-hash/model lookup",
+)
+TABLE_CLASS["nlp_sentiments"] = _r(
+    "content-hash sentiment cache keyed by text hash and model namespace; no time dimension in the materialized schema",
+    write_rate="medium",
+    read_pattern="content-hash/model lookup",
+)
 TABLE_CLASS["net_after_cost_labels"] = _h(
     chunk="1 week",
     compress_after="30 days",
@@ -850,6 +868,21 @@ TABLE_CLASS["labels_price"] = _h(
     rationale="derived realized price labels keyed to prediction and evaluation time for confidence calibration and validation",
     write_rate="medium",
     read_pattern="calibration and validation scans by symbol, prediction time, evaluation time, and horizon",
+)
+TABLE_CLASS["learned_alpha_decay_runs"] = _r(
+    "training-run metadata for learned alpha decay, capacity, and crowding estimates",
+    write_rate="low",
+    read_pattern="latest run lookup and training audit",
+)
+TABLE_CLASS["learned_alpha_decay_estimates"] = _r(
+    "learned half-life, max useful age, capacity, crowding penalty, size multiplier, and block flag by cohort",
+    write_rate="low",
+    read_pattern="latest cohort lookup from execution, portfolio, and champion paths",
+)
+TABLE_CLASS["learned_alpha_decay_age_edges"] = _r(
+    "realized net edge by signal-age bucket behind learned-alpha estimates",
+    write_rate="low",
+    read_pattern="run/cohort drill-down and estimator audit",
 )
 TABLE_CLASS["model_version_performance"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "recorded_ts_ms"})
 TABLE_CLASS["shadow_metrics"] = _h(**{**GLOBAL_FEATURE_SERIES.__dict__, "time_column": "window_end_ms"})
@@ -1055,6 +1088,9 @@ SOURCE_DECLARED_TABLES = frozenset(
         "feature_data",
         "model_predictions",
         "trade_outcomes",
+        "learned_alpha_decay_runs",
+        "learned_alpha_decay_estimates",
+        "learned_alpha_decay_age_edges",
     }
 )
 

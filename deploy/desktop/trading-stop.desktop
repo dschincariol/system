@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.1
+Name=Stop Trading System
+GenericName=Trading System
+Comment=Gracefully stop the engine + operator (data layer kept running; no kill-switch)
+Icon=media-playback-stop
+Exec=/usr/bin/konsole --hold -e /opt/trading/bin/trading-ctl stop
+Terminal=false
+Categories=System;Monitor;
+Keywords=trading;stop;engine;
+StartupNotify=true

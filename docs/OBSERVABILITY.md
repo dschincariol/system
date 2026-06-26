@@ -136,7 +136,7 @@ proof surface for placement. For GO, each high-volume target should show
 `pg_stat_archiver`; `storage_wal_guards.pg_wal_disk_risk` reports `wal_bytes`,
 `wal_files`, `.ready` backlog, and local free-space evidence.
 
-Dashboard/operator read paths now coalesce hot telemetry, dashboard price, and market-candle reads for 0.75s through `state_cache`. The Timescale telemetry and price read routers use lazy, role-keyed psycopg pools backed by `TIMESCALE_POOL_*` and `TIMESCALE_PRICES_POOL_*`, so repeated reads do not create a new Postgres connection each time. Router env parsing is memoized behind an env/password-source fingerprint and refreshes only when relevant settings change. Pool close hooks run on test cleanup and process shutdown. Cache-wrapper L1 hits are intentionally short at 0.5s; kill-switch and execution-mode wrappers only cache states that cannot make live execution more permissive.
+Dashboard/operator read paths now coalesce hot telemetry, dashboard price, and market-candle reads for 0.75s through `state_cache`. The Timescale telemetry and price read routers use lazy, role-keyed psycopg pools backed by `TIMESCALE_POOL_*` and `TIMESCALE_PRICES_POOL_*`, so repeated reads do not create a new Postgres connection each time. Router env parsing is memoized behind an env/password-source fingerprint and refreshes only when relevant settings change. Pool close hooks run on test cleanup and process shutdown. Cache-wrapper L1 hits are intentionally short at 1.0s; kill-switch and execution-mode wrappers only cache states that cannot make live execution more permissive.
 
 ## Ingestion Backpressure Signals
 

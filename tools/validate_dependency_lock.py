@@ -70,14 +70,8 @@ SHARED_PIN_SOURCES = (
     SharedPinSource("amd-rocm", "requirements-amd-rocm-full.txt"),
     SharedPinSource("amd-rocm", "requirements-amd-rocm.lock.txt"),
 )
-ROCM_SHARED_PIN_DIVERGENCE_REASON = (
-    "unverified base-version availability on ROCm image; pending confirmation"
-)
-SHARED_PIN_ALLOWLIST = (
-    SharedPinAllowlistEntry("lightgbm", "amd-rocm", "4.6.0", ROCM_SHARED_PIN_DIVERGENCE_REASON),
-    SharedPinAllowlistEntry("numpy", "amd-rocm", "2.4.6", ROCM_SHARED_PIN_DIVERGENCE_REASON),
-    SharedPinAllowlistEntry("scikit-learn", "amd-rocm", "1.9.0", ROCM_SHARED_PIN_DIVERGENCE_REASON),
-)
+SHARED_PIN_ALLOWLIST: tuple[SharedPinAllowlistEntry, ...] = ()
+ALLOWLIST_REASON_IOU_RE = re.compile(r"\b(?:pending|unverified|todo)\b", re.IGNORECASE)
 RUNTIME_INSTALL_MANIFESTS = {
     "requirements.txt": ("requirements.in", "requirements.lock.txt"),
 }
@@ -507,6 +501,26 @@ def _shared_pin_allowlist() -> Dict[Tuple[str, str], SharedPinAllowlistEntry]:
     }
 
 
+def _shared_pin_allowlist_report() -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    seen: set[Tuple[str, str]] = set()
+    for entry in SHARED_PIN_ALLOWLIST:
+        key = (entry.profile, entry.package)
+        if key in seen:
+            errors.append(f"shared_pin_allowlist_duplicate:{entry.profile}:{entry.package}")
+        seen.add(key)
+        if not entry.package.strip() or not entry.profile.strip() or not entry.expected_version.strip():
+            errors.append(f"shared_pin_allowlist_incomplete:{entry.profile}:{entry.package}")
+        reason = str(entry.reason or "").strip()
+        if not reason:
+            errors.append(f"shared_pin_allowlist_missing_reason:{entry.profile}:{entry.package}")
+            continue
+        if ALLOWLIST_REASON_IOU_RE.search(reason):
+            errors.append(f"shared_pin_allowlist_unjustified:{entry.profile}:{entry.package}:reason={reason}")
+    return errors, warnings
+
+
 def _shared_pin_reference(
     pins_by_source: Dict[str, Dict[str, str]],
     source_profiles: Dict[str, str],
@@ -557,6 +571,9 @@ def _shared_scientific_pin_report() -> Tuple[List[str], List[str]]:
     warnings: List[str] = []
     pins_by_source: Dict[str, Dict[str, str]] = {}
     source_profiles: Dict[str, str] = {}
+    allowlist_errors, allowlist_warnings = _shared_pin_allowlist_report()
+    errors.extend(allowlist_errors)
+    warnings.extend(allowlist_warnings)
     allowlist = _shared_pin_allowlist()
 
     for source in SHARED_PIN_SOURCES:

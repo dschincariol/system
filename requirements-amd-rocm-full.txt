@@ -7,15 +7,15 @@
 #   compose. This file expands it with the base runtime deps for operators who
 #   want a standalone host venv instead of the validated Docker image.
 #
-# Do not install `requirements.txt` before this file in a ROCm venv. The CPU
-# base pins conflict with the validated ROCm stack and can downgrade it:
+# Do not install `requirements.txt` before this file in a ROCm venv. This file
+# already carries the shared CPU/base scientific pins plus the ROCm wheel stack:
 #   requirements.txt        ->  this file (ROCm)         reason
 #   torch==2.4.1            ->  torch ROCm 7.2.4 wheel   validated gfx1151 kernels
 #   (no torchaudio)         ->  torchaudio ROCm 7.2.4     match torch build
 #   (no triton-rocm)        ->  triton ROCm 7.2.4         match torch build
-#   numpy==2.1.2            ->  numpy==2.4.6              Python 3.12 ROCm image parity
-#   scikit-learn==1.5.2    ->  scikit-learn==1.9.0      numpy 2.4 compatibility
-#   lightgbm==4.5.0        ->  lightgbm==4.6.0          ROCm overlay pin
+#   numpy==2.1.2            ->  numpy==2.1.2              base/CI train parity
+#   scikit-learn==1.5.2    ->  scikit-learn==1.5.2      base/CI train parity
+#   lightgbm==4.5.0        ->  lightgbm==4.5.0          base/CI train parity
 # All other pins are runtime pins from requirements-base.txt.
 #
 # XGBoost upstream GPU support is CUDA-only; no official AMD ROCm XGBoost wheel is
@@ -28,12 +28,15 @@
 -c requirements-amd-rocm.lock.txt
 
 # --- ROCm acceleration stack (deviates from requirements.txt) ---
-torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torch-2.9.1%2Brocm7.2.4.lw.git39497456-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
-torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torchaudio-2.9.0%2Brocm7.2.4.gite3c6ee2b-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
-triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/triton-3.5.1%2Brocm7.2.4.gita272dfa8-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux"
-numpy==2.4.6
-scikit-learn==1.9.0
-lightgbm==4.6.0
+torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torch-2.9.1%2Brocm7.2.4.lw.git39497456-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux" \
+    --hash=sha256:b066cd0822de22f4842929f82d6b0e9f66c92c18ad13ee0f27402c9e0b44c32d
+torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torchaudio-2.9.0%2Brocm7.2.4.gite3c6ee2b-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux" \
+    --hash=sha256:5c7b1582fa22216d336120dd9e9be5ca71fa6fe631353975e8be0c54d504b580
+triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/triton-3.5.1%2Brocm7.2.4.gita272dfa8-cp312-cp312-linux_x86_64.whl ; python_version >= "3.12" and platform_system == "Linux" \
+    --hash=sha256:fcb8c69a5b791ffa0dcc79a1e307dd2f4b436c7de7bd7e2f1bb4f587c18ca672
+numpy==2.1.2
+scikit-learn==1.5.2
+lightgbm==4.5.0
 
 # --- base runtime deps (identical pins to requirements.txt) ---
 asyncpg==0.31.0

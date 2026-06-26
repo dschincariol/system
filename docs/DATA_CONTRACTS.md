@@ -1438,7 +1438,7 @@ Every row in `evidence`, `blockers`, and `unknowns` uses:
 
 | Field | Type | Req | Meaning | Units |
 | --- | --- | --- | --- | --- |
-| `key` | `TEXT` | Yes | Stable evidence id such as `ope_gate`, `experiment_ledger`, `net_after_cost_labels`, `learned_alpha_decay`, `alpha_shrinkage`, `risk_var_backtesting`, `production_monitoring`, `shadow_live_monitoring`, or `shadow_capital_scores`. | id |
+| `key` | `TEXT` | Yes | Stable evidence id such as `promotion_guard`, `ope_gate`, `experiment_ledger`, `net_after_cost_labels`, `learned_alpha_decay`, `alpha_shrinkage`, `risk_var_backtesting`, `production_monitoring`, `shadow_live_monitoring`, or `shadow_capital_scores`. | id |
 | `label` | `TEXT` | Yes | Operator-facing evidence label. | text |
 | `state` | `TEXT` | Yes | `pass`, `block`, or `unknown`. Missing, stale, failed, or insufficient required evidence is `block`. | enum |
 | `freshness` | `TEXT` | Yes | `fresh`, `stale`, `missing`, or `unknown`. | enum |

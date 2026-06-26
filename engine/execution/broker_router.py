@@ -1,5 +1,4 @@
-# FILE: dev_core/broker_router.py
-# REPLACE ENTIRE FILE WITH THIS (copy/paste)
+# FILE: engine/execution/broker_router.py
 
 """
 Unified Broker Router
@@ -8,6 +7,7 @@ Supports:
 - sim
 - alpaca
 - ibkr
+- tradier_options
 
 Failover:
   BROKER_FAILOVER="ibkr"

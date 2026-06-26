@@ -170,6 +170,8 @@ def test_ci_rocm_profile_job_builds_profile_and_excludes_gpu_marker_by_default()
     workflow = (REPO / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
 
     assert "rocm-profile:" in workflow
+    assert "python tools/model_artifact_compat_gate.py" in workflow
+    assert "docker run --rm trading-system/runtime:amd-rocm-ci python tools/model_artifact_compat_gate.py" in workflow
     assert "requirements-amd-rocm.txt" in workflow
     assert "--build-arg TRADING_DEPENDENCY_PROFILE=amd-rocm" in workflow
     assert "--build-arg TRADING_REQUIREMENTS_FILE=requirements-amd-rocm.txt" in workflow

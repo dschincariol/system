@@ -58,7 +58,7 @@ The `engine/api/` package exposes the engine to the dashboard UI and operator to
 - [../terminal/api/api_terminal_orders.py](../terminal/api/api_terminal_orders.py)
   Risk-gated terminal order-entry handlers that emit normal portfolio-order intents.
 - [api_system.py](api_system.py)
-  System/operator diagnostics, support snapshots, service status, provider telemetry, watchdogs, and read-only aggregation surfaces. `api_system.py` remains the compatibility facade; route specs and shared response helpers are delegated to [system/](system/).
+  System/operator diagnostics, support snapshots, service status, provider telemetry, watchdogs, and read-only aggregation surfaces. It also owns the read-only risk-model reads `api_get_portfolio_risk` (`GET /api/risk/portfolio`), `api_get_alpha_decay` (`GET /api/alpha_decay`), and `api_get_risk_var_backtest` (`GET /api/risk/var_backtest`, delegating to `engine.risk.var_backtesting.build_var_backtest_payload`). `api_system.py` remains the compatibility facade; route specs (`ROUTE_SPECS_SYSTEM` in [system/route_specs.py](system/route_specs.py)) and shared response helpers are delegated to [system/](system/).
 
 ## Terminal Order Contract
 
@@ -328,6 +328,7 @@ The payload also includes `action_guards.broker_activation`, which the dashboard
 - alpha shrinkage metadata from `runtime_meta.last_alpha_shrinkage`
 - production monitoring drift/calibration/shadow-live metrics from `production_monitoring_metrics`
 - shadow-capital scores from `shadow_capital_scores`
+- VaR/CVaR backtesting evidence from `risk_var_backtest_results` (Kupiec/Christoffersen and traffic-light status, with `/api/risk/var_backtest` as the source route)
 
 Drilldowns are registered as `GET /api/governance/evidence/promotion_blockers`, `GET /api/governance/evidence/generated_candidates`, and `GET /api/governance/evidence/shadow_capital`. The first-class shadow-capital score route is `GET /api/governance/shadow_capital/scores`.
 
@@ -340,7 +341,7 @@ These routes are sensitive operational GET routes. They are explanatory only: pr
 The payload includes:
 
 - `structured_documents`: extraction counts, latest extraction and availability timestamps, low-confidence counts, confidence buckets, source-document lineage, symbol coverage, event-type coverage, extraction-failure telemetry when persisted in `event_log`, shadow-only labels, and `structured_doc_events` PIT status.
-- `graph_features`: graph snapshot counts, latest snapshot freshness, observed graph feature ids, relationship-type coverage, sampled snapshot lineage, `graph_relational_v1` PIT status, environment availability, and explicit shadow-only/direct-authority flags.
+- `graph_features`: graph snapshot counts, latest snapshot freshness, observed graph feature ids, relationship-type coverage, sampled snapshot lineage, `graph_relational_v1` PIT status, environment availability, the latest `graph_challenger_runs` benchmark run with shadow/direct-authority and train/serve-parity warnings, and explicit shadow-only/direct-authority flags.
 - `explanation_paths`: the decision/explanation sources that may carry structured-document or graph feature contributions.
 
 The route is explanatory only. Live model serving still rejects shadow feature contracts through the feature registry, graph promotion remains blocked by existing governance gates, and execution authority remains in runtime, risk, broker, and execution-policy controls.

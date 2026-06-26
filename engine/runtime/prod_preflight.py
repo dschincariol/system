@@ -1840,6 +1840,53 @@ def _memory_pressure_gate() -> Tuple[List[str], List[str], List[str], Dict[str, 
     return notes, warnings, errors, summary
 
 
+def _live_host_readiness_required() -> bool:
+    if _env_truthy("PREFLIGHT_REQUIRE_LIVE_HOST_READINESS"):
+        return True
+    return any(
+        str(os.environ.get(name) or "").strip().lower() == "live"
+        for name in ("ENGINE_MODE", "EXECUTION_MODE", "OPERATOR_MODE", "MODE")
+    )
+
+
+def _live_host_readiness_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
+    required = _live_host_readiness_required()
+    state: Dict[str, Any] = {"required": required, "ok": True, "errors": []}
+    notes: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    if not required:
+        notes.append(f"live host readiness not required mode={_runtime_mode_name()}")
+        state["skipped"] = True
+        return notes, warnings, errors, state
+
+    try:
+        from tools.live_host_readiness_check import live_host_readiness_errors
+
+        errors = list(
+            live_host_readiness_errors(
+                require_active=True,
+                paid_equity_provider_names=_paid_equity_provider_names(),
+            )
+        )
+    except Exception as e:
+        _warn_nonfatal(
+            "PROD_PREFLIGHT_LIVE_HOST_READINESS_FAILED",
+            e,
+            once_key="live_host_readiness_gate",
+        )
+        errors = [f"live_host_readiness_validation_failed:{type(e).__name__}:{e}"]
+
+    state["ok"] = not errors
+    state["errors"] = list(errors)
+    if errors:
+        return notes, warnings, errors, state
+
+    notes.append("live host readiness ok")
+    return notes, warnings, errors, state
+
+
 def _storage_placement_gate() -> Tuple[List[str], List[str], List[str], Dict[str, Any]]:
     try:
         from engine.runtime.storage_placement import check_storage_placement
@@ -2603,6 +2650,7 @@ def main() -> int:
         "backup_restore_evidence": {},
         "disk_pressure": {},
         "memory_pressure": {},
+        "live_host_readiness": {},
         "storage_placement": {},
         "lob_deeplob_shadow": {},
         "resource_isolation": {},
@@ -2661,6 +2709,19 @@ def main() -> int:
         else:
             for error in disk_errors:
                 print("[disk]", error)
+        return 3
+
+    live_host_notes, live_host_warnings, live_host_errors, live_host_readiness = _live_host_readiness_gate()
+    result["steps"].extend(live_host_notes)
+    result["warnings"].extend(live_host_warnings)
+    result["live_host_readiness"] = dict(live_host_readiness or {})
+    if live_host_errors:
+        result["errors"].extend(live_host_errors)
+        if args.json:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        else:
+            for error in live_host_errors:
+                print("[live-host-readiness]", error)
         return 3
 
     memory_notes, memory_warnings, memory_errors, memory_pressure = _memory_pressure_gate()

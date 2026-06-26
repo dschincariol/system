@@ -38,6 +38,7 @@ def test_main_migration_generates_compression_orderby_for_real_time_column(
     conn = FakeConn()
     monkeypatch.setattr(migration, "_table_exists", lambda _conn, _table: True)
     monkeypatch.setattr(migration, "_is_hypertable", lambda _conn, _table: True)
+    monkeypatch.setattr(migration, "_column_exists", lambda _conn, _table, _column: True)
     monkeypatch.setattr(migration, "_existing_columns", lambda _conn, _table, columns: tuple(columns))
     monkeypatch.setattr(migration, "_is_integer_time", lambda _conn, _table, _column: False)
 

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.1
+Name=Trading System — Login Token
+GenericName=Trading System Token
+Comment=Show the dashboard API token + LAN login URL for browsing from another device
+Icon=dialog-password
+Exec=/usr/bin/konsole --hold -e /opt/trading/bin/trading-ctl token
+Terminal=false
+Categories=System;
+Keywords=trading;token;login;

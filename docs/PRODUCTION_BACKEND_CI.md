@@ -29,7 +29,7 @@ The skip and shrinkage failures are enforced by [tools/run_required_backend_test
 
 ## Safety-Critical Money Path Gate
 
-The `Safety-critical money path (SQLite/mocks)` job runs the eight runtime-owned
+The `Safety-critical money path (SQLite/mocks)` job runs the nine runtime-owned
 money-path control suites under safe-mode SQLite/mocks:
 
 - `tests/test_kill_switch_regressions.py`
@@ -40,6 +40,7 @@ money-path control suites under safe-mode SQLite/mocks:
 - `tests/test_real_capital_safety_e2e.py`
 - `tests/test_position_reconcile_safety.py`
 - `tests/test_live_prelive_reconcile_policy.py`
+- `tests/test_risk_invariants_property.py`
 
 Each file uses module-level `pytestmark = pytest.mark.safety_critical`. Module
 scope is deliberate because these files mix `unittest.TestCase` methods and
@@ -47,10 +48,10 @@ module-level `test_` functions; a single module-level mark is selected reliably
 by `pytest -m safety_critical` for both styles.
 
 The CI command passes every file as an expected source and requires at least
-`130` selected tests. If a file is removed, renamed, loses the marker, or the
+`136` selected tests. If a file is removed, renamed, loses the marker, or the
 selection goes empty, the runner prints `selected_tests=N` and fails the job
 before the gate can silently shrink. A repository meta-test also checks that the
-workflow names exactly those eight files and that each carries the module-level
+workflow names exactly those nine files and that each carries the module-level
 marker.
 
 Safety-critical tests in the SQLite/mocks lane must not inherit an ambient host
@@ -59,6 +60,29 @@ and run in the production-backend gate. Boot-level SQLite/mocks tests should pin
 cache settings to memory or a deliberately unreachable local Redis endpoint with
 short timeouts so Redis outages, authentication policy, or a developer's local
 Redis socket cannot change the safety-critical result.
+
+## Branch Coverage Gate
+
+The `Coverage gate (branch, money paths)` CI job runs
+`python tools/coverage_gate.py run`, not `check`, so the job regenerates
+`artifacts/coverage/coverage.json`, `coverage.xml`, and
+`coverage_gate_metadata.json` from the current tree before enforcing floors.
+The generated artifacts are ignored local/CI output and are uploaded only as CI
+evidence; they are not the trusted source committed to the repository.
+
+The strict `python tools/coverage_gate.py check` path remains fail-closed for
+missing, unstamped, stale, focused-run, hash-mismatched, or config-drifted
+coverage reports. `--allow-unstamped` is a forensic local inspection mode only
+and must not appear in CI. `run` stamps the fresh report and returns the maximum
+severity of the pytest exit code and the coverage-gate result, so a pytest
+failure cannot be reported as a coverage pass and a gate failure or stale report
+cannot be swallowed by a passing pytest run.
+
+Package floors are configured in `pyproject.toml` under
+`[tool.trading_system.coverage_gate.package_minimums]` and are enforced
+generically by `tools/coverage_gate.py`. HG-5's `engine/strategy` floor remains
+at `55.67`; the 2026-06-26 close-out measurement was `56.21%`, preserving the
+documented fallback buffer without lowering the gate below measured coverage.
 
 ## Local Reproduction
 
@@ -196,7 +220,7 @@ Run the safety-critical SQLite/mocks gate:
 ```bash
 python tools/run_required_backend_tests.py \
   --label safety-critical-money-path \
-  --min-selected 130 \
+  --min-selected 136 \
   --expected-source tests/test_kill_switch_regressions.py \
   --expected-source tests/test_broker_router_dry_run_gates.py \
   --expected-source tests/test_broker_order_idempotency_regressions.py \
@@ -205,6 +229,7 @@ python tools/run_required_backend_tests.py \
   --expected-source tests/test_real_capital_safety_e2e.py \
   --expected-source tests/test_position_reconcile_safety.py \
   --expected-source tests/test_live_prelive_reconcile_policy.py \
+  --expected-source tests/test_risk_invariants_property.py \
   -- -q -m "safety_critical" -rs \
     tests/test_kill_switch_regressions.py \
     tests/test_broker_router_dry_run_gates.py \
@@ -213,7 +238,8 @@ python tools/run_required_backend_tests.py \
     tests/test_drawdown_fail_closed.py \
     tests/test_real_capital_safety_e2e.py \
     tests/test_position_reconcile_safety.py \
-    tests/test_live_prelive_reconcile_policy.py
+    tests/test_live_prelive_reconcile_policy.py \
+    tests/test_risk_invariants_property.py
 ```
 
 Run the targeted production-path suite:

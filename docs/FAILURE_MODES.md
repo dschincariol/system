@@ -39,11 +39,15 @@ pinging, so a missed watchdog deadline lets systemd send `SIGABRT` and apply
 
 The operator sends `READY=1` after the HTTP listener is bound and sends
 `WATCHDOG=1` at `<=30s` cadence after its periodic watchdog body completes
-without an unrecoverable exception. The engine uses `NotifyAccess=main`; the
-operator uses `NotifyAccess=all` so its `/usr/bin/systemd-notify` fallback is
-accepted if the native `unix-dgram` module is unavailable on a host. The primary
-path for both services is still direct AF_UNIX datagrams from the main process,
-including systemd's NUL-prefixed abstract socket form.
+without an unrecoverable exception. Its primary notify path is a native AF_UNIX
+datagram from the main node process, including systemd's NUL-prefixed abstract
+socket form; its fallback spawns `/usr/bin/systemd-notify` as a child with
+`--pid=parent`. systemd authorizes notify datagrams by the sender socket's
+SCM_CREDENTIALS PID, not the `--pid=parent` MAINPID payload, so
+`NotifyAccess=main` would reject the child-originated fallback datagram and
+break the watchdog heartbeat. The operator therefore uses `NotifyAccess=all`,
+whereas the engine uses `NotifyAccess=main` because it never notifies from a
+child process.
 
 Memory cgroups make the supervised app processes preferred victims over
 co-located Postgres, Redis, and storage services. The engine has

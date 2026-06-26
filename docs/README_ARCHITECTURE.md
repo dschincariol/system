@@ -2,7 +2,7 @@
 
 This document explains the repo in plain English.
 
-Last verified against code: 2026-06-21
+Last verified against code: 2026-06-26
 
 For the grounded, code-referenced architecture reference (exact entrypoints, control planes, and modules), see [ARCHITECTURE.md](ARCHITECTURE.md). This document is its plain-English companion.
 
@@ -264,7 +264,7 @@ In practical terms, training now writes a feature contract and serving reads tha
 
 ### Current feature inventory
 
-`engine/strategy/feature_registry.py` is the source of truth. The default serving set is exactly 111 feature ids: 8 base ids plus 103 unified symbol-snapshot ids when `USE_SYMBOL_SNAPSHOT_FEATURES=1` (the default). The full registered catalog is larger, about 1,762 ids without shadow groups and about 1,802 with shadow groups, because optional and shadow groups include NLP embeddings, filings, transcripts, tsfresh, symbolic/discovered features, time-series foundation-model embeddings, and other opt-in surfaces. The larger catalog is the opt-in/shadow superset, not the default serving surface; `tests/test_feature_default_count_parity.py` pins the 111-id serving count.
+`engine/strategy/feature_registry.py` is the source of truth. The default serving set is exactly 111 feature ids: 8 base ids plus 103 unified symbol-snapshot ids when `USE_SYMBOL_SNAPSHOT_FEATURES=1` (the default). The full registered catalog is larger, about 1,762 ids without shadow groups and about 1,902 with shadow groups, because optional and shadow groups include NLP embeddings, filings, transcripts, tsfresh, symbolic/discovered features, time-series foundation-model embeddings, and other opt-in surfaces. The larger catalog is the opt-in/shadow superset, not the default serving surface; `tests/test_feature_default_count_parity.py` pins the 111-id serving count.
 
 Current groups visible in the registry include:
 
@@ -347,10 +347,11 @@ The current data job directory includes price/news/event processing plus newer a
 - Form 4 and congressional trade ingestion jobs
 - event processors for base, live, enriched, and shadow paths
 - `process_finbert_sentiment.py`, `snapshot_model_features.py`, and `compute_tsfresh_snapshots.py`
+- `llm_event_extraction.py`, a shadow-default bounded-LLM structured-event extractor that projects accepted rows into `structured_document_events`
 
 ### What "AI" means in this repo
 
-There are three different AI/ML concepts in the codebase:
+There are four different AI/ML concepts in the codebase:
 
 - trading ML
   the predictive models in `engine/strategy/` that generate trading intent
@@ -358,8 +359,10 @@ There are three different AI/ML concepts in the codebase:
   the advisory-only layer in `engine/execution/execution_ai_advisor.py` that comments on execution quality but does not control orders
 - operator AI
   the bounded diagnostic assistant in `services/operator_ai/agent.js` that analyzes runtime failures and suggests guarded repair actions
+- LLM structured extraction
+  the bounded extractor in `engine/data/llm_event_extraction.py` that turns already-available source documents into validated, shadow-only structured-event feature rows; it is a deterministic-validated extractor, not a predictor
 
-Only the first one affects trading signals. The other two are read-side or advisory layers.
+Only the first one affects trading signals directly. The others are read-side, advisory, or shadow-only layers.
 
 ## 9. Portfolio And Allocation
 

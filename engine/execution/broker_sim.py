@@ -4,7 +4,6 @@ FILE: broker_sim.py
 Execution subsystem module for `broker_sim`.
 """
 
-# dev_core/broker_sim.py
 """
 Broker simulator (paper execution).
 

@@ -122,13 +122,31 @@ This profile is simulation-only. It sets `ENGINE_MODE=paper`,
 capital cannot be armed or routed. `KILL_SWITCH_GLOBAL=0` lets the simulator run;
 setting it to `1` freezes every order path, including paper simulation.
 
-To drive one simulated fill through the dashboard/API:
+To drive one simulated fill through the dashboard/API, include an explicit
+terminal confirmation payload. The browser terminal collects the same `TRADE`
+token, consequence acknowledgement, and short hold through the shared modal
+before it sends any BUY/SELL request; it does not synthesize those fields.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/terminal/order \
   -H "Content-Type: application/json" \
   -H "X-API-Token: $(cat data/secrets/dashboard_api_token)" \
-  -d '{"symbol":"AAPL","side":"BUY","qty":1}'
+  -d '{
+    "symbol":"AAPL",
+    "side":"BUY",
+    "qty":1,
+    "confirm":"TRADE",
+    "confirmation":"TRADE",
+    "confirmation_token":"TRADE",
+    "confirmation_method":"typed_phrase",
+    "confirmation_hold_ms":0,
+    "consequence_ack":true,
+    "actor":"terminal_operator",
+    "source":"terminal",
+    "source_surface":"terminal",
+    "action_id":"terminal.order",
+    "target":"BUY AAPL qty 1.0000"
+  }'
 python engine/execution/jobs/broker_apply_orders.py
 python engine/execution/jobs/execution_poll_and_attrib.py
 ```

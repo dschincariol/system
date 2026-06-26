@@ -19,7 +19,20 @@ The `engine/execution/` tree turns approved portfolio or strategy intents into b
 - [broker_sim.py](broker_sim.py)
   Simulation broker used in non-live modes.
 - [kill_switch.py](kill_switch.py)
-  Execution safety switches.
+  Persistent, fail-closed execution kill-switch barrier. Beyond manual/scoped
+  switches (global, symbol, regime, model) and price/event freshness checks,
+  `execution_allowed(...)` runs automatic capital and model risk triggers:
+  `_capital_risk_trigger` evaluates daily drawdown
+  (`KILL_SWITCH_DAILY_DRAWDOWN_PCT`, default 0.05), rolling drawdown
+  (`KILL_SWITCH_ROLLING_DRAWDOWN_PCT`, default 0.12 over
+  `KILL_SWITCH_ROLLING_DRAWDOWN_LOOKBACK_DAYS`), historical VaR
+  (`KILL_SWITCH_VAR_CONFIDENCE`, default 0.99), single-position concentration
+  (`KILL_SWITCH_CONCENTRATION_MAX_SINGLE`, default 0.35), and stale/unavailable
+  equity (`KILL_SWITCH_MAX_EQUITY_AGE_S`, default 300s, surfaced through
+  `capital_equity_freshness_snapshot(...)`); `_model_risk_trigger` evaluates
+  per-model drawdown and consecutive losses. Trips persist `risk_events` and
+  auto-activate switches with `KILL_SWITCH_COOLDOWN_MINUTES` (default 60)
+  cooldown metadata.
 - [execution_mode.py](execution_mode.py)
   Runtime execution-mode state and policy.
 - [execution_policy_engine.py](execution_policy_engine.py)
@@ -125,6 +138,14 @@ gates, then prefers the FX-capable broker (`ibkr`) at the front of that already
 validated chain when the batch contains FX spot pairs. The same execution-mode,
 kill-switch, pre-live reconcile, live broker contract, options, and RL-source
 guards still run before any adapter can submit.
+
+Live FX trading is default-off. For non-dry routes, `broker_router._fx_order_safety_block(...)`
+fails closed with `fx_live_trading_disabled_by_default` (stop-failover) when an FX
+batch would route to a live broker and `FX_LIVE_TRADING_ENABLED` is unset or
+false; if no FX-capable broker is in the chain it instead blocks with
+`fx_broker_unavailable`. As defense in depth, `broker_ibkr_gateway.fx_order_block(...)`
+re-checks the same `FX_LIVE_TRADING_ENABLED` flag (`require_live_enabled=True`) at
+the IBKR adapter boundary before any live FX `placeOrder`.
 
 `fx_session.py` derives weekend boundaries from `engine.data.prices.fx_clock`,
 the FX-04 canonical clock. The shared default is Sunday 17:00 ET open and Friday

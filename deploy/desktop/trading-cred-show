@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# trading-cred-show — print ONLY the dashboard API token, decrypted from the
+# systemd encrypted credstore. Runs as root, invoked via pkexec, authorized
+# narrowly by /etc/polkit-1/rules.d/49-trading-system.rules. Takes no arguments
+# and reveals exactly one secret, so the polkit grant cannot be widened by args.
+set -euo pipefail
+exec systemd-creds decrypt --name=dashboard_api_token \
+  /etc/credstore.encrypted/dashboard_api_token.cred -

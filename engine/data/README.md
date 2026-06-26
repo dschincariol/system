@@ -107,6 +107,31 @@ The `engine/data/` tree owns external data acquisition and transformation into D
   Event processing stage before labels and predictions.
 - [jobs/label_due_events.py](jobs/label_due_events.py)
   Converts due events into training labels once enough horizon data exists.
+- [llm_event_extraction.py](llm_event_extraction.py)
+  Structured LLM financial-event extraction. LLMs here are bounded extractors,
+  not predictors: `run_llm_event_extraction_batch(...)` selects only
+  already-available source documents (`select_source_documents`), builds a
+  deterministic prompt, asks a provider adapter (`OpenAIResponsesAdapter`,
+  `AnthropicToolAdapter`, or the test `FakeLLMEventExtractionAdapter`) for a
+  strict JSON object, validates every field deterministically
+  (`validate_extraction_payload`), persists accepted rows with lineage and an
+  audit row (`persist_llm_extracted_events`, `ensure_llm_event_extraction_schema`),
+  and projects shadow-only feature rows into `structured_document_events`. The
+  path is default-off, cost-bounded (`max_docs`/`max_cost_usd`), and holds no
+  execution authority.
+- [jobs/llm_event_extraction.py](jobs/llm_event_extraction.py)
+  Bounded one-shot job wrapper for `run_llm_event_extraction_batch`. Gated by the
+  data-source control plane (`is_job_enabled`, default off), it acquires the job
+  lock, builds `LLMEventExtractionConfig.from_env()`, runs one batch, and records
+  pipeline/job status; the heartbeat marks `execution: False`.
+- [structured_document_events.py](structured_document_events.py)
+  Shadow-only structured-document event feature plane and PIT helpers
+  (`put_structured_document_events`, `EVENT_FEATURE_ID`,
+  `STRUCTURED_DOCUMENT_EVENT_FEATURE_IDS`) consumed by the LLM extraction path and
+  surfaced through `engine.api.feature_visibility`.
+- [event_normalization.py](event_normalization.py)
+  Shared event-normalization helpers (hashing, dedup keys, payload coercion) used
+  across non-price ingestion pipelines.
 
 ## Newer Feature Families
 
@@ -119,6 +144,10 @@ The `engine/data/` tree owns external data acquisition and transformation into D
   [finbert_sentiment.py](finbert_sentiment.py),
   [jobs/process_finbert_sentiment.py](jobs/process_finbert_sentiment.py), and
   [ingest/news_enrichment.py](ingest/news_enrichment.py).
+- Structured LLM event extraction (shadow-only, default-off):
+  [llm_event_extraction.py](llm_event_extraction.py),
+  [jobs/llm_event_extraction.py](jobs/llm_event_extraction.py), and
+  [structured_document_events.py](structured_document_events.py).
 - Point-in-time training support:
   [feature_store.py](feature_store.py),
   [universe_pit.py](universe_pit.py), and

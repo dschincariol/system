@@ -14,17 +14,23 @@ def _reload_preflight():
 
 def test_asset_class_live_enablement_defaults_disabled_or_shadow(monkeypatch):
     for key in (
+        "ENGINE_MODE",
         "FX_LIVE_TRADING_ENABLED",
         "CRYPTO_LIVE_TRADING_ENABLED",
         "FUTURES_LIVE_TRADING_ENABLED",
         "OPTIONS_INSTRUMENTS_MODE",
+        "OPTIONS_AS_INSTRUMENTS_MODE",
+        "OPTIONS_LIVE_ORDERS_ENABLED",
+        "OPTIONS_ENABLE_LIVE_ORDERS",
+        "OPTIONS_AS_INSTRUMENTS_LIVE",
     ):
         monkeypatch.delenv(key, raising=False)
 
     preflight = _reload_preflight()
     snapshot = preflight.asset_class_live_enablement_snapshot()
-    classes = snapshot["asset_classes"]
+    classes = snapshot["classes"]
 
+    assert snapshot["engine_mode"] == "safe"
     assert snapshot["any_live_permitted"] is False
     assert set(classes) == {"fx", "crypto", "futures", "options"}
     assert classes["fx"]["live_permitted"] is False
@@ -33,6 +39,7 @@ def test_asset_class_live_enablement_defaults_disabled_or_shadow(monkeypatch):
     assert classes["crypto"]["live_permitted"] is False
     assert classes["futures"]["live_permitted"] is False
     assert classes["options"]["live_permitted"] is False
+    assert classes["options"]["live_options_requested"] is False
     assert classes["options"]["flag_value"] == "shadow"
     assert classes["options"]["default_posture"] == "shadow"
 
@@ -45,13 +52,37 @@ def test_asset_class_live_enablement_flags_flip_to_live_permitted(monkeypatch):
 
     preflight = _reload_preflight()
     snapshot = preflight.asset_class_live_enablement_snapshot()
-    classes = snapshot["asset_classes"]
+    classes = snapshot["classes"]
 
     assert snapshot["any_live_permitted"] is True
     assert classes["fx"]["live_permitted"] is True
     assert classes["crypto"]["live_permitted"] is True
     assert classes["futures"]["live_permitted"] is True
     assert classes["options"]["live_permitted"] is True
+
+
+def test_asset_class_options_live_permitted_via_live_orders_flag(monkeypatch):
+    monkeypatch.delenv("OPTIONS_INSTRUMENTS_MODE", raising=False)
+    monkeypatch.delenv("OPTIONS_AS_INSTRUMENTS_MODE", raising=False)
+    monkeypatch.setenv("OPTIONS_LIVE_ORDERS_ENABLED", "1")
+
+    preflight = _reload_preflight()
+    snapshot = preflight.asset_class_live_enablement_snapshot()
+    classes = snapshot["classes"]
+
+    assert classes["options"]["live_permitted"] is True
+    assert classes["options"]["live_options_requested"] is True
+    assert classes["options"]["flag_value"] == "shadow"
+    assert snapshot["any_live_permitted"] is True
+
+
+def test_asset_class_live_enablement_snapshot_reports_explicit_engine_mode(monkeypatch):
+    monkeypatch.delenv("ENGINE_MODE", raising=False)
+
+    preflight = _reload_preflight()
+    snapshot = preflight.asset_class_live_enablement_snapshot(engine_mode="live")
+
+    assert snapshot["engine_mode"] == "live"
 
 
 def test_live_trading_preflight_surfaces_asset_class_snapshot_without_new_blockers(monkeypatch):
@@ -134,4 +165,5 @@ def test_live_trading_preflight_surfaces_asset_class_snapshot_without_new_blocke
 
     assert state["blockers"] == ["existing_contract_blocker"]
     assert state["ok"] is False
-    assert set(state["asset_class_live_enablement"]["asset_classes"]) == {"fx", "crypto", "futures", "options"}
+    assert state["asset_class_live_enablement"]["engine_mode"] == "live"
+    assert set(state["asset_class_live_enablement"]["classes"]) == {"fx", "crypto", "futures", "options"}

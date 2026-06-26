@@ -92,6 +92,78 @@ def _existing_classified_hypertables(conn) -> dict[str, Hypertable]:
     return out
 
 
+def test_risk_var_backtest_results_uses_forecast_time_column() -> None:
+    spec = TABLE_CLASS["risk_var_backtest_results"]
+    assert isinstance(spec, Hypertable)
+    assert spec.time_column == "forecast_ts_ms"
+    assert spec.chunk == "30 days"
+    assert spec.compress_after == "90 days"
+    assert spec.retain == "5 years"
+    assert spec.segmentby == ("confidence_level",)
+
+
+def test_create_hypertable_fails_when_declared_time_column_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    migration = __import__("engine.runtime.schema.migrations.0002_hypertables", fromlist=["_create_hypertable"])
+    spec = Hypertable(
+        chunk="1 day",
+        compress_after=None,
+        retain=None,
+        time_column="missing_ts_ms",
+        rationale="unit-test classified hypertable",
+        write_rate="low",
+        read_pattern="unit-test",
+    )
+    monkeypatch.setattr(migration, "_table_exists", lambda _conn, _table: True)
+    monkeypatch.setattr(migration, "_column_exists", lambda _conn, _table, _column: False)
+
+    with pytest.raises(RuntimeError, match="missing_ts_ms"):
+        migration._create_hypertable(object(), "broken_hypertable", spec)
+
+
+def test_reconcile_migration_reapplies_policy_for_risk_var_backtests(monkeypatch: pytest.MonkeyPatch) -> None:
+    migration = __import__("engine.runtime.schema.migrations.0084_reconcile_classified_hypertables", fromlist=["up"])
+    hypertables = __import__("engine.runtime.schema.migrations.0002_hypertables", fromlist=["_create_hypertable"])
+    indexes = __import__("engine.runtime.schema.migrations.0003_indexes", fromlist=["_create_hypertable_indexes"])
+    calls: list[tuple[str, str, str | None]] = []
+
+    class FakeConn:
+        def execute(self, sql: str, params: tuple[object, ...] = ()) -> "FakeConn":
+            del params
+            calls.append(("execute", str(sql), None))
+            return self
+
+    monkeypatch.delenv("TRADING_UNIT_TEST_SCHEMA_FAST", raising=False)
+    monkeypatch.setattr(hypertables, "_create_integer_now_func", lambda _conn: calls.append(("now", "", None)))
+    monkeypatch.setattr(
+        hypertables,
+        "_create_hypertable",
+        lambda _conn, table_name, spec: calls.append(("create", str(table_name), spec.time_column)),
+    )
+    monkeypatch.setattr(
+        hypertables,
+        "_enable_compression",
+        lambda _conn, table_name, spec: calls.append(("compress", str(table_name), spec.compress_after)),
+    )
+    monkeypatch.setattr(
+        hypertables,
+        "_enable_retention",
+        lambda _conn, table_name, spec: calls.append(("retain", str(table_name), spec.retain)),
+    )
+    monkeypatch.setattr(
+        indexes,
+        "_create_hypertable_indexes",
+        lambda _conn, table_name, spec: calls.append(("index", str(table_name), spec.time_column)),
+    )
+
+    migration.up(FakeConn())
+
+    assert ("execute", "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE", None) in calls
+    assert ("create", "risk_var_backtest_results", "forecast_ts_ms") in calls
+    assert ("compress", "risk_var_backtest_results", "90 days") in calls
+    assert ("retain", "risk_var_backtest_results", "5 years") in calls
+    assert ("index", "risk_var_backtest_results", "forecast_ts_ms") in calls
+
+
 def _dimension_interval_ms(value) -> int | None:
     if value is None:
         return None
@@ -136,6 +208,28 @@ def test_each_existing_classified_hypertable_is_created() -> None:
         missing = sorted(set(expected) - actual)
         assert not missing, "Classified hypertables missing from Timescale: " + ", ".join(missing)
         assert len(actual) >= len(expected)
+
+
+def test_each_existing_classified_hypertable_time_column_exists() -> None:
+    storage_pg = _prepare_db()
+    with storage_pg.connect_ro_direct(timeout_s=1) as conn:
+        rows = conn.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = ANY (current_schemas(false))
+              AND table_type = 'BASE TABLE'
+            """
+        ).fetchall()
+        existing_tables = {str(row[0]) for row in rows or []}
+        missing = sorted(
+            f"{table_name}.{classification.time_column}"
+            for table_name, classification in TABLE_CLASS.items()
+            if isinstance(classification, Hypertable)
+            and table_name in existing_tables
+            and not _column_exists(conn, table_name, classification.time_column)
+        )
+        assert not missing, "Classified hypertable time columns missing from materialized tables: " + ", ".join(missing)
 
 
 def test_each_hypertable_has_time_dimension() -> None:

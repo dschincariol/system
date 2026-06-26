@@ -2,7 +2,7 @@
 
 This document explains the main runtime database/storage contract used by the repo in human terms.
 
-Last verified against code: 2026-06-22
+Last verified against code: 2026-06-26
 
 It is not meant to replace the schema in `engine/runtime/storage.py` or `engine/runtime/storage_pg.py`. It is meant to make the schema understandable.
 
@@ -146,7 +146,9 @@ read-back values under `policy_status.chunk_intervals`, and runtime metrics emit
 `storage_pg_prices_hypertable_chunk_interval_ms` or
 `timescale_hypertable_chunk_interval_ms` gauges per table. Compatibility tables
 created after numbered migrations, such as `labels_price`, also call the
-classified hypertable helper when created.
+classified hypertable helper when created. Existing classified hypertables must
+have their declared `time_column`; a mismatch now fails schema reconciliation
+instead of leaving an unchunked regular table behind.
 
 Production soak acceptance must verify that those policies are applied in the
 running Timescale catalog. `engine.runtime.ingestion_soak` builds the read-only
@@ -523,12 +525,18 @@ These tables support offline analysis more than live control.
 | `backtest_scores` | backtest outputs |
 | `walk_forward_runs`, `walk_forward_scores` | walk-forward evaluation |
 | `backtest_cpcv_runs`, `backtest_cpcv_paths` | CPCV/PBO, cost-adjusted, and gated-backtest evidence |
-| `risk_var_forecasts`, `risk_var_backtest_results` | VaR/CVaR forecast snapshots and exception backtesting evidence |
+| `risk_var_forecasts`, `risk_var_backtest_results` | VaR/CVaR forecast snapshots and forecast-time hypertable exception backtesting evidence |
+| `har_rv_forecasts`, `garch_vol_forecasts` | point-in-time HAR-RV and GARCH-family volatility forecasts used by sizing and Monte Carlo risk inputs |
+| `tsfm_benchmark_runs`, `tsfm_benchmark_rows`, `tsfm_risk_inputs` | governed time-series foundation-model benchmark manifests, OOS benchmark rows, and shadow risk-input candidates |
 | `validation_scores` | validation results |
 | `model_metrics` | model performance summaries |
 | `embed_model_eval`, `embed_conf_calib` | embedding/evaluation calibration tables |
 | `temporal_model_eval` | evaluation for temporal models |
 | `causal_scores`, `causal_dags` | causal diagnostics and curated DAG definitions |
+
+`risk_var_backtest_results` is a genuine Timescale hypertable on
+`forecast_ts_ms`; its exception evidence uses 30-day chunks, 90-day compression,
+5-year retention, and `confidence_level` compression segmenting.
 
 ## 6. Important Table Shapes
 
@@ -842,6 +850,7 @@ If you change the schema, keep these rules:
 4. avoid changing hot-path tables casually
 5. keep dashboard-only analytics tables separate from execution-authoritative tables
 6. preserve backward compatibility where possible
+7. keep runtime `CREATE TABLE` names discoverable by `tests/test_schema_classification.py`; simple f-string table names should use module-level string constants, and unresolved static table-name constants are treated as coverage failures
 
 ## 10. Current Table Register
 

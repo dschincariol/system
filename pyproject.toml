@@ -23,9 +23,9 @@ amd-rocm = [
   "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torch-2.9.1%2Brocm7.2.4.lw.git39497456-cp312-cp312-linux_x86_64.whl ; python_version >= \"3.12\" and platform_system == \"Linux\"",
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torchaudio-2.9.0%2Brocm7.2.4.gite3c6ee2b-cp312-cp312-linux_x86_64.whl ; python_version >= \"3.12\" and platform_system == \"Linux\"",
   "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/triton-3.5.1%2Brocm7.2.4.gita272dfa8-cp312-cp312-linux_x86_64.whl ; python_version >= \"3.12\" and platform_system == \"Linux\"",
-  "numpy==2.4.6",
-  "scikit-learn==1.9.0",
-  "lightgbm==4.6.0",
+  "numpy==2.1.2",
+  "scikit-learn==1.5.2",
+  "lightgbm==4.5.0",
   "xgboost==2.1.4",
 ]
 ts-foundation = [

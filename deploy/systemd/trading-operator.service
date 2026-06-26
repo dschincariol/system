@@ -47,6 +47,10 @@ TimeoutStartSec=300s
 Restart=on-failure
 RestartSec=5
 WatchdogSec=60s
+# Operator sd_notify is native unix-dgram from the main PID, with a
+# /usr/bin/systemd-notify fallback spawned as a child process; systemd
+# authorizes the sender socket ucred PID, so NotifyAccess=main would reject the
+# child-originated fallback watchdog datagram. See docs/FAILURE_MODES.md.
 NotifyAccess=all
 StandardOutput=append:/var/lib/trading/logs/operator.log
 StandardError=append:/var/lib/trading/logs/operator.log

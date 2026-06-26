@@ -1,8 +1,10 @@
 # Database Schema
 
-Last verified against code: 2026-06-22
+Last verified against code: 2026-06-26
 
 This document records the production Postgres 16 + TimescaleDB 2.x schema classification. `engine/runtime/schema/table_classification.py` is the importable source of truth; this document is the human review record. New tables must be added there and here before shipping.
+
+The classification coverage gate scans `engine/` and `ops/` `CREATE TABLE` declarations, including simple f-string names backed by module-level string constants. Unresolved static table-name constants in `CREATE TABLE IF NOT EXISTS {TABLE_NAME}` style DDL are failures, not skipped tables.
 
 This document is the authoritative, complete table register, kept in lockstep with `engine/runtime/schema/table_classification.py`. The curated, human-readable data-flow view is [README_DATABASE_MAP.md](README_DATABASE_MAP.md), which is a subset and does not replace this register.
 
@@ -16,8 +18,9 @@ The register here documents more than raw base tables: it also includes continuo
 - `0007_audit_chain.py` adds and backfills `prev_hash`/`row_hash` on audit-chain tables.
 - `0008_audit_findings.py` creates `audit_chain_findings` for verifier divergence reports.
 - `0063_model_scoring_indexes.py` adds the unresolved model-scoring indexes used to find the latest tracked prediction per prediction id and to anti-probe already scored rows in `model_performance`.
-- `0065_hypertable_chunk_intervals.py` reruns the classified hypertable creation path for existing deployments so tables added after `0002` are converted and all hypertables converge to the same classification-driven chunk intervals as fresh installs.
+- `0065_hypertable_chunk_intervals.py` reruns the classified hypertable creation path for deployments with post-`0002` tables already present by migration `0065`, so those hypertables converge to the same classification-driven chunk intervals as fresh installs.
 - `0066_timescale_compression_orderby.py` reruns compression setup for existing deployments so previously-created hypertables gain the same descending real-time-column `compress_orderby` as fresh installs.
+- `0084_reconcile_classified_hypertables.py` reruns classified hypertable creation, compression, retention, and index setup after late table migrations such as `0079`/`0080`/`0081`. It converts `risk_var_backtest_results` on `forecast_ts_ms` and fails migration if an existing classified hypertable lacks its declared `time_column`.
 - `0068_canonical_timescale_price_sidecar_schema.py` converts legacy deployed `price_quotes` and `price_quotes_raw` sidecars from `ts_ms`-only tables to the canonical `"time" TIMESTAMPTZ` Timescale shape without dropping existing rows.
 - `0069_data_source_provider_accounts.py` adds the shared provider-account registry and provider lookup index for deployments that already applied the baseline before the DF-04 data-source catalog expansion.
 - `0082_llm_event_extraction.py` adds validated structured LLM event rows plus an append-only acceptance/rejection lineage table. These rows project only into shadow `structured_doc_events_v1.*` features.
@@ -55,7 +58,9 @@ their sidecar-owned hypertables. They report actual read-back values in
 `policy_status.chunk_intervals` plus `*_hypertable_chunk_interval_ms` gauges.
 Postgres compatibility tables that are created after numbered migrations, such
 as `labels_price`, rerun the same classified hypertable helper when they are
-created.
+created. The helper fails loudly when a materialized classified hypertable is
+missing its declared `time_column`; it no longer silently downgrades that table
+to regular Postgres storage.
 
 ## Index Plan
 
@@ -99,7 +104,7 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `alpha_decay_metrics` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `alpha_decay_runtime_history` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `alpha_decay_strategy_metrics` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
-| `alpha_lifecycle` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
+| `alpha_lifecycle` | Hypertable | time=created_ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `learned_alpha_decay_runs` | Regular | cleanup=n/a | low | latest run lookup and training audit | training-run metadata for learned alpha decay, capacity, and crowding estimates |
 | `learned_alpha_decay_estimates` | Regular | cleanup=n/a | low | latest cohort lookup from execution, portfolio, and champion paths | learned half-life, max useful age, capacity, crowding penalty, size multiplier, and block flag by cohort |
 | `learned_alpha_decay_age_edges` | Regular | cleanup=n/a | low | run/cohort drill-down and estimator audit | realized net edge by signal-age bucket behind learned-alpha estimates |
@@ -118,7 +123,7 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `broker_shadow_positions` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `capital_efficiency` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=symbol | medium | order, symbol, and time-range execution analysis | execution ledger; append-mostly financial evidence retained indefinitely |
 | `capital_preservation_audit` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
-| `causal_scores` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
+| `causal_scores` | Hypertable | time=ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `challenger_shadow_orders` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `champion_assignments` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `competition_post_commit_actions` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
@@ -147,7 +152,7 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `embed_models2` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `ensemble_blend_weights` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `ensemble_family_performance` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
-| `ensemble_predictions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
+| `ensemble_predictions` | Hypertable | time=ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `equity_history` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `event_embeddings` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `event_embeddings_seq` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
@@ -242,7 +247,7 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `model_lifecycle_runs` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `model_marketplace_scores` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `model_metrics` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
-| `model_oos_predictions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
+| `model_oos_predictions` | Hypertable | time=ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `model_position_state` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `model_post_promo_results` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `model_post_promo_watch` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
@@ -266,9 +271,9 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `news_flow_features` | Hypertable | time=asof_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest news-flow feature snapshot by symbol/time/backend | materialized point-in-time news novelty/staleness feature cache |
 | `news_story_embeddings` | Regular | cleanup=n/a | medium | symbol/backend availability-window novelty comparisons and feature snapshots | backend-aware per-story news embeddings and novelty scores keyed by event/symbol/model |
 | `news_symbol_features` | Hypertable | time=bucket_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest feature snapshot and historical replay by (symbol, time) | point-in-time feature series; append-mostly and replayed by symbol/time |
-| `nlp_embeddings` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
-| `nlp_sentiments` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
-| `nlp_text_blobs` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
+| `nlp_embeddings` | Regular | cleanup=n/a | medium | content-hash/model lookup | content-hash embedding cache keyed by text hash and model namespace; no time dimension in the materialized schema |
+| `nlp_sentiments` | Regular | cleanup=n/a | medium | content-hash/model lookup | content-hash sentiment cache keyed by text hash and model namespace; no time dimension in the materialized schema |
+| `nlp_text_blobs` | Hypertable | time=ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `notification_channel_tests` | Regular | cleanup=job_history and alerts use app-managed rotation where configured | low | primary-key or latest-state lookup | bounded or low-rate operational table; primary lookup is not a time-range scan |
 | `options_chain` | Hypertable | time=ts_ms; chunk=1 day; compress=7 days; retain=3 years; segmentby=underlying | high | underlying/time option surface and chain scans | options market data stream; append-mostly and queried by underlying/time |
 | `options_chain_v2` | Hypertable | time=ts_ms; chunk=1 day; compress=7 days; retain=3 years; segmentby=underlying | high | underlying/time option surface and chain scans | options market data stream; append-mostly and queried by underlying/time |
@@ -321,7 +326,7 @@ The tracked-only branch handles `tracked_predictions` rows that have no `predict
 | `risk_events` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
 | `risk_state` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
 | `risk_var_forecasts` | Regular | cleanup=n/a | low | latest forecasts and matured forecast scans by forecast_ts_ms | Monte Carlo VaR/CVaR forecast snapshots retained for point-in-time risk-model validation |
-| `risk_var_backtest_results` | Hypertable | time=ts_ms; chunk=30 days; compress=90 days; retain=5 years; segmentby=confidence_level | low | recent risk-model validation dashboard scans by time and confidence | VaR/CVaR exception evidence with Kupiec, Christoffersen, rolling exception rate, and traffic-light status |
+| `risk_var_backtest_results` | Hypertable | time=forecast_ts_ms; chunk=30 days; compress=90 days; retain=5 years; segmentby=confidence_level | low | recent risk-model validation dashboard scans by time and confidence | VaR/CVaR exception evidence with Kupiec, Christoffersen, rolling exception rate, and traffic-light status |
 | `rl_policies` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `rl_shadow_actions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `rl_shadow_eval` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
@@ -425,17 +430,17 @@ and governance enforcement remain in their existing downstream owners.
 | `feature_evaluation` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `feature_registry` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `experiment_ledger` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | append-only generated-candidate ledger for lineage, trial budgets, false-discovery evidence, redundancy checks, and promotion decisions |
-| `finbert_sentiment_enrichments` | Hypertable | time=asof_ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest sentiment enrichment by symbol/time/source | point-in-time FinBERT sentiment enrichments keyed by symbol/source availability |
+| `finbert_sentiment_enrichments` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | medium | latest sentiment enrichment by symbol/time/source | point-in-time FinBERT sentiment enrichments keyed by symbol/event timestamp |
 | `hypothesis_registry` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `model_best_params` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `model_hyperparameter_registry` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `model_performance` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `position_reconcile_bootstrap_audit` | Hypertable | time=ts_ms; chunk=1 week; compress=90 days; retain=none; segmentby=none | low | time-range audit review and actor/entity lookup | forensic audit ledger; append-only and retained indefinitely |
 | `position_reconcile_state` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
-| `prediction_explanations` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
+| `prediction_explanations` | Hypertable | time=ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `realized_outcomes` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=none | medium | time-range replay and dashboard scans | append-mostly feature/evaluation series keyed primarily by time |
 | `regime_state` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | mutable state table; current value is the contract and rows are updated in place |
-| `rl_shadow_decisions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
+| `rl_shadow_decisions` | Hypertable | time=ts; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |
 | `rl_training_runs` | Regular | cleanup=n/a | low to medium | model/run keyed lookup and latest status reads | training/model artifact metadata; looked up by model/run identifiers |
 | `tracked_model_registry` | Regular | cleanup=n/a | low | primary-key or latest-state lookup | registry/catalog table; primary access is by natural key, not by time range |
 | `tracked_predictions` | Hypertable | time=ts_ms; chunk=1 week; compress=30 days; retain=3 years; segmentby=symbol | high | decision replay by (symbol, time) and JSON predicates | model decision/prediction stream; append-mostly and replayed by symbol/time |

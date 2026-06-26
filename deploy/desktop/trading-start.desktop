@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.1
+Name=Start Trading System
+GenericName=Trading System
+Comment=Bring up data deps, start the engine + operator, and open the dashboard
+Icon=media-playback-start
+Exec=/usr/bin/konsole --hold -e /opt/trading/bin/trading-ctl start
+Terminal=false
+Categories=System;Monitor;
+Keywords=trading;start;engine;dashboard;
+StartupNotify=true

@@ -2,7 +2,7 @@
 
 This document maps the main Python files to the most important functions and classes inside them.
 
-Last verified against code: 2026-06-25
+Last verified against code: 2026-06-26
 
 It is designed for the moment when someone asks:
 
@@ -453,6 +453,28 @@ VaR/CVaR model-validation helpers. This module persists forecast/backtest eviden
 | --- | --- |
 | `run_var_backtest(...)` | consumes matured `risk_var_forecasts`, aligns realized returns from `equity_history`, and upserts `risk_var_backtest_results` evidence rows |
 | `build_var_backtest_payload(...)` | builds the dashboard/API payload for recent VaR/CVaR backtest rows and explicit empty/schema-missing states |
+
+### `engine/risk/covariance.py`
+
+Canonical covariance/correlation facade for money-at-risk paths (consumed by `portfolio_risk_engine.py`, `monte_carlo_risk_engine.py`, and `engine/strategy/risk.py`). It loads point-in-time price returns once for a symbol set, estimates with a Ledoit-Wolf shrinkage default, and falls back with explicit diagnostics when history is insufficient.
+
+| Function | What it does |
+| --- | --- |
+| `estimate_covariance(con, symbols, ...)` | main entrypoint: loads aligned PIT returns and returns a `RiskCovarianceEstimate` (covariance, correlation, vols, diagnostics) with PSD/RMT handling and explicit fallbacks |
+| `estimate_covariance_from_returns(...)` / `estimate_covariance_from_return_matrix(...)` | estimate directly from supplied return series/matrices |
+| `correlation_matrix_dict(...)` / `covariance_matrix_dict(...)` | serialize an estimate into symbol-keyed dict matrices |
+| `portfolio_volatility_from_estimate(...)` | computes portfolio volatility from an estimate and weights |
+
+### `engine/strategy/garch_vol.py`
+
+Conditional (GARCH-family/EWMA) volatility forecasts used as risk-sizing inputs only — they are not registered as alpha features by default. Forecasts persist into the `garch_vol_forecasts` table and are produced by the `garch_vol_forecast` job (`engine/strategy/jobs/garch_vol_forecast.py`).
+
+| Function | What it does |
+| --- | --- |
+| `forecast_garch_for_symbol(con, symbol, ...)` | builds a one-symbol conditional-volatility forecast (optional `arch` GARCH fit, EWMA/realized-variance fallback) |
+| `run_garch_vol_forecast_job(...)` | the registered job body: forecasts the candidate symbol set and upserts forecast rows |
+| `latest_garch_forecast(...)` | reads the most recent persisted forecast for a symbol |
+| `ensure_garch_vol_schema(con)` | ensures the forecast table/index exist |
 
 ## 8. API Layer
 

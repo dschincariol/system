@@ -1674,3 +1674,393 @@ VERIFY:
 After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run `git status --short --untracked-files=all`, `python tools/git_worktree_triage.py`, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
 
 ---
+
+
+---
+
+# Part C — Remaining-Work Remediation Prompts (post-verification, 2026-06-26)
+> After the full-scope verification of Parts A+B, **35/37 items were IMPLEMENTED-CORRECT**; these prompts cover everything still outstanding. **GO-R4** (P1) and **HG-11** (P2) were authored in Parts A/B but a prior implementation pass SKIPPED them — re-issued here, more prescriptive. **CL-1…CL-4** close out the verification caveats on otherwise-correct items. **GO-R11-EXEC** turns the operator/host go-live steps into a self-enforcing dev deliverable. Each is self-contained: re-confirm cited file:line in the current working tree, design+implement the optimal solution, then run the self-audit footer. Independent — run in any order; GO-R4 is the remaining go-live BLOCKER.
+
+| ID | Sev | What it closes |
+|----|-----|----------------|
+| GO-R4 | P1 | Off-host backup leg + fail-closed offsite-freshness evidence (NOT IMPLEMENTED) |
+| HG-11 | P2 | Terminal directional BUY/SELL through the confirmation modal up-front (IMPLEMENTED 2026-06-26) |
+| CL-1 | close-out | Prove the engine/strategy coverage floor actually PASSES (HG-5) |
+| CL-2 | close-out | Model-artifact compatibility gate across dependency profiles (HG-4) |
+| CL-3 | P3 | Align asset_class_live_enablement_snapshot to spec (HG-9) |
+| CL-4 | P3 | Operator-unit NotifyAccess resolution + rationale (HG-13) |
+| GO-R11-EXEC | operator+dev | Host-hardening bootstrap + live-host-readiness go-live blocker (GO-R11) |
+
+## GO-R4 — Off-host backup leg + fail-closed offsite-freshness evidence gate (P1)
+
+ROLE: You are a senior reliability engineer hardening the Postgres backup/restore evidence pipeline so a single-pool failure cannot wipe all recovery points.
+
+TARGET: /home/david/gitsandbox/system/system
+
+PROBLEM (re-confirmed against the current dirty working tree on branch codex/worktree-production-readiness; HEAD has advanced past 8184174 — re-open every file below and re-confirm line numbers before editing):
+This is one of the original 10 P1 go-live blockers and the prior remediation pass SKIPPED it entirely. There is NO offsite/off-host enforcement anywhere in the evidence gate today:
+
+- ops/backup/backup_restore_evidence.sh has ZERO offsite-freshness logic. The only matches for "offsite" are at lines 401 and 413, where the script merely CLEARS `TS_WAL_OFFSITE_CMD=` for the WAL-restore diagnosis probe — that is not a gate and does not assert anything about off-host copies. There is no `offsite` block in the signed evidence JSON payload (re-confirm: the `payload = {…}` dict starts at line ~1465 and ends at ~1569; it has base_backup, wal_archive, wal_catchup, wal_archiver, wal_archive_target, restore_drill, publish — but no `offsite`). The overall_rc aggregation at lines ~1687-1696 calls check_scripts/check_compose/check_systemd/run_base_backup/verify_wal_archive/etc. but has NO offsite check.
+- ops/backup/base_backup.sh line ~228 runs the off-host copy only behind `if [ -n "${TS_BASE_BACKUP_OFFSITE_CMD:-}" ]; then` (lines 228-232). When that env var is UNSET the off-host copy is SILENTLY skipped — there is no fail-closed path, so "no offsite configured" looks identical to success.
+- ops/backup/wal_archive.sh `offsite_copy()` (lines 182-188) similarly returns 0 immediately when `TS_WAL_OFFSITE_CMD` is empty (line 185 `[ -n "$cmd_template" ] || return 0`), and the only signal is an `offsite=true/false` token in the log line at line 208 — never gated.
+- ops/backup/offsite_base_backup_stub.sh EXISTS (51 lines, supports `s3://…` and absolute-dir `dest` via `TS_OFFSITE_BACKUP_DEST`, writes `<dest>/<name>.tar`) but is DEAD CODE — it is never invoked by base_backup.sh nor wired by default. docs/DISK_RETENTION_RUNBOOK.md (lines ~322-334) documents the operator wiring as optional only.
+- Net effect: base backups, WAL, and restore drills all live on the single pool zpool/trading-backups (/var/backups/trading; `base_dir=${TS_BACKUP_BASE_DIR:-/var/backups/trading/base}` line 30, `wal_dir=${TS_BACKUP_WAL_DIR:-/var/backups/trading/wal}` line 31). A pool/host loss destroys every recovery point and the evidence gate still reports pass.
+
+WHAT IS MISSING / INSUFFICIENT: there is no offsite-freshness assertion, no `offsite` field in the signed evidence JSON, no OFFSITE_REQUIRED knob, no fail-closed behavior, and the off-host push is unwired and optional. Because the prior pass skipped this, be forcing: all of (1)-(4) below MUST land — do not partially implement.
+
+DESIGN / REQUIRED CHANGE (implement exactly; named files/functions/env vars/behavior):
+
+(1) Off-host freshness assertion in ops/backup/backup_restore_evidence.sh — ADD a new function `verify_offsite()` and the status vars it populates.
+  - Near the other status declarations (~lines 52-99) declare, defaulted to empty/"fail":
+    `offsite_status="fail"`, `offsite_base_dest=""`, `offsite_base_last_copy_at=""`, `offsite_base_last_copy_at_ts=""`, `offsite_base_age_s=""`, `offsite_wal_dest=""`, `offsite_wal_last_copy_at=""`, `offsite_wal_last_copy_at_ts=""`, `offsite_wal_age_s=""`, `offsite_verified_at=""`.
+  - New env knobs (read at top with the other `${TS_…:-}` defaults near lines 30-46):
+    `offsite_required` from `TS_OFFSITE_REQUIRED` (treat ENGINE_MODE/EXECUTION_MODE == "live" as implicitly required, mirroring the signature_required logic at evidence Python lines ~1457-1464 — i.e. live forces required even if the knob is unset);
+    `offsite_max_age_s="${TS_OFFSITE_MAX_AGE_S:-90000}"` (default ~25h so a daily base + frequent WAL stays fresh; document the rationale);
+    base dest from `TS_OFFSITE_BACKUP_DEST` (and/or the dest implied by `TS_BASE_BACKUP_OFFSITE_CMD`); WAL offsite enablement from `TS_WAL_OFFSITE_CMD`/`TS_WAL_OFFSITE_DEST`.
+  - Behavior of `verify_offsite()` (write a `${work_dir}/offsite.out` trace like the other checks):
+    * If offsite is NOT configured (no base dest AND no WAL offsite cmd/dest) AND `offsite_required` is false → set `offsite_status="disabled"`, log the reason, `return 0` (do NOT fail).
+    * If offsite IS configured (or required): probe the most-recent off-host BASE tarball and the most-recent off-host WAL object, compute each age vs `now`. For an absolute-dir dest, reuse the existing `latest_file`/mtime helpers (`latest_file` at ~792, `file_mtime_iso` used at 932) against `<dest>` for `*.tar`. For `s3://…` dest, use `aws s3 ls`/`aws s3api head-object` under `run_capture_with_timeout` and a new `TS_OFFSITE_PROBE_TIMEOUT_S` (default = probe_timeout_s) — never block unbounded; treat a missing/empty listing as absent.
+    * Populate `offsite_base_dest`, `offsite_base_last_copy_at`(+`_ts`), `offsite_base_age_s`, and the WAL analogues. Set `offsite_verified_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`.
+    * PASS criteria: a fresh off-host BASE copy (age_s <= offsite_max_age_s) AND, when WAL offsite is configured/required, a fresh off-host WAL object (age_s <= offsite_max_age_s). On success `offsite_status="pass"`, `return 0`.
+    * FAIL criteria: required (or configured) but the relevant off-host copy is absent or stale → `offsite_status="fail"`, append the specific reason (e.g. `offsite_base_stale=… age_s=… max_age_s=…` or `offsite_base_missing=dest`), and `return 1`.
+
+(2) Fail-closed wiring in the same script.
+  - In the overall_rc aggregation block (~lines 1687-1696) ADD a line `verify_offsite || overall_rc=1` AFTER `verify_wal_archive`/`verify_wal_archiver_stats` so a stale/absent required off-host copy forces `overall_rc=1` and a non-zero exit (the script already `exit "$overall_rc"` at ~1718). When `offsite_status="disabled"` the function returns 0 and does not affect overall_rc.
+  - Surface `offsite` in the signed evidence JSON: in the env-var header that precedes the Python heredoc (the `STATUS=…/GENERATED_AT=…` block starting ~line 1280) export `OFFSITE_STATUS`, `OFFSITE_REQUIRED`, `OFFSITE_MAX_AGE_S`, `OFFSITE_BASE_DEST`, `OFFSITE_BASE_LAST_COPY_AT`, `OFFSITE_BASE_LAST_COPY_AT_TS`, `OFFSITE_BASE_AGE_S`, `OFFSITE_WAL_DEST`, `OFFSITE_WAL_LAST_COPY_AT`, `OFFSITE_WAL_LAST_COPY_AT_TS`, `OFFSITE_WAL_AGE_S`, `OFFSITE_VERIFIED_AT`. In the `payload = {…}` dict (after the `wal_archive_target`/`restore_drill` entries, ~line 1558) ADD an `"offsite"` object: `{"status": os.environ["OFFSITE_STATUS"], "required": truthy(os.environ["OFFSITE_REQUIRED"]), "max_age_s": maybe_float(os.environ["OFFSITE_MAX_AGE_S"]), "verified_at": os.environ["OFFSITE_VERIFIED_AT"], "verified_at_ts": ts(os.environ["OFFSITE_VERIFIED_AT"]), "base": {"dest": …, "last_copy_at": …, "last_copy_at_ts": ts(…), "age_s": maybe_float(…)}, "wal": {"dest": …, "last_copy_at": …, "last_copy_at_ts": ts(…), "age_s": maybe_float(…)}}`. The signed-payload canonicalization at ~line 1572 automatically covers the new field — keep it INSIDE the signed payload (do not add it after signing). Also add an `[offsite]` section to the human report builder (the `} > "$report_txt"` block ~line 1276, where the other `printf '\n[section]\n'; cat "${work_dir}/…out"` entries live).
+
+(3) Actually push off-host (close the silent-skip gap; do NOT leave the stub dead).
+  - base_backup.sh: keep `TS_BASE_BACKUP_OFFSITE_CMD` honored, but make `offsite_base_backup_stub.sh` the documented default invocation and add a fail-closed guard: introduce `TS_BASE_BACKUP_OFFSITE_REQUIRED` — when truthy and `TS_BASE_BACKUP_OFFSITE_CMD` is empty, `die offsite_required …` instead of silently skipping (the current line ~228 `if [ -n … ]` path must error, not no-op, when required). Ensure the offsite tar push runs BEFORE the `latest` symlink swap (lines 234-235) so a failed push fails the backup (`set -euo pipefail` already in effect) rather than publishing a local-only "latest".
+  - wal_archive.sh: in `offsite_copy()` (lines 182-188) add the same required-knob semantics — `TS_WAL_OFFSITE_REQUIRED` truthy with empty `TS_WAL_OFFSITE_CMD` must `die`/non-zero rather than `return 0`. Keep the existing happy path.
+  - Provide a concrete default wiring example (env file / compose) that points `TS_BASE_BACKUP_OFFSITE_CMD='bash <repo>/ops/backup/offsite_base_backup_stub.sh'` with `TS_OFFSITE_BACKUP_DEST`, and an analogous `TS_WAL_OFFSITE_CMD` for WAL — so off-host is wired by default in the live profile, not optional.
+
+(4) Documentation: update docs/DISK_RETENTION_RUNBOOK.md "Offsite Base Backup Requirement" (~lines 322-334) to (a) describe the NEW evidence gate: the `offsite` JSON field, the three states pass/fail/disabled, `TS_OFFSITE_REQUIRED`, `TS_OFFSITE_MAX_AGE_S` (with the default and rationale), `TS_OFFSITE_PROBE_TIMEOUT_S`, and `TS_BASE_BACKUP_OFFSITE_REQUIRED`/`TS_WAL_OFFSITE_REQUIRED`; (b) state plainly that in live mode the gate is fail-closed and a missing/stale off-host copy makes `backup_restore_evidence.sh` exit non-zero; (c) give the exact operator config for both an absolute-dir NAS dest and an `s3://` dest, and note that base+WAL+drills otherwise share the single zpool/trading-backups pool so off-host is mandatory for go-live. Never print secret values or real bucket credentials.
+
+GUARDRAIL: preserve all existing fail-closed/safe-mode gates; never enable live execution; read-then-change. Keep `offsite_status="disabled"` non-fatal so dev/CI without offsite still pass; only required (or live) makes it fail-closed. Do not weaken the signature_required path, the existing overall_rc aggregation, or any other check. Do not reorder existing checks except to insert verify_offsite after the WAL checks. Do not print or echo secret values, keys, or credentials anywhere.
+
+VERIFY (all must pass):
+- `bash -n ops/backup/backup_restore_evidence.sh && bash -n ops/backup/base_backup.sh && bash -n ops/backup/wal_archive.sh` is clean.
+- With offsite configured to a temp dir containing a fresh `<name>.tar` and a fresh WAL object: the latest evidence JSON contains `.offsite.status == "pass"` with non-null `.offsite.base.age_s`, `.offsite.base.dest`, and `.offsite.base.last_copy_at_ts`; the script exits 0; the `offsite` object is inside the signed payload (signature still verifies). Confirm with `jq '.offsite' <latest_json>`.
+- Remove/empty the off-host tarball (or point dest at an empty dir) with `TS_OFFSITE_REQUIRED=1`: the script exits non-zero, top-level `.status == "fail"`, and `.offsite.status == "fail"` with a stale/missing reason in the `[offsite]` report section.
+- With no offsite configured and `TS_OFFSITE_REQUIRED` unset (non-live): `.offsite.status == "disabled"` and the script still exits 0 (no regression to existing CI).
+- Extend tests/test_backup_restore_evidence_pipeline.py with cases asserting: (a) `offsite` field present in the JSON with status pass when a fresh off-host tarball/WAL exists; (b) fail-closed — non-zero exit and `offsite.status == "fail"` when the off-host copy is absent/stale and OFFSITE_REQUIRED is set; (c) `disabled` status + zero exit when unconfigured and not required; (d) the `offsite` block is covered by the HMAC signature (signature still validates after the field is added). Run `python -m pytest tests/test_backup_restore_evidence_pipeline.py -q` green.
+
+After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run git status --short --untracked-files=all, python tools/git_worktree_triage.py, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
+
+---
+
+## HG-11 — Route terminal directional BUY/SELL through the confirmation modal up-front (no synthetic consequence_ack bypass) (P2)
+
+IMPLEMENTATION NOTE (2026-06-26): Completed in `ui/terminal/terminal.js` with exported `buildDirectionalOrderBody(...)` and `submitTerminalOrder(...)`. Directional BUY/SELL now require the shared confirmation modal before the first `/api/terminal/order` POST, the body builder fails closed without an operator-supplied confirmation payload, and `tests/test_terminal_directional_confirmation.mjs` locks the no-bypass and call-order behavior.
+
+ROLE: Senior front-end / trading-safety engineer hardening the browser terminal order path.
+
+TARGET: /home/david/gitsandbox/system/system
+
+PROBLEM (re-confirmed against the current dirty working tree; HEAD is now 1944103, branch codex/worktree-production-readiness — line numbers below were re-verified, not the stale 8184174 numbers). This item was carried as HG-11 but the prior remediation pass SKIPPED it; directional BUY/SELL still self-confirms with a synthetic token. Evidence in `ui/terminal/terminal.js`:
+- `orderConfirmationPayload(token, holdMs=0)` (lines 812-830) returns a payload that hard-codes `consequence_ack: true` (line 822) and `confirmation_token: "TRADE"` (line 819) WITHOUT any operator interaction. This is a synthetic, auto-filled acknowledgement.
+- `submitTerminalOrder(side, qty, label)` (lines 1252-1276) builds `body` by spreading `...orderConfirmationPayload("TRADE")` (line 1261) and POSTs it DIRECTLY to `/api/terminal/order` (line 1265) on the very first attempt. No modal is shown before this POST. So a single BUY/SELL button click (line 1416/1424) or a single `b`/`s` keypress (lines 1379-1397) sends a real directional order with a machine-generated `consequence_ack:true` and no typed token.
+- `requestConfirmation` (imported line 44) is invoked only REACTIVELY: `requestTerminalThresholdPayload` (lines 1217-1250) calls it at line 1225 ONLY after the backend returns an over-threshold `confirmation_required` error (lines 1266-1273). Sub-threshold orders therefore never see a modal at all.
+- The arm checkbox (`terminalArmChk` wired at line 1364; `_terminalArmed` line 669) gates ONLY the keyboard path via `canUseKeyboardTradingShortcut` (lines 1198-1204). The BUY/SELL buttons are not gated by arm and are not gated by any modal.
+- Contrast: FLATTEN already requires a deliberate hold gesture — `startFlattenHold` (lines 1299-1315) with `FLATTEN_HOLD_MS=1500` (line 48), and the FLATTEN payload is built with a non-zero hold (line 1282). Directional orders have no equivalent up-front friction.
+- Testability blocker: `submitTerminalOrder` and `orderConfirmationPayload` are NOT exported from `terminal.js` (no `export` of either symbol exists), so no test can currently assert the order-body provenance.
+
+WHAT IS MISSING / INSUFFICIENT: there is NO up-front confirmation for directional orders, the acknowledgement is synthetic (not operator-entered), and there is no testable seam to prove a non-bypass. The reactive threshold modal must be PRESERVED but it is not a substitute for up-front confirmation.
+
+DESIGN / REQUIRED CHANGE (implement precisely; do not re-discover):
+1. Extract a pure, testable helper and EXPORT it: add `export function buildDirectionalOrderBody({ symbol, side, qty, confirmationPayload })` to `ui/terminal/terminal.js`. It must build the order body from the fields plus the SUPPLIED `confirmationPayload` (the object returned by `buildConfirmationPayload`/`requestConfirmation`), and must NOT call `orderConfirmationPayload(...)` internally. The body must carry `consequence_ack`, `confirmation_token`, `confirmation_method`, and `confirmation_hold_ms` taken from the operator-supplied payload — never auto-set them to `true`/`"TRADE"`. If `confirmationPayload` is missing or its `consequence_ack !== true` or its `confirmation_token` is empty, the helper MUST throw (fail closed) — there is no synthetic fallback.
+2. Rewrite `submitTerminalOrder(side, qty, label)` (lines 1252-1276) to confirm UP-FRONT before the first POST:
+   - After `canSubmitDirectionalOrder` (line 1253) and the positive-qty check, call `requestConfirmation({...})` describing the directional order. Required modal options: `title` e.g. `"Confirm terminal order"`; `action: "Terminal directional order"`; `actionId: "terminal.order"`; `target` = `` `${side} ${STATE.symbol} qty ${fmtSymbolQty(STATE.symbol, qty)}` ``; `consequence` summarizing notional/side (reuse the `renderOrderPreview` price ref if available); `confirmText: "TRADE"`; `submitLabel: "Send Order"`; `actor: "terminal_operator"`; `sourceSurface: "terminal"`; and a short hold via a NEW module constant `const DIRECTIONAL_HOLD_MS = 1000;` passed as `holdMs` so the modal requires a typed token + consequence ack + brief hold.
+   - If `confirmation.ok !== true`, set a warn banner (`` `${label || side} confirmation cancelled.` ``) and return WITHOUT any POST.
+   - Build the body via `buildDirectionalOrderBody({ symbol: STATE.symbol, side, qty: cleanQty, confirmationPayload: confirmation.payload })` and POST to `/api/terminal/order` (current line 1265).
+   - PRESERVE the reactive high-notional threshold path exactly: keep the `isThresholdConfirmationError` catch (lines 1266-1273) and `requestTerminalThresholdPayload` so an over-threshold backend error still prompts the second (threshold) modal and re-POSTs with `...thresholdPayload`.
+3. Keyboard path: keep the fast `b`/`s` shortcuts (lines 1379-1397) behind the existing arm toggle, but they MUST still route through the same up-front-confirming `submitTerminalOrder` — i.e. arming the keyboard does NOT skip the modal. Do not add a separate synthetic path for keyboard orders.
+4. Remove the now-unused `orderConfirmationPayload("TRADE")` usage from the directional flow. `orderConfirmationPayload` may remain ONLY for FLATTEN (line 1282) if still needed; do not leave any directional caller that injects a synthetic `consequence_ack`.
+5. Export `submitTerminalOrder` (or a thin testable wrapper that accepts an injected `requestConfirmation` and `postJson`) so the test in VERIFY can observe call ordering. Prefer dependency-injection via optional params with the real functions as defaults, matching the existing `tests/test_terminal_*.mjs` import style.
+
+GUARDRAIL: preserve all existing fail-closed / safe-mode gates; never enable live execution; read-then-change. The backend execution barrier `canSubmitDirectionalOrder` (lines 859-864) and `canSubmitRealTrade` (lines 853-857) MUST remain the first checks and stay unchanged. Do not weaken the reactive threshold modal. The new behavior only ADDS up-front friction; it must never make an order easier to send.
+
+VERIFY (all must pass):
+- `node --check ui/terminal/terminal.js` exits 0.
+- Add `tests/test_terminal_directional_confirmation.mjs` (Node test runner, `import test from "node:test"`, matching the existing mjs test style) that:
+  (a) asserts `buildDirectionalOrderBody` THROWS when given no `confirmationPayload` and when given one whose `consequence_ack` is not `true` (proves no synthetic bypass);
+  (b) asserts a valid operator-supplied payload yields a body whose `consequence_ack` and `confirmation_token` come from that payload (not auto-injected);
+  (c) drives `submitTerminalOrder` with an injected `requestConfirmation` stub and an injected `postJson` spy, and asserts that `requestConfirmation` is invoked and resolves BEFORE the first `postJson("/api/terminal/order", ...)` call (record call order with timestamps/sequence ids), and that when the stub returns `{ ok:false, cancelled:true }` NO POST occurs;
+  (d) asserts a sub-threshold single click cannot send: with the confirmation stub cancelling, `postJson` call count is 0.
+- Run `node --test tests/test_terminal_directional_confirmation.mjs` and capture exit code 0.
+- Confirm no remaining directional caller spreads `orderConfirmationPayload("TRADE")`: `grep -n 'orderConfirmationPayload(\"TRADE\")' ui/terminal/terminal.js` returns nothing.
+
+After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run git status --short --untracked-files=all, python tools/git_worktree_triage.py, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
+
+---
+
+## CL-1 — Prove engine/strategy coverage floor PASSES green in CI (HG-5 close-out) (close-out)
+
+ROLE: You are a senior reliability engineer closing out the coverage-floor gate (HG-5) so its PASS is proven, durable, and CI-enforced — not assumed.
+
+TARGET: /home/david/gitsandbox/system/system
+
+PROBLEM
+HG-5 added an engine/strategy coverage floor, but its PASS was never actually proven green; a prior pass left it ambiguous. Re-confirmed against the current working tree (branch codex/worktree-production-readiness, HEAD 1944103ac778c5e442a43a48e5f96f007ca4abd6 — note: NOT 8184174):
+
+1) Config is wired correctly:
+   - pyproject.toml:96 — zero_covered_module_roots includes "engine/strategy".
+   - pyproject.toml:111-122 — 12 engine/strategy modules added to zero_covered_module_allowlist.
+   - pyproject.toml:129 — [tool.trading_system.coverage_gate.package_minimums] "engine/strategy" = 55.67.
+   - tools/coverage_gate.py:424-443 (print_package_summary "Required package floors" table) and :502-528 (check_coverage floor + zero-covered enforcement loops) consume these generically — engine/strategy is enforced with no code change needed.
+
+2) The true current number is razor-thin but PASSING. Forensic run confirms:
+   `python tools/coverage_gate.py check --allow-unstamped` prints:
+     engine/strategy  PASS  55.68%  55.67%  +0.01%  38261/68710
+   That is a +0.01% margin (38261 of 68710 measured lines). One deleted test or refactor drops it below floor.
+
+3) The stamped artifact the gate trusts is STALE, so the default (stamped) check exits 2 ambiguously rather than proving PASS. `python tools/coverage_gate.py check` currently prints:
+     "Coverage gate FAILED: stale or partial coverage report" with:
+       - coverage JSON mtime/size/content-hash differ from the stamped run
+       - coverage metadata was generated with different gate config
+       - coverage metadata records pytest_exit_code=1
+       - coverage JSON is older than current source/test/gate config files
+     and returns 2.
+   The sidecar artifacts/coverage/coverage_gate_metadata.json proves the drift: its embedded "config" block lists package_minimums = {engine/execution, engine/risk, engine/runtime} and zero_covered_module_roots = [engine/risk, engine/execution, engine/runtime] — engine/strategy is ABSENT. It was stamped before the HG-5 config change and records pytest_exit_code=1.
+
+4) THE REAL BLOCKER (what is currently missing/insufficient): tools/coverage_gate.py:599-601 — run_coverage() returns `int(pytest_result.returncode)` BEFORE returning gate_result, so a non-zero pytest exit short-circuits the gate outcome. The stamped metadata records pytest_exit_code=1, i.e. the full `tests/` suite has failing tests right now. CI job "Coverage gate (branch, money paths)" (.github/workflows/validate.yml:168-204) runs `python tools/coverage_gate.py run` over the full `tests/` suite. Therefore CI's coverage gate currently FAILS on the pytest failures and NEVER reaches a green coverage-floor PASS — the engine/strategy floor PASS exists only in forensic (--allow-unstamped) mode, never in the enforced CI lane. HG-5 is effectively unproven.
+
+NET: floors pass on fresh data, but (a) the stamped artifact is stale/exit-2, (b) the +0.01% margin is undefendable, and (c) the CI lane that would prove PASS is red because the underlying suite is red.
+
+DESIGN / REQUIRED CHANGE
+Goal: make HG-5's PASS reproducible, CI-enforced from a FRESH artifact, and defended by a non-trivial margin, and make a regression below floor FAIL loudly.
+
+A. Re-establish a fresh, stamped artifact and capture the true number (do this first, read-then-change):
+   - Run `python tools/coverage_gate.py run` (full default `tests/` run) from /home/david/gitsandbox/system/system. Record the engine/strategy "Required package floors" row (Measured %, covered/measured) and the resulting exit code. This regenerates artifacts/coverage/coverage.json + coverage.xml + coverage_gate_metadata.json with the CURRENT engine/strategy config.
+   - If the full `tests/` suite exits non-zero, you MUST resolve that as part of this close-out — a green coverage gate is impossible while pytest is red. Triage the failures: if they are pre-existing/unrelated to coverage, fix or quarantine them via the project's existing skip/marker convention ONLY with an inline justification comment and never by skipping money-path tests; the coverage lane must end with pytest exit 0 AND gate exit 0. Do not mask failures by lowering coverage scope.
+
+B. Defend the floor margin (the +0.01% is unacceptable for a hard gate):
+   - Set the configured floor to a DEFENDED value. Two acceptable outcomes — pick based on the measured number from step A:
+     (i) PREFERRED: add targeted tests for the highest-importer engine/strategy modules until measured coverage is comfortably above the floor (target margin >= 1.50 percentage points). Use `python tools/coverage_gate.py check --allow-unstamped` and the "Zero-covered burndown priority (production importers)" output to pick modules. Then set pyproject.toml:129 "engine/strategy" floor to a round value <= (new measured − 1.00) so normal churn does not flip it red.
+     (ii) IF you cannot raise coverage in scope: KEEP the floor at the true defended current value but document it. Set the floor to floor(measured*100)/100 only if measured − floor >= 0.50; otherwise the floor stays at 55.67 ONLY IF measured >= 56.17. You MUST NOT leave a hard gate sitting at a sub-0.10pp margin.
+   - GUARDRAIL on the floor: never set "engine/strategy" below the real current measured coverage. If you lower it relative to 55.67, that is forbidden unless measured itself dropped, in which case investigate why before touching the number.
+
+C. Make CI prove PASS from a FRESH artifact and FAIL on staleness (don't trust a stamped file shipped in the tree):
+   - The CI "coverage" job already runs `python tools/coverage_gate.py run` (validate.yml:204), which regenerates the artifact fresh — keep that. But the run() exit semantics hide a passing gate behind pytest failures AND vice versa. Adjust tools/coverage_gate.py run_coverage() (around :599-601) so the process exit code is the MAX severity of (pytest_result.returncode, gate_result): i.e. return the larger of the two so a gate FAIL (1/2) is never swallowed by a pytest PASS, and a pytest FAIL is never reported as a coverage PASS. Preserve existing stamping behavior. Keep returning 2 (not 0/1) for missing/unstamped/stale artifacts.
+   - Ensure the default `check` path remains strict: `python tools/coverage_gate.py check` (no --allow-unstamped) MUST continue to exit 2 when the stamped metadata is missing, config-drifted, hash-mismatched, or older than sources (the _validate_run_metadata logic at :320-363 already does this — do not weaken it). The fix is that CI uses `run` (fresh) so the artifact is never stale at gate time; --allow-unstamped stays forensic-only and MUST NOT appear in any CI invocation.
+   - Do NOT commit a stale artifacts/coverage/coverage_gate_metadata.json that omits engine/strategy. Either commit a freshly regenerated sidecar that includes engine/strategy in its embedded config, or (preferred) ensure these artifacts are git-ignored so CI's fresh `run` is the single source of truth. Verify .gitignore / git status for artifacts/coverage/* and make the artifact CI-generated, not tree-shipped.
+
+D. Prove a regression below floor FAILS:
+   - Add or extend a self-test for the gate (e.g. tests/tools/test_coverage_gate*.py if present, else add one) that feeds a synthetic coverage payload where an engine/strategy module's coverage is dropped below the configured floor and asserts check_coverage(...) returns 1 and prints "engine/strategy ... is below ...". This locks in the regression behavior without depending on the live suite.
+
+GUARDRAIL: preserve all existing fail-closed/safe-mode gates; never enable live execution; read-then-change. Do not weaken _validate_run_metadata, do not introduce --allow-unstamped into CI, do not lower the engine/strategy floor below real current measured coverage, and do not skip or quarantine money-path / safety-critical tests to make the suite green.
+
+VERIFY (all must hold):
+1) Fresh gate green: from /home/david/gitsandbox/system/system, `python tools/coverage_gate.py run` exits 0, and its "Required package floors" table shows an `engine/strategy  PASS` row with Measured >= the configured floor and Delta >= the defended margin chosen in step B (>= +1.50pp if you took path B(i)).
+2) Strict check green from the fresh artifact: immediately after (1), `python tools/coverage_gate.py check` (NO --allow-unstamped) exits 0 — proving the stamped metadata now matches config (includes engine/strategy), hash, and freshness.
+3) Regression fails: artificially drop a strategy module's coverage (via the new self-test payload, or by temporarily editing the coverage JSON) and confirm check_coverage returns 1 with an "engine/strategy ... is below ..." failure line; the new self-test passes (`python -m pytest -q tests/.../test_coverage_gate*.py`).
+4) Exit-severity fix: a run where pytest passes but the gate would fail returns non-zero, and a run where the gate passes but pytest fails returns non-zero — confirm via the run_coverage return path (unit-cover the max(pytest_rc, gate_result) logic).
+5) CI uses fresh, not stamped: confirm .github/workflows/validate.yml:204 still invokes `python tools/coverage_gate.py run` (regenerates artifact) and that no CI step passes --allow-unstamped; confirm artifacts/coverage/* is not a committed stale fixture the gate trusts (git-ignored or freshly regenerated with engine/strategy in its embedded config).
+
+After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run git status --short --untracked-files=all, python tools/git_worktree_triage.py, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
+
+---
+
+## CL-2 — Close cross-profile ML-stack divergence with a model-artifact compatibility gate (HG-4 close-out) (close-out)
+
+ROLE: Senior ML-platform / release engineer closing a train/serve-skew supply-chain gap. TARGET: /home/david/gitsandbox/system/system
+
+PROBLEM (re-confirmed against the current dirty working tree; HEAD is `1944103` on branch `codex/worktree-production-readiness`, NOT `8184174` — re-confirm line numbers before editing).
+
+HG-4 added a cross-profile shared-pin equality check in `tools/validate_dependency_lock.py` (`_shared_scientific_pin_report`, ~555-608; `SHARED_SCIENTIFIC_PINS` ~40-59). But the real scientific-stack divergence between the base/CI stack and the ROCm serving image is currently *suppressed by an allowlist*, not resolved:
+- `tools/validate_dependency_lock.py:73-80` — `ROCM_SHARED_PIN_DIVERGENCE_REASON = "unverified base-version availability on ROCm image; pending confirmation"` and `SHARED_PIN_ALLOWLIST` holds three entries for profile `amd-rocm`: `lightgbm 4.6.0`, `numpy 2.4.6`, `scikit-learn 1.9.0`.
+- `_shared_scientific_pin_report` (~587-597) downgrades these mismatches from an `error` to a *warning* string `cross_profile_pin_allowlisted:...` whenever the actual ROCm pin equals the allowlisted `expected_version`. So `--strict` exits 0 and CI is green while the divergence is real.
+- Actual pins confirmed: base/CPU/CI (`requirements-base.txt`) = `numpy==2.1.2`, `scikit-learn==1.5.2`, `lightgbm==4.5.0`; ROCm (`requirements-amd-rocm-full.txt` and `requirements-amd-rocm.lock.txt`) = `numpy==2.4.6`, `scikit-learn==1.9.0`, `lightgbm==4.6.0`.
+
+WHAT IS MISSING / INSUFFICIENT. The allowlist reason is an explicit "pending confirmation" IOU that was never paid. The model-running ROCm host therefore serves champions on a *different* sklearn/numpy/lightgbm than CI/base validates against, and there is NO check anywhere that a champion sklearn-estimator pickle or LightGBM booster (saved via `engine/strategy/gbm_regressor.py` and `engine/strategy/models/lgbm_regressor.py`, which use `engine/artifacts/serialization.py` `dump/load_pickle_artifact(prefer_joblib=True)`) actually *loads and predicts identically* across that version gap. sklearn pickles are notoriously version-fragile (private attribute renames, dtype/`__setstate__` drift) and LightGBM booster pickles can warn/break across minor bumps. This is a silent train/serve-skew risk: a champion trained/validated on the base stack may load with a warning-but-wrong result, or fail outright, on the ROCm serving host. A prior remediation pass left this as a warning rather than closing it.
+
+DESIGN / REQUIRED CHANGE. Convert the allowlist from a silent pass into something backed by a *passing* compatibility check, OR eliminate it by aligning the stack. Implement BOTH a hard gate (A) and pursue alignment where feasible (B); the allowlist must end the task either removed (aligned) or annotated as justified-by-a-passing-gate.
+
+(A) Per-profile MODEL-ARTIFACT COMPATIBILITY GATE — REQUIRED, do not skip:
+1. New module `tools/model_artifact_compat_gate.py` (a runnable CLI, `def main(argv) -> int`, exit 0 = compatible). It:
+   - Loads a small set of FIXED, committed reference artifacts: a fitted scikit-learn estimator (use the same family as `engine/strategy/gbm_regressor.py` serves, e.g. `GradientBoostingRegressor`/`HistGradientBoostingRegressor`) and a fitted LightGBM model wrapped exactly as `engine/strategy/models/lgbm_regressor.py` saves it, serialized via `engine.artifacts.serialization.dump_pickle_artifact(..., prefer_joblib=True)` — the same path production uses.
+   - Loads them with `load_pickle_artifact(..., prefer_joblib=True)`, calls `.predict()` on a FIXED feature fixture (a deterministic float32 matrix committed alongside, shape matching the saved model's expected n_features), and compares the predictions to a COMMITTED golden expected-prediction vector that was generated on the base/CI stack.
+   - Asserts (i) load succeeds with no exception, (ii) predictions match golden within a TIGHT tolerance: `numpy.testing.assert_allclose(pred, golden, rtol=1e-5, atol=1e-6)` (tighten/loosen only with an in-code comment justifying the chosen bound). Emit the resolved runtime versions (`numpy`, `scikit-learn`, `lightgbm`) in the output for the evidence trail.
+   - Returns non-zero with a clear `model_artifact_incompat:<package>:<reason>` message on any load failure or out-of-tolerance prediction.
+2. Reference fixtures + golden vector: store under `tests/fixtures/model_artifact_compat/` (sklearn artifact, lightgbm artifact, feature matrix `.npy`/`.json`, golden predictions `.json` carrying the base-stack versions they were produced under). Provide a `--regenerate` flag on the gate (or a sibling `tools/gen_model_artifact_compat_fixtures.py`) so the golden can be regenerated ON THE BASE STACK and committed; document that regeneration must run on the base/CI stack only.
+3. Wire the gate to run UNDER THE ROCm PINNED STACK. The `rocm-profile` CI job in `.github/workflows/validate.yml` (job `rocm-profile`, ~121-167) already builds `trading-system/runtime:amd-rocm-ci` from `Dockerfile.runtime` with `TRADING_DEPENDENCY_PROFILE=amd-rocm`. Add a step that runs `python tools/model_artifact_compat_gate.py` INSIDE that built ROCm image (`docker run --rm trading-system/runtime:amd-rocm-ci python tools/model_artifact_compat_gate.py`) so the load+predict-parity assertion executes against `numpy 2.4.6 / scikit-learn 1.9.0 / lightgbm 4.6.0`, and FAIL the job on non-zero. Mark any GPU-only requirement with the existing `requires_rocm` marker (registered `pyproject.toml:60`); the gate itself must be CPU-runnable (load+predict needs no GPU) so it also runs in the base lane for a control comparison.
+4. Add a base-lane invocation too: run the SAME gate in the SQLite/base validation lane (alongside `python tools/validate_dependency_lock.py --strict`, validate.yml ~22-23) so the golden is self-consistent on base and the gate's own correctness is proven there.
+
+(B) STACK ALIGNMENT + allowlist disposition — REQUIRED outcome:
+- Attempt to align: determine whether `numpy 2.1.2 / scikit-learn 1.5.2 / lightgbm 4.5.0` install cleanly on the ROCm image (`rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1`, Python 3.12). If they do, bump `requirements-amd-rocm-full.txt` + `requirements-amd-rocm.lock.txt` to match base, REMOVE the three `SHARED_PIN_ALLOWLIST` entries and the `ROCM_SHARED_PIN_DIVERGENCE_REASON` IOU, and let the existing equality check pass natively.
+- If alignment is NOT feasible (document the exact reason — e.g. wheel/ABI constraint on py3.12+ROCm), then KEEP the divergent ROCm pins but you MUST: (a) replace the "pending confirmation" reason on each remaining `SHARED_PIN_ALLOWLIST` entry with a precise reason that NAMES the passing compatibility gate that justifies it (e.g. `"divergence justified by tools/model_artifact_compat_gate.py load+predict parity on amd-rocm stack; see .github/workflows/validate.yml rocm-profile"`), and (b) add a guard in `tools/validate_dependency_lock.py` (extend `_shared_scientific_pin_report` or `_shared_pin_allowlist`, ~502-507/575-608) that REJECTS (`--strict` error, not warning) any `SHARED_PIN_ALLOWLIST` entry whose `reason` still contains "pending" / "unverified" / "TODO" — i.e. an unjustified allowlist entry can no longer pass. This makes a silent IOU impossible to reintroduce.
+
+GUARDRAIL: preserve all existing fail-closed / safe-mode gates; never enable live execution; read-then-change. Do not weaken `--strict`, the gross/net or kill-switch gates, the `requires_rocm` marker semantics, or the existing hash-verified install path. The compatibility gate must FAIL CLOSED (non-zero on any load error or missing fixture).
+
+VERIFY (exact, must all hold):
+1. NEGATIVE: temporarily point the gate at an intentionally incompatible pair (e.g. perturb the golden vector, or load an artifact saved under a deliberately mismatched version) and confirm `python tools/model_artifact_compat_gate.py` exits non-zero with `model_artifact_incompat:...`. Revert.
+2. POSITIVE: `docker run --rm trading-system/runtime:amd-rocm-ci python tools/model_artifact_compat_gate.py` exits 0 on the shipped fixtures under the ROCm pinned stack; the base-lane invocation also exits 0.
+3. ALLOWLIST DISPOSITION: either `grep -n "SHARED_PIN_ALLOWLIST" tools/validate_dependency_lock.py` shows the three ROCm entries REMOVED (aligned case), OR every remaining entry's `reason` names the passing gate AND `grep -niE "pending|unverified|TODO" tools/validate_dependency_lock.py` returns no allowlist-reason hit; AND the new validator guard makes a "pending"-reason entry fail `--strict` (prove with a one-off temporary edit then revert).
+4. `python tools/validate_dependency_lock.py --strict` exits 0; `python tools/validate_repo.py` exits 0; `python -m pytest -q tests/test_dependency_lock_contract.py` passes (update/extend it for the new guard).
+
+After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run git status --short --untracked-files=all, python tools/git_worktree_triage.py, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
+
+---
+
+## CL-3 — Align asset_class_live_enablement_snapshot to HG-9 spec (engine_mode param + options posture via live_options_requested) (P3)
+
+ROLE: You are a senior runtime-safety engineer hardening live-trading preflight reporting fidelity.
+
+TARGET: /home/david/gitsandbox/system/system
+
+PROBLEM
+HG-9 landed `asset_class_live_enablement_snapshot()` but with cosmetic divergences from its spec. Re-confirmed against the current working tree (branch codex/worktree-production-readiness, HEAD 8184174, working tree dirty):
+
+- `engine/runtime/live_trading_preflight.py:510` — `def asset_class_live_enablement_snapshot() -> Dict[str, Any]:` takes NO `engine_mode`/mode parameter. The spec said it should accept the resolved engine mode so the snapshot reflects the actual runtime posture (not just env flags).
+- `engine/runtime/live_trading_preflight.py:513-536` — the options entry computes `live_permitted` solely from `options_mode == "live"` where `options_mode = os.environ.get("OPTIONS_INSTRUMENTS_MODE", "shadow")`. It does NOT consult `engine.execution.options_readiness.live_options_requested()`, which is the canonical "live options requested" predicate. `live_options_requested()` (`engine/execution/options_readiness.py:157-164`) returns True when `OPTIONS_INSTRUMENTS_MODE`/`OPTIONS_AS_INSTRUMENTS_MODE` == "live" OR any of `OPTIONS_LIVE_ORDERS_ENABLED`/`OPTIONS_ENABLE_LIVE_ORDERS`/`OPTIONS_AS_INSTRUMENTS_LIVE` is truthy. The snapshot therefore UNDER-reports options live posture when the live-orders flags are set without setting the instruments mode to "live".
+- `engine/runtime/live_trading_preflight.py:542` — returns the key `"asset_classes"`. The HG-9 spec named the key `classes`. GREP RESULT (already run, do not re-discover): the ONLY consumers of `snapshot["asset_classes"]` are the snapshot itself and the test file `tests/test_live_trading_preflight_asset_class_snapshot.py` (lines 26, 48, 137). No production/dashboard/operator code reads it. Decision is forced below.
+- Call site: `engine/runtime/live_trading_preflight.py:1268` (inside `live_trading_preflight` defined at line 1163, which resolves `mode = _normalize_mode(engine_mode if engine_mode is not None else os.environ.get("ENGINE_MODE"), "safe")`) calls `asset_class_live_enablement_snapshot()` with NO argument. It is computed AFTER blocker mutation and only surfaced read-only at line 1304 under key `"asset_class_live_enablement"`. Gating is unaffected — this is reporting-only.
+
+WHAT IS CURRENTLY MISSING/INSUFFICIENT (prior pass skipped these):
+1. No `engine_mode` parameter on the snapshot function and the call site does not pass the resolved `mode`.
+2. Options `live_permitted` ignores `live_options_requested()`.
+3. Key name not aligned to spec and not consciously reconciled with consumers.
+
+DESIGN / REQUIRED CHANGE (implement exactly; this item was skipped before — be literal)
+
+File: engine/runtime/live_trading_preflight.py
+
+1. Change the signature to:
+   `def asset_class_live_enablement_snapshot(*, engine_mode: Optional[str] = None) -> Dict[str, Any]:`
+   At the top of the body resolve the mode using the existing canonical resolver already used throughout this module:
+   `mode = _normalize_mode(engine_mode if engine_mode is not None else os.environ.get("ENGINE_MODE"), "safe")`
+   Include the resolved mode in the returned dict as a new key `"engine_mode": mode` (additive; do not remove existing keys other than the rename below).
+
+2. Options posture: import and consult `live_options_requested` from `engine.execution.options_readiness` (use a local/function-scoped import inside the function body, mirroring the lazy-import style used elsewhere in this module e.g. `production_secret_sources_snapshot` at ~:550, to avoid import cycles; wrap in try/except and default to `False` on failure so the snapshot never raises). Compute:
+   `options_live_requested = bool(live_options_requested())` (guarded)
+   The options entry's `live_permitted` MUST be: `(options_mode == "live") or options_live_requested`. Keep `flag_value` = `options_mode`, keep `flag` = `"OPTIONS_INSTRUMENTS_MODE"`, keep `default_posture` = `"shadow"`, keep `invalid_flag_value` = `options_mode not in {"shadow","paper","live"}`. Add a key `"live_options_requested": options_live_requested` to the options entry so the dual signal is auditable.
+   Do NOT change `OPTIONS_INSTRUMENTS_MODE` default resolution semantics (still defaults "shadow").
+
+3. Key name: RENAME the returned key from `"asset_classes"` to `"classes"` to match the HG-9 spec. The grep confirms the only consumers are the test file — update them (below). Do not leave an aliased duplicate key; rename cleanly. Keep `"ok"`, `"status"`, and `"any_live_permitted"` (computed over `classes.values()`).
+
+4. Call site at line ~1268: change `asset_class_live_enablement_snapshot()` to `asset_class_live_enablement_snapshot(engine_mode=mode)` so the snapshot reflects the resolved runtime mode. Do NOT move this call earlier and do NOT add its result to `blockers` — it remains reporting-only and is surfaced under `"asset_class_live_enablement"` at line ~1304 unchanged.
+
+5. Do NOT touch the GO-R7 FX live-enablement blocker logic, the options_instruments readiness blocker logic (`live_options_readiness_snapshot` at ~1260-1266), or any other blocker. `_boolean_live_enablement_entry` for fx/crypto/futures is unchanged.
+
+GUARDRAIL: preserve all existing fail-closed/safe-mode gates; never enable live execution; read-then-change. This change is reporting-only — it must not add, remove, or reorder any preflight blocker, must not flip `ok`, and must not alter mode resolution defaults (still "safe"). Defaults must remain disabled/shadow.
+
+File: tests/test_live_trading_preflight_asset_class_snapshot.py
+- Replace every `snapshot["asset_classes"]` / `state[...]["asset_class_live_enablement"]["asset_classes"]` access with `"classes"` (lines 26, 48, 137).
+- In `test_asset_class_live_enablement_defaults_disabled_or_shadow`: also `monkeypatch.delenv` for `OPTIONS_AS_INSTRUMENTS_MODE`, `OPTIONS_LIVE_ORDERS_ENABLED`, `OPTIONS_ENABLE_LIVE_ORDERS`, `OPTIONS_AS_INSTRUMENTS_LIVE` (raising=False) so the live-orders backdoor is exercised as off; assert `classes["options"]["live_permitted"] is False` and `classes["options"]["live_options_requested"] is False`.
+- Add a new test `test_asset_class_options_live_permitted_via_live_orders_flag`: with `OPTIONS_INSTRUMENTS_MODE` unset/"shadow" but `OPTIONS_LIVE_ORDERS_ENABLED=1`, assert `classes["options"]["live_permitted"] is True`, `classes["options"]["live_options_requested"] is True`, `classes["options"]["flag_value"] == "shadow"`, and `snapshot["any_live_permitted"] is True`.
+- Add assertion in an existing default-mode test that `snapshot["engine_mode"]` equals the resolved default (call with no arg and with `ENGINE_MODE` unset -> expect "safe"); and add a test calling `asset_class_live_enablement_snapshot(engine_mode="live")` asserting `snapshot["engine_mode"] == "live"`.
+- Keep the surfacing test (line 57+) asserting `state["blockers"] == ["existing_contract_blocker"]` and `state["ok"] is False` UNCHANGED except the key rename — this proves the rename/param add introduced no new blocker.
+
+VERIFY (exact checks that prove done)
+1. `cd /home/david/gitsandbox/system/system && python -m pytest tests/test_live_trading_preflight_asset_class_snapshot.py -q` passes, including the new options-via-live-orders test and the engine_mode tests.
+2. `grep -rn '\"asset_classes\"' engine/runtime/live_trading_preflight.py tests/test_live_trading_preflight_asset_class_snapshot.py` returns NOTHING (rename complete; note the unrelated provider-registry/data `asset_classes` usages elsewhere are out of scope and untouched).
+3. `grep -n 'asset_class_live_enablement_snapshot(engine_mode=mode)' engine/runtime/live_trading_preflight.py` matches at the ~1268 call site.
+4. `grep -n 'live_options_requested' engine/runtime/live_trading_preflight.py` shows the new guarded import/use inside the snapshot function.
+5. Behavioral proof the options entry requires BOTH signals to agree only in the AND-of-OR sense specified: a quick inline check (no code commit needed) —
+   `python -c "import os; os.environ.pop('OPTIONS_INSTRUMENTS_MODE',None); os.environ['OPTIONS_LIVE_ORDERS_ENABLED']='1'; from engine.runtime.live_trading_preflight import asset_class_live_enablement_snapshot as s; assert s()['classes']['options']['live_permitted'] is True; os.environ.pop('OPTIONS_LIVE_ORDERS_ENABLED'); assert s()['classes']['options']['live_permitted'] is False; print('ok')"`
+   prints `ok`.
+6. Confirm no blocker drift: the preflight surfacing test asserts `blockers == ["existing_contract_blocker"]` and `ok is False` still hold — preflight `blockers`/`ok` unchanged.
+
+After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run git status --short --untracked-files=all, python tools/git_worktree_triage.py, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
+
+---
+
+## CL-4 — Resolve operator-unit NotifyAccess (all) and document heartbeat-source rationale (HG-13 close-out) (P3)
+
+ROLE: You are a senior systemd/Node release engineer closing out HG-13 by reconciling the operator unit's NotifyAccess directive with how the operator process actually emits its sd_notify datagram, and documenting the rationale.
+
+TARGET: /home/david/gitsandbox/system/system
+
+PROBLEM
+HG-13's spec text said NotifyAccess=main on both production units, but the operator unit deliberately diverges and this divergence was never made explicit/forcing in the unit file itself.
+
+Re-confirmed current state (working tree, branch codex/worktree-production-readiness):
+- deploy/systemd/trading-engine.service:9 `Type=notify`, :48 `WatchdogSec=60s`, :49 `NotifyAccess=main`. Correct: the engine pings only from its main Python process (engine.runtime.sd_notify).
+- deploy/systemd/trading-operator.service:9 `Type=notify`, :49 `WatchdogSec=60s`, :50 `NotifyAccess=all`. This is the divergence flagged by HG-13.
+- boot/operator_server.js emits READY/WATCHDOG via systemdNotify() (defined :94-119). Primary path: native `unix-dgram` AF_UNIX datagram sent from the main node process (:104-114), honoring systemd's NUL-prefixed abstract socket form (systemdNotifyAddress :88-92). Fallback path: systemdNotifyViaCli() (:121-152) spawns `/usr/bin/systemd-notify` (SYSTEMD_NOTIFY_BIN :46) with `args = ["--pid=parent", ...]` (:131) via spawnSync when the native module is missing OR the native send throws (:100-101, :115-117).
+- docs/FAILURE_MODES.md:40-46 already states a rationale paragraph; tests/test_systemd_watchdog_hardening.py:56-57 already asserts the operator's expected NotifyAccess is "all", and :149-159 asserts the fallback wiring (`--pid=parent`, `/usr/bin/systemd-notify`, unix-dgram).
+
+DECISION (already validated against the code — do NOT re-litigate, implement it):
+NotifyAccess=all is CORRECT and must stay. Rationale: the CLI fallback runs `systemd-notify` as a CHILD process. systemd authorizes notify datagrams by the SCM_CREDENTIALS ucred of the SENDING socket (the child's PID), not by the payload's MAINPID field. The `--pid=parent` flag only rewrites the MAINPID= payload line; it does NOT change the kernel-attached sender credentials. Therefore under NotifyAccess=main systemd would REJECT the fallback datagram (sender PID != MAINPID), silently breaking the watchdog liveness contract whenever a host lacks the native `unix-dgram` module or the native send throws. NotifyAccess=all is required to accept that legitimate child-originated datagram. Tightening the operator to NotifyAccess=main is therefore WRONG and must not be done.
+
+What is currently MISSING / insufficient (the close-out gap):
+1. The operator unit file has NO comment at deploy/systemd/trading-operator.service:50 explaining WHY it diverges from the engine's NotifyAccess=main. A future maintainer "hardening for least privilege" will flip it to main and silently break the fallback heartbeat. This must be made self-documenting and forcing.
+2. docs/FAILURE_MODES.md:42-46 mentions the fallback but does not name the precise mechanism (child-PID sender credentials vs MAINPID payload) — the actual reason main would reject it. The rationale must be made technically explicit so the decision is auditable.
+3. The hardening test asserts the value "all" but does not lock in the rationale/comment, so a future edit can remove the explanation without failing CI.
+
+DESIGN / REQUIRED CHANGE
+Read each file first, then change:
+
+A. deploy/systemd/trading-operator.service — add an explanatory comment line immediately ABOVE the `NotifyAccess=all` directive (currently line 50). Keep `NotifyAccess=all` unchanged. The comment MUST convey (single or multi-line `#` comment): operator emits sd_notify via native unix-dgram from the main PID, with a `/usr/bin/systemd-notify` CLI fallback that runs as a CHILD process; systemd authorizes by the sending socket's ucred PID, so NotifyAccess=main would reject the child-originated fallback datagram and break the watchdog heartbeat — hence `all`. Cross-reference docs/FAILURE_MODES.md. Do NOT add a comment to the engine unit (its NotifyAccess=main stays correct — engine notifies only from the main process).
+
+B. docs/FAILURE_MODES.md — revise the existing operator paragraph (lines 40-46, "systemd Watchdog Heartbeat Contract" section) so the rationale is technically precise: state that the operator's primary notify path is a native AF_UNIX datagram from the main node process, and the fallback spawns `/usr/bin/systemd-notify` as a child; systemd checks the SENDER socket's SCM_CREDENTIALS PID (not the `--pid=parent` MAINPID payload), so the operator uses NotifyAccess=all to accept the child-originated fallback whereas the engine uses NotifyAccess=main because it never notifies from a child. Keep all surrounding text (engine paragraph, memory cgroup paragraph) intact. Do not weaken any existing statement.
+
+C. tests/test_systemd_watchdog_hardening.py — keep the existing `"NotifyAccess": "all"` expectation for trading-operator.service (do NOT change it to main). ADD assertions that lock in the close-out so the rationale cannot silently regress:
+   - In test_engine_and_operator_units_have_watchdog_and_memory_bounds (or a new dedicated test, e.g. test_operator_notify_access_rationale_is_documented), assert the operator unit file text contains a comment line referencing the child/fallback rationale near NotifyAccess (e.g. assert that the operator unit text contains both a `#` comment AND a substring such as "systemd-notify" or "child" or "NotifyAccess=main would reject" on a comment line preceding `NotifyAccess=all`).
+   - Assert docs/FAILURE_MODES.md contains the precise rationale tokens (e.g. both "NotifyAccess=all" and a substring identifying the sender-credentials/child mechanism such as "child" and "--pid=parent" or "sender" — pick stable substrings that exist in your edited text).
+   Keep the existing :149-159 fallback-wiring assertions unchanged.
+
+Do not change boot/operator_server.js — its notify mechanism is correct and is the ground truth the units/docs must match.
+
+GUARDRAIL: preserve all existing fail-closed/safe-mode gates; never enable live execution; read-then-change. Do NOT break the watchdog liveness contract — NotifyAccess must remain `all` on the operator and `main` on the engine. Never print secret values.
+
+VERIFY
+1. `git -C /home/david/gitsandbox/system/system diff --stat` shows only deploy/systemd/trading-operator.service, docs/FAILURE_MODES.md, and tests/test_systemd_watchdog_hardening.py changed (operator_server.js and the engine unit unchanged).
+2. `grep -n "NotifyAccess" deploy/systemd/trading-operator.service deploy/systemd/trading-engine.service` shows operator=all, engine=main, with a `#` rationale comment immediately above the operator's NotifyAccess line.
+3. `systemd-analyze verify deploy/systemd/trading-operator.service` (and the engine unit) returns clean — no new warnings/errors introduced by the comment. (If systemd-analyze is unavailable in the sandbox, run `systemd-analyze --version` to confirm absence and note it; the comment must still be syntactically valid systemd unit-file comment syntax.)
+4. docs/FAILURE_MODES.md states the rationale (child-process sender credentials vs `--pid=parent` MAINPID; main would reject the fallback) — confirm via grep for the chosen stable substrings.
+5. `python -m pytest tests/test_systemd_watchdog_hardening.py -q` passes, including the new rationale assertions and the unchanged `NotifyAccess=all` expectation.
+
+After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run git status --short --untracked-files=all, python tools/git_worktree_triage.py, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
+
+---
+
+## GO-R11-EXEC — Host-hardening bootstrap + self-enforcing live-host-readiness go-live blocker (operator+dev)
+
+ROLE: Senior SRE / release engineer hardening a single-host live trading deployment. TARGET: /home/david/gitsandbox/system/system
+
+PROBLEM (re-confirmed against the current dirty working tree on branch codex/worktree-production-readiness; line numbers verified now, HEAD has advanced to 1944103 — re-confirm before editing).
+
+GO-R11 has DEV assists but the HOST is not hardened and the readiness check is NOT self-enforcing, so go-live can still proceed against an unhardened host:
+
+1. tools/live_host_readiness_check.py EXISTS but is too narrow. It checks ONLY: total swap >= 16 GiB (MIN_SWAP_BYTES, line 10) and two systemd units trading-engine.service / trading-operator.service (SYSTEMD_UNITS, lines 11-22) for Type/WatchdogUSec/MemoryMax/OOMScoreAdjust (live_host_readiness_errors, lines 128-142). It explicitly treats a not-installed unit as a PASS (lines 98-99: `if LoadState in {"", "not-found"}: return []`) and on a host with units inactive it reports `WatchdogUSec=infinity` / `ActiveState=inactive`. It does NOT check: the backup-evidence HMAC key file mode, inline secrets in the active environment, presence of at least one paid feed credential, the trading-backup.service / trading-restore-drill.service units, or offsite-backup reachability.
+
+2. The check is wired into ONE place only — tools/validate_repo.py:536 appends `("live-host-readiness", [python, "tools/live_host_readiness_check.py"])` under `if args.live:`. It is NOT wired into engine/runtime/prod_preflight.py. prod_preflight's main gate ladder (around lines 2628-2935: provisioning -> cpu-power -> disk -> memory-pressure -> storage-placement -> postgres-tuning -> ... -> capital-equity -> paid-equity -> external-services, each returning exit code 3 on errors) has NO live-host-readiness gate. So `python -m engine.runtime.prod_preflight` can pass on an unhardened host.
+
+3. There is NO deploy/bin/apply_host_hardening.sh. deploy/bin/ contains backup_trading_db.sh, install_python_env.sh, resolve_python_requirements.sh, rotate_local_logs.sh, service_ctl.sh, upgrade_trading_system.sh — none install/enable units or apply swap. The swap/zram/ARC installer already exists at ops/server/memory_pressure_hardening.sh (invoked `sudo bash ops/server/memory_pressure_hardening.sh install`, per docs/MEMORY_PRESSURE_RUNBOOK.md lines 36-57; targets 32 GiB zram + 16 GiB /swapfile-trading + 48 GiB ARC). The deploy systemd unit files live in deploy/systemd/: trading-engine.service, trading-operator.service, trading-backup.service (+ trading-backup.timer), trading-restore-drill.service (+ trading-restore-drill.timer), trading-upgrade.service.
+
+CURRENT-HOST FACTS this item must drive to fail-closed-until-fixed: live_host_readiness_check currently reports WatchdogUSec=infinity / ActiveState=inactive (units not installed/active); swap is 512 MiB only (below the 16 GiB floor); /etc/trading/backup_evidence.hmac.key is mode 0640 (should be 0600 — install_trading_system.sh:208,254 already chmods managed key material to 0600); the untracked .env carries inline TRADING_MASTER_KEY / APP_MASTER_KEY / DASHBOARD_API_TOKEN values (the secret-source policy in engine/runtime/secret_sources.py + prod_preflight provisioning gate at lines 283-296 enforces *_FILE / *_SECRET provider sourcing but does NOT detect an inline literal sitting in the active process environment); no paid feed credential is provisioned (Polygon/IBKR); no offsite backup destination is set (TS_OFFSITE_BACKUP_DEST / TS_BASE_BACKUP_OFFSITE_CMD per ops/backup/offsite_base_backup_stub.sh:17-20).
+
+WHAT IS MISSING / INSUFFICIENT (a prior pass SKIPPED the host enforcement and the broadened check): the readiness check covers only 2 of the 7 required signals; it is not a prod_preflight blocker; there is no idempotent bootstrap script to actually apply the host state; and PRODUCTION_CHECKLIST.md does not give the exact operator runbook to flip an unhardened host to ready.
+
+DESIGN / REQUIRED CHANGE. Make GO-R11 self-enforcing in three coordinated parts. Read each touched file first; do not weaken any existing gate.
+
+(1) NEW DEV DELIVERABLE — deploy/bin/apply_host_hardening.sh. Idempotent, sudo-run, safe to re-run; bash `set -euo pipefail`; refuse to run if EUID != 0 with a clear message. It MUST, in order, with a per-step PASS/FAIL line and a final summary block:
+  a. Apply memory hardening by delegating to the existing installer (do NOT reimplement swap/zram/ARC): `bash "$REPO_DIR/ops/server/memory_pressure_hardening.sh" install` honoring env overrides TRADING_ZRAM_SIZE_GIB=32, TRADING_SWAPFILE_SIZE_GIB=16, TRADING_ZFS_ARC_MAX_GIB=48 (the runbook's documented values). Then re-verify via `bash ops/server/memory_pressure_hardening.sh verify`.
+  b. Install + enable + start the systemd units by copying deploy/systemd/{trading-engine.service,trading-operator.service,trading-backup.service,trading-backup.timer,trading-restore-drill.service,trading-restore-drill.timer} into /etc/systemd/system/ ONLY when the source differs from the installed file (compare with cmp; copy-if-changed for idempotence), then `systemctl daemon-reload`, then `systemctl enable --now` the two long-running services (trading-engine, trading-operator) and `enable --now` the two timers (trading-backup.timer, trading-restore-drill.timer). Never start trading-engine with any live-execution flag — installing/starting the supervisor unit is NOT enabling live trading; preserve whatever ENGINE_MODE the unit file already declares and do not inject live mode.
+  c. Set the backup-evidence HMAC key file to 0600 root-owned: resolve the path from $BACKUP_EVIDENCE_HMAC_KEY_FILE if set, else /etc/trading/backup_evidence.hmac.key; if it exists run `chmod 0600` + `chown root:root`; if absent, FAIL that step with a message telling the operator to provision it (do NOT create an empty key). Never print the key contents.
+  d. Print a final summary: each step name + PASS/FAIL, then exit non-zero if ANY step failed. Re-running on an already-hardened host must report all PASS and exit 0.
+  Add the script to the `chmod +x deploy/bin/*.sh` set already covered by deploy/install_trading_system.sh:274 (verify it is picked up).
+
+(2) BROADEN + WIRE THE GATE. Extend tools/live_host_readiness_check.py so live_host_readiness_errors() additionally appends a clear, reason-coded error (string form `signal:detail`) for each of:
+  - swap below MIN_SWAP_BYTES (already present — keep).
+  - WatchdogUSec not applied / ActiveState != active for the long-running units. CHANGE the not-found short-circuit (lines 98-99): when running in the prod_preflight/live path, a required unit that is `not-found` or `inactive` MUST be an error, not a silent pass. Add a parameter `require_active: bool` (default False to preserve the existing standalone CLI behavior used by validate_repo) and have prod_preflight call with require_active=True so an inactive/not-installed engine/operator unit FAILS. Keep the existing WatchdogUSec in {"", "0", "infinity"} detection (lines 105-112).
+  - MemoryMax set to the expected value per unit (already partially present — keep, and ensure it is an error not a warning).
+  - backup-evidence HMAC key file mode == 0600 (resolve path as in 1c); error `backup_key_mode_insecure:<octal>` if more permissive. Reuse the mode-reading approach in prod_preflight._credential_file_snapshot (lines 255-280) — do NOT print key bytes.
+  - NO inline secret literal in the active environment: error if any of TRADING_MASTER_KEY, APP_MASTER_KEY, DASHBOARD_API_TOKEN, DATA_SOURCE_MASTER_KEY, BACKUP_EVIDENCE_HMAC_KEY holds a non-empty value while the corresponding *_FILE/*_SECRET is the policy-approved source. Emit reason `inline_secret_present:<ENV_NAME>` — NAME ONLY, never the value. (This complements, not replaces, engine/runtime/secret_sources.py provider policy.)
+  - at least one paid feed credential present: pass if any of the Polygon/IBKR credential sources is provisioned via the approved *_FILE/*_SECRET mechanism (reuse engine.runtime.secret_sources / _paid_equity_provider_names at prod_preflight.py:130 to enumerate provider names); error `no_paid_feed_credential` otherwise. Detect presence WITHOUT reading secret values.
+  - offsite destination reachable: pass if TS_BASE_BACKUP_OFFSITE_CMD is set, OR TS_OFFSITE_BACKUP_DEST is set AND reachable (for an s3:// dest treat "configured" as sufficient; for a local/NAS path require the directory exists and is writable). Error `offsite_dest_unreachable:<reason>` otherwise.
+  Keep main() returning 0/1 and printing only reason codes (no secret values).
+  THEN add a new gate function `_live_host_readiness_gate()` in engine/runtime/prod_preflight.py that imports `live_host_readiness_errors(require_active=True)` from tools.live_host_readiness_check (add the repo root to sys.path the same way other tool-backed gates do, or move the helper under engine/runtime/ if importing from tools/ is not already supported — confirm import path before choosing), returns (notes, warnings, errors, summary), and INSERT it into the main ladder so that when the runtime is live/required it BLOCKS with `return 3` exactly like the adjacent gates (mirror the memory-pressure block at lines 2666-2677, printing `[live-host-readiness] <reason>` per error). Add a `live_host_readiness` key to the result dict initializer near lines 2605-2624. Gate it the same way other live-only blockers are (only enforce-as-blocker when the runtime mode is live / the existing live-require flag is set), so non-live preflight is not regressed.
+
+(3) DOCUMENT THE OPERATOR RUNBOOK in docs/PRODUCTION_CHECKLIST.md — a "GO-R11 host hardening" subsection with the EXACT ordered steps: (i) replace every inline secret in .env with the approved *_FILE or *_SECRET source (list TRADING_MASTER_KEY/APP_MASTER_KEY/DASHBOARD_API_TOKEN -> *_FILE at 0600 or systemd-creds *_SECRET); (ii) `sudo bash deploy/bin/apply_host_hardening.sh`; (iii) provision Polygon and IBKR credentials as *_FILE at mode 0600 (or *_SECRET); (iv) set TS_BASE_BACKUP_OFFSITE_CMD or TS_OFFSITE_BACKUP_DEST; (v) re-run `python tools/live_host_readiness_check.py` and `python -m engine.runtime.prod_preflight` and confirm exit 0. Reference docs/MEMORY_PRESSURE_RUNBOOK.md for the swap/zram/ARC detail. Do not embed any secret value in the doc.
+
+GUARDRAIL: preserve all existing fail-closed/safe-mode gates; never enable live execution (installing/starting supervisor units must not set live mode); read-then-change. apply_host_hardening.sh must be idempotent and must not weaken any secret-source policy (no chmod that loosens, no creation of empty keys). Never print secret values anywhere — emit env-var NAMES and reason codes only.
+
+VERIFY (exact, proves done):
+  - On an UNHARDENED host (current state: 512 MiB swap, units inactive, backup key 0640, inline secrets, no paid feed, no offsite), `python -m engine.runtime.prod_preflight` (live/required mode) exits NON-ZERO (3) and prints `[live-host-readiness]` lines including the swap, watchdog/inactive-unit, backup_key_mode_insecure, inline_secret_present, no_paid_feed_credential, and offsite_dest_unreachable reasons; `python tools/validate_repo.py --live` fails at the `live-host-readiness` check.
+  - After `sudo bash deploy/bin/apply_host_hardening.sh` in a test/staging context (and provisioning the secrets/feeds/offsite per the runbook), `python tools/live_host_readiness_check.py` exits 0 printing the pass line, the same prod_preflight gate passes, and re-running apply_host_hardening.sh reports all-PASS and exits 0 (idempotence).
+  - Grep the script and check output to confirm NO secret value is ever printed (only env-var names / reason codes / file modes). Add a unit test under tests/ that monkeypatches the environment + a fake systemctl/swapon/stat surface to assert live_host_readiness_errors(require_active=True) returns each reason code when its precondition is unmet and an empty list when all are satisfied, plus a control test that require_active=False preserves the prior standalone behavior.
+
+After implementation, audit your own work. Show exact files changed, why each change is required, and how the fix is enforced in production code rather than only tests/docs. Update documentation to reflect changes made. Run targeted tests for the changed behavior, then run git status --short --untracked-files=all, python tools/git_worktree_triage.py, and the relevant validators. Capture exact exit codes and key output lines. If any requirement is not fully implemented, say NO-GO and explain the remaining work.
+
+---

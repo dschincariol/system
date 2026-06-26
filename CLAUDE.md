@@ -2,24 +2,24 @@
 
 This file is loaded automatically into every Claude Code session in this repo. It is the persistent instruction surface for AI assistants working on the codebase.
 
-Last verified against code: 2026-06-21
+Last verified against code: 2026-06-26
 
 ## North Star
 
 Build an autonomous alpha discovery system that searches a universe of inputs, discovers which are useful, builds models linking inputs to predictions, and trades any financial product for profit. The goal is "best in the world" — comparable to Renaissance Technologies, Two Sigma, WorldQuant.
 
-The current system is a substantial supervised trading runtime (~950+ Python files). **Improvements build on existing architecture — never replace it.**
+The current system is a substantial supervised trading runtime (~1,500+ Python files). **Improvements build on existing architecture — never replace it.**
 
 ## System at a glance
 
-Full-stack supervised trading system, Postgres-backed runtime storage facade, ~100+ registered jobs.
+Full-stack supervised trading system, Postgres-backed runtime storage facade, ~140+ registered jobs.
 
 - **Data sources:** Prices (CCXT/IBKR/Polygon/yfinance), News/RSS, SEC/EDGAR, Social (Reddit/StockTwits), GDELT, Weather (NOAA), Options (Polygon), Earnings (FMP), Macro, Transcripts, Form 4 insider, congressional trades, and PIT universe snapshots.
-- **Features:** Schema-driven train/serve parity through `engine/strategy/feature_registry.py`. The default serving schema is exactly 111 feature ids (8 base + 103 unified symbol-snapshot ids when `USE_SYMBOL_SNAPSHOT_FEATURES=1`, the default). The full registered catalog is larger, about 1,762 ids without shadow groups and about 1,802 with shadow groups; that larger catalog is the opt-in/shadow superset, not the serving surface. Current groups include base, price, events, macro, FX, HMM regime, tech, stress, social, weather, options-symbol, availability, tsfresh, NLP/FinBERT/news, filings, and transcripts.
+- **Features:** Schema-driven train/serve parity through `engine/strategy/feature_registry.py`. The default serving schema is exactly 111 feature ids (8 base + 103 unified symbol-snapshot ids when `USE_SYMBOL_SNAPSHOT_FEATURES=1`, the default). The full registered catalog is larger, about 1,762 ids without shadow groups and about 1,902 with shadow groups; that larger catalog is the opt-in/shadow superset, not the serving surface. Current groups include base, price, events, macro, FX, HMM regime, tech, stress, social, weather, options-symbol, availability, tsfresh, NLP/FinBERT/news, filings, and transcripts.
 - **Models:** Current active families center on LightGBM, XGBoost, sklearn GBM, PatchTST, iTransformer, and a Ridge meta-ensemble (`engine/strategy/models/`, `engine/strategy/ensemble/ridge_meta.py`). Legacy/fallback paths still exist for embed regressors, temporal predictors, and regime/statistical baselines. Shadow-only RL remains advisory/shadow and has no live order authority.
 - **Strategy:** Multi-model predictor routing, canonical model intent (`engine/strategy/model_intent.py`), portfolio construction (max 3 positions, anti-flip-flop), 3-layer regime stack (macro/asset/micro), alpha lifecycle with TTL/half-life decay.
 - **Risk:** Portfolio risk engine (gross 1.0 / net 0.6, vol targeting, correlation clusters), Monte Carlo (1500 sims, VaR/CVaR), drawdown guard (6% throttle), circuit breaker, kill switch, trade suppression (HARD_BLOCK/SOFT_THROTTLE/SIZE_COMPRESSION).
-- **Execution:** Policy engine (TTL, alpha decay, aggressiveness tiers, regime sizing), TWAP/VWAP/POV/adaptive slicing, broker router (Alpaca/IBKR/Sim with failover + reconciliation gate), AI advisor (advisory only), attribution ledger.
+- **Execution:** Policy engine (TTL, alpha decay, aggressiveness tiers, regime sizing), TWAP/VWAP/POV/adaptive slicing, broker router (Alpaca/IBKR/Sim equities-crypto plus opt-in Tradier live options, with failover + reconciliation gate), AI advisor (advisory only), attribution ledger.
 - **Oversight:** Dashboard server + browser UI, operator AI (bounded LLM diagnostics), governance (promotion/replay/critic/audit), browser terminal, CPCV/gated backtest evidence, BH-FDR/Harvey-Liu-Zhu/Reality-Check gates, pool-correlation/MPC gates, era robustness, Optuna/surface robustness, and drift-triggered retraining.
 
 See `docs/README_ARCHITECTURE.md` for the full architecture document.
@@ -29,7 +29,7 @@ See `docs/README_ARCHITECTURE.md` for the full architecture document.
 5-phase roadmap persisted in `.claude/projects/.../memory/optimization_roadmap.md`. Summary:
 
 - **Phase 1 (P0, Months 1–3) — Foundation:** DONE in current code for statistical promotion gates, CPCV/PBO/deflated Sharpe, gated cost-adjusted promotion backtests, tsfresh/PySR feature discovery hooks, and Optuna HPO/surface robustness. Continue hardening survivorship-bias and data-quality coverage.
-- **Phase 2 (P1, Months 3–6) — Intelligence:** PARTIAL/DONE in current code for LightGBM, XGBoost, sklearn GBM, PatchTST, iTransformer, FinBERT/NLP feature groups, causal scoring, Ridge meta-ensemble blending, and shadow RL. Graph models, TabNet, and broader LLM transcript workflows remain future work.
+- **Phase 2 (P1, Months 3–6) — Intelligence:** PARTIAL/DONE in current code for LightGBM, XGBoost, sklearn GBM, PatchTST, iTransformer, FinBERT/NLP feature groups, causal scoring, Ridge meta-ensemble blending, shadow RL, a shadow-only temporal heterogeneous graph challenger (`engine/strategy/graph_challenger.py`, `engine/strategy/graph_relational.py`), shadow-only time-series foundation-model adapters/benchmarking (`engine/strategy/tsfm_adapters.py`, `engine/strategy/tsfm_benchmark.py`), and shadow-only structured LLM financial-event extraction (`engine/data/llm_event_extraction.py`). These graph/TSFM/LLM surfaces are advisory/shadow with no live serving authority; TabNet and broader live LLM transcript workflows remain future work.
 - **Phase 3 (P1, Months 6–9) — Scale:** PARTIAL. Runtime storage now goes through a Postgres-backed facade, but Kafka streaming, Feast feature store, Redis hot caching, broader universe expansion, and more alt data remain roadmap work.
 - **Phase 4 (P1–P2, Months 9–12) — Autonomy:** Closed-loop alpha discovery (generate → test → backtest → shadow → promote → monitor → retire); meta-learning; deep RL portfolio manager (PPO/SAC via FinRL); self-monitoring/self-repair.
 - **Phase 5 (P2–P3, 12+ months) — Edge:** L2 microstructure modeling, event-driven alpha (earnings/M&A/macro), options as instruments (vol surface arb, tail hedging).

@@ -74,7 +74,7 @@ Knob families (module-level constants read from `PORTFOLIO_RISK_*` env):
 - Budgets — asset-class budgets (`USE_ASSET_CLASS_BUDGETS`,
   `ASSET_CLASS_BUDGETS_JSON`, default EQUITY 0.80 when
   `PORTFOLIO_RISK_BIND_EQUITY_BUDGET=1` / CRYPTO 0.35 / COMMODITY 0.50 /
-  FX 0.50 / FUTURES 0.40 / RATES 0.60 / UNKNOWN 0.40), strategy budgets
+  OPTION 0.20 / FX 0.50 / FUTURES 0.40 / RATES 0.60 / UNKNOWN 0.40), strategy budgets
   (`MAX_STRATEGY_GROSS` 0.60, `MAX_STRATEGY_NET` 0.40), and an alpha-decay throttle
   (`USE_ALPHA_DECAY_THROTTLE`, `ALPHA_DECAY_FRESH_S`) that rescales per strategy
   from fresh `strategy_metrics`.

@@ -2,7 +2,7 @@
 
 This document explains where the code lives and how to navigate it.
 
-Last verified against code: 2026-06-21
+Last verified against code: 2026-06-26
 
 It is written for developers who need to answer:
 
@@ -333,6 +333,10 @@ For this functional area, do not add new operator-side `.env` feed-config flows.
 | Governance summary | `engine/strategy/model_governance_ext.py`, `engine/strategy/jobs/strategy_governance_job.py`, `engine/api/api_governance.py`, `ui/dashboard.html`, `ui/dashboard.js` |
 | Allocation overlay | `engine/strategy/allocation_risk_overlay.py`, `engine/strategy/portfolio.py` |
 | Research stress tooling | `engine/research/adversarial_scenario_generator.py`, `engine/research/model_fragility_analyzer.py`, `tools/research_stress_smoke.py` |
+| Risk-model validation (VaR/CVaR backtesting) | `engine/risk/var_backtesting.py`, `engine/runtime/jobs/risk_var_backtest.py` (`risk_var_backtest` job), `engine/api/api_system.py` (`/api/risk/var_backtest`) |
+| Conditional volatility forecasts | `engine/strategy/garch_vol.py`, `engine/strategy/jobs/garch_vol_forecast.py` (`garch_vol_forecast` job) |
+| Covariance/correlation facade | `engine/risk/covariance.py` (consumed by `engine/risk/portfolio_risk_engine.py`, `engine/risk/monte_carlo_risk_engine.py`, `engine/strategy/risk.py`) |
+| LLM structured event extraction (shadow-only) | `engine/data/llm_event_extraction.py`, `engine/data/jobs/llm_event_extraction.py` (`llm_event_extraction` job, shadow default) |
 | Operator AI diagnostics and guarded patching | `services/operator_ai/agent.js`, `boot/operator_server.js`, `engine/api/api_system.py`, `boot/operator_ui.html` |
 | Data-source control plane | `services/data_source_manager.py`, `services/credential_encryption.py`, `routes/data_sources_routes.py`, `ui/data_sources.html`, `ui/data_sources.js`, `ui/data_sources.css` |
 | Browser terminal | `engine/terminal/api/api_terminal.py`, `engine/terminal/api/api_terminal_orders.py`, `ui/terminal/terminal.html`, `ui/terminal/terminal.js`, `ui/terminal/terminal_theme.css` |

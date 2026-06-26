@@ -110,6 +110,16 @@ def _column_exists(conn, table_name: str, column_name: str) -> bool:
     return _column_info(conn, table_name, column_name) is not None
 
 
+def _require_hypertable_time_column(conn, table_name: str, spec: Hypertable) -> None:
+    time_column = spec.time_column
+    if _column_exists(conn, table_name, time_column):
+        return
+    raise RuntimeError(
+        f"classified hypertable {table_name!r} declares time_column={time_column!r}, "
+        "but the materialized table does not contain that column"
+    )
+
+
 def _existing_columns(conn, table_name: str, columns: Iterable[str]) -> tuple[str, ...]:
     return tuple(str(col) for col in columns if _column_exists(conn, table_name, str(col)))
 
@@ -272,8 +282,7 @@ def _set_chunk_interval(conn, table_name: str, spec: Hypertable) -> None:
     if not _table_exists(conn, table_name) or not _is_hypertable(conn, table_name):
         return
     time_column = spec.time_column
-    if not _column_exists(conn, table_name, time_column):
-        return
+    _require_hypertable_time_column(conn, table_name, spec)
     if _is_integer_time(conn, table_name, time_column):
         conn.execute(
             "SELECT set_chunk_time_interval(?::regclass, ?::bigint)",
@@ -290,8 +299,7 @@ def _create_hypertable(conn, table_name: str, spec: Hypertable) -> None:
     if not _table_exists(conn, table_name):
         return
     time_column = spec.time_column
-    if not _column_exists(conn, table_name, time_column):
-        return
+    _require_hypertable_time_column(conn, table_name, spec)
     if _is_hypertable(conn, table_name):
         _set_chunk_interval(conn, table_name, spec)
         return
@@ -337,6 +345,7 @@ def _enable_compression(conn, table_name: str, spec: Hypertable) -> None:
     if not spec.compress_after or not _table_exists(conn, table_name) or not _is_hypertable(conn, table_name):
         return
     time_column = spec.time_column
+    _require_hypertable_time_column(conn, table_name, spec)
     segment_columns = _existing_columns(conn, table_name, spec.segmentby)
     options = [
         "timescaledb.compress",
@@ -364,6 +373,7 @@ def _enable_compression(conn, table_name: str, spec: Hypertable) -> None:
 def _enable_retention(conn, table_name: str, spec: Hypertable) -> None:
     if not spec.retain or not _table_exists(conn, table_name) or not _is_hypertable(conn, table_name):
         return
+    _require_hypertable_time_column(conn, table_name, spec)
     if _is_integer_time(conn, table_name, spec.time_column):
         conn.execute(
             "SELECT add_retention_policy(?::regclass, ?::bigint, if_not_exists => TRUE)",

@@ -507,11 +507,20 @@ def _boolean_live_enablement_entry(
     }
 
 
-def asset_class_live_enablement_snapshot() -> Dict[str, Any]:
+def asset_class_live_enablement_snapshot(*, engine_mode: Optional[str] = None) -> Dict[str, Any]:
     """Report per-asset live-enable posture without adding preflight blockers."""
 
+    mode = _normalize_mode(engine_mode if engine_mode is not None else os.environ.get("ENGINE_MODE"), "safe")
     options_mode = str(os.environ.get("OPTIONS_INSTRUMENTS_MODE", "shadow") or "shadow").strip().lower() or "shadow"
-    asset_classes: Dict[str, Dict[str, Any]] = {
+    options_live_requested = False
+    try:
+        from engine.execution.options_readiness import live_options_requested
+
+        options_live_requested = bool(live_options_requested())
+    except Exception:
+        options_live_requested = False
+
+    classes: Dict[str, Dict[str, Any]] = {
         "fx": _boolean_live_enablement_entry(
             asset_class="fx",
             flag="FX_LIVE_TRADING_ENABLED",
@@ -531,7 +540,8 @@ def asset_class_live_enablement_snapshot() -> Dict[str, Any]:
             "asset_class": "options",
             "flag": "OPTIONS_INSTRUMENTS_MODE",
             "flag_value": options_mode,
-            "live_permitted": options_mode == "live",
+            "live_permitted": (options_mode == "live") or options_live_requested,
+            "live_options_requested": options_live_requested,
             "default_posture": "shadow",
             "invalid_flag_value": options_mode not in {"shadow", "paper", "live"},
         },
@@ -539,8 +549,9 @@ def asset_class_live_enablement_snapshot() -> Dict[str, Any]:
     return {
         "ok": True,
         "status": "ok",
-        "asset_classes": asset_classes,
-        "any_live_permitted": any(bool(item.get("live_permitted")) for item in asset_classes.values()),
+        "engine_mode": mode,
+        "classes": classes,
+        "any_live_permitted": any(bool(item.get("live_permitted")) for item in classes.values()),
     }
 
 
@@ -1265,7 +1276,7 @@ def live_trading_preflight(
     if mode == "live" and bool(options_instruments.get("required")) and not bool(options_instruments.get("ok")):
         blockers.extend(str(item) for item in list(options_instruments.get("blockers") or []))
 
-    asset_class_live_enablement = asset_class_live_enablement_snapshot()
+    asset_class_live_enablement = asset_class_live_enablement_snapshot(engine_mode=mode)
 
     phrase = _confirmation_phrase()
     blockers = list(dict.fromkeys(blockers))

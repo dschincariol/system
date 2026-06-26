@@ -240,6 +240,42 @@ def test_shared_scientific_pin_report_allowlists_documented_divergence(
     ]
 
 
+def test_shared_scientific_pin_report_rejects_unjustified_allowlist_reason(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _write_shared_pin_fixture(tmp_path, monkeypatch, amd_numpy="2.4.6")
+    monkeypatch.setattr(
+        validate_dependency_lock,
+        "SHARED_PIN_ALLOWLIST",
+        (
+            validate_dependency_lock.SharedPinAllowlistEntry(
+                "numpy",
+                "amd-rocm",
+                "2.4.6",
+                "unverified base-version availability on ROCm image; pending confirmation",
+            ),
+        ),
+    )
+
+    errors, warnings = validate_dependency_lock._shared_scientific_pin_report()
+
+    assert warnings == [
+        "cross_profile_pin_allowlisted:requirements-amd-rocm-full.txt:numpy:"
+        "reference=requirements-base.txt:2.1.2:"
+        "profile=amd-rocm:actual=2.4.6:expected=2.4.6:"
+        "reason=unverified base-version availability on ROCm image; pending confirmation",
+        "cross_profile_pin_allowlisted:requirements-amd-rocm.lock.txt:numpy:"
+        "reference=requirements-base.txt:2.1.2:"
+        "profile=amd-rocm:actual=2.4.6:expected=2.4.6:"
+        "reason=unverified base-version availability on ROCm image; pending confirmation",
+    ]
+    assert (
+        "shared_pin_allowlist_unjustified:amd-rocm:numpy:"
+        "reason=unverified base-version availability on ROCm image; pending confirmation"
+    ) in errors
+
+
 def test_shared_scientific_pin_allowlist_expected_version_is_enforced(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

@@ -1,0 +1,56 @@
+{
+  "artifacts": {
+    "lightgbm_regressor": {
+      "package": "lightgbm",
+      "path": "lgbm_regressor.joblib",
+      "sha256": "e807701d3d57d403862ef4e1f217e45c15b1f1b81b4366dabaea748614eb3a33"
+    },
+    "sklearn_gradient_boosting": {
+      "package": "scikit-learn",
+      "path": "sklearn_gradient_boosting.joblib",
+      "sha256": "c4559fc7af6ae88f8935ba3186b1c4d84b6303cf1a162e3540616fd061a151f6"
+    }
+  },
+  "base_stack_versions": {
+    "joblib": "1.5.3",
+    "lightgbm": "4.5.0",
+    "numpy": "2.1.2",
+    "python": "3.11.15",
+    "scikit-learn": "1.5.2"
+  },
+  "feature_ids": [
+    "base.source_credibility",
+    "base.log_recency_hours",
+    "base.normalized_text_len"
+  ],
+  "feature_matrix": "features.npy",
+  "feature_matrix_sha256": "ba83f5810372e4d45401f552884ee7d47edf2faa9d160dbe973b335f29998838",
+  "generated_by": "tools/model_artifact_compat_gate.py --regenerate",
+  "predictions": {
+    "lightgbm_regressor": [
+      -0.1840808093547821,
+      -0.2193976491689682,
+      0.4085550010204315,
+      0.8161831498146057,
+      0.7513924241065979,
+      1.4440367221832275,
+      1.2947628498077393,
+      0.9508313536643982
+    ],
+    "sklearn_gradient_boosting": [
+      -0.09667756391866655,
+      -0.16173981115815766,
+      0.24704056675210134,
+      0.6919926357536883,
+      0.7110568767608899,
+      1.0167641667994711,
+      1.2823070788274715,
+      0.9668366000234901
+    ]
+  },
+  "schema_version": 1,
+  "tolerance": {
+    "atol": 1e-06,
+    "rtol": 1e-05
+  }
+}

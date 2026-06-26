@@ -2,7 +2,7 @@
 
 This is the shortest canonical read path for engineers working in the repository.
 
-Last verified against code: 2026-06-21
+Last verified against code: 2026-06-26
 
 Use [DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md) for the full documentation map. Use this file when you need the fastest path into code ownership and high-risk surfaces.
 

@@ -36,6 +36,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --require-hashes -r requirements-dev.txt
 
+      - name: Run model artifact compatibility gate
+        run: python tools/model_artifact_compat_gate.py
+
       - name: Run pre-commit safety hooks on changed files
         run: |
           python -m pip install pre-commit==4.6.0
@@ -164,6 +167,9 @@ jobs:
             --build-arg TRADING_REQUIREMENTS_FILE=requirements-amd-rocm.txt \
             -t trading-system/runtime:amd-rocm-ci \
             .
+
+      - name: Run model artifact compatibility gate in ROCm image
+        run: docker run --rm trading-system/runtime:amd-rocm-ci python tools/model_artifact_compat_gate.py
 
   coverage:
     name: Coverage gate (branch, money paths)
